@@ -6260,6 +6260,52 @@ async fn initial_client_writer(writer: Option<&SharedWriter>) -> ClientWriter {
     Arc::new(std::sync::Mutex::new(sinks))
 }
 
+/// The handles a session's two halves — the [`LiveSession`] registry entry and
+/// the PTY reader task — both need, created once at startup so
+/// [`start_session`] only has to wire them together.
+///
+/// Everything here is either shared state (cloned into both halves) or one end
+/// of a channel that connects them, so building it in one place keeps the
+/// split itself readable and keeps [`start_session`] a wiring step.
+struct SharedSessionHandles {
+    pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
+    client_writer: ClientWriter,
+    term_commit: SessionCommit,
+    search_cache: SessionSearchCache,
+    attachment: SessionAttachment,
+    clipboard_command_tx: tokio::sync::mpsc::UnboundedSender<ClipboardCommand>,
+    clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
+    preserve_ai_scrollback: Arc<AtomicBool>,
+    scrollback_lines: Arc<AtomicUsize>,
+    exit_gate: Arc<SessionExitGate>,
+}
+
+impl SharedSessionHandles {
+    async fn new(
+        pty_write: WriteHalf<scribe_pty::async_fd::AsyncPtyFd>,
+        initial_attachment: InitialAttachment<'_>,
+    ) -> Self {
+        // Seed the session's attached-sink set with the initial client (if any) so
+        // the reader task keeps running detached when empty. A single sink here is
+        // byte-identical to the pre-015 `Some(writer)` slot.
+        let client_writer = initial_client_writer(initial_attachment.writer).await;
+        let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
+        let (preserve_ai_scrollback, scrollback_lines) = load_shared_scrollback_state();
+        Self {
+            pty_write: Arc::new(Mutex::new(pty_write)),
+            client_writer,
+            term_commit: Arc::default(),
+            search_cache: Arc::default(),
+            attachment: Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone))),
+            clipboard_command_tx,
+            clipboard_command_rx,
+            preserve_ai_scrollback,
+            scrollback_lines,
+            exit_gate: Arc::new(SessionExitGate::new()),
+        }
+    }
+}
+
 async fn start_session(
     ids: StartSessionIds,
     session: ManagedSession,
@@ -6274,32 +6320,19 @@ async fn start_session(
         ai_state, ai_provider_hint, cell_width, cell_height, env_envelope_id, ..
     } = session;
     let (pty_read, pty_write) = tokio::io::split(pty_fd);
-    let pty_write = Arc::new(Mutex::new(pty_write));
-
-    // Seed the session's attached-sink set with the initial client (if any) so the
-    // reader task keeps running detached when empty. A single sink here is
-    // byte-identical to the pre-015 `Some(writer)` slot.
-    let client_writer = initial_client_writer(initial_attachment.writer).await;
-    let term_commit: SessionCommit = Arc::default();
-    let search_cache: SessionSearchCache = Arc::default();
-    let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
-
-    let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
-
-    let (preserve_ai_scrollback, scrollback_lines) = load_shared_scrollback_state();
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
-    let exit_gate = Arc::new(SessionExitGate::new());
+    let shared = SharedSessionHandles::new(pty_write, initial_attachment).await;
 
     let live = LiveSession {
-        pty_write: Arc::clone(&pty_write),
+        pty_write: Arc::clone(&shared.pty_write),
         resize_fd: Arc::new(resize_fd),
         term: Arc::clone(&term),
-        term_commit: Arc::clone(&term_commit),
-        search_cache: Arc::clone(&search_cache),
+        term_commit: Arc::clone(&shared.term_commit),
+        search_cache: Arc::clone(&shared.search_cache),
         child_pid,
         child_identity,
-        client_writer: Arc::clone(&client_writer),
-        attachment: Arc::clone(&attachment),
+        client_writer: Arc::clone(&shared.client_writer),
+        attachment: Arc::clone(&shared.attachment),
         workspace_id,
         shell_name,
         title: title.unwrap_or_else(|| String::from("shell")),
@@ -6315,12 +6348,12 @@ async fn start_session(
         resize_pacer: ResizePacer::default(),
         pty,
         handoff_snapshot,
-        preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
-        scrollback_lines: Arc::clone(&scrollback_lines),
+        preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
+        scrollback_lines: Arc::clone(&shared.scrollback_lines),
         env_window_id: window_id,
         env_envelope_id,
-        clipboard_command_tx,
-        exit_gate: Arc::clone(&exit_gate),
+        clipboard_command_tx: shared.clipboard_command_tx,
+        exit_gate: Arc::clone(&shared.exit_gate),
         // Moved, never cloned: the registry entry is now the sole owner of the
         // cap slot, so the slot is freed exactly when the entry is dropped.
         _slot: slot,
@@ -6339,21 +6372,21 @@ async fn start_session(
             cell_width,
             cell_height,
             pty_read,
-            pty_write,
+            pty_write: shared.pty_write,
             term,
-            term_commit,
-            search_cache,
+            term_commit: shared.term_commit,
+            search_cache: shared.search_cache,
             ansi_processor,
             osc_parser,
             event_rx,
-            clipboard_command_rx,
-            client_writer,
-            attachment,
-            preserve_ai_scrollback,
-            scrollback_lines,
+            clipboard_command_rx: shared.clipboard_command_rx,
+            client_writer: shared.client_writer,
+            attachment: shared.attachment,
+            preserve_ai_scrollback: shared.preserve_ai_scrollback,
+            scrollback_lines: shared.scrollback_lines,
         },
         runtime,
-        &exit_gate,
+        &shared.exit_gate,
     );
 }
 
