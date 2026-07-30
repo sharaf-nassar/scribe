@@ -489,3 +489,214 @@ Derived headline numbers:
   integer-exact per unit (2.00 titles, 1.00 branch walks, 1.00 config reads), so
   repeats would not move them; the batch-size distributions are the only rows
   with run-to-run spread.
+
+## Per-prompt shell hook cost
+
+Wall time and process creations charged to one no-op prompt cycle by
+Scribe's shell integration, per shell, with `terminal.env_persistence`
+enabled and disabled, at `b90c932`. Before side of the US4-5 / US4-6
+shell-hook-waste comparison and of the US5 helper-transport numbers.
+
+### Result: per-prompt cost
+
+Marginal cost of one extra prompt cycle, median of 3 passes, derived by
+differencing a 40-prompt and a 200-prompt scripted loop so shell startup,
+integration sourcing, the one-shot baseline emit and teardown all cancel.
+`spawns` = `clone`+`clone3`+`vfork`+`fork`, `execs` = `execve`+`execveat`,
+both from `strace -f -c` and both exact (integers, reproduced across
+passes).
+
+| shell | enabled ms | disabled ms | spawns | execs | OSC-only ms | no-integration ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bash 5.2.21 | 6.89 | 6.86 | 4 | 0 | 3.01 | 0.02 |
+| zsh 5.9 | 4.38 | 4.48 | 2 | 0 | 2.30 | 0.11 |
+| fish 3.7.0 | 24.32 | 25.20 | 6 | 6 | 7.03 | 4.02 |
+| nu 0.114.1 | 0.99 | 1.01 | 0 | 0 | 0.90 | 0.94 |
+| pwsh 7.6.4 | 2.93 | 2.51 | 0 | 0 | 2.54 | 1.25 |
+
+`enabled` and `disabled` are separate runs against separate hook sockets
+whose peers ingest and drop the frame respectively. **They are equal by
+construction, and that is the finding.** Three independent reasons stack
+up at `b90c932`: (a) no shell-visible persistence gate exists, so the
+snapshot/diff runs unconditionally (#33, #34); (b) a no-op prompt
+produces an empty diff, so the helper is not forked per prompt anyway;
+(c) `--event=env-delta` never parses, so no env event reaches the server
+in either arm (defect D3 below). US4-5 has to make the `disabled` column
+converge on the `OSC-only` column.
+
+`OSC-only` is the same integration truncated immediately before its
+`Env-delta capture` section — the cost target for the disabled path.
+`no-integration` is `SCRIBE_SHELL_INTEGRATION=0`, the bare-shell floor.
+
+So the env-delta machinery alone costs **3.9 ms and 2 forks** per bash
+prompt, **2.1 ms** per zsh prompt, **17.3 ms and 2 forks/execs** per fish
+prompt, and **0 ms** on nu and pwsh only because their integrations are
+broken (D1, D2).
+
+### Result: session startup cost
+
+Time from spawn to first prompt, and process creations over the same
+window. This is where the one-shot `--baseline-ready` emit lands.
+
+| shell | enabled ms | spawns | OSC-only ms | spawns | no-integration ms | spawns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bash | 195 | 135 | 13.7 | 6 | 9.0 | 2 |
+| zsh | 3208 | 4345 | 33.1 | 3 | 30.0 | 1 |
+| fish | 110 | 14 | 25.1 | 9 | 24.1 | 6 |
+| nu | 23 | 1 | 20.2 | 1 | 23.6 | 1 |
+| pwsh | 748 | 27 | 655 | 27 | 548 | 28 |
+
+**zsh pays 3.2 seconds and 4,345 forks before its first prompt.**
+`__scribe_json_escape` runs `hex=$(printf '%d' "'$c")` for *every
+character* of *every* exported value, and the baseline emit escapes the
+whole environment: 4,345 command substitutions for a 4.9 KB payload.
+bash's 135 forks are the same function called twice per variable rather
+than twice per character.
+
+### Where the per-prompt cost goes
+
+- **bash — 4 forks, 0 execs.** `$(__scribe_urlencode "$PWD")`,
+  `$(__scribe_sanitize_context ...)` inside `__scribe_emit_context`
+  (2 forks, matching the OSC-only column), plus `$(__scribe_diff_env ...)`
+  and the `< <(compgen -e)` process substitution in
+  `__scribe_snapshot_env` (2 more).
+- **zsh — 2 forks, 0 execs.** Both are the OSC-only substitutions; the
+  env snapshot/diff is pure in-process, so its 2.1 ms is CPU, not forks.
+- **fish — 6 forks, 6 execs.** `hostname` twice and `basename` once for
+  the OSC marks, `fish` itself forks once per prompt, plus **two `seq`
+  binaries per prompt** from `for i in (seq 1 $now_count)` /
+  `(seq 1 $last_count)` in `__scribe_emit_env_delta`. The remaining
+  17.3 ms is the O(N^2) `contains -i` scan the same item (#35) targets.
+- **nu — 0 forks.** Scribe's script never loads (D1); the figure is
+  nushell's own prompt.
+- **pwsh — 0 forks.** The prompt function throws before the env-delta
+  call (D2); with that repaired the per-prompt cost is 3.95 ms.
+
+### Defects found while measuring
+
+None of these three is in the 82-finding inventory, and each one makes a
+Wave 1 acceptance criterion unverifiable as written.
+
+- **D1 — `scribe.nu` does not parse on nu 0.114.1**, so the entire
+  Nushell integration (OSC marks *and* env-delta) never loads. First
+  error: `nu::parser::missing_positional` at `scribe.nu:26` —
+  `hostname | str trim | __scribe-sanitize-context` pipes into a command
+  whose `value` is a required positional (same shape at line 49). Fixing
+  that exposes a second: `(char esc)` at line 115 is no longer a known
+  character name. Reproduce with a plain interactive `nu` under
+  `XDG_DATA_DIRS=<scripts>:...` and `TERM_PROGRAM=Scribe`.
+- **D2 — `scribe.ps1` throws on every prompt.** `__Scribe-EmitContext`
+  assigns `$host = __Scribe-HostName`, and `$host` is a read-only
+  PowerShell automatic variable: *"Cannot overwrite variable Host because
+  it is read-only or constant."* The prompt function dies after OSC 133;D
+  and OSC 7, so OSC 1337 `ScribeContext`, `CodexTaskLabelCleared`, the
+  OSC 2 title and OSC 133;A are never emitted, PowerShell falls back to
+  its `PS>` prompt, and `__Scribe-EmitEnvDelta` (called by the wrapper
+  after the inner prompt returns) never runs.
+- **D3 — `--event=env-delta` is rejected by the helper in all five
+  scripts.** `EventKind` in `crates/scribe-hook-helper/src/main.rs`
+  carries `#[clap(rename_all = "snake_case")]`, so the accepted value is
+  `env_delta`; every other adapter already uses snake_case
+  (`state_changed`, `context_changed`, ...). `Cli::try_parse` fails, the
+  helper exits 0 silently per FR-007, and no socket is ever opened. A
+  listener on `SCRIBE_HOOK_SOCK` counts 0 connections for the as-shipped
+  scripts and 1 per session start once the spelling is corrected.
+
+### Result: helper invocation cost and argv payload
+
+Baseline-emit `--added-json=` literal actually placed on the command
+line, for the 60-variable measurement environment:
+
+| shell | argv bytes | helper invocations per session start |
+| --- | ---: | ---: |
+| bash | 4,953 | 1 |
+| zsh | 4,909 | 1 |
+| fish | 4,384 (+726 on the first delta) | 2 |
+| nu | — | 0 (D1) |
+| pwsh | 5,942 | 1 |
+
+`scribe-hook-helper` wall cost, 200 sequential invocations of a
+4,561-byte payload after one warm-up:
+
+| invocation | mean ms |
+| --- | ---: |
+| as shipped (`--event=env-delta`, rejected at parse) | 1.03 |
+| corrected spelling, live socket (connect + write) | 1.26 |
+| corrected spelling, `SCRIBE_HOOK_SOCK` unset | 1.11 |
+
+So ~1.0 ms of the helper's cost is process start and clap parsing and
+only ~0.15 ms is the actual IPC — the relevant number for #26 (helper
+resolution and packaging) and #42-#45 (payload transport off argv).
+
+### Measurement environment
+
+- Commit: `b90c932` (`chore(beads): record GPUI rebuild audit`).
+  `dist/shell-integration/**` and `crates/scribe-hook-helper` are
+  unchanged between `b90c932` and the Wave 0 merge base.
+- Helper built at that commit with
+  `CARGO_BUILD_JOBS=12 cargo build --release -p scribe-hook-helper`
+  (cargo 1.95.0).
+- Host: Linux 6.17.0-29-generic, 64 cores, strace 6.8, Python 3.12.3.
+  Shells: bash 5.2.21, zsh 5.9, fish 3.7.0, nu 0.114.1, pwsh 7.6.4
+  (snap, classic confinement).
+- Every shell is started on a real PTY with `TERM=xterm-256color`,
+  `TERM_PROGRAM=Scribe`, `SCRIBE_SHELL_INTEGRATION=1`,
+  `SCRIBE_SESSION_ID=5c21be00-0000-0000-0000-000000000025`,
+  `SCRIBE_HOOK_SOCK=<sink>`, and a throwaway `HOME` / `XDG_*` tree
+  containing empty `.bashrc` / `.zshrc` / `.zshenv` / `.profile`,
+  `nushell/{config,env,login}.nu`, and a `fish/config.fish` that only
+  clears `fish_greeting`. Per-shell injection mirrors
+  `shell_integration::build_env` / `session_manager::build_shell`
+  exactly: `--rcfile` for bash, `ZDOTDIR` for zsh, `XDG_DATA_DIRS` for
+  fish and nu, `-NoLogo -NoExit -File` for pwsh.
+- **The environment is padded to exactly 60 exported variables** with
+  48-byte values, so the snapshot/diff workload is identical across
+  shells and reproducible. Real sessions vary; scale linearly with the
+  variable count (and, for zsh startup, with total payload *bytes*).
+- Load average was ~10-20 from sibling agents. The measurement mutex
+  (`.worktrees/.measure-lock`) was held for both passes, so no sibling
+  measurement overlapped. Two independent full passes were taken; the
+  per-prompt medians agreed within 6% and every syscall count agreed
+  exactly.
+
+### Reproducing (after-side re-run)
+
+The driver lives outside the repo (it is a measurement rig, not product
+code). Re-create it as follows; every number above comes from it.
+
+1. Build the helper at the commit under test and put it on a `PATH`
+   ahead of any installed copy:
+   `cargo build --release -p scribe-hook-helper`.
+2. Run a throwaway Unix-socket listener on `SCRIBE_HOOK_SOCK` that
+   accepts, reads the 4-byte big-endian length prefix plus body, and
+   counts connections. Run a second one that reads and discards without
+   decoding. The first stands in for
+   `terminal.env_persistence.enabled = true`, the second for the
+   `hook_ingress.rs` "env_persistence feature disabled; EnvChanged
+   dropped" path. The connection count is what proves an emit was real
+   rather than fast-failing.
+3. Drive each shell on a PTY (`pty.fork` or equivalent):
+   1. wait for at least one byte of output followed by 500 ms of
+      silence — this is the startup phase, and the wait for output is
+      required, because zsh emits nothing at all until after its
+      multi-second baseline emit;
+   2. write N carriage returns (`\r`, not `\n`: reedline and PSReadLine
+      only accept CR as Enter) and wait for N prompt markers plus 500 ms
+      of silence — this is the loop phase;
+   3. write `exit\r` and reap.
+   Answer terminal queries on the master side (`ESC[6n` -> `ESC[1;1R`,
+   `ESC[?u`, `ESC[c`, `ESC[>c`); without a DSR reply nu spends ~2 s per
+   prompt waiting for one.
+4. Count prompt cycles from the output stream to prove the loop really
+   ran: OSC 133;A for bash/zsh/fish, OSC 133;D for pwsh (its 133;A is
+   unreachable while D2 stands), nushell's own OSC 133;A for nu.
+5. Per-prompt cost = (loop time at N=200 - loop time at N=40) / 160,
+   median of 3 passes. Startup cost = the startup-phase time. Syscall
+   counts: one `strace -f -c -e trace=clone,clone3,vfork,fork,execve,`
+   `execveat` run at each N, differenced the same way. Note that `clone`
+   also counts thread creation, which is why pwsh's per-prompt spawn
+   figure is ~0 with noise rather than exactly 0.
+6. Take the measurement mutex; interleaved builds move the wall-clock
+   numbers by tens of percent (the syscall counts are load-independent).
+7. To reproduce the OSC-only column, copy `dist/shell-integration` and
+   truncate all five scripts at their first `Env-delta capture` line.
