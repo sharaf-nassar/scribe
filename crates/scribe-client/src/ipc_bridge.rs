@@ -134,6 +134,11 @@ const RESYNC_MAX_DELAY: Duration = Duration::from_secs(2);
 pub enum InboundEvent {
     /// Output bytes destined for the named pane's `write_output`.
     PaneOutput { session_id: SessionId, bytes: Vec<u8> },
+    /// A whole-pane rebuild: the ANSI a `SessionReplay` decompressed to, or a
+    /// `ScreenSnapshot`'s RIS-prefixed replay. Kept apart from
+    /// [`Self::PaneOutput`] because it replaces the pane rather than advancing
+    /// it, so it must never be folded into a neighbouring output run.
+    PaneRebuild { session_id: SessionId, bytes: Vec<u8> },
     /// An OSC 133 prompt mark for the named pane. The wire message's
     /// `click_events` flag is dropped at the reader: click-to-move has no
     /// surface in this client, so carrying it here would be dead state.
@@ -151,6 +156,10 @@ pub enum InboundEvent {
 pub enum PaneOp {
     /// Concatenated output bytes for one `write_output`.
     Output(Vec<u8>),
+    /// A whole-pane rebuild, applied as its own burst boundary: the output runs
+    /// on either side of it stay separate ops, so no committed frame can span
+    /// it.
+    Rebuild(Vec<u8>),
     /// An OSC 133 mark to anchor against the grid as it stands after every
     /// preceding [`PaneOp::Output`] in this batch.
     PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
@@ -198,6 +207,12 @@ impl IntoIterator for CoalescedBatch {
 /// positional event closes the pane's open entry: output that arrives after a
 /// prompt mark starts a fresh run, which is what keeps the mark anchored
 /// between the bytes that preceded it and the bytes that followed.
+///
+/// A rebuild closes the open entry and opens none of its own, so the output runs
+/// before and after it are two separate ops. That is what makes a
+/// `SessionReplay` a burst boundary: coalescing it into a neighbouring run would
+/// hand the pane a single buffer in which a rebuild sits inside someone else's
+/// synchronized update.
 #[must_use]
 pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatch {
     let mut open: HashMap<SessionId, usize> = HashMap::new();
@@ -206,6 +221,10 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
         match event {
             InboundEvent::PaneOutput { session_id, bytes } => {
                 append_pane_output(&mut open, &mut entries, session_id, bytes);
+            }
+            InboundEvent::PaneRebuild { session_id, bytes } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::Rebuild(bytes)));
             }
             InboundEvent::PromptMark { session_id, kind, exit_code } => {
                 open.remove(&session_id);
@@ -247,6 +266,7 @@ fn append_pane_output(
 fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
     match op {
         PaneOp::Output(bytes) => InboundEvent::PaneOutput { session_id, bytes },
+        PaneOp::Rebuild(bytes) => InboundEvent::PaneRebuild { session_id, bytes },
         PaneOp::PromptMark { kind, exit_code } => {
             InboundEvent::PromptMark { session_id, kind, exit_code }
         }
@@ -260,7 +280,9 @@ fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
 /// Payload an event contributes to the queue's byte budget.
 fn payload_bytes(event: &InboundEvent) -> usize {
     match event {
-        InboundEvent::PaneOutput { bytes, .. } => bytes.len(),
+        InboundEvent::PaneOutput { bytes, .. } | InboundEvent::PaneRebuild { bytes, .. } => {
+            bytes.len()
+        }
         InboundEvent::PromptMark { .. }
         | InboundEvent::ScrollBottom { .. }
         | InboundEvent::TrimScrollback { .. } => 0,
@@ -272,6 +294,7 @@ fn payload_bytes(event: &InboundEvent) -> usize {
 fn event_session(event: &InboundEvent) -> SessionId {
     match event {
         InboundEvent::PaneOutput { session_id, .. }
+        | InboundEvent::PaneRebuild { session_id, .. }
         | InboundEvent::PromptMark { session_id, .. }
         | InboundEvent::ScrollBottom { session_id }
         | InboundEvent::TrimScrollback { session_id, .. } => *session_id,
@@ -1492,7 +1515,7 @@ mod tests {
                 batch
                     .into_iter()
                     .filter_map(|(id, op)| match op {
-                        PaneOp::Output(bytes) => Some((id, bytes)),
+                        PaneOp::Output(bytes) | PaneOp::Rebuild(bytes) => Some((id, bytes)),
                         PaneOp::PromptMark { .. }
                         | PaneOp::ScrollBottom
                         | PaneOp::TrimScrollback { .. } => None,
@@ -1634,6 +1657,35 @@ mod tests {
                 (second, PaneOp::Output(b"xy".to_vec())),
             ]
         );
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Rebuilds bound the output runs around them]]
+    #[test]
+    fn coalesce_keeps_a_rebuild_out_of_the_runs_around_it() {
+        let pane = SessionId::new();
+        let rebuild =
+            InboundEvent::PaneRebuild { session_id: pane, bytes: b"\x1bcreplay".to_vec() };
+        let batch = coalesce([
+            output(pane, b"before"),
+            rebuild.clone(),
+            output(pane, b"after"),
+            output(pane, b"more"),
+        ]);
+
+        // The runs on either side stay separate ops, so no committed frame can
+        // span the rebuild; output behind it still coalesces normally.
+        let entries = batch.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                (pane, PaneOp::Output(b"before".to_vec())),
+                (pane, PaneOp::Rebuild(b"\x1bcreplay".to_vec())),
+                (pane, PaneOp::Output(b"aftermore".to_vec())),
+            ]
+        );
+        // Queue-level re-coalescing runs the batch back through the same rule,
+        // so the boundary has to survive the round trip that overflow takes.
+        assert_eq!(rehydrate(entries[1].clone()), rebuild);
     }
 
     // @lat: [[test#GPUI IPC Bridge#Prompt marks split a pane's output run]]

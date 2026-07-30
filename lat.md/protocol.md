@@ -124,6 +124,8 @@ Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-scree
 
 The `scribe-test` daemon implements that same receiving half rather than skipping the frame, so e2e assertions can observe replay content and its position in a session's frame order instead of inferring the attach path from `RequestSnapshot` (see [[lat.md/test#Test Harness#Replay Observation]]).
 
+A replay's position in the stream is load-bearing: everything the server sent ahead of it is already folded into the state it carries, and everything behind it is a delta on that state. The GPUI client therefore applies it as a burst boundary of its own rather than as output — never folded into the committed frame on either side of it — which is what keeps a reattach from landing inside an unterminated synchronized update (see [[client#GPUI Client Spike#Sync Frame Queueing#Rebuild burst boundary]]).
+
 `SearchResults` pairs with `SearchRequest` and returns absolute grid spans for the current query so the client can highlight and jump between matches without replaying search locally.
 
 ### Session Events

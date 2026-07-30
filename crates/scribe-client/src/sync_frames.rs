@@ -6,10 +6,15 @@
 //! message boundaries. This module sits in front of
 //! [`crate::terminal::DisplayOnlyTerminal`]'s `feed_output`: coalesced server
 //! bytes are split into committed raw frames by [`SyncUpdateFrameSplitter`],
-//! queued per pane, then replayed one committed burst per redraw. A 150 ms
-//! expiry timer flushes an update whose terminating `CSI ? 2026 l` never
-//! arrives, and a catch-up threshold drains through a backlog so stale frames
-//! do not pile up indefinitely.
+//! queued per pane, then replayed one committed burst per redraw by
+//! [`present_next_burst`]. A 150 ms expiry timer flushes an update whose
+//! terminating `CSI ? 2026 l` never arrives, and a catch-up threshold drains
+//! through a backlog so stale frames do not pile up indefinitely.
+//!
+//! A whole-pane rebuild — a decoded `SessionReplay`, or the RIS-prefixed ANSI of
+//! a `ScreenSnapshot` — is not output in this sense: it replaces the pane rather
+//! than advancing it. [`present_rebuild`] therefore applies it as a burst
+//! boundary of its own, never folded into the commit on either side of it.
 
 use std::{
     collections::VecDeque,
@@ -110,6 +115,27 @@ impl SyncFrameQueue {
             return false;
         }
         self.raw_sync_deadline = None;
+        self.commit_held_bytes()
+    }
+
+    /// Commits whatever the splitter is still holding, so the next bytes handed
+    /// to the pane cannot be folded into a commit that started before them.
+    ///
+    /// Used ahead of a whole-pane rebuild, which is a burst boundary in its own
+    /// right: an unterminated `CSI ? 2026 h` opened by earlier output would
+    /// otherwise swallow the rebuild into the frame it is buffering. Held bytes
+    /// are committed rather than discarded so nothing the server already sent is
+    /// lost, and the leading BSU is stripped for the same reason the timeout
+    /// strips it — the update is being closed early, so replaying it must not
+    /// re-enter synchronized-update mode.
+    pub fn seal_frame_boundary(&mut self) {
+        self.raw_sync_deadline = None;
+        self.commit_held_bytes();
+    }
+
+    /// Moves the splitter's held bytes onto the frame queue, reporting whether
+    /// there were any.
+    fn commit_held_bytes(&mut self) -> bool {
         if let Some(bytes) = self.splitter.flush_timed_out() {
             self.pending_output_frames.push_back(bytes);
             true
@@ -178,6 +204,41 @@ pub fn drain_until_frame<T: OutputTarget>(
     }
 }
 
+/// Replays one paced burst — the drain's per-redraw unit of work — reporting
+/// whether `target` now owes a repaint.
+///
+/// This is the pacing wire-in: every caller that advances a pane with ordinary
+/// output goes through here rather than emptying the queue, so a caught-up pane
+/// presents one committed burst per redraw and only a pane past
+/// [`OUTPUT_FRAME_CATCH_UP_THRESHOLD`] is drained through in a single pass. An
+/// empty queue and a burst that changed nothing visible are the same answer to
+/// the caller — no repaint owed — which is why the two `None`/`false` cases fold
+/// into one bool here instead of at each call site.
+#[must_use]
+pub fn present_next_burst<T: OutputTarget>(queue: &mut SyncFrameQueue, target: &mut T) -> bool {
+    drain_until_frame(queue, target).is_some_and(|outcome| outcome.needs_redraw)
+}
+
+/// Applies a whole-pane rebuild as a burst boundary of its own, reporting
+/// whether `target` now owes a repaint.
+///
+/// A rebuild is a full state replacement, not an advance, so it is exempt from
+/// pacing on both sides. Everything the pane already had queued is committed
+/// first, in arrival order, because those bytes describe the screen the server
+/// snapshotted; the rebuild itself then reaches `feed_output` whole, bypassing
+/// the splitter entirely, because it is one logical frame the server already
+/// assembled and re-splitting it could only tear it.
+#[must_use]
+pub fn present_rebuild<T: OutputTarget>(
+    queue: &mut SyncFrameQueue,
+    target: &mut T,
+    bytes: &[u8],
+) -> bool {
+    queue.seal_frame_boundary();
+    let flushed = drain_all_committed(queue, target);
+    flushed.needs_redraw | target.feed_output(bytes).needs_redraw
+}
+
 /// Aggregate result of draining every queued committed frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainSummary {
@@ -190,6 +251,12 @@ pub struct DrainSummary {
 /// Drains every queued committed frame into `target`, one committed burst per
 /// `feed_output`, so no `write_output` ever receives a torn sync frame. Ported
 /// from the drain loop in `App::flush_session_output_now`.
+///
+/// Deliberately *not* the pacing path: emptying the queue in one pass is what
+/// collapsed a run of committed frames into a single redraw. It survives for the
+/// one case that has to ignore pacing — clearing a pane ahead of a rebuild that
+/// is about to replace it ([`present_rebuild`]) — where holding frames back
+/// would only delay bytes the next `feed_output` overwrites anyway.
 pub fn drain_all_committed<T: OutputTarget>(
     queue: &mut SyncFrameQueue,
     target: &mut T,
@@ -549,6 +616,33 @@ mod tests {
         assert_eq!(outcome.queue_state, QueueState::Drained);
         assert_eq!(target.frames.len(), 6);
         assert!(!queue.has_frames());
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Applies a rebuild as its own burst]]
+    #[gpui::test]
+    fn a_rebuild_is_applied_as_its_own_burst() {
+        let mut queue = SyncFrameQueue::default();
+        let mut target = Recorder::default();
+
+        // A committed frame pacing has not presented yet, followed by a
+        // synchronized update still open when the rebuild arrives: the state in
+        // which a rebuild folded into the output stream would be swallowed by
+        // someone else's frame instead of replacing the pane.
+        queue.queue_output_frames(&[BSU, b"queued", ESU].concat());
+        queue.queue_output_frames(&[BSU, b"held"].concat());
+        assert!(queue.raw_sync_deadline().is_some(), "the open update armed an expiry");
+
+        assert!(present_rebuild(&mut queue, &mut target, b"rebuilt"));
+
+        // Everything queued ahead of the rebuild lands first and whole, the
+        // half-open update is sealed rather than dropped, and the rebuild itself
+        // reaches the target as a frame of its own.
+        assert_eq!(
+            target.frames,
+            vec![b"\x1b[?2026hqueued\x1b[?2026l".to_vec(), b"held".to_vec(), b"rebuilt".to_vec()]
+        );
+        assert!(!queue.has_frames());
+        assert!(queue.raw_sync_deadline().is_none(), "the sealed update owes no expiry");
     }
 
     // @lat: [[test#GPUI Sync Frame Queue#Flushes raw sync update on expiry]]
