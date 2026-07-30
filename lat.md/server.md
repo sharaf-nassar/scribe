@@ -208,6 +208,12 @@ The encoder emits an ED 2 (erase display) early, which on a fresh grid scrolls t
 
 Alt-screen sessions carry only the visible grid in the replay; alt-grid history is a resize artifact rather than user content, and alt-screen applications (vim, Claude Code) redraw their own UI on reconnect.
 
+[[crates/scribe-common/src/screen_replay.rs#decompress_session_replay|Decoding streams]] the zstd frame in 64 KiB chunks and stops the moment the inflated stream would cross [[crates/scribe-common/src/screen_replay.rs#MAX_REPLAY_INFLATED_BYTES|an absolute 64 MiB ceiling]]. The earlier decoder sized a single flat buffer at eight bytes per declared cell, which the encoder overshoots by 4-5x on a truecolor-dense screen — every cell forcing its own SGR run costs 30+ bytes — so those sessions failed to decode and arrived blank. Nothing about the bound now comes from `cols`, `rows`, or `scrollback_rows`: an untrusted sender sets those independently of the bytes it actually ships, so only the observed encoded length seeds the initial allocation and only the ceiling stops the stream.
+
+Two further limits keep the streamed decode from becoming its own denial-of-service lever, which the old one-shot bulk decode did not need. The output buffer starts at 8x the encoded length, floored at 64 KiB and capped at 4 MiB, and grows only as bytes arrive, so a small frame can never reserve the ceiling up front. The decoder also refuses a frame whose header declares a back-reference window past 8 MiB (window log 23): streaming decode allocates the declared window before producing output, and the encoder's level 3 never exceeds a window log of 21. Raising the compression level past a window log of 23 therefore needs an N/N-1 release window, since receivers on the old cap would reject the new encoder's frames.
+
+A truncated or corrupt frame is an error rather than a short read, so a partial ANSI stream is never replayed into a `Term` — a garbled grid would be worse than the blank one this fix removes.
+
 ### Defuse Strategy
 
 Before the old server exits, each session's [[crates/scribe-server/src/pty_guard.rs#PtyGuard|PtyGuard]] is [[crates/scribe-server/src/pty_guard.rs#PtyGuard#defuse|defused]], leaking the inner Pty through `ManuallyDrop` so its Drop impl never sends SIGHUP to the child.
@@ -225,6 +231,8 @@ Reading the observed token at signal time narrows the reuse window to the gap be
 Maximum handoff state size is 256 MiB. Maximum file descriptors transferred is 1024. Both sides verify peer UID, and Linux/macOS senders validate the peer process before sending sensitive state.
 
 Typical v5 compressed payloads are in the low tens of megabytes even for many sessions at the default `scrollback_lines = 10_000`, since the ANSI replay + zstd combination is roughly 20-100x denser than the v4 per-cell MessagePack encoding.
+
+Those are limits on the payload as it arrives. Inflation is bounded separately and per session: one replay may expand to at most [[crates/scribe-common/src/screen_replay.rs#MAX_REPLAY_INFLATED_BYTES|64 MiB]], matching [[crates/scribe-common/src/framing.rs#MAX_MESSAGE_SIZE|the IPC frame limit]] on the grounds that a replay too large to have crossed one frame has no legitimate consumer. The 256 MiB handoff figure caps the compressed state for the whole process, so it cannot serve as the per-session post-inflate bound.
 
 ### Version Bumps
 

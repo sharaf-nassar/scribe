@@ -5,6 +5,8 @@
 //! cursor, and alt-screen flag. Used on both the client reconnect path and
 //! the server hot-reload handoff path.
 
+use std::io::Read as _;
+
 use serde::{Deserialize, Serialize};
 
 use crate::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
@@ -35,6 +37,44 @@ pub struct SessionReplay {
 /// good ratio on repetitive terminal content.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Absolute post-inflate ceiling for one replay payload, in bytes.
+///
+/// Replays reach a receiver over paths an untrusted peer can drive — LAN client
+/// attach and server-to-server handoff — so the decoder must never size its
+/// output from anything the sender *declares*: `cols`, `rows`, and
+/// `scrollback_rows` are set independently of the bytes actually shipped. The
+/// decode streams instead and stops the moment the inflated stream would cross
+/// this line. 64 MiB matches [`crate::framing::MAX_MESSAGE_SIZE`]: a replay that
+/// could not have fit in one IPC frame has no legitimate consumer.
+pub const MAX_REPLAY_INFLATED_BYTES: usize = crate::framing::MAX_MESSAGE_SIZE as usize;
+
+/// Bytes pulled from the decoder per read during a streamed inflate.
+const REPLAY_DECODE_CHUNK: usize = 64 * 1024;
+
+/// Floor for the initial output allocation, so small payloads do not start from
+/// a handful of bytes and re-grow several times.
+const REPLAY_DECODE_MIN_CAPACITY: usize = 64 * 1024;
+
+/// Cap on the *initial* output allocation. Past this the buffer only grows as
+/// bytes actually arrive, so a small frame can never reserve the ceiling up
+/// front; a legitimate multi-megabyte replay pays a handful of doublings.
+const REPLAY_DECODE_MAX_INITIAL_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// First-guess inflate ratio applied to the encoded length to size the output
+/// buffer. Purely an allocation hint — the only enforced bound is
+/// [`MAX_REPLAY_INFLATED_BYTES`].
+const REPLAY_DECODE_SIZE_HINT_RATIO: usize = 8;
+
+/// Largest back-reference window the decoder accepts, as a log2 distance.
+///
+/// Streaming decode allocates the window the *frame header* declares, so a
+/// hostile peer could otherwise buy a multi-gigabyte allocation with a few
+/// bytes. [`ZSTD_LEVEL`] caps the encoder's window log at 21 (2 MiB), so 23
+/// leaves two doublings of headroom. Raising [`ZSTD_LEVEL`] past a window log
+/// of 23 needs an N/N-1 release window first: receivers on the old value would
+/// reject the new encoder's frames outright.
+const REPLAY_DECODE_WINDOW_LOG_MAX: u32 = 23;
+
 /// Build a `SessionReplay` from a `ScreenSnapshot`.
 ///
 /// Runs `snapshot_to_ansi` and compresses the result with zstd at level 3.
@@ -60,16 +100,78 @@ pub fn build_session_replay(snapshot: &ScreenSnapshot) -> std::io::Result<Sessio
 
 /// Decompress a `SessionReplay`'s replay bytes into a plain ANSI byte buffer.
 ///
+/// Streams the zstd frame in fixed chunks and refuses to produce more than
+/// [`MAX_REPLAY_INFLATED_BYTES`]. Nothing about the bound comes from the
+/// replay's declared geometry, so a dense truecolor screen — which the encoder
+/// emits at 40+ bytes per cell — decodes fully instead of degrading to a blank
+/// session, while a hostile peer still cannot force an unbounded allocation.
+///
 /// # Errors
-/// Returns an `io::Error` if zstd decompression fails (corrupted stream or
-/// capacity exhausted).
+/// Returns an `io::Error` if the zstd stream is corrupt or truncated, or if it
+/// inflates past [`MAX_REPLAY_INFLATED_BYTES`].
 pub fn decompress_session_replay(replay: &SessionReplay) -> std::io::Result<Vec<u8>> {
-    // Capacity hint: ~8 bytes per cell upper bound, minimum 64 KiB to avoid
-    // thrashing on small payloads.
-    let total_rows = usize::from(replay.rows).saturating_add(replay.scrollback_rows as usize);
-    let hint = usize::from(replay.cols).saturating_mul(total_rows).saturating_mul(8);
-    let capacity = hint.max(64 * 1024);
-    zstd::bulk::decompress(&replay.replay_zstd, capacity)
+    inflate_bounded(&replay.replay_zstd, MAX_REPLAY_INFLATED_BYTES)
+}
+
+/// Streamed zstd inflate of `encoded`, refusing to emit more than `ceiling`
+/// bytes. Split out from [`decompress_session_replay`] so the bound itself is
+/// testable without materialising a 64 MiB buffer.
+fn inflate_bounded(encoded: &[u8], ceiling: usize) -> std::io::Result<Vec<u8>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(encoded)?;
+    decoder.window_log_max(REPLAY_DECODE_WINDOW_LOG_MAX)?;
+
+    let mut out = Vec::with_capacity(initial_inflate_capacity(encoded.len(), ceiling));
+    let mut chunk = vec![0_u8; REPLAY_DECODE_CHUNK];
+
+    loop {
+        // A frame that ends mid-stream surfaces here as an error rather than a
+        // short read, so a truncated payload can never look like a clean EOF.
+        let read = decoder.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(out);
+        }
+        if read > ceiling - out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "replay inflates past the {ceiling}-byte ceiling (encoded {} bytes)",
+                    encoded.len()
+                ),
+            ));
+        }
+        let Some(filled) = chunk.get(..read) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zstd reported more bytes read than the chunk holds",
+            ));
+        };
+        reserve_within_ceiling(&mut out, read, ceiling);
+        out.extend_from_slice(filled);
+    }
+}
+
+/// Initial output allocation for a streamed inflate.
+///
+/// Derived from the encoded length — the only size the receiver has actually
+/// observed — never from the replay's declared grid, which an untrusted sender
+/// controls independently of the payload.
+fn initial_inflate_capacity(encoded_len: usize, ceiling: usize) -> usize {
+    let upper = REPLAY_DECODE_MAX_INITIAL_CAPACITY.min(ceiling);
+    let lower = REPLAY_DECODE_MIN_CAPACITY.min(upper);
+    encoded_len.saturating_mul(REPLAY_DECODE_SIZE_HINT_RATIO).clamp(lower, upper)
+}
+
+/// Make room for `additional` more bytes, keeping capacity at or under
+/// `ceiling` so amortised doubling cannot overshoot the bound the stream is
+/// being held to. Callers must already have checked that `out.len() +
+/// additional` fits.
+fn reserve_within_ceiling(out: &mut Vec<u8>, additional: usize, ceiling: usize) {
+    if out.capacity() - out.len() >= additional {
+        return;
+    }
+    let target =
+        out.capacity().saturating_mul(2).max(out.len().saturating_add(additional)).min(ceiling);
+    out.reserve_exact(target - out.len());
 }
 
 // ── SGR diff state ──────────────────────────────────────────────────
@@ -382,6 +484,128 @@ mod tests {
             scrollback: Vec::new(),
             scrollback_rows: 0,
         }
+    }
+
+    /// A snapshot whose every cell carries its own 24-bit foreground and
+    /// background, so the SGR diff never coalesces and the encoder emits 30+
+    /// bytes per cell — the density the old 8-bytes-per-cell bound truncated.
+    fn truecolor_dense_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
+        let count = usize::from(cols) * usize::from(rows);
+        let mut cells = Vec::with_capacity(count);
+        for idx in 0..count {
+            let seed = u32::try_from(idx).unwrap_or(u32::MAX);
+            let [r, g, b, _] = seed.to_le_bytes();
+            cells.push(ScreenCell {
+                c: char::from(b'a' + u8::try_from(idx % 26).unwrap_or_default()),
+                fg: ScreenColor::Rgb { r, g, b },
+                bg: ScreenColor::Rgb { r: b, g: r, b: g },
+                flags: CellFlags::default(),
+            });
+        }
+        ScreenSnapshot {
+            cells,
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_style: CursorStyle::Block,
+            cursor_visible: true,
+            alt_screen: false,
+            active_dec_modes: Vec::new(),
+            scrollback: Vec::new(),
+            scrollback_rows: 0,
+        }
+    }
+
+    #[test]
+    fn decompress_bound_ignores_declared_geometry() {
+        // Dense enough that the retired `cols * rows * 8` capacity — and its
+        // 64 KiB floor — would have failed the decode outright.
+        let snapshot = truecolor_dense_snapshot(200, 60);
+        let ansi = snapshot_to_ansi(&snapshot);
+        assert!(ansi.len() > 64 * 1024, "fixture must exceed the retired floor: {}", ansi.len());
+
+        let mut replay = build_session_replay(&snapshot).expect("build_session_replay");
+        // Declared geometry is sender-controlled and unrelated to the payload:
+        // shrink it to a single cell and the decode must be unaffected.
+        replay.cols = 1;
+        replay.rows = 1;
+        replay.scrollback_rows = 0;
+
+        let decoded = decompress_session_replay(&replay).expect("decompress");
+        assert_eq!(decoded, ansi);
+    }
+
+    #[test]
+    fn inflate_accepts_a_stream_that_lands_exactly_on_the_ceiling() {
+        let ceiling = 100_000;
+        let encoded = zstd::bulk::compress(&vec![b'x'; ceiling], ZSTD_LEVEL).unwrap();
+
+        let decoded = inflate_bounded(&encoded, ceiling).expect("inflate at the ceiling");
+        assert_eq!(decoded.len(), ceiling);
+    }
+
+    #[test]
+    fn inflate_rejects_a_stream_one_byte_past_the_ceiling() {
+        let ceiling = 100_000;
+        let encoded = zstd::bulk::compress(&vec![b'x'; ceiling + 1], ZSTD_LEVEL).unwrap();
+
+        let error = inflate_bounded(&encoded, ceiling).expect_err("must refuse the overflow");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ceiling"), "{error}");
+    }
+
+    #[test]
+    fn inflate_rejects_a_decompression_bomb() {
+        // 32 MiB of zeros compresses to a few hundred bytes; a peer-declared
+        // size plays no part, so the streamed bound is what stops it.
+        let encoded = zstd::bulk::compress(&vec![0_u8; 32 * 1024 * 1024], ZSTD_LEVEL).unwrap();
+        assert!(encoded.len() < 64 * 1024, "bomb fixture must stay tiny: {}", encoded.len());
+
+        let error = inflate_bounded(&encoded, 1024 * 1024).expect_err("must refuse the bomb");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn inflate_rejects_a_truncated_frame() {
+        let encoded = zstd::bulk::compress(&vec![b'y'; 200_000], ZSTD_LEVEL).unwrap();
+        let truncated = &encoded[..encoded.len() / 2];
+
+        // A short read must not read back as a clean end of stream: replaying
+        // half an ANSI stream would leave a garbled grid, not a blank one.
+        inflate_bounded(truncated, MAX_REPLAY_INFLATED_BYTES)
+            .expect_err("truncated frame must not decode");
+    }
+
+    #[test]
+    fn inflate_rejects_an_oversized_declared_window() {
+        use std::io::Write as _;
+
+        // Streaming decode allocates whatever window the frame header declares,
+        // so a header past the cap must be refused before that allocation.
+        let mut wide = zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
+        wide.window_log(REPLAY_DECODE_WINDOW_LOG_MAX + 1).unwrap();
+        wide.write_all(b"tiny").unwrap();
+        let encoded = wide.finish().unwrap();
+
+        inflate_bounded(&encoded, MAX_REPLAY_INFLATED_BYTES)
+            .expect_err("window log past the cap must be refused");
+    }
+
+    #[test]
+    fn replay_ceiling_matches_the_ipc_frame_limit() {
+        assert_eq!(MAX_REPLAY_INFLATED_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_REPLAY_INFLATED_BYTES, crate::framing::MAX_MESSAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn initial_capacity_never_reserves_the_whole_ceiling() {
+        // A 1 MiB frame that could inflate to the ceiling still starts small.
+        let capacity = initial_inflate_capacity(1024 * 1024, MAX_REPLAY_INFLATED_BYTES);
+        assert!(capacity <= REPLAY_DECODE_MAX_INITIAL_CAPACITY, "{capacity}");
+        assert!(capacity >= REPLAY_DECODE_MIN_CAPACITY, "{capacity}");
+        // A tiny ceiling must clamp the hint rather than over-reserve.
+        assert_eq!(initial_inflate_capacity(16, 4096), 4096);
     }
 
     #[test]
