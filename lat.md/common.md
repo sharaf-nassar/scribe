@@ -34,6 +34,14 @@ Unified TOML config for server and client, deserialized from the active install 
 
 Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The  function reads the file and returns `ScribeConfig::default()` if absent. Prompt-bar configs still deserialize the legacy `prompt_bar_bg` key as a compatibility alias for `prompt_bar_second_row_bg`, while Debian package installs additionally rewrite that legacy key on disk during upgrade so future launches use the exact-fill row model directly.
 
+### Cached Snapshot
+
+[[crates/scribe-common/src/config.rs#config_snapshot]] hands out a process-wide `ConfigSnapshot` — the parsed [[crates/scribe-common/src/config.rs#ScribeConfig]] plus the [[crates/scribe-common/src/theme.rs#Theme]] resolved from it — so hot paths pay neither the disk read nor the parse.
+
+The snapshot exists for callers that resolve config on a per-sequence basis. Dynamic color queries are the motivating case: an OSC 4 probe over all 256 palette indices used to cost one `config.toml` read and parse per index, plus a second read and parse of the external theme file when the active theme is not a built-in preset. Warm, the same probe costs zero disk reads.
+
+A load failure is not cached, so a transiently unreadable config does not pin an error for the life of the process. Two paths drop the snapshot: [[crates/scribe-common/src/config.rs#save_config]] after it writes the file, and the server's `ConfigReloaded` handler before it re-reads. Callers that must observe the freshly-on-disk bytes — the env-persistence transition check, the settings round-trip — keep using [[crates/scribe-common/src/config.rs#load_config]] directly.
+
 ### Appearance
 
 Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, status bar height, and content padding are all in .
