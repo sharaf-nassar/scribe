@@ -216,6 +216,13 @@ async fn run_server_loop(
     // to `false` — the feature is disabled by default (FR-009).
     env_store.seed_last_enabled(load_env_persistence_seed());
 
+    // Sweep env envelopes no window snapshot still names. Spawned rather than
+    // awaited: it walks the state tree and talks to the OS keystore, and a slow
+    // or wedged secret service must never delay the accept loop. Startup is the
+    // only sound moment for it — mid-run, a window that has not yet flushed its
+    // snapshot looks exactly like an orphan.
+    tokio::spawn(env_store::gc::sweep_orphaned_envelopes(env_store::gc::ORPHAN_RETENTION));
+
     // T036: spawn the env-status forwarder before the IPC accept loop so
     // any pre-attach transitions (e.g. from sessions restored during
     // `activate_pending_sessions` above) are observed by the broadcast

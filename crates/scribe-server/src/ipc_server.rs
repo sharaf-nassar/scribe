@@ -1109,13 +1109,16 @@ pub struct LiveSession {
     pub(crate) env_window_id: WindowId,
     /// Launch-record id (== env-envelope id) naming this session's
     /// `<state_dir>/restore/env/<window_id>/<launch_id>.envz` file plus
-    /// its keystore DEK. `Some` only for cold-restart replays that
-    /// re-issued a `LaunchRecord` via `CreateSession.env_envelope_id`;
-    /// `None` for fresh first-time creations and for handoff-restored
-    /// sessions (handoff keeps env on the existing PTY across reload).
+    /// its keystore DEK. Carried by `CreateSession.env_envelope_id`: every
+    /// create path mints one, so this is `Some` from creation for anything
+    /// a client asked for. `None` at creation only for handoff-restored
+    /// sessions and for pre-minting clients, and in that case
+    /// [`crate::hook_ingress`] fills it in on the session's first
+    /// persistable delta.
     ///
-    /// `pub(crate)` so [`crate::hook_ingress`] can read it when routing an
-    /// `EnvChanged` event into [`crate::env_store::EnvStoreState::schedule_persist`].
+    /// `pub(crate)` so [`crate::hook_ingress`] can read and bootstrap it when
+    /// routing an `EnvChanged` event into
+    /// [`crate::env_store::EnvStoreState::schedule_persist`].
     pub(crate) env_envelope_id: Option<String>,
     /// Sender into the PTY reader task's OSC 52 control channel (spec 010
     /// C4). The client message dispatcher forwards

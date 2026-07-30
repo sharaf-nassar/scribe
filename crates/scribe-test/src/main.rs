@@ -320,6 +320,12 @@ enum SessionAction {
         /// Session ID to close.
         session_id: String,
     },
+    /// Print the launch (env-envelope) id the harness minted for a session it
+    /// created, so a test can assert env persistence has something to key on.
+    EnvelopeId {
+        /// Session ID to look up.
+        session_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -371,11 +377,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 }
             }
         }
-        Command::Session { action } => match action {
-            SessionAction::Create => session::create(),
-            SessionAction::Attach { session_id } => session::attach(&session_id),
-            SessionAction::Close { session_id } => session::close(&session_id),
-        },
+        Command::Session { action } => run_session(action),
         Command::Send { session_id, data } => input::send(&session_id, &data),
         Command::Resize { session_id, cols, rows } => input::resize(&session_id, cols, rows),
         Command::Screenshot { session_id, path } => capture::screenshot(&session_id, &path),
@@ -415,6 +417,17 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::LanPeer(args) => run_lan_peer(args),
         Command::RemotePeer(args) => run_remote_peer(args),
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
+    }
+}
+
+/// Route a `session` subcommand. Split out of [`run`] so the dispatcher stays a
+/// table of one-line routes.
+fn run_session(action: SessionAction) -> Result<(), TestError> {
+    match action {
+        SessionAction::Create => session::create(),
+        SessionAction::Attach { session_id } => session::attach(&session_id),
+        SessionAction::Close { session_id } => session::close(&session_id),
+        SessionAction::EnvelopeId { session_id } => session::print_envelope_id(&session_id),
     }
 }
 

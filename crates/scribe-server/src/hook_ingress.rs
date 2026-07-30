@@ -141,17 +141,55 @@ async fn handle_env_changed_dispatch(
         Ok(cfg) if cfg.terminal.env_persistence.enabled
     );
 
+    let envelope_id = match coords.envelope_id {
+        Some(id) => Some(id),
+        None if enabled && !event.baseline_ready => bootstrap_envelope_id(server, session_id).await,
+        None => None,
+    };
+
     handle_env_changed(
         &server.env_store,
         EnvChangedCtx {
             session_id,
             window_id: coords.window_id,
-            envelope_id: coords.envelope_id.as_deref(),
+            envelope_id: envelope_id.as_deref(),
             feature_enabled: enabled,
         },
         event,
     )
     .await;
+}
+
+/// Mint this session's first env-envelope id, in place, on the delta that is
+/// about to be persisted.
+///
+/// A session whose client never sent an `env_envelope_id` used to capture its
+/// environment in memory and throw it away, and no amount of waiting fixed
+/// that — only a client restart could. Minting here starts persistence on the
+/// first real delta instead, which is what makes enabling the feature take
+/// effect without one.
+///
+/// Gated on the session already having a baseline: without one the fold is
+/// dropped anyway, and a session that never emits a baseline (a handoff-
+/// restored PTY, whose shell already ran its rc under the previous server)
+/// must keep the documented "no envelope across handoff" behavior. The mint
+/// happens under the live-sessions write lock and re-checks the field, so
+/// concurrent deltas on one session agree on a single id.
+async fn bootstrap_envelope_id(server: &IpcServerState, session_id: SessionId) -> Option<String> {
+    if !server.env_store.has_baseline(session_id).await {
+        return None;
+    }
+    let mut sessions = server.live_sessions.write().await;
+    let session = sessions.get_mut(&session_id)?;
+    let id = session.env_envelope_id.get_or_insert_with(scribe_common::ids::new_launch_id).clone();
+    drop(sessions);
+    tracing::info!(
+        target: "scribe_server::hook_ingress",
+        ?session_id,
+        envelope_id = %id,
+        "minted first env envelope id for a session created without one"
+    );
+    Some(id)
 }
 
 /// Bundle of per-call inputs to [`handle_env_changed`] that come from
@@ -178,6 +216,10 @@ struct EnvChangedCtx<'a> {
 ///    `TerminalEnvDelta` via [`EnvStoreState::fold_event`], and — only if
 ///    a baseline existed and the session has an `env_envelope_id` — call
 ///    [`EnvStoreState::schedule_persist`] to (re)arm the 100 ms debounce.
+///
+/// The caller resolves the envelope id, minting one via
+/// [`bootstrap_envelope_id`] when the session was created without one, so
+/// step 3 only sees `None` for a session that vanished mid-event.
 async fn handle_env_changed(
     env_store: &Arc<EnvStoreState>,
     ctx: EnvChangedCtx<'_>,
@@ -238,12 +280,10 @@ async fn handle_env_changed(
     }
 
     let Some(launch_id) = envelope_id else {
-        // The session has no `env_envelope_id` (fresh non-restored
-        // session). The capture-side state lives in memory only until
-        // either the client is taught to issue a launch id for fresh
-        // sessions or the session ends. Per T016's pragmatic compromise:
-        // do not invent a launch id here; surface a debug log so
-        // operators can see this case in field reports.
+        // Every create path mints an id and the dispatch layer bootstraps
+        // one for the sessions that somehow arrive without it, so reaching
+        // here means the session left the live registry between the
+        // coords read and the mint. Capture stays in memory.
         tracing::debug!(
             target: "scribe_server::hook_ingress",
             ?session_id,
@@ -728,8 +768,9 @@ mod env_changed_tests {
     }
 
     /// Without an `env_envelope_id` the fold still happens but
-    /// `schedule_persist` is *not* invoked — no scheduler is spawned.
-    /// Verifies the "capture in memory only" pragmatic compromise.
+    /// `schedule_persist` is *not* invoked — no scheduler is spawned. The
+    /// dispatch layer normally mints one first; this pins the inner
+    /// handler's behavior for the session that left the registry mid-event.
     #[tokio::test(flavor = "current_thread")]
     async fn missing_envelope_id_skips_schedule_persist() {
         let env_store = Arc::new(EnvStoreState::default());

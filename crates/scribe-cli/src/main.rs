@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{WindowId, WorkspaceId};
+use scribe_common::ids::{WindowId, WorkspaceId, new_launch_id};
 use scribe_common::profiles;
 use scribe_common::protocol::{AutomationAction, ClientMessage, ServerMessage};
 use scribe_common::socket::server_socket_path;
@@ -172,13 +172,16 @@ async fn interactive_passthrough() -> Result<(), ScribeError> {
     info!("connected");
 
     let workspace_id = WorkspaceId::new();
+    // A CLI session mints its own launch id for the same reason the GUI does:
+    // without one the server has nothing to name the session's env envelope
+    // after, and env persistence never starts for the session.
     let create_msg = ClientMessage::CreateSession {
         workspace_id,
         split_direction: None,
         cwd: None,
         size: None,
         command: None,
-        env_envelope_id: None,
+        env_envelope_id: Some(new_launch_id()),
     };
     write_message(&mut write_half, &create_msg).await?;
 

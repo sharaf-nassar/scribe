@@ -50,6 +50,35 @@ pub fn print_window_id() -> Result<(), TestError> {
     }
 }
 
+/// Print the launch (env-envelope) id the daemon minted for a session it
+/// created.
+///
+/// An E2E script uses it to assert that the harness create path names an
+/// envelope — a `CreateSession` without one can never persist its environment,
+/// which is what made env persistence unobservable from the harness.
+///
+/// # Errors
+///
+/// Returns [`TestError::InfraError`] when the daemon is unreachable or did not
+/// create the session itself (an attach carries no launch id of its own).
+pub fn print_envelope_id(session_id: &str) -> Result<(), TestError> {
+    let id = SessionId::from_str(session_id)
+        .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
+
+    let response = send_request(&DaemonRequest::EnvelopeId { session_id: id })
+        .map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::EnvelopeId { envelope_id } => {
+            writeln!(io::stdout(), "{envelope_id}")
+                .map_err(|e| TestError::InfraError(format!("failed to write envelope id: {e}")))?;
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
 /// Attach to an existing (detached) session on the server.
 ///
 /// Sends `AttachSession` and prints the confirmed session UUID to stdout.

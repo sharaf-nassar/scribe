@@ -966,26 +966,30 @@ impl OutboundTear {
     }
 }
 
-/// One pane of a cold-restart snapshot, expressed as the session request that
-/// re-creates it.
+/// One session the client is asking the server to spawn.
 ///
 /// Grouped into a value rather than passed as five parallel arguments because
-/// every field comes from the same persisted `LaunchRecord` and they are only
-/// ever meaningful together.
+/// every field describes the same launch and they are only ever meaningful
+/// together. A cold-restart replay fills it from a persisted `LaunchRecord`; a
+/// new tab or pane fills it from the binding it just minted. The two are the
+/// same request — the launch id names an envelope that already exists in the
+/// first case and one that does not yet in the second, and the server reads
+/// both the same way.
 #[derive(Debug, Clone)]
-pub struct RestoredSession {
-    /// The workspace region the restored pane belongs to.
+pub struct SessionLaunch {
+    /// The workspace region the pane belongs to.
     pub workspace_id: WorkspaceId,
-    /// The grid the restored pane will occupy, so the PTY is spawned at the
-    /// size it is about to be rendered at instead of the 80×24 default.
+    /// The grid the pane will occupy, so the PTY is spawned at the size it is
+    /// about to be rendered at instead of the 80×24 default.
     pub size: TerminalSize,
-    /// The directory the saved pane was working in.
+    /// The directory the pane starts in.
     pub cwd: Option<PathBuf>,
     /// The program to spawn instead of a login shell (a custom command, or a
     /// provider resume for an AI pane).
     pub command: Option<Vec<String>>,
-    /// The persisted `LaunchRecord.launch_id`, which the server looks the saved
-    /// environment envelope up by.
+    /// The launch's `LaunchRecord.launch_id`, sent as the env-envelope id the
+    /// server keys this session's persisted environment by. Every create path
+    /// mints one: without it the session can never write an envelope.
     pub launch_id: String,
 }
 
@@ -1047,51 +1051,31 @@ impl IpcSink {
         self.enqueue(ClientMessage::ConfigReloaded)
     }
 
-    /// Requests a new session (tab) in `workspace_id`.
+    /// Requests a session — a new tab, a new pane, or one pane of a
+    /// cold-restart replay.
     ///
     /// `command` spawns an explicit program instead of the login shell, which
-    /// is how the AI-tab shortcuts open Claude Code / Codex; `cwd` inherits the
-    /// active pane's directory. `split_direction` stays `None` because the tab
-    /// shortcuts add to the existing workspace rather than dividing the window.
+    /// is how the AI-tab shortcuts open Claude Code / Codex, and how a replay
+    /// relaunches a custom or provider-resume pane. `split_direction` stays
+    /// `None` because the caller has already placed the pane; the server only
+    /// needs to know which workspace it belongs to.
+    ///
+    /// `launch.launch_id` rides along as the env-envelope id, so a replayed
+    /// pane comes back with the variables it had before the restart and a
+    /// brand-new one has an envelope to start persisting into. Sending no id
+    /// is what left fresh sessions unable to ever write one.
     ///
     /// # Errors
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
     /// when the bounded outbound queue is at its cap and refusing frames.
-    pub fn create_session(
-        &self,
-        workspace_id: WorkspaceId,
-        size: TerminalSize,
-        cwd: Option<PathBuf>,
-        command: Option<Vec<String>>,
-    ) -> Result<(), SinkError> {
+    pub fn create_session(&self, launch: SessionLaunch) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CreateSession {
-            workspace_id,
+            workspace_id: launch.workspace_id,
             split_direction: None,
-            cwd,
-            size: Some(size),
-            command,
-            env_envelope_id: None,
-        })
-    }
-
-    /// Requests the session that re-creates one pane of a cold-restart snapshot.
-    ///
-    /// Identical to [`Self::create_session`] except for `env_envelope_id`: the
-    /// persisted `LaunchRecord.launch_id` the server looks the pane's saved
-    /// environment envelope up by, so a relaunched shell comes back with the
-    /// variables it had before the crash instead of a bare login environment.
-    ///
-    /// # Errors
-    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
-    /// when the bounded outbound queue is at its cap and refusing frames.
-    pub fn create_restored_session(&self, request: RestoredSession) -> Result<(), SinkError> {
-        self.enqueue(ClientMessage::CreateSession {
-            workspace_id: request.workspace_id,
-            split_direction: None,
-            cwd: request.cwd,
-            size: Some(request.size),
-            command: request.command,
-            env_envelope_id: Some(request.launch_id),
+            cwd: launch.cwd,
+            size: Some(launch.size),
+            command: launch.command,
+            env_envelope_id: Some(launch.launch_id),
         })
     }
 
