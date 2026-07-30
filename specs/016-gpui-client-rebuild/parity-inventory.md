@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (46 sent)
+## Client messages (47 sent)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -111,7 +111,8 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `AttachSessions` | reconnect restore | scripted-E2E | `main.rs::attach_session` → `IpcSink::attach_sessions` | required |
 | `ConfigReloaded` | live config reload | scripted-E2E | `main.rs::apply_config_reload` → `IpcSink::config_reloaded` | required |
 | `ReportWorkspaceTree` | layout persistence | scripted-E2E | `main.rs::TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation | required |
-| `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, from every find-overlay query edit | required |
+| `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, once a find-overlay query settles past the 150 ms debounce | required |
+| `SearchClosed` | find overlay | scripted-E2E | `main.rs::TerminalView::close_find_overlay` → `ipc_bridge::IpcSink::search_closed`, when the overlay is dismissed or rebuilt by a theme reload | required |
 | `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::TerminalView::open_workspace_notes_modal` → `IpcSink::workspace_notes_get`, on the workspace `TerminalView::notes_workspace_id` resolves | required |
 | `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::TerminalView::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
@@ -145,7 +146,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 
-**Reachability:** 46 of 46 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 47 of 47 rows name a live-path symbol; 0 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
@@ -453,19 +454,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 46 | 46 | 0 | 0 |
+| Client messages | 47 | 47 | 0 | 0 |
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 29 | 29 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **203** | **0** | **0** |
+| **Total** | **204** | **204** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 194 are
-reachable (100%)** and 0 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **195 rows, of which 195 are
+reachable (100%)** and 0 are not. **1 of those 195** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **193 of 194**.
+the in-client figure is **194 of 195**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

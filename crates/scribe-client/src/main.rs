@@ -1362,7 +1362,7 @@ impl TerminalView {
             // Open overlays captured the old palette when they were built; drop
             // them so a live theme edit never leaves stale colours on screen.
             self.command_palette = None;
-            self.find_overlay = None;
+            self.close_find_overlay();
             self.context_menu = None;
         }
 
@@ -4602,7 +4602,7 @@ impl TerminalView {
         cx.subscribe(&overlay, |this, _overlay, event: &FindOverlayEvent, ctx| match event {
             FindOverlayEvent::QueryChanged(query) => this.send_search_request(query),
             FindOverlayEvent::Dismissed => {
-                this.find_overlay = None;
+                this.close_find_overlay();
                 ctx.notify();
             }
         })
@@ -4629,6 +4629,32 @@ impl TerminalView {
         match self.sink.search_request(session_id, query.to_owned(), SEARCH_RESULT_LIMIT) {
             Ok(()) => tracing::info!(%session_id, %query, "sent search request"),
             Err(error) => tracing::warn!(%error, "search request dropped: IPC writer closed"),
+        }
+    }
+
+    /// Drop the find overlay and release the snapshot the server cached for it.
+    ///
+    /// Every path that retires the overlay goes through here, because the
+    /// server holds a full-scrollback snapshot of the searched session for as
+    /// long as it believes the overlay is open (spec 017 US8-2).
+    fn close_find_overlay(&mut self) {
+        if self.find_overlay.take().is_some() {
+            self.send_search_closed();
+        }
+    }
+
+    /// Tell the server the find overlay closed, so it can drop the scrollback
+    /// snapshot it was reusing across this session's query edits.
+    ///
+    /// Best-effort: the server drops the same snapshot on the session's next
+    /// output, so a dropped release costs memory until then and nothing else.
+    fn send_search_closed(&self) {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return;
+        };
+        if let Err(error) = self.sink.search_closed(session_id) {
+            tracing::debug!(%error, "search release dropped: IPC writer closed");
         }
     }
 

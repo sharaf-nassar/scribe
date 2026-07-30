@@ -22,6 +22,7 @@ mod ipc_server;
 mod macos_proc;
 mod pty_guard;
 mod releases;
+mod search_cache;
 mod session_manager;
 mod shell_integration;
 mod stop_classifier;

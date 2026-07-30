@@ -356,6 +356,15 @@ pub enum ClientMessage {
         /// Maximum number of matches to return.
         limit: u32,
     },
+    /// The find overlay closed: the server may drop the scrollback snapshot it
+    /// cached to answer this session's query edits (spec 017 US8-2).
+    ///
+    /// Purely an advisory release. A server that never receives it still drops
+    /// the snapshot on the session's next output, and a client that never
+    /// sends it only delays that release.
+    SearchClosed {
+        session_id: SessionId,
+    },
     /// Request authoritative workspace notes for one or more workspaces.
     WorkspaceNotesGet {
         workspace_ids: Vec<WorkspaceId>,
