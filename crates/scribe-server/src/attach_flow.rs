@@ -13,8 +13,8 @@ use scribe_common::screen_replay::{SessionReplay, build_session_replay};
 
 use crate::ipc_server::{
     AttachSessionData, AttachedSessionIds, ClientWriter, LiveSessionRegistry, SessionAttachment,
-    SessionCommit, SharedWriter, TermCommit, begin_sink_attach, finish_sink_attach, resize_term,
-    send_message, set_pty_winsize,
+    SessionCommit, SharedWriter, TermCommit, begin_sink_attach, finish_sink_attach,
+    note_unpaced_resize_apply, resize_term, send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
 
@@ -265,6 +265,11 @@ async fn send_attach_replay(
             if let Err(error) = set_pty_winsize(entry.resize_fd.as_ref(), size) {
                 warn!(%session_id, "pre-snapshot TIOCSWINSZ failed: {error}");
             }
+            // This apply bypasses the session's pacer, so the pacer has to be
+            // told: a size a previous client's drag left armed must not mature
+            // over the geometry this client just attached at, and the report
+            // this client sends next belongs in the window that starts here.
+            note_unpaced_resize_apply(session_id, live_sessions).await;
         }
     }
 
