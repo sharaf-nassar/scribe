@@ -296,6 +296,8 @@ The pages are appearance, colors, AI, terminal, environment, keybindings, worksp
 
 The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, or action; Left/Right adjust toggles, choices, and steppers. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
+The root takes focus when the window opens, so Ctrl+K and traversal work before any click. Escape clears transient menus or an active search from every focus stop; titlebar window controls claim Enter/Space only, letting settings-wide keys continue to the root.
+
 Action controls route through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#run_action]], which is the single live entry point into [[crates/scribe-client/src/settings/server_action.rs]] — the update check, the release list, the keystore preflight, and the whole LAN trust surface below.
 
 ### Environment preflight
