@@ -1598,7 +1598,7 @@ impl SettingsWindow {
             .border_b_1()
             .border_color(colors.strong_border)
             .text_color(colors.text)
-            .child(div().text_3xl().font_weight(FontWeight::SEMIBOLD).child(self.page.nav_label()))
+            .child(div().text_lg().font_weight(FontWeight::BOLD).child(self.page.nav_label()))
             .child(
                 div()
                     .mt_1()
