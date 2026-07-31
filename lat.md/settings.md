@@ -51,10 +51,10 @@ the compositor reports as untiled — a tiled or maximized edge cannot be
 dragged, so it gets no gutter.
 [[crates/scribe-client/src/settings/window.rs#resize_edge]] maps a
 window-relative press onto one of the eight `ResizeEdge` values, giving each
-corner a square of `gutter * 1.5` so diagonal drags stay reachable, and
-returning `None` inside the content area. A left press that resolves to an edge
-calls `Window::start_window_resize`, which issues `_NET_WM_MOVERESIZE` on X11
-and `xdg_toplevel.resize` on Wayland.
+corner a square of `gutter * 1.5` so diagonal drags stay reachable only when
+both adjoining sides are untiled, and returning `None` inside the content area.
+A left press that resolves to an edge calls `Window::start_window_resize`,
+which issues `_NET_WM_MOVERESIZE` on X11 and `xdg_toplevel.resize` on Wayland.
 
 The press handler lives on the outer frame wrapper, above the settings body's
 own left-press handler; that inner handler only clears keyboard-navigation
