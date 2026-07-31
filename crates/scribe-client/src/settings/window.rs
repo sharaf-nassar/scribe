@@ -1117,16 +1117,16 @@ fn resize_edge(
     let right_edge = window_size.width - corner.width;
     let bottom_edge = window_size.height - corner.height;
     let in_corner = |origin: Point<Pixels>| Bounds::new(origin, corner).contains(&pos);
-    if !tiling.top && in_corner(point(px(0.0), px(0.0))) {
+    if !tiling.top && !tiling.left && in_corner(point(px(0.0), px(0.0))) {
         return Some(ResizeEdge::TopLeft);
     }
-    if !tiling.top && in_corner(point(right_edge, px(0.0))) {
+    if !tiling.top && !tiling.right && in_corner(point(right_edge, px(0.0))) {
         return Some(ResizeEdge::TopRight);
     }
-    if !tiling.bottom && in_corner(point(px(0.0), bottom_edge)) {
+    if !tiling.bottom && !tiling.left && in_corner(point(px(0.0), bottom_edge)) {
         return Some(ResizeEdge::BottomLeft);
     }
-    if !tiling.bottom && in_corner(point(right_edge, bottom_edge)) {
+    if !tiling.bottom && !tiling.right && in_corner(point(right_edge, bottom_edge)) {
         return Some(ResizeEdge::BottomRight);
     }
     if !tiling.top && pos.y < gutter {
