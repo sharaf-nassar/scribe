@@ -11,8 +11,8 @@
 
 use gpui::{
     AnyElement, Context, ElementId, EventEmitter, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Rgba, Role, Window, WindowControlArea, div,
-    prelude::*, px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
+    WindowControlArea, div, prelude::*, px,
 };
 
 use crate::tab_bar::{
@@ -31,6 +31,11 @@ const CHAR_WIDTH: f32 = 8.0;
 /// Fixed width of one tab in pixels (`TAB_COLS * CHAR_WIDTH`). Matching the
 /// legacy fixed-column tab layout keeps the drag-reorder geometry deterministic.
 pub const TAB_WIDTH: f32 = 176.0;
+
+/// Pointer travel, in pixels, required before an armed press on the move region
+/// hands the window to the compositor. Absorbs the jitter of an ordinary click
+/// so a wobbly press on empty chrome does not turn into a window move.
+const WINDOW_MOVE_THRESHOLD: f32 = 4.0;
 
 /// A window-control button on the right edge of the titlebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +123,11 @@ pub struct TitlebarView {
     show_equalize: bool,
     hovered_tab: Option<usize>,
     drag: Option<DragState>,
+    /// Press origin recorded by a left press on the move region, or `None` when
+    /// unarmed. Once the pointer travels [`WINDOW_MOVE_THRESHOLD`] px from it,
+    /// the window is handed to the compositor via [`Window::start_window_move`].
+    /// `WindowControlArea::Drag` is a no-op on Linux, so this is the real path.
+    move_arm: Option<Point<Pixels>>,
     focus_handle: FocusHandle,
     tab_focus_handles: Vec<FocusHandle>,
     tab_close_focus_handles: Vec<FocusHandle>,
@@ -142,6 +152,7 @@ impl TitlebarView {
             show_equalize: false,
             hovered_tab: None,
             drag: None,
+            move_arm: None,
             focus_handle: cx.focus_handle(),
             tab_focus_handles: Vec::new(),
             tab_close_focus_handles: Vec::new(),
@@ -264,6 +275,34 @@ impl TitlebarView {
         if self.drag.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Advance the window-move arm for one pointer motion.
+    ///
+    /// Returns `true` once the pointer has travelled [`WINDOW_MOVE_THRESHOLD`]
+    /// px from the recorded press origin with the left button still held, which
+    /// hands the window to the compositor and means the caller should skip the
+    /// rest of its move handling.
+    fn advance_move_arm(&mut self, event: &MouseMoveEvent, window: &Window) -> bool {
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Motion with no button held means the press has ended, even if its
+            // mouse-up landed outside the titlebar.
+            self.move_arm = None;
+            return false;
+        }
+        let Some(origin) = self.move_arm else {
+            return false;
+        };
+        // Only travel past the jitter threshold counts as a drag; a press that
+        // wobbles by a pixel stays an ordinary click.
+        let travel =
+            f32::from(event.position.x - origin.x).hypot(f32::from(event.position.y - origin.y));
+        if travel < WINDOW_MOVE_THRESHOLD {
+            return false;
+        }
+        self.move_arm = None;
+        window.start_window_move();
+        true
     }
 
     /// Move a tab from `from` to `to`, shifting the tabs in between.
@@ -621,6 +660,8 @@ impl TitlebarView {
             .hover(move |s| s.bg(hover_bg))
             .when(focused, |this| this.bg(self.colors.accent).text_color(self.colors.active_text))
             .child(glyph)
+            // Swallow the press so pointer jitter cannot arm a window move.
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
             .on_click(cx.listener(move |_, _, win, ctx| {
                 win.focus(&focus, ctx);
                 on_click(ctx);
@@ -666,6 +707,8 @@ impl TitlebarView {
             .on_mouse_move(cx.listener(|_, _: &MouseMoveEvent, _win, ctx| {
                 ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
             }))
+            // Swallow the press so pointer jitter cannot arm a window move.
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
             .on_click(cx.listener(move |_, _, win, ctx| {
                 win.focus(&focus, ctx);
                 ctx.emit(TitlebarEvent::OpenWorkspaceNotes);
@@ -734,6 +777,8 @@ impl TitlebarView {
             })
             .window_control_area(area)
             .child(glyph)
+            // Swallow the press so pointer jitter cannot arm a window move.
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
             .on_click(cx.listener(move |_, _, win, ctx| {
                 win.focus(&focus, ctx);
                 Self::activate_window_control(kind, win, ctx);
@@ -835,8 +880,26 @@ impl Render for TitlebarView {
             .bg(self.colors.bg)
             .border_b_1()
             .border_color(self.colors.separator)
+            // Declared for Windows, where the platform consults the hit-test
+            // areas. X11/Wayland ignore it, so the handlers below drive the move.
             .window_control_area(WindowControlArea::Drag)
+            // Bubble-phase listeners run front-to-back, so a tab's own
+            // `on_mouse_down` has already armed `drag` by the time this runs;
+            // an active tab drag therefore never arms a window move.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _win, _ctx| {
+                    this.move_arm = this.drag.is_none().then_some(event.position);
+                }),
+            )
+            // A press anywhere outside the titlebar ends any arm it left behind.
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _win, _ctx| {
+                this.move_arm = None;
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, win, ctx| {
+                if this.advance_move_arm(event, win) {
+                    return;
+                }
                 if this.drag.is_some() && event.pressed_button == Some(MouseButton::Left) {
                     this.update_drag(f32::from(event.position.x), ctx);
                 }
@@ -848,7 +911,10 @@ impl Render for TitlebarView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _win, ctx| this.end_drag(ctx)),
+                cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
+                    this.move_arm = None;
+                    this.end_drag(ctx);
+                }),
             )
             .children(self.render_badge())
             .child(
