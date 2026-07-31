@@ -1188,7 +1188,10 @@ Codex panes still keep `last_sent_grid = None` during reconnect, but they only q
 
 Padding is computed per-pane based on edge adjacency via . Internal edges get zero padding; external edges use configured values.
 
-All padding values are multiplied by the display scale factor for physical-pixel rendering (see ).
+Live GPUI layout passes configured padding through as logical pixels and lets
+GPUI own DPI scaling. The sole app-level scale-factor multiplication is
+[[crates/scribe-client/src/restore_replay.rs#effective_padding]] during
+saved-layout geometry replay; see [[rendering#Glyph Atlas#DPI Scaling]].
 
 ## Layout
 

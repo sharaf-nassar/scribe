@@ -7,7 +7,7 @@ A GPU-accelerated terminal emulator with a client-server architecture and first-
 - [[protocol]] — IPC messages, screen snapshots, identity types, and AI state
 - [[server]] — PTY sessions, workspaces, handoff, and updater
 - [[client]] — Panes, layout, input, IPC, selection, and UI chrome
-- [[rendering]] — Glyph atlas, wgpu pipeline, colour palette, and box drawing
+- [[rendering]] — GPUI paint path, DPI scaling, colour palette, and box drawing
 - [[pty]] — Async PTY I/O, OSC interception, and metadata parsing
 - [[settings]] — Webview config editor, key paths, and singleton
 - [[test]] — Integration test harness: PTY capture, IPC helpers, assertion utilities, and screenshot rendering
