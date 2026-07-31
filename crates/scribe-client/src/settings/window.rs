@@ -2660,8 +2660,11 @@ fn settings_window_control(
             SettingsWindowControl::Close => window.remove_window(),
         }))
         .on_key_down(cx.listener(move |_, event: &KeyDownEvent, window, ctx| {
-            ctx.stop_propagation();
             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                // Activation belongs to this button, but settings-wide keys
+                // (Ctrl+K, Escape, and navigation) must continue along the
+                // focused event path to `#settings-root`.
+                ctx.stop_propagation();
                 match kind {
                     SettingsWindowControl::Minimize => window.minimize_window(),
                     SettingsWindowControl::Maximize => window.zoom_window(),
