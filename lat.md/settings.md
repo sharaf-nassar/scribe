@@ -270,6 +270,9 @@ Content uses 46px gutters, a 32px page title, 18px summary, explicit
 stable 438px right column aligns values: choices and read-only fields are 42px
 high, steppers are 207×38px with 48px actions, switches are 52×30px, and
 actions are 40px high. Switch tracks and warm-light knobs are fully rounded.
+Read-only color, text, keybinding, and gated values use a muted fill, open
+bottom rule, and explicit `READ ONLY` marker instead of an interactive
+control outline.
 
 At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 
