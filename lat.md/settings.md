@@ -265,8 +265,9 @@ with Ctrl+K and filters page names, summaries, section names, control labels,
 and dotted keys. Matching pages remain navigable, and matching controls filter
 inside the selected page; the field is never a decorative placeholder.
 
-Content uses 46px gutters, a 32px page title, 18px summary, explicit
-"Changes apply instantly" status, 66px section headings, and 54px rows. A
+Content uses 46px gutters, an 18px bold page title, 14px summary and body
+copy, explicit "Changes apply instantly" status, 18px section headings, and
+54px rows. A
 stable 438px right column aligns values: choices and read-only fields are 42px
 high, steppers are 207×38px with 48px actions, switches are 52×30px, and
 actions are 40px high. Switch tracks and warm-light knobs are fully rounded.
