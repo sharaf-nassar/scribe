@@ -5,31 +5,81 @@ TOML configuration and live-apply behavior.
 
 ## Window
 
-The retired GTK/wry settings application is replaced by
-`crates/scribe-client/src/settings`, which opens and focuses one GPUI settings
-window from `scribe-client --settings` or in-app commands.
+The retired GTK/wry settings application is gone. `crates/scribe-client/src/settings` now opens one GPUI window inside the running client process, from `scribe-client --settings` or from an in-app entry point.
 
-The inlined document carries a restrictive Content Security Policy: no default loads, no network connects, and only the inline script/style blocks produced by the asset embedder are allowed.
+[[crates/scribe-client/src/settings/window.rs#open_settings_window]] is the only
+place the window is created. It sets the app id `scribe-client` so panels that
+match by WM_CLASS group it with the terminal window, titles it `Scribe
+Settings` with `appears_transparent` so the custom 54px titlebar replaces the
+system one, and passes the geometry described in
+[[settings#State Persistence]] — including `window_min_size`, which the
+compositor keeps enforcing during an interactive resize.
 
-On Linux, the icon pixbuf is loaded from the hicolor theme and set directly on the window so that panels which match by WM_CLASS still display the correct icon.
+The page content, palette, navigation, and accessibility contract are described
+in [[settings#GPUI Settings Window]]. This section covers only the window
+shell: how it is decorated, resized, and moved.
 
-The visible window title is flavor-aware: stable installs use `Scribe Settings`, while `scribe-dev` uses `devScribe Settings` so task bars distinguish dev windows from production ones.
+### Client-side decorations
 
-On launch, five pieces of state are injected into the webview: the host platform, the current config, keybinding defaults (for reset-to-default UI), all theme preset colours, and a list of available monospace fonts from fontdb.
+The window opts into `WindowDecorations::Client`, so the window manager draws no frame and the app must supply its own resize border, move region, and window buttons.
 
-When Settings is opened from a client terminal, the client sends a  so the window can be centered over that terminal instead of replaying stale off-screen coordinates.
+On X11 that clears the decorations flag in `_MOTIF_WM_HINTS`; on Wayland it
+requests client xdg-decoration mode. Either way every WM-provided resize border
+and corner disappears, which is why the resize and move contracts below exist
+at all. The request is not binding: X11 without a running compositor falls back
+to server decorations, so
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_window_frame]]
+reads `Window::window_decorations()` on every render and takes the
+pass-through path — no inset, no gutter, no hit-testing — whenever the answer
+is `Decorations::Server`.
 
-On X11, both the fresh-launch and singleton-refocus paths route the raise through , which fetches `gdk_x11_get_server_time` and calls `present_with_time` so the window manager accepts the cross-process raise instead of demoting it to a "demand attention" hint that would leave Settings behind the launcher terminal. Wayland falls back to bare `present` because position requests are no-ops there anyway.
+The window background stays `WindowBackgroundAppearance::Opaque`. Resize does
+not need transparency (both backends delegate the drag to the compositor), and
+an opaque window is the safer default on an X11 session with no compositor, so
+the gutter is painted as deliberate chrome instead of Zed-style drop shadow: a
+`#0c0d0e` graphite matte one step below every interior surface, with the body
+carrying a one-pixel `#4f4f51` seam against it. It reads as a window frame
+rather than as stray padding.
 
-### Font Discovery
+### Resize contract
 
-The `list_monospace_fonts` function queries fontdb for all system monospace font families, returning a deduplicated sorted list.
+Under client decorations the app pads each untiled side by [[crates/scribe-client/src/settings/window.rs#RESIZE_GUTTER]] and treats that band as the window's resize border.
 
-### Platform Differences
+`render_window_frame` calls `Window::set_client_inset` with the same value so
+the platform layer knows the visual frame is inset, then pads only the sides
+the compositor reports as untiled — a tiled or maximized edge cannot be
+dragged, so it gets no gutter.
+[[crates/scribe-client/src/settings/window.rs#resize_edge]] maps a
+window-relative press onto one of the eight `ResizeEdge` values, giving each
+corner a square of `gutter * 1.5` so diagonal drags stay reachable, and
+returning `None` inside the content area. A left press that resolves to an edge
+calls `Window::start_window_resize`, which issues `_NET_WM_MOVERESIZE` on X11
+and `xdg_toplevel.resize` on Wayland.
 
-Linux uses GTK3 with glib socket/signal watchers; macOS uses tao EventLoop with background threads.
+The press handler lives on the outer frame wrapper, above the settings body's
+own left-press handler; that inner handler only clears keyboard-navigation
+styling and never stops propagation, so the edge press is not swallowed.
+[[crates/scribe-client/src/settings/window.rs#resize_cursor_overlay]] paints
+last and inserts a window-sized `HitboxBehavior::Normal` hitbox purely so
+`Window::set_cursor_style` has something hovered to attach the directional
+cursor to; because it never blocks the mouse, it cannot eat a click. A
+`resize_edge` change recorded on the view triggers the repaint that swaps the
+cursor glyph.
 
-The settings frontend formats shortcut badges from the injected platform flag. On macOS, both `cmd` and `super` modifiers render as the `⌘` glyph, and the platform is injected before config so reopened settings windows do not fall back to Linux-style `Super` labels. Search indexes the raw shortcut plus modifier aliases, so queries like `command`, `cmd`, or `super` still find `⌘`-rendered keybindings. Bare `cmd+w` is handled at the tao window layer and closes the settings window through the same path as a native close request. The Notifications page also uses the platform flag to show Linux-only timeout controls or, on macOS, a shortcut button that opens the system Notifications pane.
+### Move contract
+
+The titlebar keeps its `WindowControlArea::Drag` declarations — that hit-test hook is what moves the window on Windows — and adds an explicit press/move pair, because both Linux backends implement `on_hit_test_window_control` as an empty body.
+
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_titlebar]]
+arms a `should_move` flag on left press, and the first left-button move while
+it is armed clears it and calls `Window::start_window_move`. Mouse-up and
+mouse-down-out disarm it. The press only arms the flag when `resize_edge`
+returns `None`, so in the few pixels where the top corner squares reach into
+the titlebar the resize grab wins and the move never competes with it.
+
+The min/max/close buttons stop mouse-down propagation before it reaches the
+titlebar's arming handler, so a click carrying a pixel of pointer jitter cannot
+start a window move and consume the click.
 
 ## Config Application
 

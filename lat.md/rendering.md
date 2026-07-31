@@ -48,9 +48,13 @@ The  rasterizes glyphs via cosmic-text and caches them in a 1024x1024 RGBA8 text
 
 ### DPI Scaling
 
-Font sizes and chrome dimensions are multiplied by `window.scale_factor()` so the UI renders at the native physical resolution.
+GPUI owns DPI scaling. The client supplies logical-pixel sizes only and never multiplies them by a scale factor itself.
 
-The wgpu surface operates in physical pixels (e.g. 2x on Retina), so raw config values would appear at half the expected size without scaling. The client stores `scale_factor` on  and applies it to: font sizes in all four  construction sites (init, config hot-reload, zoom, resize), status bar height, tab bar height and padding, scrollbar width, content padding (via ), focus border width, and indicator height. On resize, scale-factor changes (e.g. dragging between monitors) are detected and the atlas is rebuilt.
+`Window::paint_glyph` in the pinned gpui rev takes a logical `origin` and `font_size`, reads `self.scale_factor()`, scales the origin, and forwards the factor in `RenderGlyphParams` so rasterization happens at device resolution. Layout does the same via `stretch_auto_size_to_fill`. Nothing the client passes in is pre-scaled.
+
+Every size the client hands to GPUI is therefore a logical pixel: `px(...)` values, the Tailwind-scale text helpers, and the configured terminal font size. [[crates/scribe-client/src/terminal_element.rs#GridFont#from_appearance]] clamps `appearance.font_size` to `MIN_FONT_SIZE` and passes it through unscaled, and the grid's `shape_line` calls in [[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint_preedit]] and [[crates/scribe-client/src/terminal_element.rs#paint_row_text]] hand that same `px(font.size)` straight to GPUI's text system. `scribe-client` contains no `set_rem_size` and no `text_size(` call, so GPUI's default `px(16.)` rem size is the only rem input to sizing.
+
+The sole remaining app-level use of a scale factor is geometry replay: [[crates/scribe-client/src/restore_replay.rs#effective_padding]] multiplies configured content padding by `scale_factor` when reconstructing a pane's grid from a saved layout. That path scales rectangles, not fonts or chrome typography.
 
 ### Shelf Packing
 

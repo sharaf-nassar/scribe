@@ -34,13 +34,17 @@
 use std::time::Duration;
 
 use gpui::{
-    AccessibleAction, App, Bounds, Context, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    Rgba, Role, Text, TitlebarOptions, Toggled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowHandle, WindowOptions, div, point, prelude::*, px,
-    rgb, size,
+    AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, FocusHandle, FontWeight,
+    HitboxBehavior, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
+    ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle,
+    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
 };
 use scribe_common::config::{ScribeConfig, load_config};
-use scribe_common::protocol::{PreflightError, TrustedDeviceInfo, TrustedNetworkInfo};
+use scribe_common::protocol::{
+    PreflightError, Release, ReleaseListResultState, TrustedDeviceInfo, TrustedNetworkInfo,
+    UpdateCheckResultState,
+};
 use serde_json::{Value, json};
 
 use crate::settings::model::{
@@ -55,6 +59,22 @@ use crate::tab_bar::srgba;
 /// One-shot server-action timeout for the releases page (update check / release
 /// list). Short so a click never hangs the UI thread if the server is down.
 const SERVER_ACTION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long [`SettingsWindow::after_paint`] yields before starting a blocking
+/// server action — two frames at 60 Hz, enough for the pending status line to
+/// be drawn and presented.
+const PENDING_PAINT_DELAY: Duration = Duration::from_millis(34);
+
+/// Width of the client-side-decoration resize gutter painted around the window.
+///
+/// The window opts into [`WindowDecorations::Client`], which removes the WM
+/// frame on both Linux backends, so this band *is* the window's resize border:
+/// [`resize_edge`] hit-tests it and [`Window::start_window_resize`] hands the
+/// drag to the compositor. Kept narrow because the window background is
+/// [`WindowBackgroundAppearance::Opaque`] — the gutter is a solid painted frame,
+/// not Zed's translucent drop shadow, so it has to read as chrome rather than as
+/// stray padding.
+const RESIZE_GUTTER: Pixels = px(6.0);
 
 /// The feature-014 LAN trust state the Remote page renders, refreshed from the
 /// local server by [`SettingsWindow::refresh_trust`].
@@ -103,7 +123,12 @@ fn preflight_reason(error: &PreflightError) -> String {
             "the Secret Service / D-Bus session bus is unavailable".to_owned()
         }
         PreflightError::KeystoreAccessDenied => "keystore access was denied".to_owned(),
-        PreflightError::Unknown { reason } => reason.clone(),
+        // `Unknown` also carries every transport failure, whose reason is a raw
+        // socket/OS string. Framing it keeps the diagnostic without presenting
+        // "Resource temporarily unavailable (os error 11)" as the answer.
+        PreflightError::Unknown { reason } => {
+            format!("the local Scribe server did not complete the probe ({reason})")
+        }
     }
 }
 
@@ -111,6 +136,9 @@ fn preflight_reason(error: &PreflightError) -> String {
 #[derive(Clone, Copy)]
 struct SettingsColors {
     page_bg: Rgba,
+    /// Fill for the client-decoration resize gutter — a graphite matte one step
+    /// below every interior surface so the frame reads as window chrome.
+    frame_bg: Rgba,
     nav_bg: Rgba,
     nav_active_bg: Rgba,
     nav_hover_bg: Rgba,
@@ -141,6 +169,7 @@ impl SettingsColors {
         let text = rgb(0x00ef_ede8);
         Self {
             page_bg,
+            frame_bg: rgb(0x000c_0d0e),
             nav_bg,
             nav_active_bg: rgb(0x002b_2925),
             nav_hover_bg: rgb(0x0023_2426),
@@ -180,6 +209,25 @@ pub struct SettingsWindow {
     /// keys while its own window is focused, never terminal-window shortcuts.
     focus_index: usize,
     keyboard_navigation: bool,
+    /// Resize edge the pointer currently sits over, tracked only so a change of
+    /// edge forces the repaint that lets the cursor overlay swap glyphs.
+    resize_edge: Option<ResizeEdge>,
+    /// Armed by a left press on the titlebar drag region; the next left-button
+    /// move hands the window to the compositor via
+    /// [`Window::start_window_move`]. `WindowControlArea::Drag` is a no-op on
+    /// both Linux backends, so this is the real path there.
+    should_move: bool,
+    /// Vertical scroll position of the settings page body, retained across
+    /// frames so the scroller can report how far its content overflows and so a
+    /// page switch can rewind it to the top.
+    scroll_handle: ScrollHandle,
+    /// Config key of the choice control whose dropdown is currently open, or
+    /// `None` when no menu is showing. At most one menu is open at a time.
+    open_choice: Option<String>,
+    /// Scroll position of that dropdown. Shared because only one is ever open,
+    /// and rewound on open so the live value is on screen even in the ~190-entry
+    /// theme preset list.
+    choice_scroll: ScrollHandle,
 }
 
 /// One focus stop in the settings window's stable keyboard traversal order.
@@ -239,6 +287,11 @@ impl SettingsWindow {
             search_query: String::new(),
             focus_index: 0,
             keyboard_navigation: false,
+            resize_edge: None,
+            should_move: false,
+            scroll_handle: ScrollHandle::new(),
+            open_choice: None,
+            choice_scroll: ScrollHandle::new(),
         }
     }
 
@@ -252,24 +305,40 @@ impl SettingsWindow {
     }
 
     /// Route a `{key, value}` edit through the ported apply path, then reload.
-    fn commit(&mut self, key: &str, value: Value, cx: &mut Context<Self>) {
+    ///
+    /// Returns whether the edit was accepted. A success used to clear the status
+    /// line, which made a saved edit and a rejected one look identical; it now
+    /// confirms in the same place a rejection reports.
+    fn commit(&mut self, key: &str, value: Value, cx: &mut Context<Self>) -> bool {
         let mut obj = serde_json::Map::new();
         obj.insert("key".to_owned(), Value::String(key.to_owned()));
         obj.insert("value".to_owned(), value);
         let payload = Value::Object(obj).to_string();
-        match crate::settings::apply::apply_settings_change(&payload) {
+        let applied = match crate::settings::apply::apply_settings_change(&payload) {
             Ok(()) => {
                 self.reload();
-                self.status = None;
+                self.status = Some(format!("Saved {key}."));
+                true
             }
-            Err(e) => self.status = Some(format!("{key}: {e}")),
-        }
+            Err(e) => {
+                self.status = Some(format!("{key} was not saved — {e}"));
+                false
+            }
+        };
         cx.notify();
+        applied
     }
 
     fn select_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         self.page = page;
         self.status = None;
+        // A dropdown belongs to one control on one page; leaving the page must
+        // not leave its menu floating over the next one.
+        self.open_choice = None;
+        // The scroller is one retained element across every page, so without an
+        // explicit rewind a short page inherits the previous page's offset and
+        // opens blank below its own content.
+        self.scroll_handle.set_offset(Point::default());
         if self.keyboard_navigation {
             self.focus_index =
                 settings_nav_pages().iter().position(|candidate| *candidate == page).unwrap_or(0);
@@ -308,7 +377,9 @@ impl SettingsWindow {
             }));
         }
         targets.extend(page_controls(self.page).into_iter().filter_map(|control| {
-            if !self.control_matches_search(&control) {
+            // A control its parent toggle has gated renders inert, so keyboard
+            // traversal must skip it too rather than stop on a dead stop.
+            if !self.control_matches_search(&control) || !self.control_is_enabled(&control.key) {
                 return None;
             }
             match control.kind {
@@ -373,7 +444,12 @@ impl SettingsWindow {
             SettingsFocusTarget::Page(page) => self.select_page(page, cx),
             SettingsFocusTarget::Control(control) => match control.kind {
                 ControlKind::Toggle => self.toggle(&control.key, cx),
-                ControlKind::Choice(options) => self.cycle(&control.key, &options, cx),
+                // Keyboard activation opens the same dropdown a click opens, so
+                // the option set is discoverable without pointer use; the arrow
+                // keys then step the live value through it.
+                ControlKind::Choice(options) => {
+                    self.toggle_choice_menu(&control.key, &options, cx);
+                }
                 ControlKind::Stepper { min, max, step, .. } => {
                     self.step(&control.key, (min, max), step, cx);
                 }
@@ -419,8 +495,7 @@ impl SettingsWindow {
             || page_controls(page).iter().any(|control| {
                 control.label.to_lowercase().contains(&query)
                     || control.key.to_lowercase().contains(&query)
-                    || control_section(page, &control.key)
-                        .is_some_and(|section| section.to_lowercase().contains(&query))
+                    || control_section(page, &control.key).to_lowercase().contains(&query)
             })
     }
 
@@ -430,8 +505,7 @@ impl SettingsWindow {
             || self.page.nav_label().to_lowercase() == query
             || control.label.to_lowercase().contains(&query)
             || control.key.to_lowercase().contains(&query)
-            || control_section(self.page, &control.key)
-                .is_some_and(|section| section.to_lowercase().contains(&query))
+            || control_section(self.page, &control.key).to_lowercase().contains(&query)
     }
 
     fn align_page_to_search(&mut self) {
@@ -441,6 +515,9 @@ impl SettingsWindow {
         {
             self.page = page;
             self.status = None;
+            // Jumping to a different page for a match must rewind the shared
+            // scroller too, or the match lands above the retained offset.
+            self.scroll_handle.set_offset(Point::default());
         }
     }
 
@@ -462,7 +539,11 @@ impl SettingsWindow {
                 self.search_query.pop();
                 self.align_page_to_search();
             }
-            "delete" => self.search_query.clear(),
+            // The caret is pinned to the end of the query, so there is nothing to
+            // the right to forward-delete. Wiping the whole query here made Delete
+            // and Backspace behave wildly differently for no reason; Escape is the
+            // deliberate clear.
+            "delete" => {}
             "enter" => self.align_page_to_search(),
             "tab" => window.focus_next(cx),
             _ if !claimed_by_modifier => {
@@ -498,6 +579,10 @@ impl SettingsWindow {
             return;
         }
         let handled = match event.keystroke.key.as_str() {
+            // Escape is handled on the root, not only inside the search field, so
+            // a user who filters and then clicks a control is never stranded in a
+            // filtered UI with no visible way out.
+            "escape" => self.dismiss_transient_state(cx),
             "tab" | "down" => {
                 self.move_focus(1, cx);
                 true
@@ -519,6 +604,23 @@ impl SettingsWindow {
         }
     }
 
+    /// Back out of whatever transient state Escape should unwind, innermost
+    /// first: an open dropdown, then an active search filter. Returns whether
+    /// anything was actually dismissed so the caller only claims the keystroke
+    /// when it did something.
+    fn dismiss_transient_state(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.close_choice_menu(cx) {
+            return true;
+        }
+        if self.search_query.is_empty() {
+            return false;
+        }
+        self.search_query.clear();
+        self.align_page_to_search();
+        cx.notify();
+        true
+    }
+
     fn toggle(&mut self, key: &str, cx: &mut Context<Self>) {
         let current = current_value(&self.config, key).as_bool().unwrap_or(false);
         let next = !current;
@@ -532,19 +634,53 @@ impl SettingsWindow {
         self.commit(key, Value::Bool(next), cx);
     }
 
+    /// Run `work` after the pending status line the caller just set has been
+    /// drawn and presented.
+    ///
+    /// Every server action here is a blocking round trip on the UI thread, so
+    /// running it inline paints the pending state and the result in the same
+    /// frame: the user sees a freeze and then a result, never a working-on-it
+    /// state. `Window::on_next_frame` is not enough — its callbacks run at the
+    /// top of the frame, ahead of the draw — so this yields to the event loop
+    /// for long enough that the pending frame reaches the screen first.
+    fn after_paint(
+        cx: &mut Context<Self>,
+        work: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        cx.spawn(async move |settings, app| {
+            app.background_executor().timer(PENDING_PAINT_DELAY).await;
+            settings.update(app, work).ok();
+        })
+        .detach();
+    }
+
     /// The gated ON transition of [`ENV_PERSISTENCE_KEY`]: probe the server's OS
     /// keystore first and commit only if it answers `ok`. A failing probe leaves
     /// the config untouched and reports the actionable reason.
     fn enable_env_persistence(&mut self, key: &str, cx: &mut Context<Self>) {
-        match server_action::request_env_preflight(SERVER_ACTION_TIMEOUT) {
-            EnvPreflightOutcome::Ok => {
-                self.commit(key, Value::Bool(true), cx);
-                let ok = self.status.is_none();
-                if ok {
-                    self.status =
-                        Some("Keystore preflight passed; environment persistence is on.".into());
-                }
+        self.status = Some(KEYSTORE_PENDING.to_owned());
+        cx.notify();
+        let key = key.to_owned();
+        Self::after_paint(cx, move |this, ctx| {
+            let outcome = server_action::request_env_preflight(SERVER_ACTION_TIMEOUT);
+            this.finish_env_preflight(&key, outcome, ctx);
+        });
+    }
+
+    /// Apply the gated toggle's probe result: commit and confirm on success,
+    /// leave the config untouched and say why on failure.
+    fn finish_env_preflight(
+        &mut self,
+        key: &str,
+        outcome: EnvPreflightOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            EnvPreflightOutcome::Ok if self.commit(key, Value::Bool(true), cx) => {
+                self.status =
+                    Some("Keystore preflight passed; environment persistence is on.".to_owned());
             }
+            EnvPreflightOutcome::Ok => {}
             EnvPreflightOutcome::Err(error) => {
                 self.status = Some(format!(
                     "Environment persistence stays off — {}",
@@ -555,22 +691,63 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// The option set a choice control actually offers, which is the declared
+    /// list plus the live config value whenever that value is not one of the
+    /// declared options.
+    ///
+    /// `theme.preset` is open-ended — any installed theme name is legal — so a
+    /// cycle restricted to the declared options steps off the user's value on
+    /// the first click and can never return to it. Splicing the live value in
+    /// keeps every reachable state reachable again.
+    fn choice_options(
+        &self,
+        key: &str,
+        options: &[(&'static str, &'static str)],
+    ) -> Vec<(String, String)> {
+        let value = current_value(&self.config, key);
+        let token = value.as_str().unwrap_or("");
+        let mut out = options
+            .iter()
+            .map(|(option, label)| ((*option).to_owned(), choice_label(option, label)))
+            .collect::<Vec<_>>();
+        if !token.is_empty() && !out.iter().any(|(candidate, _)| candidate == token) {
+            out.insert(0, (token.to_owned(), humanize_choice_token(token)));
+        }
+        out
+    }
+
+    /// Step a choice control by one position through [`Self::choice_options`],
+    /// wrapping at both ends.
+    fn cycle_by(
+        &mut self,
+        key: &str,
+        options: &[(&'static str, &'static str)],
+        direction: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let options = self.choice_options(key, options);
+        let count = options.len();
+        if count == 0 {
+            return;
+        }
+        let value = current_value(&self.config, key);
+        let token = value.as_str().unwrap_or("");
+        let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
+        let next =
+            if direction.is_negative() { (index + count - 1) % count } else { (index + 1) % count };
+        let Some((chosen, _)) = options.get(next) else {
+            return;
+        };
+        self.commit(key, Value::String(chosen.clone()), cx);
+    }
+
     fn cycle(
         &mut self,
         key: &str,
         options: &[(&'static str, &'static str)],
         cx: &mut Context<Self>,
     ) {
-        if options.is_empty() {
-            return;
-        }
-        let current = current_value(&self.config, key);
-        let current_token = current.as_str().unwrap_or("");
-        let idx = options.iter().position(|(v, _)| *v == current_token).unwrap_or(0);
-        let Some((next, _)) = options.get((idx + 1) % options.len()) else {
-            return;
-        };
-        self.commit(key, Value::String((*next).to_owned()), cx);
+        self.cycle_by(key, options, 1, cx);
     }
 
     fn cycle_previous(
@@ -579,16 +756,7 @@ impl SettingsWindow {
         options: &[(&'static str, &'static str)],
         cx: &mut Context<Self>,
     ) {
-        if options.is_empty() {
-            return;
-        }
-        let current = current_value(&self.config, key);
-        let current_token = current.as_str().unwrap_or("");
-        let index = options.iter().position(|(value, _)| *value == current_token).unwrap_or(0);
-        let previous = (index + options.len() - 1) % options.len();
-        if let Some((value, _)) = options.get(previous) {
-            self.commit(key, Value::String((*value).to_owned()), cx);
-        }
+        self.cycle_by(key, options, -1, cx);
     }
 
     fn step(&mut self, key: &str, bounds: (f64, f64), delta: f64, cx: &mut Context<Self>) {
@@ -637,7 +805,23 @@ impl SettingsWindow {
         )
     }
 
+    /// Dispatch an action button.
+    ///
+    /// Anything that talks to the local server paints a pending line first and
+    /// runs on the next frame; purely local actions run inline. Every rendered
+    /// action key reaches a real arm of [`Self::perform_action`].
     fn run_action(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(pending) = action_pending_message(key) else {
+            self.perform_action(key, cx);
+            return;
+        };
+        self.status = Some(pending);
+        cx.notify();
+        let key = key.to_owned();
+        Self::after_paint(cx, move |this, ctx| this.perform_action(&key, ctx));
+    }
+
+    fn perform_action(&mut self, key: &str, cx: &mut Context<Self>) {
         // Per-row trust mutations carry their record key in the action id, so they
         // are matched by prefix before the fixed action table.
         if let Some(id) = key.strip_prefix(REMOVE_TRUSTED_NETWORK_PREFIX) {
@@ -697,34 +881,113 @@ impl SettingsWindow {
             }
             "action.check_for_updates" => {
                 let state = server_action::request_update_check(SERVER_ACTION_TIMEOUT);
-                self.status = Some(format!("Update check: {state:?}"));
+                self.status = Some(update_check_summary(&state));
             }
             "action.list_releases" => {
                 let state = server_action::request_release_list(SERVER_ACTION_TIMEOUT);
-                self.status = Some(format!("Releases: {state:?}"));
+                self.status = Some(release_list_summary(&state));
             }
             "workspaces.reset_badge_colors" | "terminal.smart_selection.reset" => {
                 self.commit(key, Value::Bool(true), cx);
                 return;
             }
-            "workspaces.add_root" => {
-                self.status = Some(
-                    "Adding a workspace root needs inline path entry (tracked follow-on)."
-                        .to_owned(),
-                );
-            }
-            _ => self.status = Some(format!("no handler for {key}")),
+            // Unreachable from the UI: every action key the model renders has an
+            // arm above. Kept loud rather than silent so a future control wired
+            // to a missing key reports itself instead of looking inert.
+            _ => self.status = Some(format!("Settings bug: no handler is wired to {key}.")),
         }
         cx.notify();
+    }
+}
+
+/// The line shown while a server-backed action is in flight, or `None` for an
+/// action that completes locally and needs no pending state.
+fn action_pending_message(key: &str) -> Option<String> {
+    if key.starts_with(REMOVE_TRUSTED_NETWORK_PREFIX) {
+        return Some("Removing the trusted network…".to_owned());
+    }
+    if key.starts_with(REVOKE_TRUSTED_DEVICE_PREFIX) {
+        return Some("Revoking the approved device…".to_owned());
+    }
+    match key {
+        REFRESH_TRUST_ACTION => Some("Reading trust state from the server…".to_owned()),
+        ADD_CURRENT_NETWORK_ACTION => Some("Trusting the current network…".to_owned()),
+        ENV_PREFLIGHT_ACTION => Some(KEYSTORE_PENDING.to_owned()),
+        "action.check_for_updates" => Some("Checking for updates…".to_owned()),
+        "action.list_releases" => Some("Fetching the release list…".to_owned()),
+        _ => None,
+    }
+}
+
+/// Plain-language rendering of a manual update check, replacing the raw `{:?}`
+/// of the state enum the panel used to print.
+fn update_check_summary(state: &UpdateCheckResultState) -> String {
+    match state {
+        UpdateCheckResultState::NoUpdate => {
+            "Up to date — no newer release on this channel.".to_owned()
+        }
+        UpdateCheckResultState::UpdateAvailable { version, release_url } => {
+            format!("Update available: {version} — {release_url}")
+        }
+        UpdateCheckResultState::Failed { reason } => format!("Update check failed — {reason}"),
+    }
+}
+
+/// Plain-language rendering of a release listing.
+///
+/// Only the version, date, and pre-release flag are shown: a `Release` also
+/// carries `body_html`, and Debug-printing the whole state dumped that sanitized
+/// markup — escaped entities and literal `\n` included — straight into the panel.
+fn release_list_summary(state: &ReleaseListResultState) -> String {
+    match state {
+        ReleaseListResultState::Fresh { releases } => {
+            format!("Releases — {}", release_versions(releases))
+        }
+        ReleaseListResultState::Stale { releases, reason } => {
+            format!("Releases (cached; refresh failed — {reason}) — {}", release_versions(releases))
+        }
+        ReleaseListResultState::Failed { reason } => format!("Release list failed — {reason}"),
+    }
+}
+
+/// The newest few releases as `version — date`, with a count of the remainder.
+fn release_versions(releases: &[Release]) -> String {
+    if releases.is_empty() {
+        return "none published.".to_owned();
+    }
+    let shown = releases
+        .iter()
+        .take(RELEASE_SUMMARY_MAX)
+        .map(|release| {
+            let date = release.published_at.split('T').next().unwrap_or(&release.published_at);
+            let tag = if release.prerelease { " (pre-release)" } else { "" };
+            format!("{} — {date}{tag}", release.version)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    match releases.len().saturating_sub(RELEASE_SUMMARY_MAX) {
+        0 => shown,
+        rest => format!("{shown}; +{rest} older"),
     }
 }
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors;
+        // The window asked for client-side decorations, but the compositor gets
+        // the last word: X11 without a running compositor falls back to server
+        // decorations, in which case the WM still paints resize borders and the
+        // app must not add a gutter of its own.
+        let decorations = window.window_decorations();
+        let tiling = client_tiling(decorations);
+        match decorations {
+            Decorations::Client { .. } => window.set_client_inset(RESIZE_GUTTER),
+            Decorations::Server => window.set_client_inset(px(0.0)),
+        }
+        let client_side = matches!(decorations, Decorations::Client { .. });
         let nav = self.render_nav(cx);
         let content = self.render_content(window, cx);
-        div()
+        let body = div()
             .id("settings-root")
             .role(Role::Application)
             .aria_label("Scribe settings")
@@ -743,14 +1006,149 @@ impl Render for SettingsWindow {
             .flex_col()
             .bg(colors.page_bg)
             .text_color(colors.text)
+            .when(client_side, |this| this.border_1().border_color(colors.strong_border))
             .child(self.render_titlebar(window, cx))
-            .child(div().flex_1().min_h(px(0.0)).w_full().flex().child(nav).child(content))
+            .child(div().flex_1().min_h(px(0.0)).w_full().flex().child(nav).child(content));
+        self.render_window_frame(decorations, tiling, body, cx)
     }
 }
 
+/// Edge tiling reported for the window, or "nothing tiled" under server
+/// decorations where the app never draws a gutter in the first place.
+fn client_tiling(decorations: Decorations) -> Tiling {
+    match decorations {
+        Decorations::Server => Tiling::default(),
+        Decorations::Client { tiling } => tiling,
+    }
+}
+
+/// Map a window-relative press position onto the resize edge it grabs, or
+/// `None` when the position is inside the content area.
+///
+/// Corners take a square of `gutter * 1.5` so diagonal resizes stay reachable;
+/// tiled sides are excluded because a tiled or maximized edge cannot be dragged.
+/// Mirrors the geometry of Zed's `client_side_decorations` helper.
+fn resize_edge(
+    pos: Point<Pixels>,
+    gutter: Pixels,
+    window_size: Size<Pixels>,
+    tiling: Tiling,
+) -> Option<ResizeEdge> {
+    if Bounds::new(Point::default(), window_size).inset(gutter * 1.5).contains(&pos) {
+        return None;
+    }
+    let corner = size(gutter * 1.5, gutter * 1.5);
+    let right_edge = window_size.width - corner.width;
+    let bottom_edge = window_size.height - corner.height;
+    let in_corner = |origin: Point<Pixels>| Bounds::new(origin, corner).contains(&pos);
+    if !tiling.top && in_corner(point(px(0.0), px(0.0))) {
+        return Some(ResizeEdge::TopLeft);
+    }
+    if !tiling.top && in_corner(point(right_edge, px(0.0))) {
+        return Some(ResizeEdge::TopRight);
+    }
+    if !tiling.bottom && in_corner(point(px(0.0), bottom_edge)) {
+        return Some(ResizeEdge::BottomLeft);
+    }
+    if !tiling.bottom && in_corner(point(right_edge, bottom_edge)) {
+        return Some(ResizeEdge::BottomRight);
+    }
+    if !tiling.top && pos.y < gutter {
+        Some(ResizeEdge::Top)
+    } else if !tiling.bottom && pos.y > window_size.height - gutter {
+        Some(ResizeEdge::Bottom)
+    } else if !tiling.left && pos.x < gutter {
+        Some(ResizeEdge::Left)
+    } else if !tiling.right && pos.x > window_size.width - gutter {
+        Some(ResizeEdge::Right)
+    } else {
+        None
+    }
+}
+
+/// The directional pointer shown while hovering a resize edge or corner.
+const fn resize_cursor(edge: ResizeEdge) -> CursorStyle {
+    match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+    }
+}
+
+/// A full-window overlay whose only job is to set the directional resize cursor.
+///
+/// The hitbox is deliberately window-sized and [`HitboxBehavior::Normal`] so it
+/// never swallows a click; it exists purely so [`Window::set_cursor_style`] has
+/// a hovered hitbox to attach to, and it paints last so its cursor wins over the
+/// content beneath it.
+fn resize_cursor_overlay(tiling: Tiling) -> impl IntoElement {
+    canvas(
+        |_bounds, window, _cx| {
+            let bounds =
+                Bounds::new(point(px(0.0), px(0.0)), window.window_bounds().get_bounds().size);
+            window.insert_hitbox(bounds, HitboxBehavior::Normal)
+        },
+        move |_bounds, hitbox, window, _cx| {
+            let window_size = window.window_bounds().get_bounds().size;
+            let Some(edge) =
+                resize_edge(window.mouse_position(), RESIZE_GUTTER, window_size, tiling)
+            else {
+                return;
+            };
+            window.set_cursor_style(resize_cursor(edge), &hitbox);
+        },
+    )
+    .size_full()
+    .absolute()
+}
+
 impl SettingsWindow {
+    /// Wrap the settings body in the client-side-decoration frame: a resize
+    /// gutter on every untiled side, plus the cursor overlay. Under server
+    /// decorations the window manager still owns the frame, so the wrapper is a
+    /// plain pass-through with no gutter and no hit-testing.
+    fn render_window_frame(
+        &self,
+        decorations: Decorations,
+        tiling: Tiling,
+        body: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let frame = div().id("settings-window-frame").size_full().bg(self.colors.frame_bg);
+        let Decorations::Client { .. } = decorations else {
+            return frame.child(body).into_any_element();
+        };
+        frame
+            .when(!tiling.top, |this| this.pt(RESIZE_GUTTER))
+            .when(!tiling.bottom, |this| this.pb(RESIZE_GUTTER))
+            .when(!tiling.left, |this| this.pl(RESIZE_GUTTER))
+            .when(!tiling.right, |this| this.pr(RESIZE_GUTTER))
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, key_window, ctx| {
+                let window_size = key_window.window_bounds().get_bounds().size;
+                let edge = resize_edge(event.position, RESIZE_GUTTER, window_size, tiling);
+                if edge != this.resize_edge {
+                    this.resize_edge = edge;
+                    ctx.notify();
+                }
+            }))
+            // Sits above the body's own left-press handler, which only clears
+            // keyboard navigation and never stops propagation.
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, key_window, _| {
+                let window_size = key_window.window_bounds().get_bounds().size;
+                if let Some(edge) = resize_edge(event.position, RESIZE_GUTTER, window_size, tiling)
+                {
+                    key_window.start_window_resize(edge);
+                }
+            })
+            .child(body)
+            .child(resize_cursor_overlay(tiling))
+            .into_any_element()
+    }
+
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
+        let tiling = client_tiling(window.window_decorations());
         div()
             .id("settings-titlebar")
             .role(Role::TitleBar)
@@ -763,7 +1161,37 @@ impl SettingsWindow {
             .bg(colors.header_bg)
             .border_b_1()
             .border_color(colors.border)
+            // `WindowControlArea::Drag` is what makes dragging work on Windows;
+            // both Linux backends implement `on_hit_test_window_control` as an
+            // empty body, so the explicit press/move pair below is the real
+            // path there.
             .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, key_window, _| {
+                    // The top corners' resize squares reach a few pixels into
+                    // the titlebar; the resize grab has to win there, so only
+                    // arm the move outside them.
+                    let window_size = key_window.window_bounds().get_bounds().size;
+                    this.should_move =
+                        resize_edge(event.position, RESIZE_GUTTER, window_size, tiling).is_none();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _key_window, _| {
+                    this.should_move = false;
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _key_window, _| {
+                this.should_move = false;
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, key_window, _| {
+                if this.should_move && event.pressed_button == Some(MouseButton::Left) {
+                    this.should_move = false;
+                    key_window.start_window_move();
+                }
+            }))
             .child(
                 div()
                     .w(px(54.0))
@@ -772,7 +1200,7 @@ impl SettingsWindow {
                     .items_center()
                     .justify_center()
                     .window_control_area(WindowControlArea::Drag)
-                    .text_xl()
+                    .text_lg()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
                     .child("S"),
@@ -783,7 +1211,7 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .window_control_area(WindowControlArea::Drag)
-                    .text_lg()
+                    .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors.text)
                     .child("Scribe Settings"),
@@ -797,8 +1225,13 @@ impl SettingsWindow {
 
     fn render_nav(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
+        // Groups that a search filters away entirely are dropped *before* the
+        // index is assigned. Enumerating the full list instead left the first
+        // surviving group with a non-zero index, so a filtered nav opened with a
+        // separator above its first entry and nothing above the separator.
         let items = settings_nav_groups()
             .into_iter()
+            .filter(|(_, pages)| pages.iter().any(|page| self.page_matches_search(*page)))
             .enumerate()
             .flat_map(|(index, (group, pages))| self.render_nav_group(index, group, pages, cx))
             .collect::<Vec<_>>();
@@ -894,14 +1327,24 @@ impl SettingsWindow {
             .flex()
             .items_center()
             .gap_3()
-            .text_base()
+            .text_sm()
             .font_weight(weight)
             .bg(background)
             .text_color(foreground)
-            .when(selected || focused, |el| el.border_l(px(4.0)).border_color(colors.accent))
+            .relative()
+            // Selection is the accent bar; keyboard focus is a full outline in a
+            // different colour. Both used to draw the same 4px accent bar, so a
+            // focused row and the selected row were indistinguishable — and two
+            // identical bars appeared whenever they differed.
+            .when(selected, |el| {
+                el.child(
+                    div().absolute().left_0().top_0().bottom_0().w(px(4.0)).bg(colors.accent),
+                )
+            })
+            .when(focused, |el| el.border_1().border_color(colors.text))
             .hover(move |style| style.bg(colors.nav_hover_bg).text_color(colors.text))
             .active(move |style| style.bg(colors.control_pressed_bg))
-            .on_click(cx.listener(move |this, _, _, ctx| {
+            .on_click(cx.listener(move |this, _, _win, ctx| {
                 this.begin_pointer_interaction(&SettingsFocusTarget::Page(page));
                 this.select_page(page, ctx);
             }))
@@ -932,7 +1375,6 @@ impl SettingsWindow {
             children.extend(self.render_trust_sections(cx));
         }
         children.extend(self.render_control_rows(cx));
-        children.extend(self.status.as_deref().map(|status| self.render_status(status)));
 
         div()
             .id("settings-content")
@@ -945,21 +1387,40 @@ impl SettingsWindow {
             // long trust note can never push the right-aligned controls off-window.
             .min_w(px(0.0))
             .h_full()
-            .overflow_x_hidden()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .bg(colors.page_bg)
+            // The search field stays pinned above the scroller so a filtered
+            // query never scrolls out of reach of the results it is filtering.
             .child(self.render_search(window, cx))
             .child(
                 div()
-                    .w_full()
+                    .id("settings-scroll")
+                    // `flex_1` claims the space the search field leaves, and the
+                    // zero `min_h` is what actually bounds it: a flex item's
+                    // automatic minimum size is its content height, which on a
+                    // long page would size the viewport to the content and leave
+                    // nothing to scroll.
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_x_hidden()
+                    .overflow_y_scroll()
+                    // The rows are children of the scroller itself. Wrapping them
+                    // in an intermediate div makes the scroller see one flex item
+                    // that reports its own box rather than its children's extent,
+                    // so the content never measures as overflowing and the wheel
+                    // is clamped to a zero maximum.
+                    .track_scroll(&self.scroll_handle)
                     .px(px(46.0))
                     .pb(px(48.0))
                     .flex()
                     .flex_col()
                     .children(children),
             )
+            // Pinned below the scroller, not appended to it. As the last row of a
+            // page taller than the viewport the status line landed off-screen, so
+            // a rejected edit and a successful one looked identical.
+            .children(self.status.clone().map(|status| self.render_status(&status, cx)))
             .into_any_element()
     }
 
@@ -984,11 +1445,14 @@ impl SettingsWindow {
             .rounded_sm()
             .border_1()
             .border_color(if focused { colors.accent } else { colors.strong_border })
-            .bg(colors.read_only_bg)
-            .text_lg()
+            // Focus outranks hover here. The hover rule used to repaint a focused
+            // field's border in the dim hover colour, so a focused-and-hovered
+            // field looked exactly like an unfocused one.
+            .bg(if focused { colors.control_bg } else { colors.read_only_bg })
+            .text_sm()
             .text_color(colors.text)
             .cursor_text()
-            .hover(move |style| style.border_color(colors.dim_text))
+            .when(!focused, |el| el.hover(move |style| style.border_color(colors.dim_text)))
             .on_click(cx.listener(move |_, _, focused_window, ctx| {
                 focused_window.focus(&focus, ctx);
             }))
@@ -998,8 +1462,24 @@ impl SettingsWindow {
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
+                    .flex()
+                    .items_center()
                     .text_color(if query.is_empty() { colors.quiet_text } else { colors.text })
-                    .child(if query.is_empty() { "Search settings".to_owned() } else { query }),
+                    .child(if query.is_empty() { "Search settings".to_owned() } else { query })
+                    // The insertion point is always at the end of the query, so a
+                    // static bar there is the honest caret: it says the field
+                    // takes typing without implying a movable cursor it has not
+                    // got.
+                    .when(focused, |el| {
+                        el.child(
+                            div()
+                                .ml(px(2.0))
+                                .w(px(2.0))
+                                .h(px(18.0))
+                                .flex_none()
+                                .bg(colors.accent),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1046,7 +1526,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .mt_1()
-                    .text_lg()
+                    .text_sm()
                     .text_color(colors.dim_text)
                     .child(Text::new_inaccessible(elide(summary, PAGE_SUMMARY_MAX_CHARS).into())),
             )
@@ -1056,7 +1536,7 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .text_base()
+                    .text_sm()
                     .text_color(colors.accent)
                     .child(div().size(px(12.0)).rounded_sm().bg(colors.accent))
                     .child("Changes apply instantly"),
@@ -1072,9 +1552,9 @@ impl SettingsWindow {
             .filter(|control| self.control_matches_search(control))
         {
             let section = control_section(self.page, &control.key);
-            if section != previous_section {
-                rows.extend(section.map(|name| self.control_section_heading(name)));
-                previous_section = section;
+            if previous_section != Some(section) {
+                rows.push(self.control_section_heading(section));
+                previous_section = Some(section);
             }
             rows.push(self.render_control(&control, cx));
         }
@@ -1084,7 +1564,10 @@ impl SettingsWindow {
         rows
     }
 
-    fn render_status(&self, status: &str) -> gpui::AnyElement {
+    /// The pinned result line under the content pane, with an explicit dismiss
+    /// so a long action result can be cleared instead of sitting there until the
+    /// next edit replaces it.
+    fn render_status(&self, status: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
         div()
             .id("settings-status")
@@ -1094,13 +1577,43 @@ impl SettingsWindow {
             .px_3()
             .py_2()
             .my_3()
+            .flex()
+            .items_center()
+            .gap_3()
             .rounded_xs()
             .border_1()
             .border_color(colors.accent)
             .bg(colors.status_bg)
             .text_sm()
             .text_color(colors.text)
-            .child(Text::new_inaccessible(status.to_owned().into()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(Text::new_inaccessible(status.to_owned().into())),
+            )
+            .child(
+                div()
+                    .id("settings-status-dismiss")
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label("Dismiss status message")
+                    .flex_none()
+                    .size(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_xs()
+                    .text_color(colors.dim_text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.control_hover_bg).text_color(colors.text))
+                    .on_click(cx.listener(|this, _, _win, ctx| {
+                        this.status = None;
+                        ctx.notify();
+                    }))
+                    .child("×"),
+            )
             .into_any_element()
     }
 
@@ -1272,7 +1785,7 @@ impl SettingsWindow {
             .flex()
             .items_end()
             .pb_3()
-            .text_xl()
+            .text_lg()
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(self.colors.text)
             .border_b_1()
@@ -1294,7 +1807,7 @@ impl SettingsWindow {
             .flex()
             .items_end()
             .pb_3()
-            .text_xl()
+            .text_lg()
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(self.colors.text)
             .border_b_1()
@@ -1314,7 +1827,7 @@ impl SettingsWindow {
             .flex_none()
             .flex()
             .items_center()
-            .text_base()
+            .text_sm()
             .text_color(self.colors.dim_text)
             .border_b_1()
             .border_color(self.colors.border)
@@ -1364,12 +1877,18 @@ impl SettingsWindow {
 
     fn render_control(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
+        let enabled = self.control_is_enabled(&control.key);
         let label = row_label(&control.label, colors.text);
-        let value_widget = self.render_value_widget(control, cx);
+        let value_widget = if enabled {
+            self.render_value_widget(control, cx)
+        } else {
+            self.render_gated_value(control)
+        };
         div()
             .id(("settings-control", key_hash(&control.key)))
             .role(Role::Group)
             .aria_label(control.label.clone())
+            .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
             .w_full()
             .h(px(54.0))
             .flex_none()
@@ -1378,7 +1897,8 @@ impl SettingsWindow {
             .gap_6()
             .border_b_1()
             .border_color(colors.border)
-            .hover(move |style| style.bg(colors.row_hover_bg))
+            .when(!enabled, |el| el.opacity(GATED_OPACITY))
+            .when(enabled, |el| el.hover(move |style| style.bg(colors.row_hover_bg)))
             .child(label)
             .child(
                 div()
@@ -1390,6 +1910,48 @@ impl SettingsWindow {
                     .child(value_widget),
             )
             .into_any_element()
+    }
+
+    /// Whether a control is live, or dimmed and inert because the toggle it
+    /// depends on is off.
+    ///
+    /// The notification delivery condition and both timeout controls do nothing
+    /// while `notifications.enabled` is off, but they used to render at full
+    /// brightness and accept edits, which read as three working controls with no
+    /// effect.
+    fn control_is_enabled(&self, key: &str) -> bool {
+        let Some(parent) = gating_toggle(key) else {
+            return true;
+        };
+        current_value(&self.config, parent).as_bool().unwrap_or(false)
+    }
+
+    /// The read-only stand-in shown for a control its parent toggle has gated:
+    /// the live value, so the row still says what it is set to.
+    fn render_gated_value(&self, control: &Control) -> gpui::AnyElement {
+        let shown = match &control.kind {
+            ControlKind::Toggle => {
+                let on = current_value(&self.config, &control.key).as_bool().unwrap_or(false);
+                if on { "On".to_owned() } else { "Off".to_owned() }
+            }
+            ControlKind::Choice(options) => {
+                let value = current_value(&self.config, &control.key);
+                let token = value.as_str().unwrap_or("").to_owned();
+                self.choice_options(&control.key, options)
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == token)
+                    .map_or(token, |(_, label)| label)
+            }
+            ControlKind::Stepper { min, decimals, .. } => {
+                let current = current_value(&self.config, &control.key).as_f64().unwrap_or(*min);
+                format!("{current:.*}", *decimals as usize)
+            }
+            ControlKind::Color
+            | ControlKind::Text
+            | ControlKind::Keybinding
+            | ControlKind::Action => String::new(),
+        };
+        read_only_value(&control.key, &control.label, &shown, &self.colors)
     }
 
     fn render_value_widget(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1453,20 +2015,25 @@ impl SettingsWindow {
     ) -> gpui::AnyElement {
         let colors = self.colors;
         let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
+        let effective = self.choice_options(&control.key, options);
         let value = current_value(&self.config, &control.key);
-        let token = value.as_str().unwrap_or("");
-        let display =
-            options.iter().find(|(choice, _)| *choice == token).map_or(token, |(_, label)| *label);
+        let token = value.as_str().unwrap_or("").to_owned();
+        let display = effective
+            .iter()
+            .find(|(choice, _)| *choice == token)
+            .map_or_else(|| token.clone(), |(_, label)| label.clone());
         let key = control.key.clone();
-        let options = options.to_vec();
+        let declared = options.to_vec();
         let pointer_target = SettingsFocusTarget::Control(control.clone());
-        div()
+        let open = self.open_choice.as_deref() == Some(control.key.as_str());
+        let button = div()
             .id(("choice", key_hash(&control.key)))
             .focusable()
             .tab_stop(true)
-            .role(Role::Button)
+            .role(Role::ComboBox)
             .aria_label(control.label.clone())
-            .aria_value(display)
+            .aria_value(display.clone())
+            .aria_expanded(open)
             .w(px(438.0))
             .h(px(42.0))
             .px_4()
@@ -1476,7 +2043,7 @@ impl SettingsWindow {
             .gap_3()
             .rounded_xs()
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.strong_border })
+            .border_color(if focused || open { colors.accent } else { colors.strong_border })
             .bg(colors.control_bg)
             .text_sm()
             .text_color(colors.text)
@@ -1485,11 +2052,151 @@ impl SettingsWindow {
             .active(move |style| style.bg(colors.control_pressed_bg))
             .on_click(cx.listener(move |this, _, _win, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
-                this.cycle(&key, &options, ctx);
+                this.toggle_choice_menu(&key, &declared, ctx);
             }))
-            .child(display.to_owned())
-            .child(div().text_base().text_color(colors.dim_text).child("⌄"))
+            .child(Text::new_inaccessible(display.into()))
+            .child(div().text_base().text_color(colors.dim_text).child(if open {
+                "⌃"
+            } else {
+                "⌄"
+            }));
+        let close_key = control.key.clone();
+        div()
+            .id(("choice-shell", key_hash(&control.key)))
+            .relative()
+            .w(px(438.0))
+            // The height is load-bearing, not decoration: the anchored menu is
+            // absolutely positioned, so with an automatic height this shell
+            // measures as zero-height and the hit test never reaches the button
+            // inside it — the control stops responding to clicks entirely.
+            .h(px(42.0))
+            .flex_none()
+            .when(open, |el| {
+                el.on_mouse_down_out(cx.listener(move |this, _, _win, ctx| {
+                    this.close_choice_menu(ctx);
+                }))
+                .child(self.render_choice_menu(control, &effective, &close_key, cx))
+            })
+            .child(button)
             .into_any_element()
+    }
+
+    /// The anchored dropdown for an open choice control: one activatable row per
+    /// option, with the live value marked. Deferred so it paints above the rows
+    /// beneath it and escapes the scroller's clip, and anchored so a menu opened
+    /// near the bottom of the window flips above its button instead of running
+    /// off-screen.
+    fn render_choice_menu(
+        &self,
+        control: &Control,
+        options: &[(String, String)],
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let value = current_value(&self.config, &control.key);
+        let token = value.as_str().unwrap_or("").to_owned();
+        let rows = options
+            .iter()
+            .enumerate()
+            .map(|(index, (option, label))| {
+                let selected = *option == token;
+                let commit_key = key.to_owned();
+                let commit_value = option.clone();
+                div()
+                    .id(("choice-option", key_hash(&format!("{key}:{option}"))))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::MenuItem)
+                    .aria_label(label.clone())
+                    .aria_selected(selected)
+                    .aria_position_in_set(index + 1)
+                    .aria_size_of_set(options.len())
+                    .w_full()
+                    .h(px(CHOICE_OPTION_HEIGHT))
+                    .flex_none()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .text_sm()
+                    .text_color(if selected { colors.accent } else { colors.text })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.control_hover_bg))
+                    .active(move |style| style.bg(colors.control_pressed_bg))
+                    .on_click(cx.listener(move |this, _, _win, ctx| {
+                        this.open_choice = None;
+                        this.commit(&commit_key, Value::String(commit_value.clone()), ctx);
+                    }))
+                    .child(Text::new_inaccessible(label.clone().into()))
+                    .child(if selected { "✓" } else { "" })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        gpui::deferred(
+            gpui::anchored().snap_to_window_with_margin(px(12.0)).child(
+                div()
+                    .id(("choice-menu", key_hash(key)))
+                    .role(Role::Menu)
+                    .aria_label(control.label.clone())
+                    .w(px(438.0))
+                    .mt(px(46.0))
+                    .max_h(px(CHOICE_MENU_MAX_HEIGHT))
+                    // The option rows are direct children of the scroller: an
+                    // intermediate wrapper would report its own box as the
+                    // content extent and clamp the wheel to zero.
+                    .overflow_y_scroll()
+                    .track_scroll(&self.choice_scroll)
+                    .flex()
+                    .flex_col()
+                    .rounded_xs()
+                    .border_1()
+                    .border_color(colors.accent)
+                    .bg(colors.nav_active_bg)
+                    .children(rows),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    /// Open this choice's dropdown, or close it when it is already the open one.
+    fn toggle_choice_menu(
+        &mut self,
+        key: &str,
+        options: &[(&'static str, &'static str)],
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_choice.as_deref() == Some(key) {
+            self.open_choice = None;
+        } else {
+            self.open_choice = Some(key.to_owned());
+            self.align_choice_scroll(key, options);
+        }
+        cx.notify();
+    }
+
+    /// Position the dropdown scroller so the live value is on screen when the
+    /// menu opens. Without it a config sitting near the end of the generated
+    /// theme preset list would open on an unrelated stretch of the alphabet.
+    fn align_choice_scroll(&mut self, key: &str, options: &[(&'static str, &'static str)]) {
+        let options = self.choice_options(key, options);
+        let value = current_value(&self.config, key);
+        let token = value.as_str().unwrap_or("");
+        let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
+        let rows = f32::from(u16::try_from(index).unwrap_or(u16::MAX));
+        let lead = (rows * CHOICE_OPTION_HEIGHT - CHOICE_MENU_LEAD).max(0.0);
+        self.choice_scroll.set_offset(point(px(0.0), px(-lead)));
+    }
+
+    /// Dismiss any open choice dropdown, notifying only when one was showing.
+    fn close_choice_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_open = self.open_choice.take().is_some();
+        if was_open {
+            cx.notify();
+        }
+        was_open
     }
 
     fn render_text_value(&self, control: &Control) -> gpui::AnyElement {
@@ -1680,7 +2387,7 @@ impl SettingsWindow {
                     .flex()
                     .justify_end()
                     .font_family("monospace")
-                    .text_base()
+                    .text_sm()
                     .text_color(colors.dim_text)
                     .child(Text::new_inaccessible(elide(&shown, READ_ONLY_MAX_CHARS).into())),
             )
@@ -1688,8 +2395,71 @@ impl SettingsWindow {
     }
 }
 
+/// Height of one dropdown option row, also the unit the open-scroll uses to put
+/// the live value on screen.
+const CHOICE_OPTION_HEIGHT: f32 = 40.0;
+
+/// How much of a dropdown is kept visible above the live value when it opens.
+const CHOICE_MENU_LEAD: f32 = 120.0;
+
+/// Tallest a dropdown grows before it scrolls internally — the theme preset list
+/// has close to 190 entries.
+const CHOICE_MENU_MAX_HEIGHT: f32 = 400.0;
+
+/// Shared pending line for both keystore probes (the manual action and the
+/// toggle's gated ON transition), so the two surfaces say the same thing.
+const KEYSTORE_PENDING: &str = "Probing the OS keystore…";
+
+/// How many releases the status line names before it summarizes the rest.
+const RELEASE_SUMMARY_MAX: usize = 4;
+
+/// Dimming applied to a control whose parent toggle is off.
+const GATED_OPACITY: f32 = 0.42;
+
+/// The toggle a control depends on, or `None` when it stands alone.
+///
+/// Kept as one table so [`SettingsWindow::control_is_enabled`] and the keyboard
+/// traversal filter can never disagree about what is gated.
+fn gating_toggle(key: &str) -> Option<&'static str> {
+    match key {
+        "notifications.condition" | "notifications.timeout_mode" | "notifications.timeout_secs" => {
+            Some("notifications.enabled")
+        }
+        _ => None,
+    }
+}
+
 const NOTE_MAX_CHARS: usize = 120;
 const PAGE_SUMMARY_MAX_CHARS: usize = 100;
+
+/// Display text for one choice option: the model's declared caption, or a
+/// title-cased token when the model declared none.
+///
+/// A generated option set — the ~190-entry theme preset list — carries its raw
+/// name in both slots because there is no hand-written caption to carry, so the
+/// two being equal is exactly the "no caption" signal. Every hand-written option
+/// differs from its value by at least capitalization.
+fn choice_label(value: &str, label: &str) -> String {
+    if value == label { humanize_choice_token(value) } else { label.to_owned() }
+}
+
+/// Title-case a raw config token (`gruvbox-dark` → `Gruvbox Dark`) so a value
+/// that has no declared display label still reads like the rest of the list.
+fn humanize_choice_token(token: &str) -> String {
+    token
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                let mut capitalized = first.to_uppercase().collect::<String>();
+                capitalized.push_str(chars.as_str());
+                capitalized
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Shorten `text` to `max` characters, appending an ellipsis when it was cut.
 fn elide(text: &str, max: usize) -> String {
@@ -1712,8 +2482,8 @@ fn row_label(text: &str, color: Rgba) -> gpui::Stateful<gpui::Div> {
         .flex_1()
         .min_w(px(0.0))
         .overflow_hidden()
-        .text_lg()
-        .font_weight(FontWeight::NORMAL)
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
 }
@@ -1742,7 +2512,7 @@ fn read_only_value(
         .border_color(colors.border)
         .bg(colors.read_only_bg)
         .font_family("monospace")
-        .text_base()
+        .text_sm()
         .text_color(colors.dim_text)
         .child(Text::new_inaccessible(elide(value, READ_ONLY_MAX_CHARS).into()))
         .into_any_element()
@@ -1775,7 +2545,7 @@ fn action_button(text: &str, colors: &SettingsColors) -> gpui::Stateful<gpui::Di
         .rounded_xs()
         .border_1()
         .border_color(colors.accent)
-        .text_base()
+        .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
         .bg(colors.accent_soft)
         .text_color(colors.accent)
@@ -1806,7 +2576,7 @@ fn settings_search_icon(color: Rgba) -> gpui::AnyElement {
                 .left(px(10.0))
                 .top(px(8.0))
                 .font_family("monospace")
-                .text_base()
+                .text_sm()
                 .font_weight(FontWeight::NORMAL)
                 .text_color(color)
                 .child("╲"),
@@ -1856,10 +2626,13 @@ fn settings_window_control(
         .items_center()
         .justify_center()
         .window_control_area(area)
-        .text_base()
+        .text_sm()
         .font_weight(FontWeight::NORMAL)
         .text_color(colors.quiet_text)
         .hover(move |style| style.bg(hover).text_color(colors.text))
+        // Keep the press off the titlebar's drag arming so a click with a pixel
+        // of jitter can never turn into a window move that eats the click.
+        .on_mouse_down(MouseButton::Left, |_, _, ctx| ctx.stop_propagation())
         .on_click(cx.listener(move |_, _, window, _| match kind {
             SettingsWindowControl::Minimize => window.minimize_window(),
             SettingsWindowControl::Maximize => window.zoom_window(),
@@ -1977,19 +2750,22 @@ fn page_summary(page: SettingsPage) -> &'static str {
 
 /// Visual grouping only: control order and keys remain exactly those returned
 /// by `page_controls`.
-fn control_section(page: SettingsPage, key: &str) -> Option<&'static str> {
+///
+/// Every page names a section, Environment included — it used to return nothing
+/// and open on bare rows, which read as a different kind of page.
+fn control_section(page: SettingsPage, key: &str) -> &'static str {
     match page {
-        SettingsPage::Appearance => Some(appearance_section(key)),
-        SettingsPage::Colors => Some(colors_section(key)),
-        SettingsPage::Ai => Some(ai_section(key)),
-        SettingsPage::Terminal => Some(terminal_section(key)),
-        SettingsPage::Environment => None,
-        SettingsPage::Keybindings => Some(keybinding_section(key)),
-        SettingsPage::Workspaces => Some("Workspace configuration"),
-        SettingsPage::Updates => Some("Automatic updates"),
-        SettingsPage::Releases => Some("Release service"),
-        SettingsPage::Notifications => Some(notification_section(key)),
-        SettingsPage::Remote => Some(remote_section(key)),
+        SettingsPage::Appearance => appearance_section(key),
+        SettingsPage::Colors => colors_section(key),
+        SettingsPage::Ai => ai_section(key),
+        SettingsPage::Terminal => terminal_section(key),
+        SettingsPage::Environment => "Environment persistence",
+        SettingsPage::Keybindings => keybinding_section(key),
+        SettingsPage::Workspaces => "Workspace configuration",
+        SettingsPage::Updates => "Automatic updates",
+        SettingsPage::Releases => "Release service",
+        SettingsPage::Notifications => notification_section(key),
+        SettingsPage::Remote => remote_section(key),
     }
 }
 
@@ -2225,7 +3001,17 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()
         },
-        |_, cx| cx.new(SettingsWindow::new),
+        |window, cx| {
+            let view = cx.new(SettingsWindow::new);
+            // GPUI dispatches key events along the path built from the focused
+            // node, so until something is focused the path excludes
+            // `#settings-root` and its `on_key_down` never runs. Focusing the
+            // root here is what makes Ctrl+K and keyboard traversal live from
+            // the first frame instead of after an incidental click.
+            let root = view.read(cx).focus_handle.clone();
+            window.focus(&root, cx);
+            view
+        },
     ) {
         Ok(handle) => Some(handle),
         Err(error) => {

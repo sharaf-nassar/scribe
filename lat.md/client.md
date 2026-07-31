@@ -716,7 +716,34 @@ The GPUI rebuild replaces native window decorations with a custom titlebar that 
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 
-[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: a `WindowControlArea::Drag` move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and the window controls drive the platform window through GPUI's `WindowControlArea` hit regions. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and the window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+
+### Window move region
+
+Dragging empty titlebar space moves the window through an imperative
+`Window::start_window_move()` call, not through a declared hit-test region.
+`WindowControlArea::Drag` is kept for Windows but is a no-op on Linux.
+
+Both the X11 and Wayland backends of the pinned GPUI revision implement
+`on_hit_test_window_control` as an empty body, so the painted `Drag` hitboxes
+are never consulted and the platform never starts a move on its own.
+`start_window_move()` *is* implemented on both (`_NET_WM_MOVERESIZE` on X11,
+`xdg_toplevel::_move` on Wayland), so [[crates/scribe-client/src/titlebar.rs#TitlebarView]]
+drives it directly: a left press on the root titlebar records the press origin
+in `move_arm`, and `advance_move_arm` starts the move once the pointer has
+travelled `WINDOW_MOVE_THRESHOLD` px from that origin with the button still
+held. A press that wobbles by a pixel stays an ordinary click. Mouse-up
+disarms, as does a press outside the titlebar or any motion with no button
+held — so a mouse-up lost outside the window cannot strand an arm that a later
+press-and-drag would redeem.
+
+The arm step is gated on `drag.is_none()`, so `None` means unarmed. GPUI
+dispatches its bubble phase front-to-back, so a tab's own `on_mouse_down`
+has already recorded the drag-reorder state by the time the root handler
+runs — pressing a tab therefore reorders tabs and never moves the window. The gear, equalize, workspace-notes,
+and min/maximize/close buttons each stop propagation on left press for the same
+reason, so a click with a pixel of pointer jitter cannot arm a move and swallow
+the click. The same pattern is used by the settings window titlebar.
 
 ### Keyboard operation
 
