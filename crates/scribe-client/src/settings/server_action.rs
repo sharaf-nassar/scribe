@@ -265,8 +265,8 @@ pub struct LanEnvOutcome {
     pub fingerprint_words: Option<String>,
     /// Whether the current network can be fingerprinted as a trusted network.
     pub current_network_addable: bool,
-    /// Short explanatory note for the disabled "Add current network" control when
-    /// `!current_network_addable`; `None` otherwise or when the server sends none.
+    /// Short explanatory note shown when the "Add current network" action is
+    /// unavailable; `None` otherwise or when the server sends none.
     pub current_network_reason: Option<String>,
 }
 
@@ -287,7 +287,7 @@ pub fn request_lan_env(timeout: Duration) -> LanEnvOutcome {
     }
 }
 
-fn try_request_lan_env(timeout: Duration) -> Result<LanEnvOutcome, String> {
+pub(super) fn try_request_lan_env(timeout: Duration) -> Result<LanEnvOutcome, String> {
     let path = server_socket_path();
     let mut stream = UnixStream::connect(&path)
         .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
@@ -346,7 +346,9 @@ pub fn request_trusted_networks(timeout: Duration) -> TrustedNetworksOutcome {
     }
 }
 
-fn try_request_trusted_networks(timeout: Duration) -> Result<TrustedNetworksOutcome, String> {
+pub(super) fn try_request_trusted_networks(
+    timeout: Duration,
+) -> Result<TrustedNetworksOutcome, String> {
     let path = server_socket_path();
     let mut stream = UnixStream::connect(&path)
         .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
@@ -411,7 +413,7 @@ fn parse_trusted_devices_response(msg: ServerMessage) -> Result<Vec<TrustedDevic
 /// Fire-and-forget, exactly like [`request_trigger_update`]: the server has no
 /// reply frame for this mutation, so we write the frame and close. The settings
 /// UI re-issues the list/env queries afterward to render the updated trust
-/// state; the disabled "Add current network" control already pre-empts the
+/// state; the conditional "Add current network" control already pre-empts the
 /// unidentifiable-network case surfaced by [`request_lan_env`].
 pub fn request_add_current_network(timeout: Duration) -> Result<(), String> {
     let path = server_socket_path();
