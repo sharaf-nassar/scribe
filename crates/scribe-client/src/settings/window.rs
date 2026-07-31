@@ -362,7 +362,9 @@ impl SettingsWindow {
             .collect::<Vec<_>>();
         if self.page == SettingsPage::Remote {
             targets.push(SettingsFocusTarget::Action(REFRESH_TRUST_ACTION.to_owned()));
-            targets.push(SettingsFocusTarget::Action(ADD_CURRENT_NETWORK_ACTION.to_owned()));
+            if self.current_network_can_be_trusted() {
+                targets.push(SettingsFocusTarget::Action(ADD_CURRENT_NETWORK_ACTION.to_owned()));
+            }
             targets.extend(self.trust.networks.iter().map(|network| {
                 SettingsFocusTarget::Action(format!(
                     "{REMOVE_TRUSTED_NETWORK_PREFIX}{}",
@@ -779,12 +781,28 @@ impl SettingsWindow {
     /// networks plus current-network trust flag (`ListTrustedNetworks`), the
     /// approved devices (`ListTrustedDevices`), and the feature-013 tailnet
     /// environment (`GetRemoteEnv`). Every helper folds its own failures into a
-    /// fail-closed default, so this always leaves one renderable shape behind.
-    fn refresh_trust(&mut self) {
-        let lan = server_action::request_lan_env(SERVER_ACTION_TIMEOUT);
-        let networks = server_action::request_trusted_networks(SERVER_ACTION_TIMEOUT);
+    /// fail-closed default. The two replies that govern the current network's
+    /// trust action remain fallible here so a refresh cannot turn a transport
+    /// failure into a false "not trusted" result.
+    fn refresh_trust(&mut self) -> Result<(), ()> {
+        let lan = server_action::try_request_lan_env(SERVER_ACTION_TIMEOUT);
+        let networks = server_action::try_request_trusted_networks(SERVER_ACTION_TIMEOUT);
         let devices = server_action::request_trusted_devices(SERVER_ACTION_TIMEOUT);
         let remote = server_action::request_remote_env(SERVER_ACTION_TIMEOUT);
+        let (lan, networks) = match (lan, networks) {
+            (Ok(lan), Ok(networks)) => (lan, networks),
+            (lan, networks) => {
+                if let Err(reason) = lan {
+                    tracing::warn!("LAN trust refresh failed: {reason}");
+                }
+                if let Err(reason) = networks {
+                    tracing::warn!("trusted-network refresh failed: {reason}");
+                }
+                // Stale addability must never leave an active Trust control.
+                self.trust.loaded = false;
+                return Err(());
+            }
+        };
         self.trust = TrustState {
             loaded: true,
             lan,
@@ -793,6 +811,12 @@ impl SettingsWindow {
             current_trusted: networks.current_trusted,
             devices,
         };
+        Ok(())
+    }
+
+    /// Whether fresh server state permits adding the current network.
+    fn current_network_can_be_trusted(&self) -> bool {
+        self.trust.loaded && self.trust.lan.current_network_addable && !self.trust.current_trusted
     }
 
     /// One-line summary of the trust state for the status footer.
@@ -802,6 +826,84 @@ impl SettingsWindow {
             self.trust.networks.len(),
             self.trust.devices.len(),
             if self.trust.current_trusted { "trusted" } else { "not trusted" }
+        )
+    }
+
+    fn refresh_trust_status(&mut self) -> String {
+        if self.refresh_trust().is_ok() {
+            return self.trust_summary();
+        }
+        "Could not refresh trust state. Check that Scribe is running, then try Refresh again."
+            .to_owned()
+    }
+
+    fn remove_trusted_network_status(&mut self, id: &str) -> String {
+        if let Err(reason) =
+            server_action::request_remove_trusted_network(id.to_owned(), SERVER_ACTION_TIMEOUT)
+        {
+            tracing::warn!("remove trusted network failed: {reason}");
+            return "Could not remove the trusted network. Check that Scribe is running, then try \
+                    again."
+                .to_owned();
+        }
+        if self.refresh_trust().is_err() {
+            return "Remove request sent, but Scribe could not refresh trust state. Use Refresh to \
+                    confirm the change."
+                .to_owned();
+        }
+        format!("Removed trusted network {id}. {}", self.trust_summary())
+    }
+
+    fn revoke_trusted_device_status(&mut self, device_id: &str) -> String {
+        if let Err(reason) = server_action::request_revoke_trusted_device(
+            device_id.to_owned(),
+            SERVER_ACTION_TIMEOUT,
+        ) {
+            tracing::warn!("revoke trusted device failed: {reason}");
+            return "Could not revoke the approved device. Check that Scribe is running, then try \
+                    again."
+                .to_owned();
+        }
+        if self.refresh_trust().is_err() {
+            return "Revoke request sent, but Scribe could not refresh trust state. Use Refresh to \
+                    confirm the change."
+                .to_owned();
+        }
+        format!("Revoked device {device_id}. {}", self.trust_summary())
+    }
+
+    fn trust_current_network_status(&mut self) -> String {
+        if !self.current_network_can_be_trusted() {
+            return "This network cannot be trusted from the current state. Use Refresh, then try \
+                    again when Trust it is available."
+                .to_owned();
+        }
+        if let Err(reason) = server_action::request_add_current_network(SERVER_ACTION_TIMEOUT) {
+            tracing::warn!("trust current network failed: {reason}");
+            return "Could not trust the current network. Check that Scribe is running, then try \
+                    again."
+                .to_owned();
+        }
+        if self.refresh_trust().is_err() {
+            return "Trust request sent, but Scribe could not confirm it. Use Refresh before trying \
+                    again."
+                .to_owned();
+        }
+        if self.trust.current_trusted {
+            return format!("Trusted the current network. {}", self.trust_summary());
+        }
+        if self.trust.lan.current_network_addable {
+            return "Scribe did not confirm this network as trusted. Use Refresh, then try again."
+                .to_owned();
+        }
+        format!(
+            "Scribe could not trust this network — {}. Change networks or use Refresh to try \
+             again.",
+            self.trust
+                .lan
+                .current_network_reason
+                .as_deref()
+                .unwrap_or("it cannot be fingerprinted")
         )
     }
 
@@ -825,47 +927,21 @@ impl SettingsWindow {
         // Per-row trust mutations carry their record key in the action id, so they
         // are matched by prefix before the fixed action table.
         if let Some(id) = key.strip_prefix(REMOVE_TRUSTED_NETWORK_PREFIX) {
-            self.status = match server_action::request_remove_trusted_network(
-                id.to_owned(),
-                SERVER_ACTION_TIMEOUT,
-            ) {
-                Ok(()) => {
-                    self.refresh_trust();
-                    Some(format!("Removed trusted network {id}. {}", self.trust_summary()))
-                }
-                Err(e) => Some(format!("Remove trusted network failed: {e}")),
-            };
+            self.status = Some(self.remove_trusted_network_status(id));
             cx.notify();
             return;
         }
         if let Some(device_id) = key.strip_prefix(REVOKE_TRUSTED_DEVICE_PREFIX) {
-            self.status = match server_action::request_revoke_trusted_device(
-                device_id.to_owned(),
-                SERVER_ACTION_TIMEOUT,
-            ) {
-                Ok(()) => {
-                    self.refresh_trust();
-                    Some(format!("Revoked device {device_id}. {}", self.trust_summary()))
-                }
-                Err(e) => Some(format!("Revoke trusted device failed: {e}")),
-            };
+            self.status = Some(self.revoke_trusted_device_status(device_id));
             cx.notify();
             return;
         }
         match key {
             REFRESH_TRUST_ACTION => {
-                self.refresh_trust();
-                self.status = Some(self.trust_summary());
+                self.status = Some(self.refresh_trust_status());
             }
             ADD_CURRENT_NETWORK_ACTION => {
-                self.status =
-                    match server_action::request_add_current_network(SERVER_ACTION_TIMEOUT) {
-                        Ok(()) => {
-                            self.refresh_trust();
-                            Some(format!("Trusted the current network. {}", self.trust_summary()))
-                        }
-                        Err(e) => Some(format!("Trust current network failed: {e}")),
-                    };
+                self.status = Some(self.trust_current_network_status());
             }
             ENV_PREFLIGHT_ACTION => {
                 self.status =
@@ -1639,7 +1715,10 @@ impl SettingsWindow {
                 },
                 cx,
             ),
-            self.trust_row(
+        ];
+
+        if self.current_network_can_be_trusted() {
+            out.push(self.trust_row(
                 TrustRow {
                     label: "This network".to_owned(),
                     button: "Trust it",
@@ -1647,8 +1726,8 @@ impl SettingsWindow {
                     action_key: ADD_CURRENT_NETWORK_ACTION.to_owned(),
                 },
                 cx,
-            ),
-        ];
+            ));
+        }
 
         if !self.trust.loaded {
             out.push(self.note_row("Trust state not loaded — use Refresh."));
