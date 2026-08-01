@@ -177,6 +177,23 @@ impl TabSessions {
         self.active_session()
     }
 
+    /// Move a tab within the strip while keeping the same session active.
+    ///
+    /// Returns `false` for an out-of-range or unchanged move so callers can
+    /// skip a redundant redraw.
+    pub fn reorder(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return false;
+        }
+        let active_session = self.active_session();
+        let moved = self.tabs.remove(from);
+        self.tabs.insert(to, moved);
+        self.active = active_session
+            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
+            .unwrap_or(0);
+        true
+    }
+
     /// Retitle a session's tab, returning `true` when the label changed.
     pub fn set_title(&mut self, session_id: SessionId, title: String) -> bool {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {

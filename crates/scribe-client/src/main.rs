@@ -1317,13 +1317,17 @@ impl TerminalView {
                 this.set_workspace_notes_preview(*hovered, ctx);
             }
             TitlebarEvent::OpenWorkspaceNotes => this.open_workspace_notes_modal(ctx),
+            TitlebarEvent::ReorderTab { from, to } => {
+                if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(*from, *to)) {
+                    ctx.notify();
+                }
+            }
             // The tab-strip and window-control events come from the same view
             // but are their own reachability rows, outside this entry point.
             // They are named rather than folded into a `_` arm so a new
             // titlebar event fails to compile here.
             TitlebarEvent::SelectTab(_)
             | TitlebarEvent::CloseTab(_)
-            | TitlebarEvent::ReorderTab { .. }
             | TitlebarEvent::WindowControl(_)
             | TitlebarEvent::Equalize => {}
         })
