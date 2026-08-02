@@ -62,11 +62,11 @@ reproducible observation.
 6. **Chord is unbound.** `ctrl+shift+m` maps to no overlay; `OVERLAY_CHORDS` has
    4 entries and the array type literal drops `5` -> `4` (it will not compile
    otherwise). The chord is left free, not reassigned and not swallowed.
-7. **Persisted data deleted.** `workspace_notes.toml` and any
-   `.workspace_notes.toml.<pid>.<ms>.tmp` siblings are gone from
-   `~/.local/state/scribe/` and `~/.local/state/scribe-dev/` on this machine for
-   this user, with no backup copy created, and deleted **after** the approved
-   rebuild/reinstall/restart so no running binary can recreate them.
+7. **Persisted data deleted.** Each successful Debian configure removes only
+   its resolved target user's matching flavor `workspace_notes.toml` and
+   `.workspace_notes.toml.<pid>.<ms>.tmp` siblings, with no backup, after
+   fail-closed process gates prove no old server can recreate them. Unsafe or
+   deferred paths stay pending for a later configure.
 
 ## Non-Goals
 
@@ -93,9 +93,9 @@ reproducible observation.
   existed and why it was cut; only stale cross-references elsewhere get scrubbed.
   This is a different act from the mandatory `specs/016-*` gate edits, which are
   fully in scope.
-- **No cross-machine or multi-user data deletion.** Data removal is bounded to
-  this machine and this user's state dirs. Nothing is done for other hosts,
-  other accounts, or `/etc/`.
+- **No cross-machine or multi-user sweep.** Each package invocation is bounded
+  to its resolved target user's matching flavor directory. Nothing scans other
+  accounts, hosts, the sibling flavor, or `/etc/`.
 - **No macOS or Windows deletion mechanism.** macOS ships as a `.dmg` with no
   maintainer scripts and no Windows target is built, so there is nothing to hook.
   Those clauses are dropped rather than deferred.
@@ -204,19 +204,20 @@ behind.*
 
 Acceptance criteria:
 
-Scope is **this machine, this user**. `dpkg` shows `scribe` and `scribe-dev`
-installed as systemd *user* units, `/etc/scribe*` does not exist, and no other
-account holds Scribe state. macOS and Windows clauses are dropped as
-unreachable, not deferred.
+Scope is each Debian package configure's resolved target user and exact package
+identity. `scribe` may delete only stable state and `scribe-dev` only dev state.
+macOS and Windows clauses are dropped as unreachable, not deferred.
 
-The mechanism is a documented manual `rm`, run **last**, in this exact order:
+The mechanism is a `postinst` migration, run **last**, in this exact order:
 
 1. Land the client + server + protocol removal.
-2. Rebuild and reinstall.
-3. Restart the servers and clients so no live process retains notes code or the
-   in-memory store. **The user has explicitly approved this restart for this
-   step**, which is the standing rule's required exception.
-4. Delete the files. After step 3 resurrection is impossible.
+2. Build and install or reconfigure the package.
+3. Let `postinst` run its normal lifecycle unchanged. Separately, a successful
+   exact `/proc` scan authorizes cleanup immediately when it captures no writer
+   or only installed-binary hashes. Older captured writers require successful
+   hot/cold replacement and verified exit; unreadable state skips deletion.
+4. `postinst` deletes that package flavor's files. After step 3 resurrection is
+   impossible; a later successful package configure retries skipped cleanup.
 
 Acceptance criteria:
 
@@ -224,24 +225,30 @@ Acceptance criteria:
   the running server holds the entire store in memory and `persist_next` writes
   a full clone with `.truncate(true)` while `ensure_private_parent` recreates
   the directory, so one mutation on an old binary restores the whole file.
-- The deletion command is exactly:
-  `rm -f ~/.local/state/scribe/workspace_notes.toml
-  ~/.local/state/scribe-dev/workspace_notes.toml`, plus a
-  `.workspace_notes.toml.*.tmp` sweep in both directories (which currently
-  matches nothing — no `.tmp` leftovers exist).
-- Verification is
-  `find ~/.local/state/scribe ~/.local/state/scribe-dev -name '*workspace_notes*'`
-  returning empty. This replaces the previous unbounded "no copy exists
-  anywhere" negative, which no command could check.
+- The script resolves the target user's absolute `$XDG_STATE_HOME` (or XDG's
+  `$HOME/.local/state` fallback) and removes only
+  `<state-home>/<package-flavor>/workspace_notes.toml` plus
+  `.workspace_notes.toml.*.tmp` siblings. It never targets both flavors from
+  one package.
+- Immediately before deletion, a fresh direct `/proc` scan must succeed and
+  find no exact flavor server or only processes hashing to the installed
+  binary. The selected file/temp pattern must be absent afterward while the
+  sibling flavor and unrelated state remain.
+- Cleanup scanning never suppresses or reroutes normal socket/`pgrep` package
+  lifecycle behavior. A zero-writer or already-installed-writer scan is safe
+  independent of whether a fresh service start succeeds.
+- If maintainer-script root has neither `SUDO_UID` nor `PKEXEC_UID`, cleanup
+  stays pending instead of guessing root as the desktop user. State resolution,
+  a symlinked flavor directory, deletion, or absence-verification failure emits
+  a cleanup-pending warning. Deletion and verification run as target UID.
 - **The state directories are NOT removed wholesale.** They hold `restore/`,
   `windows/`, `settings_state.toml`, `driver_state.toml`, and the LAN trust and
   certificate files, all in active use.
 - No backup, archive, or `.bak` is written at any step.
-- **Stale-file startup check.** With a `workspace_notes.toml` deliberately left
-  in place, start a dev daemon on the post-removal build and confirm it neither
-  reads the file, nor logs a warning about it, nor recreates it. This is the one
-  cheap mechanical check available for this story and it does not touch the
-  live server.
+- **Stale-file startup check.** Before shipping the destructive migration, an
+  isolated post-removal dev daemon was run with a fixture file present and
+  confirmed not to read, warn about, recreate, or rewrite it. Installer
+  validation uses isolated fixtures and never host Scribe state or services.
 
 Supporting facts: the write path is mutation-only (`write_toml_atomic` <-
 `persist_next` <- `apply_mutation` <- `handle_workspace_notes_mutate`, reachable
@@ -334,8 +341,8 @@ Acceptance criteria:
   under `just restart-server` / `restart-server-release` (which do not touch
   clients at all) and in four other `postinst` fallback branches. The mitigation
   is operational, not code — restart server and clients together.
-- The Scribe server is not restarted to verify *this* story. (The one approved
-  restart belongs to Story 3 step 3.)
+- The Scribe server is not restarted to verify *this* story. Live lifecycle
+  work belongs only to the later user-controlled package upgrade in Story 3.
 
 Constitution: principle 7 — document the compatibility decision and never
 disrupt the live server.
@@ -515,26 +522,31 @@ stages from the repo root; **both must return zero lines**.
 COMMON=(--hidden --pcre2 -g '!.git' -g '!target' -g '!.worktrees' \
         -g '!node_modules' -g '!*.lock' -g '!specs/**' -g '!.beads/**')
 
-# GATE A: hard ban. Any hit = removal incomplete.
+# GATE A: hard ban outside the one installer-migration file.
 A='(?i)workspace[-_ ]?notes|WorkspaceNote|ArchiveReason|AddingNote|WORKSPACE_NOTES|notes_(focus_handle|workspace_id|preview|modal|adopted)|(Create|Archive|Edit|Empty)Note\b|\bnote_id\b|(active|archived)_notes|hovered_note_id|NOTE_LIST_ROWS|NOTE_TEXT|hover_notes_affordance|requested_notes_workspace'
-rg -n "${COMMON[@]}" "$A" .
+rg -n "${COMMON[@]}" "$A" . \
+  | rg -v --pcre2 '^(\./)?dist/debian/postinst:'
 
 # GATE B: remaining note-bearing identifiers minus the false-positive allowlist.
-ALLOW='note_row|Role::Note|settings-note|NOTE_MAX_CHARS|tailnet_note|trust_status_notes|note_activity|note_active|note_inactive|note_unpaced_resize_apply|note_external_apply|ENABLE_FOOTNOTES|loading_note|STARTUP_NOTE|RELEASE_NOTES|notes-file'
+ALLOW='note_row|Role::Note|settings-note|NOTE_MAX_CHARS|tailnet_note|trust_status_notes|note_activity|note_active|note_inactive|note_unpaced_resize_apply|note_external_apply|ENABLE_FOOTNOTES|loading_note|STARTUP_NOTE|RELEASE_NOTES|notes-file|generate_notes|prev_notes'
 rg -on "${COMMON[@]}" '(?i)\w*note\w*' . \
+  | rg -v --pcre2 '^(\./)?dist/debian/postinst:' \
   | rg -v  --pcre2 "$ALLOW" \
   | rg -iv --pcre2 ':(notes?|noted|noting)$'
 ```
 
 Pre-removal these return 709 lines across 24 files and 842 tokens respectively.
-Simulating the file deletions leaves only genuine workspace-notes identifiers
-and zero false positives, so the gate is clean **iff** the removal is complete.
+After removal, the only intentional hits are the tightly excluded migration in
+`dist/debian/postinst`; any output after that one-file filter means removal is
+incomplete.
 
 `specs/**` and `.beads/**` are excluded by design — they are historical records,
 and `.beads/interactions.jsonl` is an append-only audit log that must not be
 rewritten. This exclusion is *not* a licence to skip the mandatory
 `specs/016-*` gate edits below, which are checked by a different mechanism.
 `lat.md/` is deliberately **inside** the gate and needs line-by-line treatment.
+The `postinst` exclusion authorizes only the retired-data migration; adding a
+second excluded path or broad directory glob is not permitted.
 
 ### False positives — do not touch
 
@@ -552,8 +564,9 @@ search that is not listed here is in scope for removal.
 | `crates/scribe-client/src/remote/tests.rs` | `awaiting_approval_swaps_loading_note_until_settled` |
 | `crates/scribe-client/src/remote.rs` | "loading note" prose |
 | `.github/workflows/release.yml` | release-notes step |
+| `tools/release-me/release.sh` | `generate_notes`, `prev_notes` release-note helpers |
 | `tools/perf-ab-rig/run-perf-ab.sh` | `STARTUP_NOTE` |
-| `dist/shell-integration/fish/.../scribe.fish`, `dist/debian/postinst` | prose only |
+| `dist/shell-integration/fish/.../scribe.fish` | prose only |
 | `AGENTS.md` | one prose mention |
 | `lat.md/settings.md` | "release notes" |
 | `lat.md/server.md` | `note_unpaced_resize_apply` / `ResizePacer#note_external_apply` links |
@@ -639,9 +652,9 @@ today:
   obligates removing the data.
 - No migration, no schema change, no DB, no embedded field in any other state
   file.
-- **Nothing in build, uninstall, or GC removes it.** `dist/debian/postrm` only
-  clears `/etc/scribe*` on purge, and `/etc/scribe*` does not exist here.
-  Deletion is therefore an explicit manual step, ordered last — see Story 3.
+- **Build, uninstall, and GC do not remove it.** `dist/debian/postrm` only clears
+  `/etc/scribe*` on purge. The Debian `postinst` upgrade migration owns deletion
+  because it can order cleanup after server replacement — see Story 3.
 - **Deleting source does not disarm installed binaries.** `/usr/bin/scribe-client`
   and `/usr/bin/scribe-dev` are running now and still contain the notes UI; a
   single mutation would restore the entire file. Hence the mandatory
@@ -791,11 +804,10 @@ and `launch-gate-checklist.md` — "41-script visual suite" -> 40, plus the
   completion.
 - Run the two-stage [completion gate](#completion-gate); both stages must return
   zero.
-- **NEVER restart the Scribe server without explicit user approval.** The user
-  has granted exactly **one** approval: Story 3 step 3, the post-reinstall
-  restart of servers and clients that makes the data deletion final. No other
-  step may restart the server — in particular, Story 6 is verified by reading
-  and documentation, not by exercising a live upgrade.
+- **NEVER restart the Scribe server outside the user-controlled package
+  upgrade.** Story 3's live rollout remains a separate user action. Development
+  and fixture validation must not touch host Scribe state, binaries, or
+  services; Story 6 remains documentation-only.
 
 ### Constitution
 
@@ -812,8 +824,9 @@ and `launch-gate-checklist.md` — "41-script visual suite" -> 40, plus the
   the *server*, not launching a client. `titlebar.sh` and
   `window-chrome-bands.sh` survive but assert nothing about the notes button, so
   the gap is real. Story 2's path is the keybinding unit tests plus a manual
-  chord press; Story 3's is the `find` check plus the stale-file startup check;
-  Story 6's is the documented decision record, not a live upgrade.
+  chord press; Story 3's is isolated installer fixtures plus the completed
+  stale-file startup check; Story 6's is the documented decision record, not a
+  live upgrade.
 - **Principle 4 — Performance Budgets: INAPPLICABLE.** Explicitly marked, as the
   constitution requires. This is a pure removal — no new hot path, allocation,
   render work, or IO — so there is no budget to state and none to regress.
@@ -829,10 +842,10 @@ protocol variants, the chord, and the docs, and because
 version they already moved past. The `specs/016-*` gate numbers revert with the
 same commit, so the gates stay self-consistent in both directions.
 
-The **note data is not revertible**. Story 3 step 4 is the point of no return:
-once the two `workspace_notes.toml` files are removed there is, by explicit
-design, no backup, archive, or export anywhere to restore from. Everything
-before step 4 is undoable; nothing after it is.
+The **note data is not revertible**. Story 3 step 4 is the point of no return for
+each package flavor: once `postinst` removes its `workspace_notes.toml` there is,
+by explicit design, no backup, archive, or export to restore from. Everything
+before that flavor's cleanup is undoable; nothing after it is.
 
 Release communication is optional but cheap: there is no `CHANGELOG` and no
 README mention, but release notes are the annotated git tag body and the client
@@ -851,11 +864,11 @@ the trail from question to decision stays readable.
 |---|---|---|
 | 1. Protocol removal vs. staged deprecation | Delete all four variants outright, one atomic change, no no-op arms | Q1 |
 | 1b. Bump `REMOTE_PROTOCOL_VERSION` `3 -> 4`? | No. It stays `3` | Q2 |
-| 2. Data-deletion mechanism | Documented manual `rm`, run **last**, after an approved rebuild/reinstall/restart; this machine and this user only | Q5, Q-A |
+| 2. Data-deletion mechanism | Flavor-scoped Debian `postinst` migration after verified server replacement; skipped on deferred/failed lifecycle paths | Q5, Q-A |
 | 3. Historical `specs/` archive | Keep `specs/004` and `specs/007`; scrub only stale cross-references. Separately, the `specs/016-*` gate documents are mandatory in-scope edits | Q-B, Q3 |
 | 4a. `tab-window-chords.sh` chord narrative | Leave it alone — it contains no `ctrl+shift+m` reference; the text is `ctrl+shift+N` rationale | Q6 note, Constraints |
 | 4b. Freed `ctrl+shift+m` | Leave unbound. Not swallowed, not reassigned | Q6 |
-| 5. Verification beyond the gates | Client-only launch is permitted and is Story 1's path; the server is restarted exactly once, for Story 3 step 3 | Q7, Constitution |
+| 5. Verification beyond the gates | Client-only launch is Story 1's path; destructive installer behavior is fixture-only until the user-controlled upgrade | Q7, Constitution |
 
 Two follow-up beads are filed **outside** this spec's scope, both surfaced by
 the research rather than caused by the removal: the silent LAN-picker drop at
@@ -872,6 +885,10 @@ below are ordered by confidence and blast radius; the parenthetical names the
 dimensions that independently flagged each item, so multi-dimension hits are
 the higher-confidence ones. Several passes verified spec claims against the
 source and found some of them wrong — those corrections are folded in.
+
+This section preserves review-time findings and rejected/manual proposals. The
+normative Story 3, Q5 answer, Data Model, and package-migration plan supersede
+its manual-`rm` wording.
 
 ### Critical Questions (answer before planning)
 
@@ -1317,9 +1334,10 @@ accordingly.
 **Q5: What is the achievable scope and mechanism for deleting the stored note
 data, and is a server restart authorized?**
 
-A: **Delete the data LAST, after rebuild/reinstall/restart. The user has
-approved restarting the server and clients for this.** Scope is this machine and
-this user only.
+A: **Delete each flavor's data LAST in its Debian package upgrade, after
+verified server replacement.** The live install/restart remains a separate
+user-controlled action. Each invocation targets one resolved user and one exact
+package identity.
 
 The actual data is two files: `~/.local/state/scribe/workspace_notes.toml`
 (2005 bytes, mode 0600, mtime 2026-05-25, 1 workspace, 0 active + 5 archived
@@ -1345,24 +1363,24 @@ contain the notes UI; one mutation would restore the *entire* file, because the
 server holds the whole store in memory and `persist_next` writes a full clone
 with `.truncate(true)` while `ensure_private_parent` recreates the directory.
 
-Approved sequence: (1) land the client + server removal; (2) rebuild and
-reinstall; (3) restart the servers and clients so no process retains notes code
-or the in-memory store — **the user has approved this restart**; (4) delete the
-files. After step 3, resurrection is impossible.
+Approved sequence: (1) land removal; (2) build and configure the package; (3)
+run cleanup-only exact process inventory without changing normal lifecycle; (4)
+when no writer or only installed-binary writers exist, remove that flavor's
+legacy file/temp siblings immediately; older writers require successful normal
+hot/cold replacement and verified exit first. Unreadable, deferred, failed, or
+timed-out cleanup retries on a later configure.
 
-Commands: `rm -f ~/.local/state/scribe/workspace_notes.toml
-~/.local/state/scribe-dev/workspace_notes.toml`, plus a
-`.workspace_notes.toml.*.tmp` sweep in both directories (currently matching
-nothing). Verify with
-`find ~/.local/state/scribe ~/.local/state/scribe-dev -name '*workspace_notes*'`
-returning empty. **Do not remove the state directories wholesale** — they hold
-`restore/`, `windows/`, `settings_state.toml`, `driver_state.toml`, and the LAN
-trust and certificate files, all in use.
+`postinst` resolves the target user's absolute state home and runs non-recursive
+`rm -f` only for `<state-home>/<package-flavor>/workspace_notes.toml` and
+`.workspace_notes.toml.*.tmp`. **It does not remove the state directory or the
+sibling flavor** — those directories hold `restore/`, `windows/`,
+`settings_state.toml`, `driver_state.toml`, and LAN trust/certificate state.
+No backup, archive, or `.bak` is created.
 
 The macOS and Windows clauses are **dropped** from Story 3: macOS ships as a
 `.dmg` with no maintainer scripts and no Windows target is built. The unbounded
-"no copy exists anywhere" negative is replaced by the concrete `find` check
-above.
+"no copy exists anywhere" negative is replaced by isolated flavor-scoped
+fixture checks.
 
 **Q6: What happens to `ctrl+shift+m` once it is unbound — leave it, swallow it,
 or reassign it?**

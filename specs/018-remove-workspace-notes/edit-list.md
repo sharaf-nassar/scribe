@@ -4,6 +4,11 @@ This is the authoritative edit inventory for the removal. It was surveyed at
 `ac46d1c6413aaab1cb52c687cb3501aec29e92ba`; symbols, headings, and literal
 text govern, while the current line coordinates below are only navigation aids.
 
+**2026-08-02 supersession:** the source-removal inventory remains authoritative,
+but its manual two-flavor data-deletion order is superseded by the current
+`spec.md` and `plan.md`. Debian `postinst` now retries one flavor-scoped,
+fail-closed migration per configure; agents do not run the host lifecycle.
+
 ## Survey verdicts
 
 - `lat search` resolved the live notes, overlay-chord, and visual-E2E sections;
@@ -413,11 +418,11 @@ These facts constrain sequencing; they are not extra edit targets.
   `env_store/gc.rs:76-86`; Debian `postrm` purges only `/etc/scribe*` at
   `dist/debian/postrm:1-17`. Neither removes notes data.
 
-Operational order remains strict: land the atomic code-and-gate commit; rebuild
-and reinstall; perform the one approved server/client restart; run the stale-
-file startup check; only then delete both stable/dev `workspace_notes.toml`
-files and matching temp files without backup. No implementation item may move
-data deletion earlier.
+Operational order remains strict: land removal; complete the isolated stale-file
+startup check; land the installer migration; then let each user-controlled
+package configure replace its exact-flavor server and delete only that flavor's
+legacy file/temp siblings without backup. Deferred or indeterminate lifecycle
+state remains pending for a later configure.
 
 ## Completion and quality gates
 
