@@ -1351,8 +1351,8 @@ pub struct LanPeerInfo {
     pub addr: String,
     /// Control port from the SRV record.
     pub port: u16,
-    /// [`REMOTE_PROTOCOL_VERSION`] from TXT `protovers`; incompatible peers are
-    /// filtered before connecting.
+    /// [`REMOTE_PROTOCOL_VERSION`] from TXT `protovers`; the picker keeps an
+    /// incompatible peer visible with update guidance but prevents connecting.
     pub protovers: u32,
     /// Whether the peer is currently advertised; evicted peers are greyed/omitted.
     pub online: bool,

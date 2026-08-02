@@ -1587,7 +1587,7 @@ Locally-controlled windows carry no controller and contribute nothing, so an all
 
 Verifies the ported  picker state machine — the transport-free core of the winit  — so the multi-machine connect flow behaves identically over the frozen IPC protocol.
 
-The suite drives  and  to assert the tailnet/LAN merge: a dual-reachable machine collapses to one LAN-preferred row with an "also Tailscale" hint, an incompatible-version LAN peer is dropped, and online peers sort before offline. It then walks the step transitions through  — a manual `host:port` entry winning over the highlighted peer, a probe dialing over the row's transport, and the window step producing `Attach`/`NewWindow`  intents with feature-015 share occupancy. Finally it checks the typed failure copy for tailnet/LAN refusals, the awaiting-approval overlay swap, and the  key/click actions, all read back through the flattened .
+The suite drives  and  to assert the tailnet/LAN merge: a dual-reachable machine collapses to one LAN-preferred row with an "also Tailscale" hint, an incompatible-version LAN peer remains as one dimmed row, and online peers sort before offline. It then walks the step transitions through  — a manual `host:port` entry winning over the highlighted peer, a probe dialing over the row's transport, and the window step producing `Attach`/`NewWindow`  intents with feature-015 share occupancy. Finally it checks the typed failure copy for tailnet/LAN refusals, the awaiting-approval overlay swap, and the  key/click actions, all read back through the flattened .
 
 ### GPUI remote handshake
 
