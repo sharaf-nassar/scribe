@@ -30,9 +30,19 @@ Messages sent from the UI client to the server, defined in [[crates/scribe-commo
 
 ### Session Lifecycle
 
-`CreateSession` spawns a new PTY with optional workspace, split direction, working directory, dimensions, and command.
+`CreateSession` spawns a new PTY with optional workspace, split direction, working directory, dimensions, command, environment-envelope id, and structured AI launch intent.
+
+Its `ai_launch: Option<AiLaunchSpec>` carries provider, `New`/`Resume` mode, and optional conversation id alongside the legacy `command` argv. The field defaults to `None` when absent. This plumbing milestone preserves spawn behavior: the server stores the value, while `command` remains authoritative until the server-owned argv builder lands.
 
 `CloseSession` terminates a session. `CloseWindow` closes all sessions in a window and is acknowledged with `WindowClosed` before the client exits. The client also uses `CloseWindow` when a session exit leaves the window with no panes so the empty window is removed from persisted state before it exits. `QuitAll` broadcasts a shutdown request to every connected client, including the sender.
+
+#### Structured AI launch survives MessagePack
+
+A named-MessagePack `CreateSession` round-trip preserves both the structured AI fields and the dual-written legacy command.
+
+#### Missing structured AI launch defaults safely
+
+A legacy named-MessagePack `CreateSession` frame with no `ai_launch` field decodes it as `None`.
 
 ### Terminal I/O
 
@@ -188,6 +198,8 @@ The full wire contract is `specs/013-remote-window-control/contracts/remote-prot
 
 Feature 015 bumps [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] to `3` (`specs/015-multi-machine-sharing/contracts/remote-protocol-v3.md`) and layers an additive multi-machine-sharing delta over the v2 catalogue: control-handoff frames, a full-state roster broadcast, sharing fields on `WindowInfo`, an additive `Welcome.participant_id`, and a `Resize` reinterpreted as a per-participant viewport report. Every addition is `#[serde(default)]` and rides the existing framing. Because negotiation stays exact-match, a v2 peer never enters a share — it is refused `IncompatibleVersion` with both versions named, never a half-join (FR-014). See [[protocol#Remote Protocol#Sharing Messages]].
 
+Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is remote-visible. The exact-match gate makes v3/v4 remote pairs refuse with `IncompatibleVersion`; local Unix-socket compatibility instead relies on the additive field's serde default and dual-written legacy command.
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -196,7 +208,7 @@ The dialer and owner gate compatibility on [[crates/scribe-common/src/protocol.r
 
 ### Protocol Compatibility After Feature Removal
 
-A retired feature's four message variants and six supporting types were deleted outright, with no compatibility shim, no no-op arm, and no deprecation window; [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] remains `3`.
+A retired feature's four message variants and six supporting types were deleted outright, with no compatibility shim, no no-op arm, and no deprecation window; that removal left [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] at `3`. Feature 018 later advances it to `4` for structured AI launch.
 
 Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
 
@@ -271,7 +283,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014 (and again to `3` for feature 015, [[protocol#Remote Protocol#Sharing Messages]]) — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), and `4` for feature 018 structured AI launch — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 

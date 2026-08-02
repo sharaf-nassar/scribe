@@ -24,7 +24,10 @@ use crate::ids::{SessionId, WindowId, WorkspaceId};
 /// the new share-control [`ClientMessage`] variants and roster/notice
 /// [`ServerMessage`] variants are additive under the same exact-match policy, so
 /// a v2 peer and a v3 peer never share a window (FR-014, D4).
-pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
+///
+/// Bumped to `4` for feature 018: [`ClientMessage::CreateSession`] gains the
+/// additive structured AI-launch request used by server-owned command building.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +204,27 @@ pub struct SessionContext {
     pub tmux_session: Option<String>,
 }
 
+/// Whether an AI launch starts a new conversation or resumes one.
+///
+/// This type is also persisted in client restore-state TOML. Its serde variant
+/// names are therefore intentionally the Rust names `New` and `Resume`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiResumeMode {
+    New,
+    Resume,
+}
+
+/// Structured AI launch intent carried alongside the legacy command argv.
+///
+/// The server accepts this value now so a later command-builder change can
+/// make it authoritative without another protocol shape change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiLaunchSpec {
+    pub provider: AiProvider,
+    pub resume_mode: AiResumeMode,
+    pub conversation_id: Option<String>,
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +263,11 @@ pub enum ClientMessage {
         /// The first element is the program, remaining elements are arguments.
         #[serde(default)]
         command: Option<Vec<String>>,
+        /// Structured AI launch intent. During the dual-write compatibility
+        /// window clients also send the legacy `command` argv; until the
+        /// server-owned argv builder lands, `command` remains authoritative.
+        #[serde(default)]
+        ai_launch: Option<AiLaunchSpec>,
         /// Cold-restart restore association: the `LaunchRecord.launch_id` whose
         /// persisted env envelope (if present) should be decrypted and applied
         /// to this freshly-spawned PTY. `None` for plain new sessions.
@@ -1369,6 +1398,19 @@ mod tests {
     use super::*;
     use serde::de::IgnoredAny;
 
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum ClientMessageWithoutAiLaunch {
+        CreateSession {
+            workspace_id: WorkspaceId,
+            split_direction: Option<LayoutDirection>,
+            cwd: Option<PathBuf>,
+            size: Option<TerminalSize>,
+            command: Option<Vec<String>>,
+            env_envelope_id: Option<String>,
+        },
+    }
+
     fn sample_release() -> Release {
         Release {
             version: "0.4.2".to_string(),
@@ -1398,6 +1440,67 @@ mod tests {
     struct InternalTagOnly {
         #[serde(rename = "type")]
         tag: String,
+    }
+
+    // @lat: [[protocol#Client Messages#Session Lifecycle#Structured AI launch survives MessagePack]]
+    #[test]
+    fn create_session_ai_launch_round_trips_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let original = ClientMessage::CreateSession {
+            workspace_id,
+            split_direction: None,
+            cwd: Some(PathBuf::from("/tmp/project")),
+            size: Some(TerminalSize { cols: 120, rows: 40, cell_width: 8, cell_height: 16 }),
+            command: Some(vec!["sh".to_owned(), "-lic".to_owned(), "exec codex".to_owned()]),
+            ai_launch: Some(AiLaunchSpec {
+                provider: AiProvider::CodexCode,
+                resume_mode: AiResumeMode::Resume,
+                conversation_id: Some("conversation-42".to_owned()),
+            }),
+            env_envelope_id: Some("launch-42".to_owned()),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize CreateSession");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize CreateSession");
+
+        match decoded {
+            ClientMessage::CreateSession {
+                workspace_id: decoded_workspace_id,
+                ai_launch: Some(ai_launch),
+                command,
+                ..
+            } => {
+                assert_eq!(decoded_workspace_id, workspace_id);
+                assert_eq!(ai_launch.provider, AiProvider::CodexCode);
+                assert_eq!(ai_launch.resume_mode, AiResumeMode::Resume);
+                assert_eq!(ai_launch.conversation_id.as_deref(), Some("conversation-42"));
+                assert_eq!(
+                    command.as_deref().and_then(|argv| argv.first()).map(String::as_str),
+                    Some("sh")
+                );
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    // @lat: [[protocol#Client Messages#Session Lifecycle#Missing structured AI launch defaults safely]]
+    #[test]
+    fn create_session_missing_ai_launch_defaults_to_none() {
+        let legacy = ClientMessageWithoutAiLaunch::CreateSession {
+            workspace_id: WorkspaceId::new(),
+            split_direction: None,
+            cwd: None,
+            size: None,
+            command: None,
+            env_envelope_id: Some("legacy-launch".to_owned()),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&legacy).expect("serialize legacy CreateSession");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize legacy CreateSession");
+
+        assert!(matches!(decoded, ClientMessage::CreateSession { ai_launch: None, .. }));
     }
 
     /// Mirror of [`ReleaseListResultState`] used purely to assert the

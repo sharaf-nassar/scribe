@@ -3238,6 +3238,7 @@ impl TerminalView {
             size,
             cwd: launch.cwd.clone(),
             command: command_argv(&launch.command),
+            ai_launch: None,
             launch_id: launch.launch_id.clone(),
         });
         match result {
@@ -3442,6 +3443,7 @@ impl TerminalView {
             size: self.focused_pane_size,
             cwd: None,
             command,
+            ai_launch: None,
             launch_id,
         });
         if let Err(error) = result {
@@ -3746,6 +3748,7 @@ impl TerminalView {
             size: self.focused_pane_size,
             cwd: None,
             command: None,
+            ai_launch: None,
             launch_id,
         });
         if let Err(error) = result {

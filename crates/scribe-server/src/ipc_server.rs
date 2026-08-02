@@ -29,10 +29,10 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo,
-    PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch,
-    ServerMessage, SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
-    WorkspaceListEntry, WorkspaceTreeNode,
+    AiLaunchSpec, AutomationAction, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal,
+    ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal,
+    SearchMatch, ServerMessage, SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo,
+    WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -993,6 +993,7 @@ struct CreateSessionRequest {
     cwd: Option<std::path::PathBuf>,
     size: Option<TerminalSize>,
     command: Option<Vec<String>>,
+    ai_launch: Option<AiLaunchSpec>,
     env_envelope_id: Option<String>,
 }
 
@@ -6000,6 +6001,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
             cwd,
             size,
             command,
+            ai_launch,
             env_envelope_id,
         } => {
             handle_create_session(
@@ -6009,6 +6011,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
                     cwd,
                     size,
                     command,
+                    ai_launch,
                     env_envelope_id,
                 },
                 context,
@@ -6190,6 +6193,7 @@ async fn handle_create_session(
             cwd: request.cwd,
             size: request.size,
             command: request.command,
+            ai_launch: request.ai_launch,
             env_envelope_id: request.env_envelope_id,
         })
         .await
