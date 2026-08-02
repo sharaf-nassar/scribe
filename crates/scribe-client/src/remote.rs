@@ -145,6 +145,9 @@ struct PeerRow {
     transport: PeerTransport,
     /// Whether the peer is currently reachable on `transport`.
     online: bool,
+    /// Advertised LAN protocol when it does not match this client's protocol.
+    /// Such rows stay visible for actionable feedback but cannot be dialed.
+    incompatible_protocol: Option<u32>,
     /// `Some(other)` when the SAME machine is also reachable on `other` but was
     /// deduped into this single row (dual-reachable, LAN preferred).
     also_other: Option<PeerTransport>,
@@ -252,8 +255,9 @@ impl RemoteConnect {
 
     /// Rebuild the merged, deduped, sorted peer list from the tailnet + LAN
     /// sources (feature 014, T024). Dual-reachable machines collapse to a single
-    /// LAN-preferred row; incompatible-version LAN peers are dropped. Online peers
-    /// sort first, then by name, then LAN before tailnet.
+    /// LAN-preferred row. Incompatible-version LAN peers remain as disabled rows
+    /// with update guidance; they do not consume a usable same-name tailnet row.
+    /// Online peers sort first, then by name, then LAN before tailnet.
     fn rebuild_rows(&mut self) {
         let tailnet_port = RemoteConfig::default().port;
         let mut tailnet: Vec<(&RemotePeerInfo, bool)> =
@@ -261,16 +265,19 @@ impl RemoteConnect {
 
         let mut rows: Vec<PeerRow> = Vec::new();
         for lan in &self.lan_peers {
-            if lan.protovers != REMOTE_PROTOCOL_VERSION {
-                continue;
-            }
-            let also_other = claim_tailnet_match(&mut tailnet, &lan.host);
+            let incompatible_protocol =
+                (lan.protovers != REMOTE_PROTOCOL_VERSION).then_some(lan.protovers);
+            let also_other = incompatible_protocol
+                .is_none()
+                .then(|| claim_tailnet_match(&mut tailnet, &lan.host))
+                .flatten();
             rows.push(PeerRow {
                 name: lan.name.clone(),
                 host: lan.addr.clone(),
                 port: lan.port,
                 transport: PeerTransport::Lan,
                 online: lan.online,
+                incompatible_protocol,
                 also_other,
             });
         }
@@ -285,6 +292,7 @@ impl RemoteConnect {
                 port: tailnet_port,
                 transport: PeerTransport::Tailnet,
                 online: peer.online,
+                incompatible_protocol: None,
                 also_other: None,
             });
         }
@@ -447,7 +455,11 @@ impl RemoteConnect {
                 transport: PeerTransport::Tailnet,
             };
         }
-        let Some(row) = self.rows.get(self.selected).filter(|row| row.online) else {
+        let Some(row) = self
+            .rows
+            .get(self.selected)
+            .filter(|row| row.online && row.incompatible_protocol.is_none())
+        else {
             return RemoteConnectAction::None;
         };
         let host = row.host.clone();
@@ -837,6 +849,22 @@ pub struct PickerView {
 /// Build a merged peer-step row: an online marker, the device name, its transport
 /// label, and — for a dual-reachable machine shown once — an "also on …" hint.
 fn peer_row(row: &PeerRow) -> PickerRow {
+    if let Some(peer_protocol) = row.incompatible_protocol {
+        let update_target = if peer_protocol < REMOTE_PROTOCOL_VERSION {
+            format!("Update Scribe on {}.", row.name)
+        } else {
+            String::from("Update Scribe on this machine.")
+        };
+        return PickerRow {
+            text: format!(
+                "! {}  {}  Scribe version mismatch (protocol {peer_protocol} vs {}). {update_target}",
+                row.name,
+                row.transport.label(),
+                REMOTE_PROTOCOL_VERSION
+            ),
+            dim: true,
+        };
+    }
     let marker = if row.online { "* " } else { "  " };
     let label = row.transport.label();
     let text = row.also_other.map_or_else(
