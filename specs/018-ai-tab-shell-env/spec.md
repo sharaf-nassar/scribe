@@ -2,11 +2,11 @@
 
 ## Problem Statement
 
-AI tabs (Claude Code via ctrl+alt+c, Codex via ctrl+alt+x, and their resume
-variants) launch through a client-built argv of
+Before feature 018, AI tabs (Claude Code via ctrl+alt+c, Codex via ctrl+alt+x,
+and their resume variants) launched through a client-built argv of
 `[<shell>, "-lic", "exec <binary> [resume-args]"]`
 (`ai_tab_command`, crates/scribe-client/src/main.rs:5870-5879). This design
-has three defects:
+had three defects:
 
 1. **Bash shell integration silently never attaches to AI tabs.** The server
    prepends `--rcfile <scripts>/bash/scribe.bash` for bash
@@ -45,9 +45,9 @@ has three defects:
    tabs and reconcile with each shell's integration mechanism (bash
    rcfile/`ENV`, zsh `ZDOTDIR`, fish/nushell `XDG_DATA_DIRS`).
 
-The net user-visible symptoms today: AI CLIs can start with an incomplete
+The pre-implementation user-visible symptoms were: AI CLIs could start with an incomplete
 environment relative to the user's real login shell, persisted terminal env
-is not restored into bash AI tabs, and AI tabs always start in `$HOME`
+was not restored into bash AI tabs, and AI tabs always started in `$HOME`
 regardless of the focused pane's directory or the `ai_tab_cwd` setting.
 
 ## Goals
@@ -58,8 +58,9 @@ regardless of the focused pane's directory or the `ai_tab_cwd` setting.
   before the AI binary runs (Principle 2: consistent UX; Principle 7:
   documented, compatible change). Decided: Clarifications Q3.
 - The client sends a structured `ai_launch` field (provider + resume
-  flag/conversation + cwd) on CreateSession; the SERVER owns argv
-  construction and resolves the shell from the HOST's env/passwd.
+  mode/conversation) plus the existing `cwd` on CreateSession; the SERVER owns
+  argv construction and resolves the HOST shell passwd-first, then from the
+  daemon's `SHELL`, then `sh`.
   Dual-write compat (legacy `command` argv in the same frame) keeps old
   servers — including the un-restartable live one — on exactly today's
   behavior; `REMOTE_PROTOCOL_VERSION` bumps 3→4. Decided:
@@ -95,9 +96,9 @@ regardless of the focused pane's directory or the `ai_tab_cwd` setting.
   AI tabs only). The follow-up evaluation rejects login-shell unification
   without a separate opt-in specification and migration plan; see the plan's
   Architecture Approach.
-- No fix here for the zsh/fish plain-tab FR-008 non-conformance (delta
-  applied pre-rc, baseline captured pre-rc — Clarifications Q4); it is
-  filed as a separate spec-006 defect bead.
+- Feature 018 itself did not change plain zsh/fish restore ordering. The
+  separate scribe-ebz follow-up has since fixed that FR-008 defect by moving
+  restore and baseline capture to the first prompt after user rc/config.
 - No escape-hatch/fast-path setting for slow login profiles
   (Clarifications Q6), and no AI-tab opt-out of the restore delta
   (Clarifications Q7).
@@ -471,7 +472,7 @@ are merged below.
    injectors already read `ZDOTDIR`/`XDG_DATA_DIRS` from the daemon env
    (shell_integration.rs:179-210), a pre-existing bug class this decision
    either fixes or doubles down on. A structured "AI launch" request
-   (provider + resume + cwd; server owns argv) changes the IPC contract
+   (provider + resume intent beside the existing cwd; server owns argv) changes the IPC contract
    (protocol.rs CreateSession) and raises mixed-version client/server
    compatibility on a server that cannot be hot-restarted (Principle 7).
    — why it matters: decides patch vs IPC redesign, and remote
@@ -503,10 +504,10 @@ are merged below.
    as-is. — why it matters: the bash design is genuinely undetermined
    and nushell needs an explicit mechanism-or-limitation decision;
    flagged by: feasibility, ambiguity, requirements, stakeholders.
-4. **Restore-delta vs login-profile precedence: pick a winner.** The
-   shells disagree TODAY: zsh applies the delta from `.zshenv` (before
-   `.zprofile`/`.zshrc`, so user rc silently wins) while bash applies it
-   post-rc (delta wins). Under full login startup, "applied before exec"
+4. **Restore-delta vs login-profile precedence: pick a winner.** At review
+   time the shells disagreed: zsh applied the delta from `.zshenv` (before
+   `.zprofile`/`.zshrc`, so user rc silently won) while bash applied it
+   post-rc (delta won). Under full login startup, "applied before exec"
    is satisfiable by both orders while semantics diverge — this is an
    observable amendment to the spec-006 env-persistence contract and
    must be documented as such (Principle 7).
@@ -553,12 +554,13 @@ are merged below.
   `CustomCommand` stores raw argv. BUT both argv-construction sites
   (`ai_tab_command` and `restore_replay::command_argv`) must change in
   lockstep or fresh launches and relaunches silently diverge.
-- Good news, verified: zsh and fish need no new mechanism (`-lic` is
+- At feature-018 validation time, zsh and fish needed no new AI mechanism (`-lic` is
   login+interactive in both; vendor conf.d loads under `fish -c`; zsh
   `.zshenv` redirect is login-compatible). OQ6's premise is stale —
   scribe.zsh:139-142 and scribe.fish:150-154 already source-and-delete
-  the restore file. (Correction from validation: they source it at the
-  WRONG TIME — pre-rc — violating FR-008; see Clarifications Q4.)
+  the restore file. Validation also found their plain-tab source point was
+  pre-rc; the later scribe-ebz follow-up moved it to a first-prompt initializer
+  after user rc/config.
 - OQ4 (`exec`) is not a real fork: keep `exec`; move it from Open
   Questions to a recorded decision. Prompt-time features are inherently
   moot; only pre-exec env effects are load-bearing.
@@ -597,9 +599,10 @@ User Stories, and Constraints sections have been updated to match.
 ### Q1 → 1A amended: server-owned argv via structured AI launch
 
 The client sends a structured `ai_launch` field (provider + resume
-flag/conversation + cwd) on CreateSession; the server owns argv
-construction and resolves the shell from the HOST's env/passwd (passwd
-is live; the daemon env does have `SHELL` — validated). Compat:
+mode/conversation) plus the existing `cwd` on CreateSession; the server owns
+argv construction and resolves the shell from the HOST passwd entry first,
+then daemon `SHELL`, then `sh` (passwd is live; the daemon env does have
+`SHELL` — validated). Compat:
 DUAL-WRITE — the client sends both `ai_launch` AND the legacy `command`
 argv in the same frame; new servers prefer `ai_launch`, old servers
 (including the un-restartable live one) degrade to exactly today's
@@ -658,15 +661,14 @@ documented limitation.
 ### Q4 → 4A reframed: enforce existing FR-008 for AI tabs; file the plain-tab defect separately
 
 Delta-wins is ALREADY the spec-006 contract (FR-008 MUST; research.md
-R1.3 apply-after-rc). Validation found zsh and fish plain tabs violate
-it TODAY: the delta is applied pre-rc (.zshenv-time / conf.d-time) AND
-the env baseline is captured pre-rc, so user rc exports get persisted
-into the envelope as user-set deltas. This feature: AI tabs apply the
+R1.3 apply-after-rc). Validation found zsh and fish plain tabs violated
+it at that point: the delta was applied pre-rc (.zshenv-time / conf.d-time)
+and the env baseline was captured pre-rc, so user rc exports entered the
+envelope as user-set deltas. Feature 018 made AI tabs apply the
 delta via the pre-exec preamble AFTER login files (delta wins) on
-bash/zsh/fish. The plain-tab zsh/fish non-conformance is filed as a
-SEPARATE spec-006 defect bead (not fixed here). lat.md/server.md:572
-(falsely asserting uniform post-rc apply) is corrected as part of this
-feature's doc sync.
+bash/zsh/fish. The separate scribe-ebz follow-up then fixed plain zsh/fish by
+deferring restore and baseline capture to their first prompt after user rc.
+The spec-006 amendment and lat.md now record both shipped paths.
 
 ### Q5 → 5A amended: `ai_tab_cwd` live with `home` escape hatch
 

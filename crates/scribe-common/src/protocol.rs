@@ -216,8 +216,8 @@ pub enum AiResumeMode {
 
 /// Structured AI launch intent carried alongside the legacy command argv.
 ///
-/// The server accepts this value now so a later command-builder change can
-/// make it authoritative without another protocol shape change.
+/// Current servers make this authoritative for provider command construction;
+/// the legacy argv remains dual-written for older local servers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiLaunchSpec {
     pub provider: AiProvider,
