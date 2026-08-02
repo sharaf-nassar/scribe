@@ -174,6 +174,21 @@ disposable Debian container.
 
 Functional end-to-end tests that drive real sessions through the `scribe-test` harness and assert rendered output.
 
+### E2E Image Build Profiles
+
+Docker harness images build from an explicit release or debug binary profile so diagnostics never overwrite the normal release image tags.
+
+`just docker-func` and `just docker-visual` stage release binaries by default
+and retain the `scribe-test-func` and `scribe-test-visual` tags. Run
+`just docker-func profile=debug` or `just docker-visual profile=debug` to
+stage `target/debug` binaries under the separate `scribe-test-func-debug` or
+`scribe-test-visual-debug` tags. No other profile is accepted.
+
+The staging helper rejects a required binary that is missing or older than
+the newest commit touching `crates/`. Rebuild with `just build-release` for
+release images or `just build` for debug images before retrying the Docker
+recipe.
+
 The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integration` tree at `/usr/local/share/scribe/shell-integration` so the in-container `scribe-server`'s  resolves them and injects `SCRIBE_SHELL_INTEGRATION=1` plus the per-shell rcfile/ZDOTDIR/XDG plumbing into every spawned PTY. Without this copy, the `shell-integration.sh` e2e test never sees the env var or the OSC marks the integration scripts emit.
 
 ### AI Indicator E2E

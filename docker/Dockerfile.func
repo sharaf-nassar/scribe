@@ -5,6 +5,10 @@ RUN apt-get update && \
         fonts-jetbrains-mono \
         ca-certificates \
         clang \
+        dbus \
+        dbus-x11 \
+        fish \
+        gnome-keyring \
         libdbus-1-3 \
         libfontconfig-dev \
         libssl-dev \
@@ -13,16 +17,20 @@ RUN apt-get update && \
         libx11-xcb-dev \
         libxkbcommon-x11-dev \
         libzstd-dev \
+        zsh \
     && rm -rf /var/lib/apt/lists/*
 
-COPY target/release/scribe-server /usr/local/bin/scribe-server
-COPY target/release/scribe-test /usr/local/bin/scribe-test
+ARG BIN_DIR=target/e2e-stage/release
+
+COPY ${BIN_DIR}/scribe-server /usr/local/bin/scribe-server
+COPY ${BIN_DIR}/scribe-test /usr/local/bin/scribe-test
+COPY ${BIN_DIR}/scribe-cli /usr/local/bin/scribe-cli
 # AI state, prompt text, and context-window % reach the server over the hook
 # channel (spec 003, FR-020..FR-022) — OSC 1337 no longer carries them. The
 # `ai-state-indicator` / `ai-context-thresholds` e2e tests drive that channel by
 # running the helper inside the session shell, where scribe-server exports
 # SCRIBE_HOOK_SOCK and SCRIBE_SESSION_ID.
-COPY target/release/scribe-hook-helper /usr/local/bin/scribe-hook-helper
+COPY ${BIN_DIR}/scribe-hook-helper /usr/local/bin/scribe-hook-helper
 # Shell-integration scripts: scribe-server's `find_scripts_dir()` resolves
 # `<exe_dir>/../share/<flavor>/shell-integration`, i.e. `/usr/local/share/scribe/shell-integration`
 # for this container's `/usr/local/bin/scribe-server` (stable flavor). Without
@@ -32,7 +40,7 @@ COPY dist/shell-integration /usr/local/share/scribe/shell-integration
 COPY docker/entrypoint-func.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/scribe-server /usr/local/bin/scribe-test \
-    /usr/local/bin/scribe-hook-helper
+    /usr/local/bin/scribe-cli /usr/local/bin/scribe-hook-helper
 
 RUN mkdir -p /output
 

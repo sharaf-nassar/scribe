@@ -121,13 +121,35 @@ setup-codex:
 
 # ==================== E2E Testing ====================
 
-# Rebuild functional test container (after cargo build --release)
-docker-func:
-    docker build -f docker/Dockerfile.func -t scribe-test-func .
+# Rebuild functional test container from release or debug binaries
+docker-func profile="release":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A binary is stale when it is absent or older than the newest commit touching crates/.
+    requested="{{ profile }}"
+    profile="${requested#profile=}"
+    case "$profile" in
+        release) image="scribe-test-func" ;;
+        debug) image="scribe-test-func-debug" ;;
+        *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
+    esac
+    tools/e2e-stage.sh "$profile" scribe-server scribe-test scribe-hook-helper scribe-cli
+    docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.func -t "$image" .
 
-# Rebuild visual test container (after cargo build --release)
-docker-visual:
-    docker build -f docker/Dockerfile.visual -t scribe-test-visual .
+# Rebuild visual test container from release or debug binaries
+docker-visual profile="release":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A binary is stale when it is absent or older than the newest commit touching crates/.
+    requested="{{ profile }}"
+    profile="${requested#profile=}"
+    case "$profile" in
+        release) image="scribe-test-visual" ;;
+        debug) image="scribe-test-visual-debug" ;;
+        *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
+    esac
+    tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper
+    docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
 
 # Run a functional E2E test (e.g. just e2e-func func/smoke.sh)
 e2e-func script:
