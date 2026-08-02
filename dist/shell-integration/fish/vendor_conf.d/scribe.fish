@@ -30,6 +30,13 @@ if set -q XDG_DATA_DIRS
     end
 end
 
+# AI tabs apply their restore delta from the post-login pre-exec preamble.
+# This pre-rc load only cleans the injected vendor path and installs nothing.
+if set -q SCRIBE_AI_TAB; and test "$SCRIBE_AI_TAB" = "1"
+    set -e SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT
+    return 0
+end
+
 # ── URL-encode helper ────────────────────────────────────────────
 function __scribe_urlencode
     string escape --style=url -- $argv[1]
