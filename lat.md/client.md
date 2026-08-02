@@ -374,7 +374,13 @@ The two halves of the truth move on different threads — the IPC reader owns th
 
 Three things can be out of step. The root region starts on a client-minted `WorkspaceId` because the shell exists before the first `Welcome`, and adopts the server's through  once a `SessionList` names one. A pane whose session exited is retired by . And a session the server has just created has no pane yet: a split queues the pane that asked for it (), and anything else — a new tab, a reattach, a refocus after an exit — lands in the pane the user is looking at.
 
-A fourth thing settles first, ahead of all three: the `WorkspaceInfo` answers the reader parked. See .
+Root-ID adoption settles before the `WorkspaceInfo` answers the reader parked,
+so initial metadata matches a server-owned region instead of being discarded as
+unclaimed. Metadata still precedes pane/session adoption, allowing a workspace
+split's answer to re-key its region before that region claims its new session.
+`SessionList` workspace entries join the same ordered queue, so reconnects
+restore each slot's name, accent, and project root without waiting for another
+CWD change. See .
 
 ### GPUI Workspace IPC
 
