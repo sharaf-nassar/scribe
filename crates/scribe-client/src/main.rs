@@ -9,6 +9,7 @@ mod terminal_element;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
@@ -124,8 +125,8 @@ use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{
-        AiContextThresholds, SmartSelectionActionKind, SmartSelectionConfig, StatusBarStatsConfig,
-        load_config,
+        AiContextThresholds, AiTabCwd, SmartSelectionActionKind, SmartSelectionConfig,
+        StatusBarStatsConfig, load_config,
     },
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId},
@@ -555,25 +556,26 @@ struct WindowSeed {
 fn launch_binding_for(
     command: Option<&Vec<String>>,
     ai_launch: Option<&AiLaunchSpec>,
+    cwd: Option<PathBuf>,
 ) -> LaunchBinding {
     if let Some(ai_launch) = ai_launch {
         return restore_replay::new_ai_binding(
             ai_launch.provider,
             ai_launch.resume_mode,
-            None,
+            cwd,
             ai_launch.conversation_id.clone(),
         );
     }
     let Some(argv) = command else {
-        return restore_replay::new_shell_binding(None);
+        return restore_replay::new_shell_binding(cwd);
     };
     if let Some(provider) = restore_replay::detect_ai_command(argv, true) {
-        return restore_replay::new_ai_binding(provider, AiResumeMode::Resume, None, None);
+        return restore_replay::new_ai_binding(provider, AiResumeMode::Resume, cwd, None);
     }
     if let Some(provider) = restore_replay::detect_ai_command(argv, false) {
-        return restore_replay::new_ai_binding(provider, AiResumeMode::New, None, None);
+        return restore_replay::new_ai_binding(provider, AiResumeMode::New, cwd, None);
     }
-    restore_replay::new_custom_binding(argv.clone(), None)
+    restore_replay::new_custom_binding(argv.clone(), cwd)
 }
 
 /// Everything the window needs to persist its state and replay a cold restart.
@@ -1532,18 +1534,18 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusRight => self.focus_workspace(FocusDirection::Right, cx),
             LayoutAction::WorkspaceFocusUp => self.focus_workspace(FocusDirection::Up, cx),
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
-            LayoutAction::NewTab => self.create_tab(None, None),
+            LayoutAction::NewTab => self.create_tab(None, None, None),
             LayoutAction::NewClaudeTab => {
-                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New);
+                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New, cx);
             }
             LayoutAction::NewClaudeResumeTab => {
-                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::Resume);
+                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::Resume, cx);
             }
             LayoutAction::NewCodexTab => {
-                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::New);
+                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::New, cx);
             }
             LayoutAction::NewCodexResumeTab => {
-                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume);
+                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume, cx);
             }
             LayoutAction::NextTab => self.switch_tab(TabSessions::focus_next, cx),
             LayoutAction::PrevTab => self.switch_tab(TabSessions::focus_prev, cx),
@@ -1985,6 +1987,28 @@ impl TerminalView {
         origin: ActionOrigin,
         cx: &mut Context<Self>,
     ) {
+        // A server-forwarded action has no visible pane focus to inherit. Keep
+        // its cwd unset even when this window still remembers the last focused
+        // session, so the server's home guard decides the launch directory.
+        let automated_ai = match (&action, origin) {
+            (AutomationAction::NewClaudeTab, ActionOrigin::Server) => {
+                Some((AiProvider::ClaudeCode, AiResumeMode::New))
+            }
+            (AutomationAction::NewClaudeResumeTab, ActionOrigin::Server) => {
+                Some((AiProvider::ClaudeCode, AiResumeMode::Resume))
+            }
+            (AutomationAction::NewCodexTab, ActionOrigin::Server) => {
+                Some((AiProvider::CodexCode, AiResumeMode::New))
+            }
+            (AutomationAction::NewCodexResumeTab, ActionOrigin::Server) => {
+                Some((AiProvider::CodexCode, AiResumeMode::Resume))
+            }
+            _ => None,
+        };
+        if let Some((provider, resume_mode)) = automated_ai {
+            self.create_ai_tab_request(provider, resume_mode, None);
+            return;
+        }
         if let Some(key_action) = key_action_for_automation(&action) {
             if origin == ActionOrigin::Local
                 && matches!(key_action, KeyAction::Layout(_))
@@ -2073,7 +2097,7 @@ impl TerminalView {
             }
             ContextMenuAction::SendText(text) => self.send_key_bytes(text.into_bytes()),
             ContextMenuAction::RunCommandInWindow(command) => {
-                self.create_tab(Some(shell_command_argv(&command)), None);
+                self.create_tab(Some(shell_command_argv(&command)), None, None);
             }
             ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
             ContextMenuAction::Copy => self.copy_selection(),
@@ -3433,7 +3457,12 @@ impl TerminalView {
     ///
     /// The tab appears once the server answers with `SessionCreated`, so the
     /// strip never shows a tab whose PTY failed to spawn.
-    fn create_tab(&mut self, command: Option<Vec<String>>, ai_launch: Option<AiLaunchSpec>) {
+    fn create_tab(
+        &mut self,
+        command: Option<Vec<String>>,
+        ai_launch: Option<AiLaunchSpec>,
+        cwd: Option<PathBuf>,
+    ) {
         let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         else {
             tracing::warn!("new tab ignored: no workspace is attached yet");
@@ -3445,13 +3474,13 @@ impl TerminalView {
         // has to relaunch rather than a bare login shell. The binding's launch
         // id rides along as the env-envelope id so the session persists its
         // environment under the same id the next snapshot will point at.
-        let binding = launch_binding_for(command.as_ref(), ai_launch.as_ref());
+        let binding = launch_binding_for(command.as_ref(), ai_launch.as_ref(), cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
             workspace_id,
             size: self.focused_pane_size,
-            cwd: None,
+            cwd,
             command,
             ai_launch,
             launch_id,
@@ -3462,9 +3491,43 @@ impl TerminalView {
     }
 
     /// Ask for an AI tab using structured intent plus the old-server argv twin.
-    fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode) {
+    fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode, cx: &App) {
+        let cwd = self.resolve_ai_tab_cwd(cx);
+        self.create_ai_tab_request(provider, resume_mode, cwd);
+    }
+
+    /// Build one immutable structured + legacy-compatible AI create request.
+    fn create_ai_tab_request(
+        &mut self,
+        provider: AiProvider,
+        resume_mode: AiResumeMode,
+        cwd: Option<PathBuf>,
+    ) {
         let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
-        self.create_tab(launch.command, launch.ai_launch);
+        self.create_tab(launch.command, launch.ai_launch, cwd);
+    }
+
+    /// Resolve a fresh AI tab's working directory from live client state.
+    ///
+    /// A missing pane CWD (no focused session, an automation action without
+    /// visible focus, or a shell that never emitted OSC 7) stays `None`, which
+    /// leaves the server's directory validation and `$HOME` fallback as the
+    /// final guard. Cold-restart replay does not call this path; it keeps the
+    /// persisted `LaunchRecord.cwd` passed by [`Self::dispatch_replay_launch`].
+    fn resolve_ai_tab_cwd(&self, cx: &App) -> Option<PathBuf> {
+        match self.config.config().config.terminal.ai_tab_cwd {
+            AiTabCwd::Pane => self.focused_session_cwd(),
+            AiTabCwd::ProjectRoot => {
+                self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd())
+            }
+            AiTabCwd::Home => None,
+        }
+    }
+
+    /// Read the focused session's last server-reported OSC 7 directory.
+    fn focused_session_cwd(&self) -> Option<PathBuf> {
+        let session_id = self.shared.active_session.lock().ok().and_then(|guard| *guard)?;
+        self.shared.chrome_metadata.lock().ok()?.session(session_id)?.cwd.clone()
     }
 
     /// Move the tab selection with `move_selection` and attach whatever it
@@ -3756,7 +3819,7 @@ impl TerminalView {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
-        let binding = launch_binding_for(None, None);
+        let binding = launch_binding_for(None, None, None);
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
@@ -8368,7 +8431,24 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
         ServerMessage::EnvStatus { session_id, state } => {
             update_chrome_metadata(ctx, |store| store.set_env_status(session_id, state));
         }
-        ServerMessage::WorkspaceNamed { workspace_id, name, .. } => {
+        ServerMessage::WorkspaceNamed { workspace_id, name, project_root } => {
+            // Auto-naming is also the live project-root update. Park it for
+            // the GPUI thread before bumping the redraw generation so the
+            // focused workspace slot and status-bar metadata advance together.
+            let Ok(mut parked) = ctx.workspaces.lock() else {
+                tracing::warn!(
+                    "workspace info mutex poisoned; dropping WorkspaceNamed project root"
+                );
+                update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
+                return;
+            };
+            parked.push(WorkspaceInfo {
+                workspace_id,
+                name: (!name.is_empty()).then(|| name.clone()),
+                accent: None,
+                project_root,
+            });
+            drop(parked);
             update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
         }
         // Unreachable: the caller only routes the chrome family here.
