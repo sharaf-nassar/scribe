@@ -4407,8 +4407,16 @@ where
                 debug!("client disconnected before Hello");
                 return None;
             }
+            Err(ScribeError::Deserialization { source }) => {
+                // `read_message` consumed the complete length-prefixed payload
+                // before decoding it, so only this error preserves alignment.
+                // Keep waiting for a valid first message on the next frame.
+                warn!("skipping undecodable client frame before Hello: {source}");
+            }
             Err(e) => {
-                warn!("failed to read Hello message: {e}");
+                // A framing/size failure can leave bytes from the declared frame
+                // unread. Continuing could interpret payload bytes as a prefix.
+                warn!("failed to read Hello frame; closing connection: {e}");
                 return None;
             }
         }
@@ -5574,8 +5582,16 @@ where
                 debug!(%window_id, "client disconnected");
                 return LoopExit::Disconnected;
             }
+            Some(Err(ScribeError::Deserialization { source })) => {
+                // The frame body is already consumed, leaving the next length
+                // prefix aligned. Discard only this malformed message.
+                warn!(%window_id, "skipping undecodable client frame: {source}");
+                continue;
+            }
             Some(Err(e)) => {
-                warn!(%window_id, "failed to read client message: {e}");
+                // I/O and size failures do not guarantee that the declared frame
+                // was consumed, so the stream is unsafe to continue parsing.
+                warn!(%window_id, "failed to read client frame; disconnecting: {e}");
                 return LoopExit::Disconnected;
             }
         };

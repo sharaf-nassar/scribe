@@ -12,6 +12,8 @@ Each frame is a 4-byte big-endian u32 payload length followed by the MessagePack
 
 The maximum payload size is 64 MiB; reattach payloads ride on the far denser zstd-compressed ANSI `SessionReplay` encoding, so routine attach traffic stays well below the cap.
 
+Once the declared payload has been read in full, a MessagePack decode failure affects only that frame: the server discards it and reads the next prefix. Header/body I/O failures and oversized lengths close the connection because framing synchronization is not guaranteed. Mandatory remote preambles remain fail-closed before authorization. See [[server#Server#Startup#Frame Error Policy]].
+
 ### Socket Path
 
 The server socket lives at a platform-specific runtime directory selected by the active install flavor.
