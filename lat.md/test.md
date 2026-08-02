@@ -1152,6 +1152,14 @@ The rig has two modes. `assess` (default) generates the current-state report fro
 
 `--startup-only`, `--latency-only` and `--scroll-only` narrow a live run to one metric so a perf bead can re-measure a fix in a minute rather than paying for every workload; everything they exclude reports `NOT-MEASURED`, so a narrowed run is an iteration loop and never a gate verdict.
 
+### AI tab open latency
+
+The separate `--ai-tab-only --live` mode gates AI-tab launch overhead against a soft 1000 ms budget without adding a sixth metric to the five-result A/B report.
+
+It waits for the seed pane's PTY byte count to become idle before timing, then reuses `open_owned_tab` ownership polling with the `ctrl+alt+c` chord and ends on the first PTY-counter increase from a PATH-first `claude` marker stub. The timed span has no settle delay; the ordinary 1.5 s post-open sleep is skipped. The stub must contain and print `SCRIBE_AI_TAB_PERF_MARKER` immediately, then remain alive until the rig closes the owned session, so a real AI CLI cannot be timed accidentally.
+
+The 2026-08-01 verification ran project-built release binaries under Xvfb and openbox in a disposable, network-disabled container with isolated runtime, home, config, state, data, and cache directories and no host Scribe socket. It measured **587.627 ms**, passing the 1000 ms budget.
+
 The latency workload takes 60 samples rather than the 25 it started with. Both clients land in the 0.2–0.4 ms band once they are measured at the same pipeline stage, and there the median of 25 moved by more than the gate's own 10% allowance between back-to-back runs of the *same* binary (0.260 then 0.366 ms) — enough noise to decide the verdict by itself.
 
 The three comparative metrics are enforced with a 10% run-to-run noise allowance, which is the repeatability of these measurements on a loaded desktop rather than extra headroom. A comparative metric with no committed baseline reads `NO-BASELINE`, and the overall verdict is `INCOMPLETE` unless all five metrics are measured and inside their thresholds; a `FAIL` on any metric fails the gate and reopens the perf bead.
