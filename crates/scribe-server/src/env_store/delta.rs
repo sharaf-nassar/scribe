@@ -38,6 +38,8 @@ pub const EXCLUSION_SET: &[&str] = &[
     "SCRIBE_HOOK_HELPER",
     "SCRIBE_RESTORE_ENV_DELTA_FILE",
     "SCRIBE_ENV_PERSIST",
+    "SCRIBE_AI_TAB",
+    "SCRIBE_INTEGRATION_SCRIPT",
     // Terminal identification (Scribe injects fresh values)
     "TERM",
     "COLORTERM",
@@ -63,6 +65,10 @@ pub const EXCLUSION_SET: &[&str] = &[
     "_",
     "OLDPWD",
     "SHLVL",
+    "SHELL",
+    "ENV",
+    "ZDOTDIR",
+    "XDG_DATA_DIRS",
     // Locale/auth tickets with host-specific lifetime
     "KRB5CCNAME",
     "GPG_TTY",
@@ -265,9 +271,21 @@ mod tests {
     #[test]
     fn well_known_excludes_are_present() {
         // Spot-check a representative entry from each category.
-        for name in
-            ["SCRIBE_HOOK_SOCK", "TERM", "DISPLAY", "SSH_AUTH_SOCK", "TMUX", "SHLVL", "GPG_TTY"]
-        {
+        for name in [
+            "SCRIBE_HOOK_SOCK",
+            "SCRIBE_AI_TAB",
+            "SCRIBE_INTEGRATION_SCRIPT",
+            "TERM",
+            "DISPLAY",
+            "SSH_AUTH_SOCK",
+            "TMUX",
+            "SHLVL",
+            "SHELL",
+            "ENV",
+            "ZDOTDIR",
+            "XDG_DATA_DIRS",
+            "GPG_TTY",
+        ] {
             assert!(is_excluded(name), "expected {name} to be in ExclusionSet");
         }
     }

@@ -453,6 +453,8 @@ Encrypted on-disk persistence of per-terminal exported-env deltas across cold re
 
 The on-disk envelope is an AEAD-sealed MessagePack blob of the working `TerminalEnvDelta`; its 256-bit ChaCha20-Poly1305 data-encryption key (DEK) lives in the OS secret store, scoped by install flavor and the `(window_id, launch_id)` pair so stable and `scribe-dev` installs cannot collide. There is no plaintext fallback — keystore failure stops persistence and degrades the session's `EnvStatus` instead of writing unencrypted. See `specs/006-persist-terminal-env/` for the full design.
 
+Q7 sanctions excluding `SHELL`, `ENV`, `ZDOTDIR`, `XDG_DATA_DIRS`, `SCRIBE_AI_TAB`, and `SCRIBE_INTEGRATION_SCRIPT` from plain-tab capture too, preventing stale shell-startup or Scribe-integration controls from redirecting later launches.
+
 ### Keystore Wrapper
 
  wraps the cross-platform `keyring` crate (macOS Keychain + Linux Secret Service) behind binary DEK get/set/delete primitives.
