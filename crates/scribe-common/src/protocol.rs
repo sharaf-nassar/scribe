@@ -264,8 +264,8 @@ pub enum ClientMessage {
         #[serde(default)]
         command: Option<Vec<String>>,
         /// Structured AI launch intent. During the dual-write compatibility
-        /// window clients also send the legacy `command` argv; until the
-        /// server-owned argv builder lands, `command` remains authoritative.
+        /// window clients also send the legacy `command` argv. Servers that
+        /// understand this field make it authoritative.
         #[serde(default)]
         ai_launch: Option<AiLaunchSpec>,
         /// Cold-restart restore association: the `LaunchRecord.launch_id` whose
