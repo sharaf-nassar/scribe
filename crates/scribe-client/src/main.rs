@@ -3681,12 +3681,14 @@ impl TerminalView {
 
     /// Split the focused pane and ask the server for the session it will host.
     fn split_pane(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+        // Capture before the split moves focus onto its unbound pending pane.
+        let cwd = self.focused_session_cwd();
         if self.shell.split_focused_pane(direction, cx).is_none() {
             tracing::warn!(?direction, "split ignored: the window has no focused pane");
             return;
         }
         tracing::info!(?direction, panes = self.shell.pane_count(cx), "split the focused pane");
-        self.request_pane_session();
+        self.request_pane_session(cwd);
         self.after_layout_change(cx);
     }
 
@@ -3770,6 +3772,9 @@ impl TerminalView {
     /// because the new one does not exist yet; the `MoveSession` raised when the
     /// pane adopts it is what tells the server the session changed regions.
     fn split_workspace(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+        // The new region receives focus immediately, so preserve the source
+        // pane's directory before its root pane is queued without a session.
+        let cwd = self.focused_session_cwd();
         let accent = self.next_region_accent(cx);
         let Some(workspace_id) = self.shell.split_workspace(direction, accent, cx) else {
             tracing::warn!(?direction, "workspace split ignored: no focused region");
@@ -3784,7 +3789,7 @@ impl TerminalView {
             regions = self.shell.region_count(cx),
             "split the window into a new workspace region"
         );
-        self.request_pane_session();
+        self.request_pane_session(cwd);
         self.after_layout_change(cx);
     }
 
@@ -3812,20 +3817,21 @@ impl TerminalView {
     /// Ask the server for a session to fill the pane that just appeared.
     ///
     /// The pane was queued by the split, so the reconcile pass hands it the
-    /// session as soon as `SessionCreated` lands.
-    fn request_pane_session(&mut self) {
+    /// session as soon as `SessionCreated` lands. `cwd` is captured from the
+    /// source pane before the split moves focus to this pending pane.
+    fn request_pane_session(&mut self, cwd: Option<PathBuf>) {
         let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         else {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
-        let binding = launch_binding_for(None, None, None);
+        let binding = launch_binding_for(None, None, cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
             workspace_id,
             size: self.focused_pane_size,
-            cwd: None,
+            cwd,
             command: None,
             ai_launch: None,
             launch_id,
