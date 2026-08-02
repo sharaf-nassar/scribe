@@ -78,7 +78,7 @@ use scribe_client::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client::remote_handshake::{self, RemoteDialer};
 use scribe_client::remote_picker::{RemotePickerColors, remote_picker_overlay};
 use scribe_client::restore_replay::{
-    self, ReplayLaunch, command_argv, prepare_replay, round_positive_f32_to_u16,
+    self, ReplayLaunch, prepare_replay, round_positive_f32_to_u16,
 };
 use scribe_client::restore_state::{AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState};
 use scribe_client::scrollbar::{
@@ -130,8 +130,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
-        AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind, ServerMessage,
-        SessionInfo, TerminalSize, WindowInfo,
+        AiLaunchSpec, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
+        ServerMessage, SessionInfo, TerminalSize, WindowInfo,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -549,11 +549,21 @@ struct WindowSeed {
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
 /// the same thing.
 ///
-/// An AI tab is recognised from its argv rather than from the shortcut that
-/// opened it, which is what lets a custom command that happens to invoke a
-/// provider come back as an AI launch too. A resume invocation is matched first
-/// because a resume argv also contains the provider's bare binary name.
-fn launch_binding_for(command: Option<&Vec<String>>) -> LaunchBinding {
+/// Structured AI shortcuts bind directly from their typed launch intent.
+/// Legacy argv detection remains only for custom commands that happen to invoke
+/// a provider, with resume matched before the provider's bare binary name.
+fn launch_binding_for(
+    command: Option<&Vec<String>>,
+    ai_launch: Option<&AiLaunchSpec>,
+) -> LaunchBinding {
+    if let Some(ai_launch) = ai_launch {
+        return restore_replay::new_ai_binding(
+            ai_launch.provider,
+            ai_launch.resume_mode,
+            None,
+            ai_launch.conversation_id.clone(),
+        );
+    }
     let Some(argv) = command else {
         return restore_replay::new_shell_binding(None);
     };
@@ -1522,18 +1532,18 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusRight => self.focus_workspace(FocusDirection::Right, cx),
             LayoutAction::WorkspaceFocusUp => self.focus_workspace(FocusDirection::Up, cx),
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
-            LayoutAction::NewTab => self.create_tab(None),
+            LayoutAction::NewTab => self.create_tab(None, None),
             LayoutAction::NewClaudeTab => {
-                self.create_tab(Some(ai_tab_command(AiProvider::ClaudeCode, false)));
+                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New);
             }
             LayoutAction::NewClaudeResumeTab => {
-                self.create_tab(Some(ai_tab_command(AiProvider::ClaudeCode, true)));
+                self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::Resume);
             }
             LayoutAction::NewCodexTab => {
-                self.create_tab(Some(ai_tab_command(AiProvider::CodexCode, false)));
+                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::New);
             }
             LayoutAction::NewCodexResumeTab => {
-                self.create_tab(Some(ai_tab_command(AiProvider::CodexCode, true)));
+                self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume);
             }
             LayoutAction::NextTab => self.switch_tab(TabSessions::focus_next, cx),
             LayoutAction::PrevTab => self.switch_tab(TabSessions::focus_prev, cx),
@@ -2063,7 +2073,7 @@ impl TerminalView {
             }
             ContextMenuAction::SendText(text) => self.send_key_bytes(text.into_bytes()),
             ContextMenuAction::RunCommandInWindow(command) => {
-                self.create_tab(Some(shell_command_argv(&command)));
+                self.create_tab(Some(shell_command_argv(&command)), None);
             }
             ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
             ContextMenuAction::Copy => self.copy_selection(),
@@ -3237,8 +3247,8 @@ impl TerminalView {
             workspace_id: launch.workspace_id,
             size,
             cwd: launch.cwd.clone(),
-            command: command_argv(&launch.command),
-            ai_launch: None,
+            command: launch.session_launch.command.clone(),
+            ai_launch: launch.session_launch.ai_launch.clone(),
             launch_id: launch.launch_id.clone(),
         });
         match result {
@@ -3423,7 +3433,7 @@ impl TerminalView {
     ///
     /// The tab appears once the server answers with `SessionCreated`, so the
     /// strip never shows a tab whose PTY failed to spawn.
-    fn create_tab(&mut self, command: Option<Vec<String>>) {
+    fn create_tab(&mut self, command: Option<Vec<String>>, ai_launch: Option<AiLaunchSpec>) {
         let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         else {
             tracing::warn!("new tab ignored: no workspace is attached yet");
@@ -3435,7 +3445,7 @@ impl TerminalView {
         // has to relaunch rather than a bare login shell. The binding's launch
         // id rides along as the env-envelope id so the session persists its
         // environment under the same id the next snapshot will point at.
-        let binding = launch_binding_for(command.as_ref());
+        let binding = launch_binding_for(command.as_ref(), ai_launch.as_ref());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
@@ -3443,12 +3453,18 @@ impl TerminalView {
             size: self.focused_pane_size,
             cwd: None,
             command,
-            ai_launch: None,
+            ai_launch,
             launch_id,
         });
         if let Err(error) = result {
             tracing::warn!(%error, "new tab dropped: IPC writer closed");
         }
+    }
+
+    /// Ask for an AI tab using structured intent plus the old-server argv twin.
+    fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode) {
+        let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
+        self.create_tab(launch.command, launch.ai_launch);
     }
 
     /// Move the tab selection with `move_selection` and attach whatever it
@@ -3740,7 +3756,7 @@ impl TerminalView {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
-        let binding = launch_binding_for(None);
+        let binding = launch_binding_for(None, None);
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
@@ -5585,17 +5601,6 @@ fn spawn_background_command(command: &str) {
     if let Err(error) = child.spawn() {
         tracing::warn!(%error, "smart selection command failed to spawn");
     }
-}
-
-fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
-    let shell = scribe_common::shell::default_shell_program();
-    let binary = provider.binary_name();
-    let command = if resume {
-        format!("exec {binary} {}", provider.resume_args().join(" "))
-    } else {
-        format!("exec {binary}")
-    };
-    vec![shell, String::from("-lic"), command]
 }
 
 /// Narrow a viewport cell index to the `u16` axis a mouse report carries.

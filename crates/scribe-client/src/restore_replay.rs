@@ -18,12 +18,14 @@ use std::path::PathBuf;
 use scribe_common::ai_state::AiProvider;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
-use scribe_common::protocol::{LayoutDirection, PaneTreeNode, TerminalSize, WorkspaceTreeNode};
+use scribe_common::protocol::{
+    AiLaunchSpec, AiResumeMode, LayoutDirection, PaneTreeNode, TerminalSize, WorkspaceTreeNode,
+};
 
 use crate::layout::{LayoutNode, PaneEdges, PaneId, Rect, SplitDirection};
 use crate::restore_state::{
-    AiResumeMode, LaunchBinding, LaunchKind, LaunchRecord, PaneSnapshot, TabSnapshot,
-    WindowRestoreState, WorkspaceLayoutSnapshot, WorkspaceSnapshot,
+    LaunchBinding, LaunchKind, LaunchRecord, PaneSnapshot, TabSnapshot, WindowRestoreState,
+    WorkspaceLayoutSnapshot, WorkspaceSnapshot,
 };
 use crate::workspace_layout::WindowLayout;
 
@@ -46,6 +48,17 @@ pub enum ReplayCommand {
     AiGeneric { provider: AiProvider },
 }
 
+/// Immutable command/spec pair sent for one session launch.
+///
+/// AI launches always carry both fields during the compatibility window: a
+/// new server consumes `ai_launch`, while an old server ignores that field and
+/// consumes `command`. Plain shells and custom commands keep `ai_launch` empty.
+#[derive(Debug, Clone)]
+pub struct SessionLaunchValues {
+    pub command: Option<Vec<String>>,
+    pub ai_launch: Option<AiLaunchSpec>,
+}
+
 /// One session to re-create during cold-restart replay.
 #[derive(Debug, Clone)]
 pub struct ReplayLaunch {
@@ -54,6 +67,9 @@ pub struct ReplayLaunch {
     pub pane_id: PaneId,
     pub cwd: Option<PathBuf>,
     pub command: ReplayCommand,
+    /// Wire values built together from `command`, keeping the structured AI
+    /// intent and its legacy argv twin in lockstep through replay dispatch.
+    pub session_launch: SessionLaunchValues,
     /// Persisted launch identifier from the restored snapshot. During
     /// cold-restart replay the client forwards this as
     /// `ClientMessage::CreateSession::env_envelope_id` so the server can look
@@ -182,31 +198,61 @@ pub fn prepare_replay(snapshot: &WindowRestoreState) -> RebuiltWindow {
     rebuild_layout_from_snapshot(snapshot)
 }
 
-/// Expand a [`ReplayCommand`] into the argv the server should spawn, or `None`
-/// for a plain login shell.
+/// Build the structured AI intent and its legacy argv compatibility twin.
+///
+/// The legacy command remains client-built only while old servers may receive
+/// this frame. Conversation ids are quoted solely for that old-server shell
+/// command; new servers consume the untouched structured value.
 #[must_use]
-pub fn command_argv(command: &ReplayCommand) -> Option<Vec<String>> {
-    match command {
-        ReplayCommand::Shell => None,
-        ReplayCommand::Custom(argv) => Some(argv.clone()),
-        ReplayCommand::AiTargeted { provider, conversation_id } => {
-            let conversation_id = shell_single_quote(conversation_id);
-            let args = provider.resume_args().join(" ");
-            Some(vec![
-                scribe_common::shell::default_shell_program(),
-                String::from("-lic"),
-                format!("exec {} {args} {conversation_id}", provider.binary_name()),
-            ])
+pub fn ai_launch_values(
+    provider: AiProvider,
+    resume_mode: AiResumeMode,
+    conversation_id: Option<String>,
+) -> SessionLaunchValues {
+    let ai_launch = AiLaunchSpec { provider, resume_mode, conversation_id };
+    let binary = provider.binary_name();
+    let mut shell_command = format!("exec {binary}");
+    if resume_mode == AiResumeMode::Resume {
+        for argument in provider.resume_args() {
+            shell_command.push(' ');
+            shell_command.push_str(argument);
         }
-        ReplayCommand::AiGeneric { provider } => {
-            let args = provider.resume_args().join(" ");
-            Some(vec![
-                scribe_common::shell::default_shell_program(),
-                String::from("-lic"),
-                format!("exec {} {args}", provider.binary_name()),
-            ])
+        if let Some(target_id) = ai_launch.conversation_id.as_deref() {
+            shell_command.push(' ');
+            shell_command.push_str(&shell_single_quote(target_id));
         }
     }
+    SessionLaunchValues {
+        command: Some(vec![
+            scribe_common::shell::default_shell_program(),
+            String::from("-lic"),
+            shell_command,
+        ]),
+        ai_launch: Some(ai_launch),
+    }
+}
+
+/// Build both wire values for a cold-restart replay command.
+#[must_use]
+pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
+    match command {
+        ReplayCommand::Shell => SessionLaunchValues { command: None, ai_launch: None },
+        ReplayCommand::Custom(argv) => {
+            SessionLaunchValues { command: Some(argv.clone()), ai_launch: None }
+        }
+        ReplayCommand::AiTargeted { provider, conversation_id } => {
+            ai_launch_values(*provider, AiResumeMode::Resume, Some(conversation_id.clone()))
+        }
+        ReplayCommand::AiGeneric { provider } => {
+            ai_launch_values(*provider, AiResumeMode::Resume, None)
+        }
+    }
+}
+
+/// Expand a [`ReplayCommand`] into its legacy argv compatibility twin.
+#[must_use]
+pub fn command_argv(command: &ReplayCommand) -> Option<Vec<String>> {
+    replay_launch_values(command).command
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -622,12 +668,15 @@ fn queue_from_launch_record(
         grid: None,
     };
     context.panes.insert(pane_id, pane);
+    let command = replay_command_from_record(record);
+    let session_launch = replay_launch_values(&command);
     context.launches.push_back(ReplayLaunch {
         placeholder_session_id,
         workspace_id,
         pane_id,
         cwd: binding.fallback_cwd.clone(),
-        command: replay_command_from_record(record),
+        command,
+        session_launch,
         launch_id: record.launch_id.clone(),
     });
 }
