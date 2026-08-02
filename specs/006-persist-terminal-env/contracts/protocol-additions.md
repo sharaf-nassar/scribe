@@ -46,7 +46,7 @@ CreateSession {
 
 - Carries the `LaunchRecord.launch_id` from the client's restore TOML when the session is being re-issued by `restore_replay`.
 - Server lookup path: `$XDG_STATE_HOME/<flavor>/restore/env/<window_id>/<env_envelope_id>.envz`.
-- On a successful decrypt the server materializes a temp delta file (see `hook-event-additions.md::SCRIBE_RESTORE_ENV_DELTA_FILE`) and injects its path as a PTY env var so the shell integration can source it after rc.
+- On a successful decrypt the server materializes a shell-specific temp delta file (see `hook-event-additions.md::SCRIBE_RESTORE_ENV_DELTA_FILE`) and injects its path as a PTY env var for the launch's supported post-startup consumer.
 - On any failure (missing file, corrupt header, decrypt error, keystore unavailable) the session continues without an applied delta; the failure transitions the session's `EnvStatus` to `Degraded` and an `EnvStatus` event is emitted.
 
 Backward compatibility: clients omitting the field and servers not yet knowing it both default to `None`. No version bump.

@@ -5,7 +5,7 @@
 
 ## Summary
 
-Add an opt-in, per-terminal environment-persistence feature. Detect changes to exported environment variables as they occur (via the existing structured hook channel, a new `EnvChanged` event kind emitted by each shell's prompt-time hook). Compute a per-session delta against a startup-baseline captured at the post-rc tail of the shell integration script. Persist the delta to disk as an encrypted envelope (ChaCha20-Poly1305; AEAD data key in the OS secret store via the cross-platform `keyring` crate). On cold restart, the client passes the existing `LaunchRecord.launch_id` to the server as `env_envelope_id`; the server decrypts the envelope into a temp file and the shell integration sources it *after* rc has run and *before* the baseline-ready emit, preserving FR-008 precedence. The feature is gated by one toggle in Settings → Terminal → General (default OFF) with a server-side preflight that refuses-with-message if the OS secret store is missing or misconfigured, and a runtime fail-safe that stops persisting (never plaintext) and surfaces a non-intrusive status-bar indicator. The existing handoff/upgrade path is unchanged — the PTY's file descriptor is preserved across handoff so env never resets there.
+Add an opt-in, per-terminal environment-persistence feature. Detect changes to exported environment variables as they occur (via the existing structured hook channel, a new `EnvChanged` event kind emitted by each resident shell's prompt-time hook). Compute a per-session delta against a startup baseline captured after user startup and restore apply: at the integration tail for bash/nushell/PowerShell and at the first prompt for zsh/fish. Persist the delta to disk as an encrypted envelope (ChaCha20-Poly1305; AEAD data key in the OS secret store via the cross-platform `keyring` crate). On cold restart, the client passes the existing `LaunchRecord.launch_id` to the server as `env_envelope_id`; the server decrypts the envelope into a shell-specific temp file and a supported post-startup consumer applies it, preserving FR-008 precedence. Structured AI bash/zsh/fish launches consume the file after login and before `exec` but emit no baseline or prompt deltas; other AI shell kinds stage none. The feature is gated by one toggle in Settings → Terminal → General (default OFF) with a server-side preflight that refuses-with-message if the OS secret store is missing or misconfigured, and a runtime fail-safe that stops persisting (never plaintext) and surfaces a non-intrusive status-bar indicator. The existing handoff/upgrade path is unchanged — the PTY's file descriptor is preserved across handoff so env never resets there.
 
 ## Technical Context
 
@@ -86,11 +86,11 @@ crates/
 │   │   └── settings.css     # +.setting-error styling (red, semi-transparent bg, left border)
 │   └── apply.rs             # +"terminal.env_persistence.enabled" match arm; +preflight invocation before save
 └── dist/                    # Shell integration scripts
-    ├── bash                 # +tail: source $SCRIBE_RESTORE_ENV_DELTA_FILE (after rc); +tail: register prompt hook; +tail: one-shot env-delta emit with --baseline-ready
-    ├── zsh                  # idem (add-zsh-hook precmd)
-    ├── fish                 # idem (fish_prompt event)
-    ├── nu                   # idem (pre_prompt hook)
-    └── pwsh                 # idem (prompt function)
+    ├── bash                 # post-rc tail: apply restore, baseline, then PROMPT_COMMAND delta hook
+    ├── zsh                  # first precmd after rc: apply restore + baseline before recurring precmd delta hook
+    ├── fish                 # first fish_prompt after config: apply restore + baseline before recurring delta hook
+    ├── nu                   # post-startup autoload tail: JSON restore + baseline, then pre_prompt delta hook
+    └── pwsh                 # post-profile script tail: .ps1 restore + baseline, then prompt wrapper
 ```
 
 **Structure Decision**: Extend the existing Rust workspace; no new crate. Encrypted persistence is encapsulated in a new `env_store` submodule of `scribe-server` (the owner of PTY lifecycle, hook ingress, and existing on-disk persistence). Change detection reuses the existing structured hook channel — no new IPC transport. Restore reuses the existing client launch-record replay pipeline — only the new `env_envelope_id` field is added on `CreateSession`. Settings reuses the existing webview configuration pattern, with one toggle row and one inline error row. This preserves constitution principle I (clear crate boundaries) and principle III (consistent UX).

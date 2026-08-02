@@ -131,7 +131,7 @@ Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compat
 
 AI tab shortcuts are configured through provider-specific keys: `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, and `new_codex_resume_tab`.
 
-AI tab working directory offers Active pane (`pane`, default), Project root (`project_root`, falling back through pane to home), and Home (`home`). The selected variant's fallback behavior appears directly under the settings row, and saving a new value affects the next fresh AI tab without restarting the client.
+AI tab working directory offers Active pane (`pane`, default), Project root (`project_root`, falling back through pane to home), and Home (`home`, sent as no cwd so the server uses its validated home fallback). The selected variant's fallback behavior appears directly under the settings row, and saving a new value affects the next fresh AI tab without restarting the client.
 
 Context threshold settings are persisted under `terminal.ai_context_thresholds` and control the warn/danger band boundaries and their display colors. `warn` (default 70) and `danger` (default 90) are integer percentages. `ok_color`, `warn_color`, and `danger_color` are `#rrggbb` hex strings (defaults `#5fa05f`, `#d4a017`, `#c83030`). These thresholds color both the prompt-bar AI context % indicator and the tab inline suffix; see  for band classification logic.
 

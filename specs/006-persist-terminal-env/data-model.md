@@ -42,12 +42,12 @@ The per-terminal snapshot of the exported environment captured immediately after
 
 **Validation**
 
-- Captured exactly once per session, on the `EnvChanged { baseline_ready: true }` event.
+- Captured exactly once per capture-capable resident shell session, on the `EnvChanged { baseline_ready: true }` event. Exec-away AI tabs emit no baseline.
 - Never persisted to disk — strictly in-memory on the server.
 
 **State transitions**
 
-- `Unknown` → `Captured` on the post-rc emit. Immutable thereafter for the session's life.
+- `Unknown` → `Captured` on the post-startup emit. Immutable thereafter for the session's life.
 
 ### EnvChangeEvent
 
@@ -60,7 +60,7 @@ A single hook-channel event reporting set/modify/unset since the shell's previou
 | `session_id` | `SessionId` | Owning session (resolved by the existing hook-channel discovery via `SCRIBE_SESSION_ID`). |
 | `added` | `Vec<(String, String)>` | Names + current values for added/modified vars since the shell's last emit. |
 | `removed` | `Vec<String>` | Names unset since the shell's last emit. |
-| `baseline_ready` | `bool` | `true` exactly once per session — on the post-rc tail emit. `false` on all subsequent emits. |
+| `baseline_ready` | `bool` | `true` once for a capture-capable resident shell after startup/restore. `false` on later emits; AI tabs emit none. |
 
 **Validation**
 

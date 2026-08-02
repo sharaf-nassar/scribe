@@ -89,9 +89,10 @@ the server-built preamble — but both paths source the staged file exactly
 once, AFTER login files, and DELETE it; no path leaves the temp file behind.
 Shell kinds with no delta-apply path (nushell, PowerShell, Unknown) get no
 staging at all (see above). Either way the delta lands AFTER login
-files and BEFORE `exec` — delta wins, satisfying spec-006 FR-008. The
-plain-tab zsh/fish pre-rc non-conformance is NOT fixed here; it is filed as a
-separate spec-006 defect bead. Baseline emission (Q3d, planning decides):
+files and BEFORE `exec` — delta wins, satisfying spec-006 FR-008. Feature 018
+left the separately filed plain-tab zsh/fish issue untouched; scribe-ebz later
+fixed it with post-rc first-prompt initialization. Baseline emission (Q3d,
+planning decides):
 DROP it for AI tabs — `SCRIBE_AI_TAB=1` skips `__scribe_emit_env_baseline`
 (scribe.bash:374-395) and the zsh/fish equivalents. AI tabs exec away
 pre-prompt and never emit deltas, so a baseline buys nothing and costs a
@@ -305,7 +306,7 @@ scribe.bash's emulation block is untouched for plain tabs.
   pre-prompt) and the nushell/PowerShell no-integration limitations.
 - **specs/006-persist-terminal-env/** — amendment note recording the AI-tab
   delta-apply mechanism (preamble consumer, post-login, delta wins) and the
-  known plain-tab zsh/fish pre-rc non-conformance filed as a defect bead.
+  later scribe-ebz plain-tab zsh/fish post-rc correction.
 - **lat.md/client.md** — correct :1424 (describes `ai_tab_cwd` as already
   live and client-side `-lic` shell resolution as current); rewrite for
   structured launch.
@@ -560,7 +561,8 @@ are done.
    only checks it was run and met budget. Script authoring is independent
    [P]; running the measurement is blocked by: 2a, 2b, 3. Blocks: 8.
 7a. **Follow-up beads** — file the spec-006 zsh/fish plain-tab FR-008
-   defect bead; the plain-tab login-shell unification bead; the DUAL-WRITE
+   defect bead (later fixed by scribe-ebz); the plain-tab login-shell
+   unification bead (later rejected by scribe-ad2); the DUAL-WRITE
    RETIREMENT bead (trigger: once the live server runs protocol v4, drop
    the legacy argv twin and the argv-sniffing fallback; `launch_binding_for`
    must not regress to sniffing); sibling-launcher (`shell_command_argv`,

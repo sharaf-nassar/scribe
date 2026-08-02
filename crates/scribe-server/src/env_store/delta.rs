@@ -107,7 +107,8 @@ pub struct EnvChangeEvent {
 }
 
 /// Per-session snapshot of exported env after shell startup/rc completes.
-/// Captured exactly once per session, in-memory only, never on disk.
+/// Captured once for a resident shell that emits a baseline; AI tabs emit none.
+/// The snapshot remains in memory only and is never written to disk.
 #[derive(Debug, Clone)]
 pub struct StartupBaseline {
     pub vars: BTreeMap<String, String>,

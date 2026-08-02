@@ -19,23 +19,23 @@ The change emit goes through the existing `scribe-hook-helper` → `ClientMessag
 - `/proc/<pid>/environ` polling — Linux-only (macOS has no equivalent); race-prone; would skip macOS entirely, violating FR-010 graceful-degradation by platform.
 - Hybrid OSC-baseline + hook-delta — extra complexity for no win; hook channel is sufficient for both.
 
-**Code touchpoints**: `crates/scribe-common/src/hook.rs` (add variant); `crates/scribe-hook-helper/src/main.rs` (add `env-delta` event with `--added-json` / `--removed-json` / `--baseline-ready` flags); `crates/scribe-server/src/hook_ingress.rs` (translate `EnvChanged` → in-memory delta update + debounced persist); `dist/` shell-integration scripts (per-shell hook function emit). See `data-model.md` for entity shapes.
+**Code touchpoints**: `crates/scribe-common/src/hook.rs` (add variant); `crates/scribe-hook-helper/src/main.rs` (add `env_delta` with a JSON `--payload-stdin` document and `--baseline-ready` flag, retaining the older value flags for compatibility); `crates/scribe-server/src/hook_ingress.rs` (translate `EnvChanged` → in-memory delta update + debounced persist); `dist/` shell-integration scripts (per-shell hook function emit). See `data-model.md` for entity shapes.
 
-### R1.2 Baseline capture — Decision: shell integration emits a one-shot `baseline_ready` flag on its post-rc tail emit
+### R1.2 Baseline capture — Decision: shell integration emits one `baseline_ready` event after user startup
 
-At the very tail of the integration script (after rc files have been sourced, after the restore-delta file — if any — has been sourced; see R1.3), the script invokes `scribe-hook-helper --event=env-delta --added-json='<full exported-env snapshot>' --baseline-ready`. The server treats that one event as the `StartupBaseline` for the session and persists nothing yet; subsequent `EnvChanged` events with `baseline_ready: false` are folded into a `TerminalEnvDelta` against that baseline and persisted (debounced).
+After rc/profile processing and restore apply, a capture-capable resident shell pipes its full exported-env snapshot to `scribe-hook-helper --event=env_delta --payload-stdin --baseline-ready`. Bash, nushell, and PowerShell emit at their integration tail; zsh/fish emit from a self-removing first-prompt initializer registered before the recurring delta handler. The server treats that event as `StartupBaseline` and persists nothing yet; later `EnvChanged` events are folded into a debounced `TerminalEnvDelta`. Exec-away AI tabs emit neither event class.
 
-**Rationale**: the per-shell signal for "rc is done, the user has not yet typed anything" is exactly the tail of the integration script — by construction. Folding the baseline-ready signal into the existing `EnvChanged` variant (rather than introducing a separate `InitDone` kind) keeps the protocol surface minimal.
+**Rationale**: the trigger must mean "user startup is done and no command has run yet." An integration tail provides that for bash/nushell/PowerShell; zsh/fish integration loads pre-rc, so their first prompt is the correct boundary. Folding the baseline-ready signal into `EnvChanged` keeps the protocol surface minimal.
 
 **Alternatives considered**:
 - Separate `HookEventKind::InitDone` marker — extra variant for no semantic gain; the post-rc snapshot is itself the baseline payload.
 - Detecting "shell ready" from the server (e.g. waiting for the first OSC 133;A) — fragile across shells, doesn't reliably correspond to rc completion (zsh emits OSC 133;A before some `precmd` hooks finish).
 
-**Code touchpoints**: each `dist/` integration script gains a single tail emit; `crates/scribe-server/src/env_store/delta.rs` handles the `baseline_ready` branch (record baseline, clear any prior delta, do not persist on baseline event).
+**Code touchpoints**: each `dist/` integration script gains one baseline emit at its post-startup boundary; `crates/scribe-server/src/env_store/delta.rs` handles the `baseline_ready` branch (record baseline, clear any prior delta, do not persist on baseline event).
 
-### R1.3 Delta apply at restore — Decision: server writes a per-spawn temp delta file; shell integration sources it AFTER rc, immediately before the baseline-ready emit
+### R1.3 Delta apply at restore — Decision: server writes a per-spawn shell-specific file; a supported consumer applies it AFTER startup
 
-On a restore-driven PTY spawn (`CreateSession.env_envelope_id.is_some()`), the server decrypts the envelope, writes the resulting `export NAME=value` / `unset NAME` lines to a 0o600 temp file under `$XDG_RUNTIME_DIR/<flavor>/env-apply/<session_id>-<pid>.sh`, and injects its path via a new PTY env var `SCRIBE_RESTORE_ENV_DELTA_FILE`. At the tail of each shell's integration script (i.e., after rc has run), the script sources the file if the env var is present, then unlinks the file, then performs the baseline-ready emit. The server unlinks any unconsumed temp file after a short grace period.
+On a supported restore-driven PTY spawn (`CreateSession.env_envelope_id.is_some()`), the server decrypts the envelope, renders a 0o600 apply file in the target shell's dialect (`.sh`, `.fish`, `.json`, or `.ps1`) under `$XDG_RUNTIME_DIR/<flavor>/env-apply/`, and injects its path as `SCRIBE_RESTORE_ENV_DELTA_FILE`. Resident bash/nushell/PowerShell consume it at the post-startup integration tail; zsh/fish consume it from their first prompt after rc/config. Structured AI bash uses its AI-mode integration from the post-login preamble, while AI zsh/fish use the preamble directly. Each consumer unlinks the file; unsupported AI kinds never stage one, and the server defensively unlinks any unconsumed file after 60 seconds.
 
 **Rationale**: this is the only ordering that satisfies FR-008 ("captured user-set value wins"). Sourcing BEFORE rc would let rc files clobber the restored values (e.g., `~/.bashrc` resetting `PATH`). Sourcing AFTER rc preserves the user's working environment as the final state of init. The restored values then naturally become part of the post-restore `StartupBaseline` snapshot — which is correct: on a subsequent restart, only what the user changes from that point forward needs to be re-persisted (delta-only model stays consistent and idempotent).
 
@@ -44,7 +44,7 @@ On a restore-driven PTY spawn (`CreateSession.env_envelope_id.is_some()`), the s
 - Write `export` commands to the PTY's stdin after spawn — fragile timing, may interleave with user keystrokes, depends on shell having opened its line editor.
 - Source before rc (R1 agent's original proposal) — REJECTED for FR-008 reasons noted above; this is the explicit correction recorded under `Cross-stream reconciliations`.
 
-**Code touchpoints**: `crates/scribe-server/src/session_manager.rs#build_pty_options` (inject `SCRIBE_RESTORE_ENV_DELTA_FILE` when the spawn is restore-driven); `crates/scribe-server/src/env_store/store.rs` (decrypt + write temp file + schedule grace-period unlink); each `dist/` script (source-then-unlink block at tail, immediately before the baseline emit).
+**Code touchpoints**: `crates/scribe-server/src/session_manager.rs#build_pty_options` (inject `SCRIBE_RESTORE_ENV_DELTA_FILE` for a supported restore consumer); `crates/scribe-server/src/env_store/store.rs` (decrypt + write temp file + schedule grace-period unlink); each `dist/` script plus the structured-AI server preamble (apply then unlink at the shell's post-startup boundary).
 
 ### R1.4 Performance budgets — concrete numbers
 

@@ -1546,13 +1546,13 @@ mod tests {
 // contracts/hook-event-additions.md and research.md::R1.3 / R3.5).
 //
 // Plain-shell integration consumes `SCRIBE_RESTORE_ENV_DELTA_FILE` after user
-// startup: directly at the tail for bash, or from the first prompt event for
-// zsh/fish, whose integration loads before user rc files. Structured AI
-// launches instead consume it after login from either the bash AI-mode
-// integration script or the zsh/fish server preamble. Every supported path
-// applies then unlinks it; unsupported shell kinds never stage it. This step
-// is intentionally skipped for handoff-restored sessions: per R3.5, handoff
-// preserves the PTY's process so env stays intact.
+// startup: at the integration tail for bash/nushell/PowerShell, or from the
+// first prompt event for zsh/fish, whose integration loads before user rc
+// files. Structured AI launches instead consume it after login from either
+// the bash AI-mode integration script or the zsh/fish server preamble. Every
+// supported path applies then unlinks it; unsupported shell kinds never stage
+// it. This step is intentionally skipped for handoff-restored sessions: per
+// R3.5, handoff preserves the PTY's process so env stays intact.
 // ---------------------------------------------------------------------------
 
 /// Read `terminal.env_persistence.enabled` once for a spawn.
@@ -1576,9 +1576,9 @@ fn env_persistence_enabled() -> bool {
 }
 
 /// Decrypt the per-session env envelope, write a shell-source-compatible
-/// temp file, and return the absolute path. The shell integration script
-/// sources this path after rc has run, applies the deltas, and unlinks the
-/// file.
+/// temp file, and return the absolute path. The launch's supported post-startup
+/// consumer — shell integration for plain sessions and AI bash, or the server
+/// preamble for AI zsh/fish — applies the delta and unlinks the file.
 ///
 /// The caller feature-gates the call; this helper returns `None` (via early
 /// returns) when:
@@ -1709,8 +1709,7 @@ async fn write_private_owner_only(path: &std::path::Path, content: &str) -> std:
     .map_err(|e| std::io::Error::other(format!("blocking panic: {e}")))?
 }
 
-const RESTORE_HEADER: &str =
-    "# Scribe env restore — sourced by shell integration after rc, then unlinked.\n";
+const RESTORE_HEADER: &str = "# Scribe env restore — applied after shell startup, then unlinked.\n";
 
 /// File-name extension for the staged restore file.
 ///

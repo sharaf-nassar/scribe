@@ -112,9 +112,9 @@ pub enum HookEventKind {
         added: Vec<(String, String)>,
         #[serde(default)]
         removed: Vec<String>,
-        /// `true` exactly once per session — on the post-rc tail emit. The server
-        /// records the snapshot in `added` as the session's `StartupBaseline`
-        /// and clears any prior delta. `false` on all subsequent emits.
+        /// `true` once for a capture-capable resident shell after startup and
+        /// restore apply. The server records `added` as `StartupBaseline` and
+        /// clears any prior delta. AI tabs emit no baseline or prompt deltas.
         #[serde(default)]
         baseline_ready: bool,
     },
