@@ -34,13 +34,13 @@ Messages sent from the UI client to the server, defined in [[crates/scribe-commo
 
 `CreateSession` spawns a new PTY with optional workspace, split direction, working directory, dimensions, command, environment-envelope id, and structured AI launch intent.
 
-Its `ai_launch: Option<AiLaunchSpec>` carries provider, `New`/`Resume` mode, and optional conversation id alongside the legacy `command` argv. The field defaults to `None` when absent. When present, structured intent is authoritative and the server ignores the compatibility argv while building the host-shell command.
+Its `ai_launch: Option<AiLaunchSpec>` carries provider, `New`/`Resume` mode, and optional conversation id. The field defaults to `None` when absent. AI creates send it with `command: None`; the server builds the host-shell command. Custom launches keep using `command` with `ai_launch: None`.
 
 `CloseSession` terminates a session. `CloseWindow` closes all sessions in a window and is acknowledged with `WindowClosed` before the client exits. The client also uses `CloseWindow` when a session exit leaves the window with no panes so the empty window is removed from persisted state before it exits. `QuitAll` broadcasts a shutdown request to every connected client, including the sender.
 
 #### Structured AI launch survives MessagePack
 
-A named-MessagePack `CreateSession` round-trip preserves both the structured AI fields and the dual-written legacy command.
+A named-MessagePack `CreateSession` round-trip preserves structured AI fields while its generic `command` field remains empty.
 
 #### Missing structured AI launch defaults safely
 
@@ -200,7 +200,7 @@ The full wire contract is `specs/013-remote-window-control/contracts/remote-prot
 
 Feature 015 bumps [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] to `3` (`specs/015-multi-machine-sharing/contracts/remote-protocol-v3.md`) and layers an additive multi-machine-sharing delta over the v2 catalogue: control-handoff frames, a full-state roster broadcast, sharing fields on `WindowInfo`, an additive `Welcome.participant_id`, and a `Resize` reinterpreted as a per-participant viewport report. Every addition is `#[serde(default)]` and rides the existing framing. Because negotiation stays exact-match, a v2 peer never enters a share — it is refused `IncompatibleVersion` with both versions named, never a half-join (FR-014). See [[protocol#Remote Protocol#Sharing Messages]].
 
-Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is remote-visible. The exact-match gate makes v3/v4 remote pairs refuse with `IncompatibleVersion`; local Unix-socket compatibility instead relies on the additive field's serde default and dual-written legacy command.
+Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is remote-visible. The exact-match gate makes v3/v4 remote pairs refuse with `IncompatibleVersion`. Local AI frames are structured-only; package installation makes the upgraded server ready before relaunching the updated client. The additive field's serde default remains for old/custom command frames.
 
 ### Remote Transport
 

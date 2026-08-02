@@ -15,13 +15,13 @@ consumed at bead-creation time.
 | US-3: `ai_tab_cwd` live (`pane` default, `project_root` chain, new `home`, typed fallback, fresh-creates-only, live settings reload, no dead UI options) | Items 4a (`Home` variant + settings UI incl. apply.rs arm), 4b (client cwd resolution, `TerminalView::reload_config` live read, end-to-end fallback enumeration), 8 (`readlink /proc/<pid>/cwd` per variant) | full |
 | US-4: zsh/fish/nushell/unknown correctness (zsh ZDOTDIR chain, fish vendor conf.d + PATH, nushell documented no-integration + no staging, unknown-shell debug-log path, valid per-shell `-lic` syntax) | Architecture Approach per-shell builders (exact zsh/fish preamble syntax, nushell `nu -l -i -c` no-integration, PowerShell folded into Unknown, Unknown arm preserved); items 2b, 8 (US-4 matrix) | full |
 | Goal: real login+interactive launch before the AI binary runs | Architecture Approach (Q3 invocation); items 2b, 8 | full |
-| Goal: structured `ai_launch`, server-owned argv, dual-write compat, `REMOTE_PROTOCOL_VERSION` 3→4 | Architecture Approach + API/Interface Changes (dual-write matrix, v4 gates); items 1, 3 | full |
+| Goal: structured `ai_launch`, server-owned argv, structured-only AI frames, `REMOTE_PROTOCOL_VERSION` 3→4 | Architecture Approach + API/Interface Changes (compatibility matrix, v4 gates); items 1, 3, 7a | full |
 | Goal: integration attaches to AI tabs on bash/zsh/fish; nushell documented limitation | Items 2a, 2b; Architecture Approach per-shell table | full |
 | Goal: restore delta applied post-login, delta wins (spec-006 FR-008) on bash/zsh/fish | Architecture Approach (Q4 mechanism split, sourced exactly once, deleted); items 2a, 2b, 7b (FR-008 contract comment + spec-006 amendment note), 8 (cold-restart marker check) | full |
 | Goal: `ai_tab_cwd` live with `home` variant, client-resolved, server-guarded | Items 4a, 4b | full |
 | Goal: ~1s perf budget with named `--ai-tab-only` command | Item 6 (owns measurement; stub-binary, no fixed sleeps), item 8 (verifies run + budget) | full |
 | Goal: lat.md sync incl. correcting server.md:572 and client.md:1424 | Item 7b; Affected Components lat.md/server.md, client.md, common.md, settings.md bullets | full |
-| Q1: server-owned argv via structured launch, dual-write, v4 bump, `launch_binding_for` rewire, lockstep argv sites | Items 1 (protocol + plumbing), 3 (client structured launch, binding rewire, replay lockstep), 2b (`ai_provider_hint` from structured field) | full |
+| Q1: server-owned argv via structured launch, v4 bump, `launch_binding_for` rewire, structured-only retirement | Items 1 (protocol + plumbing), 3 (client structured launch and binding rewire), 2b (`ai_provider_hint` from structured field), 7a (retirement) | full |
 | Q2: AI tabs only; plain tabs unchanged | Architecture Approach ("plain tabs untouched"), Non-Goals honored; follow-up unification bead in item 7a. Noted documented edge: `--rcfile` removal changes hand-typed custom `["bash"]` launches (Risks; spec-mandated) | full |
 | Q3 (a-f): real login + source-preamble, AI-mode gate, `-i` kept, env-var path crossing, baseline decision (planning), bashrc consequence documented, dead `--rcfile` removed | Architecture Approach (all six amendments; Q3d decided: DROP baseline for AI tabs with rationale); items 2a, 2b | full |
 | Q4: enforce FR-008 for AI tabs; track plain-tab zsh/fish separately | Architecture Approach (Q4 paragraph); items 2a, 2b, 7a (later fixed by scribe-ebz), 7b (server/spec-006 correction) | full |
@@ -45,13 +45,12 @@ existing epic covers this work (spec and plan agree).
 
 Honest consolidation of the plan's Risks section plus analysis findings:
 
-1. **Old-live-server window / dual-write retirement deferred.** The live
-   server cannot be restarted; the new pipeline activates only after an
-   approved upgrade. Until the retirement bead (item 7a) lands, TWO argv
-   builders and the token-sniffing fallback coexist indefinitely — a
-   drift surface if either is edited alone. Mitigated by the lockstep
-   requirement (item 3) and the explicit retirement trigger, but the
-   window's length is user-controlled, not plan-controlled.
+1. **Unsupported mixed local versions.** Structured-only AI frames cannot
+   launch through a pre-v4 local server. Debian `postinst` prevents that state
+   in the supported flow by upgrading and waiting for the server before
+   relaunching the new client; failure or deferral leaves the old client in
+   place. Manually launching the new binary against the old server remains
+   explicitly unsupported.
 2. **Login-profile latency variance.** nvm/conda/mise chains can blow the
    ~1s budget on other machines; Q6 forbids an escape hatch, so a miss is
    a finding to surface, not a mitigation path. Budget is scoped to this
@@ -103,9 +102,7 @@ Near-empty, as expected after Clarifications:
   error ships — that is a recorded scope decision, not an open question.
 - **Baseline emission (Q3d)** was delegated to planning and IS decided:
   drop for AI tabs, gated on `SCRIBE_AI_TAB=1` only. Closed.
-- Genuinely open: none blocking. Two watch items, not questions: the exact
-  timing of dual-write retirement (depends on the user approving a live
-  server upgrade — item 7a trigger is defined, the date is not), and
+- Genuinely open: none blocking. One watch item, not a question:
   whether `AiProvider`/serde derives are reused on the wire vs mirrored
   (plan item on ai_state.rs leaves "confirm or mirror" to implementation;
   bounded either way).
@@ -134,8 +131,8 @@ including the previously open OQ9, now closed via item 2b's typed fallback
 chain and documented command-not-found consequence. The one constitution
 tension (Principle 2 vs Q3e) is a knowingly accepted, documented outcome of
 the user's own redesign directive rather than an oversight, and the
-riskiest surfaces (dual-write compat window, cold-restart binding rewire,
+riskiest surfaces (server-first upgrade sequencing, cold-restart binding rewire,
 double-sourcing) each have a named mitigation and a named manual check in
 the item-8 gate. Remaining risks are execution-discipline items (sandbox
-artifact freshness, apply.rs string arm, retirement-bead follow-through),
+artifact freshness and the apply.rs string arm),
 none of which blocks bead creation.
