@@ -32,7 +32,7 @@ Messages sent from the UI client to the server, defined in [[crates/scribe-commo
 
 `CreateSession` spawns a new PTY with optional workspace, split direction, working directory, dimensions, command, environment-envelope id, and structured AI launch intent.
 
-Its `ai_launch: Option<AiLaunchSpec>` carries provider, `New`/`Resume` mode, and optional conversation id alongside the legacy `command` argv. The field defaults to `None` when absent. This plumbing milestone preserves spawn behavior: the server stores the value, while `command` remains authoritative until the server-owned argv builder lands.
+Its `ai_launch: Option<AiLaunchSpec>` carries provider, `New`/`Resume` mode, and optional conversation id alongside the legacy `command` argv. The field defaults to `None` when absent. When present, structured intent is authoritative and the server ignores the compatibility argv while building the host-shell command.
 
 `CloseSession` terminates a session. `CloseWindow` closes all sessions in a window and is acknowledged with `WindowClosed` before the client exits. The client also uses `CloseWindow` when a session exit leaves the window with no panes so the empty window is removed from persisted state before it exits. `QuitAll` broadcasts a shutdown request to every connected client, including the sender.
 
