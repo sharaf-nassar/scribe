@@ -78,7 +78,8 @@ pub enum ClosedPane {
     LastPane,
 }
 
-/// Server-owned workspace metadata delivered by `ServerMessage::WorkspaceInfo`.
+/// Server-owned workspace metadata delivered by `WorkspaceInfo` or
+/// `WorkspaceNamed`.
 ///
 /// Kept as one value so the reader can park a whole update and the GPUI thread
 /// can apply it to the region's slot in a single call, rather than threading
@@ -357,6 +358,14 @@ impl PaneShell {
     /// The focused workspace region's ID.
     pub fn focused_workspace_id(&self, cx: &App) -> WorkspaceId {
         self.workspace.read(cx).focused_workspace_id()
+    }
+
+    /// The server-derived project root for the focused workspace region.
+    pub fn focused_workspace_project_root(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let workspace = self.workspace.read(cx);
+        workspace
+            .find_workspace(workspace.focused_workspace_id())
+            .and_then(|slot| slot.project_root.clone())
     }
 
     /// The focused workspace region's live accent color.
