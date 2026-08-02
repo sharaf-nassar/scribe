@@ -540,11 +540,10 @@ are merged below.
    the keystore, EXCLUSION_SET filters staleness not secrecy) to AI
    processes — record the decision (and whether AI tabs get a restore
    opt-out) rather than inheriting it. (b) Every story requires new
-   server behavior, and the live server must not be restarted
-   (CLAUDE.md); name the manual verification vehicle (dev-flavor
-   `scribe-dev` identity split, shell_integration.rs:107-130, or an
-   explicitly approved restart) so acceptance criteria are actually
-   reachable. — flagged by: stakeholders, requirements, gaps.
+   server behavior, and the host server must not be accessed or restarted;
+   name a disposable, networkless sandbox as the manual verification vehicle
+   so acceptance criteria are actually reachable. — flagged by:
+   stakeholders, requirements, gaps.
 
 ### Non-Blocking Observations
 
@@ -698,7 +697,7 @@ Measurement: extend tools/perf-ab-rig/run-perf-ab.sh with a timed
 session-appearance polling — giving Principle 4 a named command. No
 escape-hatch/fast-path setting.
 
-### Q7 → 7A amended: full env accepted; verify via dev flavor; add SHELL to EXCLUSION_SET
+### Q7 → 7A amended: full env accepted; sandbox verification; add SHELL to EXCLUSION_SET
 
 Decision recorded (Principle 5): the full login env AND the persisted
 restore-delta flow into AI CLIs deliberately — explicit user intent,
@@ -707,10 +706,10 @@ patterns (persisting API_TOKEN is asserted-intended in its own tests,
 delta.rs:276-280) — accepted. Amendment: add `SHELL` to EXCLUSION_SET
 in this feature (a restored stale SHELL could redirect which
 interpreter launches — control-flow, not staleness); consider
-ENV/ZDOTDIR/XDG_DATA_DIRS alongside. Verification vehicle: the
-`scribe-dev` flavor (fully isolated by executable stem:
-socket/config/state/keystore; a dev server already runs on this
-machine). Named commands: `just install-dev`, `/usr/bin/scribe-dev`,
-`tools/perf-ab-rig/run-perf-ab.sh --live`. NEVER `just server` /
-`just restart-server` (stable flavor → live server). The live
-production server is never restarted.
+ENV/ZDOTDIR/XDG_DATA_DIRS alongside. Verification vehicle: fresh release
+artifacts inside a disposable `--network none` sandbox with isolated `HOME`,
+XDG directories, display/runtime variables, and `/run`; no host Scribe socket,
+process, display, or user-state mount is allowed. Artifact timestamps and
+SHA-256 values are checked before execution. Host-installed `scribe-dev`,
+`just install-dev`, `just server`, and restart targets are forbidden. Results
+and limitations are recorded in `verification.md`.

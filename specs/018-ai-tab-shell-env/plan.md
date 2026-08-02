@@ -385,15 +385,17 @@ extensions are explicitly justified:
    enumerates exclusion behavior; extending it for `SHELL` (and the other
    added names) keeps the asserted-intended semantics honest.
 
-Everything else is manual, per user story, on the `scribe-dev` flavor
-(fully isolated by executable stem: socket/config/state/keystore). Named
-commands — NEVER `just server` / `just restart-server` (stable flavor →
-live server; Principle 7):
+Everything else is manual, per user story, inside a disposable sandbox.
+Scribe processes must run with `--network none`, an isolated `HOME` and all
+XDG/display/runtime variables, a private `/run`, and no host Scribe, display,
+runtime-socket, or user-state mounts. Build fresh release artifacts outside
+the sandbox, verify their timestamps and SHA-256 values, mount or copy only
+those artifacts into the sandbox, and re-check hashes before execution.
+Never install or run `/usr/bin/scribe-dev`, `just install-dev`, `just server`,
+or either restart target for this verification.
 
-- Build/install: `just ready`, then `just install-dev`; run
-  `/usr/bin/scribe-dev`.
 - **US-1 (login env)**: add `export SCRIBE_SENTINEL=profile` to
-  `~/.bash_profile`; open an AI tab (ctrl+alt+c) in scribe-dev;
+  the sandbox `~/.bash_profile`; open an AI tab in the sandbox client;
   `tr '\0' '\n' < /proc/$(pgrep -n claude)/environ | grep SCRIBE_SENTINEL`.
   Also verify PATH resolution itself, not just env inheritance: install a
   shim `claude` in a profile-PATH-only directory and confirm
@@ -401,8 +403,8 @@ live server; Principle 7):
   Repeat with the sentinel in `~/.zprofile` / fish `config.fish` after
   pointing the passwd shell at zsh/fish (`chsh -s`), restoring afterwards.
 - **US-2 (integration parity / delta restore)**: with env persistence on in
-  the dev flavor, export a marker var in a plain tab, cold-restart the DEV
-  server only, confirm the relaunched AI tab's `/proc/<pid>/environ`
+  the sandbox, export a marker var in a plain tab, stop and relaunch only the
+  disposable sandbox server, then confirm the AI tab's `/proc/<pid>/environ`
   contains the marker (delta applied post-login). Assert the staged delta
   temp file EXISTS in the per-flavor `$XDG_RUNTIME_DIR` staging dir before
   the AI tab consumes it, and is deleted after startup. Confirm no
@@ -426,10 +428,10 @@ live server; Principle 7):
   disposable `--network none` container with Xvfb + openbox, an isolated
   `/run`, `HOME`, config, state, data, and cache, and no host Scribe socket.
   Result: **587.627 ms — PASS** against the 1000 ms soft budget.
-- **Regression sweep**: `just ready`, then `just e2e-func
-  func/shell-integration.sh`, `just e2e-func func/env-persistence.sh`,
-  `just e2e-func func/cold-restart.sh` — plain-tab integration, env
-  persistence, and cold-restart replay must stay green.
+- **Regression sweep**: run `just ready` as a static worktree check, then run
+  the existing `func/shell-integration.sh`, `func/env-persistence.sh`, and
+  `func/cold-restart.sh` scripts in the audited networkless sandbox. Plain-tab
+  integration, env persistence, and cold-restart replay must stay green.
 - **Remote refusal**: optional spot check that a v3 peer is refused with
   `IncompatibleVersion` (log inspection), no new harness.
 - **PowerShell non-regression**: one smoke check that the plain-tab
@@ -575,12 +577,11 @@ are done.
    by: 2b, 3, 4b (documents final behavior). Blocks: nothing — runs in
    parallel with the verification gate.
 8. **Manual verification gate** — execute the full Testing Strategy command
-   list on the `scribe-dev` flavor (US-1..US-4 matrices incl. staged-file
+   list in the audited networkless sandbox (US-1..US-4 matrices incl. staged-file
    and ZDOTDIR/XDG_DATA_DIRS leak checks, PowerShell smoke, cold-restart
    replay); confirm the perf measurement from the rig item met budget; run
-   `just ready` and the regression sweep (`just e2e-func
-   func/shell-integration.sh`, `func/env-persistence.sh`,
-   `func/cold-restart.sh`); record results in the epic. Blocked by: 2a,
+   `just ready` and the three existing regression scripts through that sandbox;
+   record results in `verification.md`. Blocked by: 2a,
    2b, 3, 4b, 5, 6. Final gate.
 
 Dependency check: 1→{2b,3}; 3→4b; 4a→4b; {2a,2b,3}→6; {2b,3,4b}→7b;
