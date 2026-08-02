@@ -26,7 +26,7 @@ the exact audited source revision or for an enabled screen reader.
 
 | ID | Surface | Finding | User impact | Priority | Remediation |
 | --- | --- | --- | --- | --- | --- |
-| A11Y-01 | Titlebar and tabs | Tabs, tab-close targets, equalize/settings/workspace-notes icons, and custom window controls are mouse-only. `TitlebarView` tracks only its root focus and has no key listener or child focus order. | Keyboard-only users cannot operate custom chrome or discover its focused control. | P1 | `scribe-38e.108` |
+| A11Y-01 | Titlebar and tabs | Tabs, tab-close targets, equalize/settings icons, and custom window controls were mouse-only. `TitlebarView` tracked only its root focus and had no key listener or child focus order. | Keyboard-only users could not operate custom chrome or discover its focused control. | P1 | `scribe-38e.108` |
 | A11Y-02 | Titlebar and tabs | No titlebar element sets an AccessKit role, accessible name, selected state, or non-pointer action. Icon glyphs (`⚙`, `⊞`, `N`, `×`) therefore do not convey purpose; tabs do not expose their title or active state. | Screen readers and voice control cannot identify or invoke terminal-window chrome. | P1 | `scribe-38e.109` |
 | A11Y-03 | Settings operation | Settings has one root `FocusHandle`; its sidebar, toggles, choices, steppers, actions, and trust mutation controls are generic click targets with no child focus or key handling. | Keyboard-only users cannot navigate settings, change a value, or reach overflow content reliably. | P1 | `scribe-38e.110` |
 | A11Y-04 | Settings semantics | Settings rows render generic divs. Labels are not programmatically associated with controls; current value, selected page, toggle state, and preflight/trust feedback are not exposed as accessible state or live feedback. | Screen-reader users cannot understand settings structure, state, or action results. | P1 | `scribe-38e.111` |
@@ -40,8 +40,8 @@ can be called complete.
 ## Evidence
 
 - `crates/scribe-client/src/titlebar.rs`: the root uses `track_focus`, while
-  `render_tab`, `render_tab_close`, `render_icon_button`,
-  `render_workspace_notes_button`, and `render_window_control` use mouse/click
+  `render_tab`, `render_tab_close`, `render_icon_button`, and
+  `render_window_control` used mouse/click
   listeners only. No `on_key_down`, role, label, or accessibility action is
   present.
 - `crates/scribe-client/src/settings/window.rs`: the root uses `track_focus`;

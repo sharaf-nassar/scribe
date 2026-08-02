@@ -112,21 +112,13 @@ use scribe_client::window_state::{
     WindowGeometry, WindowRegistry, geometry_from_bounds, geometry_size_is_sane,
     normalize_legacy_geometry, window_bounds_for,
 };
-use scribe_client::workspace_notes::WorkspaceNotesStore;
-use scribe_client::workspace_notes_modal::{
-    WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
-};
-use scribe_client::workspace_notes_preview::{
-    MAX_PREVIEW_ROWS, WorkspaceNotesPreviewAction, WorkspaceNotesPreviewColors,
-    WorkspaceNotesPreviewView,
-};
 use scribe_client::x11_focus::X11FocusGuard;
 use scribe_client::zoom::ZoomState;
 use scribe_client::{
     smart_selection::CompiledSmartSelection,
-    tab_bar::{TabBarColors, context_suffix},
+    tab_bar::{TabBarColors, badge_label, context_suffix},
     tab_session::{TabEntry, TabSessions},
-    titlebar::{TITLEBAR_HEIGHT, TitlebarEvent, TitlebarView},
+    titlebar::{TitlebarEvent, TitlebarView},
 };
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
@@ -138,8 +130,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
-        ArchiveReason, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
-        ServerMessage, SessionInfo, TerminalSize, WindowInfo,
+        AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind, ServerMessage,
+        SessionInfo, TerminalSize, WindowInfo,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -383,11 +375,6 @@ struct Shared {
     /// the server's answer and the next reconcile pass applies it on the thread
     /// that owns the layout.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
-    /// Server-owned workspace notes. The IPC reader folds every
-    /// `WorkspaceNotesSnapshot` reply and `WorkspaceNotesChanged` broadcast into
-    /// this cache; the open notes modal adopts it on the next redraw, because a
-    /// modal is a GPUI entity the reader thread must not touch.
-    notes: Arc<Mutex<WorkspaceNotesStore>>,
     /// Spec-010 OSC 52 state. The IPC reader records the negotiated gating bit,
     /// parks a confirmation request, and queues the host clipboard jobs the
     /// server forwards; the view's lifecycle tick raises the prompt as a modal
@@ -700,14 +687,6 @@ struct PointerState {
     report_cell: Option<(u16, u16)>,
 }
 
-/// The transient titlebar-hover notes surface and the cache version it shows.
-#[derive(Default)]
-struct WorkspaceNotesPreviewSurface {
-    view: Option<Entity<WorkspaceNotesPreviewView>>,
-    workspace_id: Option<WorkspaceId>,
-    adopted: u64,
-}
-
 impl ClipboardSurfaces {
     /// Open a live host clipboard handle around an already-subscribed paste
     /// gate, with no OSC 52 prompt in flight.
@@ -872,14 +851,6 @@ struct TerminalView {
     /// [`UpdateAction`] routes to install-vs-restart. `None` whenever the open
     /// modal is not an update confirmation.
     update_dialog_kind: Option<UpdateDialogKind>,
-    /// The per-workspace notes modal overlay, present only while open.
-    workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
-    /// The hover preview anchored to the titlebar's notes affordance.
-    workspace_notes_preview: WorkspaceNotesPreviewSurface,
-    /// The `WorkspaceNotesStore` version the open modal is already showing, so
-    /// a redraw only re-hydrates it when the reader has folded in a newer
-    /// snapshot or change broadcast.
-    workspace_notes_adopted: u64,
     /// OSC 8 URI held while the disallowed-scheme dialog is up, so an "Open
     /// Anyway" choice can activate the verbatim URI (spec 009 FR-015). The
     /// dialog view owns its own copy for display; this is the activation copy
@@ -1091,9 +1062,6 @@ impl TerminalView {
             context_menu: None,
             dialog: None,
             update_dialog_kind: None,
-            workspace_notes_modal: None,
-            workspace_notes_preview: WorkspaceNotesPreviewSurface::default(),
-            workspace_notes_adopted: 0,
             pending_osc8_uri: None,
             pending_lan_approval: None,
             clipboard: ClipboardSurfaces::new(gate),
@@ -1313,10 +1281,6 @@ impl TerminalView {
         });
         cx.subscribe(&bar, |this, _bar, event: &TitlebarEvent, ctx| match event {
             TitlebarEvent::OpenSettings => this.open_or_focus_settings(ctx),
-            TitlebarEvent::WorkspaceNotesHover(hovered) => {
-                this.set_workspace_notes_preview(*hovered, ctx);
-            }
-            TitlebarEvent::OpenWorkspaceNotes => this.open_workspace_notes_modal(ctx),
             TitlebarEvent::ReorderTab { from, to } => {
                 if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(*from, *to)) {
                     ctx.notify();
@@ -1485,6 +1449,37 @@ impl TerminalView {
                 bar.set_tabs(data, ctx);
             }
         });
+    }
+
+    /// Project the focused tab's live pane topology into titlebar chrome.
+    ///
+    /// The shell is reconciled before this runs each frame, so asynchronous
+    /// session retirement and adoption cannot leave the equalize affordance
+    /// one topology behind. The titlebar setter is idempotent to avoid turning
+    /// this projection into a redraw loop.
+    fn sync_equalize_visibility(&mut self, cx: &mut Context<Self>) {
+        let show = self.shell.focused_region_pane_count(cx) >= 2;
+        self.titlebar.update(cx, |bar, ctx| bar.set_show_equalize(show, ctx));
+    }
+
+    /// Project the focused workspace's live name and accent into the titlebar.
+    ///
+    /// [`PaneShell`] owns region identity, count, focus, and accent. The IPC reader
+    /// owns the authoritative name in shared chrome metadata, so copy that name
+    /// and release its mutex before touching the GPUI titlebar entity.
+    fn sync_workspace_badge(&mut self, cx: &mut Context<Self>) {
+        let workspace_id = self.shell.focused_workspace_id(cx);
+        let multi_workspace = self.shell.region_count(cx) > 1;
+        let accent = opaque_slot(self.shell.focused_workspace_accent(cx));
+        let name = self
+            .shared
+            .chrome_metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.workspace_name(workspace_id).map(ToOwned::to_owned));
+        let badge =
+            badge_label(name.as_deref(), multi_workspace).map(|label| (label.to_owned(), accent));
+        self.titlebar.update(cx, |bar, ctx| bar.set_badge(badge, ctx));
     }
 
     /// Run one [`LayoutAction`] intercepted from the key path.
@@ -4988,277 +4983,6 @@ impl TerminalView {
         mutate(&mut guard);
     }
 
-    /// The workspace the notes surface belongs to: the one the user is in.
-    ///
-    /// The focused region wins whenever the server itself minted its id, which
-    /// is what makes a split window open notes for the region under the cursor
-    /// rather than for the window as a whole. A region the client opened but
-    /// the server has not answered for yet is not a workspace the server can
-    /// look notes up by, so the fallback is the focused tab's workspace — the
-    /// id `SessionList` / `SessionCreated` filed that session under.
-    ///
-    /// `None` means the client has not yet learned any server workspace, and
-    /// the callers treat that as "nothing to ask about" instead of inventing an
-    /// id the server has never seen.
-    fn notes_workspace_id(&self, cx: &App) -> Option<WorkspaceId> {
-        let focused = self.shell.focused_workspace_id(cx);
-        if self.shell.is_server_workspace(focused) {
-            return Some(focused);
-        }
-        self.shared.tabs.lock().ok().and_then(|tabs| tabs.active_workspace())
-    }
-
-    /// Open the workspace-notes modal on the focused workspace, seeded from the
-    /// cache the reader keeps, and ask the server for its authoritative copy.
-    ///
-    /// Nothing is fabricated here: the modal is bound to the very
-    /// [`WorkspaceId`] the server knows the focused pane by, so the
-    /// `WorkspaceNotesGet` it puts on the wire names a workspace the server can
-    /// answer for, and the `WorkspaceNotesMutate` a save produces is filed
-    /// against real notes. The reply lands on the reader thread and is folded
-    /// in by [`Self::sync_workspace_notes`] on the next redraw.
-    fn open_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
-        self.workspace_notes_preview = WorkspaceNotesPreviewSurface::default();
-        self.command_palette = None;
-        self.context_menu = None;
-        let Some(workspace_id) = self.notes_workspace_id(cx) else {
-            tracing::warn!("workspace notes requested before any server workspace is known");
-            return;
-        };
-        let colors = WorkspaceNotesModalColors::from(&self.chrome);
-        let (draft, active, archived, cached_error, adopted) =
-            self.shared.notes.lock().map_or_else(
-                |_| (String::new(), Vec::new(), Vec::new(), None, 0),
-                |store| {
-                    (
-                        store.draft_text(workspace_id),
-                        store.active_notes(workspace_id),
-                        store.archived_notes(workspace_id),
-                        store.last_error().map(str::to_owned),
-                        store.version(),
-                    )
-                },
-            );
-        self.workspace_notes_adopted = adopted;
-        let modal = cx.new(|cx| {
-            let mut view = WorkspaceNotesModalView::new(&colors, cx);
-            view.open(workspace_id, draft, cx);
-            view.set_notes(active, archived, cx);
-            view.set_error(cached_error, cx);
-            view
-        });
-        if let Err(error) = self.sink.workspace_notes_get(vec![workspace_id]) {
-            tracing::warn!(%error, "workspace notes get dropped: IPC writer closed");
-        }
-        cx.subscribe(&modal, |this, modal, action, ctx| {
-            this.route_workspace_notes_action(&modal, action, ctx);
-        })
-        .detach();
-        self.workspace_notes_modal = Some(modal);
-        tracing::info!(%workspace_id, "opened the workspace notes modal");
-        cx.notify();
-    }
-
-    /// Show or hide the compact notes preview bound to the focused workspace.
-    ///
-    /// The titlebar owns the hover affordance, while this shell owns the
-    /// server-backed data and the preview entity. Keeping that boundary makes
-    /// the view a normal overlay: opening the modal clears it, and every hover
-    /// begins with a fresh `WorkspaceNotesGet` instead of inventing local data.
-    fn set_workspace_notes_preview(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        if !hovered {
-            if self.workspace_notes_preview.view.take().is_some() {
-                self.workspace_notes_preview.workspace_id = None;
-                cx.notify();
-            }
-            return;
-        }
-        if self.workspace_notes_modal.is_some() || self.workspace_notes_preview.view.is_some() {
-            return;
-        }
-        let Some(workspace_id) = self.notes_workspace_id(cx) else {
-            return;
-        };
-        let (summaries, total_count, adopted) = self.shared.notes.lock().map_or_else(
-            |_| (Vec::new(), 0, 0),
-            |store| {
-                let (summaries, total_count) =
-                    store.hover_summaries(workspace_id, MAX_PREVIEW_ROWS, 56);
-                (summaries, total_count, store.version())
-            },
-        );
-        let colors = WorkspaceNotesPreviewColors::from(&self.chrome);
-        let preview = cx.new(|cx| {
-            let mut view = WorkspaceNotesPreviewView::new(colors);
-            view.set_summaries(summaries, total_count, cx);
-            view
-        });
-        cx.subscribe(&preview, move |this, _preview, action, ctx| match action {
-            WorkspaceNotesPreviewAction::OpenEditor => this.open_workspace_notes_modal(ctx),
-            WorkspaceNotesPreviewAction::ArchiveNote(note_id) => {
-                this.send_workspace_notes_mutation(
-                    scribe_common::protocol::WorkspaceNotesMutation::ArchiveNote {
-                        workspace_id,
-                        note_id: note_id.clone(),
-                        reason: ArchiveReason::Done,
-                    },
-                );
-            }
-            WorkspaceNotesPreviewAction::FocusEditor => {}
-        })
-        .detach();
-        self.workspace_notes_preview.view = Some(preview);
-        self.workspace_notes_preview.workspace_id = Some(workspace_id);
-        self.workspace_notes_preview.adopted = adopted;
-        if let Err(error) = self.sink.workspace_notes_get(vec![workspace_id]) {
-            tracing::warn!(%error, "workspace notes hover get dropped: IPC writer closed");
-        }
-        cx.notify();
-    }
-
-    /// Fold the newest server notes into the open modal.
-    ///
-    /// Runs on every redraw for the same reason [`Self::sync_find_results`]
-    /// does: the snapshot reply and the change broadcast both arrive on the IPC
-    /// reader thread, which cannot touch a GPUI entity. The store's version is
-    /// the gate, so an unchanged cache costs one comparison and never clobbers
-    /// what the user is typing; the draft is only replaced while it is pristine
-    /// ([`WorkspaceNotesModalView::replace_pristine_draft`]), which is what
-    /// keeps a late snapshot from eating typed text.
-    fn sync_workspace_notes(&mut self, cx: &mut Context<Self>) {
-        self.sync_workspace_notes_modal(cx);
-        self.sync_workspace_notes_preview(cx);
-    }
-
-    fn sync_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.workspace_notes_modal.clone() else { return };
-        let Some(workspace_id) = modal.read(cx).workspace_id() else { return };
-        let Ok(store) = self.shared.notes.lock() else { return };
-        if store.version() == self.workspace_notes_adopted {
-            return;
-        }
-        self.workspace_notes_adopted = store.version();
-        let active = store.active_notes(workspace_id);
-        let archived = store.archived_notes(workspace_id);
-        let draft = store.draft_text(workspace_id);
-        let error = store.last_error().map(str::to_owned);
-        modal.update(cx, |view, ctx| {
-            view.set_notes(active, archived, ctx);
-            view.replace_pristine_draft(draft, ctx);
-            view.set_error(error, ctx);
-        });
-    }
-
-    fn sync_workspace_notes_preview(&mut self, cx: &mut Context<Self>) {
-        let Some(preview) = self.workspace_notes_preview.view.clone() else { return };
-        let Some(workspace_id) = self.workspace_notes_preview.workspace_id else { return };
-        let Ok(store) = self.shared.notes.lock() else { return };
-        if store.version() == self.workspace_notes_preview.adopted {
-            return;
-        }
-        self.workspace_notes_preview.adopted = store.version();
-        let (summaries, total_count) = store.hover_summaries(workspace_id, MAX_PREVIEW_ROWS, 56);
-        preview.update(cx, |view, ctx| view.set_summaries(summaries, total_count, ctx));
-    }
-
-    /// Route one modal control to its side effect: state transitions update the
-    /// modal, Save/archive emit a `WorkspaceNotesMutate`, and Close clears it.
-    fn route_workspace_notes_action(
-        &mut self,
-        modal: &Entity<WorkspaceNotesModalView>,
-        action: &WorkspaceNotesModalAction,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            WorkspaceNotesModalAction::Close => {
-                self.workspace_notes_modal = None;
-                cx.notify();
-            }
-            WorkspaceNotesModalAction::Save => {
-                if let Some(mutation) = modal.read(cx).save_mutation() {
-                    self.send_workspace_notes_mutation(mutation);
-                }
-            }
-            WorkspaceNotesModalAction::CancelEdit => {
-                modal.update(cx, |m, ctx| {
-                    m.cancel_edit();
-                    ctx.notify();
-                });
-            }
-            WorkspaceNotesModalAction::ShowActive => {
-                modal.update(cx, |m, ctx| {
-                    m.set_view(
-                        scribe_client::workspace_notes_modal::WorkspaceNotesView::Active,
-                        ctx,
-                    );
-                });
-            }
-            WorkspaceNotesModalAction::ShowArchive => {
-                modal.update(cx, |m, ctx| {
-                    m.set_view(
-                        scribe_client::workspace_notes_modal::WorkspaceNotesView::Archive,
-                        ctx,
-                    );
-                });
-            }
-            WorkspaceNotesModalAction::EditActive(note_id) => {
-                let note_id = note_id.clone();
-                modal.update(cx, |m, ctx| m.begin_active_edit_by_id(&note_id, ctx));
-            }
-            WorkspaceNotesModalAction::EditArchived(note_id) => {
-                let note_id = note_id.clone();
-                modal.update(cx, |m, ctx| m.begin_archived_edit_by_id(&note_id, ctx));
-            }
-            WorkspaceNotesModalAction::EditAllArchive => {
-                modal.update(cx, WorkspaceNotesModalView::begin_archive_bulk_edit_all);
-            }
-            WorkspaceNotesModalAction::ArchiveDone(note_id) => {
-                if let Some(mutation) =
-                    modal.read(cx).archive_mutation(note_id, ArchiveReason::Done)
-                {
-                    self.send_workspace_notes_mutation(mutation);
-                }
-            }
-            WorkspaceNotesModalAction::ArchiveRemoved(note_id) => {
-                if let Some(mutation) =
-                    modal.read(cx).archive_mutation(note_id, ArchiveReason::Removed)
-                {
-                    self.send_workspace_notes_mutation(mutation);
-                }
-            }
-        }
-    }
-
-    /// Enqueue a workspace-notes mutation on the outbound sink.
-    fn send_workspace_notes_mutation(
-        &self,
-        mutation: scribe_common::protocol::WorkspaceNotesMutation,
-    ) {
-        if let Err(error) = self.sink.workspace_notes_mutate(mutation) {
-            tracing::warn!(%error, "workspace notes mutation dropped: IPC writer closed");
-        }
-    }
-
-    /// Apply one keystroke to the open workspace-notes modal: Escape/Enter emit
-    /// Close/Save, Backspace deletes, and printable input types into the buffer.
-    fn handle_notes_modal_key(
-        modal: &Entity<WorkspaceNotesModalView>,
-        event: &KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let typed = event.keystroke.key_char.as_ref().filter(|t| !t.is_empty()).cloned();
-        match event.keystroke.key.as_str() {
-            "escape" => modal.update(cx, |_, ctx| ctx.emit(WorkspaceNotesModalAction::Close)),
-            "enter" => modal.update(cx, |_, ctx| ctx.emit(WorkspaceNotesModalAction::Save)),
-            "backspace" => modal.update(cx, WorkspaceNotesModalView::pop_char),
-            _ => {
-                if let Some(text) = typed {
-                    modal.update(cx, |m, ctx| text.chars().for_each(|ch| m.push_char(ch, ctx)));
-                }
-            }
-        }
-    }
-
     /// Claim a keystroke for a shell-owned overlay, with no overlay up yet.
     ///
     /// Two things are claimed ahead of the PTY here: the configured
@@ -5314,7 +5038,6 @@ impl TerminalView {
                     cx,
                 );
             }
-            OverlayChord::WorkspaceNotes => self.open_workspace_notes_modal(cx),
             OverlayChord::ViMode => self.toggle_vi_mode(cx),
         }
     }
@@ -5391,7 +5114,6 @@ impl TerminalView {
             return true;
         }
         let overlay_free = self.dialog.is_none()
-            && self.workspace_notes_modal.is_none()
             && self.find_overlay.is_none()
             && !self.remote_connect.is_active();
 
@@ -5422,11 +5144,6 @@ impl TerminalView {
                 "left" => dialog.update(cx, DialogView::focus_prev),
                 _ => {}
             }
-            return true;
-        }
-
-        if let Some(modal) = self.workspace_notes_modal.clone() {
-            Self::handle_notes_modal_key(&modal, event, cx);
             return true;
         }
 
@@ -6313,17 +6030,6 @@ impl TerminalView {
         })
     }
 
-    fn build_workspace_notes_preview_overlay(&self) -> Option<gpui::AnyElement> {
-        self.workspace_notes_preview.view.clone().map(|preview| {
-            div()
-                .absolute()
-                .top(px(TITLEBAR_HEIGHT))
-                .right(px(154.0))
-                .child(preview)
-                .into_any_element()
-        })
-    }
-
     /// Build the active remote-connect picker above normal terminal chrome.
     fn build_remote_picker_overlay(&self) -> Option<gpui::AnyElement> {
         self.remote_connect.is_active().then(|| {
@@ -6385,9 +6091,10 @@ impl Render for TerminalView {
         self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
-        self.sync_workspace_notes(cx);
         self.sync_remote_connect();
         self.reconcile_panes(cx);
+        self.sync_workspace_badge(cx);
+        self.sync_equalize_visibility(cx);
         self.sync_grid_geometry(cx);
         let ime = self.sync_ime(cx);
         let grid = self.render_grid(ime, cx);
@@ -6407,7 +6114,6 @@ impl Render for TerminalView {
         let share = self.build_share_overlay();
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
-        let notes_preview = self.build_workspace_notes_preview_overlay();
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -6477,8 +6183,6 @@ impl Render for TerminalView {
             .children(self.find_overlay.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
-            .children(self.workspace_notes_modal.clone())
-            .children(notes_preview)
             .children(share)
             .children(tooltip)
             .children(remote_picker)
@@ -6732,7 +6436,6 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
         workspaces: Arc::new(Mutex::new(Vec::new())),
-        notes: Arc::new(Mutex::new(WorkspaceNotesStore::new())),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
     };
@@ -7367,7 +7070,6 @@ fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
         lan: Arc::clone(&ctx.shared.lan),
         prompt_marks: Arc::clone(&ctx.shared.prompt_marks),
         workspaces: Arc::clone(&ctx.shared.workspaces),
-        notes: Arc::clone(&ctx.shared.notes),
         clipboard: Arc::clone(&ctx.shared.clipboard),
         remote: Arc::clone(&ctx.shared.remote),
         out_tx: ctx.out_tx.clone(),
@@ -7843,9 +7545,6 @@ struct ReaderCtx {
     /// `WorkspaceInfo` answers the reader parks for the shell's reconcile pass;
     /// see the `workspaces` field of `Shared`.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
-    /// Server-owned workspace notes the reader folds snapshots and change
-    /// broadcasts into; see the `notes` field of `Shared`.
-    notes: Arc<Mutex<WorkspaceNotesStore>>,
     /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
@@ -8167,8 +7866,6 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::GitBranch { .. } => "GitBranch",
         ServerMessage::SessionList { .. } => "SessionList",
         ServerMessage::WorkspaceInfo { .. } => "WorkspaceInfo",
-        ServerMessage::WorkspaceNotesSnapshot { .. } => "WorkspaceNotesSnapshot",
-        ServerMessage::WorkspaceNotesChanged { .. } => "WorkspaceNotesChanged",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::WindowClosed { .. } => "WindowClosed",
@@ -8398,13 +8095,6 @@ async fn dispatch_server_message(
         ServerMessage::SearchResults { session_id, query, matches } => {
             on_search_results(ctx, session_id, query, matches, attached);
         }
-        // The snapshot answers a `WorkspaceNotesGet`; the change broadcast is
-        // pushed to every connected window after one accepted mutation. Both
-        // carry the same server-owned collection shape and both land in the one
-        // cache the open modal reads, so they are named here and routed as one
-        // to [`on_workspace_notes_message`].
-        notes @ (ServerMessage::WorkspaceNotesSnapshot { .. }
-        | ServerMessage::WorkspaceNotesChanged { .. }) => on_workspace_notes_message(ctx, notes),
         ServerMessage::Error { message } => on_server_error(ctx, message),
         // Feature 015: the four share/control notices are routed as one group so
         // this table stays a screen of routing decisions; the arm names each
@@ -8581,62 +8271,8 @@ fn on_search_results(
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
-/// The prefix the server puts on a rejected workspace-notes mutation.
-///
-/// `ServerMessage::Error` is one flat channel for every rejection, so this is
-/// what separates a notes rejection from an unrelated one and lets it surface
-/// in the modal's own footer instead of only in the status line.
-const WORKSPACE_NOTES_ERROR_PREFIX: &str = "workspace note mutation failed";
-
-/// Fold one server notes answer into the client-side cache.
-///
-/// `WorkspaceNotesSnapshot` is the reply to the `WorkspaceNotesGet` the modal
-/// sends when it opens; `WorkspaceNotesChanged` is what the server fans out to
-/// every connected window after it has persisted an accepted mutation. The
-/// broadcast is the *only* thing that moves the rendered lists — the modal
-/// never optimistically applies its own edit — which is what keeps two windows
-/// converged on the server's last accepted state.
-///
-/// The reader cannot touch the modal, which is a GPUI entity owned by the
-/// window thread, so it writes the cache, bumps its version, and bumps the
-/// repaint generation; [`TerminalView::sync_workspace_notes`] adopts it on the
-/// next frame.
-fn on_workspace_notes_message(ctx: &ReaderCtx, message: ServerMessage) {
-    let Ok(mut store) = ctx.notes.lock() else {
-        tracing::warn!("workspace notes mutex poisoned; dropping a notes answer");
-        return;
-    };
-    match message {
-        ServerMessage::WorkspaceNotesSnapshot { collections } => {
-            tracing::info!(collections = collections.len(), "workspace notes snapshot received");
-            store.apply_collections(collections);
-        }
-        ServerMessage::WorkspaceNotesChanged { collection } => {
-            tracing::info!(
-                workspace_id = %collection.workspace_id,
-                active = collection.active_notes.len(),
-                archived = collection.archived_notes.len(),
-                "workspace notes changed",
-            );
-            store.apply_collection(collection);
-        }
-        // Unreachable: the caller only routes the two notes variants here.
-        other => tracing::warn!(kind = server_message_variant(&other), "not a notes message"),
-    }
-    drop(store);
-    ctx.generation.fetch_add(1, Ordering::Release);
-}
-
-/// Surface one server rejection: always on the status line, and additionally in
-/// the notes modal's footer when the rejection is about a notes mutation.
+/// Surface one server rejection on the status line.
 fn on_server_error(ctx: &ReaderCtx, message: String) {
-    if message.starts_with(WORKSPACE_NOTES_ERROR_PREFIX) {
-        if let Ok(mut store) = ctx.notes.lock() {
-            store.set_error(message.clone());
-        } else {
-            tracing::warn!("workspace notes mutex poisoned; dropping a notes error");
-        }
-    }
     set_status(&ctx.status, &ctx.generation, message);
 }
 

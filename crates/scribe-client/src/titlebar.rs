@@ -58,10 +58,6 @@ pub enum TitlebarEvent {
     OpenSettings,
     /// The equalize icon was clicked (equalize the active tab's panes).
     Equalize,
-    /// The workspace-notes affordance gained or lost pointer hover.
-    WorkspaceNotesHover(bool),
-    /// Open the workspace-notes modal.
-    OpenWorkspaceNotes,
     /// A window-control button was clicked.
     WindowControl(WindowControlKind),
 }
@@ -92,6 +88,7 @@ struct TabClose<'a> {
     id: ElementId,
     title: &'a str,
     foreground: Rgba,
+    visible: bool,
     focused: bool,
 }
 
@@ -132,7 +129,6 @@ pub struct TitlebarView {
     tab_focus_handles: Vec<FocusHandle>,
     tab_close_focus_handles: Vec<FocusHandle>,
     equalize_focus_handle: FocusHandle,
-    notes_focus_handle: FocusHandle,
     gear_focus_handle: FocusHandle,
     minimize_focus_handle: FocusHandle,
     maximize_focus_handle: FocusHandle,
@@ -156,12 +152,11 @@ impl TitlebarView {
             focus_handle: cx.focus_handle(),
             tab_focus_handles: Vec::new(),
             tab_close_focus_handles: Vec::new(),
-            equalize_focus_handle: cx.focus_handle(),
-            notes_focus_handle: cx.focus_handle(),
-            gear_focus_handle: cx.focus_handle(),
-            minimize_focus_handle: cx.focus_handle(),
-            maximize_focus_handle: cx.focus_handle(),
-            close_focus_handle: cx.focus_handle(),
+            equalize_focus_handle: cx.focus_handle().tab_stop(true),
+            gear_focus_handle: cx.focus_handle().tab_stop(true),
+            minimize_focus_handle: cx.focus_handle().tab_stop(true),
+            maximize_focus_handle: cx.focus_handle().tab_stop(true),
+            close_focus_handle: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -180,8 +175,8 @@ impl TitlebarView {
     pub fn set_tabs(&mut self, tabs: Vec<TabData>, cx: &mut Context<Self>) {
         self.tabs = tabs;
         while self.tab_focus_handles.len() < self.tabs.len() {
-            self.tab_focus_handles.push(cx.focus_handle().tab_index(0));
-            self.tab_close_focus_handles.push(cx.focus_handle().tab_index(0));
+            self.tab_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
+            self.tab_close_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
         }
         self.tab_focus_handles.truncate(self.tabs.len());
         self.tab_close_focus_handles.truncate(self.tabs.len());
@@ -195,12 +190,18 @@ impl TitlebarView {
 
     /// Set the workspace badge (label + accent), or clear it with `None`.
     pub fn set_badge(&mut self, badge: Option<(String, Rgba)>, cx: &mut Context<Self>) {
+        if self.badge == badge {
+            return;
+        }
         self.badge = badge;
         cx.notify();
     }
 
     /// Toggle the equalize icon (shown only when the active tab has 2+ panes).
     pub fn set_show_equalize(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_equalize == show {
+            return;
+        }
         self.show_equalize = show;
         cx.notify();
     }
@@ -329,7 +330,6 @@ impl TitlebarView {
         self.tab_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.tab_close_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.equalize_focus_handle.is_focused(window)
-            || self.notes_focus_handle.is_focused(window)
             || self.gear_focus_handle.is_focused(window)
             || self.minimize_focus_handle.is_focused(window)
             || self.maximize_focus_handle.is_focused(window)
@@ -485,7 +485,7 @@ impl TitlebarView {
     }
 
     fn render_tab_close(&self, close: TabClose<'_>, cx: &mut Context<Self>) -> AnyElement {
-        let TabClose { index, id: tab_id, title, foreground: fg, focused } = close;
+        let TabClose { index, id: tab_id, title, foreground: fg, visible, focused } = close;
         let Some(focus) = self.tab_close_focus_handles.get(index).cloned() else {
             return div().into_any_element();
         };
@@ -496,6 +496,7 @@ impl TitlebarView {
             .track_focus(&focus)
             .ml_1()
             .px_0p5()
+            .opacity(if visible { 1.0 } else { 0.0 })
             .text_color(fg)
             .when(focused, |this| this.bg(self.colors.accent).text_color(self.colors.active_text))
             .child("\u{00D7}")
@@ -529,18 +530,18 @@ impl TitlebarView {
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
-        let close = (tab.is_active || self.hovered_tab == Some(index) || focused).then(|| {
-            self.render_tab_close(
-                TabClose {
-                    index,
-                    id: id.clone(),
-                    title: &tab.title,
-                    foreground,
-                    focused: close_focused,
-                },
-                cx,
-            )
-        });
+        let visible = tab.is_active || self.hovered_tab == Some(index) || focused || close_focused;
+        let close = Some(self.render_tab_close(
+            TabClose {
+                index,
+                id: id.clone(),
+                title: &tab.title,
+                foreground,
+                visible,
+                focused: close_focused,
+            },
+            cx,
+        ));
         let underline = tab.is_active.then(|| {
             div()
                 .absolute()
@@ -673,53 +674,6 @@ impl TitlebarView {
                 }
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     key_activate(ctx);
-                }
-            }))
-            .into_any_element()
-    }
-
-    fn render_workspace_notes_button(
-        &self,
-        focused_window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let hover_bg = self.colors.gradient_top;
-        let focus = self.notes_focus_handle.clone();
-        div()
-            .id("workspace-notes")
-            .role(Role::Button)
-            .aria_label("Show workspace notes")
-            .track_focus(&focus)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(34.0))
-            .h_full()
-            .text_color(self.colors.text)
-            .hover(move |style| style.bg(hover_bg))
-            .when(focus.is_focused(focused_window), |this| {
-                this.bg(self.colors.accent).text_color(self.colors.active_text)
-            })
-            .child("N")
-            .on_hover(cx.listener(|_, hovered: &bool, _win, ctx| {
-                ctx.emit(TitlebarEvent::WorkspaceNotesHover(*hovered));
-            }))
-            .on_mouse_move(cx.listener(|_, _: &MouseMoveEvent, _win, ctx| {
-                ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
-            }))
-            // Swallow the press so pointer jitter cannot arm a window move.
-            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-            .on_click(cx.listener(move |_, _, win, ctx| {
-                win.focus(&focus, ctx);
-                ctx.emit(TitlebarEvent::OpenWorkspaceNotes);
-            }))
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, win, ctx| {
-                ctx.stop_propagation();
-                if Self::focus_next_or_previous(event, win, ctx) {
-                    return;
-                }
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    ctx.emit(TitlebarEvent::OpenWorkspaceNotes);
                 }
             }))
             .into_any_element()
@@ -863,7 +817,6 @@ impl Render for TitlebarView {
         let tabs = self.render_tabs(focused_window, cx);
         let equalize = self.render_equalize_button(focused_window, cx);
         let gear = self.render_gear_button(focused_window, cx);
-        let workspace_notes = self.render_workspace_notes_button(focused_window, cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -903,11 +856,6 @@ impl Render for TitlebarView {
                 if this.drag.is_some() && event.pressed_button == Some(MouseButton::Left) {
                     this.update_drag(f32::from(event.position.x), ctx);
                 }
-                let width = f32::from(win.bounds().size.width);
-                let x = f32::from(event.position.x);
-                if (width - 188.0..width - 154.0).contains(&x) {
-                    ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
-                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -931,7 +879,6 @@ impl Render for TitlebarView {
             // Draggable spacer fills the gap between tabs and the right controls.
             .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .children(equalize)
-            .child(workspace_notes)
             .children(gear)
             .child(self.render_window_control(WindowControlKind::Minimize, focused_window, cx))
             .child(self.render_window_control(WindowControlKind::Maximize, focused_window, cx))

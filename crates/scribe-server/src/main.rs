@@ -53,7 +53,6 @@ use scribe_server::session_exit;
 use scribe_server::child_watch;
 mod updater;
 mod workspace_manager;
-mod workspace_notes;
 
 #[cfg(test)]
 mod handoff_tests;
@@ -223,8 +222,6 @@ async fn run_server_loop(
     let release_catalog = Arc::new(tokio::sync::Mutex::new(releases::ReleaseCatalog::default()));
     let release_fetcher: Arc<dyn releases::ReleaseFetcher> =
         Arc::new(releases::GithubReleaseFetcher::new());
-    let workspace_notes =
-        Arc::new(tokio::sync::Mutex::new(workspace_notes::WorkspaceNotesStore::load()));
     // The env-store registry holds per-session env-capture state for the
     // life of the server. `Arc` so the per-session persist tasks spawned
     // by `schedule_persist` can hold a back-pointer alongside hook ingress.
@@ -261,7 +258,6 @@ async fn run_server_loop(
         updater_handle: Arc::clone(&updater_handle),
         release_catalog: Arc::clone(&release_catalog),
         release_fetcher: Arc::clone(&release_fetcher),
-        workspace_notes: Arc::clone(&workspace_notes),
         env_store: Arc::clone(&env_store),
         remote_control: Arc::clone(&remote_control),
     };

@@ -471,8 +471,6 @@ pub enum OverlayChord {
     CloseDialog,
     /// Open the clipboard-confirmation dialog.
     ClipboardDialog,
-    /// Open the workspace-notes modal.
-    WorkspaceNotes,
     /// Toggle vi / copy mode over the terminal grid.
     ///
     /// Vi mode is a shell-owned keyboard mode rather than a painted overlay,
@@ -490,11 +488,10 @@ pub enum OverlayChord {
 /// `ctrl+shift+n` (`new_window`) are user actions and are therefore NOT used
 /// here. A rebind can still move a user action onto one of these chords, which
 /// [`translate_overlay_chord`] resolves in the user's favour.
-pub const OVERLAY_CHORDS: [(&str, OverlayChord); 5] = [
+pub const OVERLAY_CHORDS: [(&str, OverlayChord); 4] = [
     ("ctrl+shift+u", OverlayChord::TooltipDemo),
     ("ctrl+shift+d", OverlayChord::CloseDialog),
     ("ctrl+shift+k", OverlayChord::ClipboardDialog),
-    ("ctrl+shift+m", OverlayChord::WorkspaceNotes),
     ("ctrl+shift+space", OverlayChord::ViMode),
 ];
 

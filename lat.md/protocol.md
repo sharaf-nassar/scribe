@@ -56,14 +56,6 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 The reported tree's [[crates/scribe-common/src/protocol.rs#WorkspaceTreeNode]] `Leaf` carries per-workspace tab ordering (`session_ids`), per-tab pane layouts (`pane_trees`), and the per-workspace active tab index (`active_tab_index`). Accent colors and names still travel separately in `WorkspaceListEntry` / `WorkspaceNamed`. The active tab index is `#[serde(default)]` so a pre-active-tab-aware handoff envelope degrades to 0 (last-active-tab is then re-asserted on the next client report).
 
-### Workspace Notes
-
-Workspace note messages keep note state server-owned while the client renders only cached snapshots.
-
-`WorkspaceNotesGet` requests authoritative note collections for one or more `WorkspaceId` values. `WorkspaceNotesMutate` carries a [[crates/scribe-common/src/protocol.rs#WorkspaceNotesMutation]] value for saving drafts, creating active notes, editing notes, archiving notes, or bulk-editing archived notes.
-
-The server validates each mutation, persists the resulting store, and only then broadcasts [[protocol#Server Messages#Workspace Notes]] to connected clients.
-
 ### Automation
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
@@ -164,14 +156,6 @@ All three variants honour the attach-time `clipboard_gating` negotiation: the se
 
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
 
-### Workspace Notes
-
-Workspace notes are delivered as server-authoritative collections, not as client-owned persisted files.
-
-`WorkspaceNotesSnapshot` answers `WorkspaceNotesGet` with `Vec<WorkspaceNotesCollection>`. `WorkspaceNotesChanged` broadcasts one updated [[crates/scribe-common/src/protocol.rs#WorkspaceNotesCollection]] after an accepted mutation has been written to the server-owned note store.
-
-Clients replace their local note cache from these messages. The broadcast also acts as the success acknowledgement for the requester; failed mutations use `Error` and do not update client caches.
-
 ### Automation
 
 Automation responses expose connected windows to the CLI and let the server forward actions into a specific client window.
@@ -208,7 +192,15 @@ Feature 015 bumps [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
 
-The dialer and owner gate compatibility on [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]], a `u32` starting at 1 with an exact-match policy (bump on any change to remote-visible semantics). Up to 8 remote connections are accepted concurrently, separate from the 32 local cap; excess connections are refused `Busy` after the preamble. Everything within an accepted session — `Welcome`, `AttachSessions`, `SessionReplay`, `PtyOutput`, `KeyInput` (4 KiB cap), resize, scroll/search, clipboard, workspace, and notes messages — keeps byte-identical semantics.
+The dialer and owner gate compatibility on [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]], a `u32` starting at 1 with an exact-match policy (bump on any change to remote-visible semantics). Up to 8 remote connections are accepted concurrently, separate from the 32 local cap; excess connections are refused `Busy` after the preamble. Everything within an accepted session — `Welcome`, `AttachSessions`, `SessionReplay`, `PtyOutput`, `KeyInput` (4 KiB cap), resize, scroll/search, clipboard, and workspace messages — keeps byte-identical semantics.
+
+### Protocol Compatibility After Feature Removal
+
+A retired feature's four message variants and six supporting types were deleted outright, with no compatibility shim, no no-op arm, and no deprecation window; [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] remains `3`.
+
+Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
+
+Repository precedent also left the version unchanged across three earlier remote-visible semantic changes. Together, those constraints make outright deletion at version `3` safer and more consistent than either a staged wire shim or a bump.
 
 ### Preamble Handshake
 

@@ -53,12 +53,12 @@ stopped, upgraded, or replaced.
 | Oracle | Command / method | Result |
 | --- | --- | --- |
 | Unit / golden / GPUI | `cargo test --workspace --no-fail-fast` | **PASS — 967 passed, 0 failed, 0 ignored across 20 suites** |
-| Visual E2E | all executable `tests/e2e/visual/*.sh`, with each script's documented environment | **PASS — 41/41** |
+| Visual E2E | all executable `tests/e2e/visual/*.sh`, with each script's documented environment | **PASS — 40/40** |
 | Functional/lifecycle E2E | all `tests/e2e/func/*.sh` | **PASS — 13/13** |
 | Perf A/B | `tools/perf-ab-rig/run-perf-ab.sh --live` | **PASS — 5/5 measured and inside budget** |
-| Reachability | `tools/check-reachability.sh --working-tree` | **PASS — 65/67 modules, 54/59 server messages, 36/36 layout actions** |
-| Parity drift | `just parity-inventory` | **PASS — 203/203 reachable, 0 unwired, 0 missing; all 48 requirement ids carried** |
-| Parity threshold | `just parity-gate` | **GO — 194/194 user-facing rows reachable (100%)** |
+| Reachability | `tools/check-reachability.sh --working-tree` | **PASS — 64/64 modules, 52/57 server messages, 36/36 layout actions** |
+| Parity drift | `just parity-inventory` | **PASS — 199/199 reachable, 0 unwired, 0 missing; all 48 requirement ids carried** |
+| Parity threshold | `just parity-gate` | **GO — 190/190 user-facing rows reachable (100%)** |
 | Manual | live installed GPUI client on `:0` | **PASS — opacity and IME** |
 | Documentation graph | `lat check` | **PASS** |
 
@@ -67,9 +67,9 @@ stopped, upgraded, or replaced.
 `just parity-gate` reports:
 
 ```text
-parity inventory: 203 rows, 203 reachable, 0 unwired, 0 missing
-  (194 user-facing, 193 reachable in-client, 48 spec requirements carried)
-parity gate: GO — 194 of 194 user-facing rows reachable (100%),
+parity inventory: 199 rows, 199 reachable, 0 unwired, 0 missing
+  (190 user-facing, 189 reachable in-client, 48 spec requirements carried)
+parity gate: GO — 190 of 190 user-facing rows reachable (100%),
   0 unwired, 0 missing
 ```
 
@@ -80,7 +80,7 @@ Every inventory row's own verification method ran:
 
 | Method | Gate evidence |
 | --- | --- |
-| `visual-E2E` | complete 41-script visual suite |
+| `visual-E2E` | complete 40-script visual suite |
 | `scripted-E2E` | complete 13-script functional suite plus visual scripts |
 | `visual-E2E (+ golden bytes)` | visual suite plus workspace golden tests |
 | `gpui-test` | workspace test suite |
@@ -121,7 +121,7 @@ working tree:
 `session-tooling`, `settings-entry`, `settings-trust`, `share-control`,
 `tab-window-chords`, `terminal-viewport`, `terminal-zoom`, `titlebar`,
 `update-dismiss`, `update-trigger`, `window-chrome-bands`,
-`window-lifecycle`, `window-resize`, `workspace-ipc`, `workspace-notes`,
+`window-lifecycle`, `window-resize`, `workspace-ipc`,
 `workspace-split`, and `x11-focus-guard`.
 
 `update-common.sh` is a helper, not a test.

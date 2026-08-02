@@ -334,18 +334,6 @@ The gap those rows had was reachability, not correctness: the window's workspace
 
 The inbound half is injected rather than provoked, because that is what makes it an assertion about the reader rather than about the split: a `WorkspaceInfo` carrying a display name must repaint the status bar's left group, and the same frame with `name: null` must repaint it back to the original pixels. The injected accent is the server's own, echoed out of the recorded frame, so the name is the only thing that moves between captures. The band is derived from each capture's own content bounding box rather than from `xdotool getwindowgeometry`, whose rectangle does not line up with the client area under openbox, and is cropped to the left quarter so the status bar's own 2 s sparkline resample cannot swamp the comparison.
 
-### Workspace notes on the wire
-
-`tests/e2e/visual/workspace-notes.sh` (`just e2e-visual-workspace-notes`) is the app-level oracle for the `WorkspaceNotesGet` / `WorkspaceNotesMutate` client rows and the inbound `WorkspaceNotesSnapshot` / `WorkspaceNotesChanged` rows (see ).
-
-Before opening the modal, the test hovers the real titlebar notes affordance and compares its window capture with the attached-pane baseline. The minimum pixel delta proves  reaches the visible hover-preview view, not only its unit-tested model.
-
-The gap those rows had was not correctness but reality: the modal opened against a workspace id the client had just minted for itself, and both server answers fell into the reader's drop counter, so nothing the server said could ever reach the screen. Every `#[gpui::test]` over the modal passes in that world, so the  wire tap (`SCRIBE_SHARE_TAP=1`) records the real socket and the record is truncated at each phase boundary. Phase 0 is the same daemon-stop-and-relaunch preamble  documents; it is also what gives the window a server-minted workspace to open notes for.
-
-The decisive de-demo assertion is the first one: the `WorkspaceNotesGet` that `ctrl+shift+m` puts on the wire must name the exact workspace the server's own `SessionList` filed the harness session under. A client-minted id can never equal it, so the phase fails outright on the old behaviour rather than passing on a plausible-looking frame. Typing a note and pressing Enter must then produce a `CreateActiveNote` mutation for that same workspace carrying that text, draw a `WorkspaceNotesChanged` broadcast out of the real server, and repaint the modal that is already open.
-
-Closing and reopening the modal drops every local list, so the note that comes back can only be the server's answer to the fresh request: the phase requires the recorded `WorkspaceNotesSnapshot` to carry the text and the reopened modal to hold strictly more ink than the empty one. The last phase injects a `WorkspaceNotesChanged` — the server's own recorded collection plus one extra note — through the tap, because a frame nothing the client did caused is what makes it an assertion about the reader rather than about the save path.
-
 ### Config live reload
 
 `tests/e2e/visual/config-reload.sh` is the scripted oracle for the `ConfigReloaded` parity row: it edits `config.toml` under an already-running client, the user-visible scenario the headless suites cannot reach.

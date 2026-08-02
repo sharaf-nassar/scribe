@@ -115,7 +115,7 @@ rollback for non-Vulkan cutover failures.
 | `dist/debian/*`, deb metadata | New Depends (`libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon-x11-0`, xcb libs; − `libgtk-4-1` at cutover), postinst Vulkan guard. |
 | `LICENSE-*`, README, all `Cargo.toml` license fields | GPL-3.0-or-later migration (step-0), attribution notices for Zed (GPL) and GPUI (Apache-2.0). |
 | `lat.md/` | client.md, rendering.md, settings.md, architecture.md rewritten post-cutover; test.md updated for new harness details. |
-| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (46 ClientMessage / 59 ServerMessage / 54 named keybinding actions / rendering + spec-behaviour + removed-key rows), each row carrying a mandatory "Reachable from" live-path symbol, plus a coverage index binding every `spec.md` requirement-register id to a carrying row. |
+| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (45 ClientMessage / 57 ServerMessage / 54 named keybinding actions / rendering + spec-behaviour + removed-key rows), each row carrying a mandatory "Reachable from" live-path symbol, plus a coverage index binding every `spec.md` requirement-register id to a carrying row. |
 
 ## Data Model
 
@@ -314,8 +314,8 @@ path.
 
 **Phase D — Dialogs & overlays (depends on: phase C shell):**
 - Command palette, context menu, tooltips.
-- Dialog suite: close, update, paste confirmation, clipboard/OSC52,
-  disallowed scheme, workspace notes modal + hover preview.
+- Dialog suite: close, update, paste confirmation, clipboard/OSC52, and
+  disallowed scheme.
 - AI indicator, prompt bar.
 
 **Phase E — Integrations (depends on: phase B; remote/LAN items also
@@ -458,9 +458,8 @@ sharing tail, which is the largest single block of unreachable rows:
   `ListReleases`, `UpdateCheckResult`, `ReleaseList` are already reachable, but
   only from the `--settings` window.)
 - FU-15 X11 focus guard — start `x11_focus.rs` from `open_window`.
-- FU-20 Subscribe / snapshot tooling; FU-21 workspace notes on a real
-  workspace (de-demo the fabricated `WorkspaceId` and route the reply);
-  FU-22 Bell; FU-23 in-app settings entry point.
+- FU-20 Subscribe / snapshot tooling; FU-22 Bell; FU-23 in-app settings entry
+  point.
 - FU-16 Remote (tailnet), FU-17 LAN (mTLS) dial and approval, FU-18 trusted
   devices/networks in the settings window, FU-19 sharing and control. The whole
   of features 013/014/015 is currently unreachable from the GPUI client;
@@ -499,8 +498,9 @@ surface** (bead `scribe-38e.94`, 2026-07-27). Every acceptance criterion and
 porting obligation carries a stable register id, the inventory carries a
 coverage index over those ids, and the same check fails when an id has no
 carrying row — so a requirement can no longer be absent from the metric. Adding
-that derivation grew the inventory from 174 to 203 rows (194 user-facing) and
-moved the figure to 188/194 in-client, 189/194 reachable, because five
+that derivation grew the inventory from 174 to 199 rows (190 user-facing) and
+moved the figure to 189/190 in-client, 190/190 reachable after the workspace
+notes surface was descoped. Five
 requirements that had never been tabulated turn out not to be reachable
 (FU-24..FU-28 in `reachability-audit.md`). Cutover (`scribe-38e.43`+) stays blocked until that
 threshold is met alongside the existing perf and manual re-gate criteria in
@@ -509,13 +509,13 @@ threshold is met alongside the existing perf and manual re-gate criteria in
 #### The go threshold
 
 **Go requires every user-facing row to be reachable: `Unwired = 0` and
-`Missing = 0` on the roll-up's Total row — 194 of 194 user-facing rows (100%)
-at the register's current size, 203 of 203 including the removed-configuration-
+`Missing = 0` on the roll-up's Total row — 190 of 190 user-facing rows (100%)
+at the register's current size, 199 of 199 including the removed-configuration-
 key rows.** Anything less is a NO-GO on this criterion. Score it mechanically
 with `just parity-gate` (`tools/check-parity-inventory.sh --gate`), which
 re-derives the counts exactly as the pre-commit check does and then exits
 non-zero while any user-facing row is unreachable. At the 2026-07-27 gate the
-score was 189/194, five rows short.
+score is now 190/190 after the workspace notes descope.
 
 The number is derived, not chosen. Goal 1 of `spec.md` is "full, reachable
 feature parity … no user-visible regression in functionality", and
@@ -528,7 +528,7 @@ picking one would be a silent amendment of Goal 1.
 
 Two clarifications keep the bar honest rather than merely strict:
 
-- **The denominator moves; the bar does not.** 194 is today's count, not a
+- **The denominator moves; the bar does not.** 190 is today's count, not a
   constant. Adding a requirement to `spec.md`'s register adds a row and raises
   the denominator (the check fails until it does), and the threshold stays
   "all of them". Cite the ratio, not the literal, when the register grows.

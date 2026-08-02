@@ -273,15 +273,6 @@ e2e-visual-ai-task-label:
 # client to adopt the harness session first.
 e2e-visual-workspace-ipc:
     docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-ipc.sh
-# Run the workspace-notes visual E2E: the modal opening on the SERVER's own
-# workspace id, WorkspaceNotesGet / WorkspaceNotesMutate leaving the client, and
-# the WorkspaceNotesSnapshot / WorkspaceNotesChanged answers rendering into the
-# modal. Needs the wire tap (frames are the evidence, and the last phase injects
-# a change the client never asked for) and a longer budget than the default 60 s
-# because the run relaunches the client to adopt the harness session first.
-e2e-visual-workspace-notes:
-    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-notes.sh
-
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
 # response and the bridge read reply leaving the client, and the seeded config
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run

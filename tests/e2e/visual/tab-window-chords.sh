@@ -4,7 +4,7 @@
 # Two parity rows were unreachable for the whole rebuild because the shell
 # hard-coded overlay chords on top of the Linux defaults: Ctrl+Shift+Q
 # (`close_tab`) opened the close-dialog demo, and Ctrl+Shift+N (`new_window`)
-# opened the workspace-notes modal. Both keystrokes were claimed by
+# opened the since-removed notes modal. Both keystrokes were claimed by
 # `handle_overlay_key` and never reached `handle_binding`, so the actions could
 # only be run from the command palette or after a rebind.
 #
@@ -211,7 +211,7 @@ shot /output/01-close-tab.png
 echo "PHASE 1 PASS: ctrl+shift+q closed the tab end to end (client chord, server close)"
 
 # ── Phase 2: Ctrl+Shift+N opens a second window ───────────────────
-# The workspace-notes modal used to own this chord, and `NewWindow` had no
+# A since-removed modal used to own this chord, and `NewWindow` had no
 # handler at all. Both the log line and a second mapped X11 window are asserted:
 # the log proves the action ran, the window count proves it really opened one.
 WINDOWS_LOG_BEFORE=$(count_log "opened a new terminal window")

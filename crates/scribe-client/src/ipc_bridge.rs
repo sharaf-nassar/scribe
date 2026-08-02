@@ -52,10 +52,7 @@ use scribe_client::share::ControlIntent;
 use scribe_common::{
     framing::write_message,
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::{
-        AutomationAction, ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation,
-        WorkspaceTreeNode,
-    },
+    protocol::{AutomationAction, ClientMessage, PromptMarkKind, TerminalSize, WorkspaceTreeNode},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -1239,21 +1236,11 @@ impl IpcSink {
         self.enqueue(ClientMessage::SearchClosed { session_id })
     }
 
-    /// Requests the authoritative workspace notes for `workspace_ids` so the
-    /// modal and hover preview can render server-owned state.
-    ///
-    /// # Errors
-    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
-    /// when the bounded outbound queue is at its cap and refusing frames.
-    pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkError> {
-        self.enqueue(ClientMessage::WorkspaceNotesGet { workspace_ids })
-    }
-
     /// Asks the server to mint a workspace for the window region the
     /// `workspace_split_*` chords just opened.
     ///
     /// A workspace region is a *server* concept — it owns the accent colour,
-    /// the auto-derived name and the notes collection — so a region the client
+    /// the auto-derived name — so a region the client
     /// invents locally is a layout box with nothing behind it. The reply is a
     /// single `WorkspaceInfo` carrying the real [`WorkspaceId`], which the shell
     /// adopts onto the region that asked (see `PaneShell::adopt_pending_workspace`).
@@ -1328,20 +1315,6 @@ impl IpcSink {
     /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn control_intent(&self, intent: ControlIntent) -> Result<(), SinkError> {
         self.enqueue(intent.into_message())
-    }
-
-    /// Requests a server-side workspace-notes mutation (draft save, note
-    /// create/edit, archive, or bulk archive edit) built by the modal or
-    /// preview from the current editor state.
-    ///
-    /// # Errors
-    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
-    /// when the bounded outbound queue is at its cap and refusing frames.
-    pub fn workspace_notes_mutate(
-        &self,
-        mutation: WorkspaceNotesMutation,
-    ) -> Result<(), SinkError> {
-        self.enqueue(ClientMessage::WorkspaceNotesMutate { mutation })
     }
 
     /// Confirms the pending update, so the server downloads, verifies, and
