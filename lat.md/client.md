@@ -146,7 +146,7 @@ When the pending input-start row falls inside the trimmed region it is cleared, 
 
 The local IPC supervisor redials an upgraded server without restarting the GPUI process.
 
- retains one window's IPC queues across a local server handoff, redials with bounded backoff, and sends `Hello` plus `ListSessions` before queued UI traffic. The reply follows , rebuilding the registry, workspace metadata, and tab strip, then  replays every visible pane's connection-local attachment at its retained grid dimensions. LAN and tailnet dials keep their one-shot refusal behavior so a rejected peer never becomes an endless local-looking retry.
+ retains one window's IPC queues across a local server handoff, redials with bounded backoff, and sends `Hello` plus `ListSessions` before queued UI traffic. A successful connection resets the backoff to its 100 ms initial delay, so each later outage gets a fresh fast retry instead of inheriting an earlier outage's 2 s ceiling. The reply follows , rebuilding the registry, workspace metadata, and tab strip, then  replays every visible pane's connection-local attachment at its retained grid dimensions. LAN and tailnet dials keep their one-shot refusal behavior so a rejected peer never becomes an endless local-looking retry.
 
 #### Created and exited transitions
 

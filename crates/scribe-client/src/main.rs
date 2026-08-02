@@ -6701,7 +6701,16 @@ async fn supervise_connection(mut ctx: IpcThread) {
     );
 
     loop {
-        match run_connection(&mut ctx).await {
+        let result = run_connection(&mut ctx).await;
+        // Reader and writer failures also end connections that were fully live,
+        // so the Result alone cannot distinguish them from failed dial attempts.
+        // Consume the shared connection marker before choosing the next delay:
+        // every new outage starts at the short initial retry interval.
+        if ctx.shared.connected.swap(false, Ordering::AcqRel) {
+            reconnect_delay = INITIAL_RECONNECT_DELAY;
+        }
+
+        match result {
             Ok(()) => tracing::info!("server connection closed"),
             Err(error) => {
                 // Logged as well as published: the status line is one line wide
@@ -6710,7 +6719,6 @@ async fn supervise_connection(mut ctx: IpcThread) {
                 // diagnosing a dead window needs, long after the window is gone.
                 tracing::warn!(%error, "server connection failed");
                 if !retry_local {
-                    ctx.shared.connected.store(false, Ordering::Release);
                     set_status(
                         &ctx.shared.status,
                         &ctx.shared.generation,
@@ -6725,7 +6733,6 @@ async fn supervise_connection(mut ctx: IpcThread) {
             return;
         }
 
-        ctx.shared.connected.store(false, Ordering::Release);
         // A queue still at its cap outranks the generic "connection lost" line:
         // the user is typing into a window that is refusing input, and that is
         // the fact that has to be on screen while the redial backs off.
