@@ -1,21 +1,32 @@
 #!/bin/bash
 set -e
 
-PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+MAINTSCRIPT_PACKAGE="${DPKG_MAINTSCRIPT_PACKAGE:-}"
+PACKAGE_NAME="${MAINTSCRIPT_PACKAGE:-scribe}"
 PRIVILEGED_USER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
-if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
-    APP_DISPLAY_NAME="Scribe Dev"
-    APP_SLUG="scribe-dev"
-    SERVER_BIN_NAME="scribe-dev-server"
-    CLIENT_BIN_NAME="scribe-dev"
-    AUTO_SETUP_HOOKS=0
-else
-    APP_DISPLAY_NAME="Scribe"
-    APP_SLUG="scribe"
-    SERVER_BIN_NAME="scribe-server"
-    CLIENT_BIN_NAME="scribe-client"
-    AUTO_SETUP_HOOKS=1
-fi
+case "$PACKAGE_NAME" in
+    scribe-dev)
+        APP_DISPLAY_NAME="Scribe Dev"
+        APP_SLUG="scribe-dev"
+        SERVER_BIN_NAME="scribe-dev-server"
+        CLIENT_BIN_NAME="scribe-dev"
+        AUTO_SETUP_HOOKS=0
+        ;;
+    scribe)
+        APP_DISPLAY_NAME="Scribe"
+        APP_SLUG="scribe"
+        SERVER_BIN_NAME="scribe-server"
+        CLIENT_BIN_NAME="scribe-client"
+        AUTO_SETUP_HOOKS=1
+        ;;
+    *)
+        APP_DISPLAY_NAME=""
+        APP_SLUG=""
+        SERVER_BIN_NAME=""
+        CLIENT_BIN_NAME=""
+        AUTO_SETUP_HOOKS=0
+        ;;
+esac
 
 SERVER_BIN_PATH="/usr/bin/${SERVER_BIN_NAME}"
 CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
@@ -27,6 +38,7 @@ HOT_RELOAD_READY_TIMEOUT_SECS="${HOT_RELOAD_READY_TIMEOUT_SECS:-30}"
 # unit so package installs hot-reload the server whenever those inputs change,
 # even if the server binary itself is unchanged.
 SERVER_RUNTIME_GENERATION=""
+WORKSPACE_NOTES_MIGRATION_REVISION="1"
 
 # binary_changed PID INSTALLED_PATH
 # Returns 0 (true) if the binary changed or comparison failed, 1 (false) if unchanged.
@@ -43,6 +55,108 @@ binary_changed() {
         return 1  # unchanged
     fi
     return 0  # changed (or comparison failed — treat as changed for safety)
+}
+
+SERVER_SCAN_RECORDS=()
+
+scan_server_process_records() {
+    local binary="$1"
+    local proc_dir="" pid="" proc_uid="" exe="" start_time="" exe_hash=""
+
+    SERVER_SCAN_RECORDS=()
+    [ -r /proc/self/stat ] || return 1
+    [ -n "$(readlink /proc/self/exe 2>/dev/null || true)" ] || return 1
+
+    for proc_dir in /proc/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+        pid="${proc_dir#/proc/}"
+
+        proc_uid="$(stat -c '%u' "$proc_dir" 2>/dev/null || true)"
+        if [ -z "$proc_uid" ]; then
+            [ ! -e "$proc_dir" ] && continue
+            return 1
+        fi
+        [ "$proc_uid" = "$TARGET_UID" ] || continue
+
+        exe="$(readlink "${proc_dir}/exe" 2>/dev/null || true)"
+        if [ -z "$exe" ]; then
+            [ ! -e "$proc_dir" ] && continue
+            grep -qE '^State:[[:space:]]+Z' "${proc_dir}/status" 2>/dev/null && continue
+            return 1
+        fi
+
+        case "$exe" in
+            "$binary"|"$binary (deleted)")
+                start_time="$(awk '{print $22}' "${proc_dir}/stat" 2>/dev/null || true)"
+                exe_hash="$(sha256sum "${proc_dir}/exe" 2>/dev/null | cut -d' ' -f1 || true)"
+                if [ -z "$start_time" ] || [ -z "$exe_hash" ]; then
+                    [ ! -e "$proc_dir" ] && continue
+                    return 1
+                fi
+                SERVER_SCAN_RECORDS+=("${pid}:${start_time}:${exe_hash}")
+                ;;
+        esac
+    done
+    return 0
+}
+
+server_process_record_is_alive() {
+    local record="$1"
+    local pid="" recorded_start=""
+    local current_start="" current_hash=""
+
+    IFS=: read -r pid recorded_start _ <<< "$record"
+    kill -0 "$pid" 2>/dev/null || return 1
+    pid_is_zombie "$pid" && return 1
+
+    current_start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [ -n "$current_start" ] || return 0
+    [ "$current_start" = "$recorded_start" ] || return 1
+
+    current_hash="$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1 || true)"
+    [ -n "$current_hash" ] || return 0
+
+    # The same PID and birth time is still the captured process identity.
+    # Executable hash is read to make an unreadable proc entry fail closed;
+    # even an exec by the same process does not authorize deletion.
+    return 0
+}
+
+wait_for_server_process_records_exit() {
+    local attempts="${1:-50}"
+    shift
+    local -a records=("$@")
+    local record="" any_alive=0
+
+    while [ "$attempts" -gt 0 ]; do
+        any_alive=0
+        for record in "${records[@]}"; do
+            [ -n "$record" ] || continue
+            if server_process_record_is_alive "$record"; then
+                any_alive=1
+            fi
+        done
+        [ "$any_alive" = "1" ] || return 0
+        sleep 0.2
+        attempts=$((attempts - 1))
+    done
+
+    return 1
+}
+
+server_process_records_match_installed() {
+    local installed="$1"
+    shift
+    local installed_hash="" record="" pid="" start_time="" exe_hash=""
+
+    installed_hash="$(sha256sum "$installed" 2>/dev/null | cut -d' ' -f1 || true)"
+    [ -n "$installed_hash" ] || return 1
+
+    for record in "$@"; do
+        [ -n "$record" ] || continue
+        IFS=: read -r pid start_time exe_hash <<< "$record"
+        [ "$exe_hash" = "$installed_hash" ] || return 1
+    done
 }
 
 run_user_systemctl() {
@@ -113,6 +227,8 @@ compute_server_runtime_generation() {
         printf 'runtime-contract-v1\n'
         printf 'app-slug=%s\n' "$APP_SLUG"
         printf 'service-name=%s\n' "$SERVICE_NAME"
+        printf 'workspace-notes-migration-revision=%s\n' \
+            "$WORKSPACE_NOTES_MIGRATION_REVISION"
         printf 'service-unit-sha256=%s\n' "$(sha256_file_or_missing "$service_unit")"
         emit_function_definition run_user_systemctl
         emit_function_definition user_manager_env
@@ -120,6 +236,15 @@ compute_server_runtime_generation() {
         emit_function_definition run_user_command
         emit_function_definition launch_user_binary
         emit_function_definition cold_restart_server
+        emit_function_definition scan_server_process_records
+        emit_function_definition server_process_record_is_alive
+        emit_function_definition wait_for_server_process_records_exit
+        emit_function_definition server_process_records_match_installed
+        emit_function_definition pid_is_zombie
+        emit_function_definition user_state_home
+        emit_function_definition resolve_workspace_notes_state_dir
+        emit_function_definition delete_workspace_notes_data
+        emit_function_definition attempt_workspace_notes_cleanup
     } | sha256sum | cut -d' ' -f1
 }
 
@@ -141,6 +266,127 @@ user_config_home() {
     home_dir="$(getent passwd "$TARGET_UID" | cut -d: -f6)"
     [ -n "$home_dir" ] || return 1
     printf '%s/.config\n' "$home_dir"
+}
+
+user_state_home() {
+    local state_home=""
+
+    if [ -n "$PRIVILEGED_USER_UID" ]; then
+        # Read the target user's manager environment instead of inheriting the
+        # privileged installer's XDG_STATE_HOME.
+        state_home="$(user_manager_env XDG_STATE_HOME 2>/dev/null || true)"
+    else
+        state_home="${XDG_STATE_HOME:-}"
+    fi
+
+    if [ -n "$state_home" ]; then
+        # XDG_STATE_HOME must be absolute. Refuse a relative override rather
+        # than letting a maintainer-script working directory select the target.
+        [ "${state_home#/}" != "$state_home" ] || return 1
+        printf '%s\n' "$state_home"
+        return 0
+    fi
+
+    local home_dir=""
+    home_dir="$(getent passwd "$TARGET_UID" | cut -d: -f6)"
+    [ -n "$home_dir" ] || return 1
+    [ "${home_dir#/}" != "$home_dir" ] || return 1
+    printf '%s/.local/state\n' "$home_dir"
+}
+
+WORKSPACE_NOTES_STATE_DIR=""
+
+resolve_workspace_notes_state_dir() {
+    local state_home=""
+
+    state_home="$(user_state_home)" || return 1
+    [ -n "$state_home" ] || return 1
+    WORKSPACE_NOTES_STATE_DIR="${state_home}/${APP_SLUG}"
+}
+
+delete_workspace_notes_data() {
+    local notes_state_dir="$WORKSPACE_NOTES_STATE_DIR"
+    local restore_nullglob=0
+    local -a temp_targets=()
+    local -a remaining_temp_targets=()
+
+    [ -n "$notes_state_dir" ] || return 1
+
+    # Expand only the exact temporary-file pattern, then delete those paths as
+    # the resolved target user, never as maintainer-script root.
+    [ ! -L "$notes_state_dir" ] || return 1
+    if [ -e "$notes_state_dir" ] && [ ! -d "$notes_state_dir" ]; then
+        return 1
+    fi
+
+    if ! shopt -q nullglob; then
+        restore_nullglob=1
+        shopt -s nullglob
+    fi
+    temp_targets=("${notes_state_dir}"/.workspace_notes.toml.*.tmp)
+    [ "$restore_nullglob" = "0" ] || shopt -u nullglob
+
+    run_user_command rm -f -- \
+        "${notes_state_dir}/workspace_notes.toml" \
+        "${temp_targets[@]}" || return 1
+
+    # A directory swap or symlink race fails verification rather than turning
+    # a best-effort delete into a false success.
+    [ ! -L "$notes_state_dir" ] || return 1
+    if [ -e "$notes_state_dir" ] && [ ! -d "$notes_state_dir" ]; then
+        return 1
+    fi
+    [ ! -e "${notes_state_dir}/workspace_notes.toml" ] || return 1
+    [ ! -L "${notes_state_dir}/workspace_notes.toml" ] || return 1
+
+    restore_nullglob=0
+    if ! shopt -q nullglob; then
+        restore_nullglob=1
+        shopt -s nullglob
+    fi
+    remaining_temp_targets=("${notes_state_dir}"/.workspace_notes.toml.*.tmp)
+    [ "$restore_nullglob" = "0" ] || shopt -u nullglob
+    [ "${#remaining_temp_targets[@]}" -eq 0 ]
+}
+
+warn_workspace_notes_cleanup_pending() {
+    echo "  ⚠ Legacy workspace-note cleanup pending: $1"
+    echo "    A later successful package configure will retry it."
+}
+
+attempt_workspace_notes_cleanup() {
+    local -a current_server_records=()
+
+    if [ "$WORKSPACE_NOTES_CLEANUP_TARGET_KNOWN" != "1" ]; then
+        warn_workspace_notes_cleanup_pending "target desktop user is unknown."
+        return 1
+    fi
+
+    if ! resolve_workspace_notes_state_dir; then
+        warn_workspace_notes_cleanup_pending "target user state directory could not be resolved safely."
+        return 1
+    fi
+
+    # This is the final server-state observation before deletion. A failed scan
+    # or any exact-path server whose executable differs from the installed
+    # note-free binary keeps cleanup pending.
+    if ! scan_server_process_records "$SERVER_BIN_PATH"; then
+        warn_workspace_notes_cleanup_pending "server process scan was indeterminate."
+        return 1
+    fi
+    current_server_records=("${SERVER_SCAN_RECORDS[@]}")
+    if ! server_process_records_match_installed \
+        "$SERVER_BIN_PATH" "${current_server_records[@]}"; then
+        warn_workspace_notes_cleanup_pending "an old or unreadable server executable remains."
+        return 1
+    fi
+
+    if ! delete_workspace_notes_data; then
+        warn_workspace_notes_cleanup_pending "flavor-scoped deletion or verification failed."
+        return 1
+    fi
+
+    echo "  ✓ Retired workspace annotation data cleaned for ${APP_SLUG}."
 }
 
 is_hex_color() {
@@ -417,6 +663,15 @@ stop_client_processes() {
 
 SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"
 
+case "$MAINTSCRIPT_PACKAGE" in
+    scribe|scribe-dev)
+        ;;
+    *)
+        echo "Unsupported package identity: ${MAINTSCRIPT_PACKAGE:-<missing>}" >&2
+        exit 1
+        ;;
+esac
+
 case "$1" in
     configure)
         TARGET_UID="${PRIVILEGED_USER_UID:-$(id -u)}"
@@ -426,6 +681,12 @@ case "$1" in
         DEFER_COLD_RESTART_FLAG="${STATE_DIR}/update-defer-cold-restart"
         RESTART_REQUIRED_FLAG="${STATE_DIR}/update-restart-required"
         SERVER_RUNTIME_GENERATION_FILE="${STATE_DIR}/server-runtime-generation"
+        WORKSPACE_NOTES_CLEANUP_SAFE=0
+        WORKSPACE_NOTES_CLEANUP_TARGET_KNOWN=1
+        WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="server lifecycle did not establish a safe cleanup point."
+        if [ "$(id -u)" = "0" ] && [ -z "$PRIVILEGED_USER_UID" ]; then
+            WORKSPACE_NOTES_CLEANUP_TARGET_KNOWN=0
+        fi
 
         ensure_state_dir
         probe_client_vulkan || true
@@ -436,8 +697,24 @@ case "$1" in
         run_user_systemctl daemon-reload || true
         refresh_service_enablement || true
 
-        # Check for a running server process, not just a stale socket file.
-        # Use -f (full cmdline match) — see cold_restart_server for rationale.
+        # Inventory exact-path server processes directly from /proc. Cleanup is
+        # never authorized when this scan is indeterminate.
+        ORIGINAL_SERVER_RECORDS=()
+        SERVER_PROCESS_SCAN_OK=0
+        if scan_server_process_records "$SERVER_BIN_PATH"; then
+            ORIGINAL_SERVER_RECORDS=("${SERVER_SCAN_RECORDS[@]}")
+            SERVER_PROCESS_SCAN_OK=1
+            if [ "${#ORIGINAL_SERVER_RECORDS[@]}" -eq 0 ] || \
+                server_process_records_match_installed \
+                    "$SERVER_BIN_PATH" "${ORIGINAL_SERVER_RECORDS[@]}"; then
+                WORKSPACE_NOTES_CLEANUP_SAFE=1
+            else
+                WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="captured server executable differs from the installed binary."
+            fi
+        else
+            WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="initial server process scan was indeterminate."
+        fi
+
         SERVER_RUNNING=0
         if [ -S "$SOCK" ] && pgrep -u "$TARGET_UID" -f "$SERVER_BIN_PATH" >/dev/null 2>&1; then
             SERVER_RUNNING=1
@@ -528,6 +805,14 @@ case "$1" in
 
                 if [ "$UPGRADE_OK" = "1" ]; then
                     record_server_runtime_generation
+                    if [ "$SERVER_PROCESS_SCAN_OK" = "1" ]; then
+                        if wait_for_server_process_records_exit \
+                            50 "${ORIGINAL_SERVER_RECORDS[@]}"; then
+                            WORKSPACE_NOTES_CLEANUP_SAFE=1
+                        else
+                            WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="a captured old server process did not exit after hot handoff."
+                        fi
+                    fi
                     echo "  ✓ ${APP_DISPLAY_NAME} server hot-reloaded successfully."
                     echo "    All terminal sessions have been preserved."
 
@@ -571,6 +856,7 @@ case "$1" in
                         chown "${TARGET_UID}:${TARGET_UID}" "${RESTART_REQUIRED_FLAG}" 2>/dev/null || true
                         rm -f "${DEFER_COLD_RESTART_FLAG}" 2>/dev/null || true
                         SERVER_RESTART_DEFERRED=1
+                        WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="cold restart was deferred with an old server active."
                         echo "  Restart deferred — continue from the ${APP_DISPLAY_NAME} update prompt when ready."
                     else
                         # Prompt only when the previous server is still alive and
@@ -582,6 +868,14 @@ case "$1" in
 
                         if cold_restart_server; then
                             SERVER_COLD_RESTARTED=1
+                            if [ "$SERVER_PROCESS_SCAN_OK" = "1" ]; then
+                                if wait_for_server_process_records_exit \
+                                    50 "${ORIGINAL_SERVER_RECORDS[@]}"; then
+                                    WORKSPACE_NOTES_CLEANUP_SAFE=1
+                                else
+                                    WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="a captured old server process remained after cold restart."
+                                fi
+                            fi
                             record_server_runtime_generation
                             echo ""
                             echo "  ✓ Scribe server restarted with new version."
@@ -590,6 +884,7 @@ case "$1" in
                             echo "  ✗ Scribe server restart failed."
                             echo "    Run 'systemctl --user status ${SERVICE_NAME}' for details."
                             SERVER_READY=0
+                            WORKSPACE_NOTES_CLEANUP_BLOCK_REASON="server restart failed."
                         fi
                     fi
                 fi
@@ -675,6 +970,17 @@ case "$1" in
                 echo "    ${CLIENT_BIN_NAME}"
             fi
             echo ""
+        fi
+
+        # Retry on every configure, including reinstalls after purge. The
+        # lifecycle gate and final /proc rescan keep deferred, failed, and
+        # indeterminate paths non-destructive.
+        if [ "$WORKSPACE_NOTES_CLEANUP_TARGET_KNOWN" != "1" ]; then
+            attempt_workspace_notes_cleanup || true
+        elif [ "$WORKSPACE_NOTES_CLEANUP_SAFE" = "1" ]; then
+            attempt_workspace_notes_cleanup || true
+        else
+            warn_workspace_notes_cleanup_pending "$WORKSPACE_NOTES_CLEANUP_BLOCK_REASON"
         fi
 
         if [ "$AUTO_SETUP_HOOKS" != "1" ]; then

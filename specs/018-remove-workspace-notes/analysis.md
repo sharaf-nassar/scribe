@@ -8,6 +8,13 @@ disagree, the clarification is treated as authoritative, per the spec's own
 status note; where the spec and the plan disagree on a measured fact, the
 plan's `## Alignment fixes applied` entry is treated as the later measurement.
 
+**2026-08-02 supersession:** data-deletion lifecycle references in this report
+describe the pre-implementation plan. They are superseded by the flavor-scoped,
+fail-closed Debian `postinst` migration in current `spec.md` and `plan.md`:
+agents validate statically, and only a later user-controlled configure may
+delete data after verified server replacement. Other analysis remains
+historical evidence for the removal.
+
 ## Coverage Table
 
 Twenty-two items: the 7 Goals, the 6 User Stories, and the 9 Clarification
@@ -23,10 +30,10 @@ plan title, since the plan deliberately uses no step codes.
 | **Goal 4** — docs consistent, `lat check` passes | Work items *Delete the `lat.md` notes sections and fix the surrounding prose*, *Record the compatibility decision in `lat.md/protocol.md`*; `lat check` green is an acceptance criterion of *Run the quality gate* by deliberate relocation | full |
 | **Goal 5** — titlebar visually correct, no dead gap | `## API / Interface Changes § User-facing surface changes`; work items *`titlebar.rs`, including the `e530da7` carry-forward* and *Manual client-launch verification* (screenshot evidence required) | full |
 | **Goal 6** — `ctrl+shift+m` unbound, `OVERLAY_CHORDS` arity 5 -> 4 | `## API / Interface Changes` ("Compile-enforced detail"); work items *`keybindings.rs` chord and array arity*, *Edit down the shared hot spots in client `main.rs`* (`open_overlay_chord` has exactly four arms) | full |
-| **Goal 7** — persisted data deleted, no backup, after restart | `## Data Model § Data destruction is an ordered operator step, not code`; work items *Rebuild, reinstall, and restart*, *Stale-file startup check on a dev daemon*, *Delete the note data* | full |
+| **Goal 7** — persisted data deleted, no backup, after restart | Superseded by `## Data Model § Data destruction is an ordered package migration`; work items *Stale-file startup check*, *Implement flavor-scoped package cleanup*, and *User-controlled rebuild, install, and lifecycle* | full |
 | **Story 1** — UI affordances are gone | Work items *`titlebar.rs`, including the `e530da7` carry-forward* (band lines only; `advance_move_arm` and `update_drag` preserved verbatim; no hard-coded pixel band survives) and *Manual client-launch verification*; `## Testing Strategy` per-story map row 1 | full |
 | **Story 2** — `ctrl+shift+m` opens nothing | Work items *`keybindings.rs` chord and array arity*, *Edit down the shared hot spots in client `main.rs`*, *Manual client-launch verification* (chord press plus all four surviving overlay chords); `## Testing Strategy` per-story map row 2 | full |
-| **Story 3** — stored note data deleted, no backup | `## Data Model`; work items *Rebuild, reinstall, and restart*, *Stale-file startup check on a dev daemon*, *Delete the note data*; `## Testing Strategy` per-story map row 3 (order is the criterion) | full |
+| **Story 3** — stored note data deleted, no backup | Superseded by `## Data Model`; installer implementation follows isolated stale-file evidence and precedes the user-controlled configure; `## Testing Strategy` row 3 keeps ordering as the criterion | full |
 | **Story 4** — no dead code left in any crate | Work items *Delete the protocol types and variants in `scribe-common`*, *Remove the server side*, *Delete the client notes modules…*, *Delete the notes-only surface in client `main.rs`*, *Edit down the shared hot spots…*, *`ipc_bridge.rs`*, *`scribe-test` daemon or-pattern edit*, *Run the quality gate*; retained-by-design items asserted in `## Affected Components § Must NOT be touched` | full |
 | **Story 5** — `lat.md` reflects reality | Work items *Delete the `lat.md` notes sections and fix the surrounding prose* (including `architecture.md:16` and `:148`), *Record the compatibility decision in `lat.md/protocol.md`*, *Delete the client notes modules…* (the 16 `// @lat:` anchors leave with their files) | full |
 | **Story 6** — live upgrade degrades to a recoverable blip | `## Architecture Approach`, `## API / Interface Changes § Breaking wire changes`, `## Risks` (mixed-version window); work item *Record the compatibility decision in `lat.md/protocol.md`*; `## Testing Strategy` per-story map row 6 (documentation plus a diff assertion that `REMOTE_PROTOCOL_VERSION` is untouched) | full |
@@ -34,10 +41,10 @@ plan title, since the plan deliberately uses no step codes.
 | **Q2** — `REMOTE_PROTOCOL_VERSION` stays `3` | `### Rejected alternatives` (b) with all three grounds; `## API / Interface Changes`; the constant is named as a diff assertion on Story 6 | full |
 | **Q3** — both CI count-gates are mandatory in-scope work | `### The atomicity constraint is mechanical, not stylistic`; the two recompute work items; the `--staged` hook consequence carried onto the commit item | full |
 | **Q4** — symbol names govern; `e530da7` carry-forwards | `## Affected Components` opening banner; `### Compiler-invisible hazards` items 2 and 3; work item *Re-verify the scope survey against the rebased tree*, which blocks every other item and emits `edit-list.md` | full |
-| **Q5** — data deleted last, after rebuild/reinstall/restart | `## Data Model` 4-step ordering with step 3b inserted; the four terminal work items, split so the point of no return stands alone | full |
+| **Q5** — data deleted last, after verified lifecycle | Superseded by `## Data Model`: flavor-scoped `postinst` cleanup is the point of no return and retries after unsafe configure paths | full |
 | **Q6** — leave `ctrl+shift+m` unbound, not swallowed, not reassigned | `## API / Interface Changes § User-facing surface changes` (the `0x0D` fall-through documented as behavior, not a defect); `## Affected Components` (`keybindings/tests.rs` not edited) | full |
 | **Q7** — the two-stage `rg` gate is the "done" oracle | `## Testing Strategy`, block copied verbatim; plus the plan-time correction that GATE A cannot reach zero without the `tab-window-chords.sh` reword, and that neither gate sees the singular `workspace-note` | full |
-| **Q-A** — server restart authorized, for step 3 only | `### Constitution check` P7; work item *Rebuild, reinstall, and restart* ("the one item authorized to restart the server"); every other item's verification is restart-free | full |
+| **Q-A** — live lifecycle is user-controlled | `### Constitution check` P7; agents perform only static/isolated validation and the user controls package install/restart | full |
 | **Q-B** — keep `specs/004` and `specs/007` | `## Affected Components § Must NOT be touched`; stale cross-references owned by the P3 work item *Scrub the stale `specs/**` cross-references* | full |
 
 **Headline: 22 items — 22 full, 0 partial, 0 none.**
