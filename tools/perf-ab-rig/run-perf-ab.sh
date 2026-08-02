@@ -51,7 +51,7 @@
 #
 # Usage:
 #   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--scroll-only]
-#       [--latency-only]
+#       [--latency-only] [--ai-tab-only]
 #       [--out PATH] [--new-client PATH] [--old-client PATH] [--baseline PATH]
 #       [--record-baseline] [--samples N] [--firehose-mib N] [--tabs N]
 #       [--scribe-test PATH]
@@ -60,7 +60,10 @@
 # keys are typed); metrics 2-5 report NOT-MEASURED. This is the fast loop for
 # the startup perf bead. --scroll-only is the same idea for metric 5, which is
 # the one metric measured on both clients purely to attribute a failure, and
-# --latency-only for metric 2.
+# --latency-only for metric 2. --ai-tab-only is a separate Q6 gate: it times
+# the Claude-tab chord to the first PTY bytes from a marker stub named `claude`
+# on PATH, reports its result directly, and does not write the five-metric A/B
+# report.
 #
 # A full --live run has two hard prerequisites, both checked up front and both
 # fatal rather than degraded (see `live_preflight`): the `scribe-test` helper
@@ -77,6 +80,7 @@ MODE="assess"
 # Empty means "score all five metrics"; otherwise the single metric a --live run
 # is limited to. `metric_enabled` is the only reader.
 ONLY_METRIC=""
+AI_TAB_ONLY=0
 OUT="${REPO_ROOT}/specs/016-gpui-client-rebuild/perf-ab-report.md"
 NEW_CLIENT=""
 OLD_CLIENT=""
@@ -114,6 +118,8 @@ SCRIBE_STARTUP_BUDGET_MS=150   # absolute ceiling on Scribe-attributable startup
 MEM_REGRESSION_MAX_PCT=20      # memory may exceed old client by at most 20%
 SCROLL_TARGET_FPS=60           # sustained scroll target
 SCROLL_DROPPED_MAX_PCT=1       # dropped-frame ceiling
+AI_TAB_BUDGET_MS=1000          # Q6 soft budget: approximately one second
+AI_TAB_STUB_MARKER="SCRIBE_AI_TAB_PERF_MARKER"
 # "No worse than the old client" is enforced with this run-to-run noise
 # allowance on both sides of the comparison; it is not extra headroom, it is the
 # measurement's own repeatability on a loaded desktop.
@@ -149,6 +155,7 @@ while [[ $# -gt 0 ]]; do
     --startup-only) ONLY_METRIC="startup"; shift ;;
     --scroll-only) ONLY_METRIC="scroll"; shift ;;
     --latency-only) ONLY_METRIC="latency"; shift ;;
+    --ai-tab-only) AI_TAB_ONLY=1; shift ;;
     --out) OUT="$2"; shift 2 ;;
     --new-client) NEW_CLIENT="$2"; shift 2 ;;
     --old-client) OLD_CLIENT="$2"; shift 2 ;;
@@ -158,10 +165,15 @@ while [[ $# -gt 0 ]]; do
     --firehose-mib) FIREHOSE_MIB="$2"; shift 2 ;;
     --tabs) MEMORY_TABS="$2"; shift 2 ;;
     --scribe-test) SCRIBE_TEST_BIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,68p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,73p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$AI_TAB_ONLY" -eq 1 && -n "$ONLY_METRIC" ]]; then
+  echo "--ai-tab-only cannot be combined with another --*-only mode" >&2
+  exit 2
+fi
 
 # How synthetic keys are delivered. `window` addresses the client window
 # directly, so a keystroke cannot escape into another application even if focus
@@ -177,6 +189,9 @@ PROBE_FILE=""
 OWNED_SESSION=""
 CLEANUP_SESSIONS=""
 MEASURED_TABS=""
+TAB_OPEN_STARTED_NS=""
+TAB_FIRST_PTY_NS=""
+AI_TAB_ELAPSED_MS=""
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -383,7 +398,8 @@ close_seeded_sessions() {
 live_blocker() {
   [[ -n "${DISPLAY:-}" ]] || { echo "no DISPLAY is set, so no client can be driven."; return; }
   command -v xdotool >/dev/null 2>&1 || { echo "xdotool is not installed, so no workload can be driven."; return; }
-  local socket="/run/user/$(id -u)/${DEV_EXE_STEM}/server.sock"
+  local socket
+  socket="/run/user/$(id -u)/${DEV_EXE_STEM}/server.sock"
   [[ -S "$socket" ]] || { echo "no running ${DEV_EXE_STEM} server at ${socket} to attach to; install and start one with \`just install-dev\` (the rig never drives the stable server)."; return; }
   echo ""
 }
@@ -414,6 +430,7 @@ client_has_probe() {
 live_preflight() {
   local bin label
   for label in new old; do
+    [[ "$AI_TAB_ONLY" -eq 1 && "$label" == "old" ]] && continue
     if [[ "$label" == new ]]; then bin="$NEW_CLIENT"; else bin="$OLD_CLIENT"; fi
     [[ -n "$bin" ]] || continue
     [[ -x "$bin" ]] || die \
@@ -431,7 +448,7 @@ live_preflight() {
     die \
       "--${label}-client ${bin} was built without the shared perf probe: the" \
       "binary contains no ${PROBE_ENV_KEY} string, so it can never write a probe" \
-      "report and the input-latency, firehose and memory workloads would each" \
+      "report and the tab-driven workloads would each" \
       "time out as \"never reached a first frame\"." \
       "Pass a client built from this tree, e.g." \
       "--${label}-client target/release/scribe-client, or re-run with" \
@@ -458,6 +475,17 @@ live_preflight() {
     "${SCRIBE_TEST_BIN} could not seed a session for the client to attach to." \
     "Check that the server socket is healthy and re-run; --startup-only skips" \
     "this step entirely."
+}
+
+# Resolve and validate the marker stub before an AI-tab measurement. Merely
+# finding a `claude` command is not enough: accidentally timing the real CLI
+# would include its startup and make this Q6 measurement meaningless.
+ai_tab_stub() {
+  local stub
+  stub="$(command -v claude 2>/dev/null || true)"
+  [[ -n "$stub" && -x "$stub" && -r "$stub" ]] || return 1
+  grep -qa -- "$AI_TAB_STUB_MARKER" "$stub" 2>/dev/null || return 1
+  echo "$stub"
 }
 
 # The X11 window id owned by $CLIENT_PID, or empty.
@@ -563,23 +591,45 @@ run_command() {
   send_keys Return
 }
 
-# Try the new-tab binding once with the current KEY_MODE and wait for a session
-# the rig has not seen before to become the focused one. Args: the pre-existing
-# session list, comma-wrapped. Sets OWNED_SESSION on success.
+# Try a tab binding once with the current KEY_MODE and wait for a session the
+# rig has not seen before to become the focused one. Args: the pre-existing
+# session list (comma-wrapped), chord, and whether this is the timed AI path.
+# Sets OWNED_SESSION on success. The timed path additionally brackets the key
+# send and first subsequent PTY-byte observation without a settle sleep.
 try_new_tab() {
-  local before="$1" after focused waited=0
+  local before="$1" chord="$2" timed="$3"
+  local after focused bytes_before="" bytes_now="" waited=0
+  local max_polls=100 poll_delay=0.1 session_seen=0
   focus_client || return 1
-  send_keys ctrl+shift+t || return 1
-  while [[ $waited -lt 100 ]]; do
-    sleep 0.1
-    waited=$((waited + 1))
+  if [[ "$timed" -eq 1 ]]; then
+    bytes_before="$(probe_value "$PROBE_FILE" pty_bytes)"
+    bytes_before="${bytes_before:-0}"
+    TAB_OPEN_STARTED_NS="$(date +%s%N)"
+    TAB_FIRST_PTY_NS=""
+    max_polls=1000
+    poll_delay=0.01
+  fi
+  send_keys "$chord" || return 1
+  while [[ $waited -lt $max_polls ]]; do
     after="$(probe_value "$PROBE_FILE" session_ids)"
     focused="$(probe_value "$PROBE_FILE" focused_session)"
     if [[ -n "$focused" && "$focused" != "-" && "$before" != *",${focused},"* ]] \
       && [[ ",${after}," == *",${focused},"* ]]; then
       OWNED_SESSION="$focused"
+      session_seen=1
+    fi
+    if [[ "$timed" -eq 1 && -z "$TAB_FIRST_PTY_NS" ]]; then
+      bytes_now="$(probe_value "$PROBE_FILE" pty_bytes)"
+      if [[ -n "$bytes_now" && "$bytes_now" -gt "$bytes_before" ]]; then
+        TAB_FIRST_PTY_NS="$(date +%s%N)"
+      fi
+    fi
+    if [[ "$session_seen" -eq 1 ]] \
+      && [[ "$timed" -eq 0 || -n "$TAB_FIRST_PTY_NS" ]]; then
       return 0
     fi
+    sleep "$poll_delay"
+    waited=$((waited + 1))
   done
   return 1
 }
@@ -598,6 +648,7 @@ try_new_tab() {
 # that worked sticks for the rest of the run.
 # Returns non-zero when no owned tab could be opened.
 open_owned_tab() {
+  local chord="${1:-ctrl+shift+t}" timed="${2:-0}"
   local before mode other
   OWNED_SESSION=""
   wait_for_attached_session || return 1
@@ -606,11 +657,13 @@ open_owned_tab() {
   [[ "$KEY_MODE" == "xtest" ]] && other="window"
   for mode in "$KEY_MODE" "$other"; do
     KEY_MODE="$mode"
-    if try_new_tab "$before"; then
+    if try_new_tab "$before" "$chord" "$timed"; then
       CLEANUP_SESSIONS="${CLEANUP_SESSIONS} ${OWNED_SESSION}"
-      # Let the new shell finish printing its prompt so echo timing is not
-      # measured against prompt paint.
-      sleep 1.5
+      if [[ "$timed" -eq 0 ]]; then
+        # Let the new shell finish printing its prompt so echo timing is not
+        # measured against prompt paint. The AI timer deliberately skips this.
+        sleep 1.5
+      fi
       return 0
     fi
   done
@@ -644,6 +697,78 @@ rss_kb() {
   local pid="$1"
   [[ -r "/proc/$pid/status" ]] || { echo ""; return; }
   awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status"
+}
+
+# Wait for the attached seed shell to stop producing bytes before the timer is
+# armed. This settle is condition-based and happens before the measured span;
+# the timed path itself ends on the first counter increment.
+wait_for_pty_idle() {
+  local last="" now="" stable=0 waited=0
+  while [[ $waited -lt 100 ]]; do
+    now="$(probe_value "$PROBE_FILE" pty_bytes)"
+    if [[ -n "$now" && "$now" == "$last" ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 4 ]] && return 0
+    else
+      stable=0
+      last="$now"
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  log "AI tab: seed pane did not reach an idle PTY-byte count"
+  return 1
+}
+
+# Stop the marker stub with Ctrl+C, which closes the exec-backed AI session.
+# The session id came from open_owned_tab's ownership interlock, so this never
+# targets a pre-existing tab.
+close_owned_ai_tab() {
+  local waited=0 sessions
+  if [[ "$(probe_value "$PROBE_FILE" focused_session)" == "$OWNED_SESSION" ]]; then
+    send_keys ctrl+c || true
+  fi
+  while [[ $waited -lt 50 ]]; do
+    sessions=",$(probe_value "$PROBE_FILE" session_ids),"
+    if [[ "$sessions" != *",${OWNED_SESSION},"* ]]; then
+      CLEANUP_SESSIONS=""
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  log "AI tab: marker session ${OWNED_SESSION} did not close after Ctrl+C"
+  if "$SCRIBE_TEST_BIN" daemon start >/dev/null 2>&1 \
+    && "$SCRIBE_TEST_BIN" session close "$OWNED_SESSION" >/dev/null 2>&1; then
+    "$SCRIBE_TEST_BIN" daemon stop >/dev/null 2>&1 || true
+    CLEANUP_SESSIONS=""
+    return 0
+  fi
+  "$SCRIBE_TEST_BIN" daemon stop >/dev/null 2>&1 || true
+  return 1
+}
+
+# Q6: tab-open chord to first PTY byte from the PATH marker stub. The first
+# output after the pre-timer idle check comes from the stub in the disposable
+# measurement profile; open_owned_tab simultaneously proves that the new,
+# focused session belongs to this run.
+measure_ai_tab_latency() {
+  local bin="$1" elapsed
+  AI_TAB_ELAPSED_MS=""
+  start_client "$bin" || return 1
+  if ! wait_for_attached_session || ! wait_for_pty_idle; then
+    stop_client
+    return 1
+  fi
+  if ! open_owned_tab ctrl+alt+c 1; then
+    stop_client
+    return 1
+  fi
+  elapsed="$(calc "(end - start) / 1000000" \
+    "start=$TAB_OPEN_STARTED_NS" "end=$TAB_FIRST_PTY_NS")"
+  close_owned_ai_tab || true
+  stop_client
+  AI_TAB_ELAPSED_MS="$elapsed"
 }
 
 # --------------------------------------------------------------------------
@@ -1131,7 +1256,7 @@ eval_firehose() {
 
 eval_memory() {
   local pair new_raw old_raw
-  pair="$(eval_pair memory-${MEMORY_TABS}-tabs measure_memory memory_rss_kb memory)"
+  pair="$(eval_pair "memory-${MEMORY_TABS}-tabs" measure_memory memory_rss_kb memory)"
   new_raw="${pair%%|*}"
   old_raw="${pair##*|}"
   # measure_memory returns `<rss_kb>#<tabs>`; a committed baseline is bare kB.
@@ -1198,6 +1323,39 @@ eval_scroll() {
 # --------------------------------------------------------------------------
 # Report generation
 # --------------------------------------------------------------------------
+
+run_ai_tab_only() {
+  [[ "$MODE" == "live" ]] || die \
+    "--ai-tab-only is a timed runtime measurement and requires --live."
+  [[ -n "$NEW_CLIENT" ]] || die \
+    "--ai-tab-only requires --new-client <bin>." \
+    "Pass a probe-enabled client built from this tree."
+
+  local blocker stub verdict
+  blocker="$(live_blocker)"
+  [[ -z "$blocker" ]] || die "AI-tab measurement blocked: ${blocker}"
+  stub="$(ai_tab_stub || true)"
+  [[ -n "$stub" ]] || die \
+    "--ai-tab-only requires a marker stub named claude on PATH." \
+    "The executable must contain the literal ${AI_TAB_STUB_MARKER}, print that" \
+    "marker immediately, and remain alive until the rig sends Ctrl+C."
+  log "AI tab: marker stub ${stub}"
+
+  live_preflight
+  measure_ai_tab_latency "$NEW_CLIENT" || die \
+    "AI-tab latency was not captured." \
+    "The marker must be the first output in the disposable login profile, and" \
+    "the ctrl+alt+c tab must appear in the runtime probe before the timeout."
+
+  verdict="FAIL"
+  if float_cmp "$AI_TAB_ELAPSED_MS" "<=" "$AI_TAB_BUDGET_MS"; then
+    verdict="PASS"
+  fi
+  echo "ai_tab_open_to_first_pty_byte_ms=${AI_TAB_ELAPSED_MS}"
+  echo "ai_tab_budget_ms=${AI_TAB_BUDGET_MS}"
+  echo "ai_tab_budget_verdict=${verdict}"
+  [[ "$verdict" == "PASS" ]]
+}
 
 overall_verdict() {
   local status
@@ -1349,4 +1507,8 @@ EOF
   return 0
 }
 
-emit_report
+if [[ "$AI_TAB_ONLY" -eq 1 ]]; then
+  run_ai_tab_only
+else
+  emit_report
+fi

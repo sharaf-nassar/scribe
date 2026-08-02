@@ -382,6 +382,10 @@ live server; Principle 7):
   program, using a stub AI binary that prints a marker immediately (so the
   real CLI's own startup is excluded by construction); the timed path
   contains no fixed sleeps. Budget: within ~1s on this machine's profile.
+  Verification on 2026-08-01 used project-built release binaries inside a
+  disposable `--network none` container with Xvfb + openbox, an isolated
+  `/run`, `HOME`, config, state, data, and cache, and no host Scribe socket.
+  Result: **587.627 ms — PASS** against the 1000 ms soft budget.
 - **Regression sweep**: `just ready`, then `just e2e-func
   func/shell-integration.sh`, `just e2e-func func/env-persistence.sh`,
   `just e2e-func func/cold-restart.sh` — plain-tab integration, env

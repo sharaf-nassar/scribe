@@ -71,6 +71,43 @@ it waits for a rewrite before it snapshots; see
 the others report `NOT-MEASURED`. They are the fast iteration loops for the
 startup and scroll perf beads.
 
+`--ai-tab-only` is a separate Q6 measurement rather than a sixth A/B metric.
+With `--live`, it times the `ctrl+alt+c` key send to the first increase in the
+client's PTY-byte counter and prints machine-readable milliseconds, the 1000 ms
+budget, and `PASS` or `FAIL`. It does not write the five-metric report.
+
+## AI tab open latency
+
+Run this mode only in a disposable, window-managed container with its own
+Scribe server, display, `HOME`, XDG directories, and `/run`; disable container
+networking and do not mount a host Scribe socket. The server's login-shell PATH
+and the rig's PATH must resolve `claude` to the same marker stub. The rig rejects
+an executable that does not contain `SCRIBE_AI_TAB_PERF_MARKER`, avoiding an
+accidental measurement of the real Claude CLI.
+
+The stub prints its marker immediately, then remains alive until the rig sends
+Ctrl+C. A minimal stub is:
+
+```sh
+#!/bin/sh
+# SCRIBE_AI_TAB_PERF_MARKER
+echo SCRIBE_AI_TAB_PERF_MARKER
+exec sleep 300
+```
+
+The rig waits for the seed pane's PTY count to become idle before arming the
+timer. Once armed, it sends the AI-tab chord and condition-polls both the PTY
+counter and the same new-session/focus ownership conditions used by
+`open_owned_tab`; it does not apply the normal 1.5 s tab settle or another
+fixed delay. A marker process that exits before ownership is proven fails the
+measurement instead of returning an ambiguous number.
+
+```bash
+tools/perf-ab-rig/run-perf-ab.sh --ai-tab-only --live \
+  --new-client target/release/scribe-client \
+  --scribe-test target/release/scribe-test
+```
+
 ## Live mode never drives the stable server
 
 A live run seeds sessions, opens ten tabs, types shell commands into them and
