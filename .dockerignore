@@ -2,12 +2,8 @@
 .dockerignore
 Dockerfile*
 target/*
-!target/release
-target/release/*
-!target/release/scribe-server
-!target/release/scribe-client
-!target/release/scribe-test
-!target/release/scribe-hook-helper
+!target/e2e-stage/
+!target/e2e-stage/**
 node_modules/
 *.log
 .env
