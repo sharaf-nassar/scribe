@@ -341,7 +341,7 @@ fn ai_controls() -> Vec<Control> {
         choice(
             "terminal.ai_tab_cwd",
             "AI tab working dir",
-            vec![("pane", "Active pane"), ("project_root", "Project root")],
+            vec![("pane", "Active pane"), ("project_root", "Project root"), ("home", "Home")],
         ),
     ];
     // The AI assistant states table: per-state indicator config.

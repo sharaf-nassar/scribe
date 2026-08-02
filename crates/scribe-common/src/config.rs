@@ -1119,7 +1119,8 @@ impl<'de> Deserialize<'de> for ClipboardPolicyConfig {
 ///
 /// `Pane` (default) inherits the focused pane's CWD, like a plain new tab.
 /// `ProjectRoot` anchors the tab to the workspace project root when the pane
-/// is inside a configured workspace root.
+/// is inside a configured workspace root. `Home` starts the tab in the user's
+/// home directory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiTabCwd {
@@ -1128,6 +1129,8 @@ pub enum AiTabCwd {
     Pane,
     /// Anchor to the workspace project root when inside a configured root.
     ProjectRoot,
+    /// Start in the user's home directory.
+    Home,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
