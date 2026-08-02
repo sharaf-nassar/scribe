@@ -32,7 +32,7 @@ use scribe_common::protocol::{
     AutomationAction, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo,
     PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch,
     ServerMessage, SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
-    WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
+    WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -62,7 +62,6 @@ use crate::session_manager::{
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
-use crate::workspace_notes::WorkspaceNotesStore;
 
 /// Buffer size for PTY reads. 64 KiB balances throughput and latency.
 const PTY_READ_BUF_SIZE: usize = 64 * 1024;
@@ -951,8 +950,6 @@ pub struct IpcServerState {
     /// Fetcher used to refresh `release_catalog`. Production wires the real
     /// `GithubReleaseFetcher`; tests may inject deterministic stubs.
     pub release_fetcher: Arc<dyn ReleaseFetcher>,
-    /// Authoritative server-owned workspace notes store.
-    pub workspace_notes: Arc<Mutex<WorkspaceNotesStore>>,
     /// Server-wide registry of per-session env-store state (baselines,
     /// working deltas, status, and per-session persist schedulers). Owned
     /// here so hook ingress (`crate::hook_ingress`) and the session
@@ -5864,8 +5861,6 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::RequestSnapshot { .. }
         | ClientMessage::CreateWorkspace
         | ClientMessage::ListSessions
-        | ClientMessage::WorkspaceNotesGet { .. }
-        | ClientMessage::WorkspaceNotesMutate { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
         }
@@ -6095,23 +6090,6 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
                 &context.server.workspace_manager,
                 context.writer,
                 context.window_id,
-            )
-            .await;
-        }
-        ClientMessage::WorkspaceNotesGet { workspace_ids } => {
-            handle_workspace_notes_get(
-                &context.server.workspace_notes,
-                context.writer,
-                &workspace_ids,
-            )
-            .await;
-        }
-        ClientMessage::WorkspaceNotesMutate { mutation } => {
-            handle_workspace_notes_mutate(
-                &context.server.workspace_notes,
-                &context.server.window_shares,
-                context.writer,
-                mutation,
             )
             .await;
         }
@@ -7758,44 +7736,9 @@ async fn handle_list_sessions(
     send_message(writer, &list_msg).await;
 }
 
-async fn handle_workspace_notes_get(
-    workspace_notes: &Arc<Mutex<WorkspaceNotesStore>>,
-    writer: &SharedWriter,
-    workspace_ids: &[WorkspaceId],
-) {
-    let collections = workspace_notes.lock().await.collections_for(workspace_ids);
-    send_message(writer, &ServerMessage::WorkspaceNotesSnapshot { collections }).await;
-}
-
-async fn handle_workspace_notes_mutate(
-    workspace_notes: &Arc<Mutex<WorkspaceNotesStore>>,
-    window_shares: &WindowShares,
-    writer: &SharedWriter,
-    mutation: WorkspaceNotesMutation,
-) {
-    let collection = match workspace_notes.lock().await.apply_mutation(mutation) {
-        Ok(collection) => collection,
-        Err(error) => {
-            send_error(writer, &format!("workspace note mutation failed: {error}")).await;
-            return;
-        }
-    };
-    broadcast_workspace_notes_changed(window_shares, collection).await;
-}
-
-async fn broadcast_workspace_notes_changed(
-    window_shares: &WindowShares,
-    collection: scribe_common::protocol::WorkspaceNotesCollection,
-) {
-    let msg = ServerMessage::WorkspaceNotesChanged { collection };
-    for writer in connected_window_writers(window_shares).await {
-        send_message(&writer, &msg).await;
-    }
-}
-
 /// Snapshot the controller writer of every connected window's share — the fan-out
-/// target for server-wide broadcasts (`QuitRequested`, workspace-notes changes,
-/// updater notices). In `SingleController` mode each share has one participant, so
+/// target for server-wide broadcasts (`QuitRequested` and updater notices). In
+/// `SingleController` mode each share has one participant, so
 /// this is byte-identical to iterating the pre-015 `connected_clients` values.
 pub async fn connected_window_writers(window_shares: &WindowShares) -> Vec<SharedWriter> {
     window_shares

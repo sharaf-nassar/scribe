@@ -117,8 +117,6 @@ Determination techniques, in order of authority:
 | `ConfigReloaded` | scripted-E2E | WIRED | `main.rs:347` in `apply_config_reload`; watcher wired by bead .57 (`a50a5f2`) |
 | `ReportWorkspaceTree` | scripted-E2E | WIRED (bead .66) | `TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation |
 | `SearchRequest` | scripted-E2E | WIRED (bead .69) | `TerminalView::send_search_request` → `IpcSink::search_request`, on every find-overlay query edit |
-| `WorkspaceNotesGet` | scripted-E2E | WIRED | `main.rs` `open_workspace_notes_modal` → `IpcSink::workspace_notes_get`, on the workspace `notes_workspace_id` resolves from live state |
-| `WorkspaceNotesMutate` | scripted-E2E | WIRED | `main.rs` `route_workspace_notes_action` → `IpcSink::workspace_notes_mutate`, against that same workspace |
 | `Hello` | scripted-E2E | WIRED | `main.rs:1295`, sent on every connect |
 | `CloseWindow` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::close_window` |
 | `QuitAll` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::quit_all` |
@@ -189,8 +187,6 @@ Everything else is silently discarded on the wire.
 | `GitBranch` | visual-E2E | MISSING | no reference; `StatusBarData.git_branch` hardcoded `None` |
 | `SessionList` | scripted-E2E | WIRED | `run_reader` arm → `sync_tab_strip` |
 | `WorkspaceInfo` | scripted-E2E | WIRED (bead .66) | `dispatch_server_message` arm → `on_workspace_info` → `ChromeMetadata::name_workspace` (status bar) and parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` |
-| `WorkspaceNotesSnapshot` | scripted-E2E | WIRED | `main.rs` `on_workspace_notes_message` → `WorkspaceNotesStore::apply_collections` → `TerminalView::sync_workspace_notes` |
-| `WorkspaceNotesChanged` | scripted-E2E | WIRED | `main.rs` `on_workspace_notes_message` → `WorkspaceNotesStore::apply_collection` → `TerminalView::sync_workspace_notes` |
 | `SearchResults` | scripted-E2E | WIRED (bead .69) | `on_search_results` → `FindResults` → `FindOverlayView::adopt_results` → `TerminalElement::with_highlights` |
 | `Welcome` | scripted-E2E | WIRED | `run_reader` arm → `SessionRegistry::adopt_window` |
 | `WindowClosed` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_window_closed` |
@@ -382,7 +378,6 @@ restated row by row — `parity-inventory.md` names each one's live-path chain a
 its oracle.
 | AI indicator borders and tab tint | `US4-1` | WIRED | `main.rs::on_ai_message` updates and remembers provider state; `on_pane_output_message`, the redraw/lifecycle ticks, and the key path drive activity, animation, stale clear, and attention clear. `TerminalView::{sync_tabs,render_panes}` paint the tab indicator and workspace border through `pane_border_edges`; `tests/e2e/visual/ai-indicator.sh` drives the real hook and asserts both pixel surfaces. |
 | Pane dividers and drag-resize | `US3-10` | WIRED | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids. |
-| Workspace notes hover preview | `US4-3` | WIRED | The titlebar notes affordance emits `WorkspaceNotesHover`; `TerminalView::set_workspace_notes_preview` creates and renders `WorkspaceNotesPreviewView`; `tests/e2e/visual/workspace-notes.sh` hovers it and asserts the preview pixels. |
 
 These features were invisible to *both* gates. `ai_indicator` is imported by
 `main.rs`, so the module ratchet in `tools/check-reachability.sh` scores it
@@ -588,18 +583,6 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   decode. The reply is consumed by the existing `ScreenSnapshot` arm, now
   `apply_screen_snapshot`. Verified on the wire and on screen by
   `tests/e2e/visual/session-tooling.sh`.
-- **FU-21 Workspace notes on a real workspace.** Rows: `WorkspaceNotesSnapshot`,
-  `WorkspaceNotesChanged`, plus de-demoing `WorkspaceNotesGet` /
-  `WorkspaceNotesMutate`. **Landed.** The modal now opens on the workspace
-  `TerminalView::notes_workspace_id` resolves from live state — the focused
-  region when the server minted it, otherwise the focused tab's workspace — and
-  declines to open at all when no server workspace is known yet, so no
-  fabricated `WorkspaceId` reaches the wire. Both server answers have an arm:
-  `on_workspace_notes_message` folds them into the shared
-  `WorkspaceNotesStore` and `TerminalView::sync_workspace_notes` adopts them
-  into the open modal on the next redraw, version-gated so a late snapshot
-  never eats a typed draft. Verified on the wire and on screen by
-  `tests/e2e/visual/workspace-notes.sh`.
 - **FU-22 Bell.** Row: `Bell`. **Landed.** `bell.rs` is now in `main.rs`'s
   import closure and `ServerMessage::Bell` has its own reader arm. The reader
   queues the belling session; the window-lifecycle tick refreshes the gate's
@@ -688,14 +671,12 @@ the app constructs the entity:
 
 - **To `scripted-E2E`** (a real client + real server, asserting on the wire):
   `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree`, `SearchRequest`,
-  `WorkspaceNotesGet`, `WorkspaceNotesMutate`, `GetRemoteEnv`,
+  `GetRemoteEnv`,
   `ListTrustedDevices`, `ListTrustedNetworks`, `GetLanEnv`, `DismissUpdate`
   (the three trust queries have since been moved and are covered by
   `tests/e2e/visual/settings-trust.sh`; the outbound workspace frames and the
-  inbound `WorkspaceInfo` by `tests/e2e/visual/workspace-ipc.sh`; the four
-  workspace-notes rows by `tests/e2e/visual/workspace-notes.sh`);
-  and inbound `CwdChanged`, `SessionContextChanged`, `WorkspaceInfo`,
-  `WorkspaceNotesSnapshot`, `WorkspaceNotesChanged`, `SearchResults`,
+  inbound `WorkspaceInfo` by `tests/e2e/visual/workspace-ipc.sh`);
+  and inbound `CwdChanged`, `SessionContextChanged`, `WorkspaceInfo`, `SearchResults`,
   `EnvPreflightResult`, `PromptMark`, `ScrollBottom`, `TrustedDeviceList`,
   `TrustedNetworkList`, `LanEnv`, `RemoteEnv`, `UpdateCheckResult`,
   `ReleaseList`, `PromptReceived`.

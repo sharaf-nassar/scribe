@@ -116,7 +116,7 @@ Any keystore error during persist (`LockedKeyring`, `NoStorageAccess`, etc.) cau
 
 ### R3.1 Storage owner — Decision: server-side
 
-The server owns PTY lifecycles, the hook ingress that observes env changes, the keystore interface, and existing on-disk persistence patterns (handoff state, workspace notes). Putting encrypted envelopes anywhere else would either (a) push the encryption interface onto the client, doubling the cryptographic surface, or (b) force a round-trip protocol just to read or update a delta. Server ownership also keeps the fail-safe path local: if encryption can't proceed, the server simply stops persisting and emits an `EnvStatus` event.
+The server owns PTY lifecycles, the hook ingress that observes env changes, the keystore interface, and the existing handoff-state persistence pattern. Putting encrypted envelopes anywhere else would either (a) push the encryption interface onto the client, doubling the cryptographic surface, or (b) force a round-trip protocol just to read or update a delta. Server ownership also keeps the fail-safe path local: if encryption can't proceed, the server simply stops persisting and emits an `EnvStatus` event.
 
 ### R3.2 Storage layout
 

@@ -251,8 +251,9 @@ rebuild doesn't trade identity for polish.
 - **US4-2** Command-boundary marks render on the scrollbar (success/failure
   ticks, absolute-position shift on trim) — built as a custom GPUI scrollbar
   element (Zed has no equivalent).
-- **US4-3** Workspace system (accent colors, badges, notes modal + hover
-  preview, workspace splits) works as today.
+- **US4-3** *(descoped 2026-08-01, bead scribe-1am: the workspace notes modal and
+  hover preview are removed from the product)* Workspace system (accent colors,
+  badges, workspace splits) works as today.
 - **US4-4** Remote/LAN: remote connect picker, LAN approval dialog
   (fingerprint words), lost-control banner, share roster/control passing all
   work as today.
@@ -307,6 +308,9 @@ so regressions are caught during the rebuild, not after cutover.
   `lib.rs` module outside that closure must carry an explicit unwired marker
   naming its fix bead. The unimplemented-dispatch catch-alls become a
   `warn`-level counter that a scripted run asserts is zero.
+
+On 2026-08-01, epic `scribe-1am` descoped the workspace notes modal and hover
+preview from US4-3 while retaining accent colors, badges, and workspace splits.
 
 ## Constraints
 

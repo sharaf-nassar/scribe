@@ -716,7 +716,7 @@ The GPUI rebuild replaces native window decorations with a custom titlebar that 
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 
-[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Equalize is visible only when the focused region's active tab has at least two panes; the root view projects the reconciled live pane tree into the titlebar each frame, so split, close, focus, and asynchronous session retirement cannot leave stale chrome. The badge is projected in the same post-reconcile pass from the focused region's ID, count, and accent plus the shared live workspace name, so naming and focus changes cannot leave stale badge geometry. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
 
 ### Window move region
 
@@ -740,7 +740,7 @@ press-and-drag would redeem.
 The arm step is gated on `drag.is_none()`, so `None` means unarmed. GPUI
 dispatches its bubble phase front-to-back, so a tab's own `on_mouse_down`
 has already recorded the drag-reorder state by the time the root handler
-runs — pressing a tab therefore reorders tabs and never moves the window. The gear, equalize, workspace-notes,
+runs — pressing a tab therefore reorders tabs and never moves the window. The gear, equalize,
 and min/maximize/close buttons each stop propagation on left press for the same
 reason, so a click with a pixel of pointer jitter cannot arm a move and swallow
 the click. The same pattern is used by the settings window titlebar.
@@ -748,8 +748,17 @@ the click. The same pattern is used by the settings window titlebar.
 ### Keyboard operation
 
 Every interactive titlebar control is a GPUI tab stop in painted order: tabs,
-their close targets, equalize when visible, workspace notes, settings, then
+their close targets, equalize when visible, settings, then
 minimize, maximize, and close.
+
+Their tracked focus handles are explicit tab stops with one shared tab index,
+so GPUI insertion order supplies that sequence while equalize appears or
+disappears.
+
+Every tab's close node stays mounted in that order at zero opacity until its
+tab is active or hovered, its tab has focus, or the close node itself has
+focus. This keeps forward and reverse traversal stable because pinned GPUI
+registers only mounted focus handles; focus reveals the glyph on the next frame.
 
 Tab from the terminal enters that order and
 Shift+Tab reverses it; focused controls paint the accent focus treatment so
@@ -759,8 +768,7 @@ Enter or Space activates the focused control. On a tab, Left/Right move focus
 between tabs, while Ctrl+Shift+Left/Right reorders the focused tab and retains
 focus on it; neither route reaches the PTY. Closing a focused tab preserves
 the active-tab invariant; the nearest remaining tab receives focus, while GPUI
-continues its deterministic tab-stop order. Workspace Notes opens its modal,
-settings opens its singleton window,
+continues its deterministic tab-stop order. Settings opens its singleton window,
 equalize emits its normal titlebar event, and window controls invoke their
 native operations.
 
@@ -968,7 +976,7 @@ The GPUI rebuild ports the three interactive overlays — command palette, right
 
 Surfaces with no `KeybindingsConfig` field of their own are opened from a fixed chord the shell hard-codes, and a hard-coded chord must never shadow a configured action.
 
- is that table — the tooltip demo, the close dialog, the clipboard dialog, and the workspace-notes modal — and  resolves a keystroke against it *after*  has had first refusal, returning `None` whenever a binding claims the key. The precedence is load-bearing because  runs ahead of : a chord claimed there never reaches the binding dispatcher at all. For the whole of the rebuild the close dialog sat on `ctrl+shift+q` and the notes modal on `ctrl+shift+n`, which are the Linux defaults for `close_tab` and `new_window`, so both actions were unreachable without a rebind. The overlays moved to `ctrl+shift+d` and `ctrl+shift+m` (chords no default binding uses) and the precedence rule keeps any future collision — including one a user creates by rebinding onto an overlay chord — resolved in the user's favour.
+ is that table — the tooltip demo, the close dialog, the clipboard dialog, and vi mode — and  resolves a keystroke against it *after*  has had first refusal, returning `None` whenever a binding claims the key. The precedence is load-bearing because  runs ahead of : a chord claimed there never reaches the binding dispatcher at all. During the rebuild the close dialog sat on `ctrl+shift+q`, the Linux default for `close_tab`, so the action was unreachable without a rebind. The dialog moved to `ctrl+shift+d`, and the precedence rule keeps any future collision — including one a user creates by rebinding onto an overlay chord — resolved in the user's favour.
 
 ### Overlay Action Routing
 
@@ -1079,58 +1087,6 @@ Verifies  followed by  emits the newly focused button's  on .
 ### Dialog view click and dismissal resolve
 
 Verifies  emits the clicked button's outcome regardless of focus, and that  emits the safe cancel outcome for an Esc or backdrop click.
-
-## GPUI Workspace Notes
-
-The GPUI rebuild ports the per-workspace notes modal and its hover preview as `gpui::Entity` views, replacing the winit `CellInstance` painters while keeping the state machines and geometry verbatim.
-
- caches the server-owned  per workspace and projects  rows for the preview;  is the shared inline-editor buffer (FR-020) whose caret-motion and scroll helpers are byte-for-byte ports.
-
- folds the active/archive/editor state machine (the  toggle, the  target, draft dirty flag, and `\n---\n` bulk splitter) into one entity, painting the panel, nav, note rows, and editor with GPUI elements. Clicking a control emits a ;  and  turn the current state into a frozen  for the shell to send.
-
- ports the winit `WORKSPACE_NOTES_DEBOUNCE` timer: each edit restarts a 250 ms window via a cancel-on-drop `gpui::Task`, so a typing burst collapses to one  flush, and workspace-switch / close paths force one with .
-
- paints the hover preview in two modes — a read-only list with a "+N more" overflow row plus a "+" affordance (FR-001), or the inline editor (FR-002) with a caret, error row, and scroll clamp. The pure sizing/wrap helpers (, , ) stay testable; clicks emit a .
-
-The shell wires both over the frozen protocol through  and ; Ctrl+Shift+M opens the modal and routes its actions. Hovering the titlebar notes affordance emits `::WorkspaceNotesHover`, which  resolves against the focused server workspace, fetches, and paints on the live overlay layer.
-
-### GPUI Workspace Notes IPC
-
-The notes surface is bound to the workspace the user is actually in, and every list it paints comes from the server: nothing is fabricated client-side and nothing is applied optimistically.
-
- resolves the target `WorkspaceId` before anything opens: the focused region when the server itself minted its id (`PaneShell::is_server_workspace`), otherwise the focused tab's workspace — the id `SessionList` / `SessionCreated` filed that session under. When the client has learned no server workspace yet,  declines to open rather than inventing an id the server has never seen. That is what makes the `WorkspaceNotesGet` it sends answerable and the `WorkspaceNotesMutate` a save produces land on real notes.
-
-The inbound half lands on the IPC reader thread, which must never touch a GPUI entity, so  folds both `WorkspaceNotesSnapshot` (the answer to the modal's own request) and `WorkspaceNotesChanged` (the broadcast the server fans out after each accepted mutation) into the shared  and bumps the repaint generation.  adopts it on the next redraw, gated on  so an unchanged cache costs one comparison; the draft is only replaced while pristine (), so a late snapshot never eats typed text. Because the broadcast is the only thing that moves the rendered lists, two windows converge on the server's last accepted mutation.
-
-A rejected mutation arrives as the flat `ServerMessage::Error` channel, so  matches the server's `workspace note mutation failed` prefix and mirrors that one class of error into the store's `last_error`, where the modal footer renders it, in addition to the status line every error reaches.
-
-### Inline editor caret motion
-
-Verifies  inserts and backspaces on char boundaries and that horizontal, line-edge, and vertical caret motion preserve the character column across multi-byte text.
-
-### Store projects summaries
-
-Verifies  flattens whitespace, caps each summary length, and reports the total active count so the preview can show overflow.
-
-### Modal view and edit-mode state machine
-
-Verifies  open seeds the draft, close resets the editor, switching views cancels a non-draft edit, and draft typing marks the buffer dirty while editing an existing note does not.
-
-### Modal save maps to a mutation
-
-Verifies  maps each edit mode to the right  (blank draft yields none), and that archive controls carry the correct reason.
-
-### Draft debounce coalesces and fires once
-
-Verifies  emits no flush before the 250 ms window, exactly one flush after it, coalesces a typing burst into a single flush, and that  forces one immediately while cancelling the pending timer.
-
-### Preview sizing and wrap geometry
-
-Verifies the preview's pure geometry:  sizes to the longest note or editor line and clamps,  splits on hard and soft breaks, and the caret line/column helpers track the wrapped position.
-
-### Preview inline and editor modes
-
-Verifies  toggles between the read-only affordance and the inline editor as its  buffer is set and cleared.
 
 ## App State
 
@@ -1277,54 +1233,6 @@ Verifies that a registered session with `context=None` returns `None` from `tab_
 
 Verifies that when `warn_color` is set to an unparseable hex string, `tab_context_suffix` still returns `Some` and the color equals the provided `fallback_color` rather than `None`, matching the other context displays' invalid-hex fallback behavior.
 
-## Workspace Notes
-
-Workspace notes are server-backed notes scoped to a workspace badge and rendered by client GPU overlays.
-
- is a non-durable cache of server snapshots. It is populated from `WorkspaceNotesSnapshot` and `WorkspaceNotesChanged` messages, while durable state lives in . The client no longer writes `workspace_notes.toml`.
-
-Click routing uses  to turn the rendered workspace badge/name into a modal target.  focuses that workspace, closes transient overlays, and opens  with any saved draft.  consumes modal keys before PTY translation: **Enter saves, Ctrl+Enter inserts a newline**, Backspace edits the text, the spacebar inserts a literal space, and Escape closes or cancels edits.
-
-Opening a modal or receiving reconnect workspace metadata triggers . Snapshot drafts hydrate the modal only while its local draft is pristine; typed text is never overwritten by a late snapshot. User edits are sent through `WorkspaceNotesMutate`; the client updates visible lists only from server broadcasts so multiple windows converge on the server's last accepted mutation.
-
-The active view supports creating notes, editing active notes, and moving done or removed notes to archive. The archive view keeps archived notes separate, supports single archived-note edits, and has an edit-all mode that sends one bulk mutation without touching active notes.
-
-Clicking outside the notes modal closes it through the same draft-preserving path as the explicit close action. Empty modal space remains inert so controls are the only in-modal click targets.
-
-Draft typing is debounced by , then flushed immediately by  on modal close. Update, restart, quit, and window-close actions defer until pending draft or modal mutations receive the server broadcast that proves durability.
-
-The modal renderer keeps terminal-cell geometry while spacing header tabs, note list, New-note editor, bordered input with a visible caret, retryable server-error text, and footer zones with theme-derived surfaces and title-cased actions.
-
-Hover previews are derived from active notes only and rendered by .  draws the bounded preview above terminal content but before modal overlays, while suppressing it behind the notes modal, context menu, close dialog, and update dialog.
-
-The hover preview stays open while the pointer is over the workspace badge or preview bounds. Visible preview notes highlight on hover with a left accent bar drawn by `draw_row_hover` (no row-wide tint — the bar plus brighter `hover_text` carry the selection signal), and clicking one sends `ArchiveNote { reason: Done }` so lightweight note cleanup does not require opening the modal.
-
-### Inline Note Editor
-
-The hover preview exposes an inline note-capture affordance — a `~2 col × 1 row` bordered "+" cell — that lets a user create a new active note without opening the modal.
-
-Visual treatment: when the editor is open the row uses an underline-only style (no box fill, no top/side borders) with a leading accent "›" prompt indicator rendered by `draw_editor_text`. An `EDITOR_PREFIX_COLS`-wide indent is reserved across wrapped continuation rows so the caret column stays aligned, and `editor_content_cols` subtracts the prefix from the wrap budget so layout sizing and `clamp_scroll_to_caret` agree with the renderer.
-
-Affordance routing: the read-only preview reserves a bottom row for a bordered "+" cell positioned with one cell of inset from the preview's right and bottom inner borders. Its hit-rect is published on `.affordance_rect`. Hover state is tracked by the new `App` field `affordance_hovered_workspace`. Click routing in  hit-tests the affordance before existing note-row archival, and on hit calls .
-
-Per-workspace state: the editor's lifetime state lives in a per-workspace map field `adding_note_states: HashMap<WorkspaceId, AddingNoteState>` on `App`. Multiple workspaces can hold "adding note" state simultaneously (relevant under split panes and cross-workspace pointer movement); editor state survives pointer-leave / pointer-return cycles because the map is independent of which preview is currently rendered. A single workspace is also tracked in `focused_inline_editor: Option<WorkspaceId>` so the keyboard router knows which editor owns key focus when keys arrive between the modal handler and PTY translation.
-
- holds `draft_text: String`, `draft_dirty: bool`, `caret_byte: usize`, `scroll_offset_rows: usize`, `last_server_error: Option<String>`, and `committed_pending: bool`. The struct is constructed via  which seeds `draft_text` from the workspace's existing saved draft (shared buffer with the modal's New-note editor) and places the caret at the end of that text. Text mutation goes through  and ; caret navigation goes through `move_caret_left`, `move_caret_right`, `move_caret_up`, `move_caret_down`, `move_caret_line_start`, `move_caret_line_end`. The helper  gates empty-draft Enter as a no-op.
-
-Caret math is UTF-8-safe end-to-end: vertical movement computes column position as a CHAR count (not a byte difference) and converts back to a byte offset via the file-private `byte_offset_of_nth_char` helper, so multi-byte glyphs (CJK, emoji, combining marks) never leave `caret_byte` mid-codepoint. `String::insert` / `String::replace_range` panics on bad boundaries are therefore unreachable from any keymap path.
-
-Keyboard capture:  runs at level 2 of the  chain (Special commands) when `focused_inline_editor` is set, before PTY translation. The keymap matches the modal post-FR-017: Enter commits via  sending `WorkspaceNotesMutation::CreateActiveNote`; Ctrl+Enter calls `insert_char('\n')` for a literal newline; Escape calls  which discards the in-progress draft text without flushing; Space inserts a literal space; Backspace deletes the previous char; arrow keys, Home, and End drive caret navigation. Commit-coalescing (FR-016) short-circuits successive Enter presses while `committed_pending == true`.
-
-Draft pipeline: typing piggybacks on the existing `workspace_notes_save_pending: Option<Instant>` debounce timer. When  elapses or any higher-priority overlay fires,  (driven by ) emits one `SaveDraft` per workspace whose `draft_dirty` flag is set. The shared-buffer guarantee (FR-020) means committing via either the modal or the inline editor consumes the same draft.
-
-Layout & growth:  carries `inline_editor: Option<&mut AddingNoteState>`, `affordance_hovered: bool`, and `max_editor_rows: Option<usize>`. The `&mut` is needed because the build pass calls  internally — after `PreviewLayout::new` computes the real `cols` and `editor_rows` — so the scroll-to-caret math always uses the renderer's actual content width (not an external estimate). The build call site in  computes `max_editor_rows` via  — 3/4 of the focused pane's vertical extent per FR-019 — and passes a `&mut` borrow of the workspace's `AddingNoteState`. The layout struct `PreviewLayout` (in `workspace_notes_preview.rs`) tracks `bottom_zone_row`, `editor_rows`, and `has_editor_error` to drive rendering of either the "+" affordance row (`draw_affordance`) or the inline editor row (`draw_editor_row`). Wrapping helpers (`wrap_text_for_editor`, `wrapped_row_count`, `caret_line_index`, `caret_visible_col`, `longest_visible_line_chars`) are pure functions that compute visual wrap geometry;  uses a parallel `visual_line_of` helper so editor state and renderer agree on caret position.
-
-Scroll inputs: caret-tracking auto-scroll fires inside `clamp_scroll_to_caret`;  consumes mouse-wheel events landing inside `WorkspaceNotesPreviewInteraction.editor_rect` and updates `scroll_offset_rows` without moving the caret (wheel events outside the editor row fall through to the terminal). A static overlay scrollbar inside the editor row visually indicates scroll position when wrapped content exceeds `editor_rows`; the full `ScrollbarState` fade animation pattern (``) is reserved for a future polish pass.
-
-Dismissal & errors: higher-priority overlays (notes modal, context menu, command palette, search overlay, close dialog, update dialog) close all inline editors and flush their drafts through `SaveDraft` via . The dismiss is wired at the **overlay-open entry points themselves** (`open_workspace_notes_modal`, `handle_open_command_palette`, `handle_open_find`, context-menu-open, `handle_close_requested`, update-dialog-open) rather than from the render path, so the flush IPC fires synchronously at the moment the user takes the action — no in-render side effects.  gates the read-only preview against all six overlay sources so the affordance disappears the same frame any of them opens. The modal-open path captures the inline editor's local `draft_text` for the target workspace BEFORE the dismiss runs, then passes that text directly to `WorkspaceNotesModal::open` — otherwise the asynchronous `SaveDraft` ack would leave the modal showing stale text.
-
-The pointer-leave-while-editing exemption in  falls back to `focused_inline_editor` as the hover anchor so the editor stays visible across hover gaps. Window-close and update-relaunch flush through  which iterates inline-editor drafts before allowing the action to proceed. Late server snapshots are reconciled by  which adopts the broadcast draft only when the local `draft_dirty == false` (FR-015 pristine-draft policy) and clamps the caret to the nearest char boundary in the new text. Server rejections of an in-flight `CreateActiveNote` surface into `AddingNoteState.last_server_error` (set in the `ServerError` arm of ) while preserving the typed text so the user can retry without retyping.
-
 ## Input
 
 Keybindings are parsed from config into a `Bindings` struct in  with over 50 configurable actions.
@@ -1371,8 +1279,6 @@ The demo and source evidence are recorded in
 Key events are resolved through a four-level priority chain from layout shortcuts down to raw terminal byte encoding.
 
 On macOS, bare `cmd+w` is handled before that chain and routed to the same close-request path as the native window close button, so it never falls through to pane bindings or terminal input.
-
-The hover-preview inline editor (see ) inserts itself at level 2: when `focused_inline_editor` is set,  consumes the key before the rest of the chain runs. This is in addition to the existing modal handler, which still receives keys through `handle_workspace_notes_window_event` when the modal is open.
 
 Above the level-4 encoder,  short-circuits the dispatch at the entry of `handle_keyboard` whenever an OS IME composition is in flight, so synthesized winit key events that the IME is mid-composing never reach the legacy or Kitty encoder. See  for the state machine that drives that predicate.
 
@@ -1434,8 +1340,6 @@ The query field accepts clipboard paste (`Ctrl+V` / `Cmd+V`), reading the host c
 ### Mouse Handling
 
 Mouse events are processed for text selection, scrollbar interaction, divider drag, tab drag, prompt bar interactions, and context menus.
-
-Workspace-notes hover-preview hit testing extends this with three rects on `WorkspaceNotesPreviewInteraction`: the "+" affordance (`affordance_rect`, click opens the inline editor), the editor row (`editor_rect`, absorbs clicks so they don't archive notes behind it), and the in-editor wheel routing through  which consumes the wheel inside the editor row.
 
 Selection modes are click-drag for cell, double-click for word or configured Smart Selection, triple-click for line, and quad-click for Smart Selection when configured that way. Scrollbar supports click-to-jump and drag-to-scroll. Divider drag resizes splits with 4px hit tolerance. Tab drag reorders with visual offset.
 
@@ -1529,7 +1433,7 @@ The state lives in  (composition text, optional caret byte range, and the absolu
 
 The gate predicate is `window_focused && current_surface == TerminalPane`; the result is ANDed with the X11 active-window guard and pushed to `window.set_ime_allowed(...)` whenever it changes.
 
- handles the immutable surface check: it returns false when the search overlay, command palette, workspace-notes modal, close / update / context-menu dialogs, or the workspace-notes hover-preview inline editor (FR-005) is active.  then ANDs that with `!compositor_overlay_active` (the X11 active-window guard, which mutates the post-reactivation debounce) and pushes the result to winit. The pushed value is memoised in `last_ime_allowed` so steady-state ticks (the per-frame `about_to_wait` call on Linux) short-circuit without touching winit IPC; the gate only flips when the computed value differs from the last push. Whenever the gate flips to disallowed, any in-flight `PreeditState` is dropped so focus loss or surface change immediately retires the visual overlay (FR-008) and clears the  short-circuit.
+ handles the immutable surface check: it returns false when the search overlay, command palette, or close / update / context-menu dialogs are active.  then ANDs that with `!compositor_overlay_active` (the X11 active-window guard, which mutates the post-reactivation debounce) and pushes the result to winit. The pushed value is memoised in `last_ime_allowed` so steady-state ticks (the per-frame `about_to_wait` call on Linux) short-circuit without touching winit IPC; the gate only flips when the computed value differs from the last push. Whenever the gate flips to disallowed, any in-flight `PreeditState` is dropped so focus loss or surface change immediately retires the visual overlay (FR-008) and clears the  short-circuit.
 
 #### Cursor-Rect Strategy
 

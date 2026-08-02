@@ -205,16 +205,6 @@ Each connected window can report its workspace split layout via `ReportWorkspace
 
 The reported tree's leaves carry per-tab `session_ids`, per-tab pane split trees, and the per-workspace `active_tab_index` — the server stores the tree opaquely and ships it back unchanged on the next `SessionList`, so adding new per-leaf fields requires no server-logic changes. Clients are responsible for reporting the tree after every layout-mutating action (split, close, tab switch, divider drag), which guarantees the server's stored tree is fresh enough that the next handoff or reconnect round-trips the user's focused tab.
 
-### Workspace Notes
-
-Workspace notes are durable server-owned user content keyed by `WorkspaceId`.
-
-The authoritative store lives in  and is loaded from `$XDG_STATE_HOME/<flavor>/workspace_notes.toml` during server startup. The file must carry `owner = "server"`, so the client-local note file used by the earlier implementation is ignored and the new store starts fresh.
-
- clones the current store, applies one , writes the next TOML file atomically, and commits the in-memory state only after the write succeeds. `ipc_server` then broadcasts `WorkspaceNotesChanged` to all connected clients. If validation or persistence fails, the requester receives `Error` and no broadcast is sent.
-
-Drafts use the same store as saved notes. Clients debounce `SaveDraft` while typing and force a final draft mutation before close, save, or shutdown transitions that can otherwise lose unsaved text.
-
 ## Handoff
 
 Zero-downtime server upgrades are implemented in  using Unix file descriptor passing.
@@ -238,8 +228,6 @@ Each session also carries the child's PID and an additive `#[serde(default)]` ch
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
 
 The per-window workspace tree rides separately in  and carries the per-leaf `active_tab_index` (also `#[serde(default)]` for cross-version compatibility — a pre-active-tab-aware sender degrades to 0, and the next client report restores the correct value). This is why focused-tab state survives `--upgrade` without a dedicated per-window state struct.
-
-Workspace notes are not embedded in handoff state. They are write-through server state, so the replacement server reloads the persisted notes store before answering note snapshots.
 
 ### Session Replay Encoding
 

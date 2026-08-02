@@ -13,7 +13,7 @@ The workspace contains eight crates, each with a focused responsibility.
 
 ### scribe-common
 
-Shared types used by every other crate: the IPC , error definitions, , configuration, theme system, socket path conventions, and workspace-note wire types. This is a leaf dependency with no internal cross-crate references.
+Shared types used by every other crate: the IPC protocol, error definitions, configuration, theme system, and socket path conventions. This is a leaf dependency with no internal cross-crate references.
 
 The protocol surface also carries the  /  message pair that backs the settings window's release-history panel.
 
@@ -145,7 +145,7 @@ Every acceptance criterion and porting obligation in `specs/016-gpui-client-rebu
 
 This closed the systemic hole behind the 2026-07-27 NO-GO: nine spec requirements — mouse reporting, mouse-wheel scrolling, IME composition, cold-restart restore, the command-mark scrollbar, window geometry persistence, the desktop notification dispatcher, server lifecycle management, and file drag-and-drop — had never been enumerated, so no oracle scored them and the gate read 163 of 164 rows reachable while nine requirements were missing from the product. The escape hatch is narrow: tree, licensing and CI requirements (`US5-*`, `US6-*`) are marked `not a parity row` with the artifact that gates them, because no reachable client symbol can carry them.
 
-Widening the census surfaced five requirements with no live path. Pane dividers and the AI indicator's painted half are now wired; server-upgrade reattach and the remote connect picker remain missing, while the workspace-notes hover preview remains unwired. The AI gap was invisible to the module ratchet because `ai_indicator` is imported by `main.rs`; module-level reachability is a floor, not a substitute for a per-requirement row.
+Widening the census surfaced requirements with no live path. Pane dividers and the AI indicator's painted half are now wired; server-upgrade reattach and the remote connect picker remain missing. The AI gap was invisible to the module ratchet because `ai_indicator` is imported by `main.rs`; module-level reachability is a floor, not a substitute for a per-requirement row.
 
 #### Go Threshold
 

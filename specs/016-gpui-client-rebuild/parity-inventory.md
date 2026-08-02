@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (47 sent)
+## Client messages (45 sent)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -113,8 +113,6 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ReportWorkspaceTree` | layout persistence | scripted-E2E | `main.rs::TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation | required |
 | `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, once a find-overlay query settles past the 150 ms debounce | required |
 | `SearchClosed` | find overlay | scripted-E2E | `main.rs::TerminalView::close_find_overlay` → `ipc_bridge::IpcSink::search_closed`, when the overlay is dismissed or rebuilt by a theme reload | required |
-| `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::TerminalView::open_workspace_notes_modal` → `IpcSink::workspace_notes_get`, on the workspace `TerminalView::notes_workspace_id` resolves | required |
-| `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::TerminalView::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
 | `CloseWindow` | close dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::close_window`, from the close dialog the WM close request and the quit chord raise | required |
 | `QuitAll` | quit-all dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::quit_all`, from the same close dialog | required |
@@ -146,19 +144,18 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 
-**Reachability:** 47 of 47 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 45 of 45 rows name a live-path symbol; 0 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (59 handled)
+## Server messages (57 handled)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
-The planning note named 57 variants; the frozen source at this inventory's
-baseline contains 59. This table intentionally follows the source so neither
-additive sharing variant is omitted.
+The planning note named 57 variants, matching the frozen source at this
+inventory's current baseline.
 
 The live reader's dispatcher `main.rs::dispatch_server_message` names 54 of the
 59 variants and routes the rest to `main.rs::unhandled_server_message`, which
@@ -195,8 +192,6 @@ that does not exist.
 | `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
 | `SessionList` | startup/reconnect | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_session_list` → `main.rs::sync_tab_strip` | required |
 | `WorkspaceInfo` | workspace layout | scripted-E2E | `main.rs::on_workspace_info` → `ChromeMetadata::name_workspace` + parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` | required |
-| `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collections` → `TerminalView::sync_workspace_notes` | required |
-| `WorkspaceNotesChanged` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collection` → `TerminalView::sync_workspace_notes` | required |
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_welcome` → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
@@ -234,7 +229,7 @@ that does not exist.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 59 of 59 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 57 of 57 rows name a live-path symbol; 0 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -364,7 +359,7 @@ beads `.56` and `.53`), the command-mark scrollbar (bead `.88`), and the X11
 focus guard (FU-15). The audit's figure at `f56ef95` was 0 of 5, with 3 unwired
 and 2 missing; the scrollbar row was added afterwards with bead `.88`.
 
-## Spec behaviour requirements (29)
+## Spec behaviour requirements (28)
 
 These rows are derived from [`spec.md`](spec.md)'s requirement register rather
 than from the legacy client's IPC surface: every acceptance criterion and
@@ -405,7 +400,6 @@ further requirements that are not reachable today.
 | AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::{update,remember_provider}`; `on_pane_output_message` → `note_activity`; `TerminalView::{tick_ai_animation,poll_window_lifecycle,on_key_down}` → `{tick,needs_animation,clear_stale_processing,clear_attention_states}`; `render_panes` aggregates `workspace_border_color` and paints `pane_border_edges`; `sync_tabs` feeds `tab_indicator_color` to `TitlebarView` — `tests/e2e/visual/ai-indicator.sh` | required |
 | Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tabs` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
 | Workspace accent colours and badges | `US4-3` | region accents and status badges | visual-E2E | `main.rs::TerminalView::next_region_accent` → `PaneShell::split_workspace`, painted through `main.rs::pane_border`; the tmux/session/share badges via `status_bar::build_model` — `tests/e2e/visual/workspace-split.sh` | required |
-| Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | `titlebar::TitlebarView` emits `WorkspaceNotesHover` from its notes affordance → `main.rs::TerminalView::set_workspace_notes_preview` creates `workspace_notes_preview::WorkspaceNotesPreviewView`, requests the server snapshot, and renders it on the live overlay layer — `tests/e2e/visual/workspace-notes.sh` | required |
 | Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | `main.rs::TerminalView::open_remote_connect` → `remote::RemoteConnect` → `remote_picker::remote_picker_overlay`; the picker receives fresh peer snapshots through `TerminalView::sync_remote_connect`, probes a selected tailnet peer with `RemoteHandshake` + `ListWindows`, then launches the chosen window with its dial environment — `tests/e2e/visual/remote-control.sh` | required |
 | Status bar segments | `US4-5` | full segment set | visual-E2E | `main.rs::TerminalView::build_status_model` → `status_bar::build_model` → `status_bar::render`, with the CPU/mem/GPU/net sparklines fed by `sys_stats::SystemStatsCollector` — `tests/e2e/visual/window-chrome-bands.sh` | required |
 | xterm-256 palette | `PO-1` | indexed colour resolution | golden | `main.rs` builds one `color::TerminalColors` per theme, which owns `palette::ColorPalette`; `TerminalColors::resolve_color` resolves every indexed cell on the paint path. The reachability ratchet follows that transitive `main → color → palette` import chain. | required |
@@ -414,7 +408,7 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 29 of 29 rows name a live-path symbol; 0 are unwired and 0 are
+**Reachability:** 28 of 28 rows name a live-path symbol; 0 are unwired and 0 are
 missing. None of the original five had a row
 before 2026-07-27, so none was scored by the gate.
 
@@ -454,19 +448,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 47 | 47 | 0 | 0 |
-| Server messages | 59 | 59 | 0 | 0 |
+| Client messages | 45 | 45 | 0 | 0 |
+| Server messages | 57 | 57 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 29 | 0 | 0 |
+| Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **204** | **204** | **0** | **0** |
+| **Total** | **199** | **199** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **195 rows, of which 195 are
-reachable (100%)** and 0 are not. **1 of those 195** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **190 rows, of which 190 are
+reachable (100%)** and 0 are not. **1 of those 190** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **194 of 195**.
+the in-client figure is **189 of 190**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
@@ -516,7 +510,7 @@ than by a reachable client symbol.
 | `US3-10` | `Pane dividers and drag-resize`, `Focused pane and workspace accent border` |
 | `US4-1` | `AI indicator borders and tab tint`, `Prompt bar and tab context meter`, `AiStateChanged`, `TaskLabelChanged` |
 | `US4-2` | `Command-mark scrollbar` |
-| `US4-3` | `Workspace accent colours and badges`, `Workspace notes hover preview`, `WorkspaceNotesSnapshot`, `workspace_split_vertical` |
+| `US4-3` | `Workspace accent colours and badges`, `workspace_split_vertical` |
 | `US4-4` | `Remote connect picker overlay`, `LanApprovalRequest`, `WindowTakenOver`, `ShareRoster`, `ControlRequested` |
 | `US4-5` | `Status bar segments` |
 | `US5-1` | not a parity row — deletion sweep, gated by bead `scribe-38e.45` |

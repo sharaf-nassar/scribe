@@ -359,6 +359,14 @@ impl PaneShell {
         self.workspace.read(cx).focused_workspace_id()
     }
 
+    /// The focused workspace region's live accent color.
+    pub fn focused_workspace_accent(&self, cx: &App) -> [f32; 4] {
+        let workspace = self.workspace.read(cx);
+        workspace
+            .find_workspace(workspace.focused_workspace_id())
+            .map_or(FALLBACK_PANE_ACCENT, |slot| slot.accent_color)
+    }
+
     /// The focused pane of the focused region.
     pub fn focused_pane(&self, cx: &App) -> Option<PaneId> {
         self.focused.get(&self.focused_workspace_id(cx)).copied()
@@ -639,6 +647,13 @@ impl PaneShell {
     /// Total number of live panes across every region.
     pub fn pane_count(&self, cx: &App) -> usize {
         self.trees.values().map(|tree| tree.read(cx).all_pane_ids().len()).sum()
+    }
+
+    /// Number of panes in the focused region's active tab.
+    pub fn focused_region_pane_count(&self, cx: &App) -> usize {
+        self.trees
+            .get(&self.focused_workspace_id(cx))
+            .map_or(0, |tree| tree.read(cx).all_pane_ids().len())
     }
 
     /// Number of workspace regions the window is split into.

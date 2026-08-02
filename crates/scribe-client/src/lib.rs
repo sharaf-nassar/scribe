@@ -116,9 +116,6 @@ pub mod window_chrome;
 pub mod window_lifecycle;
 pub mod window_state;
 pub mod workspace_layout;
-pub mod workspace_notes;
-pub mod workspace_notes_modal;
-pub mod workspace_notes_preview;
 pub mod workspace_tree;
 #[cfg(target_os = "linux")]
 pub mod x11_focus;
