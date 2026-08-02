@@ -550,9 +550,8 @@ struct WindowSeed {
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
 /// the same thing.
 ///
-/// Structured AI shortcuts bind directly from their typed launch intent.
-/// Legacy argv detection remains only for custom commands that happen to invoke
-/// a provider, with resume matched before the provider's bare binary name.
+/// AI shortcuts bind directly from typed launch intent. Every command without
+/// that intent remains a custom command, regardless of its argv contents.
 fn launch_binding_for(
     command: Option<&Vec<String>>,
     ai_launch: Option<&AiLaunchSpec>,
@@ -569,12 +568,6 @@ fn launch_binding_for(
     let Some(argv) = command else {
         return restore_replay::new_shell_binding(cwd);
     };
-    if let Some(provider) = restore_replay::detect_ai_command(argv, true) {
-        return restore_replay::new_ai_binding(provider, AiResumeMode::Resume, cwd, None);
-    }
-    if let Some(provider) = restore_replay::detect_ai_command(argv, false) {
-        return restore_replay::new_ai_binding(provider, AiResumeMode::New, cwd, None);
-    }
     restore_replay::new_custom_binding(argv.clone(), cwd)
 }
 
@@ -3490,13 +3483,13 @@ impl TerminalView {
         }
     }
 
-    /// Ask for an AI tab using structured intent plus the old-server argv twin.
+    /// Ask for an AI tab using structured intent.
     fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode, cx: &App) {
         let cwd = self.resolve_ai_tab_cwd(cx);
         self.create_ai_tab_request(provider, resume_mode, cwd);
     }
 
-    /// Build one immutable structured + legacy-compatible AI create request.
+    /// Build one immutable structured AI create request.
     fn create_ai_tab_request(
         &mut self,
         provider: AiProvider,

@@ -214,10 +214,7 @@ pub enum AiResumeMode {
     Resume,
 }
 
-/// Structured AI launch intent carried alongside the legacy command argv.
-///
-/// Current servers make this authoritative for provider command construction;
-/// the legacy argv remains dual-written for older local servers.
+/// Structured AI launch intent for server-owned provider command construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiLaunchSpec {
     pub provider: AiProvider,
@@ -263,9 +260,8 @@ pub enum ClientMessage {
         /// The first element is the program, remaining elements are arguments.
         #[serde(default)]
         command: Option<Vec<String>>,
-        /// Structured AI launch intent. During the dual-write compatibility
-        /// window clients also send the legacy `command` argv. Servers that
-        /// understand this field make it authoritative.
+        /// Structured AI launch intent. AI clients leave `command` empty when
+        /// this is present; the server owns shell resolution and argv.
         #[serde(default)]
         ai_launch: Option<AiLaunchSpec>,
         /// Cold-restart restore association: the `LaunchRecord.launch_id` whose
@@ -1451,7 +1447,7 @@ mod tests {
             split_direction: None,
             cwd: Some(PathBuf::from("/tmp/project")),
             size: Some(TerminalSize { cols: 120, rows: 40, cell_width: 8, cell_height: 16 }),
-            command: Some(vec!["sh".to_owned(), "-lic".to_owned(), "exec codex".to_owned()]),
+            command: None,
             ai_launch: Some(AiLaunchSpec {
                 provider: AiProvider::CodexCode,
                 resume_mode: AiResumeMode::Resume,
@@ -1475,10 +1471,7 @@ mod tests {
                 assert_eq!(ai_launch.provider, AiProvider::CodexCode);
                 assert_eq!(ai_launch.resume_mode, AiResumeMode::Resume);
                 assert_eq!(ai_launch.conversation_id.as_deref(), Some("conversation-42"));
-                assert_eq!(
-                    command.as_deref().and_then(|argv| argv.first()).map(String::as_str),
-                    Some("sh")
-                );
+                assert!(command.is_none());
             }
             other => panic!("unexpected variant after round-trip: {other:?}"),
         }

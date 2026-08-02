@@ -61,16 +61,18 @@ The repair parks authoritative `SessionList` workspace entries on the existing o
 
 ## Protocol and compatibility
 
-Protocol v4 and dual-write behavior passed compile, unit, static, and new-server runtime checks, while old-server runtime compatibility remains explicitly unexecuted.
+Initial protocol-v4 dual-write behavior passed compile, unit, static, and new-server runtime checks. The later structured-only retirement replaces that transitional client behavior without claiming old-server runtime compatibility.
 
 | Assertion | Status | Evidence |
 |---|---|---|
 | Remote protocol version | PASS | `REMOTE_PROTOCOL_VERSION` is exactly `4`; remote gates use exact-match semantics. |
-| Structured + legacy dual-write frame | PASS | `create_session_ai_launch_round_trips_through_msgpack_named` passed and retained both fields. |
+| Structured-only AI frame | PASS | `create_session_ai_launch_round_trips_through_msgpack_named` passed with `command: None` and preserved `ai_launch`. |
+| Structured-only cold replay | PASS | `ai_replay_uses_structured_launch_only` passed with provider, resume mode, and conversation id intact. |
+| Initial structured + legacy dual-write frame | HISTORICAL PASS | The original verification retained both fields before the compatibility path was retired. |
 | New-server structured preference | PASS | Server source branches on `Some(ai_launch)` into `build_ai_shell`; fresh sandbox launches exercised server-owned bash login argv. |
 | Missing field / legacy decode | PASS | `create_session_missing_ai_launch_defaults_to_none` passed. |
-| Cold-replay dual values | PASS | `ai_command_detection_and_replay_argv` passed; sandbox cold replay relaunched the AI shim. |
-| Known-old-server runtime | NOT-RUN | No provenance-verifiable pre-feature server artifact was available, and verification did not build or install one. Compatibility evidence is named-MessagePack defaulting plus retained legacy argv. |
+| Initial cold-replay dual values | HISTORICAL PASS | The original sandbox cold replay relaunched the AI shim before structured-only retirement. |
+| Known-old-server runtime | OUT OF CONTRACT | The updated client deliberately carries no AI legacy argv. Packaged upgrades transition the server before relaunching it. |
 
 ## Regression and performance evidence
 

@@ -5,6 +5,28 @@
 - Worktree directory preference: `~/.config/superpowers/worktrees/scribe/`
 - NEVER restart the Scribe server without first asking the user and receiving explicit approval. This includes `just restart-server`, `just restart-server-release`, and direct `scribe-server --upgrade` invocations; restarting is extremely disruptive to active work.
 
+## Validation and testing: Docker sandbox ONLY (HARD RULE)
+
+- ALL validation, testing, debugging, and experimentation against
+  `scribe-server`, `scribe-client`, or `scribe-test` MUST run inside the
+  Docker E2E harness (`docker/Dockerfile.func`, `docker/Dockerfile.visual`)
+  — NEVER against this machine's live install. The developer works inside
+  Scribe all day; touching the host server disrupts active work.
+- Enter ONLY through the just recipes: `just docker-func` /
+  `just docker-visual` build the images (both require `just build-release`
+  first), then `just e2e-func <script>`, `just e2e-visual <script>`,
+  `just e2e`, or the purpose-built `e2e-*` recipes run them. Test scripts
+  live under `tests/e2e/`; logs and screenshots land in `./test-output`.
+- NEVER run `scribe-server`, `scribe-client`, `scribe`, `scribe-dev`, or
+  any `scribe-test` subcommand directly on the host. The socket path
+  (`crates/scribe-common/src/socket.rs`) has no environment override, so a
+  host invocation targets the developer's LIVE server socket and PID file
+  — `scribe-test server stop` would SIGTERM the real server. The container
+  boundary is the only isolation guarantee.
+- If the harness lacks a capability you need (debug builds, extra shells,
+  CLI coverage, version pairing, ...), STOP and ask the user. Do not fall
+  back to driving the host as a workaround.
+
 ## Build environment
 
 - Use Rust 1.95.0 or newer.

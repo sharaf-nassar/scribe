@@ -50,9 +50,8 @@ pub enum ReplayCommand {
 
 /// Immutable command/spec pair sent for one session launch.
 ///
-/// AI launches always carry both fields during the compatibility window: a
-/// new server consumes `ai_launch`, while an old server ignores that field and
-/// consumes `command`. Plain shells and custom commands keep `ai_launch` empty.
+/// AI launches use only `ai_launch`; custom commands use only `command`.
+/// Plain shells leave both fields empty.
 #[derive(Debug, Clone)]
 pub struct SessionLaunchValues {
     pub command: Option<Vec<String>>,
@@ -67,8 +66,8 @@ pub struct ReplayLaunch {
     pub pane_id: PaneId,
     pub cwd: Option<PathBuf>,
     pub command: ReplayCommand,
-    /// Wire values built together from `command`, keeping the structured AI
-    /// intent and its legacy argv twin in lockstep through replay dispatch.
+    /// Wire values derived from `command`, keeping structured AI intent intact
+    /// through replay dispatch.
     pub session_launch: SessionLaunchValues,
     /// Persisted launch identifier from the restored snapshot. During
     /// cold-restart replay the client forwards this as
@@ -114,30 +113,6 @@ struct ReplayRebuildContext<'a> {
     panes: &'a mut HashMap<PaneId, PaneRestore>,
     launches: &'a mut VecDeque<ReplayLaunch>,
     records: &'a [LaunchRecord],
-}
-
-/// Return `true` when `argv` invokes the given provider's binary (optionally as
-/// a resume).
-#[must_use]
-pub fn is_ai_command(argv: &[String], provider: AiProvider, resume: bool) -> bool {
-    let tokens: Vec<&str> = argv.iter().flat_map(|part| part.split_whitespace()).collect();
-    let binary = provider.binary_name();
-
-    if resume {
-        let resume_args = provider.resume_args();
-        tokens.windows(1 + resume_args.len()).any(|parts| {
-            parts.first().copied() == Some(binary)
-                && parts.get(1..).is_some_and(|args| args == resume_args)
-        })
-    } else {
-        tokens.contains(&binary)
-    }
-}
-
-/// Detect which AI provider (if any) an argv launches.
-#[must_use]
-pub fn detect_ai_command(argv: &[String], resume: bool) -> Option<AiProvider> {
-    AiProvider::all().iter().copied().find(|provider| is_ai_command(argv, *provider, resume))
 }
 
 /// Build a fresh shell launch binding with a new launch id.
@@ -198,41 +173,20 @@ pub fn prepare_replay(snapshot: &WindowRestoreState) -> RebuiltWindow {
     rebuild_layout_from_snapshot(snapshot)
 }
 
-/// Build the structured AI intent and its legacy argv compatibility twin.
-///
-/// The legacy command remains client-built only while old servers may receive
-/// this frame. Conversation ids are quoted solely for that old-server shell
-/// command; new servers consume the untouched structured value.
+/// Build structured AI intent for a fresh launch or cold-restart replay.
 #[must_use]
 pub fn ai_launch_values(
     provider: AiProvider,
     resume_mode: AiResumeMode,
     conversation_id: Option<String>,
 ) -> SessionLaunchValues {
-    let ai_launch = AiLaunchSpec { provider, resume_mode, conversation_id };
-    let binary = provider.binary_name();
-    let mut shell_command = format!("exec {binary}");
-    if resume_mode == AiResumeMode::Resume {
-        for argument in provider.resume_args() {
-            shell_command.push(' ');
-            shell_command.push_str(argument);
-        }
-        if let Some(target_id) = ai_launch.conversation_id.as_deref() {
-            shell_command.push(' ');
-            shell_command.push_str(&shell_single_quote(target_id));
-        }
-    }
     SessionLaunchValues {
-        command: Some(vec![
-            scribe_common::shell::default_shell_program(),
-            String::from("-lic"),
-            shell_command,
-        ]),
-        ai_launch: Some(ai_launch),
+        command: None,
+        ai_launch: Some(AiLaunchSpec { provider, resume_mode, conversation_id }),
     }
 }
 
-/// Build both wire values for a cold-restart replay command.
+/// Build wire values for a cold-restart replay command.
 #[must_use]
 pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
     match command {
@@ -247,30 +201,6 @@ pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
             ai_launch_values(*provider, AiResumeMode::Resume, None)
         }
     }
-}
-
-/// Expand a [`ReplayCommand`] into its legacy argv compatibility twin.
-#[must_use]
-pub fn command_argv(command: &ReplayCommand) -> Option<Vec<String>> {
-    replay_launch_values(command).command
-}
-
-fn shell_single_quote(value: &str) -> String {
-    if value.is_empty() {
-        return String::from("''");
-    }
-
-    let mut escaped = String::with_capacity(value.len() + 2);
-    escaped.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            escaped.push_str("'\"'\"'");
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped.push('\'');
-    escaped
 }
 
 /// Derive a [`ReplayCommand`] from a persisted launch record.
@@ -939,9 +869,9 @@ mod tests {
         spawn_restore_children(0);
     }
 
-    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#AI command detection]]
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Structured AI replay]]
     #[test]
-    fn ai_command_detection_and_replay_argv() {
+    fn ai_replay_uses_structured_launch_only() {
         let record = LaunchRecord {
             launch_id: "ai-1".to_owned(),
             cwd: None,
@@ -957,11 +887,15 @@ mod tests {
             prompt_count: 3,
         };
         let command = replay_command_from_record(&record);
-        let argv = command_argv(&command).expect("ai resume yields argv");
-        // The conversation id is single-quoted and the resume args are present.
-        assert!(argv.last().unwrap().contains("codex resume 'conv-42'"));
-
-        let codex_argv = vec!["codex".to_owned(), "resume".to_owned()];
-        assert_eq!(detect_ai_command(&codex_argv, true), Some(AiProvider::CodexCode));
+        let launch = replay_launch_values(&command);
+        assert!(launch.command.is_none());
+        assert_eq!(
+            launch.ai_launch,
+            Some(AiLaunchSpec {
+                provider: AiProvider::CodexCode,
+                resume_mode: AiResumeMode::Resume,
+                conversation_id: Some("conv-42".to_owned()),
+            })
+        );
     }
 }

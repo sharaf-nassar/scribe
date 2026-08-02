@@ -61,10 +61,11 @@ regardless of the focused pane's directory or the `ai_tab_cwd` setting.
   mode/conversation) plus the existing `cwd` on CreateSession; the SERVER owns
   argv construction and resolves the HOST shell passwd-first, then from the
   daemon's `SHELL`, then `sh`.
-  Dual-write compat (legacy `command` argv in the same frame) keeps old
-  servers — including the un-restartable live one — on exactly today's
-  behavior; `REMOTE_PROTOCOL_VERSION` bumps 3→4. Decided:
-  Clarifications Q1.
+  AI frames set `command: None`; generic custom commands retain the command
+  field. `REMOTE_PROTOCOL_VERSION` bumps 3→4. The package upgrade makes the
+  v4 server ready before relaunching the updated client, so no local
+  backward-compatibility argv is required. Decided: Clarifications Q1 and
+  the same-release retirement amendment.
 - Shell integration attaches to AI tabs on bash/zsh/fish via a pre-exec
   source-preamble (script path crossing server→shell as the
   `SCRIBE_INTEGRATION_SCRIPT` env var, never string-interpolated) with
@@ -350,23 +351,20 @@ that checkout):
   apply.rs:299,424-429) — no runtime consumer exists. There is no
   `home` variant today; the always-`$HOME` behavior is unrepresentable.
   (A `home` variant is added by this feature — Clarifications Q5.)
-- **Server-side re-detection**: `ResolvedShell::for_request`
-  (session_manager.rs:821-828) + `shell_binary_str` (:833-838) re-derive
-  the shell kind from `command[0]`, falling back to the SERVER's
-  `default_shell_program()` when `command` is `None`. AI-provider
-  hinting scans the command tokens for the binary name
-  (`command_ai_provider_hint`, :840-846) — the redesigned argv must keep
-  the AI binary name discoverable in the command for tab-title/state
-  hinting and cold-restart relaunch.
+- **Server-side resolution**: structured `ai_launch` makes
+  `ResolvedShell::for_request` choose the host login shell independently of
+  `command`, and supplies the AI-provider hint directly. Generic legacy/custom
+  command frames retain command-based shell resolution and provider hinting;
+  that server compatibility path does not classify the client's persisted
+  launch binding.
 - **Q1 decision fallout (validated)**: `launch_binding_for`
-  (crates/scribe-client/src/main.rs:568-579) derives launch intent by
-  sniffing argv and must be rewired to construct `LaunchKind::Ai`
-  bindings directly, or AI tabs cold-restart as plain shells. The
+  (crates/scribe-client/src/main.rs) constructs `LaunchKind::Ai` bindings
+  only from structured intent; commands without `ai_launch` remain custom
+  commands regardless of argv contents. The
   server may set `ai_provider_hint` directly from the structured
   `ai_launch` field instead of token-sniffing
-  (session_manager.rs:840-846). Both argv sites (`ai_tab_command`
-  main.rs:5870, `restore_replay::command_argv` :188-208) change in
-  lockstep. The remote protocol gate (ipc_server.rs:3460) makes
+  (session_manager.rs). Fresh and replayed AI creates both send
+  `command: None` with `ai_launch: Some(...)`. The remote protocol gate makes
   cross-version remote pairs refuse loudly with IncompatibleVersion
   after the `REMOTE_PROTOCOL_VERSION` 3→4 bump.
 - **Process invariants**: Principle 7 — never restart the live Scribe
@@ -601,21 +599,15 @@ The client sends a structured `ai_launch` field (provider + resume
 mode/conversation) plus the existing `cwd` on CreateSession; the server owns
 argv construction and resolves the shell from the HOST passwd entry first,
 then daemon `SHELL`, then `sh` (passwd is live; the daemon env does have
-`SHELL` — validated). Compat:
-DUAL-WRITE — the client sends both `ai_launch` AND the legacy `command`
-argv in the same frame; new servers prefer `ai_launch`, old servers
-(including the un-restartable live one) degrade to exactly today's
-behavior. No silent-failure window. `REMOTE_PROTOCOL_VERSION` bumps
-3→4 (CreateSession is remote-visible; validated gate at
-ipc_server.rs:3460 — cross-version remote pairs refuse loudly with
-IncompatibleVersion). Client fallout (validated): `launch_binding_for`
-(main.rs:568-579) currently derives launch intent by sniffing argv —
-it must be rewired to construct `LaunchKind::Ai` bindings directly, or
-AI tabs cold-restart as plain shells. The server may set
-`ai_provider_hint` directly from the structured field instead of
-token-sniffing (session_manager.rs:840-846). Both argv sites
-(`ai_tab_command` main.rs:5870, `restore_replay::command_argv`
-:188-208) change in lockstep.
+`SHELL` — validated). Fresh and cold-replayed AI frames set `command: None`;
+generic custom commands retain `command: Some(...)` and `ai_launch: None`.
+`REMOTE_PROTOCOL_VERSION` bumps 3→4 (CreateSession is remote-visible;
+validated exact-match gate — cross-version remote pairs refuse loudly with
+IncompatibleVersion). `launch_binding_for` constructs `LaunchKind::Ai` only
+from the structured field and never infers AI intent from custom argv. The
+same package release can retire the compatibility twin because Debian
+`postinst` completes the server upgrade before it relaunches the updated
+client; a failed or deferred server upgrade suppresses that relaunch.
 
 ### Q2 → 2A: AI tabs only
 

@@ -8,14 +8,13 @@ Implements the seven binding clarification decisions from
 **Structured AI launch, server-owned argv (Q1).** `ClientMessage::CreateSession`
 (crates/scribe-common/src/protocol.rs:278-304) gains an additive
 `#[serde(default)] ai_launch: Option<AiLaunchSpec>` field carrying
-`{provider, resume_mode, conversation_id}`. The client DUAL-WRITES: every AI
-launch sends both `ai_launch` AND the legacy `command` argv
-(`[shell, "-lic", "exec …"]`) in the same frame. A new server prefers
-`ai_launch` and ignores the legacy argv; an old server — including the
-un-restartable live one (Principle 7) — deserializes the unknown field away
-(serde default-tolerant, precedent: `Hello.clipboard_gating` / 
-`Welcome.participant_id`, protocol.rs:381-393, :745-765) and runs the legacy
-argv, i.e. exactly today's behavior. No silent-failure window.
+`{provider, resume_mode, conversation_id}`. Every AI launch sends
+`ai_launch: Some(...)` with `command: None`; custom commands retain
+`command: Some(...)` with `ai_launch: None`. The server owns all AI argv
+construction. The initial dual-write transition is retired in the same
+release: Debian `postinst` upgrades and waits for the server before relaunching
+the updated client, and suppresses relaunch when server upgrade fails or is
+deferred. Manual new-client/old-server operation is unsupported by design.
 `REMOTE_PROTOCOL_VERSION` bumps 3→4 (protocol.rs:15-27); the exact-match
 remote gates (ipc_server.rs:3460 for LAN, RemoteHandshakeReply for tailnet)
 make cross-version remote pairs refuse loudly with `IncompatibleVersion`.
@@ -130,12 +129,11 @@ bead within the epic.
   profile emulation (:52-60) skips login files on Linux; does not deliver
   the login env without deeper script surgery, and never gives real login
   semantics (`$0`, profile guards).
-- *Capability negotiation instead of dual-write*: the local socket has no
-  version handshake to extend (client+server ship together; drift is handled
-  by `stale_server_reason`, server_lifecycle.rs:66), and adding one for a
-  single additive field is strictly more moving parts than dual-write, which
-  degrades to exactly today's behavior on the live server with zero
-  negotiation.
+- *Capability negotiation or permanent dual-write*: the local socket has no
+  version handshake to extend, and client/server ship together. Debian
+  `postinst` already enforces server-first readiness before client relaunch,
+  so another negotiation layer or duplicate argv builder adds drift without
+  serving a supported package-upgrade state.
 
 **Plain-tab login-shell follow-up (scribe-ad2): REJECT.** Feature 018's
 login-and-interactive launch architecture must not be generalized to plain
@@ -181,8 +179,9 @@ plain tabs untouched (Q2), AI tabs gain parity; P3 manual verification named
 per story, only existing round-trip/test files extended; P4 ~1s budget with
 named `--ai-tab-only` command; P5 full-env + restore-delta flow into AI CLIs
 recorded as deliberate user intent (Q7), `SHELL` joins EXCLUSION_SET;
-P6 untouched (no network); P7 dual-write compat documented, live server never
-restarted, lat.md synced. Tension noted: P2 vs Q3e — bash users whose
+P6 untouched (no network); P7 structured-only contract and server-first
+package sequencing documented, live server never restarted during development,
+lat.md synced. Tension noted: P2 vs Q3e — bash users whose
 interactive setup lives only in `~/.bashrc` without profile chaining will see
 AI tabs stop reading it (real login semantics); this is the user's explicit
 redesign directive and is documented, not mitigated.
@@ -212,27 +211,26 @@ scribe.bash's emulation block is untouched for plain tabs.
   enum in protocol.rs if drift risk is unacceptable).
 - **crates/scribe-client/src/ipc_bridge.rs** — `SessionLaunch` gains
   `ai_launch: Option<AiLaunchSpec>` (:1005-1030); `create_session` forwards
-  it on the frame (:1116-1130). Dual-write happens here or in the callers —
-  callers pass both structured spec and legacy argv.
+  it on the frame (:1116-1130). AI callers pass structured intent with no
+  command; generic custom commands retain the command-only path.
 - **crates/scribe-client/src/main.rs** — the two AI argv call sites collapse
   into a structured-launch builder: AI action handlers (:1531-1541) call a
   new `create_ai_tab(provider, resume)` instead of
-  `create_tab(Some(ai_tab_command(…)))`; `ai_tab_command` (:5870-5879)
-  becomes the LEGACY-argv builder used only for the dual-write compat field;
+  `create_tab(Some(ai_tab_command(…)))`; the client-side AI argv builder is
+  removed;
   `create_tab` (:3430-3455) grows the structured path and the resolved
   `cwd` (US-3); `launch_binding_for` (:568-579) is rewired so AI launches
   construct `LaunchKind::Ai` bindings DIRECTLY from the structured spec —
-  argv-sniffing (`detect_ai_command`) stays only for custom-command
-  classification. Without this rewire AI tabs cold-restart as plain shells
+  command argv is never sniffed for launch classification. Without this
+  rewire AI tabs cold-restart as plain shells
   (validated regression, spec Q1). Launch identity is UNCHANGED: the
   structured path mints the same `LaunchBinding` and its `launch_id` still
   rides as `env_envelope_id` on the frame, so server-side restore-delta
   staging (session_manager.rs:786-788) and env-envelope keying work
   identically for structured launches.
-- **crates/scribe-client/src/restore_replay.rs** — `command_argv` (:188-210)
-  changes in lockstep: AI replay variants return the structured spec (plus
-  legacy dual-write argv) instead of building `[shell, -lic, exec …]`
-  client-side; `shell_single_quote` of conversation_id moves server-side;
+- **crates/scribe-client/src/restore_replay.rs** — AI replay variants return
+  only the structured spec instead of building `[shell, -lic, exec …]`
+  client-side; conversation-id quoting stays server-side;
   `ReplayLaunch`/`queue_from_launch_record` (:595-633) carry the structured
   spec through to `create_session`. `restore_state.rs` `LaunchKind`
   (:129-133) already persists `{provider, resume_mode, conversation_id}` —
@@ -347,14 +345,18 @@ scribe.bash's emulation block is untouched for plain tabs.
   `#[serde(default)] ai_launch: Option<AiLaunchSpec>`. No field removed;
   `command` stays and keeps its meaning for custom commands and legacy
   compat.
-- **Dual-write semantics:**
+- **Compatibility semantics:**
 
   | Client | Server | Effective behavior |
   |---|---|---|
-  | old | old | Legacy argv, today's behavior (baseline) |
-  | old | new | No `ai_launch` → server runs legacy `command` path unchanged (minus the dead bash `--rcfile` insertion, which never took effect for `-l` launches) |
-  | new | old | Old server drops the unknown field, runs the dual-written legacy argv → exactly today's behavior; covers the un-restartable live server |
-  | new | new | Server prefers `ai_launch`, owns argv, legacy `command` ignored for spawn |
+  | old | old | Legacy/custom command behavior (baseline) |
+  | old | new | No `ai_launch` → server runs the existing `command` path |
+  | new | old | Unsupported mixed local install; AI frame has no legacy command |
+  | new | new | Server consumes `ai_launch` and owns argv |
+
+  Packaged upgrades avoid the unsupported row: `postinst` makes the new server
+  ready before relaunching the new client and leaves the old client in place
+  when that server transition fails or is deferred.
 
 - **REMOTE_PROTOCOL_VERSION 3→4** (protocol.rs:27): CreateSession is
   remote-visible; exact-match gates mean a v3 peer and a v4 peer refuse
@@ -363,10 +365,9 @@ scribe.bash's emulation block is untouched for plain tabs.
   stop interoperating until both sides update — consistent with the v2/v3
   precedent.
 - **No local-socket version constant exists** — client and server ship
-  together; local drift is already handled by `stale_server_reason`
-  (crates/scribe-client/src/server_lifecycle.rs:66) prompting a server
-  refresh. Dual-write covers the window where the live server predates the
-  field.
+  together; local drift is handled by `stale_server_reason` and package
+  server-first sequencing. A manually launched new client against an old
+  server is outside the compatibility contract.
 - **`SessionLaunch`** (ipc_bridge.rs) and **`SessionLaunchRequest`**
   (session_manager.rs:240-250) grow the same optional field — internal,
   non-wire.
@@ -380,7 +381,7 @@ extensions are explicitly justified:
    round-trip suite already covers message compatibility; adding
    `CreateSession` cases with `ai_launch` present/absent (and an
    old-frame-without-field decode) is changed existing coverage protecting
-   the dual-write contract — the single highest-risk compat surface.
+   structured-only AI frames while retaining legacy/custom decode support.
 2. **env_store/delta.rs exclusion tests** (:276-280 area): the suite
    enumerates exclusion behavior; extending it for `SHELL` (and the other
    added names) keeps the asserted-intended semantics honest.
@@ -440,12 +441,11 @@ or either restart target for this verification.
 
 ## Risks
 
-- **Old-live-server window**: the live server cannot be restarted; until the
-  user approves an upgrade, new clients hit the old server. Dual-write
-  guarantees exactly-today's behavior in that window; the new pipeline
-  activates only after an approved server upgrade. Rollback is equally
-  cheap: revert the client to legacy-argv-only — old and new servers both
-  accept it.
+- **Mixed local versions**: a manually launched new client cannot open an AI
+  tab against a pre-v4 server because structured intent has no legacy argv
+  twin. The supported Debian upgrade path prevents this state by making the
+  new server ready before relaunching the updated client; failure or deferral
+  leaves the old client running.
 - **Double-sourcing regression**: if the `SCRIBE_AI_TAB=1` gate in
   scribe.bash regresses, /etc/profile + profile run twice (verified
   failure mode). Mitigation: the gate short-circuits the entire
@@ -526,12 +526,12 @@ are done.
    no per-launch temp-file leak; documented consequence sentence for
    AI-binary-not-found (shell prints command-not-found and the tab exits).
    Blocked by: 1. Blocks: 6 (measurement), 7b, 8. [P with 3]
-3. **Client structured launch, binding rewire, dual-write** — AI action
-   handlers → structured `create_ai_tab`; `ai_tab_command` demoted to
-   legacy dual-write builder; `launch_binding_for` constructs
-   `LaunchKind::Ai` directly; `restore_replay::command_argv` +
-   `queue_from_launch_record` replay the structured spec with dual-write;
-   conversation-id quoting removed client-side. Acceptance: the structured
+3. **Client structured launch and binding rewire** — AI action handlers →
+   structured `create_ai_tab`; client-side AI argv construction removed;
+   `launch_binding_for` constructs
+   `LaunchKind::Ai` directly; `queue_from_launch_record` replays the
+   structured spec without a command;
+   conversation-id quoting remains server-side. Acceptance: the structured
    path mints the same `LaunchBinding` and sends the same `launch_id` as
    `env_envelope_id`, so restore-delta staging keys identically. Build new
    launch values rather than mutating shared config/binding state
@@ -562,12 +562,13 @@ are done.
    item OWNS the measurement and records the number; the verification gate
    only checks it was run and met budget. Script authoring is independent
    [P]; running the measurement is blocked by: 2a, 2b, 3. Blocks: 8.
-7a. **Follow-up beads** — file the spec-006 zsh/fish plain-tab FR-008
+7a. **Follow-up beads and structured-only retirement** — file the spec-006 zsh/fish plain-tab FR-008
    defect bead (later fixed by scribe-ebz); the plain-tab login-shell
-   unification bead (later rejected by scribe-ad2); the DUAL-WRITE
-   RETIREMENT bead (trigger: once the live server runs protocol v4, drop
-   the legacy argv twin and the argv-sniffing fallback; `launch_binding_for`
-   must not regress to sniffing); sibling-launcher (`shell_command_argv`,
+   unification bead (later rejected by scribe-ad2). The retirement bead now
+   ships in the same release: drop the legacy AI argv twin and argv-sniffing
+   fallback because package installation upgrades the server before client
+   relaunch; `launch_binding_for` must not regress to sniffing. Also file
+   sibling-launcher (`shell_command_argv`,
    `spawn_background_command`) and split-pane-cwd follow-ups. Independent.
    Blocks: nothing. [P with everything]
 7b. **Docs and lat.md sync** — server.md:572 correction + AI-tab-moot
@@ -644,8 +645,8 @@ Two audit passes (A: spec↔plan alignment, B: plan quality) were applied.
   consequence; plain-tab arm untouched.
 - **B4 (must)** — item 4 split: 4a Home variant + settings UI ([P]); 4b cwd
   resolution in the create path (blocked by 3, 4a).
-- **B5 (must)** — dual-write retirement follow-up bead named in item 7a
-  with explicit trigger and no-sniffing-regression guard.
+- **B5 (must)** — structured-only retirement is folded into item 7a with
+  server-first package sequencing and a no-sniffing-regression guard.
 - **B6 (should)** — decided in item 2b: AI launches skip `inject_bash`'s
   `ENV=` injection; `SCRIBE_INTEGRATION_SCRIPT` supersedes it.
 - **B7 (should)** — decided: fish preamble restores

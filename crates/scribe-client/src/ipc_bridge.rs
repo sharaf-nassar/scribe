@@ -1020,11 +1020,11 @@ pub struct SessionLaunch {
     pub size: TerminalSize,
     /// The directory the pane starts in.
     pub cwd: Option<PathBuf>,
-    /// The program to spawn instead of a login shell (a custom command, or a
-    /// provider resume for an AI pane).
+    /// The program to spawn instead of a login shell. AI launches leave this
+    /// empty; genuinely custom commands remain explicit here.
     pub command: Option<Vec<String>>,
-    /// Structured AI intent carried alongside the legacy command during the
-    /// compatibility window. `None` keeps every existing launch unchanged.
+    /// Structured AI intent. When present, `command` is empty and the server
+    /// owns shell resolution and argv construction.
     pub ai_launch: Option<AiLaunchSpec>,
     /// The launch's `LaunchRecord.launch_id`, sent as the env-envelope id the
     /// server keys this session's persisted environment by. Every create path
