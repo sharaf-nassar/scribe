@@ -7,6 +7,13 @@
 [[ -n "${_SCRIBE_INTEGRATION_SOURCED:-}" ]] && return 0
 _SCRIBE_INTEGRATION_SOURCED=1
 
+# AI tabs apply their restore delta from the post-login pre-exec preamble.
+# This pre-rc load only consumes the integration marker and installs nothing.
+if [[ "${SCRIBE_AI_TAB:-}" == "1" ]]; then
+	unset SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT
+	return 0
+fi
+
 # ── Colored completions ──────────────────────────────────────────
 zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
 
