@@ -533,11 +533,11 @@ Two clarifications keep the bar honest rather than merely strict:
   the denominator (the check fails until it does), and the threshold stays
   "all of them". Cite the ratio, not the literal, when the register grows.
 - **Descoping is the only relief valve, and it shrinks the denominator instead
-  of lowering the bar.** Re-gate criterion B1 already allows a capability to be
-  "explicitly descoped in `spec.md` with a recorded decision"; that deletes the
-  register id and its row, so the surviving rows must still all be reachable.
-  A descope is a human decision recorded in the spec — never a threshold
-  adjustment made at gate time.
+  of lowering the bar.** A capability may leave the parity scope only through
+  a recorded human decision that amends `spec.md` to remove its requirement
+  register id. The corresponding inventory row is then removed, while every
+  surviving row must still be reachable. A descope is a spec change — never a
+  threshold adjustment made at gate time.
 
 Meeting the threshold is necessary, not sufficient: reachability is a
 per-row structural fact, and the gate still requires each row's own
