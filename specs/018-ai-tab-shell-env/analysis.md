@@ -27,7 +27,7 @@ consumed at bead-creation time.
 | Q4: enforce FR-008 for AI tabs; track plain-tab zsh/fish separately | Architecture Approach (Q4 paragraph); items 2a, 2b, 7a (later fixed by scribe-ebz), 7b (server/spec-006 correction) | full |
 | Q5: `home` variant, no migration, client-resolved cwd, server guard, fresh-creates-only, own bead | Items 4a, 4b (ships as own beads within epic); Data Model (`AiTabCwd::Home`, serde default stays `Pane`) | full |
 | Q6: soft ~1s budget + named `--ai-tab-only` command, no escape hatch | Item 6; Testing Strategy perf entry; Risks (latency variance: measured, not mitigated) | full |
-| Q7: full env + delta into AI CLIs recorded as deliberate; `SHELL` (+ ENV/ZDOTDIR/XDG_DATA_DIRS/SCRIBE_* vars) to EXCLUSION_SET; verify via `scribe-dev` flavor | Architecture Approach constitution-check paragraph (decision recorded); item 5 (EXCLUSION_SET + tests + plain-tab-capture sentence); Testing Strategy (dev-flavor commands, never `just restart-server`) | full |
+| Q7: full env + delta into AI CLIs recorded as deliberate; `SHELL` (+ ENV/ZDOTDIR/XDG_DATA_DIRS/SCRIBE_* vars) to EXCLUSION_SET; verify in a disposable sandbox | Architecture Approach constitution-check paragraph (decision recorded); item 5 (EXCLUSION_SET + tests + plain-tab-capture sentence); Testing Strategy (networkless sandbox boundary, no host Scribe execution) | full |
 | lat.md doc-sync obligations (server.md, client.md, common.md, settings.md, spec-006 amendment, FR-008 code comment) | Item 7b (blocked by 2b/3/4b so it documents final behavior); Affected Components doc bullets | full |
 
 Coverage headline: **19 full / 0 partial / 0 none.**
@@ -60,11 +60,10 @@ Honest consolidation of the plan's Risks section plus analysis findings:
    refuse loudly with `IncompatibleVersion` until both ends update —
    intentional and precedented, but a real interop outage for any
    long-lived remote pairing.
-4. **Verification depends on the dev-flavor install being current.** The
-   entire manual gate (item 8) runs on `scribe-dev`; a stale dev install
-   silently verifies old code. The plan names `just ready` +
-   `just install-dev` before verification but has no freshness assertion
-   (e.g. build-stamp check) — verifier discipline required.
+4. **Verification depends on sandbox artifact freshness.** The entire manual
+   gate (item 8) runs on copied or read-only-mounted release artifacts; a stale
+   build silently verifies old code. The plan therefore requires timestamps
+   and SHA-256 values before execution and matching hashes inside the sandbox.
 5. **nushell no-integration.** Documented limitation (validated on nu
    0.114.1); residual risk is user surprise, mitigated only by docs.
 6. **Double-sourcing regression.** If the `SCRIBE_AI_TAB=1` gate in
@@ -117,11 +116,11 @@ Near-empty, as expected after Clarifications:
 |---|---|---|
 | 1. Clear Boundaries and Typed Failure | pass | Typed `AiLaunchSpec` wire struct; typed, logged shell-resolution fallback chain; explicit cwd fallback tiers; server retains `is_dir → $HOME` guard. |
 | 2. Session-Safe, Consistent UX | **tension** | Q3e: bashrc-only bash users (profile does not chain `~/.bashrc`) see different env in AI tabs vs plain tabs — documented consequence of real login semantics per the user's explicit redesign directive; plan records it as "documented, not mitigated". Minor same-family edge: `--rcfile` removal for hand-typed custom bash commands. Otherwise plain tabs untouched (Q2) and AI tabs gain parity. |
-| 3. Explicit, Risk-Based Verification | pass | Per-story named manual verification commands on `scribe-dev`; no new test files; only two justified existing-coverage extensions (protocol round-trip, exclusion tests). |
+| 3. Explicit, Risk-Based Verification | pass | Per-story named manual verification inside a networkless sandbox; no new test files; only two justified existing-coverage extensions (protocol round-trip, exclusion tests). |
 | 4. Performance Budgets and Measurement | pass | ~1s tab-open budget with named `run-perf-ab.sh --ai-tab-only` command; stub-binary methodology excludes AI CLI startup; item 6 owns the number. |
 | 5. Default-Safe Trust Boundaries | pass | Q7 decision explicitly recorded (full env + persisted delta into AI CLIs is deliberate user intent); `SHELL` + control-flow vars join EXCLUSION_SET; script/delta paths cross as env vars, never string-interpolated. |
 | 6. Local-First Data Locality | pass | No network-touching change; everything is local launch plumbing. |
-| 7. Compatible, Documented, Operationally Safe Change | pass | Dual-write compat matrix documented; v4 bump with loud refusal consistent with v2/v3 precedent; live server never restarted (dev-flavor verification); lat.md sync is its own sequenced item (7b) including corrections to existing false text. |
+| 7. Compatible, Documented, Operationally Safe Change | pass | Dual-write compat matrix documented; v4 bump with loud refusal consistent with v2/v3 precedent; host Scribe is never accessed (sandbox verification); lat.md sync is its own sequenced item (7b) including corrections to existing false text. |
 
 ## Recommendation
 
@@ -137,6 +136,6 @@ tension (Principle 2 vs Q3e) is a knowingly accepted, documented outcome of
 the user's own redesign directive rather than an oversight, and the
 riskiest surfaces (dual-write compat window, cold-restart binding rewire,
 double-sourcing) each have a named mitigation and a named manual check in
-the item-8 gate. Remaining risks are execution-discipline items (dev-flavor
-freshness, apply.rs string arm, retirement-bead follow-through), none of
-which blocks bead creation.
+the item-8 gate. Remaining risks are execution-discipline items (sandbox
+artifact freshness, apply.rs string arm, retirement-bead follow-through),
+none of which blocks bead creation.
