@@ -20,7 +20,7 @@ use vte::ansi::Processor as AnsiProcessor;
 use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{SessionContext, TerminalSize};
+use scribe_common::protocol::{AiLaunchSpec, SessionContext, TerminalSize};
 use scribe_common::screen::{
     CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, DecPrivateMode, ScreenCell,
     ScreenColor, ScreenSnapshot,
@@ -247,6 +247,9 @@ pub struct SessionLaunchRequest {
     pub cwd: Option<std::path::PathBuf>,
     pub size: Option<TerminalSize>,
     pub command: Option<Vec<String>>,
+    /// Structured AI launch intent retained for the server-owned argv builder.
+    /// Until that builder lands, the legacy `command` path remains authoritative.
+    pub ai_launch: Option<AiLaunchSpec>,
     /// Optional launch-record id naming an encrypted env envelope to apply
     /// to the new PTY (cold-restart replay). `None` for normal first-time
     /// session creation and for handoff-restored sessions (env stays on the
@@ -452,6 +455,9 @@ impl SessionManager {
     ) -> PreparedSessionLaunch {
         let shell_binary = shell.binary.as_str();
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
+        // Accepted and retained for the server-owned argv builder that lands
+        // next; this plumbing change intentionally keeps `command` authoritative.
+        let _structured_ai_launch = request.ai_launch.as_ref();
         let ai_provider_hint = command_ai_provider_hint(request.command.as_deref());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let event_listener = ScribeEventListener::new(session_id, event_tx);

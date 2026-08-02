@@ -292,9 +292,15 @@ What a pane relaunches as is decided by its .  classifies a `CreateSession` from
 
 Clearing follows intent. An explicit quit flushes the geometry and drops only the snapshot, so the next launch reopens where the user left off with fresh panes; a window close drops both, since the window itself is gone. Only a crash — this process dying before either path runs — leaves a snapshot behind to replay. The whole path is asserted against the running app by .
 
+`LaunchKind::Ai` persists the shared [[crates/scribe-common/src/protocol.rs#AiResumeMode]] directly. Moving that type out of the client does not migrate snapshots: serialized mode names remain exactly `New` and `Resume`.
+
 #### Snapshot round-trips through disk
 
 A saved  loads back with its window, focused workspace, workspace name, and launch records intact and reports as replayable.
+
+#### AI resume variant names stay stable
+
+Both AI resume modes serialize to their historical `New`/`Resume` TOML names and deserialize back to the same variant.
 
 #### Claim skips non-replayable and remaining count
 

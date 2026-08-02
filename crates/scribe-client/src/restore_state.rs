@@ -19,6 +19,7 @@ use std::time::Duration;
 use scribe_common::ai_state::AiProvider;
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::{WindowId, WorkspaceId};
+pub use scribe_common::protocol::AiResumeMode;
 use scribe_common::protocol::LayoutDirection;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -130,13 +131,6 @@ pub enum LaunchKind {
     Shell,
     CustomCommand { argv: Vec<String> },
     Ai { provider: AiProvider, resume_mode: AiResumeMode, conversation_id: Option<String> },
-}
-
-/// Whether an AI launch was newly created or resumed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AiResumeMode {
-    New,
-    Resume,
 }
 
 /// Runtime binding kept on each pane so restore snapshots can refer to a stable
@@ -569,6 +563,37 @@ mod tests {
         assert_eq!(loaded.workspaces[0].name.as_deref(), Some("proj"));
         assert_eq!(loaded.launches[0].launch_id, "launch-a");
         assert!(loaded.is_replayable());
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#AI resume variant names stay stable]]
+    #[test]
+    fn ai_resume_mode_toml_round_trip_preserves_variant_names() {
+        for (resume_mode, variant_name) in
+            [(AiResumeMode::New, "New"), (AiResumeMode::Resume, "Resume")]
+        {
+            let original = LaunchKind::Ai {
+                provider: AiProvider::ClaudeCode,
+                resume_mode,
+                conversation_id: None,
+            };
+            let encoded = toml::to_string(&original).expect("serialize AI launch kind");
+            assert_eq!(
+                encoded,
+                format!(
+                    "kind = \"ai\"\nprovider = \"claude_code\"\nresume_mode = \"{variant_name}\"\n"
+                )
+            );
+
+            let decoded: LaunchKind = toml::from_str(&encoded).expect("deserialize AI launch kind");
+            assert!(matches!(
+                decoded,
+                LaunchKind::Ai {
+                    provider: AiProvider::ClaudeCode,
+                    resume_mode: decoded_mode,
+                    conversation_id: None,
+                } if decoded_mode == resume_mode
+            ));
+        }
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Claim skips non-replayable and remaining count]]

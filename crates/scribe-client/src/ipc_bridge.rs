@@ -52,7 +52,10 @@ use scribe_client::share::ControlIntent;
 use scribe_common::{
     framing::write_message,
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::{AutomationAction, ClientMessage, PromptMarkKind, TerminalSize, WorkspaceTreeNode},
+    protocol::{
+        AiLaunchSpec, AutomationAction, ClientMessage, PromptMarkKind, TerminalSize,
+        WorkspaceTreeNode,
+    },
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -1020,6 +1023,9 @@ pub struct SessionLaunch {
     /// The program to spawn instead of a login shell (a custom command, or a
     /// provider resume for an AI pane).
     pub command: Option<Vec<String>>,
+    /// Structured AI intent carried alongside the legacy command during the
+    /// compatibility window. `None` keeps every existing launch unchanged.
+    pub ai_launch: Option<AiLaunchSpec>,
     /// The launch's `LaunchRecord.launch_id`, sent as the env-envelope id the
     /// server keys this session's persisted environment by. Every create path
     /// mints one: without it the session can never write an envelope.
@@ -1118,6 +1124,7 @@ impl IpcSink {
             cwd: launch.cwd,
             size: Some(launch.size),
             command: launch.command,
+            ai_launch: launch.ai_launch,
             env_envelope_id: Some(launch.launch_id),
         });
         if result.is_err() {
@@ -1583,6 +1590,7 @@ mod tests {
             size: sample_size(),
             cwd: None,
             command: None,
+            ai_launch: None,
             launch_id: "launch".to_owned(),
         }
     }
