@@ -1337,6 +1337,8 @@ Tab actions: new, Claude Code new/resume, Codex new/resume, close, next, prev, s
 
 Fresh AI creates resolve that directory client-side from the live config, focused session `ChromeMetadata.cwd`, and focused `WorkspaceSlot.project_root`, then dual-write it beside structured intent in `CreateSession.cwd`. Missing focus or OSC 7 metadata, server-forwarded automation without visible focus, and explicit `home` send `None`, leaving the server's directory check and home fallback authoritative. The resolved value is also captured in the launch binding for later persistence; cold-restart replay bypasses fresh resolution and sends the persisted `LaunchRecord.cwd` unchanged.
 
+Pane and workspace splits instead always capture the source pane's last server-reported CWD before focus moves to the new pending pane, then send and persist that directory for the new shell. They do not consult `terminal.ai_tab_cwd`, which governs AI tabs only; missing CWD metadata still leaves the server's home fallback authoritative. Smart-selection commands intentionally keep their existing non-split semantics: a command opened in a new tab sends no CWD, while a detached coprocess inherits the client process CWD.
+
 ### Command Palette
 
 The command palette is a GPU-rendered action picker for common window actions, profile switching, and explicit Claude Code and Codex tab actions, opened from a dedicated keybinding and reusing the normal layout-action handlers.
