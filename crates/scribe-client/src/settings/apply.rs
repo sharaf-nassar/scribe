@@ -426,6 +426,7 @@ fn apply_terminal_behavior_key(
             config.terminal.ai_tab_cwd = match s {
                 "pane" => scribe_common::config::AiTabCwd::Pane,
                 "project_root" => scribe_common::config::AiTabCwd::ProjectRoot,
+                "home" => scribe_common::config::AiTabCwd::Home,
                 _ => return Err(format!("invalid ai_tab_cwd: {s}")),
             };
         }
