@@ -136,6 +136,45 @@ bead within the epic.
   degrades to exactly today's behavior on the live server with zero
   negotiation.
 
+**Plain-tab login-shell follow-up (scribe-ad2): REJECT.** Feature 018's
+login-and-interactive launch architecture must not be generalized to plain
+tabs. An AI shell runs login files, applies a server-owned post-login preamble,
+and immediately `exec`s the provider, so it deliberately skips resident-shell
+prompt hooks, baseline capture, and recurring env-delta integration. A plain
+shell remains alive and needs all of that integration. Sharing a `-l` flag
+would therefore leave two distinct startup modes while changing the behavior
+of every ordinary tab.
+
+| Shell kind | Current plain-tab startup and integration | Login-unification impact |
+|---|---|---|
+| Bash | `build_shell` starts a non-login interactive shell with `--rcfile scribe.bash`; the script sources `~/.bashrc` on Linux and emulates login-profile order on macOS, then applies a restore delta and captures the baseline. | Real `-li` startup would require a new plain-tab source mode to avoid sourcing profiles twice. On Linux it would replace the long-standing `.bashrc` contract with first-profile-wins login behavior; feature 018's AI mode cannot be reused because it exits before prompt and capture wiring. |
+| Zsh | A no-argument interactive launch uses the `ZDOTDIR` `.zshenv` bootstrap, restores the user's `ZDOTDIR`, loads the integration, then lets normal interactive rc finish before first-prompt restore and baseline capture. | `-l` adds login-only startup files and their side effects around that sequence. The transport still works, so the flag adds compatibility risk without removing a separate integration path. |
+| Fish | A no-argument interactive launch discovers Scribe through vendor `conf.d`; the script removes the injected `XDG_DATA_DIRS` entry and defers restore/baseline work until the first prompt after user config. | `-l` activates login-conditional user setup for every tab. Vendor injection and first-prompt restore remain necessary, so no architecture or matrix is eliminated. |
+| Nushell | A no-argument REPL discovers the vendor autoload script and applies its JSON restore path in the resident shell. | `-l -i` can remain a REPL, but nushell startup/autoload behavior is version-sensitive and still needs its unique integration and restore dialect. The extra mode changes user config behavior without a shared preamble benefit. |
+| PowerShell | The plain path is its own `-NoLogo -NoExit -File scribe.ps1` contract, with profile-aware restore and prompt wrapping inside the script. | POSIX `-lic` is not a PowerShell launch contract. A login change would need a separate PowerShell design while retaining `-File` ordering, so it cannot participate in a uniform conversion. |
+| Unknown | Scribe passes no invented startup flags and lets the PTY-backed shell use its native interactive behavior; integration remains unsupported. | No portable login or command flag exists. Adding `-l`/`-i` could prevent the shell from starting, violating the graceful unsupported-shell contract. |
+
+The spec-006 contract also depends on reconstructing the same startup baseline,
+then layering the persisted delta after startup so the delta wins (FR-008).
+Changing plain tabs to login startup would change that baseline beneath
+already-persisted `LaunchRecord`/envelope associations. Handoff-held PTYs would
+keep the old process, but the next cold restore would silently respawn under a
+different rc contract; no persisted startup-mode marker or opt-out exists to
+migrate that boundary safely.
+
+There is no remote-correctness gain to offset the change. A default plain tab
+is already resolved by the host server through `default_shell_program()`
+(`SHELL` first, then the host passwd entry), and an explicit custom command
+remains explicit. Reusing feature 018's passwd-first resolver would only change
+which host source wins. It would also make every ordinary tab pay login-profile
+costs such as nvm/conda/mise setup, without feature 018's AI-only performance
+budget or an escape hatch.
+
+Revisit only for a demonstrated plain-tab user need under a new opt-in spec
+that defines per-shell startup ordering, remote/custom-command scope,
+spec-006 baseline migration, compatibility fallback, and an every-tab latency
+budget. It is not a continuation of feature 018.
+
 Constitution check: P1 typed `AiLaunchSpec` + explicit fallback chains; P2
 plain tabs untouched (Q2), AI tabs gain parity; P3 manual verification named
 per story, only existing round-trip/test files extended; P4 ~1s budget with
