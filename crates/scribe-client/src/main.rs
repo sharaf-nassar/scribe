@@ -4015,15 +4015,19 @@ impl TerminalView {
     /// yet — and each is settled here rather than from the reader, which must
     /// never touch GPUI entities.
     fn reconcile_panes(&mut self, cx: &mut Context<Self>) {
-        // Ahead of everything else: a `WorkspaceInfo` is the answer to the
-        // `CreateWorkspace` a split sent, and the session that split asked for
-        // is adopted below. Applying it first is what lets the adoption see the
-        // region's real workspace and raise a `MoveSession` for it.
-        let mut changed = self.adopt_workspace_info(cx);
+        // The root region must adopt the active server id before metadata is
+        // drained: `SessionCreated` and its following `WorkspaceInfo` can both
+        // land before one frame, and applying the latter against the original
+        // client-local id would discard its project root as unclaimed.
+        let mut changed = false;
         if let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         {
             changed |= self.shell.adopt_server_workspace(workspace_id, cx);
         }
+        // Metadata still lands before pane/session adoption. A `WorkspaceInfo`
+        // answering `CreateWorkspace` therefore re-keys the split region before
+        // its session is adopted below and moved into that server workspace.
+        changed |= self.adopt_workspace_info(cx);
         let live: HashSet<SessionId> = self.shared.tabs.lock().map_or_else(
             |_| HashSet::new(),
             |tabs| tabs.tabs().iter().map(|tab| tab.session_id).collect(),
@@ -8233,8 +8237,8 @@ async fn dispatch_server_message(
     Ok(())
 }
 
-/// Adopt the server's session inventory: rebuild the reconnect topology, seed
-/// the chrome metadata, and reconcile the tab strip.
+/// Adopt the server's session inventory: rebuild the reconnect topology, park
+/// workspace metadata for the pane shell, seed chrome, and reconcile the tabs.
 ///
 /// The list replays each pane's last-known CWD, branch and context, so a
 /// reattach restores the status bar without waiting for the next shell prompt
@@ -8256,6 +8260,31 @@ fn on_session_list(
         workspaces = registry.reconnect_topology().len(),
         "rebuilt reconnect topology"
     );
+    // The list is authoritative for the same workspace fields as a standalone
+    // `WorkspaceInfo`. Park its entries on the reader-owned queue so a fresh
+    // client restores project roots instead of waiting for a later CWD change.
+    // Message dispatch is ordered, so a following live `WorkspaceNamed` update
+    // is appended after this snapshot and wins when the foreground drains it.
+    if let Ok(mut parked) = ctx.workspaces.lock() {
+        parked.extend(workspaces.iter().map(|workspace| {
+            let accent = scribe_common::theme::hex_to_rgba(&workspace.accent_color).ok();
+            if accent.is_none() {
+                tracing::warn!(
+                    workspace_id = %workspace.workspace_id,
+                    accent_color = workspace.accent_color,
+                    "workspace accent is not a #rrggbb colour"
+                );
+            }
+            WorkspaceInfo {
+                workspace_id: workspace.workspace_id,
+                name: workspace.name.clone(),
+                accent,
+                project_root: workspace.project_root.clone(),
+            }
+        }));
+    } else {
+        tracing::warn!("workspace info mutex poisoned; dropping SessionList metadata");
+    }
     update_chrome_metadata(ctx, |metadata| {
         metadata.seed_from_session_list(sessions, workspaces);
     });
