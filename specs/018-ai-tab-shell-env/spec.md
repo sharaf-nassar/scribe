@@ -92,7 +92,9 @@ regardless of the focused pane's directory or the `ai_tab_cwd` setting.
 ## Non-Goals
 
 - No change to plain-tab launch semantics (decided, Clarifications Q2:
-  AI tabs only). Plain-tab login-shell unification is a follow-up bead.
+  AI tabs only). The follow-up evaluation rejects login-shell unification
+  without a separate opt-in specification and migration plan; see the plan's
+  Architecture Approach.
 - No fix here for the zsh/fish plain-tab FR-008 non-conformance (delta
   applied pre-rc, baseline captured pre-rc — Clarifications Q4); it is
   filed as a separate spec-006 defect bead.
@@ -616,8 +618,12 @@ token-sniffing (session_manager.rs:840-846). Both argv sites
 ### Q2 → 2A: AI tabs only
 
 Plain-tab launch semantics are unchanged in this feature; a follow-up
-bead considers unifying later. Non-Goals is now firm and the US-2
-hedge is removed.
+evaluation considered unifying them and rejected it. Feature 018's login-shell
+pipeline is specialized for shells that immediately `exec` an AI binary; it
+does not preserve the resident prompt, integration, and env-capture lifecycle
+that plain tabs require. Any future proposal must be a separate opt-in spec
+with shell-by-shell startup, restore-baseline, performance, and migration
+acceptance. Non-Goals is now firm and the US-2 hedge is removed.
 
 ### Q3 → 3A amended: real login+interactive bash + source-preamble
 
