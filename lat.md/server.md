@@ -18,6 +18,12 @@ Splitting the pools is what makes a hook burst survivable. Hook events arrive as
 
 A local first frame is read under `LOCAL_PRE_HELLO_TIMEOUT` (5 s). Every local caller writes immediately after connecting, so a still-silent connection is an abandoned or half-open dialer sitting on a pending slot; reads after the first frame stay untimed, since an idle window is legitimate. Remote transports keep their own caps and their own idle timeout — see [[server#Remote Control#Accept Path]].
 
+### Frame Error Policy
+
+The server skips an undecodable MessagePack payload only after the framing layer has consumed that payload completely and preserved alignment.
+
+Both [[crates/scribe-server/src/ipc_server.rs#establish_client_window]] and [[crates/scribe-server/src/ipc_server.rs#run_client_message_loop]] then read the next frame, so one incompatible or corrupt message does not discard an otherwise usable connection. Framing I/O failures, oversized lengths, and timeouts still close because the stream may be incomplete or its next boundary unknown. Remote transport preambles are a deliberate fail-closed exception before authorization. See [[protocol#Protocol#Transport#Frame Format]].
+
 ### Upgrade Path
 
 When launched with `--upgrade`, the server restores handoff state and received file descriptors from the old instance instead of starting fresh.

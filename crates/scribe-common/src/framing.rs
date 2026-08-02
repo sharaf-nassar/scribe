@@ -17,6 +17,11 @@ pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 /// Returns `ScribeError::Io` on read failure, `ScribeError::Deserialization`
 /// on decode failure, or `ScribeError::ProtocolError` if the message
 /// exceeds the size limit.
+///
+/// A `Deserialization` error is recoverable at the framing layer: the length
+/// prefix and its complete payload have already been consumed, so the next read
+/// starts at the next frame. `Io` and oversized-frame errors are not recoverable
+/// because the declared frame may remain only partly consumed.
 pub async fn read_message<T, R>(reader: &mut R) -> Result<T, ScribeError>
 where
     T: for<'de> Deserialize<'de>,
