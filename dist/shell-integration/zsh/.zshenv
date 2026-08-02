@@ -17,8 +17,11 @@ if [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]]; then
 	source "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 
-# Source the integration script (uses SCRIBE_SHELL_INTEGRATION_DIR set by server)
-# The script path is relative to this .zshenv file
+# Source the integration script (uses SCRIBE_SHELL_INTEGRATION_DIR set by server).
+# This bootstrap runs before the user's remaining startup files, so plain-tab
+# restore and baseline work is scheduled for the first precmd rather than run
+# while this file is being sourced.
+# The script path is relative to this .zshenv file.
 _scribe_self="${(%):-%x}"
 _scribe_dir="${_scribe_self:A:h}"
 if [[ -f "${_scribe_dir}/scribe.zsh" ]]; then

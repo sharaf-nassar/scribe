@@ -137,10 +137,10 @@ end
 
 # ── Env-delta capture (feature 006) ──────────────────────────────
 # Three additions, in this order, per spec contract:
-#   1. Source the restore-delta file if the server staged one (post-rc).
-#   2. Initialize the per-session "last emitted" snapshot.
-#   3. One-shot baseline emit (--baseline-ready), then register a
-#      fish_prompt event handler that emits subsequent deltas.
+#   1. Register a one-shot fish_prompt handler during vendor conf.d loading.
+#   2. At the first prompt, source the staged restore delta after config.fish,
+#      then initialize and emit the post-restore baseline.
+#   3. Run the recurring fish_prompt delta handler after that initializer.
 #
 # Helper invocations fail open: stdout/stderr discarded, exit code
 # ignored via `or true`.
@@ -151,14 +151,35 @@ end
 # both exposed every exported value and silently dropped large
 # environments.
 
-# Source restore-delta file (FR-008: applied AFTER rc has run).
-# The file contains `set -gx NAME 'value'` / `set -e NAME` lines that
-# the server wrote as a fish-compatible apply script.
-if set -q SCRIBE_RESTORE_ENV_DELTA_FILE
-    and test -f "$SCRIBE_RESTORE_ENV_DELTA_FILE"
-    builtin source "$SCRIBE_RESTORE_ENV_DELTA_FILE"
-    rm -f "$SCRIBE_RESTORE_ENV_DELTA_FILE" 2>/dev/null
-    set -e SCRIBE_RESTORE_ENV_DELTA_FILE
+# Vendor conf.d loads before the user's config.fish. Event handlers run in
+# registration order, so this one-shot initializer is defined before the
+# recurring delta handler below and runs after config.fish at the first prompt.
+set -g __scribe_env_persist_at_spawn 1
+if set -q SCRIBE_ENV_PERSIST
+    set __scribe_env_persist_at_spawn "$SCRIBE_ENV_PERSIST"
+end
+
+function __scribe_initialize_env_delta --on-event fish_prompt
+    functions --erase __scribe_initialize_env_delta
+
+    # The file contains `set -gx NAME 'value'` / `set -e NAME` lines that
+    # the server wrote as a fish-compatible apply script.
+    if set -q SCRIBE_RESTORE_ENV_DELTA_FILE
+        and test -f "$SCRIBE_RESTORE_ENV_DELTA_FILE"
+        set -l restore_file "$SCRIBE_RESTORE_ENV_DELTA_FILE"
+        builtin source "$restore_file"
+        rm -f "$restore_file" 2>/dev/null
+        set -e SCRIBE_RESTORE_ENV_DELTA_FILE
+    end
+
+    # The integration still consumes a staged restore when persistence is off,
+    # but it must not call helpers or install capture state in that mode.
+    if test "$__scribe_env_persist_at_spawn" = "0"
+        return 0
+    end
+
+    set -g __scribe_env_capture_ready 1
+    __scribe_emit_env_delta --baseline
 end
 
 # Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
@@ -167,7 +188,10 @@ end
 # below would all be built for nothing. Everything past this point belongs
 # to the env-delta feature, so return rather than branch. Absence means a
 # server that predates the gate: keep emitting.
-if set -q SCRIBE_ENV_PERSIST; and test "$SCRIBE_ENV_PERSIST" = "0"
+if test "$__scribe_env_persist_at_spawn" = "0"
+    if not status is-interactive
+        __scribe_initialize_env_delta
+    end
     return 0
 end
 
@@ -248,6 +272,10 @@ end
 # list can never turn a concatenation into a cartesian product that
 # drops or duplicates the payload.
 function __scribe_emit_env_delta --on-event fish_prompt
+    if not set -q __scribe_env_capture_ready
+        return 0
+    end
+
     set -l baseline 0
     if test "$argv[1]" = --baseline
         set baseline 1
@@ -328,5 +356,9 @@ function __scribe_emit_env_delta --on-event fish_prompt
     or true
 end
 
-# One-shot baseline emit at the tail (post-rc + post-restore).
-__scribe_emit_env_delta --baseline
+# A non-interactive shell never emits fish_prompt. Explicit non-interactive
+# sourcing therefore initializes at the script tail, after all helpers exist;
+# Scribe terminal sessions are interactive and always take the post-rc event.
+if not status is-interactive
+    __scribe_initialize_env_delta
+end

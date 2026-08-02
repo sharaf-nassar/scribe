@@ -129,11 +129,10 @@ fi
 
 # ── Env-delta capture (feature 006) ──────────────────────────────
 # Three additions, in this order, per spec contract:
-#   1. Source the restore-delta file if the server staged one (post-rc, so
-#      user-set values from the previous session beat any rc-driven defaults).
-#   2. Initialize the per-session "last emitted" snapshot.
-#   3. One-shot baseline emit (--baseline-ready), then register an
-#      add-zsh-hook precmd that emits subsequent deltas.
+#   1. Register a one-shot precmd while .zshenv is loading.
+#   2. At the first prompt, source the staged restore delta after user rc files,
+#      then initialize and emit the post-restore baseline.
+#   3. Run the recurring env-delta precmd after that one-shot initializer.
 #
 # Helper invocations fail open: stdout/stderr discarded, exit code ignored.
 #
@@ -142,12 +141,29 @@ fi
 # MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form both exposed
 # every exported value and silently dropped large environments.
 
-# Source restore-delta file (FR-008: applied AFTER rc has run).
-if [[ -n "${SCRIBE_RESTORE_ENV_DELTA_FILE:-}" && -f "${SCRIBE_RESTORE_ENV_DELTA_FILE}" ]]; then
-	source "${SCRIBE_RESTORE_ENV_DELTA_FILE}"
-	rm -f "${SCRIBE_RESTORE_ENV_DELTA_FILE}" 2>/dev/null || true
-	unset SCRIBE_RESTORE_ENV_DELTA_FILE
-fi
+# .zshenv loads before .zprofile/.zshrc, so restore and baseline capture must
+# wait for the first precmd. This hook is registered before the recurring delta
+# hook below, which makes the first delta pass observe the restored baseline
+# rather than treating rc-only exports as user-session changes.
+typeset -g __scribe_env_persist_at_spawn="${SCRIBE_ENV_PERSIST:-1}"
+__scribe_initialize_env_delta() {
+	add-zsh-hook -d precmd __scribe_initialize_env_delta
+
+	if [[ -n "${SCRIBE_RESTORE_ENV_DELTA_FILE:-}" && -f "${SCRIBE_RESTORE_ENV_DELTA_FILE}" ]]; then
+		local restore_file="$SCRIBE_RESTORE_ENV_DELTA_FILE"
+		source "$restore_file"
+		rm -f "$restore_file" 2>/dev/null || true
+		unset SCRIBE_RESTORE_ENV_DELTA_FILE
+	fi
+
+	# The integration still consumes a staged restore when persistence is off,
+	# but it must not call helpers or install capture state in that mode.
+	[[ "$__scribe_env_persist_at_spawn" == "0" ]] && return 0
+
+	__scribe_emit_env_baseline
+	typeset -g __scribe_env_capture_ready=1
+}
+add-zsh-hook precmd __scribe_initialize_env_delta
 
 # Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
 # `terminal.env_persistence.enabled` is off, and drops every EnvChanged it
@@ -155,7 +171,8 @@ fi
 # below would all be built for nothing. Everything past this point belongs
 # to the env-delta feature, so return rather than branch. Absence means a
 # server that predates the gate: keep emitting.
-if [[ "${SCRIBE_ENV_PERSIST:-1}" == "0" ]]; then
+if [[ "$__scribe_env_persist_at_spawn" == "0" ]]; then
+	[[ ! -o interactive ]] && __scribe_initialize_env_delta
 	return 0
 fi
 
@@ -240,6 +257,8 @@ __scribe_build_added_json() {
 # Per-prompt env-delta emit. Skips the helper invocation entirely when
 # the diff is empty.
 __scribe_emit_env_delta() {
+	[[ -z "${__scribe_env_capture_ready:-}" ]] && return 0
+
 	typeset -A __scribe_env_now
 	__scribe_snapshot_env __scribe_env_now
 
@@ -294,7 +313,7 @@ __scribe_emit_env_delta() {
 	done
 }
 
-# One-shot baseline emit at the tail (post-rc + post-restore).
+# One-shot baseline emit, called by the first-precmd initializer after restore.
 __scribe_emit_env_baseline() {
 	__scribe_snapshot_env __scribe_env_last
 	local added_json
@@ -305,5 +324,4 @@ __scribe_emit_env_baseline() {
 			>/dev/null 2>&1 || true
 }
 
-__scribe_emit_env_baseline
 add-zsh-hook precmd __scribe_emit_env_delta

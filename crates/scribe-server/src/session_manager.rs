@@ -1545,12 +1545,14 @@ mod tests {
 // Cold-restart env restore-apply (see specs/006-persist-terminal-env/
 // contracts/hook-event-additions.md and research.md::R1.3 / R3.5).
 //
-// Plain-shell integration sources `SCRIBE_RESTORE_ENV_DELTA_FILE` at the tail
-// of init. Structured AI launches instead consume it after login from either
-// the bash AI-mode integration script or the zsh/fish server preamble. Every
-// supported path applies then unlinks it; unsupported shell kinds never stage
-// it. This step is intentionally skipped for handoff-restored sessions: per
-// R3.5, handoff preserves the PTY's process so env stays intact.
+// Plain-shell integration consumes `SCRIBE_RESTORE_ENV_DELTA_FILE` after user
+// startup: directly at the tail for bash, or from the first prompt event for
+// zsh/fish, whose integration loads before user rc files. Structured AI
+// launches instead consume it after login from either the bash AI-mode
+// integration script or the zsh/fish server preamble. Every supported path
+// applies then unlinks it; unsupported shell kinds never stage it. This step
+// is intentionally skipped for handoff-restored sessions: per R3.5, handoff
+// preserves the PTY's process so env stays intact.
 // ---------------------------------------------------------------------------
 
 /// Read `terminal.env_persistence.enabled` once for a spawn.

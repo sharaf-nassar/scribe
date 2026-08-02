@@ -202,6 +202,12 @@ It cycles all five `AiState` variants without corrupting the grid, asserts a con
 
 It reads the entrypoint session's id back with `scribe-test session envelope-id`, creates a second session and asserts its id is a distinct UUID (a shared constant would satisfy a bare non-empty check), and drives the second session to a prompt so the id provably belongs to a live launch rather than a bookkeeping entry. It deliberately stops short of asserting an `.envz` file: the functional container has no running secret service, so the keystore fails and the persist path degrades by design.
 
+### Plain-Shell Env Restore Ordering
+
+Disposable zsh/fish startup probes verify post-rc restore precedence without attaching to a Scribe process or host socket.
+
+Each probe uses isolated `HOME`/XDG/runtime paths, a staged restore file, an rc/config export that conflicts with it, and a stub hook helper. At the first prompt the restored value must win, the file and transport variable must be gone, and exactly one `--baseline-ready` frame must contain both the restored value and an rc-only export. A second prompt after one session-only export must emit only that export as the delta, proving rc-only values remain baseline state. Companion AI-mode probes require the marker to be consumed while the restore file remains and no plain-tab initializer is installed, preserving post-login preamble ownership.
+
 ### Fresh Create Geometry E2E
 
 `tests/e2e/func/fresh-create-geometry.sh` asserts the create-is-an-attach contract: the PTY starts on the grid the create named, the create draws no `SessionReplay`, and no `SIGWINCH` is spent on a grid that did not change.
