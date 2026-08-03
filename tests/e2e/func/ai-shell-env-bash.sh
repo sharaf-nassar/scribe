@@ -112,4 +112,75 @@ if ! grep -F 'resolved host login shell for AI launch' "$SERVER_LOG" \
     exit 1
 fi
 
+if [ "${SCRIBE_KEYRING:-0}" != "1" ]; then
+    echo "KEYRING SKIP: encrypted bash restore requires SCRIBE_KEYRING=1"
+    echo "PASS: bash AI launch used passwd shell, login startup, integration env, argv, and cwd guard"
+    exit 0
+fi
+
+# Seed through the same plain-shell integration, hook ingress, and debounced
+# encrypted store path as env-persistence.sh. The entrypoint owns the D-Bus and
+# Secret Service fixture; this restart only gives the disposable server its
+# normal desktop-session runtime directory before the writer is created.
+cat >"$HOME/.config/scribe/config.toml" <<'TOML'
+[terminal.env_persistence]
+enabled = true
+TOML
+printf '%s\n' 'export AI_ENCRYPTED_RESTORE=profile' >>"$HOME/.bash_profile"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+scribe-test daemon stop
+scribe-test server stop
+scribe-test server start
+scribe-test daemon start
+
+WRITER=$(scribe-test session create)
+WRITER_ENVELOPE=$(scribe-test session envelope-id "$WRITER")
+WINDOW=$(scribe-test daemon window-id)
+scribe-test wait-idle "$WRITER" --ms 500
+RESTORED_VALUE=bash-envz-restore-4c19a7
+scribe-test send "$WRITER" "export AI_ENCRYPTED_RESTORE=$RESTORED_VALUE\n"
+
+STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+ENVZ="$STATE_HOME/scribe/restore/env/$WINDOW/$WRITER_ENVELOPE.envz"
+for _ in $(seq 1 100); do
+    [ -s "$ENVZ" ] && break
+    sleep 0.1
+done
+if [ ! -s "$ENVZ" ]; then
+    echo "FAIL: bash writer did not persist encrypted envelope $ENVZ"
+    exit 1
+fi
+if grep -aFq "$RESTORED_VALUE" "$ENVZ"; then
+    echo "FAIL: bash envelope leaked restored plaintext"
+    exit 1
+fi
+
+rm -f "$RECORD"
+AI_SESSION=$(scribe-test session create \
+    --ai-provider claude \
+    --ai-resume-mode resume \
+    --ai-conversation-id "$CONVERSATION_ID" \
+    --cwd "$REQUESTED_CWD" \
+    --env-envelope-id "$WRITER_ENVELOPE")
+wait_for_record
+assert_invocation "$REQUESTED_CWD"
+assert_env "AI_ENCRYPTED_RESTORE=$RESTORED_VALUE"
+
+# prepare_restore_env_file stages this exact session-specific name beneath
+# $XDG_RUNTIME_DIR/scribe/env-apply. Seeing the delta in the provider proves
+# the file was sourced; its absence proves the AI preamble consumed it.
+STAGING_DIR="$XDG_RUNTIME_DIR/scribe/env-apply"
+if [ ! -d "$STAGING_DIR" ]; then
+    echo "FAIL: bash restore staging directory was not created"
+    exit 1
+fi
+STAGED_FILE=$(find "$STAGING_DIR" -maxdepth 1 -type f \
+    -name "$AI_SESSION-*.sh" -print -quit)
+if [ -n "$STAGED_FILE" ]; then
+    echo "FAIL: bash AI restore staging file was not consumed: $STAGED_FILE"
+    exit 1
+fi
+
+scribe-test session close "$WRITER"
+echo "KEYRING PASS: bash AI launch restored encrypted delta and consumed staging file"
 echo "PASS: bash AI launch used passwd shell, login startup, integration env, argv, and cwd guard"

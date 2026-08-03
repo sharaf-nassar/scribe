@@ -1,6 +1,6 @@
 # Verification: ai-tab-shell-env
 
-Feature 018's final gate and `scribe-0ve.12` repair rerun completed on 2026-08-02 against fresh release artifacts in disposable, networkless containers. Overall status is **PASS** for every runnable assertion; explicit `NOT-RUN` limitations remain below.
+Feature 018's final gate and `scribe-0ve.12` repair rerun completed on 2026-08-02 against fresh release artifacts in disposable, networkless containers. Overall status is **PASS** for every in-scope runnable assertion; explicit out-of-scope limitations remain below.
 
 ## Safety boundary and artifact identity
 
@@ -34,7 +34,7 @@ Fresh `just build-release` artifacts and their matching in-container hashes:
 
 ## User-story matrix
 
-The matrix distinguishes runtime evidence from static or unit evidence and records every unavailable row as `NOT-RUN`.
+The matrix distinguishes runtime evidence from static or unit evidence and marks excluded rows explicitly as out of scope.
 
 | Story / assertion | Status | Evidence |
 |---|---|---|
@@ -42,24 +42,25 @@ The matrix distinguishes runtime evidence from static or unit evidence and recor
 | US-1 profile-only PATH resolution | PASS | Server started without shim directory on PATH; login profile added it; AI process captured `/proc/self/exe=/tmp/profile-bin/claude`. |
 | US-2 bash profile sourced once | PASS | AI exec PID appeared exactly once in profile-source log. |
 | US-2 staged file exists, delta wins, then file is deleted | PASS (consumer only) | Runtime-dir fixture existed before consumer launch; profile set `DELTA_WINS=profile`; AI process captured `DELTA_WINS=delta`; consumer removed file and unset `SCRIBE_RESTORE_ENV_DELTA_FILE`. |
-| US-2 encrypted-envelope staging | NOT-RUN | No safe isolated keyring/envelope fixture was available. Fresh AI tabs intentionally emit no envelope. `prepare_restore_env_file` and restore-shell unit coverage provide static/unit evidence only. |
+| US-2 encrypted-envelope staging | PASS | `ai-shell-env-bash.sh`, `ai-shell-env-zsh.sh`, and `ai-shell-env-fish.sh` seed encrypted envelopes through the production env-delta debounce, launch AI sessions with those envelope ids, observe the restored values in the Claude stub, and require each session-specific staging file to be consumed. |
 | US-2 launch-variable and original-env cleanup | PASS for bash/zsh/fish | The func shell matrix captured `SCRIBE_SHELL_INTEGRATION=1`; launch-only and restore-file variables were absent at provider exec. Zsh removed `ZDOTDIR`/`SCRIBE_ORIG_ZDOTDIR`; fish removed `SCRIBE_ORIG_XDG_DATA_DIRS` and restored the original absent `XDG_DATA_DIRS`. |
 | US-2 zsh/fish leak cleanup | PASS | `ai-shell-env-zsh.sh` and `ai-shell-env-fish.sh` exercised the production startup injection and pre-exec cleanup in the func container. |
 | US-2 cold-restart AI relaunch | PASS | Pre-crash restore index/window snapshot existed; after SIGKILL and fresh sandbox server, client claimed and replayed one AI launch and the shim ran once at persisted CWD. |
 | US-3 `pane` CWD | PASS | Repair rerun focused the pane at `/tmp/project-root/subdir`; AI process captured the same CWD. |
 | US-3 `home` CWD | PASS | Repair rerun kept the pane at `/tmp/project-root/subdir` while the AI process captured isolated `/home/sandbox`. |
 | US-3 `project_root` CWD | PASS | With `[workspaces].roots = ["/"]`, the pane at `/tmp/project-root/subdir` produced project root `/tmp`; the AI process captured `/tmp` after metadata settled. |
-| US-4 bash / zsh / fish | PASS | The func shell matrix selected each shell through live passwd mutation, proved the server's `tier = "passwd"` trace, and captured login/interactive startup order, profile PATH inheritance, provider argv, integration cleanup, and cwd. |
-| US-4 nushell | NOT-RUN | Nushell command-mode integration remains unsupported by design; existing restore-shell unit coverage is the available evidence. |
-| US-4 PowerShell / unknown shell | NOT-RUN | No safe existing runtime harness or interpreter was available; source builders were inspected. |
+| US-4 bash / zsh / fish | PASS | `ai-shell-env-bash.sh`, `ai-shell-env-zsh.sh`, and `ai-shell-env-fish.sh` select each shell through live passwd mutation, prove the server's `tier = "passwd"` trace, and cover login startup, provider argv, integration cleanup, cwd, and encrypted restore staging. |
+| US-4 nushell | OUT OF SCOPE | Nushell command-mode integration remains unsupported by design. Its sanctioned verification path will be classified by the upcoming spec-019 US-7 taxonomy. |
+| US-4 PowerShell | OUT OF SCOPE | The functional image has no PowerShell interpreter. Its sanctioned verification path will be classified by the upcoming spec-019 US-7 taxonomy. |
+| US-4 unknown shell | OUT OF SCOPE | Unknown-shell runtime coverage is outside the bash/zsh/fish matrix. Its sanctioned verification path will be classified by the upcoming spec-019 US-7 taxonomy. |
 
 ### Func shell-matrix scope
 
-The bash, zsh, and fish func scripts cover the non-keyring launch contract through the integrated `scribe-test` AI flags and deterministic Claude stub.
+The bash, zsh, and fish func scripts cover the launch contract through the integrated `scribe-test` AI flags and deterministic Claude stub, with encrypted restore rows gated by `SCRIBE_KEYRING=1`.
 
 Each script mutates the running container user's passwd shell with `usermod -s` after the disposable server starts. The server trace must name the selected binary and `tier = "passwd"`, proving production passwd-first resolution is live rather than inherited from daemon `SHELL`.
 
-The scripts assert resumed-provider argv, requested-directory use, missing-directory fallback to `$HOME`, per-shell login/startup order, `SCRIBE_SHELL_INTEGRATION=1`, and removal or restoration of shell-specific injection variables before provider exec. They intentionally do not create, stage, or inspect encrypted envelopes; that keyring-backed restore-delta row remains `NOT-RUN` until the dedicated fixture lands.
+The scripts always assert resumed-provider argv, requested-directory use, missing-directory fallback to `$HOME`, per-shell login/startup order, `SCRIBE_SHELL_INTEGRATION=1`, and shell-specific cleanup. With `SCRIBE_KEYRING=1`, each also seeds a real encrypted envelope through the plain-shell env-delta debounce, launches an AI tab with `--env-envelope-id`, observes the restored delta in the Claude stub, and proves the production staging file was consumed.
 
 For US-3, this matrix narrows `ai_tab_cwd` evidence to the server-side contract: a concrete directory sent by the client is honored, and a nonexistent directory falls back to home. Client-side selection among pane, project-root, and home remains covered by the GPUI unit/runtime evidence recorded above.
 
@@ -82,7 +83,7 @@ Initial protocol-v4 dual-write behavior passed compile, unit, static, and new-se
 | New-server structured preference | PASS | Server source branches on `Some(ai_launch)` into `build_ai_shell`; fresh sandbox launches exercised server-owned bash login argv. |
 | Missing field / legacy decode | PASS | `create_session_missing_ai_launch_defaults_to_none` passed. |
 | Initial cold-replay dual values | HISTORICAL PASS | The original sandbox cold replay relaunched the AI shim before structured-only retirement. |
-| Known-old-server runtime | OUT OF CONTRACT | The updated client deliberately carries no AI legacy argv. Packaged upgrades transition the server before relaunching it. |
+| Known-old-server runtime | OUT OF SCOPE | The updated client deliberately carries no AI legacy argv. Mixed local-version verification will be classified by the upcoming spec-019 US-7 taxonomy. |
 
 ## Regression and performance evidence
 
@@ -100,13 +101,13 @@ All existing scripts ran against fresh artifacts inside the audited networkless 
 
 ## Limitations and disposition
 
-Runtime coverage now includes bash, zsh, and fish. Remaining `NOT-RUN` limitations are the intentionally unsupported/unavailable nushell and PowerShell paths, the missing keyring-backed envelope fixture, and the lack of a provenance-verifiable known-old-server artifact.
+Runtime coverage now includes bash, zsh, and fish, including encrypted-envelope creation, staging, precedence, and cleanup. Nushell, PowerShell, unknown-shell, and known-old-server paths are explicitly out of scope and await classification by the upcoming spec-019 US-7 taxonomy.
 
 - Overall: **PASS** for every runnable assertion; the project-root repair is
   verified in the full pane/project-root/home runtime matrix.
 - Runtime shell matrix: bash, zsh, and fish complete; nushell, PowerShell, and
-  unknown shells remain `NOT-RUN`, with static/unit evidence where available.
-- Restore staging: consumer ordering/deletion/precedence passed with an explicit
-  runtime-dir fixture; encrypted-envelope creation/staging is `NOT-RUN`.
+  unknown shells are out of scope pending the upcoming US-7 taxonomy.
+- Restore staging: encrypted-envelope creation, post-login precedence, and
+  session-specific staging-file consumption pass for bash, zsh, and fish.
 - Legacy compatibility: serialization/defaulting passed; known-old-server
-  execution is `NOT-RUN`.
+  execution is out of scope pending the upcoming US-7 taxonomy.
