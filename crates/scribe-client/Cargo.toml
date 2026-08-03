@@ -19,9 +19,11 @@ path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal_gpui = { package = "alacritty_terminal", git = "https://github.com/zed-industries/alacritty.git", rev = "4c129667" }
+anyhow = "1"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+image = { version = "0.25.10", default-features = false }
 notify.workspace = true
 regex.workspace = true
 # Settings window: singleton socket peer-cred/flock, one-shot server-action

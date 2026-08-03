@@ -72,6 +72,8 @@ pub mod divider;
 pub mod drag_drop;
 pub mod focus_border;
 pub mod fonts;
+pub mod gpui_image_lifecycle;
+pub mod gpui_image_spike;
 pub mod hook_setup;
 pub mod input;
 pub mod keybindings;

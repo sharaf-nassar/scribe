@@ -194,6 +194,10 @@ e2e-func-hardened script image="scribe-test-func":
 e2e-visual script image="scribe-test-visual" runtime_profile="default":
     #!/usr/bin/env bash
     set -euo pipefail
+    script="{{ script }}"
+    if [[ "$script" != */* && -f "tests/e2e/visual/$script" ]]; then
+        script="visual/$script"
+    fi
     image="{{ image }}"
     image="${image#image=}"
     requested="{{ runtime_profile }}"
@@ -216,7 +220,7 @@ e2e-visual script image="scribe-test-visual" runtime_profile="default":
             ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
-    docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
+    docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" "/tests/$script"
 
 # Run a visual E2E test under the hardened Docker runtime profile.
 e2e-visual-hardened script image="scribe-test-visual":
@@ -510,6 +514,7 @@ e2e-all-visual: build-release docker-visual
         'visual/share-control.sh|e2e-visual-share'
         'visual/tab-switching.sh|e2e-visual-tab-switching'
         'visual/tab-window-chords.sh|e2e-visual'
+        'visual/terminal-image-gpui-spike.sh|e2e-visual'
         'visual/terminal-viewport.sh|e2e-visual-terminal-viewport'
         'visual/terminal-zoom.sh|e2e-visual-terminal-zoom'
         'visual/titlebar.sh|e2e-visual'
