@@ -182,6 +182,21 @@ Docker E2E recipes default to portable software rendering and keep test sources 
 
 `just e2e-func <script> image=<tag>` and `just e2e-visual <script> image=<tag>` select a prebuilt release or debug image. Both recipes pass through `TEST_TIMEOUT`, `RUST_LOG`, and `SCRIBE_KEYRING` from the host environment.
 
+### Hardened Runtime Profile
+
+The hardened Docker runtime profile checks both E2E images under network, filesystem, and capability restrictions without changing their release or debug binary profile.
+
+`just e2e-func-hardened <script> image=<tag>` and `just e2e-visual-hardened <script> image=<tag>` reuse the selected image with `--network none`, a read-only root filesystem, and every Linux capability dropped. `/run`, `/tmp`, and `/root` are isolated tmpfs mounts for runtime state; `/tests` stays read-only and `/output` remains the only writable bind mount.
+
+Run the profile's real smoke checks with:
+
+```bash
+just e2e-func-hardened func/smoke.sh
+just e2e-visual-hardened visual/titlebar.sh
+```
+
+The optional `image=<tag>` argument composes with both release and debug image tags. Normal `e2e-func` and `e2e-visual` runs retain the default Docker runtime profile.
+
 Visual recipes omit GPU passthrough by default because lavapipe supplies deterministic software Vulkan. Set `SCRIBE_E2E_GPUS=all` (or another Docker GPU request) to opt in; hosts without NVIDIA container tooling need no special flag.
 
 Every recipe mounts `./tests/e2e` at `/tests:ro`, leaving `/output` as the only writable bind mount. Both entrypoints export `SCRIBE_E2E_SANDBOX=1`, and every func or visual shell script checks that sentinel before its first command and exits 99 when invoked directly on the host.

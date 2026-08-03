@@ -122,6 +122,7 @@ setup-codex:
 # ==================== E2E Testing ====================
 
 gpu_flags := if env("SCRIBE_E2E_GPUS", "") == "" { "" } else { "--gpus " + env("SCRIBE_E2E_GPUS") }
+hardened_e2e_flags := "--network none --read-only --cap-drop ALL --tmpfs /run:rw,nosuid,nodev,mode=755 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --tmpfs /root:rw,nosuid,nodev,mode=700"
 
 # Rebuild functional test container from release or debug binaries
 docker-func profile="release":
@@ -154,18 +155,42 @@ docker-visual profile="release":
     docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
 
 # Run a functional E2E test (e.g. just e2e-func func/smoke.sh)
-e2e-func script image="scribe-test-func":
+e2e-func script image="scribe-test-func" runtime_profile="default":
     #!/usr/bin/env bash
+    set -euo pipefail
     image="{{ image }}"
     image="${image#image=}"
-    docker run --rm -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
+    requested="{{ runtime_profile }}"
+    runtime_profile="${requested#runtime_profile=}"
+    case "$runtime_profile" in
+        default) runtime_flags=() ;;
+        hardened) runtime_flags=( {{ hardened_e2e_flags }} ) ;;
+        *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
+    esac
+    docker run --rm "${runtime_flags[@]}" -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
+
+# Run a functional E2E test under the hardened Docker runtime profile.
+e2e-func-hardened script image="scribe-test-func":
+    just e2e-func "{{ script }}" "{{ image }}" runtime_profile=hardened
 
 # Run a visual E2E test. Set SCRIBE_E2E_GPUS to opt into GPU passthrough.
-e2e-visual script image="scribe-test-visual":
+e2e-visual script image="scribe-test-visual" runtime_profile="default":
     #!/usr/bin/env bash
+    set -euo pipefail
     image="{{ image }}"
     image="${image#image=}"
-    docker run --rm {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
+    requested="{{ runtime_profile }}"
+    runtime_profile="${requested#runtime_profile=}"
+    case "$runtime_profile" in
+        default) runtime_flags=() ;;
+        hardened) runtime_flags=( {{ hardened_e2e_flags }} ) ;;
+        *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
+    esac
+    docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
+
+# Run a visual E2E test under the hardened Docker runtime profile.
+e2e-visual-hardened script image="scribe-test-visual":
+    just e2e-visual "{{ script }}" "{{ image }}" runtime_profile=hardened
 
 # Run a visual E2E test that needs a live pane BOTH the GPUI client and
 # scribe-test can see (SCRIBE_SHARED_PANE=1). The entrypoint creates the session
