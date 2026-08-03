@@ -13,6 +13,7 @@ mod replay;
 mod server;
 mod session;
 mod share_tap;
+mod sixel_decoder;
 mod wait;
 
 use std::fmt;
@@ -278,6 +279,18 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Run adversarial checks against the vendored bounded Sixel decoder.
+    SixelDecoder {
+        /// Frozen terminal-image contract JSON.
+        #[arg(long)]
+        contract: PathBuf,
+        /// Directory containing Scribe-owned terminal-image fixtures.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -485,6 +498,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::DecodeSpike { contract, evidence } => {
             decode_spike::run(&contract, &evidence).map_err(TestError::TestFailure)
+        }
+        Command::SixelDecoder { contract, fixtures, evidence } => {
+            sixel_decoder::run(&contract, &fixtures, &evidence).map_err(TestError::TestFailure)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =

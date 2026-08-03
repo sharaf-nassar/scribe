@@ -210,6 +210,56 @@ their allocation controls cannot alone enforce every Scribe trust budget.
 `specs/020-terminal-images/decoder-decision.md` records source evidence, fork
 ownership, evidence schema, and remaining production work.
 
+## Bounded Sixel Decoder
+
+The vendored decoder makes Sixel rasterization interruptible and fallible at every untrusted growth boundary without exposing partial images.
+
+[[third_party/icy-sixel-decoder/src/lib.rs#DecodeLimits]] vendors the decoder
+concepts from `icy_sixel 0.5.0`, crates.io SHA-256
+`85518b9086bf01117761b90e7691c0ef3236fa8adfb1fb44dd248fe5f87215d5`,
+at upstream revision `998cbb2c6d8ed5272f9cc4702a4660778972bf3f`.
+`README.md`, `LICENSE-MIT`, and `LICENSE-APACHE` in that directory retain the
+source URL, exact license texts, fork delta, excluded code, and Scribe
+maintainer ownership for CVE and upstream-release review.
+
+`DecodeLimits` carries the frozen 4096-axis, 16,777,216-pixel, 67,108,864-byte
+RGBA, 134,217,728-work-unit, absolute monotonic deadline, and 4096-unit check
+interval boundaries. Caller hooks provide cooperative cancellation and an
+allocation-accounting veto. Every dimension/add/multiply and canvas offset is
+checked; each canvas allocation uses `try_reserve_exact` before mutation.
+
+Input examinations, emitted RGBA bytes, and pixel writes charge cumulative
+work. Cancellation and deadline checks happen at entry, at most every 4096
+charged units, and before returning. Failure drops the private canvas and
+returns a payload-free typed category, so no stale or partial result can
+escape. Complete 7-bit/C1 DCS and already-framed payload entry points share
+the same budget implementation.
+
+The fork preserves raster attributes, repeat, `$`/`-`, 256 private palette
+registers, RGB/HLS definitions, least-significant-bit sixel rows, and opaque
+`P2=0/2` versus transparent `P2=1` backgrounds. Encoder and quantizer source,
+`quantette`, unsafe/SIMD fills, full terminal parsers such as termwiz, and C
+Sixel libraries are absent. `DEPENDENCY-TREE.txt` records the dependency-free
+normal tree and its `scribe-test` reverse edge.
+
+## Bounded Sixel Decoder Verification
+
+Docker verification exercises owned fixtures and adversarial allocation, arithmetic, work, cancellation, deadline, palette, raster, repeat, and malformed-input boundaries.
+
+`tests/e2e/terminal-image-sixel-decoder.sh` invokes the production vendored
+crate through the `scribe-test sixel-decoder` command. It covers 7-bit and C1
+owned fixtures, background/palette/repeat/raster semantics, exact and
+max-plus-one dimensions and growth, palette 255/256, deterministic allocation
+denial, immediate and interval cancellation, expired deadline, truncated and
+overflowed controls, plus exact and max-plus-one work accounting.
+
+The run atomically writes
+`test-output/terminal-images/sixel-decoder-evidence.json` with the contract
+version, source revision/checksum/licenses, explicit exclusions, frozen limits,
+typed outcomes, and an `all_passed` aggregate. Invoke it only through
+`just e2e-func terminal-image-sixel-decoder.sh` after rebuilding the functional
+Docker image.
+
 ## Decode Spike Verification
 
 Docker verification exercises exact decode limits and emits a reviewable decision plus structured evidence without implementing production decoders.
