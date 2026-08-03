@@ -33,6 +33,10 @@ cosmic-text = { version = "0.17", features = [
   "monospace_fallback",
 ] }
 png = "0.17"
+png_spike = { package = "png", version = "0.18.1" }
+flate2 = { version = "1.1.9", default-features = false, features = [
+  "rust_backend",
+] }
 tracing.workspace = true
 nix.workspace = true
 
