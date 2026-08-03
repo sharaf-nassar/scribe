@@ -36,6 +36,7 @@ use scribe_common::protocol::{
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
+use scribe_common::terminal_images::TerminalImageCapabilities;
 use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
@@ -3851,7 +3852,12 @@ async fn handle_remote_client(
             let Some(conn_id) =
                 control.register_connection(Transport::Tailnet, sever_tx, None).await
             else {
-                send_handshake_reply(&mut write_half, Some(RemoteRefusal::Disabled)).await;
+                send_handshake_reply(
+                    &mut write_half,
+                    client_version,
+                    Some(RemoteRefusal::Disabled),
+                )
+                .await;
                 info!(
                     target: REMOTE_AUDIT_TARGET,
                     "remote: refused peer={} reason={}",
@@ -3861,7 +3867,7 @@ async fn handle_remote_client(
                 // The cap permit drops with this scope.
                 return;
             };
-            send_handshake_reply(&mut write_half, None).await;
+            send_handshake_reply(&mut write_half, client_version, None).await;
             // Feature 013 (T029, research D5): interpose a bounded per-connection
             // output queue between the fan-out hot path and this (possibly slow)
             // tailnet link. The drain task owns the TCP write half; the
@@ -3885,7 +3891,7 @@ async fn handle_remote_client(
             drop(permit);
         }
         Err(reject) => {
-            send_handshake_reply(&mut write_half, Some(reject.refusal)).await;
+            send_handshake_reply(&mut write_half, client_version, Some(reject.refusal)).await;
             let detail = if reject.tagged { " detail=tagged" } else { "" };
             info!(
                 target: REMOTE_AUDIT_TARGET,
@@ -4023,8 +4029,11 @@ where
 /// Write the mandatory `RemoteHandshakeReply` (accepted when `refusal` is `None`,
 /// otherwise the typed refusal). Always carries the server's remote-protocol and
 /// Scribe versions for the client's mismatch copy.
-async fn send_handshake_reply<W>(writer: &mut W, refusal: Option<RemoteRefusal>)
-where
+async fn send_handshake_reply<W>(
+    writer: &mut W,
+    client_version: u32,
+    refusal: Option<RemoteRefusal>,
+) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let reply = ServerMessage::RemoteHandshakeReply {
@@ -4032,6 +4041,14 @@ where
         refusal,
         server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
         server_scribe_version: env!("CARGO_PKG_VERSION").to_owned(),
+        version_mismatch: (refusal == Some(RemoteRefusal::IncompatibleVersion))
+            .then(|| {
+                scribe_common::terminal_images::RemoteProtocolMismatch::between(
+                    client_version,
+                    REMOTE_PROTOCOL_VERSION,
+                )
+            })
+            .flatten(),
     };
     if let Err(e) = write_message(writer, &reply).await {
         debug!("failed to write remote handshake reply: {e}");
@@ -4341,7 +4358,7 @@ where
             return None;
         };
         match first {
-            Ok(ClientMessage::Hello { window_id, clipboard_gating, takeover }) => {
+            Ok(ClientMessage::Hello { window_id, clipboard_gating, takeover, .. }) => {
                 // Long-lived: exchange the pending permit for one of the 32 client
                 // slots. A full pool closes the connection, exactly as the
                 // pre-017 accept-time rejection did — minus the accept.
@@ -4996,6 +5013,7 @@ async fn handle_client_hello(
                 other_windows,
                 clipboard_gating: true,
                 participant_id,
+                terminal_images: TerminalImageCapabilities::default(),
             };
             send_message(writer, &welcome).await;
 
@@ -5020,6 +5038,7 @@ async fn handle_client_hello(
                 clipboard_gating: true,
                 // A lost-control landing registers no participant.
                 participant_id: None,
+                terminal_images: TerminalImageCapabilities::default(),
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;

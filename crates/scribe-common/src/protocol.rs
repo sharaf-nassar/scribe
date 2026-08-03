@@ -6,6 +6,10 @@ use crate::ai_state::{AiProcessState, AiProvider};
 use crate::config::SharingMode;
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
+use crate::terminal_images::{
+    RemoteProtocolMismatch, TerminalImageCapabilities, TerminalImageCapabilityMismatch,
+    TerminalImageLiveMessage, TerminalImageReplayMessage,
+};
 
 /// Version of the remote-only wire protocol. Exchanged in the tailnet
 /// [`ClientMessage::RemoteHandshake`] preamble (feature 013) and the LAN
@@ -27,7 +31,10 @@ use crate::ids::{SessionId, WindowId, WorkspaceId};
 ///
 /// Bumped to `4` for feature 018: [`ClientMessage::CreateSession`] gains the
 /// additive structured AI-launch request used by server-owned command building.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
+///
+/// Bumped to `5` for terminal-images v1: remote peers must share the typed
+/// image capability, live-update, and replay contract exactly.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 5;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +358,10 @@ pub enum ClientMessage {
         /// lost-control reclaim) that atomically swaps the window's writer.
         #[serde(default)]
         takeover: bool,
+        /// Terminal-image renderer features. Missing means incapable so local
+        /// old/new handshakes remain safely decodable.
+        #[serde(default)]
+        terminal_images: TerminalImageCapabilities,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -714,6 +725,25 @@ pub enum ServerMessage {
         /// unaffected (contracts/remote-protocol-v3.md).
         #[serde(default)]
         participant_id: Option<u64>,
+        /// Effective terminal-image subset for this connection. Missing from an
+        /// older local server means unsupported.
+        #[serde(default)]
+        terminal_images: TerminalImageCapabilities,
+    },
+    /// One bounded live terminal-image record at an output boundary.
+    TerminalImageLive {
+        session_id: SessionId,
+        message: TerminalImageLiveMessage,
+    },
+    /// One bounded generation-tagged image replay record.
+    TerminalImageReplay {
+        session_id: SessionId,
+        message: TerminalImageReplayMessage,
+    },
+    /// Typed refusal for an incapable viewer of an image-enabled session.
+    TerminalImageCapabilityMismatch {
+        session_id: SessionId,
+        mismatch: TerminalImageCapabilityMismatch,
     },
     /// Confirms that the server permanently removed a window and its sessions.
     WindowClosed {
@@ -837,6 +867,10 @@ pub enum ServerMessage {
         server_remote_protocol_version: u32,
         /// Server's human-readable Scribe version, named for mismatch copy.
         server_scribe_version: String,
+        /// Present for `IncompatibleVersion`; old remote peers are already
+        /// refused by exact version before this additive field matters.
+        #[serde(default)]
+        version_mismatch: Option<RemoteProtocolMismatch>,
     },
     /// Feature 013: sent to a client whose window was claimed by another
     /// controller. The displaced client stops sending input for that window,

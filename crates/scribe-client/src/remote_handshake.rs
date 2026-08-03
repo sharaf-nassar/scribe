@@ -184,6 +184,7 @@ where
             refusal,
             server_remote_protocol_version,
             server_scribe_version,
+            version_mismatch: _,
         }) => map_reply(accepted, refusal, server_remote_protocol_version, &server_scribe_version),
         Ok(other) => {
             tracing::warn!(

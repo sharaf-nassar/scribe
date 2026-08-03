@@ -149,25 +149,30 @@ are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (57 handled)
+## Server messages (60 variants, 3 sequenced gaps)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
-The planning note named 57 variants, matching the frozen source at this
-inventory's current baseline.
+The original planning note named 57 variants. Terminal-images v1 adds three
+typed contract variants before their sequenced server/client implementation.
 
-The live reader's dispatcher `main.rs::dispatch_server_message` names 54 of the
-59 variants and routes the rest to `main.rs::unhandled_server_message`, which
+The live reader's dispatcher `main.rs::dispatch_server_message` handles 52 of
+60 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
-silently; the `_ => {}` catch-all the audit found is gone. The five variants it
-does not name — `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`,
-`TrustedDeviceList`, `TrustedNetworkList` — are consumed by the settings
+silently; the `_ => {}` catch-all the audit found is gone. Five variants —
+`UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
+`TrustedNetworkList` — are consumed by the settings
 window's synchronous request/reply helper in `settings/server_action.rs`, and
 each of those rows says so. `tools/check-parity-inventory.sh` enforces that:
 any variant the dispatcher does not handle must either carry a marker cell or
 be annotated a settings-window row, so this column cannot claim a reader arm
 that does not exist.
+
+The three terminal-image variants remain explicit sequenced gaps in this
+contract bead: `scribe-aq1.10` and `scribe-aq1.11` own live fanout/client state
+plus capability mismatch UI; `scribe-aq1.12` and `scribe-aq1.13` own server
+replay and atomic client staging.
 
 | Variant | Surface | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
@@ -194,6 +199,9 @@ that does not exist.
 | `WorkspaceInfo` | workspace layout | scripted-E2E | `main.rs::on_workspace_info` → `ChromeMetadata::name_workspace` + parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` | required |
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_welcome` → `session_lifecycle::SessionRegistry::adopt_window` | required |
+| `TerminalImageLive` | ordered image scene updates | scripted-E2E | — (unwired: producer/fanout `scribe-aq1.10`; client consumer/state `scribe-aq1.11`) | required |
+| `TerminalImageReplay` | generation-tagged image snapshot | scripted-E2E | — (unwired: server replay `scribe-aq1.12`; atomic client staging `scribe-aq1.13`) | required |
+| `TerminalImageCapabilityMismatch` | incapable-viewer refusal | scripted-E2E | — (unwired: attach refusal `scribe-aq1.10`; client mismatch UI `scribe-aq1.11`) | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
 | `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
@@ -229,7 +237,7 @@ that does not exist.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 57 of 57 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 57 of 60 rows name a live-path symbol; 3 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -449,18 +457,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
 | Client messages | 45 | 45 | 0 | 0 |
-| Server messages | 57 | 57 | 0 | 0 |
+| Server messages | 60 | 57 | 3 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **199** | **199** | **0** | **0** |
+| **Total** | **202** | **199** | **3** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **190 rows, of which 190 are
-reachable (100%)** and 0 are not. **1 of those 190** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **193 rows, of which 190 are
+reachable (98%)** and 3 are not. **1 of those 193** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **189 of 190**.
+the in-client figure is **189 of 193**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

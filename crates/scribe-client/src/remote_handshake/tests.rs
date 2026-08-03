@@ -38,6 +38,7 @@ fn accepted_reply() -> ServerMessage {
         refusal: None,
         server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
         server_scribe_version: "test".to_owned(),
+        version_mismatch: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn refused_reply(refusal: Option<RemoteRefusal>) -> ServerMessage {
         refusal,
         server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
         server_scribe_version: "test".to_owned(),
+        version_mismatch: None,
     }
 }
 
