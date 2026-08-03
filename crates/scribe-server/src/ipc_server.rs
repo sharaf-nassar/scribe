@@ -4449,13 +4449,15 @@ fn claim_local_slot(slot: Option<&mut LocalSlot>, kind: LocalSlotKind) -> bool {
 /// belongs to the [`MAX_TRANSIENT_CONNECTIONS`] pool rather than the client pool.
 /// Exactly the arms [`establish_local_first_frame`] and
 /// [`establish_local_lan_first_frame`] answer with `None`; everything else is a
-/// legacy no-`Hello` claim (still used by `scribe-cli`) that registers a window
-/// and must hold a client slot. A transient arm added there but missed here is
+/// legacy no-`Hello` claim that registers a window and must hold a client slot.
+/// A transient arm added there but missed here is
 /// merely charged to the client pool — the pre-017 behavior, never a leak.
 fn is_transient_first_frame(msg: &ClientMessage) -> bool {
     matches!(
         msg,
-        ClientMessage::CheckForUpdates
+        ClientMessage::ListWindows
+            | ClientMessage::DispatchAction { .. }
+            | ClientMessage::CheckForUpdates
             | ClientMessage::ListReleases
             | ClientMessage::TriggerUpdate
             | ClientMessage::HookEvent(_)
@@ -4504,6 +4506,15 @@ async fn establish_local_first_frame(
     attached_ids: &AttachedSessionIds,
 ) -> Option<WindowId> {
     match msg {
+        ClientMessage::ListWindows => {
+            handle_list_windows(&server.window_shares, &server.workspace_manager, writer).await;
+            None
+        }
+        ClientMessage::DispatchAction { window_id, action } => {
+            handle_transient_dispatch_action(window_id, action, &server.window_shares, writer)
+                .await;
+            None
+        }
         ClientMessage::CheckForUpdates => {
             // Transient action: the caller (e.g. the standalone settings
             // window) does not want a registered window. Run the check, send
@@ -8531,6 +8542,63 @@ async fn handle_dispatch_action(
         return;
     };
 
+    if !try_send_message(&target_writer, &ServerMessage::RunAction { action }).await {
+        send_error(writer, &format!("failed to dispatch action to {target_window_id}")).await;
+        return;
+    }
+
+    send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
+}
+
+/// Route a local one-shot CLI action without registering or impersonating a
+/// window. Unlike a post-`Hello` client, the transient caller has no window of
+/// its own: an explicit target is allowed, while omission is unambiguous only
+/// when exactly one window is connected.
+async fn handle_transient_dispatch_action(
+    requested_window_id: Option<WindowId>,
+    action: AutomationAction,
+    window_shares: &WindowShares,
+    writer: &SharedWriter,
+) {
+    let shares = window_shares.read().await;
+    let target_window_id = match requested_window_id {
+        Some(window_id) if shares.contains_key(&window_id) => Some(window_id),
+        Some(window_id) => {
+            drop(shares);
+            send_error(writer, &format!("window not connected: {window_id}")).await;
+            return;
+        }
+        None if shares.is_empty() => {
+            drop(shares);
+            send_error(writer, "cannot dispatch action: no connected windows").await;
+            return;
+        }
+        None if shares.len() > 1 => {
+            let count = shares.len();
+            drop(shares);
+            send_error(
+                writer,
+                &format!("cannot dispatch action without --window: {count} connected windows"),
+            )
+            .await;
+            return;
+        }
+        None => shares.keys().next().copied(),
+    };
+
+    let Some(target_window_id) = target_window_id else {
+        drop(shares);
+        send_error(writer, "cannot dispatch action: no connected windows").await;
+        return;
+    };
+    let target_writer =
+        shares.get(&target_window_id).and_then(|share| share.controller_writer().cloned());
+    drop(shares);
+
+    let Some(target_writer) = target_writer else {
+        send_error(writer, &format!("window not connected: {target_window_id}")).await;
+        return;
+    };
     if !try_send_message(&target_writer, &ServerMessage::RunAction { action }).await {
         send_error(writer, &format!("failed to dispatch action to {target_window_id}")).await;
         return;

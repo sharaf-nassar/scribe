@@ -3,6 +3,7 @@
 //! Unix socket.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -14,7 +15,7 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
-    AiLaunchSpec, AiResumeMode, ClientMessage, ServerMessage, TerminalSize,
+    AiLaunchSpec, AiResumeMode, AutomationAction, ClientMessage, ServerMessage, TerminalSize,
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -23,7 +24,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
-use crate::cmd_socket::{DaemonRequest, DaemonResponse, ReplayFrameInfo, daemon_socket_path};
+use crate::cmd_socket::{
+    DaemonRequest, DaemonResponse, ReplayFrameInfo, daemon_socket_path, send_request,
+};
 use crate::replay::ReplayView;
 
 // ---------------------------------------------------------------------------
@@ -159,6 +162,8 @@ struct DaemonState {
     /// surfaced by `scribe-test session envelope-id` so an E2E script can assert
     /// that the harness create path really names an envelope.
     envelope_ids: HashMap<SessionId, String>,
+    /// Most recent action the server asked this daemon window to run.
+    last_action: Option<AutomationAction>,
 }
 
 impl DaemonState {
@@ -169,6 +174,7 @@ impl DaemonState {
             last_session_created: None,
             window_id: None,
             envelope_ids: HashMap::new(),
+            last_action: None,
         }
     }
 }
@@ -250,6 +256,33 @@ pub async fn stop() -> Result<(), ScribeError> {
     // Wait for the response (daemon will exit after responding).
     let _response: DaemonResponse = read_message(&mut reader).await?;
     Ok(())
+}
+
+/// Print the most recent automation action, or `none` when the oracle is empty.
+pub fn print_last_action() -> Result<(), ScribeError> {
+    let response = send_request(&DaemonRequest::LastAction)?;
+    match response {
+        DaemonResponse::LastAction { action } => {
+            let value = action.map_or_else(|| "none".to_owned(), |action| format!("{action:?}"));
+            writeln!(io::stdout(), "{value}")?;
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(ScribeError::IpcError { reason: message }),
+        other => Err(ScribeError::ProtocolError {
+            reason: format!("unexpected daemon response: {other:?}"),
+        }),
+    }
+}
+
+/// Reset the automation-action oracle to its deterministic empty state.
+pub fn clear_last_action() -> Result<(), ScribeError> {
+    match send_request(&DaemonRequest::ClearAction)? {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error { message } => Err(ScribeError::IpcError { reason: message }),
+        other => Err(ScribeError::ProtocolError {
+            reason: format!("unexpected daemon response: {other:?}"),
+        }),
+    }
 }
 
 /// Run the daemon event loop (foreground). This is the `daemon run` entry.
@@ -509,7 +542,8 @@ async fn dispatch_window_message(
             debug!(count = windows.len(), "window list (ignored by test daemon)");
         }
         ServerMessage::RunAction { action } => {
-            debug!(?action, "run action (ignored by test daemon)");
+            debug!(?action, "recording automation action");
+            state.lock().await.last_action = Some(action);
         }
         ServerMessage::ActionDispatched { window_id } => {
             debug!(%window_id, "action dispatched (ignored by test daemon)");
@@ -925,6 +959,14 @@ async fn process_request(
         }
         DaemonRequest::WindowId => handle_window_id(state).await,
         DaemonRequest::EnvelopeId { session_id } => handle_envelope_id(session_id, state).await,
+        DaemonRequest::LastAction => {
+            let action = state.lock().await.last_action.clone();
+            DaemonResponse::LastAction { action }
+        }
+        DaemonRequest::ClearAction => {
+            state.lock().await.last_action = None;
+            DaemonResponse::Ok
+        }
         DaemonRequest::Shutdown => {
             handle_shutdown(shutdown);
             DaemonResponse::Ok

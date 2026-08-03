@@ -24,6 +24,7 @@ ARG BIN_DIR=target/e2e-stage/release
 
 COPY ${BIN_DIR}/scribe-server /usr/local/bin/scribe-server
 COPY ${BIN_DIR}/scribe-test /usr/local/bin/scribe-test
+COPY ${BIN_DIR}/scribe-cli /usr/local/bin/scribe
 COPY ${BIN_DIR}/scribe-cli /usr/local/bin/scribe-cli
 # AI state, prompt text, and context-window % reach the server over the hook
 # channel (spec 003, FR-020..FR-022) — OSC 1337 no longer carries them. The
@@ -40,7 +41,7 @@ COPY dist/shell-integration /usr/local/share/scribe/shell-integration
 COPY docker/entrypoint-func.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/scribe-server /usr/local/bin/scribe-test \
-    /usr/local/bin/scribe-cli /usr/local/bin/scribe-hook-helper
+    /usr/local/bin/scribe /usr/local/bin/scribe-cli /usr/local/bin/scribe-hook-helper
 
 RUN mkdir -p /output
 

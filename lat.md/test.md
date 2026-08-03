@@ -29,7 +29,7 @@ Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 
 
 An `empty_output_frames` counter rides alongside it, incremented (and logged) whenever a zero-byte `PtyOutput` arrives. The byte counters cannot express that event — an empty frame moves neither of them — yet it is exactly the waste the server's [[server#Server#Sessions#PTY Reader Task|empty-frame send guard]] exists to prevent, so the harness records it separately and lets a test assert on it.
 
-All sessions are keyed by `SessionId` inside , which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, plus the `window_id` the server assigned in its `Welcome`.
+All sessions are keyed by `SessionId` inside , which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, the `window_id` assigned in `Welcome`, and the most recent automation action received in `RunAction`.
 
 ### Request Handling
 
@@ -47,11 +47,17 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by . The helper  creates a short-lived tokio runtime, connects, sends one , and receives one .
 
-Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `AssertNoEmptyOutput`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, and `Shutdown`.
+Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `AssertNoEmptyOutput`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, `LastAction`, `ClearAction`, and `Shutdown`.
 
-Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `ReplayStatus { applied, failed, live_bytes, last }`, `WindowId { window_id }`, `AssertFailed { message }`, and `Error { message }`.
+Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `ReplayStatus { applied, failed, live_bytes, last }`, `WindowId { window_id }`, `LastAction { action }`, `AssertFailed { message }`, and `Error { message }`.
 
 `WindowId` (surfaced as `scribe-test daemon window-id`, printed by ) exists so a second process can be pointed at the daemon's window instead of claiming one of its own — the join target the shared-pane visual rig passes to the GPUI client as `SCRIBE_JOIN_WINDOW` (). It errors rather than returning a placeholder when no `Welcome` has arrived, because joining "no window" would silently reproduce the empty-window bug it exists to prevent.
+
+### Automation Action Oracle
+
+The daemon records the last `AutomationAction` delivered in `RunAction`, making headless CLI dispatch observable without GUI effects or discarded daemon logs.
+
+`scribe-test daemon last-action` prints the Rust variant name, such as `NewTab`, or `none` before an action arrives. `scribe-test daemon clear-action` resets that state, so a smoke phase can clear, dispatch, then compare exact output without inheriting an earlier action.
 
 ## Session Management
 

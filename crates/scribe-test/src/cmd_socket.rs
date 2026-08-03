@@ -4,7 +4,7 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
-use scribe_common::protocol::AiResumeMode;
+use scribe_common::protocol::{AiResumeMode, AutomationAction};
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -153,6 +153,10 @@ pub enum DaemonRequest {
     EnvelopeId {
         session_id: SessionId,
     },
+    /// Read the most recent automation action delivered to the daemon.
+    LastAction,
+    /// Clear the recorded automation action before an assertion phase.
+    ClearAction,
     Shutdown,
 }
 
@@ -183,6 +187,11 @@ pub enum DaemonResponse {
     /// `CreateSession`.
     EnvelopeId {
         envelope_id: String,
+    },
+    /// Most recent `RunAction`, or `None` after startup/reset and before one
+    /// arrives.
+    LastAction {
+        action: Option<AutomationAction>,
     },
     /// What the daemon has seen on a session's replay path: how many frames it
     /// applied, how many failed to inflate, the running live-output byte count,

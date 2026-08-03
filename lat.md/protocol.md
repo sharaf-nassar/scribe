@@ -72,7 +72,9 @@ The reported tree's [[crates/scribe-common/src/protocol.rs#WorkspaceTreeNode]] `
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
 
-`ListWindows` returns every connected window with its ID, session count, and connection status, plus the feature-013 workspace names and remote-controller identity per window ([[protocol#Remote Protocol#Window Context Fields]]). `DispatchAction` carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session, but the server only routes it to the caller's connected window. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when the target is missing or belongs to another connection.
+`ListWindows` returns every connected window with its ID, session count, and connection status, plus the feature-013 workspace names and remote-controller identity per window ([[protocol#Remote Protocol#Window Context Fields]]). A local CLI sends it as a one-shot pre-`Hello` request, so enumeration never registers an ephemeral window. Remote pre-`Hello` rules remain unchanged.
+
+`DispatchAction` carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session. A local pre-`Hello` CLI request may name any connected target; when omitted, dispatch succeeds only if exactly one window is connected. It receives `ActionDispatched` or a typed `Error` and registers no window. A post-`Hello` client remains restricted to its own window, and remote pre-`Hello` dispatch remains refused.
 
 ### Connection
 
