@@ -12,21 +12,37 @@ use std::{
 
 use gpui::{Bounds, ContentMask, Corners, Pixels, RenderImage, Window, point, px, size};
 use image::{Frame, ImageBuffer, Rgba};
-use scribe_common::terminal_images::{
-    ImageBoundError, ImageLimitName, ImageLimits, PixelRect, TerminalImageDefinition,
-    TerminalImageGeneration, TerminalImageId,
+use scribe_common::{
+    ids::SessionId,
+    terminal_images::{
+        ImageBoundError, ImageLimitName, ImageLimits, PixelRect, TerminalImageDefinition,
+        TerminalImageGeneration, TerminalImageId,
+    },
 };
 
 /// Stable identity of one decoded source generation in a window-local cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GpuiImageKey {
+    pub session_id: Option<SessionId>,
     pub image_id: TerminalImageId,
     pub generation: TerminalImageGeneration,
 }
 
 impl From<&TerminalImageDefinition> for GpuiImageKey {
     fn from(definition: &TerminalImageDefinition) -> Self {
-        Self { image_id: definition.id, generation: definition.generation }
+        Self { session_id: None, image_id: definition.id, generation: definition.generation }
+    }
+}
+
+impl GpuiImageKey {
+    /// Window-local identity for a source owned by one terminal session.
+    #[must_use]
+    pub fn for_session(session_id: SessionId, definition: &TerminalImageDefinition) -> Self {
+        Self {
+            session_id: Some(session_id),
+            image_id: definition.id,
+            generation: definition.generation,
+        }
     }
 }
 
@@ -35,6 +51,7 @@ impl From<&TerminalImageDefinition> for GpuiImageKey {
 pub struct GpuiImageCacheStats {
     pub render_images_created: u64,
     pub cache_reuses: u64,
+    pub pressure_rejections: u64,
     pub atlas_drops: u64,
     pub final_reference_drops: u64,
 }
@@ -71,6 +88,7 @@ pub struct GpuiImageCache {
     entries: HashMap<GpuiImageKey, CacheEntry>,
     insertion_order: VecDeque<GpuiImageKey>,
     projected_gpu_bytes: u64,
+    max_projected_gpu_bytes: u64,
     stats: GpuiImageCacheStats,
 }
 
@@ -84,10 +102,20 @@ impl GpuiImageCache {
     /// Construct an empty cache using the frozen v1 per-view ceiling.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_projected_gpu_limit(ImageLimits::V1.max_view_projected_gpu_bytes)
+    }
+
+    /// Construct a cache with a smaller view-local ceiling for isolated
+    /// renderer pressure probes. The frozen production ceiling remains the
+    /// upper bound even when callers request more.
+    #[must_use]
+    pub fn with_projected_gpu_limit(max_projected_gpu_bytes: u64) -> Self {
         Self {
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
             projected_gpu_bytes: 0,
+            max_projected_gpu_bytes: max_projected_gpu_bytes
+                .min(ImageLimits::V1.max_view_projected_gpu_bytes),
             stats: GpuiImageCacheStats::default(),
         }
     }
@@ -111,8 +139,33 @@ impl GpuiImageCache {
         canonical_rgba: &[u8],
         window: &mut Window,
     ) -> Result<Arc<RenderImage>, GpuiImageError> {
+        self.get_or_insert_key(GpuiImageKey::from(definition), definition, canonical_rgba, window)
+    }
+
+    /// Return or create the source scoped to one session in this window.
+    pub fn get_or_insert_for_session(
+        &mut self,
+        session_id: SessionId,
+        definition: &TerminalImageDefinition,
+        canonical_rgba: &[u8],
+        window: &mut Window,
+    ) -> Result<Arc<RenderImage>, GpuiImageError> {
+        self.get_or_insert_key(
+            GpuiImageKey::for_session(session_id, definition),
+            definition,
+            canonical_rgba,
+            window,
+        )
+    }
+
+    fn get_or_insert_key(
+        &mut self,
+        key: GpuiImageKey,
+        definition: &TerminalImageDefinition,
+        canonical_rgba: &[u8],
+        _window: &mut Window,
+    ) -> Result<Arc<RenderImage>, GpuiImageError> {
         validate_canonical(definition, canonical_rgba)?;
-        let key = GpuiImageKey::from(definition);
         if let Some(entry) = self.entries.get(&key) {
             if entry.definition != *definition {
                 return Err(GpuiImageError::ConflictingDefinition);
@@ -123,22 +176,26 @@ impl GpuiImageCache {
 
         let projected_gpu_bytes =
             definition.rgba_bytes.checked_mul(2).ok_or(ImageBoundError::ArithmeticOverflow)?;
-        if projected_gpu_bytes > ImageLimits::V1.max_view_projected_gpu_bytes {
+        if projected_gpu_bytes > self.max_projected_gpu_bytes {
+            self.stats.pressure_rejections = self.stats.pressure_rejections.saturating_add(1);
             return Err(
                 ImageBoundError::LimitExceeded(ImageLimitName::ViewProjectedGpuBytes).into()
             );
         }
-        while self
+        if self
             .projected_gpu_bytes
             .checked_add(projected_gpu_bytes)
             .ok_or(ImageBoundError::ArithmeticOverflow)?
-            > ImageLimits::V1.max_view_projected_gpu_bytes
+            > self.max_projected_gpu_bytes
         {
-            if !self.evict_oldest(window)? {
-                return Err(
-                    ImageBoundError::LimitExceeded(ImageLimitName::ViewProjectedGpuBytes).into()
-                );
-            }
+            // Existing entries may already be referenced by primitives queued
+            // earlier in this frame. Never drop or reuse their atlas tiles
+            // during admission; reject this source and retry on a later frame
+            // after stale/unplaced cleanup has run before painting.
+            self.stats.pressure_rejections = self.stats.pressure_rejections.saturating_add(1);
+            return Err(
+                ImageBoundError::LimitExceeded(ImageLimitName::ViewProjectedGpuBytes).into()
+            );
         }
 
         // No GPUI object or backing buffer is created before the checks above.
@@ -158,6 +215,61 @@ impl GpuiImageCache {
         self.insertion_order.push_back(key);
         self.stats.render_images_created = self.stats.render_images_created.saturating_add(1);
         Ok(image)
+    }
+
+    /// Remove sources from one session that no longer exist in its CPU scene.
+    pub fn retain_session_definitions(
+        &mut self,
+        session_id: SessionId,
+        live: &std::collections::HashSet<GpuiImageKey>,
+        window: &mut Window,
+    ) -> Result<(), GpuiImageError> {
+        let stale = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|key| key.session_id == Some(session_id) && !live.contains(key))
+            .collect::<Vec<_>>();
+        for key in stale {
+            self.evict(key, window)?;
+        }
+        Ok(())
+    }
+
+    /// Remove every source belonging to a closed pane session.
+    pub fn clear_session(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+    ) -> Result<(), GpuiImageError> {
+        let keys = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|key| key.session_id == Some(session_id))
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.evict(key, window)?;
+        }
+        Ok(())
+    }
+
+    /// Drop cache entries whose owning pane session is no longer in the view.
+    pub fn retain_sessions(
+        &mut self,
+        live_sessions: &std::collections::HashSet<SessionId>,
+        window: &mut Window,
+    ) -> Result<(), GpuiImageError> {
+        let stale_sessions = self
+            .entries
+            .keys()
+            .filter_map(|key| key.session_id)
+            .filter(|session_id| !live_sessions.contains(session_id))
+            .collect::<std::collections::HashSet<_>>();
+        for session_id in stale_sessions {
+            self.clear_session(session_id, window)?;
+        }
+        Ok(())
     }
 
     /// Look up a source without changing deterministic insertion order.
@@ -265,6 +377,32 @@ pub fn paint_cropped_image(
     source: PixelRect,
     destination: Bounds<Pixels>,
 ) -> Result<(), GpuiImageError> {
+    paint_cropped_image_clipped(
+        window,
+        image,
+        CroppedImageGeometry { source_size, source, destination, clip: destination },
+    )
+}
+
+/// Source and destination geometry for one clipped image placement.
+#[derive(Clone, Copy)]
+pub struct CroppedImageGeometry {
+    pub source_size: (u32, u32),
+    pub source: PixelRect,
+    pub destination: Bounds<Pixels>,
+    pub clip: Bounds<Pixels>,
+}
+
+/// Paint a source rect with placement geometry distinct from its viewport clip.
+///
+/// Keeping `destination` unchanged while narrowing `clip` preserves scaling
+/// across partially visible cells, negative rows, pixel offsets, and resizes.
+pub fn paint_cropped_image_clipped(
+    window: &mut Window,
+    image: Arc<RenderImage>,
+    geometry: CroppedImageGeometry,
+) -> Result<(), GpuiImageError> {
+    let CroppedImageGeometry { source_size, source, destination, clip } = geometry;
     ImageLimits::V1.canonical_rgba_len(source_size.0, source_size.1)?;
     let source_right =
         source.x.checked_add(source.width).ok_or(GpuiImageError::InvalidSourceCrop)?;
@@ -309,7 +447,7 @@ pub fn paint_cropped_image(
         ),
         size: size(px(image_width * scale_x), px(image_height * scale_y)),
     };
-    window.with_content_mask(Some(ContentMask { bounds: destination }), |window| {
+    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
         window
             .paint_image(full_bounds, Corners::default(), image, 0, false)
             .map_err(GpuiImageError::PaintImage)

@@ -21,6 +21,14 @@ The functional harness applies owned fixtures directly to the production client 
 
 The fixture proves operation order, commit-only publication, definition replacement, placement deletion, generation cleanup, scroll/erase/reset effects, typed quota rejection, placeholder copy filtering, and visible update-required mismatch copy.
 
+## Layered GPUI Terminal Images
+
+The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.
+
+### Renderer phases and lifecycle stay pixel-stable
+
+The 2x corpus samples all phases, geometry, placeholders, Sixel chronology, find precedence, scroll/resize envelopes, off-margin immunity, soft/hard deletion and unplaced-data retention, pressure, eviction, pane close, and recovery.
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.

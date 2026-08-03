@@ -77,6 +77,7 @@ pub mod gpui_image_spike;
 pub mod hook_setup;
 pub mod input;
 pub mod keybindings;
+pub mod kitty_placeholder;
 pub mod lan;
 pub mod lan_approval;
 pub mod lan_dial;

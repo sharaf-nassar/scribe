@@ -15,13 +15,23 @@ Kitty uses 7-bit APC `G`/ST, direct `t=d`, formats `f=24/32/100`, RFC 1950
 crop, cell span, pixel offset, cursor movement, signed z-order, and Unicode
 `U=1` placeholders are supported. Placeholder identity uses `U+10EEEE`,
 official diacritics, foreground image id, underline placement id, and
-background alpha color.
+specified left-cell inheritance. The IPC placeholder background byte is
+reserved compatibility data, not a second image-opacity channel.
 
 Kitty delete selectors are exactly `a/A`, `i/I`, `p/P`, `x/X`, `y/Y`, and
 `z/Z`. Any delete aborts an incomplete transfer. `q=0` permits success and
 failure replies, `q=1` suppresses success, and `q=2` suppresses all replies.
 Retransmitting an image id replaces its data and placements; reusing an
 image/placement pair replaces that placement.
+
+Physical Kitty and Sixel row, column, and cell deletes select against the
+placement's effective clipped cell extent, not only its anchor. Virtual
+`U=1` placements ignore all, placement, cell, row, column, and z selectors;
+only an image selector carrying their explicit image id removes them. A hard
+delete frees only definitions selected by placements it actually removed,
+once no placement references them. An explicit image-id delete can free an
+unplaced target. Unrelated unplaced definitions and data used by a protected
+virtual placement survive every other hard scope.
 
 Kitty images below z `-1073741824` paint beneath non-default backgrounds;
 other negative images paint above backgrounds and below glyphs; nonnegative
@@ -111,9 +121,18 @@ loaders.
 
 Placements carry protocol, typed image and placement identity, generation,
 cell anchor, source crop, destination cell extent, pixel offsets, z-index,
-scroll/cursor behavior, and bounded placeholder metadata. Typed grid effects
-bind image-driven cursor, scroll, erase, resize, screen, and reset consequences
-to the same ordered client operation stream.
+scroll/cursor behavior, an optional exclusive logical-cell clip, and bounded
+placeholder metadata. The clip defaults absent for replay compatibility and
+preserves original source mapping through repeated scroll and resize. Typed
+grid effects bind image-driven cursor, scroll, erase, resize, screen, and reset
+consequences to the same ordered client operation stream.
+
+Common placement validation rejects empty geometry, inconsistent
+protocol/kind/placeholder combinations, and invalid clips before replay or
+client ingestion. A clip is nonempty, bounded by exclusive cell coordinate
+65,536, forbidden on virtual placeholders, and contained by the placement's
+logical envelope. That envelope adds one right or bottom cell when the
+corresponding pixel offset is nonzero.
 
 Live IPC uses generation-tagged begin, update, and commit records under one
 monotonic output sequence. Replay uses begin metadata, definition metadata,
@@ -352,7 +371,9 @@ Docker verification freezes MessagePack bytes, bounded decode behavior, local ha
 hex for legacy/current local handshakes, live chunks, every replay phase,
 capability refusal, and client-older/server-older remote mismatches.
 `scribe-test terminal-image-ipc` decodes them through the production shared
-types, checks maximum and maximum-plus-one bounds, and writes
+types, checks maximum and maximum-plus-one bounds, round-trips a named clipped
+placement, proves absent legacy clips remain omitted/defaulted, rejects
+reversed, empty, out-of-range, placeholder, and protocol-mismatched placements, and writes
 `test-output/terminal-images/ipc.json`. Invoke it with
 `just e2e-func terminal-image-ipc.sh`.
 
@@ -395,6 +416,43 @@ source audit prove that the shared identity is one atlas key, `drop_image`
 deallocates it, and device recovery clears then lazily rebuilds that key. Those
 facts are frozen in
 `specs/020-terminal-images/gpui-lifecycle-decision.md`.
+
+## Layered GPUI Renderer Verification
+
+The Docker visual corpus verifies production placement paint, phase ordering, geometry, placeholder mapping, and final-reference cleanup on Linux WGPU.
+
+`tests/e2e/visual/terminal-image-renderer.sh` launches the guarded
+`--terminal-image-renderer-probe` surface at a real 2x GPUI X11 scale and
+captures crop, scale, alpha, every paint phase, 8-bit inherited and 32-bit
+placeholder mapping, Sixel text chronology, production scroll/margin effects,
+cache pressure, eviction, pane close, and atlas recovery. It invokes the same
+[[crates/scribe-client/src/terminal_element.rs#TerminalElement]] and shared
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache]] used by live
+panes.
+
+Evidence lands under `test-output/terminal-images/linux/renderer/`.
+`renderer.json` records device-space coordinates plus observed and expected RGB
+for every phase/geometry assertion, the platform scale factor, and pixel
+comparisons. Pressure must reject the extra live source without an atlas drop
+or pixel change at the hard cache bound. Distinct overlapping Sixels prove
+later completion wins below text; a selected current match proves find
+precedence above images.
+Eviction and Linux atlas-invalidation repaint must each change zero pixels;
+pane close must leave zero projected GPU bytes after `Window::drop_image`.
+
+The probe applies typed scroll effects through
+[[crates/scribe-client/src/terminal_image_scene.rs#CommittedImageScene#apply_grid_effect]],
+then hands the resulting committed scene to the renderer. This exercises the
+production common-placement logical envelope and clip for partially visible
+Kitty and Sixel rasters. First and repeated scroll captures keep the original
+source crop, destination extent, and nonzero Y offset while the stored clip
+moves through the margins, proving no proportional recrop or rounding drift.
+An off-margin placement keeps its resized envelope, X/Y offsets, mapping, and
+sampled pixels through an unrelated margin scroll. Production-scene delete
+counts prove physical effective-extent selectors, virtual-placement immunity,
+hard-scope definition selection, unrelated unplaced-definition survival, and
+explicit deletion of an unplaced image. Linux atlas
+invalidation remains a device-recovery proxy, not a physical-device-loss claim.
 
 ## Native macOS Metal Validation
 
@@ -443,7 +501,7 @@ placements, a green cropped quadrant, reusable texture space after
 a pinned test hook, observe GPUI context and atlas recreation, preserve source
 identities, and require a zero-difference repaint.
 
-No native driver is created by the lifecycle spike: terminal placement
-rendering and a genuine device-loss hook do not exist yet. The workflow remains
-fail-closed until downstream renderer work supplies both; an atlas-clear
-surrogate must not satisfy the Metal device-loss assertion.
+Terminal placement rendering now exists, but the genuine Metal device-loss
+hook and downstream native driver do not. The workflow remains fail-closed
+until those native pieces land; the Linux atlas-clear proxy must not satisfy
+the Metal device-loss assertion.

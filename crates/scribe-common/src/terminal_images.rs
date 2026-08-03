@@ -124,6 +124,9 @@ pub enum ImageLimitName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageBoundError {
     InvalidDimensions,
+    InvalidPlacementGeometry,
+    InvalidPlacementClip,
+    InvalidPlacementKind,
     ArithmeticOverflow,
     LimitExceeded(ImageLimitName),
     InconsistentCanonicalLength,
@@ -134,6 +137,13 @@ impl fmt::Display for ImageBoundError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDimensions => f.write_str("image dimensions must be non-zero"),
+            Self::InvalidPlacementGeometry => {
+                f.write_str("terminal image placement geometry is invalid")
+            }
+            Self::InvalidPlacementClip => f.write_str("terminal image placement clip is invalid"),
+            Self::InvalidPlacementKind => {
+                f.write_str("terminal image placement protocol and kind are inconsistent")
+            }
             Self::ArithmeticOverflow => f.write_str("image size arithmetic overflowed"),
             Self::LimitExceeded(limit) => write!(f, "image limit exceeded: {limit:?}"),
             Self::InconsistentCanonicalLength => {
@@ -414,7 +424,51 @@ pub enum TerminalImagePlacementKind {
 pub struct PlaceholderMetadata {
     pub image_identity_bits: u8,
     pub placement_id_in_underline: bool,
+    /// Reserved wire-compatibility byte. Kitty has no separate placeholder
+    /// background-opacity channel; renderers must not apply this as image alpha.
     pub background_alpha: u8,
+}
+
+/// Persistent exclusive cell bounds masking a classic or Sixel placement.
+///
+/// Source/destination geometry stays immutable while scroll and resize effects
+/// move and intersect this mask. Renderers convert its edges with their own
+/// current cell metrics, preserving pixel offsets and multi-view resizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalImageCellClip {
+    pub top: i32,
+    pub left: i32,
+    pub bottom: i32,
+    pub right: i32,
+}
+
+impl TerminalImageCellClip {
+    pub const MAX_EXCLUSIVE_CELL: i32 = 65_536;
+
+    pub fn validate(self) -> Result<(), ImageBoundError> {
+        if self.top < 0
+            || self.left < 0
+            || self.top >= self.bottom
+            || self.left >= self.right
+            || self.bottom > Self::MAX_EXCLUSIVE_CELL
+            || self.right > Self::MAX_EXCLUSIVE_CELL
+        {
+            return Err(ImageBoundError::InvalidPlacementClip);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let intersection = Self {
+            top: self.top.max(other.top),
+            left: self.left.max(other.left),
+            bottom: self.bottom.min(other.bottom),
+            right: self.right.min(other.right),
+        };
+        (intersection.top < intersection.bottom && intersection.left < intersection.right)
+            .then_some(intersection)
+    }
 }
 
 /// One canonical terminal-cell placement. All geometry is scalar and bounded
@@ -434,8 +488,68 @@ pub struct TerminalImagePlacement {
     pub z_index: i32,
     pub scrolls_with_grid: bool,
     pub move_cursor: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_clip: Option<TerminalImageCellClip>,
     #[serde(default)]
     pub placeholder: Option<PlaceholderMetadata>,
+}
+
+impl TerminalImagePlacement {
+    /// Validate placement-only scalars before definition-bound source checks.
+    pub fn validate_scalars(&self) -> Result<(), ImageBoundError> {
+        if self.source.width == 0
+            || self.source.height == 0
+            || self.destination.columns == 0
+            || self.destination.rows == 0
+        {
+            return Err(ImageBoundError::InvalidPlacementGeometry);
+        }
+        match self.kind {
+            TerminalImagePlacementKind::KittyClassic
+                if self.protocol == TerminalImageProtocol::Kitty && self.placeholder.is_none() => {}
+            TerminalImagePlacementKind::KittyUnicodePlaceholder
+                if self.protocol == TerminalImageProtocol::Kitty && self.placeholder.is_some() => {}
+            TerminalImagePlacementKind::Sixel
+                if self.protocol == TerminalImageProtocol::Sixel && self.placeholder.is_none() => {}
+            _ => return Err(ImageBoundError::InvalidPlacementKind),
+        }
+        if self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder
+            && self.cell_clip.is_some()
+        {
+            return Err(ImageBoundError::InvalidPlacementClip);
+        }
+        if let Some(clip) = self.cell_clip {
+            clip.validate()?;
+            let envelope = self.logical_cell_envelope()?;
+            if envelope.intersection(clip) != Some(clip) {
+                return Err(ImageBoundError::InvalidPlacementClip);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checked conservative cell envelope for classic and Sixel pixels.
+    pub fn logical_cell_envelope(&self) -> Result<TerminalImageCellClip, ImageBoundError> {
+        if self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
+            return Err(ImageBoundError::InvalidPlacementKind);
+        }
+        let top = self.anchor.row;
+        let left = i32::from(self.anchor.column);
+        let extra_row = i32::from(u8::from(self.pixel_offset_y > 0));
+        let extra_column = i32::from(u8::from(self.pixel_offset_x > 0));
+        let bottom = top
+            .checked_add(i32::from(self.destination.rows))
+            .and_then(|value| value.checked_add(extra_row))
+            .ok_or(ImageBoundError::ArithmeticOverflow)?;
+        let right = left
+            .checked_add(i32::from(self.destination.columns))
+            .and_then(|value| value.checked_add(extra_column))
+            .ok_or(ImageBoundError::ArithmeticOverflow)?;
+        if top >= bottom || left >= right {
+            return Err(ImageBoundError::InvalidPlacementGeometry);
+        }
+        Ok(TerminalImageCellClip { top, left, bottom, right })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,7 +741,7 @@ impl TerminalImageReplayMessage {
                 if *generation != placement.generation {
                     return Err(ImageBoundError::InconsistentGeneration);
                 }
-                Ok(())
+                placement.validate_scalars()
             }
             Self::Commit { .. } => Ok(()),
         }

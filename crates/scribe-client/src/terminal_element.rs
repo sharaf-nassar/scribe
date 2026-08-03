@@ -7,17 +7,24 @@
 //! from an explicit Nerd-Font-first fallback chain, and ligatures from the
 //! `calt` OpenType feature gated on `appearance.ligatures`.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontFeatures,
-    FontStyle, FontWeight, Pixels, Rgba, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle,
-    Window, canvas, div, fill, point, prelude::*, px, size,
+    FontStyle, FontWeight, Pixels, RenderImage, Rgba, StrikethroughStyle, TextAlign, TextRun,
+    UnderlineStyle, Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use scribe_client::{
     box_drawing,
     color::{TerminalColors, linear_to_srgb_rgba},
+    gpui_image_lifecycle::{
+        CroppedImageGeometry, GpuiImageCache, GpuiImageError, GpuiImageKey,
+        paint_cropped_image_clipped,
+    },
+    kitty_placeholder::kitty_placeholder_diacritic_index,
     layout::Rect,
     opacity::{opaque_slot, scale_alpha},
     preedit::{Ime, PreeditGeometry, PreeditOverlay, PreeditState, compute_overlay},
@@ -29,8 +36,16 @@ use scribe_client::{
     search::{MatchHighlight, MatchHighlightColors},
     selection::SelectionSpan,
     split_scroll,
+    terminal_image_scene::{CommittedImageScene, KITTY_IMAGE_PLACEHOLDER},
 };
-use scribe_common::config::{AppearanceConfig, CursorShape};
+use scribe_common::{
+    config::{AppearanceConfig, CursorShape},
+    ids::SessionId,
+    terminal_images::{
+        TerminalImageDefinition, TerminalImageId, TerminalImagePlacement,
+        TerminalImagePlacementKind, TerminalImageProtocol, TerminalPlacementId,
+    },
+};
 
 use crate::terminal::{Cell, Content, CursorPlacement, Flags, ShellCursorShape, ViewportPoint};
 
@@ -323,7 +338,18 @@ pub struct TerminalElement {
     /// attached to the pane, which is the only case with no viewport to
     /// describe.
     scrollbar: Option<ScrollbarPaint>,
+    /// Immutable CPU scene plus the window-local cache shared by all panes.
+    images: Option<TerminalImagesPaint>,
     bounds_sink: GridBounds,
+}
+
+/// One pane's terminal-image scene and its window-local upload cache.
+#[derive(Clone)]
+pub struct TerminalImagesPaint {
+    pub session_id: Option<SessionId>,
+    pub scene: Arc<CommittedImageScene>,
+    pub cache: Rc<RefCell<GpuiImageCache>>,
+    pub active_sessions: Rc<HashSet<SessionId>>,
 }
 
 impl TerminalElement {
@@ -348,8 +374,16 @@ impl TerminalElement {
             ime: None,
             cursor: None,
             scrollbar: None,
+            images: None,
             bounds_sink,
         }
+    }
+
+    /// Paint this pane's committed image scene through the shared view cache.
+    #[must_use]
+    pub fn with_terminal_images(mut self, images: TerminalImagesPaint) -> Self {
+        self.images = Some(images);
+        self
     }
 
     /// Draw this pane's overlay scrollbar on top of the finished grid.
@@ -394,12 +428,7 @@ impl TerminalElement {
         self
     }
 
-    /// Paint `selection` as the active mouse selection under the find matches.
-    ///
-    /// Selection is folded into the same per-cell resolve the find highlights
-    /// use, and applied first, so a find match inside a selection still reads
-    /// as a match — the search accent wins the overlap, exactly as it does in
-    /// the winit client.
+    /// Paint `selection` as the active mouse selection above terminal images.
     #[must_use]
     pub fn with_selection(mut self, selection: Vec<SelectionSpan>) -> Self {
         self.selection = selection;
@@ -439,35 +468,41 @@ impl TerminalElement {
         let default_bg = linear_to_srgb_rgba(self.colors.cells.default_bg());
         let variants = FontVariants::new(&self.font);
         let thickness = self.font.decoration_thickness();
-        let mut resolved: Vec<ResolvedCell> = Vec::new();
         let cursor = self.painted_cursor();
+        let resolved_rows = self.resolve_rows(bounds, line_height, default_bg);
+        let image_geometry = ImageGridGeometry { viewport: bounds, cell_width, line_height };
 
-        for (row_index, row) in self.content.rows.iter().enumerate() {
+        self.sync_image_cache(window);
+
+        // Phase 1: Kitty's deepest z band and Sixel's legacy raster layer sit
+        // above the terminal fill but below every non-default cell background.
+        self.paint_images(ImagePaintPhase::BehindCellBackgrounds, image_geometry, window);
+
+        // Phase 2: non-default cell backgrounds occlude deep Kitty and Sixel
+        // pixels. Resolve first, then paint globally so later image phases can
+        // cross row boundaries without row-local ordering inversions.
+        for (row_index, resolved) in resolved_rows.iter().enumerate() {
             let top = bounds.top() + line_height * grid_f32(row_index);
-            if top >= bounds.bottom() {
-                break;
-            }
             let geometry =
                 CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
+            paint_cell_backgrounds(resolved, geometry, window);
+        }
 
-            resolved.clear();
-            resolved.extend(row.iter().map(|cell| {
-                let (fg, bg) =
-                    self.colors.cells.resolve_cell_colors_srgb(cell.fg, cell.bg, cell.flags);
-                let painted_bg = (!slots_equal(bg, default_bg))
-                    .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
-                ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
-            }));
-            self.apply_selection(row_index, &mut resolved);
-            self.apply_highlights(row_index, default_bg, &mut resolved);
-            apply_block_cursor(cursor, row_index, default_bg, &mut resolved);
+        // Phase 3: remaining negative-z Kitty placements cover cell
+        // backgrounds while staying below box drawing and glyphs.
+        self.paint_images(ImagePaintPhase::Negative, image_geometry, window);
 
-            paint_cell_backgrounds(&resolved, geometry, window);
-            paint_box_drawing(row, &resolved, geometry, window);
+        // Phase 4: box drawing and shaped terminal text.
+        for (row_index, (row, resolved)) in self.content.rows.iter().zip(&resolved_rows).enumerate()
+        {
+            let top = bounds.top() + line_height * grid_f32(row_index);
+            let geometry =
+                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
+            paint_box_drawing(row, resolved, geometry, window);
             paint_row_text(
                 &RowPaint {
                     cells: row,
-                    resolved: &resolved,
+                    resolved,
                     font: &self.font,
                     variants: &variants,
                     thickness,
@@ -478,6 +513,11 @@ impl TerminalElement {
             );
         }
 
+        // Phase 5: nonnegative Kitty placements cover terminal glyphs.
+        self.paint_images(ImagePaintPhase::Nonnegative, image_geometry, window);
+
+        // Phase 6: selection, cursor, split-scroll,
+        // scrollbar, and IME/chrome overlays remain above every image.
         let overlay = OverlayGeometry {
             bounds,
             cell_width,
@@ -489,6 +529,30 @@ impl TerminalElement {
             )),
             cursor: opaque_slot(linear_to_srgb_rgba(self.colors.cells.cursor_color())),
         };
+        self.paint_selection_overlay(
+            overlay,
+            &SelectionOverlayPaint {
+                resolved_rows: &resolved_rows,
+                variants: &variants,
+                thickness,
+            },
+            window,
+            cx,
+        );
+        paint_block_cursor(
+            cursor,
+            overlay,
+            &BlockCursorPaint {
+                default_bg,
+                content: &self.content,
+                resolved_rows: &resolved_rows,
+                font: &self.font,
+                variants: &variants,
+                thickness,
+            },
+            window,
+            cx,
+        );
         paint_line_cursor(cursor, overlay, window);
         self.paint_vi_cursor(overlay, window);
         self.paint_split_scroll(overlay, window);
@@ -497,6 +561,201 @@ impl TerminalElement {
         // the thumb. The IME registration below draws nothing.
         self.paint_scrollbar(bounds, window);
         self.serve_ime(overlay, window, cx);
+    }
+
+    fn resolve_rows(
+        &self,
+        bounds: Bounds<Pixels>,
+        line_height: Pixels,
+        default_bg: [f32; 4],
+    ) -> Vec<Vec<ResolvedCell>> {
+        let mut rows = Vec::new();
+        for (row_index, row) in self.content.rows.iter().enumerate() {
+            if bounds.top() + line_height * grid_f32(row_index) >= bounds.bottom() {
+                break;
+            }
+            let mut resolved = row
+                .iter()
+                .map(|cell| {
+                    let (fg, bg) =
+                        self.colors.cells.resolve_cell_colors_srgb(cell.fg, cell.bg, cell.flags);
+                    let painted_bg = (!slots_equal(bg, default_bg))
+                        .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
+                    ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
+                })
+                .collect::<Vec<_>>();
+            self.apply_highlights(row_index, default_bg, &mut resolved);
+            rows.push(resolved);
+        }
+        rows
+    }
+
+    fn sync_image_cache(&self, window: &mut Window) {
+        let Some(images) = self.images.as_ref() else { return };
+        if let Err(error) =
+            images.cache.borrow_mut().retain_sessions(&images.active_sessions, window)
+        {
+            tracing::warn!(%error, "closed terminal pane image cleanup failed");
+        }
+        let Some(session_id) = images.session_id else { return };
+        // This runs before this pane queues any image primitive. Definitions
+        // without an active-screen placement are safe to drop here; live
+        // sources stay resident for the whole frame and admission never evicts
+        // them under pressure.
+        let live = images
+            .scene
+            .placements()
+            .iter()
+            .filter_map(|placement| {
+                images.scene.definitions.iter().find(|definition| {
+                    definition.metadata.id == placement.image_id
+                        && definition.metadata.generation == placement.generation
+                })
+            })
+            .map(|definition| GpuiImageKey::for_session(session_id, &definition.metadata))
+            .collect::<HashSet<_>>();
+        if let Err(error) =
+            images.cache.borrow_mut().retain_session_definitions(session_id, &live, window)
+        {
+            tracing::warn!(%error, %session_id, "terminal image cache cleanup failed");
+        }
+    }
+
+    fn paint_images(
+        &self,
+        phase: ImagePaintPhase,
+        geometry: ImageGridGeometry,
+        window: &mut Window,
+    ) {
+        let Some(images) = self.images.as_ref() else { return };
+        let Some(session_id) = images.session_id else { return };
+        let mut placements = images
+            .scene
+            .placements()
+            .iter()
+            .enumerate()
+            .filter(|(_, placement)| image_phase(placement) == phase)
+            .collect::<Vec<_>>();
+        placements
+            .sort_by_key(|(chronology, placement)| image_sort_key(phase, placement, *chronology));
+        let default_placeholder_placements = default_placeholder_placements(&images.scene);
+
+        for (_, placement) in placements {
+            let Some(definition) = images.scene.definitions.iter().find(|definition| {
+                definition.metadata.id == placement.image_id
+                    && definition.metadata.generation == placement.generation
+            }) else {
+                continue;
+            };
+            let image = images.cache.borrow_mut().get_or_insert_for_session(
+                session_id,
+                &definition.metadata,
+                &definition.rgba,
+                window,
+            );
+            let image = match image {
+                Ok(image) => image,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %session_id,
+                        image_id = placement.image_id.0,
+                        "terminal image source preparation failed"
+                    );
+                    continue;
+                }
+            };
+            let result = match placement.kind {
+                TerminalImagePlacementKind::KittyUnicodePlaceholder => paint_placeholder_cells(
+                    window,
+                    PreparedImagePlacement {
+                        image: &image,
+                        definition: &definition.metadata,
+                        placement,
+                    },
+                    &self.content,
+                    geometry,
+                    default_placeholder_placements.get(&placement.image_id).copied(),
+                ),
+                TerminalImagePlacementKind::KittyClassic | TerminalImagePlacementKind::Sixel => {
+                    paint_classic_placement(
+                        window,
+                        PreparedImagePlacement {
+                            image: &image,
+                            definition: &definition.metadata,
+                            placement,
+                        },
+                        geometry,
+                    )
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    %error,
+                    %session_id,
+                    image_id = placement.image_id.0,
+                    "terminal image placement paint failed"
+                );
+            }
+        }
+    }
+
+    /// Repaint selected cells after nonnegative images, preserving selected
+    /// glyphs and box drawing while leaving the block cursor as the final cell
+    /// overlay.
+    fn paint_selection_overlay(
+        &self,
+        overlay: OverlayGeometry,
+        paint: &SelectionOverlayPaint<'_>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let bg = scale_alpha(
+            opaque_slot(linear_to_srgb_rgba(self.colors.cells.selection_bg())),
+            self.colors.opacity,
+        );
+        let fg = opaque_slot(linear_to_srgb_rgba(self.colors.cells.selection_fg()));
+        for span in &self.selection {
+            let Some(row) = self.content.rows.get(span.row) else { continue };
+            let Some(resolved) = paint.resolved_rows.get(span.row) else { continue };
+            let end = span.end_col.min(row.len().saturating_sub(1));
+            if span.start_col > end {
+                continue;
+            }
+            let Some(cells) = row.get(span.start_col..=end) else { continue };
+            let Some(base) = resolved.get(span.start_col..=end) else { continue };
+            let mut selected = base
+                .iter()
+                .map(|cell| ResolvedCell { fg, bg: Some(bg), flags: cell.flags })
+                .collect::<Vec<_>>();
+            restore_highlights_over_selection(
+                &mut selected,
+                resolved,
+                *span,
+                end,
+                &self.highlights,
+            );
+            let geometry = CellGeometry {
+                left: overlay.bounds.left() + px(overlay.cell_width * grid_f32(span.start_col)),
+                top: overlay.bounds.top() + overlay.line_height * grid_f32(span.row),
+                width: overlay.cell_width,
+                height: overlay.line_height,
+            };
+            paint_cell_backgrounds(&selected, geometry, window);
+            paint_box_drawing(cells, &selected, geometry, window);
+            paint_row_text(
+                &RowPaint {
+                    cells,
+                    resolved: &selected,
+                    font: &self.font,
+                    variants: paint.variants,
+                    thickness: paint.thickness,
+                    geometry,
+                },
+                window,
+                cx,
+            );
+        }
     }
 
     /// Draw the pane's overlay scrollbar: the thumb plus one tick per command
@@ -663,30 +922,6 @@ impl TerminalElement {
         }
     }
 
-    /// Recolour the cells of `row_index` that the mouse selection covers.
-    ///
-    /// Both channels come from the theme's `selection` / `selection_foreground`
-    /// keys rather than from a blend, so selected text keeps a single, uniform
-    /// look across coloured shell output — which is what makes a selection
-    /// readable as one contiguous region.
-    fn apply_selection(&self, row_index: usize, resolved: &mut [ResolvedCell]) {
-        if self.selection.is_empty() {
-            return;
-        }
-        let cells_theme = &self.colors.cells;
-        let bg = opaque_slot(linear_to_srgb_rgba(cells_theme.selection_bg()));
-        let fg = opaque_slot(linear_to_srgb_rgba(cells_theme.selection_fg()));
-        for span in self.selection.iter().filter(|span| span.row == row_index) {
-            let Some(cells) = resolved.get_mut(span.start_col..=span.end_col) else {
-                continue;
-            };
-            for cell in cells {
-                cell.bg = Some(scale_alpha(bg, self.colors.opacity));
-                cell.fg = fg;
-            }
-        }
-    }
-
     /// Resolve the focused frame's blink/config state with the terminal's own
     /// cursor visibility and DECSCUSR shape.
     fn painted_cursor(&self) -> Option<PaintedCursor> {
@@ -770,6 +1005,377 @@ impl TerminalElement {
             window.paint_quad(fill(stroke, accent));
         }
     }
+}
+
+/// Restore resolved find colours after phase-6 selection recolouring.
+fn restore_highlights_over_selection(
+    selected: &mut [ResolvedCell],
+    base: &[ResolvedCell],
+    selection: SelectionSpan,
+    selection_end: usize,
+    highlights: &[MatchHighlight],
+) {
+    for highlight in highlights.iter().filter(|item| item.row == selection.row) {
+        let start = selection.start_col.max(highlight.start_col);
+        let end = selection_end.min(highlight.end_col);
+        if start > end {
+            continue;
+        }
+        let selected_start = start.saturating_sub(selection.start_col);
+        let selected_end = end.saturating_sub(selection.start_col);
+        let Some(target) = selected.get_mut(selected_start..=selected_end) else { continue };
+        let Some(source) = base.get(start..=end) else { continue };
+        target.copy_from_slice(source);
+    }
+}
+
+const KITTY_BACKGROUND_Z_CUTOFF: i32 = -1_073_741_824;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImagePaintPhase {
+    BehindCellBackgrounds,
+    Negative,
+    Nonnegative,
+}
+
+fn image_phase(placement: &TerminalImagePlacement) -> ImagePaintPhase {
+    if placement.protocol == TerminalImageProtocol::Sixel
+        || placement.z_index < KITTY_BACKGROUND_Z_CUTOFF
+    {
+        ImagePaintPhase::BehindCellBackgrounds
+    } else if placement.z_index < 0 {
+        ImagePaintPhase::Negative
+    } else {
+        ImagePaintPhase::Nonnegative
+    }
+}
+
+fn image_sort_key(
+    phase: ImagePaintPhase,
+    placement: &TerminalImagePlacement,
+    chronology: usize,
+) -> (u8, i32, u64, u64, usize) {
+    if phase == ImagePaintPhase::BehindCellBackgrounds
+        && placement.protocol == TerminalImageProtocol::Sixel
+    {
+        // Sixel has no z-index. It occupies the legacy graphics layer after
+        // deepest Kitty images and preserves raster completion chronology.
+        (1, 0, 0, 0, chronology)
+    } else {
+        (0, placement.z_index, placement.image_id.0, placement.id.0, chronology)
+    }
+}
+
+fn default_placeholder_placements(
+    scene: &CommittedImageScene,
+) -> HashMap<TerminalImageId, TerminalPlacementId> {
+    scene
+        .placements()
+        .iter()
+        .filter(|placement| placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder)
+        .fold(HashMap::new(), |mut choices, placement| {
+            choices
+                .entry(placement.image_id)
+                .and_modify(|id| *id = (*id).min(placement.id))
+                .or_insert(placement.id);
+            choices
+        })
+}
+
+#[derive(Clone, Copy)]
+struct PreparedImagePlacement<'a> {
+    image: &'a Arc<RenderImage>,
+    definition: &'a TerminalImageDefinition,
+    placement: &'a TerminalImagePlacement,
+}
+
+fn paint_classic_placement(
+    window: &mut Window,
+    prepared: PreparedImagePlacement<'_>,
+    geometry: ImageGridGeometry,
+) -> Result<(), GpuiImageError> {
+    let PreparedImagePlacement { image, definition, placement } = prepared;
+    let Some(ClassicGeometry { destination, clip }) = classic_geometry(placement, geometry) else {
+        return Ok(());
+    };
+    paint_cropped_image_clipped(
+        window,
+        Arc::clone(image),
+        CroppedImageGeometry {
+            source_size: (definition.width, definition.height),
+            source: placement.source,
+            destination,
+            clip,
+        },
+    )
+}
+
+struct ClassicGeometry {
+    destination: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
+}
+
+fn classic_geometry(
+    placement: &TerminalImagePlacement,
+    geometry: ImageGridGeometry,
+) -> Option<ClassicGeometry> {
+    let ImageGridGeometry { viewport, cell_width, line_height } = geometry;
+    let destination = Bounds::new(
+        point(
+            viewport.left()
+                + px(cell_width * f32::from(placement.anchor.column))
+                + px(f32::from(placement.pixel_offset_x)),
+            viewport.top()
+                + line_height * grid_i32_f32(placement.anchor.row)
+                + px(f32::from(placement.pixel_offset_y)),
+        ),
+        size(
+            px(cell_width * f32::from(placement.destination.columns)),
+            line_height * f32::from(placement.destination.rows),
+        ),
+    );
+    let mut clip = intersect_bounds(destination, viewport)?;
+    if let Some(cell_clip) = placement.cell_clip {
+        let logical_clip = Bounds::new(
+            point(
+                viewport.left() + px(cell_width * cell_clip_f32(cell_clip.left)),
+                viewport.top() + line_height * cell_clip_f32(cell_clip.top),
+            ),
+            size(
+                px(cell_width * cell_clip_f32(cell_clip.right.saturating_sub(cell_clip.left))),
+                line_height * cell_clip_f32(cell_clip.bottom.saturating_sub(cell_clip.top)),
+            ),
+        );
+        clip = intersect_bounds(clip, logical_clip)?;
+    }
+    Some(ClassicGeometry { destination, clip })
+}
+
+#[derive(Clone, Copy)]
+struct PlaceholderCellState {
+    row: u16,
+    column: u16,
+    image_msb: Option<u16>,
+    foreground: vte::ansi::Color,
+    underline: Option<vte::ansi::Color>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageGridGeometry {
+    viewport: Bounds<Pixels>,
+    cell_width: f32,
+    line_height: Pixels,
+}
+
+struct PlaceholderGeometry {
+    destination: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
+}
+
+fn paint_placeholder_cells(
+    window: &mut Window,
+    prepared: PreparedImagePlacement<'_>,
+    content: &Content,
+    geometry: ImageGridGeometry,
+    default_placement_id: Option<TerminalPlacementId>,
+) -> Result<(), GpuiImageError> {
+    let PreparedImagePlacement { image, definition, placement } = prepared;
+    let Some(metadata) = placement.placeholder else { return Ok(()) };
+    for (row_index, row) in content.rows.iter().enumerate() {
+        let mut previous = None;
+        for (column_index, cell) in row.iter().enumerate() {
+            if cell.c != KITTY_IMAGE_PLACEHOLDER {
+                previous = None;
+                continue;
+            }
+            let Some(state) = decode_placeholder_cell(cell, previous) else {
+                previous = None;
+                continue;
+            };
+            previous = Some(state);
+            let Some(image_id) =
+                placeholder_image_id(cell.fg, state.image_msb, metadata.image_identity_bits)
+            else {
+                continue;
+            };
+            if image_id != placement.image_id.0 {
+                continue;
+            }
+            if !placeholder_placement_matches(
+                placement,
+                cell,
+                metadata.placement_id_in_underline,
+                default_placement_id,
+            ) {
+                continue;
+            }
+            if state.column >= placement.destination.columns
+                || state.row >= placement.destination.rows
+            {
+                continue;
+            }
+            let Some(PlaceholderGeometry { destination, clip }) =
+                placeholder_cell_geometry(placement, state, (row_index, column_index), geometry)?
+            else {
+                continue;
+            };
+            paint_cropped_image_clipped(
+                window,
+                Arc::clone(image),
+                CroppedImageGeometry {
+                    source_size: (definition.width, definition.height),
+                    source: placement.source,
+                    destination,
+                    clip,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn placeholder_placement_matches(
+    placement: &TerminalImagePlacement,
+    cell: &Cell,
+    placement_id_in_underline: bool,
+    default_placement_id: Option<TerminalPlacementId>,
+) -> bool {
+    let requested = placement_id_in_underline
+        .then(|| placeholder_color_id(cell.underline_color))
+        .flatten()
+        .filter(|id| *id != 0);
+    requested.map_or_else(|| default_placement_id == Some(placement.id), |id| id == placement.id.0)
+}
+
+fn placeholder_cell_geometry(
+    placement: &TerminalImagePlacement,
+    state: PlaceholderCellState,
+    grid_cell: (usize, usize),
+    geometry: ImageGridGeometry,
+) -> Result<Option<PlaceholderGeometry>, GpuiImageError> {
+    let ImageGridGeometry { viewport, cell_width, line_height } = geometry;
+    let (row_index, column_index) = grid_cell;
+    let cell_bounds = Bounds::new(
+        point(
+            viewport.left() + px(cell_width * grid_f32(column_index)),
+            viewport.top() + line_height * grid_f32(row_index),
+        ),
+        size(px(cell_width), line_height),
+    );
+    let source_width = f32::from(
+        u16::try_from(placement.source.width).map_err(|_| GpuiImageError::InvalidSourceCrop)?,
+    );
+    let source_height = f32::from(
+        u16::try_from(placement.source.height).map_err(|_| GpuiImageError::InvalidSourceCrop)?,
+    );
+    let slot_width = cell_width * f32::from(placement.destination.columns);
+    let slot_height = f32::from(line_height) * f32::from(placement.destination.rows);
+    let fit_scale = (slot_width / source_width).min(slot_height / source_height);
+    let fitted_width = source_width * fit_scale;
+    let fitted_height = source_height * fit_scale;
+    let slot_left = f32::from(cell_bounds.left()) - cell_width * f32::from(state.column)
+        + f32::from(placement.pixel_offset_x);
+    let slot_top = f32::from(cell_bounds.top()) - f32::from(line_height) * f32::from(state.row)
+        + f32::from(placement.pixel_offset_y);
+    let destination = Bounds::new(
+        point(
+            px(slot_left + (slot_width - fitted_width) / 2.0),
+            px(slot_top + (slot_height - fitted_height) / 2.0),
+        ),
+        size(px(fitted_width), px(fitted_height)),
+    );
+    let Some(cell_clip) = intersect_bounds(cell_bounds, destination) else { return Ok(None) };
+    Ok(intersect_bounds(cell_clip, viewport).map(|clip| PlaceholderGeometry { destination, clip }))
+}
+
+fn decode_placeholder_cell(
+    cell: &Cell,
+    previous: Option<PlaceholderCellState>,
+) -> Option<PlaceholderCellState> {
+    let marks = cell
+        .zerowidth()
+        .iter()
+        .map(|mark| kitty_placeholder_diacritic_index(*mark))
+        .collect::<Option<Vec<_>>>()?;
+    let inherits = |prior: PlaceholderCellState| {
+        prior.foreground == cell.fg && prior.underline == cell.underline_color
+    };
+    let (row, column, image_msb) = match marks.as_slice() {
+        [] => {
+            let prior = previous.filter(|prior| inherits(*prior))?;
+            (prior.row, prior.column.checked_add(1)?, prior.image_msb)
+        }
+        [row] => {
+            let prior = previous.filter(|prior| inherits(*prior) && prior.row == *row)?;
+            (*row, prior.column.checked_add(1)?, prior.image_msb)
+        }
+        [row, column] => {
+            let inherited_msb = previous
+                .filter(|prior| {
+                    inherits(*prior)
+                        && prior.row == *row
+                        && prior.column.checked_add(1) == Some(*column)
+                })
+                .and_then(|prior| prior.image_msb);
+            (*row, *column, inherited_msb)
+        }
+        [row, column, image_msb] => (*row, *column, Some(*image_msb)),
+        _ => return None,
+    };
+    Some(PlaceholderCellState {
+        row,
+        column,
+        image_msb,
+        foreground: cell.fg,
+        underline: cell.underline_color,
+    })
+}
+
+fn placeholder_image_id(
+    foreground: vte::ansi::Color,
+    image_msb: Option<u16>,
+    identity_bits: u8,
+) -> Option<u64> {
+    let low = placeholder_color_id(Some(foreground))?;
+    match identity_bits {
+        8 => Some(low & 0xff),
+        24 => Some(low & 0x00ff_ffff),
+        32 => Some((u64::from(image_msb?) << 24) | (low & 0x00ff_ffff)),
+        _ => None,
+    }
+}
+
+fn placeholder_color_id(color: Option<vte::ansi::Color>) -> Option<u64> {
+    match color? {
+        vte::ansi::Color::Indexed(index) => Some(u64::from(index)),
+        vte::ansi::Color::Spec(rgb) => {
+            Some((u64::from(rgb.r) << 16) | (u64::from(rgb.g) << 8) | u64::from(rgb.b))
+        }
+        vte::ansi::Color::Named(_) => None,
+    }
+}
+
+fn intersect_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+    let left = f32::from(a.left()).max(f32::from(b.left()));
+    let top = f32::from(a.top()).max(f32::from(b.top()));
+    let right = f32::from(a.right()).min(f32::from(b.right()));
+    let bottom = f32::from(a.bottom()).min(f32::from(b.bottom()));
+    (right > left && bottom > top)
+        .then(|| Bounds::new(point(px(left), px(top)), size(px(right - left), px(bottom - top))))
+}
+
+fn grid_i32_f32(value: i32) -> f32 {
+    let clamped =
+        i16::try_from(value).unwrap_or(if value.is_negative() { i16::MIN } else { i16::MAX });
+    f32::from(clamped)
+}
+
+/// Convert validated nonnegative clip coordinates through exact u16 chunks.
+fn cell_clip_f32(value: i32) -> f32 {
+    let value = value.clamp(0, 65_536);
+    let high = u16::try_from(value / 32_768).unwrap_or(2);
+    let low = u16::try_from(value % 32_768).unwrap_or(0);
+    f32::from(high).mul_add(32_768.0, f32::from(low))
 }
 
 /// The per-frame geometry and palette the two grid overlays share.
@@ -970,29 +1576,74 @@ struct ResolvedCell {
     flags: Flags,
 }
 
-/// Invert the block cursor's cell before backgrounds and text are painted, so
-/// its glyph stays visible instead of being covered by a late overlay quad.
-fn apply_block_cursor(
-    cursor: Option<PaintedCursor>,
-    row_index: usize,
+struct SelectionOverlayPaint<'a> {
+    resolved_rows: &'a [Vec<ResolvedCell>],
+    variants: &'a FontVariants,
+    thickness: Pixels,
+}
+
+struct BlockCursorPaint<'a> {
     default_bg: [f32; 4],
-    resolved: &mut [ResolvedCell],
+    content: &'a Content,
+    resolved_rows: &'a [Vec<ResolvedCell>],
+    font: &'a GridFont,
+    variants: &'a FontVariants,
+    thickness: Pixels,
+}
+
+/// Paint a block cursor after every image phase, then redraw its cell glyph.
+fn paint_block_cursor(
+    cursor: Option<PaintedCursor>,
+    overlay: OverlayGeometry,
+    paint: &BlockCursorPaint<'_>,
+    window: &mut Window,
+    cx: &mut App,
 ) {
-    let Some(cursor) =
-        cursor.filter(|cursor| cursor.shape == CursorShape::Block && cursor.point.row == row_index)
+    let Some(cursor) = cursor.filter(|cursor| cursor.shape == CursorShape::Block) else {
+        return;
+    };
+    let Some(cell) =
+        paint.content.rows.get(cursor.point.row).and_then(|row| row.get(cursor.point.col)).copied()
     else {
         return;
     };
-    let Some(cell) = resolved.get_mut(cursor.point.col) else {
+    let Some(mut resolved) = paint
+        .resolved_rows
+        .get(cursor.point.row)
+        .and_then(|row| row.get(cursor.point.col))
+        .copied()
+    else {
         return;
     };
-    let foreground = cell.fg;
-    cell.fg = cell.bg.unwrap_or_else(|| opaque_slot(default_bg));
-    cell.bg = Some(foreground);
+    let cursor_background = resolved.fg;
+    resolved.fg = resolved.bg.unwrap_or_else(|| opaque_slot(paint.default_bg));
+    resolved.bg = Some(cursor_background);
+    let geometry = CellGeometry {
+        left: overlay.bounds.left() + px(overlay.cell_width * grid_f32(cursor.point.col)),
+        top: overlay.bounds.top() + overlay.line_height * grid_f32(cursor.point.row),
+        width: overlay.cell_width,
+        height: overlay.line_height,
+    };
+    if geometry.left >= overlay.bounds.right() || geometry.top >= overlay.bounds.bottom() {
+        return;
+    }
+    paint_cell_backgrounds(&[resolved], geometry, window);
+    paint_box_drawing(&[cell], &[resolved], geometry, window);
+    paint_row_text(
+        &RowPaint {
+            cells: &[cell],
+            resolved: &[resolved],
+            font: paint.font,
+            variants: paint.variants,
+            thickness: paint.thickness,
+            geometry,
+        },
+        window,
+        cx,
+    );
 }
 
-/// Draw beam and underline cursors after the normal cell contents. A block is
-/// already folded into its cell by [`apply_block_cursor`].
+/// Draw beam and underline cursors after the normal cell contents and images.
 fn paint_line_cursor(cursor: Option<PaintedCursor>, overlay: OverlayGeometry, window: &mut Window) {
     let Some(cursor) = cursor else {
         return;
@@ -1185,6 +1836,9 @@ fn run_matches(a: &TextRun, b: &TextRun) -> bool {
 /// row's blank tail before shaping it. A blank cell still counts when it
 /// carries an underline or strikethrough, which TUIs use to draw rules.
 fn is_painted_cell(cell: &Cell) -> bool {
+    if cell.c == KITTY_IMAGE_PLACEHOLDER {
+        return false;
+    }
     !matches!(cell.c, ' ' | '\0') || cell.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
 }
 
@@ -1195,7 +1849,11 @@ fn is_painted_cell(cell: &Cell) -> bool {
 /// Stray control characters are blanked so a malformed stream can never make
 /// `shape_line` see a newline.
 fn shaped_char(c: char) -> char {
-    if box_drawing::is_box_drawing(c) || c.is_control() { ' ' } else { c }
+    if box_drawing::is_box_drawing(c) || c == KITTY_IMAGE_PLACEHOLDER || c.is_control() {
+        ' '
+    } else {
+        c
+    }
 }
 
 /// The integer mask resolution used to rasterize one cell of box drawing.

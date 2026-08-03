@@ -6,14 +6,14 @@
 //! been checked. A malformed, stale, interrupted, or partial burst therefore
 //! cannot leak into paint state.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use scribe_common::terminal_images::{
-    BoundedImageBytes, CellExtent, ImageBoundError, ImageLimitName, ImageLimits, PixelRect,
-    TerminalGridEffect, TerminalImageCapabilityMismatch, TerminalImageDataChunk,
+    BoundedImageBytes, ImageBoundError, ImageLimitName, ImageLimits, PixelRect, TerminalGridEffect,
+    TerminalImageCapabilityMismatch, TerminalImageCellClip, TerminalImageDataChunk,
     TerminalImageDefinition, TerminalImageDelete, TerminalImageDeleteScope,
     TerminalImageGeneration, TerminalImageId, TerminalImageLiveMessage, TerminalImagePlacement,
-    TerminalImagePlacementKind, TerminalImageProtocol, TerminalImageRejection, TerminalImageUpdate,
+    TerminalImagePlacementKind, TerminalImageRejection, TerminalImageUpdate,
     TerminalOutputSequence, TerminalPlacementId, TerminalScreenKind,
 };
 use unicode_width::UnicodeWidthChar;
@@ -66,6 +66,20 @@ impl CommittedImageScene {
             TerminalScreenKind::Primary => &self.primary_placements,
             TerminalScreenKind::Alternate => &self.alternate_placements,
         }
+    }
+
+    /// Apply one terminal grid mutation to this committed scene.
+    ///
+    /// Live bursts use the same operation before publication. Exposing the
+    /// operation on owned scenes also keeps renderer-boundary probes on the
+    /// production margin and source-cropping path.
+    pub fn apply_grid_effect(&mut self, effect: &TerminalGridEffect) {
+        apply_grid_effect(self, effect);
+    }
+
+    /// Apply one protocol-normalized deletion to this owned scene.
+    pub fn apply_delete(&mut self, delete: TerminalImageDelete) {
+        apply_delete(self, delete);
     }
 
     fn placements_mut(&mut self) -> &mut Vec<TerminalImagePlacement> {
@@ -251,11 +265,11 @@ fn apply_update(
         TerminalImageUpdate::Delete { delete } => {
             // Kitty specifies that every delete aborts all incomplete uploads.
             pending.definitions.clear();
-            apply_delete(&mut pending.scene, delete);
+            pending.scene.apply_delete(delete);
             Ok(())
         }
         TerminalImageUpdate::GridEffect { effect } => {
-            apply_grid_effect(&mut pending.scene, &effect);
+            pending.scene.apply_grid_effect(&effect);
             pending.scene.last_grid_effects.push(effect);
             Ok(())
         }
@@ -386,44 +400,43 @@ fn validate_placement(
     placement: &TerminalImagePlacement,
     definition: &TerminalImageDefinition,
 ) -> Result<(), LiveSceneError> {
+    placement.validate_scalars()?;
     let PixelRect { x, y, width, height } = placement.source;
-    let CellExtent { columns, rows } = placement.destination;
     let source_right = x.checked_add(width).ok_or(LiveSceneError::InvalidPlacement)?;
     let source_bottom = y.checked_add(height).ok_or(LiveSceneError::InvalidPlacement)?;
-    if width == 0
-        || height == 0
-        || columns == 0
-        || rows == 0
-        || source_right > definition.width
-        || source_bottom > definition.height
-    {
+    if source_right > definition.width || source_bottom > definition.height {
         return Err(LiveSceneError::InvalidPlacement);
-    }
-    match placement.kind {
-        TerminalImagePlacementKind::KittyUnicodePlaceholder => {
-            if placement.protocol != TerminalImageProtocol::Kitty || placement.placeholder.is_none()
-            {
-                return Err(LiveSceneError::InvalidPlacement);
-            }
-        }
-        TerminalImagePlacementKind::KittyClassic => {
-            if placement.protocol != TerminalImageProtocol::Kitty || placement.placeholder.is_some()
-            {
-                return Err(LiveSceneError::InvalidPlacement);
-            }
-        }
-        TerminalImagePlacementKind::Sixel => {
-            if placement.protocol != TerminalImageProtocol::Sixel || placement.placeholder.is_some()
-            {
-                return Err(LiveSceneError::InvalidPlacement);
-            }
-        }
     }
     Ok(())
 }
 
 fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
     let applies = |placement: &TerminalImagePlacement| delete_matches(placement, &delete);
+    let mut selected_images = HashSet::new();
+    if delete.free_image_data {
+        match delete.scope {
+            TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement => {
+                selected_images.extend(
+                    scene
+                        .primary_placements
+                        .iter()
+                        .chain(&scene.alternate_placements)
+                        .filter(|placement| applies(placement))
+                        .map(|placement| placement.image_id),
+                );
+            }
+            _ => selected_images.extend(
+                scene
+                    .placements()
+                    .iter()
+                    .filter(|placement| applies(placement))
+                    .map(|placement| placement.image_id),
+            ),
+        }
+        if delete.scope == TerminalImageDeleteScope::Image {
+            selected_images.extend(delete.image_id);
+        }
+    }
     match delete.scope {
         TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement => {
             scene.primary_placements.retain(|placement| !applies(placement));
@@ -437,10 +450,10 @@ fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
             .iter()
             .chain(&scene.alternate_placements)
             .map(|placement| placement.image_id)
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         scene.definitions.retain(|definition| {
-            let selected = delete.image_id.is_none_or(|id| id == definition.metadata.id);
-            !selected || placed_images.contains(&definition.metadata.id)
+            !selected_images.contains(&definition.metadata.id)
+                || placed_images.contains(&definition.metadata.id)
         });
         scene.retained_rgba_bytes =
             scene.definitions.iter().map(|item| item.metadata.rgba_bytes).sum();
@@ -450,18 +463,27 @@ fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
 fn delete_matches(placement: &TerminalImagePlacement, delete: &TerminalImageDelete) -> bool {
     let image_matches = delete.image_id.is_none_or(|id| placement.image_id == id);
     let placement_matches = delete.placement_id.is_none_or(|id| placement.id == id);
+    if placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
+        return delete.scope == TerminalImageDeleteScope::Image
+            && delete.image_id.is_some()
+            && image_matches;
+    }
+    let effective = effective_placement_clip(placement);
     match delete.scope {
         TerminalImageDeleteScope::AllPlacements => true,
-        TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement => {
-            image_matches && placement_matches
-        }
+        TerminalImageDeleteScope::Image => image_matches,
+        TerminalImageDeleteScope::Placement => image_matches && placement_matches,
         TerminalImageDeleteScope::Cell => delete.coordinate.is_some_and(|coordinate| {
-            placement.anchor.row == coordinate || i32::from(placement.anchor.column) == coordinate
+            effective.is_some_and(|clip| {
+                clip_contains_row(clip, coordinate) || clip_contains_column(clip, coordinate)
+            })
         }),
-        TerminalImageDeleteScope::Row => delete.coordinate == Some(placement.anchor.row),
-        TerminalImageDeleteScope::Column => {
-            delete.coordinate == Some(i32::from(placement.anchor.column))
-        }
+        TerminalImageDeleteScope::Row => delete.coordinate.is_some_and(|coordinate| {
+            effective.is_some_and(|clip| clip_contains_row(clip, coordinate))
+        }),
+        TerminalImageDeleteScope::Column => delete.coordinate.is_some_and(|coordinate| {
+            effective.is_some_and(|clip| clip_contains_column(clip, coordinate))
+        }),
         TerminalImageDeleteScope::ZIndex => delete.coordinate == Some(placement.z_index),
     }
 }
@@ -470,18 +492,7 @@ fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffec
     match *effect {
         TerminalGridEffect::MoveCursor { .. } | TerminalGridEffect::SoftReset => {}
         TerminalGridEffect::Scroll { top, bottom, rows } => {
-            let top = i32::from(top);
-            let bottom = i32::from(bottom);
-            scene.placements_mut().retain_mut(|placement| {
-                if !placement.scrolls_with_grid
-                    || placement.anchor.row < top
-                    || placement.anchor.row > bottom
-                {
-                    return true;
-                }
-                placement.anchor.row = placement.anchor.row.saturating_sub(rows);
-                placement.anchor.row >= top && placement.anchor.row <= bottom
-            });
+            apply_scroll(scene, top, bottom, rows);
         }
         TerminalGridEffect::EraseCells { top, left, bottom, right } => {
             scene.placements_mut().retain(|placement| {
@@ -490,11 +501,7 @@ fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffec
             });
         }
         TerminalGridEffect::ResizeClip { columns, rows } => {
-            scene.placements_mut().retain(|placement| {
-                placement.anchor.row >= 0
-                    && placement.anchor.row < i32::from(rows)
-                    && placement.anchor.column < columns
-            });
+            apply_resize_clip(scene, columns, rows);
         }
         TerminalGridEffect::SwitchScreen { screen } => {
             scene.active_screen = screen;
@@ -510,6 +517,88 @@ fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffec
     }
 }
 
+fn apply_scroll(scene: &mut CommittedImageScene, top: u16, bottom: u16, rows: i32) {
+    let top = i32::from(top);
+    let bottom = i32::from(bottom).saturating_add(1);
+    let margin = TerminalImageCellClip {
+        top,
+        left: 0,
+        bottom,
+        right: TerminalImageCellClip::MAX_EXCLUSIVE_CELL,
+    };
+    scene.placements_mut().retain_mut(|placement| scroll_placement(placement, margin, rows));
+}
+
+fn scroll_placement(
+    placement: &mut TerminalImagePlacement,
+    margin: TerminalImageCellClip,
+    rows: i32,
+) -> bool {
+    if rows == 0
+        || !placement.scrolls_with_grid
+        || placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder
+    {
+        return true;
+    }
+    let Ok(old_envelope) = placement.logical_cell_envelope() else { return false };
+    let participates = match placement.cell_clip {
+        None => placement.anchor.row >= margin.top && placement.anchor.row < margin.bottom,
+        Some(clip) => old_envelope
+            .intersection(clip)
+            .and_then(|effective| effective.intersection(margin))
+            .is_some(),
+    };
+    if !participates {
+        return true;
+    }
+    placement.anchor.row = placement.anchor.row.saturating_sub(rows);
+    let Ok(new_envelope) = placement.logical_cell_envelope() else { return false };
+    let candidate = placement.cell_clip.map_or(margin, |clip| shift_clip_rows(clip, rows));
+    placement.cell_clip =
+        new_envelope.intersection(candidate).and_then(|effective| effective.intersection(margin));
+    placement.cell_clip.is_some()
+}
+
+fn apply_resize_clip(scene: &mut CommittedImageScene, columns: u16, rows: u16) {
+    let viewport = TerminalImageCellClip {
+        top: 0,
+        left: 0,
+        bottom: i32::from(rows),
+        right: i32::from(columns),
+    };
+    scene.placements_mut().retain_mut(|placement| {
+        if placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
+            return true;
+        }
+        let Ok(envelope) = placement.logical_cell_envelope() else { return false };
+        let candidate = placement.cell_clip.unwrap_or(envelope);
+        placement.cell_clip =
+            envelope.intersection(candidate).and_then(|effective| effective.intersection(viewport));
+        placement.cell_clip.is_some()
+    });
+}
+
+fn shift_clip_rows(clip: TerminalImageCellClip, rows: i32) -> TerminalImageCellClip {
+    TerminalImageCellClip {
+        top: clip.top.saturating_sub(rows),
+        bottom: clip.bottom.saturating_sub(rows),
+        ..clip
+    }
+}
+
+fn effective_placement_clip(placement: &TerminalImagePlacement) -> Option<TerminalImageCellClip> {
+    let envelope = placement.logical_cell_envelope().ok()?;
+    placement.cell_clip.map_or(Some(envelope), |clip| envelope.intersection(clip))
+}
+
+fn clip_contains_row(clip: TerminalImageCellClip, row: i32) -> bool {
+    row >= clip.top && row < clip.bottom
+}
+
+fn clip_contains_column(clip: TerminalImageCellClip, column: i32) -> bool {
+    column >= clip.left && column < clip.right
+}
+
 fn placement_intersects(
     placement: &TerminalImagePlacement,
     top: u16,
@@ -517,16 +606,15 @@ fn placement_intersects(
     bottom: u16,
     right: u16,
 ) -> bool {
-    let placement_top = placement.anchor.row;
-    let placement_left = i32::from(placement.anchor.column);
-    let placement_bottom =
-        placement_top.saturating_add(i32::from(placement.destination.rows)).saturating_sub(1);
-    let placement_right =
-        placement_left.saturating_add(i32::from(placement.destination.columns)).saturating_sub(1);
-    placement_top <= i32::from(bottom)
-        && placement_bottom >= i32::from(top)
-        && placement_left <= i32::from(right)
-        && placement_right >= i32::from(left)
+    let erase = TerminalImageCellClip {
+        top: i32::from(top),
+        left: i32::from(left),
+        bottom: i32::from(bottom).saturating_add(1),
+        right: i32::from(right).saturating_add(1),
+    };
+    effective_placement_clip(placement)
+        .and_then(|effective| effective.intersection(erase))
+        .is_some()
 }
 
 /// Remove Kitty placeholder cells and only their attached coordinate marks.

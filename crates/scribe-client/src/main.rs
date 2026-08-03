@@ -6,8 +6,10 @@ mod session_lifecycle;
 mod sync_frames;
 mod terminal;
 mod terminal_element;
+mod terminal_image_renderer_probe;
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
@@ -52,6 +54,7 @@ use scribe_client::dialog::{
 };
 use scribe_client::divider::{self, DividerDrag};
 use scribe_client::drag_drop::dropped_path_insertion;
+use scribe_client::gpui_image_lifecycle::GpuiImageCache;
 use scribe_client::input::{self, KeyInput, TerminalMode};
 use scribe_client::keybindings::{
     KeyAction, LayoutAction, OverlayChord, translate_key_action, translate_overlay_chord,
@@ -106,7 +109,7 @@ use scribe_client::split_scroll::{SplitScrollEligibility, SplitScrollState};
 use scribe_client::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client::sys_stats::SystemStatsCollector;
 use scribe_client::terminal_image_scene::{
-    capability_mismatch_message, filter_terminal_image_placeholders,
+    CommittedImageScene, capability_mismatch_message, filter_terminal_image_placeholders,
 };
 use scribe_client::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client::update::UpdateState;
@@ -164,7 +167,7 @@ use crate::{
     terminal::{Content, DisplayOnlyTerminal, PaneFrame, PaneGrid, PaneGrids, PaneStream, Scroll},
     terminal_element::{
         CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
-        cell_at, hits_jump_chip, record_grid_area,
+        TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
     },
 };
 
@@ -850,6 +853,8 @@ struct TerminalView {
     /// so a redraw only re-sends `Resize` when a split actually changed a
     /// pane's size.
     pane_sizes: HashMap<SessionId, TerminalSize>,
+    /// One projected-GPU-bounded source cache shared by every pane in this view.
+    image_cache: Rc<RefCell<GpuiImageCache>>,
     /// Geometry of the focused pane, which is where a new tab or a split's
     /// session opens. Starts at the whole window and shrinks with the layout.
     focused_pane_size: TerminalSize,
@@ -1096,6 +1101,7 @@ impl TerminalView {
             prompt_bar_enabled,
             shell,
             pane_sizes: HashMap::new(),
+            image_cache: Rc::new(RefCell::new(GpuiImageCache::new())),
             focused_pane_size: seed.terminal_size,
             last_reported_tree: None,
             titlebar,
@@ -4300,6 +4306,34 @@ impl TerminalView {
         })
     }
 
+    fn terminal_images_paint(
+        &self,
+        session_id: Option<SessionId>,
+        active_sessions: Rc<HashSet<SessionId>>,
+    ) -> TerminalImagesPaint {
+        let scene = session_id.and_then(|id| self.pane_frame(id)).map_or_else(
+            || Arc::new(CommittedImageScene::default()),
+            |frame| Arc::clone(&frame.image_scene),
+        );
+        TerminalImagesPaint {
+            session_id,
+            scene,
+            cache: Rc::clone(&self.image_cache),
+            active_sessions,
+        }
+    }
+
+    fn prepare_pane_surfaces(
+        &mut self,
+        placements: &[pane_shell::PanePlacement],
+    ) -> Rc<HashSet<SessionId>> {
+        let sessions = placements.iter().filter_map(|placement| placement.session_id);
+        for session_id in sessions.clone() {
+            self.scrollbars.panes.entry(session_id).or_default();
+        }
+        Rc::new(sessions.collect())
+    }
+
     /// Lower the pane layout onto absolutely positioned grid elements.
     ///
     /// Positions are fractions of the grid area, so the split ratios the pure
@@ -4325,14 +4359,12 @@ impl TerminalView {
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, cx);
+        let active_sessions = self.prepare_pane_surfaces(&placements);
         let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
         // borrows `self` immutably. The state has to outlive the element (the
         // fade is a wall-clock animation across frames), so it lives here and
         // the element only borrows a handle to it.
-        for session_id in placements.iter().filter_map(|placement| placement.session_id) {
-            self.scrollbars.panes.entry(session_id).or_default();
-        }
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
         let mut ime = Some(ime);
@@ -4343,6 +4375,9 @@ impl TerminalView {
         placements
             .into_iter()
             .map(|placement| {
+                let session_id = placement.session_id;
+                let image_paint =
+                    self.terminal_images_paint(session_id, Rc::clone(&active_sessions));
                 let content = if placement.focused {
                     focused.take().unwrap_or_default()
                 } else {
@@ -4386,7 +4421,8 @@ impl TerminalView {
                     bounds,
                 )
                 .with_highlights(highlights)
-                .with_selection(selection);
+                .with_selection(selection)
+                .with_terminal_images(image_paint);
                 if placement.focused {
                     element = element.with_cursor(cursor);
                 }
@@ -6663,6 +6699,10 @@ fn main() -> std::process::ExitCode {
     }
     if std::env::args().skip(1).any(|arg| arg == "--gpui-image-spike") {
         scribe_client::gpui_image_spike::run();
+        return std::process::ExitCode::SUCCESS;
+    }
+    if std::env::args().skip(1).any(|arg| arg == "--terminal-image-renderer-probe") {
+        terminal_image_renderer_probe::run();
         return std::process::ExitCode::SUCCESS;
     }
     // Arm the perf rig's runtime probe before anything can paint or type; it
