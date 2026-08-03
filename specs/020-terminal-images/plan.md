@@ -80,6 +80,7 @@ Primary references are the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/k
 - `crates/scribe-image-decode/` — shared caller-owned cumulative work, cancellation, monotonic deadline, allocation veto, and peak-allocation accounting consumed by both decoder forks.
 - `Cargo.toml`/`Cargo.lock` — direct `base64` 0.22.1 and `flate2` 1.1.9 aligned with already locked versions; no generic `image`, full `termwiz`, `quantette`, or C decoder in server decode paths.
 - `crates/scribe-test/` and `tests/e2e/` — typed protocol support, direct PTY/SSH application corpus, functional malformed/quota/replay cases, and visual fixtures.
+- `.github/workflows/native-macos-metal.yml`, `tools/run-native-macos-terminal-images.sh`, `justfile`, and repository policy — manual GPU-backed macOS dispatch, runner guard, downstream driver contract, evidence retention, and fail-closed release ownership.
 - `lat.md/client.md`, `lat.md/server.md`, `lat.md/pty.md`, `lat.md/rendering.md`, `lat.md/common.md`, and `lat.md/test.md` — architecture and verification contracts.
 
 ## Data Model
@@ -128,7 +129,12 @@ No database schema or disk migration is introduced. Handoff state gains defaulte
 
 ## Testing Strategy
 
-All automated Scribe validation runs through the Docker E2E harness and its `just` entry points. No host `scribe-server`, `scribe-client`, `scribe`, or `scribe-test` invocation is allowed. Native macOS evidence is a release blocker, but current repository policy provides no sanctioned native runtime harness; implementation must first add/approve that capability rather than mislabel Linux Docker results as macOS validation.
+Automated Linux Scribe validation runs through the Docker E2E harness and its
+`just` entry points. No developer-host `scribe-server`, `scribe-client`,
+`scribe`, or `scribe-test` invocation is allowed. Native macOS runtime is the
+sole narrow exception: the manual `Native macOS Metal` GitHub Actions workflow
+runs on the GPU-accelerated ARM64 `macos-14-xlarge` hosted runner and enters
+through `just native-macos-terminal-images`.
 
 Protocol and state tests:
 
@@ -153,7 +159,24 @@ Running-client functional/visual corpus:
 
 Performance follows clarification 7C through `tests/e2e/functional/terminal-images-performance.sh` and `tests/e2e/visual/terminal-images-frame-stability.sh`, invoked only with `just e2e-func` and `just e2e-visual`. They record text throughput, input latency, CPU, frame stability, decode/upload latency, and retained CPU/GPU measurements for qualitative material-regression review. No numeric performance-regression threshold gates release. Numeric performance goals are explicitly inapplicable for v1 under Constitution principle 4; its named-command measurement requirement still applies. Numeric resource ceilings remain hard security assertions.
 
-macOS parity requires the same named application/protocol corpus on native macOS before default-on release. Because current repository policy forbids unsanctioned host validation, the release task must establish an approved native harness or receive an explicit policy exception before running it.
+macOS parity requires the same named application/protocol corpus before
+default-on release. After the workflow is on the default branch and the target
+ref contains executable `tests/native-macos/terminal-images-metal.sh`, a
+repository maintainer with GitHub write access dispatches
+`gh workflow run native-macos-metal.yml --ref <release-candidate-ref>`.
+No secrets are required. The run uploads
+`test-output/terminal-images/macos/` as
+`native-macos-metal-<run-id>` for 14 days, including runner/display metadata
+and the corpus log. Downstream work may invoke Scribe only through that driver
+and only on this workflow.
+
+The job has a 120-minute timeout and no `continue-on-error`. Any build, corpus,
+timeout, missing-driver, or upload failure blocks GPUI platform work and
+default-on release. Product failures require a fixing commit before rerun. A
+maintainer may rerun an Actions infrastructure failure, but the release
+evidence must retain both run URLs and its rationale. Acceptance requires a
+green run for the exact candidate SHA plus the retained artifact; Linux Docker
+or a successful macOS package build cannot substitute.
 
 ## Risks
 
@@ -167,7 +190,9 @@ macOS parity requires the same named application/protocol corpus on native macOS
 - **Yazi discovery:** generic Kitty query selects Yazi's classic path for unknown terminals, not placeholders. Mitigation: gate v1 image display on a pinned released Yazi using its generic Kitty probe, verify placeholder semantics with owned fixtures, and pursue upstream truthful Scribe detection as a non-blocking P3 follow-up; never impersonate Kitty.
 - **Sixel ambiguity:** DEC and xterm disagree about DECSDM semantics. Mitigation: document/test xterm-compatible `?80` and `?8452` behavior as a deliberate compatibility choice.
 - **Mixed versions:** capable server plus incapable viewer can produce invisible or cursor-divergent state. Mitigation: refuse incapable attachment to image-enabled sessions with a typed update-required result; use exact-match remote versions; exercise old/new local handshakes, old/new handoff, downgrade config, and maximum-scene rollback fixtures.
-- **Native macOS validation gap:** Linux Docker cannot prove native Metal behavior. Mitigation: sanctioned native harness/CI is a blocking release work item.
+- **Native macOS evidence:** Linux Docker and the package-only release matrix
+  cannot prove Metal behavior. Mitigation: only the manual GPU-backed workflow
+  may run the native corpus, and its exact-SHA artifact remains a blocking gate.
 - **Upstream maintenance/license:** vendored parsers/decoder create ownership. Mitigation: pin source revisions, retain MIT/Apache attribution, document delta, audit CVEs/licenses, and keep the fork decode-only.
 - **Rollback:** malformed real-world sequences or GPU problems may require rapid disablement. Mitigation: master kill switch changes truthful advertising, releases state/resources, and leaves text path intact.
 
@@ -178,7 +203,7 @@ The following work items become task beads. Titles intentionally omit numeric pr
 | Work item | Priority | Depends on | Verifiable acceptance |
 | --- | --- | --- | --- |
 | Specify image protocol contract and security limits | P0 | None | Commit the exact matrix, capability lifecycle, Sixel chronology, typed failures, numeric `ImageLimits`, app/version corpus, and owned fixtures in `specs/020-terminal-images/` and `lat.md/`; `just e2e-func terminal-image-contract.sh` passes and writes `test-output/terminal-images/contract.json`. |
-| Approve and provision native macOS validation path | P0 | Protocol contract | Record a sanctioned native runner/harness or explicit repository-policy authorization before runtime use; document command, owner, artifacts, and failure handling in the plan/support docs; `lat check` passes. This blocks platform-dependent GPUI work, not only final release. |
+| Approve and provision native macOS validation path | P0 | Protocol contract | Manual `.github/workflows/native-macos-metal.yml` uses hosted GPU-backed `macos-14-xlarge`; a write-access maintainer dispatches `gh workflow run native-macos-metal.yml --ref <release-candidate-ref>`, owns triage/review, and retains `native-macos-metal-<run-id>` for 14 days. The Actions-only guard fails before runtime when the downstream driver is absent; every non-success blocks platform GPUI work and release; `lat check` passes. |
 | Spike bounded Sixel and Kitty decode | P0 | Protocol contract | `tests/e2e/functional/terminal-image-decode-spike.sh` proves fallible allocation, cooperative cancellation, zlib/PNG ceilings, max/max-plus-one dimensions, gradual-growth defense, and returns a written go/no-go decoder decision through `just e2e-func`. |
 | Spike GPUI crop, upload, and eviction | P0 | Protocol contract; macOS path approval | `tests/e2e/visual/terminal-image-gpui-spike.sh` chooses existing API, bounded crop cache, or pinned GPUI UV patch; proves upload reuse, `drop_image`, device loss, and dimension cap on Linux plus defines the native Metal assertion; `just e2e-visual` passes. |
 | Define common image types and IPC fixtures | P1 | Protocol contract | Add `scribe-common` image types, capability fields, bounded live/replay messages, sequence boundaries, typed mismatch response, remote version bump, serde/MessagePack fixtures, and `scribe-test` decoding; `just e2e-func terminal-image-ipc.sh` proves old/new local handshakes and remote mismatch. |

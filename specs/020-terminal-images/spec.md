@@ -125,14 +125,17 @@ Acceptance Criteria:
 - The server owns bounded parsed protocol/data state and exactly-once PTY replies. Typed replay/render IPC transfers immutable bounded state to clients, which own per-view GPU caches; terminal image escapes are not themselves Scribe IPC.
 - Dependency APIs, format support, licenses, maintenance status, and limits must be verified from current primary documentation and source before selection.
 - Test code may be planned because this requested feature changes existing coverage, but all Scribe validation and experimentation must use the Docker functional/visual harness. Never invoke host Scribe binaries or restart the live server.
+- Native macOS runtime validation is the sole exception: only the manual
+  `.github/workflows/native-macos-metal.yml` workflow on GitHub's hosted
+  `macos-14-xlarge` runner may invoke the downstream Metal corpus. A repository
+  maintainer with write access owns dispatch, evidence review, and failure
+  triage; developer workstations remain forbidden.
 - Current primary documentation and ecosystem evidence must define the exact Kitty and Sixel semantics. iTerm2 OSC 1337 remains researched prior art but is excluded from v1.
 - Image handling must remain fully local and usable offline.
 - Exact numeric limits for encoded/chunk data, dimensions, pixels, decompressed/decoded bytes, retained CPU/GPU resources, placements, queues, concurrency, work, and decode time are mandatory security controls.
 - Performance acceptance uses named measurements and qualitative no-material-regression review, without numeric regression thresholds or measurement-derived frozen performance limits. Numeric performance goals are explicitly inapplicable for v1 under Constitution principle 4; analysis must still verify the named-command measurement requirement.
 
 ## Open Questions
-
-- Which native macOS environment can provide required runtime evidence without substituting Linux Docker binaries?
 
 The decoder question is resolved by
 [`decoder-decision.md`](decoder-decision.md): use a Scribe-owned bounded
@@ -164,7 +167,9 @@ Human decisions resolve the first specification gate and define the v1 product b
 
 ### Critical Questions
 
-The human gate and frozen contract resolve all product-scope and protocol-boundary questions. Remaining decoder and native-runner questions are listed in Open Questions and must be answered without reopening v1.
+The human gate, frozen contract, bounded decoder decision, and sanctioned
+GitHub-hosted Metal workflow resolve product scope, protocol boundaries, the
+decoder, and the native runner without reopening v1.
 
 ### Non-Blocking Observations
 

@@ -767,7 +767,11 @@ The Docker harness keeps host services isolated, but unsupported hardware, platf
 Real hardware and non-Linux operating systems remain outside the disposable Docker images.
 
 - **Real GPU:** lavapipe is the default visual renderer. Ask the user before work that requires a real GPU; `SCRIBE_E2E_GPUS` is an explicit host opt-in, not an automatic fallback.
-- **macOS:** ask the user for macOS validation. The Linux containers do not stand in for macOS behavior.
+- **macOS:** terminal-image Metal runtime validation uses only the manual
+  GitHub-hosted path in [[terminal-images#Native macOS Metal Validation]]. The
+  Linux containers and package-only macOS release jobs do not stand in for
+  native Metal behavior; every other macOS validation request still requires
+  explicit user authorization.
 
 ### Network topology stand-ins
 

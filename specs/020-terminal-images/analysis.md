@@ -35,7 +35,10 @@ New epic: `terminal image protocol support`.
 
 ## Remaining Risks
 
-- The native macOS runtime path is not yet sanctioned under repository policy. A P0 infrastructure/authorization task blocks GPUI platform work and release before any native invocation.
+- Native macOS runtime is sanctioned only through the manual GitHub Actions
+  `macos-14-xlarge` workflow. Platform-dependent GPUI work remains blocked
+  until its downstream corpus driver exists and produces passing Metal
+  evidence for the candidate commit.
 - The bounded Sixel fork creates long-term security and license ownership. The plan pins source/license material, removes encoder-only dependencies, records the fork delta, assigns CVE maintenance, and gates adoption on adversarial evidence.
 - GPUI may lack source-UV cropping and public atlas accounting. A P0 visual spike must choose existing APIs, bounded crop variants, or a minimal pinned GPUI patch before renderer work.
 - Server-side decode delays later bytes at a graphics boundary. The design bounds queue, work, and deadline, applies backpressure, and proves that later text/replies cannot overtake the command while leaving text-only streams off the decoder path.
@@ -51,7 +54,6 @@ No unresolved product-scope, protocol-contract, or epic-selection question remai
 
 - Decoder-fork go/no-go and final vendored revision.
 - GPUI crop/UV mechanism and whether native evidence requires lowering the frozen 4096-pixel ceiling.
-- Sanctioned native macOS command/runner and evidence owner.
 
 ## Constitution Check
 

@@ -27,6 +27,27 @@
   CLI coverage, version pairing, ...), STOP and ask the user. Do not fall
   back to driving the host as a workaround.
 
+### Native macOS Metal validation exception
+
+- Native Scribe runtime validation is authorized only through
+  `.github/workflows/native-macos-metal.yml` on GitHub's hosted
+  `macos-14-xlarge` ARM64 runner. This narrow exception does not authorize
+  invoking Scribe on a developer workstation or another macOS host.
+- A repository maintainer with GitHub write access owns dispatch, failure
+  triage, evidence review, and the release decision. Dispatch only after the
+  workflow is present on the default branch and the target ref contains the
+  executable `tests/native-macos/terminal-images-metal.sh` corpus driver.
+- Invoke with
+  `gh workflow run native-macos-metal.yml --ref <release-candidate-ref>`.
+  No repository or environment secrets are required. The workflow uploads
+  `test-output/terminal-images/macos/` as
+  `native-macos-metal-<run-id>` for 14 days.
+- Any build, corpus, timeout, missing-driver, or artifact-upload failure leaves
+  the native gate red and blocks platform-dependent GPUI work and default-on
+  release. Do not retry product failures without a fixing commit. A maintainer
+  may retry an Actions infrastructure failure, retaining both run URLs in the
+  release evidence.
+
 ## Build environment
 
 - Use Rust 1.95.0 or newer.

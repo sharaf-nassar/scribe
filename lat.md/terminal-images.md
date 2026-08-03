@@ -371,3 +371,37 @@ It also freezes placeholder-copy input and typed capability mismatch data.
 `test-output/terminal-images/client-scene.json`, and requires every evidence
 field to pass. This is CPU-scene evidence only; it makes no renderer, replay,
 server fanout, or settings claim.
+## Native macOS Metal Validation
+
+Native Metal evidence runs only on the sanctioned GPU-backed GitHub-hosted runner and never on a developer workstation.
+
+`.github/workflows/native-macos-metal.yml` is a manual `workflow_dispatch` job
+on ARM64 `macos-14-xlarge`. GitHub documents that runner class as carrying GPU
+hardware acceleration. The workflow has read-only repository permission,
+requires no secrets, builds release binaries, and invokes
+`just native-macos-terminal-images`. The guarded recipe refuses every context
+except GitHub Actions on the named macOS ARM64 runner, then requires executable
+`tests/native-macos/terminal-images-metal.sh` before any Scribe runtime call.
+
+A repository maintainer with GitHub write access owns dispatch, triage,
+evidence review, and the release verdict. After the workflow is on the default
+branch and the driver exists at the target ref, invoke:
+
+```bash
+gh workflow run native-macos-metal.yml --ref <release-candidate-ref>
+```
+
+The job records candidate SHA, ref, runner identity, OS, architecture, and
+display/Metal metadata under `test-output/terminal-images/macos/`. The
+driver receives that directory in `SCRIBE_NATIVE_MACOS_OUTPUT_DIR`; its merged
+stdout/stderr is `run.log`. `actions/upload-artifact` archives the directory as
+`native-macos-metal-<run-id>` for 14 days, even after a corpus failure. Download
+it with `gh run download <run-id> --dir <destination>`.
+
+The 120-minute job has no soft-failure path. Build, corpus, timeout,
+missing-driver, and artifact-upload failures block platform-dependent GPUI work
+and default-on release. Product failures require a fixing commit. A maintainer
+may retry an Actions infrastructure failure only when both run URLs and the
+rationale remain in release evidence. A green exact-candidate run and retained
+artifact are both required; Linux Docker and package-only macOS jobs do not
+ substitute. See [[test#Sandbox limits#Host-only hardware and platforms]].

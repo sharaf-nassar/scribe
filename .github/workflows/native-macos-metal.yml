@@ -1,0 +1,68 @@
+name: Native macOS Metal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terminal-images:
+    name: Terminal images (Metal)
+    runs-on: macos-14-xlarge
+    timeout-minutes: 120
+    env:
+      SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-14-xlarge
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Record runner evidence
+        run: |
+          evidence="$GITHUB_WORKSPACE/test-output/terminal-images/macos"
+          mkdir -p "$evidence"
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'sha=%s\n' "$GITHUB_SHA"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            uname -a
+            sw_vers
+          } > "$evidence/runner.txt"
+          system_profiler SPDisplaysDataType > "$evidence/display.txt"
+
+      - name: Require native corpus driver
+        run: |
+          driver="$GITHUB_WORKSPACE/tests/native-macos/terminal-images-metal.sh"
+          if [[ ! -f "$driver" || ! -x "$driver" ]]; then
+            printf 'ERROR: native corpus driver is unavailable: %s\n' \
+              "$driver" >&2
+            exit 2
+          fi
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: 'false'
+
+      - name: Install just
+        run: cargo install just --locked --version 1.57.0
+
+      - name: Build release binaries
+        run: just build-release
+
+      - name: Run native Metal corpus
+        run: just native-macos-terminal-images
+
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-macos-metal-${{ github.run_id }}
+          path: test-output/terminal-images/macos/
+          if-no-files-found: error
+          retention-days: 14
