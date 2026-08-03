@@ -1,0 +1,230 @@
+name: E2E
+
+on:
+  pull_request:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: E2E suite to run
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - smoke
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
+
+jobs:
+  smoke:
+    name: PR smoke
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: 'false'
+
+      - name: Install build dependencies and just
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libfontconfig-dev \
+            libssl-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            mesa-vulkan-drivers
+          cargo install just --locked --version 1.57.0
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build release binaries
+        run: just build-release
+
+      - name: Stage functional binaries
+        run: >-
+          tools/e2e-stage.sh release scribe-server scribe-test
+          scribe-hook-helper scribe-cli
+
+      - name: Build functional image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.func
+          build-args: BIN_DIR=target/e2e-stage/release
+          load: true
+          tags: scribe-test-func
+          cache-from: type=gha,scope=e2e-func
+          cache-to: type=gha,mode=max,scope=e2e-func
+
+      - name: Stage visual binaries
+        run: >-
+          tools/e2e-stage.sh release scribe-server scribe-client
+          scribe-test scribe-hook-helper
+
+      - name: Build visual image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.visual
+          build-args: BIN_DIR=target/e2e-stage/release
+          load: true
+          tags: scribe-test-visual
+          cache-from: type=gha,scope=e2e-visual
+          cache-to: type=gha,mode=max,scope=e2e-visual
+
+      - name: Run functional smoke
+        run: |
+          just e2e-func func/smoke.sh
+          just e2e-func func/session-exit-status.sh
+          just e2e-func func/cli-smoke.sh
+
+      - name: Run visual smoke
+        run: just e2e-visual visual/titlebar.sh
+
+  nightly:
+    name: Nightly full suite (informational)
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: 'false'
+
+      - name: Install build dependencies and just
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libfontconfig-dev \
+            libssl-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            mesa-vulkan-drivers
+          cargo install just --locked --version 1.57.0
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build release binaries
+        run: just build-release
+
+      - name: Stage functional binaries
+        run: >-
+          tools/e2e-stage.sh release scribe-server scribe-test
+          scribe-hook-helper scribe-cli
+
+      - name: Build functional image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.func
+          build-args: BIN_DIR=target/e2e-stage/release
+          load: true
+          tags: scribe-test-func
+          cache-from: type=gha,scope=e2e-func
+          cache-to: type=gha,mode=max,scope=e2e-func
+
+      - name: Stage visual binaries
+        run: >-
+          tools/e2e-stage.sh release scribe-server scribe-client
+          scribe-test scribe-hook-helper
+
+      - name: Build visual image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.visual
+          build-args: BIN_DIR=target/e2e-stage/release
+          load: true
+          tags: scribe-test-visual
+          cache-from: type=gha,scope=e2e-visual
+          cache-to: type=gha,mode=max,scope=e2e-visual
+
+      - name: Prepare artifact directory
+        run: mkdir -p test-output
+
+      - name: Run functional suite
+        id: functional
+        continue-on-error: true
+        run: just e2e
+
+      - name: Run visual suite
+        id: visual
+        if: always()
+        continue-on-error: true
+        run: just e2e-all-visual
+
+      - name: Write run summary
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+          VISUAL_OUTCOME: ${{ steps.visual.outcome }}
+        run: |
+          {
+            echo '## E2E nightly'
+            echo
+            echo '| Suite | Outcome |'
+            echo '| --- | --- |'
+            printf '| `just e2e` | `%s` |\n' "$FUNCTIONAL_OUTCOME"
+            printf '| `just e2e-all-visual` | `%s` |\n' "$VISUAL_OUTCOME"
+            echo
+            echo 'This job is informational and does not block the workflow.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload E2E output
+        if: >-
+          always() &&
+          (github.event_name == 'workflow_dispatch' ||
+          steps.functional.outcome != 'success' ||
+          steps.visual.outcome != 'success')
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-e2e-${{ github.run_id }}
+          path: test-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report nightly outcome
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+          VISUAL_OUTCOME: ${{ steps.visual.outcome }}
+        run: |
+          if [[ "$FUNCTIONAL_OUTCOME" != success || \
+                "$VISUAL_OUTCOME" != success ]]; then
+            echo 'One or more nightly E2E suites failed.' >&2
+            exit 1
+          fi

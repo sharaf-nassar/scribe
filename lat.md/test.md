@@ -196,6 +196,22 @@ E2E aggregate runs are serial-only on one host. Concurrent runs would race on sh
 
 No aggregate silently retries a failure. A repeatedly flaky script needs a quarantine bead recording evidence and an owner before any temporary exclusion; the inventory check must represent that quarantine explicitly so omission cannot masquerade as coverage. Current functional and visual inventories have no quarantined scripts.
 
+## E2E CI
+
+GitHub Actions runs a blocking pull-request smoke gate and an informational nightly suite on GPU-less Ubuntu 22.04 runners.
+
+`.github/workflows/e2e.yml` runs the smoke job for every `pull_request`. A manual `workflow_dispatch` choice can also select `smoke` or `nightly`; the daily schedule and manual `nightly` choice are the only triggers for the nightly job, so no trigger can start both jobs.
+
+The blocking smoke job has a 40-minute timeout and a warm-runtime target of at most 25 minutes. It builds release binaries and both Docker images, then runs `func/smoke.sh`, `func/session-exit-status.sh`, `func/cli-smoke.sh`, and `visual/titlebar.sh` through the Docker-only just recipes. Two local runs on 2026-08-02 passed in 119.86 seconds cold and 18.47 seconds warm.
+
+The informational nightly job has a four-hour timeout and runs the complete `just e2e` and `just e2e-all-visual` aggregates described above. Each aggregate runs even if the other fails, and the job reports a failing outcome without failing the workflow. It never retries; repeated flakes follow the quarantine-bead contract above.
+
+Rust dependencies use `Swatinem/rust-cache` with the compatible `v1-rust` prefix. Docker Buildx imports and exports GitHub Actions layers under separate `e2e-func` and `e2e-visual` scopes, loading the results as the exact `scribe-test-func` and `scribe-test-visual` tags consumed by the just recipes.
+
+Failed nightly runs upload `test-output/` for 14 days, including `test-output/e2e-visual-summary.jsonl` when the visual aggregate starts. Manual nightly runs upload the same directory even on success and always write suite outcomes to the GitHub Actions step summary for acceptance evidence.
+
+Hosted validation remains external and pending after push: this unpushed implementation has no GitHub pull-request, manual, scheduled, or full hosted-nightly run to cite. Post-push acceptance must record a real warm PR duration and manual-nightly artifact/summary result before treating hosted CI timing and execution as measured.
+
 ## AI-Launch Harness Plumbing
 
 The functional harness can launch structured AI sessions and inspect the provider process without requiring a GPUI client.
