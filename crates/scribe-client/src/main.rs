@@ -6661,6 +6661,10 @@ fn main() -> std::process::ExitCode {
         }
         return std::process::ExitCode::SUCCESS;
     }
+    if std::env::args().skip(1).any(|arg| arg == "--gpui-image-spike") {
+        scribe_client::gpui_image_spike::run();
+        return std::process::ExitCode::SUCCESS;
+    }
     // Arm the perf rig's runtime probe before anything can paint or type; it
     // stays inert unless `SCRIBE_PERF_PROBE` names a report path.
     scribe_common::perf_probe::init_from_env();

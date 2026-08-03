@@ -371,6 +371,31 @@ It also freezes placeholder-copy input and typed capability mismatch data.
 `test-output/terminal-images/client-scene.json`, and requires every evidence
 field to pass. This is CPU-scene evidence only; it makes no renderer, replay,
 server fanout, or settings claim.
+
+## GPUI Lifecycle Verification
+
+The isolated visual spike proves the selected shared-source crop and lifecycle path on Linux WGPU without implementing terminal image placement rendering.
+
+`tests/e2e/visual/terminal-image-gpui-spike.sh` launches the guarded
+`--gpui-image-spike` surface inside the visual Docker harness. The release
+binary records GPUI's selected Linux WGPU adapter/backend, paints a
+four-quadrant source twice through one `RenderImage`, and checks GPUI's source
+identity across atlas invalidation. It uses
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image]],
+requiring the cropped destination to remain green before and after atlas
+invalidation and final-reference eviction.
+
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache]] rejects
+4097-by-1 metadata before constructing a `RenderImage`, uploads 1-by-1 and
+4096-by-1 sources, shares one source identity across full and cropped
+placements, and calls `Window::drop_image` for each final cache reference.
+Evidence lands in `test-output/terminal-images/linux/gpui-spike.json` beside
+the three compared captures and sanitized log. The chosen path and pinned
+source audit prove that the shared identity is one atlas key, `drop_image`
+deallocates it, and device recovery clears then lazily rebuilds that key. Those
+facts are frozen in
+`specs/020-terminal-images/gpui-lifecycle-decision.md`.
+
 ## Native macOS Metal Validation
 
 Native Metal evidence runs only on the sanctioned GPU-backed GitHub-hosted runner and never on a developer workstation.
@@ -404,4 +429,21 @@ and default-on release. Product failures require a fixing commit. A maintainer
 may retry an Actions infrastructure failure only when both run URLs and the
 rationale remain in release evidence. A green exact-candidate run and retained
 artifact are both required; Linux Docker and package-only macOS jobs do not
- substitute. See [[test#Sandbox limits#Host-only hardware and platforms]].
+substitute. See [[test#Sandbox limits#Host-only hardware and platforms]].
+
+### Required Metal lifecycle assertions
+
+The downstream native driver must run the same crop and lifecycle corpus on Metal plus a genuine recoverable device-loss phase.
+
+The driver must record a Metal adapter, one upload for shared full/crop
+placements, a green cropped quadrant, reusable texture space after
+`drop_image`, three final-reference drops, unchanged pixels after recreation,
+1-by-1 and 4096-by-1 uploads, and 4097-by-1 rejection with zero new
+`RenderImage` objects. It must then induce one recoverable device loss through
+a pinned test hook, observe GPUI context and atlas recreation, preserve source
+identities, and require a zero-difference repaint.
+
+No native driver is created by the lifecycle spike: terminal placement
+rendering and a genuine device-loss hook do not exist yet. The workflow remains
+fail-closed until downstream renderer work supplies both; an atlas-clear
+surrogate must not satisfy the Metal device-loss assertion.

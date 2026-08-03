@@ -34,6 +34,32 @@ Every size the client hands to GPUI is therefore a logical pixel: `px(...)` valu
 
 The sole remaining app-level use of a scale factor is geometry replay: [[crates/scribe-client/src/restore_replay.rs#effective_padding]] multiplies configured content padding by `scale_factor` when reconstructing a pane's grid from a saved layout. That path scales rectangles, not fonts or chrome typography.
 
+## Terminal Image Resources
+
+Terminal image definitions own one bounded window-local GPUI source per image generation; placements and crops never duplicate uploads.
+
+The pinned GPUI revision `f96212f2c50f54d93712fa130d6226b1ce7d76b5`
+keys `Window::paint_image` atlas entries by `RenderImage` identity and frame.
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#get_or_insert]]
+therefore caches `(image_id, generation) -> Arc<RenderImage>`, charges two
+canonical byte lengths for texture plus upload staging, and evicts in insertion
+order before the frozen per-view projected-GPU ceiling can be exceeded.
+
+GPUI exposes no source UV rectangle at this revision. Instead,
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image]] scales
+the full image so the requested source rectangle covers its destination,
+translates by the source offset, and intersects it with
+`Window::with_content_mask`. The WGPU shader derives UVs from those translated
+full bounds, so every crop shares the original atlas key without a crop cache
+or GPUI patch.
+
+Cleanup remains explicit. Final cache removal calls `Window::drop_image` before
+releasing the last source reference. GPUI removes every frame key and WGPU
+deallocates its atlas tile. Device recovery clears GPUI's atlas but preserves
+the CPU `RenderImage`; the next paint reconstructs the same key lazily.
+[[terminal-images#GPUI Lifecycle Verification]] records Linux runtime evidence
+and the separate native Metal gate.
+
 ## Render Pipeline
 
 GPUI owns frame scheduling, scene batching, render pipelines, command

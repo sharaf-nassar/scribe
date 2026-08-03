@@ -148,6 +148,13 @@ numeric security limits, application pins, and fixture ownership are resolved
 in [`contract.md`](contract.md). A later native platform spike may lower the
 4096-pixel texture ceiling, but cannot raise any v1 trust-boundary limit.
 
+The GPUI crop and lifecycle decision is resolved in
+[`gpui-lifecycle-decision.md`](gpui-lifecycle-decision.md): reuse one bounded
+full-source `RenderImage`, select source pixels through translated bounds plus
+a content mask, and call `drop_image` at final cache removal. Linux retains the
+4096-pixel ceiling; Metal must pass its separate native assertion before
+release.
+
 ## Clarifications
 
 Human decisions resolve the first specification gate and define the v1 product boundary.

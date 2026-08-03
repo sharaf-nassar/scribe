@@ -40,7 +40,7 @@ New epic: `terminal image protocol support`.
   until its downstream corpus driver exists and produces passing Metal
   evidence for the candidate commit.
 - The bounded Sixel fork creates long-term security and license ownership. The plan pins source/license material, removes encoder-only dependencies, records the fork delta, assigns CVE maintenance, and gates adoption on adversarial evidence.
-- GPUI may lack source-UV cropping and public atlas accounting. A P0 visual spike must choose existing APIs, bounded crop variants, or a minimal pinned GPUI patch before renderer work.
+- GPUI revision `f96212f2c50f54d93712fa130d6226b1ce7d76b5` lacks a source-UV field but exposes translated image bounds and `Window::with_content_mask`. The P0 spike selected that existing API, one bounded source cache, explicit `drop_image`, and no crop variants or GPUI patch; see [`gpui-lifecycle-decision.md`](gpui-lifecycle-decision.md).
 - Server-side decode delays later bytes at a graphics boundary. The design bounds queue, work, and deadline, applies backpressure, and proves that later text/replies cannot overtake the command while leaving text-only streams off the decoder path.
 - Raw `PtyOutput` plus canonical image state adds wire and memory pressure for capable viewers. The frozen framed, decoded, 128 MiB session, 256 MiB view, 512 MiB process, and 1 MiB replay ceilings plus replay-dirty recovery constrain it.
 - Kitty and Sixel standards leave edge behavior undefined or contradictory. The plan freezes xterm-compatible DECSDM/8452 and Sixel chronology, refuses to claim undefined overlap parity, and builds owned fixtures from primary sources.
@@ -50,10 +50,13 @@ New epic: `terminal image protocol support`.
 
 ## Unresolved Questions
 
-No unresolved product-scope, protocol-contract, or epic-selection question remains. The following bounded technical decisions are intentionally assigned to later P0 tasks:
+No unresolved product-scope, protocol-contract, or epic-selection question remains. The following bounded technical decision is intentionally assigned to later P0 work:
 
 - Decoder-fork go/no-go and final vendored revision.
-- GPUI crop/UV mechanism and whether native evidence requires lowering the frozen 4096-pixel ceiling.
+
+The GPUI crop/UV decision is closed. Linux WGPU accepts the frozen 4096-pixel
+axis ceiling, so the spike does not lower it. Actual Metal behavior remains a
+platform gate, not an invitation to raise that ceiling.
 
 ## Constitution Check
 
