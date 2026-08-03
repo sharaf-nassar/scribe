@@ -261,9 +261,13 @@ It cycles all five `AiState` variants without corrupting the grid, asserts a con
 
 ### Env Persistence Create-Path E2E
 
-`tests/e2e/func/env-persistence.sh` asserts that a harness-created session carries a launch (env-envelope) id, which is the precondition for every other env-persistence assertion.
+`tests/e2e/func/env-persistence.sh` verifies launch ids on every run and, with the opt-in keyring fixture, encrypted env-delta persistence and restore.
 
-It reads the entrypoint session's id back with `scribe-test session envelope-id`, creates a second session and asserts its id is a distinct UUID (a shared constant would satisfy a bare non-empty check), and drives the second session to a prompt so the id provably belongs to a live launch rather than a bookkeeping entry. It deliberately stops short of asserting an `.envz` file: the functional container has no running secret service, so the keystore fails and the persist path degrades by design.
+It reads the entrypoint session's id back with `scribe-test session envelope-id`, creates a second session and asserts its id is a distinct UUID (a shared constant would satisfy a bare non-empty check), and drives the second session to a prompt so the id provably belongs to a live launch rather than a bookkeeping entry.
+
+With `SCRIBE_KEYRING=1`, the functional entrypoint starts a session D-Bus and unlocked Secret Service before the server. The script enables persistence, exports a unique value from a fresh integrated shell, and polls the launch's real `.envz` past the 100 ms production debounce. It requires private file permissions, rejects plaintext leakage, then creates another session with the same envelope id and observes the restored value, proving the encrypted write/read path end to end.
+
+Without `SCRIBE_KEYRING=1`, only the launch-id and live-session checks run. The remaining persistence caveat is that there is no shutdown flush: tests must keep the source session alive and poll for debounce completion before closing it.
 
 ### Plain-Shell Env Restore Ordering
 
