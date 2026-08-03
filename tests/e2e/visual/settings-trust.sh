@@ -113,6 +113,49 @@ locate_seed_point() {
     echo "window ${WIDTH}x${HEIGHT} at ${X},${Y}; focus seed at ${SEED_X},${SEED_Y}"
 }
 
+# Resolve the Docker bridge's real default-gateway MAC before the first
+# `GetLanEnv`. A fresh network namespace has an empty neighbour table, so
+# netdev otherwise reports the gateway MAC as zero and the production settings
+# model correctly omits the unavailable "Trust it" focus target. That shifts
+# every later semantic target by one and makes four Down presses pass Revoke.
+# A refused TCP connect is sufficient: ARP resolution happens before the port
+# result, and the `/proc/net/arp` check makes the fixture precondition explicit.
+prime_gateway_neighbor() {
+    python3 - <<'PY'
+import socket
+import time
+
+gateway = None
+with open("/proc/net/route") as routes:
+    next(routes, None)
+    for line in routes:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == "00000000":
+            gateway = socket.inet_ntoa(bytes.fromhex(fields[2])[::-1])
+            break
+
+if gateway is None:
+    raise SystemExit("FAIL: Docker E2E has no default gateway to fingerprint")
+
+for _ in range(10):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        try:
+            probe.connect((gateway, 9))
+        except OSError:
+            pass
+    with open("/proc/net/arp") as neighbors:
+        for line in neighbors:
+            fields = line.split()
+            if len(fields) >= 4 and fields[0] == gateway and fields[3] != "00:00:00:00:00:00":
+                print(f"primed Docker gateway neighbor {gateway} at {fields[3]}")
+                raise SystemExit(0)
+    time.sleep(0.1)
+
+raise SystemExit(f"FAIL: Docker gateway {gateway} did not resolve to a MAC")
+PY
+}
+
 shot() {
     raise_window
     sleep 0.3
@@ -135,12 +178,14 @@ key() {
     sleep 0.3
 }
 
-# Focus the search field through its own shortcut and replace the query. The
-# window renders `Ctrl+K` in the field itself; `delete` is its clear-query key.
+# Focus the search field through its own shortcut and replace the query. Escape
+# is the field's deliberate clear-query key and returns focus to the root, so
+# focus it again before typing the replacement.
 search_for() {
     raise_window
     key ctrl+k
-    key Delete
+    key Escape
+    key ctrl+k
     xdotool type --clearmodifiers --delay 40 "$1"
     sleep 0.8
     echo "search reads '$1'"
@@ -162,9 +207,16 @@ activate_target() {
 
 # Count recorded client frames of a given message type.
 count_client() {
-    python3 - "$RECORD" "$1" <<'PY'
+    python3 - "$RECORD" "$@" <<'PY'
 import json, sys
 path, wanted = sys.argv[1], sys.argv[2]
+def norm(value):
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+pairs = [(k, norm(v)) for k, v in (p.split("=", 1) for p in sys.argv[3:])]
 total = 0
 try:
     fh = open(path)
@@ -178,7 +230,9 @@ with fh:
         except ValueError:
             continue
         if row.get("dir") == "client" and row.get("message", {}).get("type") == wanted:
-            total += 1
+            msg = row.get("message", {})
+            if all(msg.get(k) == v for k, v in pairs):
+                total += 1
 print(total)
 PY
 }
@@ -272,6 +326,20 @@ assert_grew() {
     fi
 }
 
+# Fail unless exactly one matching client frame was added after the gesture.
+assert_client_grew_once() {
+    local kind="$1" before="$2" now expected
+    shift 2
+    now=$(count_client "$kind" "$@")
+    expected=$(( before + 1 ))
+    if [ "$now" -ne "$expected" ]; then
+        echo "FAIL: expected exactly one new client $kind frame on the wire" >&2
+        echo "      (was $before, now $now; filters: ${*:-none})" >&2
+        exit 1
+    fi
+}
+
+prime_gateway_neighbor
 sleep 1.5
 raise_window
 assert_titled
@@ -334,9 +402,12 @@ echo "              control re-issues the trust queries"
 # Revoked before the network is removed: the device rows follow the network rows
 # in the traversal, so shrinking the network list first would move them.
 REVOKE_BEFORE=$(count_client RevokeTrustedDevice)
+REVOKE_MATCH_BEFORE=$(count_client RevokeTrustedDevice "device_id=$SEEDED_DEVICE_ID")
 reset_focus
 activate_target "$REMOTE_REVOKE_DEVICE_STEPS"
-assert_grew RevokeTrustedDevice client "$REVOKE_BEFORE"
+assert_client_grew_once RevokeTrustedDevice "$REVOKE_BEFORE"
+assert_client_grew_once RevokeTrustedDevice "$REVOKE_MATCH_BEFORE" \
+    "device_id=$SEEDED_DEVICE_ID"
 assert_client_frame RevokeTrustedDevice "device_id=$SEEDED_DEVICE_ID" >/dev/null
 shot /output/06-device-revoked.png
 echo "PHASE 3 PASS: the approved device's Revoke control sends"
