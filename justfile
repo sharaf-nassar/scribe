@@ -124,6 +124,10 @@ setup-codex:
 gpu_flags := if env("SCRIBE_E2E_GPUS", "") == "" { "" } else { "--gpus " + env("SCRIBE_E2E_GPUS") }
 hardened_e2e_flags := "--network none --read-only --cap-drop ALL"
 
+# Run the sanctioned native macOS Metal corpus on its GitHub Actions runner.
+native-macos-terminal-images:
+    tools/run-native-macos-terminal-images.sh
+
 # Rebuild functional test container from release or debug binaries
 docker-func profile="release":
     #!/usr/bin/env bash
