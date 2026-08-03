@@ -122,7 +122,7 @@ setup-codex:
 # ==================== E2E Testing ====================
 
 gpu_flags := if env("SCRIBE_E2E_GPUS", "") == "" { "" } else { "--gpus " + env("SCRIBE_E2E_GPUS") }
-hardened_e2e_flags := "--network none --read-only --cap-drop ALL --tmpfs /run:rw,nosuid,nodev,mode=755 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --tmpfs /root:rw,nosuid,nodev,mode=700"
+hardened_e2e_flags := "--network none --read-only --cap-drop ALL"
 
 # Rebuild functional test container from release or debug binaries
 docker-func profile="release":
@@ -164,7 +164,20 @@ e2e-func script image="scribe-test-func" runtime_profile="default":
     runtime_profile="${requested#runtime_profile=}"
     case "$runtime_profile" in
         default) runtime_flags=() ;;
-        hardened) runtime_flags=( {{ hardened_e2e_flags }} ) ;;
+        hardened)
+            runtime_uid=$(id -u)
+            runtime_gid=$(id -g)
+            runtime_flags=(
+                {{ hardened_e2e_flags }}
+                --user "$runtime_uid:$runtime_gid"
+                --env USER=scribe-e2e
+                --env HOME=/root
+                --env SHELL=/bin/bash
+                --tmpfs "/run:rw,nosuid,nodev,mode=755,uid=$runtime_uid,gid=$runtime_gid"
+                --tmpfs "/tmp:rw,nosuid,nodev,mode=1777,uid=$runtime_uid,gid=$runtime_gid"
+                --tmpfs "/root:rw,nosuid,nodev,mode=700,uid=$runtime_uid,gid=$runtime_gid"
+            )
+            ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
     docker run --rm "${runtime_flags[@]}" -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
@@ -183,7 +196,20 @@ e2e-visual script image="scribe-test-visual" runtime_profile="default":
     runtime_profile="${requested#runtime_profile=}"
     case "$runtime_profile" in
         default) runtime_flags=() ;;
-        hardened) runtime_flags=( {{ hardened_e2e_flags }} ) ;;
+        hardened)
+            runtime_uid=$(id -u)
+            runtime_gid=$(id -g)
+            runtime_flags=(
+                {{ hardened_e2e_flags }}
+                --user "$runtime_uid:$runtime_gid"
+                --env USER=scribe-e2e
+                --env HOME=/root
+                --env SHELL=/bin/bash
+                --tmpfs "/run:rw,nosuid,nodev,mode=755,uid=$runtime_uid,gid=$runtime_gid"
+                --tmpfs "/tmp:rw,nosuid,nodev,mode=1777,uid=$runtime_uid,gid=$runtime_gid"
+                --tmpfs "/root:rw,nosuid,nodev,mode=700,uid=$runtime_uid,gid=$runtime_gid"
+            )
+            ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
     docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro -v ./test-output:/output "$image" /tests/{{script}}
