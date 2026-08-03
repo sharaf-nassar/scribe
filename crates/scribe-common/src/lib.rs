@@ -14,4 +14,5 @@ pub mod screen_replay;
 pub mod settings_window;
 pub mod shell;
 pub mod socket;
+pub mod terminal_images;
 pub mod theme;

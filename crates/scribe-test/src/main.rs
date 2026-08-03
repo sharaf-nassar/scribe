@@ -5,6 +5,7 @@ mod daemon;
 mod decode_spike;
 mod input;
 mod ipc;
+mod ipc_fixtures;
 mod lan_peer;
 mod remote_peer;
 mod render;
@@ -227,6 +228,18 @@ enum Command {
     /// `RemoteHandshakeReply`, and splice an accepted connection to the local
     /// server.
     RemotePeer(RemotePeerArgs),
+    /// Decode and verify stable bounded terminal-image `MessagePack` fixtures.
+    TerminalImageIpc {
+        /// Canonical fixture manifest containing expected `MessagePack` hex.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// JSON evidence path.
+        #[arg(long)]
+        output: PathBuf,
+        /// Emit computed fixture hex without comparing it (maintainer use).
+        #[arg(long)]
+        dump: bool,
+    },
     /// Send one JSON-encoded `ServerMessage` to a running `share-tap`, which
     /// frames it to the client as if the server had sent it.
     ShareInject {
@@ -481,6 +494,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::LanPeer(args) => run_lan_peer(args),
         Command::RemotePeer(args) => run_remote_peer(args),
+        Command::TerminalImageIpc { fixtures, output, dump } => {
+            ipc_fixtures::verify(&fixtures, &output, dump).map_err(TestError::TestFailure)
+        }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
     }
 }

@@ -7240,6 +7240,7 @@ where
             // Clipboard* frame, which is what made the whole surface dead.
             clipboard_gating: true,
             takeover,
+            terminal_images: scribe_common::terminal_images::TerminalImageCapabilities::default(),
         },
     )
     .await
@@ -8093,6 +8094,9 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::WorkspaceInfo { .. } => "WorkspaceInfo",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
+        ServerMessage::TerminalImageLive { .. } => "TerminalImageLive",
+        ServerMessage::TerminalImageReplay { .. } => "TerminalImageReplay",
+        ServerMessage::TerminalImageCapabilityMismatch { .. } => "TerminalImageCapabilityMismatch",
         ServerMessage::WindowClosed { .. } => "WindowClosed",
         ServerMessage::WindowList { .. } => "WindowList",
         ServerMessage::RunAction { .. } => "RunAction",
@@ -8988,6 +8992,7 @@ fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
             refusal,
             server_remote_protocol_version,
             server_scribe_version,
+            version_mismatch: _,
         } => {
             // Normally consumed by `remote_handshake::perform_remote_handshake`
             // before this reader exists; one arriving afterwards still means the

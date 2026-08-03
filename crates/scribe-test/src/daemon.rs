@@ -301,7 +301,12 @@ pub async fn run() -> Result<(), ScribeError> {
     // daemon stop → daemon start → session attach.
     crate::ipc::send(
         &mut raw_server_writer,
-        &ClientMessage::Hello { window_id: None, clipboard_gating: false, takeover: false },
+        &ClientMessage::Hello {
+            window_id: None,
+            clipboard_gating: false,
+            takeover: false,
+            terminal_images: scribe_common::terminal_images::TerminalImageCapabilities::default(),
+        },
     )
     .await?;
 
@@ -454,6 +459,9 @@ async fn dispatch_server_message(
         | ServerMessage::TrustedNetworkList { .. }
         | ServerMessage::LanEnv { .. }
         | ServerMessage::LanDialIdentity { .. }
+        | ServerMessage::TerminalImageLive { .. }
+        | ServerMessage::TerminalImageReplay { .. }
+        | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }

@@ -204,6 +204,8 @@ Feature 015 bumps [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION
 
 Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is remote-visible. The exact-match gate makes v3/v4 remote pairs refuse with `IncompatibleVersion`. Local AI frames are structured-only; package installation makes the upgraded server ready before relaunching the updated client. The additive field's serde default remains for old/custom command frames.
 
+Terminal-images v1 bumps the constant to `5` because capabilities, live output boundaries, and generation-tagged replay are remote-visible. A typed mismatch names both versions and whether client or server must update; local capability fields remain default-false for old/new Unix-socket decoding. See [[terminal-images#Terminal Images#Typed IPC Contract]].
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -212,7 +214,12 @@ The dialer and owner gate compatibility on [[crates/scribe-common/src/protocol.r
 
 ### Protocol Compatibility After Feature Removal
 
-A retired feature's four message variants and six supporting types were deleted outright, with no compatibility shim, no no-op arm, and no deprecation window; that removal left [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] at `3`. Feature 018 later advances it to `4` for structured AI launch.
+A retired feature was deleted without a compatibility shim while later remote-visible additions advanced the exact-match protocol version.
+
+Deleting four message variants and six supporting types left
+[[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] at `3`.
+Feature 018 later advanced it to `4` for structured AI launch, and
+terminal-images v1 advances it to `5`.
 
 Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
 
@@ -287,7 +294,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), and `4` for feature 018 structured AI launch — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, and `5` for terminal-images v1 — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 

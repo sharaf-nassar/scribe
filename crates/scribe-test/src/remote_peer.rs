@@ -117,6 +117,14 @@ async fn serve(mut stream: TcpStream, config: &RemotePeerConfig) -> std::io::Res
             refusal,
             server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
             server_scribe_version: env!("CARGO_PKG_VERSION").to_owned(),
+            version_mismatch: (refusal == Some(RemoteRefusal::IncompatibleVersion))
+                .then(|| {
+                    scribe_common::terminal_images::RemoteProtocolMismatch::between(
+                        *remote_protocol_version,
+                        REMOTE_PROTOCOL_VERSION,
+                    )
+                })
+                .flatten(),
         },
     )
     .await?;

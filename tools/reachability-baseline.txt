@@ -26,7 +26,7 @@
 
 counts modules-total 64
 counts modules-wired 64
-counts server-messages-total 57
+counts server-messages-total 60
 counts server-messages-handled 52
 counts layout-actions-total 36
 counts layout-actions-handled 36
@@ -35,4 +35,7 @@ unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
+unhandled-server-message TerminalImageCapabilityMismatch
+unhandled-server-message TerminalImageLive
+unhandled-server-message TerminalImageReplay
 unhandled-server-message UpdateCheckResult

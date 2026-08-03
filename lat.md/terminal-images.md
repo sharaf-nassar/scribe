@@ -98,6 +98,35 @@ Capable handoff preserves latch, generation, committed state, and bounded
 partial framing. Unsupported downgrade fails typed; detach, replay, reconnect,
 handoff, and multiple viewers never synthesize duplicate PTY replies.
 
+## Typed IPC Contract
+
+Shared image types keep local compatibility while giving remote peers one exact bounded wire contract.
+
+[[crates/scribe-common/src/terminal_images.rs#ImageLimits]] freezes every v1
+security ceiling in code. Canonical definitions carry typed IDs, generation,
+checked RGBA dimensions, and byte length. Actual bytes travel only through a
+custom-deserialized `BoundedImageBytes` chunk capped at 1,048,576 bytes; the
+contract cannot represent paths, URLs, shared-memory names, or other indirect
+loaders.
+
+Placements carry protocol, typed image and placement identity, generation,
+cell anchor, source crop, destination cell extent, pixel offsets, z-index,
+scroll/cursor behavior, and bounded placeholder metadata. Typed grid effects
+bind image-driven cursor, scroll, erase, resize, screen, and reset consequences
+to the same ordered client operation stream.
+
+Live IPC uses generation-tagged begin, update, and commit records under one
+monotonic output sequence. Replay uses begin metadata, definition metadata,
+bounded definition chunks, placements, and commit; every record repeats the
+generation so a client can reject mixed snapshots before exposing partial
+state. Replay begin validates definition, placement, and retained-byte totals.
+
+Local `Hello` and `Welcome` image capabilities default every missing field to
+false, preserving old/new MessagePack decoding. An incapable attach has a
+typed capability mismatch with required and offered sets. Remote protocol v5
+uses exact matching and a typed mismatch naming client/server versions plus
+which endpoint must update.
+
 ## Sixel Chronology
 
 Sixel mode behavior deliberately follows current xterm polarity instead of DEC's contradictory DECSDM description.
@@ -197,3 +226,15 @@ The run writes schema-versioned
 `decoder-decision.md`. Evidence contains only limits, typed outcomes, counts,
 dimensions, allocation peaks, and compressed sizes; it never records image
 payloads or decoded pixels.
+
+## IPC Contract Verification
+
+Docker verification freezes MessagePack bytes, bounded decode behavior, local handshake defaults, and both remote version directions.
+
+`tests/e2e/fixtures/terminal-images/ipc.json` stores stable named MessagePack
+hex for legacy/current local handshakes, live chunks, every replay phase,
+capability refusal, and client-older/server-older remote mismatches.
+`scribe-test terminal-image-ipc` decodes them through the production shared
+types, checks maximum and maximum-plus-one bounds, and writes
+`test-output/terminal-images/ipc.json`. Invoke it with
+`just e2e-func terminal-image-ipc.sh`.
