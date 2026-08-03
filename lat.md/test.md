@@ -634,6 +634,8 @@ Two rigs stand in for what one machine cannot supply, and neither fakes the clie
 
 Four phases run after the same daemon-stop-and-relaunch preamble  documents. The startup probe's `GetLanEnv` and `ListLanPeers` are asserted on the wire together with the real server's `LanEnv` and `LanPeerList` answers and the client's own log lines proving it acted on them — no injection is involved, and the peer list is legitimately empty in a container with no mDNS. An injected `LanApprovalRequest` must then change the window's body pixels, and a bare Enter on the default focus must put `LanApprovalDecision { approve: false }` on the wire; a second request with `name_collision` set, Tab, and Enter must put `approve: true` on it. Finally a client launched with `SCRIBE_LAN_DIAL` must fetch its dial identity from the real server, land a `LanHello` on the stand-in peer's encrypted wire, show "Waiting for approval on the peer…" while the peer holds the gate, and send `Hello` over the LAN link once the gate approves.
 
+The approving frame is also the modal focus-trap oracle: exactly one Tab must move from Decline to Approve. If global titlebar traversal claims that Tab, Enter cannot emit the approving `LanApprovalDecision` and the phase fails on the recorded wire.
+
 Phase 1's baselines are sampled before the relaunch, because the LAN probe runs as part of connecting; sampling afterwards would race the frames the phase waits for. The dial phase skips loudly rather than passing silently when the stand-in cannot borrow an identity, so a container without a keyring reports a gap instead of a green run.
 
 ### Tailnet remote control
@@ -669,6 +671,8 @@ Nothing is stubbed and nothing is injected. The wire tap (, `SCRIBE_SHARE_TAP=1`
 
 The five phases each assert a different half of the conversation. A phase-0 preamble hands the client a live pane through the same daemon-stop-and-relaunch trick  documents, asserted on the client's own `AttachSessions` frame. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 4 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
 
+The one-Tab Quit Scribe path and two-Tab Kill Window path are focus-trap checks as well as action checks: traversal must remain inside the close modal until Enter emits the exact lifecycle frame, while the real server acknowledgement remains the only exit oracle.
+
 Exiting is asserted as process death rather than as a screenshot, because the whole point of the acknowledgement is that the app goes away; a pixel check could not tell a torn-down window from a hung one.
 
 ### Cold-restart restore drives the real client
@@ -690,6 +694,8 @@ Nothing is stubbed on the client side. `tests/e2e/visual/fake-update-api.py` sta
 Both scripts share `tests/e2e/visual/update-common.sh`, which grows the window first — both bottom bands are on screen at the default size now that it is derived (see ), but a wider window spreads the status bar's left and right groups apart and leaves the centred CTA clear space of its own — then diffs the centred status-bar band before and after the broadcast. A non-zero delta proves the CTA rendered; the bounding box of the changed pixels is where the script actually moves the pointer and clicks, so the click cannot silently miss.
 
 `update-trigger.sh` then presses Enter on the default "Update Now" and waits for the server's `client triggered update window_id=…` line — the server only logs that on receiving `TriggerUpdate` from that window — before capturing the CTA relabelled "Downloading..." and then "Update failed" as the server's real download and (deliberately invalid) signature check drive `UpdateProgress`. `update-dismiss.sh` Tabs onto "Later" instead, waits for `client dismissed update notification window_id=…`, and asserts the CTA band is once again pixel-identical to the no-update baseline.
+
+Together they lock modal focus handoff from the pointer-activated CTA and modal-local Tab traversal: Enter must no longer remain captured by the CTA, and Tab must not escape to a titlebar control before the server log records the chosen action.
 
 ### Desktop notifications fire, coalesce, and focus on click
 

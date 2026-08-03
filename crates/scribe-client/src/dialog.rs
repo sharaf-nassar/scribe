@@ -26,7 +26,7 @@
 //! GPU quad painting and pixel hit-testing are dropped in favour of
 //! GPUI flex layout and `on_click` listeners.
 
-use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
+use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Rgba, div, prelude::*, px};
 use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
 use scribe_common::theme::ChromeColors;
 
@@ -853,6 +853,12 @@ pub struct DialogView {
 }
 
 impl EventEmitter<DialogEvent> for DialogView {}
+
+impl Focusable for DialogView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl DialogView {
     /// Build a modal view over `dialog`.

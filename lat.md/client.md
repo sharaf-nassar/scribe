@@ -1060,6 +1060,8 @@ Each modal is one variant of  —  (quit / kill / cancel, warning about active s
 
  renders any spec onto a dimmed backdrop and a rounded, drop-shadowed box with a centred title, body, separator rule, and a button row whose accent / warm-red-destructive / subtle tones come from  resolved against a theme-derived .  /  cycle focus,  activates the focused button,  activates a clicked button, and  (Esc / backdrop) resolves to the safe  action — each emitting a tagged  on  for the shell to route. The paste gate reuses  and renders the parked  in caret notation so a control sequence in the preview can never drive the terminal (FR-005), returning it verbatim via  for byte-identical delivery.
 
+While a modal exists, [[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] moves GPUI keyboard focus onto its [[crates/scribe-client/src/dialog.rs#DialogView]] handle. Root dispatch applies the compositor guard, then [[crates/scribe-client/src/main.rs#TerminalView#handle_overlay_key]], before plain Tab may enter [[crates/scribe-client/src/main.rs#TerminalView#focus_next_titlebar_control]]. Tab and Shift+Tab therefore cycle only modal buttons; ordinary titlebar traversal resumes once the modal closes.
+
 The spike wires two representative modals into  — Ctrl+Shift+Q opens the close dialog and Ctrl+Shift+K opens the clipboard dialog — so the visual E2E harness (`tests/e2e/visual/dialogs.sh`) can screenshot the modal chrome, the focus ring, and the tone-tagged buttons across the three- and four-button layouts.
 
 The update confirmation is the first of the five that is a live surface rather than a demo:  routes the resolved  before dropping the overlay, so `DialogOutcome::Update` reaches  and turns into IPC (see ). The other four still only close.
