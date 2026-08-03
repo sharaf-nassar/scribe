@@ -317,7 +317,22 @@ send_keys ctrl+Tab
 if ! wait_for_log_growth "focused pane moved" "$CYCLE_BEFORE" 15; then
     fail "PHASE 4 FAIL: ctrl+Tab never reached cycle_pane"
 fi
-echo "PHASE 4 PASS: ctrl+Tab cycled pane focus"
+shot /output/04-cycle-before-typing.png
+CYCLE_LEFT_BEFORE=$(half_ink /output/04-cycle-before-typing.png left)
+CYCLE_RIGHT_BEFORE=$(half_ink /output/04-cycle-before-typing.png right)
+type_line "echo CYCLE_PANE_RIGHT_MARKER"
+shot /output/04-cycle-typed-right.png
+CYCLE_LEFT_AFTER=$(half_ink /output/04-cycle-typed-right.png left)
+CYCLE_RIGHT_AFTER=$(half_ink /output/04-cycle-typed-right.png right)
+CYCLE_LEFT_DELTA=$(( CYCLE_LEFT_AFTER - CYCLE_LEFT_BEFORE ))
+CYCLE_RIGHT_DELTA=$(( CYCLE_RIGHT_AFTER - CYCLE_RIGHT_BEFORE ))
+if [ "$CYCLE_RIGHT_DELTA" -lt "$INK_DELTA_MIN" ]; then
+    fail "PHASE 4 FAIL: after ctrl+Tab, typing added $CYCLE_RIGHT_DELTA px to the right pane"
+fi
+if [ "$CYCLE_LEFT_DELTA" -ge "$CYCLE_RIGHT_DELTA" ]; then
+    fail "PHASE 4 FAIL: after ctrl+Tab, the left pane changed as much as the right ($CYCLE_LEFT_DELTA vs $CYCLE_RIGHT_DELTA)"
+fi
+echo "PHASE 4 PASS: ctrl+Tab cycled keyboard focus to the right pane (right +$CYCLE_RIGHT_DELTA, left +$CYCLE_LEFT_DELTA)"
 
 # ── Phase 5: drag the visible divider and re-lay both grids ──────
 # The split from phase 1 is side by side, so its divider starts at the grid
