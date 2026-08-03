@@ -46,6 +46,11 @@ LABEL_DELTA_MIN="${LABEL_DELTA_MIN:-40}"
 # noise tolerance only.
 CLEARED_DELTA_MAX="${CLEARED_DELTA_MAX:-2}"
 
+# The openbox decoration is 20 px tall and the client's own titlebar is 34 px.
+# Stop exactly at their shared bottom edge so the terminal cursor cannot blink
+# into a comparison that is meant to cover only the tab strip.
+TAB_BAND_HEIGHT=54
+
 find_window() {
     local wid
     wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
@@ -83,13 +88,13 @@ window_bbox() {
 # Crop the tab strip out of a full screenshot. The client's titlebar is
 # TITLEBAR_HEIGHT (34 px) tall and lays its tabs out from the left edge, so the
 # left half of the window's top band is all tab and holds none of the gear icon
-# or the window controls on the right. The band is 60 px so it still contains
-# the whole tab row underneath openbox's own decoration, whose pixels are
-# identical in every capture and so contribute nothing to a diff.
+# or the window controls on the right. TAB_BAND_HEIGHT includes openbox's own
+# decoration and the whole client titlebar, but no pixels from the terminal
+# grid below it.
 crop_tab_band() {
     local src="$1" dest="$2" w h ox oy
     read -r w h ox oy <<<"$(window_bbox "$src")"
-    convert "$src" -crop "$((w / 2))x60+${ox}+${oy}" +repage "$dest"
+    convert "$src" -crop "$((w / 2))x${TAB_BAND_HEIGHT}+${ox}+${oy}" +repage "$dest"
 }
 
 # Count lit pixels inside the Scribe window of a full-screen capture. Rendered
