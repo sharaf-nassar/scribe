@@ -219,7 +219,17 @@ Every script changes root's passwd shell with `usermod -s` after the disposable 
 
 The matrix covers the server side of `ai_tab_cwd`: an existing `--cwd` is preserved, while a nonexistent path falls back to `$HOME`. Client selection among pane, project-root, and home modes remains covered by the spec-018 GPUI suites documented in `specs/018-ai-tab-shell-env/verification.md`.
 
-Encrypted-envelope staging and restore-delta precedence are excluded until the functional keyring fixture exists. These scripts assert only the non-keyring startup, integration, cleanup, argv, and cwd contracts.
+Each script keeps its startup, integration, cleanup, argv, and cwd assertions active without a keyring. With `SCRIBE_KEYRING=1`, the functional entrypoint's integrated Secret Service fixture enables a real plain-shell env delta to pass through the production 100 ms debounce into an encrypted `.envz`; an AI launch using `--env-envelope-id` must expose that delta in the deterministic Claude stub and consume its session-specific file from `$XDG_RUNTIME_DIR/scribe/env-apply/`.
+
+Run the covered keyring rows exactly as:
+
+```bash
+SCRIBE_KEYRING=1 just e2e-func func/ai-shell-env-bash.sh
+SCRIBE_KEYRING=1 just e2e-func func/ai-shell-env-zsh.sh
+SCRIBE_KEYRING=1 just e2e-func func/ai-shell-env-fish.sh
+```
+
+The source session stays alive while polling for the `.envz` and through AI consumption because persistence has no shutdown flush. With the flag unset, every script skips only the encrypted row and retains all non-keyring assertions.
 
 #### Bash AI Shell Environment
 
