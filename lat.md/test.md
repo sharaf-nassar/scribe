@@ -695,6 +695,73 @@ The measurement is geometric rather than golden-image. Phase 1 reads the client 
 
 Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom five rows fell outside the 596 px viewport, and this is the assertion that catches it. Phase 3 asserts the pane status strip and the window status bar each carry ink in their own band at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the strip *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while both status bands below it keep their ink, which is what the bands' `flex_none` layout guarantees.
 
+## Sandbox limits
+
+The Docker harness keeps host services isolated, but unsupported hardware, platforms, topologies, profiles, and workflows require the sanctioned alternatives below.
+
+### Host-only hardware and platforms
+
+Real hardware and non-Linux operating systems remain outside the disposable Docker images.
+
+- **Real GPU:** lavapipe is the default visual renderer. Ask the user before work that requires a real GPU; `SCRIBE_E2E_GPUS` is an explicit host opt-in, not an automatic fallback.
+- **macOS:** ask the user for macOS validation. The Linux containers do not stand in for macOS behavior.
+
+### Network topology stand-ins
+
+Real multi-machine discovery and transport environments are outside the single-host container topology.
+
+Do not claim a real multi-machine, mDNS, or tailnet check. Use `scribe-test share-tap` and `scribe-test share-inject` for recorded or injected local frames, `scribe-test lan-peer` for a LAN peer, and `scribe-test remote-peer` for a tailnet peer. The focused recipes are `just e2e-visual-share`, `just e2e-visual-lan-approval`, and `just e2e-visual-remote-control`.
+
+### Protocol version pairing
+
+The local socket has no compatibility gate, so local-IPC version pairing is not a harness target.
+
+Use `scribe-test remote-peer --refuse incompatible_version` as the sanctioned version-refusal check. It exercises the remote transport's typed compatibility refusal without inventing a local-IPC gate.
+
+### Shell and build profiles
+
+Runtime shell coverage and container binary profiles follow explicit matrices instead of host fallbacks.
+
+- **nushell/PowerShell:** retain the out-of-scope rows in the [spec-018 limitation matrix](../specs/018-ai-tab-shell-env/verification.md); the functional image covers bash, zsh, and fish.
+- **Instrumented builds:** use the debug profile only: `just docker-func profile=debug` or `just docker-visual profile=debug`. Other instrumented image profiles are unsupported.
+
+### Same-host concurrency
+
+Fixed image tags, output paths, and runtime namespaces make aggregate runs single-host serial workflows.
+
+Parallel same-host runs are unsupported. Run `just e2e` and `just e2e-all-visual` serially, or use separate hosts.
+
+### Performance
+
+Performance validation uses the dedicated A/B script because runtime probes and isolated app identity fall outside E2E image orchestration.
+
+Use `tools/perf-ab-rig/run-perf-ab.sh`. Its `--live` mode attaches to the isolated `scribe-dev` server and never restarts it; assess mode does not launch a GUI.
+
+### Packaging
+
+Packaging uses an offline regression rig instead of install tests against the active workstation.
+
+Use `tests/install/postinst-regressions.sh`; `just test-install-vulkan-guard` runs its Vulkan upgrade guard in a disposable Debian container.
+
+### Change-class taxonomy
+
+Every supported change class maps to a named sandbox recipe or path; exceptions map to a named limit above.
+
+| Change class | Sandbox route |
+|---|---|
+| `server` | `just e2e`; focused work uses `just e2e-func <script>` under `tests/e2e/func/`. |
+| `client rendering` | `just e2e-all-visual`; focused work uses `just e2e-visual <script>` under `tests/e2e/visual/`. |
+| `CLI` | `just e2e-func func/cli-smoke.sh` (`tests/e2e/func/cli-smoke.sh`). |
+| `protocol` | `just e2e-visual-workspace-ipc`; version refusal maps to **Protocol version pairing** above. |
+| `persistence` | `just e2e`, which runs `tests/e2e/func/env-persistence.sh` with the keyring fixture. |
+| `packaging` | **Packaging** above: `tests/install/postinst-regressions.sh`. |
+| `AI launch` | `just e2e`, including `tests/e2e/func/ai-launch-smoke.sh` and the bash/zsh/fish shell matrix. |
+| `sharing/remote` | `just e2e-visual-share`, `just e2e-visual-lan-approval`, and `just e2e-visual-remote-control`; real topology maps to **Network topology stand-ins** above. |
+
+`.github/workflows/release.yml` builds and packages artifacts directly. Release workflows do not consume E2E images; `.github/workflows/e2e.yml` owns those images.
+
+The host-isolation policy remains authoritative in [CLAUDE.md](../CLAUDE.md) and [AGENTS.md](../AGENTS.md); this section records its consequences and sanctioned alternatives.
+
 ## GPUI IPC Bridge
 
 Unit tests for the GPUI client's  — the inbound coalescing drain and the outbound  — proving keystroke-before-output ordering and Zed-style 4 ms / 100-event coalescing over the frozen IPC protocol.
