@@ -1,0 +1,17 @@
+Generated 2026-08-03 from the assigned worktree with:
+
+    cargo tree -p scribe-png-decoder --edges normal --prefix none
+
+scribe-png-decoder v0.18.1-scribe.1 (third_party/image-png-decoder)
+flate2 v1.1.9
+crc32fast v1.5.0
+cfg-if v1.0.4
+miniz_oxide v0.8.9
+adler2 v2.0.1
+simd-adler32 v0.3.8
+scribe-image-decode v0.0.0-dev (crates/scribe-image-decode)
+
+The fork uses flate2's pure-Rust `rust_backend`; it contains no encoder,
+generic image decoder, APNG/text/profile parser, URL/path loader, C zlib, or
+other C/FFI image library. Regenerate and review this file whenever either
+decoder manifest changes.

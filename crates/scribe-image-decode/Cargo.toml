@@ -1,0 +1,11 @@
+[package]
+name = "scribe-image-decode"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+rust-version.workspace = true
+description = "Shared bounded terminal-image decode controls"
+publish = false
+
+[lints]
+workspace = true

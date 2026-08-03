@@ -6,6 +6,7 @@ pub mod error;
 pub mod framing;
 pub mod hook;
 pub mod ids;
+pub mod kitty_decode;
 pub mod perf_probe;
 pub mod profiles;
 pub mod protocol;

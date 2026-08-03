@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 scribe-common.workspace = true
 scribe-client = { path = "../scribe-client" }
+scribe-image-decode.workspace = true
+scribe-png-decoder.workspace = true
 # The LAN peer stand-in terminates a REAL mutual-TLS handshake with the same
 # server-owned `LanTls` builder the shipped listener uses, so the client under
 # test is never talking to a hand-rolled TLS shim.
@@ -39,6 +41,7 @@ png_spike = { package = "png", version = "0.18.1" }
 flate2 = { version = "1.1.9", default-features = false, features = [
   "rust_backend",
 ] }
+base64.workspace = true
 icy-sixel-decoder = { path = "../../third_party/icy-sixel-decoder" }
 tracing.workspace = true
 nix.workspace = true

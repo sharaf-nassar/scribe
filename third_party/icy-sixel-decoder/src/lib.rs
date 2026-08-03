@@ -7,98 +7,14 @@
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
-use std::time::Instant;
+
+pub use scribe_image_decode::{
+    AllocationDenied, DecodeHooks, DecodeLimits, DecodeStats, NoopHooks,
+};
+use scribe_image_decode::{BudgetError, DecodeBudget as Budget};
 
 const SIXEL_CELL_HEIGHT: usize = 6;
 const PALETTE_SIZE: usize = 256;
-
-// @lat: [[terminal-images#Terminal Images#Bounded Sixel Decoder]]
-/// Caller-owned hard limits for one Sixel decode.
-#[derive(Clone, Copy, Debug)]
-pub struct DecodeLimits {
-    /// Maximum raster width.
-    pub max_width_pixels: usize,
-    /// Maximum raster height.
-    pub max_height_pixels: usize,
-    /// Maximum checked width-times-height.
-    pub max_pixels: usize,
-    /// Maximum canonical RGBA result bytes.
-    pub max_rgba_bytes: usize,
-    /// Maximum cumulative input/output/pixel work.
-    pub max_work_units: u64,
-    /// Absolute monotonic deadline supplied by the caller.
-    pub deadline: Instant,
-    /// Maximum work between cancellation/deadline observations.
-    pub check_interval_work_units: u64,
-}
-
-impl DecodeLimits {
-    /// Frozen terminal-images-v1 limits with a caller-selected deadline.
-    pub const fn terminal_images_v1(deadline: Instant) -> Self {
-        Self {
-            max_width_pixels: 4_096,
-            max_height_pixels: 4_096,
-            max_pixels: 16_777_216,
-            max_rgba_bytes: 67_108_864,
-            max_work_units: 134_217_728,
-            deadline,
-            check_interval_work_units: 4_096,
-        }
-    }
-
-    fn validate(self) -> Result<(), DecodeError> {
-        if self.max_width_pixels == 0 || self.max_height_pixels == 0 {
-            return Err(DecodeError::InvalidLimit { limit: LimitName::Dimensions });
-        }
-        if self.max_pixels == 0 {
-            return Err(DecodeError::InvalidLimit { limit: LimitName::Pixels });
-        }
-        if self.max_rgba_bytes == 0 {
-            return Err(DecodeError::InvalidLimit { limit: LimitName::RgbaBytes });
-        }
-        if self.max_work_units == 0 {
-            return Err(DecodeError::InvalidLimit { limit: LimitName::WorkUnits });
-        }
-        if self.check_interval_work_units == 0 {
-            return Err(DecodeError::InvalidLimit { limit: LimitName::CheckInterval });
-        }
-        Ok(())
-    }
-}
-
-/// Cooperative controls owned by the decode caller.
-pub trait DecodeHooks {
-    /// Return true when this decode must stop.
-    fn is_cancelled(&self) -> bool;
-
-    /// Called before each canvas allocation. Tests and process accounting can
-    /// reject an allocation deterministically before the allocator is touched.
-    fn before_allocation(&self, _requested_bytes: usize) -> Result<(), AllocationDenied> {
-        Ok(())
-    }
-}
-
-/// Default hooks for callers that need only deadline/work enforcement.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopHooks;
-
-impl DecodeHooks for NoopHooks {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-/// Payload-free allocation denial from a caller hook.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AllocationDenied;
-
-impl fmt::Display for AllocationDenied {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("allocation denied")
-    }
-}
-
-impl Error for AllocationDenied {}
 
 /// Stable limit identifiers safe for diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,14 +154,6 @@ impl BackgroundMode {
     }
 }
 
-/// Work/allocation evidence returned only with a completed image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecodeStats {
-    pub work_units: u64,
-    pub cooperative_checks: u64,
-    pub peak_live_allocation_bytes: usize,
-}
-
 /// Completed canonical RGBA Sixel image.
 #[derive(Debug)]
 pub struct DecodedSixel {
@@ -267,6 +175,24 @@ pub fn decode_sixel(
     let mut budget = Budget::new(limits, hooks)?;
     let parsed = parse_sequence(data, &mut budget)?;
     decode_payload_with_budget(parsed.payload, parsed.settings, budget)
+}
+
+impl From<BudgetError> for DecodeError {
+    fn from(error: BudgetError) -> Self {
+        match error {
+            BudgetError::InvalidLimits => Self::InvalidLimit { limit: LimitName::WorkUnits },
+            BudgetError::WorkBudgetExceeded { requested, maximum } => {
+                Self::WorkBudgetExceeded { requested, maximum }
+            }
+            BudgetError::DecodeDeadlineExceeded { work_units } => {
+                Self::DecodeDeadlineExceeded { work_units }
+            }
+            BudgetError::DecodeCancelled { work_units } => Self::DecodeCancelled { work_units },
+            BudgetError::AllocationFailed { requested_bytes } => {
+                Self::AllocationFailed { requested_bytes }
+            }
+        }
+    }
 }
 
 /// Decode a Sixel payload after an external framer has removed DCS/ST.
@@ -434,95 +360,6 @@ fn parse_fixed_u16_params<const N: usize>(
     Ok(output)
 }
 
-struct Budget<'a> {
-    limits: DecodeLimits,
-    hooks: &'a dyn DecodeHooks,
-    work_units: u64,
-    next_check: u64,
-    checks: u64,
-    live_allocation_bytes: usize,
-    peak_live_allocation_bytes: usize,
-}
-
-impl<'a> Budget<'a> {
-    fn new(limits: DecodeLimits, hooks: &'a impl DecodeHooks) -> Result<Self, DecodeError> {
-        let mut budget = Self {
-            limits,
-            hooks,
-            work_units: 0,
-            next_check: limits.check_interval_work_units,
-            checks: 0,
-            live_allocation_bytes: 0,
-            peak_live_allocation_bytes: 0,
-        };
-        budget.check_now()?;
-        Ok(budget)
-    }
-
-    fn charge(&mut self, units: u64) -> Result<(), DecodeError> {
-        let requested =
-            self.work_units.checked_add(units).ok_or(DecodeError::WorkBudgetExceeded {
-                requested: u64::MAX,
-                maximum: self.limits.max_work_units,
-            })?;
-        if requested > self.limits.max_work_units {
-            return Err(DecodeError::WorkBudgetExceeded {
-                requested,
-                maximum: self.limits.max_work_units,
-            });
-        }
-        while self.next_check <= requested {
-            self.work_units = self.next_check;
-            self.check_now()?;
-            self.next_check = self
-                .next_check
-                .checked_add(self.limits.check_interval_work_units)
-                .ok_or(DecodeError::WorkBudgetExceeded {
-                    requested,
-                    maximum: self.limits.max_work_units,
-                })?;
-        }
-        self.work_units = requested;
-        Ok(())
-    }
-
-    fn check_now(&mut self) -> Result<(), DecodeError> {
-        self.checks = self.checks.saturating_add(1);
-        if self.hooks.is_cancelled() {
-            return Err(DecodeError::DecodeCancelled { work_units: self.work_units });
-        }
-        if Instant::now() >= self.limits.deadline {
-            return Err(DecodeError::DecodeDeadlineExceeded { work_units: self.work_units });
-        }
-        Ok(())
-    }
-
-    fn begin_allocation(&mut self, bytes: usize) -> Result<(), DecodeError> {
-        self.hooks
-            .before_allocation(bytes)
-            .map_err(|_| DecodeError::AllocationFailed { requested_bytes: bytes })?;
-        self.live_allocation_bytes = self
-            .live_allocation_bytes
-            .checked_add(bytes)
-            .ok_or(DecodeError::AllocationFailed { requested_bytes: bytes })?;
-        self.peak_live_allocation_bytes =
-            self.peak_live_allocation_bytes.max(self.live_allocation_bytes);
-        Ok(())
-    }
-
-    fn end_allocation(&mut self, bytes: usize) {
-        self.live_allocation_bytes = self.live_allocation_bytes.saturating_sub(bytes);
-    }
-
-    const fn stats(&self) -> DecodeStats {
-        DecodeStats {
-            work_units: self.work_units,
-            cooperative_checks: self.checks,
-            peak_live_allocation_bytes: self.peak_live_allocation_bytes,
-        }
-    }
-}
-
 struct Decoder {
     canvas: Canvas,
     palette: Palette,
@@ -672,7 +509,7 @@ impl Decoder {
         if self.target_width > 0 || self.target_height > 0 {
             let width = self.target_width.max(1);
             let height = self.target_height.max(1);
-            guard_dimensions(width, height, budget.limits)?;
+            guard_dimensions(width, height, budget.limits())?;
             self.canvas.ensure_visible(width, height, self.background(), budget)?;
             self.extent_width = self.extent_width.max(width);
             self.extent_height = self.extent_height.max(height);
@@ -687,7 +524,7 @@ impl Decoder {
         self.repeat = 1;
         let width = checked_add(self.pos_x, span)?;
         let height = checked_add(self.pos_y, SIXEL_CELL_HEIGHT)?;
-        guard_dimensions(width, height, budget.limits)?;
+        guard_dimensions(width, height, budget.limits())?;
         self.canvas.ensure_visible(width, height, self.background(), budget)?;
         for bit in 0..SIXEL_CELL_HEIGHT {
             if bits & (1 << bit) != 0 {
@@ -719,7 +556,7 @@ impl Decoder {
         }
         let width = self.extent_width.max(self.target_width).max(1);
         let height = self.extent_height.max(self.target_height).max(1);
-        guard_dimensions(width, height, budget.limits)?;
+        guard_dimensions(width, height, budget.limits())?;
         self.canvas.ensure_visible(width, height, self.background(), budget)?;
         if self.canvas.width != width || self.canvas.height != height {
             return Err(DecodeError::InvalidDimensions {
@@ -752,8 +589,8 @@ impl Canvas {
         }
         let new_width = width.max(self.width).max(1);
         let new_height = height.max(self.height).max(1);
-        guard_dimensions(new_width, new_height, budget.limits)?;
-        let new_bytes = rgba_bytes(new_width, new_height, budget.limits)?;
+        guard_dimensions(new_width, new_height, budget.limits())?;
+        let new_bytes = rgba_bytes(new_width, new_height, budget.limits())?;
         budget.begin_allocation(new_bytes)?;
         let mut next = Vec::new();
         if next.try_reserve_exact(new_bytes).is_err() {

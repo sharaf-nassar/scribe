@@ -29,7 +29,7 @@ work checks.
 Excluded entirely: encoder APIs/source, `quantette`, quantization types,
 benchmarks, CLI/image dependencies, deprecated whole-image entry points,
 unsafe pointer fills, x86/x86_64 SIMD span paths, and all C/FFI decoders. The
-fork has no third-party Rust dependency.
+only dependency is Scribe's shared caller-owned decode-budget crate.
 
 ## Security ownership and updates
 
