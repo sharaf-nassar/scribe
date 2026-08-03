@@ -6127,10 +6127,12 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.keystroke.key != "tab" {
+        let modifiers = event.keystroke.modifiers;
+        if event.keystroke.key != "tab" || modifiers.control || modifiers.alt || modifiers.platform
+        {
             return false;
         }
-        if event.keystroke.modifiers.shift {
+        if modifiers.shift {
             window.focus_prev(cx);
         } else {
             window.focus_next(cx);
@@ -6213,7 +6215,8 @@ impl Render for TerminalView {
                 if view.focus.cursor_blink.show_now() {
                     ctx.notify();
                 }
-                // Tab enters the titlebar order rather than reaching the PTY.
+                // Plain Tab enters the titlebar order. Modified Tab chords
+                // continue to the configured binding dispatcher below.
                 if Self::focus_next_titlebar_control(event, win, ctx) {
                     return;
                 }
