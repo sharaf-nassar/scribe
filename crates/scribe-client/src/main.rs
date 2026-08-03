@@ -19,9 +19,9 @@ use std::{
 };
 
 use gpui::{
-    App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role, ScrollWheelEvent, Size,
-    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
+    App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role, ScrollWheelEvent,
+    Size, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
     WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
@@ -6112,8 +6112,16 @@ impl TerminalView {
         })
     }
 
-    /// Restore focus when another surface left the terminal window unfocused.
+    /// Keep keyboard focus inside a modal, or restore it to terminal chrome
+    /// when no modal owns the window.
     fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.dialog.as_ref() {
+            let focus = dialog.focus_handle(cx);
+            if !focus.is_focused(window) {
+                window.focus(&focus, cx);
+            }
+            return;
+        }
         if !self.focus.root.is_focused(window)
             && !self.titlebar.read(cx).has_keyboard_focus(window)
             && !self.focus.update.is_focused(window)
@@ -6215,23 +6223,24 @@ impl Render for TerminalView {
                 if view.focus.cursor_blink.show_now() {
                     ctx.notify();
                 }
-                // Plain Tab enters the titlebar order. Modified Tab chords
-                // continue to the configured binding dispatcher below.
-                if Self::focus_next_titlebar_control(event, win, ctx) {
-                    return;
-                }
                 // The X11 active-window guard gates everything: while a
                 // compositor overlay owns the screen the keystroke was never
                 // meant for this window, so it reaches no consumer at all.
                 if view.compositor_overlay_active(event) {
                     return;
                 }
-                // Overlays own the keyboard first, then the configured
-                // bindings, and only then the generic PTY byte encoder.
-                if view.handle_overlay_key(event, ctx)
-                    || view.handle_vi_key(event, ctx)
-                    || view.handle_binding(event, ctx)
-                {
+                // An active overlay owns every key, including plain Tab. With
+                // no overlay, plain Tab enters the titlebar order; modified
+                // Tab chords continue to configured bindings below.
+                if view.handle_overlay_key(event, ctx) {
+                    return;
+                }
+                if Self::focus_next_titlebar_control(event, win, ctx) {
+                    return;
+                }
+                // Vi mode and configured bindings run before the generic PTY
+                // byte encoder.
+                if view.handle_vi_key(event, ctx) || view.handle_binding(event, ctx) {
                     return;
                 }
                 view.on_key_down(event, ctx);
