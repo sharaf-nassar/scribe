@@ -17,9 +17,13 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+#[cfg(target_os = "linux")]
 use x11rb::rust_connection::RustConnection;
 
 /// Debounce window after the compositor overlay dismisses.
@@ -30,6 +34,7 @@ pub const REACTIVATION_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Returns `None` on Wayland, macOS, or any backend that does not expose an
 /// Xlib/Xcb handle, which is the signal that the focus guard should stay off.
 #[must_use]
+#[cfg(target_os = "linux")]
 pub fn xcb_window_id(handle_source: &impl HasWindowHandle) -> Option<u32> {
     let handle = handle_source.window_handle().ok()?;
     match handle.as_raw() {
@@ -37,6 +42,13 @@ pub fn xcb_window_id(handle_source: &impl HasWindowHandle) -> Option<u32> {
         RawWindowHandle::Xcb(h) => Some(h.window.get()),
         _ => None,
     }
+}
+
+/// Non-Linux platforms never expose an X11 window id.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn xcb_window_id<T>(_handle_source: &T) -> Option<u32> {
+    None
 }
 
 /// Pure reactivation debounce state machine, shared by [`X11FocusGuard`].
@@ -109,10 +121,15 @@ impl ReactivationDebounce {
 /// Polls `_NET_ACTIVE_WINDOW` and suppresses keyboard input while our window is
 /// not the active one (or was not active very recently).
 pub struct X11FocusGuard {
+    #[cfg(target_os = "linux")]
     conn: RustConnection,
+    #[cfg(target_os = "linux")]
     root: u32,
+    #[cfg(target_os = "linux")]
     net_active_window: u32,
+    #[cfg(target_os = "linux")]
     our_window: u32,
+    #[cfg(target_os = "linux")]
     debounce: ReactivationDebounce,
 }
 
@@ -122,6 +139,7 @@ impl X11FocusGuard {
     /// Returns `None` when X11 is unavailable (e.g. pure Wayland) or when the
     /// connection/atom intern fails for any reason.
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub fn new(our_x11_window_id: u32) -> Option<Self> {
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let setup = conn.setup();
@@ -142,8 +160,16 @@ impl X11FocusGuard {
     /// Convenience constructor: build the guard from a GPUI window handle,
     /// yielding `None` on non-X11 backends (where the guard should stay off).
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub fn from_window_handle(handle_source: &impl HasWindowHandle) -> Option<Self> {
         Self::new(xcb_window_id(handle_source)?)
+    }
+
+    /// Keep the cross-platform client shell inert when X11 is unavailable.
+    #[must_use]
+    #[cfg(not(target_os = "linux"))]
+    pub fn from_window_handle<T>(_handle_source: &T) -> Option<Self> {
+        None
     }
 
     /// Refresh cached state by querying `_NET_ACTIVE_WINDOW`.
@@ -151,6 +177,7 @@ impl X11FocusGuard {
     /// Call from a periodic callback so the guard has an up-to-date picture of
     /// whether a compositor overlay is active. Does not itself suppress input.
     pub fn poll(&mut self) {
+        #[cfg(target_os = "linux")]
         if self.query_is_active() {
             self.debounce.note_active(Instant::now());
         } else {
@@ -160,6 +187,7 @@ impl X11FocusGuard {
 
     /// Clear the reactivation debounce on a genuine focus event.
     pub fn clear_reactivation_debounce(&mut self) {
+        #[cfg(target_os = "linux")]
         self.debounce.clear();
     }
 
@@ -167,13 +195,20 @@ impl X11FocusGuard {
     /// window is not the current `_NET_ACTIVE_WINDOW`, or it just became active
     /// again within [`REACTIVATION_DEBOUNCE`].
     pub fn should_suppress_key(&mut self) -> bool {
-        let is_active = self.query_is_active();
-        self.debounce.observe(is_active, Instant::now())
+        #[cfg(not(target_os = "linux"))]
+        return false;
+
+        #[cfg(target_os = "linux")]
+        {
+            let is_active = self.query_is_active();
+            self.debounce.observe(is_active, Instant::now())
+        }
     }
 
     /// Query `_NET_ACTIVE_WINDOW` and return whether it matches our window.
     /// Assumes active on any X11 error so a transient failure never wedges
     /// input.
+    #[cfg(target_os = "linux")]
     fn query_is_active(&self) -> bool {
         let Ok(cookie) = self.conn.get_property(
             false,

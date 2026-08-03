@@ -24,8 +24,8 @@
 # actions, then the selected page's actionable controls), so a phase says "the
 # second focus target while the search reads `remote`" instead of "48px below
 # the page header". The redesigned window is free to move any of it: grouped
-# nav, the 1500x1050 geometry, the custom client chrome and the search bar can
-# all be re-laid-out without touching this file, and no production layout
+# nav, compact geometry, custom client chrome and the search bar can all be
+# re-laid-out without touching this file, and no production layout
 # constant exists to keep a click landing here.
 #
 # The one pointer gesture is a click on the empty sidebar background below the

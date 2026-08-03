@@ -247,6 +247,12 @@ e2e-visual-settings-trust:
 e2e-visual-settings-entry:
     docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/settings-entry.sh
 
+# Run the live tab-switching E2E through the shared-pane rig and the wire tap.
+# The client creates its own second tab, then keyboard and titlebar selection
+# changes are asserted on the recorded `AttachSessions` frames.
+e2e-visual-tab-switching:
+    docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/tab-switching.sh
+
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll
 # on, and the run relaunches the client twice so it needs a longer budget.
@@ -393,7 +399,7 @@ e2e-visual-drag-drop:
     docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/drag-drop.sh
 
 # Run the server-lifecycle visual E2E: a stale socket diagnosed by name, and an
-# autostart that ends in a painting window. The run stops the server and
+# autostart that ends in a live initial shell. The run stops the server and
 # relaunches the client twice, so it needs a longer budget than the default 60 s.
 e2e-visual-server-lifecycle:
     docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/server-lifecycle.sh
@@ -498,6 +504,7 @@ e2e-all-visual: build-release docker-visual
         'visual/settings-entry.sh|e2e-visual-settings-entry'
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
+        'visual/tab-switching.sh|e2e-visual-tab-switching'
         'visual/tab-window-chords.sh|e2e-visual'
         'visual/terminal-viewport.sh|e2e-visual-terminal-viewport'
         'visual/terminal-zoom.sh|e2e-visual-terminal-zoom'

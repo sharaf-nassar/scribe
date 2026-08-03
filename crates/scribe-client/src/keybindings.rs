@@ -193,21 +193,28 @@ impl Keybinding {
 
     /// Match a character binding, allowing for GPUI's shifted-symbol spelling.
     ///
-    /// GPUI's Linux backends name a key by the keysym the *current* modifier
-    /// level resolves to and then drop the shift flag for single-character
-    /// non-letter keys, so pressing `ctrl+shift+\` arrives as control plus the
-    /// key `|` with shift clear — nothing like the `ctrl+shift+\` the config
-    /// (and the legacy winit client, which read `key_without_modifiers`)
-    /// spells it as. Every shifted-symbol default binding — `split_vertical`,
-    /// `split_horizontal`, `zoom_in` — is unreachable without accepting that
-    /// second spelling, so a shift-carrying character binding also matches its
-    /// US-layout shifted glyph arriving with shift already folded in.
+    /// GPUI can spell shifted symbols in two different ways. Linux backends
+    /// often resolve the keysym at the active modifier level and drop the shift
+    /// flag for single-character non-letter keys, so pressing `ctrl+shift+\`
+    /// arrives as control plus the key `|` with shift clear. macOS can keep
+    /// the shift flag *and* still report the shifted glyph (`}` for
+    /// `cmd+shift+]`). Every shifted-symbol default binding —
+    /// `split_vertical`, `split_horizontal`, `zoom_in`, `next_tab`, and
+    /// `prev_tab` — is unreachable without accepting both spellings, so a
+    /// shift-carrying character binding also matches its US-layout shifted
+    /// glyph whether GPUI folded shift away or preserved it.
     fn character_matches(&self, target: char, input: &KeyInput) -> bool {
         let Some(base) = input.base else {
             return false;
         };
-        if modifiers_match(self.modifiers, input.modifiers) && base.eq_ignore_ascii_case(&target) {
-            return true;
+        if modifiers_match(self.modifiers, input.modifiers) {
+            if base.eq_ignore_ascii_case(&target) {
+                return true;
+            }
+            if self.modifiers.shift && shifted_ascii(target).is_some_and(|shifted| base == shifted)
+            {
+                return true;
+            }
         }
         if !self.modifiers.shift || input.modifiers.shift {
             return false;

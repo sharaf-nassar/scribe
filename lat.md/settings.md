@@ -235,10 +235,10 @@ That same socket also accepts a `quit` command from the client and server shutdo
 
 Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via .
 
-The GPUI settings launch prefers 1500×1050 and enforces a 1040×720 minimum
-when the display can hold it. A saved size below that minimum is migrated to
-the preferred composition; valid saved sizes and positions clamp to the
-primary display's visible work area.
+The GPUI settings launch opens at its 1040×720 layout minimum when the display
+can hold it. Saved geometry is restored only when its size is between that
+minimum and the primary display's visible work area; undersized or oversized
+legacy physical-pixel geometry migrates to the compact centered composition.
 
 ## GPUI Settings Window
 
@@ -255,9 +255,11 @@ canvas, `#1e1f20` navigation, `#272829` controls, `#4f4f51` strong seams,
 surfaces stay flat; 2–4px corners, one-pixel rules, and monospace technical
 values distinguish controls without cards, shadows, or decorative chrome.
 
-The 54px custom titlebar supplies a draggable region and real native window
-actions. Below it, an independently scrollable 314px sidebar groups the eleven
-real pages under Terminal, Intelligence, Workflow, System, and Connectivity.
+The compact 32px custom titlebar centers `Scribe Settings` between symmetric
+144px chrome reservations, matching the native macOS traffic-light band while
+keeping clear of those buttons and the three right-side actions. Below it, an
+independently scrollable 314px sidebar groups the eleven real pages under
+Terminal, Intelligence, Workflow, System, and Connectivity.
 Non-focusable group labels do not enter keyboard traversal; each 44px page row
 uses a normalized outline glyph and selected rows use a warm fill with a 4px
 amber seam. Inset separators and first-group top air establish group rhythm.

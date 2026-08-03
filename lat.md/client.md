@@ -194,7 +194,7 @@ The shell's live key path runs the configured bindings before the PTY encoder, s
 
  lowers each `KeyDownEvent` through  and , and is consulted after the overlays own the keyboard but before , which runs the ported byte encoder for everything no binding claimed — an unbound named key such as PageUp/PageDown therefore reaches the PTY as `CSI 5~` / `CSI 6~` instead of being dropped. The resolved  is handed to , the shell's single live dispatch point, which the command palette also targets so a row and its chord can never drift apart. A matched  reaches ; the four scrollback actions and the three zoom actions run () and the three mark-relative jumps run (), and the clipboard pair copies the pane selection and pastes the host clipboard back through the spec-011 gate () — so no bound shortcut is swallowed any more. That dispatcher still matches exhaustively rather than with a `_` arm, so a new `LayoutAction` fails to compile instead of joining a dropped set unnoticed.  ratchets that set.
 
-The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send  into the focused workspace (the AI variants through , which execs the CLI under the login shell exactly like the winit client), `next_tab` / `prev_tab` / `select_tab_N` move the selection and re-, and `close_tab` sends .
+The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send  into the focused workspace (the AI variants through , which execs the CLI under the login shell exactly like the winit client), `next_tab` / `prev_tab` / `select_tab_N` move the selection and re-, and `close_tab` sends . The same switch/close paths are also what the titlebar's tab buttons emit, so pointer activation and keyboard shortcuts stay in lockstep instead of maintaining a second tab-only code path.
 
 `new_window` opens a second top-level window in the same process through , rather than re-spawning the binary the way the winit client's `spawn_client_process` had to — GPUI is multi-window, as the settings window already shows.  builds each window's own `Shared` state and its own IPC connection, and `main` calls it for the startup window too, so the two paths cannot drift. Independent state is what makes it a window rather than a mirror: the `Hello` on that second connection carries no window id, so the server registers a *new* window and gives it its own sessions, tab strip, and status line.
 
@@ -507,6 +507,8 @@ OS-integration surfaces the GPUI client owns beyond the terminal grid: local ser
 
  polls `_NET_ACTIVE_WINDOW` and suppresses keystrokes while a compositor overlay obscures the window, reading GPUI's Xcb/Xlib window id via  (per the XID capability spike); non-X11 backends yield no id and leave the guard off. Its suppression timing lives in the pure  so it is testable without a display server.
 
+The module remains available on non-Linux targets with an inert guard API, so the platform-agnostic window lifecycle compiles unchanged while X11 dependencies and behavior remain Linux-only.
+
  starts the guard from the live window-open path:  hands it the real `Window`, which is the first point an Xcb window id exists. Three call sites keep it honest —  refreshes it every  so an overlay opening while the user is idle is noticed before their next keystroke (the GPUI client has no winit-style event-loop tick to piggyback on),  clears the reactivation debounce on a genuine activation because compositor overlays never send one, and  is the first gate on the key path — ahead of the overlay router, the bindings, and the PTY encoder — so a key aimed at the overlay lands nowhere in the client. Every dropped keystroke is logged, since silently vanishing input is precisely this guard's failure mode.
 
  quotes a dropped file path for the focused pane's shell via  (POSIX, fish, PowerShell, or nushell) and appends a trailing space; per FR-013 it bypasses the paste-confirmation gate because the path is already quoted.
@@ -514,6 +516,8 @@ OS-integration surfaces the GPUI client owns beyond the terminal grid: local ser
 ### Server Lifecycle Wiring
 
 The running client reaches the lifecycle port:  opens its one local connection through  rather than a bare `UnixStream::connect`, so a client launched with no server running starts one instead of failing the window.
+
+After the first authoritative `SessionList`, a genuinely fresh window with no sessions requests one login shell through `CreateSession`. The one-shot is disabled for cold-restart replay and existing-window claims, and a non-empty first list consumes it, so reconnects cannot add surprise tabs. The reader stages the shell's launch binding before enqueueing the request, allowing the foreground restore state to retain the same environment-envelope launch id after `SessionCreated` arrives.
 
 A refused connect is diagnosed before the autostart is attempted.  separates the two cases that look identical at the syscall: no socket file at all means no server has ever run for this user, while a socket file that refuses connections is the residue of a server that died without unlinking it. That sentence is carried into the error the autostart failure returns, so the status line names the stale socket instead of showing a bare `systemctl` exit code, and  logs it as well — the window is one line wide and outlives nothing.
 
@@ -728,7 +732,7 @@ The GPUI rebuild replaces native window decorations with a custom titlebar that 
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 
-[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Equalize is visible only when the focused region's active tab has at least two panes; the root view projects the reconciled live pane tree into the titlebar each frame, so split, close, focus, and asynchronous session retirement cannot leave stale chrome. The badge is projected in the same post-reconcile pass from the focused region's ID, count, and accent plus the shared live workspace name, so naming and focus changes cannot leave stale badge geometry. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Equalize is visible only when the focused region's active tab has at least two panes; the root view projects the reconciled live pane tree into the titlebar each frame, so split, close, focus, and asynchronous session retirement cannot leave stale chrome. The badge is projected in the same post-reconcile pass from the focused region's ID, count, and accent plus the shared live workspace name, so naming and focus changes cannot leave stale badge geometry. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); `SelectTab` and `CloseTab` route through that same subscription into the shell's normal tab switch/close handlers, and [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour while `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. A press now suppresses the click path only after an actual reorder: the transient drag arm that protects against jitter no longer blocks an ordinary tab click. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
 
 ### Window move region
 
@@ -784,6 +788,11 @@ continues its deterministic tab-stop order. Settings opens its singleton window,
 equalize emits its normal titlebar event, and window controls invoke their
 native operations.
 
+Pointer activation is deliberately different from keyboard activation. A click
+may focus the tab control for the duration of the event, but once the shell has
+switched the live session it defers focus back to the terminal root so typing
+resumes immediately without a second click.
+
 ### Tab flash envelope self-decays
 
 Verifies  peaks at 1.0, eases down mid-envelope, and returns `None` at or past `TAB_FLASH_SECS` (and for negative/NaN inputs) so the flash self-clears and cannot pin the redraw loop.
@@ -814,7 +823,7 @@ Verifies  converts small counts exactly and saturates at `u16::MAX` for patholog
 
 ### Selecting a tab activates it and emits
 
-Verifies  marks the clicked tab active (clearing the others) and emits `TitlebarEvent::SelectTab`.
+Verifies  marks the chosen tab active, clears the others, and emits `TitlebarEvent::SelectTab` with the activation source.
 
 ### Closing a tab removes it and reactivates
 
@@ -823,6 +832,10 @@ Verifies  removes the tab, keeps exactly one tab active when the active tab is c
 ### Drag reorder moves the tab and emits
 
 Verifies a `begin_drag`/`update_drag`/`end_drag` sequence on  moves the dragged tab to the hovered slot and emits `TitlebarEvent::ReorderTab`.
+
+### A drag arm without reordering still selects
+
+Verifies the titlebar's transient drag arm does not suppress a normal tab click unless the pointer actually crossed into another tab slot.
 
 ### Out-of-range interactions are no-ops
 
@@ -1292,7 +1305,7 @@ The demo and source evidence are recorded in
 
 Key events are resolved through a four-level priority chain from layout shortcuts down to raw terminal byte encoding.
 
-On macOS, bare `cmd+w` is handled before that chain and routed to the same close-request path as the native window close button, so it never falls through to pane bindings or terminal input.
+On macOS, GPUI application actions reserve bare `cmd+w` and `cmd+q` before that chain and expose them through the native File and Scribe menus. `cmd+w` follows the active window's normal close path, while `cmd+q` defers its terminal-window update until action dispatch returns the active window to GPUI's table, then raises the server-owned close dialog before any process exits; neither chord can fall through to pane bindings or terminal input.
 
 Above the level-4 encoder,  short-circuits the dispatch at the entry of `handle_keyboard` whenever an OS IME composition is in flight, so synthesized winit key events that the IME is mid-composing never reach the legacy or Kitty encoder. See  for the state machine that drives that predicate.
 
@@ -1333,7 +1346,7 @@ The one piece still missing is the per-pane mode: the binary always passes `::le
 
 The GPUI rebuild ports the keybinding parser and layout-action dispatch from the winit client, retargeted at GPUI's `Keystroke`/`Modifiers` via the intermediate , so no configured shortcut regresses at cutover.
 
-GPUI's Linux backends name a key by the keysym the *current* modifier level resolves to and then drop the shift flag for single-character non-letter keys, so `ctrl+shift+\` arrives as control plus the key `|` with shift clear — nothing like the combo the config spells. Every shifted-symbol default (`split_vertical`, `split_horizontal`, `zoom_in`) was therefore unreachable in the running client, so  also accepts a binding's US-layout shifted glyph () arriving with shift already folded in. Letters are absent from that table on purpose: the backends already report them by their own lowercase key and keep the shift flag.
+GPUI's backends do not spell shifted symbols uniformly. Linux resolves the keysym at the active modifier level and may drop the shift flag for single-character non-letter keys, so `ctrl+shift+\` arrives as control plus the key `|` with shift clear; macOS can keep the shift flag while still reporting the shifted glyph (`}` for `cmd+shift+]`). Every shifted-symbol default (`split_vertical`, `split_horizontal`, `zoom_in`, `next_tab`, `prev_tab`) was therefore unreachable on at least one live backend until  accepted a binding's US-layout shifted glyph () in both forms. Letters are absent from that table on purpose: the backends already report them by their own lowercase key and keep the shift flag.
 
  parses every configurable action from  (invalid combos skipped with a warning).  reads the same combo vocabulary as , mapping `cmd`/`super` onto GPUI's platform modifier, and  requires an exact modifier match (ignoring the GPUI function flag) on a key-down event, comparing characters against the unshifted base case-insensitively.  runs the legacy three-level intercept order — layout shortcuts, then command-palette/settings/find, then the seven fixed terminal-shortcut escape sequences — returning a ; the generic byte encoder handles level 4 when it returns `None`. All 50+  variants are enumerated one-for-one against the legacy tables. The module also owns the shell's fixed overlay chords, so that the "a configured binding always wins" rule lives next to the table it outranks — see .
 
@@ -1482,6 +1495,8 @@ Automation requests use that same path in both directions. `scribe-cli action ..
 Starts and connects to the server process, with a retry loop waiting up to 5 seconds for the socket to appear.
 
 On Linux, the client starts the server via `systemctl --user start scribe-server`. On macOS, release builds install `com.scribe.server.plist` into `~/Library/LaunchAgents/` with the current bundle's `scribe-server` path, re-bootstrap the job if that path changes, and then `kickstart` it. If a socket already exists, the client inspects the connected server's peer PID and restarts it when the running executable path differs from the current bundle or when the installed server binary is newer than the running process start time, which lets manual DMG replacements hot-reload the background server on next launch. When that stale-server refresh fires, the client prefers a direct `scribe-server --upgrade` spawn over `launchctl kickstart -k` so the new server performs a handoff with the still-running old one; kickstart only terminates the old server when launchd still manages it, and after a DMG drop-replace that old server is typically a launchd orphan whose flock a fresh non-upgrade child would crash-loop against. `launchctl` remains the fallback if the direct spawn fails. Dev builds without a bundle fall back to spawning the server binary directly.
+
+Stable macOS launches also repair bundled AI hooks before any window mode is chosen. Because a DMG install has no `postinst` equivalent, `repair_ai_hooks_on_startup` probes `~/.claude/settings.json` and `~/.codex/{config.toml,hooks.json}` for the current app bundle's `Contents/Resources/ai-hook-{claude,codex}.sh` paths and reruns the bundled setup scripts when they are missing or stale after a first install or app move. Dev builds skip the repair, and Claude's `statusLine` is only rewritten when it is absent or still points at an older Scribe bundle, so custom non-Scribe status lines are preserved.
 
  polls the socket's peer PID after the `--upgrade` spawn and only returns once the connected server differs from the captured old PID. If the new server fails to take over within `SERVER_REFRESH_TIMEOUT` — most often because the in-process handoff aborted (incompatible state format from a long-deferred update, peer-validation rejection, or any other `--upgrade` exit) — the client falls back to , which force-terminates every scribe-server process other than ourselves (via `pgrep -x scribe-server`), removes stale `server.sock` / `handoff.sock` files, and starts a fresh server through the normal path. Live sessions in the stuck old server are lost on that fallback path, but Scribe launches instead of looping until the wait deadline expires and then crashing.
 

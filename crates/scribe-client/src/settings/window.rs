@@ -27,7 +27,7 @@
 //! STORY: Grouped navigation establishes scope; search shortens retrieval; a
 //! spacious section rhythm and aligned controls carry the user to live values.
 //! FIRST VIEWPORT: The active destination, page purpose, and highest-frequency
-//! controls are legible immediately in the preferred 1500×1050 composition.
+//! controls remain legible at the compact 1040×720 composition.
 //! FORM: Contemporary native settings workspace in fixed Obsidian Amber.
 //! No dealt staging was adopted because it did not fit settings truth.
 
@@ -47,6 +47,7 @@ use scribe_common::protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::app_shortcuts::CloseWindow;
 use crate::settings::model::{
     ADD_CURRENT_NETWORK_ACTION, Control, ControlKind, ENV_PERSISTENCE_KEY, ENV_PREFLIGHT_ACTION,
     REFRESH_TRUST_ACTION, REMOVE_TRUSTED_NETWORK_PREFIX, REVOKE_TRUSTED_DEVICE_PREFIX,
@@ -75,6 +76,15 @@ const PENDING_PAINT_DELAY: Duration = Duration::from_millis(34);
 /// not Zed's translucent drop shadow, so it has to read as chrome rather than as
 /// stray padding.
 const RESIZE_GUTTER: Pixels = px(6.0);
+
+/// Smallest composition that keeps the fixed navigation and control columns
+/// visible without clipping their labels.
+const SETTINGS_MIN_WIDTH: f32 = 1040.0;
+const SETTINGS_MIN_HEIGHT: f32 = 720.0;
+
+/// Native macOS traffic lights occupy a 28px titlebar band. Four extra pixels
+/// add breathing room while keeping the custom cross-platform chrome dense.
+const SETTINGS_TITLEBAR_HEIGHT: f32 = 32.0;
 
 /// The feature-014 LAN trust state the Remote page renders, refreshed from the
 /// local server by [`SettingsWindow::refresh_trust`].
@@ -1068,6 +1078,7 @@ impl Render for SettingsWindow {
             .role(Role::Application)
             .aria_label("Scribe settings")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, key_window, ctx| {
                 this.on_key_down(event, key_window, ctx);
             }))
@@ -1230,7 +1241,7 @@ impl SettingsWindow {
             .role(Role::TitleBar)
             .aria_label("Scribe Settings title bar")
             .w_full()
-            .h(px(54.0))
+            .h(px(SETTINGS_TITLEBAR_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
@@ -1268,31 +1279,29 @@ impl SettingsWindow {
                     key_window.start_window_move();
                 }
             }))
+            // Balance the three 48px controls on the right. On macOS this also
+            // reserves the traffic-light region, keeping the centered title
+            // clear of the native buttons without platform-specific offsets.
             .child(
                 div()
-                    .w(px(54.0))
+                    .w(px(144.0))
                     .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
+                    .flex_none()
                     .window_control_area(WindowControlArea::Drag)
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(colors.text)
-                    .child("S"),
             )
             .child(
                 div()
                     .h_full()
+                    .flex_1()
                     .flex()
                     .items_center()
+                    .justify_center()
                     .window_control_area(WindowControlArea::Drag)
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors.text)
                     .child("Scribe Settings"),
             )
-            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .child(settings_window_control(SettingsWindowControl::Minimize, window, &colors, cx))
             .child(settings_window_control(SettingsWindowControl::Maximize, window, &colors, cx))
             .child(settings_window_control(SettingsWindowControl::Close, window, &colors, cx))
@@ -3104,45 +3113,34 @@ fn key_hash(key: &str) -> u64 {
 /// process, not a separate binary) holds it for exactly that. `None` means the
 /// platform refused the window, which is already logged here.
 pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
-    const PREFERRED_WIDTH: f32 = 1500.0;
-    const PREFERRED_HEIGHT: f32 = 1050.0;
-    const MIN_WIDTH: f32 = 1040.0;
-    const MIN_HEIGHT: f32 = 720.0;
-
     let visible = cx.primary_display().map(|display| display.visible_bounds());
     let available =
-        visible.map_or(size(px(PREFERRED_WIDTH), px(PREFERRED_HEIGHT)), |bounds| bounds.size);
-    let width = PREFERRED_WIDTH.min(f32::from(available.width));
-    let height = PREFERRED_HEIGHT.min(f32::from(available.height));
+        visible.map_or(size(px(SETTINGS_MIN_WIDTH), px(SETTINGS_MIN_HEIGHT)), |bounds| bounds.size);
     let minimum = size(
-        px(MIN_WIDTH.min(f32::from(available.width))),
-        px(MIN_HEIGHT.min(f32::from(available.height))),
+        px(SETTINGS_MIN_WIDTH.min(f32::from(available.width))),
+        px(SETTINGS_MIN_HEIGHT.min(f32::from(available.height))),
     );
-    let preferred = size(px(width), px(height));
-    let saved = crate::settings::state::load().geometry;
-    let bounds =
-        saved.filter(|geometry| geometry.width >= 1040 && geometry.height >= 720).map_or_else(
-            || Bounds::centered(None, preferred, cx),
-            |geometry| {
-                let saved_width = logical_i32(geometry.width)
-                    .min(f32::from(available.width))
-                    .max(f32::from(minimum.width));
-                let saved_height = logical_i32(geometry.height)
-                    .min(f32::from(available.height))
-                    .max(f32::from(minimum.height));
-                let saved_size = size(px(saved_width), px(saved_height));
-                let Some(display) = visible else {
-                    return Bounds::centered(None, saved_size, cx);
-                };
-                let left = f32::from(display.origin.x);
-                let top = f32::from(display.origin.y);
-                let right = left + f32::from(display.size.width) - saved_width;
-                let bottom = top + f32::from(display.size.height) - saved_height;
-                let x = logical_i32(geometry.x).clamp(left, right.max(left));
-                let y = logical_i32(geometry.y).clamp(top, bottom.max(top));
-                Bounds::new(point(px(x), px(y)), saved_size)
-            },
-        );
+    let saved = crate::settings::state::load()
+        .geometry
+        .filter(|geometry| saved_settings_geometry_fits(*geometry, available));
+    let bounds = saved.map_or_else(
+        || Bounds::centered(None, minimum, cx),
+        |geometry| {
+            let saved_width = logical_i32(geometry.width);
+            let saved_height = logical_i32(geometry.height);
+            let saved_size = size(px(saved_width), px(saved_height));
+            let Some(display) = visible else {
+                return Bounds::centered(None, saved_size, cx);
+            };
+            let left = f32::from(display.origin.x);
+            let top = f32::from(display.origin.y);
+            let right = left + f32::from(display.size.width) - saved_width;
+            let bottom = top + f32::from(display.size.height) - saved_height;
+            let x = logical_i32(geometry.x).clamp(left, right.max(left));
+            let y = logical_i32(geometry.y).clamp(top, bottom.max(top));
+            Bounds::new(point(px(x), px(y)), saved_size)
+        },
+    );
     match cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -3175,6 +3173,25 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
             None
         }
     }
+}
+
+/// Whether persisted geometry is already usable in GPUI's logical coordinate
+/// space.
+///
+/// The retired settings app wrote physical Retina dimensions such as
+/// 3520×2424. Clamping those numbers to a logical work area makes the window
+/// effectively full-screen, so an out-of-area size is migrated to the compact
+/// default instead of being interpreted as a user resize.
+fn saved_settings_geometry_fits(
+    geometry: crate::settings::state::SettingsWindowGeometry,
+    available: Size<Pixels>,
+) -> bool {
+    let width = logical_i32(geometry.width);
+    let height = logical_i32(geometry.height);
+    width >= SETTINGS_MIN_WIDTH
+        && height >= SETTINGS_MIN_HEIGHT
+        && width <= f32::from(available.width)
+        && height <= f32::from(available.height)
 }
 
 fn logical_i32(value: i32) -> f32 {

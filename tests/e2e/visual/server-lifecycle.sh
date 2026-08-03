@@ -17,7 +17,8 @@
 #      client is left holding — and it must reach the status line, not just the
 #      log.
 #   2. AUTOSTART. With a service manager that can actually start the server, the
-#      same refused connect must end in a live connection and a painting window.
+#      same refused connect must end in a live connection, an initial shell, and
+#      a painting window.
 #      Systemd is not available in a container, so `systemctl` is shimmed by a
 #      script that starts the real `scribe-server` — the shim stands in for the
 #      service manager only. Everything the client does around it (the refused
@@ -172,11 +173,22 @@ fi
 if ! wait_for_pattern "$PHASE2_LOG" "connected to scribe-server" 40; then
     fail "the autostarted server never accepted the client's connection"
 fi
-# A freshly autostarted server owns no sessions, so the proof that the client is
-# really talking to it is the completed handshake: `Welcome` carries the window
-# id the server just minted for this connection.
+# A freshly autostarted server owns no sessions. `Welcome` proves the handshake
+# completed, then the empty authoritative list must make this fresh window ask
+# for and adopt exactly one initial login shell.
 if ! wait_for_pattern "$PHASE2_LOG" "welcome: adopted window" 40; then
     fail "the client never completed a handshake with the autostarted server"
+fi
+if ! wait_for_pattern "$PHASE2_LOG" "requested initial shell session" 40; then
+    fail "the fresh client never requested its initial shell"
+fi
+[ "$(plain_log "$PHASE2_LOG" | grep -cF "requested initial shell session")" -eq 1 ] \
+    || fail "the fresh client requested more than one initial shell"
+if ! wait_for_pattern "$PHASE2_LOG" "opened a new tab" 40; then
+    fail "the server never created the fresh client's initial shell"
+fi
+if ! wait_for_pattern "$PHASE2_LOG" "pane adopted a session" 40; then
+    fail "the fresh client never adopted its initial shell into the window"
 fi
 [ -S "$SOCKET" ] || fail "no server socket exists after the autostart"
 
@@ -190,7 +202,7 @@ done
 xdotool windowactivate --sync "$WID" 2>/dev/null || true
 sleep 1
 scrot -o /output/00-autostarted.png
-echo "PHASE 2 PASS: the client autostarted a server, connected, and painted window $WID"
+echo "PHASE 2 PASS: the client autostarted a server, opened a shell, and painted window $WID"
 plain_log "$PHASE2_LOG" | grep -F "connected to scribe-server" | tail -1
 
 echo ""

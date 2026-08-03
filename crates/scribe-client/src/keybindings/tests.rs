@@ -110,6 +110,20 @@ fn matches_only_on_key_down() {
     assert!(!kb.matches(&input_for(&kb, KeyState::Released)));
 }
 
+#[test]
+fn shifted_symbol_matches_when_gpui_keeps_shift_set() {
+    let kb = Keybinding::parse("cmd+shift+]").expect("valid");
+    let input = KeyInput {
+        token: KeyToken::Char('}'),
+        base: Some('}'),
+        text: Some("}".into()),
+        modifiers: Modifiers { platform: true, shift: true, ..Modifiers::default() },
+        location: KeyLocation::Standard,
+        state: KeyState::Pressed,
+    };
+    assert!(kb.matches(&input));
+}
+
 /// The whole point of the port: every named action must still resolve. Drives
 /// each action from its default binding and asserts the exact intercepted
 /// action — 42 layout actions plus palette/settings/find plus 7 terminal
