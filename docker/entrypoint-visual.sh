@@ -309,12 +309,11 @@ case "$VISUAL_APP" in
         # Shared-pane rig: create the session FIRST, then start the client as a
         # second participant in the daemon's window.
         #
-        # The default order below (client first, session second) leaves the
-        # client blind: the server sends `SessionCreated` only to the connection
-        # that asked for it, and `ListSessions` answers a window with its OWN
-        # sessions, so a client that got its own window renders an empty grid
-        # while the daemon's pane runs untouched. Handing the client the
-        # daemon's window id closes that gap without evicting the daemon: under
+        # The default order below (client first, session second) leaves each
+        # participant on a different pane: the client bootstraps its own shell,
+        # while the server sends the daemon's later `SessionCreated` only to the
+        # connection that asked for it. Handing the client the daemon's window
+        # id closes that gap without evicting the daemon: under
         # `sharing_mode = "free_for_all"` the server resolves a non-takeover
         # claim of a connected window as an ADDITIVE join, so both processes
         # stay attached to the same pane — the client renders and types into it,
@@ -343,6 +342,9 @@ case "$VISUAL_APP" in
             wait_for_log "attaching to session" 20 \
                 || echo "WARNING: client never logged an attach" >&2
         else
+            # Most visual scripts drive the daemon's off-window pane. The
+            # client has already bootstrapped its own visible login shell; use
+            # SCRIBE_SHARED_PANE when both sides must observe the same session.
             SESSION=$(scribe-test session create)
             export SESSION
         fi

@@ -48,6 +48,9 @@ SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
 TITLEBAR_HEIGHT=34
 WINDOW_CONTROLS_WIDTH=120
 GEAR_WIDTH=34
+COMPACT_SETTINGS_WIDTH=1040
+COMPACT_SETTINGS_HEIGHT=720
+SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"
 
 TERM_X=0
 TERM_Y=0
@@ -129,6 +132,16 @@ settings_ink() {
     printf '%s' "${value%.*}"
 }
 
+settings_size() {
+    local wid info w h
+    wid=$(list_settings_windows | tail -1)
+    [ -z "$wid" ] && { printf '0 0'; return; }
+    info=$(xwininfo -id "$wid")
+    w=$(printf '%s\n' "$info" | awk '/^  Width:/ { print $2 }')
+    h=$(printf '%s\n' "$info" | awk '/^  Height:/ { print $2 }')
+    printf '%s %s' "$w" "$h"
+}
+
 send_keys() {
     xdotool key --clearmodifiers "$@"
     sleep 0.5
@@ -178,6 +191,19 @@ focus_terminal
 if [ "$(count_settings_windows)" -ne 0 ]; then
     fail "PHASE 0 FAIL: a settings window was already open before any entry point ran"
 fi
+# Reproduce the old macOS settings app's physical-pixel Retina geometry. GPUI
+# consumes logical coordinates, so accepting this as-is would clamp the window
+# to almost the entire display instead of using the compact first-open size.
+mkdir -p "$SETTINGS_STATE_DIR"
+cat >"$SETTINGS_STATE_DIR/settings_state.toml" <<'TOML'
+open = false
+
+[geometry]
+x = 296
+y = 78
+width = 3520
+height = 2424
+TOML
 shot /output/00-terminal-only.png
 echo "PHASE 0 PASS: terminal window up (${TERM_W}x${TERM_H}), no settings window"
 
@@ -193,12 +219,16 @@ fi
 if ! wait_for_log_growth "opened the settings window" "$OPENS_BEFORE" 10; then
     fail "PHASE 1 FAIL: the chord never reached open_or_focus_settings"
 fi
+SETTINGS_SIZE=$(settings_size)
+if [ "$SETTINGS_SIZE" != "$COMPACT_SETTINGS_WIDTH $COMPACT_SETTINGS_HEIGHT" ]; then
+    fail "PHASE 1 FAIL: settings opened at $SETTINGS_SIZE, expected compact ${COMPACT_SETTINGS_WIDTH}x${COMPACT_SETTINGS_HEIGHT}"
+fi
 shot /output/01-settings-open.png
 INK=$(settings_ink /output/01-settings-open.png)
 if [ "$INK" -lt "$SETTINGS_INK_MIN" ]; then
     fail "PHASE 1 FAIL: the settings window painted $INK px (min $SETTINGS_INK_MIN)"
 fi
-echo "PHASE 1 PASS: ctrl+, opened the settings window (ink $INK)"
+echo "PHASE 1 PASS: ctrl+, opened the compact $SETTINGS_SIZE settings window (ink $INK)"
 
 # ── Phase 2: the chord again raises it, never duplicates it ───────
 # The retained `WindowHandle` is the deduplication. A second open would leave

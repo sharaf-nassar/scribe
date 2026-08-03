@@ -436,7 +436,7 @@ Screenshots are taken full-screen because a Vulkan surface may not be readable p
 
 `SCRIBE_SHARED_PANE=1` (`just e2e-visual-shared <script>`) is how a visual test gets a live pane that BOTH the GPUI client and `scribe-test` can see. Without it the client is blind to the harness's session and the harness is blind to the client's.
 
-By default `docker/entrypoint-visual.sh` launches the client and only then runs `scribe-test session create`. The server sends `SessionCreated` solely to the connection that asked for it, and  answers a window with its OWN sessions (falling back to unowned ones), so the running client never learns the daemon's session exists — it renders an empty grid while the pane the test drives runs untouched. That is what made the emoji check a false pass and left the reconnect capture unasserted.
+By default `docker/entrypoint-visual.sh` launches the client, which bootstraps its own visible login shell, and only then runs `scribe-test session create`. The server sends `SessionCreated` solely to the connection that asked for it, so the client and daemon still cannot see each other's sessions: the window renders one pane while the test drives another. Before fresh-window bootstrap, that window was an empty grid, which made the emoji check a false pass and left the reconnect capture unasserted.
 
 Under `SCRIBE_SHARED_PANE=1` the entrypoint instead seeds `[remote] sharing_mode = "free_for_all"` into `config.toml` *before* the server starts, creates the session first, reads the daemon's window id with `scribe-test daemon window-id`, and passes it to the client as `SCRIBE_JOIN_WINDOW`. The client's `Hello` names that window, the server resolves it as a local additive share join (), and the client's `AttachSessions` ADDS its sink alongside the daemon's. Both stay attached: the window under the camera shows the pane, and `scribe-test send` / `wait-output` / `snapshot` still work against it. `free_for_all` (rather than `shared_single_typist`) is the mode because both participants must be able to type — the harness through `KeyInput`, the user's simulated input through the client.
 
@@ -472,7 +472,7 @@ It runs on the . The script used to open with a phase 0 that killed the client, 
 
 `tests/e2e/visual/settings-entry.sh` (`just e2e-visual-settings-entry`) is the app-level oracle for the `settings` parity row: it drives the running terminal window and asserts a second top-level window really maps (see ).
 
-The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. Four phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
+The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. Four phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. Before the first open, the test seeds a 3520×2424 physical-pixel legacy geometry and requires the mapped client to use the compact 1040×720 fallback instead of filling the work area. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
 
 Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin, so a frame-relative gear click would land in the window manager's own title bar. The gear offset is derived from the titlebar's fixed 34px band and its 34/40px buttons, so a titlebar layout change fails the phase rather than missing silently.
 
@@ -481,6 +481,12 @@ Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparen
 `tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
 
 Both chords were claimed by  before the binding dispatcher ever saw them, so only the live window can prove the fix. The script presses `ctrl+shift+q` and waits for the `closing the active tab` line that  alone writes, then presses `ctrl+shift+n` and requires both the `opened a new terminal window` line and a second mapped X11 window — a log line alone would not distinguish "the action ran" from "a window actually appeared". A third phase opens the close dialog on its relocated `ctrl+shift+d` and asserts the frame really repainted, so moving the overlay off `close_tab`'s default did not strand the surface. It reuses the session-adoption preamble documented under .
+
+### Tab switching is live
+
+`tests/e2e/visual/tab-switching.sh` proves live tab switching and post-click typing by driving keyboard shortcuts and titlebar clicks in a two-tab window, then requiring matching `AttachSessions` frames plus typed output from the active session.
+
+The wire assertion matters because the first symptom was not "the underline failed to move" but "the running pane never switched", and the second was subtler: after a titlebar click, the right session was attached but typing stayed trapped in the chrome. The script starts from the shared-pane rig so the first session id is known up front, opens a second tab through the client's own `ctrl+shift+t`, then requires `ctrl+Prior` / `ctrl+Next` and two titlebar clicks to produce `AttachSessions` for the expected session ids in turn. After each titlebar click it immediately types an `echo` into the active pane without re-focusing the terminal and waits for that output, proving the shell not only switched sessions but also restored terminal focus after pointer activation.
 
 ### Pane and workspace layout is live
 
@@ -536,7 +542,7 @@ Multi-machine sharing needs a second machine, so the run interposes  (`scribe-te
 
 The script walks the surface in five phases, screenshotting each: a `ShareRoster` raises the roster panel and the presence badge; a `ControlRequested` opens the modal prompt, swallows an ordinary keystroke, and Esc puts `ControlGrant { accept: false }` on the wire; a roster handing control to the remote peer makes the client a viewer, whose keystroke is swallowed and raises the take-control hint from which Enter puts `ControlClaim` on the wire; `ControlDenied` posts its notice; and `ShareEnded` tears the surfaces down. The wire assertions read the recorded JSONL, so they prove the client emitted the frames rather than that a test constructed them.
 
-Keystroke *suppression* is asserted from the client log rather than from an absent `KeyInput`: the GPUI client cannot create its own first session yet (`CreateWorkspace` is missing, FU-6), so its window holds no PTY in this rig and would emit no `KeyInput` either way. `run_share_key` logs every swallowed key for exactly that reason, and the absent-`KeyInput` check is kept alongside it as a regression guard.
+Keystroke *suppression* is asserted from both the client log and an absent `KeyInput`. A fresh GPUI window now bootstraps a real first PTY, so the wire assertion is meaningful rather than vacuously true; `run_share_key` logs every swallowed key as the independent client-side oracle.
 
 ### AI task labels rename the tab
 
@@ -734,7 +740,7 @@ The dropped path deliberately holds a space and a single quote, because survivin
 
 Phase 1 plants a bound-but-unlistened socket — exactly what a crashed server leaves, so `connect` gets `ECONNREFUSED` rather than `ENOENT` — with no `systemctl` on `PATH`, so the autostart cannot succeed and the diagnosis is what the client is left holding. It asserts the client names the stale socket, tries the autostart anyway, and carries the diagnosis into the status-line failure rather than reporting a bare exit code.
 
-Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` that starts the real `scribe-server`. The shim stands in for the service manager only — systemd does not exist in a container — while the refused connect, the decision to start, the retry loop, the handshake and the mapped window are all the shipped code path. It asserts the client reaches `connected to scribe-server`, completes a `Welcome` handshake with the server it just started, and maps a painting window.
+Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` that starts the real `scribe-server`. The shim stands in for the service manager only — systemd does not exist in a container — while the refused connect, the decision to start, the retry loop, the handshake and the mapped window are all the shipped code path. It asserts the client reaches `connected to scribe-server`, completes a `Welcome` handshake, requests exactly the fresh window's initial shell, adopts the created session into its pane, and maps a painting window.
 
 ### Window chrome bands stay on screen
 
@@ -1228,6 +1234,10 @@ A running server at the same path that started after the installed binary's modi
 ### Unknown timestamps are not stale
 
 When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
+
+### macOS peer PID drives stale refresh
+
+The macOS socket probe reads `LOCAL_PEERPID`, allowing a connected client to identify the actual server process and refresh a stale app-bundle binary instead of silently accepting it.
 
 ### Missing socket is named as no server
 

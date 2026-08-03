@@ -19,14 +19,16 @@ use std::{
 };
 
 use gpui::{
-    App, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role, ScrollWheelEvent,
-    Size, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
+    App, AppContext as _, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
+    ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*,
+    px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client::animation::AnimationSettings;
+use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client::clipboard::{
@@ -119,7 +121,7 @@ use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{TabBarColors, badge_label, context_suffix},
     tab_session::{TabEntry, TabSessions},
-    titlebar::{TitlebarEvent, TitlebarView},
+    titlebar::{TabActivationSource, TitlebarEvent, TitlebarView},
 };
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
@@ -323,6 +325,10 @@ struct Shared {
     /// and empty session list proves the server lost everything, which is the
     /// one case a persisted restore snapshot may be replayed into.
     session_list_seen: Arc<AtomicBool>,
+    /// One-shot fresh-window bootstrap. The IPC reader owns the decision and
+    /// request because the first `SessionList` can arrive before GPUI builds
+    /// the view; the view later claims the staged binding for restore state.
+    initial_session: Arc<InitialSessionBootstrap>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
     ai: Arc<Mutex<AiChrome>>,
     /// Server-reported terminal chrome (CWD, git branch, session context, env
@@ -388,6 +394,38 @@ struct Shared {
     /// banner from it, suppresses input while that banner is up, and drains the
     /// automation queue on its lifecycle tick.
     remote: Arc<Mutex<RemoteChrome>>,
+}
+
+/// State shared across the IPC reader and GPUI view for a fresh window's first
+/// login shell.
+struct InitialSessionBootstrap {
+    /// Armed only when startup has no cold snapshot. The first authoritative
+    /// list consumes it even when non-empty, preventing later reconnects from
+    /// creating a surprise session after the original sessions disappear.
+    armed: AtomicBool,
+    /// Launch metadata staged before `CreateSession` is enqueued. The view
+    /// claims it once `SessionCreated` adds the new tab, preserving the launch
+    /// id used by environment-envelope and cold-restart persistence.
+    binding: Mutex<Option<LaunchBinding>>,
+}
+
+impl InitialSessionBootstrap {
+    fn new(armed: bool) -> Self {
+        Self { armed: AtomicBool::new(armed), binding: Mutex::new(None) }
+    }
+
+    /// Consume the one-shot decision on the first list for a connection.
+    fn claim(&self, first_on_connection: bool, session_count: usize) -> bool {
+        first_on_connection && self.armed.swap(false, Ordering::AcqRel) && session_count == 0
+    }
+
+    /// Prevent a shared-window or remote-window claim from creating anything.
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+        if let Ok(mut binding) = self.binding.lock() {
+            *binding = None;
+        }
+    }
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -915,6 +953,12 @@ struct TerminalView {
     _bounds_observer: Subscription,
 }
 
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.root.clone()
+    }
+}
+
 impl TerminalView {
     /// Start the X11 active-window guard from the live window.
     ///
@@ -1291,14 +1335,20 @@ impl TerminalView {
                     ctx.notify();
                 }
             }
+            TitlebarEvent::SelectTab { index, source } => {
+                let index = *index;
+                let source = *source;
+                this.switch_tab(move |tabs| tabs.select(index), ctx);
+                if source == TabActivationSource::Pointer {
+                    this.defer_terminal_focus(ctx);
+                }
+            }
+            TitlebarEvent::CloseTab(index) => this.close_tab_at(*index),
             // The tab-strip and window-control events come from the same view
             // but are their own reachability rows, outside this entry point.
             // They are named rather than folded into a `_` arm so a new
             // titlebar event fails to compile here.
-            TitlebarEvent::SelectTab(_)
-            | TitlebarEvent::CloseTab(_)
-            | TitlebarEvent::WindowControl(_)
-            | TitlebarEvent::Equalize => {}
+            TitlebarEvent::WindowControl(_) | TitlebarEvent::Equalize => {}
         })
         .detach();
         bar
@@ -3168,6 +3218,12 @@ impl TerminalView {
         let Ok(tabs) = self.shared.tabs.lock() else { return };
         let live: Vec<SessionId> = tabs.tabs().iter().map(|tab| tab.session_id).collect();
         drop(tabs);
+        if !live.is_empty()
+            && let Ok(mut pending) = self.shared.initial_session.binding.lock()
+            && let Some(binding) = pending.take()
+        {
+            self.restore.requested.push_front(binding);
+        }
         for session_id in &live {
             if self.restore.bindings.contains_key(session_id) {
                 continue;
@@ -3552,6 +3608,20 @@ impl TerminalView {
         self.sync_tabs(cx);
     }
 
+    /// Hand keyboard focus back to the terminal after a pointer tab action.
+    ///
+    /// The click legitimately focuses the titlebar control first; deferring the
+    /// terminal focus until after that event settles matches standard terminal
+    /// behavior where a mouse tab switch immediately leaves typing live.
+    fn defer_terminal_focus(&self, cx: &mut Context<Self>) {
+        let focus = self.focus.root.clone();
+        cx.with_window(cx.entity_id(), move |window, cx| {
+            window.defer(cx, move |window, cx| {
+                window.focus(&focus, cx);
+            });
+        });
+    }
+
     /// Point the client at `session_id`: attach it, announce the client size,
     /// and subscribe so the switched-to tab streams and reports its own state.
     ///
@@ -3586,8 +3656,28 @@ impl TerminalView {
         let Some(session_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_session()) else {
             return;
         };
+        self.close_session(session_id, "close tab dropped");
+    }
+
+    /// Close the tab at `index`, if it exists.
+    fn close_tab_at(&self, index: usize) {
+        let Some(session_id) = self
+            .shared
+            .tabs
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.tabs().get(index).map(|tab| tab.session_id))
+        else {
+            return;
+        };
+        self.close_session(session_id, "tab close dropped");
+    }
+
+    /// Close `session_id`, logging the request so UI and shortcut paths share
+    /// the same IPC edge and diagnostics.
+    fn close_session(&self, session_id: SessionId, warning: &str) {
         if let Err(error) = self.sink.close_session(session_id) {
-            tracing::warn!(%error, "close tab dropped: IPC writer closed");
+            tracing::warn!(%error, "{warning}: IPC writer closed");
             return;
         }
         // The strip is pixels only, and the chord that gets here was shadowed
@@ -3607,10 +3697,9 @@ impl TerminalView {
     /// and grid are independent of this one's.
     fn open_new_window(&mut self, cx: &mut Context<Self>) {
         let terminal_size = self.terminal_size;
-        let (shared, sink) = start_window_backend(terminal_size);
-        // A deliberately opened window starts blank. Claiming a restore entry
-        // here would reopen some *other* crashed window's panes inside it, which
-        // is why the winit client skipped restore for `--window-id` launches.
+        let (shared, sink) = start_window_backend(terminal_size, true);
+        // A deliberately opened window starts fresh rather than claiming a
+        // restore entry, then its backend creates its own first login shell.
         open_window(
             cx,
             &shared,
@@ -6205,6 +6294,11 @@ impl Render for TerminalView {
         // than the configured value.
         div()
             .track_focus(&self.focus.root)
+            .on_action(cx.listener(
+                |view, _: &CloseWindow, _window, ctx| {
+                    view.request_window_close(ctx);
+                },
+            ))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
                 // Claim every key the window sees, at every level below.
                 //
@@ -6497,7 +6591,10 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
 ///
 /// Called once from [`main`] for the startup window and again for every
 /// [`LayoutAction::NewWindow`], so the two paths cannot drift.
-fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
+fn start_window_backend(
+    terminal_size: TerminalSize,
+    bootstrap_initial_session: bool,
+) -> (Shared, IpcSink) {
     let shared = Shared {
         panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
         attached: Arc::new(Mutex::new(HashSet::new())),
@@ -6508,6 +6605,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
+        initial_session: Arc::new(InitialSessionBootstrap::new(bootstrap_initial_session)),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
@@ -6554,6 +6652,8 @@ fn main() -> std::process::ExitCode {
     // Arm the perf rig's runtime probe before anything can paint or type; it
     // stays inert unless `SCRIBE_PERF_PROBE` names a report path.
     scribe_common::perf_probe::init_from_env();
+    // @lat: [[client#IPC Client#Server Lifecycle]]
+    scribe_client::hook_setup::repair_ai_hooks_on_startup();
 
     // `scribe-client --settings` opens (or focuses) the settings window instead
     // of the terminal shell. The singleton absorbs the retired settings app's
@@ -6569,7 +6669,8 @@ fn main() -> std::process::ExitCode {
     // the window is opened at.
     let cold_start = ColdStart::resolve();
     let terminal_size = default_terminal_size();
-    let (shared, sink) = start_window_backend(terminal_size);
+    let bootstrap_initial_session = cold_start.snapshot.is_none();
+    let (shared, sink) = start_window_backend(terminal_size, bootstrap_initial_session);
 
     application().run(move |cx: &mut App| {
         // Picker probes use Tokio networking while all view mutations return
@@ -6585,7 +6686,28 @@ fn main() -> std::process::ExitCode {
         // screenshots stay byte-identical — under the E2E determinism path.
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
-        open_window(cx, &shared, &sink, terminal_size, cold_start);
+        app_shortcuts::register(cx);
+        if let Some(terminal_window) = open_window(cx, &shared, &sink, terminal_size, cold_start) {
+            // A settings window can be active in this process, so Quit is an
+            // app-level action rather than a listener on the terminal root.
+            // It still lands on the terminal's server-owned close workflow.
+            cx.on_action(move |_: &Quit, cx| {
+                // GPUI removes the active window from its window table while
+                // dispatching an action through it. Updating the handle here
+                // would therefore fail every time; defer until dispatch has
+                // returned the window to the table.
+                cx.defer(move |cx| {
+                    if terminal_window
+                        .update(cx, |view, _window, ctx| {
+                            view.request_window_close(ctx);
+                        })
+                        .is_err()
+                    {
+                        tracing::warn!("quit shortcut ignored: terminal window is unavailable");
+                    }
+                });
+            });
+        }
         cx.activate(true);
     });
     std::process::ExitCode::SUCCESS
@@ -6643,6 +6765,8 @@ fn run_settings() {
         scribe_client::fonts::register_embedded_fonts(cx);
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
+        app_shortcuts::register(cx);
+        cx.on_action(|_: &Quit, cx| cx.quit());
         // The handle is only useful to a caller that can be asked twice; this
         // process exists to show one settings window and exit with it.
         open_settings_window(cx);
@@ -6661,7 +6785,7 @@ fn open_window(
     sink: &IpcSink,
     terminal_size: TerminalSize,
     cold_start: ColdStart,
-) {
+) -> Option<WindowHandle<TerminalView>> {
     let bounds = Bounds::centered(None, startup_window_size(cx), cx);
     // Restored geometry wins over the grid-derived startup size, and it is
     // applied at creation rather than after: GPUI takes the bounds (and the
@@ -6687,7 +6811,7 @@ fn open_window(
     // surface configure. Timing it separates the platform GPU bring-up floor
     // from Scribe's own startup work for the perf gate.
     let bringup_start = Instant::now();
-    if let Err(error) = cx.open_window(
+    match cx.open_window(
         WindowOptions {
             window_bounds: Some(window_bounds),
             // Set WM_NAME/_NET_WM_NAME to "Scribe" so the X11 visual-E2E harness
@@ -6713,7 +6837,11 @@ fn open_window(
             })
         },
     ) {
-        tracing::error!(%error, "failed to open GPUI window");
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::error!(%error, "failed to open GPUI window");
+            None
+        }
     }
 }
 
@@ -7096,6 +7224,7 @@ where
         Transport::Remote { window_id, takeover } => (*window_id, *takeover),
     };
     if let Some(window_id) = claim_window {
+        ctx.shared.initial_session.disarm();
         tracing::info!(%window_id, takeover, "claiming an existing window");
     }
     // Write the connection handshake directly before draining the shared
@@ -7154,6 +7283,7 @@ fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
+        initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
         update: Arc::clone(&ctx.shared.update),
         lifecycle: Arc::clone(&ctx.shared.lifecycle),
@@ -7614,6 +7744,8 @@ struct ReaderCtx {
     /// Latched by the first `SessionList`; see the `session_list_seen` field of
     /// `Shared`.
     session_list_seen: Arc<AtomicBool>,
+    /// One-shot first-shell state; see the `initial_session` field of `Shared`.
+    initial_session: Arc<InitialSessionBootstrap>,
     /// Feature-015 share state the reader folds roster and control notices into.
     share: Arc<Mutex<ShareChrome>>,
     /// Update availability / progress the centred status-bar CTA renders from.
@@ -8297,7 +8429,53 @@ fn on_session_list(
         reattach_visible_sessions(ctx, sessions)?;
     }
     let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
-    sync_tab_strip(ctx, sessions, attached)
+    sync_tab_strip(ctx, sessions, attached)?;
+    request_initial_session(ctx, sessions.len(), first_on_connection)
+}
+
+/// Create the login shell that makes a genuinely fresh window useful.
+///
+/// Cold-restart windows enter with the one-shot disarmed so their persisted
+/// launches remain the sole source of sessions. Existing-window claims are
+/// disarmed before `Hello`; a non-empty first list consumes the one-shot too,
+/// preserving server-owned sessions without adding another tab.
+fn request_initial_session(
+    ctx: &ReaderCtx,
+    session_count: usize,
+    first_on_connection: bool,
+) -> Result<(), String> {
+    if !ctx.initial_session.claim(first_on_connection, session_count) {
+        return Ok(());
+    }
+
+    let workspace_id = WorkspaceId::new();
+    let binding = restore_replay::new_shell_binding(None);
+    let launch_id = binding.launch_id.clone();
+    let mut pending = match ctx.initial_session.binding.lock() {
+        Ok(pending) => pending,
+        Err(_) => {
+            ctx.initial_session.armed.store(true, Ordering::Release);
+            return Err("initial-session binding mutex poisoned".to_owned());
+        }
+    };
+    *pending = Some(binding);
+    drop(pending);
+
+    if let Err(error) = ctx.sink.create_session(SessionLaunch {
+        workspace_id,
+        size: reader_attach_size(ctx),
+        cwd: None,
+        command: None,
+        ai_launch: None,
+        launch_id,
+    }) {
+        // The request never entered the ordered queue, so let the next
+        // connection retry rather than leaving this fresh window empty.
+        ctx.initial_session.armed.store(true, Ordering::Release);
+        return Err(error.to_string());
+    }
+    tracing::info!(%workspace_id, "requested initial shell session");
+    Ok(())
 }
 
 /// Reattach panes retained by the live window to a replacement server stream.
@@ -9250,6 +9428,33 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[lat.md/client#Client#GPUI Client Spike#Server Lifecycle Wiring]]
+    #[test]
+    fn fresh_window_bootstrap_is_claimed_exactly_once() {
+        let bootstrap = InitialSessionBootstrap::new(true);
+
+        assert!(bootstrap.claim(true, 0));
+        assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[test]
+    fn existing_sessions_consume_fresh_window_bootstrap() {
+        let bootstrap = InitialSessionBootstrap::new(true);
+
+        assert!(!bootstrap.claim(true, 1));
+        assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[test]
+    fn disabled_or_claimed_window_never_bootstraps_a_session() {
+        let cold_restore = InitialSessionBootstrap::new(false);
+        assert!(!cold_restore.claim(true, 0));
+
+        let claimed_window = InitialSessionBootstrap::new(true);
+        claimed_window.disarm();
+        assert!(!claimed_window.claim(true, 0));
+    }
 
     /// A snapshot whose rows each carry their own index, so a row that landed
     /// on the wrong line — or scrolled off into scrollback — is visible in the

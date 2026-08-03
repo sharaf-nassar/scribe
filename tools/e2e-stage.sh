@@ -35,6 +35,15 @@ if [[ -z "$newest_crates_commit" ]]; then
     exit 2
 fi
 
+file_mtime() {
+    local path="$1"
+    if stat -f '%m' "$path" >/dev/null 2>&1; then
+        stat -f '%m' "$path"
+        return
+    fi
+    stat -c '%Y' "$path"
+}
+
 source_dir="target/$profile"
 for binary in "$@"; do
     source_path="$source_dir/$binary"
@@ -44,7 +53,7 @@ for binary in "$@"; do
         exit 2
     fi
 
-    binary_mtime="$(stat -c %Y "$source_path")"
+    binary_mtime="$(file_mtime "$source_path")"
     if (( binary_mtime < newest_crates_commit )); then
         printf 'ERROR: required staging source %s is stale.\n' "$source_path" >&2
         printf 'It is older than the newest commit touching crates/.\n' >&2

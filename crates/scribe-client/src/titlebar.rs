@@ -45,11 +45,18 @@ pub enum WindowControlKind {
     Close,
 }
 
+/// How a tab activation was triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabActivationSource {
+    Pointer,
+    Keyboard,
+}
+
 /// Events the titlebar emits for the shell to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitlebarEvent {
-    /// A tab was clicked; make it active.
-    SelectTab(usize),
+    /// A tab was activated; make it active and react to the input source.
+    SelectTab { index: usize, source: TabActivationSource },
     /// A tab's close button was clicked.
     CloseTab(usize),
     /// A tab finished a drag-reorder from `from` to `to`.
@@ -73,6 +80,8 @@ struct DragState {
     grab_offset: f32,
     /// Current cursor X in window pixels.
     cursor_x: f32,
+    /// Whether the cursor actually crossed into another tab slot.
+    reordered: bool,
 }
 
 struct IconButton {
@@ -207,14 +216,14 @@ impl TitlebarView {
     }
 
     /// Make `index` the active tab and emit [`TitlebarEvent::SelectTab`].
-    pub fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub fn select(&mut self, index: usize, source: TabActivationSource, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             tab.is_active = i == index;
         }
-        cx.emit(TitlebarEvent::SelectTab(index));
+        cx.emit(TitlebarEvent::SelectTab { index, source });
         cx.notify();
     }
 
@@ -251,7 +260,7 @@ impl TitlebarView {
         }
         let tab_x = origin_x + px_units(source) * TAB_WIDTH;
         let grab_offset = cursor_x - tab_x;
-        self.drag = Some(DragState { source, origin_x, grab_offset, cursor_x });
+        self.drag = Some(DragState { source, origin_x, grab_offset, cursor_x, reordered: false });
         cx.notify();
     }
 
@@ -266,6 +275,7 @@ impl TitlebarView {
             self.move_tab(drag.source, target);
             cx.emit(TitlebarEvent::ReorderTab { from: drag.source, to: target });
             drag.source = target;
+            drag.reordered = true;
         }
         self.drag = Some(drag);
         cx.notify();
@@ -394,7 +404,7 @@ impl TitlebarView {
             return;
         }
         if matches!(key, "enter" | "space") {
-            self.select(index, cx);
+            self.select(index, TabActivationSource::Keyboard, cx);
         }
     }
 
@@ -625,10 +635,9 @@ impl TitlebarView {
                     this.begin_drag(index, cursor_x, origin_x, ctx);
                 }),
             )
-            .on_click(cx.listener(move |this, _, window, ctx| {
-                window.focus(&tab_focus, ctx);
-                if this.drag.is_none() {
-                    this.select(index, ctx);
+            .on_click(cx.listener(move |this, _, _window, ctx| {
+                if !this.drag.as_ref().is_some_and(|drag| drag.reordered) {
+                    this.select(index, TabActivationSource::Pointer, ctx);
                 }
             }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, ctx| {
@@ -896,7 +905,7 @@ mod tests {
     use gpui::{AppContext as _, Entity, TestAppContext};
     use scribe_common::theme::minimal_dark;
 
-    use super::{TitlebarEvent, TitlebarView};
+    use super::{TabActivationSource, TitlebarEvent, TitlebarView};
     use crate::tab_bar::{TabBarColors, TabData};
 
     /// Create a titlebar seeded with `n` tabs (the first active) and a captured
@@ -936,12 +945,25 @@ mod tests {
     #[gpui::test]
     fn select_activates_the_tab_and_emits(cx: &mut TestAppContext) {
         let (bar, log) = titlebar_with_tabs(3, cx);
-        bar.update(cx, |bar, cx| bar.select(2, cx));
+        bar.update(cx, |bar, cx| bar.select(2, TabActivationSource::Pointer, cx));
         bar.read_with(cx, |bar, _| {
             assert!(bar.tabs()[2].is_active);
             assert!(!bar.tabs()[0].is_active);
         });
-        assert_eq!(log.lock().unwrap().as_slice(), &[TitlebarEvent::SelectTab(2)]);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[TitlebarEvent::SelectTab { index: 2, source: TabActivationSource::Pointer }]
+        );
+    }
+
+    #[gpui::test]
+    fn keyboard_selection_emits_keyboard_source(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(3, cx);
+        bar.update(cx, |bar, cx| bar.select(1, TabActivationSource::Keyboard, cx));
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[TitlebarEvent::SelectTab { index: 1, source: TabActivationSource::Keyboard }]
+        );
     }
 
     // @lat: [[client#GPUI Titlebar#Closing a tab removes it and reactivates]]
@@ -972,12 +994,35 @@ mod tests {
         assert!(log.lock().unwrap().iter().any(|e| matches!(e, TitlebarEvent::ReorderTab { .. })));
     }
 
+    // @lat: [[client#GPUI Titlebar#A drag arm without reordering still selects]]
+    #[gpui::test]
+    fn drag_arm_without_reorder_keeps_click_selection_live(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(3, cx);
+        bar.update(cx, |bar, cx| {
+            bar.begin_drag(1, super::TAB_WIDTH + 4.0, 0.0, cx);
+            bar.update_drag(super::TAB_WIDTH + 20.0, cx);
+            assert!(bar.drag.as_ref().is_some_and(|drag| !drag.reordered));
+            if !bar.drag.as_ref().is_some_and(|drag| drag.reordered) {
+                bar.select(1, TabActivationSource::Pointer, cx);
+            }
+            bar.end_drag(cx);
+        });
+        bar.read_with(cx, |bar, _| {
+            assert!(bar.tabs()[1].is_active);
+            assert!(!bar.tabs()[0].is_active);
+        });
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[TitlebarEvent::SelectTab { index: 1, source: TabActivationSource::Pointer }]
+        );
+    }
+
     // @lat: [[client#GPUI Titlebar#Out-of-range interactions are no-ops]]
     #[gpui::test]
     fn out_of_range_interactions_are_noops(cx: &mut TestAppContext) {
         let (bar, log) = titlebar_with_tabs(2, cx);
         bar.update(cx, |bar, cx| {
-            bar.select(9, cx);
+            bar.select(9, TabActivationSource::Keyboard, cx);
             bar.close(9, cx);
             bar.begin_drag(9, 0.0, 0.0, cx);
         });
