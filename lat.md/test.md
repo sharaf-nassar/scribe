@@ -241,6 +241,34 @@ the newest commit touching `crates/`. Rebuild with `just build-release` for
 release images or `just build` for debug images before retrying the Docker
 recipe.
 
+### Debug Image Smoke and Diagnosis
+
+Debug-image validation uses named functional and visual smokes with expanded budgets for unoptimized binaries and lavapipe startup.
+
+Build the debug artifacts and both isolated image tags through the supported
+recipes:
+
+```bash
+just build
+just docker-func profile=debug
+just docker-visual profile=debug
+```
+
+Run the functional smoke with a 90-second budget and the visual titlebar smoke
+with a 240-second budget:
+
+```bash
+TEST_TIMEOUT=90 just e2e-func func/smoke.sh image=scribe-test-func-debug
+TEST_TIMEOUT=240 just e2e-visual visual/titlebar.sh image=scribe-test-visual-debug
+```
+
+For single-script diagnosis, reuse the debug image and enable trace logging.
+This exact functional rerun is verified:
+
+```bash
+TEST_TIMEOUT=90 RUST_LOG=trace just e2e-func func/smoke.sh image=scribe-test-func-debug
+```
+
 The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integration` tree at `/usr/local/share/scribe/shell-integration` so the in-container `scribe-server`'s  resolves them and injects `SCRIBE_SHELL_INTEGRATION=1` plus the per-shell rcfile/ZDOTDIR/XDG plumbing into every spawned PTY. Without this copy, the `shell-integration.sh` e2e test never sees the env var or the OSC marks the integration scripts emit.
 
 ### CLI Smoke E2E
