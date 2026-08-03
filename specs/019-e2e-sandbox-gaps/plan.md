@@ -509,9 +509,9 @@ check (P3, P7).
   clean, so a silently-excluded script fails the check; injected
   failure proves the aggregate's collection semantics; summary file schema
   matches Data Model; a `lat refs`/grep sweep confirms no stale mentions
-  of the old 12-script `e2e` list survive in docs. Covers the recipe half
+  of the pre-US-6 `e2e` list survive in docs. Covers the recipe half
   of US-6. Interim commits keep
-  the existing 12-script `e2e` green throughout (spec constraint).
+  the pre-US-6 `e2e` list green throughout (spec constraint).
 
 - **E2E CI workflows.** New `.github/workflows/e2e.yml`: blocking PR smoke
   (rust-cache, `cargo build --release`, `just docker-func docker-visual`,
@@ -589,7 +589,7 @@ Review-alignment fixes applied to this plan; one line per fix, tagged with its r
 - A3 (should): full-func-suite item enumerates the 8 previously-omitted scripts and adds an acceptance diff of `ls tests/e2e/func/*.sh` against the `e2e` recipe body.
 - A4 (should): `profile` recipe parameter constrained to exactly `release|debug`, erroring on anything else (Clarification Q5).
 - A5 (should): GPU/sentinel item notes the entrypoint-visual.sh `SCRIBE_E2E_SANDBOX=1` export as the sanctioned exception to the "visual image gains nothing new" constraint.
-- A6 (should): `lat refs`/grep sweep for stale recipe mentions (old --gpus invocations, 12-script e2e list) added to GPU/sentinel and full-suite acceptance.
+- A6 (should): `lat refs`/grep sweep for stale recipe mentions (old --gpus invocations and the legacy e2e list) added to GPU/sentinel and full-suite acceptance.
 - S1 (should): CI acceptance requires a second warm-cache PR run measured ≤25 min, names the `v1-rust` cargo cache prefix-key shared with release.yml, and commits buildx gha caching IN with named scopes (`e2e-func`, `e2e-visual`).
 - S2 (should): rollback notes added — GPU/sentinel (single-line reverts), full-suite (quarantine-bead policy extends to the local e2e list), CI (PR smoke demotable to non-blocking by config).
 - S3 (should): "bit-identical" acceptance replaced with capturing `docker images -q scribe-test-func:latest`, running `just docker-func profile=debug`, and asserting the release tag's image ID is unchanged.

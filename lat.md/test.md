@@ -186,6 +186,16 @@ Visual recipes omit GPU passthrough by default because lavapipe supplies determi
 
 Every recipe mounts `./tests/e2e` at `/tests:ro`, leaving `/output` as the only writable bind mount. Both entrypoints export `SCRIBE_E2E_SANDBOX=1`, and every func or visual shell script checks that sentinel before its first command and exits 99 when invoked directly on the host.
 
+`just e2e` builds the release functional image and runs all executable `tests/e2e/func/*.sh` scripts. Its explicit inventory includes AI launch, bash/zsh/fish launch, and CLI coverage plus every older geometry, lifecycle, input, and persistence script. A sorted inventory comparison aborts before the first container if a script is omitted. Only `env-persistence.sh` receives `SCRIBE_KEYRING=1`; the more expensive encrypted rows in the three AI shell scripts remain the focused opt-in commands documented below.
+
+`just e2e-all-visual` builds the release visual image and runs every executable `tests/e2e/visual/*.sh` test serially. `update-common.sh` is a non-executable sourced helper, not a test. Each test delegates to its specialized recipe when one exists, preserving that recipe's timeout, fixture, and config contract; remaining tests use `e2e-visual`. A sorted inventory-to-mapping comparison makes omissions fatal.
+
+The visual aggregate truncates `test-output/e2e-visual-summary.jsonl` at startup, then immediately appends one JSON object after each script. Rows contain `script`, `recipe`, `status` (`pass` or `fail`), integer `exit_code`, and integer `duration_s`. Failures do not stop later scripts, but any failure makes the aggregate exit nonzero after collection.
+
+E2E aggregate runs are serial-only on one host. Concurrent runs would race on shared `test-output/`, overwrite the single release/debug Docker image tags, and collide in the shared `/run/user/<uid>` Scribe socket namespace. Use separate hosts rather than parallel local invocations.
+
+No aggregate silently retries a failure. A repeatedly flaky script needs a quarantine bead recording evidence and an owner before any temporary exclusion; the inventory check must represent that quarantine explicitly so omission cannot masquerade as coverage. Current functional and visual inventories have no quarantined scripts.
+
 ## AI-Launch Harness Plumbing
 
 The functional harness can launch structured AI sessions and inspect the provider process without requiring a GPUI client.
