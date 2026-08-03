@@ -1,0 +1,16 @@
+Generated 2026-08-03 from the assigned worktree with:
+
+    cargo tree -p icy-sixel-decoder --edges normal --prefix none
+
+icy-sixel-decoder v0.5.0-scribe.1 (third_party/icy-sixel-decoder)
+
+Reverse production-use evidence from:
+
+    cargo tree -p scribe-test -i icy-sixel-decoder --edges normal --prefix none
+
+icy-sixel-decoder v0.5.0-scribe.1 (third_party/icy-sixel-decoder)
+scribe-test v0.0.0-dev (crates/scribe-test)
+
+The decoder has no normal, build, or target-specific dependencies. Therefore
+its tree contains no quantette, termwiz, libsixel, sixel-sys, or other C Sixel
+library. Regenerate and review this file whenever the fork manifest changes.

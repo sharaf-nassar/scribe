@@ -38,6 +38,7 @@ png_spike = { package = "png", version = "0.18.1" }
 flate2 = { version = "1.1.9", default-features = false, features = [
   "rust_backend",
 ] }
+icy-sixel-decoder = { path = "../../third_party/icy-sixel-decoder" }
 tracing.workspace = true
 nix.workspace = true
 

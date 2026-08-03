@@ -1,0 +1,18 @@
+[package]
+name = "icy-sixel-decoder"
+version = "0.5.0-scribe.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bounded decoder-only icy_sixel fork for Scribe"
+repository = "https://github.com/scribe-terminal/scribe"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Keep this vendored package standalone when a worktree is nested below
+# another checkout's workspace directory.
+[workspace]
