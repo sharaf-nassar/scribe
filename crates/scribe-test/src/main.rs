@@ -276,6 +276,10 @@ enum DaemonAction {
     /// Print the window ID the server assigned the daemon. Pass it to a client
     /// as `SCRIBE_JOIN_WINDOW` so it joins the daemon's window share.
     WindowId,
+    /// Print the most recent automation action, or `none` when empty.
+    LastAction,
+    /// Reset the recorded automation action to empty.
+    ClearAction,
     /// Internal: run the daemon in the foreground (not user-facing).
     Run,
 }
@@ -423,25 +427,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 }
             }
         }
-        Command::Daemon { action } => {
-            let rt =
-                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
-            match action {
-                DaemonAction::Start => {
-                    rt.block_on(daemon::start()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-                DaemonAction::Stop => {
-                    rt.block_on(daemon::stop()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-                DaemonAction::WindowId => {
-                    drop(rt);
-                    session::print_window_id()
-                }
-                DaemonAction::Run => {
-                    rt.block_on(daemon::run()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-            }
-        }
+        Command::Daemon { action } => run_daemon(&action),
         Command::Session { action } => run_session(action),
         Command::Send { session_id, data } => input::send(&session_id, &data),
         Command::Resize { session_id, cols, rows } => input::resize(&session_id, cols, rows),
@@ -483,6 +469,33 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::LanPeer(args) => run_lan_peer(args),
         Command::RemotePeer(args) => run_remote_peer(args),
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
+    }
+}
+
+fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    match action {
+        DaemonAction::Start => {
+            rt.block_on(daemon::start()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        DaemonAction::Stop => {
+            rt.block_on(daemon::stop()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        DaemonAction::WindowId => {
+            drop(rt);
+            session::print_window_id()
+        }
+        DaemonAction::LastAction => {
+            drop(rt);
+            daemon::print_last_action().map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        DaemonAction::ClearAction => {
+            drop(rt);
+            daemon::clear_last_action().map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        DaemonAction::Run => {
+            rt.block_on(daemon::run()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
     }
 }
 
