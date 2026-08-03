@@ -180,6 +180,16 @@ Visual recipes omit GPU passthrough by default because lavapipe supplies determi
 
 Every recipe mounts `./tests/e2e` at `/tests:ro`, leaving `/output` as the only writable bind mount. Both entrypoints export `SCRIBE_E2E_SANDBOX=1`, and every func or visual shell script checks that sentinel before its first command and exits 99 when invoked directly on the host.
 
+## AI-Launch Harness Plumbing
+
+The functional harness can launch structured AI sessions and inspect the provider process without requiring a GPUI client.
+
+`scribe-test session create --ai-provider <claude|codex>` populates the production `AiLaunchSpec`; `--ai-resume-mode <new|resume>` defaults to `new`, and `--ai-conversation-id <id>` supplies the resume target. `--cwd <path>` names the PTY working directory, while `--env-envelope-id <id>` overrides the harness-minted launch id for restore-envelope scenarios. Omitting every new flag preserves plain-session behavior.
+
+`tests/e2e/bin/claude` is the deterministic Claude stand-in already reachable through the functional container's `/tests/bin` PATH. It atomically writes `${SCRIBE_AI_STUB_OUT:-/tmp}/claude-invocation.txt`: argv one argument per line, an `--ENV--` delimiter, then locale-sorted environment entries. The stub writes only to the requested directory, never the read-only `/tests` mount.
+
+`tests/e2e/func/ai-launch-smoke.sh` requests a resumed Claude launch with a quoted conversation id, explicit cwd, and envelope override. It asserts the stub's exact argv, `PWD`, and daemon-reported envelope id.
+
 ## E2E Functional Tests
 
 Functional end-to-end tests that drive real sessions through the `scribe-test` harness and assert rendered output.

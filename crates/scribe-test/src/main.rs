@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use scribe_common::ai_state::AiProvider;
+use scribe_common::protocol::AiResumeMode;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -321,6 +323,21 @@ enum SessionAction {
         /// Rows the PTY is spawned at (needs `--cols`; default 80x24).
         #[arg(long)]
         rows: Option<u16>,
+        /// AI provider to launch through the server-owned shell path.
+        #[arg(long, value_enum)]
+        ai_provider: Option<AiProviderArg>,
+        /// Start a new AI conversation or resume an existing one.
+        #[arg(long, value_enum, requires = "ai_provider")]
+        ai_resume_mode: Option<AiResumeModeArg>,
+        /// Conversation identifier passed to a resumed AI launch.
+        #[arg(long, requires = "ai_provider")]
+        ai_conversation_id: Option<String>,
+        /// Working directory for the new session.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Existing environment-envelope identifier to restore.
+        #[arg(long)]
+        env_envelope_id: Option<String>,
     },
     /// Attach to an existing (detached) session.
     Attach {
@@ -344,6 +361,36 @@ enum SessionAction {
         /// Session ID to look up.
         session_id: String,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AiProviderArg {
+    Claude,
+    Codex,
+}
+
+impl From<AiProviderArg> for AiProvider {
+    fn from(provider: AiProviderArg) -> Self {
+        match provider {
+            AiProviderArg::Claude => Self::ClaudeCode,
+            AiProviderArg::Codex => Self::CodexCode,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AiResumeModeArg {
+    New,
+    Resume,
+}
+
+impl From<AiResumeModeArg> for AiResumeMode {
+    fn from(mode: AiResumeModeArg) -> Self {
+        match mode {
+            AiResumeModeArg::New => Self::New,
+            AiResumeModeArg::Resume => Self::Resume,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +490,23 @@ fn run(cli: Cli) -> Result<(), TestError> {
 /// table of one-line routes.
 fn run_session(action: SessionAction) -> Result<(), TestError> {
     match action {
-        SessionAction::Create { cols, rows } => session::create(cols, rows),
+        SessionAction::Create {
+            cols,
+            rows,
+            ai_provider,
+            ai_resume_mode,
+            ai_conversation_id,
+            cwd,
+            env_envelope_id,
+        } => session::create(session::CreateOptions {
+            cols,
+            rows,
+            ai_provider: ai_provider.map(Into::into),
+            ai_resume_mode: ai_resume_mode.map(Into::into),
+            ai_conversation_id,
+            cwd,
+            env_envelope_id,
+        }),
         SessionAction::Attach { session_id, cols, rows } => {
             session::attach(&session_id, cols, rows)
         }
