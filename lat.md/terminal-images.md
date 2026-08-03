@@ -214,7 +214,7 @@ ownership, evidence schema, and remaining production work.
 
 The vendored decoder makes Sixel rasterization interruptible and fallible at every untrusted growth boundary without exposing partial images.
 
-[[third_party/icy-sixel-decoder/src/lib.rs#DecodeLimits]] vendors the decoder
+[[third_party/icy-sixel-decoder/src/lib.rs#decode_sixel]] vendors the decoder
 concepts from `icy_sixel 0.5.0`, crates.io SHA-256
 `85518b9086bf01117761b90e7691c0ef3236fa8adfb1fb44dd248fe5f87215d5`,
 at upstream revision `998cbb2c6d8ed5272f9cc4702a4660778972bf3f`.
@@ -222,7 +222,8 @@ at upstream revision `998cbb2c6d8ed5272f9cc4702a4660778972bf3f`.
 source URL, exact license texts, fork delta, excluded code, and Scribe
 maintainer ownership for CVE and upstream-release review.
 
-`DecodeLimits` carries the frozen 4096-axis, 16,777,216-pixel, 67,108,864-byte
+[[crates/scribe-image-decode/src/lib.rs#DecodeBudget|DecodeBudget]] carries the
+shared frozen 4096-axis, 16,777,216-pixel, 67,108,864-byte
 RGBA, 134,217,728-work-unit, absolute monotonic deadline, and 4096-unit check
 interval boundaries. Caller hooks provide cooperative cancellation and an
 allocation-accounting veto. Every dimension/add/multiply and canvas offset is
@@ -239,8 +240,8 @@ The fork preserves raster attributes, repeat, `$`/`-`, 256 private palette
 registers, RGB/HLS definitions, least-significant-bit sixel rows, and opaque
 `P2=0/2` versus transparent `P2=1` backgrounds. Encoder and quantizer source,
 `quantette`, unsafe/SIMD fills, full terminal parsers such as termwiz, and C
-Sixel libraries are absent. `DEPENDENCY-TREE.txt` records the dependency-free
-normal tree and its `scribe-test` reverse edge.
+Sixel libraries are absent. `DEPENDENCY-TREE.txt` records the shared
+Scribe-owned budget dependency and its `scribe-test` reverse edge.
 
 ## Bounded Sixel Decoder Verification
 
@@ -258,6 +259,72 @@ The run atomically writes
 version, source revision/checksum/licenses, explicit exclusions, frozen limits,
 typed outcomes, and an `all_passed` aggregate. Invoke it only through
 `just e2e-func terminal-image-sixel-decoder.sh` after rebuilding the functional
+Docker image.
+
+## Shared Decode Budget
+
+Kitty and Sixel charge one caller-owned cooperative budget, preventing either decoder from weakening work, cancellation, deadline, or allocation policy.
+
+[[crates/scribe-image-decode/src/lib.rs#DecodeBudget]] owns cumulative work,
+the next 4096-unit observation boundary, an absolute monotonic deadline,
+caller cancellation and allocation hooks, and peak live-allocation evidence.
+Checked work overflow, hook denial, cancellation, and deadline expiry return
+typed payload-free errors. The Sixel and PNG forks use this exact type rather
+than independently approximating the frozen interval.
+
+## Bounded Kitty Normalization
+
+Kitty direct payloads become canonical RGBA only after exact chunk, base64, transport, compression, dimension, and format validation.
+
+[[crates/scribe-common/src/kitty_decode.rs#KittyTransfer]] rejects every
+indirect transport before allocation, caps each 4096-byte chunk and cumulative
+chunk/encoded/decoded counts, requires exact RFC 4648 padding boundaries, and
+drops encoded bytes after each chunk. Optional RFC 1950 data uses low-level
+`flate2 1.1.9` with 4096-byte caller storage, counter-derived input/output work,
+projected-output checks, fallible growth, and no trailing compressed bytes.
+
+Raw `f=24` and `f=32` require exact checked `s*v*channels` length before the
+canonical allocation; RGB conversion writes opaque alpha. `f=100` accepts only
+a PNG signature and delegates to the bounded decoder fork. Completed results
+retain width, height, canonical RGBA, alpha metadata, and safe counts only;
+base64, compressed data, paths, URLs, resource names, and partial results never
+escape normalization.
+
+## Bounded Kitty PNG Decoder
+
+The decoder-only PNG fork retains static PNG semantics while exposing every untrusted allocation and work boundary to Scribe.
+
+[[third_party/image-png-decoder/src/lib.rs#decode_png]] is pinned to `png
+0.18.1`, crates.io SHA-256
+`60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61`,
+at upstream revision `2a3f980245e3ae38b82ade96533e7b450e8477bb`.
+The adjacent README, exact MIT/Apache licenses, and dependency tree record
+provenance, fork delta, exclusions, pure-Rust dependencies, and Scribe CVE and
+upstream-update ownership.
+
+The fork validates signature, chunk order/length/CRC, dimensions, color/depth,
+IDAT completion, filters, transparency, and Adam7 with checked arithmetic. It
+supports every legal static PNG color/depth combination and converts to RGBA.
+Unknown ancillary chunks are CRC-checked then skipped without allocation;
+unknown critical chunks, APNG, text/profile retention, encoders, generic image
+selection, and indirect resource loaders are excluded.
+
+## Bounded Kitty Decoder Verification
+
+Docker verification covers supported normalization plus adversarial payload, resource, allocation, work, deadline, and decompression boundaries.
+
+`tests/e2e/terminal-image-kitty-decode.sh` invokes the production normalizer
+through `scribe-test kitty-decode`. Stable cases cover RGB, RGBA, exact chunk
+accumulation, RFC 1950 zlib, PNG, malformed base64, padded non-final chunks,
+raw-length mismatch, truncated/non-PNG input, every indirect source class with
+zero allocations, deterministic allocation denial, cancellation, deadline,
+and a valid stream expanding one byte beyond the frozen ceiling.
+
+The run atomically writes schema-versioned
+`test-output/terminal-images/kitty-decode-evidence.json` with exact dependency
+versions, revisions, checksums, licenses, fork exclusions, frozen limits,
+typed case outcomes, and `all_passed`. Run only through
+`just e2e-func terminal-image-kitty-decode.sh` after rebuilding the functional
 Docker image.
 
 ## Decode Spike Verification

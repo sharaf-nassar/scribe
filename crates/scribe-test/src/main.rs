@@ -7,6 +7,7 @@ mod decode_spike;
 mod input;
 mod ipc;
 mod ipc_fixtures;
+mod kitty_decode;
 mod lan_peer;
 mod remote_peer;
 mod render;
@@ -301,6 +302,15 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Run adversarial checks against bounded Kitty normalization.
+    KittyDecode {
+        /// Frozen terminal-image contract JSON.
+        #[arg(long)]
+        contract: PathBuf,
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -511,6 +521,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::SixelDecoder { contract, fixtures, evidence } => {
             sixel_decoder::run(&contract, &fixtures, &evidence).map_err(TestError::TestFailure)
+        }
+        Command::KittyDecode { contract, evidence } => {
+            kitty_decode::run(&contract, &evidence).map_err(TestError::TestFailure)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =

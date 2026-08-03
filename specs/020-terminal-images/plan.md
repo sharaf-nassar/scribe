@@ -77,6 +77,7 @@ Primary references are the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/k
 - `crates/scribe-client/src/settings/`, `crates/scribe-common/src/config.rs`, and settings docs — default-on master image kill switch with runtime capability changes and payload-free disabled/rejected affordance.
 - `third_party/icy-sixel-decoder/` and attribution/license inventory — bounded decoder-only `icy_sixel` 0.5.0 fork with no encoder/quantizer dependency.
 - `third_party/image-png-decoder/` and attribution/license inventory — bounded decoder-only `png` 0.18.1 fork with Scribe work/cancellation hooks and no encoder/APNG/ancillary metadata paths.
+- `crates/scribe-image-decode/` — shared caller-owned cumulative work, cancellation, monotonic deadline, allocation veto, and peak-allocation accounting consumed by both decoder forks.
 - `Cargo.toml`/`Cargo.lock` — direct `base64` 0.22.1 and `flate2` 1.1.9 aligned with already locked versions; no generic `image`, full `termwiz`, `quantette`, or C decoder in server decode paths.
 - `crates/scribe-test/` and `tests/e2e/` — typed protocol support, direct PTY/SSH application corpus, functional malformed/quota/replay cases, and visual fixtures.
 - `lat.md/client.md`, `lat.md/server.md`, `lat.md/pty.md`, `lat.md/rendering.md`, `lat.md/common.md`, and `lat.md/test.md` — architecture and verification contracts.
