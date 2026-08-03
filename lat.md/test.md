@@ -13,6 +13,14 @@ The two-process model keeps the server connection alive across many short-lived 
 
 Two exit codes distinguish failure kinds.  has two variants: `TestFailure` (exit 1) for assertion mismatches, and `InfraError` (exit 2) for socket, spawn, or timeout problems.
 
+## Terminal Image Client Scene
+
+The functional harness applies owned fixtures directly to the production client CPU scene without touching a host Scribe process.
+
+### Ordered live fixture stays atomic and bounded
+
+The fixture proves operation order, commit-only publication, definition replacement, placement deletion, generation cleanup, scroll/erase/reset effects, typed quota rejection, placeholder copy filtering, and visible update-required mismatch copy.
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.

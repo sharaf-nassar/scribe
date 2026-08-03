@@ -288,3 +288,19 @@ capability refusal, and client-older/server-older remote mismatches.
 types, checks maximum and maximum-plus-one bounds, and writes
 `test-output/terminal-images/ipc.json`. Invoke it with
 `just e2e-func terminal-image-ipc.sh`.
+
+## Client Live Scene Verification
+
+Docker verification proves ordered atomic live state, cleanup, text filtering, and truthful mismatch plumbing before image painting exists.
+
+`tests/e2e/fixtures/terminal-images/client-scene.json` drives production
+[[crates/scribe-client/src/terminal_image_scene.rs#LiveImageScene]] records
+through definitions, bounded chunks, placements, replacement, delete, scroll,
+erase, hard reset, interrupted generation replacement, and stale rejection.
+It also freezes placeholder-copy input and typed capability mismatch data.
+
+`tests/e2e/terminal-image-client-scene.sh` invokes
+`scribe-test terminal-image-client-scene`, writes
+`test-output/terminal-images/client-scene.json`, and requires every evidence
+field to pass. This is CPU-scene evidence only; it makes no renderer, replay,
+server fanout, or settings claim.

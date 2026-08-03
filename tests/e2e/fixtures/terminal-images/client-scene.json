@@ -1,0 +1,42 @@
+{
+  "live_messages": [
+    {"type":"begin","generation":1,"sequence":1},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"define","definition":{"id":1,"generation":1,"width":1,"height":1,"rgba_bytes":4,"has_alpha":true}}},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"definition_chunk","chunk":{"id":1,"generation":1,"offset":0,"data":[1,2,3,4],"final_chunk":true}}},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"define","definition":{"id":2,"generation":1,"width":1,"height":1,"rgba_bytes":4,"has_alpha":false}}},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"definition_chunk","chunk":{"id":2,"generation":1,"offset":0,"data":[5,6,7,8],"final_chunk":true}}},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"place","placement":{"id":10,"image_id":1,"generation":1,"protocol":"kitty","kind":"kitty_classic","anchor":{"row":4,"column":0},"source":{"x":0,"y":0,"width":1,"height":1},"destination":{"columns":1,"rows":1},"pixel_offset_x":0,"pixel_offset_y":0,"z_index":0,"scrolls_with_grid":true,"move_cursor":false,"placeholder":null}}},
+    {"type":"update","generation":1,"sequence":1,"update":{"type":"place","placement":{"id":20,"image_id":2,"generation":1,"protocol":"sixel","kind":"sixel","anchor":{"row":2,"column":0},"source":{"x":0,"y":0,"width":1,"height":1},"destination":{"columns":2,"rows":1},"pixel_offset_x":0,"pixel_offset_y":0,"z_index":-1,"scrolls_with_grid":true,"move_cursor":false,"placeholder":null}}},
+    {"type":"commit","generation":1,"sequence":1},
+
+    {"type":"begin","generation":2,"sequence":2},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"define","definition":{"id":1,"generation":2,"width":1,"height":1,"rgba_bytes":4,"has_alpha":true}}},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"definition_chunk","chunk":{"id":1,"generation":2,"offset":0,"data":[9,8,7,6],"final_chunk":true}}},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"place","placement":{"id":11,"image_id":1,"generation":2,"protocol":"kitty","kind":"kitty_classic","anchor":{"row":3,"column":0},"source":{"x":0,"y":0,"width":1,"height":1},"destination":{"columns":1,"rows":1},"pixel_offset_x":0,"pixel_offset_y":0,"z_index":0,"scrolls_with_grid":true,"move_cursor":false,"placeholder":null}}},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"grid_effect","effect":{"type":"scroll","top":0,"bottom":10,"rows":1}}},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"grid_effect","effect":{"type":"erase_cells","top":1,"left":0,"bottom":1,"right":2}}},
+    {"type":"commit","generation":2,"sequence":2},
+
+    {"type":"begin","generation":3,"sequence":3},
+    {"type":"update","generation":3,"sequence":3,"update":{"type":"delete","delete":{"scope":"placement","image_id":1,"placement_id":11,"coordinate":null,"free_image_data":true}}},
+    {"type":"commit","generation":3,"sequence":3},
+
+    {"type":"begin","generation":4,"sequence":4},
+    {"type":"update","generation":4,"sequence":4,"update":{"type":"grid_effect","effect":{"type":"hard_reset"}}},
+    {"type":"commit","generation":4,"sequence":4},
+
+    {"type":"begin","generation":5,"sequence":5},
+    {"type":"update","generation":5,"sequence":5,"update":{"type":"define","definition":{"id":3,"generation":5,"width":1,"height":1,"rgba_bytes":4,"has_alpha":true}}},
+    {"type":"begin","generation":6,"sequence":6},
+    {"type":"commit","generation":6,"sequence":6},
+    {"type":"begin","generation":5,"sequence":7}
+  ],
+  "copy_input": "left􎻮̅̍right café́",
+  "copy_expected": "leftright café́",
+  "mismatch": {
+    "required": {"runtime_enabled": true, "features": 127},
+    "offered": {"runtime_enabled": false, "features": 0}
+  },
+  "mismatch_contains": "Update Scribe to display terminal images",
+  "quota_definition_count": 129
+}

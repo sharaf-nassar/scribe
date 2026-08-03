@@ -1078,7 +1078,9 @@ impl Render for SettingsWindow {
             .role(Role::Application)
             .aria_label("Scribe settings")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|_, _: &CloseWindow, action_window, _| {
+                action_window.remove_window();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, key_window, ctx| {
                 this.on_key_down(event, key_window, ctx);
             }))
