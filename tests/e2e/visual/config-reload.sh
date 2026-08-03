@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Scripted E2E: live config reload in the running GPUI terminal window.
 #
 # Backs the `ClientMessage::ConfigReloaded` parity row. The client is already

@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E test: custom titlebar with the integrated tab bar.
 #
 # Captures the assembled titlebar (workspace-badge pill, tab strip with the
@@ -9,7 +10,7 @@
 # close control is only screenshotted, never clicked, so the window survives the
 # run for later stages.
 #
-# Requires: visual container with --gpus all
+# Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS)
 set -e
 
 # Helper: focus the Scribe window and capture a full-screen screenshot.

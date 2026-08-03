@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual + scripted E2E: declining the update in the terminal window sends
 # `ClientMessage::DismissUpdate` and clears the centred status-bar CTA.
 #
@@ -9,10 +10,7 @@
 # that message.
 #
 # Run with:
-#   docker run --rm --gpus all -e TEST_TIMEOUT=180 \
-#     -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest \
-#     -v ./tests/e2e:/tests -v ./test-output:/output \
-#     scribe-test-visual /tests/visual/update-dismiss.sh
+#   SCRIBE_E2E_GPUS=all just e2e-visual-update
 set -e
 
 # shellcheck source=/dev/null

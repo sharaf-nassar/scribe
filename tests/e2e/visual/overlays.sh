@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E test: the command palette, right-click context menu, and hover
 # tooltip overlays of the GPUI client rebuild.
 #
@@ -9,7 +10,7 @@
 # head+tail-truncated URL clamped inside the viewport. Every overlay is drawn
 # with rounded corners, a drop shadow, and hover/selected states.
 #
-# Requires: visual container with --gpus all, xdotool, scrot.
+# Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot.
 set -e
 
 find_window() {

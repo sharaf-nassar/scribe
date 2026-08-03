@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Scripted E2E: command-palette and context-menu entries actually run.
 #
 # Both overlays used to open and then do nothing — the shell subscribed to

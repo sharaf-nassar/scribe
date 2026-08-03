@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E: a real provider hook paints the GPUI AI chrome.
 #
 # The hook helper writes to the real server socket. The server broadcasts the

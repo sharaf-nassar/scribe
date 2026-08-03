@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E test: workspace split via keybinding
 #
 # Presses Ctrl+Alt+\ in the real scribe-client window to trigger a
@@ -6,7 +7,7 @@
 # alive by typing into each via xdotool.  Screenshots are captured at
 # each stage for visual inspection.
 #
-# Requires: visual container with --gpus all
+# Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS)
 set -e
 
 # Helper: focus the Scribe window and capture a full-screen screenshot.

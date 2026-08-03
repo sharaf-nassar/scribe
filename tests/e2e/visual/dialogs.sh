@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E test: the modal dialog suite of the GPUI client rebuild, walking two
 # representative modals — the close dialog (three buttons: Quit Scribe / Kill
 # Window / Cancel, Cancel default focus) and the OSC 52 clipboard dialog (four
@@ -15,7 +16,7 @@
 # box, a centred title, the body copy, a separator rule, and accent/destructive
 # button tones.
 #
-# Requires: visual container with --gpus all, xdotool, scrot.
+# Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot.
 set -e
 
 find_window() {

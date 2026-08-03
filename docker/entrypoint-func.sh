@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+export SCRIBE_E2E_SANDBOX=1
+export PATH="/tests/bin:$PATH"
+
 cleanup() {
     scribe-test daemon stop || true
     scribe-test server stop || true
@@ -21,6 +24,6 @@ SESSION=$(scribe-test session create)
 export SESSION
 
 EXIT_CODE=0
-timeout 30 "$1" 2>&1 | tee /output/result.log || EXIT_CODE=$?
+timeout "${TEST_TIMEOUT:-30}" "$1" 2>&1 | tee /output/result.log || EXIT_CODE=$?
 
 exit $EXIT_CODE
