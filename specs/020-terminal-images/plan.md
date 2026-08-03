@@ -84,7 +84,16 @@ Primary references are the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/k
 
 `TerminalImageCapabilities` records Kitty direct formats/actions, Unicode placeholders, Sixel, and the runtime-enabled bit. It is negotiated in `Hello`/`Welcome` with defaults that mean unsupported for older peers.
 
-`ImageLimits` is a server-owned immutable policy with exact numeric ceilings for framed bytes, accumulated chunks, base64 output, inflated bytes, width/height, pixels, canonical RGBA bytes, images, placements, per-session retained CPU bytes, per-view projected GPU bytes, process retained bytes, concurrent decodes, queue depth, work units, and decode deadline. A security spike freezes values before parser/decoder implementation. A provisional independent dimension ceiling may not exceed 4096 pixels per axis and must be reduced if native platform evidence requires it.
+`ImageLimits` is the server-owned immutable policy frozen in
+[`contract.md`](contract.md): 16 MiB control strings, 4096-byte Kitty chunks,
+32,768 chunks, 89,478,488 encoded bytes, 64 MiB decoded/inflated/canonical
+bytes, 4096 pixels per axis and 16,777,216 pixels, 128 images, 1024
+placements, 128 MiB session CPU, 256 MiB projected view GPU, and 512 MiB
+process retention. The process permits two active and eight queued decodes,
+charges 128 MiB queued bytes and 134,217,728 work units, waits at most 1000 ms
+in queue, and decodes at most 2000 ms with checks every 4096 work units.
+Replay/handoff chunks are at most 1 MiB. Native platform evidence may lower,
+but never raise, the 4096-pixel v1 ceiling.
 
 `TerminalImageId` and `TerminalPlacementId` are typed identifiers. Kitty preserves specified image/placement numbers; Sixel receives a server-internal monotonically allocated image ID and anonymous placement.
 
@@ -132,9 +141,9 @@ Protocol and state tests:
 
 Running-client functional/visual corpus:
 
-- Owned fixtures adapted from Kitty's official graphics tests rather than importing its test suite.
-- A pinned current Yazi release renders through its generic successful Kitty probe (`KgpOld`) without terminal spoofing; owned placeholder fixtures separately prove `Kgp` semantics. Upstream Scribe recognition may improve adapter selection but cannot block task closure on an external merge.
-- A pinned Chafa release is the dual-protocol previewer, gnuplot's Sixel terminal is the plotting workflow, and raw protocol fixtures cover complete semantics.
+- Ten owned ASCII-hex fixtures cover the frozen Kitty/Sixel matrix without importing an external test suite; `tests/e2e/fixtures/terminal-images/fixtures.tsv` owns their paths and expected outcomes.
+- Yazi `v26.5.6` (`aa526434f00bb44e2e902d9a4ac5f810da1018b9`) renders through its generic successful Kitty probe (`KgpOld`) without terminal spoofing; owned placeholder fixtures separately prove `Kgp` semantics. Upstream Scribe recognition may improve adapter selection but cannot block task closure on an external merge.
+- Chafa `1.18.2` is the dual-protocol previewer and gnuplot `6.0.3` with `sixelgd` is the plotting workflow.
 - Direct PTY and an actual SSH path inside the authorized harness verify fragmented output and bidirectional replies.
 - A network-disabled Docker pass proves core parsing, replay, rendering, settings, and fixtures remain local/offline; only the dedicated in-container SSH case enables its loopback transport.
 - Kill switch causes no Kitty probe reply and DA without attribute 4, while ordinary terminal output remains correct.
