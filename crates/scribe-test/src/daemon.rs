@@ -9,10 +9,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use regex::{Regex, RegexBuilder};
+use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
-use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
+use scribe_common::protocol::{
+    AiLaunchSpec, AiResumeMode, ClientMessage, ServerMessage, TerminalSize,
+};
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
 use tokio::net::unix::OwnedWriteHalf;
@@ -859,9 +862,10 @@ async fn process_request(
     shutdown: &Arc<Notify>,
 ) -> DaemonResponse {
     match request {
-        DaemonRequest::CreateSession { cols, rows } => {
-            handle_create_session(harness_size(cols, rows), state, notifiers, server_writer).await
-        }
+        request @ DaemonRequest::CreateSession { .. } => match create_session_params(request) {
+            Ok(params) => handle_create_session(params, state, notifiers, server_writer).await,
+            Err(message) => DaemonResponse::Error { message },
+        },
         DaemonRequest::AttachSession { session_id, cols, rows } => {
             let params = AttachParams { session_id, size: harness_size(cols, rows) };
             handle_attach_session(params, state, notifiers, server_writer).await
@@ -956,9 +960,42 @@ struct AttachParams {
     size: Option<TerminalSize>,
 }
 
+/// Everything one harness session-create request contributes to the server
+/// launch. Grouped so the async handler stays within Clippy's argument limit.
+struct CreateSessionParams {
+    size: Option<TerminalSize>,
+    ai_provider: Option<AiProvider>,
+    ai_resume_mode: Option<AiResumeMode>,
+    ai_conversation_id: Option<String>,
+    cwd: Option<PathBuf>,
+    env_envelope_id: Option<String>,
+}
+
+fn create_session_params(request: DaemonRequest) -> Result<CreateSessionParams, String> {
+    match request {
+        DaemonRequest::CreateSession {
+            cols,
+            rows,
+            ai_provider,
+            ai_resume_mode,
+            ai_conversation_id,
+            cwd,
+            env_envelope_id,
+        } => Ok(CreateSessionParams {
+            size: harness_size(cols, rows),
+            ai_provider,
+            ai_resume_mode,
+            ai_conversation_id,
+            cwd,
+            env_envelope_id,
+        }),
+        _ => Err("internal request routing error: expected CreateSession".to_owned()),
+    }
+}
+
 /// Create a workspace, then a session within it.
 async fn handle_create_session(
-    size: Option<TerminalSize>,
+    params: CreateSessionParams,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
@@ -981,17 +1018,22 @@ async fn handle_create_session(
         let mut guard = state.lock().await;
         guard.last_session_created = None;
     }
-    // The harness mints a launch id like every other create path: without one
-    // the server has no envelope to persist the session's environment into, and
-    // an env-persistence E2E would observe nothing no matter what the shell did.
-    let envelope_id = new_launch_id();
+    // The harness mints a launch id like every other create path unless a test
+    // names an existing envelope to restore. Without either, the server has no
+    // envelope to key this session's environment by.
+    let envelope_id = params.env_envelope_id.unwrap_or_else(new_launch_id);
+    let ai_launch = params.ai_provider.map(|provider| AiLaunchSpec {
+        provider,
+        resume_mode: params.ai_resume_mode.unwrap_or(AiResumeMode::New),
+        conversation_id: params.ai_conversation_id,
+    });
     let msg = ClientMessage::CreateSession {
         workspace_id,
         split_direction: None,
-        cwd: None,
-        size,
+        cwd: params.cwd,
+        size: params.size,
         command: None,
-        ai_launch: None,
+        ai_launch,
         env_envelope_id: Some(envelope_id.clone()),
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {

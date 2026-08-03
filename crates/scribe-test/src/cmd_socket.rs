@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
+use scribe_common::protocol::AiResumeMode;
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -24,6 +26,16 @@ pub enum DaemonRequest {
     CreateSession {
         cols: Option<u16>,
         rows: Option<u16>,
+        #[serde(default)]
+        ai_provider: Option<AiProvider>,
+        #[serde(default)]
+        ai_resume_mode: Option<AiResumeMode>,
+        #[serde(default)]
+        ai_conversation_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        env_envelope_id: Option<String>,
     },
     /// Attach to a session, optionally naming the grid to attach at.
     ///

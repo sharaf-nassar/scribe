@@ -1,25 +1,49 @@
 use std::io::{self, Write as _};
+use std::path::PathBuf;
 use std::str::FromStr as _;
 
+use scribe_common::ai_state::AiProvider;
 use scribe_common::ids::SessionId;
+use scribe_common::protocol::AiResumeMode;
 
 use crate::TestError;
 use crate::cmd_socket::{DaemonRequest, DaemonResponse, send_request};
+
+/// Optional launch details accepted by `session create`.
+pub struct CreateOptions {
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+    pub ai_provider: Option<AiProvider>,
+    pub ai_resume_mode: Option<AiResumeMode>,
+    pub ai_conversation_id: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub env_envelope_id: Option<String>,
+}
 
 /// Create a new terminal session via the daemon.
 ///
 /// Sends `CreateSession` and prints the resulting session UUID to stdout.
 /// `cols`/`rows` name the grid the PTY is spawned at, the way a real client
 /// names the pane the session is about to fill; omitting them keeps the
-/// server's 80x24 default.
+/// server's 80x24 default. The AI launch fields remain separate so the daemon
+/// exercises the same `AiLaunchSpec` construction as the production client
+/// path.
 ///
 /// # Errors
 ///
 /// Returns [`TestError::InfraError`] when the daemon is unreachable or the
 /// server refused the create.
-pub fn create(cols: Option<u16>, rows: Option<u16>) -> Result<(), TestError> {
-    let response = send_request(&DaemonRequest::CreateSession { cols, rows })
-        .map_err(|e| TestError::InfraError(e.to_string()))?;
+pub fn create(options: CreateOptions) -> Result<(), TestError> {
+    let request = DaemonRequest::CreateSession {
+        cols: options.cols,
+        rows: options.rows,
+        ai_provider: options.ai_provider,
+        ai_resume_mode: options.ai_resume_mode,
+        ai_conversation_id: options.ai_conversation_id,
+        cwd: options.cwd,
+        env_envelope_id: options.env_envelope_id,
+    };
+    let response = send_request(&request).map_err(|e| TestError::InfraError(e.to_string()))?;
 
     match response {
         DaemonResponse::SessionCreated { session_id } => {

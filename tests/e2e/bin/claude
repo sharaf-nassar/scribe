@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+output_dir=${SCRIBE_AI_STUB_OUT:-/tmp}
+record="$output_dir/claude-invocation.txt"
+temporary="$record.$$"
+
+mkdir -p "$output_dir"
+{
+    for argument do
+        printf '%s\n' "$argument"
+    done
+    printf '%s\n' '--ENV--'
+    env | LC_ALL=C sort
+} > "$temporary"
+mv "$temporary" "$record"
