@@ -9,12 +9,13 @@ use scribe_common::protocol::{
     ClientMessage, REMOTE_PROTOCOL_VERSION, RemoteRefusal, ServerMessage,
 };
 use scribe_common::terminal_images::{
-    BoundedImageBytes, CellExtent, ImageLimits, PixelRect, RemoteProtocolMismatch,
-    RemoteProtocolUpdateTarget, TerminalCellAnchor, TerminalImageCapabilities,
-    TerminalImageCapabilityMismatch, TerminalImageDataChunk, TerminalImageDefinition,
-    TerminalImageGeneration, TerminalImageId, TerminalImageLiveMessage, TerminalImagePlacement,
-    TerminalImagePlacementKind, TerminalImageProtocol, TerminalImageReplayMessage,
-    TerminalImageUpdate, TerminalOutputSequence, TerminalPlacementId,
+    BoundedImageBytes, CellExtent, ImageBoundError, ImageLimits, PixelRect, PlaceholderMetadata,
+    RemoteProtocolMismatch, RemoteProtocolUpdateTarget, TerminalCellAnchor,
+    TerminalImageCapabilities, TerminalImageCapabilityMismatch, TerminalImageCellClip,
+    TerminalImageDataChunk, TerminalImageDefinition, TerminalImageGeneration, TerminalImageId,
+    TerminalImageLiveMessage, TerminalImagePlacement, TerminalImagePlacementKind,
+    TerminalImageProtocol, TerminalImageReplayMessage, TerminalImageUpdate, TerminalOutputSequence,
+    TerminalPlacementId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,7 @@ struct Evidence<'a> {
     max_replay_chunk_bytes: u64,
     local_handshake: LocalHandshakeEvidence,
     remote_mismatch: RemoteMismatchEvidence,
+    placement_validation: PlacementValidationEvidence,
     messagepack_hex: &'a BTreeMap<String, String>,
 }
 
@@ -50,6 +52,13 @@ struct LocalHandshakeEvidence {
 struct RemoteMismatchEvidence {
     older_remote_updates_client: bool,
     newer_remote_updates_server: bool,
+}
+
+#[derive(Serialize)]
+struct PlacementValidationEvidence {
+    clipped_replay_round_trip: bool,
+    legacy_none_omitted_and_defaulted: bool,
+    malformed_replays_rejected: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,6 +105,7 @@ pub fn verify(fixtures: &Path, output: &Path, dump: bool) -> Result<(), String> 
 
     decode_fixtures(&encoded)?;
     verify_bounds()?;
+    let placement_validation = verify_placement_validation(&encoded, &fixture_model()?)?;
     let (older_remote_updates_client, newer_remote_updates_server) = verify_remote_directions()?;
 
     let evidence = Evidence {
@@ -112,6 +122,7 @@ pub fn verify(fixtures: &Path, output: &Path, dump: bool) -> Result<(), String> 
             older_remote_updates_client,
             newer_remote_updates_server,
         },
+        placement_validation,
         messagepack_hex: &encoded,
     };
     if let Some(parent) = output.parent() {
@@ -162,6 +173,7 @@ fn fixture_model() -> Result<FixtureModel, String> {
         z_index: -1,
         scrolls_with_grid: true,
         move_cursor: false,
+        cell_clip: None,
         placeholder: None,
     };
     let mismatch = TerminalImageCapabilityMismatch::new(
@@ -302,6 +314,22 @@ fn insert_replay_fixtures(
             },
         },
     )?;
+    let mut clipped = model.placement.clone();
+    clipped.destination = CellExtent { columns: 3, rows: 2 };
+    clipped.pixel_offset_x = 1;
+    clipped.pixel_offset_y = 1;
+    clipped.cell_clip = Some(TerminalImageCellClip { top: 2, left: 4, bottom: 4, right: 6 });
+    insert_named(
+        values,
+        "replay_placement_clipped",
+        &ServerMessage::TerminalImageReplay {
+            session_id: model.session_id,
+            message: TerminalImageReplayMessage::Placement {
+                generation: model.generation,
+                placement: clipped,
+            },
+        },
+    )?;
     insert_named(
         values,
         "replay_commit",
@@ -412,6 +440,116 @@ fn verify_bounds() -> Result<(), String> {
         return Err("maximum-plus-one replay definition count was accepted".to_owned());
     }
     Ok(())
+}
+
+fn verify_placement_validation(
+    fixtures: &BTreeMap<String, String>,
+    model: &FixtureModel,
+) -> Result<PlacementValidationEvidence, String> {
+    let legacy_none_omitted_and_defaulted = verify_legacy_placement(fixtures)?;
+    let clipped_replay_round_trip = verify_clipped_placement(fixtures)?;
+    let malformed_replays_rejected = verify_malformed_placements(model)?;
+    Ok(PlacementValidationEvidence {
+        clipped_replay_round_trip,
+        legacy_none_omitted_and_defaulted,
+        malformed_replays_rejected,
+    })
+}
+
+fn verify_legacy_placement(fixtures: &BTreeMap<String, String>) -> Result<bool, String> {
+    let legacy = fixtures
+        .get("replay_placement")
+        .ok_or_else(|| "missing legacy replay placement".to_owned())?;
+    let legacy_bytes = unhex(legacy)?;
+    let legacy_none_omitted =
+        !legacy_bytes.windows(b"cell_clip".len()).any(|window| window == b"cell_clip");
+    let decoded: ServerMessage =
+        rmp_serde::from_slice(&legacy_bytes).map_err(|error| error.to_string())?;
+    Ok(legacy_none_omitted
+        && matches!(
+            decoded,
+            ServerMessage::TerminalImageReplay {
+                message: TerminalImageReplayMessage::Placement {
+                    placement: TerminalImagePlacement { cell_clip: None, .. },
+                    ..
+                },
+                ..
+            }
+        ))
+}
+
+fn verify_clipped_placement(fixtures: &BTreeMap<String, String>) -> Result<bool, String> {
+    let clipped = fixtures
+        .get("replay_placement_clipped")
+        .ok_or_else(|| "missing clipped replay placement".to_owned())?;
+    let clipped_message: ServerMessage =
+        rmp_serde::from_slice(&unhex(clipped)?).map_err(|error| error.to_string())?;
+    let clipped_replay_round_trip = matches!(
+        &clipped_message,
+        ServerMessage::TerminalImageReplay {
+            message: TerminalImageReplayMessage::Placement {
+                placement: TerminalImagePlacement {
+                    cell_clip: Some(TerminalImageCellClip { top: 2, left: 4, bottom: 4, right: 6 }),
+                    ..
+                },
+                ..
+            },
+            ..
+        }
+    );
+    if let ServerMessage::TerminalImageReplay { message, .. } = clipped_message {
+        message.validate().map_err(|error| error.to_string())?;
+    } else {
+        return Err("clipped replay decoded as wrong server message".to_owned());
+    }
+    Ok(clipped_replay_round_trip)
+}
+
+fn verify_malformed_placements(model: &FixtureModel) -> Result<usize, String> {
+    let mut reversed = model.placement.clone();
+    reversed.cell_clip = Some(TerminalImageCellClip { top: 4, left: 3, bottom: 2, right: 4 });
+    let mut empty = model.placement.clone();
+    empty.cell_clip = Some(TerminalImageCellClip { top: 2, left: 3, bottom: 2, right: 4 });
+    let mut out_of_range = model.placement.clone();
+    out_of_range.cell_clip =
+        Some(TerminalImageCellClip { top: 2, left: 3, bottom: 3, right: 65_537 });
+    let mut placeholder_with_clip = model.placement.clone();
+    placeholder_with_clip.kind = TerminalImagePlacementKind::KittyUnicodePlaceholder;
+    placeholder_with_clip.placeholder = Some(PlaceholderMetadata {
+        image_identity_bits: 32,
+        placement_id_in_underline: false,
+        background_alpha: 255,
+    });
+    placeholder_with_clip.cell_clip =
+        Some(TerminalImageCellClip { top: 2, left: 3, bottom: 3, right: 4 });
+    let mut protocol_mismatch = model.placement.clone();
+    protocol_mismatch.protocol = TerminalImageProtocol::Sixel;
+
+    let cases = [
+        (reversed, ImageBoundError::InvalidPlacementClip),
+        (empty, ImageBoundError::InvalidPlacementClip),
+        (out_of_range, ImageBoundError::InvalidPlacementClip),
+        (placeholder_with_clip, ImageBoundError::InvalidPlacementClip),
+        (protocol_mismatch, ImageBoundError::InvalidPlacementKind),
+    ];
+    let malformed_replays_rejected = cases
+        .into_iter()
+        .filter(|(placement, expected)| {
+            TerminalImageReplayMessage::Placement {
+                generation: model.generation,
+                placement: placement.clone(),
+            }
+            .validate()
+                == Err(*expected)
+        })
+        .count();
+    if malformed_replays_rejected != 5 {
+        return Err(format!(
+            "only {malformed_replays_rejected} malformed placements were rejected"
+        ));
+    }
+
+    Ok(malformed_replays_rejected)
 }
 
 fn verify_remote_directions() -> Result<(bool, bool), String> {

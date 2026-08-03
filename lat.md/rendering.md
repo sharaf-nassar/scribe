@@ -40,10 +40,13 @@ Terminal image definitions own one bounded window-local GPUI source per image ge
 
 The pinned GPUI revision `f96212f2c50f54d93712fa130d6226b1ce7d76b5`
 keys `Window::paint_image` atlas entries by `RenderImage` identity and frame.
-[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#get_or_insert]]
-therefore caches `(image_id, generation) -> Arc<RenderImage>`, charges two
-canonical byte lengths for texture plus upload staging, and evicts in insertion
-order before the frozen per-view projected-GPU ceiling can be exceeded.
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#get_or_insert_for_session]]
+therefore caches `(session_id, image_id, generation) -> Arc<RenderImage>` for
+the whole view, charges two canonical byte lengths for texture plus upload
+staging, and removes only closed-session or unplaced entries before any image
+primitive is queued. When live sources fill the frozen per-view projected-GPU
+ceiling, admission rejects the new source for that frame instead of evicting a
+tile that earlier primitives may still reference.
 
 GPUI exposes no source UV rectangle at this revision. Instead,
 [[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image]] scales
@@ -57,8 +60,49 @@ Cleanup remains explicit. Final cache removal calls `Window::drop_image` before
 releasing the last source reference. GPUI removes every frame key and WGPU
 deallocates its atlas tile. Device recovery clears GPUI's atlas but preserves
 the CPU `RenderImage`; the next paint reconstructs the same key lazily.
+Definition deletion and pane/session removal are reconciled during paint by
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#retain_session_definitions]]
+and
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#retain_sessions]],
+so both paths drop atlas keys while a live `Window` is available.
 [[terminal-images#GPUI Lifecycle Verification]] records Linux runtime evidence
 and the separate native Metal gate.
+
+## Terminal Image Paint Phases
+
+Terminal images use six ordered paint phases around cell content, keeping Kitty z-order and Sixel chronology compatible with terminal text.
+
+[[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint_grid]] paints
+deep Kitty placements and Sixel first, then non-default cell backgrounds,
+remaining negative Kitty placements, box drawing and shaped text, nonnegative
+Kitty placements, and selection/find/cursor/split-scroll/scrollbar/chrome
+overlays. Selection repaints above images, then restores overlapping resolved
+find cells so the search accent keeps its existing precedence.
+Placements sort by z-index, image id, placement id, then committed chronology;
+Sixel retains completion order in its background raster band.
+
+Classic placements derive destination bounds from current logical cell metrics,
+then [[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image_clipped]]
+keeps full placement scaling while intersecting its content mask with the pane
+viewport. Typed scroll and resize effects preserve source crop, destination
+extent, and pixel offsets while moving/intersecting an exclusive logical-cell
+clip carried by the common placement. Each renderer converts that clip with
+its current cell metrics, preventing repeated-scroll rounding drift and
+preserving offset fractions across resize. Scribe never pre-multiplies
+placement coordinates by GPUI's DPI scale. Placeholder prototypes carry no
+physical clip; their matching terminal cells remain authoritative.
+
+Unicode-placeholder cells preserve their three zero-width coordinate marks and
+underline colour in [[crates/scribe-client/src/terminal.rs#Cell]].
+[[crates/scribe-client/src/kitty_placeholder.rs#kitty_placeholder_diacritic_index]]
+maps the official 297 marks, and
+[[crates/scribe-client/src/terminal_element.rs#paint_placeholder_cells]] resolves
+8/24/32-bit image identity, deterministic missing placement identity, and
+left-cell inheritance. It aspect-fits the source once across the virtual
+placement, then clips that destination through each matching cell, preserving
+transparent cell backgrounds and source aspect. Placeholder markers remain
+absent from the shaped glyph pass; the reserved IPC background byte adds no
+opacity.
 
 ## Render Pipeline
 

@@ -1506,9 +1506,19 @@ their staging state without exposing a partial operation burst.
 Definitions and placements retain operation order. Replacement removes the old
 image's placements only after replacement bytes complete; delete, screen,
 scroll, erase, resize, and reset effects clean active scene state under the
-frozen per-session quotas. `PaneFrame` captures the committed CPU scene with the
-text snapshot but no GPUI image resource, cache, or renderer capability is
-claimed yet.
+frozen per-session quotas. Classic and Sixel scroll/resize clipping persists as
+exclusive logical cell bounds intersected with a conservative placement
+envelope, leaving source, destination, and pixel offsets unchanged. Nonzero
+offsets extend that envelope by one cell; later scrolls move only placements
+whose effective old clip intersects their margin. Resize and Sixel erase also
+use the effective envelope. Physical delete selectors use the same clipped
+extent, while placeholder cells remain the virtual placement authority and
+only an explicit image-id delete removes their placement. Hard deletion derives
+definition candidates from placements actually removed; only explicit Image
+scope may add an unplaced definition, preventing unrelated data sweeps.
+`PaneFrame` captures
+the committed CPU scene with the text snapshot but no GPUI image resource or
+cache.
 
 [[crates/scribe-client/src/terminal_image_scene.rs#filter_terminal_image_placeholders]]
 removes `U+10EEEE` and at most its three zero-width coordinate marks from

@@ -80,6 +80,12 @@ pub struct Cell {
     /// SGR attributes: BOLD, ITALIC, UNDERLINE, STRIKEOUT, INVERSE, DIM,
     /// HIDDEN, and the wide-char bookkeeping flags.
     pub flags: Flags,
+    /// Up to three Kitty placeholder coordinate marks retained from Alacritty.
+    pub zerowidth: [char; 3],
+    /// Number of initialized entries in [`Self::zerowidth`].
+    pub zerowidth_len: u8,
+    /// Raw underline colour, which Kitty placeholders use as placement ID.
+    pub underline_color: Option<Color>,
 }
 
 impl Default for Cell {
@@ -89,7 +95,18 @@ impl Default for Cell {
             fg: Color::Named(vte::ansi::NamedColor::Foreground),
             bg: Color::Named(vte::ansi::NamedColor::Background),
             flags: Flags::empty(),
+            zerowidth: ['\0'; 3],
+            zerowidth_len: 0,
+            underline_color: None,
         }
+    }
+}
+
+impl Cell {
+    /// Combining marks retained for Kitty placeholder resolution.
+    #[must_use]
+    pub fn zerowidth(&self) -> &[char] {
+        self.zerowidth.get(..usize::from(self.zerowidth_len)).unwrap_or(&self.zerowidth)
     }
 }
 
@@ -826,12 +843,26 @@ impl DisplayOnlyTerminal {
     fn read_row(term: &Term<VoidListener>, line: i32, columns: usize) -> Vec<Cell> {
         let grid = term.grid();
         let line = Line(line.clamp(grid.topmost_line().0, grid.bottommost_line().0));
-        (0..columns)
-            .map(|column| {
-                let cell = &grid[line][Column(column)];
-                Cell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags }
-            })
-            .collect()
+        (0..columns).map(|column| Self::snapshot_cell(&grid[line][Column(column)])).collect()
+    }
+
+    fn snapshot_cell(cell: &alacritty_terminal_gpui::term::cell::Cell) -> Cell {
+        let mut zerowidth = ['\0'; 3];
+        let mut zerowidth_len = 0u8;
+        let marks = cell.zerowidth().unwrap_or_default();
+        for (target, mark) in zerowidth.iter_mut().zip(marks.iter().copied()) {
+            *target = mark;
+            zerowidth_len = zerowidth_len.saturating_add(1);
+        }
+        Cell {
+            c: cell.c,
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+            zerowidth,
+            zerowidth_len,
+            underline_color: cell.underline_color(),
+        }
     }
 }
 

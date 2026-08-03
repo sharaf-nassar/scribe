@@ -33,7 +33,7 @@ the exact revision compiled by Scribe.
 
 ## Selected Crop Path
 
-One `(image_id, generation)` cache entry owns the full `RenderImage`; every placement references that same identity.
+One `(session_id, image_id, generation)` cache entry owns the full `RenderImage`; every placement in that session references the same identity.
 
 For source rectangle `(sx, sy, sw, sh)`, source dimensions `(iw, ih)`, and
 destination `(dx, dy, dw, dh)`, Scribe paints the full image at:
@@ -42,13 +42,17 @@ destination `(dx, dy, dw, dh)`, Scribe paints the full image at:
 scale = (dw / sw, dh / sh)
 origin = (dx - sx * scale.x, dy - sy * scale.y)
 size = (iw * scale.x, ih * scale.y)
-mask = destination
+envelope = conservative_cells(destination, pixel_offsets)
+mask = intersection(envelope, logical_cell_clip, viewport)
 ```
 
 This maps the selected source rectangle exactly onto the destination while the
-mask removes every other source pixel. It preserves one atlas key across full,
-classic-crop, and placeholder placements. No crop variant cache, CPU recrop,
-extra upload, shader patch, or GPUI fork is required.
+mask removes every other source pixel. Scroll and resize move/intersect the
+common placement's logical cell clip without changing source, destination, or
+pixel offsets. The envelope adds one right/bottom cell for nonzero X/Y offsets,
+and the renderer converts the effective intersection with current cell metrics. It preserves
+one atlas key across full, classic-crop, and placeholder placements. No crop
+variant cache, CPU recrop, extra upload, shader patch, or GPUI fork is required.
 
 ## Resource and Limit Contract
 
@@ -56,10 +60,15 @@ The per-view cache validates common metadata and byte length before allocating a
 
 Each source charges twice its canonical RGBA length against
 `ImageLimits::V1.max_view_projected_gpu_bytes`: one texture plus one
-upload/staging estimate. Insertions evict oldest source generations until the
-new charge fits. Final removal calls `Window::drop_image` before releasing the
-last cache reference. Invalid dimensions, including 4097-by-1, return the
-common typed `Dimensions` rejection before BGRA conversion, `image::Frame`, or
+upload/staging estimate. Before a pane queues image primitives, it removes
+closed-session and unplaced source generations. Admission never evicts a live
+entry: if remaining live entries plus a new source exceed the view ceiling,
+the new source is skipped for that frame. This prevents `drop_image` from
+reusing an atlas tile that an earlier same-frame primitive still references
+and avoids cross-session eviction churn while preserving the hard bound.
+Final removal calls `Window::drop_image` before releasing the last cache
+reference. Invalid dimensions, including 4097-by-1, return the common typed
+`Dimensions` rejection before BGRA conversion, `image::Frame`, or
 `RenderImage::new`.
 
 The Linux probe uploads 1-by-1 and 4096-by-1 resources. This proves the frozen
