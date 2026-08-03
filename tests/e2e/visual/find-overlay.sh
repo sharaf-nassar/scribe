@@ -53,6 +53,8 @@ DIFF_MIN="${DIFF_MIN:-40}"
 
 # Maximum changed pixels for two crops to count as identical. Non-zero only so a
 # single stray antialiased pixel cannot fail the "highlights were dropped" check.
+# The terminal cursor is hidden before the baseline, so its independent blink
+# never consumes this budget.
 DIFF_MAX="${DIFF_MAX:-40}"
 
 fail() {
@@ -210,7 +212,10 @@ pixel_diff() {
 sleep 1.0
 focus
 measure_window
-scribe-test send "$SESSION" "printf '${NEEDLE} ${NEEDLE} ${NEEDLE}\\n'\n"
+# Cursor blink is not controlled by SCRIBE_DISABLE_ANIMATIONS. Hide only that
+# terminal animation before taking the quiet baseline; the full grid remains in
+# every crop, so stale search highlights still count against DIFF_MAX.
+scribe-test send "$SESSION" "printf '${NEEDLE} ${NEEDLE} ${NEEDLE}\\n\\033[?25l'\n"
 scribe-test wait-output "$SESSION" "$NEEDLE" >/dev/null \
     || fail "PHASE 0: the seeded needle never reached the session"
 sleep 1.5

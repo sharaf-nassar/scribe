@@ -535,7 +535,7 @@ Nothing is stubbed. The image ships `scribe-hook-helper`, so the script posts a 
 
 Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the entrypoint's `$SESSION` belongs to the test daemon's window and is therefore hidden from the client's `ListSessions`, so the daemon is stopped and the client relaunched, after which it adopts the session through the normal attach path. `scribe-hook-helper` needs no daemon — it addresses the socket directly with the session id in its environment — so the hook channel outlives that teardown.
 
-Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the window's top band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten).
+Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the 54 px chrome-only band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten). The band includes openbox's 20 px decoration and the client's 34 px titlebar, then stops before the terminal grid so its blinking cursor cannot contaminate the clear oracle.
 
 ### Clipboard and OSC 52 bridge
 
@@ -1622,6 +1622,11 @@ Driving  followed by a `KeyInput` on the same ordered writer channel, the test a
 Covers the pure halves of : the query/reply state machine, the viewport projection of the server's absolute grid rows, and the recolouring that turns a match into painted cells.
 
 None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights.
+
+The visual fixture disables the terminal cursor with DECTCEM before capturing
+its quiet baseline. That removes only cursor blink from the comparison; the
+full grid remains cropped and the 40-pixel ceiling still detects stale search
+highlights after Escape.
 
 #### A typed query asks the server once
 
