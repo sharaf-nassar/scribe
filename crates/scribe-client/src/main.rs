@@ -105,6 +105,9 @@ use scribe_client::smart_selection::{
 use scribe_client::split_scroll::{SplitScrollEligibility, SplitScrollState};
 use scribe_client::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client::sys_stats::SystemStatsCollector;
+use scribe_client::terminal_image_scene::{
+    capability_mismatch_message, filter_terminal_image_placeholders,
+};
 use scribe_client::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client::update::UpdateState;
 use scribe_client::url_detect;
@@ -139,6 +142,7 @@ use scribe_common::{
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
     socket::server_socket_path,
+    terminal_images::ImageLimits,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -4261,7 +4265,14 @@ impl TerminalView {
     /// The last painted frame of `session_id`'s grid, or `None` when nothing
     /// has ever reached that pane.
     fn pane_content(&self, session_id: SessionId) -> Option<Arc<Content>> {
-        self.pane_frame(session_id).map(|frame| Arc::clone(&frame.content))
+        self.pane_frame(session_id).map(|frame| {
+            debug_assert!(
+                frame.image_scene.definitions.len()
+                    <= usize::try_from(ImageLimits::V1.max_images_per_session)
+                        .unwrap_or(usize::MAX)
+            );
+            Arc::clone(&frame.content)
+        })
     }
 
     /// Resolve one animated AI border colour per workspace for this frame.
@@ -4791,6 +4802,7 @@ impl TerminalView {
     /// matches, and asking the server to search for "" would only cost a round
     /// trip to be told there are no matches.
     fn send_search_request(&self, query: &str) {
+        let query = filter_terminal_image_placeholders(query);
         if query.is_empty() {
             return;
         }
@@ -4799,7 +4811,7 @@ impl TerminalView {
             tracing::debug!("find query typed with no attached pane; nothing to search");
             return;
         };
-        match self.sink.search_request(session_id, query.to_owned(), SEARCH_RESULT_LIMIT) {
+        match self.sink.search_request(session_id, query.clone(), SEARCH_RESULT_LIMIT) {
             Ok(()) => tracing::info!(%session_id, %query, "sent search request"),
             Err(error) => tracing::warn!(%error, "search request dropped: IPC writer closed"),
         }
@@ -6692,25 +6704,29 @@ fn main() -> std::process::ExitCode {
             // app-level action rather than a listener on the terminal root.
             // It still lands on the terminal's server-owned close workflow.
             cx.on_action(move |_: &Quit, cx| {
-                // GPUI removes the active window from its window table while
-                // dispatching an action through it. Updating the handle here
-                // would therefore fail every time; defer until dispatch has
-                // returned the window to the table.
-                cx.defer(move |cx| {
-                    if terminal_window
-                        .update(cx, |view, _window, ctx| {
-                            view.request_window_close(ctx);
-                        })
-                        .is_err()
-                    {
-                        tracing::warn!("quit shortcut ignored: terminal window is unavailable");
-                    }
-                });
+                defer_terminal_window_close(terminal_window, cx);
             });
         }
         cx.activate(true);
     });
     std::process::ExitCode::SUCCESS
+}
+
+/// Request the terminal close after GPUI finishes dispatching the Quit action.
+fn defer_terminal_window_close(terminal_window: WindowHandle<TerminalView>, cx: &mut App) {
+    // GPUI removes the active window from its window table while dispatching an
+    // action through it. Updating the handle synchronously would therefore
+    // fail; defer until dispatch has returned the window to the table.
+    cx.defer(move |cx| {
+        if terminal_window
+            .update(cx, |view, _window, ctx| {
+                view.request_window_close(ctx);
+            })
+            .is_err()
+        {
+            tracing::warn!("quit shortcut ignored: terminal window is unavailable");
+        }
+    });
 }
 
 /// Verify that the Vulkan loader can initialize a usable adapter before an
@@ -7579,6 +7595,13 @@ fn apply_pane_op(
             *kept_rows,
             grid,
         ),
+        PaneOp::TerminalImageLive(message) => match grid.apply_image_live(message.clone()) {
+            Ok(committed) => usize::from(committed),
+            Err(error) => {
+                tracing::warn!(%session, %error, "rejected terminal image live burst");
+                0
+            }
+        },
     }
 }
 
@@ -8296,6 +8319,10 @@ async fn dispatch_server_message(
         output @ (ServerMessage::PtyOutput { .. }
         | ServerMessage::SessionReplay { .. }
         | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output).await,
+        image @ (ServerMessage::TerminalImageLive { .. }
+        | ServerMessage::TerminalImageCapabilityMismatch { .. }) => {
+            on_terminal_image_message(ctx, image);
+        }
         // The terminal-chrome family all lands in the same two stores (the tab
         // strip's labels and the shared metadata), so it is named here and
         // routed as one to [`on_chrome_message`].
@@ -8455,12 +8482,9 @@ fn request_initial_session(
     let workspace_id = WorkspaceId::new();
     let binding = restore_replay::new_shell_binding(None);
     let launch_id = binding.launch_id.clone();
-    let mut pending = match ctx.initial_session.binding.lock() {
-        Ok(pending) => pending,
-        Err(_) => {
-            ctx.initial_session.armed.store(true, Ordering::Release);
-            return Err("initial-session binding mutex poisoned".to_owned());
-        }
+    let Ok(mut pending) = ctx.initial_session.binding.lock() else {
+        ctx.initial_session.armed.store(true, Ordering::Release);
+        return Err("initial-session binding mutex poisoned".to_owned());
     };
     *pending = Some(binding);
     drop(pending);
@@ -8711,6 +8735,26 @@ async fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
             }
         }
         // Unreachable: the caller only routes the pane-content family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Route live image records through the pane FIFO and show typed attach
+/// mismatches in the existing visible status strip.
+fn on_terminal_image_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::TerminalImageLive { session_id, message } => {
+            if is_attached(ctx, session_id) {
+                forward_inbound(
+                    &ctx.in_tx,
+                    InboundEvent::TerminalImageLive { session_id, message },
+                );
+            }
+        }
+        ServerMessage::TerminalImageCapabilityMismatch { session_id, mismatch } => {
+            tracing::warn!(%session_id, ?mismatch, "terminal image capability mismatch");
+            set_status(&ctx.status, &ctx.generation, capability_mismatch_message(mismatch));
+        }
         other => unhandled_server_message(&other),
     }
 }

@@ -56,6 +56,7 @@ use scribe_common::{
         AiLaunchSpec, AutomationAction, ClientMessage, PromptMarkKind, TerminalSize,
         WorkspaceTreeNode,
     },
+    terminal_images::{TerminalImageLiveMessage, TerminalImageUpdate},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -156,6 +157,9 @@ pub enum InboundEvent {
     /// The server trimmed the named pane's scrollback back to `kept_rows`, so
     /// the display grid has to drop the same oldest rows.
     TrimScrollback { session_id: SessionId, kept_rows: usize },
+    /// One live terminal-image boundary/update. It shares this FIFO with text
+    /// so its commit cannot overtake the PTY bytes it follows.
+    TerminalImageLive { session_id: SessionId, message: TerminalImageLiveMessage },
 }
 
 /// One operation a drained batch applies to a pane, in arrival order.
@@ -176,6 +180,8 @@ pub enum PaneOp {
     /// Drop the pane's oldest scrollback rows until `kept_rows` remain, and
     /// shift every surviving absolute-row anchor by however many went.
     TrimScrollback { kept_rows: usize },
+    /// A generation/sequence-tagged image operation kept as its own boundary.
+    TerminalImageLive(TerminalImageLiveMessage),
 }
 
 /// A drained, per-pane-collapsed batch. A pane's consecutive output runs are
@@ -246,6 +252,10 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
                 open.remove(&session_id);
                 entries.push((session_id, PaneOp::TrimScrollback { kept_rows }));
             }
+            InboundEvent::TerminalImageLive { session_id, message } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::TerminalImageLive(message)));
+            }
         }
     }
     CoalescedBatch { entries }
@@ -284,6 +294,9 @@ fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
         PaneOp::TrimScrollback { kept_rows } => {
             InboundEvent::TrimScrollback { session_id, kept_rows }
         }
+        PaneOp::TerminalImageLive(message) => {
+            InboundEvent::TerminalImageLive { session_id, message }
+        }
     }
 }
 
@@ -293,9 +306,18 @@ fn payload_bytes(event: &InboundEvent) -> usize {
         InboundEvent::PaneOutput { bytes, .. } | InboundEvent::PaneRebuild { bytes, .. } => {
             bytes.len()
         }
+        InboundEvent::TerminalImageLive {
+            message:
+                TerminalImageLiveMessage::Update {
+                    update: TerminalImageUpdate::DefinitionChunk { chunk },
+                    ..
+                },
+            ..
+        } => chunk.data.len(),
         InboundEvent::PromptMark { .. }
         | InboundEvent::ScrollBottom { .. }
-        | InboundEvent::TrimScrollback { .. } => 0,
+        | InboundEvent::TrimScrollback { .. }
+        | InboundEvent::TerminalImageLive { .. } => 0,
     }
 }
 
@@ -307,7 +329,8 @@ fn event_session(event: &InboundEvent) -> SessionId {
         | InboundEvent::PaneRebuild { session_id, .. }
         | InboundEvent::PromptMark { session_id, .. }
         | InboundEvent::ScrollBottom { session_id }
-        | InboundEvent::TrimScrollback { session_id, .. } => *session_id,
+        | InboundEvent::TrimScrollback { session_id, .. }
+        | InboundEvent::TerminalImageLive { session_id, .. } => *session_id,
     }
 }
 
@@ -1518,7 +1541,8 @@ mod tests {
                         PaneOp::Output(bytes) | PaneOp::Rebuild { bytes, .. } => Some((id, bytes)),
                         PaneOp::PromptMark { .. }
                         | PaneOp::ScrollBottom
-                        | PaneOp::TrimScrollback { .. } => None,
+                        | PaneOp::TrimScrollback { .. }
+                        | PaneOp::TerminalImageLive(_) => None,
                     })
                     .collect(),
             );

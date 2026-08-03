@@ -1490,6 +1490,34 @@ The write task serializes commands to `ClientMessage` and writes to the socket. 
 
 Automation requests use that same path in both directions. `scribe-cli action ...` becomes  `DispatchAction`, the server forwards it as  `RunAction`, and the client executes it through the same handlers the keyboard shortcuts and command palette already use.
 
+### Terminal Image Live Scene
+
+Each GPUI pane owns an immutable, bounded CPU image scene that advances atomically beside its text grid.
+
+`TerminalImageLive` records enter the same ordered inbound queue as `PtyOutput`.
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#apply_image_live]]
+hands each record to
+[[crates/scribe-client/src/terminal_image_scene.rs#LiveImageScene#apply]], which
+clones the committed scene on `Begin`, stages definitions, contiguous bounded
+chunks, placements, deletes, and grid effects, then swaps one `Arc` only on a
+matching `Commit`. Invalid, stale, interrupted, or incomplete generations drop
+their staging state without exposing a partial operation burst.
+
+Definitions and placements retain operation order. Replacement removes the old
+image's placements only after replacement bytes complete; delete, screen,
+scroll, erase, resize, and reset effects clean active scene state under the
+frozen per-session quotas. `PaneFrame` captures the committed CPU scene with the
+text snapshot but no GPUI image resource, cache, or renderer capability is
+claimed yet.
+
+[[crates/scribe-client/src/terminal_image_scene.rs#filter_terminal_image_placeholders]]
+removes `U+10EEEE` and at most its three zero-width coordinate marks from
+selection/copy and outbound search queries while retaining ordinary surrounding
+and combining text. A typed capability mismatch reaches the visible pane status
+strip through
+[[crates/scribe-client/src/terminal_image_scene.rs#capability_mismatch_message]];
+the client continues offering false image capabilities until painting exists.
+
 ### Server Lifecycle
 
 Starts and connects to the server process, with a retry loop waiting up to 5 seconds for the socket to appear.

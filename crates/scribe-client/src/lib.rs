@@ -109,6 +109,7 @@ pub mod status_bar;
 pub mod sys_stats;
 pub mod tab_bar;
 pub mod tab_session;
+pub mod terminal_image_scene;
 pub mod titlebar;
 pub mod tooltip;
 pub mod update;

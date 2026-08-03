@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 scribe-common.workspace = true
+scribe-client = { path = "../scribe-client" }
 # The LAN peer stand-in terminates a REAL mutual-TLS handshake with the same
 # server-owned `LanTls` builder the shipped listener uses, so the client under
 # test is never talking to a hand-rolled TLS shim.

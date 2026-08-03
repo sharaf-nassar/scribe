@@ -1,5 +1,6 @@
 mod assert;
 mod capture;
+mod client_scene;
 mod cmd_socket;
 mod daemon;
 mod decode_spike;
@@ -240,6 +241,15 @@ enum Command {
         /// Emit computed fixture hex without comparing it (maintainer use).
         #[arg(long)]
         dump: bool,
+    },
+    /// Apply fixture-driven live records through the production client scene.
+    TerminalImageClientScene {
+        /// Canonical live-scene fixture manifest.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// JSON evidence path.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Send one JSON-encoded `ServerMessage` to a running `share-tap`, which
     /// frames it to the client as if the server had sent it.
@@ -512,6 +522,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::RemotePeer(args) => run_remote_peer(args),
         Command::TerminalImageIpc { fixtures, output, dump } => {
             ipc_fixtures::verify(&fixtures, &output, dump).map_err(TestError::TestFailure)
+        }
+        Command::TerminalImageClientScene { fixtures, output } => {
+            client_scene::verify(&fixtures, &output).map_err(TestError::TestFailure)
         }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
     }

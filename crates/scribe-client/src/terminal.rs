@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use scribe_common::ids::SessionId;
+use scribe_common::terminal_images::{TerminalGridEffect, TerminalImageLiveMessage};
 
 pub use alacritty_terminal_gpui::grid::Scroll;
 pub use alacritty_terminal_gpui::term::cell::Flags;
@@ -49,8 +50,12 @@ use scribe_client::split_scroll::{
     SplitScrollEligibility, align_pin_rows_to_logical_lines, compute_pin_rows,
     split_scroll_eligible,
 };
+use scribe_client::terminal_image_scene::{
+    CommittedImageScene, LiveImageScene, LiveSceneApply, LiveSceneError,
+    filter_terminal_image_placeholders,
+};
 use scribe_client::vi_mode::{self, ViMotion};
-use vte::ansi::{Color, CursorShape as TerminalCursorShape};
+use vte::ansi::{Color, CursorShape as TerminalCursorShape, Handler as _};
 
 use crate::session_lifecycle::PromptAnchor;
 use crate::sync_frames::{
@@ -221,6 +226,9 @@ pub struct DisplayOnlyTerminal {
     /// grid lines, so scrolling moves the highlight with the content rather
     /// than leaving it pinned to the screen.
     selection: SelectionState,
+    /// Atomically published CPU-only terminal-image state. GPU resources stay
+    /// outside this model and land with the renderer bead.
+    image_scene: LiveImageScene,
     /// Scrollback capacity this grid was built with, restored after a
     /// [`Self::trim_history`] shrinks the ring to drop rows.
     scrollback_lines: usize,
@@ -241,6 +249,7 @@ impl DisplayOnlyTerminal {
             scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
+            image_scene: LiveImageScene::default(),
         };
         terminal.make_content();
         terminal
@@ -312,6 +321,59 @@ impl DisplayOnlyTerminal {
     /// Returns the content captured after the most recent output frame.
     pub fn content(&self) -> Arc<Content> {
         Arc::clone(&self.content)
+    }
+
+    /// Apply one ordered live image record beside the text parser.
+    pub fn apply_image_live(
+        &mut self,
+        message: TerminalImageLiveMessage,
+    ) -> Result<bool, LiveSceneError> {
+        let outcome = self.image_scene.apply(message)?;
+        let LiveSceneApply::Committed(scene) = outcome else {
+            return Ok(false);
+        };
+        for effect in &scene.last_grid_effects {
+            self.apply_image_grid_effect(effect);
+        }
+        self.make_content();
+        Ok(true)
+    }
+
+    /// Current immutable CPU image scene for future paint/cache consumers.
+    #[must_use]
+    pub fn image_scene(&self) -> Arc<CommittedImageScene> {
+        self.image_scene.committed()
+    }
+
+    fn apply_image_grid_effect(&mut self, effect: &TerminalGridEffect) {
+        match *effect {
+            TerminalGridEffect::MoveCursor { row, column } => {
+                self.term.goto(row, usize::from(column));
+            }
+            TerminalGridEffect::Scroll { top, bottom, rows } if rows != 0 => {
+                let lines = self.term.screen_lines();
+                let start = usize::from(top).min(lines);
+                let end = usize::from(bottom).saturating_add(1).min(lines);
+                if start >= end {
+                    return;
+                }
+                let region = Line(i32::try_from(start).unwrap_or(i32::MAX))
+                    ..Line(i32::try_from(end).unwrap_or(i32::MAX));
+                let positions =
+                    usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX).min(end - start);
+                if rows > 0 {
+                    self.term.grid_mut().scroll_up::<Color>(&region, positions);
+                } else {
+                    self.term.grid_mut().scroll_down(&region, positions);
+                }
+            }
+            TerminalGridEffect::Scroll { .. }
+            | TerminalGridEffect::EraseCells { .. }
+            | TerminalGridEffect::ResizeClip { .. }
+            | TerminalGridEffect::SwitchScreen { .. }
+            | TerminalGridEffect::SoftReset
+            | TerminalGridEffect::HardReset => {}
+        }
     }
 
     /// Current viewport geometry in terminal cells.
@@ -606,7 +668,7 @@ impl DisplayOnlyTerminal {
     /// `None` when nothing is selected.
     #[must_use]
     pub fn selection_text(&self) -> Option<String> {
-        self.selection.copy_text(&self.term)
+        self.selection.copy_text(&self.term).map(|text| filter_terminal_image_placeholders(&text))
     }
 
     /// The active selection projected onto the painted viewport, one span per
@@ -835,6 +897,8 @@ impl PaneStream {
 pub struct PaneFrame {
     /// The grid snapshot the pane paints.
     pub content: Arc<Content>,
+    /// CPU image scene captured at the same commit as the text projection.
+    pub image_scene: Arc<CommittedImageScene>,
     /// Viewport measurements the overlay scrollbar sizes its thumb from.
     pub metrics: ScrollMetrics,
     /// The active selection projected onto the painted viewport.
@@ -852,6 +916,7 @@ impl PaneFrame {
     fn capture(terminal: &DisplayOnlyTerminal) -> Self {
         Self {
             content: terminal.content(),
+            image_scene: terminal.image_scene(),
             metrics: terminal.scroll_metrics(),
             selection_spans: terminal.selection_spans(),
             cursor: terminal.cursor_placement(),

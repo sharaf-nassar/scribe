@@ -24,10 +24,10 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 64
-counts modules-wired 64
+counts modules-total 67
+counts modules-wired 67
 counts server-messages-total 60
-counts server-messages-handled 52
+counts server-messages-handled 54
 counts layout-actions-total 36
 counts layout-actions-handled 36
 
@@ -35,7 +35,5 @@ unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
-unhandled-server-message TerminalImageCapabilityMismatch
-unhandled-server-message TerminalImageLive
 unhandled-server-message TerminalImageReplay
 unhandled-server-message UpdateCheckResult
