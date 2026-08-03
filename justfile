@@ -229,11 +229,22 @@ e2e-visual-lan-approval:
 e2e-visual-remote-control:
     docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/remote-control-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/remote-control.sh
 
-# Run the update-surface visual E2E pair. The server polls a fake releases API
-# inside the container, so it needs a longer budget than the default 60 s.
-e2e-visual-update:
-    docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/update-trigger.sh
-    docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/update-dismiss.sh
+# Run either update-surface visual E2E, or both when no script is named. The
+# optional selector lets the aggregate report each script independently while
+# this recipe remains the source of truth for their shared environment.
+e2e-visual-update script="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    requested="{{ script }}"
+    requested="${requested#script=}"
+    case "$requested" in
+        "") scripts=(visual/update-trigger.sh visual/update-dismiss.sh) ;;
+        visual/update-trigger.sh|visual/update-dismiss.sh) scripts=("$requested") ;;
+        *) printf 'ERROR: unknown update E2E script %q.\n' "$requested" >&2; exit 2 ;;
+    esac
+    for script in "${scripts[@]}"; do
+        docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual "/tests/$script"
+    done
 
 # Run the window-chrome band visual E2E: the derived window size, the whole
 # terminal grid, and the prompt/status bands all on screen. Uses the shared-pane
@@ -349,17 +360,140 @@ e2e-visual-server-upgrade-reattach:
 e2e-visual-ime:
     docker run --rm {{gpu_flags}} -e TEST_TIMEOUT=240 -e SCRIBE_IME=1 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/ime-preedit.sh
 
+# Run the pane/workspace layout E2E with its openbox-safe keybinding.
+e2e-visual-pane-workspace-layout:
+    docker run --rm {{gpu_flags}} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/pane-workspace-layout-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/pane-workspace-layout.sh
+
+# Run paste confirmation with its opt-in policy enabled.
+e2e-visual-paste-confirmation:
+    docker run --rm {{gpu_flags}} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/paste-confirmation-config.toml)" -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/paste-confirmation.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
-    just e2e-func func/smoke.sh
-    just e2e-func func/session-exit-status.sh
-    just e2e-func func/reconnect.sh
-    just e2e-func func/attach-lossless.sh
-    just e2e-func func/workspace-split.sh
-    just e2e-func func/shell-integration.sh
-    just e2e-func func/hot-reload.sh
-    just e2e-func func/cold-restart.sh
-    just e2e-func func/failure-server-down.sh
-    just e2e-func func/failure-socket-loss.sh
-    just e2e-func func/ai-state-indicator.sh
-    just e2e-func func/ai-context-thresholds.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+    scripts=(
+        func/ai-context-thresholds.sh
+        func/ai-launch-smoke.sh
+        func/ai-shell-env-bash.sh
+        func/ai-shell-env-fish.sh
+        func/ai-shell-env-zsh.sh
+        func/ai-state-indicator.sh
+        func/attach-lossless.sh
+        func/cli-smoke.sh
+        func/cold-restart.sh
+        func/env-persistence.sh
+        func/failure-server-down.sh
+        func/failure-socket-loss.sh
+        func/fresh-create-geometry.sh
+        func/handoff-truecolor.sh
+        func/hot-reload.sh
+        func/keybindings-validation.sh
+        func/multi-window.sh
+        func/reconnect.sh
+        func/resize-coalescing.sh
+        func/session-exit-status.sh
+        func/shell-integration.sh
+        func/smoke.sh
+        func/terminal-shortcuts.sh
+        func/viewport-debounce.sh
+        func/workspace-split.sh
+    )
+    mapfile -t inventory < <(find tests/e2e/func -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'func/%f\n' | sort)
+    mapfile -t mapped < <(printf '%s\n' "${scripts[@]}" | sort)
+    if ! diff -u <(printf '%s\n' "${inventory[@]}") <(printf '%s\n' "${mapped[@]}"); then
+        echo 'ERROR: functional E2E recipe does not match executable script inventory.' >&2
+        exit 2
+    fi
+    for script in "${scripts[@]}"; do
+        if [[ "$script" == func/env-persistence.sh ]]; then
+            SCRIBE_KEYRING=1 just e2e-func "$script"
+        else
+            just e2e-func "$script"
+        fi
+    done
+
+# Full visual E2E suite: build once, delegate each executable test to its recipe,
+# collect every result, and leave a crash-tolerant machine-readable summary.
+e2e-all-visual: build-release docker-visual
+    #!/usr/bin/env bash
+    set -uo pipefail
+    mappings=(
+        'visual/ai-indicator.sh|e2e-visual-shared'
+        'visual/ai-task-label.sh|e2e-visual-ai-task-label'
+        'visual/bell.sh|e2e-visual-bell'
+        'visual/clipboard-osc52.sh|e2e-visual-clipboard'
+        'visual/cold-restart.sh|e2e-visual-cold-restart'
+        'visual/color-emoji.sh|e2e-visual-shared'
+        'visual/config-reload.sh|e2e-visual'
+        'visual/dialogs.sh|e2e-visual'
+        'visual/drag-drop.sh|e2e-visual-drag-drop'
+        'visual/find-overlay.sh|e2e-visual-find'
+        'visual/ime-preedit.sh|e2e-visual-ime'
+        'visual/lan-approval.sh|e2e-visual-lan-approval'
+        'visual/mouse-reporting.sh|e2e-visual-mouse-reporting'
+        'visual/notifications.sh|e2e-visual-notifications'
+        'visual/overlay-actions.sh|e2e-visual-shared'
+        'visual/overlays.sh|e2e-visual'
+        'visual/pane-workspace-layout.sh|e2e-visual-pane-workspace-layout'
+        'visual/paste-confirmation.sh|e2e-visual-paste-confirmation'
+        'visual/prompt-marks.sh|e2e-visual-prompt-marks'
+        'visual/reconnect.sh|e2e-visual'
+        'visual/remote-control.sh|e2e-visual-remote-control'
+        'visual/scrollbar.sh|e2e-visual-scrollbar'
+        'visual/server-lifecycle.sh|e2e-visual-server-lifecycle'
+        'visual/server-upgrade-reattach.sh|e2e-visual-server-upgrade-reattach'
+        'visual/session-tooling.sh|e2e-visual-session-tooling'
+        'visual/settings-entry.sh|e2e-visual-settings-entry'
+        'visual/settings-trust.sh|e2e-visual-settings-trust'
+        'visual/share-control.sh|e2e-visual-share'
+        'visual/tab-window-chords.sh|e2e-visual'
+        'visual/terminal-viewport.sh|e2e-visual-terminal-viewport'
+        'visual/terminal-zoom.sh|e2e-visual-terminal-zoom'
+        'visual/titlebar.sh|e2e-visual'
+        'visual/update-dismiss.sh|e2e-visual-update'
+        'visual/update-trigger.sh|e2e-visual-update'
+        'visual/window-chrome-bands.sh|e2e-visual-chrome-bands'
+        'visual/window-lifecycle.sh|e2e-visual-window-lifecycle'
+        'visual/window-resize.sh|e2e-visual-window-resize'
+        'visual/workspace-ipc.sh|e2e-visual-workspace-ipc'
+        'visual/workspace-split.sh|e2e-visual'
+        'visual/x11-focus-guard.sh|e2e-visual'
+    )
+    mapfile -t inventory < <(find tests/e2e/visual -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'visual/%f\n' | sort)
+    mapfile -t mapped < <(printf '%s\n' "${mappings[@]}" | cut -d'|' -f1 | sort)
+    if ! diff -u <(printf '%s\n' "${inventory[@]}") <(printf '%s\n' "${mapped[@]}"); then
+        echo 'ERROR: visual E2E mapping does not match executable script inventory.' >&2
+        exit 2
+    fi
+    mkdir -p test-output
+    summary=test-output/e2e-visual-summary.jsonl
+    : >"$summary"
+    failures=0
+    for mapping in "${mappings[@]}"; do
+        IFS='|' read -r script recipe <<<"$mapping"
+        started=$(date +%s)
+        case "$recipe" in
+            e2e-visual|e2e-visual-shared|e2e-visual-update)
+                just "$recipe" "$script"
+                exit_code=$?
+                ;;
+            *)
+                just "$recipe"
+                exit_code=$?
+                ;;
+        esac
+        duration_s=$(($(date +%s) - started))
+        if ((exit_code == 0)); then
+            status=pass
+        else
+            status=fail
+            failures=$((failures + 1))
+        fi
+        printf '{"script":"%s","recipe":"%s","status":"%s","exit_code":%d,"duration_s":%d}\n' \
+            "$script" "$recipe" "$status" "$exit_code" "$duration_s" >>"$summary"
+    done
+    if ((failures > 0)); then
+        printf 'ERROR: %d visual E2E script(s) failed; see %s.\n' "$failures" "$summary" >&2
+        exit 1
+    fi

@@ -295,8 +295,8 @@ have to guess whether host fallback is acceptable (it never is).
   except the debug-tag variant.
 - Nothing in the harness may depend on runtime network access (the future
   hardened-profile bead will set `--network none`).
-- `just e2e`'s existing 12 scripts must stay green at every intermediate
-  commit; the expanded definition applies once US-6 lands.
+- `just e2e`'s pre-US-6 scripts must stay green at every intermediate commit;
+  the expanded definition applies once US-6 lands.
 - Cross-story ordering (becomes bead dependencies): shared
   Dockerfile/justfile plumbing (US-1's staging mechanism) first; US-5 →
   US-2 keyring rows; US-5 → US-6 all-func recipe.
