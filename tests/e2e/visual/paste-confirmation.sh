@@ -1,10 +1,11 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual E2E test: spec-011 paste confirmation (US2 control-character trigger
 # + non-risky passthrough edge cases).
 #
 # Pastes into the REAL scribe-client window via xdotool (the only way to
 # exercise the client-side paste gate; scribe-test `Send` injects server-side
-# and bypasses it). Requires: visual container with --gpus all, xclip, and
+# and bypasses it). Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xclip, and
 # SCRIBE_EXTRA_CONFIG seeding `terminal.paste_confirmation = true`.
 #
 # Screenshots land in /output for inspection. A risky paste is gated only when

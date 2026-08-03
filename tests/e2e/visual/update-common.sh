@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Shared rig for the two update-surface visual E2E tests.
 #
 # Both tests drive the same first phases — stand up the fake releases API, wait
@@ -7,7 +8,7 @@
 # which button of the confirmation modal they activate. Everything common lives
 # here.
 #
-# Requires: visual container with --gpus all, xdotool, scrot, imagemagick,
+# Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot, imagemagick,
 # python3, and the container started with
 #   -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest
 #   -e SCRIBE_EXTRA_CONFIG='[terminal.status_bar_stats]\ncpu = false\n…'

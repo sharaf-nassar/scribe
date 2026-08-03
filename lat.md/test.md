@@ -170,6 +170,16 @@ restores the preinst stash, leaves a running session alive, emits a warning,
 and disables relaunch. `just test-install-vulkan-guard` runs this guard in a
 disposable Debian container.
 
+## E2E Recipe Contract
+
+Docker E2E recipes default to portable software rendering and keep test sources immutable, while explicit image and environment parameters support focused diagnostics.
+
+`just e2e-func <script> image=<tag>` and `just e2e-visual <script> image=<tag>` select a prebuilt release or debug image. Both recipes pass through `TEST_TIMEOUT`, `RUST_LOG`, and `SCRIBE_KEYRING` from the host environment.
+
+Visual recipes omit GPU passthrough by default because lavapipe supplies deterministic software Vulkan. Set `SCRIBE_E2E_GPUS=all` (or another Docker GPU request) to opt in; hosts without NVIDIA container tooling need no special flag.
+
+Every recipe mounts `./tests/e2e` at `/tests:ro`, leaving `/output` as the only writable bind mount. Both entrypoints export `SCRIBE_E2E_SANDBOX=1`, and every func or visual shell script checks that sentinel before its first command and exits 99 when invoked directly on the host.
+
 ## E2E Functional Tests
 
 Functional end-to-end tests that drive real sessions through the `scribe-test` harness and assert rendered output.

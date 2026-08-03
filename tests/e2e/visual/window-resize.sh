@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Scripted + visual E2E: a live window resize republishes every pane's grid.
 #
 # Resizing the window re-lays the panes locally from the grid band's measured

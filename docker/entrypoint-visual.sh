@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+export SCRIBE_E2E_SANDBOX=1
+
 RESOLUTION="${RESOLUTION:-1920x1080}"
 VISUAL_APP="${SCRIBE_VISUAL_APP:-client}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-60}"

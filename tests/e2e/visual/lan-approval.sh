@@ -1,4 +1,5 @@
 #!/bin/bash
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
 # Visual + scripted E2E: the feature-014 LAN surface of the GPUI client, asserted
 # on the real wire (fix unit FU-17).
 #
