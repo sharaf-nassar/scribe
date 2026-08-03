@@ -217,6 +217,14 @@ recipe.
 
 The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integration` tree at `/usr/local/share/scribe/shell-integration` so the in-container `scribe-server`'s  resolves them and injects `SCRIBE_SHELL_INTEGRATION=1` plus the per-shell rcfile/ZDOTDIR/XDG plumbing into every spawned PTY. Without this copy, the `shell-integration.sh` e2e test never sees the env var or the OSC marks the integration scripts emit.
 
+### CLI Smoke E2E
+
+`tests/e2e/func/cli-smoke.sh` validates the headless `scribe` CLI against the disposable functional server.
+
+Covered surface is `windows`, explicit-window `action new-tab`, `profile active`, `profile list`, and a server-absent `windows` failure. Window enumeration must return only the connected daemon window, proving the transient CLI request creates no extra window. Action dispatch must arrive at that daemon as `RunAction(NewTab)`. Profile reads must identify the active profile without changing the profile store, and server absence must return nonzero with useful socket error text.
+
+Bare interactive passthrough is intentionally not exercised. Profile-writing commands (`save`, `switch`, `import`, and `export`) and the GUI effect of routed actions are also outside this smoke test; the action oracle covers routing only.
+
 ### AI Shell Environment Matrix
 
 Three functional scripts verify structured AI launch behavior across the supported bash, zsh, and fish login shells without relying on a GPUI client.
