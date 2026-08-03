@@ -158,3 +158,42 @@ checks exact security values and fixture ownership/hex integrity, then copies
 the canonical JSON unchanged to
 `test-output/terminal-images/contract.json`. Invoke it with
 `just e2e-func terminal-image-contract.sh` after building the functional image.
+
+## Bounded Decode Decision
+
+Production decoding is a conditional go through narrow decoder-only forks and Scribe-owned limits; generic or stock whole-image entry points are outside the trust boundary.
+
+The decode spike selects `flate2 1.1.9` low-level `Decompress` behind a
+4,096-work-unit Scribe loop. The loop charges input and output, checks the
+monotonic deadline and cancellation, rejects projected inflation, and grows
+output only through fallible allocation.
+
+Sixel vendors only `icy_sixel 0.5.0` decoder source and adds caller-owned
+dimension, pixel, allocation, work, deadline, and cancellation limits. Its
+encoder, `quantette`, and unaudited SIMD span paths are excluded. PNG vendors
+only `png 0.18.1` decoder core and adds the same hook at compressed-input,
+inflated-output, unfilter, and pixel-conversion boundaries; encoder, APNG, and
+ancillary text/profile paths are excluded.
+
+Generic `image 0.25.10`, stock `png`, stock `icy_sixel`, and C decoders are
+no-go. The first two expose no cooperative hook at the frozen interval and
+their allocation controls cannot alone enforce every Scribe trust budget.
+`specs/020-terminal-images/decoder-decision.md` records source evidence, fork
+ownership, evidence schema, and remaining production work.
+
+## Decode Spike Verification
+
+Docker verification exercises exact decode limits and emits a reviewable decision plus structured evidence without implementing production decoders.
+
+`tests/e2e/functional/terminal-image-decode-spike.sh` runs the harness-only
+probe through `just e2e-func`. It loads frozen `contract.json` values and covers
+exact max/max-plus-one dimensions, a real fallible maximum allocation,
+deterministic allocation denial, cumulative work max-plus-one, cooperative
+cancellation, deadline checks, zlib and PNG bombs, valid PNG decode, and
+gradual Sixel canvas growth.
+
+The run writes schema-versioned
+`test-output/terminal-images/decode-spike-evidence.json` and
+`decoder-decision.md`. Evidence contains only limits, typed outcomes, counts,
+dimensions, allocation peaks, and compressed sizes; it never records image
+payloads or decoded pixels.

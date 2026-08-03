@@ -133,7 +133,12 @@ Acceptance Criteria:
 ## Open Questions
 
 - Which native macOS environment can provide required runtime evidence without substituting Linux Docker binaries?
-- Which decoder implementation or bounded adaptation best satisfies the direct-inline trust boundary and required cancellation controls?
+
+The decoder question is resolved by
+[`decoder-decision.md`](decoder-decision.md): use a Scribe-owned bounded
+`flate2` loop and narrow decoder-only Sixel/PNG forks with common allocation,
+work, deadline, and cancellation controls. Generic and stock whole-image
+decode entry points are no-go.
 
 The v1 protocol matrix, xterm-compatible Sixel chronology, typed failures,
 numeric security limits, application pins, and fixture ownership are resolved

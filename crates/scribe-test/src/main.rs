@@ -2,6 +2,7 @@ mod assert;
 mod capture;
 mod cmd_socket;
 mod daemon;
+mod decode_spike;
 mod input;
 mod ipc;
 mod lan_peer;
@@ -255,6 +256,15 @@ enum Command {
         #[arg(long, default_value_t = 5000)]
         timeout: u64,
     },
+    /// Run the bounded terminal-image decoder feasibility probe.
+    DecodeSpike {
+        /// Frozen terminal-image contract JSON.
+        #[arg(long)]
+        contract: PathBuf,
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -459,6 +469,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::AssertSignal { session_id, signal, timeout } => {
             assert::assert_signal(&session_id, signal, timeout)
+        }
+        Command::DecodeSpike { contract, evidence } => {
+            decode_spike::run(&contract, &evidence).map_err(TestError::TestFailure)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =
