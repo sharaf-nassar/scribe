@@ -186,7 +186,7 @@ Docker E2E recipes default to portable software rendering and keep test sources 
 
 The hardened Docker runtime profile checks both E2E images under network, filesystem, and capability restrictions without changing their release or debug binary profile.
 
-`just e2e-func-hardened <script> image=<tag>` and `just e2e-visual-hardened <script> image=<tag>` reuse the selected image with `--network none`, a read-only root filesystem, and every Linux capability dropped. `/run`, `/tmp`, and `/root` are isolated tmpfs mounts for runtime state; `/tests` stays read-only and `/output` remains the only writable bind mount.
+`just e2e-func-hardened <script> image=<tag>` and `just e2e-visual-hardened <script> image=<tag>` reuse the selected image with `--network none`, a read-only root filesystem, and every Linux capability dropped. Hardened containers run as the invoking host's numeric UID/GID, so a fresh host-owned `test-output/` remains writable without `DAC_OVERRIDE`. `/run`, `/tmp`, and `/root` are isolated tmpfs mounts owned by that identity; fixed `USER`, `HOME`, and `SHELL` values give the passwd-less numeric user a complete PTY environment. `/tests` stays read-only and `/output` remains the only writable bind mount.
 
 Run the profile's real smoke checks with:
 
