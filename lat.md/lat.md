@@ -9,5 +9,6 @@ A GPU-accelerated terminal emulator with a client-server architecture and first-
 - [[client]] — Panes, layout, input, IPC, selection, and UI chrome
 - [[rendering]] — GPUI paint path, DPI scaling, colour palette, and box drawing
 - [[pty]] — Async PTY I/O, OSC interception, and metadata parsing
+- [[terminal-images]] — Frozen Kitty/Sixel contract, security limits, lifecycle, fixtures, and compatibility corpus
 - [[settings]] — Webview config editor, key paths, and singleton
 - [[test]] — Integration test harness: PTY capture, IPC helpers, assertion utilities, and screenshot rendering

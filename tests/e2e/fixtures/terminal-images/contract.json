@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "contract_version": "terminal-images-v1",
+  "verified_on": "2026-08-03",
+  "primary_sources": {
+    "kitty": "https://sw.kovidgoyal.net/kitty/graphics-protocol/",
+    "dec_sixel": "https://manx-docs.org/mirror/vt100.net/docs/vt3xx-gp/chapter14.html",
+    "xterm_controls": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Sixel-Graphics",
+    "xterm_runtime": "https://invisible-island.net/xterm/manpage/xterm.html",
+    "yazi_release": "https://github.com/sxyazi/yazi/releases/tag/v26.5.6",
+    "chafa_release": "https://github.com/hpjansson/chafa/releases/tag/1.18.2",
+    "gnuplot_release": "https://www.gnuplot.info/ReleaseNotes_6_0_3.html"
+  },
+  "kitty": {
+    "framing": ["esc_apc_g", "esc_st"],
+    "formats": [24, 32, 100],
+    "transports": ["direct"],
+    "compression": ["rfc1950_zlib"],
+    "actions": ["transmit", "transmit_display", "put", "query", "delete"],
+    "placement": ["classic", "unicode_placeholder"],
+    "delete_selectors": ["a", "A", "i", "I", "p", "P", "x", "X", "y", "Y", "z", "Z"],
+    "quiet": {
+      "0": "success_and_failure",
+      "1": "failure_only",
+      "2": "none"
+    },
+    "z_layers": [
+      "below_nondefault_background_if_less_than_-1073741824",
+      "negative_above_background_below_glyph",
+      "nonnegative_above_glyph"
+    ],
+    "excluded": [
+      "c1_apc",
+      "file",
+      "temporary_file",
+      "shared_memory",
+      "url",
+      "network",
+      "animation",
+      "frame_composition",
+      "relative_parent_placement",
+      "image_number_allocation",
+      "usage_hints"
+    ]
+  },
+  "sixel": {
+    "framing": ["esc_dcs_esc_st", "c1_dcs_c1_st"],
+    "commands": ["raster_attributes", "repeat", "palette_select", "palette_hls", "palette_rgb", "graphics_cr", "graphics_nl"],
+    "background": {
+      "0": "paint_zero_bits_with_background",
+      "1": "preserve_zero_bits",
+      "2": "paint_zero_bits_with_background"
+    },
+    "discovery": "da1_attribute_4_when_runtime_enabled",
+    "modes": {
+      "80_reset": "cursor_anchor_scroll_and_advance",
+      "80_set": "page_origin_crop_cursor_unchanged",
+      "8452_reset": "advance_to_original_column",
+      "8452_set": "advance_right_of_raster"
+    },
+    "layer": "above_default_background_below_nondefault_background_and_glyphs",
+    "soft_reset": "preserve_raster_reset_modes",
+    "hard_reset": "clear_raster",
+    "excluded": ["regis", "object_ids", "reusable_placements", "z_index", "animation", "vector", "video"]
+  },
+  "capability_lifecycle": [
+    "text_only_unlatched",
+    "capable_creator_or_first_enable_latches_exact_v1",
+    "viewerless_session_keeps_parsing_replying_and_retaining",
+    "incapable_attach_is_capability_mismatch",
+    "server_emits_each_reply_once_in_pty_order",
+    "kill_switch_cancels_clears_unadvertises_then_unlatches",
+    "reenable_requires_new_capable_latch",
+    "capable_handoff_preserves_latch_generation_and_bounded_state"
+  ],
+  "failure_categories": [
+    "policy_disabled",
+    "unsupported_protocol",
+    "unsupported_action",
+    "unsupported_transport",
+    "malformed_framing",
+    "malformed_control",
+    "malformed_payload",
+    "truncated_sequence",
+    "chunk_mismatch",
+    "invalid_dimensions",
+    "quota_exceeded",
+    "work_budget_exceeded",
+    "decode_deadline_exceeded",
+    "decode_cancelled",
+    "decode_failed",
+    "image_not_found",
+    "capability_mismatch",
+    "renderer_unavailable",
+    "evicted"
+  ],
+  "limits": {
+    "max_control_string_bytes": 16777216,
+    "max_kitty_chunk_payload_bytes": 4096,
+    "max_chunks_per_transfer": 32768,
+    "max_accumulated_encoded_bytes": 89478488,
+    "max_base64_decoded_bytes": 67108864,
+    "max_inflated_bytes": 67108864,
+    "max_width_pixels": 4096,
+    "max_height_pixels": 4096,
+    "max_pixels": 16777216,
+    "max_canonical_rgba_bytes": 67108864,
+    "max_images_per_session": 128,
+    "max_placements_per_session": 1024,
+    "max_session_retained_cpu_bytes": 134217728,
+    "max_view_projected_gpu_bytes": 268435456,
+    "max_process_retained_bytes": 536870912,
+    "max_concurrent_decodes": 2,
+    "max_decode_queue_depth": 8,
+    "max_decode_queue_bytes": 134217728,
+    "max_work_units_per_command": 134217728,
+    "max_queue_wait_ms": 1000,
+    "max_decode_ms": 2000,
+    "max_replay_chunk_bytes": 1048576,
+    "deadline_check_interval_work_units": 4096
+  },
+  "work_unit": "one input byte examined, output byte emitted, or pixel write",
+  "applications": [
+    {
+      "id": "yazi",
+      "version": "v26.5.6",
+      "revision": "aa526434f00bb44e2e902d9a4ac5f810da1018b9",
+      "protocol": "kitty_classic_via_generic_query",
+      "paths": ["direct_pty", "ssh"],
+      "terminal_spoofing": false
+    },
+    {
+      "id": "chafa",
+      "version": "1.18.2",
+      "protocol": "kitty_and_sixel",
+      "paths": ["direct_pty", "ssh"],
+      "commands": ["chafa --format kitty --probe off", "chafa --format sixels --probe off"]
+    },
+    {
+      "id": "gnuplot",
+      "version": "6.0.3",
+      "protocol": "sixelgd",
+      "paths": ["direct_pty", "ssh"],
+      "command": "set terminal sixelgd"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "kitty-query-order",
+      "path": "fixtures/terminal-images/kitty-query-order.hex",
+      "encoding": "hex",
+      "expect": "kitty_ok_precedes_da1"
+    },
+    {
+      "id": "kitty-rgb-classic",
+      "path": "fixtures/terminal-images/kitty-rgb-classic.hex",
+      "encoding": "hex",
+      "expect": "one_red_rgb_definition_and_classic_placement"
+    },
+    {
+      "id": "kitty-rgba-zlib-chunked",
+      "path": "fixtures/terminal-images/kitty-rgba-zlib-chunked.hex",
+      "encoding": "hex",
+      "expect": "one_half_alpha_red_rgba_definition_after_two_chunks"
+    },
+    {
+      "id": "kitty-png-classic",
+      "path": "fixtures/terminal-images/kitty-png-classic.hex",
+      "encoding": "hex",
+      "expect": "one_png_definition_and_classic_placement"
+    },
+    {
+      "id": "kitty-unicode-placeholder",
+      "path": "fixtures/terminal-images/kitty-unicode-placeholder.hex",
+      "encoding": "hex",
+      "expect": "virtual_placement_and_two_placeholder_cells"
+    },
+    {
+      "id": "kitty-delete-lifecycle",
+      "path": "fixtures/terminal-images/kitty-delete-lifecycle.hex",
+      "encoding": "hex",
+      "expect": "soft_specific_then_hard_image_delete"
+    },
+    {
+      "id": "sixel-7bit",
+      "path": "fixtures/terminal-images/sixel-7bit.hex",
+      "encoding": "hex",
+      "expect": "opaque_red_six_pixel_column"
+    },
+    {
+      "id": "sixel-c1-transparent",
+      "path": "fixtures/terminal-images/sixel-c1-transparent.hex",
+      "encoding": "hex",
+      "expect": "transparent_background_red_six_pixel_column"
+    },
+    {
+      "id": "sixel-mode-chronology",
+      "path": "fixtures/terminal-images/sixel-mode-chronology.hex",
+      "encoding": "hex",
+      "expect": "xterm_80_8452_cursor_and_text_order"
+    },
+    {
+      "id": "malformed-recovery",
+      "path": "fixtures/terminal-images/malformed-recovery.hex",
+      "encoding": "hex",
+      "expect": "can_sub_abort_and_adjacent_text_survives"
+    }
+  ]
+}

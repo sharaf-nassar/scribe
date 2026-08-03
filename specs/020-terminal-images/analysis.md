@@ -39,7 +39,7 @@ New epic: `terminal image protocol support`.
 - The bounded Sixel fork creates long-term security and license ownership. The plan pins source/license material, removes encoder-only dependencies, records the fork delta, assigns CVE maintenance, and gates adoption on adversarial evidence.
 - GPUI may lack source-UV cropping and public atlas accounting. A P0 visual spike must choose existing APIs, bounded crop variants, or a minimal pinned GPUI patch before renderer work.
 - Server-side decode delays later bytes at a graphics boundary. The design bounds queue, work, and deadline, applies backpressure, and proves that later text/replies cannot overtake the command while leaving text-only streams off the decoder path.
-- Raw `PtyOutput` plus canonical image state adds wire and memory pressure for capable viewers. Separate framed, decoded, session, view, process, and replay limits plus replay-dirty recovery constrain it; the contract task freezes exact numbers.
+- Raw `PtyOutput` plus canonical image state adds wire and memory pressure for capable viewers. The frozen framed, decoded, 128 MiB session, 256 MiB view, 512 MiB process, and 1 MiB replay ceilings plus replay-dirty recovery constrain it.
 - Kitty and Sixel standards leave edge behavior undefined or contradictory. The plan freezes xterm-compatible DECSDM/8452 and Sixel chronology, refuses to claim undefined overlap parity, and builds owned fixtures from primary sources.
 - Current Yazi uses classic Kitty for an unknown-but-query-capable terminal. V1 gates real Yazi display on that truthful path and tests Unicode placeholders independently; upstream Scribe recognition remains optional P3 work.
 - Incapable local clients cannot safely render an image-enabled session. The plan chooses an explicit typed refusal instead of invisible/cursor-divergent degradation and tests old/new/rollback paths.
@@ -47,13 +47,11 @@ New epic: `terminal image protocol support`.
 
 ## Unresolved Questions
 
-No unresolved product-scope or epic-selection question remains. The following bounded technical decisions are intentionally assigned to P0 tasks rather than left as implementation latitude:
+No unresolved product-scope, protocol-contract, or epic-selection question remains. The following bounded technical decisions are intentionally assigned to later P0 tasks:
 
-- Exact numeric security limits and decoder queue/deadline values.
 - Decoder-fork go/no-go and final vendored revision.
-- GPUI crop/UV mechanism and cross-platform dimension ceiling.
+- GPUI crop/UV mechanism and whether native evidence requires lowering the frozen 4096-pixel ceiling.
 - Sanctioned native macOS command/runner and evidence owner.
-- Exact pinned Yazi, Chafa, and gnuplot versions used by release fixtures.
 
 ## Constitution Check
 

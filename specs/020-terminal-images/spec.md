@@ -132,10 +132,13 @@ Acceptance Criteria:
 
 ## Open Questions
 
-- What exact sequence, decoded, retained-memory, placement, dimension, and decode-time limits fit Scribe's pane model and GPUI texture constraints?
-- How should Sixel cursor advance and image anchoring use cell metrics when parsing occurs outside GPUI's foreground thread?
 - Which native macOS environment can provide required runtime evidence without substituting Linux Docker binaries?
 - Which decoder implementation or bounded adaptation best satisfies the direct-inline trust boundary and required cancellation controls?
+
+The v1 protocol matrix, xterm-compatible Sixel chronology, typed failures,
+numeric security limits, application pins, and fixture ownership are resolved
+in [`contract.md`](contract.md). A later native platform spike may lower the
+4096-pixel texture ceiling, but cannot raise any v1 trust-boundary limit.
 
 ## Clarifications
 
@@ -148,12 +151,15 @@ Human decisions resolve the first specification gate and define the v1 product b
 5. **Rollout — A:** Enable by default only after release gates pass. Keep a master kill switch, truthful runtime advertisement, preserved text/copy, and a payload-free disabled/rejected affordance; applications own textual fallback.
 6. **Platform parity — A:** Require the same natively verified Linux and macOS subset before release.
 7. **Performance gates — C:** Use named measurements and qualitative no-material-regression review without numeric performance thresholds. Numeric performance goals are explicitly marked inapplicable for v1 under Constitution principle 4, while named-command measurement remains required. Numeric security resource limits remain required because they define the untrusted-payload boundary, not performance regression acceptance.
+8. **Frozen contract:** [`contract.md`](contract.md) is the normative v1
+   protocol/security contract. Machine-readable values and owned fixture paths
+   are validated by `just e2e-func terminal-image-contract.sh`.
 
 ## Spec Review
 
 ### Critical Questions
 
-The human gate resolved all product-scope questions. Remaining technical questions are listed in Open Questions and must be answered during planning and analysis without reopening the accepted v1 boundary.
+The human gate and frozen contract resolve all product-scope and protocol-boundary questions. Remaining decoder and native-runner questions are listed in Open Questions and must be answered without reopening v1.
 
 ### Non-Blocking Observations
 
