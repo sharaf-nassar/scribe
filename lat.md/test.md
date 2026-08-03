@@ -211,6 +211,34 @@ recipe.
 
 The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integration` tree at `/usr/local/share/scribe/shell-integration` so the in-container `scribe-server`'s  resolves them and injects `SCRIBE_SHELL_INTEGRATION=1` plus the per-shell rcfile/ZDOTDIR/XDG plumbing into every spawned PTY. Without this copy, the `shell-integration.sh` e2e test never sees the env var or the OSC marks the integration scripts emit.
 
+### AI Shell Environment Matrix
+
+Three functional scripts verify structured AI launch behavior across the supported bash, zsh, and fish login shells without relying on a GPUI client.
+
+Every script changes root's passwd shell with `usermod -s` after the disposable container server starts, then requires the server debug log to report the selected binary with `tier = "passwd"`. The deterministic Claude stub records resumed-provider argv and the environment after shell startup.
+
+The matrix covers the server side of `ai_tab_cwd`: an existing `--cwd` is preserved, while a nonexistent path falls back to `$HOME`. Client selection among pane, project-root, and home modes remains covered by the spec-018 GPUI suites documented in `specs/018-ai-tab-shell-env/verification.md`.
+
+Encrypted-envelope staging and restore-delta precedence are excluded until the functional keyring fixture exists. These scripts assert only the non-keyring startup, integration, cleanup, argv, and cwd contracts.
+
+#### Bash AI Shell Environment
+
+`tests/e2e/func/ai-shell-env-bash.sh` verifies first-profile-wins bash login startup and the AI integration preamble before provider exec.
+
+The stub must see only `.bash_profile`'s marker and PATH, not `.bash_login`, `.profile`, or `.bashrc`. It also requires `SCRIBE_SHELL_INTEGRATION=1` while launch-only `SCRIBE_AI_TAB`, `SCRIBE_INTEGRATION_SCRIPT`, restore-file, and `ENV` variables are absent.
+
+#### Zsh AI Shell Environment
+
+`tests/e2e/func/ai-shell-env-zsh.sh` verifies `.zshenv` → `.zprofile` → `.zshrc` ordering through the redirected integration bootstrap.
+
+The stub must see the complete order and integration marker, with `ZDOTDIR`, `SCRIBE_ORIG_ZDOTDIR`, launch-only variables, and the restore-file variable removed before exec.
+
+#### Fish AI Shell Environment
+
+`tests/e2e/func/ai-shell-env-fish.sh` verifies Scribe's vendor `conf.d` script runs before the user's `config.fish` and supplies the provider PATH.
+
+The stub must see the vendor/config order and integration marker, with `SCRIBE_ORIG_XDG_DATA_DIRS`, launch-only variables, and the restore-file variable removed and the originally absent `XDG_DATA_DIRS` restored before exec.
+
 ### AI Indicator E2E
 
 Two scripts covering the AI state indicator and its context-window percentage, both driving the  rather than OSC 1337 and reading the result back through .
