@@ -169,9 +169,11 @@ async fn route_chunk(
         move |bytes| {
             client.borrow_mut().observe(bytes);
         },
-        move |bytes| async move {
+        move |_observer, bytes, image_result| async move {
             term.borrow_mut().observe(bytes.as_ref());
+            (image_result, None)
         },
+        |_rejection| {},
     )
     .await
 }

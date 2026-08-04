@@ -219,11 +219,52 @@ admission uses a checked upper bound of one non-raw boundary per input byte.
 Normal reads parse directly, avoiding copies of retained transfer payloads;
 only reads near sequence exhaustion use speculative rollback framing.
 
-Each production PTY read enters `process_pty_reader_ingress`, which advances the
-seam before invoking the existing client-delivery and `Term`-feed sinks exactly
-once with the same effective bytes. The seam returns typed `Raw` or sequenced
-`Image` boundaries in source order. Recognized Sixel modes also produce an
-image-side boundary. No image fanout or PTY reply write-back is connected yet.
+Each production PTY read advances the seam before delivering the same effective
+bytes to the client once. The seam returns typed `Raw` or sequenced `Image`
+boundaries in source order. Recognized Sixel modes also produce an image-side
+boundary. No image fanout or PTY reply write-back is connected yet.
+
+The existing Alacritty ANSI processor feeds every byte to the real production
+`Term` exactly once. It may split one `advance` call at completed graphics
+boundaries so later bytes in the same read cannot contaminate an image-time
+observation; ordered boundary ends are consumed and deduplicated linearly, and
+the normal no-image read remains one call. Split controls create no effects
+until Alacritty changes state or the framer completes a boundary. If image
+framing rejects a read, the same bytes still cross the delegating handler once
+as one full span because no committed image cuts exist. The live reader and
+Docker probe share one ingress orchestration seam, so client delivery, `Term`
+mutation, typed rejection, and payload-free logging each keep one production
+occurrence.
+
+One delegating `Handler` observes that same `Term`; no replay parser or
+image-only cursor engine exists. Payload-free snapshots retain active screen,
+primary and alternate dimensions, each grid's current and saved cursor plus
+deferred-wrap flag, margins, origin/wrap modes, and cell pixel metrics. Typed
+effects use half-open scroll and erase bounds and cover ED2, reset, screen
+switch, and both-grid resize. Image cursor movement delegates to Alacritty's
+`goto`, clearing deferred wrap in the terminal and observer together.
+
+Callback decisions use live post-delegation Alacritty modes. A same-span mode 7
+change therefore controls pending-wrap scrolling immediately, while DECCOLM
+set and unset reset the active grid and margins and emit a full-display erase.
+ED1 mirrors pinned `0.26.0-rc1`: row index 1 does not clear row 0, while rows
+above index 1 clear preceding rows plus the cursor-row left portion.
+
+Printable-input effects follow pinned Alacritty character widths: combining
+characters return before a pending wrap, while a width-two glyph that does not
+fit calls `wrapline` and may scroll without a pre-existing pending wrap.
+
+VTE synchronized-update expiry flushes buffered callbacks through the same
+delegating handler. Timeout expiry consumes no new source bytes, so its result
+is a state/effect observation without a fabricated input range or replay.
+
+The observer handle is session-owned and shared with live, attach-time, paced,
+and shared-window resize paths. `Term::resize` runs first, resizing active and
+inactive grids and resetting margins; one internal resize effect then records
+both dimensions. Only the active grid's cursor and saved cursor are publicly
+readable afterward; inactive cursor facts are marked unavailable rather than
+clamped or synthesized. Activating that grid refreshes them from the real
+`Term`. Observations remain internal and carry no cells or payloads.
 
 Payload-free work counters distinguish direct reads from speculative clones.
 Transactional rejection preserves framer offsets, pending metadata, sequence,

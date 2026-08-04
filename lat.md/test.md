@@ -57,6 +57,43 @@ normal framing, transactional exhaustion, and disconnected image fanout. It
 also requires the IPC verifier to compare newly encoded default MessagePack
 bytes with pinned legacy fixture hex.
 
+## Terminal Image Observer Parity
+
+The functional harness compares production image observations with the pinned real Alacritty `Term` without starting a host runtime.
+
+### Production Alacritty Probe
+
+The probe verifies one-processor terminal observation across image-relevant lifecycle transitions.
+
+It drives the production `SessionTerminal` framer, real `Term`, existing ANSI
+processor, delegating observer, image cursor-move helper, and resize observer.
+Every span compares active cursor, saved cursor, deferred wrap, dimensions, and
+modes directly with Alacritty state.
+
+Cases cover last-column wrap and image cursor movement, per-grid save/restore,
+DECSTBM margin scrolling, exact ED1/ED2 effects and cells, 1049 entry/exit,
+same-span mode 7 and DECCOLM, split CSI/APC reads, and same-read text/image
+chronology. Bottom-edge combining and width-two inputs compare emitted scrolls
+with the real post-feed cursor and history. A 1,024-boundary read with adjacent
+duplicate cuts proves source-order linear deduplication.
+
+A forced typed image rejection runs through the same ingress seam called by
+`process_pty_chunk`. Controlled production callbacks prove exact client bytes,
+one real `Term`/observer feed, the retained typed error, and one payload-free
+rejection diagnostic without replay or a second parser.
+
+A real VTE synchronized update is buffered then timeout-flushed through the
+observer with no fabricated input range. History/reflow resize cases prove both
+grid dimensions, unavailable inactive cursor facts, and exact refresh after
+screen activation. Evidence is schema-versioned and payload-free.
+
+### Docker Evidence Entry Point
+
+`terminal-image-observer-parity.sh` runs the exact production observer probe in the functional Docker image.
+
+The gate pins Alacritty `0.26.0-rc1`, one processor, payload-free evidence, and
+an explicit passing result for every lifecycle case.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

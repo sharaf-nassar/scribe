@@ -58,6 +58,22 @@ Sessions move from the SessionManager (pending) to the LiveSessionRegistry (acti
 
 The reader task runs three processing paths per read cycle: raw byte forwarding, ANSI processing through the alacritty_terminal state machine, and metadata extraction via the OSC interceptor.
 
+Terminal-image chronology is observed inside the ANSI path, not by replaying
+PTY bytes through a second parser. A delegating handler forwards every callback
+to the same real `Term` and records only cursor, saved cursor, deferred wrap,
+screen, margin, mode, dimension, scroll, and erase facts. Completed graphics
+boundaries may split one processor feed, but every byte is still consumed once.
+Image-state rejection uses one full-span delegating feed because no trustworthy
+graphics cuts committed. Synchronized-update timeout flushes also use the
+delegating handler, but publish state/effects without claiming a new byte span.
+
+The session's payload-free observer is also carried by attach and live resize
+handles. Every production resize observes the real post-resize `Term`, whose
+Alacritty path resizes active and inactive grids together, before publishing an
+internal both-grid resize effect. Inactive cursor facts become unavailable
+until that grid is activated and read from the real `Term`; dimensions remain
+exact for both grids. No image update is fanned out at this stage.
+
 The read is raced against a per-session cancellation signal, and the task's `JoinHandle` is retained instead of discarded. Both live on the session's [[crates/scribe-server/src/session_exit.rs#SessionExitGate|exit gate]], shared by the `LiveSession` and the reader. The gate exists because the PTY master fd is duplicated three ways — the reader's `AsyncPtyFd`, the resize fd, and the `Pty` parked on the `LiveSession` — so dropping any one of them never delivers EOF. A child that ignores SIGHUP (`trap '' HUP; sleep inf`) would otherwise park the reader on a `read()` that can never complete, with no handle left to stop or bound it. Every select arm is cancel-safe, so losing the race never drops a wakeup or a byte.
 
 The gate also holds the exactly-once exit funnel. Reader EOF, a reader read error, reader cancellation, an explicit `CloseSession`/`CloseWindow`, and the child-exit watcher all call [[crates/scribe-server/src/ipc_server.rs#finalize_session_exit|one idempotent finalizer]]; a compare-and-swap on the gate elects exactly one of them to emit `SessionExited` and unwire the session from the live registry, the attachment set, and the workspace manager. A close racing the child's own death therefore neither double-emits nor drops the notification. The end of the master stream only proves that every slave fd closed, which a live child can do on its own, so when a child-exit watcher is armed it is the authoritative emitter and the reader yields to it; handoff-inherited sessions arm no watcher and keep that path with `exit_code: None`. Both stream endings count: Linux answers a read on a master whose last slave closed with `EIO` rather than a zero-length read, so the ordinary "the shell exited" case reaches the reader as an error, not an EOF.
