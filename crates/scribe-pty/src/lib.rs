@@ -2,6 +2,7 @@ pub mod async_fd;
 pub mod claude_picker_filter;
 pub mod ed3_filter;
 pub mod event_listener;
+pub mod graphics_framing;
 pub mod lf_crlf_filter;
 pub mod metadata;
 pub mod osc_interceptor;
