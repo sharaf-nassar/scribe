@@ -4,6 +4,7 @@ mod client_scene;
 mod cmd_socket;
 mod daemon;
 mod decode_spike;
+mod framing_probe;
 mod input;
 mod ipc;
 mod ipc_fixtures;
@@ -311,6 +312,15 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify bounded terminal-image framing against owned fixtures.
+    ImageFraming {
+        /// Directory containing terminal-images-v1 ASCII-hex fixtures.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -524,6 +534,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::KittyDecode { contract, evidence } => {
             kitty_decode::run(&contract, &evidence).map_err(TestError::TestFailure)
+        }
+        Command::ImageFraming { fixtures, evidence } => {
+            framing_probe::run(&fixtures, &evidence).map_err(TestError::TestFailure)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =

@@ -163,6 +163,46 @@ erase, scroll, trim, resize clipping, alternate-screen destruction, and RIS
 apply in byte chronology. Resize clips without resampling; DECSTR preserves
 committed raster and resets modes.
 
+## Bounded Framing and Parsing
+
+The graphics framer recognizes the frozen image subset across arbitrary PTY reads while preserving exact byte order for the existing terminal path.
+
+`GraphicsFramer` runs before the future image-state integration seam and holds
+at most one bounded APC/DCS. A speculative DCS candidate retains raw header
+bytes up to the control-string ceiling because a non-`q` final byte must pass
+through exactly; its parallel Sixel parameter scanner uses three fixed slots,
+one checked numeric accumulator, and field/status metadata. Seven-bit Kitty APC
+and seven-bit/C1 Sixel DCS accept split introducers and terminators. CAN or SUB
+cancels a recognized image string; EOF reports a typed truncated sequence;
+over-budget input is discarded without retaining more payload until ST restores
+the ordinary byte stream. A numeric Sixel-looking DCS header that crosses the
+ceiling is charged through its offending digit or separator, converted to the
+same failed discard state, and never returned as raw terminal bytes.
+
+Recovery is overlap-safe: a repeated ESC can begin the real seven-bit ST, an
+ESC followed by C1 ST ends with typed malformed framing, and an ESC/C1 control
+after an abandoned introducer candidate is reprocessed from ground. Sixel's
+three introducer parameters use constant scanner metadata and mark a fourth
+field at its separator or numeric overflow at its offending digit. Once `q`
+confirms Sixel, a malformed header seeds the active typed failure, so subsequent
+body bytes are counted for termination recovery but never copied into the body
+buffer. ST, CAN, SUB, and EOF extend the failure's exact source range without
+replacing an earlier malformed or quota category; cancellation is malformed
+framing only when no earlier failure exists.
+
+Each result carries a half-open absolute raw-byte range. `Raw` events and
+recognized `?80`/`?8452` mode annotations expose their exact terminal bytes for
+one downstream feed; Kitty/Sixel commands and failures expose no terminal
+payload. This lets the later ordered server integration suppress image strings,
+forward every unrelated byte once, and preserve an auditable commit boundary.
+
+Kitty parsing accepts only direct `t=d`, `f=24/32/100`, `o=z`, actions
+`t/T/p/q/d`, v1 placement/delete controls, quiet/chunk flags, and encoded chunks
+up to 4,096 bytes. Sixel parsing accepts the three DCS parameters, sixel data,
+repeat, raster attributes, palette selection/HLS/RGB, graphics CR/newline, and
+the exact xterm private modes. Unsupported or malformed controls return the
+frozen typed category with safe limit identity only, never payload bytes.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.
@@ -206,6 +246,30 @@ checks exact security values and fixture ownership/hex integrity, then copies
 the canonical JSON unchanged to
 `test-output/terminal-images/contract.json`. Invoke it with
 `just e2e-func terminal-image-contract.sh` after building the functional image.
+
+## Framing Verification
+
+Docker verification proves framing is invariant across PTY read boundaries and that recovery never consumes adjacent terminal text.
+
+`tests/e2e/terminal-image-framing.sh` runs the production `scribe-pty` framer
+through `scribe-test image-framing`. Every owned fixture is tried whole, at
+every two-chunk byte split, and one byte per read. Every feed verifies the
+fixture's complete parsed command expectation and contiguous raw-range tiling.
+For every forwarded event, it also proves range length equals byte length and
+the bytes equal the corresponding source-input slice; suppressed commands and
+failures retain ranges without terminal bytes.
+Adversarial cases cover both Sixel forms, split and overlapping ESC/ST and C1
+controls, candidate resynchronization, CAN/SUB, malformed and unsupported
+controls, fourth-field/overflow classification before a later body quota,
+malformed-header recovery, mixed terminators, EOF truncation,
+exact/over-budget strings, Sixel numeric-header max-plus-one discard, first-error
+preservation across CAN/SUB, Kitty chunk limits, and bounded non-image DCS
+passthrough. Boundary and cancellation cases cover every split, both Sixel
+forms, exact failure ranges, adjacent text, and absence of raw payload leakage.
+After every assertion passes, the probe atomically publishes schema-versioned,
+payload-free audit evidence to `test-output/terminal-images/framing.json`, with
+owned-fixture semantic/tiling counts and stable markers for each adversarial
+case family.
 
 ## Bounded Decode Decision
 
