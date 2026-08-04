@@ -167,8 +167,8 @@ committed raster and resets modes.
 
 The graphics framer recognizes the frozen image subset across arbitrary PTY reads while preserving exact byte order for the existing terminal path.
 
-`GraphicsFramer` runs before the future image-state integration seam and holds
-at most one bounded APC/DCS. A speculative DCS candidate retains raw header
+`GraphicsFramer` runs inside the server image-state seam and holds at most one
+bounded APC/DCS. A speculative DCS candidate retains raw header
 bytes up to the control-string ceiling because a non-`q` final byte must pass
 through exactly; its parallel Sixel parameter scanner uses three fixed slots,
 one checked numeric accumulator, and field/status metadata. Seven-bit Kitty APC
@@ -202,6 +202,33 @@ up to 4,096 bytes. Sixel parsing accepts the three DCS parameters, sixel data,
 repeat, raster attributes, palette selection/HLS/RGB, graphics CR/newline, and
 the exact xterm private modes. Unsupported or malformed controls return the
 frozen typed category with safe limit identity only, never payload bytes.
+
+## Server-Owned Session State Seam
+
+One production `SessionTerminal` owns terminal-image ordering and state so later hardening extends one path instead of creating probe-only engines.
+
+Each production PTY reader owns exactly one seam through
+`PtyTerminalImageState`. The seam owns `GraphicsFramer`, generation and
+sequence cursors, active screen, definition and placement maps, and
+payload-free pending-transfer metadata. Sessions share one immutable v1
+process policy.
+
+Placement identity is keyed by screen plus the complete protocol identity
+`(image_id, placement_id)`, matching client canonical state. Sequence
+admission uses a checked upper bound of one non-raw boundary per input byte.
+Normal reads parse directly, avoiding copies of retained transfer payloads;
+only reads near sequence exhaustion use speculative rollback framing.
+
+Each production PTY read enters `process_pty_reader_ingress`, which advances the
+seam before invoking the existing client-delivery and `Term`-feed sinks exactly
+once with the same effective bytes. The seam returns typed `Raw` or sequenced
+`Image` boundaries in source order. Recognized Sixel modes also produce an
+image-side boundary. No image fanout or PTY reply write-back is connected yet.
+
+Payload-free work counters distinguish direct reads from speculative clones.
+Transactional rejection preserves framer offsets, pending metadata, sequence,
+screen, definitions, and placements; operational work counters may still
+record the rejected rollback attempt.
 
 ## Typed Failures
 

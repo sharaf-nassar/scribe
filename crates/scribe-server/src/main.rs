@@ -45,6 +45,10 @@ use scribe_server::lan;
 // the LIBRARY crate for the same reason as `tailnet`/`lan` — a second in-binary
 // copy would recompile its `pub` items into dead-code warnings.
 use scribe_server::session_exit;
+// The PTY reader owns the library's single terminal-image seam implementation;
+// re-export it here so the binary's `ipc_server` module uses that production
+// type instead of compiling a second copy.
+use scribe_server::terminal_image_state;
 // Spec 017 US1-2: `mod session_manager` opens each child's pidfd and
 // `mod ipc_server` arms the watcher over it, both through
 // `crate::child_watch`. Re-exported for the same reason — the non-Linux build

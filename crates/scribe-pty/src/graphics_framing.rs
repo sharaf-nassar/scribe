@@ -47,6 +47,16 @@ pub enum GraphicsProtocol {
     Sixel,
 }
 
+/// Payload-free metadata for the recognized graphics transfer currently held
+/// across PTY reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingGraphicsTransfer {
+    pub range: RawByteRange,
+    pub protocol: GraphicsProtocol,
+    pub retained_payload_bytes: usize,
+    pub discarding: bool,
+}
+
 /// Stable terminal-images-v1 rejection categories used by framing/parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphicsFailureCategory {
@@ -291,14 +301,14 @@ impl SixelHeaderScanner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Candidate {
     start: u64,
     bytes: Vec<u8>,
     kind: CandidateKind,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ActiveKind {
     Kitty,
     UnsupportedKittyC1,
@@ -322,7 +332,7 @@ impl ActiveKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ActiveString {
     start: u64,
     kind: ActiveKind,
@@ -334,7 +344,7 @@ struct ActiveString {
     failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum FramerState {
     Ground,
     Candidate(Candidate),
@@ -343,6 +353,7 @@ enum FramerState {
 
 /// Incremental bounded APC/DCS framer over arbitrary PTY byte chunks.
 // @lat: [[terminal-images#Terminal Images#Bounded Framing and Parsing]]
+#[derive(Clone)]
 pub struct GraphicsFramer {
     state: FramerState,
     offset: u64,
@@ -399,6 +410,24 @@ impl GraphicsFramer {
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Describe an active graphics string without exposing its payload.
+    #[must_use]
+    pub fn pending_transfer(&self) -> Option<PendingGraphicsTransfer> {
+        let FramerState::Active(active) = &self.state else {
+            return None;
+        };
+        let retained_payload_bytes = match active.kind {
+            ActiveKind::Kitty | ActiveKind::UnsupportedKittyC1 => active.kitty_payload_bytes,
+            ActiveKind::Sixel { .. } => active.body.len(),
+        };
+        Some(PendingGraphicsTransfer {
+            range: RawByteRange::new(active.start, self.offset),
+            protocol: active.kind.protocol(),
+            retained_payload_bytes,
+            discarding: active.failure.is_some(),
+        })
     }
 
     fn process_byte(&mut self, position: u64, byte: u8, output: &mut EventOutput) {

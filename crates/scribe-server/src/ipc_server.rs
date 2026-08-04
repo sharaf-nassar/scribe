@@ -61,6 +61,9 @@ use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
     snapshot_term,
 };
+use crate::terminal_image_state::{
+    PtyTerminalImageState, TerminalImageProcessPolicy, process_pty_reader_ingress,
+};
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
 
@@ -1048,6 +1051,8 @@ struct PtyReaderState {
     /// `Term` critical section as every feed, so an attach can pair a snapshot
     /// with the exact output it contains.
     term_commit: SessionCommit,
+    /// Exactly one authoritative terminal-image seam owned by this reader.
+    terminal_images: PtyTerminalImageState,
     /// The find overlay's cached scrollback snapshot, dropped by every feed
     /// this task performs (spec 017 US8-2).
     search_cache: SessionSearchCache,
@@ -6514,6 +6519,7 @@ fn spawn_pty_reader(
         pty_write: inputs.pty_write,
         term: inputs.term,
         term_commit: inputs.term_commit,
+        terminal_images: PtyTerminalImageState::new(TerminalImageProcessPolicy::v1()),
         search_cache: inputs.search_cache,
         ansi_processor: inputs.ansi_processor,
         osc_parser: inputs.osc_parser,
@@ -8900,31 +8906,49 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     // safe because the reader task is the only writer of this session's cursor.
     let chunk_commit = state.term_commit.get().saturating_add(chunk_len(effective.as_ref()));
 
-    // Step 1: Fast path — forward (possibly filtered) bytes to UI client.
-    send_pty_output(&state.client_writer, state.session_id, effective.as_ref(), chunk_commit);
-
-    // Step 1b: If ED 3 was suppressed, tell the client to snap the
-    // viewport to bottom.  A real ED 3 would have reset `display_offset`
-    // to 0 inside `clear_history()`, but since we stripped the sequence,
-    // the client's Term never ran that code. It rides the chunk's cursor value
-    // so a buffered attach keeps it paired with the output that provoked it.
-    if suppressed_ed3 {
-        let msg = ServerMessage::ScrollBottom { session_id: state.session_id };
-        send_to_client(&state.client_writer, Some(chunk_commit), &msg);
-    }
-
-    // Step 2: State path — feed (possibly filtered) bytes into Term.
     if capture_baseline_after_feed {
         state.pending_ai_scrollback_baseline = true;
     }
-    feed_term(
-        &state.term,
-        &state.term_commit,
-        &state.search_cache,
-        &mut state.ansi_processor,
-        effective.as_ref(),
+
+    // The shared production ingress advances the reader-owned image seam,
+    // sends effective bytes to the client path once, and feeds the same bytes
+    // to Term once. Image rejection never suppresses those ordinary sinks.
+    let session_id = state.session_id;
+    let client_writer = &state.client_writer;
+    let term = &state.term;
+    let term_commit = &state.term_commit;
+    let search_cache = &state.search_cache;
+    let ansi_processor = &mut state.ansi_processor;
+    let image_result = process_pty_reader_ingress(
+        &mut state.terminal_images,
+        effective,
+        |effective| {
+            // Step 1: Fast path — forward filtered bytes to the UI client.
+            send_pty_output(client_writer, session_id, effective, chunk_commit);
+
+            // Step 1b: Pair a suppressed ED 3 with the chunk cursor.
+            if suppressed_ed3 {
+                let msg = ServerMessage::ScrollBottom { session_id };
+                send_to_client(client_writer, Some(chunk_commit), &msg);
+            }
+        },
+        |effective| async move {
+            // Step 2: State path — feed filtered bytes into Term.
+            feed_term(term, term_commit, search_cache, ansi_processor, effective.as_ref()).await;
+        },
     )
     .await;
+
+    if let Err(error) = image_result {
+        let image_state = state.terminal_images.state();
+        warn!(
+            session_id = %state.session_id,
+            %error,
+            image_sequence = image_state.sequence.0,
+            "terminal image state rejected PTY chunk"
+        );
+    }
+
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
     // Step 2b: a prompt returning while mouse-reporting modes are still
