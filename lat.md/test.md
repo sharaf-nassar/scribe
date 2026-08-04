@@ -21,6 +21,42 @@ The functional harness applies owned fixtures directly to the production client 
 
 The fixture proves operation order, commit-only publication, definition replacement, placement deletion, generation cleanup, scroll/erase/reset effects, typed quota rejection, placeholder copy filtering, and visible update-required mismatch copy.
 
+## Terminal Image Session State Seam
+
+The functional harness exercises the production server-owned image seam without starting a host Scribe runtime or substituting a test-only engine.
+
+### Production Seam Probe
+
+The probe verifies split-read ordering through the server-owned seam.
+
+It invokes the same shared reader-ingress function called by the live
+`process_pty_chunk`. Controlled client and `Term` sinks derive exact call
+counts, byte totals, and matching digests instead of relying on a declared
+delivery label.
+
+The probe completes a split Kitty command beside raw text and a Sixel mode
+change, then checks shared immutable policy, ordering, screen ownership,
+payload-free pending metadata, failures, candidate fallback, empty input, and
+multiple boundaries.
+
+An immutable zero sequence ceiling forces typed exhaustion through that same
+production engine. Evidence confirms rejection leaves pending metadata,
+canonical counts, active screen, sequence, and framer offset unchanged.
+
+An 8 MiB Sixel transfer split across 64 KiB reads records exact framing work.
+All 130 reads use direct parsing with zero speculative deep clones; the forced
+near-exhaustion case separately records rollback parsing without claiming
+byte-exact RSS.
+
+### Docker Evidence Entry Point
+
+`terminal-image-state-seam.sh` runs the production probe and the existing IPC fixture verifier inside the functional image.
+
+The gate checks shared production ingress, exact sink routing, clone-free
+normal framing, transactional exhaustion, and disconnected image fanout. It
+also requires the IPC verifier to compare newly encoded default MessagePack
+bytes with pinned legacy fixture hex.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

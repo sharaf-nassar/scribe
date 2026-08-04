@@ -17,6 +17,7 @@ mod server;
 mod session;
 mod share_tap;
 mod sixel_decoder;
+mod terminal_image_state_seam;
 mod wait;
 
 use std::fmt;
@@ -321,6 +322,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify the production server-owned terminal-image state seam.
+    TerminalImageStateSeam {
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -537,6 +544,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::ImageFraming { fixtures, evidence } => {
             framing_probe::run(&fixtures, &evidence).map_err(TestError::TestFailure)
+        }
+        Command::TerminalImageStateSeam { evidence } => {
+            terminal_image_state_seam::run(&evidence).map_err(TestError::TestFailure)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =
