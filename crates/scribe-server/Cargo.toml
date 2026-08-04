@@ -253,6 +253,8 @@ ignored = [
 [dependencies]
 scribe-common.workspace = true
 alacritty_terminal.workspace = true
+cursor-icon.workspace = true
+unicode-width.workspace = true
 ammonia = "4.1"
 dirs.workspace = true
 scribe-pty.workspace = true

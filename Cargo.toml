@@ -45,7 +45,9 @@ flate2 = { version = "1.1.9", default-features = false, features = [
 
 # Terminal
 vte = { version = "0.15", features = ["ansi"] }
+cursor-icon = "1.2"
 alacritty_terminal = { version = "0.26.0-rc1", default-features = false }
+unicode-width = "0.2"
 toml = "0.8"
 dirs = "6"
 notify = "8"

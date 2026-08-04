@@ -62,7 +62,10 @@ use crate::session_manager::{
     snapshot_term,
 };
 use crate::terminal_image_state::{
-    PtyTerminalImageState, TerminalImageProcessPolicy, process_pty_reader_ingress,
+    PtyTerminalImageState, SessionTerminalCommit, SessionTerminalError, TerminalGridObservation,
+    TerminalGridObserverHandle, TerminalImageProcessPolicy,
+    feed_terminal_image_result_with_observer, flush_terminal_observed, observe_terminal_resize,
+    process_pty_reader_ingress,
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
@@ -1236,6 +1239,9 @@ pub struct LiveSession {
     /// lock alongside a replay snapshot so the attach knows which buffered
     /// frames that snapshot already reflects.
     pub(crate) term_commit: SessionCommit,
+    /// Payload-free Alacritty observation shared with the PTY reader and every
+    /// production resize call for this session.
+    terminal_grid_observer: TerminalGridObserverHandle,
     /// Scrollback snapshot the open find overlay's query edits are reading
     /// (spec 017 US8-2), so a multi-keystroke query snapshots once.
     search_cache: SessionSearchCache,
@@ -1350,6 +1356,7 @@ pub struct AttachSessionData {
     pub attachment: SessionAttachment,
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     pub term_commit: SessionCommit,
+    pub terminal_grid_observer: TerminalGridObserverHandle,
     pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
@@ -1368,6 +1375,7 @@ impl LiveSession {
         if let Some(size) = target_dims.filter(|size| size.has_pixels()) {
             self.cell_width = size.cell_width;
             self.cell_height = size.cell_height;
+            self.terminal_grid_observer.set_cell_size(size.cell_width, size.cell_height);
         }
 
         AttachSessionData {
@@ -1378,6 +1386,7 @@ impl LiveSession {
             attachment: Arc::clone(&self.attachment),
             term: Arc::clone(&self.term),
             term_commit: Arc::clone(&self.term_commit),
+            terminal_grid_observer: self.terminal_grid_observer.clone(),
             resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
@@ -6404,12 +6413,16 @@ async fn start_session(
     let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
     let shared = SharedSessionHandles::new(pty_write, initial_attachment).await;
+    let terminal_images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
+    let terminal_grid_observer = terminal_images.grid_observer();
+    terminal_grid_observer.set_cell_size(cell_width, cell_height);
 
     let live = LiveSession {
         pty_write: Arc::clone(&shared.pty_write),
         resize_fd: Arc::new(resize_fd),
         term: Arc::clone(&term),
         term_commit: Arc::clone(&shared.term_commit),
+        terminal_grid_observer: terminal_grid_observer.clone(),
         search_cache: Arc::clone(&shared.search_cache),
         child_pid,
         child_identity,
@@ -6463,6 +6476,7 @@ async fn start_session(
             event_rx,
             clipboard_command_rx: shared.clipboard_command_rx,
             client_writer: shared.client_writer,
+            terminal_images,
             attachment: shared.attachment,
             preserve_ai_scrollback: shared.preserve_ai_scrollback,
             scrollback_lines: shared.scrollback_lines,
@@ -6491,6 +6505,7 @@ struct PtyReaderInputs {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
     client_writer: ClientWriter,
+    terminal_images: PtyTerminalImageState,
     attachment: SessionAttachment,
     preserve_ai_scrollback: Arc<AtomicBool>,
     scrollback_lines: Arc<AtomicUsize>,
@@ -6519,7 +6534,7 @@ fn spawn_pty_reader(
         pty_write: inputs.pty_write,
         term: inputs.term,
         term_commit: inputs.term_commit,
-        terminal_images: PtyTerminalImageState::new(TerminalImageProcessPolicy::v1()),
+        terminal_images: inputs.terminal_images,
         search_cache: inputs.search_cache,
         ansi_processor: inputs.ansi_processor,
         osc_parser: inputs.osc_parser,
@@ -7221,13 +7236,21 @@ async fn apply_grid_to_window_sessions(
         let handles = {
             let sessions = server.live_sessions.read().await;
             sessions.get(&session_id).map(|s| {
-                (Arc::clone(&s.term), Arc::clone(&s.resize_fd), s.cell_width, s.cell_height)
+                (
+                    Arc::clone(&s.term),
+                    Arc::clone(&s.resize_fd),
+                    s.terminal_grid_observer.clone(),
+                    s.cell_width,
+                    s.cell_height,
+                )
             })
         };
-        let Some((term, resize_fd, cell_width, cell_height)) = handles else {
+        let Some((term, resize_fd, terminal_grid_observer, cell_width, cell_height)) = handles
+        else {
             continue;
         };
-        let reflowed = resize_term(&term, cols, rows).await;
+        terminal_grid_observer.set_cell_size(cell_width, cell_height);
+        let reflowed = resize_term(&term, &terminal_grid_observer, cols, rows).await;
         let size = TerminalSize { cols, rows, cell_width, cell_height };
         if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
             warn!(%session_id, "authoritative-grid TIOCSWINSZ failed: {e}");
@@ -7342,17 +7365,22 @@ async fn apply_session_resize(
     size: TerminalSize,
     live_sessions: &LiveSessionRegistry,
 ) -> bool {
-    let (term, resize_fd) = {
+    let (term, resize_fd, terminal_grid_observer) = {
         let sessions = live_sessions.read().await;
         let Some(session) = sessions.get(&session_id) else {
             warn!(%session_id, "Resize for unknown session");
             return false;
         };
-        (Arc::clone(&session.term), Arc::clone(&session.resize_fd))
+        (
+            Arc::clone(&session.term),
+            Arc::clone(&session.resize_fd),
+            session.terminal_grid_observer.clone(),
+        )
     };
 
     // Resize the Term state (lock + drop before any await).
-    let reflowed = resize_term(&term, size.cols, size.rows).await;
+    terminal_grid_observer.set_cell_size(size.cell_width, size.cell_height);
+    let reflowed = resize_term(&term, &terminal_grid_observer, size.cols, size.rows).await;
 
     // Signal the PTY with TIOCSWINSZ.
     if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
@@ -7593,6 +7621,7 @@ impl alacritty_terminal::grid::Dimensions for ResizeDimensions {
 /// redundant full repaint (scribe-k9o).
 pub async fn resize_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    terminal_grid_observer: &TerminalGridObserverHandle,
     cols: u16,
     rows: u16,
 ) -> bool {
@@ -7601,7 +7630,9 @@ pub async fn resize_term(
     let before = (term_guard.columns(), term_guard.screen_lines());
     let size = ResizeDimensions { cols: usize::from(cols), lines: usize::from(rows) };
     term_guard.resize(size);
-    before != (term_guard.columns(), term_guard.screen_lines())
+    let changed = before != (term_guard.columns(), term_guard.screen_lines());
+    observe_terminal_resize(terminal_grid_observer, &*term_guard, changed);
+    changed
 }
 
 /// Set PTY window size via `TIOCSWINSZ` ioctl.
@@ -8805,7 +8836,14 @@ async fn select_pty_read_or_clipboard(
         tokio::pin!(sleep);
         tokio::select! {
             () = &mut sleep => {
-                stop_term_sync(&state.term, &mut state.ansi_processor).await;
+                let observer = state.terminal_images.grid_observer();
+                let observation = stop_term_sync(
+                    &state.term,
+                    &observer,
+                    &mut state.ansi_processor,
+                )
+                .await;
+                state.terminal_images.record_grid_observation(&observation);
                 maybe_capture_preserved_ai_scrollback_baseline(state).await;
                 None
             }
@@ -8910,9 +8948,10 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
         state.pending_ai_scrollback_baseline = true;
     }
 
-    // The shared production ingress advances the reader-owned image seam,
-    // sends effective bytes to the client path once, and feeds the same bytes
-    // to Term once. Image rejection never suppresses those ordinary sinks.
+    // Advance the reader-owned image seam before ordinary delivery, then feed
+    // every effective byte exactly once through the same real Alacritty Term.
+    // The observer splits processor calls only at completed image boundaries;
+    // client delivery remains one unchanged read.
     let session_id = state.session_id;
     let client_writer = &state.client_writer;
     let term = &state.term;
@@ -8921,33 +8960,40 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     let ansi_processor = &mut state.ansi_processor;
     let image_result = process_pty_reader_ingress(
         &mut state.terminal_images,
-        effective,
-        |effective| {
+        effective.as_ref(),
+        |delivered_bytes| {
             // Step 1: Fast path — forward filtered bytes to the UI client.
-            send_pty_output(client_writer, session_id, effective, chunk_commit);
-
-            // Step 1b: Pair a suppressed ED 3 with the chunk cursor.
+            send_pty_output(client_writer, session_id, delivered_bytes, chunk_commit);
+            // Step 1b: Pair a suppressed ED 3 with the chunk cursor before
+            // the Term feed, preserving the existing client frame order.
             if suppressed_ed3 {
                 let msg = ServerMessage::ScrollBottom { session_id };
                 send_to_client(client_writer, Some(chunk_commit), &msg);
             }
         },
-        |effective| async move {
-            // Step 2: State path — feed filtered bytes into Term.
-            feed_term(term, term_commit, search_cache, ansi_processor, effective.as_ref()).await;
+        |observer, delivered_bytes, image_result| {
+            feed_term_image_result_observed(
+                term,
+                term_commit,
+                search_cache,
+                ansi_processor,
+                ObservedImageResultFeed { observer, bytes: delivered_bytes, image_result },
+            )
+        },
+        |rejection| {
+            warn!(
+                session_id = %session_id,
+                error = %rejection.error,
+                image_sequence = rejection.image_sequence.0,
+                "terminal image state rejected PTY chunk"
+            );
         },
     )
     .await;
 
-    if let Err(error) = image_result {
-        let image_state = state.terminal_images.state();
-        warn!(
-            session_id = %state.session_id,
-            %error,
-            image_sequence = image_state.sequence.0,
-            "terminal image state rejected PTY chunk"
-        );
-    }
+    // Step 2: State path — the shared ingress seam fed filtered bytes into
+    // Term. Image sequence rejection never suppresses ordinary delivery.
+    let _image_commit = image_result.ok();
 
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
@@ -9338,13 +9384,41 @@ async fn feed_term(
     term_commit.advance(chunk_len(bytes))
 }
 
+/// One owned image result and its exact source bytes for the real Term feed.
+struct ObservedImageResultFeed<'a> {
+    observer: TerminalGridObserverHandle,
+    bytes: &'a [u8],
+    image_result: Result<SessionTerminalCommit, SessionTerminalError>,
+}
+
+async fn feed_term_image_result_observed(
+    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: &TermCommit,
+    search_cache: &SearchSnapshotCache,
+    ansi_processor: &mut AnsiProcessor,
+    mut feed: ObservedImageResultFeed<'_>,
+) -> (Result<SessionTerminalCommit, SessionTerminalError>, Option<TerminalGridObservation>) {
+    let mut term_guard = term.lock().await;
+    let observation = feed_terminal_image_result_with_observer(
+        &feed.observer,
+        &mut *term_guard,
+        ansi_processor,
+        feed.bytes,
+        &mut feed.image_result,
+    );
+    search_cache.invalidate();
+    term_commit.advance(chunk_len(feed.bytes));
+    (feed.image_result, Some(observation))
+}
+
 /// Flush a synchronized update after its timeout elapses.
 async fn stop_term_sync(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    observer: &TerminalGridObserverHandle,
     ansi_processor: &mut AnsiProcessor,
-) {
+) -> TerminalGridObservation {
     let mut term_guard = term.lock().await;
-    ansi_processor.stop_sync(&mut *term_guard);
+    flush_terminal_observed(observer, &mut *term_guard, ansi_processor)
 }
 
 fn capture_osc_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {

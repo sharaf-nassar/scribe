@@ -17,6 +17,7 @@ use crate::ipc_server::{
     note_unpaced_resize_apply, resize_term, send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
+use crate::terminal_image_state::TerminalGridObserverHandle;
 
 /// How many sessions may be in the attach replay stage at once, process-wide.
 ///
@@ -52,6 +53,7 @@ struct AttachEntry {
     attachment: SessionAttachment,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     term_commit: SessionCommit,
+    terminal_grid_observer: TerminalGridObserverHandle,
     resize_fd: Arc<OwnedFd>,
     target_dims: Option<TerminalSize>,
     has_handoff_snapshot: bool,
@@ -68,6 +70,7 @@ impl From<AttachSessionData> for AttachEntry {
             attachment: data.attachment,
             term: data.term,
             term_commit: data.term_commit,
+            terminal_grid_observer: data.terminal_grid_observer,
             resize_fd: data.resize_fd,
             target_dims: data.target_dims,
             has_handoff_snapshot: data.has_handoff_snapshot,
@@ -261,7 +264,7 @@ async fn send_attach_replay(
         // first; resizing before that replay can make a live foreground
         // process redraw and overwrite the restored history immediately.
         if size.has_grid() {
-            resize_term(&entry.term, size.cols, size.rows).await;
+            resize_term(&entry.term, &entry.terminal_grid_observer, size.cols, size.rows).await;
             if let Err(error) = set_pty_winsize(entry.resize_fd.as_ref(), size) {
                 warn!(%session_id, "pre-snapshot TIOCSWINSZ failed: {error}");
             }
@@ -428,6 +431,7 @@ mod tests {
             attachment: Arc::new(Mutex::new(None)),
             term: Arc::new(Mutex::new(make_term(session_id))),
             term_commit: Arc::new(TermCommit::default()),
+            terminal_grid_observer: TerminalGridObserverHandle::default(),
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,

@@ -17,6 +17,7 @@ mod server;
 mod session;
 mod share_tap;
 mod sixel_decoder;
+mod terminal_image_observer_parity;
 mod terminal_image_state_seam;
 mod wait;
 
@@ -328,6 +329,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Compare production image observations with the real Alacritty Term.
+    TerminalImageObserverParity {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -545,9 +552,8 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::ImageFraming { fixtures, evidence } => {
             framing_probe::run(&fixtures, &evidence).map_err(TestError::TestFailure)
         }
-        Command::TerminalImageStateSeam { evidence } => {
-            terminal_image_state_seam::run(&evidence).map_err(TestError::TestFailure)
-        }
+        Command::TerminalImageStateSeam { evidence } => run_terminal_image_state_seam(&evidence),
+        Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =
                 tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
@@ -564,6 +570,14 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
     }
+}
+
+fn run_terminal_image_state_seam(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_state_seam::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_observer_parity(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_observer_parity::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
