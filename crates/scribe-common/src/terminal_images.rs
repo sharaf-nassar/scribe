@@ -194,6 +194,19 @@ impl TerminalImageFeatures {
     pub const fn contains(self, required: Self) -> bool {
         self.0 & required.0 == required.0
     }
+
+    /// Build a feature set from its raw bits. Unknown bits are dropped, so a
+    /// peer cannot claim a feature this build does not define.
+    #[must_use]
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits & Self::V1.0)
+    }
+
+    /// Raw bits, for intersecting two advertised sets.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

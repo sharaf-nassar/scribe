@@ -563,6 +563,85 @@ Every specification acceptance criterion maps to the assembly case that
 exercised it and to the child functional gate that certifies it independently,
 so a reviewer can trace any criterion to evidence without rerunning the epic.
 
+## Session Capability Latch
+
+Image capability is server session state latched once by a capable viewer, so viewer count, detach, controller changes, and reattach cannot change what a running application was already told.
+
+[[crates/scribe-server/src/terminal_image_sharing.rs#SessionImageSharing]] holds
+the latched subset and the master switch. A session begins
+`text-only-unlatched` and admits anyone. The first capable viewer latches the
+intersection of its advertised renderer capability with Scribe's compile-time v1
+subset; a later viewer joins that latch instead of widening or narrowing it, so
+the advertised subset is stable for the life of the session. A latched session
+keeps parsing, replying, and retaining bounded state with zero viewers.
+
+Disabling the master switch is the only thing that clears a latch. The
+transition is reported once as `disabled_cleared_latch`, a repeated write is
+`unchanged`, and re-enabling never restores the old latch — a capable viewer
+must claim again. While disabled the session advertises nothing, so discovery
+cannot mistake a policy-disabled Scribe for an enabled implementation.
+
+## Incapable Viewer Refusal
+
+A viewer that cannot render what a session latched is refused for that session with a typed mismatch rather than attached to a screen whose graphics it would silently drop.
+
+[[crates/scribe-server/src/ipc_server.rs#admit_image_capable_sessions]] runs
+between the window-ownership filter and the attach itself. For each requested
+session it either latches an unlatched session to the attaching viewer or, when
+the viewer does not support the latched subset, drops that session from the
+batch and answers `TerminalImageCapabilityMismatch` naming the required and
+offered capability. The rest of the batch still attaches, and nothing here
+clears a latch, so a refusal cannot be used to downgrade a session.
+
+## Exactly-Once PTY Replies
+
+The server owns every image protocol reply and writes it to the originating PTY once, in PTY byte order, ahead of the terminal's own replies for the same read.
+
+[[crates/scribe-server/src/terminal_image_sharing.rs#plan_pty_replies]] turns one
+committed read into the ordered replies it owes: an APC `G` result echoing `i`
+and `p` for each completed Kitty command, and a stable error code for each Kitty
+failure. `q=1` suppresses success, a continuation chunk replies only when its
+final chunk lands, and a session whose capability is not live owes nothing at
+all. The planner is pure, so replanning the same commit — what a reattach or a
+replay would do — cannot add a second reply.
+
+[[crates/scribe-server/src/ipc_server.rs#deliver_image_commit]] is the single
+production caller. It runs immediately after the reader's ingress seam and
+before `process_metadata_events` drains the terminal's own event queue, which is
+what puts a Kitty result ahead of the DA1 reply an application requests directly
+behind its capability probe. Clients never synthesize a reply through
+`KeyInput`.
+
+## Sixel DA1 Advertisement
+
+Sixel discovery is attribute `4` appended to the terminal's own primary device-attributes reply, exactly once and only while the capability is live.
+
+[[crates/scribe-server/src/terminal_image_sharing.rs#augment_device_attributes]]
+rewrites the `PtyWrite` event the authoritative `Term` raised for DA1, preserving
+every attribute the terminal already reported and skipping a reply that already
+carries `4`. Any other terminal reply — the secondary DA, DSR, DECRPM — passes
+through untouched, and a disabled or unlatched session gains nothing, so
+discovery stays truthful in both directions. `$TERM` and `TERM_PROGRAM` are
+never spoofed.
+
+## Capable-Sink Image Fanout
+
+Typed image records reach the attached sinks that can render them and no others, so one incapable connection cannot suppress or corrupt a capable viewer's convergence.
+
+[[crates/scribe-server/src/ipc_server.rs#AttachedSinks#fan_out_images]] walks the
+per-session sink set and skips any sink whose `Hello` capability does not support
+the session's latched subset. Each connection's advertised capability lives on
+its lock-free output-queue handle rather than behind the connection mutex,
+because the fan-out runs inside the per-session sink lock where nothing may
+await. Records are non-droppable frames, so a saturated link sheds `PtyOutput`
+and resyncs instead of losing an image record silently.
+
+The returned count is the viewer count the zero/one/multiple-viewer contract is
+written against. Zero viewers is a normal outcome, not an error: the session
+still commits canonical state and still answers the PTY. A shared-mode join adds
+a sink, a `SingleController` re-point replaces the set, and a disconnect removes
+one — none of which touches the latch.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.

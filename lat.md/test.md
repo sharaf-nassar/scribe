@@ -445,6 +445,57 @@ scheduler counters, one converged digest pair per session, and a complete
 40-criterion mapping. It also refuses any manifest that embedded array-shaped
 payload data.
 
+## Image Replies and Viewer Sharing
+
+The functional harness certifies the server's reply write-back, capability latch, and capable-sink fan-out against the production sink set, without starting a host Scribe runtime.
+
+### Reply and Capability Probe
+
+The recorded reply order is the production order, so the corpus outcome `kitty_ok_precedes_da1` is observed rather than declared.
+
+The probe drives the pinned `kitty-query-order` fixture through production
+framing and the real Alacritty terminal, then asks the production reply planner
+and the terminal's own event queue what each owes the PTY — image replies first,
+terminal replies second. Replanning the same committed read proves a reattach or
+replay adds no second reply, and planning it against a disabled session proves
+the discovery reply disappears entirely.
+
+The kill-switch case latches a session, disables it, writes the same value
+again, and re-enables it, recording each transition. It checks that DA1 gains
+attribute `4` only while the capability is live and never twice, that a disabled
+session owes no Kitty reply and admits an ordinary text viewer, and that a
+capable viewer must re-latch after re-enable.
+
+The capability case runs its admissions twice — once with viewers present and
+once after — because the latch is session state: the same capable viewers are
+admitted and the same incapable viewer is refused with the same typed required
+and offered subsets either way.
+
+### Viewer Fanout Receipts
+
+The fan-out cases install real bounded output queues on the real per-session
+sink set and read each connection's delivered frames back off its own pipe, so
+"this viewer received the burst exactly once" is a receipt rather than an
+inference.
+
+One committed fixture burst is fanned out with zero viewers, one capable viewer,
+two capable viewers beside one incapable connection, after a non-additive
+controller re-point, and after a detach. The incapable connection must receive
+nothing while the capable ones each receive the whole burst once; the displaced
+viewers must go silent without any latch change; and a viewerless session must
+deliver nothing while still holding its capability.
+
+### Docker Evidence Entry Point
+
+`terminal-image-replies-sharing.sh` runs the probe against the pinned fixture
+directory and validates the payload-free evidence it writes.
+
+The gate pins the schema version, the production engine name, a passing result
+for all nine cases, the exact reply order and counts, the enabled and disabled
+DA1 strings, the exact kill-switch transition sequence, every viewer delivery
+and receipt count, and the typed refusal totals. It also refuses any evidence
+that embedded array-shaped payload data.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

@@ -61,6 +61,10 @@ use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
     snapshot_term,
 };
+use crate::terminal_image_sharing::{
+    SessionImageSharing, augment_device_attributes, effective_connection_subset,
+    images_master_enabled, plan_pty_replies,
+};
 use crate::terminal_image_state::{
     ObservedTerminalGridSpan, ProductionTerminalFeed, PtyTerminalImageState, SessionTerminalCommit,
     SessionTerminalError, TerminalGridObservation, TerminalGridObserverHandle,
@@ -312,13 +316,37 @@ impl AttachedSinks {
     /// across the whole fan-out without ever awaiting under it.
     fn fan_out(&mut self, commit: Option<u64>, msg: &ServerMessage) {
         for sink in &mut self.sinks {
-            match &mut sink.state {
-                SinkState::Live => {
-                    sink.queue.enqueue(msg);
-                }
-                SinkState::Buffering(buffered) => buffered.push(commit, msg),
+            deliver_frame(sink, commit, msg);
+        }
+    }
+
+    /// Fan typed image records out to the sinks that can actually render them.
+    ///
+    /// An incapable sink is skipped rather than sent records it would reject:
+    /// the same set can legitimately hold one capable viewer and one incapable
+    /// diagnostic connection, and the capable ones must still converge. Returns
+    /// how many sinks received the burst, which is the viewer count the
+    /// zero/one/multiple-viewer contract is written against.
+    ///
+    /// Records are `Keep` frames, so a saturated link sheds `PtyOutput` and
+    /// resyncs rather than losing an image record silently.
+    // @lat: [[terminal-images#Terminal Images#Capable-Sink Image Fanout]]
+    fn fan_out_images(
+        &mut self,
+        required: TerminalImageCapabilities,
+        messages: &[ServerMessage],
+    ) -> usize {
+        let mut delivered = 0;
+        for sink in &mut self.sinks {
+            if !sink.queue.image_capabilities().supports(required) {
+                continue;
+            }
+            delivered += 1;
+            for msg in messages {
+                deliver_frame(sink, None, msg);
             }
         }
+        delivered
     }
 
     /// Detach the sink identified by `writer` (`Arc::ptr_eq`); returns whether it
@@ -329,6 +357,18 @@ impl AttachedSinks {
         let before = self.sinks.len();
         self.sinks.retain(|s| !Arc::ptr_eq(&s.writer, writer));
         self.sinks.len() != before
+    }
+}
+
+/// Deliver one frame to a sink according to its attach state: straight into the
+/// connection's queue when live, into the pending buffer while it still awaits
+/// its replay.
+fn deliver_frame(sink: &mut AttachedSink, commit: Option<u64>, msg: &ServerMessage) {
+    match &mut sink.state {
+        SinkState::Live => {
+            sink.queue.enqueue(msg);
+        }
+        SinkState::Buffering(buffered) => buffered.push(commit, msg),
     }
 }
 
@@ -361,6 +401,19 @@ impl BufferedFrames {
 /// enforces that no sink send is ever awaited while the set is locked (#58).
 /// Empty when the session is detached (the reader silently skips sends).
 pub type ClientWriter = Arc<std::sync::Mutex<AttachedSinks>>;
+
+/// Server-owned image capability for one session, shared by the PTY reader
+/// (replies, fan-out) and the dispatch path (attach admission, kill switch).
+/// A **std** mutex for the same reason as [`ClientWriter`]: every critical
+/// section is non-blocking bookkeeping and never spans an `.await`.
+pub type SharedImageSharing = Arc<std::sync::Mutex<SessionImageSharing>>;
+
+/// Lock one session's image capability.
+pub fn lock_image_sharing(
+    sharing: &SharedImageSharing,
+) -> std::sync::MutexGuard<'_, SessionImageSharing> {
+    sharing.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Lock the per-session attached-sink set.
 ///
@@ -1056,6 +1109,8 @@ struct PtyReaderState {
     term_commit: SessionCommit,
     /// Exactly one authoritative terminal-image seam owned by this reader.
     terminal_images: PtyTerminalImageState,
+    /// This session's latched image capability and master-switch state.
+    image_sharing: SharedImageSharing,
     /// The find overlay's cached scrollback snapshot, dropped by every feed
     /// this task performs (spec 017 US8-2).
     search_cache: SessionSearchCache,
@@ -1253,6 +1308,10 @@ pub struct LiveSession {
     /// `pub(crate)` so `hook_ingress` can clone the writer when routing
     /// inbound `HookEvent`s through `send_metadata_event`.
     pub(crate) client_writer: ClientWriter,
+    /// Server-owned image capability, latched independently of viewer count so
+    /// detach, reattach, and controller changes cannot change what the running
+    /// application was already told.
+    pub(crate) image_sharing: SharedImageSharing,
     attachment: SessionAttachment,
     workspace_id: WorkspaceId,
     shell_name: String,
@@ -1825,6 +1884,32 @@ struct OutputQueueShared {
     /// Wakes the drain task when frames are enqueued, a session goes replay-dirty,
     /// or the connection is shutting down.
     notify: tokio::sync::Notify,
+    /// This connection's `Hello` image-renderer capability, packed by
+    /// [`pack_image_capabilities`]. It lives here rather than behind the
+    /// connection's async mutex because the image fan-out runs inside the
+    /// per-session sink lock, where nothing may await.
+    image_capabilities: std::sync::atomic::AtomicU32,
+}
+
+/// Pack a capability set into one atomic word: the low bits are feature bits,
+/// the sign bit is runtime enablement.
+const IMAGE_RUNTIME_ENABLED_BIT: u32 = 1 << 31;
+
+fn pack_image_capabilities(capabilities: TerminalImageCapabilities) -> u32 {
+    let mut packed = u32::from(capabilities.features.bits());
+    if capabilities.runtime_enabled {
+        packed |= IMAGE_RUNTIME_ENABLED_BIT;
+    }
+    packed
+}
+
+fn unpack_image_capabilities(packed: u32) -> TerminalImageCapabilities {
+    TerminalImageCapabilities {
+        runtime_enabled: packed & IMAGE_RUNTIME_ENABLED_BIT != 0,
+        features: scribe_common::terminal_images::TerminalImageFeatures::from_bits(
+            u16::try_from(packed & u32::from(u16::MAX)).unwrap_or(0),
+        ),
+    }
 }
 
 struct OutputQueueInner {
@@ -1885,6 +1970,16 @@ impl OutputQueueShared {
 }
 
 impl OutputSink {
+    /// Record this connection's advertised image-renderer capability.
+    pub(crate) fn set_image_capabilities(&self, capabilities: TerminalImageCapabilities) {
+        self.0.image_capabilities.store(pack_image_capabilities(capabilities), Ordering::Relaxed);
+    }
+
+    /// Read this connection's advertised image-renderer capability.
+    pub(crate) fn image_capabilities(&self) -> TerminalImageCapabilities {
+        unpack_image_capabilities(self.0.image_capabilities.load(Ordering::Relaxed))
+    }
+
     /// Enqueue one `ServerMessage` for the drain task. Never blocks on the link.
     ///
     /// `PtyOutput` is the sole droppable, high-volume stream: while its session is
@@ -2029,7 +2124,7 @@ fn enforce_queue_ceiling(g: &mut OutputQueueInner) {
 ///
 /// `live_sessions` is the registry the drain task rebuilds a catch-up
 /// `SessionReplay` from when a session goes replay-dirty.
-fn spawn_output_queue<W>(
+pub fn spawn_output_queue<W>(
     write_half: W,
     live_sessions: LiveSessionRegistry,
 ) -> (OutputSink, tokio::task::JoinHandle<()>)
@@ -2045,6 +2140,8 @@ where
             closed: false,
         }),
         notify: tokio::sync::Notify::new(),
+        // Incapable until this connection's `Hello` says otherwise.
+        image_capabilities: std::sync::atomic::AtomicU32::new(0),
     });
     let drain = tokio::spawn(output_queue_drain(Arc::clone(&shared), write_half, live_sessions));
     (OutputSink(shared), drain)
@@ -4303,6 +4400,20 @@ async fn serve_connection<R>(
     finish_served_connection(exit, window_id, conn, remote_identity.as_ref()).await;
 }
 
+/// Record a connection's renderer capability on its lock-free output-queue
+/// handle and return the subset it is told it has.
+///
+/// The handle rather than the connection mutex, because the image fan-out runs
+/// inside the per-session sink lock where nothing may await.
+async fn record_image_capabilities(
+    writer: &SharedWriter,
+    advertised: TerminalImageCapabilities,
+) -> TerminalImageCapabilities {
+    let images = effective_connection_subset(advertised, images_master_enabled());
+    writer.lock().await.queue().set_image_capabilities(images);
+    images
+}
+
 /// Tear a served connection down after its message loop returns: on a sever, send
 /// the best-effort final `RemoteDisconnect` (T023); always run the detach cleanup
 /// (window ownership released, owning sessions untouched); then, for a remote
@@ -4336,6 +4447,37 @@ async fn finish_served_connection(
             ),
         }
     }
+}
+
+/// Complete a `Hello` first frame: charge the connection's client slot, record
+/// the renderer capability it advertised, and register its window claim.
+///
+/// `hello` is always [`ClientMessage::Hello`]; any other frame is refused
+/// without touching the admission pool.
+async fn claim_hello_window(
+    hello: ClientMessage,
+    conn: ConnState<'_>,
+    controller: &ControllerIdentity,
+    local: Option<&mut LocalSlot>,
+) -> Option<WindowId> {
+    let ClientMessage::Hello { window_id, clipboard_gating, takeover, terminal_images, .. } = hello
+    else {
+        return None;
+    };
+    // Long-lived: exchange the pending permit for one of the 32 client slots.
+    // A full pool closes the connection, exactly as the pre-017 accept-time
+    // rejection did — minus the accept.
+    if !claim_local_slot(local, LocalSlotKind::Client) {
+        return None;
+    }
+    let claim = HelloClaim {
+        requested_window_id: window_id,
+        clipboard_gating,
+        takeover,
+        controller,
+        terminal_images: record_image_capabilities(conn.writer, terminal_images).await,
+    };
+    Some(handle_client_hello(claim, conn.server, conn.writer).await)
 }
 
 async fn establish_client_window<R>(
@@ -4372,20 +4514,8 @@ where
             return None;
         };
         match first {
-            Ok(ClientMessage::Hello { window_id, clipboard_gating, takeover, .. }) => {
-                // Long-lived: exchange the pending permit for one of the 32 client
-                // slots. A full pool closes the connection, exactly as the
-                // pre-017 accept-time rejection did — minus the accept.
-                if !claim_local_slot(local.as_deref_mut(), LocalSlotKind::Client) {
-                    return None;
-                }
-                let claim = HelloClaim {
-                    requested_window_id: window_id,
-                    clipboard_gating,
-                    takeover,
-                    controller,
-                };
-                return Some(handle_client_hello(claim, conn.server, conn.writer).await);
+            Ok(hello @ ClientMessage::Hello { .. }) => {
+                return claim_hello_window(hello, conn, controller, local.as_deref_mut()).await;
             }
             // Feature 013 (fix 5): the picker's window-probe. An ALREADY-authorized
             // remote connection may enumerate this machine's windows read-only
@@ -4965,6 +5095,9 @@ struct HelloClaim<'a> {
     clipboard_gating: bool,
     /// Feature 013: explicit takeover of a currently-connected window.
     takeover: bool,
+    /// Spec 020: the image subset this connection may actually render, already
+    /// intersected with Scribe's v1 support and the master switch.
+    terminal_images: TerminalImageCapabilities,
     /// This connection's controller identity (local vs remote peer).
     controller: &'a ControllerIdentity,
 }
@@ -5027,7 +5160,7 @@ async fn handle_client_hello(
                 other_windows,
                 clipboard_gating: true,
                 participant_id,
-                terminal_images: TerminalImageCapabilities::default(),
+                terminal_images: claim.terminal_images,
             };
             send_message(writer, &welcome).await;
 
@@ -5052,7 +5185,7 @@ async fn handle_client_hello(
                 clipboard_gating: true,
                 // A lost-control landing registers no participant.
                 participant_id: None,
-                terminal_images: TerminalImageCapabilities::default(),
+                terminal_images: claim.terminal_images,
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
@@ -5429,6 +5562,7 @@ async fn claim_window(
         clipboard_gating: false,
         takeover: false,
         controller: &local,
+        terminal_images: TerminalImageCapabilities::default(),
     };
     match resolve_and_register_claim(
         window_shares,
@@ -6397,6 +6531,12 @@ impl SharedSessionHandles {
     }
 }
 
+/// A fresh session's image capability: `text-only-unlatched` under the current
+/// master switch, until the first capable viewer latches it.
+fn new_session_image_sharing() -> SharedImageSharing {
+    Arc::new(std::sync::Mutex::new(SessionImageSharing::new(images_master_enabled())))
+}
+
 async fn start_session(
     ids: StartSessionIds,
     session: ManagedSession,
@@ -6416,7 +6556,7 @@ async fn start_session(
     let terminal_images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
     let terminal_grid_observer = terminal_images.grid_observer();
     terminal_grid_observer.set_cell_size(cell_width, cell_height);
-
+    let image_sharing = new_session_image_sharing();
     let live = LiveSession {
         pty_write: Arc::clone(&shared.pty_write),
         resize_fd: Arc::new(resize_fd),
@@ -6427,6 +6567,7 @@ async fn start_session(
         child_pid,
         child_identity,
         client_writer: Arc::clone(&shared.client_writer),
+        image_sharing: Arc::clone(&image_sharing),
         attachment: Arc::clone(&shared.attachment),
         workspace_id,
         shell_name,
@@ -6477,6 +6618,7 @@ async fn start_session(
             clipboard_command_rx: shared.clipboard_command_rx,
             client_writer: shared.client_writer,
             terminal_images,
+            image_sharing,
             attachment: shared.attachment,
             preserve_ai_scrollback: shared.preserve_ai_scrollback,
             scrollback_lines: shared.scrollback_lines,
@@ -6506,6 +6648,7 @@ struct PtyReaderInputs {
     clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
     client_writer: ClientWriter,
     terminal_images: PtyTerminalImageState,
+    image_sharing: SharedImageSharing,
     attachment: SessionAttachment,
     preserve_ai_scrollback: Arc<AtomicBool>,
     scrollback_lines: Arc<AtomicUsize>,
@@ -6535,6 +6678,7 @@ fn spawn_pty_reader(
         term: inputs.term,
         term_commit: inputs.term_commit,
         terminal_images: inputs.terminal_images,
+        image_sharing: inputs.image_sharing,
         search_cache: inputs.search_cache,
         ansi_processor: inputs.ansi_processor,
         osc_parser: inputs.osc_parser,
@@ -8207,6 +8351,8 @@ async fn handle_attach_sessions(
 
     let (session_ids, dimensions) =
         filter_attachable_sessions(session_ids, dimensions, context).await;
+    let (session_ids, dimensions) =
+        admit_image_capable_sessions(session_ids, dimensions, context).await;
     if session_ids.is_empty() {
         return;
     }
@@ -8223,6 +8369,68 @@ async fn handle_attach_sessions(
     )
     .await;
     attached_extend(context.attached_ids, attached).await;
+}
+
+/// Apply the image capability contract to one attach batch.
+///
+/// A capable viewer latches an unlatched session — that is what makes a
+/// created-then-attached session image-enabled. A viewer lacking what a session
+/// already latched is refused for that session with the typed mismatch instead
+/// of being attached to a screen whose graphics it cannot draw; the rest of its
+/// batch still attaches. Zero-viewer retention is unaffected: nothing here
+/// clears a latch.
+// @lat: [[terminal-images#Terminal Images#Incapable Viewer Refusal]]
+async fn admit_image_capable_sessions(
+    session_ids: Vec<SessionId>,
+    dimensions: Vec<TerminalSize>,
+    context: &ClientDispatchContext<'_>,
+) -> (Vec<SessionId>, Vec<TerminalSize>) {
+    if session_ids.is_empty() {
+        return (session_ids, dimensions);
+    }
+    let viewer = context.writer.lock().await.queue().image_capabilities();
+    let include_dimensions = !dimensions.is_empty();
+    let mut allowed_ids = Vec::with_capacity(session_ids.len());
+    let mut allowed_dimensions = Vec::with_capacity(dimensions.len());
+    let mut refusals = Vec::new();
+
+    let sessions = context.server.live_sessions.read().await;
+    for (idx, session_id) in session_ids.into_iter().enumerate() {
+        let refusal = sessions.get(&session_id).and_then(|session| {
+            let mut sharing = lock_image_sharing(&session.image_sharing);
+            match sharing.admit(viewer) {
+                Ok(()) => {
+                    sharing.latch(viewer);
+                    None
+                }
+                Err(mismatch) => Some(mismatch),
+            }
+        });
+        if let Some(mismatch) = refusal {
+            refusals.push((session_id, mismatch));
+            continue;
+        }
+        allowed_ids.push(session_id);
+        if include_dimensions {
+            allowed_dimensions.push(dimensions.get(idx).copied().unwrap_or_default());
+        }
+    }
+    drop(sessions);
+
+    for (session_id, mismatch) in refusals {
+        warn!(
+            %session_id,
+            window_id = %context.window_id,
+            "AttachSessions refused: viewer cannot render this session's latched images"
+        );
+        send_message(
+            context.writer,
+            &ServerMessage::TerminalImageCapabilityMismatch { session_id, mismatch },
+        )
+        .await;
+    }
+
+    (allowed_ids, allowed_dimensions)
 }
 
 async fn filter_attachable_sessions(
@@ -8714,6 +8922,17 @@ fn send_to_client(client_writer: &ClientWriter, commit: Option<u64>, msg: &Serve
     lock_sinks(client_writer).fan_out(commit, msg);
 }
 
+/// Fan typed image records out to the capable sinks only, returning how many
+/// viewers received them. Zero viewers is a normal, non-error outcome: an
+/// image-latched session keeps parsing and retaining state while unwatched.
+pub fn send_image_records(
+    client_writer: &ClientWriter,
+    required: TerminalImageCapabilities,
+    messages: &[ServerMessage],
+) -> usize {
+    lock_sinks(client_writer).fan_out_images(required, messages)
+}
+
 /// Install an attaching connection's sink on a session in the buffering state,
 /// before its replay snapshot is taken (see [`AttachedSinks::begin_attach`]).
 ///
@@ -8993,7 +9212,13 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
 
     // Step 2: State path — the shared ingress seam fed filtered bytes into
     // Term. Image sequence rejection never suppresses ordinary delivery.
-    let _image_commit = image_result.ok();
+    if let Ok(image_commit) = image_result {
+        // Step 2a: answer the PTY and fan typed records to capable viewers
+        // BEFORE `process_metadata_events` drains the Term's own event queue.
+        // That single ordering is what puts a Kitty result ahead of the DA1
+        // reply an application requests immediately behind its probe.
+        deliver_image_commit(state, &image_commit).await;
+    }
 
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
@@ -9006,6 +9231,62 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
 
     // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
     process_metadata_events(state).await;
+}
+
+/// Answer the PTY and fan committed image records out for one read.
+///
+/// Ordering is the whole point: every reply this read owes is written to the
+/// PTY in image-output-sequence order first, then the canonical mutations are
+/// committed and published to the capable sinks. Both steps are skipped for a
+/// session whose capability is unlatched or killed, so a disabled Scribe
+/// answers no discovery probe and leaks no records.
+async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTerminalCommit) {
+    let (enabled, required) = {
+        let sharing = lock_image_sharing(&state.image_sharing);
+        (sharing.images_enabled(), sharing.effective())
+    };
+    for reply in plan_pty_replies(commit, enabled) {
+        debug!(
+            session_id = %state.session_id,
+            sequence = reply.sequence.0,
+            bytes = reply.bytes.len(),
+            "writing terminal image reply to PTY"
+        );
+        write_term_response(&state.pty_write, state.session_id, &reply.bytes).await;
+    }
+    if !enabled {
+        return;
+    }
+    // ponytail: canonical RGBA bytes are not yet routed to live viewers, so a
+    // definition needing pixels withdraws itself from the burst and the client
+    // converges on the next combined replay instead. Upgrade path: the combined
+    // replay task owns the payload provider and passes it here.
+    let messages = match state.terminal_images.commit_and_publish(commit, &mut |_| None) {
+        Ok(messages) => messages,
+        Err(error) => {
+            warn!(
+                session_id = %state.session_id,
+                error = %error,
+                "terminal image publication rejected a committed read"
+            );
+            return;
+        }
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let session_id = state.session_id;
+    let frames: Vec<ServerMessage> = messages
+        .into_iter()
+        .map(|message| ServerMessage::TerminalImageLive { session_id, message })
+        .collect();
+    let viewers = send_image_records(&state.client_writer, required, &frames);
+    debug!(
+        %session_id,
+        records = frames.len(),
+        viewers,
+        "fanned terminal image records to capable viewers"
+    );
 }
 
 /// Reset mouse-reporting / focus-event modes left enabled when a shell
@@ -9508,7 +9789,12 @@ async fn handle_session_event(
             write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
         }
         SessionEvent::PtyWrite(text) => {
-            write_term_response(&state.pty_write, state.session_id, text.as_bytes()).await;
+            // The authoritative Term answers DA1 for this session; Sixel
+            // discovery is attribute 4 appended to that same reply, exactly
+            // once and only while the capability is actually live.
+            let sixel_enabled = lock_image_sharing(&state.image_sharing).images_enabled();
+            let response = augment_device_attributes(&text, sixel_enabled);
+            write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
         }
         SessionEvent::TextAreaSizeRequest(format) => {
             let size = current_window_size(state).await;

@@ -269,7 +269,7 @@ fn hardening_evidence_cases() -> Vec<CaseEvidence> {
     ]
 }
 
-fn read_hex(path: &Path) -> Result<Vec<u8>, String> {
+pub fn read_hex(path: &Path) -> Result<Vec<u8>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let hex = text.trim();
