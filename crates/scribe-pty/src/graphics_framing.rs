@@ -371,6 +371,14 @@ pub struct GraphicsFailure {
     pub protocol: GraphicsProtocol,
     pub category: GraphicsFailureCategory,
     pub limit: Option<GraphicsLimit>,
+    /// The `q=` level this failure must honor, so `q=2` suppresses the error
+    /// reply exactly as it suppresses the success reply.
+    ///
+    /// `0` means "no quiet level was ever readable here", which is also the
+    /// value every failure carries when the sequence never framed or parsed
+    /// far enough to have one. Such a failure still replies: silence must be
+    /// requested, never inferred from a stream we could not read.
+    pub quiet: u8,
 }
 
 impl GraphicsFailure {
@@ -379,7 +387,7 @@ impl GraphicsFailure {
         protocol: GraphicsProtocol,
         category: GraphicsFailureCategory,
     ) -> Self {
-        Self { range, protocol, category, limit: None }
+        Self { range, protocol, category, limit: None, quiet: 0 }
     }
 }
 
@@ -1873,6 +1881,10 @@ impl GraphicsFramer {
 
         match active.kind {
             ActiveKind::Kitty => {
+                // Read the quiet level before the parse consumes the body: a
+                // control that fails to parse must not cost the command the
+                // `q=` operand it did spell correctly.
+                let quiet = kitty_quiet_hint(active.body.as_slice());
                 let body = active.body.into_payload();
                 match parse_kitty(body) {
                     Ok(command) => output.event(GraphicsEvent::Kitty { range, command })?,
@@ -1882,16 +1894,19 @@ impl GraphicsFramer {
                             protocol,
                             category,
                             limit,
+                            quiet,
                         }))?;
                     }
                 }
             }
             ActiveKind::UnsupportedKittyC1 => {
-                output.event(GraphicsEvent::Failure(GraphicsFailure::new(
+                output.event(GraphicsEvent::Failure(GraphicsFailure {
                     range,
                     protocol,
-                    GraphicsFailureCategory::UnsupportedProtocol,
-                )))?;
+                    category: GraphicsFailureCategory::UnsupportedProtocol,
+                    limit: None,
+                    quiet: kitty_quiet_hint(active.body.as_slice()),
+                }))?;
             }
             ActiveKind::Sixel { parameters, .. } => match parameters {
                 Err(category) => output.event(GraphicsEvent::Failure(GraphicsFailure::new(
@@ -1925,8 +1940,29 @@ impl GraphicsFramer {
             protocol: active.kind.protocol(),
             category,
             limit,
+            // This string broke while it was still being framed, so its body is
+            // not a control string we ever read; it gets the loud default.
+            quiet: 0,
         }
     }
+}
+
+/// Best-effort `q=` level from a Kitty body that framed all the way to its
+/// terminator.
+///
+/// Returns `0` unless the controls carry one well-formed `q=` operand, which is
+/// what keeps a stream from silencing its own errors by never spelling a quiet
+/// level it could be held to. Scanning independently of the control loop also
+/// means a `q=2` is honored whether it precedes or follows the control that
+/// actually failed.
+fn kitty_quiet_hint(body: &[u8]) -> u8 {
+    let controls = body.split(|byte| *byte == b';').next().unwrap_or_default();
+    controls
+        .split(|byte| *byte == b',')
+        .filter_map(|pair| split_at_byte(pair, b'='))
+        .find(|(key, _)| *key == b"q")
+        .and_then(|(_, value)| parse_quiet(value).ok())
+        .unwrap_or(0)
 }
 
 fn charge_kitty_payload(active: &mut ActiveString, byte: u8) -> bool {

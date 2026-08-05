@@ -715,10 +715,24 @@ The server owns every image protocol reply and writes it to the originating PTY 
 [[crates/scribe-server/src/terminal_image_sharing.rs#plan_pty_replies]] turns one
 committed read into the ordered replies it owes: an APC `G` result echoing `i`
 and `p` for each completed Kitty command, and a stable error code for each Kitty
-failure. `q=1` suppresses success, a continuation chunk replies only when its
-final chunk lands, and a session whose capability is not live owes nothing at
-all. The planner is pure, so replanning the same commit — what a reattach or a
-replay would do — cannot add a second reply.
+failure. A continuation chunk replies only when its final chunk lands, and a
+session whose capability is not live owes nothing at all. The planner is pure,
+so replanning the same commit — what a reattach or a replay would do — cannot
+add a second reply.
+
+Both reply kinds honor the command's own quiet level. `q=1` suppresses success
+only, so an error is still answered; `q=2` suppresses the failure reply as
+well. Every failure therefore carries the level it must honor:
+[[crates/scribe-pty/src/graphics_framing.rs#GraphicsFailure]] reads it from the
+controls of a body that framed to its terminator, and the seam propagates the
+transfer's first-chunk level to decode-time and truncation failures, because a
+continuation chunk may omit every control.
+
+A failure whose quiet level was never readable — malformed framing, a string
+that never terminated, a `q=` operand that is not a defined level — carries `0`
+and still replies. Silence has to be requested in a sequence we could actually
+read, otherwise a hostile stream could mute its own diagnostics by malforming
+them.
 
 [[crates/scribe-server/src/ipc_server.rs#deliver_image_commit]] is the single
 production caller. It runs immediately after the reader's ingress seam and

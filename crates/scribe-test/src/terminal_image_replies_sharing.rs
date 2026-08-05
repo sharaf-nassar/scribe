@@ -51,6 +51,7 @@ struct Evidence<'a> {
     engine: &'a str,
     payload_free: bool,
     replies: ReplyEvidence,
+    failure_quiet: FailureQuietEvidence,
     viewers: ViewerEvidence,
     capability: CapabilityEvidence,
     kill_switch: KillSwitchEvidence,
@@ -68,6 +69,20 @@ struct ReplyEvidence {
     replayed_kitty_replies: usize,
     /// Replies planned while the session's capability is not live.
     disabled_kitty_replies: usize,
+}
+
+/// What each quiet level does to the reply owed by one rejected Kitty command.
+#[derive(Serialize)]
+struct FailureQuietEvidence {
+    /// Replies planned for the same rejected command at `q=0`, `q=1`, `q=2`.
+    q0_failure_replies: usize,
+    q1_failure_replies: usize,
+    q2_failure_replies: usize,
+    /// The stable code the loud levels answered with.
+    failure_code: String,
+    /// A command whose `q=` operand itself is unparseable cannot be honored, so
+    /// its failure stays loud instead of being silently swallowed.
+    unreadable_quiet_failure_replies: usize,
 }
 
 /// Delivery receipts across viewer counts, a controller change, and a detach.
@@ -219,6 +234,9 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
     cases.insert("kitty_reply_before_da", "pass");
     cases.insert("reply_exactly_once", "pass");
 
+    let failure_quiet = verify_failure_quiet()?;
+    cases.insert("failure_quiet_suppression", "pass");
+
     let kill_switch = verify_kill_switch(fixtures)?;
     cases.insert("da4_enablement", "pass");
     cases.insert("kill_switch_transitions", "pass");
@@ -238,6 +256,7 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
         engine: "scribe-server image replies and capable-sink fanout",
         payload_free: true,
         replies,
+        failure_quiet,
         viewers,
         capability,
         kill_switch,
@@ -294,6 +313,67 @@ fn verify_reply_order(fixtures: &Path) -> Result<ReplyEvidence, String> {
         // the reader writing it once is the whole exactly-once guarantee.
         replayed_kitty_replies: replayed.len(),
         disabled_kitty_replies: disabled.len(),
+    })
+}
+
+/// One rejected Kitty command, driven through production framing and the
+/// production reply planner at each quiet level the contract defines.
+///
+/// `t=f` is an unsupported transport, so the same command is rejected
+/// identically every time and only the `q=` operand differs. The contract makes
+/// `q=1` a success-only suppressor, so an error must still be answered there;
+/// only `q=2` silences it. A `q=` value that is not a defined level cannot be
+/// honored at all, and its failure stays loud.
+fn verify_failure_quiet() -> Result<FailureQuietEvidence, String> {
+    let rejected = |quiet: &str| format!("\u{1b}_Ga=T,t=f,q={quiet};\u{1b}\\").into_bytes();
+
+    let mut codes = Vec::new();
+    let mut counts = Vec::new();
+    for quiet in ["0", "1", "2"] {
+        let mut probe = Probe::new();
+        let commit = probe.feed(&rejected(quiet))?;
+        let planned = plan_pty_replies(&commit, true);
+        for reply in &planned {
+            let text = String::from_utf8_lossy(&reply.bytes).into_owned();
+            let code = text
+                .strip_prefix("\u{1b}_G;")
+                .and_then(|rest| rest.strip_suffix("\u{1b}\\"))
+                .ok_or_else(|| {
+                    format!("q={quiet} failure reply is not an APC G error: {text:?}")
+                })?;
+            codes.push(code.to_owned());
+        }
+        counts.push(planned.len());
+    }
+    let [q0, q1, q2] = counts.as_slice() else {
+        return Err("expected one planning result per quiet level".to_owned());
+    };
+    if (*q0, *q1, *q2) != (1, 1, 0) {
+        return Err(format!("quiet levels planned {q0}/{q1}/{q2} failure replies, expected 1/1/0"));
+    }
+    if codes.iter().any(|code| code != "ENOSYS") {
+        return Err(format!("unsupported transport answered with {codes:?}, expected ENOSYS"));
+    }
+
+    // `q=9` is not a defined level, so the operand is rejected along with the
+    // command and no quiet level was ever readable. Staying silent here would
+    // let a stream mute its own diagnostics by malforming them.
+    let mut probe = Probe::new();
+    let commit = probe.feed(&rejected("9"))?;
+    let unreadable = plan_pty_replies(&commit, true);
+    if unreadable.len() != 1 {
+        return Err(format!(
+            "an unreadable quiet level planned {} replies, expected 1",
+            unreadable.len()
+        ));
+    }
+
+    Ok(FailureQuietEvidence {
+        q0_failure_replies: *q0,
+        q1_failure_replies: *q1,
+        q2_failure_replies: *q2,
+        failure_code: codes.join(","),
+        unreadable_quiet_failure_replies: unreadable.len(),
     })
 }
 

@@ -24,9 +24,9 @@ grep -Fq '"engine": "scribe-server image replies and capable-sink fanout"' "$EVI
 grep -Fq '"payload_free": true' "$EVIDENCE" || fail "evidence claims retained payloads"
 
 # Every acceptance behavior maps to a named case.
-for case in kitty_reply_before_da reply_exactly_once da4_enablement \
-    kill_switch_transitions incapable_attach_refusal latch_survives_detach \
-    zero_one_multiple_viewers controller_change detach; do
+for case in kitty_reply_before_da reply_exactly_once failure_quiet_suppression \
+    da4_enablement kill_switch_transitions incapable_attach_refusal \
+    latch_survives_detach zero_one_multiple_viewers controller_change detach; do
     grep -Fq "\"$case\": \"pass\"" "$EVIDENCE" || fail "case $case did not pass"
 done
 
@@ -42,6 +42,18 @@ grep -Fq '"replayed_kitty_replies": 1' "$EVIDENCE" \
     || fail "replanning a committed read changed its reply count"
 grep -Fq '"disabled_kitty_replies": 0' "$EVIDENCE" \
     || fail "a disabled session still answered a Kitty probe"
+
+# The contract's quiet ladder applies to errors too: q=2 suppresses a failure
+# reply, q=1 suppresses success only and must keep answering errors, and a q=
+# operand that is not a defined level cannot silence anything.
+grep -Fq '"q0_failure_replies": 1' "$EVIDENCE" || fail "q=0 swallowed a failure reply"
+grep -Fq '"q1_failure_replies": 1' "$EVIDENCE" \
+    || fail "q=1 suppressed a failure reply; it suppresses success only"
+grep -Fq '"q2_failure_replies": 0' "$EVIDENCE" || fail "q=2 did not suppress the failure reply"
+grep -Fq '"failure_code": "ENOSYS,ENOSYS"' "$EVIDENCE" \
+    || fail "an unsupported transport did not answer ENOSYS at both loud levels"
+grep -Fq '"unreadable_quiet_failure_replies": 1' "$EVIDENCE" \
+    || fail "a failure whose quiet level was unreadable was silently swallowed"
 
 # DA1 gains attribute 4 only while the capability is live, and every kill-switch
 # transition is reported exactly once.
