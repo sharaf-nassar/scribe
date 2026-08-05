@@ -66,6 +66,11 @@ log_field_max() {
     printf '%s' "${value:-0}"
 }
 
+# Value of a named field on one already-extracted log line. Handoff seam counts
+# are point-in-time rather than monotonic, so they have to be read off the line
+# that states them instead of through `log_field_max`.
+line_field() { printf '%s' "$2" | sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p"; }
+
 log_lines() { wc -l <"$SERVER_LOG" | tr -d ' '; }
 
 wait_log() {
@@ -301,35 +306,70 @@ pass_case ssh_transport
 
 # ---------------------------------------------------------------------------
 # Phase 8: upgrade. A hot-reload must leave the session image-capable and its
-# scene coherent. Coherent means all or nothing: the successor may inherit the
-# whole committed scene or start empty, but a half-carried scene — placements
-# naming definitions that did not travel — is the failure this asserts against.
+# scene coherent. Coherent means all or nothing: the successor installs the
+# whole committed scene, and a half-carried scene — placements naming
+# definitions that did not travel — is the failure this asserts against.
+#
+# The handoff seam is the only place that property is observable. The export
+# runs with the session's reads paused and the restore runs before the
+# successor's reader consumes a byte, so nothing can move the grid between
+# them. Every later reading is taken after the attach has redrawn and this
+# phase's own output has scrolled the 24-row grid, and a placement that scrolls
+# off the top is retired by design — so a post-attach count is a bound on the
+# restored scene, never an equality with it.
 # ---------------------------------------------------------------------------
+MARK=$(($(log_lines) + 1))
 run_in_session "$WORK/emit.sh $WORK/rgb-4.bin preupgrade" "EMIT-DONE-preupgrade"
-PRE_PLACEMENTS=$(log_field_max classic_placements)
-[ "$PRE_PLACEMENTS" -ge 1 ] || fail "nothing was on the grid to carry across the upgrade"
+wait_field_at_least classic_placements 1 "$MARK" ||
+    fail "nothing was on the grid to carry across the upgrade"
+SEAM=$(($(log_lines) + 1))
 scribe-test daemon stop
 scribe-test server upgrade
 scribe-test daemon start
 scribe-test session attach "$SESSION"
+wait_log "exported terminal image state for handoff" "$SEAM" 15 ||
+    fail "the upgrade exported no terminal image state"
+EXPORTED=$(plain_log "$SEAM" | grep -F "exported terminal image state for handoff" | head -1)
+# The export counters are registry-wide; one live session is what makes them
+# comparable with the per-session restore line below.
+EXPORTED_SESSIONS=$(line_field sessions "$EXPORTED")
+[ "$EXPORTED_SESSIONS" = "1" ] ||
+    fail "the seam exported $EXPORTED_SESSIONS sessions; the scene comparison is void"
+EXPORTED_DEFINITIONS=$(line_field definitions "$EXPORTED")
+EXPORTED_PLACEMENTS=$(line_field placements "$EXPORTED")
+[ "$EXPORTED_PLACEMENTS" -ge 1 ] ||
+    fail "nothing was on the grid to carry across the upgrade"
+[ "$(line_field dropped_scenes "$EXPORTED")" = "0" ] ||
+    fail "the export refused a scene it was asked to carry: $EXPORTED"
+wait_log "restored terminal image state from handoff" "$SEAM" 15 ||
+    fail "the successor installed none of the exported image state"
+RESTORED=$(plain_log "$SEAM" | grep -F "restored terminal image state from handoff" | head -1)
+RESTORED_DEFINITIONS=$(line_field definitions "$RESTORED")
+RESTORED_PLACEMENTS=$(line_field placements "$RESTORED")
+[ "$RESTORED_DEFINITIONS" = "$EXPORTED_DEFINITIONS" ] &&
+    [ "$RESTORED_PLACEMENTS" = "$EXPORTED_PLACEMENTS" ] ||
+    fail "the upgrade left a partial scene: exported" \
+        "$EXPORTED_DEFINITIONS/$EXPORTED_PLACEMENTS definitions/placements," \
+        "restored $RESTORED_DEFINITIONS/$RESTORED_PLACEMENTS"
+SCENE_CARRIED=true
 MARK=$(($(log_lines) + 1))
 # The successor's counters start at zero. Make it commit a read that transmits
-# nothing — a discovery query — and read back what it believes is on the grid,
-# before it has decoded anything of its own.
+# nothing — a discovery query — and read back what it believes is on the grid.
+# Scroll may already have retired some of the restored placements by then, so
+# what this can assert is the ceiling: a server that decoded nothing must never
+# hold more placements than it was handed.
 run_in_session "$WORK/probe.sh $OUT/functional-probe-upgraded.txt $WORK/kitty-query-order.bin" \
     "PROBE-DONE" 15000
 wait_log "terminal image application evidence" "$MARK" ||
     fail "the upgraded server committed no image read"
 UPGRADED=$(plain_log "$MARK" | grep -F "terminal image application evidence" | head -1)
-POST_PLACEMENTS=$(printf '%s' "$UPGRADED" | sed -n 's/.* classic_placements=\([0-9]*\).*/\1/p')
-POST_TRANSFERS=$(printf '%s' "$UPGRADED" | sed -n 's/.* kitty_transfers=\([0-9]*\).*/\1/p')
+POST_PLACEMENTS=$(line_field classic_placements "$UPGRADED")
+POST_TRANSFERS=$(line_field kitty_transfers "$UPGRADED")
 [ "$POST_TRANSFERS" = "0" ] ||
     fail "the upgraded server decoded $POST_TRANSFERS transfers of its own; the check is void"
-case "$POST_PLACEMENTS" in
-    0) SCENE_CARRIED=false ;;
-    "$PRE_PLACEMENTS") SCENE_CARRIED=true ;;
-    *) fail "the upgrade left a partial scene: $PRE_PLACEMENTS placements became $POST_PLACEMENTS" ;;
-esac
+[ "$POST_PLACEMENTS" -le "$RESTORED_PLACEMENTS" ] ||
+    fail "the upgraded server holds $POST_PLACEMENTS placements having decoded" \
+        "nothing; only $RESTORED_PLACEMENTS were restored"
 # The discovery reply proves the capability came back with the session, and a
 # fresh transmission proves the successor's own pipeline is whole.
 UPGRADED_REPLY=$(cat "$OUT/functional-probe-upgraded.txt")
