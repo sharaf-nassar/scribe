@@ -770,11 +770,106 @@ over SSH with no terminal spoofing anywhere, and the versions are checked
 before the first assertion so a moved package cannot masquerade as the pinned
 one. Evidence lands in `test-output/terminal-images/linux/apps/`.
 
+## Terminal Image Safety and Continuity
+
+`terminal-images-functional.sh` is the only image corpus with a live scribe-server, a real PTY, a real detach, a real hot-reload, and a real SSH hop in the loop, so it asserts what a session keeps across those events.
+
+Every other terminal-image functional script drives production code in-process.
+This one deliberately does not re-derive their unit behavior; it runs the owned
+fixtures through a session an application could have been sitting in, and reads
+its conclusions off the server's own per-session evidence line.
+
+### Live Capable Viewer
+
+Only a capable viewer latches a session, and only a latched session parses graphics at all, so the corpus first replaces the container's runtime with one that announces a renderer.
+
+The harness daemon announces `TerminalImageCapabilities::V1` under the same
+`SCRIBE_TERMINAL_IMAGES=1` opt-in the client uses, and the corpus restarts the
+server with its log redirected before creating the session it drives. Both are
+prerequisites rather than assertions: without them the live server treats every
+harness session as ordinary text and the whole corpus would pass vacuously.
+
+### Protocol Safety and Bounded Overflow
+
+Two aborted control strings and one over-limit declaration have to fail in a typed, bounded way while the application text around them survives untouched.
+
+The `malformed-recovery` fixture aborts a Kitty APC with CAN and a Sixel DCS
+with SUB; both must be counted as typed failures, the `BEFORE`/`AFTER`/`TAIL`
+text between them must reach the screen, and the server must not panic. A Kitty
+transmit declaring 4097 pixels of width — one past the frozen ceiling — must be
+refused with nothing retained, and the next well-formed image must still land,
+because a bounded rejection that poisons the session is not bounded.
+
+Graphics replies are written back to the PTY as input, so an unread success or
+error report sits in front of whatever is typed next. Every command the corpus
+sends therefore discards the input line first, and every liveness marker is
+assembled in the shell rather than spelled out in the command, so the tty's echo
+of the keys cannot be mistaken for the command's output.
+
+### Reply Order and the SSH Hop
+
+An application that probes and then asks for device attributes must read the Kitty result first, over a direct PTY and over SSH alike.
+
+The probe leaves canonical mode before reading — a discovery reply carries no
+newline, so a cooked line discipline would never hand it to the reader, over
+either transport — and records the raw reply. Both transports must yield the
+Kitty `OK` ahead of a DA1 carrying attribute `4`. An image transmitted over the
+same SSH hop must decode; the decode counter rather than the placement count is
+what proves it, because a login banner scrolls placements off the grid.
+
+### Viewerless Retention, Attach, and Fan-out
+
+A session whose only viewer left has to keep parsing and keep its latch, and be whole when a viewer returns.
+
+An emitter armed inside the session fires after the daemon has detached. The
+detached window must still produce a decode and a placement, and the returning
+viewer must find a usable session. Zero, one, and several viewers reading one
+committed burst off their own queues is a receipt the landed fan-out probe
+already collects against the production sink set, so this corpus runs that probe
+inside the live pass instead of building a second oracle for it.
+
+### Upgrade and Kill-switch Rollback
+
+A hot-reload must leave the session image-capable and its scene coherent, and the master switch must stop advertising while leaving the text path alone.
+
+Coherent means all or nothing: the successor may inherit the whole committed
+scene or start empty, but placements naming definitions that did not travel are
+the failure. The successor is asked to commit a read that transmits nothing, so
+the placements it reports are ones it never decoded; the corpus records which of
+the two outcomes it saw rather than pinning today's answer. It then requires
+discovery to answer again and a fresh transmission to decode.
+
+The switch is delivered the way an operator rolling back would deliver it —
+write the config, hot-reload, keep the sessions — because only a running client
+watches `config.toml` and this container has none; the in-process settings corpus
+owns the no-restart runtime transition. A disabled server must answer no Kitty
+probe and a DA1 without attribute `4`, still run commands, and only answer
+discovery again once a capable viewer has re-latched.
+
+### Local-only Posture
+
+Everything before the SSH case runs with no network transport at all, so the boundary is measured before it is opened.
+
+Every local and remote endpoint in `/proc/net/tcp` and `/proc/net/tcp6` must be
+unbound or loopback at that point. The one deliberate exception is the SSH case
+that follows, which is loopback as well.
+
+### Docker Evidence Entry Point
+
+`just e2e-func terminal-images-functional.sh` runs the whole pass and writes `test-output/terminal-images/functional.json`.
+
+The manifest is payload-free by construction — case names, the observed upgrade
+outcome, and the final counters — and the run refuses any manifest that embedded
+array-shaped data. The recorded probe replies, the sharing probe's log, and the
+server log it read land beside it.
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.
 
 The daemon is started with `scribe-test daemon start` (spawns itself as `daemon run`) and stopped with `scribe-test daemon stop` (sends a `Shutdown` request). The  function owns the main event loop, running a server-reader task and a command-listener task concurrently.
+
+The daemon announces no terminal-image renderer unless `SCRIBE_TERMINAL_IMAGES=1` is set, mirroring the client's own opt-in. A capable announcement is what latches the sessions it creates and attaches, so a script that needs the live server to parse graphics sets it before `daemon start`; everything else keeps the ordinary text path.
 
 After connecting to scribe-server, the daemon sends `ClientMessage::Hello { window_id: None }` as its first message. The server then runs  which adopts any unconnected window-with-sessions instead of allocating a fresh `WindowId`. Without this, a `daemon stop` / `daemon start` cycle would leave the new daemon owning a brand-new window while the prior daemon's sessions remain bound to the prior `WindowId`, and the server would deny any subsequent `AttachSessions` request as cross-window. The reconnect e2e test exercises exactly this flow.
 
