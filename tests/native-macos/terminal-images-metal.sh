@@ -243,12 +243,12 @@ PY
 #
 # Only a capable viewer latches a session, and only a latched session parses
 # graphics at all, so the harness daemon announces the renderer subset exactly
-# as the Linux corpus does. Evidence is read from the server's own counters:
-# the native run asserts protocol effects, not pixels, because window capture
-# needs an interactive TCC grant no hosted runner has.
+# as the Linux corpus does — from the default-on `terminal.images.enabled`
+# switch, with no harness-only opt-in. Evidence is read from the server's own
+# counters: the native run asserts protocol effects, not pixels, because window
+# capture needs an interactive TCC grant no hosted runner has.
 # ---------------------------------------------------------------------------
 export SCRIBE_TEST_SERVER_LOG="$SERVER_LOG"
-export SCRIBE_TERMINAL_IMAGES=1
 scribe-test server start || fail "the native scribe-server did not start"
 scribe-test daemon start || fail "the capable harness viewer did not start"
 SESSION=$(scribe-test session create)

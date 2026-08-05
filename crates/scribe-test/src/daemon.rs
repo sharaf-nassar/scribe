@@ -285,23 +285,6 @@ pub fn clear_last_action() -> Result<(), ScribeError> {
     }
 }
 
-/// The terminal-image renderer capability the harness daemon announces.
-///
-/// Mirrors the client's own `SCRIBE_TERMINAL_IMAGES=1` opt-in so a functional
-/// script can stand in for a capable viewer. Only a capable viewer latches a
-/// session, and only a latched session parses graphics, answers discovery
-/// probes, and retains image state — so without this the live server treats
-/// every harness session as ordinary text.
-// @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
-fn advertised_terminal_image_capabilities()
--> scribe_common::terminal_images::TerminalImageCapabilities {
-    if std::env::var_os("SCRIBE_TERMINAL_IMAGES").is_some_and(|value| value == "1") {
-        scribe_common::terminal_images::TerminalImageCapabilities::V1
-    } else {
-        scribe_common::terminal_images::TerminalImageCapabilities::default()
-    }
-}
-
 /// Run the daemon event loop (foreground). This is the `daemon run` entry.
 pub async fn run() -> Result<(), ScribeError> {
     let state: SharedState = Arc::new(Mutex::new(DaemonState::new()));
@@ -322,7 +305,13 @@ pub async fn run() -> Result<(), ScribeError> {
             window_id: None,
             clipboard_gating: false,
             takeover: false,
-            terminal_images: advertised_terminal_image_capabilities(),
+            // Read the same default-on `terminal.images.enabled` switch the
+            // client reads, so the harness daemon stands in for a real viewer
+            // instead of mirroring it by hand. A script that wants a text-only
+            // live server writes `enabled = false` into the container's config
+            // — exactly the rollback a user would perform.
+            // @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
+            terminal_images: scribe_common::terminal_images::advertised_capabilities(),
         },
     )
     .await?;

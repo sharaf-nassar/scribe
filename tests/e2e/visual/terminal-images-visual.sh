@@ -284,8 +284,9 @@ EOF
 # Phase 0: an image-capable client on a live pane.
 #
 # Capability is what latches a session: until a viewer announces the renderer
-# subset the server leaves the session text-only, so the entrypoint's ordinary
-# client is replaced with one that opts in.
+# subset the server leaves the session text-only. Terminal images are on by
+# default, so the entrypoint's client is replaced only to own the log and the
+# relaunch cycle, not to opt anything in.
 # ---------------------------------------------------------------------------
 kill "${SCRIBE_CLIENT_PID:?visual entrypoint did not export SCRIBE_CLIENT_PID}" 2>/dev/null || true
 wait "$SCRIBE_CLIENT_PID" 2>/dev/null || true
@@ -295,7 +296,7 @@ sleep 1.0
 
 launch_client() {
     : >"$CLIENT_LOG"
-    SCRIBE_TERMINAL_IMAGES=1 LIBGL_ALWAYS_SOFTWARE=1 \
+    LIBGL_ALWAYS_SOFTWARE=1 \
         scribe-client >"$CLIENT_LOG" 2>&1 &
     CLIENT_PID=$!
     wait_client_log "pane adopted a session" 45 \

@@ -7254,25 +7254,6 @@ enum Transport {
     },
 }
 
-/// The terminal-image renderer capability this client announces in `Hello`.
-///
-/// A capable viewer latches the sessions it attaches to, which is what turns
-/// on parsing, discovery replies, and retained image state for every
-/// application running in them. The renderer is complete, but canonical pixels
-/// still reach it only through the combined replay path, so the announcement
-/// stays opt-in until the enablement surface owns it.
-// ponytail: env opt-in, replace with the settings master switch once that
-// lands (specs/020-terminal-images/plan.md, enablement/diagnostics task).
-// @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
-fn advertised_terminal_image_capabilities()
--> scribe_common::terminal_images::TerminalImageCapabilities {
-    if std::env::var_os("SCRIBE_TERMINAL_IMAGES").is_some_and(|value| value == "1") {
-        scribe_common::terminal_images::TerminalImageCapabilities::V1
-    } else {
-        scribe_common::terminal_images::TerminalImageCapabilities::default()
-    }
-}
-
 /// Send the handshake, start the writer and the drain, run the local-only LAN
 /// startup probes, and hand the read half to the live reader.
 ///
@@ -7319,7 +7300,14 @@ where
             // Clipboard* frame, which is what made the whole surface dead.
             clipboard_gating: true,
             takeover,
-            terminal_images: advertised_terminal_image_capabilities(),
+            // Spec 020: terminal images are on by default, so this announces
+            // the complete v1 renderer unless the user set
+            // `terminal.images.enabled = false`. A capable viewer latches the
+            // sessions it attaches to, which is what turns on parsing,
+            // discovery replies, and retained image state for every
+            // application running in them.
+            // @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
+            terminal_images: scribe_common::terminal_images::advertised_capabilities(),
         },
     )
     .await

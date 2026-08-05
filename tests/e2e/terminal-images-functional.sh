@@ -145,13 +145,13 @@ PROBE
 # Phase 0: a live server whose log is readable, and a capable viewer.
 #
 # Only a capable viewer latches a session, and only a latched session parses
-# graphics at all. The entrypoint's daemon announces no renderer, so the corpus
-# replaces the whole runtime with one that does.
+# graphics at all. Terminal images are on by default, so the corpus only has to
+# replace the runtime to pick up a readable server log; the restarted daemon
+# announces the renderer from `terminal.images.enabled`.
 # ---------------------------------------------------------------------------
 scribe-test daemon stop
 scribe-test server stop
 export SCRIBE_TEST_SERVER_LOG="$SERVER_LOG"
-export SCRIBE_TERMINAL_IMAGES=1
 scribe-test server start
 scribe-test daemon start
 SESSION=$(scribe-test session create)
