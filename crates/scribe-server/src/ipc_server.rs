@@ -64,7 +64,7 @@ use crate::session_manager::{
 use crate::terminal_image_replay;
 use crate::terminal_image_sharing::{
     SessionImageSharing, augment_device_attributes, effective_connection_subset,
-    images_master_enabled, plan_pty_replies,
+    images_master_enabled, plan_pty_replies, set_images_master_enabled,
 };
 use crate::terminal_image_state::{
     ObservedTerminalGridSpan, ProductionTerminalFeed, PtyTerminalImageState, SessionTerminalCommit,
@@ -8693,6 +8693,7 @@ async fn handle_config_reloaded(server: &IpcServerState) {
             }
         }
     }
+    apply_image_master_switch(cfg.images_enabled, &sessions);
     apply_reload_to_sessions(&sessions, &term_config, new_scrollback, &cfg).await;
     let sessions_len = sessions.len();
     drop(sessions);
@@ -8714,6 +8715,40 @@ async fn handle_config_reloaded(server: &IpcServerState) {
     // Synchronous notify — the actual apply runs on the supervisor task, never on
     // this dispatch loop, and the server is never restarted.
     server.remote_control.request_reload();
+}
+
+/// Spec 020: mirror `terminal.images.enabled` into the process-wide master
+/// switch and into every live session's capability latch.
+///
+/// The process switch decides what the next connection or session is told; the
+/// per-session write decides what an already-latched session does from now on.
+/// Disabling unlatches, which is what stops advertising, PTY replies, and
+/// fan-out immediately — including for a session with no viewer at all.
+/// Re-enabling deliberately restores nothing: a capable viewer must latch
+/// again, so an application is never told images came back without a renderer
+/// behind them.
+///
+/// Retained bytes and committed scenes belong to each session's PTY reader,
+/// which releases them when it observes the switch; this function only reports
+/// how many sessions owe that release.
+// @lat: [[terminal-images#Terminal Images#Image Master Switch]]
+fn apply_image_master_switch(enabled: bool, sessions: &HashMap<SessionId, LiveSession>) -> usize {
+    if set_images_master_enabled(enabled) == enabled {
+        return 0;
+    }
+    let releasing = sessions
+        .values()
+        .filter(|session| {
+            lock_image_sharing(&session.image_sharing).set_master_enabled(enabled).releases_state()
+        })
+        .count();
+    info!(
+        images_enabled = enabled,
+        sessions = sessions.len(),
+        releasing,
+        "terminal image master switch changed"
+    );
+    releasing
 }
 
 /// Apply a reloaded server config to every live session: refresh the
@@ -9318,7 +9353,47 @@ async fn handle_clipboard_command(state: &mut PtyReaderState, cmd: ClipboardComm
         }
         ClipboardCommand::RefreshPolicy { policy } => {
             handle_clipboard_policy_refresh(state, policy);
+            // Spec 020: the `ConfigReloaded` that broadcast this refresh is
+            // also where the image master switch can flip, and it reaches
+            // every live session. The PTY reader owns the image seam
+            // exclusively, so the release has to happen on this task — which
+            // this arm already woke.
+            release_images_if_disabled(state);
         }
+    }
+}
+
+/// Drop every image resource this session still holds once the master switch
+/// is off.
+///
+/// Cancels outstanding decode admissions, discards partial framing, releases
+/// retained buffers, and clears committed definitions and placements, so a
+/// disabled Scribe cannot replay a scene to a later viewer or keep pixels
+/// resident. The seam itself skips a session that holds nothing, so a config
+/// reload across many text-only sessions costs one predicate each.
+///
+/// Nothing is published and no PTY reply is written — a disabled session has
+/// no capable sinks and owes no discovery answer. The terminal's text is
+/// untouched, so the application's own textual fallback keeps rendering.
+// @lat: [[terminal-images#Terminal Images#Image Master Switch]]
+fn release_images_if_disabled(state: &mut PtyReaderState) {
+    if images_master_enabled() {
+        return;
+    }
+    let held = state.terminal_images.state();
+    match state.terminal_images.release_for_policy_disable() {
+        Ok(None) => {}
+        Ok(Some(_)) => info!(
+            session_id = %state.session_id,
+            definitions = held.definition_count,
+            placements = held.placement_count,
+            "released terminal image state after the master switch went off"
+        ),
+        Err(error) => warn!(
+            session_id = %state.session_id,
+            %error,
+            "terminal image release after disable failed"
+        ),
     }
 }
 

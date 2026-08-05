@@ -648,6 +648,69 @@ still commits canonical state and still answers the PTY. A shared-mode join adds
 a sink, a `SingleController` re-point replaces the set, and a disconnect removes
 one — none of which touches the latch.
 
+## Image Master Switch
+
+Terminal graphics ship on and turn off from one place, so a bad decoder, a hostile stream, or a GPU problem is a settings change rather than a downgrade.
+
+[[crates/scribe-common/src/config.rs#TerminalImagesConfig]] holds the single
+`terminal.images.enabled` boolean, defaulted on so an existing config keeps
+today's behavior. The server mirrors it into the process-wide switch at startup
+and on every `ConfigReloaded`, and
+[[crates/scribe-server/src/ipc_server.rs#apply_image_master_switch]] writes the
+same value into every live session's latch. Disabling therefore stops
+advertising, PTY replies, and fan-out at once, including for a session nobody is
+watching. Re-enabling restores nothing: a capable viewer must latch again, so an
+application is never told images came back without a renderer behind them.
+
+Retained bytes belong to each session's PTY reader, which owns the image seam
+alone. [[crates/scribe-server/src/ipc_server.rs#release_images_if_disabled]]
+runs on the reader when the reload broadcast wakes it and calls
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#release_for_policy_disable]],
+which retires the session exactly as a close does — decode admissions
+cancelled, partial framing discarded, retained buffers dropped — and then
+performs the same canonical reset a hard terminal reset performs, so no
+committed scene survives to be replayed to a later viewer. The seam skips a
+session holding nothing, so the reload costs one predicate per text-only
+session, and a second release is a no-op.
+
+Text is never part of this. The release opens a retirement boundary whose raw
+outputs are the same bytes the terminal already showed, and the grid, its
+scrollback, and the application's own textual fallback are untouched.
+
+## Localized Image Diagnostics
+
+Scribe's own image messages come from one static catalog keyed by the frozen rejection taxonomy, so a diagnostic cannot carry a byte an application produced.
+
+[[crates/scribe-common/src/terminal_images.rs#TerminalImageRejectionReason#localized_message]]
+maps each category to one `&'static str`. There is no interpolation and no
+placeholder, which is what makes the payload-free guarantee structural rather
+than a review rule: there is nowhere for pixels, base64, identifiers, or paths
+to go. Translating Scribe means translating exactly this table.
+
+A pane reads its notice through
+[[crates/scribe-client/src/terminal_image_scene.rs#CommittedImageScene#diagnostic_notice]],
+which renders the scene's last typed rejection. The notice is additive: it never
+replaces the application's textual fallback, and the published definitions and
+placements beside it are unchanged.
+
+## Renderer Failure Cleanup
+
+A failed GPU operation releases that session's sources once and marks the view unavailable, instead of retrying an upload that cannot work on every frame.
+
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageError#is_renderer_failure]]
+separates the two kinds of failure. A bounded rejection — a view limit, a bad
+crop, an inconsistent definition — is Scribe refusing one image and says nothing
+about the GPU path, so the rest of the scene keeps painting.
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageError#rejection_reason]]
+gives each failure its payload-free diagnostic category, `renderer_unavailable`
+for the window operations and a bounded category otherwise.
+
+Only a window failure reaches
+[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#note_renderer_failure]],
+which drops the session's cached sources and latches the unavailable flag until
+a later source builds successfully. Glyph painting is a separate pass, so the
+pane keeps its text through the failure and through the cleanup.
+
 ## Combined Image Replay
 
 A viewer with no knowable scene is caught up by one bounded generation-tagged burst rather than by incremental deltas, so a late attach and a shed backlog share one recovery.
@@ -1159,6 +1222,17 @@ counts prove physical effective-extent selectors, virtual-placement immunity,
 hard-scope definition selection, unrelated unplaced-definition survival, and
 explicit deletion of an unplaced image. Linux atlas
 invalidation remains a device-recovery proxy, not a physical-device-loss claim.
+
+## Image Settings Verification
+
+`just e2e-func terminal-image-settings.sh` proves the master switch, its resource release, its truthful advertising, the diagnostic catalog, and the renderer-failure taxonomy against shipped code.
+
+The gate writes `test-output/terminal-images/settings.json` and its own run log,
+then refuses either artifact if the pinned fixture's image payload appears in
+it. The probe drives the settings model, the settings write path, the server
+latch and reply planner, the session image seam, the client scene, and the GPUI
+error taxonomy; see [[test#Test Harness#Image Settings and Diagnostics]] for the
+case-by-case description.
 
 ## Native macOS Metal Validation
 

@@ -115,6 +115,7 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "terminal.natural_scroll" => Value::Bool(t.scroll.natural_scroll),
         "terminal.keyboard_protocol_enhanced" => Value::Bool(t.keyboard_protocol_enhanced),
         "terminal.paste_confirmation" => Value::Bool(t.paste_confirmation),
+        "terminal.images.enabled" => Value::Bool(t.images.enabled),
         "terminal.env_persistence.enabled" => Value::Bool(t.env_persistence.enabled),
         "terminal.claude_code_integration" => Value::Bool(t.ai_integration.claude_code.enabled()),
         "terminal.codex_code_integration" => Value::Bool(t.ai_integration.codex_code.enabled()),

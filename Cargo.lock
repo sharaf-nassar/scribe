@@ -6168,6 +6168,7 @@ name = "scribe-test"
 version = "0.0.0-dev"
 dependencies = [
  "alacritty_terminal 0.26.0-rc1",
+ "anyhow",
  "base64",
  "clap",
  "cosmic-text 0.17.0",
@@ -6187,6 +6188,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "vte",
 ]

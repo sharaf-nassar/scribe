@@ -542,6 +542,76 @@ DA1 strings, the exact kill-switch transition sequence, every viewer delivery
 and receipt count, and the typed refusal totals. It also refuses any evidence
 that embedded array-shaped payload data.
 
+## Image Settings and Diagnostics
+
+The functional harness certifies the terminal-image master switch, the resources a disable frees, the diagnostic catalog, and the renderer-failure taxonomy without starting a host Scribe runtime.
+
+### Master Switch Round Trip
+
+The switch is proven default-on and proven to survive a disable and a re-enable through the shipped settings surface rather than through a hand-written config.
+
+The case finds `terminal.images.enabled` in the production Terminal page control
+list, requires it to be a labelled toggle, and reads its value back through the
+settings window's own reader. A config that never mentioned images must still
+parse as enabled. The disable and the re-enable go through the shipped
+`apply_settings_change` path against an isolated config root, and each write is
+read back off disk as a plain boolean inside `[terminal.images]` — scoped to
+that table, because several unrelated tables also carry an `enabled` key.
+
+### Resource Release and Text Fallback
+
+Disabling a latched session frees everything it holds while the terminal's own text stands, which is the property that makes the switch a safe rollback.
+
+The case commits the pinned RGB fixture wrapped in ordinary text, records the
+committed definitions, placements, and charged session storage, then releases
+through the production seam. Afterwards the definitions, placements, pending
+transfer, and both storage counters must all be zero, a second release must free
+nothing, and the visible grid text must be byte-identical and still contain the
+application's surrounding words.
+
+### Truthful Advertising While Disabled
+
+A disabled Scribe must not answer a discovery probe or claim a capability, because a false claim makes an application emit graphics nothing will draw.
+
+The case plans the pinned query fixture's replies with the switch on and off,
+requires the answer to disappear when off, and checks that DA1 gains attribute
+`4` only while enabled. It also requires the connection subset to be empty, a
+latch attempt to fail while disabled, and a capable viewer to latch again after
+re-enable.
+
+### Renderer Failure Taxonomy
+
+A failed window operation and a bounded per-image rejection are different things, and only the first means the renderer is unusable.
+
+The case classifies a failed paint, a failed atlas drop, and a view-limit
+rejection through the production predicate, then checks each one's payload-free
+diagnostic category. It publishes the pinned client-scene corpus into a live
+scene, applies a renderer-unavailable rejection, and requires the localized
+notice to appear while the scene's definitions and placements stay exactly as
+they were.
+
+### Payload-Free Localized Catalog
+
+Every frozen rejection category has one distinct human-readable message that cannot interpolate anything, which is what makes payload-free diagnostics structural.
+
+The case walks the complete taxonomy, requires the messages to be distinct and
+free of placeholders, digits, and control bytes, and serializes a fully
+populated diagnostic record to confirm it carries only enums and numbers.
+
+### Docker Evidence Entry Point
+
+`terminal-image-settings.sh` runs the probe against the pinned fixture directory
+with an isolated config root and validates the payload-free evidence it writes.
+
+The gate pins the schema version, the production engine name, a passing result
+for all eleven cases, the settings key and label, the exact TOML lines both
+writes left behind, the release counters, the transition sequence, the enabled
+and disabled DA1 strings, the renderer classification, and the exact localized
+strings for the disabled and renderer-unavailable affordances. It then refuses
+the evidence, the run log, or the saved config if any of them contains the
+fixture's image payload, a graphics control string, or array-shaped payload
+data.
+
 ## Combined Image Replay
 
 The functional harness certifies generation-tagged replay, bounded chunking, and backpressure recovery against the production planner and the production sink set, without starting a host Scribe runtime.

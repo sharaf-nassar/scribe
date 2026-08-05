@@ -1789,6 +1789,62 @@ impl SessionTerminal {
         self.sixel_decoded_storage = None;
     }
 
+    /// Release everything this session holds because the master switch went
+    /// off, and report the retirement boundary the caller must still sequence.
+    ///
+    /// The kill switch owes the same guarantees a session close does plus one
+    /// more: committed canonical state has to go too, because a disabled
+    /// Scribe must not be able to replay a scene to a later viewer. Retirement
+    /// is therefore the existing [`TransferRetirement::Close`] path — decode
+    /// admissions cancelled, partial framing discarded, retained buffers
+    /// dropped — followed by the same canonical reset a hard terminal reset
+    /// performs, so definitions, placements, and the active screen return to
+    /// empty under a fresh generation.
+    ///
+    /// Text is untouched: the raw outputs in the returned commit are the same
+    /// bytes the terminal would have shown anyway.
+    ///
+    /// Returns `None` when the session owns nothing to release. That guard is
+    /// here rather than in a caller because releasing is not free: it opens a
+    /// retirement boundary and a fresh generation, and a config reload reaches
+    /// every session whether or not it ever showed an image.
+    // @lat: [[terminal-images#Terminal Images#Image Master Switch]]
+    pub fn release_for_policy_disable(
+        &mut self,
+    ) -> Result<Option<SessionTerminalCommit>, SessionTerminalError> {
+        if !self.holds_image_resources() {
+            return Ok(None);
+        }
+        let commit = self.retire_transfers(TransferRetirement::Close)?;
+        self.in_storage_transaction(|terminal, log| {
+            let mut next = terminal.canonical.clone();
+            next.set_generation(terminal.generation);
+            next.reset(log).map_err(SessionTerminalError::Storage)?;
+            terminal.generation = next.generation();
+            terminal.canonical = next;
+            Ok(())
+        })?;
+        Ok(Some(commit))
+    }
+
+    /// Whether this session still owns image resources a disable must free.
+    ///
+    /// Covers committed state, partial framing, and every retained decode
+    /// buffer, including a transfer that finished framing and is waiting on
+    /// decode — that one owns bytes while owning no framer state.
+    #[must_use]
+    pub fn holds_image_resources(&self) -> bool {
+        self.canonical.definition_count() != 0
+            || self.canonical.placement_count() != 0
+            || self.pending_transfer.is_some()
+            || self.pending_kitty_decode.is_some()
+            || self.pending_kitty_storage.is_some()
+            || self.completed_kitty_storage.is_some()
+            || self.sixel_body_storage.is_some()
+            || self.kitty_decoded_storage.is_some()
+            || self.sixel_decoded_storage.is_some()
+    }
+
     /// Payload-free requested/observed ownership by allocation path.
     #[must_use]
     pub fn storage_ownership(&self) -> ImageStorageOwnership {
@@ -2881,6 +2937,20 @@ impl PtyTerminalImageState {
         retirement: TransferRetirement,
     ) -> Result<SessionTerminalCommit, SessionTerminalError> {
         self.terminal.retire_transfers(retirement)
+    }
+
+    /// Release every retained and committed image resource after the master
+    /// switch went off. `None` means the session held nothing.
+    pub fn release_for_policy_disable(
+        &mut self,
+    ) -> Result<Option<SessionTerminalCommit>, SessionTerminalError> {
+        self.terminal.release_for_policy_disable()
+    }
+
+    /// Whether this session still owns image resources a disable must free.
+    #[must_use]
+    pub fn holds_image_resources(&self) -> bool {
+        self.terminal.holds_image_resources()
     }
 
     /// Return the observer shared with the production resize path.

@@ -1174,6 +1174,12 @@ pub struct TerminalConfig {
     /// off, so absent configs keep today's unconditional paste behavior.
     #[serde(default)]
     pub paste_confirmation: bool,
+    /// Terminal graphics (Kitty/Sixel) master switch, stored under the
+    /// `terminal.images` TOML sub-table (spec 020). Default-on; turning it off
+    /// is the rollback path that stops advertising, replying, decoding, and
+    /// retaining image data without touching the text pipeline.
+    #[serde(default)]
+    pub images: TerminalImagesConfig,
 }
 
 impl Default for TerminalConfig {
@@ -1192,7 +1198,28 @@ impl Default for TerminalConfig {
             keyboard_protocol_enhanced: true,
             clipboard_policy: ClipboardPolicyConfig::default(),
             paste_confirmation: false,
+            images: TerminalImagesConfig::default(),
         }
+    }
+}
+
+/// Terminal-image master switch (spec 020 rollback control).
+///
+/// One boolean, deliberately in its own sub-table so the rollback knob is
+/// discoverable as `terminal.images.enabled` rather than buried among the
+/// flattened legacy `terminal.*` keys.
+// @lat: [[terminal-images#Terminal Images#Image Master Switch]]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalImagesConfig {
+    /// Whether Scribe may advertise, parse, decode, retain, and render
+    /// terminal graphics at all. Off means every session degrades to text.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TerminalImagesConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

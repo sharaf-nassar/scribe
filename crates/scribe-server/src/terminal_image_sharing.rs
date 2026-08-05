@@ -60,6 +60,18 @@ pub enum KillSwitchTransition {
     Enabled,
 }
 
+impl KillSwitchTransition {
+    /// Whether this transition obliges the session's reader to cancel decode
+    /// work and release retained and committed image state.
+    ///
+    /// Only a disable that actually cleared a latch owns resources; disabling
+    /// an already-text-only session frees nothing, and no enable ever does.
+    #[must_use]
+    pub const fn releases_state(self) -> bool {
+        matches!(self, Self::Disabled { cleared_latch: true })
+    }
+}
+
 impl SessionImageSharing {
     /// A fresh `text-only-unlatched` session under the current master switch.
     #[must_use]

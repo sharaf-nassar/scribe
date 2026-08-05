@@ -111,6 +111,13 @@ The persist-environment toggle is keyed `terminal.env_persistence.enabled`, defa
 
 The Clipboard (OSC 52) subsection exposes the four policy keys defined by spec 010: `terminal.clipboard.read_mode` and `terminal.clipboard.write_mode` (each Deny/Allow/Prompt), `terminal.clipboard.max_write_bytes` (bytes, default 16,777,216, hard ceiling 536,870,912 = 512 MiB), and the FR-019 opt-in `terminal.clipboard.focus_gate_writes` (bool, default false). The keys live under the `[terminal.clipboard]` TOML sub-table (serde-renamed from the Rust field `clipboard_policy` on `TerminalConfig` because the legacy flattened `TerminalClipboardConfig` already owns the unrenamed `clipboard` identifier). The webview ⇄ TOML round-trip is handled by , which clamps `max_write_bytes` to the public ceiling `CLIPBOARD_MAX_WRITE_BYTES_CEILING` and routes `focus_gate_writes` straight onto `config.terminal.clipboard_policy.focus_gate_writes`. Saving any of the keys triggers the file watcher → `ConfigReloaded` round-trip described in  so live PTY readers refresh their per-session policy snapshot without a restart; the client-side focus-gate is read off the same `App::config` snapshot the watcher already refreshes (no dedicated IPC variant).
 
+The terminal-images toggle is keyed `terminal.images.enabled`, is labelled
+"Terminal images", defaults ON, and stores as a plain boolean under the
+`[terminal.images]` TOML sub-table. It is the rollback control for spec 020: the
+server applies it live on the `ConfigReloaded` round-trip, so turning it off
+stops advertising, releases retained image state, and leaves the text pipeline
+alone without a restart — see [[terminal-images#Terminal Images#Image Master Switch]].
+
 Status bar stat toggles remain on the Terminal page under the Status Bar section.
 
 ### Smart Selection Keys

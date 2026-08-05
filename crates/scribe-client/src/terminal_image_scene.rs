@@ -65,6 +65,20 @@ impl Default for CommittedImageScene {
 }
 
 impl CommittedImageScene {
+    /// The localized, payload-free sentence this pane shows about its last
+    /// image rejection, or `None` when nothing was rejected.
+    ///
+    /// The scene keeps only the typed rejection; the words come from the
+    /// shared catalog, so a pane can never render bytes, identifiers, or paths
+    /// that came out of the PTY. This notice is additive: the application's own
+    /// textual fallback is ordinary terminal text and keeps painting whether or
+    /// not a notice is shown.
+    // @lat: [[terminal-images#Terminal Images#Localized Image Diagnostics]]
+    #[must_use]
+    pub fn diagnostic_notice(&self) -> Option<&'static str> {
+        self.last_rejection.map(|rejection| rejection.reason.localized_message())
+    }
+
     /// Placements belonging to the terminal's active screen, in operation order.
     #[must_use]
     pub fn placements(&self) -> &[TerminalImagePlacement] {
