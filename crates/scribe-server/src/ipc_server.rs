@@ -1545,6 +1545,11 @@ pub struct AttachSessionData {
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     pub term_commit: SessionCommit,
     pub terminal_grid_observer: TerminalGridObserverHandle,
+    /// The session's canonical image seam and its capability latch, so a fresh
+    /// sink can be paid its replay debt at attach instead of on the next
+    /// committed PTY read.
+    pub terminal_images: SessionImageState,
+    pub image_sharing: SharedImageSharing,
     pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
@@ -1575,6 +1580,8 @@ impl LiveSession {
             term: Arc::clone(&self.term),
             term_commit: Arc::clone(&self.term_commit),
             terminal_grid_observer: self.terminal_grid_observer.clone(),
+            terminal_images: Arc::clone(&self.terminal_images),
+            image_sharing: Arc::clone(&self.image_sharing),
             resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
@@ -9640,7 +9647,34 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
             "fanned terminal image records to capable viewers"
         );
     }
-    deliver_image_replay(state, &images, required);
+    deliver_image_replay(&state.client_writer, state.session_id, &images, required);
+}
+
+/// Pay a just-attached sink's replay debt without waiting for a PTY read.
+///
+/// The commit path drains debt on the session's next committed read, which on a
+/// quiet pane never comes: a viewer attaching to an idle image session would
+/// paint text with no images until the application happened to write a byte.
+/// The attach path calls this once its sink is live, so the two ways a sink
+/// accrues debt each have a drain that fires when they happen.
+// @lat: [[terminal-images#Terminal Images#Combined Image Replay#Replay debt]]
+pub async fn drain_image_replay_debt(
+    client_writer: &ClientWriter,
+    session_id: SessionId,
+    images: &SessionImageState,
+    sharing: &SharedImageSharing,
+) {
+    let (enabled, required) = {
+        let sharing = lock_image_sharing(sharing);
+        (sharing.images_enabled(), sharing.effective())
+    };
+    // An unlatched or disabled session has no scene to owe, so the common
+    // image-free attach never touches the image lock at all.
+    if !enabled {
+        return;
+    }
+    let images = images.lock().await;
+    deliver_image_replay(client_writer, session_id, &images, required);
 }
 
 /// Give every capable sink that owes one the session's whole canonical scene.
@@ -9651,15 +9685,15 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
 /// is independent of viewer count and the server never keeps a per-sink copy.
 // @lat: [[terminal-images#Terminal Images#Combined Image Replay]]
 fn deliver_image_replay(
-    state: &PtyReaderState,
+    client_writer: &ClientWriter,
+    session_id: SessionId,
     images: &PtyTerminalImageState,
     required: TerminalImageCapabilities,
 ) {
-    let debt = image_replay_debt(&state.client_writer, required);
+    let debt = image_replay_debt(client_writer, required);
     if debt == 0 {
         return;
     }
-    let session_id = state.session_id;
     let snapshot = images.state();
     let definitions = images.canonical_definitions();
     let placements = images.canonical_placements();
@@ -9678,7 +9712,7 @@ fn deliver_image_replay(
         .into_iter()
         .map(|message| ServerMessage::TerminalImageReplay { session_id, message })
         .collect();
-    let viewers = send_image_replay(&state.client_writer, required, &records);
+    let viewers = send_image_replay(client_writer, required, &records);
     debug!(
         %session_id,
         generation = snapshot.generation.0,

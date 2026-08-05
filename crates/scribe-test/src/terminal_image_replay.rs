@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use scribe_common::framing::MAX_MESSAGE_SIZE;
 use scribe_common::ids::SessionId;
@@ -18,8 +19,9 @@ use scribe_common::terminal_images::{
     TerminalImagePlacement, TerminalImageReplayMessage, TerminalOutputSequence, TerminalScreenKind,
 };
 use scribe_server::image_sharing_probe::{self, ProbeViewer};
-use scribe_server::ipc_server::ClientWriter;
+use scribe_server::ipc_server::{ClientWriter, SessionImageState, SharedImageSharing};
 use scribe_server::terminal_image_replay::{ReplayInputs, ReplayPlanCounters, plan_replay};
+use scribe_server::terminal_image_sharing::SessionImageSharing;
 use serde::Serialize;
 
 use crate::terminal_image_replies_sharing::{
@@ -34,6 +36,7 @@ struct Evidence<'a> {
     payload_free: bool,
     bounded: BoundedEvidence,
     attach: AttachEvidence,
+    idle_attach: IdleAttachEvidence,
     recovery: RecoveryEvidence,
     sharing: SharingEvidence,
     cases: BTreeMap<&'a str, &'a str>,
@@ -74,6 +77,23 @@ struct AttachEvidence {
     /// Definitions the burst carried, and their placements.
     replayed_definitions: u32,
     replayed_placements: u32,
+}
+
+/// A viewer attaching to a session whose application is not writing anything.
+#[derive(Serialize)]
+struct IdleAttachEvidence {
+    /// Debt the fresh sink carries once its text replay is on the wire.
+    debt_at_attach: usize,
+    /// Debt left after the attach path's own drain. Must reach zero without a
+    /// PTY read, which is the whole point.
+    debt_after_drain: usize,
+    /// Replay records the idle viewer read back off its pipe.
+    records_received: usize,
+    commit_seen: bool,
+    /// A policy-disabled session drains nothing and sends nothing, so a scene
+    /// it was told to stop keeping cannot reach a late viewer.
+    disabled_records_received: usize,
+    disabled_debt_kept: usize,
 }
 
 /// A viewer whose queued output was shed and has to be caught back up.
@@ -131,6 +151,9 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
     cases.insert("atomic_late_attach", "pass");
     cases.insert("live_buffered_behind_replay", "pass");
 
+    let idle_attach = verify_idle_attach_drain(fixtures).await?;
+    cases.insert("idle_attach_drains_replay_debt", "pass");
+
     let recovery = verify_dropped_output_recovery(fixtures).await?;
     cases.insert("dropped_output_recovery", "pass");
 
@@ -146,6 +169,7 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
         payload_free: true,
         bounded,
         attach,
+        idle_attach,
         recovery,
         sharing,
         cases,
@@ -272,7 +296,7 @@ struct Scene {
 
 /// Commit the pinned fixture through production framing and keep both what the
 /// session retained and what it published live.
-fn commit_scene(fixtures: &Path, session_id: SessionId) -> Result<Scene, String> {
+fn commit_scene(fixtures: &Path, session_id: SessionId) -> Result<(Scene, Probe), String> {
     let bytes = crate::framing_probe::read_hex(&fixtures.join(RGB_CLASSIC_FIXTURE))?;
     let mut probe = Probe::new();
     let commit = probe.feed(&bytes)?;
@@ -286,17 +310,20 @@ fn commit_scene(fixtures: &Path, session_id: SessionId) -> Result<Scene, String>
     if definitions.is_empty() || placements.is_empty() {
         return Err("the pinned fixture retained no canonical scene".to_owned());
     }
-    Ok(Scene {
-        generation: state.generation,
-        sequence: state.sequence,
-        active_screen: state.active_screen,
-        definitions,
-        placements,
-        live: messages
-            .into_iter()
-            .map(|message| ServerMessage::TerminalImageLive { session_id, message })
-            .collect(),
-    })
+    Ok((
+        Scene {
+            generation: state.generation,
+            sequence: state.sequence,
+            active_screen: state.active_screen,
+            definitions,
+            placements,
+            live: messages
+                .into_iter()
+                .map(|message| ServerMessage::TerminalImageLive { session_id, message })
+                .collect(),
+        },
+        probe,
+    ))
 }
 
 /// Plan one replay burst for `scene` and wrap it as wire frames.
@@ -324,7 +351,7 @@ fn plan_frames(scene: &Scene, session_id: SessionId) -> (Vec<ServerMessage>, Rep
 /// before any delta, and never a fragment of one.
 async fn verify_atomic_late_attach(fixtures: &Path) -> Result<AttachEvidence, String> {
     let session_id = SessionId::new();
-    let scene = commit_scene(fixtures, session_id)?;
+    let (scene, _probe) = commit_scene(fixtures, session_id)?;
     let required = TerminalImageCapabilities::V1;
     let client_writer = image_sharing_probe::new_client_writer();
 
@@ -397,11 +424,72 @@ async fn verify_atomic_late_attach(fixtures: &Path) -> Result<AttachEvidence, St
     Ok(evidence)
 }
 
+/// A viewer joining a session whose application is idle is caught up at attach.
+///
+/// Nothing feeds the terminal after the scene is committed, so every record the
+/// viewer reads back was produced by the attach path's own drain rather than by
+/// a later committed PTY read — which on a quiet pane never arrives.
+// @lat: [[test#Test Harness#Combined Image Replay#Idle Attach Drains Replay Debt]]
+async fn verify_idle_attach_drain(fixtures: &Path) -> Result<IdleAttachEvidence, String> {
+    let session_id = SessionId::new();
+    let (_scene, probe) = commit_scene(fixtures, session_id)?;
+    let required = TerminalImageCapabilities::V1;
+    let images: SessionImageState = Arc::new(tokio::sync::Mutex::new(probe.images));
+    let mut latched = SessionImageSharing::new(true);
+    latched.latch(required);
+    let sharing: SharedImageSharing = Arc::new(std::sync::Mutex::new(latched));
+
+    let client_writer = image_sharing_probe::new_client_writer();
+    let mut viewer = image_sharing_probe::attach_viewer(&client_writer, required, true).await;
+    let debt_at_attach = image_sharing_probe::replay_debt(&client_writer, required);
+    image_sharing_probe::drain_attach_replay_debt(&client_writer, session_id, &images, &sharing)
+        .await;
+    let debt_after_drain = image_sharing_probe::replay_debt(&client_writer, required);
+    let observed = viewer.drain().await;
+
+    // The same attach against a session the master switch turned off must hand
+    // the newcomer nothing at all.
+    let mut disabled = image_sharing_probe::attach_viewer(&client_writer, required, true).await;
+    sharing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_master_enabled(false);
+    image_sharing_probe::drain_attach_replay_debt(&client_writer, session_id, &images, &sharing)
+        .await;
+
+    let evidence = IdleAttachEvidence {
+        debt_at_attach,
+        debt_after_drain,
+        records_received: count_replay_records(&observed),
+        commit_seen: observed.iter().any(|frame| {
+            matches!(
+                frame,
+                ServerMessage::TerminalImageReplay {
+                    message: TerminalImageReplayMessage::Commit { .. },
+                    ..
+                }
+            )
+        }),
+        disabled_records_received: count_replay_records(&disabled.drain().await),
+        disabled_debt_kept: image_sharing_probe::replay_debt(&client_writer, required),
+    };
+    if evidence.debt_at_attach != 1 {
+        return Err("attaching a viewer did not put it in replay debt".to_owned());
+    }
+    if evidence.debt_after_drain != 0 {
+        return Err("the attach drain left the idle viewer in replay debt".to_owned());
+    }
+    if evidence.records_received == 0 || !evidence.commit_seen {
+        return Err("the idle viewer never read a complete replay burst".to_owned());
+    }
+    if evidence.disabled_records_received != 0 || evidence.disabled_debt_kept != 1 {
+        return Err("a disabled session replayed its retired scene at attach".to_owned());
+    }
+    Ok(evidence)
+}
+
 /// A saturated viewer sheds this session's queued output, stops receiving
 /// deltas, and is caught up by one fresh combined replay.
 async fn verify_dropped_output_recovery(fixtures: &Path) -> Result<RecoveryEvidence, String> {
     let session_id = SessionId::new();
-    let scene = commit_scene(fixtures, session_id)?;
+    let (scene, _probe) = commit_scene(fixtures, session_id)?;
     let required = TerminalImageCapabilities::V1;
     let client_writer = image_sharing_probe::new_client_writer();
     let mut viewer = attach_settled(&client_writer, &scene, session_id, required, true).await;
@@ -462,7 +550,7 @@ async fn verify_dropped_output_recovery(fixtures: &Path) -> Result<RecoveryEvide
 /// are served by one plan.
 async fn verify_viewerless_and_simultaneous(fixtures: &Path) -> Result<SharingEvidence, String> {
     let session_id = SessionId::new();
-    let scene = commit_scene(fixtures, session_id)?;
+    let (scene, _probe) = commit_scene(fixtures, session_id)?;
     let required = TerminalImageCapabilities::V1;
     let client_writer = image_sharing_probe::new_client_writer();
 

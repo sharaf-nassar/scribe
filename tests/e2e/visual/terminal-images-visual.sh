@@ -236,14 +236,6 @@ write("delete.bin", b"\x1b_Ga=d,d=I,i=11,q=2\x1b\\")
 # Reset: RIS on its own.
 write("reset.bin", RIS)
 
-# Save and restore the cursor: a PTY read that changes nothing on screen and
-# carries no image information whatsoever. Two phases below need the session's
-# PTY reader to take one more turn, because that is where the server drains a
-# newly attached sink's replay debt and where it releases the scenes the master
-# switch retired. Whatever those phases then measure came out of canonical
-# server state, since these six bytes cannot draw anything.
-write("poke.bin", b"\x1b[s\x1b[u")
-
 # Scroll: park the cursor on the last row and push three lines through it, so
 # the box that started at the home row is clipped by the top margin.
 write("scroll.bin", b"\x1b[999;1H\n\n\n")
@@ -470,15 +462,17 @@ echo "PHASE 12 PASS: RIS cleared the painted scene"
 # Phase 13: replay. The relaunched viewer never saw the transmission, so the
 # whole scene has to come back out of canonical server state.
 #
-# The burst is drained where the session's PTY reader commits its next read, so
-# the poke is what gives the reader that turn. It draws nothing itself.
+# Nothing is typed into the pane between the relaunch and the capture: the
+# attach itself pays the new sink's replay debt, so an idle application is not
+# a reason for a viewer to sit in front of an imageless pane.
 # ---------------------------------------------------------------------------
 run_step rgb replay-before
 assert_present "$OUT/replay-before.png" "$RED" "$IMAGE_PX_MIN" replay_precondition >/dev/null
 kill "$CLIENT_PID" 2>/dev/null || true
 wait "$CLIENT_PID" 2>/dev/null || true
 start_client "$IMAGE_SESSION"
-run_step poke replay
+sleep 1.5
+capture "$OUT/replay.png"
 REPLAY_PX=$(assert_present "$OUT/replay.png" "$RED" "$IMAGE_PX_MIN" replay_restored)
 echo "PHASE 13 PASS: a relaunched client replayed $REPLAY_PX px of red out of canonical state"
 
@@ -534,7 +528,8 @@ grep -qF "released terminal image state after the master switch went off session
 kill "$CLIENT_PID" 2>/dev/null || true
 wait "$CLIENT_PID" 2>/dev/null || true
 start_client "$IMAGE_SESSION"
-run_step poke disabled
+sleep 1.5
+capture "$OUT/disabled.png"
 assert_absent "$OUT/disabled.png" "$RED" disabled_cleared >/dev/null
 run_step ready disabled-recovered
 echo "PHASE 16 PASS: terminal.images.enabled=false retired the scene and kept the pane alive"

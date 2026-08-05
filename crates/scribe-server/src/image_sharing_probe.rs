@@ -6,9 +6,10 @@
 //! server path calls anything in this module.
 
 use crate::ipc_server::{
-    AttachedSinks, ClientSink, ClientWriter, OutputSink, SharedWriter, begin_sink_attach,
-    finish_sink_attach, image_replay_debt, lock_sinks, new_live_session_registry,
-    send_image_records, send_image_replay, spawn_output_queue,
+    AttachedSinks, ClientSink, ClientWriter, OutputSink, SessionImageState, SharedImageSharing,
+    SharedWriter, begin_sink_attach, drain_image_replay_debt, finish_sink_attach,
+    image_replay_debt, lock_sinks, new_live_session_registry, send_image_records,
+    send_image_replay, spawn_output_queue,
 };
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::ServerMessage;
@@ -108,6 +109,17 @@ pub fn fan_out_image_replay(
     records: &[ServerMessage],
 ) -> usize {
     send_image_replay(client_writer, required, records)
+}
+
+/// Drain replay debt the way the production attach path does, straight from
+/// canonical session state and without a PTY read to ride on.
+pub async fn drain_attach_replay_debt(
+    client_writer: &ClientWriter,
+    session_id: SessionId,
+    images: &SessionImageState,
+    sharing: &SharedImageSharing,
+) {
+    drain_image_replay_debt(client_writer, session_id, images, sharing).await;
 }
 
 /// Release a viewer's replay debt the way the production attach path does.
