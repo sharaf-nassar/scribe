@@ -913,15 +913,21 @@ inside the live pass instead of building a second oracle for it.
 
 A hot-reload must leave the session image-capable and its scene coherent, and the master switch must stop advertising while leaving the text path alone.
 
-Coherent means all or nothing: the successor may inherit the whole committed
-scene or start empty, but placements naming definitions that did not travel are
-the failure. The successor is asked to commit a read that transmits nothing, so
-the placements it reports are ones it never decoded; the corpus records which of
-the two outcomes it saw rather than pinning today's answer. With the live
-handoff wired to the reader's seam that observation is now
-`upgrade_scene_carried: true` — the successor reports exactly the sender's
-placement count. It then requires discovery to answer again and a fresh
-transmission to decode.
+Coherent means all or nothing, and the handoff seam is the only place that is
+observable: the export runs with the session's reads paused and the restore runs
+before the successor's reader consumes a byte, so nothing moves the grid between
+them. The corpus reads both log lines and requires the restored definition and
+placement counts to equal the exported ones, with `dropped_scenes=0` and exactly
+one live session to make the registry-wide export counters comparable — that is
+`upgrade_scene_carried: true`.
+
+A count taken after the attach is a ceiling on that scene rather than an
+equality with it, because the attach redraw and the phase's own output scroll the
+24-row grid and a placement that scrolls off the top is retired by design. So the
+successor is still asked to commit a read that transmits nothing, and the
+placements it then reports — ones it never decoded — must not exceed what was
+restored. It then requires discovery to answer again and a fresh transmission to
+decode.
 
 The switch is delivered the way an operator rolling back would deliver it —
 write the config, hot-reload, keep the sessions — because only a running client
