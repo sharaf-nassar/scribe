@@ -19,6 +19,24 @@ fn pid_file_path() -> PathBuf {
     )
 }
 
+/// Write the server PID file, creating the runtime directory first.
+///
+/// The PID is recorded before the server has bound its socket, so nothing has
+/// created the runtime directory yet. Linux hides this because `/run/user/{uid}`
+/// already exists; a fresh macOS host has no
+/// `~/Library/Application Support/Scribe/run` and the bare write fails ENOENT.
+async fn write_pid_file(pid: u32) -> Result<(), ScribeError> {
+    let path = pid_file_path();
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| ScribeError::IpcError {
+            reason: format!("failed to create runtime dir {}: {e}", dir.display()),
+        })?;
+    }
+    tokio::fs::write(path, pid.to_string())
+        .await
+        .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })
+}
+
 /// Maximum time to wait for the server socket to appear after spawning.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -66,10 +84,7 @@ pub async fn start() -> Result<(), ScribeError> {
             reason: format!("failed to spawn scribe-server: {e}"),
         })?;
 
-    let pid = child.id();
-    tokio::fs::write(pid_file_path(), pid.to_string())
-        .await
-        .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })?;
+    write_pid_file(child.id()).await?;
 
     wait_for_socket().await
 }
@@ -169,9 +184,7 @@ pub async fn upgrade() -> Result<(), ScribeError> {
     wait_for_socket().await?;
 
     // Update PID file to point to the new process.
-    tokio::fs::write(pid_file_path(), new_pid.to_string())
-        .await
-        .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })?;
+    write_pid_file(new_pid).await?;
 
     Ok(())
 }
