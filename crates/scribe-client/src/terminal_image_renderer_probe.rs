@@ -522,12 +522,15 @@ fn fixture_pressure_scene() -> CommittedImageScene {
     scene
 }
 
+/// Scroll margins are half-open, so `bottom: 5` covers rows 1..=4 — exactly the
+/// four destination rows of the offset placement, leaving its pixel-offset
+/// spill row outside the margin so partial clipping stays observable.
 fn fixture_scrolled_scene(repeated: bool) -> CommittedImageScene {
     let mut scene = fixture_scene();
-    scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 4, rows: 1 });
+    scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 5, rows: 1 });
     scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 8, bottom: 10, rows: 1 });
     if repeated {
-        scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 4, rows: 1 });
+        scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 5, rows: 1 });
     }
     scene
 }
@@ -542,7 +545,7 @@ fn fixture_off_margin_scene(scrolled: bool) -> CommittedImageScene {
     let mut scene = fixture_scene();
     scene.apply_grid_effect(&TerminalGridEffect::ResizeClip { columns: 57, rows: 16 });
     if scrolled {
-        scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 4, rows: 1 });
+        scene.apply_grid_effect(&TerminalGridEffect::Scroll { top: 1, bottom: 5, rows: 1 });
     }
     scene
 }

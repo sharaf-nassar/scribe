@@ -248,6 +248,11 @@ done
 assert_cell_rgb "$OUT/04-first-scroll.png" 2 0 .5 .75 5 5 6 4 first_scroll_margin_top
 assert_cell_rgb "$OUT/04-first-scroll.png" 2 1 .5 .5 0 255 0 3 first_scroll_original_source_top
 assert_cell_rgb "$OUT/04-first-scroll.png" 2 3 .5 .5 255 255 0 3 first_scroll_original_source_bottom
+# The half-open margin ends at row 5, so the placement's last destination row
+# stays visible and its pixel-offset spill is clipped mid-cell. A clip interval
+# that loses its exclusive bottom row would blank this fraction entirely.
+assert_cell_rgb "$OUT/04-first-scroll.png" 2 4 .5 .2 255 255 0 3 first_scroll_margin_bottom_fraction
+assert_cell_rgb "$OUT/04-first-scroll.png" 2 4 .5 .7 5 5 6 4 first_scroll_margin_bottom_edge
 assert_cell_rgb "$OUT/04-first-scroll.png" 56 2 .5 .2 0 190 230 3 first_scroll_offset_fraction
 assert_cell_rgb "$OUT/04-first-scroll.png" 56 2 .5 .7 5 5 6 4 first_scroll_offset_edge
 assert_cell_rgb "$OUT/04-first-scroll.png" 41 9 .25 .25 235 190 25 3 first_scroll_sixel_earlier_visible
