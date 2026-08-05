@@ -229,6 +229,27 @@ impl TerminalImageCapabilities {
     }
 }
 
+/// The terminal-image renderer capability a viewer announces in its `Hello`,
+/// read from the `terminal.images.enabled` master switch.
+///
+/// The switch is default-on, so terminal images ship on: an absent or
+/// unreadable config announces the complete v1 renderer, and
+/// `terminal.images.enabled = false` is the rollback that announces nothing.
+/// Only a capable viewer latches a session, and only a latched session parses
+/// graphics, answers discovery probes, and retains image state — so this one
+/// boolean decides whether every session behind this viewer is graphical or
+/// plain text. Every viewer process (the client and the harness daemon that
+/// stands in for one) reads it here so the two can never drift.
+// @lat: [[terminal-images#Terminal Images#Image Master Switch]]
+#[must_use]
+pub fn advertised_capabilities() -> TerminalImageCapabilities {
+    if crate::config::load_config().unwrap_or_default().terminal.images.enabled {
+        TerminalImageCapabilities::V1
+    } else {
+        TerminalImageCapabilities::default()
+    }
+}
+
 macro_rules! typed_id {
     ($name:ident) => {
         #[derive(

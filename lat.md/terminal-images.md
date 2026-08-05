@@ -782,8 +782,9 @@ one — none of which touches the latch.
 Terminal graphics ship on and turn off from one place, so a bad decoder, a hostile stream, or a GPU problem is a settings change rather than a downgrade.
 
 [[crates/scribe-common/src/config.rs#TerminalImagesConfig]] holds the single
-`terminal.images.enabled` boolean, defaulted on so an existing config keeps
-today's behavior. The server mirrors it into the process-wide switch at startup
+`terminal.images.enabled` boolean, defaulted on, so terminal images ship on and
+`enabled = false` is the only thing that turns them off. The server mirrors it
+into the process-wide switch at startup
 and on every `ConfigReloaded`, and
 [[crates/scribe-server/src/ipc_server.rs#apply_image_master_switch]] writes the
 same value into every live session's latch. Disabling therefore stops
@@ -805,6 +806,16 @@ session, and a second release is a no-op.
 Text is never part of this. The release opens a retirement boundary whose raw
 outputs are the same bytes the terminal already showed, and the grid, its
 scrollback, and the application's own textual fallback are untouched.
+
+The switch is also the only gate on the viewer side.
+[[crates/scribe-common/src/terminal_images.rs#advertised_capabilities]] reads it
+when a viewer builds its `Hello`, so a default install announces the complete v1
+renderer and latches every session it opens, and an unreadable config announces
+it too rather than silently degrading. Both viewer processes — the GPUI client
+and the [[test#Test Harness#Daemon|harness daemon]] that stands in for one —
+call that single function, so a shipped client and the corpus that certifies it
+cannot disagree about what is advertised. There is no environment variable and
+no second opt-in: the announcement is on unless the boolean is off.
 
 ### Rollback procedure
 
@@ -1087,11 +1098,12 @@ Real released applications are run inside a real pane so protocol choice is obse
 The corpus is built into the visual image from checksum-pinned upstream
 artifacts, never from a distribution package: Debian ships older Chafa and
 gnuplot builds, and no Yazi at all. A capable viewer must latch a session
-before any of it works, so the harness announces the renderer subset with
-`SCRIBE_TERMINAL_IMAGES=1`
-([[crates/scribe-client/src/main.rs#advertised_terminal_image_capabilities]]);
-a session created by that client latches at creation, because a created session
-is attached by its creator and never through `AttachSessions`.
+before any of it works, and
+[[crates/scribe-common/src/terminal_images.rs#advertised_capabilities]] makes an
+ordinary client capable by default, so the corpus launches `scribe-client` with
+no image-specific environment at all; a session created by that client latches
+at creation, because a created session is attached by its creator and never
+through `AttachSessions`.
 
 Each committed read whose observed boundaries or live placements changed emits
 one summary naming cumulative PTY replies, Kitty commands, completed Kitty

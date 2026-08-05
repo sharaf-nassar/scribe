@@ -117,13 +117,13 @@ write_step yazi-ssh "$SSH 'timeout --foreground -k 1 5 yazi $STEPS/pictures || t
 #
 # Capability is what latches a session: until a viewer announces the renderer
 # subset, the server leaves the session text-only, answers no discovery probe,
-# and every pinned application correctly falls back to text. The renderer is
-# complete, so the opt-in announcement is truthful.
+# and every pinned application correctly falls back to text. Terminal images
+# are on by default, so a plain client relaunch announces the renderer.
 # ---------------------------------------------------------------------------
 kill "${SCRIBE_CLIENT_PID:?visual entrypoint did not export SCRIBE_CLIENT_PID}" 2>/dev/null || true
 wait "$SCRIBE_CLIENT_PID" 2>/dev/null || true
 : >"$CLIENT_LOG"
-SCRIBE_TERMINAL_IMAGES=1 LIBGL_ALWAYS_SOFTWARE=1 \
+LIBGL_ALWAYS_SOFTWARE=1 \
     scribe-client >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 trap 'kill "$CLIENT_PID" 2>/dev/null || true' EXIT

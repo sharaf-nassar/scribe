@@ -191,12 +191,13 @@ printf '\x1b_Ga=T,f=24,s=4097,v=1,t=d;AAAA\x1b\\' >"$WORK/overflow.bin"
 
 # ---------------------------------------------------------------------------
 # Phase 0: a live server whose log is readable, and a capable viewer. Only a
-# capable viewer latches a session, and only a latched session parses graphics.
+# capable viewer latches a session, and only a latched session parses graphics;
+# the default-on `terminal.images.enabled` switch makes the restarted daemon
+# capable without any harness-only opt-in.
 # ---------------------------------------------------------------------------
 scribe-test daemon stop
 scribe-test server stop
 export SCRIBE_TEST_SERVER_LOG="$SERVER_LOG"
-export SCRIBE_TERMINAL_IMAGES=1
 scribe-test server start
 scribe-test daemon start
 SESSION=$(scribe-test session create)

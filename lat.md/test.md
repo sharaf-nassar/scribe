@@ -785,9 +785,12 @@ The 2x corpus samples all phases, geometry, placeholders, Sixel chronology, find
 
 ### Pinned applications reach a working image path
 
-The rig replaces the entrypoint's client with an image-capable one
-(`SCRIBE_TERMINAL_IMAGES=1`), because only a capable viewer latches a session
-and an unlatched session answers no discovery probe at all.
+The rig replaces the entrypoint's client with a freshly launched one against a
+clean log, because only a capable viewer latches a session and an unlatched
+session answers no discovery probe at all.
+
+No image-specific environment is set: terminal images are on by default, so a
+plain `scribe-client` is already capable.
 
 Each step is typed into the pane with `xdotool`, runs from a generated script,
 and signals completion with a sentinel file; the server's per-session evidence
@@ -856,13 +859,16 @@ its conclusions off the server's own per-session evidence line.
 
 ### Live Capable Viewer
 
-Only a capable viewer latches a session, and only a latched session parses graphics at all, so the corpus first replaces the container's runtime with one that announces a renderer.
+Only a capable viewer latches a session, and only a latched session parses graphics at all, so the corpus first restarts the container's runtime with a readable server log.
 
-The harness daemon announces `TerminalImageCapabilities::V1` under the same
-`SCRIBE_TERMINAL_IMAGES=1` opt-in the client uses, and the corpus restarts the
-server with its log redirected before creating the session it drives. Both are
-prerequisites rather than assertions: without them the live server treats every
-harness session as ordinary text and the whole corpus would pass vacuously.
+The harness daemon announces `TerminalImageCapabilities::V1` through the same
+[[crates/scribe-common/src/terminal_images.rs#advertised_capabilities]] the
+client calls, so it is capable by default and needs no harness-only opt-in. The
+corpus restarts the server with its log redirected before creating the session
+it drives. That capability is a prerequisite rather than an assertion: with
+`terminal.images.enabled = false` in the container's config the live server
+would treat every harness session as ordinary text and the whole corpus would
+pass vacuously.
 
 ### Protocol Safety and Bounded Overflow
 
@@ -1059,7 +1065,7 @@ Long-lived process that maintains an open IPC connection to scribe-server, buffe
 
 The daemon is started with `scribe-test daemon start` (spawns itself as `daemon run`) and stopped with `scribe-test daemon stop` (sends a `Shutdown` request). The  function owns the main event loop, running a server-reader task and a command-listener task concurrently.
 
-The daemon announces no terminal-image renderer unless `SCRIBE_TERMINAL_IMAGES=1` is set, mirroring the client's own opt-in. A capable announcement is what latches the sessions it creates and attaches, so a script that needs the live server to parse graphics sets it before `daemon start`; everything else keeps the ordinary text path.
+The daemon announces its terminal-image renderer from [[crates/scribe-common/src/terminal_images.rs#advertised_capabilities]] — the same default-on `terminal.images.enabled` switch the shipped client reads — rather than mirroring the client by hand, so the harness and the product can never disagree about what a viewer advertises. A capable announcement is what latches the sessions the daemon creates and attaches, so every script gets a graphics-capable live server by default; a script that wants the text-only path writes `enabled = false` into the container's config, which is the same rollback a user performs.
 
 After connecting to scribe-server, the daemon sends `ClientMessage::Hello { window_id: None }` as its first message. The server then runs  which adopts any unconnected window-with-sessions instead of allocating a fresh `WindowId`. Without this, a `daemon stop` / `daemon start` cycle would leave the new daemon owning a brand-new window while the prior daemon's sessions remain bound to the prior `WindowId`, and the server would deny any subsequent `AttachSessions` request as cross-window. The reconnect e2e test exercises exactly this flow.
 

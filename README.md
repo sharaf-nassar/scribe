@@ -134,7 +134,8 @@ Open the graphical settings editor with `Ctrl+,` to modify configuration without
 
 `[terminal.images] enabled` is the master switch for inline terminal graphics,
 shown in the settings editor as the **Terminal images** toggle on the Terminal
-page. It is on by default.
+page. It is on by default, and clearing it is the only way to turn terminal
+graphics off — there is no separate opt-in and no environment variable.
 
 With it on, Scribe renders images that applications such as Yazi, Chafa, and
 gnuplot send inline over the Kitty graphics protocol or Sixel, including over an
@@ -151,7 +152,8 @@ image support to applications, releases the image data it is holding, and
 applies the change to running sessions immediately — no restart is needed. Text
 output, scrollback, and each application's own text-only fallback are
 unaffected. Turning it back on lets new sessions use images again; images that
-were already on screen do not come back.
+were already on screen do not come back, and a Scribe window that was started
+while the switch was off picks images back up the next time it connects.
 
 When Scribe refuses an image it shows a short one-line notice in the pane
 explaining the category of the problem — for example that the image was too

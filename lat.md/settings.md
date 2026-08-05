@@ -116,7 +116,10 @@ The terminal-images toggle is keyed `terminal.images.enabled`, is labelled
 `[terminal.images]` TOML sub-table. It is the rollback control for spec 020: the
 server applies it live on the `ConfigReloaded` round-trip, so turning it off
 stops advertising, releases retained image state, and leaves the text pipeline
-alone without a restart — see [[terminal-images#Terminal Images#Image Master Switch]].
+alone without a restart. The same key is the viewer-side gate: the client reads
+it when it builds its `Hello`, so clearing the toggle also stops the client
+announcing a renderer on its next connection — see
+[[terminal-images#Terminal Images#Image Master Switch]].
 The `Control` model carries a key and a label but no description field, so the
 toggle ships label-only; the user-facing explanation of what the switch covers,
 what it refuses, and what turning it off does lives in the README's "Terminal

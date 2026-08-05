@@ -234,8 +234,9 @@ run_step() {
 
 # ---------------------------------------------------------------------------
 # Phase 0: an image-capable client on a live pane. Capability is what latches a
-# session, so the entrypoint's ordinary client is replaced with one that opts
-# in to the renderer subset.
+# session, so the entrypoint's client is replaced with a freshly launched one
+# whose log this script owns; terminal images are on by default, so an ordinary
+# `scribe-client` already announces the renderer subset.
 # ---------------------------------------------------------------------------
 kill "${SCRIBE_CLIENT_PID:?visual entrypoint did not export SCRIBE_CLIENT_PID}" 2>/dev/null || true
 wait "$SCRIBE_CLIENT_PID" 2>/dev/null || true
@@ -243,7 +244,7 @@ scribe-test daemon stop >/dev/null 2>&1 || true
 sleep 1.0
 
 : >"$CLIENT_LOG"
-SCRIBE_TERMINAL_IMAGES=1 LIBGL_ALWAYS_SOFTWARE=1 \
+LIBGL_ALWAYS_SOFTWARE=1 \
     RUST_LOG="${RUST_LOG:-scribe_client=info}" \
     scribe-client >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
