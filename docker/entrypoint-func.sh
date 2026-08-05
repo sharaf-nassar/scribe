@@ -43,7 +43,13 @@ scribe-test daemon start
 SESSION=$(scribe-test session create)
 export SESSION
 
+# A long corpus declares its own budget with a `# e2e-timeout: <seconds>` line,
+# the same way the visual entrypoint reads one, so `just e2e-func <script>`
+# runs it correctly without a bespoke recipe per script. An explicit
+# TEST_TIMEOUT from the caller still wins.
+DECLARED_TIMEOUT=$(sed -n 's/^# e2e-timeout: *\([0-9][0-9]*\).*/\1/p' "${1:-/dev/null}" 2>/dev/null | head -1 || true)
+
 EXIT_CODE=0
-timeout "${TEST_TIMEOUT:-30}" "$1" 2>&1 | tee /output/result.log || EXIT_CODE=$?
+timeout "${TEST_TIMEOUT:-${DECLARED_TIMEOUT:-30}}" "$1" 2>&1 | tee /output/result.log || EXIT_CODE=$?
 
 exit $EXIT_CODE
