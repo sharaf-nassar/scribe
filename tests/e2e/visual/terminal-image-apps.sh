@@ -1,4 +1,5 @@
 #!/bin/bash
+# e2e-timeout: 900
 [ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe visual e2e container." >&2; exit 99; }
 # @lat: [[test#Pinned Terminal Image Application Corpus#Pinned applications reach a working image path]]
 set -euo pipefail

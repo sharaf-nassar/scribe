@@ -5,7 +5,11 @@ export SCRIBE_E2E_SANDBOX=1
 
 RESOLUTION="${RESOLUTION:-1920x1080}"
 VISUAL_APP="${SCRIBE_VISUAL_APP:-client}"
-TEST_TIMEOUT="${TEST_TIMEOUT:-60}"
+# A long corpus declares its own budget with a `# e2e-timeout: <seconds>` line,
+# so `just e2e-visual <script>` runs it correctly without a bespoke recipe per
+# script. An explicit TEST_TIMEOUT from the caller still wins.
+DECLARED_TIMEOUT=$(sed -n 's/^# e2e-timeout: *\([0-9][0-9]*\).*/\1/p' "${1:-/dev/null}" 2>/dev/null | head -1 || true)
+TEST_TIMEOUT="${TEST_TIMEOUT:-${DECLARED_TIMEOUT:-60}}"
 TEST_HOME="${TEST_HOME:-/tmp/scribe-visual-home}"
 DAEMON_STARTED=0
 SERVER_STARTED=0
