@@ -127,7 +127,7 @@ Acceptance Criteria:
 - Test code may be planned because this requested feature changes existing coverage, but all Scribe validation and experimentation must use the Docker functional/visual harness. Never invoke host Scribe binaries or restart the live server.
 - Native macOS runtime validation is the sole exception: only the manual
   `.github/workflows/native-macos-metal.yml` workflow on GitHub's hosted
-  `macos-14-xlarge` runner may invoke the downstream Metal corpus. A repository
+  `macos-14` runner may invoke the downstream Metal corpus. A repository
   maintainer with write access owns dispatch, evidence review, and failure
   triage; developer workstations remain forbidden.
 - Current primary documentation and ecosystem evidence must define the exact Kitty and Sixel semantics. iTerm2 OSC 1337 remains researched prior art but is excluded from v1.

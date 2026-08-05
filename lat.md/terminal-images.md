@@ -1316,8 +1316,10 @@ case-by-case description.
 Native Metal evidence runs only on the sanctioned GPU-backed GitHub-hosted runner and never on a developer workstation.
 
 `.github/workflows/native-macos-metal.yml` is a manual `workflow_dispatch` job
-on ARM64 `macos-14-xlarge`. GitHub documents that runner class as carrying GPU
-hardware acceleration. The workflow has read-only repository permission,
+on ARM64 `macos-14`, GitHub's standard Apple-silicon macOS runner, which is
+free for public repositories. Whether that runner exposes a usable Metal
+device is what this corpus verifies; a run that cannot reach Metal fails
+closed rather than degrading silently. The workflow has read-only permission,
 requires no secrets, builds release binaries, and invokes
 `just native-macos-terminal-images`. The guarded recipe refuses every context
 except GitHub Actions on the named macOS ARM64 runner, then requires executable

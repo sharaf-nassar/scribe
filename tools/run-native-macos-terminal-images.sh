@@ -8,7 +8,7 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_OS:-}" != "macOS" ]]; then
 fi
 
 if [[ "${RUNNER_ARCH:-}" != "ARM64" || \
-      "${SCRIBE_NATIVE_MACOS_RUNNER:-}" != "github-actions-macos-14-xlarge" ]]; then
+      "${SCRIBE_NATIVE_MACOS_RUNNER:-}" != "github-actions-macos-14" ]]; then
     printf '%s\n' \
         'ERROR: native macOS validation requires the sanctioned Metal runner.' >&2
     exit 2

@@ -134,7 +134,7 @@ Automated Linux Scribe validation runs through the Docker E2E harness and its
 `just` entry points. No developer-host `scribe-server`, `scribe-client`,
 `scribe`, or `scribe-test` invocation is allowed. Native macOS runtime is the
 sole narrow exception: the manual `Native macOS Metal` GitHub Actions workflow
-runs on the GPU-accelerated ARM64 `macos-14-xlarge` hosted runner and enters
+runs on the GPU-accelerated ARM64 `macos-14` hosted runner and enters
 through `just native-macos-terminal-images`.
 
 Protocol and state tests:
@@ -204,7 +204,7 @@ The following work items become task beads. Titles intentionally omit numeric pr
 | Work item | Priority | Depends on | Verifiable acceptance |
 | --- | --- | --- | --- |
 | Specify image protocol contract and security limits | P0 | None | Commit the exact matrix, capability lifecycle, Sixel chronology, typed failures, numeric `ImageLimits`, app/version corpus, and owned fixtures in `specs/020-terminal-images/` and `lat.md/`; `just e2e-func terminal-image-contract.sh` passes and writes `test-output/terminal-images/contract.json`. |
-| Approve and provision native macOS validation path | P0 | Protocol contract | Manual `.github/workflows/native-macos-metal.yml` uses hosted GPU-backed `macos-14-xlarge`; a write-access maintainer dispatches `gh workflow run native-macos-metal.yml --ref <release-candidate-ref>`, owns triage/review, and retains `native-macos-metal-<run-id>` for 14 days. The Actions-only guard fails before runtime when the downstream driver is absent; every non-success blocks platform GPUI work and release; `lat check` passes. |
+| Approve and provision native macOS validation path | P0 | Protocol contract | Manual `.github/workflows/native-macos-metal.yml` uses hosted GPU-backed `macos-14`; a write-access maintainer dispatches `gh workflow run native-macos-metal.yml --ref <release-candidate-ref>`, owns triage/review, and retains `native-macos-metal-<run-id>` for 14 days. The Actions-only guard fails before runtime when the downstream driver is absent; every non-success blocks platform GPUI work and release; `lat check` passes. |
 | Spike bounded Sixel and Kitty decode | P0 | Protocol contract | `tests/e2e/functional/terminal-image-decode-spike.sh` proves fallible allocation, cooperative cancellation, zlib/PNG ceilings, max/max-plus-one dimensions, gradual-growth defense, and returns a written go/no-go decoder decision through `just e2e-func`. |
 | Spike GPUI crop, upload, and eviction | P0 | Protocol contract; macOS path approval | `tests/e2e/visual/terminal-image-gpui-spike.sh` uses translated bounds plus a content mask over one bounded source cache; proves upload reuse, `drop_image`, recovery reupload, and dimension caps on Linux, while [`gpui-lifecycle-decision.md`](gpui-lifecycle-decision.md) defines genuine native Metal device-loss assertions; `just e2e-visual terminal-image-gpui-spike.sh` passes. |
 | Define common image types and IPC fixtures | P1 | Protocol contract | Add `scribe-common` image types, capability fields, bounded live/replay messages, common placement validation, sequence boundaries, typed mismatch response, remote version bump, serde/MessagePack fixtures, and `scribe-test` decoding; `just e2e-func terminal-image-ipc.sh` proves clipped replay, malformed rejection, old/new local handshakes, and remote mismatch. |

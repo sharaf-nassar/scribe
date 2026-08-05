@@ -36,7 +36,7 @@ New epic: `terminal image protocol support`.
 ## Remaining Risks
 
 - Native macOS runtime is sanctioned only through the manual GitHub Actions
-  `macos-14-xlarge` workflow. Platform-dependent GPUI work remains blocked
+  `macos-14` workflow. Platform-dependent GPUI work remains blocked
   until its downstream corpus driver exists and produces passing Metal
   evidence for the candidate commit.
 - The bounded Sixel fork creates long-term security and license ownership. The plan pins source/license material, removes encoder-only dependencies, records the fork delta, assigns CVE maintenance, and gates adoption on adversarial evidence.
