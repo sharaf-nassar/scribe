@@ -303,6 +303,61 @@ the production seam while an unrelated session holds one of two slots.
 
 `terminal-image-scheduler.sh` runs the production scheduling probe in the functional Docker image and validates payload-free admission, refusal, ordering, cancellation, deadline, bounded-queue, and zero-ownership outcomes.
 
+## Incomplete Transfer Retirement
+
+The functional harness proves that every abandoned graphics transfer is discarded with a typed boundary, publishes nothing, and gives back its storage and decode admission exactly once.
+
+### Stream Termination Paths
+
+Nine hostile streams stop mid-transfer and are retired through EOF, reset, and
+close.
+
+Partial APC and DCS frames, a sequence cut between the two bytes of its ST
+terminator, a payload split across two reads, an incomplete raw Kitty chunk, and
+an incomplete zlib chunk each retire as one `truncated_sequence` failure carrying
+the originating protocol. Reset and close discard framing silently because the
+terminal context those bytes belonged to is gone, while stream end still flushes
+an unclassified candidate as ordinary raw text. Every case ends with no
+definition, no placement, no published image, an unchanged generation, no pending
+transfer metadata, and zero session and process requested storage.
+
+### Idempotent Repetition
+
+Retiring an already-retired session changes nothing and cannot underflow the
+storage ledger.
+
+A session that retired a partial APC frame through both reset and close is
+retired twice more. Each repetition returns an empty commit, the session and
+process requested currents are identical before and after, and both remain zero
+rather than wrapping below it.
+
+### Refused Admission Paths
+
+Cancellation and queue-wait expiry retire the transfer that requested the
+admission rather than leaving buffered chunks behind.
+
+With the single decode slot held by an unrelated session, a seam feeding a
+non-final Kitty chunk blocks in admission. Cancelling exactly that session target
+retires one entry and turns the read into a typed quota boundary with no pending
+transfer, no retained bytes, and nothing published; cancelling the whole session
+- what `retire_transfers` does on close - reaches the same queued admission. A
+seam whose own admission outlives a 120 ms queue wait expires the same way, and
+the scheduler counts the expiry.
+
+### Reply Chronology
+
+Query replies keep their issue order and stay ahead of the boundary that retires
+a later incomplete transfer.
+
+One read carries two Kitty queries followed by an unterminated transmit. Both
+query boundaries appear in image-id order with strictly increasing output
+sequences, and the stream-end retirement takes a sequence after both, so no
+retirement can reorder a reply that was already owed.
+
+### Docker Evidence Entry Point
+
+`terminal-image-transfer-lifecycle.sh` runs the production retirement probe in the functional Docker image and validates payload-free typed boundaries, invisibility, idempotence, refused-admission, chronology, and zero-ownership outcomes.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

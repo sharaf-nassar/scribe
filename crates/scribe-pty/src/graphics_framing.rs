@@ -1236,6 +1236,17 @@ impl GraphicsFramer {
         Ok(working)
     }
 
+    /// Abandon any incomplete graphics string without emitting its bytes.
+    ///
+    /// Reset and close destroy the terminal context an unterminated candidate
+    /// or active string belonged to, so no raw text and no failure boundary is
+    /// owed; dropping the retained state releases its storage exactly once.
+    // @lat: [[terminal-images#Terminal Images#Incomplete Transfer Retirement]]
+    pub fn discard(&mut self) {
+        self.transaction = None;
+        self.state = FramerState::Ground;
+    }
+
     /// End the stream, rejecting an incomplete image string without payload.
     pub fn finish(
         &mut self,
