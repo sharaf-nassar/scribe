@@ -1463,6 +1463,10 @@ production common-placement logical envelope and clip for partially visible
 Kitty and Sixel rasters. First and repeated scroll captures keep the original
 source crop, destination extent, and nonzero Y offset while the stored clip
 moves through the margins, proving no proportional recrop or rounding drift.
+Those fixture margins are half-open like every other grid bound, so their
+`bottom` names the first row below the region, and the first-scroll capture
+samples both halves of the last in-margin row: a clip interval that lost its
+exclusive bottom row would blank a fraction the probe still expects painted.
 An off-margin placement keeps its resized envelope, X/Y offsets, mapping, and
 sampled pixels through an unrelated margin scroll. Production-scene delete
 counts prove physical effective-extent selectors, virtual-placement immunity,
