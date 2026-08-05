@@ -9,10 +9,10 @@ permissions:
 jobs:
   terminal-images:
     name: Terminal images (Metal)
-    runs-on: macos-14-xlarge
+    runs-on: macos-14
     timeout-minutes: 120
     env:
-      SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-14-xlarge
+      SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-14
 
     steps:
       - uses: actions/checkout@v6

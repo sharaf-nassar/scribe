@@ -934,7 +934,7 @@ server log it read land beside it.
 
 ## Native macOS Metal Parity Corpus
 
-`tests/native-macos/terminal-images-metal.sh` is the only terminal-image corpus that runs outside Docker, on the sanctioned GPU-backed `macos-14-xlarge` runner, and the only one that can observe Metal.
+`tests/native-macos/terminal-images-metal.sh` is the only terminal-image corpus that runs outside Docker, on the sanctioned Apple-silicon `macos-14` runner, and the only one that can observe Metal.
 
 It exists to answer one question the Linux harness cannot: does the supported
 macOS platform advertise and reach the same image subset? It therefore repeats

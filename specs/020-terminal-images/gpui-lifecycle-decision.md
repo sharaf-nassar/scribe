@@ -116,7 +116,7 @@ Docker induced a physical device loss or expose unsupported atlas internals.
 
 ## Native Metal Assertions
 
-Native Metal remains a distinct fail-closed runtime gate on the sanctioned GitHub-hosted `macos-14-xlarge` runner.
+Native Metal remains a distinct fail-closed runtime gate on the sanctioned GitHub-hosted `macos-14` runner.
 
 The downstream executable `tests/native-macos/terminal-images-metal.sh` must:
 

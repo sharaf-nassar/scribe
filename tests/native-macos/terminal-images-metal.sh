@@ -51,7 +51,7 @@ fail() {
 [ "${GITHUB_ACTIONS:-}" = "true" ] || fail "native validation is authorized only in GitHub Actions"
 [ "${RUNNER_OS:-}" = "macOS" ] || fail "native validation requires the macOS runner"
 [ "${RUNNER_ARCH:-}" = "ARM64" ] || fail "native validation requires the ARM64 runner"
-[ "${SCRIBE_NATIVE_MACOS_RUNNER:-}" = "github-actions-macos-14-xlarge" ] \
+[ "${SCRIBE_NATIVE_MACOS_RUNNER:-}" = "github-actions-macos-14" ] \
     || fail "native validation requires the sanctioned Metal runner marker"
 
 mkdir -p "$PROTOCOL" "$APPS" "$GPUI" "$WORK"

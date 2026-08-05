@@ -31,7 +31,7 @@
 
 - Native Scribe runtime validation is authorized only through
   `.github/workflows/native-macos-metal.yml` on GitHub's hosted
-  `macos-14-xlarge` ARM64 runner. This narrow exception does not authorize
+  `macos-14` ARM64 runner. This narrow exception does not authorize
   invoking Scribe on a developer workstation or another macOS host.
 - A repository maintainer with GitHub write access owns dispatch, failure
   triage, evidence review, and the release decision. Dispatch only after the
