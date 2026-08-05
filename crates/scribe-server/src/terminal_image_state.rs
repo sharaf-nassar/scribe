@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use crate::terminal_image_mutations::{
     CanonicalImageState, DecodedImageMeta, MutationContext, MutationLog,
 };
+use crate::terminal_image_publication::{
+    DefinitionPayload, PublicationInputs, publish as publish_burst,
+};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions as _;
@@ -27,8 +30,8 @@ use scribe_common::kitty_decode::{
 };
 use scribe_common::terminal_images::{
     ImageLimits, TerminalImageCellClip, TerminalImageDefinition, TerminalImageGeneration,
-    TerminalImagePlacement, TerminalImageRejectionReason, TerminalOutputSequence,
-    TerminalScreenKind,
+    TerminalImageLiveMessage, TerminalImagePlacement, TerminalImageRejectionReason,
+    TerminalOutputSequence, TerminalScreenKind,
 };
 use scribe_image_decode::{
     DecodeAdmissionError, DecodeBudget, DecodeBuffer, DecodeCeilings, DecodeLimits, DecodePermit,
@@ -973,6 +976,7 @@ fn decoded_storage_digest(storage: Option<&DecodeBuffer>) -> u64 {
 pub struct TerminalImageProcessPolicy {
     limits: ImageLimits,
     output_sequence_ceiling: u64,
+    generation_ceiling: u64,
     process_storage: Arc<StorageProcess>,
     session_storage_limit: u64,
     observed_capacity_extra: usize,
@@ -1009,6 +1013,7 @@ impl TerminalImageProcessPolicy {
             Arc::new(Self {
                 limits: ImageLimits::V1,
                 output_sequence_ceiling: u64::MAX,
+                generation_ceiling: u64::MAX,
                 process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
                 session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
                 observed_capacity_extra: 0,
@@ -1028,6 +1033,26 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling,
+            generation_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
+            session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
+        })
+    }
+
+    /// Construct immutable v1 policy with a smaller generation ceiling so
+    /// validation can reach generation exhaustion through the production seam.
+    #[must_use]
+    pub fn with_generation_ceiling_for_validation(generation_ceiling: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            generation_ceiling,
             process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
             session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
             observed_capacity_extra: 0,
@@ -1046,6 +1071,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits { max_work_units_per_command, ..ImageLimits::V1 },
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
             session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
             observed_capacity_extra: 0,
@@ -1066,6 +1092,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(process_storage_limit),
             session_storage_limit,
             observed_capacity_extra: 0,
@@ -1088,6 +1115,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(process_storage_limit),
             session_storage_limit,
             observed_capacity_extra,
@@ -1110,6 +1138,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(process_storage_limit),
             session_storage_limit,
             observed_capacity_extra,
@@ -1135,6 +1164,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(process_storage_limit),
             session_storage_limit,
             observed_capacity_extra: 0,
@@ -1165,6 +1195,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(u64::MAX),
             session_storage_limit: u64::MAX,
             observed_capacity_extra: 0,
@@ -1196,6 +1227,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(process_storage_limit),
             session_storage_limit,
             observed_capacity_extra,
@@ -1214,6 +1246,7 @@ impl TerminalImageProcessPolicy {
         Arc::new(Self {
             limits: ImageLimits::V1,
             output_sequence_ceiling: u64::MAX,
+            generation_ceiling: u64::MAX,
             process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
             session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
             observed_capacity_extra: 0,
@@ -1293,6 +1326,7 @@ impl SessionTerminalCommit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionTerminalError {
     SequenceExhausted,
+    GenerationExhausted,
     Storage(GraphicsStorageRejection),
 }
 
@@ -1302,6 +1336,7 @@ impl fmt::Display for SessionTerminalError {
             Self::SequenceExhausted => {
                 formatter.write_str("terminal image output sequence exhausted")
             }
+            Self::GenerationExhausted => formatter.write_str("terminal image generation exhausted"),
             Self::Storage(rejection) => {
                 write!(formatter, "terminal image storage failure: {rejection:?}")
             }
@@ -1354,6 +1389,10 @@ pub struct SessionTerminal {
     generation: TerminalImageGeneration,
     sequence: TerminalOutputSequence,
     canonical: CanonicalImageState,
+    /// Active screen the last published burst left the client on. Canonical
+    /// state can adopt an observed screen before a read commits, so the
+    /// publication boundary keeps its own view of what the client knows.
+    published_screen: TerminalScreenKind,
     pending_transfer: Option<PendingGraphicsTransfer>,
     framing_work: SessionTerminalFramingWork,
     grid_observer: TerminalGridObserverHandle,
@@ -1395,6 +1434,7 @@ impl SessionTerminal {
             generation: TerminalImageGeneration(1),
             sequence: TerminalOutputSequence(0),
             canonical: CanonicalImageState::new(policy_limits),
+            published_screen: TerminalScreenKind::Primary,
             pending_transfer: None,
             framing_work: SessionTerminalFramingWork::default(),
             grid_observer: TerminalGridObserverHandle::new(Arc::clone(&storage_budget)),
@@ -1820,6 +1860,7 @@ impl SessionTerminal {
             for (_, boundary) in images {
                 apply_image_boundary(&mut next, boundary, observation, log)?;
             }
+            terminal.generation = next.generation();
             terminal.canonical = next;
             Ok(())
         })
@@ -1840,9 +1881,85 @@ impl SessionTerminal {
             for effect in span.effects() {
                 apply_observed_effect(&mut next, effect, log)?;
             }
+            terminal.generation = next.generation();
             terminal.canonical = next;
             Ok(())
         })
+    }
+
+    /// Commit one observed read and publish the client records it implies.
+    ///
+    /// Generation and sequence headroom are checked before anything mutates,
+    /// so an exhausted counter returns a typed rejection while the last
+    /// committed canonical state, cursor, and publication history stand.
+    // @lat: [[terminal-images#Terminal Images#Client Convergence and Counter Safety]]
+    pub fn commit_and_publish(
+        &mut self,
+        commit: &SessionTerminalCommit,
+        payload: DefinitionPayload<'_>,
+    ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
+        let resets = commit
+            .grid_observations()
+            .iter()
+            .flat_map(TerminalGridSpanObservation::effects)
+            .filter(|effect| matches!(effect, ObservedTerminalGridEffect::HardReset))
+            .count();
+        self.publish_committed(resets, |terminal| terminal.commit_mutations(commit), payload)
+    }
+
+    /// Commit one out-of-band grid span and publish its client records.
+    pub fn commit_span_and_publish(
+        &mut self,
+        span: &ObservedTerminalGridSpan,
+        payload: DefinitionPayload<'_>,
+    ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
+        let resets = span
+            .effects()
+            .iter()
+            .filter(|effect| matches!(effect, ObservedTerminalGridEffect::HardReset))
+            .count();
+        self.publish_committed(resets, |terminal| terminal.commit_span_mutations(span), payload)
+    }
+
+    fn publish_committed(
+        &mut self,
+        resets: usize,
+        commit: impl FnOnce(&mut Self) -> Result<MutationLog, SessionTerminalError>,
+        payload: DefinitionPayload<'_>,
+    ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
+        let resets =
+            u64::try_from(resets).map_err(|_| SessionTerminalError::GenerationExhausted)?;
+        self.generation
+            .0
+            .checked_add(resets)
+            .filter(|generation| *generation <= self.policy.generation_ceiling)
+            .ok_or(SessionTerminalError::GenerationExhausted)?;
+        // One burst per generation this read can open, plus one for the
+        // records committed under the generation already in force.
+        self.sequence
+            .0
+            .checked_add(resets.saturating_add(1))
+            .filter(|sequence| *sequence <= self.policy.output_sequence_ceiling)
+            .ok_or(SessionTerminalError::SequenceExhausted)?;
+
+        let start_generation = self.generation;
+        let start_screen = self.published_screen;
+        let log = commit(self)?;
+        let placements = self.canonical.placements();
+        let inputs = PublicationInputs {
+            start_generation,
+            end_generation: self.generation,
+            start_screen,
+            end_screen: self.canonical.active_screen(),
+            mutations: log.as_slice(),
+            placements: &placements,
+        };
+        let first = TerminalOutputSequence(self.sequence.0.saturating_add(1));
+        let end_screen = inputs.end_screen;
+        let (messages, consumed) = publish_burst(&inputs, first, payload);
+        self.sequence = TerminalOutputSequence(self.sequence.0.saturating_add(consumed));
+        self.published_screen = end_screen;
+        Ok(messages)
     }
 
     /// Run one mutation phase under a rolled-back storage transaction.
@@ -2565,6 +2682,24 @@ impl PtyTerminalImageState {
         span: &ObservedTerminalGridSpan,
     ) -> Result<MutationLog, SessionTerminalError> {
         self.terminal.commit_span_mutations(span)
+    }
+
+    /// Commit one observed read and publish the client records it implies.
+    pub fn commit_and_publish(
+        &mut self,
+        commit: &SessionTerminalCommit,
+        payload: DefinitionPayload<'_>,
+    ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
+        self.terminal.commit_and_publish(commit, payload)
+    }
+
+    /// Commit one out-of-band grid span and publish its client records.
+    pub fn commit_span_and_publish(
+        &mut self,
+        span: &ObservedTerminalGridSpan,
+        payload: DefinitionPayload<'_>,
+    ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
+        self.terminal.commit_span_and_publish(span, payload)
     }
 
     /// Payload-free canonical definitions for inspection and evidence.

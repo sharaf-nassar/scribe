@@ -785,15 +785,35 @@ pub struct TerminalImageRejection {
 }
 
 /// Canonical live scene operation. Definition bytes are always chunked.
+///
+/// `screen` names the grid a placement operation owns. It is omitted at its
+/// legacy default, where the receiver uses whichever screen is active, so
+/// existing encoded records keep their exact bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalImageUpdate {
-    Define { definition: TerminalImageDefinition },
-    DefinitionChunk { chunk: TerminalImageDataChunk },
-    Place { placement: TerminalImagePlacement },
-    Delete { delete: TerminalImageDelete },
-    GridEffect { effect: TerminalGridEffect },
-    Rejected { rejection: TerminalImageRejection },
+    Define {
+        definition: TerminalImageDefinition,
+    },
+    DefinitionChunk {
+        chunk: TerminalImageDataChunk,
+    },
+    Place {
+        placement: TerminalImagePlacement,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<TerminalScreenKind>,
+    },
+    Delete {
+        delete: TerminalImageDelete,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<TerminalScreenKind>,
+    },
+    GridEffect {
+        effect: TerminalGridEffect,
+    },
+    Rejected {
+        rejection: TerminalImageRejection,
+    },
 }
 
 /// Live updates use explicit begin/commit boundaries, binding raw PTY output

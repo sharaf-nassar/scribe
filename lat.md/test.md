@@ -139,6 +139,43 @@ The gate pins the schema version, the production mutation engine name,
 payload-free evidence, both session ceilings, and an explicit passing result
 for every transactional case.
 
+## Client Convergence and Counter Safety
+
+The functional harness proves that records published by the production server seam rebuild the same canonical scene inside the production client, and that an exhausted counter changes nothing.
+
+### Production Convergence Probe
+
+The probe adds the real client scene to the production read path, then compares
+both canonical models.
+
+Every read runs through framing, the pinned Alacritty `Term`, the transactional
+commit, and publication, and the resulting burst is applied to
+`LiveImageScene`.
+
+Convergence is checked after every read over definitions, their replacement,
+additional placements, soft and hard deletes, ED2, a hard reset, both screen
+switches, a half-open scroll, and a resize that clips the active and inactive
+grids alike. A hard reset opens the next generation on both sides, and the
+client accepts the following publication under it.
+
+Replaying an already-applied burst is refused with a typed staleness rejection
+and leaves the published scene pointer-identical, so a duplicated or reordered
+burst can never mutate client state.
+
+Counter exhaustion is proven on the production path. A sequence ceiling reached
+after framing rejects at the publication preflight, leaving canonical state
+empty and nothing published. A generation ceiling reached by a hard reset
+rejects before the reset can run, so the definition, its placement, the
+generation, and the published scene all survive unchanged.
+
+### Docker Evidence Entry Point
+
+`terminal-image-convergence.sh` runs the production convergence probe in the functional Docker image.
+
+The gate pins the schema version, the production publication engine name,
+payload-free evidence, and an explicit passing result for every convergence and
+counter-safety case.
+
 ## Terminal Image Storage Accounting
 
 The functional harness proves requested-storage ownership through the production session seam without exposing image payloads or claiming byte-exact RSS.
