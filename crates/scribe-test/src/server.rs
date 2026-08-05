@@ -135,11 +135,13 @@ pub async fn upgrade() -> Result<(), ScribeError> {
         .parse()
         .map_err(|e| ScribeError::IpcError { reason: format!("invalid PID in file: {e}") })?;
 
-    // Launch the new server with --upgrade.
+    // Launch the new server with --upgrade. The successor inherits the same
+    // log redirection as `start`, so a script asserting on server-side
+    // behaviour does not go blind exactly at the hot-reload it is measuring.
     let child = std::process::Command::new("scribe-server")
         .arg("--upgrade")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(server_log_stdio()?)
+        .stderr(server_log_stdio()?)
         .spawn()
         .map_err(|e| ScribeError::IpcError {
             reason: format!("failed to spawn scribe-server --upgrade: {e}"),

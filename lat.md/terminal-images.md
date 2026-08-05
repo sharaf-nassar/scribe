@@ -826,6 +826,16 @@ so no raw prefix survives at all. [[crates/scribe-common/src/kitty_decode.rs#Kit
 therefore carries the normalized bytes plus the counters that bound what may
 still follow, and never the base64 text those chunks arrived as.
 
+### Live upgrade wiring
+
+The export and restore seam is complete and certified, but no production caller reaches it yet: the canonical scene lives in the PTY reader task, and the live handoff serializer cannot see it, so it sends `image_state: None`.
+
+[[crates/scribe-server/src/ipc_server.rs#serialize_live_for_handoff]] therefore
+emits a v6 payload for every session, and a real `scribe-server --upgrade`
+leaves the successor with an empty scene rather than the sender's. The live
+corpus measures which of the two happened and refuses anything in between, so
+the day the reader's state becomes reachable the same assertion keeps holding.
+
 ### Payload ceiling
 
 `HandoffState` is capped at 256 MiB for every session's text replay put

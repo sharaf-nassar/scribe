@@ -17,6 +17,11 @@ RUN apt-get update && \
         libx11-xcb-dev \
         libxkbcommon-x11-dev \
         libzstd-dev \
+        # terminal-images-functional.sh proves that graphics escapes and their
+        # replies survive an SSH pty unchanged, which needs a real sshd and
+        # client on loopback inside the container.
+        openssh-client \
+        openssh-server \
         zsh \
     && rm -rf /var/lib/apt/lists/*
 
