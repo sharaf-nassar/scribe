@@ -229,20 +229,20 @@ fn sorted_placements(
 }
 
 /// Encode one Kitty APC command with a base64 direct payload.
-fn kitty(controls: &str, payload: &[u8]) -> Vec<u8> {
+pub fn kitty(controls: &str, payload: &[u8]) -> Vec<u8> {
     format!("\x1b_G{controls};{}\x1b\\", STANDARD.encode(payload)).into_bytes()
 }
 
 /// Transmit-and-display one 1x1 RGB image under an explicit identifier.
-fn transmit_display(image_id: u32) -> Vec<u8> {
+pub fn transmit_display(image_id: u32) -> Vec<u8> {
     kitty(&format!("a=T,f=24,s=1,v=1,i={image_id}"), ONE_PIXEL_RGB)
 }
 
-fn control(bytes: &str) -> Vec<u8> {
+pub fn control(bytes: &str) -> Vec<u8> {
     bytes.as_bytes().to_vec()
 }
 
-fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
+pub fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.iter().flatten().copied().collect()
 }
 

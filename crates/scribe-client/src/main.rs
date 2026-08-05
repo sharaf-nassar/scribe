@@ -7665,6 +7665,15 @@ fn apply_pane_op(
                 0
             }
         },
+        PaneOp::TerminalImageReplay(message) => match grid.apply_image_replay(message.clone()) {
+            Ok(committed) => usize::from(committed),
+            Err(error) => {
+                // The staged snapshot is already discarded; the pane keeps the
+                // scene it last committed until the server sends a fresh one.
+                tracing::warn!(%session, %error, "rejected terminal image replay burst");
+                0
+            }
+        },
     }
 }
 
@@ -8383,6 +8392,7 @@ async fn dispatch_server_message(
         | ServerMessage::SessionReplay { .. }
         | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output).await,
         image @ (ServerMessage::TerminalImageLive { .. }
+        | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }) => {
             on_terminal_image_message(ctx, image);
         }
@@ -8811,6 +8821,14 @@ fn on_terminal_image_message(ctx: &ReaderCtx, message: ServerMessage) {
                 forward_inbound(
                     &ctx.in_tx,
                     InboundEvent::TerminalImageLive { session_id, message },
+                );
+            }
+        }
+        ServerMessage::TerminalImageReplay { session_id, message } => {
+            if is_attached(ctx, session_id) {
+                forward_inbound(
+                    &ctx.in_tx,
+                    InboundEvent::TerminalImageReplay { session_id, message },
                 );
             }
         }

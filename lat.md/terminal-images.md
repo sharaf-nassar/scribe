@@ -690,6 +690,41 @@ built once from canonical state however many sinks receive it, so the server
 never retains a per-sink copy of the scene and recovery cost does not grow with
 viewer count.
 
+## Staged Client Image Replay
+
+A viewer assembles a whole snapshot off-screen and swaps its published scene once, at the burst's commit, so no frame can ever show half a replay.
+
+[[crates/scribe-client/src/terminal_image_scene.rs#LiveImageScene#apply_replay]]
+builds an empty scene rather than cloning the published one — a replay is a
+whole snapshot, not a delta — and runs every record through the same quota,
+contiguity, placement, and screen-ownership checks a live burst uses. The
+published `Arc` is replaced only by `Commit`, and only after the burst carried
+exactly the definitions, placements, and canonical bytes its `Begin` declared.
+
+Any failure abandons the whole snapshot and leaves the published scene exactly
+as it was. That is deliberate: the pane keeps showing the last scene it could
+prove, and the server's existing replay-debt path is what corrects it. A
+half-applied snapshot would instead be a wrong picture the client believes.
+
+### Live records behind a snapshot
+
+Live records that arrive while a snapshot stages are buffered in arrival order
+and applied after the swap, never before it.
+
+A delta applied to a scene the client is about to replace is meaningless, and
+one applied afterwards must still land in the order the server emitted it. Both
+streams share the client's ordered pane FIFO, so "later" is a defined property
+rather than a race. A buffered record whose generation or output cursor the
+snapshot already covers is dropped at drain: replaying it would resurrect
+definitions and placements the snapshot deliberately replaced.
+
+The buffer is bounded by
+[[crates/scribe-client/src/terminal_image_scene.rs#MAX_BUFFERED_LIVE_RECORDS]]
+records and by the session's retained-CPU ceiling. The server suppresses live
+deltas to a sink that owes a replay, so in practice the buffer only absorbs the
+boundary between the two streams; overflow abandons the staged snapshot instead
+of growing without bound or applying part of a stream it can no longer order.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.
@@ -974,6 +1009,27 @@ It also freezes placeholder-copy input and typed capability mismatch data.
 `test-output/terminal-images/client-scene.json`, and requires every evidence
 field to pass. This is CPU-scene evidence only; it makes no renderer, replay,
 server fanout, or settings claim.
+
+## Staged Client Replay Verification
+
+Docker verification proves that a client applying the server's own planned burst never publishes a partial scene, never resurrects a superseded generation, and recovers from a corrupt burst.
+
+`tests/e2e/terminal-image-client-replay.sh` invokes
+`scribe-test terminal-image-client-replay` and writes
+`test-output/terminal-images/client-replay.json`. The probe drives real PTY
+bytes through the production seam, plans the burst with
+[[crates/scribe-server/src/terminal_image_replay.rs#plan_replay]], and applies
+every record through
+[[crates/scribe-client/src/terminal_image_scene.rs#LiveImageScene#apply_replay]],
+so atomicity is an observation of the published `Arc` identity rather than an
+inference.
+
+The gate pins one publication per burst, zero partial observations, an
+order-preserving live drain compared against the same records applied without
+buffering, typed refusal of an older generation as both a snapshot and a
+buffered delta, a typed error for each of six corruptions built by permuting
+real planned records, and the released pixels, retained-byte total, and buffer
+ceiling that make cleanup observable.
 
 ## GPUI Lifecycle Verification
 

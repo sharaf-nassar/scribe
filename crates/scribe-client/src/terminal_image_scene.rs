@@ -5,6 +5,12 @@
 //! swaps one `Arc` only after every definition is complete and every quota has
 //! been checked. A malformed, stale, interrupted, or partial burst therefore
 //! cannot leak into paint state.
+//!
+//! A replay burst is assembled the same way, except that it builds an empty
+//! scene from scratch rather than cloning the published one: it is a whole
+//! snapshot, not a delta. Live records that arrive while a snapshot is being
+//! staged are buffered and applied in arrival order after the swap, so the
+//! published scene never mixes half a snapshot with a later delta.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -13,8 +19,8 @@ use scribe_common::terminal_images::{
     TerminalImageCapabilityMismatch, TerminalImageCellClip, TerminalImageDataChunk,
     TerminalImageDefinition, TerminalImageDelete, TerminalImageDeleteScope,
     TerminalImageGeneration, TerminalImageId, TerminalImageLiveMessage, TerminalImagePlacement,
-    TerminalImagePlacementKind, TerminalImageRejection, TerminalImageUpdate,
-    TerminalOutputSequence, TerminalPlacementId, TerminalScreenKind,
+    TerminalImagePlacementKind, TerminalImageRejection, TerminalImageReplayMessage,
+    TerminalImageUpdate, TerminalOutputSequence, TerminalPlacementId, TerminalScreenKind,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -156,31 +162,82 @@ pub enum LiveSceneError {
     AllocationFailed,
     #[error("terminal image limit exceeded: {0:?}")]
     LimitExceeded(ImageLimitName),
+    #[error("terminal image replay record arrived without begin")]
+    ReplayRecordWithoutBegin,
+    #[error("terminal image replay does not carry the scene it declared")]
+    ReplayCountMismatch,
+    #[error("terminal image live records buffered behind a replay outgrew their bound")]
+    LiveBufferOverflow,
     #[error(transparent)]
     Bound(#[from] ImageBoundError),
 }
+
+/// Live records held while a replay stages.
+///
+/// The server suppresses live deltas to a sink that owes a replay, so this
+/// only ever absorbs the boundary between the two streams. Overflow abandons
+/// the staged snapshot instead of growing without bound or applying part of a
+/// stream the client can no longer order.
+pub const MAX_BUFFERED_LIVE_RECORDS: usize = 4_096;
 
 struct PendingDefinition {
     metadata: TerminalImageDefinition,
     rgba: Vec<u8>,
 }
 
-struct PendingBurst {
+/// One unpublished scene under construction, plus the definitions still
+/// accumulating chunks. Live bursts and replay snapshots share it, so both
+/// paths run the same quota, contiguity, and placement checks.
+struct SceneDraft {
     generation: TerminalImageGeneration,
-    sequence: TerminalOutputSequence,
     scene: CommittedImageScene,
     definitions: Vec<PendingDefinition>,
+}
+
+struct PendingBurst {
+    sequence: TerminalOutputSequence,
+    draft: SceneDraft,
+}
+
+/// What a replay's `Begin` promises the rest of its burst will carry.
+#[derive(Clone, Copy)]
+struct ReplayDeclaration {
+    definitions: u32,
+    placements: u32,
+    rgba_bytes: u64,
+    active_screen: Option<TerminalScreenKind>,
+}
+
+/// An off-screen snapshot being assembled from a generation-tagged replay.
+struct StagingReplay {
+    declared_definitions: u32,
+    declared_placements: u32,
+    declared_rgba_bytes: u64,
+    definitions: u32,
+    placements: u32,
+    rgba_bytes: u64,
+    draft: SceneDraft,
 }
 
 /// Live-operation state machine for one pane.
 pub struct LiveImageScene {
     committed: Arc<CommittedImageScene>,
     pending: Option<PendingBurst>,
+    replay: Option<StagingReplay>,
+    /// Live records that arrived while `replay` was staging, in arrival order.
+    buffered: Vec<TerminalImageLiveMessage>,
+    buffered_bytes: u64,
 }
 
 impl Default for LiveImageScene {
     fn default() -> Self {
-        Self { committed: Arc::new(CommittedImageScene::default()), pending: None }
+        Self {
+            committed: Arc::new(CommittedImageScene::default()),
+            pending: None,
+            replay: None,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+        }
     }
 }
 
@@ -191,13 +248,77 @@ impl LiveImageScene {
         Arc::clone(&self.committed)
     }
 
-    /// Discard an interrupted generation without changing the published scene.
+    /// Discard every unpublished record — an interrupted live generation, a
+    /// half-staged replay snapshot, and anything buffered behind it — without
+    /// changing the published scene.
     pub fn discard_partial(&mut self) {
         self.pending = None;
+        self.discard_replay();
+    }
+
+    /// Whether a replay snapshot is currently staged off-screen.
+    #[must_use]
+    pub fn is_staging_replay(&self) -> bool {
+        self.replay.is_some()
+    }
+
+    /// Live records held behind the staged snapshot, awaiting its commit.
+    #[must_use]
+    pub fn buffered_live_len(&self) -> usize {
+        self.buffered.len()
     }
 
     /// Consume one generation/sequence-tagged live record.
+    ///
+    /// While a replay stages, the record is buffered instead of applied: the
+    /// snapshot it belongs behind has not been published yet, so applying it
+    /// now would be a delta on a scene the client is about to replace.
     pub fn apply(
+        &mut self,
+        message: TerminalImageLiveMessage,
+    ) -> Result<LiveSceneApply, LiveSceneError> {
+        if self.replay.is_some() {
+            return self.buffer_live(message);
+        }
+        self.apply_live(message)
+    }
+
+    /// Consume one generation-tagged replay record.
+    ///
+    /// Records stage into an empty off-screen scene; only `Commit` swaps the
+    /// published `Arc`, and it also drains whatever live records arrived in the
+    /// meantime. Any failure abandons the whole snapshot, leaving the published
+    /// scene exactly as it was, so a corrupt burst costs a resync rather than a
+    /// wrong picture.
+    pub fn apply_replay(
+        &mut self,
+        message: TerminalImageReplayMessage,
+    ) -> Result<LiveSceneApply, LiveSceneError> {
+        let result = self.apply_replay_record(message);
+        if result.is_err() {
+            self.discard_replay();
+        }
+        result
+    }
+
+    fn buffer_live(
+        &mut self,
+        message: TerminalImageLiveMessage,
+    ) -> Result<LiveSceneApply, LiveSceneError> {
+        let bytes = live_payload_bytes(&message);
+        let projected = self.buffered_bytes.saturating_add(bytes);
+        if self.buffered.len() >= MAX_BUFFERED_LIVE_RECORDS
+            || projected > ImageLimits::V1.max_session_retained_cpu_bytes
+        {
+            self.discard_replay();
+            return Err(LiveSceneError::LiveBufferOverflow);
+        }
+        self.buffered_bytes = projected;
+        self.buffered.push(message);
+        Ok(LiveSceneApply::Staged)
+    }
+
+    fn apply_live(
         &mut self,
         message: TerminalImageLiveMessage,
     ) -> Result<LiveSceneApply, LiveSceneError> {
@@ -206,14 +327,18 @@ impl LiveImageScene {
                 // A replacement begin is also the cleanup boundary for an
                 // interrupted definition stream.
                 self.pending = None;
-                self.validate_begin(generation, sequence)?;
+                if let Some(stale) = self.stale_boundary(generation, sequence) {
+                    return Err(stale);
+                }
                 let mut scene = (*self.committed).clone();
                 scene.generation = Some(generation);
                 scene.through_sequence = Some(sequence);
                 scene.last_grid_effects.clear();
                 scene.last_rejection = None;
-                self.pending =
-                    Some(PendingBurst { generation, sequence, scene, definitions: Vec::new() });
+                self.pending = Some(PendingBurst {
+                    sequence,
+                    draft: SceneDraft { generation, scene, definitions: Vec::new() },
+                });
                 Ok(LiveSceneApply::Staged)
             }
             TerminalImageLiveMessage::Update { generation, sequence, update } => {
@@ -229,18 +354,19 @@ impl LiveImageScene {
         }
     }
 
-    fn validate_begin(
+    /// Why a live boundary describes a scene the published one already passed.
+    fn stale_boundary(
         &self,
         generation: TerminalImageGeneration,
         sequence: TerminalOutputSequence,
-    ) -> Result<(), LiveSceneError> {
+    ) -> Option<LiveSceneError> {
         if self.committed.generation.is_some_and(|committed| generation < committed) {
-            return Err(LiveSceneError::StaleGeneration);
+            return Some(LiveSceneError::StaleGeneration);
         }
         if self.committed.through_sequence.is_some_and(|committed| sequence <= committed) {
-            return Err(LiveSceneError::StaleSequence);
+            return Some(LiveSceneError::StaleSequence);
         }
-        Ok(())
+        None
     }
 
     fn apply_tagged_update(
@@ -250,10 +376,10 @@ impl LiveImageScene {
         update: TerminalImageUpdate,
     ) -> Result<(), LiveSceneError> {
         let pending = self.pending.as_mut().ok_or(LiveSceneError::UpdateWithoutBegin)?;
-        if pending.generation != generation || pending.sequence != sequence {
+        if pending.draft.generation != generation || pending.sequence != sequence {
             return Err(LiveSceneError::BoundaryMismatch);
         }
-        apply_update(pending, update)
+        apply_update(&mut pending.draft, update)
     }
 
     fn commit(
@@ -264,73 +390,260 @@ impl LiveImageScene {
         let Some(pending) = self.pending.take() else {
             return Err(LiveSceneError::CommitWithoutBegin);
         };
-        if pending.generation != generation || pending.sequence != sequence {
+        if pending.draft.generation != generation || pending.sequence != sequence {
             return Err(LiveSceneError::BoundaryMismatch);
         }
-        if !pending.definitions.is_empty() {
+        if !pending.draft.definitions.is_empty() {
             return Err(LiveSceneError::IncompleteDefinition);
         }
-        let committed = Arc::new(pending.scene);
+        let committed = Arc::new(pending.draft.scene);
         self.committed = Arc::clone(&committed);
         Ok(LiveSceneApply::Committed(committed))
     }
+
+    /// Drop the staged snapshot and everything buffered behind it. The staged
+    /// definitions are the only owner of their pixels, so this is also where
+    /// an abandoned snapshot's memory goes.
+    fn discard_replay(&mut self) {
+        self.replay = None;
+        self.buffered = Vec::new();
+        self.buffered_bytes = 0;
+    }
+
+    fn apply_replay_record(
+        &mut self,
+        message: TerminalImageReplayMessage,
+    ) -> Result<LiveSceneApply, LiveSceneError> {
+        message.validate()?;
+        match message {
+            TerminalImageReplayMessage::Begin {
+                generation,
+                definition_count,
+                placement_count,
+                total_rgba_bytes,
+                active_screen,
+                ..
+            } => {
+                self.begin_replay(
+                    generation,
+                    ReplayDeclaration {
+                        definitions: definition_count,
+                        placements: placement_count,
+                        rgba_bytes: total_rgba_bytes,
+                        active_screen,
+                    },
+                )?;
+                Ok(LiveSceneApply::Staged)
+            }
+            TerminalImageReplayMessage::Definition { generation, definition } => {
+                let staging = self.staging(generation)?;
+                staging.definitions = staging.definitions.saturating_add(1);
+                if staging.definitions > staging.declared_definitions {
+                    return Err(LiveSceneError::ReplayCountMismatch);
+                }
+                begin_definition(&mut staging.draft, definition)?;
+                Ok(LiveSceneApply::Staged)
+            }
+            TerminalImageReplayMessage::DefinitionChunk { generation, chunk } => {
+                let staging = self.staging(generation)?;
+                staging.rgba_bytes = staging.rgba_bytes.saturating_add(chunk.data.len() as u64);
+                if staging.rgba_bytes > staging.declared_rgba_bytes {
+                    return Err(LiveSceneError::ReplayCountMismatch);
+                }
+                append_definition_chunk(&mut staging.draft, &chunk)?;
+                Ok(LiveSceneApply::Staged)
+            }
+            TerminalImageReplayMessage::Placement { generation, placement, screen } => {
+                let staging = self.staging(generation)?;
+                staging.placements = staging.placements.saturating_add(1);
+                if staging.placements > staging.declared_placements {
+                    return Err(LiveSceneError::ReplayCountMismatch);
+                }
+                place(&mut staging.draft, placement, screen)?;
+                Ok(LiveSceneApply::Staged)
+            }
+            TerminalImageReplayMessage::Commit { generation, through_sequence } => {
+                self.commit_replay(generation, through_sequence)
+            }
+        }
+    }
+
+    fn begin_replay(
+        &mut self,
+        generation: TerminalImageGeneration,
+        declared: ReplayDeclaration,
+    ) -> Result<(), LiveSceneError> {
+        // Only the generation decides staleness here. A snapshot's cursor can
+        // legitimately equal the published one — a reattach with no new output
+        // between the two — and refusing that would strand the viewer.
+        if self.committed.generation.is_some_and(|committed| generation < committed) {
+            return Err(LiveSceneError::StaleGeneration);
+        }
+        // A snapshot supersedes any interrupted live burst and any earlier
+        // snapshot attempt; neither may contribute pixels to this one.
+        self.pending = None;
+        self.replay = None;
+        let scene = CommittedImageScene {
+            active_screen: declared.active_screen.unwrap_or(TerminalScreenKind::Primary),
+            ..CommittedImageScene::default()
+        };
+        self.replay = Some(StagingReplay {
+            declared_definitions: declared.definitions,
+            declared_placements: declared.placements,
+            declared_rgba_bytes: declared.rgba_bytes,
+            definitions: 0,
+            placements: 0,
+            rgba_bytes: 0,
+            draft: SceneDraft { generation, scene, definitions: Vec::new() },
+        });
+        Ok(())
+    }
+
+    fn staging(
+        &mut self,
+        generation: TerminalImageGeneration,
+    ) -> Result<&mut StagingReplay, LiveSceneError> {
+        let staging = self.replay.as_mut().ok_or(LiveSceneError::ReplayRecordWithoutBegin)?;
+        if staging.draft.generation != generation {
+            return Err(LiveSceneError::BoundaryMismatch);
+        }
+        Ok(staging)
+    }
+
+    fn commit_replay(
+        &mut self,
+        generation: TerminalImageGeneration,
+        through_sequence: TerminalOutputSequence,
+    ) -> Result<LiveSceneApply, LiveSceneError> {
+        let staging = self.replay.take().ok_or(LiveSceneError::ReplayRecordWithoutBegin)?;
+        if staging.draft.generation != generation {
+            return Err(LiveSceneError::BoundaryMismatch);
+        }
+        if !staging.draft.definitions.is_empty() {
+            return Err(LiveSceneError::IncompleteDefinition);
+        }
+        if staging.definitions != staging.declared_definitions
+            || staging.placements != staging.declared_placements
+            || staging.rgba_bytes != staging.declared_rgba_bytes
+        {
+            return Err(LiveSceneError::ReplayCountMismatch);
+        }
+        let mut published = staging.draft.scene;
+        published.generation = Some(generation);
+        published.through_sequence = Some(through_sequence);
+        self.committed = Arc::new(published);
+        let drained_effects = self.drain_buffered_live();
+        if !drained_effects.is_empty() {
+            // Each drained burst published its own effects and the next one
+            // cleared them, so the caller would otherwise only ever see the
+            // last burst's grid mutations.
+            let mut merged = (*self.committed).clone();
+            merged.last_grid_effects = drained_effects;
+            self.committed = Arc::new(merged);
+        }
+        Ok(LiveSceneApply::Committed(Arc::clone(&self.committed)))
+    }
+
+    /// Apply the live records held behind the snapshot, in arrival order, and
+    /// return every grid effect they committed.
+    ///
+    /// A record the snapshot already reflects is dropped rather than applied:
+    /// replaying it would resurrect definitions and placements the snapshot's
+    /// generation deliberately replaced.
+    fn drain_buffered_live(&mut self) -> Vec<TerminalGridEffect> {
+        self.buffered_bytes = 0;
+        let mut effects = Vec::new();
+        for message in std::mem::take(&mut self.buffered) {
+            let (generation, sequence) = live_boundary(&message);
+            if self.stale_boundary(generation, sequence).is_some() {
+                continue;
+            }
+            match self.apply_live(message) {
+                Ok(LiveSceneApply::Committed(scene)) => {
+                    effects.extend(scene.last_grid_effects.iter().cloned());
+                }
+                Ok(LiveSceneApply::Staged) => {}
+                Err(_) => self.pending = None,
+            }
+        }
+        effects
+    }
 }
 
-fn apply_update(
-    pending: &mut PendingBurst,
-    update: TerminalImageUpdate,
-) -> Result<(), LiveSceneError> {
+/// The generation/sequence boundary every live record carries.
+fn live_boundary(
+    message: &TerminalImageLiveMessage,
+) -> (TerminalImageGeneration, TerminalOutputSequence) {
+    match *message {
+        TerminalImageLiveMessage::Begin { generation, sequence }
+        | TerminalImageLiveMessage::Update { generation, sequence, .. }
+        | TerminalImageLiveMessage::Commit { generation, sequence } => (generation, sequence),
+    }
+}
+
+/// Canonical pixels one buffered live record would retain.
+fn live_payload_bytes(message: &TerminalImageLiveMessage) -> u64 {
+    match message {
+        TerminalImageLiveMessage::Update {
+            update: TerminalImageUpdate::DefinitionChunk { chunk },
+            ..
+        } => chunk.data.len() as u64,
+        _ => 0,
+    }
+}
+
+fn apply_update(draft: &mut SceneDraft, update: TerminalImageUpdate) -> Result<(), LiveSceneError> {
     match update {
-        TerminalImageUpdate::Define { definition } => begin_definition(pending, definition),
-        TerminalImageUpdate::DefinitionChunk { chunk } => append_definition_chunk(pending, &chunk),
-        TerminalImageUpdate::Place { placement, screen } => place(pending, placement, screen),
+        TerminalImageUpdate::Define { definition } => begin_definition(draft, definition),
+        TerminalImageUpdate::DefinitionChunk { chunk } => append_definition_chunk(draft, &chunk),
+        TerminalImageUpdate::Place { placement, screen } => place(draft, placement, screen),
         TerminalImageUpdate::Delete { delete, screen } => {
             // Kitty specifies that every delete aborts all incomplete uploads.
-            pending.definitions.clear();
-            pending.scene.apply_delete(delete, screen);
+            draft.definitions.clear();
+            draft.scene.apply_delete(delete, screen);
             Ok(())
         }
         TerminalImageUpdate::GridEffect { effect } => {
-            pending.scene.apply_grid_effect(&effect);
-            pending.scene.last_grid_effects.push(effect);
+            draft.scene.apply_grid_effect(&effect);
+            draft.scene.last_grid_effects.push(effect);
             Ok(())
         }
         TerminalImageUpdate::Rejected { rejection } => {
-            pending.scene.last_rejection = Some(rejection);
+            draft.scene.last_rejection = Some(rejection);
             Ok(())
         }
     }
 }
 
 fn begin_definition(
-    pending: &mut PendingBurst,
+    draft: &mut SceneDraft,
     definition: TerminalImageDefinition,
 ) -> Result<(), LiveSceneError> {
-    if definition.generation != pending.generation {
+    if definition.generation != draft.generation {
         return Err(LiveSceneError::BoundaryMismatch);
     }
     definition.validate()?;
-    pending.definitions.retain(|item| item.metadata.id != definition.id);
+    draft.definitions.retain(|item| item.metadata.id != definition.id);
 
-    let replacing = pending.scene.definition(definition.id).is_some();
-    let projected_count = pending
+    let replacing = draft.scene.definition(definition.id).is_some();
+    let projected_count = draft
         .scene
         .definitions
         .len()
-        .saturating_add(pending.definitions.len())
+        .saturating_add(draft.definitions.len())
         .saturating_add(usize::from(!replacing));
     if projected_count > ImageLimits::V1.max_images_per_session as usize {
         return Err(LiveSceneError::LimitExceeded(ImageLimitName::ImagesPerSession));
     }
 
     let existing_bytes =
-        pending.scene.definition(definition.id).map_or(0, |item| item.metadata.rgba_bytes);
-    let pending_bytes = pending
+        draft.scene.definition(definition.id).map_or(0, |item| item.metadata.rgba_bytes);
+    let pending_bytes = draft
         .definitions
         .iter()
         .try_fold(0u64, |total, item| total.checked_add(item.metadata.rgba_bytes))
         .ok_or(LiveSceneError::LimitExceeded(ImageLimitName::SessionRetainedCpuBytes))?;
-    let projected = pending
+    let projected = draft
         .scene
         .retained_rgba_bytes
         .saturating_sub(existing_bytes)
@@ -341,24 +654,24 @@ fn begin_definition(
         return Err(LiveSceneError::LimitExceeded(ImageLimitName::SessionRetainedCpuBytes));
     }
 
-    pending.definitions.push(PendingDefinition { metadata: definition, rgba: Vec::new() });
+    draft.definitions.push(PendingDefinition { metadata: definition, rgba: Vec::new() });
     Ok(())
 }
 
 fn append_definition_chunk(
-    pending: &mut PendingBurst,
+    draft: &mut SceneDraft,
     chunk: &TerminalImageDataChunk,
 ) -> Result<(), LiveSceneError> {
-    if chunk.generation != pending.generation {
+    if chunk.generation != draft.generation {
         return Err(LiveSceneError::BoundaryMismatch);
     }
     let Some(index) =
-        pending.definitions.iter().position(|definition| definition.metadata.id == chunk.id)
+        draft.definitions.iter().position(|definition| definition.metadata.id == chunk.id)
     else {
         return Err(LiveSceneError::DefinitionNotStarted);
     };
     let definition =
-        pending.definitions.get_mut(index).ok_or(LiveSceneError::DefinitionNotStarted)?;
+        draft.definitions.get_mut(index).ok_or(LiveSceneError::DefinitionNotStarted)?;
     chunk.validate(&definition.metadata)?;
     if chunk.offset != definition.rgba.len() as u64 {
         return Err(LiveSceneError::NonContiguousChunk);
@@ -372,8 +685,8 @@ fn append_definition_chunk(
         return Err(LiveSceneError::IncompleteDefinition);
     }
 
-    let complete = pending.definitions.remove(index);
-    install_definition(&mut pending.scene, complete);
+    let complete = draft.definitions.remove(index);
+    install_definition(&mut draft.scene, complete);
     Ok(())
 }
 
@@ -390,30 +703,27 @@ fn install_definition(scene: &mut CommittedImageScene, definition: PendingDefini
 }
 
 fn place(
-    pending: &mut PendingBurst,
+    draft: &mut SceneDraft,
     placement: TerminalImagePlacement,
     screen: Option<TerminalScreenKind>,
 ) -> Result<(), LiveSceneError> {
-    if placement.generation != pending.generation {
+    if placement.generation != draft.generation {
         return Err(LiveSceneError::BoundaryMismatch);
     }
     let definition =
-        pending.scene.definition(placement.image_id).ok_or(LiveSceneError::MissingDefinition)?;
+        draft.scene.definition(placement.image_id).ok_or(LiveSceneError::MissingDefinition)?;
     validate_placement(&placement, &definition.metadata)?;
 
-    let screen = screen.unwrap_or(pending.scene.active_screen);
+    let screen = screen.unwrap_or(draft.scene.active_screen);
     let key = placement_key(&placement);
-    let replacing = pending
-        .scene
-        .screen_placements(screen)
-        .iter()
-        .any(|existing| placement_key(existing) == key);
-    if pending.scene.all_placements_len().saturating_add(usize::from(!replacing))
+    let replacing =
+        draft.scene.screen_placements(screen).iter().any(|existing| placement_key(existing) == key);
+    if draft.scene.all_placements_len().saturating_add(usize::from(!replacing))
         > ImageLimits::V1.max_placements_per_session as usize
     {
         return Err(LiveSceneError::LimitExceeded(ImageLimitName::PlacementsPerSession));
     }
-    let placements = pending.scene.screen_placements_mut(screen);
+    let placements = draft.scene.screen_placements_mut(screen);
     placements.retain(|existing| placement_key(existing) != key);
     placements.push(placement);
     Ok(())

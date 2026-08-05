@@ -21,6 +21,52 @@ The functional harness applies owned fixtures directly to the production client 
 
 The fixture proves operation order, commit-only publication, definition replacement, placement deletion, generation cleanup, scroll/erase/reset effects, typed quota rejection, placeholder copy filtering, and visible update-required mismatch copy.
 
+## Staged Client Image Replay
+
+The functional harness proves that a client staging the server's own planned burst never publishes a partial or superseded scene.
+
+### Production Staging Probe
+
+The probe drives real PTY bytes through the production server seam, plans each
+burst with the server's replay planner, and applies every record through the
+production client scene, so no case invents a record shape.
+
+Atomicity is read off the published `Arc` identity: exactly one identity change
+per burst, at the commit, and no image state visible on the pane before it.
+
+Live records handed to the client between begin and commit are buffered, and
+the scene they produce after the drain is compared against the scene the same
+snapshot and the same records produce with no buffering at all. That equality
+is what makes the buffer order-preserving rather than merely lossless.
+
+A hard reset opens a genuinely newer generation, so the older snapshot and the
+older live burst are both stale in the server's own terms. The snapshot is
+refused with a typed error that leaves the published scene untouched, and the
+buffered older burst is dropped at drain instead of resurrecting its
+definitions and placements.
+
+Six corruptions — a record and a commit without begin, a placement before its
+definition, a dropped chunk, a truncated burst, and a record spliced in from
+another generation — are each permutations of records the planner really
+emitted. Each is typed, leaves the published scene in place, and clears its
+staged state; one clean burst afterwards recovers the pane.
+
+Cleanup is observable rather than asserted: a superseded scene's canonical
+pixels are proven unreachable through a weak reference, an abandoned snapshot
+leaves the pane charged only for the snapshot that follows it, and a live
+stream past the buffer ceiling abandons the snapshot with a typed error.
+
+### Docker Evidence Entry Point
+
+`terminal-image-client-replay.sh` runs the probe and validates the payload-free
+evidence it writes.
+
+The gate pins the schema version, the production engine name, a passing result
+for all five cases, the burst's record and staging counts, the buffered and
+drained live counts, every staleness and resurrection total, a typed refusal
+for each corruption, and the cleanup totals including the frozen buffer
+ceiling. It also refuses any evidence that embedded array-shaped payload data.
+
 ## Terminal Image Session State Seam
 
 The functional harness exercises the production server-owned image seam without starting a host Scribe runtime or substituting a test-only engine.
