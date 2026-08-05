@@ -536,6 +536,33 @@ leaves the last committed definitions, placements, screen, generation, and
 published scene exactly as they were. Nothing partial is emitted, and no
 exhausted counter is reused.
 
+## Authoritative Image State Assembly
+
+The independently verified image invariants compose into one server-owned engine whose combined behavior is certified by a versioned payload-free evidence manifest.
+
+Assembly adds no engine. Every session is one
+[[crates/scribe-server/src/terminal_image_state.rs#PtyTerminalImageState]] over
+the shared immutable process policy, so framing order, storage reservation,
+decode admission, transfer retirement, Alacritty-derived observation,
+transactional commit, and client publication are the same code paths the child
+invariants certified. Sessions are independent in canonical state and decode
+identity while sharing one process storage ledger and one decode scheduler, so
+neither session can spend the other's image state or bypass the process
+ceilings that bound them both.
+
+The manifest is the objective artifact that closes the epic and that downstream
+live-fanout work reads. It is versioned by `schema_version`, names the engine it
+came from, and carries the frozen `ImageLimits`, exact per-session and process
+storage counters, scheduler admission counters, typed outcomes for every
+rejection and retirement the scenario produced, and a canonical convergence
+digest pair per session. It records no image payload: definitions and
+placements are metadata only, and the digests are folded from that metadata
+rather than from pixels.
+
+Every specification acceptance criterion maps to the assembly case that
+exercised it and to the child functional gate that certifies it independently,
+so a reviewer can trace any criterion to evidence without rerunning the epic.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.

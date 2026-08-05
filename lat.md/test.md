@@ -395,6 +395,56 @@ retirement can reorder a reply that was already owed.
 
 `terminal-image-transfer-lifecycle.sh` runs the production retirement probe in the functional Docker image and validates payload-free typed boundaries, invisibility, idempotence, refused-admission, chronology, and zero-ownership outcomes.
 
+## Authoritative Image State Assembly
+
+The functional harness runs one multi-session scenario across every image invariant at once and publishes the versioned payload-free manifest that closes the epic.
+
+### Cross-Invariant Assembly Probe
+
+Two production sessions on one shared process policy run an ordered scenario
+whose stages each depend on the state the previous stage left behind.
+
+Framing goes first: one read carries ordinary text ahead of a Kitty transfer
+whose first chunk is incomplete, and a second read completes it after moving the
+cursor, so the placement must anchor where the final chunk observed the cursor.
+Accounting is then read off that session's ledger — capacity was reserved before
+every allocation and reconciled against observed capacity — and a session under
+a quota too small for one canonical image is refused with a typed storage
+rejection that retains nothing. Scheduling is checked against the process
+scheduler the seam admits through: every decode was issued, admitted, and
+released, none survives, and peak concurrency stayed inside the process ceiling.
+
+Observer effects then move the surviving placement through a half-open margin
+scroll, both alternate-screen switches, and a resize, and the seam's active
+screen is compared with the real Alacritty `Term` at each boundary. Mutations
+follow with compound define-and-place, soft and hard deletes, a malformed
+operand that fails as typed protocol input without mutating anything, and enough
+transmits to hold the session image ceiling through eviction. The second session
+abandons a Kitty transfer and closes, which must retire it as a typed truncated
+sequence, publish nothing, consume no generation, keep no pending state, and
+repeat idempotently. Overflow is proven on the production path with sequence and
+generation ceilings that reject before mutation.
+
+Convergence is asserted after every stage and again at the end as a canonical
+digest folded from generation, active screen, sorted definitions, and sorted
+screen-scoped placements on both the server and the production client scene.
+Independence closes the scenario: the two sessions hold distinct decode
+identities and disjoint canonical state while reading the identical process
+ledger.
+
+### Docker Evidence Entry Point
+
+`terminal-image-server-state.sh` requires every child gate's evidence to be
+present and passing in the same output directory, then runs the assembly probe
+and validates the manifest it writes.
+
+The gate pins the schema version, the production engine name, payload-free
+evidence, a passing result for all nine assembly cases, the typed retirement and
+overflow outcomes, the frozen limits, the reserve-before-allocation and
+scheduler counters, one converged digest pair per session, and a complete
+40-criterion mapping. It also refuses any manifest that embedded array-shaped
+payload data.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

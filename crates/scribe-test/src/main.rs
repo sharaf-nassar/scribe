@@ -23,6 +23,7 @@ mod terminal_image_convergence;
 mod terminal_image_mutations;
 mod terminal_image_observer_parity;
 mod terminal_image_scheduler;
+mod terminal_image_server_state;
 mod terminal_image_state_seam;
 mod terminal_image_transfer_lifecycle;
 mod wait;
@@ -371,6 +372,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Certify the assembled authoritative terminal-image state engine.
+    TerminalImageServerState {
+        /// Versioned payload-free JSON manifest destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -581,6 +588,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageTransferLifecycle { evidence } => run_transfer_lifecycle(&evidence),
         Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
         Command::TerminalImageConvergence { evidence } => run_terminal_image_convergence(&evidence),
+        Command::TerminalImageServerState { evidence } => {
+            run_terminal_image_server_state(&evidence)
+        }
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
         }
@@ -648,6 +658,10 @@ fn run_terminal_image_mutations(evidence: &std::path::Path) -> Result<(), TestEr
 
 fn run_terminal_image_convergence(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_convergence::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_terminal_image_server_state(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_server_state::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
