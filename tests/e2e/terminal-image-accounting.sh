@@ -29,9 +29,9 @@ grep -Fq '"allocator_attempts": 11' "$EVIDENCE" \
     || fail "rejected request allocated before reservation"
 grep -Fq '"completed_requested": 8' "$EVIDENCE" \
     || fail "completed Kitty content was not retained"
-grep -Fq '"required_peak": 1028' "$EVIDENCE" \
+grep -Fq '"required_peak": 1060' "$EVIDENCE" \
     || fail "replacement required peak drifted"
-grep -Fq '"enforced_limit": 1027' "$EVIDENCE" \
+grep -Fq '"enforced_limit": 1059' "$EVIDENCE" \
     || fail "replacement failing limit drifted"
 grep -Fq '"failed_growth_rollback": true' "$EVIDENCE" || fail "growth rollback failed"
 grep -Fq '"failed_replacement_rollback": true' "$EVIDENCE" \
@@ -108,7 +108,7 @@ grep -Fq '"no_deadlock": "pass"' "$EVIDENCE" \
     || fail "concurrent release case deadlocked"
 grep -Fq '"framing_event_metadata_peak": 480' "$EVIDENCE" \
     || fail "framing-event metadata peak drifted"
-grep -Fq '"terminal_output_metadata_peak": 496' "$EVIDENCE" \
+grep -Fq '"terminal_output_metadata_peak": 528' "$EVIDENCE" \
     || fail "terminal-output metadata peak drifted"
 grep -Fq '"decoded_kitty_peak": 28' "$EVIDENCE" \
     || fail "decoded Kitty replacement peak drifted"
@@ -120,7 +120,7 @@ grep -Fq '"global_max_minus_scope": "first_ingress_framing_peak"' "$EVIDENCE" \
     || fail "Kitty global max-minus scope drifted"
 grep -Fq '"final_rollback_scope": "decoded_kitty_occurrence_2"' "$EVIDENCE" \
     || fail "Kitty final rollback scope drifted"
-grep -Fq '"replacement_peak": 1272' "$EVIDENCE" \
+grep -Fq '"replacement_peak": 1304' "$EVIDENCE" \
     || fail "Sixel replacement peak drifted"
 grep -Fq '"decoded_growth_overlap": 240' "$EVIDENCE" \
     || fail "Sixel geometric growth overlap drifted"
@@ -130,7 +130,7 @@ grep -Fq '"body_digest": 2489256947087179384' "$EVIDENCE" \
     || fail "Sixel body digest drifted"
 grep -Fq '"decoded_digest": 13492316921505547432' "$EVIDENCE" \
     || fail "Sixel decoded digest drifted"
-grep -Fq '"exact_limit": 1272' "$EVIDENCE" \
+grep -Fq '"exact_limit": 1304' "$EVIDENCE" \
     || fail "Sixel exact limit drifted"
 grep -Fq '"global_max_minus_stage": "terminal_outputs_publication_reserve"' "$EVIDENCE" \
     || fail "Sixel max-minus stage drifted"
@@ -144,9 +144,9 @@ grep -Fq '"failed_reconcile_reconciliations": 11' "$EVIDENCE" \
     || fail "observed-capacity reconcile telemetry drifted"
 grep -Fq '"process_current_at_limit": 29' "$EVIDENCE" \
     || fail "cross-session retained current drifted"
-grep -Fq '"required_peak": 1032' "$EVIDENCE" \
+grep -Fq '"required_peak": 1064' "$EVIDENCE" \
     || fail "cross-session required peak drifted"
-grep -Fq '"enforced_limit": 1031' "$EVIDENCE" \
+grep -Fq '"enforced_limit": 1063' "$EVIDENCE" \
     || fail "cross-session enforced limit drifted"
 grep -Fq '"rejection_reservation_delta": 10' "$EVIDENCE" \
     || fail "cross-session rejection reservations drifted"
@@ -154,19 +154,19 @@ grep -Fq '"rejection_allocator_delta": 7' "$EVIDENCE" \
     || fail "cross-session rejection allocations drifted"
 grep -Fq '"detached_requested": 32' "$EVIDENCE" \
     || fail "detached command body size drifted"
-grep -Fq '"detached_outputs_requested": 496' "$EVIDENCE" \
+grep -Fq '"detached_outputs_requested": 528' "$EVIDENCE" \
     || fail "detached output metadata size drifted"
-grep -Fq '"detached_total_requested": 528' "$EVIDENCE" \
+grep -Fq '"detached_total_requested": 560' "$EVIDENCE" \
     || fail "detached package size drifted"
-grep -Fq '"in_flight_process_peak": 1124' "$EVIDENCE" \
+grep -Fq '"in_flight_process_peak": 1156' "$EVIDENCE" \
     || fail "concurrent in-flight peak no longer exceeds the committed peak"
-grep -Fq '"process_current_before": 532' "$EVIDENCE" \
+grep -Fq '"process_current_before": 564' "$EVIDENCE" \
     || fail "concurrent initial current drifted"
 grep -Fq '"process_current_after_external_release": 596' "$EVIDENCE" \
     || fail "concurrent provisional current drifted"
 grep -Fq '"process_current_after_failure": 4' "$EVIDENCE" \
     || fail "concurrent rollback current drifted"
-grep -Fq '"process_peak_after_failure": 1016' "$EVIDENCE" \
+grep -Fq '"process_peak_after_failure": 1048' "$EVIDENCE" \
     || fail "concurrent committed peak drifted"
 grep -Fq '"class_states_exact": "pass"' "$EVIDENCE" \
     || fail "concurrent class snapshots drifted"
@@ -214,7 +214,7 @@ for format in raw_rgba zlib_rgba png sixel; do
     grep -Fq "\"id\": \"$format\"" "$EVIDENCE" \
         || fail "missing $format production format evidence"
 done
-grep -Fq '"measured_peak": 1178' "$EVIDENCE" \
+grep -Fq '"measured_peak": 1210' "$EVIDENCE" \
     || fail "PNG production peak drifted"
 grep -Fq '"decoded_digest": 11588189572237274325' "$EVIDENCE" \
     || fail "raw/zlib RGBA digest drifted"
@@ -226,9 +226,9 @@ grep -Fq '"input_bytes": 128' "$EVIDENCE" \
     || fail "metadata hostile-input size drifted"
 grep -Fq '"event_requested_peak": 46080' "$EVIDENCE" \
     || fail "metadata event peak drifted"
-grep -Fq '"output_requested_peak": 47616' "$EVIDENCE" \
+grep -Fq '"output_requested_peak": 50688' "$EVIDENCE" \
     || fail "metadata output peak drifted"
-grep -Fq '"measured_total_peak": 78400' "$EVIDENCE" \
+grep -Fq '"measured_total_peak": 81472' "$EVIDENCE" \
     || fail "metadata total peak drifted"
 grep -Fq '"max_minus_one_rejection": "session_limit"' "$EVIDENCE" \
     || fail "format or metadata max-minus rejection drifted"

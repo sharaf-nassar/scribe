@@ -1098,7 +1098,7 @@ async fn verify_completed_kitty() -> Result<(usize, usize), String> {
     let measured =
         counters(&session).map_err(|error| format!("unbounded counters after final: {error}"))?.0;
     let expected_rgba = [255, 0, 0, 255, 0, 255, 0, 255];
-    if measured.requested_peak != 1_011
+    if measured.requested_peak != 1_043
         || owner.pending_kitty_requested != 0
         || owner.completed_kitty_requested != 0
         || owner.completed_kitty_observed != 0
@@ -1325,7 +1325,7 @@ fn sixel_classes_released(session: &PtyTerminalImageState) -> Result<bool, Strin
 
 fn set_sixel_rejection_evidence(evidence: &mut SixelStorageEvidence) {
     "terminal_outputs_publication_reserve".clone_into(&mut evidence.global_max_minus_stage);
-    evidence.global_max_minus_overlap = [496, 288, 4, 4];
+    evidence.global_max_minus_overlap = [528, 288, 4, 4];
 }
 
 fn sixel_release_valid(
@@ -1376,7 +1376,7 @@ async fn verify_exact_sixel_storage() -> Result<
                 "candidate" => storage_class_exact(*session_class, 0, 3),
                 "active" => storage_class_exact(*session_class, 0, 6),
                 "events" => storage_class_exact(*session_class, 0, 480),
-                "outputs" => storage_class_exact(*session_class, 0, 496),
+                "outputs" => storage_class_exact(*session_class, 0, 528),
                 "canonical_sixel" => storage_class_exact(*session_class, 4, 4),
                 "decoded_sixel" => storage_class_exact(*session_class, 96, 288),
                 _ => false,
@@ -1440,8 +1440,8 @@ fn exact_sixel_values(
         && class_exact
         && peak.requested_current == 100
         && peak.observed_current == 100
-        && peak.requested_peak == 1_272
-        && peak.observed_peak == 1_272
+        && peak.requested_peak == 1_304
+        && peak.observed_peak == 1_304
         && peak.reservation_attempts == 13
         && peak.allocator_attempts == 10
         && peak.reserve_before_allocation_calls == 13
@@ -1855,7 +1855,7 @@ fn verify_decoder_observed_success(bytes: &[u8]) -> Result<ImageStorageCounters,
         (StorageAllocationClass::FramingCandidate, (0, 3, 0, 9)),
         (StorageAllocationClass::FramingActive, (0, 48, 0, 54)),
         (StorageAllocationClass::FramingEvents, (0, 480, 0, 483)),
-        (StorageAllocationClass::TerminalOutputs, (0, 496, 0, 499)),
+        (StorageAllocationClass::TerminalOutputs, (0, 528, 0, 531)),
         (StorageAllocationClass::DecodedKitty, (4, 12, 7, 21)),
     ];
     let classes_exact = success_classes.iter().zip(expected_classes).all(
@@ -1874,9 +1874,9 @@ fn verify_decoder_observed_success(bytes: &[u8]) -> Result<ImageStorageCounters,
     );
     let success_exact = success_pair.0 == success_pair.1
         && success_counters.requested_current == 4
-        && success_counters.requested_peak == 1_016
+        && success_counters.requested_peak == 1_048
         && success_counters.observed_current == 7
-        && success_counters.observed_peak == 1_031
+        && success_counters.observed_peak == 1_063
         && success_counters.reservation_attempts == 15
         && success_counters.allocator_attempts == 12
         && success_counters.reserve_before_allocation_calls == 15
@@ -1937,7 +1937,8 @@ async fn measure_framer_observed(bytes: &[u8]) -> Result<(usize, usize), String>
     let (framer_requested, framer_observed) = match framer_commit.outputs.as_slice() {
         [
             SessionTerminalOutput::Image {
-                boundary: TerminalImageBoundary::Kitty { command }, ..
+                boundary: TerminalImageBoundary::Kitty { command, .. },
+                ..
             },
         ] => (command.retained_requested_bytes(), command.retained_observed_bytes()),
         other => return Err(format!("capacity-observed framer boundary drifted: {other:?}")),
@@ -1974,7 +1975,7 @@ async fn measure_framer_observed(bytes: &[u8]) -> Result<(usize, usize), String>
 
 async fn verify_exact_framer_observed(bytes: &[u8]) -> Result<(), String> {
     let exact_policy = TerminalImageProcessPolicy::with_storage_capacity_observer_for_validation(
-        1_015,
+        1_047,
         u64::MAX,
         1,
     );
@@ -1982,14 +1983,14 @@ async fn verify_exact_framer_observed(bytes: &[u8]) -> Result<(), String> {
     let exact_commit = route(&mut exact, bytes.to_vec()).await.map_err(|error| {
         observed_capacity_context(
             "framer exact",
-            ObservedCapacityLimits { session: 1_015, process: u64::MAX, extra: 1 },
+            ObservedCapacityLimits { session: 1_047, process: u64::MAX, extra: 1 },
             &exact,
             &error,
         )
     })?;
     if !observed_framer_exact(&exact) || exact_commit.outputs.len() != 1 {
         return Err(format!(
-            "framer observed-capacity limit 1015 drifted: owner={:?} counters={:?}",
+            "framer observed-capacity limit 1047 drifted: owner={:?} counters={:?}",
             exact.storage_ownership(),
             exact.validation_storage_counters(),
         ));
@@ -2001,7 +2002,7 @@ async fn verify_exact_framer_observed(bytes: &[u8]) -> Result<(), String> {
 
 fn verify_rejected_framer_observed(bytes: &[u8]) -> Result<(), String> {
     let rejected_policy = TerminalImageProcessPolicy::with_storage_capacity_observer_for_validation(
-        1_014,
+        1_046,
         u64::MAX,
         1,
     );
@@ -2069,10 +2070,10 @@ fn verify_rejected_framer_observed(bytes: &[u8]) -> Result<(), String> {
 fn observed_framer_exact(session: &PtyTerminalImageState) -> bool {
     let (session_counters, process_counters) = session.validation_storage_counters();
     let counters_exact = session_counters == process_counters
-        && session_counters.requested_current == 531
-        && session_counters.requested_peak == 1_011
-        && session_counters.observed_current == 534
-        && session_counters.observed_peak == 1_015
+        && session_counters.requested_current == 563
+        && session_counters.requested_peak == 1_043
+        && session_counters.observed_current == 566
+        && session_counters.observed_peak == 1_047
         && session_counters.reservation_attempts == 13
         && session_counters.allocator_attempts == 10
         && session_counters.reserve_before_allocation_calls == 13
@@ -2081,7 +2082,7 @@ fn observed_framer_exact(session: &PtyTerminalImageState) -> bool {
         (StorageAllocationClass::FramingCandidate, (0, 3, 0, 5)),
         (StorageAllocationClass::FramingActive, (32, 48, 33, 50)),
         (StorageAllocationClass::FramingEvents, (0, 480, 0, 481)),
-        (StorageAllocationClass::TerminalOutputs, (496, 496, 497, 497)),
+        (StorageAllocationClass::TerminalOutputs, (528, 528, 529, 529)),
         (StorageAllocationClass::DecodedKitty, (3, 3, 4, 4)),
     ];
     let classes_exact = expected.into_iter().all(|(class, values)| {
@@ -2199,7 +2200,7 @@ fn verify_cross_session() -> Result<(CrossSessionEvidence, u64), String> {
     let sixel = b"\x1bPq~\x1b\\";
     let (process_at_limit, replacement_process) = verify_cross_session_exact(&kitty, sixel)?;
     let rejected_policy =
-        TerminalImageProcessPolicy::with_storage_limits_for_validation(u64::MAX, 1_031);
+        TerminalImageProcessPolicy::with_storage_limits_for_validation(u64::MAX, 1_063);
     let mut foreign = PtyTerminalImageState::new(Arc::clone(&rejected_policy));
     let mut pressured = PtyTerminalImageState::new(rejected_policy);
     drop(foreign.process_bytes(&kitty).map_err(|error| error.to_string())?);
@@ -2249,8 +2250,8 @@ fn verify_cross_session() -> Result<(CrossSessionEvidence, u64), String> {
             typed_rejection: "process_limit",
             foreign_session_unchanged: unchanged,
             current_after_release: final_process.requested_current,
-            required_peak: 1_032,
-            enforced_limit: 1_031,
+            required_peak: 1_064,
+            enforced_limit: 1_063,
             reservation_attempts: after_counters.1.reservation_attempts,
             allocator_attempts: after_counters.1.allocator_attempts,
             reserve_before_allocation_calls: after_counters.1.reserve_before_allocation_calls,
@@ -2275,7 +2276,7 @@ fn verify_cross_session_exact(
     kitty: &[u8],
     sixel: &[u8],
 ) -> Result<(ImageStorageCounters, ImageStorageCounters), String> {
-    let policy = TerminalImageProcessPolicy::with_storage_limits_for_validation(u64::MAX, 1_032);
+    let policy = TerminalImageProcessPolicy::with_storage_limits_for_validation(u64::MAX, 1_064);
     let mut first = PtyTerminalImageState::new(Arc::clone(&policy));
     let mut second = PtyTerminalImageState::new(policy);
     drop(first.process_bytes(kitty).map_err(|error| error.to_string())?);
@@ -2294,7 +2295,7 @@ fn verify_cross_session_exact(
             "candidate" => (3, 3),
             "active" => (2, 48),
             "events" => (480, 480),
-            "outputs" => (496, 496),
+            "outputs" => (528, 528),
             "canonical_sixel" => (2, 2),
             "decoded_sixel" => (96, 96),
             _ => return false,
@@ -2304,19 +2305,19 @@ fn verify_cross_session_exact(
             && process.requested_peak == process.observed_peak
     });
     if first_process.requested_current != 4
-        || first_process.requested_peak != 1_016
+        || first_process.requested_peak != 1_048
         || first_process.reservation_attempts != 15
         || first_process.allocator_attempts != 12
         || first_process.reserve_before_allocation_calls != 15
         || first_process.observed_reconciliations != 12
         || process_at_limit.requested_current != 29
-        || process_at_limit.requested_peak != 1_016
+        || process_at_limit.requested_peak != 1_048
         || process_at_limit.reservation_attempts != 26
         || process_at_limit.allocator_attempts != 20
         || process_at_limit.reserve_before_allocation_calls != 26
         || process_at_limit.observed_reconciliations != 20
         || replacement_process.requested_current != 29
-        || replacement_process.requested_peak != 1_032
+        || replacement_process.requested_peak != 1_064
         || replacement_process.reservation_attempts != 37
         || replacement_process.allocator_attempts != 28
         || replacement_process.reserve_before_allocation_calls != 37
@@ -2434,7 +2435,8 @@ fn seed_concurrent_detached(
     let requested = match detached.outputs.as_slice() {
         [
             SessionTerminalOutput::Image {
-                boundary: TerminalImageBoundary::Kitty { command }, ..
+                boundary: TerminalImageBoundary::Kitty { command, .. },
+                ..
             },
         ] => command.retained_requested_bytes(),
         other => return Err(format!("detached owner did not use Kitty boundary: {other:?}")),
@@ -2535,7 +2537,7 @@ fn concurrent_classes_exact(
             (0, 3, 0, 3),
             (32, 48, 32, 48),
             (0, 480, 0, 480),
-            (496, 496, 496, 496),
+            (528, 528, 528, 528),
             (0, 0, 0, 0),
             (4, 12, 4, 12),
             (0, 0, 0, 0),
@@ -2547,7 +2549,7 @@ fn concurrent_classes_exact(
             (0, 3, 0, 3),
             (0, 48, 64, 128),
             (0, 480, 480, 480),
-            (0, 496, 0, 496),
+            (0, 528, 0, 528),
             (0, 0, 48, 48),
             (4, 12, 4, 12),
             (0, 0, 0, 0),
@@ -2559,7 +2561,7 @@ fn concurrent_classes_exact(
             (0, 0, 0, 3),
             (0, 0, 0, 48),
             (0, 0, 0, 480),
-            (0, 0, 0, 496),
+            (0, 0, 0, 528),
             (0, 0, 0, 0),
             (0, 0, 4, 12),
             (0, 0, 0, 0),
@@ -2592,22 +2594,22 @@ fn concurrent_release_valid(check: &ConcurrentReleaseCheck<'_>) -> bool {
         check.result,
         Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))
     ) && check.detached_requested == 32
-        && check.detached_outputs_requested == 496
-        && check.detached_total_requested == 528
-        && check.before.requested_current == 532
-        && check.before.requested_peak == 1_016
+        && check.detached_outputs_requested == 528
+        && check.detached_total_requested == 560
+        && check.before.requested_current == 564
+        && check.before.requested_peak == 1_048
         && check.before.reservation_attempts == 15
         && check.before.allocator_attempts == 12
         && check.before.reserve_before_allocation_calls == 15
         && check.before.observed_reconciliations == 12
         && check.after_external_release.requested_current == 596
-        && check.after_external_release.requested_peak == 1_124
+        && check.after_external_release.requested_peak == 1_156
         && check.after_external_release.reservation_attempts == 28
         && check.after_external_release.allocator_attempts == 22
         && check.after_external_release.reserve_before_allocation_calls == 28
         && check.after_external_release.observed_reconciliations == 22
         && check.process_after_failure.requested_current == 4
-        && check.process_after_failure.requested_peak == 1_016
+        && check.process_after_failure.requested_peak == 1_048
         && check.process_after_failure.reservation_attempts == 28
         && check.process_after_failure.allocator_attempts == 22
         && check.process_after_failure.reserve_before_allocation_calls == 28
@@ -3160,7 +3162,7 @@ fn verify_kitty_split_case() -> Result<KittySplitCase, String> {
         match first.outputs.as_slice() {
             [
                 SessionTerminalOutput::Image {
-                    boundary: TerminalImageBoundary::Kitty { command },
+                    boundary: TerminalImageBoundary::Kitty { command, .. },
                     ..
                 },
             ] => (
@@ -3184,7 +3186,8 @@ fn verify_kitty_split_case() -> Result<KittySplitCase, String> {
     {
         [
             SessionTerminalOutput::Image {
-                boundary: TerminalImageBoundary::Kitty { command }, ..
+                boundary: TerminalImageBoundary::Kitty { command, .. },
+                ..
             },
         ] => (
             command.action == scribe_pty::graphics_framing::KittyAction::TransmitDisplay
@@ -3273,9 +3276,9 @@ fn verify_kitty_chunk_count() -> Result<u64, String> {
     let count_after_digest = chunk_count.validation_storage_digests();
     let expected_count_before = ImageStorageCounters {
         requested_current: 98_304,
-        requested_peak: 148_440,
+        requested_peak: 148_472,
         observed_current: 98_304,
-        observed_peak: 148_440,
+        observed_peak: 148_472,
         reservation_attempts: 327_698,
         allocator_attempts: 229_394,
         reserve_before_allocation_calls: 327_698,
@@ -3283,9 +3286,9 @@ fn verify_kitty_chunk_count() -> Result<u64, String> {
     };
     let expected_count_after = ImageStorageCounters {
         requested_current: 0,
-        requested_peak: 148_440,
+        requested_peak: 148_472,
         observed_current: 0,
-        observed_peak: 148_440,
+        observed_peak: 148_472,
         reservation_attempts: 327_708,
         allocator_attempts: 229_401,
         reserve_before_allocation_calls: 327_708,
@@ -3362,7 +3365,7 @@ fn verify_kitty_query_case() -> Result<KittyQueryCase, String> {
         query_first.outputs.as_slice(),
         [SessionTerminalOutput::Image {
             sequence,
-            boundary: TerminalImageBoundary::Kitty { command },
+            boundary: TerminalImageBoundary::Kitty { command, .. },
             ..
         }] if sequence.0 == 1
             && command.action == scribe_pty::graphics_framing::KittyAction::Query

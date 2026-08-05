@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::time::Instant;
 
 /// Number of distinct paired-ledger storage classes.
-const CLASS_COUNT: usize = 8;
+const CLASS_COUNT: usize = 9;
 
 /// Stable allocation classes shared by the production image decoders.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +42,7 @@ pub enum StorageClass {
     DecodedKitty,
     DecodedSixel,
     GridObservations,
+    CanonicalMutations,
 }
 
 impl StorageClass {
@@ -55,6 +56,7 @@ impl StorageClass {
             Self::DecodedKitty => 5,
             Self::DecodedSixel => 6,
             Self::GridObservations => 7,
+            Self::CanonicalMutations => 8,
         }
     }
 }
@@ -427,8 +429,8 @@ impl DecodeStorage {
         paired_results(healthy(&process), healthy(&session))?;
         restore_peaks(&mut process.counters, checkpoint.process);
         restore_peaks(&mut session.counters, checkpoint.session);
-        restore_class_peaks(&mut process.classes, checkpoint.process_classes);
-        restore_class_peaks(&mut session.classes, checkpoint.session_classes);
+        restore_class_peaks(&mut process.classes, &checkpoint.process_classes);
+        restore_class_peaks(&mut session.classes, &checkpoint.session_classes);
         Ok(())
     }
 
@@ -457,7 +459,7 @@ fn restore_peaks(counters: &mut StorageCounters, checkpoint: StorageCounters) {
 
 fn restore_class_peaks(
     counters: &mut [StorageClassCounters; CLASS_COUNT],
-    checkpoint: [StorageClassCounters; CLASS_COUNT],
+    checkpoint: &[StorageClassCounters; CLASS_COUNT],
 ) {
     for (counter, saved) in counters.iter_mut().zip(checkpoint) {
         counter.requested_peak = saved.requested_peak;

@@ -374,6 +374,45 @@ no canonical Kitty class because the live transfer/decoded owner is retained
 directly. Class-local occurrence counts cannot be
 satisfied by unrelated framing or decoding work.
 
+## Transactional Image Mutations
+
+Canonical definitions and placements change all-or-nothing: a read either commits every mutation it implies or leaves the prior state, ownership, and counters exactly as they were.
+
+Framing runs before the terminal does, so a completed boundary cannot know its
+own cursor yet. Each boundary therefore carries payload-free decoded canonical
+facts, and a second phase replays the read's grid effects and image boundaries
+in original byte order against a clone of canonical state. The clone is swapped
+in only after the whole read succeeds. Out-of-band spans — resize and
+synchronized-update flush — commit through the same boundary.
+
+Ordered mutations are reserved from the paired session/process ledger before
+they are retained, because one grid effect can republish every live placement.
+The definition and placement maps themselves stay inside the frozen
+`max_images_per_session` and `max_placements_per_session` ceilings.
+
+A compound transmit-and-display validates both halves before committing either,
+so an invalid source rectangle or destination extent leaves no definition
+behind. Placements are keyed by screen plus the complete protocol identity
+`(image_id, placement_id)`. Server-assigned identifiers for unnamed images
+start above the Kitty `i=` range and can never collide with an application's
+choice. Reaching a session ceiling evicts the oldest committed entry by a
+monotonic tick, not by identifier value, and publishes that removal before the
+mutation that displaced it.
+
+Delete operands keep their own presence. An omitted `i=`, `p=`, `x=`, `y=`, or
+`z=` matches everything in scope; an explicit `0` stays a literal value.
+Identity and placement scopes reach both screens, matching Kitty's image-global
+delete semantics, while every geometric scope stays on the active screen. Cell
+operands are converted from Kitty's 1-based coordinates to canonical 0-based
+anchors, and the uppercase selector polarity is what frees canonical data.
+
+Protocol lifecycles stay distinct. ED2, a hard reset, and alternate-screen
+creation clear visible graphics; every other text erase leaves Kitty placements
+alone and removes only the Sixel placements sharing those cells. Erase
+rectangles, scroll margins, and resize viewports are half-open on every edge,
+matching the observer that produced them, and the client applies the same
+shared placement geometry so both sides converge.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.

@@ -469,6 +469,28 @@ impl TerminalImageCellClip {
         (intersection.top < intersection.bottom && intersection.left < intersection.right)
             .then_some(intersection)
     }
+
+    /// Half-open row containment.
+    #[must_use]
+    pub fn contains_row(self, row: i32) -> bool {
+        row >= self.top && row < self.bottom
+    }
+
+    /// Half-open column containment.
+    #[must_use]
+    pub fn contains_column(self, column: i32) -> bool {
+        column >= self.left && column < self.right
+    }
+
+    /// Translate this mask upward by a scroll of `rows` lines.
+    #[must_use]
+    pub fn shifted_rows(self, rows: i32) -> Self {
+        Self {
+            top: self.top.saturating_sub(rows),
+            bottom: self.bottom.saturating_sub(rows),
+            ..self
+        }
+    }
 }
 
 /// One canonical terminal-cell placement. All geometry is scalar and bounded
@@ -528,6 +550,101 @@ impl TerminalImagePlacement {
         Ok(())
     }
 
+    /// Visible half-open cell mask, or `None` when nothing remains visible.
+    ///
+    /// Unicode placeholders occupy terminal cells the application owns, so
+    /// they have no geometric envelope and never participate in area effects.
+    #[must_use]
+    pub fn effective_cell_clip(&self) -> Option<TerminalImageCellClip> {
+        let envelope = self.logical_cell_envelope().ok()?;
+        self.cell_clip.map_or(Some(envelope), |clip| envelope.intersection(clip))
+    }
+
+    /// Whether a half-open cell rectangle overlaps this placement's mask.
+    #[must_use]
+    pub fn intersects_cells(&self, area: TerminalImageCellClip) -> bool {
+        self.effective_cell_clip().and_then(|effective| effective.intersection(area)).is_some()
+    }
+
+    /// Exact protocol-identity match for one Kitty delete command.
+    ///
+    /// Omitted operands stay `None` and match every value; an explicit `0`
+    /// stays a literal comparison, so `i=0` can never behave as a wildcard.
+    #[must_use]
+    pub fn matches_delete(&self, delete: &TerminalImageDelete) -> bool {
+        let image_matches = delete.image_id.is_none_or(|id| self.image_id == id);
+        let placement_matches = delete.placement_id.is_none_or(|id| self.id == id);
+        if self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
+            return delete.scope == TerminalImageDeleteScope::Image
+                && delete.image_id.is_some()
+                && image_matches;
+        }
+        let effective = self.effective_cell_clip();
+        match delete.scope {
+            TerminalImageDeleteScope::AllPlacements => true,
+            TerminalImageDeleteScope::Image => image_matches,
+            TerminalImageDeleteScope::Placement => image_matches && placement_matches,
+            TerminalImageDeleteScope::Cell => delete.coordinate.is_some_and(|coordinate| {
+                effective.is_some_and(|clip| {
+                    clip.contains_row(coordinate) || clip.contains_column(coordinate)
+                })
+            }),
+            TerminalImageDeleteScope::Row => delete.coordinate.is_some_and(|coordinate| {
+                effective.is_some_and(|clip| clip.contains_row(coordinate))
+            }),
+            TerminalImageDeleteScope::Column => delete.coordinate.is_some_and(|coordinate| {
+                effective.is_some_and(|clip| clip.contains_column(coordinate))
+            }),
+            TerminalImageDeleteScope::ZIndex => delete.coordinate == Some(self.z_index),
+        }
+    }
+
+    /// Move this placement through one half-open scroll margin.
+    ///
+    /// Returns `false` when nothing visible survives, so callers can `retain`
+    /// on the result.
+    pub fn apply_scroll(&mut self, margin: TerminalImageCellClip, rows: i32) -> bool {
+        if rows == 0
+            || !self.scrolls_with_grid
+            || self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder
+        {
+            return true;
+        }
+        let Ok(old_envelope) = self.logical_cell_envelope() else { return false };
+        let participates = match self.cell_clip {
+            None => self.anchor.row >= margin.top && self.anchor.row < margin.bottom,
+            Some(clip) => old_envelope
+                .intersection(clip)
+                .and_then(|effective| effective.intersection(margin))
+                .is_some(),
+        };
+        if !participates {
+            return true;
+        }
+        self.anchor.row = self.anchor.row.saturating_sub(rows);
+        let Ok(new_envelope) = self.logical_cell_envelope() else { return false };
+        let candidate = self.cell_clip.map_or(margin, |clip| clip.shifted_rows(rows));
+        self.cell_clip = new_envelope
+            .intersection(candidate)
+            .and_then(|effective| effective.intersection(margin));
+        self.cell_clip.is_some()
+    }
+
+    /// Intersect this placement's mask with a half-open viewport rectangle.
+    ///
+    /// Returns `false` when nothing visible survives, so callers can `retain`
+    /// on the result.
+    pub fn clip_to_viewport(&mut self, viewport: TerminalImageCellClip) -> bool {
+        if self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
+            return true;
+        }
+        let Ok(envelope) = self.logical_cell_envelope() else { return false };
+        let candidate = self.cell_clip.unwrap_or(envelope);
+        self.cell_clip =
+            envelope.intersection(candidate).and_then(|effective| effective.intersection(viewport));
+        self.cell_clip.is_some()
+    }
+
     /// Checked conservative cell envelope for classic and Sixel pixels.
     pub fn logical_cell_envelope(&self) -> Result<TerminalImageCellClip, ImageBoundError> {
         if self.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
@@ -552,7 +669,7 @@ impl TerminalImagePlacement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalScreenKind {
     Primary,
@@ -560,14 +677,38 @@ pub enum TerminalScreenKind {
 }
 
 /// Grid consequences committed in the same output sequence as image state.
+///
+/// Every row and column bound is half-open: the `top`/`left` edge is included
+/// and the `bottom`/`right` edge is excluded, matching the server-side
+/// Alacritty observation that produced it. An empty rectangle therefore has
+/// `bottom <= top` or `right <= left` and affects nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalGridEffect {
-    MoveCursor { row: i32, column: u16 },
-    Scroll { top: u16, bottom: u16, rows: i32 },
-    EraseCells { top: u16, left: u16, bottom: u16, right: u16 },
-    ResizeClip { columns: u16, rows: u16 },
-    SwitchScreen { screen: TerminalScreenKind },
+    MoveCursor {
+        row: i32,
+        column: u16,
+    },
+    /// Half-open scroll region; `bottom` is the first row below the margin.
+    Scroll {
+        top: u16,
+        bottom: u16,
+        rows: i32,
+    },
+    /// Half-open erase rectangle; `bottom`/`right` are exclusive.
+    EraseCells {
+        top: u16,
+        left: u16,
+        bottom: u16,
+        right: u16,
+    },
+    ResizeClip {
+        columns: u16,
+        rows: u16,
+    },
+    SwitchScreen {
+        screen: TerminalScreenKind,
+    },
     SoftReset,
     HardReset,
 }

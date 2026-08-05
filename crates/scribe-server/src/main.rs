@@ -89,7 +89,11 @@ fn main() -> Result<(), ScribeError> {
         .map_err(|e| ScribeError::Io { source: e })?;
 
     let result = runtime.block_on(async {
-        if upgrade_mode { run_upgrade_receiver().await } else { run_normal_server().await }
+        if upgrade_mode {
+            Box::pin(run_upgrade_receiver()).await
+        } else {
+            Box::pin(run_normal_server()).await
+        }
     });
 
     // `Runtime`'s own `Drop` waits on the blocking pool with no bound, so a

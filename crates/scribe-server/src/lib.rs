@@ -24,6 +24,7 @@ pub mod session_manager;
 pub mod shell_integration;
 pub mod stop_classifier;
 pub mod tailnet;
+pub mod terminal_image_mutations;
 pub mod terminal_image_state;
 pub mod updater;
 pub mod workspace_manager;

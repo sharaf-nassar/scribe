@@ -94,6 +94,51 @@ screen activation. Evidence is schema-versioned and payload-free.
 The gate pins Alacritty `0.26.0-rc1`, one processor, payload-free evidence, and
 an explicit passing result for every lifecycle case.
 
+## Transactional Image Mutations
+
+The functional harness proves that canonical definitions and placements commit all-or-nothing through the production seam, with no host Scribe runtime and no second state engine.
+
+### Production Mutation Probe
+
+The probe drives real PTY bytes through framing, the pinned Alacritty `Term`,
+and the transactional mutation commit in production order.
+
+A transmit-and-display publishes one definition and one placement anchored at
+the cursor its final chunk observed. An oversized source rectangle rejects the
+whole compound command, so no definition survives a placement that could never
+be published; placing an untransmitted image is a typed `image_not_found`
+rejection rather than a panic.
+
+An injected mutation-class storage rejection, calibrated against an identical
+non-firing run, fails the following read. Canonical definitions, placements,
+and session/process storage ownership all match the pre-read snapshot.
+
+Delete cases separate identity from polarity. Lowercase `d=i` drops one image's
+placements and keeps its data; uppercase `d=I` also frees the unreferenced
+definition. An omitted `z=` operand matches nothing, while an explicit `z=0`
+matches only the zero-index placement, so no omitted operand can become a
+wildcard.
+
+Filling the 128-image and 1,024-placement session ceilings evicts the oldest
+entry first and publishes that removal before the mutation that displaced it.
+Placements stay scoped to the screen that was active when they were created,
+and entering the alternate screen creates a grid with no images on it.
+
+ED2 clears every visible placement on its own screen while keeping canonical
+image data; a hard reset drops definitions too. An ordinary line erase removes
+only the Sixel placement sharing those cells and leaves Kitty graphics intact.
+Erase rectangles and scroll margins are half-open, so a Sixel one column beyond
+the erase and a placement anchored on the exclusive scroll bound are both
+untouched. One resize clips the active and inactive grids alike.
+
+### Docker Evidence Entry Point
+
+`terminal-image-mutations.sh` runs the production mutation probe in the functional Docker image.
+
+The gate pins the schema version, the production mutation engine name,
+payload-free evidence, both session ceilings, and an explicit passing result
+for every transactional case.
+
 ## Terminal Image Storage Accounting
 
 The functional harness proves requested-storage ownership through the production session seam without exposing image payloads or claiming byte-exact RSS.
@@ -107,8 +152,8 @@ limits through production ingestion. A valid split 2x1 Kitty RGBA transfer
 retains 8 decoded bytes without an encoded duplicate. A 4x6 Sixel retains 4
 body and 96 decoded bytes; geometric 48-to-192 canvas growth and 96-byte
 compaction produce an exact 288-byte decoded-class overlap. Replacement of a
-retained Kitty image requires a measured 1,028-byte simultaneous peak; a
-1,027-byte ceiling preserves prior current, peak, owners, digests, and
+retained Kitty image requires a measured 1,060-byte simultaneous peak; a
+1,059-byte ceiling preserves prior current, peak, owners, digests, and
 state while attempt telemetry advances exactly.
 
 Split Kitty commands preserve first-chunk controls and exercise real base64 and
@@ -116,9 +161,9 @@ RGBA allocations. More than 4,096 aggregate encoded bytes succeed across valid
 chunks, one chunk above 4,096 fails, and chunk 32,769 fails before mutation.
 Equal repeated controls are accepted, conflicts fail, and query boundaries
 retain no canonical image state. Sixel completion drives the vendored decoder.
-Two sessions sharing one policy admit a 1,032-byte process replacement peak,
-while 1,031 rejects only later output publication and preserves both owners.
-Observed-capacity cases prove exact 1,015 framer and 1,031 decoder observed
+Two sessions sharing one policy admit a 1,064-byte process replacement peak,
+while 1,063 rejects only later output publication and preserves both owners.
+Observed-capacity cases prove exact 1,047 framer and 1,063 decoder observed
 peaks and output-metadata reconcile rollback at each one-less ceiling.
 
 The final boundary of a split transfer republishes the first command's controls
@@ -126,10 +171,10 @@ and control presence, so a last chunk carrying only `m=0` never publishes
 default action, format, dimensions, identifiers, or quiet level.
 
 A deterministic paused reservation holds one failing session transaction while
-another session drops a detached 528-byte package: 32 command-body bytes plus
-496 output-metadata bytes. With 592 provisional bytes, process current follows
-`532 + 592 - 528 = 596`, then rollback leaves the foreign decoded owner at 4.
-The committed 1,016 peak is restored instead of the in-flight 1,124 peak, and
+another session drops a detached 560-byte package: 32 command-body bytes plus
+528 output-metadata bytes. With 592 provisional bytes, process current follows
+`564 + 592 - 560 = 596`, then rollback leaves the foreign decoded owner at 4.
+The committed 1,048 peak is restored instead of the in-flight 1,156 peak, and
 the case requires the in-flight peak to exceed the committed one so peak
 rollback cannot pass vacuously. The internal invariant stays specifically typed
 without deadlock.

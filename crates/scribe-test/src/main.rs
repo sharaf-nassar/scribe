@@ -19,6 +19,7 @@ mod session;
 mod share_tap;
 mod sixel_decoder;
 mod terminal_image_accounting;
+mod terminal_image_mutations;
 mod terminal_image_observer_parity;
 mod terminal_image_state_seam;
 mod wait;
@@ -343,6 +344,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify transactional terminal-image definition and placement mutation.
+    TerminalImageMutations {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -563,11 +570,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageStateSeam { evidence } => run_terminal_image_state_seam(&evidence),
         Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
         Command::TerminalImageAccounting { evidence } => run_terminal_image_accounting(&evidence),
+        Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
-            let rt =
-                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
-            rt.block_on(share_tap::run(&listen, &upstream, &record, &control))
-                .map_err(|e| TestError::InfraError(e.to_string()))
+            run_share_tap(&listen, &upstream, &record, &control)
         }
         Command::LanPeer(args) => run_lan_peer(args),
         Command::RemotePeer(args) => run_remote_peer(args),
@@ -591,6 +596,21 @@ fn run_observer_parity(evidence: &std::path::Path) -> Result<(), TestError> {
 
 fn run_terminal_image_accounting(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_accounting::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_share_tap(
+    listen: &std::path::Path,
+    upstream: &std::path::Path,
+    record: &std::path::Path,
+    control: &std::path::Path,
+) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    rt.block_on(share_tap::run(listen, upstream, record, control))
+        .map_err(|e| TestError::InfraError(e.to_string()))
+}
+
+fn run_terminal_image_mutations(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_mutations::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
