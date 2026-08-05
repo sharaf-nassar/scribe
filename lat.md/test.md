@@ -921,6 +921,55 @@ outcome, and the final counters — and the run refuses any manifest that embedd
 array-shaped data. The recorded probe replies, the sharing probe's log, and the
 server log it read land beside it.
 
+## Native macOS Metal Parity Corpus
+
+`tests/native-macos/terminal-images-metal.sh` is the only terminal-image corpus that runs outside Docker, on the sanctioned GPU-backed `macos-14-xlarge` runner, and the only one that can observe Metal.
+
+It exists to answer one question the Linux harness cannot: does the supported
+macOS platform advertise and reach the same image subset? It therefore repeats
+the shared corpus rather than inventing a second oracle, and asserts the
+platform-specific facts on top.
+
+### The native run repeats the shared subset and adds Metal
+
+The driver re-asserts the wrapper's runner guard before touching a Scribe
+binary, so a direct invocation cannot reach a runtime call either.
+
+It records the frozen contract's digest and the pinned application versions,
+runs every in-process protocol probe against the owned fixtures — framing, IPC,
+client scene and replay, combined replay, replies and capability lifecycle,
+handoff, settings, state seam, server state, accounting, scheduling, transfer
+lifecycle, mutations, convergence, observer parity, and both decoders — and
+fails on the first non-zero probe, which is what makes the protocol claim about
+ARM64 macOS rather than about x86-64 Linux only.
+
+The pinned corpus is provisioned from the same versions and checksums
+`docker/Dockerfile.visual` pins, then driven through a live native server whose
+harness viewer announces the renderer subset. Steps assert the server's own
+counters: the owned placeholder fixture, Chafa through Kitty and through Sixel,
+gnuplot's `sixelgd`, and Yazi's answered generic Kitty query followed by a
+Sixel draw, with no typed graphics failure anywhere.
+
+The Metal phase requires the running window to report the `metal` renderer,
+one source per definition, one
+reuse across the full and cropped placements, 1-by-1 and 4096-by-1 uploads,
+4097-by-1 rejection with zero `RenderImage` objects created, atlas recovery
+that preserves source identities, and three final-reference drops. Stages
+advance unattended from the render pass, because the runner cannot synthesize
+key events.
+
+### Native evidence entry point
+
+`just native-macos-terminal-images` is the only sanctioned entry point, and it runs only from the manual workflow.
+
+Evidence lands under `test-output/terminal-images/macos/`: `metal.json` is the
+machine-readable manifest, with the protocol probe evidence, the application
+step counters and server log, and the sanitized spike log beside it. The
+manifest names what the native run deliberately does not cover — the SSH hop,
+compared pixel captures, and an induced device loss — so review reads the gap
+from the artifact instead of inferring it. See
+[[terminal-images#Native macOS Metal Validation]].
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.

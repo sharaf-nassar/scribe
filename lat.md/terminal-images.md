@@ -1341,17 +1341,36 @@ substitute. See [[test#Sandbox limits#Host-only hardware and platforms]].
 
 ### Required Metal lifecycle assertions
 
-The downstream native driver must run the same crop and lifecycle corpus on Metal plus a genuine recoverable device-loss phase.
+`tests/native-macos/terminal-images-metal.sh` runs the same contract, protocol, and pinned-application corpus the Linux harness runs, then the Metal facts Docker cannot produce.
 
-The driver must record a Metal adapter, one upload for shared full/crop
-placements, a green cropped quadrant, reusable texture space after
-`drop_image`, three final-reference drops, unchanged pixels after recreation,
-1-by-1 and 4096-by-1 uploads, and 4097-by-1 rejection with zero new
-`RenderImage` objects. It must then induce one recoverable device loss through
-a pinned test hook, observe GPUI context and atlas recreation, preserve source
-identities, and require a zero-difference repaint.
+The driver repeats the wrapper's context guard so a direct invocation cannot
+reach a runtime call either, then records the frozen contract digest, runs
+every in-process protocol probe against the owned fixtures on ARM64 macOS,
+provisions the pinned Yazi/Chafa/gnuplot versions from the same checksums
+`docker/Dockerfile.visual` pins, and drives them through a live native server
+and a capable harness viewer.
 
-Terminal placement rendering now exists, but the genuine Metal device-loss
-hook and downstream native driver do not. The workflow remains fail-closed
-until those native pieces land; the Linux atlas-clear proxy must not satisfy
-the Metal device-loss assertion.
+Its Metal phase requires the running window to report the `metal` renderer.
+`gpui_macos` has only a Metal renderer, but unlike `gpui_wgpu` it logs no
+selected adapter and returns `None` from `Window::gpu_specs`, so the window
+names the backend that painted it and the host's Metal device is recorded
+beside it from `system_profiler`. The phase then requires one `RenderImage` per
+definition, one reuse across the full and cropped placements, 1-by-1 and
+4096-by-1 uploads, 4097-by-1 rejection with zero `RenderImage` objects created,
+atlas recovery that preserves source identities, and three final-reference
+drops. Stages advance from the render pass under
+`SCRIBE_GPUI_IMAGE_SPIKE_AUTO=1`, because a hosted runner cannot synthesize key
+events without an interactive accessibility grant; the Linux spike proves that
+same unattended path.
+
+Three Linux assertions have no native counterpart and the manifest names them
+in `not_covered_natively`: the SSH hop (a transport, not a platform, fact), the
+compared pixel captures, and an induced device loss. Window capture and key
+synthesis both need a TCC grant no hosted runner has, so the native run asserts
+protocol and lifecycle effects instead of pixels. In GPUI revision
+`f96212f2c50f54d93712fa130d6226b1ce7d76b5` device-loss handling exists only in
+`gpui_wgpu`, is set only from wgpu's own callback, and has no macOS
+counterpart, so a genuine recoverable device loss cannot be induced from an
+application without forking GPUI. That
+decision is tracked separately and still blocks default-on release; the Linux
+atlas-clear proxy must not satisfy it.
