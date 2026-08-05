@@ -25,7 +25,8 @@ grep -Fq '"payload_free": true' "$EVIDENCE" || fail "evidence claims retained pa
 
 # Every acceptance behavior maps to a named case.
 for case in bounded_maximum_scene_chunks atomic_late_attach live_buffered_behind_replay \
-    dropped_output_recovery viewerless_output simultaneous_viewers \
+    idle_attach_drains_replay_debt dropped_output_recovery viewerless_output \
+    simultaneous_viewers \
     no_per_sink_retained_duplicate_scene; do
     grep -Fq "\"$case\": \"pass\"" "$EVIDENCE" || fail "case $case did not pass"
 done
@@ -53,6 +54,18 @@ grep -Fq '"wire_order": "replay_begin,replay_definition,replay_chunk,replay_plac
     "$EVIDENCE" || fail "the attaching viewer observed the wrong wire order"
 grep -Fq '"replayed_definitions": 1' "$EVIDENCE" || fail "the late attach replayed no definition"
 grep -Fq '"replayed_placements": 1' "$EVIDENCE" || fail "the late attach replayed no placement"
+
+# A viewer attaching to an idle session is caught up by the attach itself: no
+# PTY read follows the commit, and a disabled session still hands out nothing.
+grep -Fq '"debt_at_attach": 1' "$EVIDENCE" || fail "an attaching viewer owed no replay"
+grep -Fq '"debt_after_drain": 0' "$EVIDENCE" \
+    || fail "the attach path left an idle viewer in replay debt"
+grep -Fq '"commit_seen": true' "$EVIDENCE" \
+    || fail "the idle viewer never read a replay commit"
+grep -Fq '"disabled_records_received": 0' "$EVIDENCE" \
+    || fail "a disabled session replayed its retired scene at attach"
+grep -Fq '"disabled_debt_kept": 1' "$EVIDENCE" \
+    || fail "a disabled session cleared replay debt it never paid"
 
 # A saturated viewer sheds this session's queued output, stops receiving deltas
 # entirely, and one fresh combined replay clears the debt.

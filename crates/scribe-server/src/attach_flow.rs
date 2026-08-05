@@ -13,8 +13,9 @@ use scribe_common::screen_replay::{SessionReplay, build_session_replay};
 
 use crate::ipc_server::{
     AttachSessionData, AttachedSessionIds, ClientWriter, LiveSessionRegistry, SessionAttachment,
-    SessionCommit, SharedWriter, TermCommit, begin_sink_attach, finish_sink_attach,
-    note_unpaced_resize_apply, resize_term, send_message, set_pty_winsize,
+    SessionCommit, SessionImageState, SharedImageSharing, SharedWriter, TermCommit,
+    begin_sink_attach, drain_image_replay_debt, finish_sink_attach, note_unpaced_resize_apply,
+    resize_term, send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
 use crate::terminal_image_state::TerminalGridObserverHandle;
@@ -54,6 +55,8 @@ struct AttachEntry {
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     term_commit: SessionCommit,
     terminal_grid_observer: TerminalGridObserverHandle,
+    terminal_images: SessionImageState,
+    image_sharing: SharedImageSharing,
     resize_fd: Arc<OwnedFd>,
     target_dims: Option<TerminalSize>,
     has_handoff_snapshot: bool,
@@ -71,6 +74,8 @@ impl From<AttachSessionData> for AttachEntry {
             term: data.term,
             term_commit: data.term_commit,
             terminal_grid_observer: data.terminal_grid_observer,
+            terminal_images: data.terminal_images,
+            image_sharing: data.image_sharing,
             resize_fd: data.resize_fd,
             target_dims: data.target_dims,
             has_handoff_snapshot: data.has_handoff_snapshot,
@@ -241,6 +246,16 @@ async fn attach_one_session(
     begin_sink_attach(&entry.client_writer, writer, additive).await;
     let snapshot_commit = send_attach_replay(entry, writer, live_sessions).await;
     finish_sink_attach(&entry.client_writer, writer, snapshot_commit, entry.session_id);
+    // The text replay this sink just received carries no images, and on a quiet
+    // pane the commit path's drain may never run again — so the debt this
+    // attach created is paid here rather than at the application's next byte.
+    drain_image_replay_debt(
+        &entry.client_writer,
+        entry.session_id,
+        &entry.terminal_images,
+        &entry.image_sharing,
+    )
+    .await;
     install_session_attachment(entry, attached_ids).await;
     true
 }
@@ -435,6 +450,14 @@ mod tests {
                 crate::terminal_image_state::TerminalImageProcessPolicy::v1(),
             )
             .grid_observer(),
+            terminal_images: Arc::new(Mutex::new(
+                crate::terminal_image_state::PtyTerminalImageState::new(
+                    crate::terminal_image_state::TerminalImageProcessPolicy::v1(),
+                ),
+            )),
+            image_sharing: Arc::new(std::sync::Mutex::new(
+                crate::terminal_image_sharing::SessionImageSharing::new(false),
+            )),
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,

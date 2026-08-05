@@ -783,6 +783,15 @@ Either way what the viewer has seen no longer describes the session.
 the shed case at the moment the queue refuses a frame, which is synchronous and
 race-free, and stops sending deltas to that sink.
 
+Each way of accruing debt has a drain that fires when it happens.
+[[crates/scribe-server/src/ipc_server.rs#drain_image_replay_debt]] pays a fresh
+sink at the end of its attach, from canonical state and with no PTY read to ride
+on, because an application that has gone quiet would otherwise leave that viewer
+in front of an imageless pane indefinitely; the committed-read path drains the
+shed case on the session's next commit. An unlatched or disabled session skips
+the drain entirely, so a scene the master switch retired never reaches a viewer
+that joins afterwards.
+
 [[crates/scribe-server/src/ipc_server.rs#AttachedSinks#fan_out_image_replay]]
 delivers one planned burst to every sink that owes one and clears their debt
 together. Replay records are non-droppable: the burst *is* the recovery, so

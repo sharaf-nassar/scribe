@@ -640,6 +640,18 @@ requires that no live delta was delivered to a scene-less sink, that every
 replay record carried one generation, that `Commit` was the last record, and
 that the observed wire order is begin, definition, chunk, placement, commit.
 
+### Idle Attach Drains Replay Debt
+
+A viewer joining a session whose application has gone quiet is caught up by the
+attach itself, so an idle pane is never a reason to paint text without images.
+
+The case commits the pinned fixture, attaches a capable viewer through the
+production sink path, and then drives only the attach path's own drain — no PTY
+read follows. It requires the fresh sink to owe a replay, that drain to clear
+the debt, and the viewer to read a complete burst off its pipe. It then attaches
+a second viewer with the master switch off and requires that one to receive
+nothing and keep its debt, because a retired scene must not reach a late viewer.
+
 ### Dropped Output Recovery
 
 A saturated viewer sheds this session's queued output, stops receiving deltas
@@ -668,10 +680,10 @@ duplicate scene" means in evidence.
 and validates the payload-free evidence it writes.
 
 The gate pins the schema version, the production engine name, a passing result
-for all seven cases, the maximum-scene byte and chunk totals against the frozen
+for all eight cases, the maximum-scene byte and chunk totals against the frozen
 limits, the attaching viewer's exact wire order, every debt and delivery count
-across the overflow and recovery sequence, and the viewer-count independence of
-the plan. It also refuses any evidence that embedded array-shaped payload data.
+across the attach drain and the overflow and recovery sequence, and the
+viewer-count independence of the plan. It also refuses any evidence that embedded array-shaped payload data.
 
 ## Terminal Image Handoff
 
