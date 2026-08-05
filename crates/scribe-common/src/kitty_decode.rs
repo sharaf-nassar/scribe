@@ -266,10 +266,7 @@ impl KittyTransfer {
             decode_chunk(payload, previous, plan.decoded_len, &mut replacement)?;
             let old = self.decoded.replace(replacement);
             self.retain_transaction_owner(old, budget);
-        } else {
-            let decoded = self.decoded.as_mut().ok_or_else(|| {
-                KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed)
-            })?;
+        } else if let Some(decoded) = self.decoded.as_mut() {
             decoded
                 .resize(plan.projected, 0)
                 .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
@@ -278,6 +275,11 @@ impl KittyTransfer {
                 return Err(error);
             }
         }
+        // Falling through means no buffer exists and the projection still fits
+        // it, which is only reachable at `projected == 0`: a payload-free chunk.
+        // Chafa opens every chunked transfer that way — one `a=T,…,m=1` control
+        // command, then data-only continuations — and Kitty accepts it, so
+        // refusing to allocate here is the whole handling such a chunk needs.
         self.encoded_bytes = plan.accumulated;
         self.chunks = plan.chunks;
         self.final_received = !more;

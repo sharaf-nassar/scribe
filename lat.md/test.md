@@ -504,6 +504,29 @@ The visual harness exercises the production terminal image renderer and its view
 
 The 2x corpus samples all phases, geometry, placeholders, Sixel chronology, find precedence, scroll/resize envelopes, off-margin immunity, soft/hard deletion and unplaced-data retention, pressure, eviction, pane close, and recovery.
 
+## Pinned Terminal Image Application Corpus
+
+`terminal-image-apps.sh` runs the released Yazi, Chafa, and gnuplot builds the contract pins inside a real GPUI pane, over direct PTY and over in-container SSH.
+
+### Pinned applications reach a working image path
+
+The rig replaces the entrypoint's client with an image-capable one
+(`SCRIBE_TERMINAL_IMAGES=1`), because only a capable viewer latches a session
+and an unlatched session answers no discovery probe at all.
+
+Each step is typed into the pane with `xdotool`, runs from a generated script,
+and signals completion with a sentinel file; the server's per-session evidence
+line supplies the counters the step asserts on.
+
+Asserted per step: the owned Unicode-placeholder fixture leaves a live
+placeholder placement, Chafa's `--format kitty` leaves a classic placement and
+Chafa's `--format sixels` a Sixel one, gnuplot's `sixelgd` decodes a Sixel
+image, and Yazi's generic Kitty query is answered before it draws through
+Sixel. No step may raise a typed graphics failure. Every application repeats
+over SSH with no terminal spoofing anywhere, and the versions are checked
+before the first assertion so a moved package cannot masquerade as the pinned
+one. Evidence lands in `test-output/terminal-images/linux/apps/`.
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.

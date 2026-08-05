@@ -36,7 +36,7 @@ use scribe_common::protocol::{
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
-use scribe_common::terminal_images::TerminalImageCapabilities;
+use scribe_common::terminal_images::{TerminalImageCapabilities, TerminalImagePlacementKind};
 use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
@@ -67,9 +67,10 @@ use crate::terminal_image_sharing::{
 };
 use crate::terminal_image_state::{
     ObservedTerminalGridSpan, ProductionTerminalFeed, PtyTerminalImageState, SessionTerminalCommit,
-    SessionTerminalError, TerminalGridObservation, TerminalGridObserverHandle,
-    TerminalImageProcessPolicy, feed_terminal_image_result_production,
-    flush_terminal_observed_production, observe_terminal_resize, process_pty_reader_ingress,
+    SessionTerminalError, SessionTerminalOutput, TerminalGridObservation,
+    TerminalGridObserverHandle, TerminalImageBoundary, TerminalImageProcessPolicy,
+    feed_terminal_image_result_production, flush_terminal_observed_production,
+    observe_terminal_resize, process_pty_reader_ingress,
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
@@ -1177,6 +1178,34 @@ struct PtyReaderState {
     preserved_ai_scrollback: PreservedAiScrollback,
     /// Waiting for the first filtered redraw in the epoch to commit.
     pending_ai_scrollback_baseline: bool,
+    /// Last emitted application-image evidence, so the summary line is written
+    /// once per real change instead of once per PTY read.
+    image_evidence: ImageApplicationEvidence,
+}
+
+/// What a real terminal application's graphics have done to this session.
+///
+/// The cumulative counters come from the observed boundaries of every
+/// committed read, so they survive the erase or scroll that retires a
+/// placement; the placement counts are the live canonical snapshot, which is
+/// what names Kitty classic, Kitty Unicode-placeholder, and Sixel apart.
+// @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ImageApplicationEvidence {
+    /// Replies written back to the PTY (Kitty results and augmented DA).
+    replies: u64,
+    /// Kitty commands observed, including queries and continuations.
+    kitty_commands: u64,
+    /// Kitty commands that completed a transfer with decoded canonical facts.
+    kitty_transfers: u64,
+    /// Sixel images decoded from DCS payloads.
+    sixel_images: u64,
+    /// Typed graphics failures raised by framing, decode, or storage.
+    failures: u64,
+    /// Live canonical placements by kind.
+    classic_placements: usize,
+    placeholder_placements: usize,
+    sixel_placements: usize,
 }
 
 /// Minimum spacing between two grid applies driven by one session's `Resize`
@@ -6459,6 +6488,11 @@ async fn handle_create_session(
         },
     ))
     .await;
+    // A created session is attached by `InitialAttachment`, never by
+    // `AttachSessions`, so this is the only place its creator can claim the
+    // image capability. Without it a client's own bootstrapped shell stays
+    // text-only forever and no application running in it is ever answered.
+    let _ = admit_image_capable_sessions(vec![session_id], Vec::new(), context).await;
     attached_insert(context.attached_ids, session_id).await;
 }
 
@@ -6704,6 +6738,7 @@ fn spawn_pty_reader(
         scrollback_lines: inputs.scrollback_lines,
         preserved_ai_scrollback: PreservedAiScrollback::default(),
         pending_ai_scrollback_baseline: false,
+        image_evidence: ImageApplicationEvidence::default(),
     };
 
     exit_gate.set_reader(tokio::spawn(pty_reader_task(state)));
@@ -9245,7 +9280,9 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
         let sharing = lock_image_sharing(&state.image_sharing);
         (sharing.images_enabled(), sharing.effective())
     };
+    let mut replies = 0u64;
     for reply in plan_pty_replies(commit, enabled) {
+        replies += 1;
         debug!(
             session_id = %state.session_id,
             sequence = reply.sequence.0,
@@ -9272,6 +9309,7 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
             return;
         }
     };
+    record_image_application_evidence(state, commit, replies);
     if messages.is_empty() {
         return;
     }
@@ -9286,6 +9324,72 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
         records = frames.len(),
         viewers,
         "fanned terminal image records to capable viewers"
+    );
+}
+
+/// Write one line naming what a real application's graphics did, when it
+/// changes.
+///
+/// A live viewer does not receive canonical pixels yet, so this summary is the
+/// only place a pinned application's protocol choice becomes observable
+/// end-to-end: which protocol it transmitted, whether Scribe answered its
+/// discovery probe, and which placement kind survived on the grid.
+// @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
+fn record_image_application_evidence(
+    state: &mut PtyReaderState,
+    commit: &SessionTerminalCommit,
+    replies: u64,
+) {
+    let mut evidence = state.image_evidence;
+    evidence.replies += replies;
+    for output in commit.outputs.as_slice() {
+        let SessionTerminalOutput::Image { boundary, .. } = output else { continue };
+        match boundary {
+            TerminalImageBoundary::Kitty { decoded, .. } => {
+                evidence.kitty_commands += 1;
+                evidence.kitty_transfers += u64::from(decoded.is_some());
+            }
+            TerminalImageBoundary::Sixel { .. } => evidence.sixel_images += 1,
+            TerminalImageBoundary::Failure(failure) => {
+                evidence.failures += 1;
+                debug!(
+                    session_id = %state.session_id,
+                    protocol = ?failure.protocol,
+                    category = ?failure.category,
+                    limit = ?failure.limit,
+                    "terminal image application output failed"
+                );
+            }
+            TerminalImageBoundary::SixelMode { .. } => {}
+        }
+    }
+    evidence.classic_placements = 0;
+    evidence.placeholder_placements = 0;
+    evidence.sixel_placements = 0;
+    for (_, placement) in state.terminal_images.canonical_placements() {
+        match placement.kind {
+            TerminalImagePlacementKind::KittyClassic => evidence.classic_placements += 1,
+            TerminalImagePlacementKind::KittyUnicodePlaceholder => {
+                evidence.placeholder_placements += 1;
+            }
+            TerminalImagePlacementKind::Sixel => evidence.sixel_placements += 1,
+        }
+    }
+    if evidence == state.image_evidence {
+        return;
+    }
+    state.image_evidence = evidence;
+    info!(
+        session_id = %state.session_id,
+        replies = evidence.replies,
+        kitty_commands = evidence.kitty_commands,
+        kitty_transfers = evidence.kitty_transfers,
+        sixel_images = evidence.sixel_images,
+        failures = evidence.failures,
+        classic_placements = evidence.classic_placements,
+        placeholder_placements = evidence.placeholder_placements,
+        sixel_placements = evidence.sixel_placements,
+        "terminal image application evidence"
     );
 }
 

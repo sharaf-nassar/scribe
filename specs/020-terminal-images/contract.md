@@ -163,7 +163,7 @@ this contract task.
 
 | Application | Version | Required path |
 | --- | --- | --- |
-| Yazi | `v26.5.6` (`aa526434f00bb44e2e902d9a4ac5f810da1018b9`) | Unknown terminal receives a successful direct Kitty query and selects `KgpOld`; direct PTY and SSH; no `$TERM`/`TERM_PROGRAM` spoofing. Owned fixtures, not Yazi recognition, prove placeholders. |
+| Yazi | `v26.5.6` (`aa526434f00bb44e2e902d9a4ac5f810da1018b9`) | Unknown terminal receives a successful direct Kitty query, then draws through Sixel because Scribe also advertises Sixel in DA1 and this release prefers it; direct PTY and SSH; no `$TERM`/`TERM_PROGRAM` spoofing. Chafa, not Yazi, proves real-application Kitty classic display, and owned fixtures prove placeholders. |
 | Chafa | `1.18.2` | `--format kitty --probe off` and `--format sixels --probe off`; direct PTY and SSH. |
 | gnuplot | `6.0.3` | `set terminal sixelgd`; direct PTY and SSH with the build's terminal list verified first. |
 

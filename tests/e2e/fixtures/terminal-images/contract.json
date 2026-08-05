@@ -125,7 +125,8 @@
       "id": "yazi",
       "version": "v26.5.6",
       "revision": "aa526434f00bb44e2e902d9a4ac5f810da1018b9",
-      "protocol": "kitty_classic_via_generic_query",
+      "protocol": "generic_kitty_query_answered_then_sixel",
+      "observed": "Scribe answers the generic Kitty query and also advertises Sixel in DA1; this release prefers Sixel when both are offered, so Kitty classic display is proven by Chafa and Kitty placeholders by the owned fixture.",
       "paths": ["direct_pty", "ssh"],
       "terminal_spoofing": false
     },
