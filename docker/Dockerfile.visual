@@ -54,7 +54,61 @@ RUN apt-get update && \
         ibus \
         ibus-table \
         ibus-table-cangjie3 \
+        # The pinned terminal-image application corpus
+        # (specs/020-terminal-images/contract.md) is built here, and the SSH
+        # half of that corpus needs a real sshd in the container.
+        file \
+        openssh-server \
+        xz-utils \
+        libglib2.0-dev \
+        libpng-dev \
+        libjpeg-dev \
+        libwebp-dev \
+        libtiff-dev \
+        libgd-dev \
+        libreadline-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Pin the truthful application compatibility corpus.
+#
+# Debian trixie ships Chafa 1.14.5 and gnuplot 6.0.2 and no Yazi at all, so the
+# exact contract versions are fetched and checksum-verified here instead. Every
+# artifact is pinned by sha256; a silently republished upstream tarball fails
+# the build rather than changing what the corpus proves. gnuplot is configured
+# with libgd, which is what supplies the `sixelgd` terminal the plotting
+# workflow drives.
+ARG YAZI_VERSION=26.5.6
+ARG YAZI_SHA256=1c9096f0a83b8102c194385f644cdeff93cc8269426163c9d033041ebd537bd2
+ARG CHAFA_VERSION=1.18.2
+ARG CHAFA_SHA256=0b8d9ba9f347e8b6c0c71878217c9b0e478b4a42aa4babea0bf20840567239c2
+ARG GNUPLOT_VERSION=6.0.3
+ARG GNUPLOT_SHA256=ec52e3af8c4083d4538152b3f13db47f6d29929a3f6ecec5365c834e77f251ab
+RUN set -eux; \
+    mkdir -p /tmp/corpus; cd /tmp/corpus; \
+    curl -fsSL -o yazi.zip \
+        "https://github.com/sxyazi/yazi/releases/download/v${YAZI_VERSION}/yazi-x86_64-unknown-linux-gnu.zip"; \
+    echo "${YAZI_SHA256}  yazi.zip" | sha256sum -c -; \
+    python3 -c "import zipfile; zipfile.ZipFile('yazi.zip').extractall('.')"; \
+    install -m 0755 "yazi-x86_64-unknown-linux-gnu/yazi" \
+        "yazi-x86_64-unknown-linux-gnu/ya" /usr/local/bin/; \
+    curl -fsSL -o chafa.tar.xz \
+        "https://github.com/hpjansson/chafa/releases/download/${CHAFA_VERSION}/chafa-${CHAFA_VERSION}.tar.xz"; \
+    echo "${CHAFA_SHA256}  chafa.tar.xz" | sha256sum -c -; \
+    tar xf chafa.tar.xz; cd "chafa-${CHAFA_VERSION}"; \
+    ./configure --prefix=/usr/local --without-imagemagick >/dev/null; \
+    make -j"$(nproc)" >/dev/null; make install >/dev/null; ldconfig; cd /tmp/corpus; \
+    curl -fsSL -o gnuplot.tar.gz \
+        "https://downloads.sourceforge.net/project/gnuplot/gnuplot/${GNUPLOT_VERSION}/gnuplot-${GNUPLOT_VERSION}.tar.gz"; \
+    echo "${GNUPLOT_SHA256}  gnuplot.tar.gz" | sha256sum -c -; \
+    tar xf gnuplot.tar.gz; cd "gnuplot-${GNUPLOT_VERSION}"; \
+    ./configure --prefix=/usr/local --without-x --without-qt --without-wx \
+        --without-latex --with-gd >/dev/null; \
+    make -j"$(nproc)" >/dev/null; make install >/dev/null; \
+    cd /; rm -rf /tmp/corpus; \
+    yazi --version; \
+    chafa --version | head -1; \
+    gnuplot --version; \
+    gnuplot -e 'set print "-"; print GPVAL_TERMINALS' 2>&1 | grep -qw sixelgd
 
 # Force visual E2E onto lavapipe's software Vulkan ICD for deterministic
 # rendering on CI runners without a usable hardware driver. lavapipe ships in

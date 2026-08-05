@@ -122,6 +122,22 @@ fn success_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String> 
         return Err("chunk accumulation drifted".to_owned());
     }
 
+    // Chafa opens every chunked transfer with a data-less control command and
+    // sends the payload in continuations, and Kitty accepts that shape, so an
+    // empty leading chunk must accumulate nothing rather than fail the whole
+    // transfer.
+    let empty_opening = normalize(
+        params(KittyFormat::Rgb, KittyCompression::None, Some(2), Some(1)),
+        &[(b"", true), (b"/wAA", true), (b"AP8A", false)],
+        limits,
+        decode_limits(limits),
+        &NoopHooks,
+    )
+    .map_err(|error| format!("data-less opening chunk: {error}"))?;
+    if empty_opening.rgba != [255, 0, 0, 255, 0, 255, 0, 255] {
+        return Err("data-less opening chunk changed accumulation".to_owned());
+    }
+
     let zlib = normalize(
         params(KittyFormat::Rgba, KittyCompression::Rfc1950Zlib, Some(1), Some(1)),
         &[(b"eJz7z8DQ", true), (b"AAAEgAGA", false)],
@@ -156,6 +172,7 @@ fn success_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String> 
         json!({"id":"rgb","status":"pass","rgba_bytes":4}),
         json!({"id":"rgba","status":"pass","rgba_bytes":4}),
         json!({"id":"chunked","status":"pass","chunks":2}),
+        json!({"id":"empty_opening_chunk","status":"pass","chunks":3}),
         json!({"id":"zlib","status":"pass","inflated_bytes":4}),
         json!({"id":"png","status":"pass","width":1,"height":1,"rgba_bytes":4}),
     ])

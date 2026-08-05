@@ -2104,7 +2104,10 @@ fn validate_sixel_payload(bytes: &[u8]) -> Result<(), GraphicsFailureCategory> {
     let mut cursor = 0;
     while let Some(&byte) = bytes.get(cursor) {
         match byte {
-            b'?'..=b'~' | b'$' | b'-' => cursor = cursor.saturating_add(1),
+            // CR/LF carry no sixel meaning and are ignored by DEC and xterm
+            // alike; gnuplot's `sixelgd` writer emits one per raster band, so
+            // rejecting them would refuse every real plot.
+            b'?'..=b'~' | b'$' | b'-' | b'\n' | b'\r' => cursor = cursor.saturating_add(1),
             b'!' => {
                 let (repeat, next) = parse_decimal_at(bytes, cursor.saturating_add(1))?;
                 if repeat == 0

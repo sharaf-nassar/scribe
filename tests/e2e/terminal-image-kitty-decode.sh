@@ -24,7 +24,7 @@ grep -Fq '"sha256": "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db051
     || fail "PNG upstream checksum missing"
 
 for case_id in \
-    rgb rgba chunked zlib png \
+    rgb rgba chunked empty_opening_chunk zlib png \
     malformed_base64 chunk_mismatch raw_length_mismatch \
     non_png_format truncated_png indirect_sources allocation_failure \
     deadline cancellation zlib_bomb

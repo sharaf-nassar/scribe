@@ -665,16 +665,44 @@ text fallback.
 Pinned applications and owned protocol fixtures prevent release claims from drifting with package repositories or external test suites.
 
 Yazi is `v26.5.6` at
-`aa526434f00bb44e2e902d9a4ac5f810da1018b9`: an unknown terminal's successful
-Kitty query selects its `KgpOld` classic path without terminal spoofing. Chafa
+`aa526434f00bb44e2e902d9a4ac5f810da1018b9`: it probes an unknown terminal with a
+generic Kitty query, which Scribe answers, and then draws through Sixel because
+Scribe also advertises Sixel in DA1 and this release prefers it when both are
+offered. No terminal spoofing is involved either way. Chafa
 is `1.18.2`, exercised with `--format kitty --probe off` and
-`--format sixels --probe off`. gnuplot is `6.0.3`, exercised through
+`--format sixels --probe off`; its Kitty form is the corpus's real-application
+classic placement. gnuplot is `6.0.3`, exercised through
 `set terminal sixelgd`. Each application runs through direct PTY and SSH.
 
 Ten owned ASCII-hex fixtures cover Kitty query ordering, RGB, chunked zlib
 RGBA, PNG, Unicode placeholders, deletion; 7-bit and C1 Sixel; xterm mode/text
 chronology; and CAN/SUB malformed recovery. `fixtures.tsv` and `contract.json`
 freeze every path and expected outcome.
+
+## Pinned Application Corpus
+
+Real released applications are run inside a real pane so protocol choice is observed rather than assumed, and one server evidence line makes that choice assertable.
+
+The corpus is built into the visual image from checksum-pinned upstream
+artifacts, never from a distribution package: Debian ships older Chafa and
+gnuplot builds, and no Yazi at all. A capable viewer must latch a session
+before any of it works, so the harness announces the renderer subset with
+`SCRIBE_TERMINAL_IMAGES=1`
+([`advertised_terminal_image_capabilities`](../crates/scribe-client/src/main.rs));
+a session created by that client latches at creation, because a created session
+is attached by its creator and never through `AttachSessions`.
+
+Each committed read whose observed boundaries or live placements changed emits
+one summary naming cumulative PTY replies, Kitty commands, completed Kitty
+transfers, decoded Sixel images and typed failures, plus the live canonical
+placement count per kind. Canonical pixels do not reach a live viewer yet, so
+this line — not a rendered frame — is what proves an application's bytes became
+canonical image state.
+
+Two defects the corpus surfaced are fixed at their root: a Kitty transfer opened
+by a data-less control command (Chafa's shape, and legal to Kitty) no longer
+fails its first chunk, and CR/LF inside a Sixel payload (gnuplot's `sixelgd`
+shape, ignored by DEC and xterm) no longer fails validation.
 
 ## Contract Verification
 
