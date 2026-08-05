@@ -49,6 +49,9 @@ use scribe_server::session_exit;
 // re-export it here so the binary's `ipc_server` module uses that production
 // type instead of compiling a second copy.
 use scribe_server::terminal_image_state;
+// The reader's reply write-back and capable-sink fan-out live beside that seam;
+// re-export the library's copy for the same single-compile reason.
+use scribe_server::terminal_image_sharing;
 // Spec 017 US1-2: `mod session_manager` opens each child's pidfd and
 // `mod ipc_server` arms the watcher over it, both through
 // `crate::child_watch`. Re-exported for the same reason — the non-Linux build
