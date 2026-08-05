@@ -881,6 +881,9 @@ struct PendingKittyDecode {
     transfer: KittyTransfer,
     controls: KittyCommandControls,
     presence: KittyControlPresence,
+    /// Raw span from the transfer's first chunk through its latest chunk, so a
+    /// retirement failure names the bytes it discarded.
+    range: RawByteRange,
 }
 
 enum KittyTransferPreparation {
@@ -1308,6 +1311,21 @@ impl fmt::Display for SessionTerminalError {
 
 impl std::error::Error for SessionTerminalError {}
 
+/// Why an incomplete graphics transfer is being retired.
+// @lat: [[terminal-images#Terminal Images#Incomplete Transfer Retirement]]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferRetirement {
+    /// PTY EOF: unterminated candidate bytes are still ordinary text, and an
+    /// unterminated image string becomes a truncated-sequence failure.
+    StreamEnd,
+    /// Parser or session reset: framing state is discarded without output
+    /// because the terminal context those bytes belonged to is gone.
+    Reset,
+    /// Session close: reset, plus cancellation of every outstanding decode
+    /// admission and release of all retained image storage.
+    Close,
+}
+
 /// Payload-free state facts used by production inspection and functional gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionTerminalState {
@@ -1637,6 +1655,78 @@ impl SessionTerminal {
         self.storage_budget.class_counters(class).map_err(SessionTerminalError::Storage)
     }
 
+    /// Retire every incomplete transfer this session still holds.
+    ///
+    /// Partial APC/DCS framing, buffered Kitty chunks, and any in-flight decode
+    /// admission are released exactly once, and the discarded work is reported
+    /// as typed boundaries in the same sequence stream as ordinary reads, so a
+    /// pending query reply keeps its FIFO position ahead of the retirement.
+    /// Nothing incomplete is ever published as a definition or placement.
+    // @lat: [[terminal-images#Terminal Images#Incomplete Transfer Retirement]]
+    pub fn retire_transfers(
+        &mut self,
+        retirement: TransferRetirement,
+    ) -> Result<SessionTerminalCommit, SessionTerminalError> {
+        let storage_budget = Arc::clone(&self.storage_budget);
+        let _transaction =
+            storage_budget.lock_transaction().map_err(SessionTerminalError::Storage)?;
+        let checkpoint = storage_budget.checkpoint().map_err(SessionTerminalError::Storage)?;
+        let result = self.retire_transaction(retirement);
+        if result.is_err() {
+            storage_budget.rollback(&checkpoint).map_err(SessionTerminalError::Storage)?;
+        }
+        result
+    }
+
+    fn retire_transaction(
+        &mut self,
+        retirement: TransferRetirement,
+    ) -> Result<SessionTerminalCommit, SessionTerminalError> {
+        if retirement == TransferRetirement::Close {
+            self.policy
+                .decode_scheduler
+                .cancel_session(self.decode_session)
+                .map_err(|_| internal_storage_error())?;
+        }
+        let offset = self.framer.offset();
+        let mut events = match retirement {
+            TransferRetirement::StreamEnd => {
+                self.framer.finish().map_err(SessionTerminalError::Storage)?
+            }
+            TransferRetirement::Reset | TransferRetirement::Close => {
+                self.framer.discard();
+                GraphicsStorageVec::new(
+                    Arc::clone(&self.storage_budget),
+                    GraphicsStorageClass::FramingEvents,
+                )
+                .map_err(SessionTerminalError::Storage)?
+            }
+        };
+        // Taking the transfer first releases its retained chunk storage even if
+        // the boundary below cannot be recorded.
+        if let Some(pending) = self.pending_kitty_decode.take() {
+            events
+                .push(GraphicsEvent::Failure(GraphicsFailure {
+                    range: pending.range,
+                    protocol: GraphicsProtocol::Kitty,
+                    category: GraphicsFailureCategory::TruncatedSequence,
+                    limit: None,
+                }))
+                .map_err(SessionTerminalError::Storage)?;
+        }
+        self.pending_transfer = self.framer.pending_transfer();
+        if retirement == TransferRetirement::Close {
+            self.release_retained_storage();
+        }
+        let outputs = GraphicsStorageVec::new(
+            Arc::clone(&self.storage_budget),
+            GraphicsStorageClass::TerminalOutputs,
+        )
+        .map_err(SessionTerminalError::Storage)?;
+        let input_range = RawByteRange { start: offset, end: self.framer.offset() };
+        self.commit_events(events, outputs, None, input_range)
+    }
+
     /// Release every retained image buffer; framer/event owners release independently.
     pub fn release_retained_storage(&mut self) {
         self.pending_kitty_storage = None;
@@ -1902,6 +1992,9 @@ impl SessionTerminal {
             self.reject_kitty_decode(range, error, staged)?;
             return Ok(());
         }
+        if let Some(pending) = self.pending_kitty_decode.as_mut() {
+            pending.range.end = range.end;
+        }
 
         if more {
             self.append_image(
@@ -2067,6 +2160,7 @@ impl SessionTerminal {
             transfer,
             controls: command.controls(),
             presence: command.control_presence(),
+            range,
         });
         Ok(KittyTransferPreparation::Ready)
     }
@@ -2436,6 +2530,14 @@ impl PtyTerminalImageState {
         bytes: &[u8],
     ) -> Result<SessionTerminalCommit, SessionTerminalError> {
         self.terminal.process_bytes(bytes)
+    }
+
+    /// Retire incomplete transfers on EOF, reset, or close.
+    pub fn retire_transfers(
+        &mut self,
+        retirement: TransferRetirement,
+    ) -> Result<SessionTerminalCommit, SessionTerminalError> {
+        self.terminal.retire_transfers(retirement)
     }
 
     /// Return the observer shared with the production resize path.

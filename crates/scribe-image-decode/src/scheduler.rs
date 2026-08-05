@@ -350,12 +350,26 @@ impl DecodeScheduler {
         session: DecodeSessionId,
         target: DecodeTarget,
     ) -> Result<usize, DecodeAdmissionError> {
+        self.cancel(session, Some(target))
+    }
+
+    /// Cancel every queued and in-flight decode owned by one session, leaving
+    /// other sessions untouched. Session close uses this so no admission
+    /// outlives the seam that issued it.
+    // @lat: [[terminal-images#Terminal Images#Incomplete Transfer Retirement]]
+    pub fn cancel_session(&self, session: DecodeSessionId) -> Result<usize, DecodeAdmissionError> {
+        self.cancel(session, None)
+    }
+
+    fn cancel(
+        &self,
+        session: DecodeSessionId,
+        target: Option<DecodeTarget>,
+    ) -> Result<usize, DecodeAdmissionError> {
         let state = self.state.lock().map_err(|_| DecodeAdmissionError::Poisoned)?;
-        let matches = state
-            .waiters
-            .iter()
-            .chain(state.active.iter())
-            .filter(|entry| entry.session == session && entry.target == target);
+        let matches = state.waiters.iter().chain(state.active.iter()).filter(|entry| {
+            entry.session == session && target.is_none_or(|target| entry.target == target)
+        });
         let mut cancelled = 0;
         for entry in matches {
             entry.cancelled.store(true, Ordering::SeqCst);

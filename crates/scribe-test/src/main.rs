@@ -23,6 +23,7 @@ mod terminal_image_mutations;
 mod terminal_image_observer_parity;
 mod terminal_image_scheduler;
 mod terminal_image_state_seam;
+mod terminal_image_transfer_lifecycle;
 mod wait;
 
 use std::fmt;
@@ -351,6 +352,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify retirement of incomplete terminal-image transfers.
+    TerminalImageTransferLifecycle {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Verify transactional terminal-image definition and placement mutation.
     TerminalImageMutations {
         /// Versioned payload-free JSON evidence destination.
@@ -578,6 +585,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
         Command::TerminalImageAccounting { evidence } => run_terminal_image_accounting(&evidence),
         Command::TerminalImageScheduler { evidence } => run_terminal_image_scheduler(&evidence),
+        Command::TerminalImageTransferLifecycle { evidence } => run_transfer_lifecycle(&evidence),
         Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
@@ -608,6 +616,10 @@ fn run_terminal_image_accounting(evidence: &std::path::Path) -> Result<(), TestE
 
 fn run_terminal_image_scheduler(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_scheduler::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_transfer_lifecycle(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_transfer_lifecycle::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_share_tap(

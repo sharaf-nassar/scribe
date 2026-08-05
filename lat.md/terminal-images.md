@@ -425,6 +425,47 @@ and one concurrency ceiling of active entries, each payload-free. A request over
 the byte ceiling, or one arriving at a full queue, is refused at issue before
 any storage is reserved, and an unrelated session keeps its own slot.
 
+## Incomplete Transfer Retirement
+
+A transfer that never completes is discarded with a typed boundary, never as an image: stream end, reset, close, cancellation, and queue-wait expiry all release its storage and decode admission exactly once.
+
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#retire_transfers]]
+takes one
+[[crates/scribe-server/src/terminal_image_state.rs#TransferRetirement]] reason
+and returns an ordinary commit, so retirement shares the session's output
+sequence rather than a side channel. That is what preserves chronology: a Kitty
+query reply already owed keeps its earlier sequence, and the retirement boundary
+follows it.
+
+`StreamEnd` is EOF. It drains the framer through
+[[crates/scribe-pty/src/graphics_framing.rs#GraphicsFramer#finish]], so an
+unclassified candidate is still emitted as ordinary raw text while an
+unterminated APC or DCS string becomes a `TruncatedSequence` failure carrying its
+protocol. `Reset` and `Close` instead call
+[[crates/scribe-pty/src/graphics_framing.rs#GraphicsFramer#discard]]: a parser or
+session reset destroys the terminal context those bytes belonged to, so no raw
+text and no failure boundary is owed for them.
+
+Kitty chunks are the case the framer cannot see. Each chunk is a complete APC
+string, so an abandoned multi-chunk transfer leaves buffered payload with the
+framer already in ground state. Retirement takes that pending transfer first -
+releasing its charged bytes even if the boundary below cannot be recorded - and
+reports the span from its first chunk through its last as one truncated
+sequence. Nothing incomplete ever reaches a definition, a placement, or a
+generation.
+
+`Close` additionally cancels the session's outstanding admissions through
+[[crates/scribe-image-decode/src/scheduler.rs#DecodeScheduler#cancel_session]]
+and releases every retained buffer, so a decode queued behind another session's
+slot cannot outlive the seam that issued it. Cancellation and deadline refusals
+arriving during an ordinary read retire the same way: the refused admission
+becomes a typed quota boundary and the pending transfer is dropped with it - see
+[[terminal-images#Terminal Images#Mandatory Decode Scheduling]].
+
+Repetition is safe by construction. A retired session has no framing state and no
+pending transfer, so a second reset or close produces an empty commit and touches
+no counter, which is what keeps a double close from underflowing the ledger.
+
 ## Transactional Image Mutations
 
 Canonical definitions and placements change all-or-nothing: a read either commits every mutation it implies or leaves the prior state, ownership, and counters exactly as they were.
