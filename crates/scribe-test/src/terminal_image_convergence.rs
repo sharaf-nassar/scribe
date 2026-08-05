@@ -20,6 +20,7 @@ use scribe_common::terminal_images::{
 };
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 use scribe_server::session_manager::build_term_config;
+use scribe_server::terminal_image_publication::DefinitionPayload;
 use scribe_server::terminal_image_state::{
     PtyTerminalImageState, SessionTerminalError, TerminalImageProcessPolicy,
     feed_terminal_image_result_observed, observe_terminal_resize,
@@ -102,6 +103,17 @@ impl Probe {
     /// Drive one PTY read through framing, the real terminal, the canonical
     /// mutation commit, and publication, then apply the burst to the client.
     fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.feed_with(bytes, &mut definition_payload)
+    }
+
+    /// Drive one PTY read the way the production commit path does, supplying
+    /// no payload at all so every definition must be backed by the pixels the
+    /// session itself retained.
+    fn feed_retained(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.feed_with(bytes, &mut |_| None)
+    }
+
+    fn feed_with(&mut self, bytes: &[u8], payload: DefinitionPayload<'_>) -> Result<(), String> {
         let mut result = self.images.process_bytes(bytes);
         feed_terminal_image_result_observed(
             &mut self.images,
@@ -111,10 +123,8 @@ impl Probe {
             &mut result,
         );
         let commit = result.map_err(|error| error.to_string())?;
-        let messages = self
-            .images
-            .commit_and_publish(&commit, &mut definition_payload)
-            .map_err(|error| error.to_string())?;
+        let messages =
+            self.images.commit_and_publish(&commit, payload).map_err(|error| error.to_string())?;
         self.apply(messages)
     }
 
@@ -249,8 +259,9 @@ pub fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
 // @lat: [[test#Test Harness#Client Convergence and Counter Safety#Production Convergence Probe]]
 pub fn run(evidence_path: &Path) -> Result<(), String> {
     let mut cases: BTreeMap<&str, &str> = BTreeMap::new();
-    let checks: [NamedCase; 8] = [
+    let checks: [NamedCase; 9] = [
         ("definitions_and_placements_converge", case_definitions_and_placements),
+        ("single_read_burst_publishes_every_definition", case_single_read_burst),
         ("removals_converge", case_removals),
         ("reset_converges", case_reset),
         ("screen_change_converges", case_screen_change),
@@ -297,6 +308,66 @@ fn case_definitions_and_placements() -> Result<(), String> {
     // surviving placements afterwards.
     probe.feed(&transmit_display(7))?;
     probe.converged()
+}
+
+/// Every image an application transmits inside one uninterrupted read reaches
+/// the client, carrying its own pixels.
+///
+/// This case runs the production payload seam — no caller-supplied bytes — so
+/// each definition has to be backed by what the session retained for it. The
+/// images differ in both width and colour, so a pairing that drifted by one
+/// boundary either withdraws the definition on the length check or delivers a
+/// visibly wrong picture.
+// @lat: [[test#Test Harness#Client Convergence and Counter Safety#Single-Read Image Burst]]
+fn case_single_read_burst() -> Result<(), String> {
+    const IMAGES: u32 = 8;
+    let mut probe = Probe::new();
+    let mut burst = Vec::new();
+    for index in 0..IMAGES {
+        let width = index + 1;
+        let colour = burst_colour(index);
+        burst.extend(control(&format!("\x1b[{};1H", index + 1)));
+        burst.extend(kitty(
+            &format!("a=T,f=24,s={width},v=1,i={}", index + 1),
+            &vec![colour; width as usize * 3],
+        ));
+    }
+    probe.feed_retained(&burst)?;
+    probe.converged()?;
+
+    let scene = probe.committed();
+    if scene.definitions.len() != IMAGES as usize {
+        return Err(format!(
+            "one read defined {} images but the client received {}",
+            IMAGES,
+            scene.definitions.len()
+        ));
+    }
+    if scene.placements().len() != IMAGES as usize {
+        return Err(format!(
+            "one read placed {} images but the client received {}",
+            IMAGES,
+            scene.placements().len()
+        ));
+    }
+    for definition in &scene.definitions {
+        let index = u32::try_from(definition.metadata.id.0)
+            .map_err(|_| "image id outside the transmitted range".to_owned())?
+            - 1;
+        let expected = burst_colour(index);
+        if definition.rgba.len() as u64 != definition.metadata.rgba_bytes {
+            return Err(format!("image {index} arrived with an incomplete payload"));
+        }
+        if definition.rgba.iter().step_by(4).any(|red| *red != expected) {
+            return Err(format!("image {index} arrived carrying another image's pixels"));
+        }
+    }
+    Ok(())
+}
+
+/// Distinct saturated red channel per image in the single-read burst.
+fn burst_colour(index: u32) -> u8 {
+    u8::try_from(17 + index * 29).unwrap_or(u8::MAX)
 }
 
 /// Soft and hard Kitty deletes converge, including the freed definition.

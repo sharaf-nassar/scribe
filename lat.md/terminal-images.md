@@ -507,7 +507,7 @@ shared placement geometry so both sides converge.
 
 ## Retained Canonical Pixels
 
-A committed definition keeps the pixels that created it, because the decode buffers are single-slot and a scene the server can describe but not re-send is a scene no viewer and no successor can ever be given.
+A committed definition keeps the pixels that created it, because a scene the server can describe but not re-send is a scene no viewer and no successor can ever be given.
 
 [[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#retain_committed_rgba]]
 runs inside the same transaction that commits a read's mutations. The decoded
@@ -518,14 +518,21 @@ charged. The lease is released when the last owner drops it, which is what
 makes eviction, delete, erase, reset, and the master switch free the pixels
 without a second accounting path.
 
-Pairing is last-to-last: the slots only ever hold the newest decode, so the
-last definition a read committed is the one those bytes describe, and
-[[crates/scribe-server/src/terminal_image_state.rs#last_decoded_protocol]] says
-which slot to read. An exact canonical-length check guards the attachment, so a
-definition is left unbacked rather than backed by another image's bytes —
+Pairing is per image, not per read. A read can transmit several images in one
+uninterrupted write, so the decode slots — which only ever hold the newest
+decode of each protocol — cannot say which bytes belong to which definition.
+Every decode a read produces is therefore kept under the output sequence of the
+image boundary that produced it, and
+[[crates/scribe-server/src/terminal_image_state.rs#apply_image_boundary]] reads
+the definitions each boundary created straight off the mutation log, so a
+boundary that defines nothing claims no pixels. Output sequences are monotonic
+and never reused, which is what keeps an earlier read's bytes out of a later
+read's definition. An exact canonical-length check still guards the attachment,
+so a definition is left unbacked rather than backed by another image's bytes —
 unbacked is withdrawn wherever a scene is stated, which is recoverable, while
-mismatched would be a silently wrong picture. Every commit then drops the
-pixels of images canonical state no longer holds.
+mismatched would be a silently wrong picture. Once paired, the read's decodes
+are released and every commit drops the pixels of images canonical state no
+longer holds.
 
 [[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#canonical_rgba]]
 is what the definition-payload seam reads, so every place a scene is stated —
