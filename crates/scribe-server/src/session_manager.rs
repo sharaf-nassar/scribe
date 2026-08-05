@@ -1347,6 +1347,7 @@ mod tests_session_cap {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                image_state: None,
             });
             masters.push(pty.master);
             slaves.push(pty.slave);

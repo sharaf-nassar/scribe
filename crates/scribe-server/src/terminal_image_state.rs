@@ -12,12 +12,16 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::terminal_image_handoff::{
+    ExportedSessionImages, PendingKittyHandoff, SessionImageHandoff,
+};
 use crate::terminal_image_mutations::{
-    CanonicalImageState, DecodedImageMeta, MutationContext, MutationLog,
+    CanonicalImageState, CanonicalRestoreCursor, DecodedImageMeta, MutationContext, MutationLog,
 };
 use crate::terminal_image_publication::{
     DefinitionPayload, PublicationInputs, publish as publish_burst,
 };
+use crate::terminal_image_replay::{ReplayInputs, plan_replay};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions as _;
@@ -29,9 +33,10 @@ use scribe_common::kitty_decode::{
     KittyTransfer, KittyTransport,
 };
 use scribe_common::terminal_images::{
-    ImageLimits, TerminalImageCellClip, TerminalImageDefinition, TerminalImageGeneration,
-    TerminalImageLiveMessage, TerminalImagePlacement, TerminalImageRejectionReason,
-    TerminalOutputSequence, TerminalScreenKind,
+    ImageBoundError, ImageLimits, TerminalImageCellClip, TerminalImageDefinition,
+    TerminalImageGeneration, TerminalImageLiveMessage, TerminalImagePlacement,
+    TerminalImageRejectionReason, TerminalImageReplayMessage, TerminalOutputSequence,
+    TerminalScreenKind,
 };
 use scribe_image_decode::{
     DecodeAdmissionError, DecodeBudget, DecodeBuffer, DecodeCeilings, DecodeLimits, DecodePermit,
@@ -1328,6 +1333,10 @@ pub enum SessionTerminalError {
     SequenceExhausted,
     GenerationExhausted,
     Storage(GraphicsStorageRejection),
+    /// A handoff payload failed bounded validation before anything was
+    /// installed, so the successor keeps an empty session instead of a
+    /// half-restored one.
+    HandoffRejected(ImageBoundError),
 }
 
 impl fmt::Display for SessionTerminalError {
@@ -1339,6 +1348,9 @@ impl fmt::Display for SessionTerminalError {
             Self::GenerationExhausted => formatter.write_str("terminal image generation exhausted"),
             Self::Storage(rejection) => {
                 write!(formatter, "terminal image storage failure: {rejection:?}")
+            }
+            Self::HandoffRejected(error) => {
+                write!(formatter, "terminal image handoff payload rejected: {error}")
             }
         }
     }
@@ -1983,6 +1995,137 @@ impl SessionTerminal {
         }
     }
 
+    /// Capture this session's committed images and paused framing for upgrade.
+    ///
+    /// Reads are already paused when this runs, so nothing is in flight: the
+    /// scene is whatever the last read committed, and the framer holds
+    /// whatever prefix that read ended in the middle of. The scene travels as
+    /// the same bounded burst a late attacher receives, so the successor has
+    /// exactly one way to stage a scene rather than a second handoff-only one.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    #[must_use]
+    pub fn export_handoff(&self, payload: DefinitionPayload<'_>) -> ExportedSessionImages {
+        let definitions = self.canonical.definitions();
+        let placements = self.canonical.placements();
+        let plan = plan_replay(
+            &ReplayInputs {
+                generation: self.generation,
+                through_sequence: self.sequence,
+                active_screen: self.canonical.active_screen(),
+                definitions: &definitions,
+                placements: &placements,
+            },
+            payload,
+        );
+        let pending_kitty = self.pending_kitty_decode.as_ref().map(|pending| PendingKittyHandoff {
+            controls: pending.controls,
+            presence: pending.presence,
+            range: pending.range,
+            transfer: pending.transfer.export(),
+        });
+        ExportedSessionImages {
+            definitions: plan.counters.definitions,
+            placements: plan.counters.placements,
+            chunks: plan.counters.chunks,
+            scene_bytes: plan.counters.total_rgba_bytes,
+            max_chunk_bytes: plan.counters.max_chunk_bytes,
+            state: SessionImageHandoff {
+                generation: self.generation,
+                sequence: self.sequence,
+                active_screen: self.canonical.active_screen(),
+                published_screen: self.published_screen,
+                next_assigned_image_id: self.canonical.next_assigned_image_id(),
+                records: plan.records,
+                framing: self.framer.export_partial(),
+                pending_kitty,
+            },
+        }
+    }
+
+    /// Install an exported payload on a fresh session before reads resume.
+    ///
+    /// Every record is validated and the whole burst reassembled before any
+    /// field on this session moves, so a truncated or inconsistent payload
+    /// leaves an empty session rather than a partial scene. Reassembled pixels
+    /// go to `install`, which owns canonical bytes exactly as the live path's
+    /// payload seam does.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    pub fn restore_handoff(
+        &mut self,
+        state: &SessionImageHandoff,
+        install: &mut dyn FnMut(&TerminalImageDefinition, Vec<u8>),
+    ) -> Result<(), SessionTerminalError> {
+        if self.generation != TerminalImageGeneration(1)
+            || self.sequence != TerminalOutputSequence(0)
+            || self.canonical.definition_count() != 0
+            || self.canonical.placement_count() != 0
+        {
+            return Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant));
+        }
+        let restored = stage_handoff_records(state)?;
+        let pending = match &state.pending_kitty {
+            Some(pending) => Some(self.restore_pending_kitty(pending)?),
+            None => None,
+        };
+        self.framer.restore_partial(&state.framing).map_err(SessionTerminalError::Storage)?;
+        self.canonical = CanonicalImageState::restore(
+            self.policy.limits,
+            CanonicalRestoreCursor {
+                generation: state.generation,
+                active_screen: state.active_screen,
+                next_assigned_image_id: state.next_assigned_image_id,
+            },
+            &restored.definitions,
+            &restored.placements,
+        );
+        self.generation = state.generation;
+        self.sequence = state.sequence;
+        self.published_screen = state.published_screen;
+        self.pending_transfer = pending
+            .as_ref()
+            .map(|pending| PendingGraphicsTransfer {
+                range: pending.range,
+                protocol: GraphicsProtocol::Kitty,
+                retained_payload_bytes: pending.transfer.retained_requested_bytes(),
+                discarding: false,
+            })
+            .or(self.pending_transfer);
+        self.pending_kitty_decode = pending;
+        for (definition, rgba) in restored.pixels {
+            install(&definition, rgba);
+        }
+        Ok(())
+    }
+
+    fn restore_pending_kitty(
+        &self,
+        pending: &PendingKittyHandoff,
+    ) -> Result<PendingKittyDecode, SessionTerminalError> {
+        let accumulated =
+            pending.transfer.decoded.as_ref().map_or(0, |decoded| decoded.len() as u64);
+        let request = self.decode_request(
+            DecodeTarget::kitty(u64::from(pending.controls.image_id.unwrap_or(0))),
+            accumulated,
+        );
+        let permit = self.admit_decode(&request).map_err(|_| {
+            SessionTerminalError::Storage(GraphicsStorageRejection::AllocationFailed)
+        })?;
+        let mut budget = DecodeBudget::new(decode_limits(self.policy.limits), &NoopHooks, &permit)
+            .map_err(|_| {
+                SessionTerminalError::Storage(GraphicsStorageRejection::AllocationFailed)
+            })?;
+        let transfer = KittyTransfer::restore(&pending.transfer, self.policy.limits, &mut budget)
+            .map_err(|_| {
+            SessionTerminalError::Storage(GraphicsStorageRejection::AllocationFailed)
+        })?;
+        Ok(PendingKittyDecode {
+            transfer,
+            controls: pending.controls,
+            presence: pending.presence,
+            range: pending.range,
+        })
+    }
+
     /// Payload-free canonical definitions for inspection and evidence.
     #[must_use]
     pub fn canonical_definitions(&self) -> Vec<TerminalImageDefinition> {
@@ -2513,6 +2656,89 @@ enum DecodeBoundaryError {
     Protocol(GraphicsFailureCategory),
 }
 
+/// A handoff burst reassembled off to the side of any live session state.
+struct StagedHandoff {
+    definitions: Vec<TerminalImageDefinition>,
+    placements: Vec<(TerminalScreenKind, TerminalImagePlacement)>,
+    pixels: Vec<(TerminalImageDefinition, Vec<u8>)>,
+}
+
+/// Validate and reassemble a handoff burst without touching a live session.
+///
+/// The rules are the receiver's, not the sender's: every record validates on
+/// its own terms, chunks arrive contiguously and complete their definition, and
+/// every record shares the burst's generation. A `Begin` whose counts disagree
+/// with what actually arrived is a truncated payload, which is exactly the case
+/// a partial scene would come from.
+fn stage_handoff_records(
+    state: &SessionImageHandoff,
+) -> Result<StagedHandoff, SessionTerminalError> {
+    let reject = SessionTerminalError::HandoffRejected;
+    let mut staged =
+        StagedHandoff { definitions: Vec::new(), placements: Vec::new(), pixels: Vec::new() };
+    let mut partial: Vec<(TerminalImageDefinition, Vec<u8>)> = Vec::new();
+    let mut committed = false;
+    let mut declared: Option<(u32, u32)> = None;
+    for record in &state.records {
+        record.validate().map_err(reject)?;
+        if record.generation() != state.generation {
+            return Err(reject(ImageBoundError::InconsistentGeneration));
+        }
+        match record {
+            TerminalImageReplayMessage::Begin { definition_count, placement_count, .. } => {
+                if declared.is_some() {
+                    return Err(reject(ImageBoundError::InconsistentGeneration));
+                }
+                declared = Some((*definition_count, *placement_count));
+            }
+            TerminalImageReplayMessage::Definition { definition, .. } => {
+                partial.push((definition.clone(), Vec::new()));
+            }
+            TerminalImageReplayMessage::DefinitionChunk { chunk, .. } => {
+                let Some((definition, rgba)) =
+                    partial.iter_mut().find(|(definition, _)| definition.id == chunk.id)
+                else {
+                    return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+                };
+                chunk.validate(definition).map_err(reject)?;
+                if chunk.offset != rgba.len() as u64 {
+                    return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+                }
+                rgba.extend_from_slice(chunk.data.as_slice());
+            }
+            TerminalImageReplayMessage::Placement { placement, screen, .. } => {
+                staged.placements.push((screen.unwrap_or(state.active_screen), placement.clone()));
+            }
+            TerminalImageReplayMessage::Commit { .. } => committed = true,
+        }
+    }
+    if !committed || declared.is_none() {
+        return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+    }
+    for (definition, rgba) in partial {
+        if rgba.len() as u64 != definition.rgba_bytes {
+            return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+        }
+        staged.definitions.push(definition.clone());
+        staged.pixels.push((definition, rgba));
+    }
+    let counted = (
+        u32::try_from(staged.definitions.len()).unwrap_or(u32::MAX),
+        u32::try_from(staged.placements.len()).unwrap_or(u32::MAX),
+    );
+    if declared != Some(counted) {
+        return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+    }
+    // A placement whose definition never arrived would leave the successor
+    // painting a hole, so the whole payload is refused instead.
+    if staged.placements.iter().any(|(_, placement)| {
+        !staged.definitions.iter().any(|definition| definition.id == placement.image_id)
+    }) {
+        return Err(reject(ImageBoundError::InconsistentCanonicalLength));
+    }
+    Ok(staged)
+}
+
 fn decode_limits(limits: ImageLimits) -> DecodeLimits {
     DecodeLimits {
         max_width_pixels: limits.max_width_pixels as usize,
@@ -2700,6 +2926,27 @@ impl PtyTerminalImageState {
         payload: DefinitionPayload<'_>,
     ) -> Result<Vec<TerminalImageLiveMessage>, SessionTerminalError> {
         self.terminal.commit_span_and_publish(span, payload)
+    }
+
+    /// Capture committed images and paused framing for a server upgrade.
+    #[must_use]
+    pub fn export_handoff(&self, payload: DefinitionPayload<'_>) -> ExportedSessionImages {
+        self.terminal.export_handoff(payload)
+    }
+
+    /// Install an exported payload on this session before reads resume.
+    pub fn restore_handoff(
+        &mut self,
+        state: &SessionImageHandoff,
+        install: &mut dyn FnMut(&TerminalImageDefinition, Vec<u8>),
+    ) -> Result<(), SessionTerminalError> {
+        self.terminal.restore_handoff(state, install)
+    }
+
+    /// Borrow the session seam a bounded handoff export reads from.
+    #[must_use]
+    pub const fn session(&self) -> &SessionTerminal {
+        &self.terminal
     }
 
     /// Payload-free canonical definitions for inspection and evidence.

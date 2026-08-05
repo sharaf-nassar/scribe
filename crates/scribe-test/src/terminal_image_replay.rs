@@ -153,16 +153,20 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
     write_probe_evidence(evidence_path, &evidence)
 }
 
-/// The largest scene v1 admits must still travel as wire-sized chunks.
-fn verify_bounded_maximum_scene() -> Result<BoundedEvidence, String> {
+/// The largest scene terminal-images-v1 admits, at one generation.
+///
+/// Shared with the handoff gate, which has to prove the same scene survives an
+/// upgrade in the same wire-sized chunks it reaches a late attacher in.
+pub fn maximum_scene(
+    generation: TerminalImageGeneration,
+) -> Result<Vec<TerminalImageDefinition>, String> {
     let limits = ImageLimits::V1;
     let each = limits
         .canonical_rgba_len(limits.max_width_pixels, limits.max_height_pixels)
         .map_err(|error| format!("maximum canonical length: {error}"))?;
     let count = u32::try_from(limits.max_session_retained_cpu_bytes / each)
         .map_err(|error| format!("maximum image count: {error}"))?;
-    let generation = TerminalImageGeneration(1);
-    let definitions: Vec<TerminalImageDefinition> = (1..=count)
+    (1..=count)
         .map(|id| {
             TerminalImageDefinition::new(
                 scribe_common::terminal_images::TerminalImageId(u64::from(id)),
@@ -173,7 +177,15 @@ fn verify_bounded_maximum_scene() -> Result<BoundedEvidence, String> {
             )
             .map_err(|error| format!("maximum definition {id}: {error}"))
         })
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
+
+/// The largest scene v1 admits must still travel as wire-sized chunks.
+fn verify_bounded_maximum_scene() -> Result<BoundedEvidence, String> {
+    let limits = ImageLimits::V1;
+    let generation = TerminalImageGeneration(1);
+    let definitions = maximum_scene(generation)?;
+    let count = u32::try_from(definitions.len()).unwrap_or(u32::MAX);
     let plan = plan_replay(
         &ReplayInputs {
             generation,

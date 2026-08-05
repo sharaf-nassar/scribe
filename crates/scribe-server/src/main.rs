@@ -55,6 +55,9 @@ use scribe_server::terminal_image_sharing;
 // Combined replay planning lives beside them and is reached from the reader's
 // recovery path; re-export the library's copy for the same reason.
 use scribe_server::terminal_image_replay;
+// The binary's `mod handoff` names the library's image handoff wire type on
+// `HandoffSession`; re-export it so both crates agree on one type.
+use scribe_server::terminal_image_handoff;
 // Spec 017 US1-2: `mod session_manager` opens each child's pidfd and
 // `mod ipc_server` arms the watcher over it, both through
 // `crate::child_watch`. Re-exported for the same reason — the non-Linux build

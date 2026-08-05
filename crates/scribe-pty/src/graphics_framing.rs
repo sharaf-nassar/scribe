@@ -9,6 +9,8 @@ use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 pub use scribe_image_decode::{
     DecodeStorage as GraphicsStorageBudget, DecodeStorageError as GraphicsStorageRejection,
     DecodeStorageLease as GraphicsStorageLease, StorageClass as GraphicsStorageClass,
@@ -30,7 +32,7 @@ const C1_APC: u8 = 0x9f;
 const INLINE_RAW_BYTES: usize = 32;
 
 /// Absolute half-open byte boundary in the raw PTY stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RawByteRange {
     pub start: u64,
     pub end: u64,
@@ -136,7 +138,7 @@ impl RawBytes {
 }
 
 /// Supported image protocols at the framing boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum GraphicsProtocol {
     Kitty,
     Sixel,
@@ -144,7 +146,7 @@ pub enum GraphicsProtocol {
 
 /// Payload-free metadata for the recognized graphics transfer currently held
 /// across PTY reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PendingGraphicsTransfer {
     pub range: RawByteRange,
     pub protocol: GraphicsProtocol,
@@ -153,7 +155,7 @@ pub struct PendingGraphicsTransfer {
 }
 
 /// Stable terminal-images-v1 rejection categories used by framing/parsing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum GraphicsFailureCategory {
     UnsupportedProtocol,
     UnsupportedAction,
@@ -166,7 +168,7 @@ pub enum GraphicsFailureCategory {
 }
 
 /// Safe limit identifier for a rejection; no payload bytes are retained here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum GraphicsLimit {
     ControlString,
     KittyChunkPayload,
@@ -382,7 +384,7 @@ impl GraphicsFailure {
 }
 
 /// Kitty v1 actions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum KittyAction {
     Transmit,
     TransmitDisplay,
@@ -392,7 +394,7 @@ pub enum KittyAction {
 }
 
 /// Direct Kitty pixel formats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum KittyFormat {
     Rgb,
     Rgba,
@@ -400,13 +402,13 @@ pub enum KittyFormat {
 }
 
 /// Supported Kitty delete selector, preserving soft/lowercase polarity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KittyDelete {
     pub selector: char,
     pub free_data: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum KittyCompression {
     None,
     Zlib,
@@ -418,7 +420,7 @@ pub enum KittyChunkState {
     More,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum KittyPlacementMode {
     Classic,
     UnicodePlaceholder,
@@ -453,7 +455,7 @@ pub struct KittyCommand {
 }
 
 /// Payload-free immutable controls captured from a Kitty transfer's first chunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KittyCommandControls {
     pub action: KittyAction,
     pub format: Option<KittyFormat>,
@@ -569,7 +571,7 @@ impl KittyCommand {
 }
 
 /// Payload-free presence bitmap of the controls one Kitty command carried.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KittyControlPresence([u64; 4]);
 
 impl KittyCommandControls {
@@ -600,7 +602,7 @@ impl KittyCommandControls {
 }
 
 /// Parsed Sixel introducer parameters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SixelParameters {
     pub aspect: Option<u16>,
     pub background: Option<u16>,
@@ -682,13 +684,13 @@ impl GraphicsEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum StringForm {
     SevenBit,
     C1,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum CandidateKind {
     Escape,
     ApcPrefix,
@@ -703,7 +705,7 @@ enum CandidateKind {
 /// string ceiling, because a later non-`q` final byte must be forwarded
 /// exactly. This scanner is separate constant-size metadata: it detects a
 /// fourth field or `u16` overflow on the byte that makes the header malformed.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 struct SixelHeaderScanner {
     values: [Option<u16>; 3],
     current: Option<u16>,
@@ -894,7 +896,7 @@ struct Candidate {
     kind: CandidateKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum ActiveKind {
     Kitty,
     UnsupportedKittyC1,
@@ -955,6 +957,76 @@ enum FramerStateSnapshot {
         kitty_payload_bytes: usize,
         failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
     },
+}
+
+/// One paused framer's stream cursor plus whatever control string it held.
+///
+/// This is the framing half of a server handoff: the committed image scene
+/// travels as replay records, and the bytes already consumed for a string that
+/// has not terminated yet travel here. Both must land before reads resume, or
+/// the successor either loses the image or replays its prefix as text.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PartialFramingState {
+    offset: u64,
+    state: PartialFramerState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+enum PartialFramerState {
+    Ground,
+    Candidate {
+        start: u64,
+        kind: CandidateKind,
+        bytes: Vec<u8>,
+    },
+    Active {
+        start: u64,
+        kind: ActiveKind,
+        body: Vec<u8>,
+        control_bytes: usize,
+        pending_escape: bool,
+        kitty_payload_started: bool,
+        kitty_payload_bytes: usize,
+        failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
+    },
+}
+
+impl PartialFramingState {
+    /// Absolute stream offset the successor's first read must continue from.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether a control string was still open when the reader paused.
+    #[must_use]
+    pub const fn is_partial(&self) -> bool {
+        !matches!(self.state, PartialFramerState::Ground)
+    }
+
+    /// Stream bytes the open string has consumed, for payload-free evidence.
+    ///
+    /// Measured from the string's start offset rather than by adding retained
+    /// buffers together: an active string counts its control section in both
+    /// `body` and `control_bytes`, so summing them double-counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        let start = match &self.state {
+            PartialFramerState::Ground => return 0,
+            PartialFramerState::Candidate { start, .. }
+            | PartialFramerState::Active { start, .. } => *start,
+        };
+        self.offset.saturating_sub(start)
+    }
+
+    /// Protocol of the open string, once its introducer has been recognized.
+    #[must_use]
+    pub fn protocol(&self) -> Option<GraphicsProtocol> {
+        match &self.state {
+            PartialFramerState::Active { kind, .. } => Some(kind.protocol()),
+            PartialFramerState::Ground | PartialFramerState::Candidate { .. } => None,
+        }
+    }
 }
 
 struct FramerTransaction {
@@ -1234,6 +1306,90 @@ impl GraphicsFramer {
             transaction.owned_original = Some(FramerState::Active(active));
         }
         Ok(working)
+    }
+
+    /// Capture the paused framer's stream cursor and any held control string.
+    ///
+    /// A server upgrade pauses reads wherever the last one ended, which can be
+    /// mid-APC or mid-DCS. Exporting the held prefix — rather than flushing it
+    /// as text — is what lets the successor consume the string's remainder as
+    /// the same image command.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    #[must_use]
+    pub fn export_partial(&self) -> PartialFramingState {
+        let state = match &self.state {
+            FramerState::Ground => PartialFramerState::Ground,
+            FramerState::Candidate(candidate) => PartialFramerState::Candidate {
+                start: candidate.start,
+                kind: candidate.kind,
+                bytes: candidate.bytes.as_slice().to_vec(),
+            },
+            FramerState::Active(active) => PartialFramerState::Active {
+                start: active.start,
+                kind: active.kind.clone(),
+                body: active.body.as_slice().to_vec(),
+                control_bytes: active.control_bytes,
+                pending_escape: active.pending_escape,
+                kitty_payload_started: active.kitty_payload_started,
+                kitty_payload_bytes: active.kitty_payload_bytes,
+                failure: active.failure,
+            },
+        };
+        PartialFramingState { offset: self.offset, state }
+    }
+
+    /// Reinstate an exported cursor and held control string on a fresh framer.
+    ///
+    /// Retained bytes are re-reserved through this framer's own budget, so the
+    /// successor's storage ledger accounts for the restored prefix exactly as
+    /// the sender's did. A framer that already holds state refuses.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    pub fn restore_partial(
+        &mut self,
+        state: &PartialFramingState,
+    ) -> Result<(), GraphicsStorageRejection> {
+        if self.transaction.is_some() || !matches!(self.state, FramerState::Ground) {
+            return Err(GraphicsStorageRejection::InternalInvariant);
+        }
+        self.state = match &state.state {
+            PartialFramerState::Ground => FramerState::Ground,
+            PartialFramerState::Candidate { start, kind, bytes } => {
+                FramerState::Candidate(Candidate {
+                    start: *start,
+                    bytes: RetainedVec::from_slice(
+                        Arc::clone(&self.storage_budget),
+                        GraphicsStorageClass::FramingCandidate,
+                        bytes,
+                    )?,
+                    kind: *kind,
+                })
+            }
+            PartialFramerState::Active {
+                start,
+                kind,
+                body,
+                control_bytes,
+                pending_escape,
+                kitty_payload_started,
+                kitty_payload_bytes,
+                failure,
+            } => FramerState::Active(ActiveString {
+                start: *start,
+                kind: kind.clone(),
+                body: RetainedVec::from_slice(
+                    Arc::clone(&self.storage_budget),
+                    GraphicsStorageClass::FramingActive,
+                    body,
+                )?,
+                control_bytes: *control_bytes,
+                pending_escape: *pending_escape,
+                kitty_payload_started: *kitty_payload_started,
+                kitty_payload_bytes: *kitty_payload_bytes,
+                failure: *failure,
+            }),
+        };
+        self.offset = state.offset;
+        Ok(())
     }
 
     /// Abandon any incomplete graphics string without emitting its bytes.

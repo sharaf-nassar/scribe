@@ -251,6 +251,8 @@ The HandoffState contains per-session metadata, per-session replay payload, and 
 
 Per-session payloads include title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a  carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
 
+Each session also carries an additive `#[serde(default)]` image-state payload — the committed scene as a bounded replay burst, the framer's paused control-string prefix, and any chunked transfer still accumulating — so a hot reload does not blank a session's images; see [[terminal-images#Terminal Images#Image State Across Handoff]].
+
 Each session also carries the child's PID and an additive `#[serde(default)]` child-identity token, so the receiver can prove the PID still names that child before hanging it up (see ). A sender that predates the field leaves it absent and the receiver treats the child as unproven.
 
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
@@ -304,6 +306,8 @@ Bump  when  changes incompatibly. Additive per-session fields that use `#[serde(
 Feature 013 (remote window control) added no handoff fields — the remote listener is re-derived from config by the receiver rather than carried on the wire — so it stayed at v6; see .
 
 The child-identity token added for the PID check is exactly such an additive field and also stays at v6: a receiver that has never heard of it decodes the payload and ignores the key, and a receiver that expects it fills the missing value with `None`.
+
+Per-session terminal-image state is the one additive field that could not stay on the current version, because "the receiver ignores the key" is the failure: a pre-image server would restore every session's text with its images silently gone. `HANDOFF_VERSION` is therefore 7, but [[crates/scribe-server/src/handoff.rs#handoff_state_version|the payload declares 7 only when it actually carries image state]] and omits the key entirely otherwise, so an image-free payload is byte-identical to a v6 one and rolls back untouched. See [[terminal-images#Terminal Images#Image State Across Handoff]].
 
 The sender uses `rmp_serde::to_vec_named` so `HandoffState` and `HandoffSession` serialize as MessagePack **maps** keyed by field name (since v6). Earlier versions used the default `rmp_serde::to_vec` which emitted MessagePack **arrays** — positional encoding where any field insertion in the middle of the struct silently mis-aligned every later field, breaking even "previous-version" hot-reloads despite `#[serde(default)]` annotations. Named encoding makes the invariant honest: as long as renames go through `#[serde(rename = "old_name")]` or `#[serde(alias = "old_name")]`, every additive struct change preserves backward compatibility. Cross-encoding handoff (v5 positional sender → v6 named receiver) is not supported; the client falls back to a cold restart of the stale old server.
 

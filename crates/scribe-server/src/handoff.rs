@@ -94,7 +94,46 @@ use crate::workspace_manager::WorkspaceManager;
 /// direction, and the receiver treats an absent identity as "unproven" rather
 /// than as a decode failure. Bump ONLY when the serialised shape changes in a
 /// way `#[serde(default)]` cannot absorb.
-const HANDOFF_VERSION: u32 = 6;
+///
+/// Spec 020 added [`HandoffSession::image_state`], which is additive in the
+/// same `#[serde(default)]` sense — but only in one direction. A v6 server
+/// silently ignores it, which would land the successor showing a session's
+/// text with its images gone. So the payload declares v7 exactly when it
+/// carries image state, and [`handoff_version_accepted`] makes a v6 receiver
+/// refuse that payload and cold-restart instead. An image-free payload — every
+/// current session, and every session once the master switch is off — still
+/// declares v6 and rolls back to an older server untouched.
+const HANDOFF_VERSION: u32 = 7;
+
+/// Version an image-free payload declares, and the newest a pre-image server
+/// understands.
+const HANDOFF_VERSION_WITHOUT_IMAGES: u32 = 6;
+
+/// Version a payload must declare for the sessions it actually carries.
+///
+/// Downgrading a payload that carries no image state is the whole rollback
+/// story: turning the master image switch off makes the next upgrade payload
+/// v6 again, so an older server accepts it.
+// @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+#[must_use]
+pub fn handoff_state_version(sessions: &[HandoffSession]) -> u32 {
+    if sessions.iter().any(|session| session.image_state.is_some()) {
+        HANDOFF_VERSION
+    } else {
+        HANDOFF_VERSION_WITHOUT_IMAGES
+    }
+}
+
+/// Whether a receiver supporting `supported` accepts a payload at `version`.
+///
+/// N and N-1 are accepted so a normal forward upgrade never cold-restarts.
+/// N+1 is refused, which is what turns a rollback to a pre-image server into a
+/// clean cold restart rather than a silent loss of every session's images.
+// @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+#[must_use]
+pub const fn handoff_version_accepted(version: u32, supported: u32) -> bool {
+    version == supported || version == supported.saturating_sub(1)
+}
 
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
@@ -192,6 +231,18 @@ pub struct HandoffSession {
     /// Launch-time AI provider hint. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub ai_provider_hint: Option<AiProvider>,
+    /// Committed image scene, paused framing, and any in-flight chunked
+    /// transfer (spec 020). `#[serde(default)]` so a pre-image sender restores
+    /// as a session with an empty scene rather than failing to decode.
+    ///
+    /// Present only while the master image switch is on; its presence is what
+    /// lifts the payload to v7 and blocks a rollback that would drop it.
+    ///
+    /// `skip_serializing_if` matters as much as `default`: an image-free
+    /// payload must be byte-identical to one a pre-image server produced, or
+    /// "images off" would still ship a key an old receiver never expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_state: Option<crate::terminal_image_handoff::SessionImageHandoff>,
 }
 
 fn default_shell_name() -> String {
@@ -592,8 +643,8 @@ async fn serialize_state(
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
 
-    let state =
-        HandoffState { version: HANDOFF_VERSION, sessions, workspaces, workspace_tree, windows };
+    let version = handoff_state_version(&sessions);
+    let state = HandoffState { version, sessions, workspaces, workspace_tree, windows };
 
     (state, fds)
 }
@@ -698,7 +749,7 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
     // deserialization above usually fails first, and the propagated error
     // drives the client-side cold-restart fallback. Versions outside this
     // accepted range hit cold-restart here instead.
-    if state.version != HANDOFF_VERSION && state.version != HANDOFF_VERSION.saturating_sub(1) {
+    if !handoff_version_accepted(state.version, HANDOFF_VERSION) {
         return Err(ScribeError::IpcError {
             reason: format!(
                 "handoff version unsupported: got {}, supported {}..={HANDOFF_VERSION} \

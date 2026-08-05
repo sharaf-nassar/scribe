@@ -82,6 +82,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         context: None,
         ai_state: None,
         ai_provider_hint: None,
+        image_state: None,
     };
 
     let state = HandoffState {
@@ -156,6 +157,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             }),
             ai_state: None,
             ai_provider_hint: None,
+            image_state: None,
         });
         masters.push(pty.master);
         slaves.push(pty.slave);
