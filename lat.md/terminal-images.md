@@ -633,14 +633,62 @@ per-session sink set and skips any sink whose `Hello` capability does not suppor
 the session's latched subset. Each connection's advertised capability lives on
 its lock-free output-queue handle rather than behind the connection mutex,
 because the fan-out runs inside the per-session sink lock where nothing may
-await. Records are non-droppable frames, so a saturated link sheds `PtyOutput`
-and resyncs instead of losing an image record silently.
+await.
+
+A live record is a session-scoped droppable frame, exactly like the raw
+`PtyOutput` it accompanies: a saturated link sheds both together and the sink
+owes a fresh combined replay, which is cheaper and more truthful than growing
+the queue until the connection dies. A sink that owes a replay receives no live
+delta at all, because an increment applied to an unknown scene is what produces
+a divergent viewer.
 
 The returned count is the viewer count the zero/one/multiple-viewer contract is
 written against. Zero viewers is a normal outcome, not an error: the session
 still commits canonical state and still answers the PTY. A shared-mode join adds
 a sink, a `SingleController` re-point replaces the set, and a disconnect removes
 one — none of which touches the latch.
+
+## Combined Image Replay
+
+A viewer with no knowable scene is caught up by one bounded generation-tagged burst rather than by incremental deltas, so a late attach and a shed backlog share one recovery.
+
+[[crates/scribe-server/src/terminal_image_replay.rs#plan_replay]] turns a
+canonical snapshot into `Begin`, every surviving definition followed by its RGBA
+split into wire-sized chunks, every surviving placement tagged with its owning
+screen, and `Commit`. Every record carries the same generation and the
+snapshot's output cursor, so a receiver stages the whole burst and swaps at
+`Commit`; a partial scene is never observable. An empty scene is still a
+truthful two-record burst, which is what converges a viewer holding stale
+placements.
+
+Chunks are capped at the frozen `max_replay_chunk_bytes`, so the largest scene
+v1 admits — 128 MiB of canonical RGBA — becomes 128 bounded records rather than
+one oversized frame. Records are charged their real payload size in the output
+queue, because a flat nominal charge would let a large scene outgrow the queue's
+byte ceiling without the ceiling noticing.
+
+Canonical pixels arrive through the same payload seam the live publication path
+uses. A definition the caller cannot pay for is withdrawn together with every
+placement naming it: an unbacked definition would leave the receiver staging a
+scene it can never complete.
+
+### Replay debt
+
+A sink owes a replay in exactly two situations: it just attached, or its queued
+output was shed.
+
+Either way what the viewer has seen no longer describes the session.
+[[crates/scribe-server/src/ipc_server.rs#AttachedSinks#fan_out_images]] detects
+the shed case at the moment the queue refuses a frame, which is synchronous and
+race-free, and stops sending deltas to that sink.
+
+[[crates/scribe-server/src/ipc_server.rs#AttachedSinks#fan_out_image_replay]]
+delivers one planned burst to every sink that owes one and clears their debt
+together. Replay records are non-droppable: the burst *is* the recovery, so
+shedding it under the policy that triggered the recovery would loop. The plan is
+built once from canonical state however many sinks receive it, so the server
+never retains a per-sink copy of the scene and recovery cost does not grow with
+viewer count.
 
 ## Typed Failures
 

@@ -860,6 +860,10 @@ pub enum TerminalImageReplayMessage {
         definition_count: u32,
         placement_count: u32,
         total_rgba_bytes: u64,
+        /// Grid the snapshot leaves active. Omitted at its legacy default,
+        /// where the receiver keeps the primary screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_screen: Option<TerminalScreenKind>,
     },
     Definition {
         generation: TerminalImageGeneration,
@@ -872,6 +876,11 @@ pub enum TerminalImageReplayMessage {
     Placement {
         generation: TerminalImageGeneration,
         placement: TerminalImagePlacement,
+        /// Grid this placement belongs to, so an inactive-screen placement
+        /// cannot land in the wrong client bucket. Omitted at its legacy
+        /// default, where the receiver uses the snapshot's active screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<TerminalScreenKind>,
     },
     Commit {
         generation: TerminalImageGeneration,
@@ -911,7 +920,7 @@ impl TerminalImageReplayMessage {
                 }
                 Ok(())
             }
-            Self::Placement { generation, placement } => {
+            Self::Placement { generation, placement, .. } => {
                 if *generation != placement.generation {
                     return Err(ImageBoundError::InconsistentGeneration);
                 }

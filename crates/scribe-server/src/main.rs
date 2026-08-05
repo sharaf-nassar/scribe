@@ -52,6 +52,9 @@ use scribe_server::terminal_image_state;
 // The reader's reply write-back and capable-sink fan-out live beside that seam;
 // re-export the library's copy for the same single-compile reason.
 use scribe_server::terminal_image_sharing;
+// Combined replay planning lives beside them and is reached from the reader's
+// recovery path; re-export the library's copy for the same reason.
+use scribe_server::terminal_image_replay;
 // Spec 017 US1-2: `mod session_manager` opens each child's pidfd and
 // `mod ipc_server` arms the watcher over it, both through
 // `crate::child_watch`. Re-exported for the same reason — the non-Linux build

@@ -7,8 +7,8 @@
 
 use crate::ipc_server::{
     AttachedSinks, ClientSink, ClientWriter, OutputSink, SharedWriter, begin_sink_attach,
-    finish_sink_attach, lock_sinks, new_live_session_registry, send_image_records,
-    spawn_output_queue,
+    finish_sink_attach, image_replay_debt, lock_sinks, new_live_session_registry,
+    send_image_records, send_image_replay, spawn_output_queue,
 };
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::ServerMessage;
@@ -61,12 +61,23 @@ pub async fn attach_viewer(
     capabilities: TerminalImageCapabilities,
     additive: bool,
 ) -> ProbeViewer {
+    let viewer = begin_attach_viewer(client_writer, capabilities, additive).await;
+    finish_sink_attach(client_writer, &viewer.writer, 0, SessionId::new());
+    viewer
+}
+
+/// Install a viewer that is still buffering — the production window between a
+/// sink's install and its replay landing on the wire.
+pub async fn begin_attach_viewer(
+    client_writer: &ClientWriter,
+    capabilities: TerminalImageCapabilities,
+    additive: bool,
+) -> ProbeViewer {
     let (reader, write_half) = tokio::io::duplex(1 << 20);
     let (sink, _drain) = spawn_output_queue(write_half, new_live_session_registry());
     sink.set_image_capabilities(capabilities);
     let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::new(sink.clone())));
     begin_sink_attach(client_writer, &writer, additive).await;
-    finish_sink_attach(client_writer, &writer, 0, SessionId::new());
     ProbeViewer { writer, sink, reader }
 }
 
@@ -75,11 +86,31 @@ pub fn detach_viewer(client_writer: &ClientWriter, viewer: &ProbeViewer) -> bool
     lock_sinks(client_writer).detach(&viewer.writer)
 }
 
-/// Fan one burst out through the production capable-sink path.
+/// Fan one live burst out through the production capable-sink path.
 pub fn fan_out_images(
     client_writer: &ClientWriter,
+    session_id: SessionId,
     required: TerminalImageCapabilities,
     messages: &[ServerMessage],
 ) -> usize {
-    send_image_records(client_writer, required, messages)
+    send_image_records(client_writer, session_id, required, messages)
+}
+
+/// How many capable sinks currently owe a combined image replay.
+pub fn replay_debt(client_writer: &ClientWriter, required: TerminalImageCapabilities) -> usize {
+    image_replay_debt(client_writer, required)
+}
+
+/// Fan one planned replay burst out through the production recovery path.
+pub fn fan_out_image_replay(
+    client_writer: &ClientWriter,
+    required: TerminalImageCapabilities,
+    records: &[ServerMessage],
+) -> usize {
+    send_image_replay(client_writer, required, records)
+}
+
+/// Release a viewer's replay debt the way the production attach path does.
+pub fn finish_attach(client_writer: &ClientWriter, viewer: &ProbeViewer, session_id: SessionId) {
+    finish_sink_attach(client_writer, &viewer.writer, 0, session_id);
 }
