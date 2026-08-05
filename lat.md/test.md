@@ -239,6 +239,70 @@ canvas reservation in that class peak.
 
 `terminal-image-accounting.sh` runs the production accounting probe in the functional Docker image and validates payload-free exact-limit, replacement, rollback, cross-session, and zero-release outcomes.
 
+## Mandatory Decode Scheduling
+
+The functional harness proves that every production decode takes a scheduler permit, that a foreign capability is refused before work, and that admission stays fair and bounded.
+
+### Production Admission Probe
+
+Real Kitty and Sixel bytes through the production seam each take exactly one
+admission and give it back.
+
+One Kitty RGBA transmit and one Sixel command produce one decoded image each and
+exactly two admissions on the session's process scheduler. Released admissions
+equal admitted ones, the queue and active sets are empty afterward, and both
+session and process requested-storage currents return to zero once retained
+storage is released.
+
+### Capability Refusal
+
+A permit is refused before any work whenever its issuer, session, generation,
+target, or budget differs from the work presenting it.
+
+One admitted permit is authorized against five mutated requests - another
+session, another generation, another target, another storage budget, and another
+byte count - and each returns its own typed refusal. A ticket issued by one
+scheduler is refused by another, and a request larger than the byte ceiling never
+enters the queue. Afterward the storage ledger shows no reservation, no allocator
+attempt, and zero current bytes, so refusal itself charges nothing.
+
+### FIFO Admission
+
+Four tickets issued in order are admitted in that order even though their waiting
+threads race for the single free slot.
+
+A holder occupies the only concurrency slot while four tickets are issued and
+four threads block on admission. Releasing the holder drains them strictly in
+issue order; any barge would reorder the recorded admission list against the
+recorded issue list.
+
+### Cancellation and Deadline Retirement
+
+Cancelling one target retires exactly that waiter, wakes its successor, and
+reaches in-flight work without touching an unrelated target.
+
+A cancelled waiter returns the cancellation refusal and leaves the queue, after
+which the next waiter is admitted uncancelled. Cancelling an active permit's
+target makes the permit report cancellation and makes the shared decode budget
+refuse to open at all, while a same-target cancellation issued for a different
+session reaches nothing. A waiter that outlives a 120 ms queue wait retires
+itself once, and the queue is immediately usable again. Admitted and released
+counts stay equal throughout.
+
+### Bounded Queue Metadata
+
+Queue metadata never exceeds the immutable depth ceiling, and an abandoned ticket
+is pruned rather than parked.
+
+With a two-slot queue, a third request is refused as full, peak queue depth stops
+at two, and dropping both queued tickets without admitting them prunes the queue
+back to empty with both abandonments counted. A second session decodes through
+the production seam while an unrelated session holds one of two slots.
+
+### Docker Evidence Entry Point
+
+`terminal-image-scheduler.sh` runs the production scheduling probe in the functional Docker image and validates payload-free admission, refusal, ordering, cancellation, deadline, bounded-queue, and zero-ownership outcomes.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

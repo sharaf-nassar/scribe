@@ -21,6 +21,7 @@ mod sixel_decoder;
 mod terminal_image_accounting;
 mod terminal_image_mutations;
 mod terminal_image_observer_parity;
+mod terminal_image_scheduler;
 mod terminal_image_state_seam;
 mod wait;
 
@@ -344,6 +345,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify mandatory terminal-image decode scheduling.
+    TerminalImageScheduler {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Verify transactional terminal-image definition and placement mutation.
     TerminalImageMutations {
         /// Versioned payload-free JSON evidence destination.
@@ -570,6 +577,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageStateSeam { evidence } => run_terminal_image_state_seam(&evidence),
         Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
         Command::TerminalImageAccounting { evidence } => run_terminal_image_accounting(&evidence),
+        Command::TerminalImageScheduler { evidence } => run_terminal_image_scheduler(&evidence),
         Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
@@ -596,6 +604,10 @@ fn run_observer_parity(evidence: &std::path::Path) -> Result<(), TestError> {
 
 fn run_terminal_image_accounting(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_accounting::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_terminal_image_scheduler(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_scheduler::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_share_tap(

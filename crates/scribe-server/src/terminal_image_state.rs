@@ -31,8 +31,10 @@ use scribe_common::terminal_images::{
     TerminalScreenKind,
 };
 use scribe_image_decode::{
-    DecodeBudget, DecodeBuffer, DecodeLimits, DecodeStorage, DecodeStorageLease, NoopHooks,
-    StorageProcess, StorageValidation, StorageValidationPause, StorageValidationRejection,
+    DecodeAdmissionError, DecodeBudget, DecodeBuffer, DecodeCeilings, DecodeLimits, DecodePermit,
+    DecodeRequest, DecodeScheduler, DecodeSessionId, DecodeStorage, DecodeStorageLease,
+    DecodeTarget, NoopHooks, StorageProcess, StorageValidation, StorageValidationPause,
+    StorageValidationRejection,
 };
 use scribe_pty::graphics_framing::{
     GraphicsEvent, GraphicsFailure, GraphicsFailureCategory, GraphicsFramer, GraphicsProtocol,
@@ -975,6 +977,24 @@ pub struct TerminalImageProcessPolicy {
     storage_validation_rejection: Option<StorageValidationRejection>,
     storage_validation_snapshot_fault: Option<StorageSnapshotValidationFault>,
     storage_validation_pause: Option<StorageValidationPause>,
+    decode_scheduler: Arc<DecodeScheduler>,
+}
+
+/// Derive the frozen v1 decode ceilings from the frozen v1 image limits.
+fn decode_ceilings(limits: ImageLimits) -> DecodeCeilings {
+    DecodeCeilings {
+        concurrent_decodes: limits.max_concurrent_decodes,
+        queue_depth: limits.max_decode_queue_depth,
+        queue_bytes: limits.max_decode_queue_bytes,
+        queue_wait: Duration::from_millis(limits.max_queue_wait_ms),
+    }
+}
+
+/// One process-wide scheduler shared by every v1 policy, so a second policy
+/// cannot mint decode admissions that bypass the live process ceilings.
+fn v1_decode_scheduler() -> Arc<DecodeScheduler> {
+    static SCHEDULER: OnceLock<Arc<DecodeScheduler>> = OnceLock::new();
+    Arc::clone(SCHEDULER.get_or_init(|| DecodeScheduler::new(decode_ceilings(ImageLimits::V1))))
 }
 
 impl TerminalImageProcessPolicy {
@@ -993,6 +1013,7 @@ impl TerminalImageProcessPolicy {
                 storage_validation_rejection: None,
                 storage_validation_snapshot_fault: None,
                 storage_validation_pause: None,
+                decode_scheduler: v1_decode_scheduler(),
             })
         }))
     }
@@ -1011,6 +1032,7 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1028,6 +1050,7 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1047,6 +1070,7 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1068,6 +1092,7 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1089,6 +1114,7 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1117,6 +1143,7 @@ impl TerminalImageProcessPolicy {
             }),
             storage_validation_snapshot_fault: None,
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1151,6 +1178,7 @@ impl TerminalImageProcessPolicy {
                 reached,
                 resume,
             }),
+            decode_scheduler: v1_decode_scheduler(),
         })
     }
 
@@ -1172,6 +1200,25 @@ impl TerminalImageProcessPolicy {
             storage_validation_rejection: None,
             storage_validation_snapshot_fault: Some(fault),
             storage_validation_pause: None,
+            decode_scheduler: v1_decode_scheduler(),
+        })
+    }
+
+    /// Construct a policy owning a private decode scheduler with smaller
+    /// ceilings so admission ordering is observable in bounded wall time.
+    #[must_use]
+    pub fn with_decode_ceilings_for_validation(ceilings: DecodeCeilings) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
+            session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+            decode_scheduler: DecodeScheduler::new(ceilings),
         })
     }
 
@@ -1179,6 +1226,13 @@ impl TerminalImageProcessPolicy {
     #[must_use]
     pub fn limits(&self) -> ImageLimits {
         self.limits
+    }
+
+    /// The mandatory decode scheduler every session of this policy admits
+    /// through.
+    #[must_use]
+    pub fn decode_scheduler(&self) -> &Arc<DecodeScheduler> {
+        &self.decode_scheduler
     }
 }
 
@@ -1292,6 +1346,7 @@ pub struct SessionTerminal {
     kitty_decoded_storage: Option<DecodeBuffer>,
     sixel_decoded_storage: Option<DecodeBuffer>,
     pending_kitty_decode: Option<PendingKittyDecode>,
+    decode_session: DecodeSessionId,
 }
 
 impl SessionTerminal {
@@ -1312,6 +1367,7 @@ impl SessionTerminal {
                 pause: policy.storage_validation_pause.clone(),
             },
         );
+        let decode_session = policy.decode_scheduler.new_session();
         Self {
             policy,
             framer: GraphicsFramer::with_storage_budget(
@@ -1331,7 +1387,36 @@ impl SessionTerminal {
             kitty_decoded_storage: None,
             sixel_decoded_storage: None,
             pending_kitty_decode: None,
+            decode_session,
         }
+    }
+
+    /// Session identity every decode admission for this seam is bound to.
+    #[must_use]
+    pub const fn decode_session(&self) -> DecodeSessionId {
+        self.decode_session
+    }
+
+    /// Describe the exact capability one decode entry point needs, so the
+    /// ticket, the permit, and the authorization check all name one request.
+    fn decode_request(&self, target: DecodeTarget, requested_bytes: u64) -> DecodeRequest {
+        DecodeRequest {
+            session: self.decode_session,
+            generation: self.generation.0,
+            target,
+            requested_bytes,
+            storage: Arc::clone(&self.storage_budget),
+        }
+    }
+
+    /// Take one scheduler ticket and turn it into the permit every decode
+    /// entry point requires, rejecting foreign capabilities before any work.
+    fn admit_decode(&self, request: &DecodeRequest) -> Result<DecodePermit, DecodeAdmissionError> {
+        let scheduler = &self.policy.decode_scheduler;
+        let ticket = scheduler.issue(request.clone())?;
+        let permit = scheduler.admit(ticket)?;
+        permit.authorize(scheduler, request)?;
+        Ok(permit)
     }
 
     /// Consume one PTY read and return raw/image boundaries without fanout.
@@ -1783,17 +1868,29 @@ impl SessionTerminal {
 
         let more = command.chunk_state == KittyChunkState::More;
         let limits = decode_limits(self.policy.limits);
-        let storage = Arc::clone(&self.storage_budget);
-        let mut budget =
-            match DecodeBudget::new(limits, &NoopHooks, storage.as_ref()).map_err(|error| {
-                kitty_boundary_error(scribe_common::kitty_decode::KittyDecodeError::from(error))
-            }) {
-                Ok(budget) => budget,
-                Err(error) => {
-                    self.reject_kitty_decode(range, error, staged)?;
-                    return Ok(());
-                }
-            };
+        let target = DecodeTarget::kitty(u64::from(
+            self.pending_kitty_decode
+                .as_ref()
+                .and_then(|pending| pending.controls.image_id)
+                .unwrap_or(0),
+        ));
+        let requested_bytes = u64::try_from(command.payload().len()).unwrap_or(u64::MAX);
+        let request = self.decode_request(target, requested_bytes);
+        let permit = match self.admit_decode(&request) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return self.reject_decode_admission(range, GraphicsProtocol::Kitty, error, staged);
+            }
+        };
+        let mut budget = match DecodeBudget::new(limits, &NoopHooks, &permit).map_err(|error| {
+            kitty_boundary_error(scribe_common::kitty_decode::KittyDecodeError::from(error))
+        }) {
+            Ok(budget) => budget,
+            Err(error) => {
+                self.reject_kitty_decode(range, error, staged)?;
+                return Ok(());
+            }
+        };
         let push_result = self
             .pending_kitty_decode
             .as_mut()
@@ -1872,6 +1969,40 @@ impl SessionTerminal {
         Ok(())
     }
 
+    /// Turn a refused admission into a typed boundary. A foreign capability or
+    /// poisoned queue is an internal invariant — the seam issued the ticket it
+    /// is presenting — while quota, cancellation, and deadline refusals are
+    /// ordinary hostile-stream outcomes.
+    fn reject_decode_admission(
+        &mut self,
+        range: RawByteRange,
+        protocol: GraphicsProtocol,
+        error: DecodeAdmissionError,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        match error {
+            DecodeAdmissionError::ForeignIssuer
+            | DecodeAdmissionError::ForeignSession
+            | DecodeAdmissionError::ForeignGeneration
+            | DecodeAdmissionError::ForeignTarget
+            | DecodeAdmissionError::ForeignBudget
+            | DecodeAdmissionError::Poisoned => {
+                Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))
+            }
+            _ => {
+                if protocol == GraphicsProtocol::Kitty {
+                    staged.completed_kitty_transfer = self.pending_kitty_decode.take();
+                }
+                self.append_decode_failure(
+                    range,
+                    protocol,
+                    GraphicsFailureCategory::QuotaExceeded,
+                    staged,
+                )
+            }
+        }
+    }
+
     fn reject_kitty_decode(
         &mut self,
         range: RawByteRange,
@@ -1941,7 +2072,7 @@ impl SessionTerminal {
     }
 
     fn stage_sixel_event(
-        &self,
+        &mut self,
         range: RawByteRange,
         command: SixelCommand,
         staged: &mut StagedRead,
@@ -1954,7 +2085,17 @@ impl SessionTerminal {
         .map_err(SessionTerminalError::Storage)?;
         staged.sixel_body = StagedStorage::Replace(body);
         self.storage_budget.record_validation_stage(StorageAllocationClass::CanonicalSixel);
-        let canonical = match self.decode_sixel(&command) {
+        let target = DecodeTarget::sixel(staged.sequence.0.saturating_add(1));
+        let requested_bytes = u64::try_from(command.payload().len()).unwrap_or(u64::MAX);
+        let request = self.decode_request(target, requested_bytes);
+        let permit = match self.admit_decode(&request) {
+            Ok(permit) => permit,
+            Err(error) => {
+                staged.sixel_body = StagedStorage::Clear;
+                return self.reject_decode_admission(range, GraphicsProtocol::Sixel, error, staged);
+            }
+        };
+        let canonical = match self.decode_sixel(&command, &permit) {
             Ok(decoded) => {
                 let canonical = DecodedImageMeta {
                     width: u32::try_from(decoded.width).unwrap_or(u32::MAX),
@@ -2023,6 +2164,7 @@ impl SessionTerminal {
     fn decode_sixel(
         &self,
         command: &SixelCommand,
+        permit: &DecodePermit,
     ) -> Result<icy_sixel_decoder::DecodedSixel, DecodeBoundaryError> {
         let settings = DcsSettings {
             aspect_ratio: command.parameters.aspect,
@@ -2034,7 +2176,7 @@ impl SessionTerminal {
             settings,
             decode_limits(self.policy.limits),
             &NoopHooks,
-            self.storage_budget.as_ref(),
+            permit,
         )
         .map_err(|error| sixel_boundary_error(&error))
     }
@@ -2280,6 +2422,12 @@ impl PtyTerminalImageState {
     #[must_use]
     pub fn framing_work(&self) -> SessionTerminalFramingWork {
         self.terminal.framing_work()
+    }
+
+    /// Session identity every decode admission for this reader is bound to.
+    #[must_use]
+    pub const fn decode_session(&self) -> DecodeSessionId {
+        self.terminal.decode_session()
     }
 
     /// Frame one effective PTY read through the integrated session seam.

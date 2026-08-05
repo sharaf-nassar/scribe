@@ -15,12 +15,15 @@ use scribe_common::kitty_decode::{
     KittyTransport, NormalizedKittyImage,
 };
 use scribe_common::terminal_images::{ImageLimits, TerminalImageRejectionReason};
-use scribe_image_decode::{AllocationDenied, DecodeBudget, DecodeHooks, DecodeLimits, NoopHooks};
+use scribe_image_decode::{
+    AllocationDenied, BudgetError, DecodeBudget, DecodeHooks, DecodeLimits, DecodeStorageError,
+    NoopHooks,
+};
 use scribe_png_decoder::{PngLimits, decode_png};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::decode_storage::decode_storage;
+use crate::decode_storage::decode_permit;
 
 const PNG_FIXTURE_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
 
@@ -58,9 +61,11 @@ fn normalize(
     budget_limits: DecodeLimits,
     hooks: &impl DecodeHooks,
 ) -> Result<NormalizedKittyImage, KittyDecodeError> {
-    let storage = decode_storage();
+    let permit = decode_permit().map_err(|_| {
+        KittyDecodeError::from(BudgetError::Storage(DecodeStorageError::InternalInvariant))
+    })?;
     let mut budget =
-        DecodeBudget::new(budget_limits, hooks, &storage).map_err(KittyDecodeError::from)?;
+        DecodeBudget::new(budget_limits, hooks, &permit).map_err(KittyDecodeError::from)?;
     let mut transfer = KittyTransfer::new(params, limits)?;
     for &(chunk, more) in chunks {
         transfer.push_chunk(chunk, more, &mut budget)?;
@@ -130,8 +135,8 @@ fn success_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String> 
     }
 
     let png_bytes = STANDARD.decode(PNG_FIXTURE_BASE64).map_err(|error| error.to_string())?;
-    let png_storage = decode_storage();
-    let mut png_budget = DecodeBudget::new(decode_limits(limits), &NoopHooks, &png_storage)
+    let png_permit = decode_permit().map_err(|error| format!("PNG permit: {error}"))?;
+    let mut png_budget = DecodeBudget::new(decode_limits(limits), &NoopHooks, &png_permit)
         .map_err(|error| format!("PNG budget: {error}"))?;
     decode_png(&png_bytes, png_limits(limits), &mut png_budget)
         .map_err(|error| format!("direct PNG fork: {error:?} ({error})"))?;
@@ -303,9 +308,9 @@ fn rejection_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String
         "deadline",
     )?;
 
-    let cancelled_storage = decode_storage();
-    let cancelled =
-        DecodeBudget::new(decode_limits(limits), &CancelImmediately, &cancelled_storage);
+    let cancelled_permit =
+        decode_permit().map_err(|error| format!("cancellation permit: {error}"))?;
+    let cancelled = DecodeBudget::new(decode_limits(limits), &CancelImmediately, &cancelled_permit);
     if !matches!(cancelled, Err(scribe_image_decode::BudgetError::DecodeCancelled { .. })) {
         return Err("immediate cancellation did not reject".to_owned());
     }
