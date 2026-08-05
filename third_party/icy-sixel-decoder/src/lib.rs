@@ -11,7 +11,10 @@ use std::ops::Range;
 pub use scribe_image_decode::{
     AllocationDenied, DecodeHooks, DecodeLimits, DecodeStats, NoopHooks,
 };
-use scribe_image_decode::{BudgetError, DecodeBudget as Budget};
+use scribe_image_decode::{
+    BudgetError, DecodeAllocationClass, DecodeBudget as Budget, DecodeBuffer, DecodeStorage,
+    DecodeStorageError,
+};
 
 const SIXEL_CELL_HEIGHT: usize = 6;
 const PALETTE_SIZE: usize = 256;
@@ -62,6 +65,7 @@ pub enum DecodeError {
     DecodeDeadlineExceeded { work_units: u64 },
     DecodeCancelled { work_units: u64 },
     AllocationFailed { requested_bytes: usize },
+    Storage(DecodeStorageError),
     Malformed { offset: usize, reason: MalformedReason },
 }
 
@@ -75,6 +79,7 @@ impl DecodeError {
             Self::DecodeDeadlineExceeded { .. } => "decode_deadline_exceeded",
             Self::DecodeCancelled { .. } => "decode_cancelled",
             Self::AllocationFailed { .. } => "allocation_failed",
+            Self::Storage(_) => "storage",
             Self::Malformed { .. } => "malformed_payload",
         }
     }
@@ -102,6 +107,7 @@ impl fmt::Display for DecodeError {
             Self::AllocationFailed { requested_bytes } => {
                 write!(formatter, "allocation failed for {requested_bytes} bytes")
             }
+            Self::Storage(error) => write!(formatter, "Sixel storage failure: {error:?}"),
             Self::Malformed { offset, reason } => {
                 write!(formatter, "malformed Sixel at offset {offset}: {reason:?}")
             }
@@ -157,7 +163,7 @@ impl BackgroundMode {
 /// Completed canonical RGBA Sixel image.
 #[derive(Debug)]
 pub struct DecodedSixel {
-    pub rgba: Vec<u8>,
+    pub rgba: DecodeBuffer,
     pub width: usize,
     pub height: usize,
     pub aspect_ratio: PixelAspectRatio,
@@ -170,9 +176,10 @@ pub fn decode_sixel(
     data: &[u8],
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
+    storage: &DecodeStorage,
 ) -> Result<DecodedSixel, DecodeError> {
     limits.validate()?;
-    let mut budget = Budget::new(limits, hooks)?;
+    let mut budget = Budget::new(limits, hooks, storage)?;
     let parsed = parse_sequence(data, &mut budget)?;
     decode_payload_with_budget(parsed.payload, parsed.settings, budget)
 }
@@ -191,6 +198,7 @@ impl From<BudgetError> for DecodeError {
             BudgetError::AllocationFailed { requested_bytes } => {
                 Self::AllocationFailed { requested_bytes }
             }
+            BudgetError::Storage(error) => Self::Storage(error),
         }
     }
 }
@@ -201,9 +209,10 @@ pub fn decode_sixel_payload(
     settings: DcsSettings,
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
+    storage: &DecodeStorage,
 ) -> Result<DecodedSixel, DecodeError> {
     limits.validate()?;
-    let budget = Budget::new(limits, hooks)?;
+    let budget = Budget::new(limits, hooks, storage)?;
     decode_payload_with_budget(payload, settings, budget)
 }
 
@@ -381,7 +390,7 @@ impl Decoder {
         let palette = Palette::new();
         let current_color = palette.rgba(0);
         Self {
-            canvas: Canvas::default(),
+            canvas: Canvas::new(),
             palette,
             color_index: 0,
             current_color,
@@ -550,7 +559,10 @@ impl Decoder {
         }
     }
 
-    fn finish(mut self, budget: &mut Budget<'_>) -> Result<(Vec<u8>, usize, usize), DecodeError> {
+    fn finish(
+        mut self,
+        budget: &mut Budget<'_>,
+    ) -> Result<(DecodeBuffer, usize, usize), DecodeError> {
         if !self.saw_raster {
             return Err(DecodeError::Malformed { offset: 0, reason: MalformedReason::EmptyRaster });
         }
@@ -565,18 +577,24 @@ impl Decoder {
                 limit: LimitName::Dimensions,
             });
         }
-        Ok((self.canvas.data, width, height))
+        let rgba = self.canvas.into_compact(width, height, budget)?;
+        Ok((rgba, width, height))
     }
 }
 
-#[derive(Default)]
 struct Canvas {
-    data: Vec<u8>,
+    data: Option<DecodeBuffer>,
     width: usize,
     height: usize,
+    stride_width: usize,
+    allocated_height: usize,
 }
 
 impl Canvas {
+    const fn new() -> Self {
+        Self { data: None, width: 0, height: 0, stride_width: 0, allocated_height: 0 }
+    }
+
     fn ensure_visible(
         &mut self,
         width: usize,
@@ -587,43 +605,99 @@ impl Canvas {
         if width <= self.width && height <= self.height {
             return Ok(());
         }
-        let new_width = width.max(self.width).max(1);
-        let new_height = height.max(self.height).max(1);
-        guard_dimensions(new_width, new_height, budget.limits())?;
-        let new_bytes = rgba_bytes(new_width, new_height, budget.limits())?;
-        budget.begin_allocation(new_bytes)?;
-        let mut next = Vec::new();
-        if next.try_reserve_exact(new_bytes).is_err() {
-            budget.end_allocation(new_bytes);
-            return Err(DecodeError::AllocationFailed { requested_bytes: new_bytes });
-        }
-
-        for _ in 0..new_width.checked_mul(new_height).ok_or(DecodeError::InvalidDimensions {
-            width: new_width,
-            height: new_height,
-            limit: LimitName::Pixels,
-        })? {
-            budget.charge(5)?;
-            next.extend_from_slice(&background);
-        }
-
-        for row in 0..self.height {
-            for column in 0..self.width {
-                let source = pixel_offset(self.width, column, row)?;
-                let target = pixel_offset(new_width, column, row)?;
-                budget.charge(4)?;
-                let source_end = checked_add(source, 4)?;
-                let target_end = checked_add(target, 4)?;
-                next[target..target_end].copy_from_slice(&self.data[source..source_end]);
+        let need_growth = width > self.stride_width || height > self.allocated_height;
+        if need_growth {
+            let new_width =
+                geometric_dimension(self.stride_width, width, budget.limits().max_width_pixels);
+            let new_height = geometric_dimension(
+                self.allocated_height,
+                height,
+                budget.limits().max_height_pixels,
+            );
+            guard_dimensions(new_width, new_height, budget.limits())?;
+            let new_bytes = rgba_bytes(new_width, new_height, budget.limits())?;
+            let copied = self
+                .width
+                .checked_mul(self.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(DecodeError::InvalidDimensions {
+                    width: self.width,
+                    height: self.height,
+                    limit: LimitName::RgbaBytes,
+                })?;
+            let initialized_work = new_width
+                .checked_mul(new_height)
+                .and_then(|pixels| pixels.checked_mul(5))
+                .ok_or(DecodeError::InvalidDimensions {
+                    width: new_width,
+                    height: new_height,
+                    limit: LimitName::Pixels,
+                })?;
+            // Admission gates the work: every byte this growth initializes or
+            // copies is charged before any of it is performed.
+            budget.charge(u64::try_from(initialized_work).unwrap_or(u64::MAX))?;
+            budget.charge(u64::try_from(copied).unwrap_or(u64::MAX))?;
+            let mut next = budget.allocate(DecodeAllocationClass::SixelRgba, new_bytes)?;
+            next.resize(new_bytes, 0).map_err(DecodeError::Storage)?;
+            for pixel in next.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&background);
             }
-        }
 
-        let old_bytes = self.data.len();
-        self.data = next;
-        self.width = new_width;
-        self.height = new_height;
-        budget.end_allocation(old_bytes);
+            if let Some(current) = &self.data {
+                for row in 0..self.height {
+                    let source = pixel_offset(self.stride_width, 0, row)?;
+                    let target = pixel_offset(new_width, 0, row)?;
+                    let row_bytes =
+                        self.width.checked_mul(4).ok_or(DecodeError::InvalidDimensions {
+                            width: self.width,
+                            height: self.height,
+                            limit: LimitName::RgbaBytes,
+                        })?;
+                    let source_end = checked_add(source, row_bytes)?;
+                    let target_end = checked_add(target, row_bytes)?;
+                    next[target..target_end].copy_from_slice(&current[source..source_end]);
+                }
+            }
+
+            let old_bytes = self.data.as_ref().map_or(0, DecodeBuffer::requested_bytes);
+            self.data = Some(next);
+            self.stride_width = new_width;
+            self.allocated_height = new_height;
+            budget.end_allocation(old_bytes);
+        }
+        self.width = width;
+        self.height = height;
         Ok(())
+    }
+
+    fn into_compact(
+        mut self,
+        width: usize,
+        height: usize,
+        budget: &mut Budget<'_>,
+    ) -> Result<DecodeBuffer, DecodeError> {
+        let data = self
+            .data
+            .take()
+            .ok_or(DecodeError::Malformed { offset: 0, reason: MalformedReason::EmptyRaster })?;
+        if self.stride_width == width && self.allocated_height == height {
+            return Ok(data);
+        }
+        let exact_bytes = rgba_bytes(width, height, budget.limits())?;
+        budget.charge(u64::try_from(exact_bytes).unwrap_or(u64::MAX))?;
+        let mut compact = budget.allocate(DecodeAllocationClass::SixelRgba, exact_bytes)?;
+        for row in 0..height {
+            let source = pixel_offset(self.stride_width, 0, row)?;
+            let row_bytes = width.checked_mul(4).ok_or(DecodeError::InvalidDimensions {
+                width,
+                height,
+                limit: LimitName::RgbaBytes,
+            })?;
+            let source_end = checked_add(source, row_bytes)?;
+            compact.extend_from_slice(&data[source..source_end]).map_err(DecodeError::Storage)?;
+        }
+        budget.end_allocation(data.requested_bytes());
+        Ok(compact)
     }
 
     fn paint_span(
@@ -642,12 +716,20 @@ impl Canvas {
         }
         for column in columns {
             budget.charge(5)?;
-            let start = pixel_offset(self.width, column, y)?;
+            let start = pixel_offset(self.stride_width, column, y)?;
             let end = checked_add(start, 4)?;
-            self.data[start..end].copy_from_slice(&color);
+            let data = self.data.as_mut().ok_or(DecodeError::Malformed {
+                offset: 0,
+                reason: MalformedReason::EmptyRaster,
+            })?;
+            data[start..end].copy_from_slice(&color);
         }
         Ok(())
     }
+}
+
+fn geometric_dimension(current: usize, needed: usize, maximum: usize) -> usize {
+    current.max(1).checked_mul(2).unwrap_or(needed).min(maximum).max(needed)
 }
 
 struct Palette {

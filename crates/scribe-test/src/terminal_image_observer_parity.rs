@@ -14,12 +14,13 @@ use scribe_common::terminal_images::TerminalScreenKind;
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 use scribe_server::session_manager::build_term_config;
 use scribe_server::terminal_image_state::{
-    ObservedTerminalGridEffect, PtyReaderIngressRejection, PtyTerminalImageState,
-    SessionTerminalCommit, SessionTerminalError, SessionTerminalOutput, TerminalCursorObservation,
-    TerminalGridObservation, TerminalGridObserverHandle, TerminalImageProcessPolicy,
-    apply_observed_cursor_move, feed_terminal_image_result_observed,
-    feed_terminal_image_result_with_observer, feed_terminal_observed, flush_terminal_observed,
-    observe_terminal_resize, process_pty_reader_ingress,
+    ObservedTerminalGridEffect, ObservedTerminalGridSpan, PtyReaderIngressRejection,
+    PtyTerminalImageState, SessionTerminalCommit, SessionTerminalError, SessionTerminalOutput,
+    TerminalCursorObservation, TerminalGridObservation, TerminalGridObserverHandle,
+    TerminalGridSpanObservation, TerminalImageProcessPolicy, apply_observed_cursor_move,
+    feed_terminal_image_result_observed, feed_terminal_image_result_with_observer,
+    feed_terminal_observed_with_validation_cuts, flush_terminal_observed, observe_terminal_resize,
+    process_pty_reader_ingress,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -60,6 +61,7 @@ struct Probe {
     observer: TerminalGridObserverHandle,
     term: Term<ScribeEventListener>,
     processor: Processor,
+    last_resize: Option<ObservedTerminalGridSpan>,
     _event_rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
@@ -81,7 +83,14 @@ impl Probe {
         let images = PtyTerminalImageState::new(policy);
         let observer = images.grid_observer();
         observer.set_cell_size(8, 16);
-        Self { images, observer, term, processor: Processor::new(), _event_rx: event_rx }
+        Self {
+            images,
+            observer,
+            term,
+            processor: Processor::new(),
+            last_resize: None,
+            _event_rx: event_rx,
+        }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Result<SessionTerminalCommit, String> {
@@ -105,15 +114,14 @@ impl Probe {
         let before = (self.term.columns(), self.term.screen_lines());
         self.term.resize(ProbeDimensions { columns, rows });
         let changed = before != (self.term.columns(), self.term.screen_lines());
-        observe_terminal_resize(&self.observer, &self.term, changed);
+        self.last_resize = Some(observe_terminal_resize(&self.observer, &self.term, changed));
     }
 
-    fn flush_sync(&mut self) -> Result<TerminalGridObservation, String> {
-        let observation =
-            flush_terminal_observed(&self.observer, &mut self.term, &mut self.processor);
-        self.images.record_grid_observation(&observation);
-        assert_active_matches(&self.term, &observation)?;
-        Ok(observation)
+    fn flush_sync(&mut self) -> Result<ObservedTerminalGridSpan, String> {
+        let span = flush_terminal_observed(&self.observer, &mut self.term, &mut self.processor);
+        self.images.record_grid_observation(&span.observation);
+        assert_active_matches(&self.term, &span.observation)?;
+        Ok(span)
     }
 }
 
@@ -220,8 +228,8 @@ fn verify_wrap_pending_and_image_move() -> Result<(), String> {
         return Err(format!("last-column wrap state drifted: {before_move:?}"));
     }
     let moved = apply_observed_cursor_move(&probe.observer, &mut probe.term, 2, 1);
-    assert_active_matches(&probe.term, &moved)?;
-    if moved.primary.cursor
+    assert_active_matches(&probe.term, &moved.observation)?;
+    if moved.observation.primary.cursor
         != Some(TerminalCursorObservation { row: 2, column: 1, input_needs_wrap: false })
     {
         return Err(format!("image cursor move left stale wrap state: {moved:?}"));
@@ -242,8 +250,8 @@ fn verify_save_restore_and_1049() -> Result<(), String> {
     }
 
     let enter = probe.feed(b"\x1b[?1049h")?;
-    let entered = enter.grid_observations.last().ok_or("missing 1049 enter observation")?;
-    if !entered.observation.effects.iter().any(|effect| {
+    let entered = enter.grid_observations().last().ok_or("missing 1049 enter observation")?;
+    if !entered.effects().iter().any(|effect| {
         matches!(
             effect,
             ObservedTerminalGridEffect::SwitchScreen {
@@ -258,10 +266,10 @@ fn verify_save_restore_and_1049() -> Result<(), String> {
     probe.feed(b"\x1b[5;8H\x1b7\x1b[3;4H")?;
     let alternate_saved = probe.observation().alternate.saved_cursor;
     let leave = probe.feed(b"\x1b[?1049l")?;
-    let left = leave.grid_observations.last().ok_or("missing 1049 leave observation")?;
+    let left = leave.grid_observations().last().ok_or("missing 1049 leave observation")?;
     if left.observation.primary.cursor != primary.cursor
         || left.observation.alternate.saved_cursor != alternate_saved
-        || !left.observation.effects.iter().any(|effect| {
+        || !left.effects().iter().any(|effect| {
             matches!(
                 effect,
                 ObservedTerminalGridEffect::SwitchScreen {
@@ -284,26 +292,30 @@ fn verify_margins_scroll_and_ed2() -> Result<(), String> {
         return Err(format!("DECSTBM margins drifted: {margins:?}"));
     }
     let scroll = probe.feed(b"\x1b[4;1H\n")?;
-    if !scroll.grid_observations.iter().flat_map(|span| &span.observation.effects).any(|effect| {
-        matches!(
-            effect,
-            ObservedTerminalGridEffect::Scroll {
-                screen: TerminalScreenKind::Primary,
-                top: 1,
-                bottom: 4,
-                rows: 1,
-            }
-        )
-    }) {
+    if !scroll.grid_observations().iter().flat_map(TerminalGridSpanObservation::effects).any(
+        |effect| {
+            matches!(
+                effect,
+                ObservedTerminalGridEffect::Scroll {
+                    screen: TerminalScreenKind::Primary,
+                    top: 1,
+                    bottom: 4,
+                    rows: 1,
+                }
+            )
+        },
+    ) {
         return Err(format!("margin linefeed did not report half-open scroll: {scroll:?}"));
     }
     let ed2 = probe.feed(b"\x1b[2J")?;
-    if !ed2.grid_observations.iter().flat_map(|span| &span.observation.effects).any(|effect| {
-        matches!(
-            effect,
-            ObservedTerminalGridEffect::EraseDisplay { screen: TerminalScreenKind::Primary }
-        )
-    }) {
+    if !ed2.grid_observations().iter().flat_map(TerminalGridSpanObservation::effects).any(
+        |effect| {
+            matches!(
+                effect,
+                ObservedTerminalGridEffect::EraseDisplay { screen: TerminalScreenKind::Primary }
+            )
+        },
+    ) {
         return Err(format!("ED2 did not report display scope: {ed2:?}"));
     }
     Ok(())
@@ -315,8 +327,11 @@ fn verify_ed1_pinned_semantics() -> Result<(), String> {
         probe.feed(b"\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC\x1b[4;1HDDDD")?;
         let sequence = format!("\x1b[{};2H\x1b[1J", row + 1);
         let commit = probe.feed(sequence.as_bytes())?;
-        let effects: Vec<&ObservedTerminalGridEffect> =
-            commit.grid_observations.iter().flat_map(|span| &span.observation.effects).collect();
+        let effects: Vec<&ObservedTerminalGridEffect> = commit
+            .grid_observations()
+            .iter()
+            .flat_map(TerminalGridSpanObservation::effects)
+            .collect();
         let cursor_row = ObservedTerminalGridEffect::EraseCells {
             screen: TerminalScreenKind::Primary,
             top: u16::try_from(row).unwrap_or(u16::MAX),
@@ -370,27 +385,27 @@ fn expected_ed1_cell(cursor_row: i32, row: i32, column: usize) -> char {
 fn verify_split_reads() -> Result<(), String> {
     let mut probe = Probe::new(6, 4);
     let first = probe.feed(b"\x1b[2")?;
-    if first.grid_observations.iter().any(|span| !span.observation.effects.is_empty()) {
+    if first.grid_observations().iter().any(|span| !span.effects().is_empty()) {
         return Err(format!("partial CSI invented an effect: {first:?}"));
     }
     let second = probe.feed(b"J")?;
     if !second
-        .grid_observations
+        .grid_observations()
         .iter()
-        .flat_map(|span| &span.observation.effects)
+        .flat_map(TerminalGridSpanObservation::effects)
         .any(|effect| matches!(effect, ObservedTerminalGridEffect::EraseDisplay { .. }))
     {
         return Err(format!("completed split ED2 missed its effect: {second:?}"));
     }
 
     let partial = probe.feed(b"\x1b_Ga=q,f=24,s=1,v=1,i=1;/wAA")?;
-    if partial.grid_observations.iter().any(|span| !span.observation.effects.is_empty()) {
+    if partial.grid_observations().iter().any(|span| !span.effects().is_empty()) {
         return Err(format!("partial APC invented an effect: {partial:?}"));
     }
     let completed = probe.feed(b"\x1b\\")?;
     let completed_cursor =
-        completed.grid_observations.first().map(|span| span.observation.primary.cursor);
-    if completed.grid_observations.len() != 1
+        completed.grid_observations().first().map(|span| span.observation.primary.cursor);
+    if completed.grid_observations().len() != 1
         || completed_cursor != Some(probe.observation().primary.cursor)
     {
         return Err(format!("split APC completion observation drifted: {completed:?}"));
@@ -402,7 +417,7 @@ fn verify_same_read_chronology() -> Result<(), String> {
     let mut probe = Probe::new(8, 4);
     let commit = probe.feed(b"A\x1b_Ga=q,f=24,s=1,v=1,i=7;/wAA\x1b\\B")?;
     let observed_columns: Vec<u16> = commit
-        .grid_observations
+        .grid_observations()
         .iter()
         .filter_map(|span| span.observation.primary.cursor.map(|cursor| cursor.column))
         .collect();
@@ -416,8 +431,11 @@ fn verify_same_span_modes_and_deccolm() -> Result<(), String> {
     let mut probe = Probe::new(5, 3);
     probe.feed(b"\x1b[3;1Habcde")?;
     let wrap_off = probe.feed(b"\x1b[?7lZ")?;
-    let wrap_off_effects: Vec<&ObservedTerminalGridEffect> =
-        wrap_off.grid_observations.iter().flat_map(|span| &span.observation.effects).collect();
+    let wrap_off_effects: Vec<&ObservedTerminalGridEffect> = wrap_off
+        .grid_observations()
+        .iter()
+        .flat_map(TerminalGridSpanObservation::effects)
+        .collect();
     if wrap_off_effects
         .iter()
         .any(|effect| matches!(effect, ObservedTerminalGridEffect::Scroll { .. }))
@@ -432,17 +450,19 @@ fn verify_same_span_modes_and_deccolm() -> Result<(), String> {
     }
 
     let wrap_on = probe.feed(b"\x1b[?7hQ")?;
-    if !wrap_on.grid_observations.iter().flat_map(|span| &span.observation.effects).any(|effect| {
-        matches!(
-            effect,
-            ObservedTerminalGridEffect::Scroll {
-                screen: TerminalScreenKind::Primary,
-                top: 0,
-                bottom: 3,
-                rows: 1,
-            }
-        )
-    }) {
+    if !wrap_on.grid_observations().iter().flat_map(TerminalGridSpanObservation::effects).any(
+        |effect| {
+            matches!(
+                effect,
+                ObservedTerminalGridEffect::Scroll {
+                    screen: TerminalScreenKind::Primary,
+                    top: 0,
+                    bottom: 3,
+                    rows: 1,
+                }
+            )
+        },
+    ) {
         return Err(format!("same-span DECSET 7 missed its real wrap scroll: {wrap_on:?}"));
     }
 
@@ -450,12 +470,16 @@ fn verify_same_span_modes_and_deccolm() -> Result<(), String> {
     let set = probe.feed(b"\x1b[?3h")?;
     if (probe.observation().margin_top, probe.observation().margin_bottom) != (0, 3)
         || probe.term.grid()[Line(2)][Column(1)].c != ' '
-        || !set.grid_observations.iter().flat_map(|span| &span.observation.effects).any(|effect| {
-            matches!(
-                effect,
-                ObservedTerminalGridEffect::EraseDisplay { screen: TerminalScreenKind::Primary }
-            )
-        })
+        || !set.grid_observations().iter().flat_map(TerminalGridSpanObservation::effects).any(
+            |effect| {
+                matches!(
+                    effect,
+                    ObservedTerminalGridEffect::EraseDisplay {
+                        screen: TerminalScreenKind::Primary
+                    }
+                )
+            },
+        )
     {
         return Err(format!("DECSET 3 did not expose Alacritty grid reset: {set:?}"));
     }
@@ -465,9 +489,9 @@ fn verify_same_span_modes_and_deccolm() -> Result<(), String> {
     if (probe.observation().margin_top, probe.observation().margin_bottom) != (0, 3)
         || probe.term.grid()[Line(0)][Column(0)].c != ' '
         || !unset
-            .grid_observations
+            .grid_observations()
             .iter()
-            .flat_map(|span| &span.observation.effects)
+            .flat_map(TerminalGridSpanObservation::effects)
             .any(|effect| matches!(effect, ObservedTerminalGridEffect::EraseDisplay { .. }))
     {
         return Err(format!("DECRST 3 did not expose Alacritty grid reset: {unset:?}"));
@@ -481,8 +505,11 @@ fn verify_input_width_scroll_paths() -> Result<(), String> {
     let history_before = combining.term.total_lines() - combining.term.screen_lines();
     let combined = combining.feed("\u{0301}".as_bytes())?;
     let history_after = combining.term.total_lines() - combining.term.screen_lines();
-    let combined_effects: Vec<_> =
-        combined.grid_observations.iter().flat_map(|span| &span.observation.effects).collect();
+    let combined_effects: Vec<_> = combined
+        .grid_observations()
+        .iter()
+        .flat_map(TerminalGridSpanObservation::effects)
+        .collect();
     if history_after != history_before
         || combining.observation().primary.cursor
             != Some(TerminalCursorObservation { row: 2, column: 3, input_needs_wrap: true })
@@ -502,9 +529,9 @@ fn verify_input_width_scroll_paths() -> Result<(), String> {
     let wrapped = wide.feed("界".as_bytes())?;
     let wide_history_after = wide.term.total_lines() - wide.term.screen_lines();
     let scrolls = wrapped
-        .grid_observations
+        .grid_observations()
         .iter()
-        .flat_map(|span| &span.observation.effects)
+        .flat_map(TerminalGridSpanObservation::effects)
         .filter(|effect| {
             matches!(
                 effect,
@@ -537,39 +564,52 @@ fn verify_ordered_boundary_cuts() -> Result<(), String> {
     for _ in 0..BOUNDARIES {
         bytes.extend_from_slice(b"\x1b_Ga=q,f=24,s=1,v=1,i=1;/wAA\x1b\\");
     }
-    let mut commit = probe.images.process_bytes(&bytes).map_err(|error| error.to_string())?;
-    let original_outputs = std::mem::take(&mut commit.outputs);
-    let mut duplicated = Vec::with_capacity(original_outputs.len().saturating_mul(2));
-    for output in original_outputs {
-        duplicated.push(output.clone());
-        if matches!(output, SessionTerminalOutput::Image { .. }) {
-            duplicated.push(output);
+    let commit = probe.images.process_bytes(&bytes).map_err(|error| error.to_string())?;
+    let mut duplicated_cuts = Vec::with_capacity(commit.outputs.len().saturating_mul(2));
+    for output in &commit.outputs {
+        if let SessionTerminalOutput::Image { range, .. } = output {
+            duplicated_cuts.push(*range);
+            duplicated_cuts.push(*range);
         }
     }
-    commit.outputs = duplicated;
-    feed_terminal_observed(
+    let observations = feed_terminal_observed_with_validation_cuts(
         &probe.observer,
         &mut probe.term,
         &mut probe.processor,
         &bytes,
-        &mut commit,
+        (commit.input_range, &duplicated_cuts),
     );
-    if commit.grid_observations.len() != BOUNDARIES
-        || commit.grid_observations.windows(2).any(|pair| match pair {
+    if let Some(rejection) = observations.storage_rejection {
+        return Err(format!("validation cuts hit storage pressure: {rejection:?}"));
+    }
+    let observations = observations.as_slice();
+    if observations.len() != BOUNDARIES
+        || observations.windows(2).any(|pair| match pair {
             [before, after] => before.range.end != after.range.start,
             _ => false,
         })
-        || commit.grid_observations.last().map(|span| span.range.end)
-            != Some(commit.input_range.end)
+        || observations.last().map(|span| span.range.end) != Some(commit.input_range.end)
     {
         return Err(format!(
             "ordered boundary cuts were reordered or not linearly deduplicated: outputs={} observations={} final={:?}",
             commit.outputs.len(),
-            commit.grid_observations.len(),
-            commit.grid_observations.last().map(|span| span.range)
+            observations.len(),
+            observations.last().map(|span| span.range)
         ));
     }
     Ok(())
+}
+
+fn margin_scroll_effect(effect: &ObservedTerminalGridEffect) -> bool {
+    matches!(
+        effect,
+        ObservedTerminalGridEffect::Scroll {
+            screen: TerminalScreenKind::Primary,
+            top: 1,
+            bottom: 4,
+            rows: 1,
+        }
+    )
 }
 
 fn verify_image_error_observed_once() -> Result<(), String> {
@@ -580,6 +620,7 @@ fn verify_image_error_observed_once() -> Result<(), String> {
     let client_delivery_calls = Rc::new(Cell::new(0_u64));
     let term_feed_calls = Rc::new(Cell::new(0_u64));
     let rejections = Rc::new(RefCell::new(Vec::<PtyReaderIngressRejection>::new()));
+    let rejected_effects = Rc::new(RefCell::new(Vec::<ObservedTerminalGridEffect>::new()));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -590,6 +631,7 @@ fn verify_image_error_observed_once() -> Result<(), String> {
     let client_counter = Rc::clone(&client_delivery_calls);
     let term_counter = Rc::clone(&term_feed_calls);
     let rejection_sink = Rc::clone(&rejections);
+    let span_sink = Rc::clone(&rejected_effects);
     let result = runtime.block_on(process_pty_reader_ingress(
         &mut probe.images,
         bytes.to_vec(),
@@ -599,14 +641,15 @@ fn verify_image_error_observed_once() -> Result<(), String> {
         },
         move |observer, delivered, mut image_result| async move {
             term_counter.set(term_counter.get().saturating_add(1));
-            let observation = feed_terminal_image_result_with_observer(
+            let span = feed_terminal_image_result_with_observer(
                 &observer,
                 term,
                 processor,
                 delivered.as_ref(),
                 &mut image_result,
             );
-            (image_result, Some(observation))
+            span_sink.borrow_mut().extend(span.effects().iter().cloned());
+            (image_result, Some(span))
         },
         move |rejection| rejection_sink.borrow_mut().push(rejection),
     ));
@@ -615,6 +658,7 @@ fn verify_image_error_observed_once() -> Result<(), String> {
     }
     assert_active_matches(&probe.term, &probe.observation())?;
     let observation = probe.observation();
+    let rejected_effects = rejected_effects.borrow();
     let rejections = rejections.borrow();
     let rejection_text = format!("{rejections:?}");
     if client_delivery_calls.get() != 1
@@ -631,17 +675,7 @@ fn verify_image_error_observed_once() -> Result<(), String> {
         || (observation.margin_top, observation.margin_bottom) != (1, 4)
         || observation.primary.cursor
             != Some(TerminalCursorObservation { row: 3, column: 1, input_needs_wrap: false })
-        || !observation.effects.iter().any(|effect| {
-            matches!(
-                effect,
-                ObservedTerminalGridEffect::Scroll {
-                    screen: TerminalScreenKind::Primary,
-                    top: 1,
-                    bottom: 4,
-                    rows: 1,
-                }
-            )
-        })
+        || !rejected_effects.iter().any(margin_scroll_effect)
     {
         return Err(format!(
             "rejected image chunk bypassed production ingress or duplicated a sink: client_calls={} client_bytes={} term_calls={} rejection_count={} observation={observation:?}",
@@ -659,14 +693,14 @@ fn verify_synchronized_update_timeout() -> Result<(), String> {
     probe.feed(b"\x1b[?2026h")?;
     let buffered = probe.feed(b"\x1b[2;4r\x1b[4;1H\n")?;
     if probe.processor.sync_bytes_count() == 0
-        || buffered.grid_observations.iter().any(|span| !span.observation.effects.is_empty())
+        || buffered.grid_observations().iter().any(|span| !span.effects().is_empty())
     {
         return Err(format!("synchronized update did not remain buffered: {buffered:?}"));
     }
     let flushed = probe.flush_sync()?;
     if probe.processor.sync_bytes_count() != 0
-        || (flushed.margin_top, flushed.margin_bottom) != (1, 4)
-        || !flushed.effects.iter().any(|effect| {
+        || (flushed.observation.margin_top, flushed.observation.margin_bottom) != (1, 4)
+        || !flushed.effects().iter().any(|effect| {
             matches!(
                 effect,
                 ObservedTerminalGridEffect::Scroll {
@@ -688,6 +722,7 @@ fn verify_both_grid_resize() -> Result<(), String> {
     probe.feed(b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n\x1b[3;4H\x1b7")?;
     probe.feed(b"\x1b[?1049h\x1b[5;6H\x1b7")?;
     probe.resize(8, 4);
+    let resize_span = probe.last_resize.take().ok_or("missing resize observation")?;
     let resized = probe.observation();
     if (resized.primary.size.columns, resized.primary.size.rows) != (8, 4)
         || (resized.alternate.size.columns, resized.alternate.size.rows) != (8, 4)
@@ -695,7 +730,7 @@ fn verify_both_grid_resize() -> Result<(), String> {
         || resized.primary.saved_cursor.is_some()
         || resized.alternate.cursor.is_none()
         || resized.alternate.saved_cursor.is_none()
-        || !matches!(resized.effects.as_slice(), [ObservedTerminalGridEffect::Resize { .. }])
+        || !matches!(resize_span.effects(), [ObservedTerminalGridEffect::Resize { .. }])
     {
         return Err(format!("both-grid resize observation drifted: {resized:?}"));
     }

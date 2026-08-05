@@ -9,7 +9,9 @@ use std::error::Error;
 use std::fmt;
 
 use flate2::{Decompress, FlushDecompress, Status};
-use scribe_image_decode::{BudgetError, DecodeBudget};
+use scribe_image_decode::{
+    BudgetError, DecodeAllocationClass, DecodeBudget, DecodeBuffer, DecodeStorageError,
+};
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const ADAM7: [(usize, usize, usize, usize); 7] = [
@@ -48,6 +50,7 @@ pub enum PngError {
     WorkBudgetExceeded,
     DecodeDeadlineExceeded,
     DecodeCancelled,
+    Storage(DecodeStorageError),
 }
 
 impl PngError {
@@ -58,6 +61,7 @@ impl PngError {
             Self::WorkBudgetExceeded => "work_budget_exceeded",
             Self::DecodeDeadlineExceeded => "decode_deadline_exceeded",
             Self::DecodeCancelled => "decode_cancelled",
+            Self::Storage(_) => "storage",
             Self::AllocationFailed { .. }
             | Self::InflateFailed
             | Self::InflatedLengthMismatch { .. } => "decode_failed",
@@ -94,6 +98,7 @@ impl fmt::Display for PngError {
             Self::WorkBudgetExceeded => formatter.write_str("PNG work budget exceeded"),
             Self::DecodeDeadlineExceeded => formatter.write_str("PNG decode deadline exceeded"),
             Self::DecodeCancelled => formatter.write_str("PNG decode cancelled"),
+            Self::Storage(error) => write!(formatter, "PNG storage failure: {error:?}"),
         }
     }
 }
@@ -111,6 +116,7 @@ impl From<BudgetError> for PngError {
             BudgetError::AllocationFailed { requested_bytes } => {
                 Self::AllocationFailed { requested_bytes }
             }
+            BudgetError::Storage(error) => Self::Storage(error),
         }
     }
 }
@@ -120,7 +126,7 @@ impl From<BudgetError> for PngError {
 pub struct DecodedPng {
     pub width: usize,
     pub height: usize,
-    pub rgba: Vec<u8>,
+    pub rgba: DecodeBuffer,
     pub has_alpha: bool,
 }
 
@@ -192,9 +198,9 @@ pub fn decode_png(
     let parsed = parse_png(data, limits, budget)?;
     let mut inflated = inflate_idat(data, parsed.inflated_len, budget)?;
     let rgba_len = guard_dimensions(parsed.metadata.width, parsed.metadata.height, limits)?;
-    let mut rgba = allocate_zeroed(rgba_len, budget)?;
+    let mut rgba = allocate_zeroed(rgba_len, DecodeAllocationClass::PngRgba, budget)?;
     unfilter_and_convert(&mut inflated, &mut rgba, &parsed.metadata, budget)?;
-    budget.end_allocation(inflated.len());
+    budget.end_allocation(inflated.requested_bytes());
     budget.check_now()?;
     let has_alpha = matches!(parsed.metadata.color, ColorType::GrayscaleAlpha | ColorType::Rgba)
         || parsed.metadata.palette_alpha_len > 0
@@ -430,8 +436,8 @@ fn inflate_idat(
     data: &[u8],
     expected_len: usize,
     budget: &mut DecodeBudget<'_>,
-) -> Result<Vec<u8>, PngError> {
-    let mut output = allocate_zeroed(expected_len, budget)?;
+) -> Result<DecodeBuffer, PngError> {
+    let mut output = allocate_zeroed(expected_len, DecodeAllocationClass::PngInflate, budget)?;
     let mut decoder = Decompress::new(true);
     let mut cursor = SIGNATURE.len();
     let mut written = 0usize;
@@ -502,14 +508,16 @@ fn inflate_idat(
     Ok(output)
 }
 
-fn allocate_zeroed(len: usize, budget: &mut DecodeBudget<'_>) -> Result<Vec<u8>, PngError> {
-    budget.begin_allocation(len)?;
-    let mut output = Vec::new();
-    if output.try_reserve_exact(len).is_err() {
-        budget.end_allocation(len);
-        return Err(PngError::AllocationFailed { requested_bytes: len });
-    }
-    output.resize(len, 0);
+fn allocate_zeroed(
+    len: usize,
+    class: DecodeAllocationClass,
+    budget: &mut DecodeBudget<'_>,
+) -> Result<DecodeBuffer, PngError> {
+    // Admission gates the work: zero-initializing this buffer touches every
+    // byte, so the work is charged before the buffer exists.
+    budget.charge(u64::try_from(len).unwrap_or(u64::MAX))?;
+    let mut output = budget.allocate(class, len)?;
+    output.resize(len, 0).map_err(PngError::Storage)?;
     Ok(output)
 }
 

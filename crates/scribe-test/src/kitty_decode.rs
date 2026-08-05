@@ -20,6 +20,8 @@ use scribe_png_decoder::{PngLimits, decode_png};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::decode_storage::decode_storage;
+
 const PNG_FIXTURE_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +58,9 @@ fn normalize(
     budget_limits: DecodeLimits,
     hooks: &impl DecodeHooks,
 ) -> Result<NormalizedKittyImage, KittyDecodeError> {
-    let mut budget = DecodeBudget::new(budget_limits, hooks).map_err(KittyDecodeError::from)?;
+    let storage = decode_storage();
+    let mut budget =
+        DecodeBudget::new(budget_limits, hooks, &storage).map_err(KittyDecodeError::from)?;
     let mut transfer = KittyTransfer::new(params, limits)?;
     for &(chunk, more) in chunks {
         transfer.push_chunk(chunk, more, &mut budget)?;
@@ -126,7 +130,8 @@ fn success_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String> 
     }
 
     let png_bytes = STANDARD.decode(PNG_FIXTURE_BASE64).map_err(|error| error.to_string())?;
-    let mut png_budget = DecodeBudget::new(decode_limits(limits), &NoopHooks)
+    let png_storage = decode_storage();
+    let mut png_budget = DecodeBudget::new(decode_limits(limits), &NoopHooks, &png_storage)
         .map_err(|error| format!("PNG budget: {error}"))?;
     decode_png(&png_bytes, png_limits(limits), &mut png_budget)
         .map_err(|error| format!("direct PNG fork: {error:?} ({error})"))?;
@@ -298,7 +303,9 @@ fn rejection_cases(limits: ImageLimits) -> Result<Vec<serde_json::Value>, String
         "deadline",
     )?;
 
-    let cancelled = DecodeBudget::new(decode_limits(limits), &CancelImmediately);
+    let cancelled_storage = decode_storage();
+    let cancelled =
+        DecodeBudget::new(decode_limits(limits), &CancelImmediately, &cancelled_storage);
     if !matches!(cancelled, Err(scribe_image_decode::BudgetError::DecodeCancelled { .. })) {
         return Err("immediate cancellation did not reject".to_owned());
     }
@@ -337,12 +344,30 @@ fn bomb_case(limits: ImageLimits) -> Result<serde_json::Value, String> {
             decode_limits(limits),
             &NoopHooks,
         ),
-        TerminalImageRejectionReason::QuotaExceeded,
-        "zlib bomb",
+        TerminalImageRejectionReason::WorkBudgetExceeded,
+        "zlib bomb default work limit",
     )?;
-    Ok(
-        json!({"id":"zlib_bomb","status":"pass","rejection":"quota_exceeded","limit":"inflated_bytes","attempted":limits.max_inflated_bytes + 1}),
-    )
+    let mut quota_isolation = decode_limits(limits);
+    quota_isolation.max_work_units = u64::MAX;
+    expect_reason(
+        &normalize(
+            params(KittyFormat::Rgba, KittyCompression::Rfc1950Zlib, Some(1), Some(1)),
+            &chunks,
+            limits,
+            quota_isolation,
+            &NoopHooks,
+        ),
+        TerminalImageRejectionReason::QuotaExceeded,
+        "zlib bomb isolated inflated quota",
+    )?;
+    Ok(json!({
+        "id":"zlib_bomb",
+        "status":"pass",
+        "default_rejection":"work_budget_exceeded",
+        "isolated_rejection":"quota_exceeded",
+        "limit":"inflated_bytes",
+        "attempted":limits.max_inflated_bytes + 1
+    }))
 }
 
 fn png_limits(limits: ImageLimits) -> PngLimits {

@@ -252,6 +252,8 @@ ignored = [
 
 [dependencies]
 scribe-common.workspace = true
+scribe-image-decode.workspace = true
+icy-sixel-decoder = { path = "../../third_party/icy-sixel-decoder" }
 alacritty_terminal.workspace = true
 cursor-icon.workspace = true
 unicode-width.workspace = true

@@ -3,7 +3,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use flate2::{Decompress, FlushDecompress, Status};
-use scribe_image_decode::{BudgetError, DecodeBudget, DecodeStats};
+use scribe_image_decode::{
+    BudgetError, DecodeAllocationClass, DecodeBudget, DecodeBuffer, DecodeStats, DecodeStorageError,
+};
 use scribe_png_decoder::{PngError, PngLimits, decode_png};
 
 use crate::terminal_images::{ImageLimitName, ImageLimits, TerminalImageRejectionReason};
@@ -49,11 +51,12 @@ pub struct KittyDecodeError {
     pub reason: TerminalImageRejectionReason,
     pub observed: Option<u64>,
     pub limit: Option<ImageLimitName>,
+    pub storage: Option<DecodeStorageError>,
 }
 
 impl KittyDecodeError {
     const fn reason(reason: TerminalImageRejectionReason) -> Self {
-        Self { reason, observed: None, limit: None }
+        Self { reason, observed: None, limit: None, storage: None }
     }
 
     const fn limit(
@@ -61,7 +64,7 @@ impl KittyDecodeError {
         observed: u64,
         limit: ImageLimitName,
     ) -> Self {
-        Self { reason, observed: Some(observed), limit: Some(limit) }
+        Self { reason, observed: Some(observed), limit: Some(limit), storage: None }
     }
 }
 
@@ -84,6 +87,14 @@ impl From<BudgetError> for KittyDecodeError {
             }
             BudgetError::DecodeCancelled { .. } => TerminalImageRejectionReason::DecodeCancelled,
             BudgetError::AllocationFailed { .. } => TerminalImageRejectionReason::QuotaExceeded,
+            BudgetError::Storage(storage) => {
+                return Self {
+                    reason: TerminalImageRejectionReason::QuotaExceeded,
+                    observed: None,
+                    limit: None,
+                    storage: Some(storage),
+                };
+            }
         };
         Self::reason(reason)
     }
@@ -94,7 +105,7 @@ impl From<BudgetError> for KittyDecodeError {
 pub struct NormalizedKittyImage {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: DecodeBuffer,
     pub has_alpha: bool,
     pub encoded_bytes: u64,
     pub decoded_bytes: u64,
@@ -107,10 +118,19 @@ pub struct NormalizedKittyImage {
 pub struct KittyTransfer {
     params: KittyDataParams,
     limits: ImageLimits,
-    decoded: Vec<u8>,
+    decoded: Option<DecodeBuffer>,
     encoded_bytes: u64,
     chunks: u32,
     final_received: bool,
+    transaction: Option<KittyTransferTransaction>,
+}
+
+struct KittyTransferTransaction {
+    decoded_len: usize,
+    encoded_bytes: u64,
+    chunks: u32,
+    final_received: bool,
+    original_decoded: Option<DecodeBuffer>,
 }
 
 struct ChunkPlan {
@@ -118,16 +138,58 @@ struct ChunkPlan {
     accumulated: u64,
     decoded_len: usize,
     projected: usize,
+    chunks: u32,
 }
 
 struct DecodedParts {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    rgba: DecodeBuffer,
     has_alpha: bool,
 }
 
+fn decode_chunk(
+    payload: &[u8],
+    previous: usize,
+    decoded_len: usize,
+    decoded: &mut DecodeBuffer,
+) -> Result<(), KittyDecodeError> {
+    let output = decoded
+        .get_mut(previous..)
+        .ok_or_else(|| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
+    match STANDARD.decode_slice(payload, output) {
+        Ok(written) if written == decoded_len => Ok(()),
+        _ => Err(KittyDecodeError::reason(TerminalImageRejectionReason::MalformedPayload)),
+    }
+}
+
 impl KittyTransfer {
+    #[must_use]
+    pub fn retained_requested_bytes(&self) -> usize {
+        self.decoded.as_ref().map_or(0, DecodeBuffer::requested_bytes)
+    }
+
+    #[must_use]
+    pub fn retained_observed_bytes(&self) -> usize {
+        self.decoded.as_ref().map_or(0, DecodeBuffer::observed_bytes)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_digest(&self) -> u64 {
+        self.decoded.as_ref().map_or(0, |decoded| {
+            decoded.iter().fold(0, |digest, byte| {
+                digest.wrapping_mul(1_099_511_628_211).wrapping_add(u64::from(*byte))
+            })
+        })
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_state(&self) -> (u32, usize, bool) {
+        (self.chunks, self.decoded.as_ref().map_or(0, |decoded| decoded.len()), self.final_received)
+    }
+
     /// Reject policy and raw dimensions before payload storage or allocation.
     pub fn new(params: KittyDataParams, limits: ImageLimits) -> Result<Self, KittyDecodeError> {
         if params.transport != KittyTransport::Direct {
@@ -163,10 +225,11 @@ impl KittyTransfer {
         Ok(Self {
             params,
             limits,
-            decoded: Vec::new(),
+            decoded: None,
             encoded_bytes: 0,
             chunks: 0,
             final_received: false,
+            transaction: None,
         })
     }
 
@@ -178,35 +241,144 @@ impl KittyTransfer {
         budget: &mut DecodeBudget<'_>,
     ) -> Result<(), KittyDecodeError> {
         let plan = self.plan_chunk(payload, more)?;
+        // Admission gates the work: this chunk's encoded input and the bytes
+        // its decode will write are charged before either is touched.
         budget.charge(plan.payload_len)?;
-        budget.begin_allocation(plan.decoded_len)?;
-        if self.decoded.try_reserve_exact(plan.decoded_len).is_err() {
-            budget.end_allocation(plan.decoded_len);
-            return Err(KittyDecodeError::reason(TerminalImageRejectionReason::QuotaExceeded));
-        }
-        let previous = self.decoded.len();
-        self.decoded.resize(plan.projected, 0);
-        let output = self
-            .decoded
-            .get_mut(previous..)
-            .ok_or_else(|| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
-        match STANDARD.decode_slice(payload, output) {
-            Ok(written) if written == plan.decoded_len => {}
-            _ => {
-                self.decoded.truncate(previous);
-                budget.end_allocation(plan.decoded_len);
-                return Err(KittyDecodeError::reason(
-                    TerminalImageRejectionReason::MalformedPayload,
-                ));
+        budget.charge(plan.decoded_len as u64)?;
+        let previous = self.decoded.as_ref().map_or(0, |decoded| decoded.len());
+        let current_capacity = self.decoded.as_ref().map_or(0, DecodeBuffer::capacity);
+        if plan.projected > current_capacity {
+            let requested = current_capacity
+                .max(1)
+                .checked_mul(2)
+                .unwrap_or(plan.projected)
+                .max(plan.projected);
+            budget.charge(previous as u64)?;
+            let mut replacement = budget.allocate(DecodeAllocationClass::KittyBase64, requested)?;
+            if let Some(decoded) = &self.decoded {
+                replacement
+                    .extend_from_slice(decoded)
+                    .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            }
+            replacement
+                .resize(plan.projected, 0)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            decode_chunk(payload, previous, plan.decoded_len, &mut replacement)?;
+            let old = self.decoded.replace(replacement);
+            self.retain_transaction_owner(old, budget);
+        } else {
+            let decoded = self.decoded.as_mut().ok_or_else(|| {
+                KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed)
+            })?;
+            decoded
+                .resize(plan.projected, 0)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            if let Err(error) = decode_chunk(payload, previous, plan.decoded_len, decoded) {
+                decoded.truncate(previous);
+                return Err(error);
             }
         }
-        budget.charge(plan.decoded_len as u64)?;
         self.encoded_bytes = plan.accumulated;
+        self.chunks = plan.chunks;
         self.final_received = !more;
         Ok(())
     }
 
-    fn plan_chunk(&mut self, payload: &[u8], more: bool) -> Result<ChunkPlan, KittyDecodeError> {
+    /// Begin one outer `SessionTerminal` transaction without copying in-capacity bytes.
+    pub fn begin_transaction(&mut self) -> Result<(), KittyDecodeError> {
+        if self.transaction.is_some() {
+            return Err(KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed));
+        }
+        self.transaction = Some(KittyTransferTransaction {
+            decoded_len: self.decoded.as_ref().map_or(0, |decoded| decoded.len()),
+            encoded_bytes: self.encoded_bytes,
+            chunks: self.chunks,
+            final_received: self.final_received,
+            original_decoded: None,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn transaction_active(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    fn retain_transaction_owner(
+        &mut self,
+        old: Option<DecodeBuffer>,
+        budget: &mut DecodeBudget<'_>,
+    ) {
+        let old_requested = old.as_ref().map_or(0, DecodeBuffer::requested_bytes);
+        let Some(transaction) = self.transaction.as_mut() else {
+            budget.end_allocation(old_requested);
+            return;
+        };
+        if transaction.original_decoded.is_none() {
+            transaction.original_decoded = old;
+            return;
+        }
+        budget.end_allocation(old_requested);
+    }
+
+    /// Commit staged chunks and release any superseded pre-growth owner.
+    pub fn commit_transaction(&mut self) -> Result<(), KittyDecodeError> {
+        if self.transaction.take().is_none() {
+            return Err(KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed));
+        }
+        Ok(())
+    }
+
+    /// Restore exact chunk counters, length, and pre-growth owner.
+    pub fn rollback_transaction(&mut self) -> Result<(), KittyDecodeError> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
+        if let Some(original) = transaction.original_decoded {
+            self.decoded = Some(original);
+        } else if let Some(decoded) = self.decoded.as_mut() {
+            if transaction.decoded_len > decoded.len() {
+                return Err(KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed));
+            }
+            decoded.truncate(transaction.decoded_len);
+        }
+        self.encoded_bytes = transaction.encoded_bytes;
+        self.chunks = transaction.chunks;
+        self.final_received = transaction.final_received;
+        Ok(())
+    }
+
+    /// Finalize through a one-time leased copy while retaining this transfer for rollback.
+    pub fn finish_preserving(
+        &self,
+        budget: &mut DecodeBudget<'_>,
+    ) -> Result<NormalizedKittyImage, KittyDecodeError> {
+        let decoded = if let Some(current) = &self.decoded {
+            budget.charge(current.len() as u64)?;
+            let mut copy = budget.allocate(
+                DecodeAllocationClass::KittyBase64,
+                current.capacity().max(current.len()),
+            )?;
+            copy.extend_from_slice(current)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            Some(copy)
+        } else {
+            None
+        };
+        Self {
+            params: self.params,
+            limits: self.limits,
+            decoded,
+            encoded_bytes: self.encoded_bytes,
+            chunks: self.chunks,
+            final_received: self.final_received,
+            transaction: None,
+        }
+        .finish(budget)
+    }
+
+    fn plan_chunk(&self, payload: &[u8], more: bool) -> Result<ChunkPlan, KittyDecodeError> {
         if self.final_received {
             return Err(KittyDecodeError::reason(TerminalImageRejectionReason::ChunkMismatch));
         }
@@ -218,17 +390,17 @@ impl KittyTransfer {
                 ImageLimitName::KittyChunkPayloadBytes,
             ));
         }
-        self.chunks = self.chunks.checked_add(1).ok_or_else(|| {
+        let chunks = self.chunks.checked_add(1).ok_or_else(|| {
             KittyDecodeError::limit(
                 TerminalImageRejectionReason::QuotaExceeded,
                 u64::MAX,
                 ImageLimitName::ChunksPerTransfer,
             )
         })?;
-        if self.chunks > self.limits.max_chunks_per_transfer {
+        if chunks > self.limits.max_chunks_per_transfer {
             return Err(KittyDecodeError::limit(
                 TerminalImageRejectionReason::QuotaExceeded,
-                u64::from(self.chunks),
+                u64::from(chunks),
                 ImageLimitName::ChunksPerTransfer,
             ));
         }
@@ -257,13 +429,18 @@ impl KittyTransfer {
             return Err(KittyDecodeError::reason(TerminalImageRejectionReason::MalformedPayload));
         }
         let decoded_len = payload.len() / 4 * 3 - padding;
-        let projected = self.decoded.len().checked_add(decoded_len).ok_or_else(|| {
-            KittyDecodeError::limit(
-                TerminalImageRejectionReason::QuotaExceeded,
-                u64::MAX,
-                ImageLimitName::Base64DecodedBytes,
-            )
-        })?;
+        let projected = self
+            .decoded
+            .as_ref()
+            .map_or(0, |decoded| decoded.len())
+            .checked_add(decoded_len)
+            .ok_or_else(|| {
+                KittyDecodeError::limit(
+                    TerminalImageRejectionReason::QuotaExceeded,
+                    u64::MAX,
+                    ImageLimitName::Base64DecodedBytes,
+                )
+            })?;
         if projected as u64 > self.limits.max_base64_decoded_bytes {
             return Err(KittyDecodeError::limit(
                 TerminalImageRejectionReason::QuotaExceeded,
@@ -271,7 +448,7 @@ impl KittyTransfer {
                 ImageLimitName::Base64DecodedBytes,
             ));
         }
-        Ok(ChunkPlan { payload_len, accumulated, decoded_len, projected })
+        Ok(ChunkPlan { payload_len, accumulated, decoded_len, projected, chunks })
     }
 
     /// Finish validation and return only canonical RGBA.
@@ -282,15 +459,18 @@ impl KittyTransfer {
         if !self.final_received {
             return Err(KittyDecodeError::reason(TerminalImageRejectionReason::ChunkMismatch));
         }
-        let decoded_bytes = self.decoded.len() as u64;
+        let decoded = self.decoded.ok_or_else(|| {
+            KittyDecodeError::reason(TerminalImageRejectionReason::MalformedPayload)
+        })?;
+        let decoded_bytes = decoded.len() as u64;
         let (payload, inflated_bytes) = match self.params.compression {
-            KittyCompression::None => (self.decoded, decoded_bytes),
+            KittyCompression::None => (decoded, decoded_bytes),
             KittyCompression::Rfc1950Zlib => {
                 let maximum =
                     limit_to_usize(self.limits.max_inflated_bytes, ImageLimitName::InflatedBytes)?;
-                let inflated = inflate_rfc1950(&self.decoded, maximum, budget)?;
+                let inflated = inflate_rfc1950(&decoded, maximum, budget)?;
                 let len = inflated.len() as u64;
-                budget.end_allocation(self.decoded.len());
+                budget.end_allocation(decoded.requested_bytes());
                 (inflated, len)
             }
         };
@@ -312,17 +492,23 @@ impl KittyTransfer {
                         ImageLimitName::CanonicalRgbaBytes,
                     )?,
                 };
-                let decoded = decode_png(&payload, png_limits, budget).map_err(map_png_error)?;
-                let width = u32::try_from(decoded.width).map_err(|_| {
+                let png_decoded =
+                    decode_png(&payload, png_limits, budget).map_err(map_png_error)?;
+                let width = u32::try_from(png_decoded.width).map_err(|_| {
                     KittyDecodeError::reason(TerminalImageRejectionReason::InvalidDimensions)
                 })?;
-                let height = u32::try_from(decoded.height).map_err(|_| {
+                let height = u32::try_from(png_decoded.height).map_err(|_| {
                     KittyDecodeError::reason(TerminalImageRejectionReason::InvalidDimensions)
                 })?;
-                DecodedParts { width, height, rgba: decoded.rgba, has_alpha: decoded.has_alpha }
+                DecodedParts {
+                    width,
+                    height,
+                    rgba: png_decoded.rgba,
+                    has_alpha: png_decoded.has_alpha,
+                }
             }
         };
-        budget.end_allocation(payload.len());
+        budget.end_allocation(payload.requested_bytes());
         budget.check_now()?;
         Ok(NormalizedKittyImage {
             width: parts.width,
@@ -364,22 +550,24 @@ fn normalize_raw(
             reason: TerminalImageRejectionReason::MalformedPayload,
             observed: Some(payload.len() as u64),
             limit: None,
+            storage: None,
         });
     }
-    budget.begin_allocation(rgba_len)?;
-    let mut rgba = Vec::new();
-    if rgba.try_reserve_exact(rgba_len).is_err() {
-        budget.end_allocation(rgba_len);
-        return Err(KittyDecodeError::reason(TerminalImageRejectionReason::QuotaExceeded));
-    }
+    // Admission gates the work: the copy is charged before the buffer that
+    // receives it is even reserved.
     if channels == 4 {
-        rgba.extend_from_slice(payload);
         budget.charge(u64::from(width) * u64::from(height))?;
+    }
+    let mut rgba = budget.allocate(DecodeAllocationClass::KittyRgba, rgba_len)?;
+    if channels == 4 {
+        rgba.extend_from_slice(payload)
+            .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
     } else {
         for pixel in payload.chunks_exact(3) {
-            rgba.extend_from_slice(pixel);
-            rgba.push(255);
             budget.charge(1)?;
+            rgba.extend_from_slice(pixel)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            rgba.push(255).map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
         }
     }
     Ok(DecodedParts { width, height, rgba, has_alpha: channels == 4 })
@@ -389,9 +577,9 @@ fn inflate_rfc1950(
     input: &[u8],
     maximum: usize,
     budget: &mut DecodeBudget<'_>,
-) -> Result<Vec<u8>, KittyDecodeError> {
+) -> Result<DecodeBuffer, KittyDecodeError> {
     let mut decoder = Decompress::new(true);
-    let mut output = Vec::new();
+    let mut output: Option<DecodeBuffer> = None;
     let mut consumed = 0usize;
     loop {
         let mut scratch = [0u8; 4_096];
@@ -409,11 +597,11 @@ fn inflate_rfc1950(
             .map_err(|_| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
         let produced = usize::try_from(decoder.total_out().saturating_sub(before_out))
             .map_err(|_| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
-        budget.charge((used + produced) as u64)?;
         consumed = consumed
             .checked_add(used)
             .ok_or_else(|| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
-        let projected = output.len().checked_add(produced).ok_or_else(|| {
+        let output_len = output.as_ref().map_or(0, |buffer| buffer.len());
+        let projected = output_len.checked_add(produced).ok_or_else(|| {
             KittyDecodeError::limit(
                 TerminalImageRejectionReason::QuotaExceeded,
                 u64::MAX,
@@ -427,22 +615,46 @@ fn inflate_rfc1950(
                 ImageLimitName::InflatedBytes,
             ));
         }
-        budget.begin_allocation(produced)?;
-        if output.try_reserve_exact(produced).is_err() {
-            budget.end_allocation(produced);
-            return Err(KittyDecodeError::reason(TerminalImageRejectionReason::QuotaExceeded));
-        }
+        // `push_chunk` already charges every encoded byte and its decoded
+        // compressed byte. Inflation owns produced-output and geometric-copy
+        // work; charging `used` here would count compressed input twice and
+        // let the work ceiling mask the max+1 inflated-byte quota boundary.
+        budget.charge(produced as u64)?;
         let produced_bytes = scratch
             .get(..produced)
             .ok_or_else(|| KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed))?;
-        output.extend_from_slice(produced_bytes);
+        let capacity = output.as_ref().map_or(0, DecodeBuffer::capacity);
+        if projected > capacity {
+            let requested =
+                capacity.max(1).checked_mul(2).unwrap_or(projected).min(maximum).max(projected);
+            budget.charge(output_len as u64)?;
+            let mut replacement =
+                budget.allocate(DecodeAllocationClass::KittyInflate, requested)?;
+            if let Some(existing) = &output {
+                replacement
+                    .extend_from_slice(existing)
+                    .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            }
+            replacement
+                .extend_from_slice(produced_bytes)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            let old_requested = output.as_ref().map_or(0, DecodeBuffer::requested_bytes);
+            output = Some(replacement);
+            budget.end_allocation(old_requested);
+        } else if let Some(existing) = output.as_mut() {
+            existing
+                .extend_from_slice(produced_bytes)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+        }
         if status == Status::StreamEnd {
             if consumed != input.len() {
                 return Err(KittyDecodeError::reason(
                     TerminalImageRejectionReason::MalformedPayload,
                 ));
             }
-            return Ok(output);
+            return output.ok_or_else(|| {
+                KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed)
+            });
         }
         if used == 0 && produced == 0 {
             return Err(KittyDecodeError::reason(TerminalImageRejectionReason::DecodeFailed));
@@ -473,6 +685,14 @@ fn map_png_error(error: PngError) -> KittyDecodeError {
         | PngError::InvalidCrc
         | PngError::UnsupportedAnimation
         | PngError::UnsupportedColor => TerminalImageRejectionReason::MalformedPayload,
+        PngError::Storage(storage) => {
+            return KittyDecodeError {
+                reason: TerminalImageRejectionReason::QuotaExceeded,
+                observed: None,
+                limit: None,
+                storage: Some(storage),
+            };
+        }
     };
     KittyDecodeError::reason(reason)
 }

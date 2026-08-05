@@ -3,11 +3,15 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
+use std::sync::Arc;
+
+use scribe_image_decode::{DecodeStorage, StorageProcess, StorageValidation};
 
 use scribe_pty::graphics_framing::{
     GraphicsEvent, GraphicsFailureCategory, GraphicsFramer, GraphicsLimit, GraphicsProtocol,
-    KittyAction, KittyChunkState, KittyCommand, KittyCompression, KittyDelete, KittyFormat,
-    KittyPlacementMode, RawByteRange, SixelCommand, SixelMode, SixelParameters,
+    GraphicsStorageBudget, KittyAction, KittyChunkState, KittyCommand, KittyCompression,
+    KittyDelete, KittyFormat, KittyPlacementMode, MAX_CONTROL_STRING_BYTES, RawByteRange,
+    SixelMode, SixelParameters,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -24,6 +28,16 @@ const OWNED_FIXTURES: [&str; 10] = [
     "sixel-mode-chronology.hex",
     "malformed-recovery.hex",
 ];
+
+fn validation_framer(max: Option<usize>) -> GraphicsFramer {
+    let budget: Arc<GraphicsStorageBudget> = DecodeStorage::new(
+        StorageProcess::new(u64::MAX),
+        u64::MAX,
+        0,
+        StorageValidation::default(),
+    );
+    GraphicsFramer::with_storage_budget(max.unwrap_or(MAX_CONTROL_STRING_BYTES), budget)
+}
 
 #[derive(Serialize)]
 struct Evidence {
@@ -335,13 +349,18 @@ fn observe(chunks: &[&[u8]], max: Option<usize>) -> Outcome {
 }
 
 fn events_for_chunks(chunks: &[&[u8]], max: Option<usize>) -> Vec<GraphicsEvent> {
-    let mut framer =
-        max.map_or_else(GraphicsFramer::new, GraphicsFramer::with_max_control_string_bytes);
+    let mut framer = validation_framer(max);
     let mut events = Vec::new();
     for chunk in chunks {
-        events.extend(framer.push(chunk));
+        match framer.push(chunk) {
+            Ok(chunk_events) => events.extend(chunk_events),
+            Err(_) => return Vec::new(),
+        }
     }
-    events.extend(framer.finish());
+    match framer.finish() {
+        Ok(finish_events) => events.extend(finish_events),
+        Err(_) => return Vec::new(),
+    }
     events
 }
 
@@ -420,9 +439,9 @@ fn matches_kitty_query(bytes: &[u8], outcome: &Outcome) -> bool {
     expected.height = Some(1);
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Kitty { range, command }]
+        [GraphicsEvent::Kitty { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && matches_kitty_command(command, &expected)
                 && outcome.forwarded == b"\x1b[c"
     )
 }
@@ -444,9 +463,9 @@ fn matches_kitty_rgb(bytes: &[u8], outcome: &Outcome) -> bool {
     expected.height = Some(1);
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Kitty { range, command }]
+        [GraphicsEvent::Kitty { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && matches_kitty_command(command, &expected)
                 && outcome.forwarded.is_empty()
     )
 }
@@ -475,12 +494,12 @@ fn matches_kitty_chunked(bytes: &[u8], outcome: &Outcome) -> bool {
     matches!(
         outcome.annotations.as_slice(),
         [
-            GraphicsEvent::Kitty { range: first_event_range, command: first },
-            GraphicsEvent::Kitty { range: second_event_range, command: second },
+            GraphicsEvent::Kitty { range: first_event_range, command: first, .. },
+            GraphicsEvent::Kitty { range: second_event_range, command: second, .. },
         ] if *first_event_range == first_range
             && *second_event_range == second_range
-            && *first == expected_first
-            && *second == expected_second
+            && matches_kitty_command(first, &expected_first)
+            && matches_kitty_command(second, &expected_second)
             && outcome.forwarded.is_empty()
     )
 }
@@ -504,9 +523,9 @@ fn matches_kitty_png(bytes: &[u8], outcome: &Outcome) -> bool {
     expected.rows = Some(1);
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Kitty { range, command }]
+        [GraphicsEvent::Kitty { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && matches_kitty_command(command, &expected)
                 && outcome.forwarded.is_empty()
     )
 }
@@ -536,9 +555,9 @@ fn matches_kitty_placeholder(bytes: &[u8], outcome: &Outcome) -> bool {
     expected.quiet = 2;
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Kitty { range, command }]
+        [GraphicsEvent::Kitty { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && matches_kitty_command(command, &expected)
                 && outcome.forwarded == FORWARDED
     )
 }
@@ -565,12 +584,12 @@ fn matches_kitty_delete(bytes: &[u8], outcome: &Outcome) -> bool {
     matches!(
         outcome.annotations.as_slice(),
         [
-            GraphicsEvent::Kitty { range: soft_event_range, command: soft },
-            GraphicsEvent::Kitty { range: hard_event_range, command: hard },
+            GraphicsEvent::Kitty { range: soft_event_range, command: soft, .. },
+            GraphicsEvent::Kitty { range: hard_event_range, command: hard, .. },
         ] if *soft_event_range == soft_range
             && *hard_event_range == hard_range
-            && *soft == expected_soft
-            && *hard == expected_hard
+            && matches_kitty_command(soft, &expected_soft)
+            && matches_kitty_command(hard, &expected_hard)
             && outcome.forwarded.is_empty()
     )
 }
@@ -583,19 +602,14 @@ fn matches_sixel_7bit(bytes: &[u8], outcome: &Outcome) -> bool {
     if cursor != bytes.len() {
         return false;
     }
-    let expected = SixelCommand {
-        parameters: SixelParameters {
-            aspect: Some(0),
-            background: Some(0),
-            horizontal_grid: Some(0),
-        },
-        payload: b"#0;2;100;0;0#0~".to_vec(),
-    };
+    let expected_parameters =
+        SixelParameters { aspect: Some(0), background: Some(0), horizontal_grid: Some(0) };
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Sixel { range, command }]
+        [GraphicsEvent::Sixel { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && command.parameters == expected_parameters
+                && command.payload() == b"#0;2;100;0;0#0~"
                 && outcome.forwarded.is_empty()
     )
 }
@@ -608,19 +622,14 @@ fn matches_sixel_c1(bytes: &[u8], outcome: &Outcome) -> bool {
     if cursor != bytes.len() {
         return false;
     }
-    let expected = SixelCommand {
-        parameters: SixelParameters {
-            aspect: Some(0),
-            background: Some(1),
-            horizontal_grid: Some(0),
-        },
-        payload: b"\"1;1;1;6#1;2;0;100;0#1~".to_vec(),
-    };
+    let expected_parameters =
+        SixelParameters { aspect: Some(0), background: Some(1), horizontal_grid: Some(0) };
     matches!(
         outcome.annotations.as_slice(),
-        [GraphicsEvent::Sixel { range, command }]
+        [GraphicsEvent::Sixel { range, command, .. }]
             if *range == command_range
-                && *command == expected
+                && command.parameters == expected_parameters
+                && command.payload() == b"\"1;1;1;6#1;2;0;100;0#1~"
                 && outcome.forwarded.is_empty()
     )
 }
@@ -657,50 +666,37 @@ fn matches_sixel_chronology(bytes: &[u8], outcome: &Outcome) -> bool {
     if consume_expected(bytes, &mut cursor, b"C").is_none() || cursor != bytes.len() {
         return false;
     }
-    let opaque = SixelCommand {
-        parameters: SixelParameters {
-            aspect: Some(0),
-            background: Some(0),
-            horizontal_grid: Some(0),
-        },
-        payload: b"~".to_vec(),
-    };
-    let transparent = SixelCommand {
-        parameters: SixelParameters {
-            aspect: Some(0),
-            background: Some(1),
-            horizontal_grid: Some(0),
-        },
-        payload: b"~".to_vec(),
-    };
+    let opaque = SixelParameters { aspect: Some(0), background: Some(0), horizontal_grid: Some(0) };
+    let transparent =
+        SixelParameters { aspect: Some(0), background: Some(1), horizontal_grid: Some(0) };
     matches!(
         outcome.annotations.as_slice(),
         [
             GraphicsEvent::SixelMode(display_off),
             GraphicsEvent::SixelMode(cursor_off),
-            GraphicsEvent::Sixel { range: first_event_range, command: first },
+            GraphicsEvent::Sixel { range: first_event_range, command: first, .. },
             GraphicsEvent::SixelMode(cursor_on),
-            GraphicsEvent::Sixel { range: second_event_range, command: second },
+            GraphicsEvent::Sixel { range: second_event_range, command: second, .. },
             GraphicsEvent::SixelMode(display_on),
-            GraphicsEvent::Sixel { range: third_event_range, command: third },
+            GraphicsEvent::Sixel { range: third_event_range, command: third, .. },
         ] if display_off.raw.range == display_off_range
-            && display_off.raw.bytes == b"\x1b[?80l"
+            && display_off.raw.as_slice() == b"\x1b[?80l"
             && display_off.mode == SixelMode::Display && !display_off.enabled
             && cursor_off.raw.range == cursor_off_range
-            && cursor_off.raw.bytes == b"\x1b[?8452l"
+            && cursor_off.raw.as_slice() == b"\x1b[?8452l"
             && cursor_off.mode == SixelMode::CursorRight && !cursor_off.enabled
             && *first_event_range == first_range
-            && *first == opaque
+            && first.parameters == opaque && first.payload() == b"~"
             && cursor_on.raw.range == cursor_on_range
-            && cursor_on.raw.bytes == b"\x1b[?8452h"
+            && cursor_on.raw.as_slice() == b"\x1b[?8452h"
             && cursor_on.mode == SixelMode::CursorRight && cursor_on.enabled
             && *second_event_range == second_range
-            && *second == transparent
+            && second.parameters == transparent && second.payload() == b"~"
             && display_on.raw.range == display_on_range
-            && display_on.raw.bytes == b"\x1b[?80h"
+            && display_on.raw.as_slice() == b"\x1b[?80h"
             && display_on.mode == SixelMode::Display && display_on.enabled
             && *third_event_range == third_range
-            && *third == opaque
+            && third.parameters == opaque && third.payload() == b"~"
             && outcome.forwarded == b"\x1b[?80l\x1b[?8452lA\x1b[?8452hB\x1b[?80hC"
     )
 }
@@ -740,8 +736,33 @@ fn matches_malformed_recovery(bytes: &[u8], outcome: &Outcome) -> bool {
     )
 }
 
-fn expected_kitty_command(action: KittyAction, payload: &[u8]) -> KittyCommand {
-    KittyCommand {
+struct ExpectedKittyCommand {
+    action: KittyAction,
+    format: Option<KittyFormat>,
+    image_id: Option<u32>,
+    placement_id: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    source_x: Option<u32>,
+    source_y: Option<u32>,
+    source_width: Option<u32>,
+    source_height: Option<u32>,
+    columns: Option<u32>,
+    rows: Option<u32>,
+    pixel_x: Option<u32>,
+    pixel_y: Option<u32>,
+    z_index: Option<i32>,
+    move_cursor: Option<bool>,
+    placement_mode: KittyPlacementMode,
+    chunk_state: KittyChunkState,
+    quiet: u8,
+    compression: KittyCompression,
+    delete: Option<KittyDelete>,
+    payload: Vec<u8>,
+}
+
+fn expected_kitty_command(action: KittyAction, payload: &[u8]) -> ExpectedKittyCommand {
+    ExpectedKittyCommand {
         action,
         format: Some(KittyFormat::Rgba),
         image_id: None,
@@ -765,6 +786,31 @@ fn expected_kitty_command(action: KittyAction, payload: &[u8]) -> KittyCommand {
         delete: None,
         payload: payload.to_vec(),
     }
+}
+
+fn matches_kitty_command(command: &KittyCommand, expected: &ExpectedKittyCommand) -> bool {
+    command.action == expected.action
+        && command.format == expected.format
+        && command.image_id == expected.image_id
+        && command.placement_id == expected.placement_id
+        && command.width == expected.width
+        && command.height == expected.height
+        && command.source_x == expected.source_x
+        && command.source_y == expected.source_y
+        && command.source_width == expected.source_width
+        && command.source_height == expected.source_height
+        && command.columns == expected.columns
+        && command.rows == expected.rows
+        && command.pixel_x == expected.pixel_x
+        && command.pixel_y == expected.pixel_y
+        && command.z_index == expected.z_index
+        && command.move_cursor == expected.move_cursor
+        && command.placement_mode == expected.placement_mode
+        && command.chunk_state == expected.chunk_state
+        && command.quiet == expected.quiet
+        && command.compression == expected.compression
+        && command.delete == expected.delete
+        && command.payload() == expected.payload
 }
 
 fn consume_expected(input: &[u8], cursor: &mut usize, expected: &[u8]) -> Option<RawByteRange> {
@@ -892,7 +938,7 @@ fn verify_candidate_resynchronization() -> Result<(), String> {
     if escape_outcome.forwarded != b"PRE\x1bTAIL"
         || !matches!(
             escape_outcome.annotations.as_slice(),
-            [GraphicsEvent::Kitty { range, command }]
+            [GraphicsEvent::Kitty { range, command, .. }]
                 if range.start == 4 && command.action == KittyAction::Query
         )
     {
@@ -1005,9 +1051,17 @@ fn assert_malformed_sixel_control(
 }
 
 fn verify_unterminated_recovery() -> Result<(), String> {
-    let mut framer = GraphicsFramer::new();
-    let mut events = framer.push(b"PRE\x1b_Ga=q;AAAA");
-    events.extend(framer.finish());
+    let mut framer = validation_framer(None);
+    let mut events = framer
+        .push(b"PRE\x1b_Ga=q;AAAA")
+        .map_err(|error| format!("unterminated push allocation: {error:?}"))?;
+    events
+        .try_extend(
+            framer
+                .finish()
+                .map_err(|error| format!("unterminated finish allocation: {error:?}"))?,
+        )
+        .map_err(|error| format!("unterminated event growth: {error:?}"))?;
     let first = outcome_from_events(events);
     if first.forwarded != b"PRE"
         || !matches!(
@@ -1018,7 +1072,9 @@ fn verify_unterminated_recovery() -> Result<(), String> {
     {
         return Err("unterminated Kitty sequence was not rejected".to_owned());
     }
-    let second = outcome_from_events(framer.push(b"AFTER"));
+    let second = outcome_from_events(
+        framer.push(b"AFTER").map_err(|error| format!("recovery output allocation: {error:?}"))?,
+    );
     if second.forwarded != b"AFTER" || !second.annotations.is_empty() {
         return Err("text after an unterminated-stream reset was swallowed".to_owned());
     }
@@ -1042,7 +1098,7 @@ fn verify_exact_and_over_budget() -> Result<(), String> {
             over_outcome.annotations.as_slice(),
             [GraphicsEvent::Failure(failure)]
                 if failure.category == GraphicsFailureCategory::QuotaExceeded
-                    && failure.limit == Some(GraphicsLimit::ControlStringBytes)
+                    && failure.limit == Some(GraphicsLimit::ControlString)
         )
     {
         return Err("over-budget Sixel did not recover at ST".to_owned());
@@ -1053,7 +1109,7 @@ fn verify_exact_and_over_budget() -> Result<(), String> {
     if maximum_outcome.forwarded != b"PREPOST"
         || !matches!(
             maximum_outcome.annotations.as_slice(),
-            [GraphicsEvent::Kitty { command, .. }] if command.payload.len() == 4_096
+            [GraphicsEvent::Kitty { command, .. }] if command.payload().len() == 4_096
         )
     {
         return Err("maximum Kitty chunk payload was not accepted".to_owned());
@@ -1066,7 +1122,7 @@ fn verify_exact_and_over_budget() -> Result<(), String> {
             payload_outcome.annotations.as_slice(),
             [GraphicsEvent::Failure(failure)]
                 if failure.category == GraphicsFailureCategory::QuotaExceeded
-                    && failure.limit == Some(GraphicsLimit::KittyChunkPayloadBytes)
+                    && failure.limit == Some(GraphicsLimit::KittyChunkPayload)
         )
     {
         return Err("oversized Kitty chunk returned wrong typed limit".to_owned());
@@ -1113,11 +1169,11 @@ fn verify_sixel_header_quota_boundary() -> Result<(), String> {
         match expected_failure_range {
             None if matches!(
                 outcome.annotations.as_slice(),
-                [GraphicsEvent::Sixel { range, command }]
+                [GraphicsEvent::Sixel { range, command, .. }]
                     if *range == (RawByteRange {
                         start: 3,
                         end: bytes.len().saturating_sub(4) as u64,
-                    }) && command.payload.is_empty()
+                    }) && command.payload().is_empty()
             ) => {}
             Some(expected)
                 if matches!(
@@ -1125,7 +1181,7 @@ fn verify_sixel_header_quota_boundary() -> Result<(), String> {
                     [GraphicsEvent::Failure(failure)]
                         if failure.protocol == GraphicsProtocol::Sixel
                             && failure.category == GraphicsFailureCategory::QuotaExceeded
-                            && failure.limit == Some(GraphicsLimit::ControlStringBytes)
+                            && failure.limit == Some(GraphicsLimit::ControlString)
                             && failure.range == expected
                 ) => {}
             _ => {
@@ -1162,7 +1218,7 @@ fn verify_cancellation_preserves_first_failure() -> Result<(), String> {
             b"PRE\x1b_Ga=q;A\x1aPOST".as_slice(),
             4,
             GraphicsFailureCategory::QuotaExceeded,
-            Some(GraphicsLimit::ControlStringBytes),
+            Some(GraphicsLimit::ControlString),
             RawByteRange { start: 3, end: 12 },
         ),
         (
@@ -1170,7 +1226,7 @@ fn verify_cancellation_preserves_first_failure() -> Result<(), String> {
             b"PRE\x1bP0q~~~\x1aPOST".as_slice(),
             3,
             GraphicsFailureCategory::QuotaExceeded,
-            Some(GraphicsLimit::ControlStringBytes),
+            Some(GraphicsLimit::ControlString),
             RawByteRange { start: 3, end: 11 },
         ),
         (
@@ -1178,7 +1234,7 @@ fn verify_cancellation_preserves_first_failure() -> Result<(), String> {
             b"PRE\x900q~~~\x1aPOST".as_slice(),
             3,
             GraphicsFailureCategory::QuotaExceeded,
-            Some(GraphicsLimit::ControlStringBytes),
+            Some(GraphicsLimit::ControlString),
             RawByteRange { start: 3, end: 10 },
         ),
     ];
@@ -1253,7 +1309,7 @@ fn verify_non_image_passthrough() -> Result<(), String> {
     Ok(())
 }
 
-fn outcome_from_events(events: Vec<GraphicsEvent>) -> Outcome {
+fn outcome_from_events(events: impl IntoIterator<Item = GraphicsEvent>) -> Outcome {
     let mut forwarded = Vec::new();
     let mut annotations = Vec::new();
     for event in events {

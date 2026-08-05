@@ -179,6 +179,12 @@ the ordinary byte stream. A numeric Sixel-looking DCS header that crosses the
 ceiling is charged through its offending digit or separator, converted to the
 same failed discard state, and never returned as raw terminal bytes.
 
+Every public framer constructor requires a session/process storage budget.
+Candidate, active, and completed payload buffers always carry a move-only real
+lease. Storage rejection abandons the affected candidate or active string and
+returns `GraphicsStorageRejection` instead of fabricating a protocol failure or
+silently reporting image parsing as successful raw fallback.
+
 Recovery is overlap-safe: a repeated ESC can begin the real seven-bit ST, an
 ESC followed by C1 ST ends with typed malformed framing, and an ESC/C1 control
 after an abandoned introducer candidate is reprocessed from ground. Sixel's
@@ -266,10 +272,107 @@ readable afterward; inactive cursor facts are marked unavailable rather than
 clamped or synthesized. Activating that grid refreshes them from the real
 `Term`. Observations remain internal and carry no cells or payloads.
 
+Canonical Kitty and Sixel replacements, image outputs, and sequence are staged
+for the complete read while all pre-read owners remain live. Only a read whose
+every canonical allocation succeeds swaps slots and sequence. A later storage
+error drops staged/event leases and preserves exact pre-read canonical bytes,
+ownership, and sequence while ordinary ingress sinks still run once.
+
 Payload-free work counters distinguish direct reads from speculative clones.
 Transactional rejection preserves framer offsets, pending metadata, sequence,
-screen, definitions, and placements; operational work counters may still
-record the rejected rollback attempt.
+screen, definitions, and placements. Ownership current/peak counters roll back
+with canonical state, while reservation, allocator, and reconciliation attempt
+telemetry remains monotonic for the rejected work.
+
+## Exact Requested Storage Accounting
+
+Session and process ledgers cover every retained production image buffer before allocation while reporting requested live storage separately from allocator-observed capacity.
+
+Each `SessionTerminal` owns an independent session ledger and a handle to the
+process ledger frozen in its shared policy. A move-only reservation precomputes
+complete process and session snapshots under one fixed-order critical section.
+It validates every counter, health, and limit transition before committing both
+scopes ahead of `Vec::try_reserve_exact`, then atomically reconciles any extra
+observed capacity before retention. Drop precomputes both exact releases first.
+Paired preflight always inspects both snapshots: counter or invariant failures
+from either ledger outrank capacity pressure, then process capacity maps to
+`ProcessLimit` and session capacity remains `SessionLimit`. Neither ledger
+commits when either side rejects.
+
+Framer candidate and body growth uses fallible replacement buffers. The old
+buffer and reservation remain live until the requested replacement and its
+observed capacity are covered, so failed growth preserves canonical bytes.
+Kitty parsing moves one opaque, non-cloneable bytes-plus-lease owner into its
+command instead of copying payload. Commands expose only borrowed slices, and
+the owner moves through graphics events and ordered session boundaries. Sixel
+and retained raw fallback bytes follow the same path.
+
+Each PTY read creates zero-byte leased event and output vectors, then grows them
+geometrically under the same paired ledger before allocation. Consuming such a
+vector moves its lease into the consuming iterator, so ownership is released
+only after the backing allocation is freed rather than when iteration starts. Ordinary short
+raw text stays inline; retained fallback bytes remain charged until their event
+drops. Candidate, active, and EOF transactions preserve exact buffer length,
+capacity, digest, offset, state, and owner when metadata or payload growth
+fails, so retry publishes each event once.
+
+Pending Kitty transfer bytes, Sixel bodies, and Kitty or Sixel decoded buffers
+use the same paired owner. `DecodeStorage` is a concrete required type
+by the Kitty, PNG, and Sixel decoder APIs; it returns an opaque move-only
+`DecodeBuffer` whose lease reserves before the real `Vec` allocation and
+reconciles its capacity before decoder mutation. Base64, zlib, PNG inflate,
+canonical RGBA, and Sixel canvas growth are geometric: copy work is charged,
+the replacement lease and observed capacity are covered while the old owner is
+live, then one copy and swap releases the superseded owner. No production
+decoder has an unaccounted convenience entry point or forgeable storage trait.
+Kitty transfer ingestion owns encoded and compressed-input work once; zlib
+inflation owns produced-output and geometric-copy work. Work admission always
+precedes the work it admits: buffer initialization, canvas fills, and pixel
+copies are charged before the bytes are touched, so a refused decode never
+reserves or initializes the buffer it was refused for. When ceilings overlap,
+the first bound actually reached wins rather than relabeling work as storage.
+
+`SessionTerminal` feeds each Kitty chunk exactly once into one real transfer;
+it does not concatenate and re-feed prior payload. Protocol-significant
+controls come from the first chunk, and the published final boundary of a split
+transfer carries that first command's controls and control presence rather than
+the last chunk's defaults; only payload, chunk state, and range stay local to
+the final chunk. Equal explicit repeats are accepted,
+conflicts fail without merging, queries validate without publishing retained
+image state, and the final RGBA lease moves into retained state without an
+encoded duplicate. Sixel decoding still occurs at its complete DCS boundary.
+Sixel DCS settings pass from the production framer into the vendored decoder.
+Replacement reserves the simultaneous old-plus-requested-new peak; only a
+successful allocation swaps state. Session/process rejection, counter overflow,
+allocation failure, and internal invariant failure remain distinct
+`SessionTerminalError::Storage` outcomes and never enter the frozen protocol
+failure taxonomy.
+
+Session transactions serialize every process peak-increasing reservation and
+reconciliation. Current ownership is always the sum of live leases and is never
+restored wholesale: failed work drops provisional leases, while unrelated
+concurrent releases remain applied. Rollback restores only commit-visible peaks
+to the transaction checkpoint. Attempt telemetry stays monotonic, preserving
+proof that reservation preceded each allocator or reconcile stage without
+publishing a rejected peak.
+
+Counters expose requested current/peak, observed current/peak, reservation and
+allocator attempts, successful pre-allocation reservations, and
+observed-capacity reconciliations. An immutable validation observer forces
+extra reported capacity through framer and canonical allocation paths. These
+are storage-accounting facts, not allocator metadata or process RSS.
+Grid span observations and their typed effect vectors are reserved from the
+same paired ledger before allocation and travel with the commit that owns them.
+The already-fed terminal is never rewound, so storage pressure truncates that
+payload-free list and returns a typed rejection with the commit instead of
+allocating outside the ledger.
+
+Validation rejection targets name candidate, active, event metadata, output
+metadata, canonical Sixel, grid observation, and Kitty/Sixel decoded allocation
+classes. There is
+no canonical Kitty class because the live transfer/decoded owner is retained
+directly. Class-local occurrence counts cannot be
+satisfied by unrelated framing or decoding work.
 
 ## Typed Failures
 

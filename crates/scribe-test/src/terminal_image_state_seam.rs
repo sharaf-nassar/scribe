@@ -204,7 +204,7 @@ async fn verify_pending_transfer(
     if first.outputs.len() != 1
         || !matches!(
             first.outputs.first(),
-            Some(SessionTerminalOutput::Raw(raw)) if raw.bytes == b"before"
+            Some(SessionTerminalOutput::Raw(raw)) if raw.as_slice() == b"before"
         )
     {
         return Err(format!("first read did not expose only prior raw bytes: {:?}", first.outputs));
@@ -236,11 +236,11 @@ async fn verify_ordered_completion(
         .map(|output| match output {
             SessionTerminalOutput::Image {
                 sequence: TerminalOutputSequence(1),
-                boundary: TerminalImageBoundary::Kitty(_),
+                boundary: TerminalImageBoundary::Kitty { .. },
                 ..
             } => Ok("kitty"),
-            SessionTerminalOutput::Raw(raw) if raw.bytes == b"after" => Ok("raw"),
-            SessionTerminalOutput::Raw(raw) if raw.bytes == b"\x1b[?80h" => Ok("mode_raw"),
+            SessionTerminalOutput::Raw(raw) if raw.as_slice() == b"after" => Ok("raw"),
+            SessionTerminalOutput::Raw(raw) if raw.as_slice() == b"\x1b[?80h" => Ok("mode_raw"),
             SessionTerminalOutput::Image {
                 sequence: TerminalOutputSequence(2),
                 boundary:
@@ -322,7 +322,7 @@ fn verify_candidate_fallback(fallback: &SessionTerminalCommit) -> Result<(), Str
         .outputs
         .iter()
         .flat_map(|output| match output {
-            SessionTerminalOutput::Raw(raw) => raw.bytes.as_slice(),
+            SessionTerminalOutput::Raw(raw) => raw.as_slice(),
             SessionTerminalOutput::Image { .. } => &[],
         })
         .copied()
@@ -378,8 +378,17 @@ async fn verify_large_split_transfer() -> Result<FramingWorkEvidence, String> {
         return Err(format!("large Sixel prefix emitted early: {prefix:?}"));
     }
 
-    for _ in 0..(TRANSFER_BYTES / SPLIT_READ_BYTES) {
-        let chunk = vec![b'?'; SPLIT_READ_BYTES];
+    for chunk_index in 0..(TRANSFER_BYTES / SPLIT_READ_BYTES) {
+        // One raster cell proves real Sixel completion; carriage-return
+        // commands retain the large framing/storage workload without creating
+        // an intentionally over-width image in the integrated decoder.
+        let mut chunk = vec![b'$'; SPLIT_READ_BYTES];
+        if chunk_index == 0 {
+            let first = chunk
+                .first_mut()
+                .ok_or_else(|| "large split chunk unexpectedly empty".to_owned())?;
+            *first = b'?';
+        }
         let commit = route_chunk(&mut session, chunk, &client, &term)
             .await
             .map_err(|error| error.to_string())?;
@@ -405,7 +414,7 @@ async fn verify_large_split_transfer() -> Result<FramingWorkEvidence, String> {
         completed.outputs.as_slice(),
         [SessionTerminalOutput::Image {
             sequence: TerminalOutputSequence(1),
-            boundary: TerminalImageBoundary::Sixel(_),
+            boundary: TerminalImageBoundary::Sixel { .. },
             ..
         }]
     ) || session.state().pending_transfer.is_some()
@@ -488,7 +497,7 @@ async fn verify_transactional_exhaustion() -> Result<TransactionalExhaustionEvid
         || !matches!(
             raw.outputs.first(),
             Some(SessionTerminalOutput::Raw(raw))
-                if raw.bytes == b"plain" && raw.range.start == 0 && raw.range.end == 5
+                if raw.as_slice() == b"plain" && raw.range.start == 0 && raw.range.end == 5
         )
     {
         return Err(format!("rejected input advanced the production framer: {:?}", raw.outputs));

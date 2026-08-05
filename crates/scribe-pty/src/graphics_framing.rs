@@ -4,7 +4,15 @@
 //! frozen terminal-images-v1 subset, consumes image strings, and returns all
 //! unrelated bytes exactly once with absolute half-open stream ranges.
 
-use std::collections::HashSet;
+use std::fmt;
+use std::mem::size_of;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+pub use scribe_image_decode::{
+    DecodeStorage as GraphicsStorageBudget, DecodeStorageError as GraphicsStorageRejection,
+    DecodeStorageLease as GraphicsStorageLease, StorageClass as GraphicsStorageClass,
+};
 
 /// Frozen terminal-images-v1 control-string ceiling.
 pub const MAX_CONTROL_STRING_BYTES: usize = 16_777_216;
@@ -19,6 +27,7 @@ const C1_DCS: u8 = 0x90;
 const C1_CSI: u8 = 0x9b;
 const C1_ST: u8 = 0x9c;
 const C1_APC: u8 = 0x9f;
+const INLINE_RAW_BYTES: usize = 32;
 
 /// Absolute half-open byte boundary in the raw PTY stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,11 +42,97 @@ impl RawByteRange {
     }
 }
 
+/// Move-only bytes whose storage ownership cannot detach from their lease.
+pub struct GraphicsPayload {
+    bytes: Vec<u8>,
+    retention: GraphicsRetention,
+}
+
+impl GraphicsPayload {
+    /// Borrow the retained bytes without transferring their accounting lease.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Number of logical bytes in this payload.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether this payload has no logical bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Requested live storage held with these bytes.
+    #[must_use]
+    pub fn requested_bytes(&self) -> usize {
+        self.retention.requested_bytes()
+    }
+
+    /// Allocator-observed live storage held with these bytes.
+    #[must_use]
+    pub fn observed_bytes(&self) -> usize {
+        self.retention.observed_bytes()
+    }
+}
+
+impl fmt::Debug for GraphicsPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphicsPayload")
+            .field("len", &self.bytes.len())
+            .field("requested_bytes", &self.requested_bytes())
+            .field("observed_bytes", &self.observed_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GraphicsPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for GraphicsPayload {}
+
 /// Bytes that must continue to the ordinary terminal parser exactly once.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RawBytes {
     pub range: RawByteRange,
-    pub bytes: Vec<u8>,
+    payload: RawPayload,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RawPayload {
+    Inline { bytes: [u8; INLINE_RAW_BYTES], len: u8 },
+    Retained(GraphicsPayload),
+}
+
+impl RawBytes {
+    /// Borrow raw terminal bytes while their transient/retained owner lives.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.payload {
+            RawPayload::Inline { bytes, len } => bytes.get(..usize::from(*len)).unwrap_or_default(),
+            RawPayload::Retained(payload) => payload.as_slice(),
+        }
+    }
+
+    /// Number of raw terminal bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Whether this raw span is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
 }
 
 /// Supported image protocols at the framing boundary.
@@ -73,9 +168,199 @@ pub enum GraphicsFailureCategory {
 /// Safe limit identifier for a rejection; no payload bytes are retained here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphicsLimit {
-    ControlStringBytes,
-    KittyChunkPayloadBytes,
+    ControlString,
+    KittyChunkPayload,
 }
+
+/// Non-forgeable storage ownership that travels with a retained image event.
+pub struct GraphicsRetention {
+    lease: GraphicsStorageLease,
+}
+
+impl GraphicsRetention {
+    /// Requested live storage represented by this event.
+    #[must_use]
+    pub fn requested_bytes(&self) -> usize {
+        self.lease.requested_bytes()
+    }
+
+    /// Allocator-observed retained capacity represented by this event.
+    #[must_use]
+    pub fn observed_bytes(&self) -> usize {
+        self.lease.observed_bytes()
+    }
+}
+
+impl fmt::Debug for GraphicsRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphicsRetention")
+            .field("requested_bytes", &self.requested_bytes())
+            .field("observed_bytes", &self.observed_bytes())
+            .finish()
+    }
+}
+
+/// Move-only metadata whose vector capacity remains paired with a storage lease.
+pub struct GraphicsStorageVec<T> {
+    items: Vec<T>,
+    retention: GraphicsRetention,
+    budget: Arc<GraphicsStorageBudget>,
+    class: GraphicsStorageClass,
+}
+
+impl<T> GraphicsStorageVec<T> {
+    pub fn new(
+        budget: Arc<GraphicsStorageBudget>,
+        class: GraphicsStorageClass,
+    ) -> Result<Self, GraphicsStorageRejection> {
+        let retention = GraphicsRetention { lease: budget.reserve(class, 0)? };
+        Ok(Self { items: Vec::new(), retention, budget, class })
+    }
+
+    pub fn push(&mut self, item: T) -> Result<(), GraphicsStorageRejection> {
+        if self.items.len() < self.items.capacity() {
+            self.items.push(item);
+            return Ok(());
+        }
+        let needed =
+            self.items.len().checked_add(1).ok_or(GraphicsStorageRejection::CounterOverflow)?;
+        let capacity = self.items.capacity().max(1).checked_mul(2).unwrap_or(needed).max(needed);
+        let requested = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(GraphicsStorageRejection::CounterOverflow)?;
+        let mut lease = self.budget.reserve(self.class, requested)?;
+        if requested != 0 {
+            lease.record_allocation_attempt()?;
+        }
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|_| GraphicsStorageRejection::AllocationFailed)?;
+        let observed = replacement
+            .capacity()
+            .checked_mul(size_of::<T>())
+            .ok_or(GraphicsStorageRejection::CounterOverflow)?;
+        let observed = self.budget.observe_allocation_capacity(observed)?;
+        lease.reconcile_observed(observed)?;
+        replacement.append(&mut self.items);
+        replacement.push(item);
+        self.items = replacement;
+        self.retention = GraphicsRetention { lease };
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.items
+    }
+
+    pub fn try_extend(
+        &mut self,
+        items: impl IntoIterator<Item = T>,
+    ) -> Result<(), GraphicsStorageRejection> {
+        for item in items {
+            self.push(item)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn requested_bytes(&self) -> usize {
+        self.retention.requested_bytes()
+    }
+
+    #[must_use]
+    pub fn observed_bytes(&self) -> usize {
+        self.retention.observed_bytes()
+    }
+}
+
+impl<T> Deref for GraphicsStorageVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<T> DerefMut for GraphicsStorageVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+/// Owning iterator that keeps the storage lease alive until the backing
+/// allocation is actually freed. Field order is load-bearing: the items are
+/// dropped, and only then is their ownership released from the ledger.
+pub struct GraphicsStorageIntoIter<T> {
+    items: std::vec::IntoIter<T>,
+    _retention: GraphicsRetention,
+}
+
+impl<T> Iterator for GraphicsStorageIntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.items.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for GraphicsStorageIntoIter<T> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+impl<T> IntoIterator for GraphicsStorageVec<T> {
+    type Item = T;
+    type IntoIter = GraphicsStorageIntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        GraphicsStorageIntoIter { items: self.items.into_iter(), _retention: self.retention }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a GraphicsStorageVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for GraphicsStorageVec<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphicsStorageVec")
+            .field("items", &self.items)
+            .field("requested_bytes", &self.requested_bytes())
+            .field("observed_bytes", &self.observed_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: PartialEq> PartialEq for GraphicsStorageVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl<T: Eq> Eq for GraphicsStorageVec<T> {}
+
+impl PartialEq for GraphicsRetention {
+    fn eq(&self, other: &Self) -> bool {
+        self.requested_bytes() == other.requested_bytes()
+            && self.observed_bytes() == other.observed_bytes()
+    }
+}
+
+impl Eq for GraphicsRetention {}
 
 /// Typed, payload-free failure annotation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +425,7 @@ pub enum KittyPlacementMode {
 }
 
 /// Narrow parsed Kitty control data plus still-encoded direct payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct KittyCommand {
     pub action: KittyAction,
     pub format: Option<KittyFormat>,
@@ -163,7 +448,155 @@ pub struct KittyCommand {
     pub quiet: u8,
     pub compression: KittyCompression,
     pub delete: Option<KittyDelete>,
-    pub payload: Vec<u8>,
+    control_mask: [u64; 4],
+    payload: Option<GraphicsPayload>,
+}
+
+/// Payload-free immutable controls captured from a Kitty transfer's first chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyCommandControls {
+    pub action: KittyAction,
+    pub format: Option<KittyFormat>,
+    pub image_id: Option<u32>,
+    pub placement_id: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub source_x: Option<u32>,
+    pub source_y: Option<u32>,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
+    pub columns: Option<u32>,
+    pub rows: Option<u32>,
+    pub pixel_x: Option<u32>,
+    pub pixel_y: Option<u32>,
+    pub z_index: Option<i32>,
+    pub move_cursor: Option<bool>,
+    pub placement_mode: KittyPlacementMode,
+    pub quiet: u8,
+    pub compression: KittyCompression,
+    pub delete: Option<KittyDelete>,
+}
+
+impl KittyCommand {
+    /// Borrow the still-encoded direct payload with its lease attached.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_ref().map_or(&[], GraphicsPayload::as_slice)
+    }
+
+    /// Requested bytes owned by this parsed command event.
+    #[must_use]
+    pub fn retained_requested_bytes(&self) -> usize {
+        self.payload.as_ref().map_or(0, GraphicsPayload::requested_bytes)
+    }
+
+    /// Observed bytes owned by this parsed command event.
+    #[must_use]
+    pub fn retained_observed_bytes(&self) -> usize {
+        self.payload.as_ref().map_or(0, GraphicsPayload::observed_bytes)
+    }
+
+    #[must_use]
+    pub fn controls(&self) -> KittyCommandControls {
+        KittyCommandControls {
+            action: self.action,
+            format: self.format,
+            image_id: self.image_id,
+            placement_id: self.placement_id,
+            width: self.width,
+            height: self.height,
+            source_x: self.source_x,
+            source_y: self.source_y,
+            source_width: self.source_width,
+            source_height: self.source_height,
+            columns: self.columns,
+            rows: self.rows,
+            pixel_x: self.pixel_x,
+            pixel_y: self.pixel_y,
+            z_index: self.z_index,
+            move_cursor: self.move_cursor,
+            placement_mode: self.placement_mode,
+            quiet: self.quiet,
+            compression: self.compression,
+            delete: self.delete,
+        }
+    }
+
+    #[must_use]
+    pub fn control_present(&self, key: u8) -> bool {
+        let word = usize::from(key) / 64;
+        let bit = u32::from(key % 64);
+        self.control_mask.get(word).is_some_and(|mask| mask & (1_u64 << bit) != 0)
+    }
+
+    /// Payload-free record of which controls this command carried explicitly.
+    #[must_use]
+    pub fn control_presence(&self) -> KittyControlPresence {
+        KittyControlPresence(self.control_mask)
+    }
+
+    /// Republish a split transfer's saved first-command controls on its final
+    /// boundary. Continuation chunks legally omit every control, so the last
+    /// chunk's defaults must never reach consumers; only the payload, chunk
+    /// state, and range stay local to this chunk.
+    pub fn adopt_transfer_controls(
+        &mut self,
+        controls: KittyCommandControls,
+        presence: KittyControlPresence,
+    ) {
+        self.action = controls.action;
+        self.format = controls.format;
+        self.image_id = controls.image_id;
+        self.placement_id = controls.placement_id;
+        self.width = controls.width;
+        self.height = controls.height;
+        self.source_x = controls.source_x;
+        self.source_y = controls.source_y;
+        self.source_width = controls.source_width;
+        self.source_height = controls.source_height;
+        self.columns = controls.columns;
+        self.rows = controls.rows;
+        self.pixel_x = controls.pixel_x;
+        self.pixel_y = controls.pixel_y;
+        self.z_index = controls.z_index;
+        self.move_cursor = controls.move_cursor;
+        self.placement_mode = controls.placement_mode;
+        self.quiet = controls.quiet;
+        self.compression = controls.compression;
+        self.delete = controls.delete;
+        self.control_mask = presence.0;
+    }
+}
+
+/// Payload-free presence bitmap of the controls one Kitty command carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyControlPresence([u64; 4]);
+
+impl KittyCommandControls {
+    /// Validate every explicitly repeated continuation control against chunk one.
+    #[must_use]
+    pub fn accepts_continuation(self, command: &KittyCommand) -> bool {
+        (!command.control_present(b'a') || command.action == self.action)
+            && (!command.control_present(b'f') || command.format == self.format)
+            && (!command.control_present(b'i') || command.image_id == self.image_id)
+            && (!command.control_present(b'p') || command.placement_id == self.placement_id)
+            && (!command.control_present(b's') || command.width == self.width)
+            && (!command.control_present(b'v') || command.height == self.height)
+            && (!command.control_present(b'x') || command.source_x == self.source_x)
+            && (!command.control_present(b'y') || command.source_y == self.source_y)
+            && (!command.control_present(b'w') || command.source_width == self.source_width)
+            && (!command.control_present(b'h') || command.source_height == self.source_height)
+            && (!command.control_present(b'c') || command.columns == self.columns)
+            && (!command.control_present(b'r') || command.rows == self.rows)
+            && (!command.control_present(b'X') || command.pixel_x == self.pixel_x)
+            && (!command.control_present(b'Y') || command.pixel_y == self.pixel_y)
+            && (!command.control_present(b'z') || command.z_index == self.z_index)
+            && (!command.control_present(b'C') || command.move_cursor == self.move_cursor)
+            && (!command.control_present(b'U') || command.placement_mode == self.placement_mode)
+            && (!command.control_present(b'q') || command.quiet == self.quiet)
+            && (!command.control_present(b'o') || command.compression == self.compression)
+            && (!command.control_present(b'd') || command.delete == self.delete)
+    }
 }
 
 /// Parsed Sixel introducer parameters.
@@ -175,10 +608,30 @@ pub struct SixelParameters {
 }
 
 /// Narrow validated Sixel command. Payload remains encoded for the decoder.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SixelCommand {
     pub parameters: SixelParameters,
-    pub payload: Vec<u8>,
+    payload: GraphicsPayload,
+}
+
+impl SixelCommand {
+    /// Borrow the encoded Sixel body with its lease attached.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    /// Requested bytes owned by this parsed command event.
+    #[must_use]
+    pub fn retained_requested_bytes(&self) -> usize {
+        self.payload.requested_bytes()
+    }
+
+    /// Observed bytes owned by this parsed command event.
+    #[must_use]
+    pub fn retained_observed_bytes(&self) -> usize {
+        self.payload.observed_bytes()
+    }
 }
 
 /// Xterm private modes relevant to Sixel chronology.
@@ -189,7 +642,7 @@ pub enum SixelMode {
 }
 
 /// Parsed private mode transition. Its `raw` bytes still go to Alacritty.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SixelModeChange {
     pub raw: RawBytes,
     pub mode: SixelMode,
@@ -197,7 +650,7 @@ pub struct SixelModeChange {
 }
 
 /// One ordered result from [`GraphicsFramer`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum GraphicsEvent {
     Raw(RawBytes),
     Kitty { range: RawByteRange, command: KittyCommand },
@@ -211,8 +664,8 @@ impl GraphicsEvent {
     #[must_use]
     pub fn terminal_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Raw(raw) => Some(&raw.bytes),
-            Self::SixelMode(change) => Some(&change.raw.bytes),
+            Self::Raw(raw) => Some(raw.as_slice()),
+            Self::SixelMode(change) => Some(change.raw.as_slice()),
             Self::Kitty { .. } | Self::Sixel { .. } | Self::Failure(_) => None,
         }
     }
@@ -301,10 +754,143 @@ impl SixelHeaderScanner {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Fallibly allocated bytes whose observed capacity is covered before retain.
+// @lat: [[terminal-images#Terminal Images#Exact Requested Storage Accounting]]
+struct RetainedVec {
+    bytes: Vec<u8>,
+    retention: GraphicsRetention,
+    rollback: Option<(Vec<u8>, GraphicsRetention)>,
+    transactional: bool,
+    budget: Arc<GraphicsStorageBudget>,
+    class: GraphicsStorageClass,
+}
+
+impl RetainedVec {
+    fn empty(
+        budget: Arc<GraphicsStorageBudget>,
+        class: GraphicsStorageClass,
+    ) -> Result<Self, GraphicsStorageRejection> {
+        Self::with_requested_capacity(budget, class, 0)
+    }
+
+    fn with_requested_capacity(
+        budget: Arc<GraphicsStorageBudget>,
+        class: GraphicsStorageClass,
+        requested: usize,
+    ) -> Result<Self, GraphicsStorageRejection> {
+        let mut retention = GraphicsRetention { lease: budget.reserve(class, requested)? };
+        if requested > 0 {
+            retention.lease.record_allocation_attempt()?;
+        }
+        let mut bytes = Vec::new();
+        if requested > 0 {
+            bytes
+                .try_reserve_exact(requested)
+                .map_err(|_| GraphicsStorageRejection::AllocationFailed)?;
+            let observed = budget.observe_allocation_capacity(bytes.capacity())?;
+            retention.lease.reconcile_observed(observed)?;
+        }
+        Ok(Self { bytes, retention, rollback: None, transactional: false, budget, class })
+    }
+
+    fn from_slice(
+        budget: Arc<GraphicsStorageBudget>,
+        class: GraphicsStorageClass,
+        source: &[u8],
+    ) -> Result<Self, GraphicsStorageRejection> {
+        let mut retained = Self::with_requested_capacity(budget, class, source.len())?;
+        retained.bytes.extend_from_slice(source);
+        Ok(retained)
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), GraphicsStorageRejection> {
+        if self.bytes.len() < self.bytes.capacity() {
+            self.bytes.push(byte);
+            return Ok(());
+        }
+        let needed =
+            self.bytes.len().checked_add(1).ok_or(GraphicsStorageRejection::CounterOverflow)?;
+        let requested = self.bytes.capacity().max(1).checked_mul(2).unwrap_or(needed).max(needed);
+        let mut replacement =
+            Self::with_requested_capacity(Arc::clone(&self.budget), self.class, requested)?;
+        replacement.bytes.extend_from_slice(&self.bytes);
+        replacement.bytes.push(byte);
+        let previous = std::mem::replace(self, replacement);
+        self.transactional = previous.transactional;
+        self.rollback = if previous.transactional {
+            previous.rollback.or(Some((previous.bytes, previous.retention)))
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        self.bytes.pop()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn into_payload(self) -> GraphicsPayload {
+        GraphicsPayload { bytes: self.bytes, retention: self.retention }
+    }
+
+    fn begin_transaction(&mut self) {
+        self.transactional = true;
+    }
+
+    fn commit_transaction(&mut self) {
+        self.rollback = None;
+        self.transactional = false;
+    }
+
+    fn rollback_transaction(&mut self, old_len: usize) -> Result<(), GraphicsStorageRejection> {
+        if let Some((bytes, retention)) = self.rollback.take() {
+            self.bytes = bytes;
+            self.retention = retention;
+        }
+        if old_len > self.bytes.len() {
+            return Err(GraphicsStorageRejection::InternalInvariant);
+        }
+        self.bytes.truncate(old_len);
+        self.transactional = false;
+        Ok(())
+    }
+
+    fn try_clone(&self) -> Result<Self, GraphicsStorageRejection> {
+        Self::from_slice(Arc::clone(&self.budget), self.class, &self.bytes)
+    }
+}
+
+impl fmt::Debug for RetainedVec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedVec")
+            .field("len", &self.bytes.len())
+            .field("capacity", &self.bytes.capacity())
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for RetainedVec {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+#[derive(Debug)]
 struct Candidate {
     start: u64,
-    bytes: Vec<u8>,
+    bytes: RetainedVec,
     kind: CandidateKind,
 }
 
@@ -332,11 +918,11 @@ impl ActiveKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ActiveString {
     start: u64,
     kind: ActiveKind,
-    body: Vec<u8>,
+    body: RetainedVec,
     control_bytes: usize,
     pending_escape: bool,
     kitty_payload_started: bool,
@@ -344,72 +930,393 @@ struct ActiveString {
     failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum FramerState {
     Ground,
     Candidate(Candidate),
     Active(ActiveString),
 }
 
+#[derive(Clone)]
+enum FramerStateSnapshot {
+    Ground,
+    Candidate {
+        start: u64,
+        kind: CandidateKind,
+        len: usize,
+    },
+    Active {
+        start: u64,
+        kind: ActiveKind,
+        len: usize,
+        control_bytes: usize,
+        pending_escape: bool,
+        kitty_payload_started: bool,
+        kitty_payload_bytes: usize,
+        failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
+    },
+}
+
+struct FramerTransaction {
+    offset: u64,
+    snapshot: FramerStateSnapshot,
+    owned_original: Option<FramerState>,
+}
+
+fn rollback_state_buffer(
+    state: &mut FramerState,
+    snapshot: &FramerStateSnapshot,
+) -> Result<(), GraphicsStorageRejection> {
+    match (snapshot, state) {
+        (FramerStateSnapshot::Ground, _) => Ok(()),
+        (FramerStateSnapshot::Candidate { len, .. }, FramerState::Candidate(candidate)) => {
+            candidate.bytes.rollback_transaction(*len)
+        }
+        (FramerStateSnapshot::Active { len, .. }, FramerState::Active(active)) => {
+            active.body.rollback_transaction(*len)
+        }
+        _ => Err(GraphicsStorageRejection::InternalInvariant),
+    }
+}
+
 /// Incremental bounded APC/DCS framer over arbitrary PTY byte chunks.
 // @lat: [[terminal-images#Terminal Images#Bounded Framing and Parsing]]
-#[derive(Clone)]
 pub struct GraphicsFramer {
     state: FramerState,
     offset: u64,
     max_control_string_bytes: usize,
+    storage_budget: Arc<GraphicsStorageBudget>,
+    transaction: Option<FramerTransaction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphicsFramerValidationState {
+    Ground,
+    Candidate,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicsFramerValidationSnapshot {
+    pub state: GraphicsFramerValidationState,
+    pub offset: u64,
+    pub start: Option<u64>,
+    pub len: usize,
+    pub capacity: usize,
+    pub digest: u64,
+    pub requested: usize,
+    pub observed: usize,
+    pub transaction_active: bool,
 }
 
 impl GraphicsFramer {
-    /// Construct the production v1 framer.
+    /// Construct a production framer bound to one session/process budget pair.
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_max_control_string_bytes(MAX_CONTROL_STRING_BYTES)
+    pub fn with_storage_budget(
+        max_control_string_bytes: usize,
+        storage_budget: Arc<GraphicsStorageBudget>,
+    ) -> Self {
+        Self {
+            state: FramerState::Ground,
+            offset: 0,
+            max_control_string_bytes,
+            storage_budget,
+            transaction: None,
+        }
     }
 
-    /// Construct with a smaller ceiling for deterministic boundary validation.
-    #[must_use]
-    pub fn with_max_control_string_bytes(max_control_string_bytes: usize) -> Self {
-        Self { state: FramerState::Ground, offset: 0, max_control_string_bytes }
+    /// Fallibly clone retained state after reserving simultaneous copy storage.
+    pub fn try_clone(&self) -> Result<Self, GraphicsStorageRejection> {
+        let state = match &self.state {
+            FramerState::Ground => FramerState::Ground,
+            FramerState::Candidate(candidate) => FramerState::Candidate(Candidate {
+                start: candidate.start,
+                bytes: candidate.bytes.try_clone()?,
+                kind: candidate.kind,
+            }),
+            FramerState::Active(active) => FramerState::Active(ActiveString {
+                start: active.start,
+                kind: active.kind.clone(),
+                body: active.body.try_clone()?,
+                control_bytes: active.control_bytes,
+                pending_escape: active.pending_escape,
+                kitty_payload_started: active.kitty_payload_started,
+                kitty_payload_bytes: active.kitty_payload_bytes,
+                failure: active.failure,
+            }),
+        };
+        Ok(Self {
+            state,
+            offset: self.offset,
+            max_control_string_bytes: self.max_control_string_bytes,
+            storage_budget: Arc::clone(&self.storage_budget),
+            transaction: None,
+        })
     }
 
     /// Feed one arbitrary PTY read and return ordered complete events.
-    #[must_use]
-    pub fn push(&mut self, input: &[u8]) -> Vec<GraphicsEvent> {
-        let mut output = EventOutput::default();
+    pub fn push(
+        &mut self,
+        input: &[u8],
+    ) -> Result<GraphicsStorageVec<GraphicsEvent>, GraphicsStorageRejection> {
+        let events = self.push_staged(input)?;
+        self.commit_staged();
+        Ok(events)
+    }
+
+    /// Stage one read while retaining enough journal state for caller rollback.
+    #[doc(hidden)]
+    pub fn push_staged(
+        &mut self,
+        input: &[u8],
+    ) -> Result<GraphicsStorageVec<GraphicsEvent>, GraphicsStorageRejection> {
+        let input_len =
+            u64::try_from(input.len()).map_err(|_| GraphicsStorageRejection::CounterOverflow)?;
+        let _end_offset =
+            self.offset.checked_add(input_len).ok_or(GraphicsStorageRejection::CounterOverflow)?;
+        self.begin_transaction()?;
+        let mut output = match EventOutput::new(Arc::clone(&self.storage_budget)) {
+            Ok(output) => output,
+            Err(rejection) => {
+                self.rollback_staged()?;
+                return Err(rejection);
+            }
+        };
         for &byte in input {
             let position = self.offset;
-            self.offset = self.offset.saturating_add(1);
-            self.process_byte(position, byte, &mut output);
+            self.offset =
+                self.offset.checked_add(1).ok_or(GraphicsStorageRejection::CounterOverflow)?;
+            if let Err(rejection) = self.process_byte(position, byte, &mut output) {
+                self.rollback_staged()?;
+                return Err(rejection);
+            }
         }
-        output.finish()
+        match output.finish() {
+            Ok(events) => Ok(events),
+            Err(rejection) => {
+                self.rollback_staged()?;
+                Err(rejection)
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn commit_staged(&mut self) {
+        let Some(_transaction) = self.transaction.take() else { return };
+        match &mut self.state {
+            FramerState::Candidate(candidate) => candidate.bytes.commit_transaction(),
+            FramerState::Active(active) => active.body.commit_transaction(),
+            FramerState::Ground => {}
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn rollback_staged(&mut self) -> Result<(), GraphicsStorageRejection> {
+        let Some(mut transaction) = self.transaction.take() else { return Ok(()) };
+        self.offset = transaction.offset;
+        if let Some(mut original) = transaction.owned_original.take() {
+            rollback_state_buffer(&mut original, &transaction.snapshot)?;
+            self.state = original;
+            return Ok(());
+        }
+        let mut current = std::mem::replace(&mut self.state, FramerState::Ground);
+        rollback_state_buffer(&mut current, &transaction.snapshot)?;
+        self.state = match (transaction.snapshot, current) {
+            (FramerStateSnapshot::Ground, _) => FramerState::Ground,
+            (
+                FramerStateSnapshot::Candidate { start, kind, .. },
+                FramerState::Candidate(candidate),
+            ) => FramerState::Candidate(Candidate { start, kind, bytes: candidate.bytes }),
+            (
+                FramerStateSnapshot::Active {
+                    start,
+                    kind,
+                    control_bytes,
+                    pending_escape,
+                    kitty_payload_started,
+                    kitty_payload_bytes,
+                    failure,
+                    ..
+                },
+                FramerState::Active(active),
+            ) => FramerState::Active(ActiveString {
+                start,
+                kind,
+                body: active.body,
+                control_bytes,
+                pending_escape,
+                kitty_payload_started,
+                kitty_payload_bytes,
+                failure,
+            }),
+            _ => return Err(GraphicsStorageRejection::InternalInvariant),
+        };
+        Ok(())
+    }
+
+    fn begin_transaction(&mut self) -> Result<(), GraphicsStorageRejection> {
+        if self.transaction.is_some() {
+            return Err(GraphicsStorageRejection::InternalInvariant);
+        }
+        let snapshot = match &mut self.state {
+            FramerState::Ground => FramerStateSnapshot::Ground,
+            FramerState::Candidate(candidate) => {
+                candidate.bytes.begin_transaction();
+                FramerStateSnapshot::Candidate {
+                    start: candidate.start,
+                    kind: candidate.kind,
+                    len: candidate.bytes.len(),
+                }
+            }
+            FramerState::Active(active) => {
+                active.body.begin_transaction();
+                FramerStateSnapshot::Active {
+                    start: active.start,
+                    kind: active.kind.clone(),
+                    len: active.body.len(),
+                    control_bytes: active.control_bytes,
+                    pending_escape: active.pending_escape,
+                    kitty_payload_started: active.kitty_payload_started,
+                    kitty_payload_bytes: active.kitty_payload_bytes,
+                    failure: active.failure,
+                }
+            }
+        };
+        self.transaction =
+            Some(FramerTransaction { offset: self.offset, snapshot, owned_original: None });
+        Ok(())
+    }
+
+    fn preserve_candidate(
+        &mut self,
+        candidate: Candidate,
+    ) -> Result<Candidate, GraphicsStorageRejection> {
+        let must_preserve = self.transaction.as_ref().is_some_and(|transaction| {
+            transaction.owned_original.is_none()
+                && matches!(transaction.snapshot, FramerStateSnapshot::Candidate { .. })
+        });
+        if !must_preserve {
+            return Ok(candidate);
+        }
+        let working = Candidate {
+            start: candidate.start,
+            bytes: candidate.bytes.try_clone()?,
+            kind: candidate.kind,
+        };
+        if let Some(transaction) = self.transaction.as_mut() {
+            transaction.owned_original = Some(FramerState::Candidate(candidate));
+        }
+        Ok(working)
+    }
+
+    fn preserve_active(
+        &mut self,
+        active: ActiveString,
+    ) -> Result<ActiveString, GraphicsStorageRejection> {
+        let must_preserve = self.transaction.as_ref().is_some_and(|transaction| {
+            transaction.owned_original.is_none()
+                && matches!(transaction.snapshot, FramerStateSnapshot::Active { .. })
+        });
+        if !must_preserve {
+            return Ok(active);
+        }
+        let working = ActiveString {
+            start: active.start,
+            kind: active.kind.clone(),
+            body: active.body.try_clone()?,
+            control_bytes: active.control_bytes,
+            pending_escape: active.pending_escape,
+            kitty_payload_started: active.kitty_payload_started,
+            kitty_payload_bytes: active.kitty_payload_bytes,
+            failure: active.failure,
+        };
+        if let Some(transaction) = self.transaction.as_mut() {
+            transaction.owned_original = Some(FramerState::Active(active));
+        }
+        Ok(working)
     }
 
     /// End the stream, rejecting an incomplete image string without payload.
-    #[must_use]
-    pub fn finish(&mut self) -> Vec<GraphicsEvent> {
-        let state = std::mem::replace(&mut self.state, FramerState::Ground);
-        match state {
-            FramerState::Ground => Vec::new(),
-            FramerState::Candidate(candidate) => vec![GraphicsEvent::Raw(RawBytes {
-                range: RawByteRange::new(candidate.start, self.offset),
-                bytes: candidate.bytes,
-            })],
-            FramerState::Active(active) => {
-                let failure = Self::active_failure(
-                    &active,
-                    self.offset,
-                    GraphicsFailureCategory::TruncatedSequence,
-                );
-                vec![GraphicsEvent::Failure(failure)]
+    pub fn finish(
+        &mut self,
+    ) -> Result<GraphicsStorageVec<GraphicsEvent>, GraphicsStorageRejection> {
+        self.begin_transaction()?;
+        let mut events = match GraphicsStorageVec::new(
+            Arc::clone(&self.storage_budget),
+            GraphicsStorageClass::FramingEvents,
+        ) {
+            Ok(events) => events,
+            Err(rejection) => {
+                self.rollback_staged()?;
+                return Err(rejection);
             }
+        };
+        let state = std::mem::replace(&mut self.state, FramerState::Ground);
+        let result = (|| {
+            match state {
+                FramerState::Ground => {}
+                FramerState::Candidate(candidate) => {
+                    let candidate = self.preserve_candidate(candidate)?;
+                    events.push(GraphicsEvent::Raw(RawBytes {
+                        range: RawByteRange::new(candidate.start, self.offset),
+                        payload: RawPayload::Retained(candidate.bytes.into_payload()),
+                    }))?;
+                }
+                FramerState::Active(active) => {
+                    let active = self.preserve_active(active)?;
+                    let failure = Self::active_failure(
+                        &active,
+                        self.offset,
+                        GraphicsFailureCategory::TruncatedSequence,
+                    );
+                    events.push(GraphicsEvent::Failure(failure))?;
+                }
+            }
+            Ok::<(), GraphicsStorageRejection>(())
+        })();
+        if let Err(rejection) = result {
+            self.rollback_staged()?;
+            return Err(rejection);
         }
+        self.commit_staged();
+        Ok(events)
     }
 
     /// Current absolute raw-stream offset.
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_snapshot(&self) -> GraphicsFramerValidationSnapshot {
+        let (state, start, bytes) = match &self.state {
+            FramerState::Ground => (GraphicsFramerValidationState::Ground, None, None),
+            FramerState::Candidate(candidate) => (
+                GraphicsFramerValidationState::Candidate,
+                Some(candidate.start),
+                Some(&candidate.bytes),
+            ),
+            FramerState::Active(active) => {
+                (GraphicsFramerValidationState::Active, Some(active.start), Some(&active.body))
+            }
+        };
+        GraphicsFramerValidationSnapshot {
+            state,
+            offset: self.offset,
+            start,
+            len: bytes.map_or(0, |bytes| bytes.bytes.len()),
+            capacity: bytes.map_or(0, |bytes| bytes.bytes.capacity()),
+            digest: bytes.map_or(0, |bytes| {
+                bytes.bytes.iter().fold(0, |digest, byte| {
+                    digest.wrapping_mul(1_099_511_628_211).wrapping_add(u64::from(*byte))
+                })
+            }),
+            requested: bytes.map_or(0, |bytes| bytes.retention.requested_bytes()),
+            observed: bytes.map_or(0, |bytes| bytes.retention.observed_bytes()),
+            transaction_active: self.transaction.is_some(),
+        }
     }
 
     /// Describe an active graphics string without exposing its payload.
@@ -430,16 +1337,27 @@ impl GraphicsFramer {
         })
     }
 
-    fn process_byte(&mut self, position: u64, byte: u8, output: &mut EventOutput) {
+    fn process_byte(
+        &mut self,
+        position: u64,
+        byte: u8,
+        output: &mut EventOutput,
+    ) -> Result<(), GraphicsStorageRejection> {
         let state = std::mem::replace(&mut self.state, FramerState::Ground);
         self.state = match state {
-            FramerState::Ground => Self::process_ground(position, byte, output),
-            FramerState::Candidate(candidate) => self.process_candidate(candidate, byte, output),
-            FramerState::Active(active) => self.process_active(active, position, byte, output),
+            FramerState::Ground => self.process_ground(position, byte, output)?,
+            FramerState::Candidate(candidate) => self.process_candidate(candidate, byte, output)?,
+            FramerState::Active(active) => self.process_active(active, position, byte, output)?,
         };
+        Ok(())
     }
 
-    fn process_ground(position: u64, byte: u8, output: &mut EventOutput) -> FramerState {
+    fn process_ground(
+        &self,
+        position: u64,
+        byte: u8,
+        output: &mut EventOutput,
+    ) -> Result<FramerState, GraphicsStorageRejection> {
         let (kind, special) = match byte {
             ESC => (CandidateKind::Escape, true),
             C1_DCS => (
@@ -454,81 +1372,99 @@ impl GraphicsFramer {
             _ => (CandidateKind::Escape, false),
         };
         if special {
-            FramerState::Candidate(Candidate { start: position, bytes: vec![byte], kind })
+            let bytes = RetainedVec::from_slice(
+                Arc::clone(&self.storage_budget),
+                GraphicsStorageClass::FramingCandidate,
+                &[byte],
+            )?;
+            Ok(FramerState::Candidate(Candidate { start: position, bytes, kind }))
         } else {
-            output.raw_byte(position, byte);
-            FramerState::Ground
+            output.raw_byte(position, byte)?;
+            Ok(FramerState::Ground)
         }
     }
 
     fn process_candidate(
-        &self,
+        &mut self,
         mut candidate: Candidate,
         byte: u8,
         output: &mut EventOutput,
-    ) -> FramerState {
+    ) -> Result<FramerState, GraphicsStorageRejection> {
         let position = candidate.start.saturating_add(candidate.bytes.len() as u64);
         match candidate.kind {
             CandidateKind::Escape => match byte {
                 b'_' => {
-                    candidate.bytes.push(byte);
+                    if let Err(rejection) = candidate.bytes.push(byte) {
+                        self.state = FramerState::Candidate(candidate);
+                        return Err(rejection);
+                    }
                     candidate.kind = CandidateKind::ApcPrefix;
-                    FramerState::Candidate(candidate)
+                    Ok(FramerState::Candidate(candidate))
                 }
                 b'P' => {
-                    candidate.bytes.push(byte);
+                    if let Err(rejection) = candidate.bytes.push(byte) {
+                        self.state = FramerState::Candidate(candidate);
+                        return Err(rejection);
+                    }
                     candidate.kind = CandidateKind::DcsHeader {
                         form: StringForm::SevenBit,
                         scanner: SixelHeaderScanner::default(),
                     };
-                    FramerState::Candidate(candidate)
+                    Ok(FramerState::Candidate(candidate))
                 }
                 b'[' => {
-                    candidate.bytes.push(byte);
+                    if let Err(rejection) = candidate.bytes.push(byte) {
+                        self.state = FramerState::Candidate(candidate);
+                        return Err(rejection);
+                    }
                     candidate.kind = CandidateKind::Csi { form: StringForm::SevenBit };
-                    FramerState::Candidate(candidate)
+                    Ok(FramerState::Candidate(candidate))
                 }
-                _ => Self::abandon_candidate(candidate, position, byte, output),
+                _ => self.abandon_candidate(candidate, position, byte, output),
             },
             CandidateKind::ApcPrefix => {
                 if byte == b'G' {
-                    self.start_active(candidate.start, ActiveKind::Kitty, 1, None)
+                    let start = candidate.start;
+                    let _working = self.preserve_candidate(candidate)?;
+                    self.start_active(start, ActiveKind::Kitty, 1, None)
                 } else {
-                    Self::abandon_candidate(candidate, position, byte, output)
+                    self.abandon_candidate(candidate, position, byte, output)
                 }
             }
             CandidateKind::C1ApcPrefix => {
                 if byte == b'G' {
-                    self.start_active(candidate.start, ActiveKind::UnsupportedKittyC1, 1, None)
+                    let start = candidate.start;
+                    let _working = self.preserve_candidate(candidate)?;
+                    self.start_active(start, ActiveKind::UnsupportedKittyC1, 1, None)
                 } else {
-                    Self::abandon_candidate(candidate, position, byte, output)
+                    self.abandon_candidate(candidate, position, byte, output)
                 }
             }
             CandidateKind::DcsHeader { .. } => self.process_dcs_candidate(candidate, byte, output),
-            CandidateKind::Csi { form } => {
-                Self::process_csi(candidate, form, position, byte, output)
-            }
+            CandidateKind::Csi { .. } => self.process_csi(candidate, position, byte, output),
         }
     }
 
     fn abandon_candidate(
+        &mut self,
         candidate: Candidate,
         position: u64,
         byte: u8,
         output: &mut EventOutput,
-    ) -> FramerState {
-        output.raw(candidate.start, candidate.bytes);
-        Self::process_ground(position, byte, output)
+    ) -> Result<FramerState, GraphicsStorageRejection> {
+        let candidate = self.preserve_candidate(candidate)?;
+        output.raw(candidate.start, candidate.bytes.into_payload())?;
+        self.process_ground(position, byte, output)
     }
 
     fn process_dcs_candidate(
-        &self,
+        &mut self,
         mut candidate: Candidate,
         byte: u8,
         output: &mut EventOutput,
-    ) -> FramerState {
+    ) -> Result<FramerState, GraphicsStorageRejection> {
         let CandidateKind::DcsHeader { form, mut scanner } = candidate.kind else {
-            return FramerState::Candidate(candidate);
+            return Ok(FramerState::Candidate(candidate));
         };
         let position = candidate.start.saturating_add(candidate.bytes.len() as u64);
         let introducer_len = if form == StringForm::SevenBit { 2 } else { 1 };
@@ -536,29 +1472,36 @@ impl GraphicsFramer {
         if byte.is_ascii_digit() || byte == b';' {
             if held >= self.max_control_string_bytes {
                 scanner.scan(byte);
+                let start = candidate.start;
+                let _working = self.preserve_candidate(candidate)?;
                 return self.start_active(
-                    candidate.start,
+                    start,
                     ActiveKind::Sixel { form, parameters: scanner.finish() },
                     held.saturating_add(1),
                     Some((
                         GraphicsFailureCategory::QuotaExceeded,
-                        Some(GraphicsLimit::ControlStringBytes),
+                        Some(GraphicsLimit::ControlString),
                     )),
                 );
             }
             scanner.scan(byte);
-            candidate.bytes.push(byte);
+            if let Err(rejection) = candidate.bytes.push(byte) {
+                self.state = FramerState::Candidate(candidate);
+                return Err(rejection);
+            }
             candidate.kind = CandidateKind::DcsHeader { form, scanner };
-            return FramerState::Candidate(candidate);
+            return Ok(FramerState::Candidate(candidate));
         }
         if byte != b'q' {
-            return Self::abandon_candidate(candidate, position, byte, output);
+            return self.abandon_candidate(candidate, position, byte, output);
         }
 
         let parameters = scanner.finish();
         let initial_failure = parameters.as_ref().err().copied().map(|category| (category, None));
+        let start = candidate.start;
+        let _working = self.preserve_candidate(candidate)?;
         self.start_active(
-            candidate.start,
+            start,
             ActiveKind::Sixel { form, parameters },
             held.saturating_add(1),
             initial_failure,
@@ -571,129 +1514,152 @@ impl GraphicsFramer {
         kind: ActiveKind,
         control_bytes: usize,
         initial_failure: Option<(GraphicsFailureCategory, Option<GraphicsLimit>)>,
-    ) -> FramerState {
+    ) -> Result<FramerState, GraphicsStorageRejection> {
         let failure = initial_failure.or_else(|| {
             (control_bytes > self.max_control_string_bytes).then_some((
                 GraphicsFailureCategory::QuotaExceeded,
-                Some(GraphicsLimit::ControlStringBytes),
+                Some(GraphicsLimit::ControlString),
             ))
         });
-        FramerState::Active(ActiveString {
+        Ok(FramerState::Active(ActiveString {
             start,
             kind,
-            body: Vec::new(),
+            body: RetainedVec::empty(
+                Arc::clone(&self.storage_budget),
+                GraphicsStorageClass::FramingActive,
+            )?,
             control_bytes,
             pending_escape: false,
             kitty_payload_started: false,
             kitty_payload_bytes: 0,
             failure,
-        })
+        }))
     }
 
     fn process_csi(
+        &mut self,
         mut candidate: Candidate,
-        form: StringForm,
         position: u64,
         byte: u8,
         output: &mut EventOutput,
-    ) -> FramerState {
-        candidate.bytes.push(byte);
+    ) -> Result<FramerState, GraphicsStorageRejection> {
+        let CandidateKind::Csi { form } = candidate.kind else {
+            return Ok(FramerState::Candidate(candidate));
+        };
+        if let Err(rejection) = candidate.bytes.push(byte) {
+            self.state = FramerState::Candidate(candidate);
+            return Err(rejection);
+        }
         let introducer_len = if form == StringForm::SevenBit { 2 } else { 1 };
         let sequence = candidate.bytes.get(introducer_len..).unwrap_or_default();
         if !(0x40..=0x7e).contains(&byte) && is_sixel_mode_prefix(sequence) {
-            return FramerState::Candidate(candidate);
+            return Ok(FramerState::Candidate(candidate));
         }
         if !(0x40..=0x7e).contains(&byte) && is_ground_control(byte) {
             let current = candidate.bytes.pop();
             debug_assert_eq!(current, Some(byte));
-            return Self::abandon_candidate(candidate, position, byte, output);
+            return self.abandon_candidate(candidate, position, byte, output);
         }
-        let raw = RawBytes {
-            range: RawByteRange::new(
-                candidate.start,
-                candidate.start.saturating_add(candidate.bytes.len() as u64),
-            ),
-            bytes: candidate.bytes,
-        };
+        let candidate = self.preserve_candidate(candidate)?;
+        let range = RawByteRange::new(
+            candidate.start,
+            candidate.start.saturating_add(candidate.bytes.len() as u64),
+        );
+        let payload = candidate.bytes.into_payload();
         if let Some((mode, enabled)) =
-            parse_sixel_mode_bytes(raw.bytes.get(introducer_len..).unwrap_or_default())
+            parse_sixel_mode_bytes(payload.as_slice().get(introducer_len..).unwrap_or_default())
         {
-            output.event(GraphicsEvent::SixelMode(SixelModeChange { raw, mode, enabled }));
+            let raw = RawBytes { range, payload: RawPayload::Retained(payload) };
+            output.event(GraphicsEvent::SixelMode(SixelModeChange { raw, mode, enabled }))?;
         } else {
-            output.raw(raw.range.start, raw.bytes);
+            output.raw(range.start, payload)?;
         }
-        FramerState::Ground
+        Ok(FramerState::Ground)
     }
 
     fn process_active(
-        &self,
+        &mut self,
         mut active: ActiveString,
         position: u64,
         byte: u8,
         output: &mut EventOutput,
-    ) -> FramerState {
+    ) -> Result<FramerState, GraphicsStorageRejection> {
         if byte == CAN || byte == SUB {
+            let active = self.preserve_active(active)?;
             let failure = Self::active_failure(
                 &active,
                 position.saturating_add(1),
                 GraphicsFailureCategory::MalformedFraming,
             );
-            output.event(GraphicsEvent::Failure(failure));
-            return FramerState::Ground;
+            output.event(GraphicsEvent::Failure(failure))?;
+            return Ok(FramerState::Ground);
         }
 
         if active.pending_escape {
             active.pending_escape = false;
             if byte == b'\\' {
-                return Self::finish_string(
+                return self.finish_string(
                     active,
                     position.saturating_add(1),
                     StringForm::SevenBit,
                     output,
                 );
             }
-            self.charge_and_append(&mut active, ESC);
+            if let Err(rejection) = self.charge_and_append(&mut active, ESC) {
+                self.state = FramerState::Active(active);
+                return Err(rejection);
+            }
             if active.failure.is_none() {
                 active.failure = Some((GraphicsFailureCategory::MalformedFraming, None));
             }
             if byte == ESC {
                 active.pending_escape = true;
-                return FramerState::Active(active);
+                return Ok(FramerState::Active(active));
             }
             if byte == C1_ST {
-                return Self::finish_string(
+                return self.finish_string(
                     active,
                     position.saturating_add(1),
                     StringForm::C1,
                     output,
                 );
             }
-            self.charge_and_append(&mut active, byte);
-            return FramerState::Active(active);
+            if let Err(rejection) = self.charge_and_append(&mut active, byte) {
+                self.state = FramerState::Active(active);
+                return Err(rejection);
+            }
+            return Ok(FramerState::Active(active));
         }
 
         if byte == ESC {
             active.pending_escape = true;
-            return FramerState::Active(active);
+            return Ok(FramerState::Active(active));
         }
         if byte == C1_ST {
-            return Self::finish_string(active, position.saturating_add(1), StringForm::C1, output);
+            return self.finish_string(active, position.saturating_add(1), StringForm::C1, output);
         }
 
-        self.charge_and_append(&mut active, byte);
-        FramerState::Active(active)
+        if let Err(rejection) = self.charge_and_append(&mut active, byte) {
+            self.state = FramerState::Active(active);
+            return Err(rejection);
+        }
+        Ok(FramerState::Active(active))
     }
 
-    fn charge_and_append(&self, active: &mut ActiveString, byte: u8) {
+    fn charge_and_append(
+        &self,
+        active: &mut ActiveString,
+        byte: u8,
+    ) -> Result<(), GraphicsStorageRejection> {
         active.control_bytes = active.control_bytes.saturating_add(1);
         if active.control_bytes > self.max_control_string_bytes {
             if active.failure.is_none() {
                 active.failure = Some((
                     GraphicsFailureCategory::QuotaExceeded,
-                    Some(GraphicsLimit::ControlStringBytes),
+                    Some(GraphicsLimit::ControlString),
                 ));
             }
-            return;
+            return Ok(());
         }
         if matches!(&active.kind, ActiveKind::Kitty)
             && active.failure.is_none()
@@ -701,21 +1667,24 @@ impl GraphicsFramer {
         {
             active.failure = Some((
                 GraphicsFailureCategory::QuotaExceeded,
-                Some(GraphicsLimit::KittyChunkPayloadBytes),
+                Some(GraphicsLimit::KittyChunkPayload),
             ));
-            return;
+            return Ok(());
         }
         if active.failure.is_none() {
-            active.body.push(byte);
+            active.body.push(byte)?;
         }
+        Ok(())
     }
 
     fn finish_string(
+        &mut self,
         active: ActiveString,
         end: u64,
         terminator_form: StringForm,
         output: &mut EventOutput,
-    ) -> FramerState {
+    ) -> Result<FramerState, GraphicsStorageRejection> {
+        let active = self.preserve_active(active)?;
         let range = RawByteRange::new(active.start, end);
         let protocol = active.kind.protocol();
         if active.failure.is_some() {
@@ -723,50 +1692,59 @@ impl GraphicsFramer {
                 &active,
                 end,
                 GraphicsFailureCategory::MalformedFraming,
-            )));
-            return FramerState::Ground;
+            )))?;
+            return Ok(FramerState::Ground);
         }
         if active.kind.form() != terminator_form {
             output.event(GraphicsEvent::Failure(GraphicsFailure::new(
                 range,
                 protocol,
                 GraphicsFailureCategory::MalformedFraming,
-            )));
-            return FramerState::Ground;
+            )))?;
+            return Ok(FramerState::Ground);
         }
 
         match active.kind {
-            ActiveKind::Kitty => match parse_kitty(&active.body) {
-                Ok(command) => output.event(GraphicsEvent::Kitty { range, command }),
-                Err((category, limit)) => output.event(GraphicsEvent::Failure(GraphicsFailure {
-                    range,
-                    protocol,
-                    category,
-                    limit,
-                })),
-            },
+            ActiveKind::Kitty => {
+                let body = active.body.into_payload();
+                match parse_kitty(body) {
+                    Ok(command) => output.event(GraphicsEvent::Kitty { range, command })?,
+                    Err((category, limit)) => {
+                        output.event(GraphicsEvent::Failure(GraphicsFailure {
+                            range,
+                            protocol,
+                            category,
+                            limit,
+                        }))?;
+                    }
+                }
+            }
             ActiveKind::UnsupportedKittyC1 => {
                 output.event(GraphicsEvent::Failure(GraphicsFailure::new(
                     range,
                     protocol,
                     GraphicsFailureCategory::UnsupportedProtocol,
-                )));
+                )))?;
             }
             ActiveKind::Sixel { parameters, .. } => match parameters {
-                Err(category) => output
-                    .event(GraphicsEvent::Failure(GraphicsFailure::new(range, protocol, category))),
-                Ok(parameters) => match validate_sixel_payload(&active.body) {
-                    Ok(()) => output.event(GraphicsEvent::Sixel {
-                        range,
-                        command: SixelCommand { parameters, payload: active.body },
-                    }),
+                Err(category) => output.event(GraphicsEvent::Failure(GraphicsFailure::new(
+                    range, protocol, category,
+                )))?,
+                Ok(parameters) => match validate_sixel_payload(active.body.as_slice()) {
+                    Ok(()) => {
+                        let payload = active.body.into_payload();
+                        output.event(GraphicsEvent::Sixel {
+                            range,
+                            command: SixelCommand { parameters, payload },
+                        })?;
+                    }
                     Err(category) => output.event(GraphicsEvent::Failure(GraphicsFailure::new(
                         range, protocol, category,
-                    ))),
+                    )))?,
                 },
             },
         }
-        FramerState::Ground
+        Ok(FramerState::Ground)
     }
 
     fn active_failure(
@@ -793,50 +1771,65 @@ fn charge_kitty_payload(active: &mut ActiveString, byte: u8) -> bool {
     active.kitty_payload_bytes > MAX_KITTY_CHUNK_PAYLOAD_BYTES
 }
 
-impl Default for GraphicsFramer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Default)]
 struct EventOutput {
-    events: Vec<GraphicsEvent>,
+    events: GraphicsStorageVec<GraphicsEvent>,
     raw_start: Option<u64>,
-    raw: Vec<u8>,
+    raw: [u8; INLINE_RAW_BYTES],
+    raw_len: u8,
 }
 
 impl EventOutput {
-    fn raw_byte(&mut self, position: u64, byte: u8) {
+    fn new(budget: Arc<GraphicsStorageBudget>) -> Result<Self, GraphicsStorageRejection> {
+        let events = GraphicsStorageVec::new(budget, GraphicsStorageClass::FramingEvents)?;
+        Ok(Self { events, raw_start: None, raw: [0; INLINE_RAW_BYTES], raw_len: 0 })
+    }
+
+    fn raw_byte(&mut self, position: u64, byte: u8) -> Result<(), GraphicsStorageRejection> {
+        if usize::from(self.raw_len) == self.raw.len() {
+            self.flush_raw()?;
+        }
         if self.raw_start.is_none() {
             self.raw_start = Some(position);
         }
-        self.raw.push(byte);
+        if let Some(slot) = self.raw.get_mut(usize::from(self.raw_len)) {
+            *slot = byte;
+            self.raw_len = self.raw_len.saturating_add(1);
+        }
+        Ok(())
     }
 
-    fn raw(&mut self, start: u64, bytes: Vec<u8>) {
-        self.flush_raw();
-        let end = start.saturating_add(bytes.len() as u64);
-        self.events
-            .push(GraphicsEvent::Raw(RawBytes { range: RawByteRange::new(start, end), bytes }));
+    fn raw(
+        &mut self,
+        start: u64,
+        payload: GraphicsPayload,
+    ) -> Result<(), GraphicsStorageRejection> {
+        self.flush_raw()?;
+        let end = start.saturating_add(payload.len() as u64);
+        self.events.push(GraphicsEvent::Raw(RawBytes {
+            range: RawByteRange::new(start, end),
+            payload: RawPayload::Retained(payload),
+        }))
     }
 
-    fn event(&mut self, event: GraphicsEvent) {
-        self.flush_raw();
-        self.events.push(event);
+    fn event(&mut self, event: GraphicsEvent) -> Result<(), GraphicsStorageRejection> {
+        self.flush_raw()?;
+        self.events.push(event)
     }
 
-    fn flush_raw(&mut self) {
-        let Some(start) = self.raw_start.take() else { return };
-        let bytes = std::mem::take(&mut self.raw);
-        let end = start.saturating_add(bytes.len() as u64);
-        self.events
-            .push(GraphicsEvent::Raw(RawBytes { range: RawByteRange::new(start, end), bytes }));
+    fn flush_raw(&mut self) -> Result<(), GraphicsStorageRejection> {
+        let Some(start) = self.raw_start.take() else { return Ok(()) };
+        let len = self.raw_len;
+        self.raw_len = 0;
+        let bytes = std::mem::replace(&mut self.raw, [0; INLINE_RAW_BYTES]);
+        self.events.push(GraphicsEvent::Raw(RawBytes {
+            range: RawByteRange::new(start, start.saturating_add(u64::from(len))),
+            payload: RawPayload::Inline { bytes, len },
+        }))
     }
 
-    fn finish(mut self) -> Vec<GraphicsEvent> {
-        self.flush_raw();
-        self.events
+    fn finish(mut self) -> Result<GraphicsStorageVec<GraphicsEvent>, GraphicsStorageRejection> {
+        self.flush_raw()?;
+        Ok(self.events)
     }
 }
 
@@ -861,16 +1854,21 @@ fn parse_sixel_mode_bytes(bytes: &[u8]) -> Option<(SixelMode, bool)> {
 }
 
 fn parse_kitty(
-    bytes: &[u8],
+    mut payload_owner: GraphicsPayload,
 ) -> Result<KittyCommand, (GraphicsFailureCategory, Option<GraphicsLimit>)> {
-    let (controls, payload) = split_at_byte(bytes, b';').map_or((bytes, &[][..]), |parts| parts);
+    let bytes = payload_owner.as_slice();
+    let separator = bytes.iter().position(|byte| *byte == b';');
+    let payload_start = separator.map_or(bytes.len(), |index| index.saturating_add(1));
+    let controls_end = separator.unwrap_or(bytes.len());
+    let controls = bytes.get(..controls_end).unwrap_or_default();
+    let payload = bytes.get(payload_start..).unwrap_or_default();
     if controls.is_empty() {
         return Err((GraphicsFailureCategory::MalformedControl, None));
     }
     if payload.len() > MAX_KITTY_CHUNK_PAYLOAD_BYTES {
         return Err((
             GraphicsFailureCategory::QuotaExceeded,
-            Some(GraphicsLimit::KittyChunkPayloadBytes),
+            Some(GraphicsLimit::KittyChunkPayload),
         ));
     }
     if !payload
@@ -902,9 +1900,10 @@ fn parse_kitty(
         quiet: 0,
         compression: KittyCompression::None,
         delete: None,
-        payload: payload.to_vec(),
+        control_mask: [0; 4],
+        payload: None,
     };
-    let mut seen = HashSet::new();
+    let mut seen = [false; 256];
 
     for pair in controls.split(|byte| *byte == b',') {
         let Some((key_bytes, value)) = split_at_byte(pair, b'=') else {
@@ -913,13 +1912,29 @@ fn parse_kitty(
         let Some(&key) = key_bytes.first().filter(|_| key_bytes.len() == 1) else {
             return Err((GraphicsFailureCategory::MalformedControl, None));
         };
-        if !seen.insert(key) || value.is_empty() {
+        let Some(was_seen) = seen.get_mut(usize::from(key)) else {
             return Err((GraphicsFailureCategory::MalformedControl, None));
+        };
+        if *was_seen || value.is_empty() {
+            return Err((GraphicsFailureCategory::MalformedControl, None));
+        }
+        *was_seen = true;
+        let word = usize::from(key) / 64;
+        let bit = u32::from(key % 64);
+        if let Some(mask) = command.control_mask.get_mut(word) {
+            *mask |= 1_u64 << bit;
         }
         apply_kitty_control(&mut command, key, value)?;
     }
 
-    if command.chunk_state == KittyChunkState::More && !command.payload.len().is_multiple_of(4) {
+    if payload_start > 0 && payload_start <= payload_owner.bytes.len() {
+        payload_owner.bytes.drain(..payload_start);
+    } else {
+        payload_owner.bytes.clear();
+    }
+    command.payload = Some(payload_owner);
+
+    if command.chunk_state == KittyChunkState::More && !command.payload().len().is_multiple_of(4) {
         return Err((GraphicsFailureCategory::MalformedPayload, None));
     }
     Ok(command)
@@ -1089,7 +2104,7 @@ fn validate_sixel_payload(bytes: &[u8]) -> Result<(), GraphicsFailureCategory> {
                 cursor = next.saturating_add(1);
             }
             b'"' => {
-                let (_, next) = parse_numeric_fields(bytes, cursor.saturating_add(1), 4)?;
+                let (_, next) = parse_four_numeric_fields(bytes, cursor.saturating_add(1))?;
                 cursor = next;
             }
             b'#' => {
@@ -1098,7 +2113,7 @@ fn validate_sixel_payload(bytes: &[u8]) -> Result<(), GraphicsFailureCategory> {
                     return Err(GraphicsFailureCategory::MalformedPayload);
                 }
                 if bytes.get(next) == Some(&b';') {
-                    let (fields, after) = parse_numeric_fields(bytes, next.saturating_add(1), 4)?;
+                    let (fields, after) = parse_four_numeric_fields(bytes, next.saturating_add(1))?;
                     validate_palette_definition(&fields)?;
                     cursor = after;
                 } else {
@@ -1129,18 +2144,17 @@ fn parse_decimal_at(bytes: &[u8], start: usize) -> Result<(u32, usize), Graphics
     Ok((value, cursor))
 }
 
-fn parse_numeric_fields(
+fn parse_four_numeric_fields(
     bytes: &[u8],
     start: usize,
-    count: usize,
-) -> Result<(Vec<u32>, usize), GraphicsFailureCategory> {
-    let mut values = Vec::with_capacity(count);
+) -> Result<([u32; 4], usize), GraphicsFailureCategory> {
+    let mut values = [0_u32; 4];
     let mut cursor = start;
-    for field in 0..count {
+    for (field, slot) in values.iter_mut().enumerate() {
         let (value, next) = parse_decimal_at(bytes, cursor)?;
-        values.push(value);
+        *slot = value;
         cursor = next;
-        if field.saturating_add(1) < count {
+        if field < 3 {
             if bytes.get(cursor) != Some(&b';') {
                 return Err(GraphicsFailureCategory::MalformedPayload);
             }
@@ -1168,6 +2182,8 @@ fn validate_palette_definition(values: &[u32]) -> Result<(), GraphicsFailureCate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use scribe_image_decode::{StorageProcess, StorageValidation};
 
     #[test]
     fn sixel_scanner_marks_fourth_field_at_separator() {
@@ -1199,9 +2215,20 @@ mod tests {
 
     #[test]
     fn malformed_sixel_header_discards_body_while_recovering() {
-        let mut framer = GraphicsFramer::with_max_control_string_bytes(16);
-        assert!(framer.push(b"\x1bP0;0;0;0q").is_empty());
-        assert!(framer.push(b"~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~").is_empty());
+        let budget = GraphicsStorageBudget::new(
+            StorageProcess::new(u64::MAX),
+            u64::MAX,
+            0,
+            StorageValidation::default(),
+        );
+        let mut framer = GraphicsFramer::with_storage_budget(16, budget);
+        assert!(framer.push(b"\x1bP0;0;0;0q").expect("header output allocation").is_empty());
+        assert!(
+            framer
+                .push(b"~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+                .expect("payload output allocation")
+                .is_empty()
+        );
 
         let FramerState::Active(active) = &framer.state else {
             panic!("malformed Sixel must remain active until its terminator");
@@ -1210,7 +2237,7 @@ mod tests {
         assert!(active.body.is_empty());
         assert_eq!(active.control_bytes, 40);
 
-        let events = framer.push(b"\x1b\\");
+        let events = framer.push(b"\x1b\\").expect("terminator output allocation");
         assert!(matches!(
             events.as_slice(),
             [GraphicsEvent::Failure(failure)]
