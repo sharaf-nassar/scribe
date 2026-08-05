@@ -19,6 +19,7 @@ mod session;
 mod share_tap;
 mod sixel_decoder;
 mod terminal_image_accounting;
+mod terminal_image_convergence;
 mod terminal_image_mutations;
 mod terminal_image_observer_parity;
 mod terminal_image_scheduler;
@@ -364,6 +365,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify client convergence and terminal-image counter safety.
+    TerminalImageConvergence {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -521,21 +528,7 @@ fn main() -> ExitCode {
 /// Execute the parsed CLI command.
 fn run(cli: Cli) -> Result<(), TestError> {
     match cli.command {
-        Command::Server { action } => {
-            let rt =
-                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
-            match action {
-                ServerAction::Start => {
-                    rt.block_on(server::start()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-                ServerAction::Stop => {
-                    rt.block_on(server::stop()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-                ServerAction::Upgrade => {
-                    rt.block_on(server::upgrade()).map_err(|e| TestError::InfraError(e.to_string()))
-                }
-            }
-        }
+        Command::Server { action } => run_server(&action),
         Command::Daemon { action } => run_daemon(&action),
         Command::Session { action } => run_session(action),
         Command::Send { session_id, data } => input::send(&session_id, &data),
@@ -587,6 +580,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageScheduler { evidence } => run_terminal_image_scheduler(&evidence),
         Command::TerminalImageTransferLifecycle { evidence } => run_transfer_lifecycle(&evidence),
         Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
+        Command::TerminalImageConvergence { evidence } => run_terminal_image_convergence(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
         }
@@ -599,6 +593,21 @@ fn run(cli: Cli) -> Result<(), TestError> {
             client_scene::verify(&fixtures, &output).map_err(TestError::TestFailure)
         }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
+    }
+}
+
+fn run_server(action: &ServerAction) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    match action {
+        ServerAction::Start => {
+            rt.block_on(server::start()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        ServerAction::Stop => {
+            rt.block_on(server::stop()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        ServerAction::Upgrade => {
+            rt.block_on(server::upgrade()).map_err(|e| TestError::InfraError(e.to_string()))
+        }
     }
 }
 
@@ -635,6 +644,10 @@ fn run_share_tap(
 
 fn run_terminal_image_mutations(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_mutations::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_terminal_image_convergence(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_convergence::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {

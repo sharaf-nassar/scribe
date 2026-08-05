@@ -176,6 +176,12 @@ impl CanonicalImageState {
         self.generation = generation;
     }
 
+    /// Generation every definition and placement committed here is tagged with.
+    #[must_use]
+    pub const fn generation(&self) -> TerminalImageGeneration {
+        self.generation
+    }
+
     /// Payload-free canonical definitions in identifier order.
     #[must_use]
     pub fn definitions(&self) -> Vec<TerminalImageDefinition> {
@@ -431,7 +437,13 @@ impl CanonicalImageState {
     }
 
     /// Drop every definition and placement (RIS and equivalent hard resets).
+    ///
+    /// A reset invalidates the whole scene, so it also opens the next
+    /// generation. Callers preflight generation headroom before mutating; an
+    /// exhausted counter here can only mean that preflight was skipped.
     pub fn reset(&mut self, out: &mut MutationLog) -> MutationResult {
+        let next_generation =
+            self.generation.0.checked_add(1).ok_or(GraphicsStorageRejection::InternalInvariant)?;
         let doomed: Vec<PlacementKey> = self.placements.keys().copied().collect();
         for key in doomed {
             self.remove_placement(key, PlacementRemoval::GridEffect, out)?;
@@ -442,6 +454,7 @@ impl CanonicalImageState {
             out.push(CanonicalImageMutation::FreeImage { image_id, evicted: false })?;
         }
         self.active_screen = TerminalScreenKind::Primary;
+        self.generation = TerminalImageGeneration(next_generation);
         Ok(())
     }
 

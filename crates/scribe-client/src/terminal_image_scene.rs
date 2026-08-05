@@ -78,14 +78,36 @@ impl CommittedImageScene {
     }
 
     /// Apply one protocol-normalized deletion to this owned scene.
-    pub fn apply_delete(&mut self, delete: TerminalImageDelete) {
-        apply_delete(self, delete);
+    ///
+    /// `screen` restricts the deletion to one grid; `None` keeps the legacy
+    /// scope rules, where identity deletes reach both screens.
+    pub fn apply_delete(
+        &mut self,
+        delete: TerminalImageDelete,
+        screen: Option<TerminalScreenKind>,
+    ) {
+        apply_delete(self, delete, screen);
     }
 
     fn placements_mut(&mut self) -> &mut Vec<TerminalImagePlacement> {
-        match self.active_screen {
+        let screen = self.active_screen;
+        self.screen_placements_mut(screen)
+    }
+
+    fn screen_placements_mut(
+        &mut self,
+        screen: TerminalScreenKind,
+    ) -> &mut Vec<TerminalImagePlacement> {
+        match screen {
             TerminalScreenKind::Primary => &mut self.primary_placements,
             TerminalScreenKind::Alternate => &mut self.alternate_placements,
+        }
+    }
+
+    fn screen_placements(&self, screen: TerminalScreenKind) -> &[TerminalImagePlacement] {
+        match screen {
+            TerminalScreenKind::Primary => &self.primary_placements,
+            TerminalScreenKind::Alternate => &self.alternate_placements,
         }
     }
 
@@ -261,11 +283,11 @@ fn apply_update(
     match update {
         TerminalImageUpdate::Define { definition } => begin_definition(pending, definition),
         TerminalImageUpdate::DefinitionChunk { chunk } => append_definition_chunk(pending, &chunk),
-        TerminalImageUpdate::Place { placement } => place(pending, placement),
-        TerminalImageUpdate::Delete { delete } => {
+        TerminalImageUpdate::Place { placement, screen } => place(pending, placement, screen),
+        TerminalImageUpdate::Delete { delete, screen } => {
             // Kitty specifies that every delete aborts all incomplete uploads.
             pending.definitions.clear();
-            pending.scene.apply_delete(delete);
+            pending.scene.apply_delete(delete, screen);
             Ok(())
         }
         TerminalImageUpdate::GridEffect { effect } => {
@@ -370,6 +392,7 @@ fn install_definition(scene: &mut CommittedImageScene, definition: PendingDefini
 fn place(
     pending: &mut PendingBurst,
     placement: TerminalImagePlacement,
+    screen: Option<TerminalScreenKind>,
 ) -> Result<(), LiveSceneError> {
     if placement.generation != pending.generation {
         return Err(LiveSceneError::BoundaryMismatch);
@@ -378,15 +401,19 @@ fn place(
         pending.scene.definition(placement.image_id).ok_or(LiveSceneError::MissingDefinition)?;
     validate_placement(&placement, &definition.metadata)?;
 
+    let screen = screen.unwrap_or(pending.scene.active_screen);
     let key = placement_key(&placement);
-    let replacing =
-        pending.scene.placements().iter().any(|existing| placement_key(existing) == key);
+    let replacing = pending
+        .scene
+        .screen_placements(screen)
+        .iter()
+        .any(|existing| placement_key(existing) == key);
     if pending.scene.all_placements_len().saturating_add(usize::from(!replacing))
         > ImageLimits::V1.max_placements_per_session as usize
     {
         return Err(LiveSceneError::LimitExceeded(ImageLimitName::PlacementsPerSession));
     }
-    let placements = pending.scene.placements_mut();
+    let placements = pending.scene.screen_placements_mut(screen);
     placements.retain(|existing| placement_key(existing) != key);
     placements.push(placement);
     Ok(())
@@ -410,39 +437,49 @@ fn validate_placement(
     Ok(())
 }
 
-fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
+fn apply_delete(
+    scene: &mut CommittedImageScene,
+    delete: TerminalImageDelete,
+    screen: Option<TerminalScreenKind>,
+) {
     let applies = |placement: &TerminalImagePlacement| placement.matches_delete(&delete);
+    // An explicit screen always wins. Otherwise Kitty's identity scopes reach
+    // both grids and every geometric scope stays on the active one.
+    let both_screens = screen.is_none()
+        && matches!(
+            delete.scope,
+            TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement
+        );
+    let swept = screen.unwrap_or(scene.active_screen);
     let mut selected_images = HashSet::new();
     if delete.free_image_data {
-        match delete.scope {
-            TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement => {
-                selected_images.extend(
-                    scene
-                        .primary_placements
-                        .iter()
-                        .chain(&scene.alternate_placements)
-                        .filter(|placement| applies(placement))
-                        .map(|placement| placement.image_id),
-                );
-            }
-            _ => selected_images.extend(
+        if both_screens {
+            selected_images.extend(
                 scene
-                    .placements()
+                    .primary_placements
+                    .iter()
+                    .chain(&scene.alternate_placements)
+                    .filter(|placement| applies(placement))
+                    .map(|placement| placement.image_id),
+            );
+        } else {
+            selected_images.extend(
+                scene
+                    .screen_placements(swept)
                     .iter()
                     .filter(|placement| applies(placement))
                     .map(|placement| placement.image_id),
-            ),
+            );
         }
         if delete.scope == TerminalImageDeleteScope::Image {
             selected_images.extend(delete.image_id);
         }
     }
-    match delete.scope {
-        TerminalImageDeleteScope::Image | TerminalImageDeleteScope::Placement => {
-            scene.primary_placements.retain(|placement| !applies(placement));
-            scene.alternate_placements.retain(|placement| !applies(placement));
-        }
-        _ => scene.placements_mut().retain(|placement| !applies(placement)),
+    if both_screens {
+        scene.primary_placements.retain(|placement| !applies(placement));
+        scene.alternate_placements.retain(|placement| !applies(placement));
+    } else {
+        scene.screen_placements_mut(swept).retain(|placement| !applies(placement));
     }
     if delete.free_image_data {
         let placed_images = scene

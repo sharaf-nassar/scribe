@@ -574,7 +574,7 @@ fn deletion_fixture_scene() -> CommittedImageScene {
 
 fn deleted_scene(delete: TerminalImageDelete) -> CommittedImageScene {
     let mut scene = deletion_fixture_scene();
-    scene.apply_delete(delete);
+    scene.apply_delete(delete, None);
     scene
 }
 

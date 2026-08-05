@@ -505,6 +505,37 @@ rectangles, scroll margins, and resize viewports are half-open on every edge,
 matching the observer that produced them, and the client applies the same
 shared placement geometry so both sides converge.
 
+## Client Convergence and Counter Safety
+
+Canonical server state and the connected client's scene stay identical because the server publishes the exact deltas one committed read produced, and refuses to publish at all once a counter is exhausted.
+
+Publication is the only place the two models meet. One committed mutation log
+becomes generation- and sequence-tagged live records: a definition plus its
+bounded canonical chunks, a placement, an exact placement removal, a freed
+image, or a typed rejection. The seam owns no image payload, so the caller that
+owns decoded pixels supplies the bytes for each published definition.
+
+Every placement record names its owning screen, so resize clipping, eviction,
+and alternate-screen creation cannot land in the wrong client bucket. The field
+is omitted at its legacy default — whichever screen is active — and existing
+encoded records keep their exact bytes. A screen switch is published last, once
+every screen-scoped record has landed. Because a completed definition replaces
+the client's image data and drops the placements bound to the previous bytes,
+the burst that redefined an image ends by restating the placements the server
+still holds.
+
+A hard reset invalidates the whole scene and therefore opens the next
+generation. The client binds every record in one burst to a single generation,
+so a read that resets and then defines publishes two bursts, each with its own
+sequence. Clients reject a lower generation or a repeated sequence, which makes
+a duplicated, delayed, or reordered burst inert.
+
+Generation and sequence headroom are checked before anything mutates. An
+exhausted counter returns `GenerationExhausted` or `SequenceExhausted` and
+leaves the last committed definitions, placements, screen, generation, and
+published scene exactly as they were. Nothing partial is emitted, and no
+exhausted counter is reused.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.
