@@ -85,6 +85,11 @@ grep -Eq 'Selected GPU adapter:.*\((Vulkan|Gl)\)$' "$CLEAN_LOG" \
     || fail "running GPUI window did not select a Linux WGPU backend"
 backend=$(sed -n 's/.*Selected GPU adapter:.* (\([^()]\+\))$/\1/p' "$CLEAN_LOG" | tail -1)
 [ -n "$backend" ] || fail "could not parse selected WGPU backend"
+# macOS has no adapter line to read, so the native corpus asserts Metal from the
+# renderer the window itself reports. Keep that field honest where the WGPU
+# adapter line can still corroborate it.
+grep -Eq 'backend[=: ]+"?wgpu"?' "$CLEAN_LOG" \
+    || fail "the running window did not report its GPUI render backend"
 grep -zq '^VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json$' \
     "/proc/$SPIKE_PID/environ" \
     || fail "running GPUI window did not inherit the pinned Lavapipe ICD"
@@ -131,6 +136,30 @@ sed -e 's/\x1b\[[0-9;]*m//g' "$LOG" >"$CLEAN_LOG"
 grep -Eq 'final_reference_drops[=: ]+3' "$CLEAN_LOG" \
     || fail "not every source called drop_image at its final cache reference"
 
+# The native macOS corpus runs on a hosted runner that cannot synthesize key
+# events without an interactive accessibility grant, so the same stages are also
+# reachable unattended through SCRIBE_GPUI_IMAGE_SPIKE_AUTO. Prove that path
+# here, against a real window and a real atlas, instead of first on the Metal
+# gate where a failure would be indistinguishable from a platform problem.
+kill "$SPIKE_PID" 2>/dev/null || true
+wait "$SPIKE_PID" 2>/dev/null || true
+LOG="$OUT/gpui-spike-auto.log"
+: >"$LOG"
+SCRIBE_GPUI_IMAGE_SPIKE_AUTO=1 \
+    RUST_LOG="${RUST_LOG:-scribe_client=info},gpui_wgpu=info" \
+    scribe-client --gpui-image-spike >"$LOG" 2>&1 &
+SPIKE_PID=$!
+for marker in \
+    'GPUI image spike ready' \
+    'GPUI image atlas invalidated for recovery' \
+    'GPUI image cache reused after atlas invalidation' \
+    'GPUI image cache evicted at final reference' \
+    'GPUI image cache recreated after final-reference eviction'
+do
+    wait_for_log "$marker" 45 \
+        || fail "the unattended lifecycle sequence never reached: $marker"
+done
+
 python3 - "$OUT/gpui-spike.json" "$backend" "$green" "$red" "$blue" \
     "$recovery_diff" "$eviction_diff" <<'PY'
 import json
@@ -154,6 +183,7 @@ evidence = {
     "drop_image_cleanup_source_verified": True,
     "final_reference_drop_count": 3,
     "atlas_recovery_source_verified": True,
+    "unattended_auto_sequence": True,
     "recovery_preserved_source_ids": True,
     "recovery_pixel_diff": int(recovery_diff),
     "eviction_pixel_diff": int(eviction_diff),

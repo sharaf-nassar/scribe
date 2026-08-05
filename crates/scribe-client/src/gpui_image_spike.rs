@@ -19,6 +19,14 @@ use crate::gpui_image_lifecycle::{GpuiImageCache, GpuiImageKey, paint_cropped_im
 const WINDOW_WIDTH: f32 = 640.0;
 const WINDOW_HEIGHT: f32 = 320.0;
 
+/// GPUI picks its renderer at compile time: macOS windows are drawn by
+/// `gpui_macos`, which has only a Metal renderer and no adapter log, and whose
+/// `Window::gpu_specs` is `None`. Every other platform draws through
+/// `gpui_wgpu`, which logs its own selected adapter. The running window
+/// therefore reports which renderer actually painted it, so the native corpus
+/// can assert Metal from the same evidence stream as everything else.
+const RENDER_BACKEND: &str = if cfg!(target_os = "macos") { "metal" } else { "wgpu" };
+
 struct Fixture {
     definition: TerminalImageDefinition,
     rgba: Vec<u8>,
@@ -93,6 +101,11 @@ struct SpikeState {
     max_axis: Fixture,
     one_pixel: Fixture,
     stage: SpikeStage,
+    /// Walk the lifecycle stages from the render pass instead of waiting for
+    /// keystrokes. The native macOS corpus runs on a hosted runner that cannot
+    /// synthesize key events without an interactive accessibility grant.
+    auto: bool,
+    auto_scheduled: Option<SpikeStage>,
     ready_logged: bool,
     ids_before_invalidation: Option<[usize; 3]>,
     ids_before_eviction: Option<[usize; 3]>,
@@ -118,14 +131,40 @@ impl GpuiImageSpike {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.act(&event.keystroke.key, window, cx);
+    }
+
+    fn act(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        if let Err(error) = state.handle_key(event, window, cx) {
+        if let Err(error) = state.lifecycle_action(action, window, cx) {
             tracing::error!(%error, "GPUI image spike lifecycle action failed");
             self.state = None;
             cx.notify();
         }
+    }
+
+    /// Queue the keystroke the current stage would otherwise wait for. Each
+    /// stage is scheduled at most once, and the last stage schedules nothing,
+    /// so the sequence terminates on its own.
+    fn schedule_auto_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if !state.auto || !state.ready_logged || state.auto_scheduled == Some(state.stage) {
+            return;
+        }
+        state.auto_scheduled = Some(state.stage);
+        let action = match state.stage {
+            SpikeStage::Initial => "d",
+            SpikeStage::Recovered => "e",
+            _ => return,
+        };
+        let spike = cx.entity();
+        window.on_next_frame(move |window, app| {
+            spike.update(app, |spike, spike_cx| spike.act(action, window, spike_cx));
+        });
     }
 }
 
@@ -170,6 +209,9 @@ impl SpikeState {
             max_axis,
             one_pixel,
             stage: SpikeStage::Initial,
+            auto: std::env::var_os("SCRIBE_GPUI_IMAGE_SPIKE_AUTO")
+                .is_some_and(|value| value == "1"),
+            auto_scheduled: None,
             ready_logged: false,
             ids_before_invalidation: None,
             ids_before_eviction: None,
@@ -221,6 +263,7 @@ impl SpikeState {
         if !self.ready_logged {
             self.ready_logged = true;
             tracing::info!(
+                backend = RENDER_BACKEND,
                 source_id = source.id.0,
                 full_placement_id = source.id.0,
                 crop_placement_id = shared_placement.id.0,
@@ -243,13 +286,13 @@ impl SpikeState {
         ])
     }
 
-    fn handle_key(
+    fn lifecycle_action(
         &mut self,
-        event: &KeyDownEvent,
+        action: &str,
         window: &mut Window,
         cx: &mut Context<GpuiImageSpike>,
     ) -> anyhow::Result<()> {
-        match event.keystroke.key.as_ref() {
+        match action {
             "d" => {
                 let ids = self.cached_ids()?;
                 self.cache.invalidate_atlas(window)?;
@@ -297,6 +340,7 @@ impl Render for GpuiImageSpike {
             }
             None => return failed_element(&self.focus),
         };
+        self.schedule_auto_stage(window, cx);
 
         div()
             .track_focus(&self.focus)
