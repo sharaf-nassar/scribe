@@ -278,6 +278,19 @@ impl GpuiImageCache {
         );
         self.insertion_order.push_back(key);
         self.stats.render_images_created = self.stats.render_images_created.saturating_add(1);
+        // The only place a view's projected GPU charge changes upward, and the
+        // only observable moment of a first upload. Resource review reads its
+        // GPU numbers here rather than re-deriving them from definitions.
+        tracing::info!(
+            image_id = definition.id.0,
+            generation = definition.generation.0,
+            width = definition.width,
+            height = definition.height,
+            entry_projected_gpu_bytes = projected_gpu_bytes,
+            projected_gpu_bytes = self.projected_gpu_bytes,
+            sources = self.entries.len(),
+            "terminal image source uploaded"
+        );
         // A source built successfully, so whatever broke the renderer earlier
         // is over and the pane stops showing the unavailable notice.
         self.renderer_unavailable = false;

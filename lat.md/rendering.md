@@ -48,6 +48,12 @@ primitive is queued. When live sources fill the frozen per-view projected-GPU
 ceiling, admission rejects the new source for that frame instead of evicting a
 tile that earlier primitives may still reference.
 
+Admission is also the only moment the view's projected charge rises, and the
+only observable moment of a first upload, so it logs the definition's identity
+and dimensions, the entry's charge, the running total, and the cached source
+count. Resource review reads its GPU numbers from that line rather than
+re-deriving them from definitions; the line carries no pixels.
+
 GPUI exposes no source UV rectangle at this revision. Instead,
 [[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image]] scales
 the full image so the requested source rectangle covers its destination,

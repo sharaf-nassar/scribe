@@ -970,6 +970,68 @@ compared pixel captures, and an induced device loss — so review reads the gap
 from the artifact instead of inferring it. See
 [[terminal-images#Native macOS Metal Validation]].
 
+## Image Performance and Resource Review
+
+Two corpora record what terminal image support costs and gate on none of it, because clarification 7C decides performance acceptance by human judgement over recorded measurements rather than by a threshold.
+
+Numeric performance goals are marked inapplicable for v1 under Constitution
+principle 4, which still requires the hot path to be measured by a named
+command. Both scripts therefore assert only two kinds of thing: that the
+workload happened at all, and that the frozen numeric `ImageLimits` ceilings —
+security limits, not performance goals — still reject what they always
+rejected. Every duration, byte count, and pixel count they produce is written
+to a manifest for `specs/020-terminal-images/performance-review.md`, which
+carries the signed no-material-regression conclusion.
+
+### Server Measurement Pass
+
+`just e2e-func terminal-images-performance.sh` meters one live session with the image path off and then on, and writes `test-output/terminal-images/performance.json`.
+
+The two sides of the comparison are the same session across a master-switch
+hot-reload: disabled removes the graphics path from the session entirely, which
+is the honest "before image support" side, and re-enabling it re-latches
+through the capable harness viewer. Each side records a two-megabyte text
+burst, twenty keystroke-to-echo round trips, the server's own `utime + stime`
+delta, and its resident set — all read from `/proc`, since the image carries no
+`procps`.
+
+Between them runs the fixed workload the spec asks for: sixteen 256x256 direct
+RGB transfers chunked at the frozen 4,096-byte ceiling, timed as one image
+alone and then as a back-to-back batch, followed by the same sixteen
+identifiers retransmitted so replacement growth can be told apart from
+accumulation. Decode latency is measured from the PTY write to the committed
+canonical decode the server's own counter reports, not to a sentinel.
+
+The pass ends by re-proving the boundary after the load rather than before it:
+a transmit declaring 4,097 pixels of width must still be refused, retain no
+placement, and leave the session running commands.
+
+### Client Frame Stability Pass
+
+`just e2e-visual terminal-images-frame-stability.sh` runs the shipped GPUI client on a live pane and writes `test-output/terminal-images/linux/client/frame-stability.json`.
+
+Nothing in the server pass can see a frame. This one captures six consecutive
+frames of an idle window with no image and then with a scene resident, so the
+window's own cursor blink lands in the baseline instead of being mistaken for
+image instability, and records the largest and smallest pairwise pixel
+difference of each sample. The only assertion is presence: a placement that
+survives in canonical state but drops out of a frame is a defect that needs no
+threshold to name.
+
+Latency is measured where a user would notice it — from the transmission to the
+first frame that paints it, polled with unfocused captures because a stable
+capture costs as long as the interval being timed — and again across a scroll
+that repaints the placement against a moving grid.
+
+View resources come from the cache's own charge as it reports each upload,
+never from re-deriving bytes out of definitions. Eight distinct sources are
+delivered one per committed read, their peak projected charge is asserted
+against the frozen per-view ceiling, and the client's resident set is recorded
+beside it. A final phase delivers the same eight in one uninterrupted burst and
+records how many reached the view without gating on the answer, which is how
+the pass keeps a reproduction of `scribe-aq1.27` in the corpus while leaving
+convergence correctness to the task that owns it.
+
 ## Daemon
 
 Long-lived process that maintains an open IPC connection to scribe-server, buffers per-session output and screen state, and serves CLI requests over a Unix socket.
