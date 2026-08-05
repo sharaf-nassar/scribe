@@ -1,5 +1,6 @@
 mod assert;
 mod capture;
+mod client_replay;
 mod client_scene;
 mod cmd_socket;
 mod daemon;
@@ -254,6 +255,12 @@ enum Command {
         /// Emit computed fixture hex without comparing it (maintainer use).
         #[arg(long)]
         dump: bool,
+    },
+    /// Verify staged client image replay against the production planner.
+    TerminalImageClientReplay {
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
     },
     /// Apply fixture-driven live records through the production client scene.
     TerminalImageClientScene {
@@ -625,6 +632,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::RemotePeer(args) => run_remote_peer(args),
         Command::TerminalImageIpc { fixtures, output, dump } => {
             ipc_fixtures::verify(&fixtures, &output, dump).map_err(TestError::TestFailure)
+        }
+        Command::TerminalImageClientReplay { evidence } => {
+            client_replay::run(&evidence).map_err(TestError::TestFailure)
         }
         Command::TerminalImageClientScene { fixtures, output } => {
             client_scene::verify(&fixtures, &output).map_err(TestError::TestFailure)

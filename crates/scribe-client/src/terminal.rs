@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use scribe_common::ids::SessionId;
-use scribe_common::terminal_images::{TerminalGridEffect, TerminalImageLiveMessage};
+use scribe_common::terminal_images::{
+    TerminalGridEffect, TerminalImageLiveMessage, TerminalImageReplayMessage,
+};
 
 pub use alacritty_terminal_gpui::grid::Scroll;
 pub use alacritty_terminal_gpui::term::cell::Flags;
@@ -346,6 +348,25 @@ impl DisplayOnlyTerminal {
         message: TerminalImageLiveMessage,
     ) -> Result<bool, LiveSceneError> {
         let outcome = self.image_scene.apply(message)?;
+        let LiveSceneApply::Committed(scene) = outcome else {
+            return Ok(false);
+        };
+        for effect in &scene.last_grid_effects {
+            self.apply_image_grid_effect(effect);
+        }
+        self.make_content();
+        Ok(true)
+    }
+
+    /// Apply one generation-tagged image replay record beside the text parser.
+    ///
+    /// The snapshot stages off-screen; only its commit swaps the pane's scene,
+    /// and that commit also drains the live records that arrived behind it.
+    pub fn apply_image_replay(
+        &mut self,
+        message: TerminalImageReplayMessage,
+    ) -> Result<bool, LiveSceneError> {
+        let outcome = self.image_scene.apply_replay(message)?;
         let LiveSceneApply::Committed(scene) = outcome else {
             return Ok(false);
         };

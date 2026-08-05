@@ -200,7 +200,7 @@ replay and atomic client staging.
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_welcome` → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `TerminalImageLive` | ordered image scene updates | scripted-E2E | `main.rs::on_terminal_image_message` → `ipc_bridge::InboundEvent::TerminalImageLive` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::apply_image_live` → `terminal_image_scene::LiveImageScene::apply` (`tests/e2e/terminal-image-client-scene.sh`) | required |
-| `TerminalImageReplay` | generation-tagged image snapshot | scripted-E2E | — (unwired: server replay `scribe-aq1.12`; atomic client staging `scribe-aq1.13`) | required |
+| `TerminalImageReplay` | generation-tagged image snapshot | scripted-E2E | `main.rs::on_terminal_image_message` → `ipc_bridge::InboundEvent::TerminalImageReplay` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::apply_image_replay` → `terminal_image_scene::LiveImageScene::apply_replay` (`tests/e2e/terminal-image-client-replay.sh`) | required |
 | `TerminalImageCapabilityMismatch` | incapable-viewer refusal | scripted-E2E | `main.rs::on_terminal_image_message` → `terminal_image_scene::capability_mismatch_message` → visible pane status strip (`tests/e2e/terminal-image-client-scene.sh`) | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
@@ -237,7 +237,7 @@ replay and atomic client staging.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 59 of 60 rows name a live-path symbol; 1 is unwired and 0
+**Reachability:** 60 of 60 rows name a live-path symbol; 0 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -457,18 +457,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
 | Client messages | 45 | 45 | 0 | 0 |
-| Server messages | 60 | 59 | 1 | 0 |
+| Server messages | 60 | 60 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **202** | **201** | **1** | **0** |
+| **Total** | **202** | **202** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **193 rows, of which 192 are
-reachable (99%)** and 1 are not. **1 of those 193** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **193 rows, of which 193 are
+reachable (100%)** and 0 are not. **1 of those 193** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **191 of 193**.
+the in-client figure is **192 of 193**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

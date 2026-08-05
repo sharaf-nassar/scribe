@@ -56,7 +56,7 @@ use scribe_common::{
         AiLaunchSpec, AutomationAction, ClientMessage, PromptMarkKind, TerminalSize,
         WorkspaceTreeNode,
     },
-    terminal_images::{TerminalImageLiveMessage, TerminalImageUpdate},
+    terminal_images::{TerminalImageLiveMessage, TerminalImageReplayMessage, TerminalImageUpdate},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -160,6 +160,10 @@ pub enum InboundEvent {
     /// One live terminal-image boundary/update. It shares this FIFO with text
     /// so its commit cannot overtake the PTY bytes it follows.
     TerminalImageLive { session_id: SessionId, message: TerminalImageLiveMessage },
+    /// One generation-tagged terminal-image replay record. It shares the same
+    /// FIFO as the live records it supersedes, which is what makes "buffer the
+    /// live records that arrive behind a staging snapshot" a defined order.
+    TerminalImageReplay { session_id: SessionId, message: TerminalImageReplayMessage },
 }
 
 /// One operation a drained batch applies to a pane, in arrival order.
@@ -182,6 +186,8 @@ pub enum PaneOp {
     TrimScrollback { kept_rows: usize },
     /// A generation/sequence-tagged image operation kept as its own boundary.
     TerminalImageLive(TerminalImageLiveMessage),
+    /// A generation-tagged image snapshot record kept as its own boundary.
+    TerminalImageReplay(TerminalImageReplayMessage),
 }
 
 /// A drained, per-pane-collapsed batch. A pane's consecutive output runs are
@@ -256,6 +262,10 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
                 open.remove(&session_id);
                 entries.push((session_id, PaneOp::TerminalImageLive(message)));
             }
+            InboundEvent::TerminalImageReplay { session_id, message } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::TerminalImageReplay(message)));
+            }
         }
     }
     CoalescedBatch { entries }
@@ -297,6 +307,9 @@ fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
         PaneOp::TerminalImageLive(message) => {
             InboundEvent::TerminalImageLive { session_id, message }
         }
+        PaneOp::TerminalImageReplay(message) => {
+            InboundEvent::TerminalImageReplay { session_id, message }
+        }
     }
 }
 
@@ -313,11 +326,16 @@ fn payload_bytes(event: &InboundEvent) -> usize {
                     ..
                 },
             ..
+        }
+        | InboundEvent::TerminalImageReplay {
+            message: TerminalImageReplayMessage::DefinitionChunk { chunk, .. },
+            ..
         } => chunk.data.len(),
         InboundEvent::PromptMark { .. }
         | InboundEvent::ScrollBottom { .. }
         | InboundEvent::TrimScrollback { .. }
-        | InboundEvent::TerminalImageLive { .. } => 0,
+        | InboundEvent::TerminalImageLive { .. }
+        | InboundEvent::TerminalImageReplay { .. } => 0,
     }
 }
 
@@ -330,7 +348,8 @@ fn event_session(event: &InboundEvent) -> SessionId {
         | InboundEvent::PromptMark { session_id, .. }
         | InboundEvent::ScrollBottom { session_id }
         | InboundEvent::TrimScrollback { session_id, .. }
-        | InboundEvent::TerminalImageLive { session_id, .. } => *session_id,
+        | InboundEvent::TerminalImageLive { session_id, .. }
+        | InboundEvent::TerminalImageReplay { session_id, .. } => *session_id,
     }
 }
 
@@ -1542,7 +1561,8 @@ mod tests {
                         PaneOp::PromptMark { .. }
                         | PaneOp::ScrollBottom
                         | PaneOp::TrimScrollback { .. }
-                        | PaneOp::TerminalImageLive(_) => None,
+                        | PaneOp::TerminalImageLive(_)
+                        | PaneOp::TerminalImageReplay(_) => None,
                     })
                     .collect(),
             );
