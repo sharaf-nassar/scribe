@@ -9607,13 +9607,11 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
     if !enabled {
         return;
     }
-    // ponytail: the server retains no canonical RGBA yet, so the live, the
-    // replay, and the handoff-export path all withdraw any definition that
-    // needs pixels — together with every placement naming it — and a viewer
-    // converges on a scene holding exactly what the server can prove. Upgrade
-    // path: a retained canonical payload store charged to the session storage
-    // budget replaces this provider at all three call sites, and nothing else
-    // there changes.
+    // The seam backs each definition with the canonical RGBA it retained while
+    // committing this read, so the provider adds nothing here. A definition the
+    // session could not pay to retain is withdrawn together with every
+    // placement naming it, and the viewer converges on a scene holding exactly
+    // what the server can prove.
     let images_handle = Arc::clone(&state.terminal_images);
     let mut images = images_handle.lock().await;
     let messages = match images.commit_and_publish(commit, &mut |_| None) {
@@ -9673,7 +9671,7 @@ fn deliver_image_replay(
             definitions: &definitions,
             placements: &placements,
         },
-        &mut |_| None,
+        &mut |definition| images.canonical_rgba(definition),
     );
     let records: Vec<ServerMessage> = plan
         .records
