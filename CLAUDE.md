@@ -27,6 +27,34 @@
   CLI coverage, version pairing, ...), STOP and ask the user. Do not fall
   back to driving the host as a workaround.
 
+### Harness containers must not touch the host network (HARD RULE)
+
+- Every `docker run` in the `justfile` that starts a `scribe-test-*` image
+  passes `--network none`. No suite needs the bridge: the server and client
+  talk over a Unix socket, and the SSH and LAN suites dial `127.0.0.1`,
+  which exists under the null driver. The hardened profile has always run
+  this way (`hardened_e2e_flags`); the default profile now matches it.
+- This is not a hardening nicety. A bridge attach/detach rewrites the
+  Docker NAT and iptables rules for the WHOLE HOST, so every container
+  start and stop briefly disrupts new TCP connections to every other
+  project's published ports on this machine. A repeated run loop on the
+  bridge has broken unrelated dev stacks mid-session.
+- Never remove `--network none` to "fix" a suite. If a suite genuinely
+  needs egress, STOP and ask the user rather than putting the harness back
+  on the bridge.
+
+### Never loop the harness unbounded (HARD RULE)
+
+- `just e2e-func` / `just e2e-visual` create and destroy a container per
+  invocation. Repeating one in an unbounded loop is forbidden.
+- Measuring a flaky test's failure rate is the usual temptation. State an
+  explicit hard cap up front (for example "run it exactly 5 times"), never
+  an open-ended floor like "at least 5" — that reads as a licence to run
+  45. If the cap is not enough to characterise the flake, report the
+  inconclusive result and ask; do not keep going.
+- Prefer one container reused via `docker exec` over N containers when a
+  suite genuinely needs many iterations.
+
 ### Native macOS Metal validation exception
 
 - Native Scribe runtime validation is authorized only through
