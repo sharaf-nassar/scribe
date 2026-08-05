@@ -7,11 +7,12 @@ use scribe_image_decode::{
     BudgetError, DecodeAllocationClass, DecodeBudget, DecodeBuffer, DecodeStats, DecodeStorageError,
 };
 use scribe_png_decoder::{PngError, PngLimits, decode_png};
+use serde::{Deserialize, Serialize};
 
 use crate::terminal_images::{ImageLimitName, ImageLimits, TerminalImageRejectionReason};
 
 /// Kitty payload formats accepted by terminal-images v1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KittyFormat {
     Rgb,
     Rgba,
@@ -19,7 +20,7 @@ pub enum KittyFormat {
 }
 
 /// Source transport classification without carrying a path or resource name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KittyTransport {
     Direct,
     File,
@@ -29,14 +30,14 @@ pub enum KittyTransport {
 }
 
 /// Optional outer compression from Kitty's `o` control.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KittyCompression {
     None,
     Rfc1950Zlib,
 }
 
 /// Immutable first-chunk controls for one direct transfer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KittyDataParams {
     pub format: KittyFormat,
     pub transport: KittyTransport,
@@ -111,6 +112,22 @@ pub struct NormalizedKittyImage {
     pub decoded_bytes: u64,
     pub inflated_bytes: u64,
     pub stats: DecodeStats,
+}
+
+/// One in-flight chunked transfer's accumulated state, ready for the wire.
+///
+/// Chunk accumulation spans many complete APC commands, so a transfer paused
+/// for a server upgrade has no raw prefix left to replay — only these
+/// normalized bytes and the counters that bound what may still follow.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct KittyTransferState {
+    pub params: KittyDataParams,
+    /// Base64-decoded bytes accumulated so far. Absent before the first
+    /// payload-carrying chunk, which is how Chafa opens every transfer.
+    pub decoded: Option<Vec<u8>>,
+    pub encoded_bytes: u64,
+    pub chunks: u32,
+    pub final_received: bool,
 }
 
 /// One bounded in-flight Kitty transfer, storing decoded bytes only.
@@ -349,6 +366,49 @@ impl KittyTransfer {
         self.chunks = transaction.chunks;
         self.final_received = transaction.final_received;
         Ok(())
+    }
+
+    /// Capture an in-flight chunked transfer for transport across a handoff.
+    ///
+    /// Only already-normalized bytes travel: the base64 text each chunk arrived
+    /// as is never retained, so the successor resumes accumulation without ever
+    /// holding an encoded payload.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    #[must_use]
+    pub fn export(&self) -> KittyTransferState {
+        KittyTransferState {
+            params: self.params,
+            decoded: self.decoded.as_ref().map(|decoded| decoded.to_vec()),
+            encoded_bytes: self.encoded_bytes,
+            chunks: self.chunks,
+            final_received: self.final_received,
+        }
+    }
+
+    /// Rebuild an exported transfer under the successor's limits and budget.
+    ///
+    /// The accumulated bytes are re-reserved through the receiving decode
+    /// budget, so a successor that cannot pay for them rejects the transfer
+    /// instead of resuming an unaccounted accumulation.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    pub fn restore(
+        state: &KittyTransferState,
+        limits: ImageLimits,
+        budget: &mut DecodeBudget<'_>,
+    ) -> Result<Self, KittyDecodeError> {
+        let mut transfer = Self::new(state.params, limits)?;
+        if let Some(bytes) = &state.decoded {
+            budget.charge(bytes.len() as u64)?;
+            let mut decoded = budget.allocate(DecodeAllocationClass::KittyBase64, bytes.len())?;
+            decoded
+                .extend_from_slice(bytes)
+                .map_err(|error| KittyDecodeError::from(BudgetError::Storage(error)))?;
+            transfer.decoded = Some(decoded);
+        }
+        transfer.encoded_bytes = state.encoded_bytes;
+        transfer.chunks = state.chunks;
+        transfer.final_received = state.final_received;
+        Ok(transfer)
     }
 
     /// Finalize through a one-time leased copy while retaining this transfer for rollback.

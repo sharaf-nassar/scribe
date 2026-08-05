@@ -725,6 +725,74 @@ deltas to a sink that owes a replay, so in practice the buffer only absorbs the
 boundary between the two streams; overflow abandons the staged snapshot instead
 of growing without bound or applying part of a stream it can no longer order.
 
+## Image State Across Handoff
+
+A zero-downtime upgrade pauses PTY reads mid-stream, so the successor inherits three things or the application notices: the committed scene, the prefix of a control string that has not terminated, and any chunked transfer still accumulating.
+
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#export_handoff]]
+captures all three. The scene travels as the same bounded burst
+[[crates/scribe-server/src/terminal_image_replay.rs#plan_replay|the replay
+planner]] builds for a late attacher, so there is exactly one way to stage a
+scene rather than a second handoff-only format, and the max-scene chunk ceiling
+is inherited for free. Reads are already paused when this runs, so no decode is
+in flight: quiescence is the pause, not a separate barrier.
+
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#restore_handoff]]
+validates and reassembles the whole burst before any field on the session
+moves. A burst whose `Begin` counts disagree with its records, whose chunks are
+non-contiguous, or that places an image it never carried is refused outright —
+the successor keeps an empty session rather than a half-restored one, because a
+partial scene is worse than no scene.
+
+### Paused framing
+
+[[crates/scribe-pty/src/graphics_framing.rs#GraphicsFramer#export_partial]]
+captures the framer's stream cursor and whichever control string it held;
+[[crates/scribe-pty/src/graphics_framing.rs#GraphicsFramer#restore_partial]]
+reinstates both on the successor, re-reserving the retained prefix through its
+own storage budget so the ledger accounts for it exactly as the sender's did.
+
+Structured state travels rather than replayed bytes because the raw prefix is
+not recoverable: promoting a candidate to an active string consumes the
+introducer, keeping only the parsed kind and a control-byte count. A successor
+that started in Ground would print the remainder of a half-sent APC or DCS as
+visible text.
+
+Chunk accumulation has the opposite problem — it spans many *complete* commands,
+so no raw prefix survives at all. [[crates/scribe-common/src/kitty_decode.rs#KittyTransfer#export]]
+therefore carries the normalized bytes plus the counters that bound what may
+still follow, and never the base64 text those chunks arrived as.
+
+### Payload ceiling
+
+`HandoffState` is capped at 256 MiB for every session's text replay put
+together, while one session may legitimately retain 128 MiB of canonical
+pixels. [[crates/scribe-server/src/terminal_image_handoff.rs#HandoffImageExport]]
+charges each session's scene against
+[[crates/scribe-server/src/terminal_image_handoff.rs#MAX_HANDOFF_IMAGE_BYTES|a
+128 MiB image ceiling]] shared across the payload.
+
+A scene that does not fit is exported *empty*, never truncated, and the session
+still carries its generation, output cursor, and framing. That session shows no
+images after the upgrade while its text is untouched — a bounded, visible
+degradation instead of a scene the successor can never complete.
+
+### Version gating and rollback
+
+Image state is an additive `#[serde(default)]` field, so old-to-new is free: a
+payload from a server that predates it restores as an empty scene.
+
+New-to-old is not free, because a v6 server would ignore the field and land
+every session's text with its images silently gone.
+
+So [[crates/scribe-server/src/handoff.rs#handoff_state_version]] declares v7
+exactly when the payload carries image state, and
+[[crates/scribe-server/src/handoff.rs#handoff_version_accepted]] refuses N+1 —
+an older server cold-restarts instead of dropping images. An image-free payload
+declares v6 and omits the key entirely, so its bytes are the bytes a pre-image
+server produced. Turning the master image switch off is therefore the rollback
+path: the next upgrade payload is v6 again and an older server accepts it.
+
 ## Typed Failures
 
 Every rejection has a stable category and payload-free metadata suitable for diagnostics without leaking PTY image content.

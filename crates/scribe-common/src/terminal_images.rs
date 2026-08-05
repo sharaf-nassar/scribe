@@ -889,6 +889,22 @@ pub enum TerminalImageReplayMessage {
 }
 
 impl TerminalImageReplayMessage {
+    /// Generation this record belongs to.
+    ///
+    /// Every record of one burst carries the same generation, which is what
+    /// lets a receiver refuse a mixed-generation payload before staging any of
+    /// it rather than discovering the seam at `Commit`.
+    #[must_use]
+    pub const fn generation(&self) -> TerminalImageGeneration {
+        match self {
+            Self::Begin { generation, .. }
+            | Self::Definition { generation, .. }
+            | Self::DefinitionChunk { generation, .. }
+            | Self::Placement { generation, .. }
+            | Self::Commit { generation, .. } => *generation,
+        }
+    }
+
     /// Validate scalar replay metadata immediately after decode.
     pub fn validate(&self) -> Result<(), ImageBoundError> {
         match self {

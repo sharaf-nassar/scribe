@@ -102,6 +102,15 @@ struct CanonicalPlacement {
 /// Exact protocol identity of one placement, scoped to its owning screen.
 type PlacementKey = (TerminalScreenKind, TerminalImageId, TerminalPlacementId);
 
+/// Where a restored canonical state picks its counters back up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalRestoreCursor {
+    pub generation: TerminalImageGeneration,
+    pub active_screen: TerminalScreenKind,
+    /// Next server-assigned identifier, so a handoff does not reissue one.
+    pub next_assigned_image_id: u64,
+}
+
 /// Terminal facts a mutation needs from the production Alacritty observer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MutationContext {
@@ -151,6 +160,47 @@ impl CanonicalImageState {
             // they can never collide with an application-chosen identifier.
             next_assigned_image_id: u64::from(u32::MAX) + 1,
         }
+    }
+
+    /// Rebuild committed state from a handoff burst's definitions/placements.
+    ///
+    /// Ordering fixes the eviction ticks, so the successor evicts in the same
+    /// order the sender would have. `next_assigned_image_id` travels too: a
+    /// successor that restarted it would hand an application-invisible image a
+    /// identifier the sender had already issued.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    #[must_use]
+    pub fn restore(
+        limits: ImageLimits,
+        cursor: CanonicalRestoreCursor,
+        definitions: &[TerminalImageDefinition],
+        placements: &[(TerminalScreenKind, TerminalImagePlacement)],
+    ) -> Self {
+        let mut state = Self::new(limits);
+        state.generation = cursor.generation;
+        state.active_screen = cursor.active_screen;
+        state.next_assigned_image_id = cursor.next_assigned_image_id;
+        for definition in definitions {
+            let defined_at = state.next_tick();
+            state.definitions.insert(
+                definition.id,
+                CanonicalDefinition { definition: definition.clone(), defined_at },
+            );
+        }
+        for (screen, placement) in placements {
+            let placed_at = state.next_tick();
+            state.placements.insert(
+                (*screen, placement.image_id, placement.id),
+                CanonicalPlacement { placement: placement.clone(), placed_at },
+            );
+        }
+        state
+    }
+
+    /// Next server-assigned identifier, so a handoff does not reissue one.
+    #[must_use]
+    pub const fn next_assigned_image_id(&self) -> u64 {
+        self.next_assigned_image_id
     }
 
     #[must_use]

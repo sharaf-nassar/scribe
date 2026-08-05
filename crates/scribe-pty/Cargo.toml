@@ -14,6 +14,7 @@ scribe-common.workspace = true
 scribe-image-decode.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true
+serde.workspace = true
 vte.workspace = true
 tracing.workspace = true
 rustix.workspace = true

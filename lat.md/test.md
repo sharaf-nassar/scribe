@@ -603,6 +603,72 @@ limits, the attaching viewer's exact wire order, every debt and delivery count
 across the overflow and recovery sequence, and the viewer-count independence of
 the plan. It also refuses any evidence that embedded array-shaped payload data.
 
+## Terminal Image Handoff
+
+The functional harness certifies that a session's images survive a server upgrade, by pausing a real session mid-stream and measuring the successor against the same fixture fed to a session that never paused.
+
+### Ordered Resume Without Loss
+
+A paused-and-resumed session has to be indistinguishable from one that never
+paused, which is the only definition of "no loss" that cannot be argued with.
+
+Three fixtures pause at three different kinds of boundary: inside a Kitty APC
+string, inside a Sixel DCS string, and on a complete command boundary partway
+through a chunked Kitty transfer. Each pause exports through the production
+handoff seam, round-trips the payload through `MessagePack` as the upgrade
+socket does, installs it on a fresh session, and then feeds the exact bytes the
+sender never read.
+
+The case fails unless the successor resumed from the sender's byte offset, ended
+on the control's offset, matched the control's generation and output cursor,
+holds canonical definitions and placements equal to the control's, and published
+records identical to the control's. It also fails if the APC pause did not hold
+a Kitty string, the DCS pause did not hold a Sixel one, or the chunked pause
+carried no in-flight transfer.
+
+### Maximum Scene and Payload Ceiling
+
+The largest scene v1 admits has to cross the upgrade in wire-sized chunks, and a
+scene that does not fit the payload must be dropped whole rather than truncated.
+
+The case plans the frozen retention ceiling as maximum-dimension images and
+fails if any chunk exceeds the replay chunk ceiling, if any record fails its own
+receiver-side validation, if the scene does not fit the handoff image ceiling,
+or if the chunk count is not exactly the bytes divided by the ceiling.
+
+A real committed scene is then exported against a ceiling too small for it. The
+session must still travel with its generation, cursor, and framing while its
+burst collapses to `Begin` and `Commit` — two records, no definitions. Two
+malformed bursts are also offered to a receiver: one whose chunks were removed
+so its `Begin` counts over-promise, and one that places an image it never
+carried. Both must be refused outright.
+
+### Version Compatibility and Downgrade
+
+Old-to-new restore, new-to-old refusal, and the config downgrade that makes
+rollback something other than a cold restart are one connected mechanism, so
+they are measured together.
+
+The case requires an image-carrying payload to declare v7 and an image-free one
+to declare v6, and requires the image-free payload's bytes to omit the image key
+entirely rather than carry it as nil. It decodes the image-free payload into the
+current struct and requires an absent scene, decodes the image-carrying payload
+and requires its scene intact, requires a v6 receiver to refuse v7 and accept
+v6, and requires a current receiver to accept both. Finally it exports the same
+committed session with images disabled and requires that nothing at all was
+exported.
+
+### Docker Evidence Entry Point
+
+`terminal-image-handoff.sh` runs the probe against the pinned fixture directory
+and validates the payload-free evidence it writes.
+
+The gate pins the production engine name, a passing result for every case, the
+Kitty and Sixel partial-string protocols, the presence of an in-flight transfer,
+control parity for every resumed session, the maximum-scene chunk and ceiling
+totals against the frozen limits, the dropped scene's exact two-record burst,
+both malformed refusals, and every version and downgrade fact.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

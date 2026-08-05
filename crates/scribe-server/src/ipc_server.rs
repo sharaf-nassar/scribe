@@ -11427,6 +11427,10 @@ pub async fn serialize_live_for_handoff(
                 .as_ref()
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
+            // Image state is owned by the terminal-image seam, which does not
+            // hang off a live session yet. Absent keeps the payload at v6, so
+            // an older server still accepts it (see `handoff_state_version`).
+            image_state: None,
         });
 
         fds.push(Arc::clone(&live.resize_fd));
@@ -11844,6 +11848,7 @@ mod tests {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                image_state: None,
             }],
             workspaces: vec![],
             workspace_tree: None,

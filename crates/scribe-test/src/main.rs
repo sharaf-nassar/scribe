@@ -21,6 +21,7 @@ mod share_tap;
 mod sixel_decoder;
 mod terminal_image_accounting;
 mod terminal_image_convergence;
+mod terminal_image_handoff;
 mod terminal_image_mutations;
 mod terminal_image_observer_parity;
 mod terminal_image_replay;
@@ -399,6 +400,15 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify terminal-image state persistence across a server handoff.
+    TerminalImageHandoff {
+        /// Directory containing terminal-images-v1 ASCII-hex fixtures.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Certify the assembled authoritative terminal-image state engine.
     TerminalImageServerState {
         /// Versioned payload-free JSON manifest destination.
@@ -613,8 +623,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
             terminal_image_replay::run(&fixtures, &evidence).map_err(TestError::TestFailure)
         }
         Command::TerminalImageRepliesSharing { fixtures, evidence } => {
-            terminal_image_replies_sharing::run(&fixtures, &evidence)
-                .map_err(TestError::TestFailure)
+            run_replies_sharing(&fixtures, &evidence)
         }
         Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
         Command::TerminalImageAccounting { evidence } => run_terminal_image_accounting(&evidence),
@@ -622,6 +631,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageTransferLifecycle { evidence } => run_transfer_lifecycle(&evidence),
         Command::TerminalImageMutations { evidence } => run_terminal_image_mutations(&evidence),
         Command::TerminalImageConvergence { evidence } => run_terminal_image_convergence(&evidence),
+        Command::TerminalImageHandoff { fixtures, evidence } => {
+            terminal_image_handoff::run(&fixtures, &evidence).map_err(TestError::TestFailure)
+        }
         Command::TerminalImageServerState { evidence } => {
             run_terminal_image_server_state(&evidence)
         }
@@ -633,9 +645,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageIpc { fixtures, output, dump } => {
             ipc_fixtures::verify(&fixtures, &output, dump).map_err(TestError::TestFailure)
         }
-        Command::TerminalImageClientReplay { evidence } => {
-            client_replay::run(&evidence).map_err(TestError::TestFailure)
-        }
+        Command::TerminalImageClientReplay { evidence } => run_client_replay(&evidence),
         Command::TerminalImageClientScene { fixtures, output } => {
             client_scene::verify(&fixtures, &output).map_err(TestError::TestFailure)
         }
@@ -656,6 +666,17 @@ fn run_server(action: &ServerAction) -> Result<(), TestError> {
             rt.block_on(server::upgrade()).map_err(|e| TestError::InfraError(e.to_string()))
         }
     }
+}
+
+fn run_replies_sharing(
+    fixtures: &std::path::Path,
+    evidence: &std::path::Path,
+) -> Result<(), TestError> {
+    terminal_image_replies_sharing::run(fixtures, evidence).map_err(TestError::TestFailure)
+}
+
+fn run_client_replay(evidence: &std::path::Path) -> Result<(), TestError> {
+    client_replay::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_terminal_image_state_seam(evidence: &std::path::Path) -> Result<(), TestError> {
