@@ -367,9 +367,9 @@ echo "MEASURED view resources: ${PROJECTED_GPU_BYTES}B projected across ${SOURCE
 
 # ---------------------------------------------------------------------------
 # Phase 6: the same count of distinct sources delivered as one uninterrupted
-# burst. Recorded, not asserted: how many definitions of a single committed
-# read reach a view is a convergence property this measurement pass observes
-# but does not own.
+# burst. A shell that prints several images in one write commits them in one
+# read, and every definition a read commits is published, so anything short of
+# the full count is a silently lossy screen rather than a slow one.
 # ---------------------------------------------------------------------------
 run_step clear
 BURST_UPLOADS_BEFORE=$(uploads_logged)
@@ -383,6 +383,8 @@ capture "$OUT/burst.png"
 BURST_UPLOADED=$(( $(uploads_logged) - BURST_UPLOADS_BEFORE ))
 record single_burst_sources_transmitted "$UPLOAD_COUNT"
 record single_burst_sources_uploaded "$BURST_UPLOADED"
+[ "$BURST_UPLOADED" -ge "$UPLOAD_COUNT" ] \
+    || fail "only $BURST_UPLOADED of $UPLOAD_COUNT sources of one committed read reached the view"
 echo "MEASURED single-burst delivery: ${BURST_UPLOADED} of ${UPLOAD_COUNT} sources reached the view"
 
 # The renderer must not have degraded while all of this was measured.

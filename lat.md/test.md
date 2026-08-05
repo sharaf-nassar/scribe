@@ -214,6 +214,17 @@ empty and nothing published. A generation ceiling reached by a hard reset
 rejects before the reset can run, so the definition, its placement, the
 generation, and the published scene all survive unchanged.
 
+### Single-Read Image Burst
+
+Eight images transmitted in one uninterrupted read all reach the client, each carrying its own pixels, proving a burst is not truncated to whatever the read decoded last.
+
+This case supplies no caller payload at all, so it runs the seam the production
+commit path runs: every definition has to be backed by the pixels the session
+retained for it. The images differ in width and in colour, so a pairing that
+drifted by one boundary either fails the exact canonical-length check and
+withdraws the definition or delivers a visibly wrong picture — the case fails
+either way.
+
 ### Docker Evidence Entry Point
 
 `terminal-image-convergence.sh` runs the production convergence probe in the functional Docker image.
@@ -1028,9 +1039,10 @@ never from re-deriving bytes out of definitions. Eight distinct sources are
 delivered one per committed read, their peak projected charge is asserted
 against the frozen per-view ceiling, and the client's resident set is recorded
 beside it. A final phase delivers the same eight in one uninterrupted burst and
-records how many reached the view without gating on the answer, which is how
-the pass keeps a reproduction of `scribe-aq1.27` in the corpus while leaving
-convergence correctness to the task that owns it.
+asserts that all eight reach the view, because a shell printing several images
+in one write commits them in one read and every definition a read commits is
+published; anything short of the full count is a silently lossy screen rather
+than a slow one.
 
 ## Daemon
 
