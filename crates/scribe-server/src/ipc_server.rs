@@ -493,6 +493,16 @@ pub type ClientWriter = Arc<std::sync::Mutex<AttachedSinks>>;
 /// section is non-blocking bookkeeping and never spans an `.await`.
 pub type SharedImageSharing = Arc<std::sync::Mutex<SessionImageSharing>>;
 
+/// One session's authoritative terminal-image seam, shared between its PTY
+/// reader and its [`LiveSession`] registry entry.
+///
+/// The reader is the only mutator; the registry handle exists so a hot reload
+/// can export the committed scene without asking the reader to cooperate — it
+/// is parked on a `read()` at that moment and would never answer. A **tokio**
+/// mutex because the reader holds the seam across the awaited ingress feed.
+// @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+pub type SessionImageState = Arc<Mutex<PtyTerminalImageState>>;
+
 /// Lock one session's image capability.
 pub fn lock_image_sharing(
     sharing: &SharedImageSharing,
@@ -1192,8 +1202,10 @@ struct PtyReaderState {
     /// `Term` critical section as every feed, so an attach can pair a snapshot
     /// with the exact output it contains.
     term_commit: SessionCommit,
-    /// Exactly one authoritative terminal-image seam owned by this reader.
-    terminal_images: PtyTerminalImageState,
+    /// Exactly one authoritative terminal-image seam for this session. The
+    /// reader is its only mutator; the handle is shared with [`LiveSession`]
+    /// so the handoff serializer can export the committed scene.
+    terminal_images: SessionImageState,
     /// This session's latched image capability and master-switch state.
     image_sharing: SharedImageSharing,
     /// The find overlay's cached scrollback snapshot, dropped by every feed
@@ -1410,6 +1422,10 @@ pub struct LiveSession {
     /// Payload-free Alacritty observation shared with the PTY reader and every
     /// production resize call for this session.
     terminal_grid_observer: TerminalGridObserverHandle,
+    /// The reader's authoritative image seam, reachable here so a hot reload
+    /// can export this session's committed scene, paused framing, and
+    /// in-flight transfer into the successor's payload.
+    terminal_images: SessionImageState,
     /// Scrollback snapshot the open find overlay's query edits are reading
     /// (spec 017 US8-2), so a multi-keystroke query snapshots once.
     search_cache: SessionSearchCache,
@@ -6726,14 +6742,13 @@ async fn start_session(
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd, context,
-        ai_state, ai_provider_hint, cell_width, cell_height, env_envelope_id, ..
+        ai_state, ai_provider_hint, cell_width, cell_height, env_envelope_id, image_state, ..
     } = session;
     let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
     let shared = SharedSessionHandles::new(pty_write, initial_attachment).await;
-    let terminal_images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
-    let terminal_grid_observer = terminal_images.grid_observer();
-    terminal_grid_observer.set_cell_size(cell_width, cell_height);
+    let (terminal_images, terminal_grid_observer) =
+        new_session_image_seam(session_id, cell_width, cell_height, image_state.as_deref());
     let image_sharing = new_session_image_sharing();
     let live = LiveSession {
         pty_write: Arc::clone(&shared.pty_write),
@@ -6741,6 +6756,7 @@ async fn start_session(
         term: Arc::clone(&term),
         term_commit: Arc::clone(&shared.term_commit),
         terminal_grid_observer: terminal_grid_observer.clone(),
+        terminal_images: Arc::clone(&terminal_images),
         search_cache: Arc::clone(&shared.search_cache),
         child_pid,
         child_identity,
@@ -6825,11 +6841,63 @@ struct PtyReaderInputs {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
     client_writer: ClientWriter,
-    terminal_images: PtyTerminalImageState,
+    terminal_images: SessionImageState,
     image_sharing: SharedImageSharing,
     attachment: SessionAttachment,
     preserve_ai_scrollback: Arc<AtomicBool>,
     scrollback_lines: Arc<AtomicUsize>,
+}
+
+/// Build one session's image seam, sized to its cells and carrying whatever a
+/// predecessor exported for it.
+fn new_session_image_seam(
+    session_id: SessionId,
+    cell_width: u16,
+    cell_height: u16,
+    image_state: Option<&crate::terminal_image_handoff::SessionImageHandoff>,
+) -> (SessionImageState, TerminalGridObserverHandle) {
+    let mut terminal_images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
+    let observer = terminal_images.grid_observer();
+    observer.set_cell_size(cell_width, cell_height);
+    stage_restored_image_state(session_id, &mut terminal_images, image_state);
+    (Arc::new(Mutex::new(terminal_images)), observer)
+}
+
+/// Install a predecessor's committed image state before this session's reader
+/// consumes a single byte.
+///
+/// A rejected payload is logged and dropped: the seam it was rejected on is
+/// still empty, so the session starts imageless rather than half-restored,
+/// which is the same bounded degradation an over-ceiling export produces.
+// @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+fn stage_restored_image_state(
+    session_id: SessionId,
+    terminal_images: &mut PtyTerminalImageState,
+    image_state: Option<&crate::terminal_image_handoff::SessionImageHandoff>,
+) {
+    let Some(state) = image_state else { return };
+    // The successor retains no canonical pixels of its own yet, so the
+    // reassembled bytes are dropped here exactly as the live publication path
+    // drops them; the definitions and placements they back are what the
+    // restore installs.
+    match terminal_images.restore_handoff(state, &mut |_, _| {}) {
+        Ok(()) => {
+            let restored = terminal_images.state();
+            info!(
+                %session_id,
+                generation = restored.generation.0,
+                sequence = restored.sequence.0,
+                definitions = restored.definition_count,
+                placements = restored.placement_count,
+                "restored terminal image state from handoff"
+            );
+        }
+        Err(error) => warn!(
+            %session_id,
+            %error,
+            "handoff image state refused; the session starts with no images"
+        ),
+    }
 }
 
 /// Assemble the reader task's state and start it, retaining its `JoinHandle`
@@ -9289,14 +9357,14 @@ async fn select_pty_read_or_clipboard(
         tokio::pin!(sleep);
         tokio::select! {
             () = &mut sleep => {
-                let observer = state.terminal_images.grid_observer();
+                let observer = state.terminal_images.lock().await.grid_observer();
                 let observation = stop_term_sync(
                     &state.term,
                     &observer,
                     &mut state.ansi_processor,
                 )
                 .await;
-                state.terminal_images.record_grid_observation(&observation);
+                state.terminal_images.lock().await.record_grid_observation(&observation);
                 maybe_capture_preserved_ai_scrollback_baseline(state).await;
                 None
             }
@@ -9358,7 +9426,7 @@ async fn handle_clipboard_command(state: &mut PtyReaderState, cmd: ClipboardComm
             // every live session. The PTY reader owns the image seam
             // exclusively, so the release has to happen on this task — which
             // this arm already woke.
-            release_images_if_disabled(state);
+            release_images_if_disabled(state).await;
         }
     }
 }
@@ -9376,12 +9444,13 @@ async fn handle_clipboard_command(state: &mut PtyReaderState, cmd: ClipboardComm
 /// no capable sinks and owes no discovery answer. The terminal's text is
 /// untouched, so the application's own textual fallback keeps rendering.
 // @lat: [[terminal-images#Terminal Images#Image Master Switch]]
-fn release_images_if_disabled(state: &mut PtyReaderState) {
+async fn release_images_if_disabled(state: &mut PtyReaderState) {
     if images_master_enabled() {
         return;
     }
-    let held = state.terminal_images.state();
-    match state.terminal_images.release_for_policy_disable() {
+    let mut images = state.terminal_images.lock().await;
+    let held = images.state();
+    match images.release_for_policy_disable() {
         Ok(None) => {}
         Ok(Some(_)) => info!(
             session_id = %state.session_id,
@@ -9446,13 +9515,15 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     // The observer splits processor calls only at completed image boundaries;
     // client delivery remains one unchanged read.
     let session_id = state.session_id;
+    let images_handle = Arc::clone(&state.terminal_images);
+    let mut images = images_handle.lock().await;
     let client_writer = &state.client_writer;
     let term = &state.term;
     let term_commit = &state.term_commit;
     let search_cache = &state.search_cache;
     let ansi_processor = &mut state.ansi_processor;
     let image_result = process_pty_reader_ingress(
-        &mut state.terminal_images,
+        &mut images,
         effective.as_ref(),
         |delivered_bytes| {
             // Step 1: Fast path — forward filtered bytes to the UI client.
@@ -9483,6 +9554,9 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
         },
     )
     .await;
+    // Everything below reborrows the seam through `state`, so the ingress
+    // guard has to be surrendered first.
+    drop(images);
 
     // Step 2: State path — the shared ingress seam fed filtered bytes into
     // Term. Image sequence rejection never suppresses ordinary delivery.
@@ -9533,13 +9607,16 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
     if !enabled {
         return;
     }
-    // ponytail: the server retains no canonical RGBA yet, so both the live and
-    // the replay path withdraw any definition that needs pixels — together with
-    // every placement naming it — and a viewer converges on a scene holding
-    // exactly what the server can prove. Upgrade path: a retained canonical
-    // payload store charged to the session storage budget replaces this
-    // provider in both call sites, and nothing else here changes.
-    let messages = match state.terminal_images.commit_and_publish(commit, &mut |_| None) {
+    // ponytail: the server retains no canonical RGBA yet, so the live, the
+    // replay, and the handoff-export path all withdraw any definition that
+    // needs pixels — together with every placement naming it — and a viewer
+    // converges on a scene holding exactly what the server can prove. Upgrade
+    // path: a retained canonical payload store charged to the session storage
+    // budget replaces this provider at all three call sites, and nothing else
+    // there changes.
+    let images_handle = Arc::clone(&state.terminal_images);
+    let mut images = images_handle.lock().await;
+    let messages = match images.commit_and_publish(commit, &mut |_| None) {
         Ok(messages) => messages,
         Err(error) => {
             warn!(
@@ -9550,7 +9627,7 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
             return;
         }
     };
-    record_image_application_evidence(state, commit, replies);
+    record_image_application_evidence(state, &images, commit, replies);
     let session_id = state.session_id;
     if !messages.is_empty() {
         let frames: Vec<ServerMessage> = messages
@@ -9565,7 +9642,7 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
             "fanned terminal image records to capable viewers"
         );
     }
-    deliver_image_replay(state, required);
+    deliver_image_replay(state, &images, required);
 }
 
 /// Give every capable sink that owes one the session's whole canonical scene.
@@ -9575,15 +9652,19 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
 /// planned from canonical state and fanned to all of them, so the recovery cost
 /// is independent of viewer count and the server never keeps a per-sink copy.
 // @lat: [[terminal-images#Terminal Images#Combined Image Replay]]
-fn deliver_image_replay(state: &PtyReaderState, required: TerminalImageCapabilities) {
+fn deliver_image_replay(
+    state: &PtyReaderState,
+    images: &PtyTerminalImageState,
+    required: TerminalImageCapabilities,
+) {
     let debt = image_replay_debt(&state.client_writer, required);
     if debt == 0 {
         return;
     }
     let session_id = state.session_id;
-    let snapshot = state.terminal_images.state();
-    let definitions = state.terminal_images.canonical_definitions();
-    let placements = state.terminal_images.canonical_placements();
+    let snapshot = images.state();
+    let definitions = images.canonical_definitions();
+    let placements = images.canonical_placements();
     let plan = terminal_image_replay::plan_replay(
         &terminal_image_replay::ReplayInputs {
             generation: snapshot.generation,
@@ -9624,6 +9705,7 @@ fn deliver_image_replay(state: &PtyReaderState, required: TerminalImageCapabilit
 // @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
 fn record_image_application_evidence(
     state: &mut PtyReaderState,
+    images: &PtyTerminalImageState,
     commit: &SessionTerminalCommit,
     replies: u64,
 ) {
@@ -9653,7 +9735,7 @@ fn record_image_application_evidence(
     evidence.classic_placements = 0;
     evidence.placeholder_placements = 0;
     evidence.sixel_placements = 0;
-    for (_, placement) in state.terminal_images.canonical_placements() {
+    for (_, placement) in images.canonical_placements() {
         match placement.kind {
             TerminalImagePlacementKind::KittyClassic => evidence.classic_placements += 1,
             TerminalImagePlacementKind::KittyUnicodePlaceholder => {
@@ -11457,6 +11539,12 @@ pub async fn serialize_live_for_handoff(
     let sessions = live_sessions.read().await;
     let mut handoff_sessions = Vec::with_capacity(sessions.len());
     let mut fds = Vec::with_capacity(sessions.len());
+    // One export per payload, so the shared image-byte ceiling is charged
+    // across every session rather than per session. With the master switch off
+    // nothing is exported and the payload stays v6, which is what makes a
+    // rollback to a pre-image server a config change instead of a cold restart.
+    let mut images =
+        crate::terminal_image_handoff::HandoffImageExport::new(images_master_enabled());
 
     for (&session_id, live) in sessions.iter() {
         let term = live.term.lock().await;
@@ -11478,6 +11566,13 @@ pub async fn serialize_live_for_handoff(
 
         let has_ai_state = live.ai_state.is_some();
         tracing::debug!(%session_id, has_ai_state, "serializing live session for handoff");
+
+        // Reads are already paused, so the seam is quiescent and this lock is
+        // uncontended: whatever the last read committed is the whole scene.
+        let seam = live.terminal_images.lock().await;
+        let image_state =
+            images.session(seam.session(), &mut |definition| seam.canonical_rgba(definition));
+        drop(seam);
 
         handoff_sessions.push(HandoffSession {
             session_id,
@@ -11502,13 +11597,25 @@ pub async fn serialize_live_for_handoff(
                 .as_ref()
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
-            // Image state is owned by the terminal-image seam, which does not
-            // hang off a live session yet. Absent keeps the payload at v6, so
-            // an older server still accepts it (see `handoff_state_version`).
-            image_state: None,
+            image_state,
         });
 
         fds.push(Arc::clone(&live.resize_fd));
+    }
+
+    let counters = images.counters();
+    if counters.sessions > 0 {
+        info!(
+            sessions = counters.sessions,
+            definitions = counters.definitions,
+            placements = counters.placements,
+            chunks = counters.chunks,
+            rgba_bytes = counters.total_rgba_bytes,
+            dropped_scenes = counters.dropped_scenes,
+            partial_framers = counters.partial_framers,
+            pending_transfers = counters.pending_transfers,
+            "exported terminal image state for handoff"
+        );
     }
 
     (handoff_sessions, fds)

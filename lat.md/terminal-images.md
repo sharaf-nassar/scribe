@@ -505,6 +505,33 @@ rectangles, scroll margins, and resize viewports are half-open on every edge,
 matching the observer that produced them, and the client applies the same
 shared placement geometry so both sides converge.
 
+## Retained Canonical Pixels
+
+A committed definition keeps the pixels that created it, because the decode buffers are single-slot and a scene the server can describe but not re-send is a scene no viewer and no successor can ever be given.
+
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#retain_committed_rgba]]
+runs inside the same transaction that commits a read's mutations. The decoded
+bytes are *shared*, not copied: the decode slot and the retention map hold the
+same `Arc<DecodeBuffer>`, so the bytes keep the one lease the decode already
+paid for and retention costs the session nothing it had not already been
+charged. The lease is released when the last owner drops it, which is what
+makes eviction, delete, erase, reset, and the master switch free the pixels
+without a second accounting path.
+
+Pairing is last-to-last: the slots only ever hold the newest decode, so the
+last definition a read committed is the one those bytes describe, and
+[[crates/scribe-server/src/terminal_image_state.rs#last_decoded_protocol]] says
+which slot to read. An exact canonical-length check guards the attachment, so a
+definition is left unbacked rather than backed by another image's bytes —
+unbacked is withdrawn wherever a scene is stated, which is recoverable, while
+mismatched would be a silently wrong picture. Every commit then drops the
+pixels of images canonical state no longer holds.
+
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#canonical_rgba]]
+is what the definition-payload seam reads, so the handoff export states a real
+scene instead of withdrawing every definition in it. A restored scene is
+retained the same way, which is what lets a session survive a second upgrade.
+
 ## Client Convergence and Counter Safety
 
 Canonical server state and the connected client's scene stay identical because the server publishes the exact deltas one committed read produced, and refuses to publish at all once a counter is exhausted.
@@ -828,13 +855,26 @@ still follow, and never the base64 text those chunks arrived as.
 
 ### Live upgrade wiring
 
-The export and restore seam is complete and certified, but no production caller reaches it yet: the canonical scene lives in the PTY reader task, and the live handoff serializer cannot see it, so it sends `image_state: None`.
+The canonical scene is mutated only by the PTY reader, but the handoff runs on the shutdown path with every reader parked on a `read()` that will never answer, so the seam hangs off the registry entry instead of the reader task.
 
-[[crates/scribe-server/src/ipc_server.rs#serialize_live_for_handoff]] therefore
-emits a v6 payload for every session, and a real `scribe-server --upgrade`
-leaves the successor with an empty scene rather than the sender's. The live
-corpus measures which of the two happened and refuses anything in between, so
-the day the reader's state becomes reachable the same assertion keeps holding.
+[[crates/scribe-server/src/ipc_server.rs#SessionImageState]] is that shared
+handle: one tokio-mutexed seam owned by the reader and reachable from
+`LiveSession`. [[crates/scribe-server/src/ipc_server.rs#serialize_live_for_handoff]]
+opens one [[crates/scribe-server/src/terminal_image_handoff.rs#HandoffImageExport]]
+per payload and exports every session through it, so the shared image-byte
+ceiling is charged across the whole payload rather than per session. Reads are
+already paused when this runs, so the lock is uncontended and the scene it
+reads is whatever the last read committed.
+
+Restore happens before the successor's reader consumes a byte:
+[[crates/scribe-server/src/session_manager.rs#ManagedSession]] carries the
+exported state through
+[[crates/scribe-server/src/session_manager.rs#restored_managed_session]], and
+[[crates/scribe-server/src/ipc_server.rs#new_session_image_seam]] stages it onto
+the fresh seam. A refused payload is logged and dropped — the seam it was
+refused on is still empty, so the session starts imageless rather than
+half-restored, which is the same bounded degradation an over-ceiling export
+produces.
 
 ### Payload ceiling
 

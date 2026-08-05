@@ -29,7 +29,7 @@ use scribe_common::socket::server_socket_path;
 use scribe_pty::async_fd::AsyncPtyFd;
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 
-use crate::handoff::HandoffState;
+use crate::handoff::{HandoffSession, HandoffState};
 use crate::pty_guard::PtyGuard;
 use crate::shell_integration::{self, ShellKind};
 
@@ -208,6 +208,74 @@ pub struct ManagedSession {
     /// <launch_id>.envz` file plus its keystore DEK without re-deriving the
     /// id from any client-supplied input.
     pub env_envelope_id: Option<String>,
+    /// Committed terminal-image state a predecessor exported for this session,
+    /// staged onto the fresh reader seam before the first byte is read. `None`
+    /// for every freshly spawned session and for any handoff that carried no
+    /// image state.
+    // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
+    pub image_state: Option<Box<crate::terminal_image_handoff::SessionImageHandoff>>,
+}
+
+/// The per-session values [`SessionManager::restore_from_handoff`] builds
+/// before it can assemble a [`ManagedSession`].
+struct RestoredSessionParts {
+    slot: SessionSlot,
+    pty_fd: AsyncPtyFd,
+    resize_fd: OwnedFd,
+    term: Term<ScribeEventListener>,
+    ansi_processor: AnsiProcessor,
+    osc_parser: VteParser,
+    event_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    handoff_snapshot: Option<ScreenSnapshot>,
+}
+
+/// Assemble one handoff-restored session.
+///
+/// There is no `Pty` to carry: the child stays alive on the slave side and this
+/// process only ever received the master fd, so `pty` is `None` and the
+/// close-time SIGHUP is arbitrated by `child_identity` instead.
+fn restored_managed_session(
+    handoff_session: &HandoffSession,
+    parts: RestoredSessionParts,
+) -> ManagedSession {
+    ManagedSession {
+        slot: parts.slot,
+        pty_fd: parts.pty_fd,
+        resize_fd: parts.resize_fd,
+        child_pid: handoff_session.child_pid,
+        // Inherited child: this process never spawned it, so it arms no
+        // child-exit watcher and keeps EOF-based exit detection.
+        child_pidfd: None,
+        // Carried, never re-derived: re-reading the token here would certify
+        // whatever process holds the PID right now, which is exactly the
+        // assumption the check exists to reject. A sender that predates the
+        // field leaves this `None`, and the session is then exempt from the
+        // close-time SIGHUP.
+        child_identity: handoff_session.child_identity,
+        term: Arc::new(Mutex::new(parts.term)),
+        ansi_processor: parts.ansi_processor,
+        osc_parser: parts.osc_parser,
+        event_rx: parts.event_rx,
+        workspace_id: handoff_session.workspace_id,
+        shell_name: handoff_session.shell_name.clone(),
+        pty: None,
+        handoff_snapshot: parts.handoff_snapshot,
+        title: handoff_session.title.clone(),
+        task_label: handoff_session
+            .task_label
+            .clone()
+            .or_else(|| handoff_session.codex_task_label.clone()),
+        cwd: handoff_session.cwd.clone(),
+        context: handoff_session.context.clone(),
+        ai_state: handoff_session.ai_state.clone(),
+        ai_provider_hint: handoff_session.ai_provider_hint,
+        cell_width: handoff_session.cell_width.max(1),
+        cell_height: handoff_session.cell_height.max(1),
+        // Handoff keeps env on the existing PTY; no envelope is written for
+        // handoff-restored sessions, so close-time delete has nothing to do.
+        env_envelope_id: None,
+        image_state: handoff_session.image_state.clone().map(Box::new),
+    }
 }
 
 /// Terminal dimensions implementing the `Dimensions` trait from `alacritty_terminal`.
@@ -330,6 +398,7 @@ impl PreparedSessionLaunch {
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
             env_envelope_id: self.env_envelope_id,
+            image_state: None,
         })
     }
 }
@@ -640,53 +709,19 @@ impl SessionManager {
                 "restored session from handoff"
             );
 
-            // NOTE: We do NOT have a `Pty` object from alacritty_terminal here.
-            // The child process stays alive because it holds the slave side of
-            // the PTY. We only need the master fd (which we received). We must
-            // create a ManagedSession without the `pty` field, which means we
-            // need to make that field optional or restructure.
-            //
-            // For now we create a new PTY just to hold the child — but actually
-            // we cannot: the child already exists. Instead we make `pty` an
-            // Option. See the ManagedSession struct change.
-            let managed = ManagedSession {
-                slot,
-                pty_fd,
-                resize_fd,
-                child_pid: handoff_session.child_pid,
-                // Inherited child: this process never spawned it, so it arms
-                // no child-exit watcher and keeps EOF-based exit detection.
-                child_pidfd: None,
-                // Carried, never re-derived: re-reading the token here would
-                // certify whatever process holds the PID right now, which is
-                // exactly the assumption the check exists to reject. A sender
-                // that predates the field leaves this `None`, and the session
-                // is then exempt from the close-time SIGHUP.
-                child_identity: handoff_session.child_identity,
-                term: Arc::new(Mutex::new(term)),
-                ansi_processor,
-                osc_parser,
-                event_rx,
-                workspace_id: handoff_session.workspace_id,
-                shell_name: handoff_session.shell_name.clone(),
-                pty: None,
-                handoff_snapshot,
-                title: handoff_session.title.clone(),
-                task_label: handoff_session
-                    .task_label
-                    .clone()
-                    .or_else(|| handoff_session.codex_task_label.clone()),
-                cwd: handoff_session.cwd.clone(),
-                context: handoff_session.context.clone(),
-                ai_state: handoff_session.ai_state.clone(),
-                ai_provider_hint: handoff_session.ai_provider_hint,
-                cell_width: handoff_session.cell_width.max(1),
-                cell_height: handoff_session.cell_height.max(1),
-                // Handoff keeps env on the existing PTY; no envelope is
-                // written for handoff-restored sessions, so close-time
-                // delete has nothing to do.
-                env_envelope_id: None,
-            };
+            let managed = restored_managed_session(
+                handoff_session,
+                RestoredSessionParts {
+                    slot,
+                    pty_fd,
+                    resize_fd,
+                    term,
+                    ansi_processor,
+                    osc_parser,
+                    event_rx,
+                    handoff_snapshot,
+                },
+            );
 
             sessions_map.insert(handoff_session.session_id, managed);
         }
@@ -1309,6 +1344,7 @@ pub fn convert_cursor_style(
 
 #[cfg(test)]
 mod tests_session_cap {
+    use crate::handoff::{HandoffSession, HandoffState};
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
 
@@ -1316,7 +1352,6 @@ mod tests_session_cap {
     use scribe_common::ids::{SessionId, WorkspaceId};
 
     use super::{MAX_SESSIONS, SessionManager, SessionSlot};
-    use crate::handoff::{HandoffSession, HandoffState};
 
     /// Build a handoff payload of `count` sessions, each backed by a real PTY
     /// pair. The slave fds are returned so the caller keeps them open for the

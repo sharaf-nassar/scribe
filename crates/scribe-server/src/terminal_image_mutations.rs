@@ -238,6 +238,12 @@ impl CanonicalImageState {
         self.definitions.values().map(|entry| entry.definition.clone()).collect()
     }
 
+    /// Identifiers of every definition canonical state currently holds.
+    #[must_use]
+    pub fn definition_ids(&self) -> BTreeSet<TerminalImageId> {
+        self.definitions.keys().copied().collect()
+    }
+
     /// Payload-free canonical placements in screen/image/placement order.
     #[must_use]
     pub fn placements(&self) -> Vec<(TerminalScreenKind, TerminalImagePlacement)> {
