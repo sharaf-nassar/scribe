@@ -2048,7 +2048,16 @@ impl SessionTerminal {
         };
         let first = TerminalOutputSequence(self.sequence.0.saturating_add(1));
         let end_screen = inputs.end_screen;
-        let (messages, consumed) = publish_burst(&inputs, first, payload);
+        // The commit above already moved this read's decoded pixels onto the
+        // definitions it committed, so the session itself can back every
+        // definition it is about to state. The caller's provider stays ahead of
+        // the store as an override for a scene stated from bytes the session
+        // never decoded; declining it falls through to the retained pixels.
+        let retained = &*self;
+        let mut backed = |definition: &TerminalImageDefinition| {
+            payload(definition).or_else(|| retained.canonical_rgba(definition))
+        };
+        let (messages, consumed) = publish_burst(&inputs, first, &mut backed);
         self.sequence = TerminalOutputSequence(self.sequence.0.saturating_add(consumed));
         self.published_screen = end_screen;
         Ok(messages)
@@ -3620,4 +3629,66 @@ where
         });
     }
     image_result
+}
+
+#[cfg(test)]
+mod retained_publication_tests {
+    use scribe_common::terminal_images::{TerminalImageLiveMessage, TerminalImageUpdate};
+
+    use super::{PtyTerminalImageState, TerminalImageProcessPolicy};
+
+    /// One committed read publishes its definition from the pixels the session
+    /// retained, with no payload provider at the call site — the arrangement
+    /// every production publication path relies on.
+    #[test]
+    fn a_committed_definition_publishes_retained_pixels() {
+        let mut images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
+        // One black RGB pixel transmitted and displayed: `AQID` is base64 for
+        // the three payload bytes.
+        let commit = images
+            .process_bytes(b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AQID\x1b\\")
+            .expect("framing accepted the transmit");
+        let messages = images.commit_and_publish(&commit, &mut |_| None).expect("publication");
+        let defined = messages.iter().any(|message| {
+            matches!(
+                message,
+                TerminalImageLiveMessage::Update { update: TerminalImageUpdate::Define { .. }, .. }
+            )
+        });
+        let chunked = messages.iter().any(|message| {
+            matches!(
+                message,
+                TerminalImageLiveMessage::Update {
+                    update: TerminalImageUpdate::DefinitionChunk { .. },
+                    ..
+                }
+            )
+        });
+        assert!(defined, "no definition reached the client: {messages:?}");
+        assert!(chunked, "the definition carried no pixels: {messages:?}");
+    }
+
+    /// A chunked transfer decodes on the read that completes it, so the same
+    /// retention must back the definition that read commits.
+    #[test]
+    fn a_chunked_transfer_publishes_retained_pixels() {
+        let mut images = PtyTerminalImageState::new(TerminalImageProcessPolicy::v1());
+        let first = images
+            .process_bytes(b"\x1b_Ga=T,f=24,s=2,v=1,m=1;AQID\x1b\\")
+            .expect("framing accepted the first chunk");
+        let _ = images.commit_and_publish(&first, &mut |_| None).expect("first publication");
+        let last =
+            images.process_bytes(b"\x1b_Gm=0;BAUG\x1b\\").expect("framing accepted the last chunk");
+        let messages = images.commit_and_publish(&last, &mut |_| None).expect("publication");
+        let chunked = messages.iter().any(|message| {
+            matches!(
+                message,
+                TerminalImageLiveMessage::Update {
+                    update: TerminalImageUpdate::DefinitionChunk { .. },
+                    ..
+                }
+            )
+        });
+        assert!(chunked, "the chunked definition carried no pixels: {messages:?}");
+    }
 }

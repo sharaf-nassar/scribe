@@ -528,9 +528,19 @@ mismatched would be a silently wrong picture. Every commit then drops the
 pixels of images canonical state no longer holds.
 
 [[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#canonical_rgba]]
-is what the definition-payload seam reads, so the handoff export states a real
-scene instead of withdrawing every definition in it. A restored scene is
-retained the same way, which is what lets a session survive a second upgrade.
+is what the definition-payload seam reads, so every place a scene is stated —
+the live burst one committed read publishes, the replay burst a late or shed
+sink is given, and the handoff export — states a real scene instead of
+withdrawing every definition in it. A restored scene is retained the same way,
+which is what lets a session survive a second upgrade.
+
+The store is what backs the seam by default rather than what the caller has to
+remember to pass:
+[[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal#publish_committed]]
+consults the caller's provider first and falls through to the retained pixels
+when it declines, so the production commit path supplies no payload at all and a
+caller stating a scene from bytes the session never decoded can still override
+it.
 
 ## Client Convergence and Counter Safety
 
@@ -758,7 +768,8 @@ queue, because a flat nominal charge would let a large scene outgrow the queue's
 byte ceiling without the ceiling noticing.
 
 Canonical pixels arrive through the same payload seam the live publication path
-uses. A definition the caller cannot pay for is withdrawn together with every
+uses, backed by [[terminal-images#Terminal Images#Retained Canonical Pixels]].
+A definition the session could not retain is withdrawn together with every
 placement naming it: an unbacked definition would leave the receiver staging a
 scene it can never complete.
 

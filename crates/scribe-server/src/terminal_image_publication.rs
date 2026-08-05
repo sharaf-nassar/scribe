@@ -24,9 +24,11 @@ use crate::terminal_image_mutations::CanonicalImageMutation;
 
 /// Canonical RGBA bytes for one published definition.
 ///
-/// The seam is payload-free, so the caller that owns decoded pixels supplies
-/// them. Returning `None` withdraws the definition and every placement naming
-/// it from this burst rather than publishing a record the client cannot apply.
+/// Pixels the caller wants published instead of whatever the session retained
+/// when it committed the definition. Returning `None` defers to the session's
+/// own retained canonical bytes, and a definition neither source can back is
+/// withdrawn together with every placement naming it rather than published as
+/// a record the client cannot apply.
 pub type DefinitionPayload<'a> = &'a mut dyn FnMut(&TerminalImageDefinition) -> Option<Vec<u8>>;
 
 /// One generation-consistent group of updates awaiting a sequence number.
