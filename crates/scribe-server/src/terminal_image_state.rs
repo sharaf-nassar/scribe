@@ -4,7 +4,6 @@
 //! caller-owned boundaries. Live IPC fanout and PTY reply write-back remain
 //! downstream integration work.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -13,6 +12,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::terminal_image_mutations::{
+    CanonicalImageState, DecodedImageMeta, MutationContext, MutationLog,
+};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions as _;
@@ -24,9 +26,9 @@ use scribe_common::kitty_decode::{
     KittyTransfer, KittyTransport,
 };
 use scribe_common::terminal_images::{
-    ImageLimits, TerminalImageDefinition, TerminalImageGeneration, TerminalImageId,
+    ImageLimits, TerminalImageCellClip, TerminalImageDefinition, TerminalImageGeneration,
     TerminalImagePlacement, TerminalImageRejectionReason, TerminalOutputSequence,
-    TerminalPlacementId, TerminalScreenKind,
+    TerminalScreenKind,
 };
 use scribe_image_decode::{
     DecodeBudget, DecodeBuffer, DecodeLimits, DecodeStorage, DecodeStorageLease, NoopHooks,
@@ -1183,9 +1185,21 @@ impl TerminalImageProcessPolicy {
 /// Image-side meaning of one ordered graphics boundary.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TerminalImageBoundary {
-    Kitty { command: KittyCommand },
-    Sixel { command: SixelCommand },
-    SixelMode { mode: SixelMode, enabled: bool },
+    /// A Kitty command; `decoded` carries the canonical facts of a completed
+    /// transfer and stays `None` for continuations, queries, and pass-through.
+    Kitty {
+        command: KittyCommand,
+        decoded: Option<DecodedImageMeta>,
+    },
+    /// A decoded Sixel image and its canonical facts.
+    Sixel {
+        command: SixelCommand,
+        decoded: DecodedImageMeta,
+    },
+    SixelMode {
+        mode: SixelMode,
+        enabled: bool,
+    },
     Failure(GraphicsFailure),
 }
 
@@ -1267,12 +1281,7 @@ pub struct SessionTerminal {
     framer: GraphicsFramer,
     generation: TerminalImageGeneration,
     sequence: TerminalOutputSequence,
-    active_screen: TerminalScreenKind,
-    definitions: BTreeMap<TerminalImageId, TerminalImageDefinition>,
-    placements: BTreeMap<
-        (TerminalScreenKind, TerminalImageId, TerminalPlacementId),
-        TerminalImagePlacement,
-    >,
+    canonical: CanonicalImageState,
     pending_transfer: Option<PendingGraphicsTransfer>,
     framing_work: SessionTerminalFramingWork,
     grid_observer: TerminalGridObserverHandle,
@@ -1291,6 +1300,7 @@ impl SessionTerminal {
     pub fn new(policy: Arc<TerminalImageProcessPolicy>) -> Self {
         let max_control_string_bytes =
             usize::try_from(policy.limits.max_control_string_bytes).unwrap_or(usize::MAX);
+        let policy_limits = policy.limits;
         let storage_budget = DecodeStorage::new(
             Arc::clone(&policy.process_storage),
             policy.session_storage_limit,
@@ -1310,9 +1320,7 @@ impl SessionTerminal {
             ),
             generation: TerminalImageGeneration(1),
             sequence: TerminalOutputSequence(0),
-            active_screen: TerminalScreenKind::Primary,
-            definitions: BTreeMap::new(),
-            placements: BTreeMap::new(),
+            canonical: CanonicalImageState::new(policy_limits),
             pending_transfer: None,
             framing_work: SessionTerminalFramingWork::default(),
             grid_observer: TerminalGridObserverHandle::new(Arc::clone(&storage_budget)),
@@ -1502,7 +1510,7 @@ impl SessionTerminal {
 
     /// Record the screen selected by the production terminal observer.
     pub fn observe_active_screen(&mut self, screen: TerminalScreenKind) {
-        self.active_screen = screen;
+        self.canonical.set_active_screen(screen);
     }
 
     /// Return the session-owned production terminal observation handle.
@@ -1517,9 +1525,9 @@ impl SessionTerminal {
         SessionTerminalState {
             generation: self.generation,
             sequence: self.sequence,
-            active_screen: self.active_screen,
-            definition_count: self.definitions.len(),
-            placement_count: self.placements.len(),
+            active_screen: self.canonical.active_screen(),
+            definition_count: self.canonical.definition_count(),
+            placement_count: self.canonical.placement_count(),
             pending_transfer: self.pending_transfer,
         }
     }
@@ -1605,6 +1613,96 @@ impl SessionTerminal {
         self.storage_budget.shares_process_with(&other.storage_budget)
     }
 
+    /// Commit every canonical mutation implied by one observed read.
+    ///
+    /// Grid effects and image boundaries are replayed in original byte order
+    /// against a clone of canonical state. The clone is swapped in only after
+    /// the whole read succeeds, so a storage rejection anywhere leaves the
+    /// prior definitions, placements, screen, and counters untouched.
+    // @lat: [[terminal-images#Terminal Images#Transactional Image Mutations]]
+    pub fn commit_mutations(
+        &mut self,
+        commit: &SessionTerminalCommit,
+    ) -> Result<MutationLog, SessionTerminalError> {
+        self.in_storage_transaction(|terminal, log| {
+            let mut next = terminal.canonical.clone();
+            next.set_generation(terminal.generation);
+            let mut observation = terminal.grid_observer.observation();
+            let mut images = commit
+                .outputs
+                .iter()
+                .filter_map(|output| match output {
+                    SessionTerminalOutput::Image { range, boundary, .. } => {
+                        Some((*range, boundary))
+                    }
+                    SessionTerminalOutput::Raw(_) => None,
+                })
+                .peekable();
+            for span in commit.grid_observations() {
+                observation = span.observation;
+                replay_observed_span(&mut next, span, &mut images, log)?;
+            }
+            for (_, boundary) in images {
+                apply_image_boundary(&mut next, boundary, observation, log)?;
+            }
+            terminal.canonical = next;
+            Ok(())
+        })
+    }
+
+    /// Commit the canonical mutations implied by one out-of-band grid span.
+    ///
+    /// Resize and synchronized-update flush spans carry real Alacritty effects
+    /// without consuming source bytes, so they commit through the same
+    /// all-or-nothing boundary as an ordinary read.
+    pub fn commit_span_mutations(
+        &mut self,
+        span: &ObservedTerminalGridSpan,
+    ) -> Result<MutationLog, SessionTerminalError> {
+        self.in_storage_transaction(|terminal, log| {
+            let mut next = terminal.canonical.clone();
+            next.set_generation(terminal.generation);
+            for effect in span.effects() {
+                apply_observed_effect(&mut next, effect, log)?;
+            }
+            terminal.canonical = next;
+            Ok(())
+        })
+    }
+
+    /// Run one mutation phase under a rolled-back storage transaction.
+    fn in_storage_transaction(
+        &mut self,
+        apply: impl FnOnce(&mut Self, &mut MutationLog) -> Result<(), SessionTerminalError>,
+    ) -> Result<MutationLog, SessionTerminalError> {
+        let storage_budget = Arc::clone(&self.storage_budget);
+        let _transaction =
+            storage_budget.lock_transaction().map_err(SessionTerminalError::Storage)?;
+        let checkpoint = storage_budget.checkpoint().map_err(SessionTerminalError::Storage)?;
+        let mut log =
+            MutationLog::new(Arc::clone(&storage_budget)).map_err(SessionTerminalError::Storage)?;
+        match apply(self, &mut log) {
+            Ok(()) => Ok(log),
+            Err(error) => {
+                drop(log);
+                storage_budget.rollback(&checkpoint).map_err(SessionTerminalError::Storage)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Payload-free canonical definitions for inspection and evidence.
+    #[must_use]
+    pub fn canonical_definitions(&self) -> Vec<TerminalImageDefinition> {
+        self.canonical.definitions()
+    }
+
+    /// Payload-free canonical placements for inspection and evidence.
+    #[must_use]
+    pub fn canonical_placements(&self) -> Vec<(TerminalScreenKind, TerminalImagePlacement)> {
+        self.canonical.placements()
+    }
+
     fn preflight_sequence(
         &self,
         events: &[GraphicsEvent],
@@ -1666,7 +1764,7 @@ impl SessionTerminal {
     fn stage_kitty_event(
         &mut self,
         range: RawByteRange,
-        mut command: KittyCommand,
+        command: KittyCommand,
         staged: &mut StagedRead,
     ) -> Result<(), SessionTerminalError> {
         match self.prepare_kitty_transfer(range, &command, staged)? {
@@ -1674,7 +1772,7 @@ impl SessionTerminal {
             KittyTransferPreparation::Passthrough => {
                 self.append_image(
                     range,
-                    TerminalImageBoundary::Kitty { command },
+                    TerminalImageBoundary::Kitty { command, decoded: None },
                     &mut staged.sequence,
                     &mut staged.outputs,
                 )?;
@@ -1685,16 +1783,17 @@ impl SessionTerminal {
 
         let more = command.chunk_state == KittyChunkState::More;
         let limits = decode_limits(self.policy.limits);
-        let mut budget = match DecodeBudget::new(limits, &NoopHooks, self.storage_budget.as_ref())
-            .map_err(|error| {
+        let storage = Arc::clone(&self.storage_budget);
+        let mut budget =
+            match DecodeBudget::new(limits, &NoopHooks, storage.as_ref()).map_err(|error| {
                 kitty_boundary_error(scribe_common::kitty_decode::KittyDecodeError::from(error))
             }) {
-            Ok(budget) => budget,
-            Err(error) => {
-                self.reject_kitty_decode(range, error, staged)?;
-                return Ok(());
-            }
-        };
+                Ok(budget) => budget,
+                Err(error) => {
+                    self.reject_kitty_decode(range, error, staged)?;
+                    return Ok(());
+                }
+            };
         let push_result = self
             .pending_kitty_decode
             .as_mut()
@@ -1710,13 +1809,24 @@ impl SessionTerminal {
         if more {
             self.append_image(
                 range,
-                TerminalImageBoundary::Kitty { command },
+                TerminalImageBoundary::Kitty { command, decoded: None },
                 &mut staged.sequence,
                 &mut staged.outputs,
             )?;
             return Ok(());
         }
 
+        self.finish_kitty_transfer(range, command, &mut budget, staged)
+    }
+
+    /// Publish the final chunk of one Kitty transfer with its canonical facts.
+    fn finish_kitty_transfer(
+        &mut self,
+        range: RawByteRange,
+        mut command: KittyCommand,
+        budget: &mut DecodeBudget<'_>,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
         let (controls, presence) = self
             .pending_kitty_decode
             .as_ref()
@@ -1730,11 +1840,19 @@ impl SessionTerminal {
             .as_ref()
             .ok_or(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))?
             .transfer
-            .finish_preserving(&mut budget)
+            .finish_preserving(budget)
             .map_err(kitty_boundary_error);
-        match decoded {
-            Ok(_decoded) if controls.action == KittyAction::Query => {}
-            Ok(decoded) => staged.kitty_decoded = StagedDecodeStorage::Replace(decoded.rgba),
+        let canonical = match decoded {
+            Ok(_decoded) if controls.action == KittyAction::Query => None,
+            Ok(decoded) => {
+                let canonical = DecodedImageMeta {
+                    width: decoded.width,
+                    height: decoded.height,
+                    has_alpha: decoded.has_alpha,
+                };
+                staged.kitty_decoded = StagedDecodeStorage::Replace(decoded.rgba);
+                Some(canonical)
+            }
             Err(DecodeBoundaryError::Storage(error)) => {
                 return Err(SessionTerminalError::Storage(error));
             }
@@ -1743,11 +1861,11 @@ impl SessionTerminal {
                 self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)?;
                 return Ok(());
             }
-        }
+        };
         staged.completed_kitty_transfer = self.pending_kitty_decode.take();
         self.append_image(
             range,
-            TerminalImageBoundary::Kitty { command },
+            TerminalImageBoundary::Kitty { command, decoded: canonical },
             &mut staged.sequence,
             &mut staged.outputs,
         )?;
@@ -1836,8 +1954,16 @@ impl SessionTerminal {
         .map_err(SessionTerminalError::Storage)?;
         staged.sixel_body = StagedStorage::Replace(body);
         self.storage_budget.record_validation_stage(StorageAllocationClass::CanonicalSixel);
-        match self.decode_sixel(&command) {
-            Ok(decoded) => staged.sixel_decoded = StagedDecodeStorage::Replace(decoded.rgba),
+        let canonical = match self.decode_sixel(&command) {
+            Ok(decoded) => {
+                let canonical = DecodedImageMeta {
+                    width: u32::try_from(decoded.width).unwrap_or(u32::MAX),
+                    height: u32::try_from(decoded.height).unwrap_or(u32::MAX),
+                    has_alpha: false,
+                };
+                staged.sixel_decoded = StagedDecodeStorage::Replace(decoded.rgba);
+                canonical
+            }
             Err(DecodeBoundaryError::Storage(error)) => {
                 return Err(SessionTerminalError::Storage(error));
             }
@@ -1846,10 +1972,10 @@ impl SessionTerminal {
                 self.append_decode_failure(range, GraphicsProtocol::Sixel, category, staged)?;
                 return Ok(());
             }
-        }
+        };
         self.append_image(
             range,
-            TerminalImageBoundary::Sixel { command },
+            TerminalImageBoundary::Sixel { command, decoded: canonical },
             &mut staged.sequence,
             &mut staged.outputs,
         )?;
@@ -1912,6 +2038,120 @@ impl SessionTerminal {
         )
         .map_err(|error| sixel_boundary_error(&error))
     }
+}
+
+/// Apply one span's grid effects, then every image boundary that ended inside
+/// it, preserving original PTY byte order across both kinds of mutation.
+fn replay_observed_span<'a, Images>(
+    next: &mut CanonicalImageState,
+    span: &TerminalGridSpanObservation,
+    images: &mut std::iter::Peekable<Images>,
+    log: &mut MutationLog,
+) -> Result<(), SessionTerminalError>
+where
+    Images: Iterator<Item = (RawByteRange, &'a TerminalImageBoundary)>,
+{
+    for effect in span.effects() {
+        apply_observed_effect(next, effect, log)?;
+    }
+    while images.peek().is_some_and(|(range, _)| range.end <= span.range.end) {
+        let Some((_, boundary)) = images.next() else { break };
+        apply_image_boundary(next, boundary, span.observation, log)?;
+    }
+    Ok(())
+}
+
+/// Apply one Alacritty-observed effect to canonical image state.
+///
+/// Kitty graphics survive ordinary text erases; only ED2, a hard reset, and
+/// alternate-screen creation follow the Kitty visibility lifecycle. All row and
+/// column bounds stay half-open exactly as the observer produced them.
+fn apply_observed_effect(
+    next: &mut CanonicalImageState,
+    effect: &ObservedTerminalGridEffect,
+    log: &mut MutationLog,
+) -> Result<(), SessionTerminalError> {
+    let result = match *effect {
+        ObservedTerminalGridEffect::Scroll { screen, top, bottom, rows } => next.scroll(
+            screen,
+            TerminalImageCellClip {
+                top: i32::from(top),
+                left: 0,
+                bottom: i32::from(bottom),
+                right: TerminalImageCellClip::MAX_EXCLUSIVE_CELL,
+            },
+            rows,
+            log,
+        ),
+        ObservedTerminalGridEffect::EraseCells { screen, top, left, bottom, right } => next
+            .erase_cells(
+                screen,
+                TerminalImageCellClip {
+                    top: i32::from(top),
+                    left: i32::from(left),
+                    bottom: i32::from(bottom),
+                    right: i32::from(right),
+                },
+                log,
+            ),
+        ObservedTerminalGridEffect::EraseDisplay { screen } => next.clear_screen(screen, log),
+        ObservedTerminalGridEffect::Resize { primary, alternate } => {
+            let mut clip = |screen, size: TerminalGridSizeObservation| {
+                next.clip_to_viewport(
+                    screen,
+                    TerminalImageCellClip {
+                        top: 0,
+                        left: 0,
+                        bottom: i32::from(size.rows),
+                        right: i32::from(size.columns),
+                    },
+                    log,
+                )
+            };
+            clip(TerminalScreenKind::Primary, primary)
+                .and_then(|()| clip(TerminalScreenKind::Alternate, alternate))
+        }
+        ObservedTerminalGridEffect::SwitchScreen { to, .. } => {
+            next.set_active_screen(to);
+            // Entering the alternate screen creates a fresh grid, so no image
+            // placed on a previous alternate screen may survive it.
+            if to == TerminalScreenKind::Alternate { next.clear_screen(to, log) } else { Ok(()) }
+        }
+        // DECSTR leaves Kitty and Sixel graphics alone.
+        ObservedTerminalGridEffect::SoftReset => Ok(()),
+        ObservedTerminalGridEffect::HardReset => next.reset(log),
+    };
+    result.map_err(SessionTerminalError::Storage)
+}
+
+/// Apply one ordered image boundary using the terminal state it observed.
+fn apply_image_boundary(
+    next: &mut CanonicalImageState,
+    boundary: &TerminalImageBoundary,
+    observation: TerminalGridObservation,
+    log: &mut MutationLog,
+) -> Result<(), SessionTerminalError> {
+    let screen = observation.active_screen;
+    let cursor = match screen {
+        TerminalScreenKind::Primary => observation.primary.cursor,
+        TerminalScreenKind::Alternate => observation.alternate.cursor,
+    }
+    .unwrap_or_default();
+    let context = MutationContext {
+        screen,
+        cursor_row: cursor.row,
+        cursor_column: cursor.column,
+        cell_width_pixels: observation.cell_width_pixels,
+        cell_height_pixels: observation.cell_height_pixels,
+    };
+    let result = match boundary {
+        TerminalImageBoundary::Kitty { command, decoded } => {
+            next.apply_kitty(command, *decoded, context, log)
+        }
+        TerminalImageBoundary::Sixel { decoded, .. } => next.apply_sixel(*decoded, context, log),
+        TerminalImageBoundary::SixelMode { .. } | TerminalImageBoundary::Failure(_) => Ok(()),
+    };
+    result.map_err(SessionTerminalError::Storage)
 }
 
 #[derive(Clone, Copy)]
@@ -2059,6 +2299,34 @@ impl PtyTerminalImageState {
     /// Synchronize the seam's screen summary with a committed grid span.
     pub fn record_grid_observation(&mut self, observation: &TerminalGridObservation) {
         self.terminal.observe_active_screen(observation.active_screen);
+    }
+
+    /// Commit the canonical mutations implied by one observed read.
+    pub fn commit_mutations(
+        &mut self,
+        commit: &SessionTerminalCommit,
+    ) -> Result<MutationLog, SessionTerminalError> {
+        self.terminal.commit_mutations(commit)
+    }
+
+    /// Commit the canonical mutations implied by one out-of-band grid span.
+    pub fn commit_span_mutations(
+        &mut self,
+        span: &ObservedTerminalGridSpan,
+    ) -> Result<MutationLog, SessionTerminalError> {
+        self.terminal.commit_span_mutations(span)
+    }
+
+    /// Payload-free canonical definitions for inspection and evidence.
+    #[must_use]
+    pub fn canonical_definitions(&self) -> Vec<TerminalImageDefinition> {
+        self.terminal.canonical_definitions()
+    }
+
+    /// Payload-free canonical placements for inspection and evidence.
+    #[must_use]
+    pub fn canonical_placements(&self) -> Vec<(TerminalScreenKind, TerminalImagePlacement)> {
+        self.terminal.canonical_placements()
     }
 
     /// Current and peak session/process storage counters.

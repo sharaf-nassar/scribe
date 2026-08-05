@@ -411,7 +411,7 @@ fn validate_placement(
 }
 
 fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
-    let applies = |placement: &TerminalImagePlacement| delete_matches(placement, &delete);
+    let applies = |placement: &TerminalImagePlacement| placement.matches_delete(&delete);
     let mut selected_images = HashSet::new();
     if delete.free_image_data {
         match delete.scope {
@@ -460,34 +460,6 @@ fn apply_delete(scene: &mut CommittedImageScene, delete: TerminalImageDelete) {
     }
 }
 
-fn delete_matches(placement: &TerminalImagePlacement, delete: &TerminalImageDelete) -> bool {
-    let image_matches = delete.image_id.is_none_or(|id| placement.image_id == id);
-    let placement_matches = delete.placement_id.is_none_or(|id| placement.id == id);
-    if placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
-        return delete.scope == TerminalImageDeleteScope::Image
-            && delete.image_id.is_some()
-            && image_matches;
-    }
-    let effective = effective_placement_clip(placement);
-    match delete.scope {
-        TerminalImageDeleteScope::AllPlacements => true,
-        TerminalImageDeleteScope::Image => image_matches,
-        TerminalImageDeleteScope::Placement => image_matches && placement_matches,
-        TerminalImageDeleteScope::Cell => delete.coordinate.is_some_and(|coordinate| {
-            effective.is_some_and(|clip| {
-                clip_contains_row(clip, coordinate) || clip_contains_column(clip, coordinate)
-            })
-        }),
-        TerminalImageDeleteScope::Row => delete.coordinate.is_some_and(|coordinate| {
-            effective.is_some_and(|clip| clip_contains_row(clip, coordinate))
-        }),
-        TerminalImageDeleteScope::Column => delete.coordinate.is_some_and(|coordinate| {
-            effective.is_some_and(|clip| clip_contains_column(clip, coordinate))
-        }),
-        TerminalImageDeleteScope::ZIndex => delete.coordinate == Some(placement.z_index),
-    }
-}
-
 fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffect) {
     match *effect {
         TerminalGridEffect::MoveCursor { .. } | TerminalGridEffect::SoftReset => {}
@@ -495,9 +467,15 @@ fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffec
             apply_scroll(scene, top, bottom, rows);
         }
         TerminalGridEffect::EraseCells { top, left, bottom, right } => {
+            let erase = TerminalImageCellClip {
+                top: i32::from(top),
+                left: i32::from(left),
+                bottom: i32::from(bottom),
+                right: i32::from(right),
+            };
             scene.placements_mut().retain(|placement| {
                 placement.kind != TerminalImagePlacementKind::Sixel
-                    || !placement_intersects(placement, top, left, bottom, right)
+                    || !placement.intersects_cells(erase)
             });
         }
         TerminalGridEffect::ResizeClip { columns, rows } => {
@@ -519,44 +497,14 @@ fn apply_grid_effect(scene: &mut CommittedImageScene, effect: &TerminalGridEffec
 
 fn apply_scroll(scene: &mut CommittedImageScene, top: u16, bottom: u16, rows: i32) {
     let top = i32::from(top);
-    let bottom = i32::from(bottom).saturating_add(1);
+    let bottom = i32::from(bottom);
     let margin = TerminalImageCellClip {
         top,
         left: 0,
         bottom,
         right: TerminalImageCellClip::MAX_EXCLUSIVE_CELL,
     };
-    scene.placements_mut().retain_mut(|placement| scroll_placement(placement, margin, rows));
-}
-
-fn scroll_placement(
-    placement: &mut TerminalImagePlacement,
-    margin: TerminalImageCellClip,
-    rows: i32,
-) -> bool {
-    if rows == 0
-        || !placement.scrolls_with_grid
-        || placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder
-    {
-        return true;
-    }
-    let Ok(old_envelope) = placement.logical_cell_envelope() else { return false };
-    let participates = match placement.cell_clip {
-        None => placement.anchor.row >= margin.top && placement.anchor.row < margin.bottom,
-        Some(clip) => old_envelope
-            .intersection(clip)
-            .and_then(|effective| effective.intersection(margin))
-            .is_some(),
-    };
-    if !participates {
-        return true;
-    }
-    placement.anchor.row = placement.anchor.row.saturating_sub(rows);
-    let Ok(new_envelope) = placement.logical_cell_envelope() else { return false };
-    let candidate = placement.cell_clip.map_or(margin, |clip| shift_clip_rows(clip, rows));
-    placement.cell_clip =
-        new_envelope.intersection(candidate).and_then(|effective| effective.intersection(margin));
-    placement.cell_clip.is_some()
+    scene.placements_mut().retain_mut(|placement| placement.apply_scroll(margin, rows));
 }
 
 fn apply_resize_clip(scene: &mut CommittedImageScene, columns: u16, rows: u16) {
@@ -566,55 +514,8 @@ fn apply_resize_clip(scene: &mut CommittedImageScene, columns: u16, rows: u16) {
         bottom: i32::from(rows),
         right: i32::from(columns),
     };
-    scene.placements_mut().retain_mut(|placement| {
-        if placement.kind == TerminalImagePlacementKind::KittyUnicodePlaceholder {
-            return true;
-        }
-        let Ok(envelope) = placement.logical_cell_envelope() else { return false };
-        let candidate = placement.cell_clip.unwrap_or(envelope);
-        placement.cell_clip =
-            envelope.intersection(candidate).and_then(|effective| effective.intersection(viewport));
-        placement.cell_clip.is_some()
-    });
-}
-
-fn shift_clip_rows(clip: TerminalImageCellClip, rows: i32) -> TerminalImageCellClip {
-    TerminalImageCellClip {
-        top: clip.top.saturating_sub(rows),
-        bottom: clip.bottom.saturating_sub(rows),
-        ..clip
-    }
-}
-
-fn effective_placement_clip(placement: &TerminalImagePlacement) -> Option<TerminalImageCellClip> {
-    let envelope = placement.logical_cell_envelope().ok()?;
-    placement.cell_clip.map_or(Some(envelope), |clip| envelope.intersection(clip))
-}
-
-fn clip_contains_row(clip: TerminalImageCellClip, row: i32) -> bool {
-    row >= clip.top && row < clip.bottom
-}
-
-fn clip_contains_column(clip: TerminalImageCellClip, column: i32) -> bool {
-    column >= clip.left && column < clip.right
-}
-
-fn placement_intersects(
-    placement: &TerminalImagePlacement,
-    top: u16,
-    left: u16,
-    bottom: u16,
-    right: u16,
-) -> bool {
-    let erase = TerminalImageCellClip {
-        top: i32::from(top),
-        left: i32::from(left),
-        bottom: i32::from(bottom).saturating_add(1),
-        right: i32::from(right).saturating_add(1),
-    };
-    effective_placement_clip(placement)
-        .and_then(|effective| effective.intersection(erase))
-        .is_some()
+    scene.primary_placements.retain_mut(|placement| placement.clip_to_viewport(viewport));
+    scene.alternate_placements.retain_mut(|placement| placement.clip_to_viewport(viewport));
 }
 
 /// Remove Kitty placeholder cells and only their attached coordinate marks.

@@ -14,7 +14,7 @@
     {"type":"update","generation":2,"sequence":2,"update":{"type":"definition_chunk","chunk":{"id":1,"generation":2,"offset":0,"data":[9,8,7,6],"final_chunk":true}}},
     {"type":"update","generation":2,"sequence":2,"update":{"type":"place","placement":{"id":11,"image_id":1,"generation":2,"protocol":"kitty","kind":"kitty_classic","anchor":{"row":3,"column":0},"source":{"x":0,"y":0,"width":1,"height":1},"destination":{"columns":1,"rows":1},"pixel_offset_x":0,"pixel_offset_y":0,"z_index":0,"scrolls_with_grid":true,"move_cursor":false,"placeholder":null}}},
     {"type":"update","generation":2,"sequence":2,"update":{"type":"grid_effect","effect":{"type":"scroll","top":0,"bottom":10,"rows":1}}},
-    {"type":"update","generation":2,"sequence":2,"update":{"type":"grid_effect","effect":{"type":"erase_cells","top":1,"left":0,"bottom":1,"right":2}}},
+    {"type":"update","generation":2,"sequence":2,"update":{"type":"grid_effect","effect":{"type":"erase_cells","top":1,"left":0,"bottom":2,"right":2}}},
     {"type":"commit","generation":2,"sequence":2},
 
     {"type":"begin","generation":3,"sequence":3},
