@@ -62,10 +62,10 @@ use crate::session_manager::{
     snapshot_term,
 };
 use crate::terminal_image_state::{
-    PtyTerminalImageState, SessionTerminalCommit, SessionTerminalError, TerminalGridObservation,
-    TerminalGridObserverHandle, TerminalImageProcessPolicy,
-    feed_terminal_image_result_with_observer, flush_terminal_observed, observe_terminal_resize,
-    process_pty_reader_ingress,
+    ObservedTerminalGridSpan, ProductionTerminalFeed, PtyTerminalImageState, SessionTerminalCommit,
+    SessionTerminalError, TerminalGridObservation, TerminalGridObserverHandle,
+    TerminalImageProcessPolicy, feed_terminal_image_result_production,
+    flush_terminal_observed_production, observe_terminal_resize, process_pty_reader_ingress,
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
@@ -9396,19 +9396,18 @@ async fn feed_term_image_result_observed(
     term_commit: &TermCommit,
     search_cache: &SearchSnapshotCache,
     ansi_processor: &mut AnsiProcessor,
-    mut feed: ObservedImageResultFeed<'_>,
-) -> (Result<SessionTerminalCommit, SessionTerminalError>, Option<TerminalGridObservation>) {
-    let mut term_guard = term.lock().await;
-    let observation = feed_terminal_image_result_with_observer(
-        &feed.observer,
-        &mut *term_guard,
-        ansi_processor,
+    feed: ObservedImageResultFeed<'_>,
+) -> (Result<SessionTerminalCommit, SessionTerminalError>, Option<ObservedTerminalGridSpan>) {
+    feed_terminal_image_result_production(
+        ProductionTerminalFeed::new(&feed.observer, term, ansi_processor),
         feed.bytes,
-        &mut feed.image_result,
-    );
-    search_cache.invalidate();
-    term_commit.advance(chunk_len(feed.bytes));
-    (feed.image_result, Some(observation))
+        feed.image_result,
+        || {
+            search_cache.invalidate();
+            term_commit.advance(chunk_len(feed.bytes));
+        },
+    )
+    .await
 }
 
 /// Flush a synchronized update after its timeout elapses.
@@ -9417,8 +9416,7 @@ async fn stop_term_sync(
     observer: &TerminalGridObserverHandle,
     ansi_processor: &mut AnsiProcessor,
 ) -> TerminalGridObservation {
-    let mut term_guard = term.lock().await;
-    flush_terminal_observed(observer, &mut *term_guard, ansi_processor)
+    flush_terminal_observed_production(observer, term, ansi_processor).await.observation
 }
 
 fn capture_osc_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {

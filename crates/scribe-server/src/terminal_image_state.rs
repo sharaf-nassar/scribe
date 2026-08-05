@@ -8,21 +8,36 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::term::TermMode;
 use cursor_icon::CursorIcon;
+use icy_sixel_decoder::{DcsSettings, DecodeError as SixelDecodeError, decode_sixel_payload};
+use scribe_common::kitty_decode::{
+    KittyCompression as DecodeKittyCompression, KittyDataParams, KittyFormat as DecodeKittyFormat,
+    KittyTransfer, KittyTransport,
+};
 use scribe_common::terminal_images::{
     ImageLimits, TerminalImageDefinition, TerminalImageGeneration, TerminalImageId,
-    TerminalImagePlacement, TerminalOutputSequence, TerminalPlacementId, TerminalScreenKind,
+    TerminalImagePlacement, TerminalImageRejectionReason, TerminalOutputSequence,
+    TerminalPlacementId, TerminalScreenKind,
+};
+use scribe_image_decode::{
+    DecodeBudget, DecodeBuffer, DecodeLimits, DecodeStorage, DecodeStorageLease, NoopHooks,
+    StorageProcess, StorageValidation, StorageValidationPause, StorageValidationRejection,
 };
 use scribe_pty::graphics_framing::{
-    GraphicsEvent, GraphicsFailure, GraphicsFramer, KittyCommand, PendingGraphicsTransfer,
-    RawByteRange, RawBytes, SixelCommand, SixelMode,
+    GraphicsEvent, GraphicsFailure, GraphicsFailureCategory, GraphicsFramer, GraphicsProtocol,
+    GraphicsStorageBudget, GraphicsStorageClass, GraphicsStorageRejection, GraphicsStorageVec,
+    KittyAction, KittyChunkState, KittyCommand, KittyCommandControls, KittyCompression,
+    KittyControlPresence, KittyFormat, PendingGraphicsTransfer, RawByteRange, RawBytes,
+    SixelCommand, SixelMode,
 };
 use unicode_width::UnicodeWidthChar;
 use vte::ansi::Processor as AnsiProcessor;
@@ -74,7 +89,10 @@ pub enum ObservedTerminalGridEffect {
 }
 
 /// Alacritty-derived terminal facts after one ordered source span.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Payload-free scalars only. Hostile-input-proportional effect lists travel
+/// with their own paired-ledger ownership in [`ObservedTerminalGridSpan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalGridObservation {
     pub active_screen: TerminalScreenKind,
     pub primary: TerminalScreenObservation,
@@ -85,7 +103,6 @@ pub struct TerminalGridObservation {
     pub line_wrap_mode: bool,
     pub cell_width_pixels: u16,
     pub cell_height_pixels: u16,
-    pub effects: Vec<ObservedTerminalGridEffect>,
 }
 
 impl Default for TerminalGridObservation {
@@ -101,16 +118,41 @@ impl Default for TerminalGridObservation {
             line_wrap_mode: true,
             cell_width_pixels: 1,
             cell_height_pixels: 1,
-            effects: Vec::new(),
         }
     }
 }
 
+/// Terminal facts plus the accounted effects observed over one source span.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ObservedTerminalGridSpan {
+    pub observation: TerminalGridObservation,
+    effects: Option<GraphicsStorageVec<ObservedTerminalGridEffect>>,
+    /// Typed paired-ledger rejection that truncated this span's effect list.
+    pub storage_rejection: Option<GraphicsStorageRejection>,
+}
+
+impl ObservedTerminalGridSpan {
+    /// Borrow the ordered effects while their storage ownership lives.
+    #[must_use]
+    pub fn effects(&self) -> &[ObservedTerminalGridEffect] {
+        self.effects.as_ref().map_or(&[], GraphicsStorageVec::as_slice)
+    }
+}
+
 /// One observation aligned to a half-open range of the original PTY stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TerminalGridSpanObservation {
     pub range: RawByteRange,
     pub observation: TerminalGridObservation,
+    effects: Option<GraphicsStorageVec<ObservedTerminalGridEffect>>,
+}
+
+impl TerminalGridSpanObservation {
+    /// Borrow the ordered effects while their storage ownership lives.
+    #[must_use]
+    pub fn effects(&self) -> &[ObservedTerminalGridEffect] {
+        self.effects.as_ref().map_or(&[], GraphicsStorageVec::as_slice)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -122,23 +164,27 @@ struct TerminalGridObserverState {
 /// Cloneable session-owned handle shared only with production feed and resize
 /// call sites. It never retains cells or image payloads.
 #[derive(Clone, Debug)]
-pub struct TerminalGridObserverHandle(Arc<Mutex<TerminalGridObserverState>>);
-
-impl Default for TerminalGridObserverHandle {
-    fn default() -> Self {
-        Self(Arc::new(Mutex::new(TerminalGridObserverState::default())))
-    }
+pub struct TerminalGridObserverHandle {
+    state: Arc<Mutex<TerminalGridObserverState>>,
+    budget: Arc<GraphicsStorageBudget>,
 }
 
 impl TerminalGridObserverHandle {
+    /// Bind one observer to the session/process ledger pair that owns every
+    /// grid-observation allocation it produces.
+    #[must_use]
+    pub fn new(budget: Arc<GraphicsStorageBudget>) -> Self {
+        Self { state: Arc::new(Mutex::new(TerminalGridObserverState::default())), budget }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, TerminalGridObserverState> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Return the latest payload-free production observation.
     #[must_use]
     pub fn observation(&self) -> TerminalGridObservation {
-        self.lock().observation.clone()
+        self.lock().observation
     }
 
     /// Update terminal cell pixel metrics used by image coordinate capture.
@@ -203,17 +249,11 @@ impl TerminalGridObserverState {
         self.observation.line_wrap_mode = term.mode().contains(TermMode::LINE_WRAP);
     }
 
-    fn finish_span<T>(&mut self, term: &Term<T>, effects: Vec<ObservedTerminalGridEffect>) {
-        self.sync_active(term);
-        self.observation.effects = effects;
-    }
-
-    fn observe_resize<T>(&mut self, term: &Term<T>, changed: bool) {
+    fn observe_resize<T>(&mut self, term: &Term<T>, changed: bool) -> bool {
         self.initialize(term);
         if !changed {
             self.sync_active(term);
-            self.observation.effects.clear();
-            return;
+            return false;
         }
         let size = observed_size(term);
         self.observation.primary.size = size;
@@ -230,10 +270,7 @@ impl TerminalGridObserverState {
             grid.size = size;
         }
         self.sync_active(term);
-        self.observation.effects = vec![ObservedTerminalGridEffect::Resize {
-            primary: self.observation.primary.size,
-            alternate: self.observation.alternate.size,
-        }];
+        true
     }
 }
 
@@ -244,14 +281,46 @@ impl TerminalGridObserverState {
 struct ObservedTermHandler<'a, T> {
     term: &'a mut Term<T>,
     state: &'a mut TerminalGridObserverState,
-    effects: Vec<ObservedTerminalGridEffect>,
+    budget: &'a Arc<GraphicsStorageBudget>,
+    effects: Option<GraphicsStorageVec<ObservedTerminalGridEffect>>,
+    storage_rejection: Option<GraphicsStorageRejection>,
 }
 
 impl<'a, T> ObservedTermHandler<'a, T> {
-    fn new(term: &'a mut Term<T>, state: &'a mut TerminalGridObserverState) -> Self {
+    fn new(
+        term: &'a mut Term<T>,
+        state: &'a mut TerminalGridObserverState,
+        budget: &'a Arc<GraphicsStorageBudget>,
+    ) -> Self {
         state.initialize(term);
-        state.observation.effects.clear();
-        Self { term, state, effects: Vec::new() }
+        Self { term, state, budget, effects: None, storage_rejection: None }
+    }
+
+    /// Append one observed effect, reserving its storage before it is stored.
+    /// Storage pressure truncates this payload-free list; the already-fed
+    /// terminal is never rewound and the ledger stays exact.
+    fn push_effect(&mut self, effect: ObservedTerminalGridEffect) {
+        if self.storage_rejection.is_some() {
+            return;
+        }
+        let effects = match self.effects.as_mut() {
+            Some(effects) => effects,
+            None => {
+                match GraphicsStorageVec::new(
+                    Arc::clone(self.budget),
+                    GraphicsStorageClass::GridObservations,
+                ) {
+                    Ok(effects) => self.effects.insert(effects),
+                    Err(error) => {
+                        self.storage_rejection = Some(error);
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(error) = effects.push(effect) {
+            self.storage_rejection = Some(error);
+        }
     }
 
     fn screen(&self) -> TerminalScreenKind {
@@ -270,7 +339,7 @@ impl<'a, T> ObservedTermHandler<'a, T> {
         let height = i32::from(bottom.saturating_sub(top));
         let rows = rows.clamp(-height, height);
         if height > 0 && rows != 0 {
-            self.effects.push(ObservedTerminalGridEffect::Scroll {
+            self.push_effect(ObservedTerminalGridEffect::Scroll {
                 screen: self.screen(),
                 top,
                 bottom,
@@ -284,7 +353,7 @@ impl<'a, T> ObservedTermHandler<'a, T> {
         let bottom = bottom.min(size.rows);
         let right = right.min(size.columns);
         if top < bottom && left < right {
-            self.effects.push(ObservedTerminalGridEffect::EraseCells {
+            self.push_effect(ObservedTerminalGridEffect::EraseCells {
                 screen: self.screen(),
                 top,
                 left,
@@ -308,13 +377,17 @@ impl<'a, T> ObservedTermHandler<'a, T> {
         let size = observed_size(self.term);
         self.state.observation.margin_top = 0;
         self.state.observation.margin_bottom = size.rows;
-        self.effects.push(ObservedTerminalGridEffect::EraseDisplay { screen: self.screen() });
+        self.push_effect(ObservedTerminalGridEffect::EraseDisplay { screen: self.screen() });
     }
 
-    fn finish(mut self) -> TerminalGridObservation {
-        let effects = std::mem::take(&mut self.effects);
-        self.state.finish_span(self.term, effects);
-        self.state.observation.clone()
+    fn finish(mut self) -> ObservedTerminalGridSpan {
+        let effects = self.effects.take();
+        self.state.sync_active(self.term);
+        ObservedTerminalGridSpan {
+            observation: self.state.observation,
+            effects,
+            storage_rejection: self.storage_rejection,
+        }
     }
 }
 
@@ -476,8 +549,8 @@ impl<T: EventListener> Handler for ObservedTermHandler<'_, T> {
         let row = u16::try_from(cursor.row).unwrap_or(u16::MAX);
         match mode {
             ClearMode::All => {
-                self.effects
-                    .push(ObservedTerminalGridEffect::EraseDisplay { screen: self.screen() });
+                let screen = self.screen();
+                self.push_effect(ObservedTerminalGridEffect::EraseDisplay { screen });
                 Handler::clear_screen(self.term, ClearMode::All);
             }
             ClearMode::Below => {
@@ -505,7 +578,7 @@ impl<T: EventListener> Handler for ObservedTermHandler<'_, T> {
             TerminalScreenObservation { size, ..TerminalScreenObservation::default() };
         self.state.observation.margin_top = 0;
         self.state.observation.margin_bottom = size.rows;
-        self.effects.push(ObservedTerminalGridEffect::HardReset);
+        self.push_effect(ObservedTerminalGridEffect::HardReset);
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
@@ -527,7 +600,7 @@ impl<T: EventListener> Handler for ObservedTermHandler<'_, T> {
                 TerminalScreenKind::Alternate => self.state.observation.alternate = before,
             }
             self.state.sync_active(self.term);
-            self.effects.push(ObservedTerminalGridEffect::SwitchScreen {
+            self.push_effect(ObservedTerminalGridEffect::SwitchScreen {
                 from: before_screen,
                 to: after_screen,
             });
@@ -548,7 +621,7 @@ impl<T: EventListener> Handler for ObservedTermHandler<'_, T> {
                 TerminalScreenKind::Alternate => self.state.observation.alternate = before,
             }
             self.state.sync_active(self.term);
-            self.effects.push(ObservedTerminalGridEffect::SwitchScreen {
+            self.push_effect(ObservedTerminalGridEffect::SwitchScreen {
                 from: before_screen,
                 to: after_screen,
             });
@@ -737,11 +810,169 @@ impl<T: EventListener> Handler for ObservedTermHandler<'_, T> {
     }
 }
 
+pub use scribe_image_decode::{
+    StorageClass as StorageAllocationClass, StorageClassCounters as ImageStorageClassCounters,
+    StorageCounters as ImageStorageCounters, StorageLedgerOperation, StorageLedgerScope,
+    StorageLedgerValidationFault, StorageSnapshotValidationFault,
+};
+
+struct OwnedImageStorage {
+    bytes: Vec<u8>,
+    reservation: DecodeStorageLease,
+}
+
+impl OwnedImageStorage {
+    fn from_slices(
+        budget: &Arc<DecodeStorage>,
+        class: StorageAllocationClass,
+        slices: &[&[u8]],
+    ) -> Result<Self, GraphicsStorageRejection> {
+        let requested = slices.iter().try_fold(0_usize, |total, slice| {
+            total.checked_add(slice.len()).ok_or(GraphicsStorageRejection::CounterOverflow)
+        })?;
+        let mut reservation = budget.reserve(class, requested)?;
+        reservation.record_allocation_attempt()?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(requested)
+            .map_err(|_| GraphicsStorageRejection::AllocationFailed)?;
+        let observed = budget.observe_allocation_capacity(bytes.capacity())?;
+        reservation.reconcile_observed(observed)?;
+        for slice in slices {
+            bytes.extend_from_slice(slice);
+        }
+        Ok(Self { bytes, reservation })
+    }
+
+    fn requested_bytes(&self) -> usize {
+        self.reservation.requested_bytes()
+    }
+
+    fn observed_bytes(&self) -> usize {
+        self.reservation.observed_bytes()
+    }
+}
+
+enum StagedStorage {
+    Unchanged,
+    Clear,
+    Replace(OwnedImageStorage),
+}
+
+enum StagedDecodeStorage {
+    Unchanged,
+    Replace(DecodeBuffer),
+}
+
+struct StagedRead {
+    sequence: TerminalOutputSequence,
+    outputs: GraphicsStorageVec<SessionTerminalOutput>,
+    sixel_body: StagedStorage,
+    kitty_decoded: StagedDecodeStorage,
+    sixel_decoded: StagedDecodeStorage,
+    completed_kitty_transfer: Option<PendingKittyDecode>,
+}
+
+struct PendingKittyDecode {
+    transfer: KittyTransfer,
+    controls: KittyCommandControls,
+    presence: KittyControlPresence,
+}
+
+enum KittyTransferPreparation {
+    Ready,
+    Passthrough,
+    HandledFailure,
+}
+
+impl StagedStorage {
+    fn apply(self, slot: &mut Option<OwnedImageStorage>) {
+        match self {
+            Self::Unchanged => {}
+            Self::Clear => *slot = None,
+            Self::Replace(storage) => *slot = Some(storage),
+        }
+    }
+}
+
+impl StagedDecodeStorage {
+    fn apply(self, slot: &mut Option<DecodeBuffer>) {
+        match self {
+            Self::Unchanged => {}
+            Self::Replace(storage) => *slot = Some(storage),
+        }
+    }
+}
+
+/// Payload-free ownership by production retention path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageStorageOwnership {
+    pub pending_kitty_requested: usize,
+    pub pending_kitty_observed: usize,
+    pub completed_kitty_requested: usize,
+    pub completed_kitty_observed: usize,
+    pub sixel_body_requested: usize,
+    pub sixel_body_observed: usize,
+    pub kitty_decoded_requested: usize,
+    pub kitty_decoded_observed: usize,
+    pub sixel_decoded_requested: usize,
+    pub sixel_decoded_observed: usize,
+}
+
+/// Payload-free stable digests for deterministic canonical rollback evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageStorageDigests {
+    pub pending_kitty: u64,
+    pub completed_kitty: u64,
+    pub sixel_body: u64,
+    pub kitty_decoded: u64,
+    pub sixel_decoded: u64,
+}
+
+fn requested(storage: Option<&OwnedImageStorage>) -> usize {
+    storage.map_or(0, OwnedImageStorage::requested_bytes)
+}
+
+fn observed(storage: Option<&OwnedImageStorage>) -> usize {
+    storage.map_or(0, OwnedImageStorage::observed_bytes)
+}
+
+fn decoded_requested(storage: Option<&DecodeBuffer>) -> usize {
+    storage.map_or(0, DecodeBuffer::requested_bytes)
+}
+
+fn decoded_observed(storage: Option<&DecodeBuffer>) -> usize {
+    storage.map_or(0, DecodeBuffer::observed_bytes)
+}
+
+fn storage_digest(storage: Option<&OwnedImageStorage>) -> u64 {
+    storage.map_or(0, |storage| {
+        storage.bytes.iter().fold(0, |digest, byte| {
+            digest.wrapping_mul(1_099_511_628_211).wrapping_add(u64::from(*byte))
+        })
+    })
+}
+
+fn decoded_storage_digest(storage: Option<&DecodeBuffer>) -> u64 {
+    storage.map_or(0, |storage| {
+        storage.iter().fold(0, |digest, byte| {
+            digest.wrapping_mul(1_099_511_628_211).wrapping_add(u64::from(*byte))
+        })
+    })
+}
+
 /// Immutable process policy shared by every session image seam.
 #[derive(Debug)]
 pub struct TerminalImageProcessPolicy {
     limits: ImageLimits,
     output_sequence_ceiling: u64,
+    process_storage: Arc<StorageProcess>,
+    session_storage_limit: u64,
+    observed_capacity_extra: usize,
+    storage_validation_fault: Option<StorageLedgerValidationFault>,
+    storage_validation_rejection: Option<StorageValidationRejection>,
+    storage_validation_snapshot_fault: Option<StorageSnapshotValidationFault>,
+    storage_validation_pause: Option<StorageValidationPause>,
 }
 
 impl TerminalImageProcessPolicy {
@@ -750,7 +981,17 @@ impl TerminalImageProcessPolicy {
     pub fn v1() -> Arc<Self> {
         static POLICY: OnceLock<Arc<TerminalImageProcessPolicy>> = OnceLock::new();
         Arc::clone(POLICY.get_or_init(|| {
-            Arc::new(Self { limits: ImageLimits::V1, output_sequence_ceiling: u64::MAX })
+            Arc::new(Self {
+                limits: ImageLimits::V1,
+                output_sequence_ceiling: u64::MAX,
+                process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
+                session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
+                observed_capacity_extra: 0,
+                storage_validation_fault: None,
+                storage_validation_rejection: None,
+                storage_validation_snapshot_fault: None,
+                storage_validation_pause: None,
+            })
         }))
     }
 
@@ -758,7 +999,178 @@ impl TerminalImageProcessPolicy {
     /// deterministic exhaustion validation through the production seam.
     #[must_use]
     pub fn with_sequence_ceiling_for_validation(output_sequence_ceiling: u64) -> Arc<Self> {
-        Arc::new(Self { limits: ImageLimits::V1, output_sequence_ceiling })
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling,
+            process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
+            session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct immutable v1 limits with a smaller per-command work ceiling so
+    /// validation can prove that work admission precedes decoder allocation.
+    #[must_use]
+    pub fn with_work_ceiling_for_validation(max_work_units_per_command: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits { max_work_units_per_command, ..ImageLimits::V1 },
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(ImageLimits::V1.max_process_retained_bytes),
+            session_storage_limit: ImageLimits::V1.max_session_retained_cpu_bytes,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct a shared policy with small storage limits for exact boundary evidence.
+    #[must_use]
+    pub fn with_storage_limits_for_validation(
+        session_storage_limit: u64,
+        process_storage_limit: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(process_storage_limit),
+            session_storage_limit,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct immutable storage limits with deterministic extra observed
+    /// capacity for production-path reconciliation validation.
+    #[must_use]
+    pub fn with_storage_capacity_observer_for_validation(
+        session_storage_limit: u64,
+        process_storage_limit: u64,
+        observed_capacity_extra: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(process_storage_limit),
+            session_storage_limit,
+            observed_capacity_extra,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct immutable limits and one safe deterministic ledger fault.
+    #[must_use]
+    pub fn with_storage_fault_for_validation(
+        session_storage_limit: u64,
+        process_storage_limit: u64,
+        observed_capacity_extra: usize,
+        fault: StorageLedgerValidationFault,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(process_storage_limit),
+            session_storage_limit,
+            observed_capacity_extra,
+            storage_validation_fault: Some(fault),
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct immutable limits with one typed reservation rejection at an
+    /// exact production budget call for ingress transaction validation.
+    #[must_use]
+    pub fn with_storage_rejection_for_validation(
+        session_storage_limit: u64,
+        process_storage_limit: u64,
+        class: StorageAllocationClass,
+        matching_ordinal: u64,
+        rejection: GraphicsStorageRejection,
+    ) -> Arc<Self> {
+        assert!(matching_ordinal > 0, "validation rejection ordinal must be nonzero");
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(process_storage_limit),
+            session_storage_limit,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: Some(StorageValidationRejection {
+                class,
+                matching_ordinal,
+                rejection,
+            }),
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: None,
+        })
+    }
+
+    /// Construct one paused production allocation rejection so validation can
+    /// release an unrelated detached owner while the transaction gate is held.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_paused_storage_rejection_for_validation(
+        class: StorageAllocationClass,
+        matching_ordinal: u64,
+        rejection: GraphicsStorageRejection,
+        reached: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    ) -> Arc<Self> {
+        assert!(matching_ordinal > 0, "validation rejection ordinal must be nonzero");
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(u64::MAX),
+            session_storage_limit: u64::MAX,
+            observed_capacity_extra: 0,
+            storage_validation_fault: None,
+            storage_validation_rejection: Some(StorageValidationRejection {
+                class,
+                matching_ordinal,
+                rejection,
+            }),
+            storage_validation_snapshot_fault: None,
+            storage_validation_pause: Some(StorageValidationPause {
+                class,
+                matching_ordinal,
+                reached,
+                resume,
+            }),
+        })
+    }
+
+    /// Construct immutable limits with one ledger-side snapshot rejection.
+    #[must_use]
+    pub fn with_storage_snapshot_fault_for_validation(
+        session_storage_limit: u64,
+        process_storage_limit: u64,
+        observed_capacity_extra: usize,
+        fault: StorageSnapshotValidationFault,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            limits: ImageLimits::V1,
+            output_sequence_ceiling: u64::MAX,
+            process_storage: StorageProcess::new(process_storage_limit),
+            session_storage_limit,
+            observed_capacity_extra,
+            storage_validation_fault: None,
+            storage_validation_rejection: None,
+            storage_validation_snapshot_fault: Some(fault),
+            storage_validation_pause: None,
+        })
     }
 
     /// Return a copy of the immutable process limits.
@@ -769,16 +1181,16 @@ impl TerminalImageProcessPolicy {
 }
 
 /// Image-side meaning of one ordered graphics boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TerminalImageBoundary {
-    Kitty(KittyCommand),
-    Sixel(SixelCommand),
+    Kitty { command: KittyCommand },
+    Sixel { command: SixelCommand },
     SixelMode { mode: SixelMode, enabled: bool },
     Failure(GraphicsFailure),
 }
 
 /// One output from production framing, in original PTY byte order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionTerminalOutput {
     /// Bytes to feed to the ordinary terminal exactly once.
     Raw(RawBytes),
@@ -787,19 +1199,30 @@ pub enum SessionTerminalOutput {
 }
 
 /// Caller-owned result of one PTY read; no output is fanned out by the seam.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SessionTerminalCommit {
     pub generation: TerminalImageGeneration,
     pub through_sequence: TerminalOutputSequence,
-    pub outputs: Vec<SessionTerminalOutput>,
+    pub outputs: GraphicsStorageVec<SessionTerminalOutput>,
     pub input_range: RawByteRange,
-    pub grid_observations: Vec<TerminalGridSpanObservation>,
+    grid_observations: Option<GraphicsStorageVec<TerminalGridSpanObservation>>,
+    /// Typed paired-ledger rejection that truncated this commit's observations.
+    pub grid_observation_rejection: Option<GraphicsStorageRejection>,
+}
+
+impl SessionTerminalCommit {
+    /// Borrow the ordered grid spans while their storage ownership lives.
+    #[must_use]
+    pub fn grid_observations(&self) -> &[TerminalGridSpanObservation] {
+        self.grid_observations.as_ref().map_or(&[], GraphicsStorageVec::as_slice)
+    }
 }
 
 /// Failure at the session ordering seam before any image state is committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionTerminalError {
     SequenceExhausted,
+    Storage(GraphicsStorageRejection),
 }
 
 impl fmt::Display for SessionTerminalError {
@@ -807,6 +1230,9 @@ impl fmt::Display for SessionTerminalError {
         match self {
             Self::SequenceExhausted => {
                 formatter.write_str("terminal image output sequence exhausted")
+            }
+            Self::Storage(rejection) => {
+                write!(formatter, "terminal image storage failure: {rejection:?}")
             }
         }
     }
@@ -850,6 +1276,13 @@ pub struct SessionTerminal {
     pending_transfer: Option<PendingGraphicsTransfer>,
     framing_work: SessionTerminalFramingWork,
     grid_observer: TerminalGridObserverHandle,
+    storage_budget: Arc<DecodeStorage>,
+    pending_kitty_storage: Option<OwnedImageStorage>,
+    completed_kitty_storage: Option<OwnedImageStorage>,
+    sixel_body_storage: Option<OwnedImageStorage>,
+    kitty_decoded_storage: Option<DecodeBuffer>,
+    sixel_decoded_storage: Option<DecodeBuffer>,
+    pending_kitty_decode: Option<PendingKittyDecode>,
 }
 
 impl SessionTerminal {
@@ -858,9 +1291,23 @@ impl SessionTerminal {
     pub fn new(policy: Arc<TerminalImageProcessPolicy>) -> Self {
         let max_control_string_bytes =
             usize::try_from(policy.limits.max_control_string_bytes).unwrap_or(usize::MAX);
+        let storage_budget = DecodeStorage::new(
+            Arc::clone(&policy.process_storage),
+            policy.session_storage_limit,
+            policy.observed_capacity_extra,
+            StorageValidation {
+                ledger_fault: policy.storage_validation_fault,
+                rejection: policy.storage_validation_rejection,
+                snapshot_fault: policy.storage_validation_snapshot_fault,
+                pause: policy.storage_validation_pause.clone(),
+            },
+        );
         Self {
             policy,
-            framer: GraphicsFramer::with_max_control_string_bytes(max_control_string_bytes),
+            framer: GraphicsFramer::with_storage_budget(
+                max_control_string_bytes,
+                Arc::clone(&storage_budget),
+            ),
             generation: TerminalImageGeneration(1),
             sequence: TerminalOutputSequence(0),
             active_screen: TerminalScreenKind::Primary,
@@ -868,12 +1315,70 @@ impl SessionTerminal {
             placements: BTreeMap::new(),
             pending_transfer: None,
             framing_work: SessionTerminalFramingWork::default(),
-            grid_observer: TerminalGridObserverHandle::default(),
+            grid_observer: TerminalGridObserverHandle::new(Arc::clone(&storage_budget)),
+            storage_budget,
+            pending_kitty_storage: None,
+            completed_kitty_storage: None,
+            sixel_body_storage: None,
+            kitty_decoded_storage: None,
+            sixel_decoded_storage: None,
+            pending_kitty_decode: None,
         }
     }
 
     /// Consume one PTY read and return raw/image boundaries without fanout.
     pub fn process_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<SessionTerminalCommit, SessionTerminalError> {
+        let storage_budget = Arc::clone(&self.storage_budget);
+        let _transaction =
+            storage_budget.lock_transaction().map_err(SessionTerminalError::Storage)?;
+        let checkpoint = storage_budget.checkpoint().map_err(SessionTerminalError::Storage)?;
+        let kitty_existed = self.pending_kitty_decode.is_some();
+        if let Some(pending) = self.pending_kitty_decode.as_mut() {
+            pending.transfer.begin_transaction().map_err(|_| {
+                SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant)
+            })?;
+        }
+        let mut result = self.process_bytes_transaction(bytes);
+        if result.is_ok() {
+            if let Err(error) = self.commit_staged_transactions() {
+                result = Err(error);
+            }
+        } else {
+            self.rollback_staged_transactions(kitty_existed)?;
+        }
+        if result.is_err() {
+            storage_budget.rollback(&checkpoint).map_err(SessionTerminalError::Storage)?;
+        }
+        result
+    }
+
+    fn commit_staged_transactions(&mut self) -> Result<(), SessionTerminalError> {
+        self.framer.commit_staged();
+        let Some(pending) = self.pending_kitty_decode.as_mut() else { return Ok(()) };
+        if !pending.transfer.transaction_active() {
+            return Ok(());
+        }
+        pending.transfer.commit_transaction().map_err(|_| internal_storage_error())
+    }
+
+    fn rollback_staged_transactions(
+        &mut self,
+        kitty_existed: bool,
+    ) -> Result<(), SessionTerminalError> {
+        self.framer.rollback_staged().map_err(SessionTerminalError::Storage)?;
+        self.pending_transfer = self.framer.pending_transfer();
+        if !kitty_existed {
+            self.pending_kitty_decode = None;
+            return Ok(());
+        }
+        let pending = self.pending_kitty_decode.as_mut().ok_or_else(internal_storage_error)?;
+        pending.transfer.rollback_transaction().map_err(|_| internal_storage_error())
+    }
+
+    fn process_bytes_transaction(
         &mut self,
         bytes: &[u8],
     ) -> Result<SessionTerminalCommit, SessionTerminalError> {
@@ -887,6 +1392,11 @@ impl SessionTerminal {
         // directly and avoid cloning a retained transfer of up to 16 MiB.
         let boundary_upper_bound =
             u64::try_from(bytes.len()).map_err(|_| SessionTerminalError::SequenceExhausted)?;
+        let outputs = GraphicsStorageVec::new(
+            Arc::clone(&self.storage_budget),
+            GraphicsStorageClass::TerminalOutputs,
+        )
+        .map_err(SessionTerminalError::Storage)?;
         let direct_through = self
             .sequence
             .0
@@ -894,48 +1404,86 @@ impl SessionTerminal {
             .filter(|sequence| *sequence <= self.policy.output_sequence_ceiling);
 
         if direct_through.is_some() {
-            let events = self.framer.push(bytes);
+            let events = match self.framer.push_staged(bytes) {
+                Ok(events) => events,
+                Err(rejection) => {
+                    self.pending_transfer = self.framer.pending_transfer();
+                    return Err(SessionTerminalError::Storage(rejection));
+                }
+            };
             self.record_direct_read();
-            return Ok(self.commit_events(events, None, input_range));
+            self.pending_transfer = self.framer.pending_transfer();
+            return self.commit_events(events, outputs, None, input_range);
         }
 
         // Only reads close enough to sequence exhaustion to fail the safe
         // upper bound need rollback parsing. The original framer and all
         // canonical state remain untouched when actual emitted events exceed
         // the remaining sequence capacity.
-        let mut candidate_framer = self.framer.clone();
+        let mut candidate_framer =
+            self.framer.try_clone().map_err(SessionTerminalError::Storage)?;
         self.record_speculative_clone();
-        let events = candidate_framer.push(bytes);
+        let events = match candidate_framer.push(bytes) {
+            Ok(events) => events,
+            Err(rejection) => return Err(SessionTerminalError::Storage(rejection)),
+        };
         let through_sequence = self.preflight_sequence(&events)?;
+        let commit = self.commit_events(events, outputs, Some(through_sequence), input_range)?;
         self.framer = candidate_framer;
-        Ok(self.commit_events(events, Some(through_sequence), input_range))
+        self.pending_transfer = self.framer.pending_transfer();
+        Ok(commit)
     }
 
     fn commit_events(
         &mut self,
-        events: Vec<GraphicsEvent>,
+        events: GraphicsStorageVec<GraphicsEvent>,
+        outputs: GraphicsStorageVec<SessionTerminalOutput>,
         admitted_sequence: Option<TerminalOutputSequence>,
         input_range: RawByteRange,
-    ) -> SessionTerminalCommit {
-        let mut output_sequence = self.sequence;
-        let mut outputs = Vec::with_capacity(events.len());
-        for event in events {
-            self.append_event(event, &mut output_sequence, &mut outputs);
+    ) -> Result<SessionTerminalCommit, SessionTerminalError> {
+        let mut staged = StagedRead {
+            sequence: self.sequence,
+            outputs,
+            sixel_body: StagedStorage::Unchanged,
+            kitty_decoded: StagedDecodeStorage::Unchanged,
+            sixel_decoded: StagedDecodeStorage::Unchanged,
+            completed_kitty_transfer: None,
+        };
+        if let Err(error) = self.stage_events(events, &mut staged) {
+            self.restore_completed_kitty_transfer(&mut staged);
+            return Err(error);
         }
-        if let Some(admitted_sequence) = admitted_sequence {
-            assert_eq!(
-                output_sequence, admitted_sequence,
-                "sequence preflight must equal committed image boundary count"
-            );
+        if admitted_sequence.is_some_and(|admitted| staged.sequence != admitted) {
+            return Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant));
         }
-        self.sequence = output_sequence;
-        self.pending_transfer = self.framer.pending_transfer();
-        SessionTerminalCommit {
+        staged.sixel_body.apply(&mut self.sixel_body_storage);
+        staged.kitty_decoded.apply(&mut self.kitty_decoded_storage);
+        staged.sixel_decoded.apply(&mut self.sixel_decoded_storage);
+        self.sequence = staged.sequence;
+        Ok(SessionTerminalCommit {
             generation: self.generation,
             through_sequence: self.sequence,
-            outputs,
+            outputs: staged.outputs,
             input_range,
-            grid_observations: Vec::new(),
+            grid_observations: None,
+            grid_observation_rejection: None,
+        })
+    }
+
+    fn stage_events(
+        &mut self,
+        events: GraphicsStorageVec<GraphicsEvent>,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        for event in events {
+            self.stage_event(event, staged)?;
+        }
+        Ok(())
+    }
+
+    fn restore_completed_kitty_transfer(&mut self, staged: &mut StagedRead) {
+        if let Some(pending) = staged.completed_kitty_transfer.take() {
+            self.pending_kitty_decode = Some(pending);
         }
     }
 
@@ -982,10 +1530,79 @@ impl SessionTerminal {
         self.framing_work
     }
 
+    /// Current and peak session/process storage counters.
+    pub fn storage_counters(
+        &self,
+    ) -> Result<(ImageStorageCounters, ImageStorageCounters), SessionTerminalError> {
+        self.storage_budget.counters().map_err(SessionTerminalError::Storage)
+    }
+
+    pub fn storage_class_counters(
+        &self,
+        class: StorageAllocationClass,
+    ) -> Result<(ImageStorageClassCounters, ImageStorageClassCounters), SessionTerminalError> {
+        self.storage_budget.class_counters(class).map_err(SessionTerminalError::Storage)
+    }
+
+    /// Release every retained image buffer; framer/event owners release independently.
+    pub fn release_retained_storage(&mut self) {
+        self.pending_kitty_storage = None;
+        self.completed_kitty_storage = None;
+        self.pending_kitty_decode = None;
+        self.sixel_body_storage = None;
+        self.kitty_decoded_storage = None;
+        self.sixel_decoded_storage = None;
+    }
+
+    /// Payload-free requested/observed ownership by allocation path.
+    #[must_use]
+    pub fn storage_ownership(&self) -> ImageStorageOwnership {
+        ImageStorageOwnership {
+            pending_kitty_requested: self
+                .pending_kitty_decode
+                .as_ref()
+                .map_or(0, |pending| pending.transfer.retained_requested_bytes()),
+            pending_kitty_observed: self
+                .pending_kitty_decode
+                .as_ref()
+                .map_or(0, |pending| pending.transfer.retained_observed_bytes()),
+            completed_kitty_requested: requested(self.completed_kitty_storage.as_ref()),
+            completed_kitty_observed: observed(self.completed_kitty_storage.as_ref()),
+            sixel_body_requested: requested(self.sixel_body_storage.as_ref()),
+            sixel_body_observed: observed(self.sixel_body_storage.as_ref()),
+            kitty_decoded_requested: decoded_requested(self.kitty_decoded_storage.as_ref()),
+            kitty_decoded_observed: decoded_observed(self.kitty_decoded_storage.as_ref()),
+            sixel_decoded_requested: decoded_requested(self.sixel_decoded_storage.as_ref()),
+            sixel_decoded_observed: decoded_observed(self.sixel_decoded_storage.as_ref()),
+        }
+    }
+
+    /// Return stable payload-free canonical digests for validation evidence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_storage_digests(&self) -> ImageStorageDigests {
+        ImageStorageDigests {
+            pending_kitty: self
+                .pending_kitty_decode
+                .as_ref()
+                .map_or(0, |pending| pending.transfer.validation_digest()),
+            completed_kitty: storage_digest(self.completed_kitty_storage.as_ref()),
+            sixel_body: storage_digest(self.sixel_body_storage.as_ref()),
+            kitty_decoded: decoded_storage_digest(self.kitty_decoded_storage.as_ref()),
+            sixel_decoded: decoded_storage_digest(self.sixel_decoded_storage.as_ref()),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_pending_kitty_decode_state(&self) -> Option<(u32, usize, bool)> {
+        self.pending_kitty_decode.as_ref().map(|pending| pending.transfer.validation_state())
+    }
+
     /// Confirm that two sessions use the exact same process policy object.
     #[must_use]
     pub fn shares_process_policy_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.policy, &other.policy)
+        self.storage_budget.shares_process_with(&other.storage_budget)
     }
 
     fn preflight_sequence(
@@ -1004,40 +1621,239 @@ impl SessionTerminal {
             .ok_or(SessionTerminalError::SequenceExhausted)
     }
 
-    fn append_event(
-        &self,
+    fn stage_event(
+        &mut self,
         event: GraphicsEvent,
-        sequence: &mut TerminalOutputSequence,
-        outputs: &mut Vec<SessionTerminalOutput>,
-    ) {
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
         match event {
-            GraphicsEvent::Raw(raw) => outputs.push(SessionTerminalOutput::Raw(raw)),
+            GraphicsEvent::Raw(raw) => staged
+                .outputs
+                .push(SessionTerminalOutput::Raw(raw))
+                .map_err(SessionTerminalError::Storage)?,
             GraphicsEvent::Kitty { range, command } => {
-                self.append_image(range, TerminalImageBoundary::Kitty(command), sequence, outputs);
+                self.stage_kitty_event(range, command, staged)?;
             }
             GraphicsEvent::Sixel { range, command } => {
-                self.append_image(range, TerminalImageBoundary::Sixel(command), sequence, outputs);
+                self.stage_sixel_event(range, command, staged)?;
             }
             GraphicsEvent::SixelMode(change) => {
                 let range = change.raw.range;
-                outputs.push(SessionTerminalOutput::Raw(change.raw));
+                staged
+                    .outputs
+                    .push(SessionTerminalOutput::Raw(change.raw))
+                    .map_err(SessionTerminalError::Storage)?;
                 self.append_image(
                     range,
                     TerminalImageBoundary::SixelMode { mode: change.mode, enabled: change.enabled },
-                    sequence,
-                    outputs,
-                );
+                    &mut staged.sequence,
+                    &mut staged.outputs,
+                )?;
             }
             GraphicsEvent::Failure(failure) => {
                 let range = failure.range;
                 self.append_image(
                     range,
                     TerminalImageBoundary::Failure(failure),
-                    sequence,
-                    outputs,
-                );
+                    &mut staged.sequence,
+                    &mut staged.outputs,
+                )?;
             }
         }
+        Ok(())
+    }
+
+    fn stage_kitty_event(
+        &mut self,
+        range: RawByteRange,
+        mut command: KittyCommand,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        match self.prepare_kitty_transfer(range, &command, staged)? {
+            KittyTransferPreparation::Ready => {}
+            KittyTransferPreparation::Passthrough => {
+                self.append_image(
+                    range,
+                    TerminalImageBoundary::Kitty { command },
+                    &mut staged.sequence,
+                    &mut staged.outputs,
+                )?;
+                return Ok(());
+            }
+            KittyTransferPreparation::HandledFailure => return Ok(()),
+        }
+
+        let more = command.chunk_state == KittyChunkState::More;
+        let limits = decode_limits(self.policy.limits);
+        let mut budget = match DecodeBudget::new(limits, &NoopHooks, self.storage_budget.as_ref())
+            .map_err(|error| {
+                kitty_boundary_error(scribe_common::kitty_decode::KittyDecodeError::from(error))
+            }) {
+            Ok(budget) => budget,
+            Err(error) => {
+                self.reject_kitty_decode(range, error, staged)?;
+                return Ok(());
+            }
+        };
+        let push_result = self
+            .pending_kitty_decode
+            .as_mut()
+            .ok_or(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))?
+            .transfer
+            .push_chunk(command.payload(), more, &mut budget)
+            .map_err(kitty_boundary_error);
+        if let Err(error) = push_result {
+            self.reject_kitty_decode(range, error, staged)?;
+            return Ok(());
+        }
+
+        if more {
+            self.append_image(
+                range,
+                TerminalImageBoundary::Kitty { command },
+                &mut staged.sequence,
+                &mut staged.outputs,
+            )?;
+            return Ok(());
+        }
+
+        let (controls, presence) = self
+            .pending_kitty_decode
+            .as_ref()
+            .map(|pending| (pending.controls, pending.presence))
+            .ok_or(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))?;
+        // Continuation chunks may omit every control, so the published final
+        // boundary carries the transfer's first-command controls and presence.
+        command.adopt_transfer_controls(controls, presence);
+        let decoded = self
+            .pending_kitty_decode
+            .as_ref()
+            .ok_or(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))?
+            .transfer
+            .finish_preserving(&mut budget)
+            .map_err(kitty_boundary_error);
+        match decoded {
+            Ok(_decoded) if controls.action == KittyAction::Query => {}
+            Ok(decoded) => staged.kitty_decoded = StagedDecodeStorage::Replace(decoded.rgba),
+            Err(DecodeBoundaryError::Storage(error)) => {
+                return Err(SessionTerminalError::Storage(error));
+            }
+            Err(DecodeBoundaryError::Protocol(category)) => {
+                staged.completed_kitty_transfer = self.pending_kitty_decode.take();
+                self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)?;
+                return Ok(());
+            }
+        }
+        staged.completed_kitty_transfer = self.pending_kitty_decode.take();
+        self.append_image(
+            range,
+            TerminalImageBoundary::Kitty { command },
+            &mut staged.sequence,
+            &mut staged.outputs,
+        )?;
+        Ok(())
+    }
+
+    fn reject_kitty_decode(
+        &mut self,
+        range: RawByteRange,
+        error: DecodeBoundaryError,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        match error {
+            DecodeBoundaryError::Storage(error) => Err(SessionTerminalError::Storage(error)),
+            DecodeBoundaryError::Protocol(category) => {
+                staged.completed_kitty_transfer = self.pending_kitty_decode.take();
+                self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)
+            }
+        }
+    }
+
+    fn prepare_kitty_transfer(
+        &mut self,
+        range: RawByteRange,
+        command: &KittyCommand,
+        staged: &mut StagedRead,
+    ) -> Result<KittyTransferPreparation, SessionTerminalError> {
+        if let Some(pending) = self.pending_kitty_decode.as_ref() {
+            if pending.controls.accepts_continuation(command) {
+                return Ok(KittyTransferPreparation::Ready);
+            }
+            staged.completed_kitty_transfer = self.pending_kitty_decode.take();
+            self.append_decode_failure(
+                range,
+                GraphicsProtocol::Kitty,
+                GraphicsFailureCategory::MalformedControl,
+                staged,
+            )?;
+            return Ok(KittyTransferPreparation::HandledFailure);
+        }
+        if !matches!(
+            command.action,
+            KittyAction::Transmit | KittyAction::TransmitDisplay | KittyAction::Query
+        ) {
+            return Ok(KittyTransferPreparation::Passthrough);
+        }
+        let Some(params) = kitty_decode_params(command) else {
+            self.append_decode_failure(
+                range,
+                GraphicsProtocol::Kitty,
+                GraphicsFailureCategory::MalformedControl,
+                staged,
+            )?;
+            return Ok(KittyTransferPreparation::HandledFailure);
+        };
+        let transfer =
+            match KittyTransfer::new(params, self.policy.limits).map_err(kitty_boundary_error) {
+                Ok(transfer) => transfer,
+                Err(DecodeBoundaryError::Storage(error)) => {
+                    return Err(SessionTerminalError::Storage(error));
+                }
+                Err(DecodeBoundaryError::Protocol(category)) => {
+                    self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)?;
+                    return Ok(KittyTransferPreparation::HandledFailure);
+                }
+            };
+        self.pending_kitty_decode = Some(PendingKittyDecode {
+            transfer,
+            controls: command.controls(),
+            presence: command.control_presence(),
+        });
+        Ok(KittyTransferPreparation::Ready)
+    }
+
+    fn stage_sixel_event(
+        &self,
+        range: RawByteRange,
+        command: SixelCommand,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        let body = OwnedImageStorage::from_slices(
+            &self.storage_budget,
+            StorageAllocationClass::CanonicalSixel,
+            &[command.payload()],
+        )
+        .map_err(SessionTerminalError::Storage)?;
+        staged.sixel_body = StagedStorage::Replace(body);
+        self.storage_budget.record_validation_stage(StorageAllocationClass::CanonicalSixel);
+        match self.decode_sixel(&command) {
+            Ok(decoded) => staged.sixel_decoded = StagedDecodeStorage::Replace(decoded.rgba),
+            Err(DecodeBoundaryError::Storage(error)) => {
+                return Err(SessionTerminalError::Storage(error));
+            }
+            Err(DecodeBoundaryError::Protocol(category)) => {
+                staged.sixel_body = StagedStorage::Clear;
+                self.append_decode_failure(range, GraphicsProtocol::Sixel, category, staged)?;
+                return Ok(());
+            }
+        }
+        self.append_image(
+            range,
+            TerminalImageBoundary::Sixel { command },
+            &mut staged.sequence,
+            &mut staged.outputs,
+        )?;
+        Ok(())
     }
 
     fn append_image(
@@ -1045,14 +1861,159 @@ impl SessionTerminal {
         range: RawByteRange,
         boundary: TerminalImageBoundary,
         sequence: &mut TerminalOutputSequence,
-        outputs: &mut Vec<SessionTerminalOutput>,
-    ) {
-        let next =
-            sequence.0.checked_add(1).filter(|next| *next <= self.policy.output_sequence_ceiling);
-        assert!(next.is_some(), "sequence preflight admitted every image boundary");
-        let next = next.unwrap_or(sequence.0);
+        outputs: &mut GraphicsStorageVec<SessionTerminalOutput>,
+    ) -> Result<(), SessionTerminalError> {
+        let next = sequence
+            .0
+            .checked_add(1)
+            .filter(|next| *next <= self.policy.output_sequence_ceiling)
+            .ok_or(SessionTerminalError::SequenceExhausted)?;
         *sequence = TerminalOutputSequence(next);
-        outputs.push(SessionTerminalOutput::Image { sequence: *sequence, range, boundary });
+        outputs
+            .push(SessionTerminalOutput::Image { sequence: *sequence, range, boundary })
+            .map_err(SessionTerminalError::Storage)
+    }
+
+    fn append_decode_failure(
+        &self,
+        range: RawByteRange,
+        protocol: GraphicsProtocol,
+        category: GraphicsFailureCategory,
+        staged: &mut StagedRead,
+    ) -> Result<(), SessionTerminalError> {
+        self.append_image(
+            range,
+            TerminalImageBoundary::Failure(GraphicsFailure {
+                range,
+                protocol,
+                category,
+                limit: None,
+            }),
+            &mut staged.sequence,
+            &mut staged.outputs,
+        )
+    }
+
+    fn decode_sixel(
+        &self,
+        command: &SixelCommand,
+    ) -> Result<icy_sixel_decoder::DecodedSixel, DecodeBoundaryError> {
+        let settings = DcsSettings {
+            aspect_ratio: command.parameters.aspect,
+            background_mode: command.parameters.background,
+            grid_size: command.parameters.horizontal_grid,
+        };
+        decode_sixel_payload(
+            command.payload(),
+            settings,
+            decode_limits(self.policy.limits),
+            &NoopHooks,
+            self.storage_budget.as_ref(),
+        )
+        .map_err(|error| sixel_boundary_error(&error))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DecodeBoundaryError {
+    Storage(GraphicsStorageRejection),
+    Protocol(GraphicsFailureCategory),
+}
+
+fn decode_limits(limits: ImageLimits) -> DecodeLimits {
+    DecodeLimits {
+        max_width_pixels: limits.max_width_pixels as usize,
+        max_height_pixels: limits.max_height_pixels as usize,
+        max_pixels: usize::try_from(limits.max_pixels).unwrap_or(usize::MAX),
+        max_rgba_bytes: usize::try_from(limits.max_canonical_rgba_bytes).unwrap_or(usize::MAX),
+        max_work_units: limits.max_work_units_per_command,
+        deadline: Instant::now() + Duration::from_millis(limits.max_decode_ms),
+        check_interval_work_units: limits.deadline_check_interval_work_units,
+    }
+}
+
+fn kitty_decode_params(command: &KittyCommand) -> Option<KittyDataParams> {
+    let format = match command.format? {
+        KittyFormat::Rgb => DecodeKittyFormat::Rgb,
+        KittyFormat::Rgba => DecodeKittyFormat::Rgba,
+        KittyFormat::Png => DecodeKittyFormat::Png,
+    };
+    let compression = match command.compression {
+        KittyCompression::None => DecodeKittyCompression::None,
+        KittyCompression::Zlib => DecodeKittyCompression::Rfc1950Zlib,
+    };
+    Some(KittyDataParams {
+        format,
+        transport: KittyTransport::Direct,
+        compression,
+        width: command.width,
+        height: command.height,
+    })
+}
+
+fn kitty_boundary_error(
+    error: scribe_common::kitty_decode::KittyDecodeError,
+) -> DecodeBoundaryError {
+    if let Some(storage) = error.storage {
+        return DecodeBoundaryError::Storage(storage);
+    }
+    DecodeBoundaryError::Protocol(rejection_category(error.reason))
+}
+
+fn internal_storage_error() -> SessionTerminalError {
+    SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant)
+}
+
+fn sixel_boundary_error(error: &SixelDecodeError) -> DecodeBoundaryError {
+    let category = match error {
+        SixelDecodeError::InvalidLimit { .. } | SixelDecodeError::InvalidDimensions { .. } => {
+            GraphicsFailureCategory::MalformedControl
+        }
+        SixelDecodeError::QuotaExceeded { .. } | SixelDecodeError::AllocationFailed { .. } => {
+            GraphicsFailureCategory::QuotaExceeded
+        }
+        SixelDecodeError::Malformed { .. } => GraphicsFailureCategory::MalformedPayload,
+        SixelDecodeError::WorkBudgetExceeded { .. }
+        | SixelDecodeError::DecodeDeadlineExceeded { .. }
+        | SixelDecodeError::DecodeCancelled { .. } => GraphicsFailureCategory::QuotaExceeded,
+        SixelDecodeError::Storage(storage) => {
+            return DecodeBoundaryError::Storage(*storage);
+        }
+    };
+    DecodeBoundaryError::Protocol(category)
+}
+
+fn rejection_category(reason: TerminalImageRejectionReason) -> GraphicsFailureCategory {
+    match reason {
+        TerminalImageRejectionReason::PolicyDisabled
+        | TerminalImageRejectionReason::UnsupportedProtocol => {
+            GraphicsFailureCategory::UnsupportedProtocol
+        }
+        TerminalImageRejectionReason::UnsupportedAction => {
+            GraphicsFailureCategory::UnsupportedAction
+        }
+        TerminalImageRejectionReason::UnsupportedTransport => {
+            GraphicsFailureCategory::UnsupportedTransport
+        }
+        TerminalImageRejectionReason::MalformedFraming
+        | TerminalImageRejectionReason::TruncatedSequence => {
+            GraphicsFailureCategory::MalformedFraming
+        }
+        TerminalImageRejectionReason::MalformedControl => GraphicsFailureCategory::MalformedControl,
+        TerminalImageRejectionReason::MalformedPayload
+        | TerminalImageRejectionReason::ChunkMismatch
+        | TerminalImageRejectionReason::DecodeFailed => GraphicsFailureCategory::MalformedPayload,
+        TerminalImageRejectionReason::InvalidDimensions => {
+            GraphicsFailureCategory::MalformedControl
+        }
+        TerminalImageRejectionReason::QuotaExceeded
+        | TerminalImageRejectionReason::WorkBudgetExceeded
+        | TerminalImageRejectionReason::DecodeDeadlineExceeded
+        | TerminalImageRejectionReason::DecodeCancelled => GraphicsFailureCategory::QuotaExceeded,
+        TerminalImageRejectionReason::ImageNotFound
+        | TerminalImageRejectionReason::CapabilityMismatch
+        | TerminalImageRejectionReason::RendererUnavailable
+        | TerminalImageRejectionReason::Evicted => GraphicsFailureCategory::UnsupportedAction,
     }
 }
 
@@ -1099,6 +2060,68 @@ impl PtyTerminalImageState {
     pub fn record_grid_observation(&mut self, observation: &TerminalGridObservation) {
         self.terminal.observe_active_screen(observation.active_screen);
     }
+
+    /// Current and peak session/process storage counters.
+    pub fn storage_counters(
+        &self,
+    ) -> Result<(ImageStorageCounters, ImageStorageCounters), SessionTerminalError> {
+        self.terminal.storage_counters()
+    }
+
+    /// Read immutable ledger snapshots for deterministic fault validation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_storage_counters(&self) -> (ImageStorageCounters, ImageStorageCounters) {
+        self.terminal.storage_budget.validation_counters()
+    }
+
+    #[doc(hidden)]
+    pub fn validation_storage_class_counters(
+        &self,
+        class: StorageAllocationClass,
+    ) -> Result<(ImageStorageClassCounters, ImageStorageClassCounters), SessionTerminalError> {
+        self.terminal.storage_class_counters(class)
+    }
+
+    /// Return matching allocation attempts and fired rejections for the
+    /// immutable allocation-class validation target.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_rejection_observation(&self) -> (u64, u64, u64) {
+        self.terminal.storage_budget.validation_rejection_observation()
+    }
+
+    /// Return the allocation class and class-local occurrence whose observed
+    /// capacity reconciliation most recently hit a storage ceiling.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_reconcile_rejection(&self) -> Option<(StorageAllocationClass, u64)> {
+        self.terminal.storage_budget.validation_reconcile_rejection()
+    }
+
+    /// Release all canonical/pending/decoded image storage.
+    pub fn release_retained_storage(&mut self) {
+        self.terminal.release_retained_storage();
+    }
+
+    /// Payload-free ownership facts for accounting evidence.
+    #[must_use]
+    pub fn storage_ownership(&self) -> ImageStorageOwnership {
+        self.terminal.storage_ownership()
+    }
+
+    /// Return stable payload-free canonical digests for validation evidence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_storage_digests(&self) -> ImageStorageDigests {
+        self.terminal.validation_storage_digests()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn validation_pending_kitty_decode_state(&self) -> Option<(u32, usize, bool)> {
+        self.terminal.validation_pending_kitty_decode_state()
+    }
 }
 
 /// Feed one read through the existing Alacritty processor and real `Term`,
@@ -1111,11 +2134,62 @@ pub fn feed_terminal_observed<T: EventListener>(
     bytes: &[u8],
     commit: &mut SessionTerminalCommit,
 ) {
+    let cuts: Vec<RawByteRange> = commit
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            SessionTerminalOutput::Image { range, .. } => Some(*range),
+            SessionTerminalOutput::Raw(_) => None,
+        })
+        .collect();
+    let collected = feed_terminal_observed_at_cuts(
+        observer,
+        term,
+        ansi_processor,
+        bytes,
+        (commit.input_range, cuts),
+    );
+    commit.grid_observations = collected.spans;
+    commit.grid_observation_rejection = collected.storage_rejection;
+}
+
+/// Ordered span observations plus the typed paired-ledger rejection, if any,
+/// that truncated them under storage pressure.
+#[derive(Debug, Default)]
+pub struct ObservedTerminalGridSpans {
+    spans: Option<GraphicsStorageVec<TerminalGridSpanObservation>>,
+    pub storage_rejection: Option<GraphicsStorageRejection>,
+}
+
+impl ObservedTerminalGridSpans {
+    /// Borrow the ordered spans while their storage ownership lives.
+    #[must_use]
+    pub fn as_slice(&self) -> &[TerminalGridSpanObservation] {
+        self.spans.as_ref().map_or(&[], GraphicsStorageVec::as_slice)
+    }
+}
+
+/// Collect ordered span observations, reserving every retained byte of span
+/// and effect metadata from the session/process ledger pair before it is
+/// allocated. Storage pressure truncates the payload-free list and returns the
+/// typed rejection; the already-fed terminal is never rewound.
+fn feed_terminal_observed_at_cuts<T, Cuts>(
+    observer: &TerminalGridObserverHandle,
+    term: &mut Term<T>,
+    ansi_processor: &mut AnsiProcessor,
+    bytes: &[u8],
+    boundaries: (RawByteRange, Cuts),
+) -> ObservedTerminalGridSpans
+where
+    T: EventListener,
+    Cuts: IntoIterator<Item = RawByteRange>,
+{
+    let (input_range, cuts) = boundaries;
+    let mut collected = ObservedTerminalGridSpans::default();
     let mut state = observer.lock();
-    let mut absolute_start = commit.input_range.start;
-    for output in &commit.outputs {
-        let SessionTerminalOutput::Image { range, .. } = output else { continue };
-        if range.end <= commit.input_range.start || range.end > commit.input_range.end {
+    let mut absolute_start = input_range.start;
+    for range in cuts {
+        if range.end <= input_range.start || range.end > input_range.end {
             continue;
         }
         debug_assert!(
@@ -1127,34 +2201,90 @@ pub fn feed_terminal_observed<T: EventListener>(
             continue;
         }
         let relative_start =
-            usize::try_from(absolute_start - commit.input_range.start).unwrap_or(bytes.len());
-        let relative_end =
-            usize::try_from(absolute_end - commit.input_range.start).unwrap_or(bytes.len());
+            usize::try_from(absolute_start - input_range.start).unwrap_or(bytes.len());
+        let relative_end = usize::try_from(absolute_end - input_range.start).unwrap_or(bytes.len());
         let Some(span) = bytes.get(relative_start..relative_end) else {
             break;
         };
-        let mut handler = ObservedTermHandler::new(term, &mut state);
+        let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
         ansi_processor.advance(&mut handler, span);
-        let observation = handler.finish();
-        commit.grid_observations.push(TerminalGridSpanObservation {
-            range: RawByteRange { start: absolute_start, end: absolute_end },
-            observation,
-        });
+        let finished = handler.finish();
+        push_span(
+            &observer.budget,
+            &mut collected,
+            RawByteRange { start: absolute_start, end: absolute_end },
+            finished,
+        );
         absolute_start = absolute_end;
     }
-    if absolute_start < commit.input_range.end {
+    if absolute_start < input_range.end {
         let relative_start =
-            usize::try_from(absolute_start - commit.input_range.start).unwrap_or(bytes.len());
+            usize::try_from(absolute_start - input_range.start).unwrap_or(bytes.len());
         if let Some(span) = bytes.get(relative_start..) {
-            let mut handler = ObservedTermHandler::new(term, &mut state);
+            let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
             ansi_processor.advance(&mut handler, span);
-            let observation = handler.finish();
-            commit.grid_observations.push(TerminalGridSpanObservation {
-                range: RawByteRange { start: absolute_start, end: commit.input_range.end },
-                observation,
-            });
+            let finished = handler.finish();
+            push_span(
+                &observer.budget,
+                &mut collected,
+                RawByteRange { start: absolute_start, end: input_range.end },
+                finished,
+            );
         }
     }
+    collected
+}
+
+/// Reserve, then retain, one span observation and its effect ownership.
+fn push_span(
+    budget: &Arc<GraphicsStorageBudget>,
+    collected: &mut ObservedTerminalGridSpans,
+    range: RawByteRange,
+    finished: ObservedTerminalGridSpan,
+) {
+    if let Some(error) = finished.storage_rejection {
+        collected.storage_rejection = Some(error);
+    }
+    let span = TerminalGridSpanObservation {
+        range,
+        observation: finished.observation,
+        effects: finished.effects,
+    };
+    let spans = match collected.spans.as_mut() {
+        Some(spans) => spans,
+        None => match GraphicsStorageVec::new(
+            Arc::clone(budget),
+            GraphicsStorageClass::GridObservations,
+        ) {
+            Ok(spans) => collected.spans.insert(spans),
+            Err(error) => {
+                collected.storage_rejection = Some(error);
+                return;
+            }
+        },
+    };
+    if let Err(error) = spans.push(span) {
+        collected.storage_rejection = Some(error);
+    }
+}
+
+/// Exercise ordered boundary-cut deduplication using payload-free metadata.
+#[doc(hidden)]
+pub fn feed_terminal_observed_with_validation_cuts<T: EventListener>(
+    observer: &TerminalGridObserverHandle,
+    term: &mut Term<T>,
+    ansi_processor: &mut AnsiProcessor,
+    bytes: &[u8],
+    boundaries: (RawByteRange, &[RawByteRange]),
+) -> ObservedTerminalGridSpans {
+    let (input_range, cuts) = boundaries;
+    feed_terminal_observed_at_cuts(
+        observer,
+        term,
+        ansi_processor,
+        bytes,
+        (input_range, cuts.iter().copied()),
+    )
 }
 
 /// Feed one unsplittable source span through the delegating observer.
@@ -1167,9 +2297,9 @@ pub fn feed_terminal_observed_full_span<T: EventListener>(
     term: &mut Term<T>,
     ansi_processor: &mut AnsiProcessor,
     bytes: &[u8],
-) -> TerminalGridObservation {
+) -> ObservedTerminalGridSpan {
     let mut state = observer.lock();
-    let mut handler = ObservedTermHandler::new(term, &mut state);
+    let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
     ansi_processor.advance(&mut handler, bytes);
     handler.finish()
 }
@@ -1185,17 +2315,17 @@ pub fn feed_terminal_image_result_observed<T: EventListener>(
     ansi_processor: &mut AnsiProcessor,
     bytes: &[u8],
     image_result: &mut Result<SessionTerminalCommit, SessionTerminalError>,
-) -> TerminalGridObservation {
+) -> ObservedTerminalGridSpan {
     let observer = terminal_images.grid_observer();
-    let observation = feed_terminal_image_result_with_observer(
+    let span = feed_terminal_image_result_with_observer(
         &observer,
         term,
         ansi_processor,
         bytes,
         image_result,
     );
-    terminal_images.record_grid_observation(&observation);
-    observation
+    terminal_images.record_grid_observation(&span.observation);
+    span
 }
 
 /// Feed one framing result through a caller-owned production observer.
@@ -1208,17 +2338,63 @@ pub fn feed_terminal_image_result_with_observer<T: EventListener>(
     ansi_processor: &mut AnsiProcessor,
     bytes: &[u8],
     image_result: &mut Result<SessionTerminalCommit, SessionTerminalError>,
-) -> TerminalGridObservation {
+) -> ObservedTerminalGridSpan {
     match image_result {
         Ok(commit) => {
             feed_terminal_observed(observer, term, ansi_processor, bytes, commit);
-            commit
-                .grid_observations
-                .last()
-                .map_or_else(|| observer.observation(), |span| span.observation.clone())
+            // Committed effect ownership stays on the commit's own spans; this
+            // summary never duplicates the accounted effect storage.
+            ObservedTerminalGridSpan {
+                observation: commit
+                    .grid_observations()
+                    .last()
+                    .map_or_else(|| observer.observation(), |span| span.observation),
+                effects: None,
+                storage_rejection: commit.grid_observation_rejection,
+            }
         }
         Err(_) => feed_terminal_observed_full_span(observer, term, ansi_processor, bytes),
     }
+}
+
+/// Exact production lock/parser/observer orchestration for one PTY ingress result.
+pub struct ProductionTerminalFeed<'a, T: EventListener> {
+    observer: &'a TerminalGridObserverHandle,
+    term: &'a Arc<tokio::sync::Mutex<Term<T>>>,
+    ansi_processor: &'a mut AnsiProcessor,
+}
+
+impl<'a, T: EventListener> ProductionTerminalFeed<'a, T> {
+    pub fn new(
+        observer: &'a TerminalGridObserverHandle,
+        term: &'a Arc<tokio::sync::Mutex<Term<T>>>,
+        ansi_processor: &'a mut AnsiProcessor,
+    ) -> Self {
+        Self { observer, term, ansi_processor }
+    }
+}
+
+/// Feed one result through the production terminal context under its lock.
+pub async fn feed_terminal_image_result_production<T, AfterFeed>(
+    context: ProductionTerminalFeed<'_, T>,
+    bytes: &[u8],
+    mut image_result: Result<SessionTerminalCommit, SessionTerminalError>,
+    after_feed: AfterFeed,
+) -> (Result<SessionTerminalCommit, SessionTerminalError>, Option<ObservedTerminalGridSpan>)
+where
+    T: EventListener,
+    AfterFeed: FnOnce(),
+{
+    let mut term_guard = context.term.lock().await;
+    let span = feed_terminal_image_result_with_observer(
+        context.observer,
+        &mut *term_guard,
+        context.ansi_processor,
+        bytes,
+        &mut image_result,
+    );
+    after_feed();
+    (image_result, Some(span))
 }
 
 /// Flush VTE's buffered synchronized update through the production observer.
@@ -1230,11 +2406,21 @@ pub fn flush_terminal_observed<T: EventListener>(
     observer: &TerminalGridObserverHandle,
     term: &mut Term<T>,
     ansi_processor: &mut AnsiProcessor,
-) -> TerminalGridObservation {
+) -> ObservedTerminalGridSpan {
     let mut state = observer.lock();
-    let mut handler = ObservedTermHandler::new(term, &mut state);
+    let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
     ansi_processor.stop_sync(&mut handler);
     handler.finish()
+}
+
+/// Exact production lock/orchestrator path for synchronized-update timeout flush.
+pub async fn flush_terminal_observed_production<T: EventListener>(
+    observer: &TerminalGridObserverHandle,
+    term: &Arc<tokio::sync::Mutex<Term<T>>>,
+    ansi_processor: &mut AnsiProcessor,
+) -> ObservedTerminalGridSpan {
+    let mut term_guard = term.lock().await;
+    flush_terminal_observed(observer, &mut *term_guard, ansi_processor)
 }
 
 /// Synchronize the session observer after production `Term::resize`. Alacritty
@@ -1244,8 +2430,30 @@ pub fn observe_terminal_resize<T>(
     observer: &TerminalGridObserverHandle,
     term: &Term<T>,
     changed: bool,
-) {
-    observer.lock().observe_resize(term, changed);
+) -> ObservedTerminalGridSpan {
+    let mut state = observer.lock();
+    let resized = state.observe_resize(term, changed);
+    let observation = state.observation;
+    drop(state);
+    let mut span = ObservedTerminalGridSpan { observation, effects: None, storage_rejection: None };
+    if !resized {
+        return span;
+    }
+    let effect = ObservedTerminalGridEffect::Resize {
+        primary: observation.primary.size,
+        alternate: observation.alternate.size,
+    };
+    match GraphicsStorageVec::new(
+        Arc::clone(&observer.budget),
+        GraphicsStorageClass::GridObservations,
+    ) {
+        Ok(mut effects) => match effects.push(effect) {
+            Ok(()) => span.effects = Some(effects),
+            Err(error) => span.storage_rejection = Some(error),
+        },
+        Err(error) => span.storage_rejection = Some(error),
+    }
+    span
 }
 
 /// Apply an image-derived cursor movement to the real terminal and observer
@@ -1255,9 +2463,9 @@ pub fn apply_observed_cursor_move<T: EventListener>(
     term: &mut Term<T>,
     row: i32,
     column: u16,
-) -> TerminalGridObservation {
+) -> ObservedTerminalGridSpan {
     let mut state = observer.lock();
-    let mut handler = ObservedTermHandler::new(term, &mut state);
+    let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
     Handler::goto(&mut handler, row, usize::from(column));
     handler.finish()
 }
@@ -1293,7 +2501,7 @@ where
     FeedFuture: Future<
         Output = (
             Result<SessionTerminalCommit, SessionTerminalError>,
-            Option<TerminalGridObservation>,
+            Option<ObservedTerminalGridSpan>,
         ),
     >,
     Reject: FnOnce(PtyReaderIngressRejection),
@@ -1301,9 +2509,9 @@ where
     let image_result = terminal_images.terminal.process_bytes(bytes.as_ref());
     let observer = terminal_images.grid_observer();
     deliver(bytes.as_ref());
-    let (image_result, observation) = feed(observer, bytes, image_result).await;
-    if let Some(observation) = observation {
-        terminal_images.record_grid_observation(&observation);
+    let (image_result, span) = feed(observer, bytes, image_result).await;
+    if let Some(span) = span {
+        terminal_images.record_grid_observation(&span.observation);
     }
     if let Err(error) = image_result {
         reject(PtyReaderIngressRejection {

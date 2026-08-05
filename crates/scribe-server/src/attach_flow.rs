@@ -431,7 +431,10 @@ mod tests {
             attachment: Arc::new(Mutex::new(None)),
             term: Arc::new(Mutex::new(make_term(session_id))),
             term_commit: Arc::new(TermCommit::default()),
-            terminal_grid_observer: TerminalGridObserverHandle::default(),
+            terminal_grid_observer: crate::terminal_image_state::PtyTerminalImageState::new(
+                crate::terminal_image_state::TerminalImageProcessPolicy::v1(),
+            )
+            .grid_observer(),
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,

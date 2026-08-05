@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 scribe-common.workspace = true
+scribe-image-decode.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true
 vte.workspace = true

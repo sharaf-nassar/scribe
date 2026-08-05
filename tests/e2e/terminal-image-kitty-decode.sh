@@ -32,4 +32,11 @@ do
     grep -Fq "\"id\": \"$case_id\"" "$OUTPUT" || fail "evidence omits $case_id"
 done
 
+grep -Fq '"default_rejection": "work_budget_exceeded"' "$OUTPUT" \
+    || fail "default zlib bomb did not hit work budget first"
+grep -Fq '"isolated_rejection": "quota_exceeded"' "$OUTPUT" \
+    || fail "isolated zlib bomb did not hit inflated-byte quota"
+grep -Fq '"attempted": 67108865' "$OUTPUT" \
+    || fail "zlib bomb max-plus-one boundary drifted"
+
 echo "PASS: bounded Kitty decoder evidence written to $OUTPUT"

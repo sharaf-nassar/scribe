@@ -94,6 +94,106 @@ screen activation. Evidence is schema-versioned and payload-free.
 The gate pins Alacritty `0.26.0-rc1`, one processor, payload-free evidence, and
 an explicit passing result for every lifecycle case.
 
+## Terminal Image Storage Accounting
+
+The functional harness proves requested-storage ownership through the production session seam without exposing image payloads or claiming byte-exact RSS.
+
+### Production Accounting Probe
+
+The probe verifies reserve-before-allocation ownership and transactional replacement for every current retained image-storage class.
+
+Real Kitty and Sixel final boundaries establish exact and max-minus-one session
+limits through production ingestion. A valid split 2x1 Kitty RGBA transfer
+retains 8 decoded bytes without an encoded duplicate. A 4x6 Sixel retains 4
+body and 96 decoded bytes; geometric 48-to-192 canvas growth and 96-byte
+compaction produce an exact 288-byte decoded-class overlap. Replacement of a
+retained Kitty image requires a measured 1,028-byte simultaneous peak; a
+1,027-byte ceiling preserves prior current, peak, owners, digests, and
+state while attempt telemetry advances exactly.
+
+Split Kitty commands preserve first-chunk controls and exercise real base64 and
+RGBA allocations. More than 4,096 aggregate encoded bytes succeed across valid
+chunks, one chunk above 4,096 fails, and chunk 32,769 fails before mutation.
+Equal repeated controls are accepted, conflicts fail, and query boundaries
+retain no canonical image state. Sixel completion drives the vendored decoder.
+Two sessions sharing one policy admit a 1,032-byte process replacement peak,
+while 1,031 rejects only later output publication and preserves both owners.
+Observed-capacity cases prove exact 1,015 framer and 1,031 decoder observed
+peaks and output-metadata reconcile rollback at each one-less ceiling.
+
+The final boundary of a split transfer republishes the first command's controls
+and control presence, so a last chunk carrying only `m=0` never publishes
+default action, format, dimensions, identifiers, or quiet level.
+
+A deterministic paused reservation holds one failing session transaction while
+another session drops a detached 528-byte package: 32 command-body bytes plus
+496 output-metadata bytes. With 592 provisional bytes, process current follows
+`532 + 592 - 528 = 596`, then rollback leaves the foreign decoded owner at 4.
+The committed 1,016 peak is restored instead of the in-flight 1,124 peak, and
+the case requires the in-flight peak to exceed the committed one so peak
+rollback cannot pass vacuously. The internal invariant stays specifically typed
+without deadlock.
+
+Production ingress cases reject candidate and confirmed-active framing storage
+plus Kitty/Sixel canonical retention through exact typed storage errors. Each
+case uses one real Alacritty `Term`, one ANSI processor, and the production
+observer feed helper; exact client bytes and real terminal bytes occur once. A
+two-Sixel read injects failure at the second canonical allocation and proves
+one canonical replacement staged first. Allocation-class hit counts make this
+case fail if rejection occurs during framing or decoding. Outputs, sequence,
+definitions, placements, retained digests, and session/process current/peak
+ownership all match the pre-read snapshot afterward.
+
+Evidence distinguishes requested and observed current/peak counters, records
+reservation attempts separately from later allocator attempts, and requires
+all session/process current counters to return to zero after release. Immutable
+fault injection covers requested, observed, reservation, allocator,
+reconciliation, and poisoned-ledger failures. A deterministic capacity observer
+proves extra charging and failed output-metadata reconcile rollback after allocation.
+Mixed process/session snapshot cases cover both orderings for reserve and
+reconcile: internal or counter failures outrank capacity limits, both ledgers
+keep ownership state, and attempt telemetry reports the exact reached stage.
+Real raw RGBA, zlib RGBA, PNG, and Sixel inputs each pass their measured exact
+peak and fail at one less. Candidate, active, and EOF allocation faults compare
+payload-free state snapshots and retry once without duplicate publication.
+A zlib bomb under default policy proves work can be the first actual bound; the
+same input with only its work ceiling raised isolates max-plus-one inflated-byte
+QuotaExceeded. Both paths release every leased buffer.
+
+### Consumed Metadata Ownership
+
+Draining a committed metadata vector keeps its paired-ledger ownership charged until the backing allocation is actually freed.
+
+Committed output metadata is consumed through its owning iterator. Class
+counters stay charged while the iterator lives and while it is partially
+drained, and return to their pre-commit currents only after the iterator drops.
+Releasing ownership at the start of consumption would leave live bytes
+uncharged and is rejected here.
+
+### Grid Observation Accounting
+
+Grid span observations and their effect vectors are reserved from the same session and process ledger pair before they are allocated.
+
+One observed read produces spans whose effects are charged to the
+grid-observation class while the commit is alive, and the class returns to zero
+after that commit drops. A targeted refusal of the first grid-observation
+reservation returns a typed rejection on the commit, keeps the terminal fed
+exactly once, and leaves both ledgers at zero.
+
+### Work Admission Ordering
+
+Decoder work admission gates initialization instead of trailing it, so a refused decode never reserves the buffer whose initialization it refused.
+
+A Sixel payload painting one 100x6 canvas costs 3,000 initialization work units
+against a 1,000-unit per-command ceiling. The decode is refused with the frozen
+quota category, the decoded-Sixel class shows no reservation at all, and every
+ledger current returns to zero. Charging after the fill would leave the
+canvas reservation in that class peak.
+
+### Docker Evidence Entry Point
+
+`terminal-image-accounting.sh` runs the production accounting probe in the functional Docker image and validates payload-free exact-limit, replacement, rollback, cross-session, and zero-release outcomes.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

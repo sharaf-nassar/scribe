@@ -8,10 +8,32 @@ use std::time::{Duration, Instant};
 
 use icy_sixel_decoder::{
     AllocationDenied, BackgroundMode, DcsSettings, DecodeError, DecodeHooks, DecodeLimits,
-    NoopHooks, decode_sixel, decode_sixel_payload,
+    DecodedSixel, NoopHooks, decode_sixel as decode_sixel_accounted,
+    decode_sixel_payload as decode_sixel_payload_accounted,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::decode_storage::decode_storage;
+
+fn decode_sixel(
+    data: &[u8],
+    limits: DecodeLimits,
+    hooks: &impl DecodeHooks,
+) -> Result<DecodedSixel, DecodeError> {
+    let storage = decode_storage();
+    decode_sixel_accounted(data, limits, hooks, &storage)
+}
+
+fn decode_sixel_payload(
+    payload: &[u8],
+    settings: DcsSettings,
+    limits: DecodeLimits,
+    hooks: &impl DecodeHooks,
+) -> Result<DecodedSixel, DecodeError> {
+    let storage = decode_storage();
+    decode_sixel_payload_accounted(payload, settings, limits, hooks, &storage)
+}
 
 #[derive(Debug, Deserialize)]
 struct Contract {

@@ -4,6 +4,7 @@ mod client_scene;
 mod cmd_socket;
 mod daemon;
 mod decode_spike;
+mod decode_storage;
 mod framing_probe;
 mod input;
 mod ipc;
@@ -17,6 +18,7 @@ mod server;
 mod session;
 mod share_tap;
 mod sixel_decoder;
+mod terminal_image_accounting;
 mod terminal_image_observer_parity;
 mod terminal_image_state_seam;
 mod wait;
@@ -335,6 +337,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify exact production terminal-image storage accounting.
+    TerminalImageAccounting {
+        /// JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -554,6 +562,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::TerminalImageStateSeam { evidence } => run_terminal_image_state_seam(&evidence),
         Command::TerminalImageObserverParity { evidence } => run_observer_parity(&evidence),
+        Command::TerminalImageAccounting { evidence } => run_terminal_image_accounting(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =
                 tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
@@ -578,6 +587,10 @@ fn run_terminal_image_state_seam(evidence: &std::path::Path) -> Result<(), TestE
 
 fn run_observer_parity(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_observer_parity::run(evidence).map_err(TestError::TestFailure)
+}
+
+fn run_terminal_image_accounting(evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_accounting::run(evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
