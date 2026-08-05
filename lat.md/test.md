@@ -770,6 +770,49 @@ over SSH with no terminal spoofing anywhere, and the versions are checked
 before the first assertion so a moved package cannot masquerade as the pinned
 one. Evidence lands in `test-output/terminal-images/linux/apps/`.
 
+## Running Client Terminal Images
+
+`terminal-images-visual.sh` is the only image corpus that asserts pixels in the shipped GPUI window for bytes a shell wrote on a real PTY, so it fails whenever any link between the server's PTY reader and the painted frame is missing.
+
+The renderer corpus paints a synthetic scene, the functional corpus drives the
+server with no window at all, and the application corpus proves the pinned
+programs reach the server's counters. None of them can observe the live
+publication seam, which is what this corpus exists for.
+
+### A running client paints every image path
+
+Each phase feeds one generated payload to an image-capable client's pane and counts, across the client window, the pixels matching that phase's saturated colour.
+
+Every solid source is a 32x32 (or 24x24) block carrying Kitty `c=`/`r=`, so the
+painted box is a known number of *cells* whatever the container's font metrics
+are, while each transfer's base64 stays inside the frozen single-chunk ceiling.
+A one-pixel source would upscale through its own edge falloff and never reach a
+solid colour. The pane runs one file-driven loop rather than taking a typed
+command per phase, because a rejected transfer makes the server write a
+protocol error back to the PTY and readline would take those bytes as the next
+command. Counts come from two ImageMagick `-opaque` passes; every colour used
+is absent from Scribe's own chrome, so an image-free frame measures zero.
+
+Asserted in order: an `f=24` RGB, an `f=32` RGBA whose transparent half stays
+unpainted, an `f=100` PNG, and a Sixel raster each paint their box; the pinned
+Unicode-placeholder fixture paints its aspect-fitted cells; `z=-1` leaves text
+above the box while `z=1` covers it; a `y=18,h=12` source rectangle paints only
+the kept rows; scrolling clips the box against the top margin; a window resize
+and a vertical split both keep it; `a=d,d=I` and RIS both take it off the
+screen; a relaunched client replays it out of canonical state; pinned Chafa
+paints through both Kitty and Sixel; an over-limit transmit paints nothing and
+leaves the pane usable; and after `terminal.images.enabled = false` a client
+attaching next paints nothing while the pane keeps running commands.
+
+Two mechanics keep the relaunching phases honest. The container leaves more
+than one window with nobody viewing it and the server hands a starting client
+one of them, so a relaunch that comes up on the wrong session is simply
+repeated until it adopts the session the image went into. Each relaunch then
+issues a cursor save/restore, since the server drains a new sink's replay debt
+on the session's next PTY read — six bytes that carry no image information, so
+what they reveal came from canonical state. Evidence lands in
+`test-output/terminal-images/linux/client/`.
+
 ## Terminal Image Safety and Continuity
 
 `terminal-images-functional.sh` is the only image corpus with a live scribe-server, a real PTY, a real detach, a real hot-reload, and a real SSH hop in the loop, so it asserts what a session keeps across those events.
