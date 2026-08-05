@@ -28,6 +28,7 @@ mod terminal_image_replay;
 mod terminal_image_replies_sharing;
 mod terminal_image_scheduler;
 mod terminal_image_server_state;
+mod terminal_image_settings;
 mod terminal_image_state_seam;
 mod terminal_image_transfer_lifecycle;
 mod wait;
@@ -409,6 +410,15 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify the terminal-image master switch, diagnostics, and settings.
+    TerminalImageSettings {
+        /// Directory containing terminal-images-v1 ASCII-hex fixtures.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Certify the assembled authoritative terminal-image state engine.
     TerminalImageServerState {
         /// Versioned payload-free JSON manifest destination.
@@ -634,9 +644,8 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::TerminalImageHandoff { fixtures, evidence } => {
             terminal_image_handoff::run(&fixtures, &evidence).map_err(TestError::TestFailure)
         }
-        Command::TerminalImageServerState { evidence } => {
-            run_terminal_image_server_state(&evidence)
-        }
+        Command::TerminalImageSettings { fixtures, evidence } => run_settings(&fixtures, &evidence),
+        Command::TerminalImageServerState { evidence } => run_image_server_state(&evidence),
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
         }
@@ -718,8 +727,13 @@ fn run_terminal_image_convergence(evidence: &std::path::Path) -> Result<(), Test
     terminal_image_convergence::run(evidence).map_err(TestError::TestFailure)
 }
 
-fn run_terminal_image_server_state(evidence: &std::path::Path) -> Result<(), TestError> {
+fn run_image_server_state(evidence: &std::path::Path) -> Result<(), TestError> {
     terminal_image_server_state::run(evidence).map_err(TestError::TestFailure)
+}
+
+/// Verify the terminal-image master switch, diagnostics, and settings.
+fn run_settings(fixtures: &std::path::Path, evidence: &std::path::Path) -> Result<(), TestError> {
+    terminal_image_settings::run(fixtures, evidence).map_err(TestError::TestFailure)
 }
 
 fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {

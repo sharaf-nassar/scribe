@@ -660,8 +660,10 @@ impl TerminalElement {
                         %error,
                         %session_id,
                         image_id = placement.image_id.0,
+                        reason = ?error.rejection_reason(),
                         "terminal image source preparation failed"
                     );
+                    note_renderer_failure(&images.cache, &error, session_id, window);
                     continue;
                 }
             };
@@ -694,8 +696,10 @@ impl TerminalElement {
                     %error,
                     %session_id,
                     image_id = placement.image_id.0,
+                    reason = ?error.rejection_reason(),
                     "terminal image placement paint failed"
                 );
+                note_renderer_failure(&images.cache, &error, session_id, window);
             }
         }
     }
@@ -1080,6 +1084,29 @@ fn default_placeholder_placements(
                 .or_insert(placement.id);
             choices
         })
+}
+
+/// Release a session's GPU sources when the renderer itself failed.
+///
+/// Bounded per-image rejections (a limit, a bad crop, an inconsistent
+/// definition) are left alone: those are Scribe refusing one image and the
+/// rest of the scene stays valid. Only a failed window operation means the
+/// cache can no longer account for what it uploaded, and only then is the
+/// session's GPU state dropped and the view marked unavailable so the pane can
+/// show the localized notice instead of retrying every frame.
+// @lat: [[terminal-images#Terminal Images#Renderer Failure Cleanup]]
+fn note_renderer_failure(
+    cache: &Rc<RefCell<GpuiImageCache>>,
+    error: &GpuiImageError,
+    session_id: SessionId,
+    window: &mut Window,
+) {
+    if !error.is_renderer_failure() {
+        return;
+    }
+    if let Err(cleanup) = cache.borrow_mut().note_renderer_failure(session_id, window) {
+        tracing::warn!(%cleanup, %session_id, "terminal image renderer cleanup failed");
+    }
 }
 
 #[derive(Clone, Copy)]

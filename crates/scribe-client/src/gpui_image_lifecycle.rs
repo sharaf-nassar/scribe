@@ -16,7 +16,7 @@ use scribe_common::{
     ids::SessionId,
     terminal_images::{
         ImageBoundError, ImageLimitName, ImageLimits, PixelRect, TerminalImageDefinition,
-        TerminalImageGeneration, TerminalImageId,
+        TerminalImageGeneration, TerminalImageId, TerminalImageRejectionReason,
     },
 };
 
@@ -77,6 +77,41 @@ pub enum GpuiImageError {
     PaintImage(#[source] anyhow::Error),
 }
 
+impl GpuiImageError {
+    /// Whether this failure means the renderer itself could not be used, as
+    /// opposed to a bounded rejection of one particular image.
+    ///
+    /// Only the two window operations qualify. A limit, a bad crop, or an
+    /// inconsistent definition is Scribe refusing specific data and says
+    /// nothing about whether the GPU path works.
+    #[must_use]
+    pub const fn is_renderer_failure(&self) -> bool {
+        matches!(self, Self::DropImage(_) | Self::PaintImage(_))
+    }
+
+    /// The payload-free diagnostic category the user is shown for this
+    /// failure. Carries no message text of its own, so nothing derived from
+    /// image bytes can reach the UI through this path.
+    // @lat: [[terminal-images#Terminal Images#Localized Image Diagnostics]]
+    #[must_use]
+    pub const fn rejection_reason(&self) -> TerminalImageRejectionReason {
+        match self {
+            Self::DropImage(_) | Self::PaintImage(_) => {
+                TerminalImageRejectionReason::RendererUnavailable
+            }
+            Self::Bound(ImageBoundError::LimitExceeded(_)) => {
+                TerminalImageRejectionReason::QuotaExceeded
+            }
+            Self::Bound(_) | Self::InvalidSourceCrop | Self::InvalidDestination => {
+                TerminalImageRejectionReason::InvalidDimensions
+            }
+            Self::CanonicalLength | Self::ConflictingDefinition | Self::AllocationFailed => {
+                TerminalImageRejectionReason::DecodeFailed
+            }
+        }
+    }
+}
+
 struct CacheEntry {
     definition: TerminalImageDefinition,
     image: Arc<RenderImage>,
@@ -90,6 +125,7 @@ pub struct GpuiImageCache {
     projected_gpu_bytes: u64,
     max_projected_gpu_bytes: u64,
     stats: GpuiImageCacheStats,
+    renderer_unavailable: bool,
 }
 
 impl Default for GpuiImageCache {
@@ -117,7 +153,35 @@ impl GpuiImageCache {
             max_projected_gpu_bytes: max_projected_gpu_bytes
                 .min(ImageLimits::V1.max_view_projected_gpu_bytes),
             stats: GpuiImageCacheStats::default(),
+            renderer_unavailable: false,
         }
+    }
+
+    /// Whether this view's renderer is currently considered unusable.
+    ///
+    /// Latched by [`Self::note_renderer_failure`] and cleared by the first
+    /// later success, so the pane shows the localized notice for exactly as
+    /// long as the GPU path is actually broken.
+    #[must_use]
+    pub const fn renderer_unavailable(&self) -> bool {
+        self.renderer_unavailable
+    }
+
+    /// Record a renderer failure for one session and release everything that
+    /// session still holds on the GPU.
+    ///
+    /// Cleanup is the point: a window operation that failed leaves textures
+    /// this cache can no longer account for, so the session's sources are
+    /// dropped rather than retried every frame. Text is untouched — the pane
+    /// keeps painting glyphs and the application's own textual fallback.
+    // @lat: [[terminal-images#Terminal Images#Renderer Failure Cleanup]]
+    pub fn note_renderer_failure(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+    ) -> Result<(), GpuiImageError> {
+        self.renderer_unavailable = true;
+        self.clear_session(session_id, window)
     }
 
     /// Current projected upload-plus-texture charge.
@@ -214,6 +278,9 @@ impl GpuiImageCache {
         );
         self.insertion_order.push_back(key);
         self.stats.render_images_created = self.stats.render_images_created.saturating_add(1);
+        // A source built successfully, so whatever broke the renderer earlier
+        // is over and the pane stops showing the unavailable notice.
+        self.renderer_unavailable = false;
         Ok(image)
     }
 

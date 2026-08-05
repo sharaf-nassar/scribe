@@ -120,6 +120,11 @@ async fn run_normal_server() -> Result<(), ScribeError> {
 
     let cfg = config::load_config()?;
 
+    // Spec 020: mirror `terminal.images.enabled` into the process-wide master
+    // switch before anything can advertise a capability. Nothing is latched
+    // yet, so a disabled start simply never claims one.
+    terminal_image_sharing::set_images_master_enabled(cfg.images_enabled);
+
     // Feature 013: surface the configured remote-control state at startup. The
     // listener itself is started, stopped, and rebound live off this config by
     // the config-reload path (a later task); nothing is bound here.
@@ -151,6 +156,10 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     info!("scribe-server starting (upgrade mode)");
 
     let cfg = config::load_config()?;
+
+    // Spec 020: the successor decides its own image policy from the file it
+    // just read, before restoring any handed-off session state.
+    terminal_image_sharing::set_images_master_enabled(cfg.images_enabled);
 
     // Receive handoff from the old server (blocking until complete).
     let (state, fds) = handoff::receive_handoff()?;

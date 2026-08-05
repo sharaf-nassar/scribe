@@ -377,6 +377,7 @@ fn terminal_controls() -> Vec<Control> {
         toggle("terminal.natural_scroll", "Natural scroll"),
         toggle("terminal.keyboard_protocol_enhanced", "Enhanced keyboard protocol"),
         toggle("terminal.paste_confirmation", "Paste confirmation"),
+        toggle("terminal.images.enabled", "Terminal images"),
         choice(
             "terminal.clipboard.read_mode",
             "Clipboard read (OSC 52)",

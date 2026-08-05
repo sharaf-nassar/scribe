@@ -167,6 +167,31 @@ impl Probe {
         result.map_err(|error| error.to_string())
     }
 
+    /// The real terminal's visible text, rows joined by newline with trailing
+    /// blanks trimmed.
+    ///
+    /// Image policy must never touch this: an application's textual fallback is
+    /// ordinary grid text, so a gate can compare it across an enable, a
+    /// disable, and a state release.
+    #[must_use]
+    pub fn visible_text(&self) -> String {
+        let grid = self.term.grid();
+        (0..grid.screen_lines())
+            .map(|row| {
+                let line: String = (0..grid.columns())
+                    .map(|column| {
+                        grid[alacritty_terminal::index::Line(
+                            i32::try_from(row).unwrap_or(i32::MAX),
+                        )][alacritty_terminal::index::Column(column)]
+                        .c
+                    })
+                    .collect();
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Drain the terminal's own reply events, in emission order.
     fn drain_term_replies(&mut self) -> Vec<String> {
         let mut replies = Vec::new();

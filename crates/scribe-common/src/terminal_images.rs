@@ -772,6 +772,71 @@ pub enum TerminalImageRejectionReason {
     Evicted,
 }
 
+impl TerminalImageRejectionReason {
+    /// Every frozen v1 category, so a catalog or matrix can be proven
+    /// exhaustive instead of sampled.
+    pub const ALL: [Self; 19] = [
+        Self::PolicyDisabled,
+        Self::UnsupportedProtocol,
+        Self::UnsupportedAction,
+        Self::UnsupportedTransport,
+        Self::MalformedFraming,
+        Self::MalformedControl,
+        Self::MalformedPayload,
+        Self::TruncatedSequence,
+        Self::ChunkMismatch,
+        Self::InvalidDimensions,
+        Self::QuotaExceeded,
+        Self::WorkBudgetExceeded,
+        Self::DecodeDeadlineExceeded,
+        Self::DecodeCancelled,
+        Self::DecodeFailed,
+        Self::ImageNotFound,
+        Self::CapabilityMismatch,
+        Self::RendererUnavailable,
+        Self::Evicted,
+    ];
+
+    /// The user-facing sentence this rejection shows in Scribe's own UI.
+    ///
+    /// This is the single localization catalog for image diagnostics: one
+    /// `&'static str` per frozen category, no interpolation, no formatting
+    /// placeholders, and therefore no way for PTY-controlled bytes,
+    /// identifiers, paths, or pixels to reach a message. Translating Scribe
+    /// means translating exactly this table.
+    ///
+    /// A message is an operational hint about Scribe's own behavior. It never
+    /// substitutes for the application's textual fallback, which keeps
+    /// painting underneath it.
+    // @lat: [[terminal-images#Terminal Images#Localized Image Diagnostics]]
+    #[must_use]
+    pub const fn localized_message(self) -> &'static str {
+        match self {
+            Self::PolicyDisabled => "Terminal images are turned off in Scribe settings.",
+            Self::UnsupportedProtocol => "This image protocol is not supported.",
+            Self::UnsupportedAction => "This image command is not supported.",
+            Self::UnsupportedTransport => {
+                "Scribe only accepts image data sent directly over the terminal."
+            }
+            Self::MalformedFraming => "An image sequence ended incorrectly and was ignored.",
+            Self::MalformedControl => "An image command was malformed and was ignored.",
+            Self::MalformedPayload => "Image data was malformed and was discarded.",
+            Self::TruncatedSequence => "An image transfer stopped before it finished.",
+            Self::ChunkMismatch => "An image transfer arrived out of order and was discarded.",
+            Self::InvalidDimensions => "The requested image size is not allowed.",
+            Self::QuotaExceeded => "This session reached its image limit.",
+            Self::WorkBudgetExceeded => "An image needed more work than Scribe allows.",
+            Self::DecodeDeadlineExceeded => "An image took too long to decode.",
+            Self::DecodeCancelled => "Image decoding was cancelled.",
+            Self::DecodeFailed => "An image could not be decoded.",
+            Self::ImageNotFound => "The referenced image is no longer available.",
+            Self::CapabilityMismatch => "This Scribe version cannot show this session's images.",
+            Self::RendererUnavailable => "Images are unavailable because the renderer failed.",
+            Self::Evicted => "An image was released to stay within Scribe's memory limit.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalImageAction {

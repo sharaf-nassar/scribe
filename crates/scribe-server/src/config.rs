@@ -35,6 +35,11 @@ pub struct ScribeConfig {
     /// config-reload path can start, stop, or rebind each transport's listener
     /// live — never a server restart.
     pub remote: RemoteConfig,
+    /// Spec 020: `terminal.images.enabled`, the default-on terminal-graphics
+    /// master switch. Mirrored into the process-wide switch by the startup and
+    /// reload paths, which own the transition and the resource release it
+    /// implies.
+    pub images_enabled: bool,
 }
 
 impl Default for ScribeConfig {
@@ -47,6 +52,7 @@ impl Default for ScribeConfig {
             update: UpdateConfig::default(),
             clipboard_policy: ClipboardPolicyConfig::default(),
             remote: RemoteConfig::default(),
+            images_enabled: true,
         }
     }
 }
@@ -86,6 +92,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     let update = full.update;
     let clipboard_policy = full.terminal.clipboard_policy;
     let remote = full.remote;
+    let images_enabled = full.terminal.images.enabled;
 
     info!(
         roots = workspace_roots.len(),
@@ -93,6 +100,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         preserve_ai_scrollback = ai_terminal.preserve_ai_scrollback,
         clipboard_read_mode = ?clipboard_policy.read_mode,
         clipboard_write_mode = ?clipboard_policy.write_mode,
+        images_enabled,
         "server config loaded"
     );
 
@@ -104,6 +112,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         update,
         clipboard_policy,
         remote,
+        images_enabled,
     })
 }
 
