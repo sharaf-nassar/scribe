@@ -836,8 +836,11 @@ Coherent means all or nothing: the successor may inherit the whole committed
 scene or start empty, but placements naming definitions that did not travel are
 the failure. The successor is asked to commit a read that transmits nothing, so
 the placements it reports are ones it never decoded; the corpus records which of
-the two outcomes it saw rather than pinning today's answer. It then requires
-discovery to answer again and a fresh transmission to decode.
+the two outcomes it saw rather than pinning today's answer. With the live
+handoff wired to the reader's seam that observation is now
+`upgrade_scene_carried: true` — the successor reports exactly the sender's
+placement count. It then requires discovery to answer again and a fresh
+transmission to decode.
 
 The switch is delivered the way an operator rolling back would deliver it —
 write the config, hot-reload, keep the sessions — because only a running client

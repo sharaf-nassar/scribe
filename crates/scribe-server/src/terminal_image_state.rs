@@ -4,6 +4,7 @@
 //! caller-owned boundaries. Live IPC fanout and PTY reply write-back remain
 //! downstream integration work.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -16,7 +17,8 @@ use crate::terminal_image_handoff::{
     ExportedSessionImages, PendingKittyHandoff, SessionImageHandoff,
 };
 use crate::terminal_image_mutations::{
-    CanonicalImageState, CanonicalRestoreCursor, DecodedImageMeta, MutationContext, MutationLog,
+    CanonicalImageMutation, CanonicalImageState, CanonicalRestoreCursor, DecodedImageMeta,
+    MutationContext, MutationLog,
 };
 use crate::terminal_image_publication::{
     DefinitionPayload, PublicationInputs, publish as publish_burst,
@@ -34,15 +36,15 @@ use scribe_common::kitty_decode::{
 };
 use scribe_common::terminal_images::{
     ImageBoundError, ImageLimits, TerminalImageCellClip, TerminalImageDefinition,
-    TerminalImageGeneration, TerminalImageLiveMessage, TerminalImagePlacement,
+    TerminalImageGeneration, TerminalImageId, TerminalImageLiveMessage, TerminalImagePlacement,
     TerminalImageRejectionReason, TerminalImageReplayMessage, TerminalOutputSequence,
     TerminalScreenKind,
 };
 use scribe_image_decode::{
-    DecodeAdmissionError, DecodeBudget, DecodeBuffer, DecodeCeilings, DecodeLimits, DecodePermit,
-    DecodeRequest, DecodeScheduler, DecodeSessionId, DecodeStorage, DecodeStorageLease,
-    DecodeTarget, NoopHooks, StorageProcess, StorageValidation, StorageValidationPause,
-    StorageValidationRejection,
+    DecodeAdmissionError, DecodeAllocationClass, DecodeBudget, DecodeBuffer, DecodeCeilings,
+    DecodeLimits, DecodePermit, DecodeRequest, DecodeScheduler, DecodeSessionId, DecodeStorage,
+    DecodeStorageLease, DecodeTarget, NoopHooks, StorageProcess, StorageValidation,
+    StorageValidationPause, StorageValidationRejection,
 };
 use scribe_pty::graphics_framing::{
     GraphicsEvent, GraphicsFailure, GraphicsFailureCategory, GraphicsFramer, GraphicsProtocol,
@@ -911,10 +913,15 @@ impl StagedStorage {
 }
 
 impl StagedDecodeStorage {
-    fn apply(self, slot: &mut Option<DecodeBuffer>) {
+    /// Decoded pixels land behind an `Arc` so the canonical retention map can
+    /// hold the same bytes the slot does. One buffer, one lease, two owners:
+    /// retaining a committed image costs nothing the decode already paid, and
+    /// the lease is released when the last owner drops it.
+    // @lat: [[terminal-images#Terminal Images#Retained Canonical Pixels]]
+    fn apply(self, slot: &mut Option<Arc<DecodeBuffer>>) {
         match self {
             Self::Unchanged => {}
-            Self::Replace(storage) => *slot = Some(storage),
+            Self::Replace(storage) => *slot = Some(Arc::new(storage)),
         }
     }
 }
@@ -1412,9 +1419,19 @@ pub struct SessionTerminal {
     pending_kitty_storage: Option<OwnedImageStorage>,
     completed_kitty_storage: Option<OwnedImageStorage>,
     sixel_body_storage: Option<OwnedImageStorage>,
-    kitty_decoded_storage: Option<DecodeBuffer>,
-    sixel_decoded_storage: Option<DecodeBuffer>,
+    kitty_decoded_storage: Option<Arc<DecodeBuffer>>,
+    sixel_decoded_storage: Option<Arc<DecodeBuffer>>,
     pending_kitty_decode: Option<PendingKittyDecode>,
+    /// Canonical RGBA for every committed definition, keyed by image id.
+    ///
+    /// The decode buffer a transfer produced is single-slot and gone by the
+    /// next image, so without this the server could state what it has but
+    /// never re-send it. Retention is what lets a late attacher, a shed sink,
+    /// and an upgrade successor be given a scene rather than a promise. The
+    /// buffer is *moved* here rather than copied: the bytes keep the lease
+    /// they were already charged under, so retention costs the session
+    /// nothing it had not already paid for.
+    canonical_rgba: BTreeMap<TerminalImageId, Arc<DecodeBuffer>>,
     decode_session: DecodeSessionId,
 }
 
@@ -1457,6 +1474,7 @@ impl SessionTerminal {
             kitty_decoded_storage: None,
             sixel_decoded_storage: None,
             pending_kitty_decode: None,
+            canonical_rgba: BTreeMap::new(),
             decode_session,
         }
     }
@@ -1787,6 +1805,7 @@ impl SessionTerminal {
         self.sixel_body_storage = None;
         self.kitty_decoded_storage = None;
         self.sixel_decoded_storage = None;
+        self.canonical_rgba.clear();
     }
 
     /// Release everything this session holds because the master switch went
@@ -1843,6 +1862,7 @@ impl SessionTerminal {
             || self.sixel_body_storage.is_some()
             || self.kitty_decoded_storage.is_some()
             || self.sixel_decoded_storage.is_some()
+            || !self.canonical_rgba.is_empty()
     }
 
     /// Payload-free requested/observed ownership by allocation path.
@@ -1861,10 +1881,10 @@ impl SessionTerminal {
             completed_kitty_observed: observed(self.completed_kitty_storage.as_ref()),
             sixel_body_requested: requested(self.sixel_body_storage.as_ref()),
             sixel_body_observed: observed(self.sixel_body_storage.as_ref()),
-            kitty_decoded_requested: decoded_requested(self.kitty_decoded_storage.as_ref()),
-            kitty_decoded_observed: decoded_observed(self.kitty_decoded_storage.as_ref()),
-            sixel_decoded_requested: decoded_requested(self.sixel_decoded_storage.as_ref()),
-            sixel_decoded_observed: decoded_observed(self.sixel_decoded_storage.as_ref()),
+            kitty_decoded_requested: decoded_requested(self.kitty_decoded_storage.as_deref()),
+            kitty_decoded_observed: decoded_observed(self.kitty_decoded_storage.as_deref()),
+            sixel_decoded_requested: decoded_requested(self.sixel_decoded_storage.as_deref()),
+            sixel_decoded_observed: decoded_observed(self.sixel_decoded_storage.as_deref()),
         }
     }
 
@@ -1879,8 +1899,8 @@ impl SessionTerminal {
                 .map_or(0, |pending| pending.transfer.validation_digest()),
             completed_kitty: storage_digest(self.completed_kitty_storage.as_ref()),
             sixel_body: storage_digest(self.sixel_body_storage.as_ref()),
-            kitty_decoded: decoded_storage_digest(self.kitty_decoded_storage.as_ref()),
-            sixel_decoded: decoded_storage_digest(self.sixel_decoded_storage.as_ref()),
+            kitty_decoded: decoded_storage_digest(self.kitty_decoded_storage.as_deref()),
+            sixel_decoded: decoded_storage_digest(self.sixel_decoded_storage.as_deref()),
         }
     }
 
@@ -1930,6 +1950,7 @@ impl SessionTerminal {
             }
             terminal.generation = next.generation();
             terminal.canonical = next;
+            terminal.retain_committed_rgba(last_decoded_protocol(commit), log);
             Ok(())
         })
     }
@@ -1951,6 +1972,9 @@ impl SessionTerminal {
             }
             terminal.generation = next.generation();
             terminal.canonical = next;
+            // A span decodes nothing but can erase, scroll, or reset images
+            // away, so it only ever releases retained pixels.
+            terminal.retain_committed_rgba(None, log);
             Ok(())
         })
     }
@@ -2115,10 +2139,34 @@ impl SessionTerminal {
             || self.sequence != TerminalOutputSequence(0)
             || self.canonical.definition_count() != 0
             || self.canonical.placement_count() != 0
+            || !self.canonical_rgba.is_empty()
         {
             return Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant));
         }
         let restored = stage_handoff_records(state)?;
+        // Charged before anything moves, for the same reason the burst is
+        // reassembled before anything moves: a session that cannot pay to
+        // retain the scene must stay empty rather than hold a scene it can
+        // never re-state.
+        let mut retained = BTreeMap::new();
+        for (definition, rgba) in &restored.pixels {
+            // The wire carries canonical pixels without their source protocol,
+            // so a restored scene is charged to the Kitty decode class whatever
+            // decoded it. The session and process ceilings — the numbers that
+            // actually bound a session — are exact either way.
+            let mut stored = DecodeBuffer::allocate(
+                &self.storage_budget,
+                DecodeAllocationClass::KittyRgba,
+                rgba.len(),
+            )
+            .map_err(|_| {
+                SessionTerminalError::Storage(GraphicsStorageRejection::AllocationFailed)
+            })?;
+            stored.extend_from_slice(rgba).map_err(|_| {
+                SessionTerminalError::Storage(GraphicsStorageRejection::AllocationFailed)
+            })?;
+            retained.insert(definition.id, Arc::new(stored));
+        }
         let pending = match &state.pending_kitty {
             Some(pending) => Some(self.restore_pending_kitty(pending)?),
             None => None,
@@ -2147,6 +2195,7 @@ impl SessionTerminal {
             })
             .or(self.pending_transfer);
         self.pending_kitty_decode = pending;
+        self.canonical_rgba = retained;
         for (definition, rgba) in restored.pixels {
             install(&definition, rgba);
         }
@@ -2533,6 +2582,64 @@ impl SessionTerminal {
         Ok(())
     }
 
+    /// Move the pixels this read decoded onto the definition it committed,
+    /// then drop the pixels of every image canonical state no longer holds.
+    ///
+    /// The decode slots are single-slot by construction, so a read that
+    /// decoded several images still holds only the last one's bytes — the
+    /// same buffer the last committed definition describes. Pairing is
+    /// therefore last-to-last, guarded by an exact canonical-length check so a
+    /// definition is left unbacked rather than backed by another image's
+    /// bytes: unbacked is withdrawn wherever a scene is stated, which is
+    /// recoverable; mismatched would be a silently wrong picture, which is not.
+    ///
+    /// The slot keeps its own handle on the bytes, so a read that decodes and
+    /// then fails to commit leaves ownership exactly where it found it.
+    ///
+    /// ponytail: one image retained per committed read. Upgrade path: keep the
+    /// decoded buffers of a whole read in framing order and pair them with
+    /// that read's definitions positionally — only worth it once an
+    /// application is observed transmitting several images inside one read.
+    // @lat: [[terminal-images#Terminal Images#Retained Canonical Pixels]]
+    fn retain_committed_rgba(&mut self, decoded: Option<GraphicsProtocol>, log: &MutationLog) {
+        if let Some(protocol) = decoded {
+            let defined = log
+                .as_slice()
+                .iter()
+                .rev()
+                .find_map(|mutation| match mutation {
+                    CanonicalImageMutation::Define { definition } => Some(definition),
+                    _ => None,
+                })
+                .cloned();
+            let slot = match protocol {
+                GraphicsProtocol::Kitty => &mut self.kitty_decoded_storage,
+                GraphicsProtocol::Sixel => &mut self.sixel_decoded_storage,
+            };
+            if let Some(definition) = defined
+                && let Some(rgba) = slot.as_ref()
+                && rgba.len() as u64 == definition.rgba_bytes
+            {
+                let rgba = Arc::clone(rgba);
+                self.canonical_rgba.insert(definition.id, rgba);
+            }
+        }
+        let live = self.canonical.definition_ids();
+        self.canonical_rgba.retain(|id, _| live.contains(id));
+    }
+
+    /// Canonical RGBA for one definition, or `None` when the session cannot
+    /// pay for it. Backs the definition-payload seam every scene is stated
+    /// through.
+    // @lat: [[terminal-images#Terminal Images#Retained Canonical Pixels]]
+    #[must_use]
+    pub fn canonical_rgba(&self, definition: &TerminalImageDefinition) -> Option<Vec<u8>> {
+        self.canonical_rgba
+            .get(&definition.id)
+            .filter(|retained| retained.len() as u64 == definition.rgba_bytes)
+            .map(|retained| retained.to_vec())
+    }
+
     fn append_image(
         &self,
         range: RawByteRange,
@@ -2795,6 +2902,22 @@ fn stage_handoff_records(
     Ok(staged)
 }
 
+/// Protocol of the last boundary in one read that produced canonical pixels.
+///
+/// `None` when the read decoded nothing, which is what keeps a stale decode
+/// buffer from an earlier read out of a later read's definition.
+// @lat: [[terminal-images#Terminal Images#Retained Canonical Pixels]]
+fn last_decoded_protocol(commit: &SessionTerminalCommit) -> Option<GraphicsProtocol> {
+    commit.outputs.iter().rev().find_map(|output| {
+        let SessionTerminalOutput::Image { boundary, .. } = output else { return None };
+        match boundary {
+            TerminalImageBoundary::Kitty { decoded: Some(_), .. } => Some(GraphicsProtocol::Kitty),
+            TerminalImageBoundary::Sixel { .. } => Some(GraphicsProtocol::Sixel),
+            _ => None,
+        }
+    })
+}
+
 fn decode_limits(limits: ImageLimits) -> DecodeLimits {
     DecodeLimits {
         max_width_pixels: limits.max_width_pixels as usize,
@@ -3017,6 +3140,13 @@ impl PtyTerminalImageState {
     #[must_use]
     pub const fn session(&self) -> &SessionTerminal {
         &self.terminal
+    }
+
+    /// Canonical RGBA this session retained for one committed definition.
+    // @lat: [[terminal-images#Terminal Images#Retained Canonical Pixels]]
+    #[must_use]
+    pub fn canonical_rgba(&self, definition: &TerminalImageDefinition) -> Option<Vec<u8>> {
+        self.terminal.canonical_rgba(definition)
     }
 
     /// Payload-free canonical definitions for inspection and evidence.
