@@ -121,11 +121,43 @@ copy_on_select = true
 claude_code_integration = true
 keyboard_protocol_enhanced = true
 
+[terminal.images]
+enabled = true
+
 [workspaces]
 roots = ["~/work", "~/projects"]
 ```
 
 Open the graphical settings editor with `Ctrl+,` to modify configuration without editing the file directly.
+
+### Terminal images
+
+`[terminal.images] enabled` is the master switch for inline terminal graphics,
+shown in the settings editor as the **Terminal images** toggle on the Terminal
+page. It is on by default.
+
+With it on, Scribe renders images that applications such as Yazi, Chafa, and
+gnuplot send inline over the Kitty graphics protocol or Sixel, including over an
+SSH session. Only image data sent directly over the terminal is accepted —
+Scribe never opens a file, a shared-memory segment, or a URL on an
+application's behalf, and every transfer is bounded before it is decoded or
+uploaded to the GPU. Image data stays in memory: it is never written to a log,
+a crash report, a cache, or this configuration file. Rendering inside tmux, GNU
+screen, or Zellij is not supported and depends entirely on the multiplexer's own
+passthrough behaviour.
+
+Turn it off to disable terminal graphics completely. Scribe stops advertising
+image support to applications, releases the image data it is holding, and
+applies the change to running sessions immediately — no restart is needed. Text
+output, scrollback, and each application's own text-only fallback are
+unaffected. Turning it back on lets new sessions use images again; images that
+were already on screen do not come back.
+
+When Scribe refuses an image it shows a short one-line notice in the pane
+explaining the category of the problem — for example that the image was too
+large, that the format is unsupported, or that terminal images are turned off.
+The notice never contains any data from the application, so it is safe to quote
+verbatim in a bug report.
 
 ## Keyboard Shortcuts
 

@@ -25,3 +25,18 @@ available at https://github.com/zed-industries/zed.
 GPUI is consumed as a git dependency from the Zed project. GPUI is licensed
 under the Apache License, Version 2.0. Its source and license are available
 at https://github.com/zed-industries/zed.
+
+third_party/icy-sixel-decoder/ is a decoder-only fork of icy_sixel 0.5.0,
+copyright the icy_sixel authors, licensed under the MIT license or the Apache
+License, Version 2.0, at your option. Its source is available at
+https://github.com/mkrueger/icy_sixel and both license texts are retained in
+that directory.
+
+third_party/image-png-decoder/ is a decoder-only fork of png 0.18.1, copyright
+the image-rs developers, licensed under the MIT license or the Apache License,
+Version 2.0, at your option. Its source is available at
+https://github.com/image-rs/image-png and both license texts are retained in
+that directory.
+
+third_party/unix-ancillary/ is a compile-fix fork of unix-ancillary 0.1.0,
+licensed under the MIT license, whose text is retained in that directory.

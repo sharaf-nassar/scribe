@@ -157,13 +157,20 @@ The threshold is derived rather than picked: `spec.md` Goal 1 is full reachable 
 
 ### Vendored Third-Party Dependencies
 
-The `third_party/` directory holds path-patched copies of external crates with outstanding upstream bugs, wired in via `[patch.crates-io]` in the root `Cargo.toml`.
+The `third_party/` directory holds vendored copies of external crates that Scribe cannot consume as published, for two distinct reasons: an outstanding upstream bug, or a trust boundary that requires a reduced attack surface.
 
-The directory is excluded from the workspace (`exclude = ["third_party/*"]`) so workspace lints do not apply to vendored code.
+The directory is excluded from the workspace (`exclude = ["third_party/*"]`) so workspace lints do not apply to vendored code. Each entry carries its own `README.md` recording the upstream package, VCS revision, crates.io checksum, license files, fork delta, and named security ownership, plus a `DEPENDENCY-TREE.txt` pinning its transitive set. The attribution for every entry also appears in the repository `NOTICE`.
 
-Current entries:
+Bug workaround, wired in via `[patch.crates-io]` in the root `Cargo.toml`:
 
 - `third_party/unix-ancillary/` — local fork of `unix-ancillary 0.1.0`. Upstream 0.1.0 fails to compile on Apple targets because `ancillary.rs::set_cloexec` references `io::Result`/`io::Error` without importing `std::io`. The fork adds a cfg-gated `use std::io;` that mirrors the function's own cfg. Remove once a fixed release ships on crates.io.
+
+Trust-boundary forks, consumed as path dependencies rather than patches because their public API is deliberately not the upstream one. Both decode untrusted PTY bytes, forbid `unsafe`, drop every encoder and indirect-resource path, and take caller-owned limits, budgets, deadlines, and cancellation hooks. Replacing either with its stock crate, a C decoder, or a generic image library requires a new trust-boundary review — see [[terminal-images#Terminal Images#Bounded Sixel Decoder]] and [[terminal-images#Terminal Images#Bounded Kitty PNG Decoder]]:
+
+- `third_party/icy-sixel-decoder/` — decoder-only fork of `icy_sixel 0.5.0`, MIT OR Apache-2.0, consumed by `scribe-server`.
+- `third_party/image-png-decoder/` — decoder-only fork of `png 0.18.1` published locally as `scribe-png-decoder`, MIT OR Apache-2.0, consumed by `scribe-common`.
+
+Scribe maintainers own CVE and RustSec review, upstream-diff review, and emergency patches for both decoder forks. Each upstream release and each regular dependency advisory audit triggers a diff against the pinned revision; audited decoder security fixes are ported, the adversarial Docker corpus, `cargo deny`, and the dependency tree are rerun, and the pin, checksum, fork delta, and licenses are updated together. Report a suspected vulnerability privately through a GitHub security advisory on this repository rather than a public issue.
 
 ### Package Install Flow
 

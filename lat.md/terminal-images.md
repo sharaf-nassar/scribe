@@ -49,6 +49,27 @@ network loading, animations, frame composition, relative-parent placement,
 image-number allocation, iTerm2, ReGIS, vector/video, protocol translation,
 Windows, and guaranteed tmux/GNU screen/Zellij passthrough.
 
+### Support matrix
+
+One table fixes what v1 accepts and what it refuses, so a support question is answered by protocol, transport, format, action, and platform instead of by reading the contract prose above.
+
+| Axis | Supported | Excluded |
+| --- | --- | --- |
+| Protocol | Kitty graphics over 7-bit APC `G`/ST; Sixel over 7-bit and C1 DCS/ST | iTerm2 OSC 1337, ReGIS, vector and video protocols, protocol translation |
+| Kitty transport | direct inline `t=d` | `t=f`, `t=t`, `t=s`, URL and network loading, 8-bit C1 APC |
+| Kitty format | `f=24` RGB, `f=32` RGBA, `f=100` PNG, RFC 1950 `o=z` compression | every other `f=` value, APNG and animation, frame composition |
+| Kitty action | `t`, `T`, `p`, `q`, `d` | `I`, `N`, `P`, `Q`, image-number allocation, relative-parent placement |
+| Kitty placement | classic placements and Unicode `U=1` placeholders | — |
+| Sixel | `P1;P2;P3 q`, sixel bits, repeat, raster attributes, 256-entry palette with HLS and RGB definitions, `$`, `-` | — |
+| Platform | Linux X11 and Wayland, native macOS | Windows |
+| Session transport | direct PTY, SSH | guaranteed tmux, GNU screen, or Zellij passthrough |
+| Applications | Yazi, Chafa, and gnuplot at the pinned corpus versions | — |
+
+Rejection is typed only where Scribe recognizes the framing. An 8-bit Kitty APC
+or an unsupported `f=`, `t=`, or action produces a payload-free diagnostic
+category, but an iTerm2 `OSC 1337;File=` sequence is not intercepted at all: it
+passes through as ordinary bytes, renders nothing, and produces no notice.
+
 ## Trust Boundary and Limits
 
 ImageLimits rejects untrusted work before allocation, retention, IPC replay, or GPU upload with checked arithmetic and per-session isolation.
@@ -88,6 +109,56 @@ buffer growth; dimension and pixel checks precede allocation; session/process
 retention checks precede commit; view projection precedes IPC/upload. Queue
 depth and bytes are charged before enqueue, then queue and decode deadlines use
 monotonic time.
+
+Three ceilings sit outside `ImageLimits` and bound seams rather than the decode
+path: the IPC and replay chunk carrier
+[[crates/scribe-common/src/terminal_images.rs#BoundedImageBytes]] at 1,048,576
+bytes, the client's staged live buffer at
+[[crates/scribe-client/src/terminal_image_scene.rs#MAX_BUFFERED_LIVE_RECORDS]]
+records, and
+[[crates/scribe-server/src/terminal_image_handoff.rs#MAX_HANDOFF_IMAGE_BYTES]]
+at 134,217,728 bytes — half of the 268,435,456-byte `HandoffState` ceiling every
+session's upgrade payload shares.
+
+## SSH and Multiplexer Policy
+
+Image bytes are ordinary PTY bytes: nothing in Scribe detects, wraps, or unwraps a transport, so SSH works by construction and multiplexers are out of scope rather than handled.
+
+No SSH-aware, tmux-aware, GNU-screen-aware, or Zellij-aware code path exists in
+the image seam. The framer runs on whatever arrives on the local PTY, so a
+remote application's Kitty APC and Sixel DCS sequences and Scribe's own PTY
+replies traverse an SSH hop unchanged and unattributed. `tests/e2e/terminal-images-functional.sh`
+proves that against a real loopback `sshd` and `ssh -tt` inside the container and
+writes `functional-probe-ssh.txt`. The evidence is Linux-only: the native macOS
+manifest lists `ssh_transport` in `not_covered_natively`, because a hop is a
+transport fact rather than a platform one.
+
+Multiplexers get no promise and no code. Scribe emits no `ESC Ptmux;` wrapper,
+strips none, and does not chunk `ESC P` for GNU screen, so whether an image
+survives depends entirely on the multiplexer's own passthrough configuration and
+is untested. Running an image application directly in a Scribe pane is the
+supported arrangement; under a multiplexer that drops or mangles a sequence, the
+application's textual fallback is what remains.
+
+## Payload Privacy
+
+Image bytes and decoded pixels live in process memory and in the local IPC and handoff sockets only; they never reach logs, telemetry, crash metadata, settings, or a disk cache.
+
+No image module writes a file. The framer's retained buffers, the server's staged
+and owned storage, the client's pending definitions, and the GPUI `RenderImage`
+cache are all in memory, and the only cross-process copies are the local IPC
+socket and the hot-upgrade handoff socket — never a temporary file, a cache
+directory, or the config file, which persists nothing about images beyond the
+`terminal.images.enabled` boolean.
+
+Nothing on the payload path logs. The image log sites that do exist carry scalars
+and enums only: the master-switch transition, and the client's per-placement
+warning naming a session id, an image id, and a typed rejection category. The
+guarantee is structural rather than a review rule.
+[[crates/scribe-common/src/terminal_images.rs#TerminalImageRejection]] has no
+string or byte field at all, `Debug` for the payload carriers prints lengths and
+capacities instead of contents, and Scribe ships no telemetry, analytics, or
+panic-hook path that could serialize an image.
 
 ## Capability Lifecycle
 
@@ -721,6 +792,24 @@ Text is never part of this. The release opens a retirement boundary whose raw
 outputs are the same bytes the terminal already showed, and the grid, its
 scrollback, and the application's own textual fallback are untouched.
 
+### Rollback procedure
+
+Turning terminal images off is a live configuration change with no restart, no downgrade, and no package action, which is what makes it the first response to a decoder, stream, or GPU incident.
+
+Set `enabled = false` under `[terminal.images]` in
+`~/.config/scribe/config.toml`, either by editing the file or by clearing the
+"Terminal images" toggle in the settings editor. The config file watcher raises
+`ConfigReloaded`, the server mirrors the new value into the process switch and
+into every live session's latch, and each PTY reader releases its retained image
+state on its next wake. Confirm from any pane: a Kitty capability probe goes
+unanswered, and a DA1 reply no longer carries attribute 4.
+
+Rolling back never touches text. Scrollback, the grid, and the application's own
+textual fallback survive, and a hot upgrade taken while the switch is off
+declares the pre-image handoff version so an older server accepts the payload.
+Setting the key back to `true` restores advertising for sessions that latch
+again; it restores no scene the disable released.
+
 ## Localized Image Diagnostics
 
 Scribe's own image messages come from one static catalog keyed by the frozen rejection taxonomy, so a diagnostic cannot carry a byte an application produced.
@@ -736,6 +825,13 @@ A pane reads its notice through
 which renders the scene's last typed rejection. The notice is additive: it never
 replaces the application's textual fallback, and the published definitions and
 placements beside it are unchanged.
+
+Suppression is structural, not temporal. The scene holds exactly one
+`last_rejection` slot, so a storm of rejections overwrites that slot and still
+renders one notice. There is no timer, cooldown, or burst counter to tune, and
+no rejection is ever queued or replayed as a backlog of notices. The notice
+names a category and nothing else: it is the string to quote in a bug report,
+and it exposes no image id, no dimensions, no path, and no application bytes.
 
 ## Renderer Failure Cleanup
 
@@ -979,7 +1075,7 @@ artifacts, never from a distribution package: Debian ships older Chafa and
 gnuplot builds, and no Yazi at all. A capable viewer must latch a session
 before any of it works, so the harness announces the renderer subset with
 `SCRIBE_TERMINAL_IMAGES=1`
-([`advertised_terminal_image_capabilities`](../crates/scribe-client/src/main.rs));
+([[crates/scribe-client/src/main.rs#advertised_terminal_image_capabilities]]);
 a session created by that client latches at creation, because a created session
 is attached by its creator and never through `AttachSessions`.
 
@@ -994,6 +1090,54 @@ Two defects the corpus surfaced are fixed at their root: a Kitty transfer opened
 by a data-less control command (Chafa's shape, and legal to Kitty) no longer
 fails its first chunk, and CR/LF inside a Sixel payload (gnuplot's `sixelgd`
 shape, ignored by DEC and xterm) no longer fails validation.
+
+## Evidence Index
+
+Every corpus writes reviewable JSON under `test-output/terminal-images/`, so a release review reads one directory instead of re-running the harness.
+
+The Docker corpora land in the top level of that directory. Each gate below runs
+as `just e2e-func <name>` after `just docker-func`, or as `just e2e-visual
+<name>` for the `visual/` entries after `just docker-visual`. Both images need
+`just build-release` first, and `test-output/` is written by the container as
+root.
+
+| Gate | Evidence |
+| --- | --- |
+| `terminal-image-contract.sh` | `contract.json` |
+| `terminal-image-framing.sh` | `framing.json` |
+| `terminal-image-ipc.sh` | `ipc.json` |
+| `terminal-image-sixel-decoder.sh` | `sixel-decoder-evidence.json` |
+| `terminal-image-kitty-decode.sh` | `kitty-decode-evidence.json` |
+| `functional/terminal-image-decode-spike.sh` | `decode-spike-evidence.json` |
+| `terminal-image-state-seam.sh` | `state-seam.json`, `state-seam-ipc.json` |
+| `terminal-image-accounting.sh` | `accounting.json` |
+| `terminal-image-scheduler.sh` | `scheduler.json` |
+| `terminal-image-transfer-lifecycle.sh` | `transfer-lifecycle.json` |
+| `terminal-image-mutations.sh` | `mutations.json` |
+| `terminal-image-convergence.sh` | `convergence.json` |
+| `terminal-image-observer-parity.sh` | `observer-parity.json` |
+| `terminal-image-server-state.sh` | `server-state-manifest.json` |
+| `terminal-image-replay.sh` | `replay.json` |
+| `terminal-image-replies-sharing.sh` | `replies-sharing.json` |
+| `terminal-image-handoff.sh` | `handoff.json` |
+| `terminal-image-client-scene.sh` | `client-scene.json` |
+| `terminal-image-client-replay.sh` | `client-replay.json` |
+| `terminal-image-settings.sh` | `settings.json`, `settings-run.log` |
+| `terminal-images-functional.sh` | `functional.json` and its probe transcripts |
+| `terminal-images-performance.sh` | `performance.json` |
+| `visual/terminal-image-gpui-spike.sh` | `linux/gpui-spike.json` |
+| `visual/terminal-image-renderer.sh` | `linux/renderer/renderer.json` and captures |
+| `visual/terminal-image-apps.sh` | `linux/apps/apps.json` |
+| `visual/terminal-images-visual.sh` | `linux/client/client.json` |
+| `visual/terminal-images-frame-stability.sh` | `linux/client/frame-stability.json` |
+
+`server-state-manifest.json` is not independent: it refuses to write unless the
+state-seam, accounting, scheduler, transfer-lifecycle, observer-parity,
+mutations, and convergence evidence is already green in the same directory.
+
+The native macOS corpus writes `macos/` in the same directory and is the only
+evidence that does not come from Docker; it is produced on a hosted runner and
+retrieved as a workflow artifact rather than run locally.
 
 ## Contract Verification
 
@@ -1313,7 +1457,7 @@ case-by-case description.
 
 ## Native macOS Metal Validation
 
-Native Metal evidence runs only on the sanctioned GPU-backed GitHub-hosted runner and never on a developer workstation.
+Native Metal evidence runs only on the sanctioned GitHub-hosted Apple-silicon runner and never on a developer workstation.
 
 `.github/workflows/native-macos-metal.yml` is a manual `workflow_dispatch` job
 on ARM64 `macos-14`, GitHub's standard Apple-silicon macOS runner, which is
@@ -1333,12 +1477,20 @@ branch and the driver exists at the target ref, invoke:
 gh workflow run native-macos-metal.yml --ref <release-candidate-ref>
 ```
 
-The job records candidate SHA, ref, runner identity, OS, architecture, and
-display/Metal metadata under `test-output/terminal-images/macos/`. The
-driver receives that directory in `SCRIBE_NATIVE_MACOS_OUTPUT_DIR`; its merged
-stdout/stderr is `run.log`. `actions/upload-artifact` archives the directory as
+The job records candidate SHA, ref, runner identity, OS, and architecture under
+`test-output/terminal-images/macos/`: `runner.txt` and `display.txt` from the
+workflow, `metal.json` as the machine-readable manifest, `run.log` as the
+driver's merged stdout and stderr, and `protocol/`, `apps/`, and `gpui/` for the
+per-phase transcripts. The driver receives that directory in
+`SCRIBE_NATIVE_MACOS_OUTPUT_DIR`. `actions/upload-artifact` archives it as
 `native-macos-metal-<run-id>` for 14 days, even after a corpus failure. Download
 it with `gh run download <run-id> --dir <destination>`.
+
+The runner identity is asserted in three places that must agree: the workflow
+sets `SCRIBE_NATIVE_MACOS_RUNNER: github-actions-macos-14`, and both
+`tools/run-native-macos-terminal-images.sh` and the driver refuse to run unless
+they see that exact marker alongside `GITHUB_ACTIONS`, `RUNNER_OS=macOS`, and
+`RUNNER_ARCH=ARM64`.
 
 The 120-minute job has no soft-failure path. Build, corpus, timeout,
 missing-driver, and artifact-upload failures block platform-dependent GPUI work
@@ -1361,9 +1513,10 @@ and a capable harness viewer.
 
 Its Metal phase requires the running window to report the `metal` renderer.
 `gpui_macos` has only a Metal renderer, but unlike `gpui_wgpu` it logs no
-selected adapter and returns `None` from `Window::gpu_specs`, so the window
-names the backend that painted it and the host's Metal device is recorded
-beside it from `system_profiler`. The phase then requires one `RenderImage` per
+selected adapter and returns `None` from `Window::gpu_specs`, so the backend
+name is the whole of the assertion. The manifest's `device` and
+`device_metal_support` fields are best-effort `system_profiler` scrapes and are
+empty on the hosted runner by design; nothing gates on them. The phase then requires one `RenderImage` per
 definition, one reuse across the full and cropped placements, 1-by-1 and
 4096-by-1 uploads, 4097-by-1 rejection with zero `RenderImage` objects created,
 atlas recovery that preserves source identities, and three final-reference
@@ -1383,3 +1536,17 @@ counterpart, so a genuine recoverable device loss cannot be induced from an
 application without forking GPUI. That
 decision is tracked separately and still blocks default-on release; the Linux
 atlas-clear proxy must not satisfy it.
+
+### Recorded green run
+
+The gate has passed once against the shipped epic, and that run is the evidence a release review cites.
+
+Run `31040886874` against candidate SHA `209da99` on runner
+`github-actions-macos-14` retained artifact `native-macos-metal-31040886874`.
+Its manifest records `backend=metal`, a 4096-pixel maximum and 1-pixel minimum
+upload, a 4097-pixel rejection refused before GPUI, three `RenderImage` objects
+created, one cache reuse, and three final-reference drops, with `ssh_transport`,
+`pixel_captures`, and `induced_metal_device_loss` listed in
+`not_covered_natively`. The run also produced a fix rather than only a verdict:
+the harness wrote the server PID file before anything created the runtime
+directory, which fails only on a fresh macOS host.

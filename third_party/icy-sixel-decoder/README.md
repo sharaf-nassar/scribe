@@ -40,6 +40,7 @@ from the pinned revision, classify security and compatibility fixes, port only
 audited decoder changes, rerun the adversarial Docker corpus, `cargo deny`,
 and `cargo tree`, then update this pin, checksum, fork delta, and both licenses.
 
-Security reports follow Scribe's repository security policy. Do not replace
+Report a suspected vulnerability in this fork privately through a GitHub
+security advisory on the Scribe repository rather than a public issue. Do not replace
 this fork with stock `icy_sixel`, a C decoder, or a whole-terminal dependency
 without a new trust-boundary review.
