@@ -61,6 +61,7 @@ use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
     snapshot_term,
 };
+use crate::terminal_image_replay;
 use crate::terminal_image_sharing::{
     SessionImageSharing, augment_device_attributes, effective_connection_subset,
     images_master_enabled, plan_pty_replies,
@@ -229,6 +230,12 @@ struct AttachedSink {
     /// Lock-free enqueue handle into that connection's output queue.
     queue: OutputSink,
     state: SinkState,
+    /// Set while this sink's image scene is not known to match the session's:
+    /// it just attached, or its queued output was shed. Live image records are
+    /// suppressed until a combined replay lands, exactly as `PtyOutput` is
+    /// suppressed while its session owes a text resync — an incremental delta
+    /// applied to an unknown scene is what produces a divergent viewer.
+    owes_image_replay: bool,
 }
 
 /// The set of client sinks attached to one session (feature 015 T007). Folds the
@@ -253,7 +260,14 @@ impl AttachedSinks {
     /// goes through [`AttachedSinks::begin_attach`] instead.
     fn set_sole(&mut self, writer: SharedWriter, queue: OutputSink) {
         self.sinks.clear();
-        self.sinks.push(AttachedSink { writer, queue, state: SinkState::Live });
+        // A freshly created session has no scene, so this sink's empty scene
+        // already matches and it owes no replay.
+        self.sinks.push(AttachedSink {
+            writer,
+            queue,
+            state: SinkState::Live,
+            owes_image_replay: false,
+        });
     }
 
     /// Install a sink that still owes an attach replay. Frames emitted from here
@@ -272,6 +286,9 @@ impl AttachedSinks {
             writer: Arc::clone(writer),
             queue,
             state: SinkState::Buffering(BufferedFrames::default()),
+            // An attaching sink knows nothing about this session's image scene
+            // until the combined replay hands it one.
+            owes_image_replay: true,
         });
     }
 
@@ -329,11 +346,13 @@ impl AttachedSinks {
     /// how many sinks received the burst, which is the viewer count the
     /// zero/one/multiple-viewer contract is written against.
     ///
-    /// Records are `Keep` frames, so a saturated link sheds `PtyOutput` and
-    /// resyncs rather than losing an image record silently.
+    /// A live record is session-scoped and droppable: a saturated link sheds it
+    /// with that session's `PtyOutput`, marks the sink replay-dirty, and the
+    /// combined replay supersedes everything shed.
     // @lat: [[terminal-images#Terminal Images#Capable-Sink Image Fanout]]
     fn fan_out_images(
         &mut self,
+        session_id: SessionId,
         required: TerminalImageCapabilities,
         messages: &[ServerMessage],
     ) -> usize {
@@ -342,10 +361,53 @@ impl AttachedSinks {
             if !sink.queue.image_capabilities().supports(required) {
                 continue;
             }
+            if sink.owes_image_replay {
+                // Suppressed: a delta against an unknown scene diverges.
+                continue;
+            }
             delivered += 1;
-            for msg in messages {
+            // A shed frame supersedes the rest of the burst too, so the sink
+            // stops here and waits for a combined replay.
+            sink.owes_image_replay =
+                !messages.iter().all(|msg| deliver_session_frame(sink, session_id, msg));
+        }
+        delivered
+    }
+
+    /// Which attached sinks currently owe a combined image replay.
+    ///
+    /// The caller plans ONE burst for all of them, which is what keeps the
+    /// server from ever holding a per-sink copy of the scene.
+    fn image_replay_debt(&self, required: TerminalImageCapabilities) -> usize {
+        self.sinks
+            .iter()
+            .filter(|sink| {
+                sink.owes_image_replay && sink.queue.image_capabilities().supports(required)
+            })
+            .count()
+    }
+
+    /// Deliver one planned replay burst to every capable sink that owes one and
+    /// clear its debt, returning how many received it.
+    ///
+    /// Replay records are `Keep` frames: the burst is the recovery, so shedding
+    /// it under the policy that triggered the recovery would loop forever.
+    // @lat: [[terminal-images#Terminal Images#Combined Image Replay]]
+    fn fan_out_image_replay(
+        &mut self,
+        required: TerminalImageCapabilities,
+        records: &[ServerMessage],
+    ) -> usize {
+        let mut delivered = 0;
+        for sink in &mut self.sinks {
+            if !sink.owes_image_replay || !sink.queue.image_capabilities().supports(required) {
+                continue;
+            }
+            delivered += 1;
+            for msg in records {
                 deliver_frame(sink, None, msg);
             }
+            sink.owes_image_replay = false;
         }
         delivered
     }
@@ -370,6 +432,28 @@ fn deliver_frame(sink: &mut AttachedSink, commit: Option<u64>, msg: &ServerMessa
             sink.queue.enqueue(msg);
         }
         SinkState::Buffering(buffered) => buffered.push(commit, msg),
+    }
+}
+
+/// Deliver one session-scoped droppable frame, reporting whether it is actually
+/// on its way to the client.
+///
+/// `false` means the frame was superseded: the connection's backlog for this
+/// session was shed, or a fresh replay is already pending for it. Either way the
+/// sink now needs a full scene rather than this delta.
+fn deliver_session_frame(
+    sink: &mut AttachedSink,
+    session_id: SessionId,
+    msg: &ServerMessage,
+) -> bool {
+    match &mut sink.state {
+        SinkState::Live => sink.queue.enqueue_session_frame(session_id, msg),
+        SinkState::Buffering(buffered) => {
+            buffered.push(None, msg);
+            // An overflowed attach buffer is resynced by `finish_attach`, and
+            // the sink already owes a replay while it buffers.
+            !buffered.overflowed
+        }
     }
 }
 
@@ -1960,13 +2044,15 @@ struct OutputQueueInner {
     closed: bool,
 }
 
-/// One queued frame. Only [`OutFrame::Pty`] is droppable by the overflow policy;
-/// every other message (takeover notice, session-exit, workspace update, the
-/// initial attach replay, …) is kept so it is never silently lost. Each variant
-/// carries its accounted byte size so both the `PtyOutput` cap and the total-queue
-/// cap can be maintained in O(1) on pop.
+/// One queued frame. Only [`OutFrame::Session`] is droppable by the overflow
+/// policy: it carries a session's high-volume incremental streams — raw
+/// `PtyOutput` and the typed live image records committed alongside it — whose
+/// loss a fresh combined replay repairs. Every other message (takeover notice,
+/// session-exit, workspace update, an attach or resync replay, …) is kept so it
+/// is never silently lost. Each variant carries its accounted byte size so both
+/// the droppable cap and the total-queue cap can be maintained in O(1) on pop.
 enum OutFrame {
-    Pty { session_id: SessionId, bytes: usize, msg: ServerMessage },
+    Session { session_id: SessionId, bytes: usize, msg: ServerMessage },
     Keep { bytes: usize, msg: ServerMessage },
 }
 
@@ -1976,7 +2062,7 @@ impl OutputQueueInner {
     /// track what is still buffered.
     fn pop_message(&mut self) -> Option<ServerMessage> {
         match self.frames.pop_front()? {
-            OutFrame::Pty { bytes, msg, .. } => {
+            OutFrame::Session { bytes, msg, .. } => {
                 self.queued_pty_bytes = self.queued_pty_bytes.saturating_sub(bytes);
                 self.queued_total_bytes = self.queued_total_bytes.saturating_sub(bytes);
                 Some(msg)
@@ -2029,45 +2115,73 @@ impl OutputSink {
     /// equivalent of the pre-queue "dead socket" write error.
     fn enqueue(&self, msg: &ServerMessage) -> bool {
         let bytes = out_frame_bytes(msg);
-        let pty_session = match msg {
-            ServerMessage::PtyOutput { session_id, .. } => Some(*session_id),
-            _ => None,
-        };
+        if let ServerMessage::PtyOutput { session_id, .. } = msg {
+            return self.enqueue_droppable(*session_id, bytes, msg).is_some();
+        }
         // Clone off the lock (see doc-comment): the frame is prepared here and
-        // simply discarded if the overflow policy below decides to drop it.
-        let frame = pty_session.map_or_else(
-            || OutFrame::Keep { bytes, msg: msg.clone() },
-            |session_id| OutFrame::Pty { session_id, bytes, msg: msg.clone() },
-        );
-
+        // simply discarded if the queue is already closed.
+        let frame = OutFrame::Keep { bytes, msg: msg.clone() };
         let mut g = self.0.lock();
         if g.closed {
             return false;
         }
-        if let Some(session_id) = pty_session {
-            if g.dirty.contains(&session_id) {
-                // A fresh replay is already pending for this session; its live
-                // output is superseded — drop it and skip the wakeup.
-                return true;
-            }
-            if g.queued_pty_bytes.saturating_add(bytes) > OUTPUT_QUEUE_PTY_BYTES {
-                // Overflow: shed the whole `PtyOutput` backlog and let a fresh
-                // replay catch every affected session (this one too) back up.
-                drop_pty_backlog(&mut g);
-                g.dirty.insert(session_id);
-            } else {
-                g.queued_pty_bytes += bytes;
-                g.queued_total_bytes += bytes;
-                g.frames.push_back(frame);
-            }
-        } else {
-            g.queued_total_bytes += bytes;
-            g.frames.push_back(frame);
-        }
+        g.queued_total_bytes += bytes;
+        g.frames.push_back(frame);
         enforce_queue_ceiling(&mut g);
         drop(g);
         self.0.notify.notify_one();
         true
+    }
+
+    /// Enqueue one session-scoped droppable frame — raw `PtyOutput` or a live
+    /// image record — reporting whether it is actually on its way.
+    ///
+    /// `false` means the frame was superseded rather than queued: the session
+    /// already owes a fresh replay, or this frame's arrival shed the backlog.
+    /// The image fan-out uses that answer to stop sending deltas and plan a
+    /// combined replay instead; the raw output path ignores it, because the
+    /// text resync the drain task already owes covers it.
+    fn enqueue_session_frame(&self, session_id: SessionId, msg: &ServerMessage) -> bool {
+        let bytes = out_frame_bytes(msg);
+        self.enqueue_droppable(session_id, bytes, msg) == Some(true)
+    }
+
+    /// Shared droppable-frame policy. `None` means the connection is closed;
+    /// `Some(false)` means the frame was superseded by a pending replay.
+    fn enqueue_droppable(
+        &self,
+        session_id: SessionId,
+        bytes: usize,
+        msg: &ServerMessage,
+    ) -> Option<bool> {
+        // Clone off the lock (see doc-comment): the frame is prepared here and
+        // simply discarded if the overflow policy below decides to drop it.
+        let frame = OutFrame::Session { session_id, bytes, msg: msg.clone() };
+        let mut g = self.0.lock();
+        if g.closed {
+            return None;
+        }
+        if g.dirty.contains(&session_id) {
+            // A fresh replay is already pending for this session; its live
+            // output is superseded — drop it and skip the wakeup.
+            return Some(false);
+        }
+        let queued = if g.queued_pty_bytes.saturating_add(bytes) > OUTPUT_QUEUE_PTY_BYTES {
+            // Overflow: shed the whole droppable backlog and let a fresh replay
+            // catch every affected session (this one too) back up.
+            drop_pty_backlog(&mut g);
+            g.dirty.insert(session_id);
+            false
+        } else {
+            g.queued_pty_bytes += bytes;
+            g.queued_total_bytes += bytes;
+            g.frames.push_back(frame);
+            true
+        };
+        enforce_queue_ceiling(&mut g);
+        drop(g);
+        self.0.notify.notify_one();
+        Some(queued)
     }
 
     /// Mark `session_id` replay-dirty so the drain task sends it a fresh full
@@ -2099,7 +2213,7 @@ fn drop_pty_backlog(g: &mut OutputQueueInner) {
     let mut kept = VecDeque::with_capacity(g.frames.len());
     for frame in std::mem::take(&mut g.frames) {
         match frame {
-            OutFrame::Pty { session_id, .. } => {
+            OutFrame::Session { session_id, .. } => {
                 g.dirty.insert(session_id);
             }
             keep @ OutFrame::Keep { .. } => kept.push_back(keep),
@@ -2120,6 +2234,36 @@ fn out_frame_bytes(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::PtyOutput { data, .. } => data.len(),
         ServerMessage::SessionReplay { replay, .. } => replay.replay_zstd.len(),
+        // Image records carry canonical RGBA in bounded chunks. Charging them a
+        // flat nominal would let a large scene's replay outgrow the queue's
+        // byte ceiling without the ceiling ever noticing.
+        ServerMessage::TerminalImageLive { message, .. } => live_record_bytes(message),
+        ServerMessage::TerminalImageReplay { message, .. } => replay_record_bytes(message),
+        _ => OUTPUT_FRAME_NOMINAL_BYTES,
+    }
+}
+
+/// Payload bytes one live image record puts on the wire.
+fn live_record_bytes(message: &scribe_common::terminal_images::TerminalImageLiveMessage) -> usize {
+    use scribe_common::terminal_images::{TerminalImageLiveMessage, TerminalImageUpdate};
+    match message {
+        TerminalImageLiveMessage::Update {
+            update: TerminalImageUpdate::DefinitionChunk { chunk },
+            ..
+        } => OUTPUT_FRAME_NOMINAL_BYTES.saturating_add(chunk.data.len()),
+        _ => OUTPUT_FRAME_NOMINAL_BYTES,
+    }
+}
+
+/// Payload bytes one replay record puts on the wire.
+fn replay_record_bytes(
+    message: &scribe_common::terminal_images::TerminalImageReplayMessage,
+) -> usize {
+    use scribe_common::terminal_images::TerminalImageReplayMessage;
+    match message {
+        TerminalImageReplayMessage::DefinitionChunk { chunk, .. } => {
+            OUTPUT_FRAME_NOMINAL_BYTES.saturating_add(chunk.data.len())
+        }
         _ => OUTPUT_FRAME_NOMINAL_BYTES,
     }
 }
@@ -8962,10 +9106,30 @@ fn send_to_client(client_writer: &ClientWriter, commit: Option<u64>, msg: &Serve
 /// image-latched session keeps parsing and retaining state while unwatched.
 pub fn send_image_records(
     client_writer: &ClientWriter,
+    session_id: SessionId,
     required: TerminalImageCapabilities,
     messages: &[ServerMessage],
 ) -> usize {
-    lock_sinks(client_writer).fan_out_images(required, messages)
+    lock_sinks(client_writer).fan_out_images(session_id, required, messages)
+}
+
+/// How many capable sinks currently owe this session a combined image replay.
+pub fn image_replay_debt(
+    client_writer: &ClientWriter,
+    required: TerminalImageCapabilities,
+) -> usize {
+    lock_sinks(client_writer).image_replay_debt(required)
+}
+
+/// Deliver one planned combined replay burst to every capable sink that owes
+/// one, clearing its debt. The burst is planned once regardless of how many
+/// sinks receive it.
+pub fn send_image_replay(
+    client_writer: &ClientWriter,
+    required: TerminalImageCapabilities,
+    records: &[ServerMessage],
+) -> usize {
+    lock_sinks(client_writer).fan_out_image_replay(required, records)
 }
 
 /// Install an attaching connection's sink on a session in the buffering state,
@@ -9294,10 +9458,12 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
     if !enabled {
         return;
     }
-    // ponytail: canonical RGBA bytes are not yet routed to live viewers, so a
-    // definition needing pixels withdraws itself from the burst and the client
-    // converges on the next combined replay instead. Upgrade path: the combined
-    // replay task owns the payload provider and passes it here.
+    // ponytail: the server retains no canonical RGBA yet, so both the live and
+    // the replay path withdraw any definition that needs pixels — together with
+    // every placement naming it — and a viewer converges on a scene holding
+    // exactly what the server can prove. Upgrade path: a retained canonical
+    // payload store charged to the session storage budget replaces this
+    // provider in both call sites, and nothing else here changes.
     let messages = match state.terminal_images.commit_and_publish(commit, &mut |_| None) {
         Ok(messages) => messages,
         Err(error) => {
@@ -9310,20 +9476,66 @@ async fn deliver_image_commit(state: &mut PtyReaderState, commit: &SessionTermin
         }
     };
     record_image_application_evidence(state, commit, replies);
-    if messages.is_empty() {
+    let session_id = state.session_id;
+    if !messages.is_empty() {
+        let frames: Vec<ServerMessage> = messages
+            .into_iter()
+            .map(|message| ServerMessage::TerminalImageLive { session_id, message })
+            .collect();
+        let viewers = send_image_records(&state.client_writer, session_id, required, &frames);
+        debug!(
+            %session_id,
+            records = frames.len(),
+            viewers,
+            "fanned terminal image records to capable viewers"
+        );
+    }
+    deliver_image_replay(state, required);
+}
+
+/// Give every capable sink that owes one the session's whole canonical scene.
+///
+/// A sink owes a replay when it just attached or when its queued output was
+/// shed — the two ways a viewer's scene stops being knowable. One burst is
+/// planned from canonical state and fanned to all of them, so the recovery cost
+/// is independent of viewer count and the server never keeps a per-sink copy.
+// @lat: [[terminal-images#Terminal Images#Combined Image Replay]]
+fn deliver_image_replay(state: &PtyReaderState, required: TerminalImageCapabilities) {
+    let debt = image_replay_debt(&state.client_writer, required);
+    if debt == 0 {
         return;
     }
     let session_id = state.session_id;
-    let frames: Vec<ServerMessage> = messages
+    let snapshot = state.terminal_images.state();
+    let definitions = state.terminal_images.canonical_definitions();
+    let placements = state.terminal_images.canonical_placements();
+    let plan = terminal_image_replay::plan_replay(
+        &terminal_image_replay::ReplayInputs {
+            generation: snapshot.generation,
+            through_sequence: snapshot.sequence,
+            active_screen: snapshot.active_screen,
+            definitions: &definitions,
+            placements: &placements,
+        },
+        &mut |_| None,
+    );
+    let records: Vec<ServerMessage> = plan
+        .records
         .into_iter()
-        .map(|message| ServerMessage::TerminalImageLive { session_id, message })
+        .map(|message| ServerMessage::TerminalImageReplay { session_id, message })
         .collect();
-    let viewers = send_image_records(&state.client_writer, required, &frames);
+    let viewers = send_image_replay(&state.client_writer, required, &records);
     debug!(
         %session_id,
-        records = frames.len(),
+        generation = snapshot.generation.0,
+        through_sequence = snapshot.sequence.0,
+        records = records.len(),
+        chunks = plan.counters.chunks,
+        rgba_bytes = plan.counters.total_rgba_bytes,
+        withdrawn_definitions = plan.counters.withdrawn_definitions,
+        debt,
         viewers,
-        "fanned terminal image records to capable viewers"
+        "replayed the canonical terminal image scene to capable viewers"
     );
 }
 

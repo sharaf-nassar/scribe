@@ -16,11 +16,12 @@ use scribe_common::ids::SessionId;
 use scribe_common::protocol::ServerMessage;
 use scribe_common::terminal_images::{
     TerminalImageCapabilities, TerminalImageDefinition, TerminalImageFeatures,
-    TerminalImageLiveMessage,
+    TerminalImageGeneration, TerminalImageLiveMessage, TerminalOutputSequence, TerminalScreenKind,
 };
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 use scribe_server::image_sharing_probe;
 use scribe_server::session_manager::build_term_config;
+use scribe_server::terminal_image_replay::{ReplayInputs, plan_replay};
 use scribe_server::terminal_image_sharing::{
     KillSwitchTransition, SessionImageSharing, augment_device_attributes,
     effective_connection_subset, plan_pty_replies,
@@ -41,7 +42,7 @@ const CELL_HEIGHT: u16 = 16;
 /// The pinned corpus fixture whose expected outcome is `kitty_ok_precedes_da1`.
 const QUERY_ORDER_FIXTURE: &str = "kitty-query-order.hex";
 /// The pinned corpus fixture that commits one definition and one placement.
-const RGB_CLASSIC_FIXTURE: &str = "kitty-rgb-classic.hex";
+pub const RGB_CLASSIC_FIXTURE: &str = "kitty-rgb-classic.hex";
 
 #[derive(Serialize)]
 struct Evidence<'a> {
@@ -129,15 +130,17 @@ impl Dimensions for ProbeDimensions {
 }
 
 /// Server seam plus the real terminal that observes it.
-struct Probe {
-    images: PtyTerminalImageState,
+///
+/// Shared with the replay gate so both drive one production ingress.
+pub struct Probe {
+    pub images: PtyTerminalImageState,
     term: Term<ScribeEventListener>,
     processor: Processor,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
 impl Probe {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let listener = ScribeEventListener::new(SessionId::new(), event_tx);
         let dimensions = ProbeDimensions { columns: 40, rows: 10 };
@@ -149,7 +152,7 @@ impl Probe {
 
     /// Drive one PTY read through framing and the real terminal, exactly as
     /// the production reader's ingress does.
-    fn feed(
+    pub fn feed(
         &mut self,
         bytes: &[u8],
     ) -> Result<scribe_server::terminal_image_state::SessionTerminalCommit, String> {
@@ -215,7 +218,7 @@ async fn run_probe(fixtures: &Path, evidence_path: &Path) -> Result<(), String> 
         kill_switch,
         cases,
     };
-    write_evidence(evidence_path, &evidence)
+    write_probe_evidence(evidence_path, &evidence)
 }
 
 /// A valid `a=q` probe must get its Kitty result before the DA1 reply that
@@ -385,21 +388,24 @@ async fn verify_viewer_fanout(fixtures: &Path) -> Result<ViewerEvidence, String>
         true,
     );
     let client_writer = image_sharing_probe::new_client_writer();
+    let session_id = SessionId::new();
 
     // Zero viewers: a latched session keeps producing records with nobody
     // watching, and nothing is delivered or buffered anywhere.
     let zero_viewers_delivered =
-        image_sharing_probe::fan_out_images(&client_writer, required, &frames);
+        image_sharing_probe::fan_out_images(&client_writer, session_id, required, &frames);
 
     let mut first = image_sharing_probe::attach_viewer(&client_writer, required, true).await;
+    settle_image_replay(&client_writer, session_id, required);
     let one_viewer_delivered =
-        image_sharing_probe::fan_out_images(&client_writer, required, &frames);
+        image_sharing_probe::fan_out_images(&client_writer, session_id, required, &frames);
     let one_viewer_received = count_image_records(&first.drain().await);
 
     let mut second = image_sharing_probe::attach_viewer(&client_writer, required, true).await;
     let mut blind = image_sharing_probe::attach_viewer(&client_writer, incapable, true).await;
+    settle_image_replay(&client_writer, session_id, required);
     let multiple_viewers_delivered =
-        image_sharing_probe::fan_out_images(&client_writer, required, &frames);
+        image_sharing_probe::fan_out_images(&client_writer, session_id, required, &frames);
     let multiple_viewers_received =
         [count_image_records(&first.drain().await), count_image_records(&second.drain().await)];
     let incapable_viewer_received = count_image_records(&blind.drain().await);
@@ -407,8 +413,9 @@ async fn verify_viewer_fanout(fixtures: &Path) -> Result<ViewerEvidence, String>
     // Controller change: a `SingleController` re-point replaces the whole set,
     // so the displaced viewers stop receiving without any latch change.
     let mut controller = image_sharing_probe::attach_viewer(&client_writer, required, false).await;
+    settle_image_replay(&client_writer, session_id, required);
     let controller_change_delivered =
-        image_sharing_probe::fan_out_images(&client_writer, required, &frames);
+        image_sharing_probe::fan_out_images(&client_writer, session_id, required, &frames);
     let controller_change_displaced_received =
         count_image_records(&first.drain().await) + count_image_records(&second.drain().await);
     let controller_change_new_received = count_image_records(&controller.drain().await);
@@ -416,7 +423,8 @@ async fn verify_viewer_fanout(fixtures: &Path) -> Result<ViewerEvidence, String>
     if !image_sharing_probe::detach_viewer(&client_writer, &controller) {
         return Err("detaching the only viewer reported no sink".to_owned());
     }
-    let detached_delivered = image_sharing_probe::fan_out_images(&client_writer, required, &frames);
+    let detached_delivered =
+        image_sharing_probe::fan_out_images(&client_writer, session_id, required, &frames);
     let detached_viewer_received = count_image_records(&controller.drain().await);
 
     let evidence = ViewerEvidence {
@@ -490,8 +498,35 @@ fn burst_frames(fixtures: &Path) -> Result<Vec<ServerMessage>, String> {
         .collect())
 }
 
+/// Hand a newly attached viewer the session's canonical scene, exactly as the
+/// production reader does on its first commit after an attach. Until that
+/// replay lands the sink owes one, and live deltas against an unknown scene
+/// stay suppressed.
+fn settle_image_replay(
+    client_writer: &scribe_server::ipc_server::ClientWriter,
+    session_id: SessionId,
+    required: TerminalImageCapabilities,
+) {
+    let plan = plan_replay(
+        &ReplayInputs {
+            generation: TerminalImageGeneration(1),
+            through_sequence: TerminalOutputSequence(0),
+            active_screen: TerminalScreenKind::Primary,
+            definitions: &[],
+            placements: &[],
+        },
+        &mut definition_payload,
+    );
+    let records: Vec<ServerMessage> = plan
+        .records
+        .into_iter()
+        .map(|message| ServerMessage::TerminalImageReplay { session_id, message })
+        .collect();
+    image_sharing_probe::fan_out_image_replay(client_writer, required, &records);
+}
+
 /// Canonical bytes for one published definition, matching the other probes.
-fn definition_payload(definition: &TerminalImageDefinition) -> Option<Vec<u8>> {
+pub fn definition_payload(definition: &TerminalImageDefinition) -> Option<Vec<u8>> {
     let length = usize::try_from(definition.rgba_bytes).ok()?;
     Some(vec![u8::try_from(definition.id.0 % 251).unwrap_or(0); length])
 }
@@ -531,7 +566,12 @@ fn escape(text: &str) -> String {
     text.chars().flat_map(char::escape_default).collect()
 }
 
-fn write_evidence(evidence_path: &Path, evidence: &Evidence<'_>) -> Result<(), String> {
+/// Write one versioned payload-free evidence document. Shared with the replay
+/// gate so both write the same shape.
+pub fn write_probe_evidence<T: Serialize>(
+    evidence_path: &Path,
+    evidence: &T,
+) -> Result<(), String> {
     if let Some(parent) = evidence_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;

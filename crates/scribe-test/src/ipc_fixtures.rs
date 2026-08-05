@@ -278,6 +278,9 @@ fn insert_replay_fixtures(
                 definition_count: 1,
                 placement_count: 1,
                 total_rgba_bytes: 4,
+                // Legacy default: an omitted screen keeps the pinned bytes and
+                // proves an older peer still decodes the record.
+                active_screen: None,
             },
         },
     )?;
@@ -311,6 +314,7 @@ fn insert_replay_fixtures(
             message: TerminalImageReplayMessage::Placement {
                 generation: model.generation,
                 placement: model.placement.clone(),
+                screen: None,
             },
         },
     )?;
@@ -327,6 +331,7 @@ fn insert_replay_fixtures(
             message: TerminalImageReplayMessage::Placement {
                 generation: model.generation,
                 placement: clipped,
+                screen: None,
             },
         },
     )?;
@@ -435,6 +440,7 @@ fn verify_bounds() -> Result<(), String> {
         definition_count: ImageLimits::V1.max_images_per_session + 1,
         placement_count: 0,
         total_rgba_bytes: 0,
+        active_screen: None,
     };
     if oversized.validate().is_ok() {
         return Err("maximum-plus-one replay definition count was accepted".to_owned());
@@ -538,6 +544,7 @@ fn verify_malformed_placements(model: &FixtureModel) -> Result<usize, String> {
             TerminalImageReplayMessage::Placement {
                 generation: model.generation,
                 placement: placement.clone(),
+                screen: None,
             }
             .validate()
                 == Err(*expected)

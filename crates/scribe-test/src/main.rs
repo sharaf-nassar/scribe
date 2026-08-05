@@ -22,6 +22,7 @@ mod terminal_image_accounting;
 mod terminal_image_convergence;
 mod terminal_image_mutations;
 mod terminal_image_observer_parity;
+mod terminal_image_replay;
 mod terminal_image_replies_sharing;
 mod terminal_image_scheduler;
 mod terminal_image_server_state;
@@ -373,6 +374,15 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Verify combined terminal-image replay and backpressure recovery.
+    TerminalImageReplay {
+        /// Directory containing terminal-images-v1 ASCII-hex fixtures.
+        #[arg(long)]
+        fixtures: PathBuf,
+        /// Versioned payload-free JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Verify terminal-image replies, capability lifecycle, and viewer fanout.
     TerminalImageRepliesSharing {
         /// Directory containing terminal-images-v1 ASCII-hex fixtures.
@@ -592,6 +602,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
             framing_probe::run(&fixtures, &evidence).map_err(TestError::TestFailure)
         }
         Command::TerminalImageStateSeam { evidence } => run_terminal_image_state_seam(&evidence),
+        Command::TerminalImageReplay { fixtures, evidence } => {
+            terminal_image_replay::run(&fixtures, &evidence).map_err(TestError::TestFailure)
+        }
         Command::TerminalImageRepliesSharing { fixtures, evidence } => {
             terminal_image_replies_sharing::run(&fixtures, &evidence)
                 .map_err(TestError::TestFailure)

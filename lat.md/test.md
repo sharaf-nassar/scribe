@@ -496,6 +496,67 @@ DA1 strings, the exact kill-switch transition sequence, every viewer delivery
 and receipt count, and the typed refusal totals. It also refuses any evidence
 that embedded array-shaped payload data.
 
+## Combined Image Replay
+
+The functional harness certifies generation-tagged replay, bounded chunking, and backpressure recovery against the production planner and the production sink set, without starting a host Scribe runtime.
+
+### Maximum Scene Stays Bounded
+
+The largest scene v1 admits is planned in full and every record is measured, so
+"bounded" is an observation rather than a claim.
+
+The case builds the frozen retention ceiling out of maximum-dimension images,
+plans the burst, and records the chunk count, the largest chunk, and the largest
+encoded `ServerMessage`. It fails if any chunk exceeds the replay chunk ceiling,
+if any record fails its own decode validation, if a frame approaches the IPC
+message ceiling, or if the chunk count is not exactly the bytes divided by the
+ceiling.
+
+### Atomic Late Attach
+
+A viewer that joins a session which already has a scene must receive the whole
+scene before any delta, and never a fragment of one.
+
+The case installs a sink through the production buffering attach, fans the
+committed live burst at it while it still owes a replay, then delivers the
+planned replay and releases the attach. It reads the viewer's own pipe back and
+requires that no live delta was delivered to a scene-less sink, that every
+replay record carried one generation, that `Commit` was the last record, and
+that the observed wire order is begin, definition, chunk, placement, commit.
+
+### Dropped Output Recovery
+
+A saturated viewer sheds this session's queued output, stops receiving deltas
+entirely, and is caught back up by one fresh combined replay.
+
+The case floods a live sink with maximum-size definition chunks past the
+connection's shed ceiling without ever reading its pipe, then checks that the
+sink is in replay debt, that a following live burst reaches it zero times, that
+one recovery burst clears the debt exactly once, and that the viewer reads a
+complete replay commit off its pipe afterwards.
+
+### Viewerless Output and Simultaneous Viewers
+
+A session with nobody watching keeps its canonical scene and owes nothing, and
+several viewers that join later are served by one plan.
+
+The case fans a burst with zero sinks attached, then attaches two capable
+viewers and requires both to owe a replay. One planned burst serves both, each
+receives every record exactly once, and the planner's counters are identical
+whether one viewer or two are being served — which is what "no per-sink retained
+duplicate scene" means in evidence.
+
+### Docker Evidence Entry Point
+
+`terminal-image-replay.sh` runs the probe against the pinned fixture directory
+and validates the payload-free evidence it writes.
+
+The gate pins the schema version, the production engine name, a passing result
+for all seven cases, the maximum-scene byte and chunk totals against the frozen
+limits, the attaching viewer's exact wire order, every debt and delivery count
+across the overflow and recovery sequence, and the viewer-count independence of
+the plan. It also refuses any evidence that embedded array-shaped payload data.
+
 ## Layered GPUI Terminal Images
 
 The visual harness exercises the production terminal image renderer and its view-local GPUI cache inside Docker.

@@ -27,6 +27,7 @@ pub mod stop_classifier;
 pub mod tailnet;
 pub mod terminal_image_mutations;
 pub mod terminal_image_publication;
+pub mod terminal_image_replay;
 pub mod terminal_image_sharing;
 pub mod terminal_image_state;
 pub mod updater;
