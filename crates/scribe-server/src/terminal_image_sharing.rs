@@ -251,6 +251,8 @@ fn reply_bytes(boundary: &TerminalImageBoundary) -> Option<Vec<u8>> {
 
 /// `q=0` normal, `q=1` suppresses success, `q=2` suppresses everything.
 const QUIET_SUPPRESS_SUCCESS: u8 = 1;
+/// The only level that silences a failure. `q=1` must keep answering errors.
+const QUIET_SUPPRESS_FAILURE: u8 = 2;
 
 fn kitty_success_reply(command: &KittyCommand) -> Option<Vec<u8>> {
     if command.quiet >= QUIET_SUPPRESS_SUCCESS {
@@ -287,10 +289,13 @@ fn kitty_failure_reply(failure: &GraphicsFailure) -> Option<Vec<u8>> {
     if !matches!(failure.protocol, GraphicsProtocol::Kitty) {
         return None;
     }
-    // ponytail: a failure annotation carries no quiet level, so `q=2` cannot
-    // suppress an error reply the way it suppresses a success reply. Upgrade
-    // path: carry the parsed quiet level on `GraphicsFailure` when a real
-    // application is observed setting `q=2` and objecting to the error.
+    // Only `q=2` silences an error, and only when the failing sequence framed
+    // far enough for that operand to be read. A failure that never carried a
+    // readable quiet level arrives here as `0` and still answers, so a stream
+    // cannot mute its own diagnostics by malforming them.
+    if failure.quiet >= QUIET_SUPPRESS_FAILURE {
+        return None;
+    }
     let code = failure_code(failure.category);
     Some(format!("\x1b_G;{code}\x1b\\").into_bytes())
 }

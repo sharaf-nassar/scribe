@@ -1811,6 +1811,9 @@ impl SessionTerminal {
                     protocol: GraphicsProtocol::Kitty,
                     category: GraphicsFailureCategory::TruncatedSequence,
                     limit: None,
+                    // The transfer's first chunk set the quiet level for every
+                    // chunk that followed, including the ones that never came.
+                    quiet: pending.controls.quiet,
                 }))
                 .map_err(SessionTerminalError::Storage)?;
         }
@@ -2374,10 +2377,15 @@ impl SessionTerminal {
         ));
         let requested_bytes = u64::try_from(command.payload().len()).unwrap_or(u64::MAX);
         let request = self.decode_request(target, requested_bytes);
+        let quiet = self.transfer_quiet(&command);
         let permit = match self.admit_decode(&request) {
             Ok(permit) => permit,
             Err(error) => {
-                return self.reject_decode_admission(range, GraphicsProtocol::Kitty, error, staged);
+                return self.reject_decode_admission(
+                    kitty_failure(range, GraphicsFailureCategory::QuotaExceeded, quiet),
+                    error,
+                    staged,
+                );
             }
         };
         let mut budget = match DecodeBudget::new(limits, &NoopHooks, &permit).map_err(|error| {
@@ -2385,7 +2393,7 @@ impl SessionTerminal {
         }) {
             Ok(budget) => budget,
             Err(error) => {
-                self.reject_kitty_decode(range, error, staged)?;
+                self.reject_kitty_decode(range, error, quiet, staged)?;
                 return Ok(());
             }
         };
@@ -2397,7 +2405,7 @@ impl SessionTerminal {
             .push_chunk(command.payload(), more, &mut budget)
             .map_err(kitty_boundary_error);
         if let Err(error) = push_result {
-            self.reject_kitty_decode(range, error, staged)?;
+            self.reject_kitty_decode(range, error, quiet, staged)?;
             return Ok(());
         }
         if let Some(pending) = self.pending_kitty_decode.as_mut() {
@@ -2459,7 +2467,9 @@ impl SessionTerminal {
             }
             Err(DecodeBoundaryError::Protocol(category)) => {
                 staged.completed_kitty_transfer = self.pending_kitty_decode.take();
-                self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)?;
+                // `command` already adopted the transfer's controls above, so
+                // its quiet level is the transfer's own.
+                self.append_decode_failure(kitty_failure(range, category, command.quiet), staged)?;
                 return Ok(());
             }
         };
@@ -2482,8 +2492,7 @@ impl SessionTerminal {
     /// ordinary hostile-stream outcomes.
     fn reject_decode_admission(
         &mut self,
-        range: RawByteRange,
-        protocol: GraphicsProtocol,
+        failure: GraphicsFailure,
         error: DecodeAdmissionError,
         staged: &mut StagedRead,
     ) -> Result<(), SessionTerminalError> {
@@ -2497,15 +2506,10 @@ impl SessionTerminal {
                 Err(SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant))
             }
             _ => {
-                if protocol == GraphicsProtocol::Kitty {
+                if failure.protocol == GraphicsProtocol::Kitty {
                     staged.completed_kitty_transfer = self.pending_kitty_decode.take();
                 }
-                self.append_decode_failure(
-                    range,
-                    protocol,
-                    GraphicsFailureCategory::QuotaExceeded,
-                    staged,
-                )
+                self.append_decode_failure(failure, staged)
             }
         }
     }
@@ -2514,15 +2518,29 @@ impl SessionTerminal {
         &mut self,
         range: RawByteRange,
         error: DecodeBoundaryError,
+        quiet: u8,
         staged: &mut StagedRead,
     ) -> Result<(), SessionTerminalError> {
         match error {
             DecodeBoundaryError::Storage(error) => Err(SessionTerminalError::Storage(error)),
             DecodeBoundaryError::Protocol(category) => {
                 staged.completed_kitty_transfer = self.pending_kitty_decode.take();
-                self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)
+                self.append_decode_failure(kitty_failure(range, category, quiet), staged)
             }
         }
+    }
+
+    /// The quiet level a failure on `command` must honor.
+    ///
+    /// A continuation chunk may omit every control, so a chunk that does not
+    /// spell `q=` inherits the level its transfer's first chunk set — the same
+    /// adoption a completed boundary performs through
+    /// [`scribe_pty::graphics_framing::KittyCommand::adopt_transfer_controls`].
+    fn transfer_quiet(&self, command: &KittyCommand) -> u8 {
+        if command.control_present(b'q') {
+            return command.quiet;
+        }
+        self.pending_kitty_decode.as_ref().map_or(command.quiet, |pending| pending.controls.quiet)
     }
 
     fn prepare_kitty_transfer(
@@ -2535,11 +2553,10 @@ impl SessionTerminal {
             if pending.controls.accepts_continuation(command) {
                 return Ok(KittyTransferPreparation::Ready);
             }
+            let quiet = self.transfer_quiet(command);
             staged.completed_kitty_transfer = self.pending_kitty_decode.take();
             self.append_decode_failure(
-                range,
-                GraphicsProtocol::Kitty,
-                GraphicsFailureCategory::MalformedControl,
+                kitty_failure(range, GraphicsFailureCategory::MalformedControl, quiet),
                 staged,
             )?;
             return Ok(KittyTransferPreparation::HandledFailure);
@@ -2552,24 +2569,23 @@ impl SessionTerminal {
         }
         let Some(params) = kitty_decode_params(command) else {
             self.append_decode_failure(
-                range,
-                GraphicsProtocol::Kitty,
-                GraphicsFailureCategory::MalformedControl,
+                kitty_failure(range, GraphicsFailureCategory::MalformedControl, command.quiet),
                 staged,
             )?;
             return Ok(KittyTransferPreparation::HandledFailure);
         };
-        let transfer =
-            match KittyTransfer::new(params, self.policy.limits).map_err(kitty_boundary_error) {
-                Ok(transfer) => transfer,
-                Err(DecodeBoundaryError::Storage(error)) => {
-                    return Err(SessionTerminalError::Storage(error));
-                }
-                Err(DecodeBoundaryError::Protocol(category)) => {
-                    self.append_decode_failure(range, GraphicsProtocol::Kitty, category, staged)?;
-                    return Ok(KittyTransferPreparation::HandledFailure);
-                }
-            };
+        let transfer = match KittyTransfer::new(params, self.policy.limits)
+            .map_err(kitty_boundary_error)
+        {
+            Ok(transfer) => transfer,
+            Err(DecodeBoundaryError::Storage(error)) => {
+                return Err(SessionTerminalError::Storage(error));
+            }
+            Err(DecodeBoundaryError::Protocol(category)) => {
+                self.append_decode_failure(kitty_failure(range, category, command.quiet), staged)?;
+                return Ok(KittyTransferPreparation::HandledFailure);
+            }
+        };
         self.pending_kitty_decode = Some(PendingKittyDecode {
             transfer,
             controls: command.controls(),
@@ -2600,7 +2616,11 @@ impl SessionTerminal {
             Ok(permit) => permit,
             Err(error) => {
                 staged.sixel_body = StagedStorage::Clear;
-                return self.reject_decode_admission(range, GraphicsProtocol::Sixel, error, staged);
+                return self.reject_decode_admission(
+                    sixel_failure(range, GraphicsFailureCategory::QuotaExceeded),
+                    error,
+                    staged,
+                );
             }
         };
         let (canonical, pixels) = match self.decode_sixel(&command, &permit) {
@@ -2619,7 +2639,7 @@ impl SessionTerminal {
             }
             Err(DecodeBoundaryError::Protocol(category)) => {
                 staged.sixel_body = StagedStorage::Clear;
-                self.append_decode_failure(range, GraphicsProtocol::Sixel, category, staged)?;
+                self.append_decode_failure(sixel_failure(range, category), staged)?;
                 return Ok(());
             }
         };
@@ -2697,19 +2717,13 @@ impl SessionTerminal {
 
     fn append_decode_failure(
         &self,
-        range: RawByteRange,
-        protocol: GraphicsProtocol,
-        category: GraphicsFailureCategory,
+        failure: GraphicsFailure,
         staged: &mut StagedRead,
     ) -> Result<(), SessionTerminalError> {
+        let range = failure.range;
         self.append_image(
             range,
-            TerminalImageBoundary::Failure(GraphicsFailure {
-                range,
-                protocol,
-                category,
-                limit: None,
-            }),
+            TerminalImageBoundary::Failure(failure),
             &mut staged.sequence,
             &mut staged.outputs,
         )
@@ -3000,6 +3014,21 @@ fn kitty_boundary_error(
 
 fn internal_storage_error() -> SessionTerminalError {
     SessionTerminalError::Storage(GraphicsStorageRejection::InternalInvariant)
+}
+
+/// One Kitty failure boundary carrying the `q=` level its reply must honor.
+const fn kitty_failure(
+    range: RawByteRange,
+    category: GraphicsFailureCategory,
+    quiet: u8,
+) -> GraphicsFailure {
+    GraphicsFailure { range, protocol: GraphicsProtocol::Kitty, category, limit: None, quiet }
+}
+
+/// One Sixel failure boundary. Sixel has no `q=` operand and owes no protocol
+/// reply, so it always takes the loud default.
+const fn sixel_failure(range: RawByteRange, category: GraphicsFailureCategory) -> GraphicsFailure {
+    GraphicsFailure { range, protocol: GraphicsProtocol::Sixel, category, limit: None, quiet: 0 }
 }
 
 fn sixel_boundary_error(error: &SixelDecodeError) -> DecodeBoundaryError {

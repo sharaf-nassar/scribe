@@ -517,6 +517,14 @@ terminal replies second. Replanning the same committed read proves a reattach or
 replay adds no second reply, and planning it against a disabled session proves
 the discovery reply disappears entirely.
 
+The quiet case drives one rejected command — an unsupported transport — through
+the same production framing and reply planner once per quiet level, so only the
+`q=` operand differs between runs. It requires `q=0` and `q=1` to answer
+`ENOSYS` and `q=2` to answer nothing, which pins `q=1` as a success-only
+suppressor rather than a blanket one. A fourth run spells an undefined `q=9`,
+whose level is unreadable, and requires the failure to stay loud rather than be
+swallowed.
+
 The kill-switch case latches a session, disables it, writes the same value
 again, and re-enables it, recording each transition. It checks that DA1 gains
 attribute `4` only while the capability is live and never twice, that a disabled
@@ -548,10 +556,11 @@ deliver nothing while still holding its capability.
 directory and validates the payload-free evidence it writes.
 
 The gate pins the schema version, the production engine name, a passing result
-for all nine cases, the exact reply order and counts, the enabled and disabled
-DA1 strings, the exact kill-switch transition sequence, every viewer delivery
-and receipt count, and the typed refusal totals. It also refuses any evidence
-that embedded array-shaped payload data.
+for all ten cases, the exact reply order and counts, the per-quiet-level failure
+reply counts and their answered code, the enabled and disabled DA1 strings, the
+exact kill-switch transition sequence, every viewer delivery and receipt count,
+and the typed refusal totals. It also refuses any evidence that embedded
+array-shaped payload data.
 
 ## Image Settings and Diagnostics
 
