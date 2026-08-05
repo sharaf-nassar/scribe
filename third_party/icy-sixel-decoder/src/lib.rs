@@ -12,7 +12,7 @@ pub use scribe_image_decode::{
     AllocationDenied, DecodeHooks, DecodeLimits, DecodeStats, NoopHooks,
 };
 use scribe_image_decode::{
-    BudgetError, DecodeAllocationClass, DecodeBudget as Budget, DecodeBuffer, DecodeStorage,
+    BudgetError, DecodeAllocationClass, DecodeBudget as Budget, DecodeBuffer, DecodePermit,
     DecodeStorageError,
 };
 
@@ -176,10 +176,10 @@ pub fn decode_sixel(
     data: &[u8],
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
-    storage: &DecodeStorage,
+    permit: &DecodePermit,
 ) -> Result<DecodedSixel, DecodeError> {
     limits.validate()?;
-    let mut budget = Budget::new(limits, hooks, storage)?;
+    let mut budget = Budget::new(limits, hooks, permit)?;
     let parsed = parse_sequence(data, &mut budget)?;
     decode_payload_with_budget(parsed.payload, parsed.settings, budget)
 }
@@ -209,10 +209,10 @@ pub fn decode_sixel_payload(
     settings: DcsSettings,
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
-    storage: &DecodeStorage,
+    permit: &DecodePermit,
 ) -> Result<DecodedSixel, DecodeError> {
     limits.validate()?;
-    let budget = Budget::new(limits, hooks, storage)?;
+    let budget = Budget::new(limits, hooks, permit)?;
     decode_payload_with_budget(payload, settings, budget)
 }
 

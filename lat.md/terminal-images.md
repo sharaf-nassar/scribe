@@ -374,6 +374,57 @@ no canonical Kitty class because the live transfer/decoded owner is retained
 directly. Class-local occurrence counts cannot be
 satisfied by unrelated framing or decoding work.
 
+## Mandatory Decode Scheduling
+
+Every image decode is admitted by one process-owned scheduler, so no caller can charge decode work outside the frozen concurrency, queue, and byte ceilings.
+
+[[crates/scribe-image-decode/src/scheduler.rs#DecodeScheduler]] owns the
+immutable [[crates/scribe-image-decode/src/scheduler.rs#DecodeCeilings]]
+derived from the frozen limits: two concurrent decodes, an eight-deep queue,
+134,217,728 queued bytes, and a 1,000 ms queue wait. One
+[[crates/scribe-image-decode/src/scheduler.rs#DecodeTicket]] is issued per
+request and consumed by admission, which returns the only
+[[crates/scribe-image-decode/src/scheduler.rs#DecodePermit]] that can exist -
+the type has no public constructor.
+
+The permit, not the caller, owns the session storage handle, so
+[[crates/scribe-image-decode/src/lib.rs#DecodeBudget]] - the type both the
+Kitty and Sixel decoders charge - cannot be built without one. That is what
+makes admission mandatory rather than advisory: a decode entry point that skips
+scheduling does not compile.
+
+Each ticket binds an issuer, session, generation, target, requested byte count,
+and storage budget.
+[[crates/scribe-image-decode/src/scheduler.rs#DecodePermit#authorize]] re-checks
+all five where the work is about to run and returns a typed
+[[crates/scribe-image-decode/src/scheduler.rs#DecodeAdmissionError]] first, so a
+permit minted for one session, generation, or target cannot be replayed against
+another. [[crates/scribe-server/src/terminal_image_state.rs#SessionTerminal]]
+issues, admits, and authorizes one request per Kitty and Sixel decode boundary;
+a refused admission becomes a typed quota failure, and a foreign capability is
+an internal invariant because the seam is presenting a ticket it just issued.
+
+Admission is strict FIFO by issue order: a waiter is eligible only at the head
+of the queue, so a later request can never barge. Issue and admission are
+therefore a pair - the seam admits on the thread that issued - and a ticket
+dropped without admission removes itself and wakes the queue, which is what
+keeps an abandoned ticket from parking the line.
+
+Cancellation is per session target.
+[[crates/scribe-image-decode/src/scheduler.rs#DecodeScheduler#cancel_target]]
+flags queued and in-flight entries for exactly one transfer or target image,
+wakes every waiter, and leaves unrelated targets and sessions untouched. An
+in-flight cancellation is observed by the shared budget's cooperative check, so
+decoding stops at the next observation boundary instead of running to
+completion. A waiter that outlives its queue wait retires itself the same way
+and wakes its successor. Ownership is released exactly once by `Drop` on the
+ticket or the permit, never by a caller.
+
+Queue metadata is bounded by construction: at most one queue-depth of waiters
+and one concurrency ceiling of active entries, each payload-free. A request over
+the byte ceiling, or one arriving at a full queue, is refused at issue before
+any storage is reserved, and an unrelated session keeps its own slot.
+
 ## Transactional Image Mutations
 
 Canonical definitions and placements change all-or-nothing: a read either commits every mutation it implies or leaves the prior state, ownership, and counters exactly as they were.
@@ -560,7 +611,10 @@ Kitty and Sixel charge one caller-owned cooperative budget, preventing either de
 
 [[crates/scribe-image-decode/src/lib.rs#DecodeBudget]] owns cumulative work,
 the next 4096-unit observation boundary, an absolute monotonic deadline,
-caller cancellation and allocation hooks, and peak live-allocation evidence.
+caller cancellation and allocation hooks, and peak live-allocation evidence. It
+is built from a scheduler permit rather than a raw storage handle, so the budget
+also observes scheduler cancellation at every check - see
+[[terminal-images#Terminal Images#Mandatory Decode Scheduling]].
 Checked work overflow, hook denial, cancellation, and deadline expiry return
 typed payload-free errors. The Sixel and PNG forks use this exact type rather
 than independently approximating the frozen interval.

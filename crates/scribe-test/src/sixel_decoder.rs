@@ -14,15 +14,18 @@ use icy_sixel_decoder::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::decode_storage::decode_storage;
+use scribe_image_decode::DecodeStorageError;
+
+use crate::decode_storage::decode_permit;
 
 fn decode_sixel(
     data: &[u8],
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
 ) -> Result<DecodedSixel, DecodeError> {
-    let storage = decode_storage();
-    decode_sixel_accounted(data, limits, hooks, &storage)
+    let permit =
+        decode_permit().map_err(|_| DecodeError::Storage(DecodeStorageError::InternalInvariant))?;
+    decode_sixel_accounted(data, limits, hooks, &permit)
 }
 
 fn decode_sixel_payload(
@@ -31,8 +34,9 @@ fn decode_sixel_payload(
     limits: DecodeLimits,
     hooks: &impl DecodeHooks,
 ) -> Result<DecodedSixel, DecodeError> {
-    let storage = decode_storage();
-    decode_sixel_payload_accounted(payload, settings, limits, hooks, &storage)
+    let permit =
+        decode_permit().map_err(|_| DecodeError::Storage(DecodeStorageError::InternalInvariant))?;
+    decode_sixel_payload_accounted(payload, settings, limits, hooks, &permit)
 }
 
 #[derive(Debug, Deserialize)]

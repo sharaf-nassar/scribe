@@ -1,5 +1,12 @@
 //! Shared cooperative controls for untrusted terminal-image decoders.
 
+mod scheduler;
+
+pub use scheduler::{
+    DecodeAdmissionError, DecodeCeilings, DecodePermit, DecodeProtocol, DecodeRequest,
+    DecodeScheduler, DecodeSchedulerMetrics, DecodeSessionId, DecodeTarget, DecodeTicket,
+};
+
 use std::error::Error;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -1005,10 +1012,13 @@ pub struct DecodeStats {
 
 // @lat: [[terminal-images#Terminal Images#Shared Decode Budget]]
 /// Caller-owned cumulative work, cancellation, deadline, and allocation state.
+///
+/// The scheduler permit is the only route to a session storage budget, which
+/// is what makes decode admission mandatory rather than advisory.
 pub struct DecodeBudget<'a> {
     limits: DecodeLimits,
     hooks: &'a dyn DecodeHooks,
-    storage: &'a DecodeStorage,
+    permit: &'a DecodePermit,
     work_units: u64,
     next_check: u64,
     checks: u64,
@@ -1020,13 +1030,13 @@ impl<'a> DecodeBudget<'a> {
     pub fn new(
         limits: DecodeLimits,
         hooks: &'a impl DecodeHooks,
-        storage: &'a DecodeStorage,
+        permit: &'a DecodePermit,
     ) -> Result<Self, BudgetError> {
         limits.validate()?;
         let mut budget = Self {
             limits,
             hooks,
-            storage,
+            permit,
             work_units: 0,
             next_check: limits.check_interval_work_units,
             checks: 0,
@@ -1070,7 +1080,7 @@ impl<'a> DecodeBudget<'a> {
 
     pub fn check_now(&mut self) -> Result<(), BudgetError> {
         self.checks = self.checks.saturating_add(1);
-        if self.hooks.is_cancelled() {
+        if self.permit.is_cancelled() || self.hooks.is_cancelled() {
             return Err(BudgetError::DecodeCancelled { work_units: self.work_units });
         }
         if Instant::now() >= self.limits.deadline {
@@ -1099,7 +1109,7 @@ impl<'a> DecodeBudget<'a> {
         bytes: usize,
     ) -> Result<DecodeBuffer, BudgetError> {
         self.begin_allocation(bytes)?;
-        match DecodeBuffer::allocate(self.storage, class, bytes) {
+        match DecodeBuffer::allocate(self.permit.storage(), class, bytes) {
             Ok(buffer) => Ok(buffer),
             Err(error) => {
                 self.end_allocation(bytes);
