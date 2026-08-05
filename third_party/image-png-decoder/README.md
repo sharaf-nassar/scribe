@@ -44,6 +44,7 @@ advisory audit. Compare changes from the pinned revision, port relevant decoder
 security fixes, rerun the adversarial Docker corpus, `cargo deny`, and dependency
 tree review, then update this pin, checksum, fork delta, and both licenses.
 
-Security reports follow Scribe's repository security policy. Never replace the
+Report a suspected vulnerability in this fork privately through a GitHub
+security advisory on the Scribe repository rather than a public issue. Never replace the
 fork with stock `png`, generic `image`, a C decoder, or a resource loader without
 a new trust-boundary review.

@@ -117,6 +117,11 @@ The terminal-images toggle is keyed `terminal.images.enabled`, is labelled
 server applies it live on the `ConfigReloaded` round-trip, so turning it off
 stops advertising, releases retained image state, and leaves the text pipeline
 alone without a restart — see [[terminal-images#Terminal Images#Image Master Switch]].
+The `Control` model carries a key and a label but no description field, so the
+toggle ships label-only; the user-facing explanation of what the switch covers,
+what it refuses, and what turning it off does lives in the README's "Terminal
+images" configuration subsection, and the operator sequence lives in
+[[terminal-images#Terminal Images#Image Master Switch#Rollback procedure]].
 
 Status bar stat toggles remain on the Terminal page under the Status Bar section.
 
