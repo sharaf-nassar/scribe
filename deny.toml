@@ -81,6 +81,53 @@ deny = [
   { crate = "openssl-sys", reason = "Use rustls instead" },
 ]
 
+# Duplicate-version exceptions. None of these are ours to converge: the whole
+# workspace resolves to a single version of every crate it picks itself, and
+# `cargo tree -d -p scribe-server` reports exactly one duplicate (getrandom,
+# below). Everything else enters through a pinned upstream fork whose own
+# dependency graph we do not control.
+#
+# These exist so a duplicate we DO introduce is visible. Without them the check
+# reports ~58 permanent warnings, and a 59th would go unnoticed — which is the
+# opposite of what the check is for. Deleting an entry must mean the duplicate
+# is genuinely gone, never that the warning became inconvenient.
+skip-tree = [
+  # Owner: Scribe maintainers. Review when the gpui pin moves.
+  # The pinned zed gpui revision brings its own resolved graph (windows-* family,
+  # syn, toml, hashbrown, cosmic-text, harfrust, objc2, ...). Converging it would
+  # mean patching gpui's dependencies, not ours.
+  { crate = "gpui", reason = "pinned zed gpui revision resolves its own transitive graph" },
+  # Owner: Scribe maintainers. Review when the client stops needing zed's fork.
+  # scribe-client imports zed's display-only alacritty fork as
+  # `alacritty_terminal_gpui` while scribe-pty/server/test use the crates.io
+  # 0.26.0-rc1. The alias is deliberate and makes the split explicit at every
+  # import site; the two are not interchangeable.
+  { crate = "alacritty_terminal@0.26.1-dev", reason = "client uses zed's display-only fork under an explicit alias" },
+]
+
+# Remaining duplicates after the skip-trees above. Every one was traced to a
+# transitive consumer; none is a direct dependency of any scribe crate, so none
+# can be converged from this workspace.
+#
+# Owner: Scribe maintainers. Review when the gpui pin moves.
+skip = [
+  # Font stack: fontconfig-parser, swash, and gpui's own text pipeline pull
+  # different releases of the same Google Fonts crates.
+  { crate = "font-types", reason = "read-fonts 0.34 and 0.37 pull different font-types" },
+  { crate = "read-fonts", reason = "fontconfig-parser and gpui's text stack disagree" },
+  { crate = "skrifa", reason = "font stack consumers disagree" },
+  # macOS windowing and accessibility, entirely inside the gpui platform layer.
+  { crate = "objc2", reason = "gpui platform crates span two objc2 generations" },
+  { crate = "objc2-app-kit", reason = "gpui platform crates span two objc2 generations" },
+  { crate = "objc2-foundation", reason = "gpui platform crates span two objc2 generations" },
+  { crate = "accesskit_consumer", reason = "accesskit adapters pin three releases" },
+  # Same parents as the quick-xml advisories ignored above: wayland-scanner
+  # parses vendored protocol XML at build time, notify-rust is Windows-only.
+  { crate = "quick-xml", reason = "wayland-scanner and notify-rust pin 0.39/0.37" },
+  # hashbrown rides along with the above; no scribe crate depends on it directly.
+  { crate = "hashbrown", reason = "transitive consumers span 0.14 and 0.15" },
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

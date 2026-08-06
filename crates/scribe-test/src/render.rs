@@ -252,7 +252,7 @@ fn shape_cache_key(ctx: &mut RenderCtx, params: &GlyphParams) -> Option<cosmic_t
     let attrs = build_attrs(params);
     let mut char_buf = [0u8; 4];
     let text = params.ch.encode_utf8(&mut char_buf);
-    buf.set_text(&mut ctx.font_system, text, &attrs, Shaping::Advanced, None);
+    buf.borrow_with(&mut ctx.font_system).set_text(text, &attrs, Shaping::Advanced, None);
 
     buf.layout_runs()
         .next()
