@@ -3316,3 +3316,43 @@ The keybindings page lists every action the apply path routes under `keybindings
  makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
 
 The primary then accepts the handoff connection, verifies the peer UID, and reads back that exact focus command — proving the second launch focuses the running window instead of opening a duplicate.
+
+## Terminal Image Release Gate
+
+The release gate assembles `test-output/terminal-images/release-manifest.json`, the machine-readable counterpart of the human Evidence Index, mapping every specification acceptance criterion to the evidence that proves it.
+
+`tests/e2e/terminal-image-release-gate.sh` runs no Scribe runtime of its own.
+Every claim it publishes is read back out of evidence a sibling gate already
+wrote into the same output directory, so the manifest can only be green when
+those gates ran and passed together. It must therefore follow a green
+`just e2e` and the terminal-image visual suites rather than replace them.
+
+### Criterion table cannot drift from the spec
+
+The criterion count is re-derived from the spec on every invocation, so a new
+acceptance criterion fails the gate until it is mapped to evidence.
+
+`just e2e-release-gate` counts the acceptance bullets in
+`specs/020-terminal-images/spec.md` and passes the total in. The script
+refuses a table whose row count disagrees, which is what stops a criterion
+being silently omitted.
+
+### An unproven criterion cannot be green
+
+A missing evidence file, or one that never recorded its marker, marks every
+criterion depending on it unproven and fails the run.
+
+Each criterion names the evidence files that prove it, and each file is
+certified against a marker literal — a typed status for most gates, or the
+load-bearing fact the gate exists to record.
+
+The manifest is still written on failure, because a reviewer needs to see
+which criterion is unproven rather than an absent file. Marker literals are
+JSON fragments carrying quotes, so they are escaped before embedding; the
+failure path must publish a manifest a parser can still read.
+
+### Native evidence is pinned to the candidate
+
+`macos/metal.json` is certified against `candidate_sha` rather than a status,
+so a green native run against an older tree can never satisfy the gate. The
+native corpus must be re-run against the release candidate itself.
