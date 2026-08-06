@@ -14,6 +14,20 @@ if [[ "${SCRIBE_AI_TAB:-}" == "1" ]]; then
 	return 0
 fi
 
+# ── macOS login-profile emulation ────────────────────────────────
+# macOS terminals traditionally start zsh as a login shell, so PATH setup
+# lives in the profile pass: /etc/zprofile runs path_helper and ~/.zprofile
+# typically runs `brew shellenv`. Scribe spawns a non-login zsh to keep the
+# integration attached, so emulate that pass on Darwin. This runs from the
+# .zshenv bootstrap — before any rc file — which matches the real login
+# order (zshenv → zprofile → zshrc).
+if [[ ! -o login && -z "${_SCRIBE_LOGIN_PROFILE_SOURCED:-}" ]] \
+	&& [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+	_SCRIBE_LOGIN_PROFILE_SOURCED=1
+	[[ -f /etc/zprofile ]] && source /etc/zprofile
+	[[ -f "${ZDOTDIR:-$HOME}/.zprofile" ]] && source "${ZDOTDIR:-$HOME}/.zprofile"
+fi
+
 # ── Colored completions ──────────────────────────────────────────
 zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
 

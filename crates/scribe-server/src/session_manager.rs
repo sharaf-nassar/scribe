@@ -842,6 +842,15 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         ("SCRIBE_HOOK_SOCK".to_owned(), server_socket_path().to_string_lossy().into_owned()),
         ("SCRIBE_SESSION_ID".to_owned(), session_id.to_full_string()),
     ]);
+    // launchd starts the server with PATH=/usr/bin:/bin:/usr/sbin:/sbin, so
+    // without a floor every PTY session would miss Homebrew — /opt/homebrew/bin
+    // (Apple Silicon) and /usr/local/bin (Intel) are added by `brew shellenv`
+    // in the user's login profile, never by /etc/paths. This is the single env
+    // funnel for all session types (plain, AI, SSH-local), so normalizing here
+    // covers every shell, including fish/nushell/powershell which have no
+    // login-profile emulation in their integration scripts.
+    #[cfg(target_os = "macos")]
+    env.insert("PATH".to_owned(), path_with_macos_baseline(std::env::var("PATH").ok().as_deref()));
     // Packaged layouts do not put `scribe-hook-helper` on `PATH`, so hand the
     // shells and the `ai-hook-*.sh` adapters an absolute path when we can
     // resolve one. Injected unconditionally: AI hooks run even with shell
@@ -894,6 +903,31 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
         ..PtyOptions::default()
     }
+}
+
+/// Return a PATH guaranteed to contain the macOS baseline directories.
+///
+/// Missing Homebrew prefixes (`/opt/homebrew/bin`, `/usr/local/bin`) are
+/// prepended ahead of the inherited entries, matching `brew shellenv`
+/// semantics; missing system directories are appended. Non-empty inherited
+/// entries keep their order and are never duplicated, so the function is
+/// idempotent. Empty entries (POSIX implicit-cwd, e.g. `::` or a leading
+/// or trailing `:`) are deliberately dropped as a safety measure.
+///
+/// Compiled on every platform (macOS call site aside) so the unit tests
+/// run everywhere.
+#[cfg(any(target_os = "macos", test))]
+fn path_with_macos_baseline(inherited: Option<&str>) -> String {
+    const HOMEBREW_PREFIXES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+    const SYSTEM_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    let existing: Vec<&str> =
+        inherited.unwrap_or_default().split(':').filter(|entry| !entry.is_empty()).collect();
+    let mut entries: Vec<&str> =
+        HOMEBREW_PREFIXES.iter().copied().filter(|prefix| !existing.contains(prefix)).collect();
+    entries.extend(&existing);
+    entries.extend(SYSTEM_DIRS.iter().copied().filter(|dir| !existing.contains(dir)));
+    entries.join(":")
 }
 
 fn session_integration_script(kind: ShellKind, integration_enabled: bool) -> Option<String> {
@@ -1497,20 +1531,62 @@ mod tests_session_cap {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
     use std::fs;
-    #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
-    #[cfg(target_os = "macos")]
     use std::process::Command;
-    #[cfg(target_os = "macos")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use alacritty_terminal::tty::Shell;
     use scribe_common::ids::SessionId;
 
-    use super::{LaunchIntegration, PtyOptionsBuild, build_pty_options, build_shell};
+    use super::{
+        LaunchIntegration, PtyOptionsBuild, build_pty_options, build_shell,
+        path_with_macos_baseline,
+    };
     use crate::shell_integration::ShellKind;
+
+    const MACOS_BASELINE_PATH: &str =
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+    #[test]
+    fn macos_path_baseline_covers_empty_and_unset_path() {
+        assert_eq!(path_with_macos_baseline(None), MACOS_BASELINE_PATH);
+        assert_eq!(path_with_macos_baseline(Some("")), MACOS_BASELINE_PATH);
+    }
+
+    #[test]
+    fn macos_path_baseline_prepends_homebrew_ahead_of_existing_entries() {
+        assert_eq!(
+            path_with_macos_baseline(Some("/usr/bin:/bin:/usr/sbin:/sbin")),
+            MACOS_BASELINE_PATH
+        );
+        assert_eq!(
+            path_with_macos_baseline(Some("/custom/bin:/usr/bin:/bin")),
+            "/opt/homebrew/bin:/usr/local/bin:/custom/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+    }
+
+    #[test]
+    fn macos_path_baseline_never_moves_entries_already_present() {
+        assert_eq!(
+            path_with_macos_baseline(Some("/usr/bin:/opt/homebrew/bin:/bin")),
+            "/usr/local/bin:/usr/bin:/opt/homebrew/bin:/bin:/usr/sbin:/sbin"
+        );
+    }
+
+    #[test]
+    fn macos_path_baseline_drops_empty_entries() {
+        let path = path_with_macos_baseline(Some("/usr/bin::"));
+        assert_eq!(path, MACOS_BASELINE_PATH);
+        assert!(path.split(':').all(|entry| !entry.is_empty()));
+    }
+
+    #[test]
+    fn macos_path_baseline_is_idempotent() {
+        let once = path_with_macos_baseline(Some("/custom/bin:/usr/bin"));
+        assert_eq!(path_with_macos_baseline(Some(&once)), once);
+        assert_eq!(path_with_macos_baseline(Some(MACOS_BASELINE_PATH)), MACOS_BASELINE_PATH);
+    }
 
     fn pty_env(images_enabled: bool) -> std::collections::HashMap<String, String> {
         build_pty_options(PtyOptionsBuild {
@@ -1543,7 +1619,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_integration_sources_bash_profile_for_non_login_shells_on_macos() {
-        let home = make_temp_home("profile");
+        let home = make_temp_home("bash-startup-profile");
         fs::write(home.join(".bash_profile"), "export PROFILE_SEEN=1\n")
             .expect("write .bash_profile");
         fs::write(home.join(".bashrc"), "export BASHRC_SEEN=1\n").expect("write .bashrc");
@@ -1560,7 +1636,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_integration_falls_back_to_bashrc_when_no_profile_exists_on_macos() {
-        let home = make_temp_home("bashrc");
+        let home = make_temp_home("bash-startup-bashrc");
         fs::write(home.join(".bashrc"), "export BASHRC_SEEN=1\n").expect("write .bashrc");
 
         let output = run_bash_integration_check(&home);
@@ -1596,18 +1672,95 @@ mod tests {
             .expect("canonicalize bash integration script path")
     }
 
-    #[cfg(target_os = "macos")]
+    // The zsh integration's Darwin login-profile emulation gates on
+    // `uname -s`, so these tests shim `uname` on PATH and run the real
+    // script through `/bin/zsh`, making the Darwin branch testable on any
+    // Unix host.
+
+    #[test]
+    fn zsh_integration_sources_zprofile_for_non_login_shells_on_darwin() {
+        let Some(output) = run_zsh_integration_check("darwin", "Darwin", "") else { return };
+        assert!(
+            output.contains("ZPROFILE=1 GUARD=1"),
+            "expected ~/.zprofile to be sourced on Darwin, got output: {output}"
+        );
+    }
+
+    #[test]
+    fn zsh_integration_login_profile_guard_prevents_double_sourcing() {
+        let Some(output) =
+            run_zsh_integration_check("guard", "Darwin", "_SCRIBE_LOGIN_PROFILE_SOURCED=1; ")
+        else {
+            return;
+        };
+        assert!(
+            output.contains("ZPROFILE=0 GUARD=1"),
+            "expected guard to skip ~/.zprofile, got output: {output}"
+        );
+    }
+
+    #[test]
+    fn zsh_integration_skips_login_profile_off_darwin() {
+        let Some(output) = run_zsh_integration_check("linux", "Linux", "") else { return };
+        assert!(
+            output.contains("ZPROFILE=0 GUARD=0"),
+            "expected no login-profile emulation off Darwin, got output: {output}"
+        );
+    }
+
+    /// Source the shipped zsh integration in a non-login `/bin/zsh` with an
+    /// isolated HOME containing a marker `~/.zprofile`, and report whether
+    /// the marker and the double-source guard are set afterwards. Returns
+    /// `None` (skipping the test) when `/bin/zsh` is not installed.
+    fn run_zsh_integration_check(name: &str, uname_reports: &str, prelude: &str) -> Option<String> {
+        if !Path::new("/bin/zsh").exists() {
+            return None;
+        }
+        let home = make_temp_home(&format!("zsh-startup-{name}"));
+        fs::write(home.join(".zprofile"), "export ZPROFILE_SEEN=1\n").expect("write .zprofile");
+
+        let shim_dir = home.join("shim-bin");
+        fs::create_dir_all(&shim_dir).expect("create uname shim dir");
+        let shim = shim_dir.join("uname");
+        fs::write(&shim, format!("#!/bin/sh\necho {uname_reports}\n")).expect("write uname shim");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+                .expect("make uname shim executable");
+        }
+
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dist/shell-integration/zsh/scribe.zsh")
+            .canonicalize()
+            .expect("canonicalize zsh integration script path");
+        let output = Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(format!(
+                "{prelude}source '{}'; printf 'ZPROFILE=%s GUARD=%s\\n' \
+                 \"${{ZPROFILE_SEEN:-0}}\" \"${{_SCRIBE_LOGIN_PROFILE_SOURCED:-0}}\"",
+                script.display()
+            ))
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", shim_dir.display()))
+            .env("TERM_PROGRAM", "Scribe")
+            .env("SCRIBE_ENV_PERSIST", "0")
+            .output()
+            .expect("run zsh integration check");
+        cleanup_temp_home(&home);
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn make_temp_home(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("scribe-bash-startup-{name}-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("scribe-{name}-{nonce}"));
         fs::create_dir_all(&dir).expect("create temp home");
         dir
     }
 
-    #[cfg(target_os = "macos")]
     fn cleanup_temp_home(home: &Path) {
         let _ignore = fs::remove_dir_all(home);
     }
