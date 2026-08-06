@@ -29,35 +29,26 @@ esac
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-newest_crates_commit="$(git log -1 --format=%ct -- crates/)"
-if [[ -z "$newest_crates_commit" ]]; then
-    printf 'ERROR: cannot determine the newest commit touching crates/.\n' >&2
-    exit 2
-fi
-
-file_mtime() {
-    local path="$1"
-    if stat -f '%m' "$path" >/dev/null 2>&1; then
-        stat -f '%m' "$path"
-        return
-    fi
-    stat -c '%Y' "$path"
-}
+# Let cargo decide what is current. It owns the dependency graph and the
+# fingerprints, so it rebuilds exactly what changed and returns in well under a
+# second when nothing did.
+#
+# This replaces an mtime-versus-commit-timestamp heuristic that could not work:
+# binaries are built BEFORE the commit that lands them, so every commit made
+# every binary look stale, and the remedy it suggested — rerun the build — was
+# a no-op precisely because cargo already knew they were current. Comparing
+# against source mtimes fails the same way across crates: editing one crate
+# does not stale another crate's binary, but any tree-wide comparison says it
+# does.
+printf 'Ensuring %s binaries are current...\n' "$profile" >&2
+$build_command >&2
 
 source_dir="target/$profile"
 for binary in "$@"; do
     source_path="$source_dir/$binary"
     if [[ ! -f "$source_path" || ! -x "$source_path" ]]; then
         printf 'ERROR: required staging source %s is missing or not executable.\n' "$source_path" >&2
-        printf 'Build it with `%s`, then retry.\n' "$build_command" >&2
-        exit 2
-    fi
-
-    binary_mtime="$(file_mtime "$source_path")"
-    if (( binary_mtime < newest_crates_commit )); then
-        printf 'ERROR: required staging source %s is stale.\n' "$source_path" >&2
-        printf 'It is older than the newest commit touching crates/.\n' >&2
-        printf 'Rebuild it with `%s`, then retry.\n' "$build_command" >&2
+        printf 'The build reported success, so this binary is not one it produces.\n' >&2
         exit 2
     fi
 done

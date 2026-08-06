@@ -13,10 +13,14 @@
   — NEVER against this machine's live install. The developer works inside
   Scribe all day; touching the host server disrupts active work.
 - Enter ONLY through the just recipes: `just docker-func` /
-  `just docker-visual` build the images (both require `just build-release`
-  first), then `just e2e-func <script>`, `just e2e-visual <script>`,
-  `just e2e`, or the purpose-built `e2e-*` recipes run them. Test scripts
-  live under `tests/e2e/`; logs and screenshots land in `./test-output`.
+  `just docker-visual` build the images, then `just e2e-func <script>`,
+  `just e2e-visual <script>`, `just e2e`, or the purpose-built `e2e-*`
+  recipes run them. Test scripts live under `tests/e2e/`; logs and
+  screenshots land in `./test-output`.
+- The image recipes run the release build themselves before staging, so
+  `just build-release` beforehand is optional and a no-op when nothing
+  changed. A compile failure aborts staging, so an image can never be
+  built from binaries that do not match the working tree.
 - NEVER run `scribe-server`, `scribe-client`, `scribe`, `scribe-dev`, or
   any `scribe-test` subcommand directly on the host. The socket path
   (`crates/scribe-common/src/socket.rs`) has no environment override, so a
