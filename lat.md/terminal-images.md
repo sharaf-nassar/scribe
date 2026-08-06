@@ -1123,9 +1123,9 @@ Every corpus writes reviewable JSON under `test-output/terminal-images/`, so a r
 
 The Docker corpora land in the top level of that directory. Each gate below runs
 as `just e2e-func <name>` after `just docker-func`, or as `just e2e-visual
-<name>` for the `visual/` entries after `just docker-visual`. Both images need
-`just build-release` first, and `test-output/` is written by the container as
-root.
+<name>` for the `visual/` entries after `just docker-visual`. Both image
+recipes run the release build themselves before staging, and `test-output/` is
+written by the container as root.
 
 | Gate | Evidence |
 | --- | --- |
