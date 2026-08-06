@@ -498,7 +498,9 @@ fn start_server_directly(upgrade: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+// Compiled under `test` on every platform so the plist snapshot assertions
+// run on Linux CI as well.
+#[cfg(any(target_os = "macos", test))]
 fn launchd_plist_contents(label: &str, server_exe: &Path) -> String {
     let label = escape_launchd_plist_value(label);
     let server_exe = escape_launchd_plist_value(&server_exe.display().to_string());
@@ -514,6 +516,12 @@ fn launchd_plist_contents(label: &str, server_exe: &Path) -> String {
 	<array>
 		<string>{server_exe}</string>
 	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
 
 	<key>KeepAlive</key>
 	<dict>
@@ -538,7 +546,7 @@ fn launchd_plist_contents(label: &str, server_exe: &Path) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn escape_launchd_plist_value(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -902,6 +910,29 @@ mod tests {
 
     fn running(exe: &str, start: Option<u64>) -> ConnectedServerInfo {
         ConnectedServerInfo { pid: 42, exe_path: Some(PathBuf::from(exe)), start_time_secs: start }
+    }
+
+    // @lat: [[test#Server lifecycle#Launchd plist pins a baseline PATH]]
+    #[test]
+    fn launchd_plist_sets_baseline_path_environment() {
+        let plist = launchd_plist_contents(
+            "com.scribe.server",
+            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+        );
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains(
+            "<key>PATH</key>\n\t\t<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
+        ));
+    }
+
+    // @lat: [[test#Server lifecycle#Dist plist matches the generated plist]]
+    #[test]
+    fn dist_plist_matches_generated_launchd_plist() {
+        let generated = launchd_plist_contents(
+            "com.scribe.server",
+            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+        );
+        assert_eq!(generated, include_str!("../../../dist/macos/com.scribe.server.plist"));
     }
 
     // @lat: [[test#Server lifecycle#Path drift marks server stale]]

@@ -2297,6 +2297,14 @@ A running server at the same path that started after the installed binary's modi
 
 When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
 
+### Launchd plist pins a baseline PATH
+
+The generated LaunchAgent plist carries an `EnvironmentVariables` PATH that leads with both Homebrew prefixes, so a launchd-started server hands PTY sessions more than the bare system PATH.
+
+### Dist plist matches the generated plist
+
+The static `dist/macos/com.scribe.server.plist` shipped for packaging must stay byte-identical to the client's generated LaunchAgent plist, so the installed baseline PATH never drifts from the runtime generator.
+
 ### macOS peer PID drives stale refresh
 
 The macOS socket probe reads `LOCAL_PEERPID`, allowing a connected client to identify the actual server process and refresh a stale app-bundle binary instead of silently accepting it.
