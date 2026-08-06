@@ -190,6 +190,24 @@ e2e-func script image="scribe-test-func" runtime_profile="default":
 e2e-func-hardened script image="scribe-test-func":
     just e2e-func "{{ script }}" "{{ image }}" runtime_profile=hardened
 
+# Assemble the terminal-image release manifest from the evidence the sibling
+# gates already wrote. Runs no Scribe runtime of its own, so it must follow a
+# green `just e2e` and the terminal-image visual suites rather than replace
+# them. The criterion count is re-derived from the spec on every invocation, so
+# a new acceptance criterion fails the gate until it is mapped to evidence.
+e2e-release-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    candidate=$(git rev-parse HEAD)
+    criteria=$(awk '/^### US[0-9]/,/^## Constraints/' specs/020-terminal-images/spec.md | grep -cE '^- ')
+    [ "$criteria" -gt 0 ] || { echo "ERROR: derived 0 spec criteria; the spec layout changed." >&2; exit 2; }
+    printf 'release gate: candidate %s, %s spec criteria\n' "$candidate" "$criteria"
+    docker run --rm --network none \
+        -e SCRIBE_RELEASE_CANDIDATE_SHA="$candidate" \
+        -e SCRIBE_RELEASE_CRITERIA="$criteria" \
+        -v ./tests/e2e:/tests:ro -v ./test-output:/output \
+        scribe-test-func /tests/terminal-image-release-gate.sh
+
 # Run a visual E2E test. Set SCRIBE_E2E_GPUS to opt into GPU passthrough.
 e2e-visual script image="scribe-test-visual" runtime_profile="default":
     #!/usr/bin/env bash
