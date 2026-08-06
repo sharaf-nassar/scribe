@@ -584,6 +584,7 @@ impl SessionManager {
             integration,
             restore_env_file: env.restore_file,
             env_persistence: env.persistence_enabled,
+            images_enabled: crate::terminal_image_sharing::images_master_enabled(),
         });
 
         PreparedSessionLaunch {
@@ -738,9 +739,8 @@ impl SessionManager {
 /// Populate a freshly-restored `Term` with the pre-handoff content.
 ///
 /// - v5 path: decompress the `SessionReplay` and feed it through
-///   `AnsiProcessor` into `term`, then trim the pseudo-scrollback pushed in
-///   by the encoder's leading ED 2. Returns `None` because the Term now
-///   owns the content.
+///   `AnsiProcessor` into `term`, then normalize history for a replay produced
+///   by a pre-RIS server. Returns `None` because the Term now owns the content.
 /// - v4 fallback (or if v5 decompression fails): return the legacy
 ///   `ScreenSnapshot` so the first attach can deliver it.
 fn apply_handoff_content(
@@ -766,8 +766,8 @@ fn apply_handoff_content(
     let mut processor: AnsiProcessor = AnsiProcessor::new();
     processor.advance(term, &bytes);
 
-    // Trim the pseudo-scrollback the encoder's leading ED 2 pushes into
-    // history on a fresh grid. The snapshot's true scrollback_rows survives.
+    // N-1 handoff can carry the former ED-2 replay prefix. Normalize that
+    // synthetic row while preserving the snapshot's true scrollback_rows.
     let kept = (replay.scrollback_rows as usize).min(scrollback);
     let grid = term.grid_mut();
     grid.update_history(kept);
@@ -811,6 +811,7 @@ struct PtyOptionsBuild<'a> {
     integration: LaunchIntegration<'a>,
     restore_env_file: Option<&'a std::path::Path>,
     env_persistence: bool,
+    images_enabled: bool,
 }
 
 enum LaunchIntegration<'a> {
@@ -828,6 +829,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         integration,
         restore_env_file,
         env_persistence,
+        images_enabled,
     } = opts;
     let mut env = HashMap::from([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
@@ -846,6 +848,18 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     // integration disabled. Absence leaves the scripts on their PATH fallback.
     if let Some(helper) = shell_integration::find_hook_helper() {
         env.insert("SCRIBE_HOOK_HELPER".to_owned(), helper.to_string_lossy().into_owned());
+    }
+
+    // Kitty graphics env marker for applications that sniff environment
+    // variables instead of probing (Codex CLI checks `KITTY_WINDOW_ID`
+    // first and never sends an escape-sequence probe). Gated on the image
+    // master switch at spawn so a disabled Scribe never claims image
+    // capability; it is a spawn-time snapshot — a later config flip binds
+    // new sessions only, like every other env var here. It is a protocol
+    // hint, not a capability guarantee: whether images actually render
+    // still depends on an image-capable viewer latching the session.
+    if images_enabled {
+        env.insert("KITTY_WINDOW_ID".to_owned(), "1".to_owned());
     }
 
     // Spawn-time persistence gate. With the feature off the server drops
@@ -1493,9 +1507,31 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use alacritty_terminal::tty::Shell;
+    use scribe_common::ids::SessionId;
 
-    use super::build_shell;
+    use super::{LaunchIntegration, PtyOptionsBuild, build_pty_options, build_shell};
     use crate::shell_integration::ShellKind;
+
+    fn pty_env(images_enabled: bool) -> std::collections::HashMap<String, String> {
+        build_pty_options(PtyOptionsBuild {
+            session_id: SessionId::new(),
+            shell: None,
+            cwd: None,
+            shell_kind: ShellKind::Bash,
+            integration: LaunchIntegration::Disabled,
+            restore_env_file: None,
+            env_persistence: false,
+            images_enabled,
+        })
+        .env
+    }
+
+    // @lat: [[terminal-images#Terminal Images#Kitty Environment Marker]]
+    #[test]
+    fn kitty_window_id_env_follows_images_master_switch() {
+        assert_eq!(pty_env(true).get("KITTY_WINDOW_ID").map(String::as_str), Some("1"));
+        assert_eq!(pty_env(false).get("KITTY_WINDOW_ID"), None);
+    }
 
     #[test]
     fn build_shell_uses_explicit_resolved_shell_for_zsh_defaults() {

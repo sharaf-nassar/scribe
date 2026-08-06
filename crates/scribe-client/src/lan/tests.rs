@@ -2,7 +2,7 @@
 //!
 //! Cover the three directions the LAN surface reaches the client from: the
 //! owning-side approval hand-off between the IPC reader and the GPUI
-//! foreground, the discovery/environment summary the status line derives from,
+//! foreground, actionable environment feedback,
 //! and the dialing side's pending → settled transition.
 
 use scribe_common::protocol::{LanPeerInfo, LanRefusal};
@@ -57,9 +57,9 @@ fn a_second_request_replaces_an_unraised_prompt() {
     assert_eq!(lan.take_approval().map(|d| d.request_id()), Some(2));
 }
 
-// @lat: [[test#GPUI Client Headless Suites#GPUI LAN chrome#Status line reports peers and dormancy]]
+// @lat: [[test#GPUI Client Headless Suites#GPUI LAN chrome#Status line reports actionable LAN states]]
 #[test]
-fn status_line_reports_peers_and_dormancy() {
+fn status_line_reports_actionable_lan_states() {
     let mut lan = LanChrome::new();
     // Nothing probed yet: no line at all rather than a misleading "0 peers".
     assert!(lan.status_line().is_none());
@@ -78,7 +78,7 @@ fn status_line_reports_peers_and_dormancy() {
     lan.set_peers(vec![peer("desk", true), peer("old", false), peer("laptop", true)]);
     assert_eq!(lan.online_peer_count(), 2);
     assert_eq!(lan.peers().len(), 3);
-    assert_eq!(lan.status_line().as_deref(), Some("Local network: 2 peer(s)"));
+    assert!(lan.status_line().is_none());
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI LAN chrome#Dial status outranks the environment]]
@@ -97,9 +97,9 @@ fn dial_status_outranks_the_environment_line() {
         lan.dial(),
         LanDialStatus::Settled(LanConnectOutcome::Refused(LanRefusal::Declined))
     );
-    let refused = lan.status_line().expect("a settled dial always says something");
+    let refused = lan.status_line().expect("a refused dial says why");
     assert!(refused.contains("declined"), "{refused}");
 
     lan.settle_dial(LanConnectOutcome::Accepted);
-    assert_eq!(lan.status_line().as_deref(), Some("Connected over the local network"));
+    assert!(lan.status_line().is_none());
 }

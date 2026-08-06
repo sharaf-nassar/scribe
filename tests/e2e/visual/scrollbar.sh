@@ -1,5 +1,6 @@
 #!/bin/bash
 [ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
+# @lat: [[test#GPUI Command Scrollbar#New tab wheel stays hidden]]
 # Scripted E2E: the command-mark overlay scrollbar is painted by the real client.
 #
 # `scrollbar.rs` landed with a green unit suite and zero references outside its
@@ -265,13 +266,22 @@ if [ "$ink" -lt "$INK_MIN_PIXELS" ]; then
 fi
 echo "PHASE 0 PASS: the client is attached to session $SESSION ($ink lit px)"
 
-# ── Phase 1: a rested pane shows no overlay, and holds still ──────
+# ── Phase 1: a newly created tab stays bare after wheel input ─────
+# Exercise the exact New Tab path before any tab switch or generated history.
+TABS_BEFORE=$(count_log "opened a new tab")
+send_keys ctrl+shift+t
+if ! wait_for_log_growth "opened a new tab" "$TABS_BEFORE" 20; then
+    fail "PHASE 1 FAIL: Ctrl+Shift+T never opened a new tab"
+fi
+
 # The control every later strip diff is measured against. With the pointer
 # parked away from the right edge and the idle window elapsed, the fade has
 # taken the overlay to zero opacity and `build_scrollbar_render` emits nothing
 # — so the strip is whatever the cells underneath it paint. Capturing it twice
 # proves the strip is genuinely quiet: without that, a thumb assertion could be
-# satisfied by any repaint that happens to touch the right edge.
+# satisfied by any repaint that happens to touch the right edge. One wheel-up
+# then proves the new pane has no synthetic scrollback that can reveal a nearly
+# full-height thumb before any real history exists.
 unhover_scrollbar
 sleep 2.5
 capture /output/sb-01-rested.png
@@ -282,7 +292,27 @@ DIFF=$(strip_diff /output/sb-01-strip.png /output/sb-01-strip-again.png)
 if [ "${DIFF:-0}" -ge "$THUMB_DIFF_MIN" ]; then
     fail "PHASE 1 FAIL: the rested scrollbar strip is not stable (${DIFF}px between two captures)"
 fi
-echo "PHASE 1 PASS: a rested pane paints no overlay and the strip is stable (${DIFF}px)"
+BASE_SCROLL=$(count_log "terminal scrollback moved")
+xdotool click 4
+if ! wait_for_log_growth "terminal scrollback moved" "$BASE_SCROLL"; then
+    fail "PHASE 1 FAIL: the wheel never reached the terminal scrollback handler"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"moved=false"*"offset=0"*) ;;
+    *) fail "PHASE 1 FAIL: wheel input moved through new-tab history: $LINE" ;;
+esac
+capture /output/sb-01-empty-wheel.png
+strip /output/sb-01-empty-wheel.png /output/sb-01-empty-wheel-strip.png
+WHEEL_DIFF=$(strip_diff /output/sb-01-strip.png /output/sb-01-empty-wheel-strip.png)
+if [ "${WHEEL_DIFF:-0}" -ge "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 1 FAIL: empty-pane wheel revealed a scrollbar (${WHEEL_DIFF}px changed)"
+fi
+echo "PHASE 1 PASS: new-tab wheel stayed at offset 0 with no overlay (${WHEEL_DIFF}px)"
+
+# The new-tab invariant is now proven before any switch. Return to the harness's
+# known full session id so later phases can add real history through scribe-test.
+send_keys ctrl+Prior
 
 # ── Phase 2: three OSC 133 command records fill the scrollback ────
 # The middle command exits non-zero, so the three ticks must not all be the
@@ -400,6 +430,7 @@ echo "PASS: visual scrollbar test"
 echo "  Inspect screenshots in test-output/:"
 echo "    sb-00-attached.png     — the shared pane on attach"
 echo "    sb-01-rested.png       — the rested strip, with the overlay faded out"
+echo "    sb-01-empty-wheel.png  — New Tab wheel input before real scrollback"
 echo "    sb-03-thumb.png        — the thumb and command ticks on screen"
 echo "    sb-05-after-trim.png   — the ticks after a server scrollback trim"
 echo "    sb-06-faded.png        — the overlay faded back out"

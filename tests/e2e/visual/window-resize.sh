@@ -88,12 +88,10 @@ IDLE_WATCH_SECS="${IDLE_WATCH_SECS:-4}"
 # Client chrome layout, mirrored from the client so a drift shows up as a
 # failure here rather than as rows measured against the wrong band:
 #   TITLEBAR_H  titlebar.rs `TITLEBAR_HEIGHT`
-#   STRIP_H     window_chrome.rs `STATUS_STRIP_HEIGHT`
 #   BAR_H       window_chrome.rs `STATUS_BAR_HEIGHT`
 #   ROW_H_X10   terminal_element.rs `LINE_HEIGHT_RATIO` at the default font
 #               size 14 (14 * 1.35 = 18.9), x10 so row tops stay integral
 TITLEBAR_H=34
-STRIP_H=26
 BAR_H=24
 ROW_H_X10=189
 
@@ -397,7 +395,7 @@ assert_grid_matches_server() {
     grid_w=$(( WIN_W - GRID_INSET_L - GRID_INSET_R ))
     grid_h=$(( rows * ROW_H_X10 / 10 ))
     if [ "$grid_w" -le 0 ] \
-        || [ "$grid_h" -gt $(( WIN_H - TITLEBAR_H - STRIP_H - BAR_H )) ]; then
+        || [ "$grid_h" -gt $(( WIN_H - TITLEBAR_H - BAR_H )) ]; then
         fail "$label: a ${rows}-row grid does not fit the ${WIN_W}x${WIN_H} window"
     fi
     # One thresholded greyscale crop of the grid band, written as raw bytes

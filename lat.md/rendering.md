@@ -162,7 +162,7 @@ GPUI cannot upload a per-cell RGBA texture the way the wgpu atlas did, so  reduc
 
 Two rules make the result equal the configured number rather than an accumulation of it. First, the window is opened with `WindowBackgroundAppearance::Transparent` unconditionally, even at opacity 1.0: surface capability is fixed at creation, so deriving it from the startup value would force a restart to ever go translucent — the legacy client's `window_transparent` flag had exactly that wart and refused live changes (). At 1.0 every painted background is alpha 1.0 and the window is pixel-identical to an opaque one. Second, the root element paints nothing at all. The titlebar, terminal grid and status bands tile the window edge to edge, so each pixel carries the opacity alpha exactly once; filling the root as well would composite a translucent band over a translucent root and land at 0.98 for a configured 0.85.
 
-The alpha-aware surfaces are the terminal grid (), the titlebar and tab bar (), the prompt bar (), the terminal-status strip, and the window status bar (). Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit now repaints the grid and the strip too.
+The alpha-aware surfaces are the terminal grid, titlebar and tab bar, prompt bar, and window status bar. Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit repaints the grid and chrome together.
 
 ## GPUI Cell-Accurate Paint Path
 

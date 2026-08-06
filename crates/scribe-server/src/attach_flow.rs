@@ -368,9 +368,9 @@ pub async fn take_session_replay(
             let mut processor: vte::ansi::Processor = vte::ansi::Processor::new();
             processor.advance(&mut *guard, &ansi);
 
-            // Trim the pseudo-scrollback the encoder's leading ED 2 pushes into
-            // history on a fresh grid; keep only the snapshot's true
-            // scrollback_rows, then restore the configured cap.
+            // This branch can drain a snapshot through replay bytes produced by
+            // the previous server. Normalize any pre-RIS ED-2 history to the
+            // snapshot's authoritative count, then restore the configured cap.
             let scrollback_cap = guard.grid().history_size();
             let kept = (snapshot.scrollback_rows as usize).min(scrollback_cap);
             let grid = guard.grid_mut();

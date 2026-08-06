@@ -73,6 +73,9 @@ pub struct RemoteStatusData<'a> {
 /// Data needed to render the window-level status bar.
 pub struct StatusBarData<'a> {
     pub connected: bool,
+    /// Connection or pane warning/error surfaced in this existing band rather
+    /// than a separate band. Empty or absent copy renders nothing.
+    pub status_message: Option<&'a str>,
     /// Name of the focused workspace (shown when multiple workspaces exist).
     pub workspace_name: Option<&'a str>,
     /// CWD of the focused pane, displayed as a shortened path.
@@ -213,6 +216,9 @@ pub fn build_model(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Status
 /// separately announced accessibility nodes.
 fn accessibility_label(data: &StatusBarData<'_>) -> String {
     let mut states = vec![if data.connected { "Connected" } else { "Disconnected" }.to_owned()];
+    if let Some(message) = data.status_message.filter(|message| !message.is_empty()) {
+        states.push(message.to_owned());
+    }
     match data.last_command_status {
         Some(CommandStatus::Success) => states.push("Last command succeeded".to_owned()),
         Some(CommandStatus::Failure) => states.push("Last command failed".to_owned()),
@@ -244,8 +250,8 @@ fn accessibility_label(data: &StatusBarData<'_>) -> String {
 // Left side
 // ---------------------------------------------------------------------------
 
-/// Left side: connection dot, command status, env warning, remote/share
-/// surfaces, workspace name, CWD.
+/// Left side: connection dot, important status copy, command status, env
+/// warning, remote/share surfaces, workspace name, CWD.
 fn build_left(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
     let mut spans = Vec::new();
     spans.push(Span::new(" ", colors.text));
@@ -253,6 +259,11 @@ fn build_left(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
     let dot_color = if data.connected { colors.connected_dot } else { colors.disconnected_dot };
     spans.push(Span::new("\u{25CF}", dot_color));
     spans.push(Span::new(" ", colors.text));
+
+    if let Some(message) = data.status_message.filter(|message| !message.is_empty()) {
+        spans.push(Span::new(message, colors.text));
+        spans.push(Span::new("  ", colors.text));
+    }
 
     push_command_status(&mut spans, colors, data.last_command_status);
     push_env_status_warning(&mut spans, colors, data.env_status);
@@ -766,6 +777,7 @@ mod tests {
     fn data() -> StatusBarData<'static> {
         StatusBarData {
             connected: true,
+            status_message: None,
             workspace_name: None,
             cwd: None,
             git_branch: None,
@@ -803,6 +815,17 @@ mod tests {
         let disconnected = build_left(&d, &colors);
         let dot_disconnected = disconnected.iter().find(|s| s.text == "\u{25CF}").unwrap();
         crate::assert_rgba_eq(dot_disconnected.color, colors.disconnected_dot);
+    }
+
+    // @lat: [[test#GPUI Status Bar#Pane feedback shares the window status bar]]
+    #[test]
+    fn pane_feedback_shares_the_window_status_bar() {
+        let colors = colors();
+        let mut d = data();
+        d.status_message = Some("input refused: queue full");
+
+        assert!(joined(&build_left(&d, &colors)).contains("input refused: queue full"));
+        assert!(accessibility_label(&d).contains("input refused: queue full"));
     }
 
     // @lat: [[test#GPUI Status Bar#Command status glyphs distinguish outcomes]]

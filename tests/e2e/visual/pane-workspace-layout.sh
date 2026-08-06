@@ -56,11 +56,11 @@ CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 
 # Chrome bands that are not part of the pane canvas: the titlebar above it
-# (titlebar.rs TITLEBAR_HEIGHT) and the status strip + status bar below it
-# (main.rs renders 26 px and 24 px bands). Everything between is the grid area
+# (titlebar.rs TITLEBAR_HEIGHT) and the status bar below it
+# (window_chrome.rs STATUS_BAR_HEIGHT). Everything between is the grid area
 # the pane layout owns, and is the only region these assertions look at.
 TITLEBAR_H=34
-BOTTOM_BANDS_H=50
+BOTTOM_BANDS_H=24
 
 # Ink a typed marker line must add to a half-pane. One `echo` command line plus
 # its echoed output is thousands of lit pixels; a pane that never received the

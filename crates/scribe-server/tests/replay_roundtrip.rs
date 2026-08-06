@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::TermMode;
 use scribe_common::ids::SessionId;
 use scribe_common::screen_replay::{
     build_session_replay, decompress_session_replay, snapshot_to_ansi,
@@ -50,24 +51,6 @@ fn feed(term: &mut Term<ScribeEventListener>, bytes: &[u8]) {
     processor.advance(term, bytes);
 }
 
-/// Feed a compressed replay into a fresh Term and trim pseudo-scrollback
-/// introduced by the encoder's leading `\x1b[2J` (which scrolls the blank
-/// viewport into history on a fresh grid). Mirrors the trim the client
-/// performs in response to the server's `TrimScrollback` event.
-fn feed_replay(
-    term: &mut Term<ScribeEventListener>,
-    bytes: &[u8],
-    expected_scrollback_rows: u32,
-    max_scrollback: usize,
-) {
-    feed(term, bytes);
-
-    let kept_rows = (expected_scrollback_rows as usize).min(max_scrollback);
-    let grid = term.grid_mut();
-    grid.update_history(kept_rows);
-    grid.update_history(max_scrollback);
-}
-
 #[test]
 fn roundtrip_ascii_text() {
     let mut src = new_term(80, 24, 100);
@@ -79,9 +62,10 @@ fn roundtrip_ascii_text() {
     assert_eq!(bytes, snapshot_to_ansi(&snap));
 
     let mut dst = new_term(80, 24, 100);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
+    feed(&mut dst, &bytes);
 
     let snap_dst = snapshot_term(&dst);
+    assert_eq!(dst.history_size(), 0, "zero-history replay must not synthesize scrollback");
     assert_eq!(snap.cells, snap_dst.cells, "visible grid must match");
     assert_eq!(snap.scrollback, snap_dst.scrollback, "scrollback must match");
     assert_eq!(snap.cursor_row, snap_dst.cursor_row);
@@ -97,7 +81,7 @@ fn roundtrip_sgr_attributes() {
     let bytes = decompress_session_replay(&replay).unwrap();
 
     let mut dst = new_term(80, 24, 100);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
+    feed(&mut dst, &bytes);
     let snap_dst = snapshot_term(&dst);
     assert_eq!(snap.cells, snap_dst.cells);
 }
@@ -117,8 +101,9 @@ fn roundtrip_scrollback_overflow() {
     let bytes = decompress_session_replay(&replay).unwrap();
 
     let mut dst = new_term(80, 10, 100);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
+    feed(&mut dst, &bytes);
     let snap_dst = snapshot_term(&dst);
+    assert_eq!(dst.history_size(), snap.scrollback_rows as usize);
     assert_eq!(snap.scrollback, snap_dst.scrollback);
     assert_eq!(snap.cells, snap_dst.cells);
 }
@@ -132,7 +117,7 @@ fn roundtrip_wide_chars() {
     let bytes = decompress_session_replay(&replay).unwrap();
 
     let mut dst = new_term(80, 24, 100);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
+    feed(&mut dst, &bytes);
     let snap_dst = snapshot_term(&dst);
     assert_eq!(snap.cells, snap_dst.cells);
 }
@@ -175,7 +160,7 @@ fn roundtrip_truecolor_dense_screen() {
     );
 
     let mut dst = new_term(COLS, ROWS, SCROLLBACK);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, SCROLLBACK);
+    feed(&mut dst, &bytes);
     let snap_dst = snapshot_term(&dst);
     assert_eq!(snap.cells, snap_dst.cells, "visible grid must survive a dense replay");
     assert_eq!(snap.scrollback, snap_dst.scrollback, "scrollback must survive a dense replay");
@@ -194,8 +179,68 @@ fn roundtrip_soft_wrap() {
     let bytes = decompress_session_replay(&replay).unwrap();
 
     let mut dst = new_term(20, 5, 100);
-    feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
+    feed(&mut dst, &bytes);
     let snap_dst = snapshot_term(&dst);
     assert_eq!(snap.cells, snap_dst.cells, "soft-wrap content must match");
     assert_eq!(snap.scrollback, snap_dst.scrollback);
+}
+
+// @lat: [[test#Test Harness#Replay Observation#Replay replaces terminal state]]
+#[test]
+fn replay_replaces_dirty_primary_and_alternate_destinations() {
+    let mut primary_src = new_term(12, 4, 20);
+    feed(&mut primary_src, b"fresh primary");
+    let primary = snapshot_term(&primary_src);
+
+    let mut dirty_alt = new_term(12, 4, 20);
+    for row in 0..8 {
+        feed(&mut dirty_alt, format!("old {row}\r\n").as_bytes());
+    }
+    feed(&mut dirty_alt, b"\x1b[2;3r\x1b[?6h\x1b[?1049hdirty alt");
+    feed(&mut dirty_alt, &snapshot_to_ansi(&primary));
+
+    assert!(!dirty_alt.mode().contains(TermMode::ALT_SCREEN));
+    assert!(!dirty_alt.mode().contains(TermMode::ORIGIN));
+    assert_eq!(dirty_alt.history_size(), 0);
+    let rebuilt_primary = snapshot_term(&dirty_alt);
+    assert_eq!(rebuilt_primary.cells, primary.cells);
+    assert_eq!(rebuilt_primary.cursor_row, primary.cursor_row);
+    assert_eq!(rebuilt_primary.cursor_col, primary.cursor_col);
+
+    let mut alt_src = new_term(12, 4, 20);
+    feed(&mut alt_src, b"\x1b[?1049halt snapshot");
+    let alternate = snapshot_term(&alt_src);
+    assert!(alternate.alt_screen);
+
+    let mut dirty_primary = new_term(12, 4, 20);
+    for row in 0..8 {
+        feed(&mut dirty_primary, format!("stale {row}\r\n").as_bytes());
+    }
+    feed(&mut dirty_primary, b"\x1b[2;3r\x1b[?6h");
+    feed(&mut dirty_primary, &snapshot_to_ansi(&alternate));
+
+    assert!(dirty_primary.mode().contains(TermMode::ALT_SCREEN));
+    assert!(!dirty_primary.mode().contains(TermMode::ORIGIN));
+    assert_eq!(dirty_primary.history_size(), 0);
+    let rebuilt_alternate = snapshot_term(&dirty_primary);
+    assert_eq!(rebuilt_alternate.cells, alternate.cells);
+    assert_eq!(rebuilt_alternate.cursor_row, alternate.cursor_row);
+    assert_eq!(rebuilt_alternate.cursor_col, alternate.cursor_col);
+}
+
+#[test]
+fn short_snapshot_clears_omitted_dirty_cells() {
+    let mut src = new_term(10, 4, 20);
+    feed(&mut src, b"Q");
+    let mut snapshot = snapshot_term(&src);
+    snapshot.cells.truncate(1);
+
+    let mut dst = new_term(10, 4, 20);
+    feed(&mut dst, b"XXXXXXXXXX\r\nXXXXXXXXXX\r\nXXXXXXXXXX\r\nXXXXXXXXXX");
+    feed(&mut dst, &snapshot_to_ansi(&snapshot));
+
+    let rebuilt = snapshot_term(&dst);
+    assert_eq!(rebuilt.cells[0].c, 'Q');
+    assert!(rebuilt.cells[1..].iter().all(|cell| cell.c == ' '));
+    assert_eq!(dst.history_size(), 0);
 }

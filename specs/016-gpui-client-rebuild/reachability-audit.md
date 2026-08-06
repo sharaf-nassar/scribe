@@ -167,7 +167,7 @@ Everything else is silently discarded on the wire.
 | Variant | Verification method | Verdict | Evidence |
 | --- | --- | --- | --- |
 | `PtyOutput` | golden | WIRED | `run_reader` arm; gated on the attached session |
-| `ScreenSnapshot` | scripted-E2E | WIRED | `run_reader` arm → `session_lifecycle::snapshot_reset_bytes` |
+| `ScreenSnapshot` | scripted-E2E | WIRED | `run_reader` arm → `main.rs::apply_screen_snapshot` → `screen_replay::snapshot_to_ansi` |
 | `SessionReplay` | scripted-E2E | WIRED | `run_reader` arm → `session_lifecycle::decode_replay` |
 | `AiStateChanged` | visual-E2E | WIRED | `run_reader` arm → `AiStateTracker::update`; wired by bead .52 (`d3e8d32`) |
 | `AiStateCleared` | visual-E2E | WIRED | `run_reader` arm → `tracker.remove` + `clear_context` |
@@ -208,8 +208,8 @@ Everything else is silently discarded on the wire.
 | `ClipboardBridgeReadRequest` | scripted-E2E | UNWIRED | handled in `clipboard.rs`; module not imported by `main.rs` |
 | `RemoteHandshakeReply` | scripted-E2E | WIRED | `perform_remote_handshake` during the preamble; `on_remote_message` on the live reader |
 | `WindowTakenOver` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::displace` → `lost_control_overlay` |
-| `RemoteDisconnect` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::sever` → the status strip |
-| `RemotePeerList` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::set_peers` → the status strip |
+| `RemoteDisconnect` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::sever` → the status bar |
+| `RemotePeerList` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::set_peers` → the picker |
 | `RemoteEnv` | gpui-test | WIRED | `on_remote_message` → `RemoteChrome::set_env`; also parsed by `settings/server_action.rs` |
 | `LanApprovalPending` | visual-E2E | MISSING | no reference in the crate |
 | `LanApprovalResult` | visual-E2E | MISSING | no reference in the crate |
@@ -524,15 +524,14 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   `takeover` riding the ordinary `Hello`. A `WindowTakenOver` freezes the window
   under `lost_control.rs::lost_control_overlay` — every keystroke suppressed but
   the Enter/click reclaim, which leaves as the v3 `ControlClaim` — and a
-  `RemoteDisconnect` names its typed reason on the status strip. `RunAction` is
+  `RemoteDisconnect` names its typed reason on the status bar. `RunAction` is
   queued for the foreground's lifecycle tick because the actions it names touch
   GPUI entities; `DispatchAction` is its outbound twin, sent when a feature-015
   viewer picks a window-mutating palette row the server would refuse from a
   non-controller. Verified on two wires and on screen by
   `tests/e2e/visual/remote-control.sh`, whose `scribe-test remote-peer` stand-in
-  terminates the real TCP dial. The connect-picker OVERLAY remains unported:
-  `remote.rs::RemoteConnect` has no GPUI view, so the peer lists it would render
-  surface on the status strip instead.
+  terminates the real TCP dial. The remote-connect picker now renders both LAN
+  and tailnet peer lists; actionable warnings share the window status bar.
 - **FU-17 LAN (mTLS) dial and approval.** Rows: `LanHello`,
   `LanApprovalDecision`, `ListLanPeers`, `GetLanDialIdentity`,
   `LanApprovalPending`, `LanApprovalResult`, `LanApprovalRequest`, `LanPeerList`,

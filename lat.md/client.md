@@ -64,7 +64,7 @@ The writer channel is [[crates/scribe-client/src/ipc_bridge.rs#outbound_channel]
 
 The asymmetry is the whole point. Inbound frames are output, so losing some and resyncing the pane is recoverable. Outbound frames are user *input* — a keystroke, a resize, a session the user asked for — and evicting one queued `KeyInput` does not lose a byte, it hands the server the truncated remainder of a command line that then executes. So [[crates/scribe-client/src/ipc_bridge.rs#OutboundState#admit]] refuses the *incoming* frame at the cap, keeps everything already queued, and reports the refusal to its caller.
 
-A refusal does two things. It raises a tear request, which [[crates/scribe-client/src/ipc_bridge.rs#OutboundTear#wait]] delivers to [[crates/scribe-client/src/main.rs#run_writer]] even mid-write, through the [[crates/scribe-client/src/ipc_bridge.rs#write_or_tear]] race — the cap is only reachable behind a writer wedged on a socket the server has stopped reading, so the refusal has to interrupt that write rather than wait it out — and the redial then drains the same queue onto a fresh stream. And it becomes visible: [[crates/scribe-client/src/main.rs#TerminalView#report_refused_input]] puts the refused keystroke on the pane status strip, which is a live region, while [[crates/scribe-client/src/main.rs#supervise_connection]] keeps naming the refusal on every backoff for as long as the queue stays at its cap. Input that never reached the server is never silently swallowed.
+A refusal does two things. It raises a tear request, which [[crates/scribe-client/src/ipc_bridge.rs#OutboundTear#wait]] delivers to [[crates/scribe-client/src/main.rs#run_writer]] even mid-write, through the [[crates/scribe-client/src/ipc_bridge.rs#write_or_tear]] race — the cap is only reachable behind a writer wedged on a socket the server has stopped reading, so the refusal has to interrupt that write rather than wait it out — and the redial then drains the same queue onto a fresh stream. And it becomes visible: [[crates/scribe-client/src/main.rs#TerminalView#report_refused_input]] puts the refused keystroke in the window status bar's live region, while [[crates/scribe-client/src/main.rs#supervise_connection]] keeps naming the refusal on every backoff for as long as the queue stays at its cap. Input that never reached the server is never silently swallowed.
 
 Tearing costs no input either: the frame the writer already took is returned by [[crates/scribe-client/src/ipc_bridge.rs#OutboundReceiver#requeue]] and goes out first on the next stream, so the real high-water mark is the cap plus that one frame. The tear request itself is scoped to the connection it was refused on and cleared when a new one opens, because a refusal taken while no stream was alive has nothing to tear and carrying it forward would tear each redial before it wrote a frame. The backlog is never pruned across a redial — a `CreateSession` queued before the stream died is still a session the user asked for, and dropping it would be the client acting on its own behalf rather than the user's.
 
@@ -88,7 +88,7 @@ A skipped burst also builds no screen. [[crates/scribe-client/src/sync_frames.rs
 
 #### Rebuild burst boundary
 
-A whole-pane rebuild is not output and is not paced: a decoded [[protocol#Server Messages#Terminal Output#SessionReplay]] — and the RIS-prefixed ANSI of a `ScreenSnapshot` — replaces the pane rather than advancing it.
+A whole-pane rebuild is not output and is not paced: a decoded [[protocol#Server Messages#Terminal Output#SessionReplay]] — or the same self-resetting ANSI built from a `ScreenSnapshot` — replaces the pane rather than advancing it.
 
 It rides the inbound FIFO as its own [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]] variant, because its position in the byte stream is exactly what makes it correct: everything the server sent ahead of it is already folded into the state it carries. [[crates/scribe-client/src/ipc_bridge.rs#coalesce]] refuses to fold that variant into the output runs on either side of it, so no committed frame can span a rebuild.
 
@@ -104,15 +104,15 @@ A companion [[crates/scribe-client/src/main.rs#run_sync_expiry]] task waits on t
 
  ports the legacy client's reattach, reconnect, and scrollback-trim semantics onto the display-only terminal. Decode and snapshot conversion stay pure and run ahead of the drain, so a corrupt replay degrades to pane status without crashing.
 
- zstd-decompresses a `SessionReplay` (rejecting zero-dimension or corrupt streams as a ). The reader never runs that inflate itself: [[crates/scribe-client/src/session_lifecycle.rs#decode_replay_off_thread]] hands it to Tokio's blocking pool and awaits the result, so message order is preserved while the IPC thread's current-thread runtime stays free to drive the writer and the drain — a multi-megabyte reattach inflated inline froze keystrokes and every pane's repaint for as long as zstd ran. A blocking task that panics or is cancelled surfaces as the same `ReplayDecodeError` a corrupt payload does, so the snapshot-request fallback covers both.  prefixes RIS so a `ScreenSnapshot` resets the terminal before replaying `snapshot_to_ansi`.  tracks live sessions, rebuilds the reconnect topology from `SessionList`, applies `SessionCreated` / `SessionExited`, and adopts the window id from a takeover `Welcome`.  shifts stored absolute  rows after a `TrimScrollback`; the marks themselves live in the shared  store, because the drain writes them and the key path reads them.
+ zstd-decompresses a `SessionReplay` (rejecting zero-dimension or corrupt streams as a ). The reader never runs that inflate itself: [[crates/scribe-client/src/session_lifecycle.rs#decode_replay_off_thread]] hands it to Tokio's blocking pool and awaits the result, so message order is preserved while the IPC thread's current-thread runtime stays free to drive the writer and the drain — a multi-megabyte reattach inflated inline froze keystrokes and every pane's repaint for as long as zstd ran. A blocking task that panics or is cancelled surfaces as the same `ReplayDecodeError` a corrupt payload does, so the snapshot-request fallback covers both. [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] starts every new replay with RIS; [[crates/scribe-client/src/session_lifecycle.rs#ensure_replay_reset]] conditionally supplies it only for an old server's pre-RIS payload.  tracks live sessions, rebuilds the reconnect topology from `SessionList`, applies `SessionCreated` / `SessionExited`, and adopts the window id from a takeover `Welcome`.  shifts stored absolute  rows after a `TrimScrollback`; the marks themselves live in the shared  store, because the drain writes them and the key path reads them.
 
 Every attach carries a `Subscribe` for the pane it just attached, sent through  behind the `AttachSessions` from both attach paths —  on the reader's `SessionList` / `SessionCreated` route and  on a tab switch. Order matters because  rejects a subscription for a session this connection is not attached to; the shared ordered writer channel and the server's sequential per-connection dispatch make that impossible by construction. Subscribing is what makes the server run its CWD-fallback check for the newly visible pane, so a reattached tab gets its directory (and the workspace name derived from it) without waiting for the next shell prompt.
 
-A fresh create sends that `Subscribe` and nothing else. A `CreateSession` is itself an attach — the server installs this connection's sink while it starts the session, and spawns the PTY at the geometry the request named — so [[crates/scribe-client/src/main.rs#adopt_created_session|adopt_created_session]] takes the answer up instead of re-attaching it, and only a `SessionCreated` with no create outstanding goes through [[crates/scribe-client/src/main.rs#attach_session|attach_session]]. The two are told apart by [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#claim_pending_create|claim_pending_create]], a counter the sink raises on every accepted `CreateSession` and the reader claims on every genuine tab insert — the answer carries no echo of the request, so the FIFO order the single ordered writer channel guarantees is what matches them, the same rule the launch bindings follow. Re-attaching instead bought a `SessionReplay` of a terminal that had emitted nothing, whose leading `ESC [ 2J` can erase the shell's own startup bytes, and a re-point of a sink that was already this connection's.
+A fresh create sends that `Subscribe` and nothing else. A `CreateSession` is itself an attach — the server installs this connection's sink while it starts the session, and spawns the PTY at the geometry the request named — so [[crates/scribe-client/src/main.rs#adopt_created_session|adopt_created_session]] takes the answer up instead of re-attaching it, and only a `SessionCreated` with no create outstanding goes through [[crates/scribe-client/src/main.rs#attach_session|attach_session]]. The two are told apart by [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#claim_pending_create|claim_pending_create]], a counter the sink raises on every accepted `CreateSession` and the reader claims on every genuine tab insert — the answer carries no echo of the request, so the FIFO order the single ordered writer channel guarantees is what matches them, the same rule the launch bindings follow. Re-attaching instead bought a redundant full-state replay that could overwrite startup bytes already delivered, plus a re-point of a sink that was already this connection's.
 
 The grid an attach announces is the focused pane's live one. The reader thread can measure nothing, so it used to carry the nominal 120x36 startup box for the whole life of the window: every attach drove the PTY onto that box and the next redraw drove it back, a shrink and a regrow the foreground process sees as two `SIGWINCH`es. [[crates/scribe-client/src/main.rs#TerminalView#adopt_focused_pane_size|adopt_focused_pane_size]] mirrors the measured focused-pane size into `Shared` on every republish and [[crates/scribe-client/src/main.rs#reader_attach_size|reader_attach_size]] reads it back, so an attach — which always means "show this session in the focused pane" — names the grid that pane actually has.
 
- is the display-only client's resync: it owns no PTY and never replays locally, so when its pane may have drifted from the server's `Term` the only way back to a correct pane is to ask. Three live paths send it.  follows its post-font-reload `Resize` with one, because that resize raises `SIGWINCH` on the server's PTY and the client cannot derive the resulting grid itself.  sends one when a reattach replay fails to decode, turning a permanently stale tab into a repaint. [[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]] sends one per pane the bounded inbound queue had to drop, which is what lets that queue bound memory without silently losing screen state. The reply lands on , which feeds RIS plus the snapshot's own ANSI (visible grid *and* scrollback) through the drain, so everything on screen afterwards came out of that snapshot.
+ is the display-only client's resync: it owns no PTY and never replays locally, so when its pane may have drifted from the server's `Term` the only way back to a correct pane is to ask. Three live paths send it.  follows its post-font-reload `Resize` with one, because that resize raises `SIGWINCH` on the server's PTY and the client cannot derive the resulting grid itself.  sends one when a reattach replay fails to decode, turning a permanently stale tab into a repaint. [[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]] sends one per pane the bounded inbound queue had to drop, which is what lets that queue bound memory without silently losing screen state. The reply lands on , which feeds the common self-resetting ANSI (visible grid *and* scrollback) through the drain, so everything on screen afterwards came out of that snapshot.
 
 #### Replay reattach applies
 
@@ -122,9 +122,9 @@ A decoded `SessionReplay` reattach frame reproduces the session grid when writte
 
 A `SessionReplay` with a corrupt zstd payload yields a `ReplayDecodeError` and leaves the terminal untouched and still usable, so the pane surfaces an error without crashing the reader.
 
-#### Snapshot resets before replay
+#### Snapshot replay replaces prior state
 
-`snapshot_reset_bytes` clears prior pane content before replaying, so a tooling `ScreenSnapshot` replaces rather than appends onto the terminal.
+The common replay encoder clears prior pane state before painting, so a tooling `ScreenSnapshot` replaces rather than appends onto the terminal without client-only reset wrapping.
 
 #### Zero-dimension replay rejected
 
@@ -244,7 +244,7 @@ Each pane paints a non-reserving overlay scrollbar on its right edge, ticked wit
 
 State lives on the view, not on the element.  keys a  per *session* rather than per pane, because the fade belongs to the scrollback being scrolled: moving a session between panes carries its thumb with it, and a pane with no session has nothing to scroll.  drops a closed tab's state alongside its grid.
 
-Geometry is resolved during paint, because only the grid canvas knows the pane's pixel rect and the whole point of the overlay is that it hugs the right edge of the cells instead of reserving a gutter the layout would subtract.  therefore supplies the *data* —  read live off the grid by , the pane's marks cloned out of the shared prompt-mark store, and the theme palette — and  calls  against the real bounds and lowers the result onto rounded GPUI quads. The track spans the full canvas with no tab-bar inset, because this client's tab strip lives in the window titlebar.
+Geometry is resolved during paint, because only the grid canvas knows the pane's pixel rect and the whole point of the overlay is that it hugs the right edge of the cells instead of reserving a gutter the layout would subtract.  therefore supplies the *data* —  read live off the grid by , the pane's marks cloned out of the shared prompt-mark store, and the theme palette — and  calls  against the real bounds and lowers the result onto rounded GPUI quads. Whole-pane rebuilds trim the ANSI replay's synthetic history back to the server's authoritative `scrollback_rows`, so a fresh pane stays at zero history and wheel input cannot expose a blank scrollbar. The track spans the full canvas with no tab-bar inset, because this client's tab strip lives in the window titlebar.
 
 The palette comes from the theme, never from config.  takes the derived `chrome.scrollbar` slot (whose 40 % alpha doubles as the resting fade ceiling) and the ANSI green/red for the ticks; `appearance.scrollbar_width` and `appearance.scrollbar_color` stay deliberately unread, because both are declared removed keys for the GPUI client and the width is fixed at .
 
@@ -638,13 +638,13 @@ The whole surface is verified against the running app, not headlessly: see .
 
 The terminal window is a flex column of chrome bands around one flex-grown grid, and its startup size is derived from that stack rather than hardcoded — so the whole grid and every band land on screen at once.
 
- stacks, top to bottom: the , the terminal grid, the optional , the one-line pane status strip, and the window . Only the grid is flex-grown, so every pixel the chrome takes is a pixel the grid does not get.
+ stacks, top to bottom: the titlebar, terminal grid, optional prompt strip, and window status bar. Only the grid is flex-grown, so every pixel the chrome takes is a pixel the grid does not get. Connection and pane feedback share the window status bar; routine tab and attach success copy is omitted because the tab strip and connection dot already show it.
 
-The window used to open at a hardcoded 960x680, which was the painted height of the 36-row grid (36 x 18.9 px) and nothing else. The 84 px of titlebar, status strip and status bar therefore came out of the grid: the bottom five rows were clipped away, and because each band was flex-*shrinkable* under a flex-grown grid, a shorter window would have squeezed the bands themselves rather than the grid.
+The window used to open at a hardcoded 960x680, which was the painted height of the 36-row grid (36 x 18.9 px) and nothing else. The always-present titlebar and status bar therefore came out of the grid: bottom rows were clipped away, and because each band was flex-*shrinkable* under a flex-grown grid, a shorter window would have squeezed the bands themselves rather than the grid. A redundant 26 px band was later removed rather than reserving permanent space for duplicate status copy.
 
- is now the single place the band heights are stated.  sums the titlebar,  and  (GPUI lays divs out border-box, so each band's hairline is inside its own number), and  adds the grid's own extent at the metrics it is *painted* with — the live `GridFont`, not the integer cell size reported to the server, because the painted metrics decide where the last row lands.  resolves that from the live `[appearance]` config and hands it to `Bounds::centered`, so a font-size change moves the default window instead of silently clipping more rows. At the shipped defaults that is 1008x765 rather than 960x680.
+ is now the single place the band heights are stated.  sums the titlebar and status bar (GPUI lays divs out border-box, so the bar's hairline is inside that number), and  adds the grid's own extent at the metrics it is *painted* with — the live `GridFont`, not the integer cell size reported to the server, because the painted metrics decide where the last row lands.  resolves that from the live `[appearance]` config and hands it to `Bounds::centered`, so a font-size change moves the default window instead of silently clipping more rows. At the shipped defaults that is 1008x739 rather than 960x680.
 
-Two guards keep the derivation honest.  shrinks the request to the primary display, because a `font_size = 72` window taller than the screen would move the status bar off the *desktop* instead of off the window — the same defect one level up. And every band now carries `flex_none` (, the status strip in `render`, , ), so a user-shrunk window clips the grid — the surface that can afford it — instead of squeezing the status surfaces away.
+Two guards keep the derivation honest.  shrinks the request to the primary display, because a `font_size = 72` window taller than the screen would move the status bar off the *desktop* instead of off the window — the same defect one level up. And every chrome band carries `flex_none`, so a user-shrunk window clips the grid — the surface that can afford it — instead of squeezing status surfaces away.
 
 The prompt strip is deliberately excluded from the reserved height: it exists only while the attached pane has prompts, so reserving its rows up front would leave a permanent dead band under the grid. When it appears it takes its rows from the grid and the bands below it stay put. Verified on the running app by .
 
@@ -652,7 +652,7 @@ The prompt strip is deliberately excluded from the reserved height: it exists on
 
 The feature-014 LAN surface is live in the terminal window: an unknown device's approval prompt is raised and answered, the machine's own LAN environment and peers are probed, and `SCRIBE_LAN_DIAL` reaches a peer over mutual TLS.
 
- is the one piece of state the IPC reader and the GPUI view share for all of it, behind a mutex like the AI, chrome, share, update and lifecycle stores. It holds the parked approval prompt, the last `LanPeerList`, the  from the last `LanEnv`, and the  of this client's own dial, and derives the one-line  the status bar shows.
+ is the one piece of state the IPC reader and the GPUI view share for all of it, behind a mutex like the AI, chrome, share, update and lifecycle stores. It holds the parked approval prompt, the last `LanPeerList`, the  from the last `LanEnv`, and the  of this client's own dial. Its one-line  reports only actionable warnings and errors in the status bar; healthy peer counts stay in the picker.
 
 ### Owning side: the approval prompt
 
@@ -684,7 +684,7 @@ The whole surface is verified against the running app, not headlessly: see .
 
 The feature-013 tailnet surface is live in the terminal window: the account and peers are probed, a displaced window freezes under a reclaim banner, `SCRIBE_REMOTE_DIAL` reaches a peer, and automation actions round trip.
 
- is the one piece of state the IPC reader and the GPUI view share for all of it, the tailnet twin of . It holds the last `RemotePeerList`, the  from the last `RemoteEnv`, this client's own , the displaced , the typed severance reason, and the queue of inbound automation actions — and derives the one-line  the status strip shows.
+ is the one piece of state the IPC reader and the GPUI view share for all of it, the tailnet twin of . It holds the last `RemotePeerList`, the  from the last `RemoteEnv`, this client's own , the displaced , the typed severance reason, and the queue of inbound automation actions. Its one-line  reports only actionable warnings and errors in the window status bar; healthy peer counts stay in the picker.
 
 ### Startup probe: account and peers
 
@@ -700,7 +700,7 @@ At startup the client asks its own server which tailnet account it is signed in 
 
  clears the banner optimistically — matching the winit client, which drops the displaced connection and clears the state before its reclaiming `Hello` is answered — and puts the frozen v3 `::Claim` on the wire. Claiming rather than re-dialing is what makes the reclaim in-place: the GPUI client's connection is never torn down, so there is no visible close-and-reopen. A server that refuses the claim simply displaces this client again, which re-raises the banner.
 
-`RemoteDisconnect` is the peer's best-effort final frame before it closes a link for a policy reason. Recording its typed reason is the only chance the window has to say *why* the connection went away instead of just dying, so it outranks the dial status on the status strip.
+`RemoteDisconnect` is the peer's best-effort final frame before it closes a link for a policy reason. Recording its typed reason is the only chance the window has to say *why* the connection went away instead of just dying, so it outranks the dial status in the window status bar.
 
 ### Connecting side: the tailnet dial
 
@@ -732,7 +732,7 @@ The GPUI rebuild replaces native window decorations with a custom titlebar that 
 
  holds the display-independent logic ported from the winit  — the self-decaying attention-flash envelope (, additively blended by  without touching alpha), fixed-width title truncation (), the colored context-% suffix banding with pulse suppression (), the workspace-badge gate (), and the drag-reorder slot math (, walking tab edges rather than an `f32`→`usize` cast). Colors stay sRGB in  because GPUI performs its own sRGB→linear conversion at paint time.
 
-[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Equalize is visible only when the focused region's active tab has at least two panes; the root view projects the reconciled live pane tree into the titlebar each frame, so split, close, focus, and asynchronous session retirement cannot leave stale chrome. The badge is projected in the same post-reconcile pass from the focused region's ID, count, and accent plus the shared live workspace name, so naming and focus changes cannot leave stale badge geometry. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); `SelectTab` and `CloseTab` route through that same subscription into the shell's normal tab switch/close handlers, and [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour while `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. A press now suppresses the click path only after an actual reorder: the transient drag arm that protects against jitter no longer blocks an ordinary tab click. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+[[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: an imperative move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Equalize is visible only when the focused region's active tab has at least two panes; the root view projects the reconciled live pane tree into the titlebar each frame, so split, close, focus, and asynchronous session retirement cannot leave stale chrome. The badge is projected in the same post-reconcile pass from the focused region's ID, count, and accent plus the shared live workspace name, so naming and focus changes cannot leave stale badge geometry. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); `SelectTab` and `CloseTab` route through that same subscription into the shell's normal tab switch/close handlers, and [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the dragged tab's centre crosses into a neighbour's slot while `build_titlebar` applies each `ReorderTab` to [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]], preserving the authoritative order when `sync_tabs` redraws. A tab press also registers a marker value with GPUI's native drag system, whose `on_drag_move` delivery is window-wide: the drag keeps tracking the cursor after it leaves the titlebar band, the dragged tab renders slid to the cursor (clamped to the strip, painted deferred above its siblings), and a mouse-up anywhere — including outside the band, via `on_mouse_up_out` — ends the drag and keeps the committed order. A press now suppresses the click path only after an actual reorder: the transient drag arm that protects against jitter no longer blocks an ordinary tab click. Window controls drive the platform window directly (`minimize_window`, `zoom_window`, `remove_window`) rather than relying on a hit region. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
 
 ### Window move region
 
@@ -776,9 +776,14 @@ tab is active or hovered, its tab has focus, or the close node itself has
 focus. This keeps forward and reverse traversal stable because pinned GPUI
 registers only mounted focus handles; focus reveals the glyph on the next frame.
 
-Tab from the terminal enters that order and
-Shift+Tab reverses it; focused controls paint the accent focus treatment so
-keyboard position remains visible without a pointer.
+Tab traversal is scoped to the chrome: once a chrome control has focus, Tab
+advances that order and Shift+Tab reverses it, and focused controls paint the
+accent focus treatment so keyboard position remains visible without a pointer.
+A focused terminal consumes plain Tab and Shift+Tab as PTY input (`\t` /
+`ESC [ Z`) — tab completion is core terminal behavior — with
+[[crates/scribe-client/src/main.rs#TerminalView#traversal_claims_tab]] as the
+gate. Titlebar controls keep their own key handlers, so traversal continues to
+work from any focused chrome stop.
 
 Enter or Space activates the focused control. On a tab, Left/Right move focus
 between tabs, while Ctrl+Shift+Left/Right reorders the focused tab and retains
@@ -836,6 +841,18 @@ Verifies a `begin_drag`/`update_drag`/`end_drag` sequence on  moves the dragged 
 ### A drag arm without reordering still selects
 
 Verifies the titlebar's transient drag arm does not suppress a normal tab click unless the pointer actually crossed into another tab slot.
+
+### Slot swaps track the dragged tab's centre
+
+Verifies a swap requires the dragged tab's centre to cross into the neighbour's slot: a grab near the tab's edge does not swap the moment the cursor enters the neighbour, so slots cannot thrash near a boundary.
+
+### A drag survives leaving the tab strip
+
+Verifies drag updates far past either end of the strip keep the drag live, clamp the target to the first or last slot, and clamp the slide offset so the dragged tab never renders outside the strip.
+
+### Release outside the strip commits the reorder
+
+Verifies ending a drag after the pointer wanders out of the titlebar band clears the drag state and keeps the reorders committed while dragging — the `on_mouse_up_out` path in the rendered titlebar.
 
 ### Out-of-range interactions are no-ops
 
@@ -1332,6 +1349,14 @@ Apps such as `less`, `vim`, `top`, and `htop` enable DECCKM via terminfo's `smkx
 
 Numeric-keypad keys (`KeyLocation::Numpad`) emit SS3 sequences when DECPAM is active and no modifier is held: digits `0..9` map to `\x1bOp..\x1bOy`, `.,-+*/=` map to `\x1bOn`/`\x1bOl`/`\x1bOm`/`\x1bOk`/`\x1bOj`/`\x1bOo`/`\x1bOX`, and numpad Enter maps to `\x1bOM`.  runs ahead of the legacy / Kitty dispatch so the numpad table wins over the generic encoder for those events.
 
+### Terminal focus keeps Tab for the PTY
+
+Verifies [[crates/scribe-client/src/main.rs#TerminalView#traversal_claims_tab]] never claims plain Tab or Shift+Tab while the terminal root owns focus, and that [[crates/scribe-client/src/main.rs#encode_key]] emits `\t` and `ESC [ Z` so tab completion reaches the PTY.
+
+### Chrome focus keeps Tab traversal
+
+Verifies traversal claims plain Tab and Shift+Tab once chrome owns focus, while modified Tab chords and Ctrl+I — a different keystroke that encodes to the same `\t` byte — are never claimed, keeping titlebar tab stops keyboard-reachable.
+
 ### GPUI Input Encoder Port
 
 The GPUI rebuild reproduces the level-4 terminal byte encoder in , byte-identical to the winit client's  across legacy xterm, Kitty CSI-u, DECCKM, and DECPAM output.
@@ -1442,17 +1467,23 @@ The two sides are therefore routinely out of step for the length of one round tr
 
 #### Rebuild Geometry
 
-A rebuild is state, not a delta, so it is only correct at the geometry it was rendered at — which is carried on [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]]`::PaneRebuild` and [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` alongside the bytes.
+A rebuild is state, not a delta, so it is only correct at the geometry and scrollback size it was rendered with — carried on [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]]`::PaneRebuild` and [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` alongside the bytes.
 
 [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] emits every row as exactly `cols` printable characters — trailing blanks are literal spaces, with no EL or ED to absorb the difference — and ends on an absolute CUP in snapshot coordinates. Fed into a grid one column narrower, every row autowraps, the whole screen scrolls into scrollback, and the viewport is left blank with the cursor parked mid-screen; the shell's own `SIGWINCH` redraw then paints a duplicate prompt onto the wreckage.
 
-[[crates/scribe-client/src/main.rs#reshape_for_rebuild]] closes that by reshaping the pane grid to the rebuild's own `cols`/`rows` before [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] hands the bytes to the parser, and no-ops when the dimensions already agree or the wire reported zero. The reshape is driven by the rebuild rather than by the layout, and only has to hold until the size the client actually asked for comes back as a rebuild of its own — which the `RequestSnapshot` already in flight guarantees. Both producers supply it: the `ScreenSnapshot` path through [[crates/scribe-client/src/main.rs#apply_screen_snapshot]] and the reattach `SessionReplay` path through [[crates/scribe-client/src/main.rs#forward_replay]]. That also covers the bounded-queue overflow resync, which repairs a dropped pane through the same `RequestSnapshot`.
+[[crates/scribe-client/src/main.rs#reshape_for_rebuild]] closes that by reshaping the pane grid to the rebuild's own `cols`/`rows` before [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] hands the bytes to the parser, and no-ops when the dimensions already agree or the wire reported zero. [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] begins with RIS, which resets both buffers, history, margins, modes, attributes, and cursor before restoring the snapshot; it emits no ED 2, because Alacritty turns even a fresh-grid ED 2 into one synthetic history row. After replay, the drain still normalizes history to the rebuild's authoritative `scrollback_rows` solely for old-server pre-RIS payloads. The reshape is driven by the rebuild rather than by the layout, and only has to hold until the size the client actually asked for comes back as a rebuild of its own — which the `RequestSnapshot` already in flight guarantees. Both producers supply the geometry and history count: the `ScreenSnapshot` path through [[crates/scribe-client/src/main.rs#apply_screen_snapshot]] and the reattach `SessionReplay` path through [[crates/scribe-client/src/main.rs#forward_replay]]. That also covers the bounded-queue overflow resync, which repairs a dropped pane through the same `RequestSnapshot`.
 
 #### Rebuild applies at its own geometry
 
 A 120-column `ScreenSnapshot` rebuild driven through the real [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` path into a pane grid still sized 119x36 leaves the pane at 120x36 with each snapshot row on its own line.
 
 Without the reshape the grid stays 119 wide and the viewport opens on row 18 — half the snapshot has autowrapped into scrollback — which is exactly the blank-pane corruption a window drag produced roughly 25 times a second.
+
+#### Rebuild retains authoritative scrollback
+
+A modern raw replay produces exactly zero or N history rows, while compatibility normalization leaves an old pre-RIS replay at the same authoritative count.
+
+This distinguishes the producer root fix from the N-1 receiver guard and proves genuine scrollback remains usable.
 
 ### IME Composition
 

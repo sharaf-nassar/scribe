@@ -24,7 +24,7 @@ echo "PHASE 1 PASS: fresh session spawned at ${COLS}x${ROWS}"
 
 # ── Phase 2: a create is not answered with a replay ───────────────
 # There is nothing to replay — the terminal has emitted nothing yet — and the
-# replay's leading ED 2 would erase the shell's own startup bytes.
+# redundant full-state replay could overwrite the shell's own startup bytes.
 scribe-test replay status "$NEW" --expect-frames 0
 echo "PHASE 2 PASS: fresh create sent no SessionReplay"
 

@@ -3,8 +3,8 @@
 //!
 //! Six frozen-protocol server messages drive a pane's lifecycle after attach:
 //! `SessionReplay` (zstd-decompress the reattach ANSI, then present it),
-//! `ScreenSnapshot` (reset the terminal, then replay the `snapshot_to_ansi`
-//! output), `TrimScrollback` (shift stored absolute prompt marks to track the
+//! `ScreenSnapshot` (apply the self-resetting `snapshot_to_ansi` output),
+//! `TrimScrollback` (shift stored absolute prompt marks to track the
 //! dropped scrollback rows), `PromptMark` (fold one OSC 133 mark into the
 //! session's command records), and `SessionCreated` / `SessionExited` (register
 //! and retire panes). `SessionList` rebuilds the reconnect topology — sessions
@@ -32,7 +32,6 @@ use std::collections::HashMap;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{PromptMarkKind, SessionInfo},
-    screen::ScreenSnapshot,
     screen_replay::{self, SessionReplay},
 };
 
@@ -73,7 +72,25 @@ pub fn decode_replay(
         });
     }
     screen_replay::decompress_session_replay(replay)
+        .map(ensure_replay_reset)
         .map_err(|error| ReplayDecodeError { session_id, reason: error.to_string() })
+}
+
+/// Prefix RIS when decoding a replay from a server that predates self-resetting
+/// replay bytes.
+///
+/// Modern payloads already start with RIS and pass through without allocation.
+/// The receiver still normalizes history after applying either form because a
+/// legacy payload's ED 2 creates one synthetic row even on a reset grid.
+pub fn ensure_replay_reset(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(b"\x1bc") {
+        return bytes;
+    }
+
+    let mut reset = Vec::with_capacity(bytes.len() + 2);
+    reset.extend_from_slice(b"\x1bc");
+    reset.extend_from_slice(&bytes);
+    reset
 }
 
 /// Run [`decode_replay`] on the blocking pool instead of the reader's runtime
@@ -101,19 +118,6 @@ pub async fn decode_replay_off_thread(
             reason: format!("replay decode task failed: {error}"),
         }),
     }
-}
-
-/// Build the byte stream that applies a `ScreenSnapshot` to a fresh terminal.
-///
-/// Prefixes RIS (`ESC c`) so the receiving terminal is reset before the
-/// `snapshot_to_ansi` output replays, guaranteeing the tooling snapshot
-/// replaces the pane's content instead of appending onto it.
-#[must_use]
-pub fn snapshot_reset_bytes(snapshot: &ScreenSnapshot) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(2 + usize::from(snapshot.cols) * usize::from(snapshot.rows));
-    bytes.extend_from_slice(b"\x1bc");
-    bytes.extend_from_slice(&screen_replay::snapshot_to_ansi(snapshot));
-    bytes
 }
 
 /// The command-boundary record type, owned by the scrollbar module.
@@ -508,6 +512,17 @@ mod tests {
         assert_eq!(first_row(&terminal), "hello reattach");
     }
 
+    #[test]
+    fn legacy_replay_gets_one_receiver_reset() {
+        let legacy = b"\x1b[?25l\x1b[H\x1b[2Jlegacy".to_vec();
+        let mut expected = b"\x1bc".to_vec();
+        expected.extend_from_slice(&legacy);
+        assert_eq!(ensure_replay_reset(legacy), expected);
+
+        let modern = screen_replay::snapshot_to_ansi(&snapshot_with_text("modern"));
+        assert_eq!(ensure_replay_reset(modern.clone()), modern);
+    }
+
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Replay decode failure]]
     #[gpui::test]
     fn replay_decode_failure_shows_error_without_crashing(_cx: &mut gpui::TestAppContext) {
@@ -529,13 +544,14 @@ mod tests {
         assert_eq!(first_row(&terminal), "live content");
     }
 
-    // @lat: [[client#GPUI Client Spike#Session Lifecycle#Snapshot resets before replay]]
+    // @lat: [[client#GPUI Client Spike#Session Lifecycle#Snapshot replay replaces prior state]]
     #[gpui::test]
-    fn screen_snapshot_resets_before_replaying(_cx: &mut gpui::TestAppContext) {
+    fn screen_snapshot_replay_replaces_prior_content(_cx: &mut gpui::TestAppContext) {
         let mut terminal = DisplayOnlyTerminal::new(80, 24);
         terminal.feed_output(b"stale pane content that must be gone");
 
-        terminal.feed_output(&snapshot_reset_bytes(&snapshot_with_text("fresh snapshot")));
+        terminal
+            .feed_output(&screen_replay::snapshot_to_ansi(&snapshot_with_text("fresh snapshot")));
 
         assert_eq!(first_row(&terminal), "fresh snapshot");
     }

@@ -26,8 +26,8 @@
 //!   pair moves [`LanDialStatus`] from waiting to settled.
 //!
 //! Everything here is display-independent: the state is a set of plain values
-//! plus one derived [`LanChrome::status_line`], so the whole module is testable
-//! without a window.
+//! plus one derived actionable [`LanChrome::status_line`], so the whole module
+//! is testable without a window.
 
 use scribe_common::protocol::{LanPeerInfo, LanRefusal};
 
@@ -162,18 +162,14 @@ impl LanChrome {
         self.dial
     }
 
-    /// One line of user-facing LAN status, or `None` while there is nothing to
-    /// say (an idle dial on a machine whose LAN surface is dormant).
-    ///
-    /// The dial state wins when it is not idle: a client that is waiting on — or
-    /// was refused by — a peer has nothing more urgent to report.
+    /// One actionable LAN warning/error, or `None` for routine healthy state.
     #[must_use]
     pub fn status_line(&self) -> Option<String> {
         match self.dial {
             LanDialStatus::AwaitingApproval => {
                 return Some(String::from("Waiting for approval on the peer…"));
             }
-            LanDialStatus::Settled(outcome) => return Some(dial_outcome_line(outcome)),
+            LanDialStatus::Settled(outcome) => return dial_outcome_line(outcome),
             LanDialStatus::Idle => {}
         }
         let env = self.env.as_ref()?;
@@ -182,19 +178,20 @@ impl LanChrome {
                 env.current_network_reason.as_deref().unwrap_or("network not identifiable");
             return Some(format!("Local network dormant: {reason}"));
         }
-        let online = self.online_peer_count();
-        Some(format!("Local network: {online} peer(s)"))
+        None
     }
 }
 
 /// User-facing copy for a settled LAN dial, one distinct line per typed refusal
 /// so a user can tell "you declined me" from "we disagree about versions".
-fn dial_outcome_line(outcome: LanConnectOutcome) -> String {
+fn dial_outcome_line(outcome: LanConnectOutcome) -> Option<String> {
     match outcome {
-        LanConnectOutcome::Accepted => String::from("Connected over the local network"),
-        LanConnectOutcome::ConnectionFailure => String::from("Local network connection failed"),
+        LanConnectOutcome::Accepted => None,
+        LanConnectOutcome::ConnectionFailure => {
+            Some(String::from("Local network connection failed"))
+        }
         LanConnectOutcome::Refused(reason) => {
-            format!("Local network connection refused: {}", refusal_text(reason))
+            Some(format!("Local network connection refused: {}", refusal_text(reason)))
         }
     }
 }

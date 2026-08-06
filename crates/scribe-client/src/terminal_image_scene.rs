@@ -903,7 +903,7 @@ pub fn filter_terminal_image_placeholders(text: &str) -> String {
     output
 }
 
-/// Truthful local attach-refusal copy for the pane status strip.
+/// Truthful local attach-refusal copy for the window status bar.
 #[must_use]
 pub fn capability_mismatch_message(mismatch: TerminalImageCapabilityMismatch) -> String {
     format!(

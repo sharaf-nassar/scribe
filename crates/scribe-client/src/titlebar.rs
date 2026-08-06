@@ -10,9 +10,9 @@
 //! in [`crate::tab_bar`].
 
 use gpui::{
-    AnyElement, Context, ElementId, EventEmitter, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
-    WindowControlArea, div, prelude::*, px,
+    AnyElement, Context, DragMoveEvent, ElementId, EventEmitter, FocusHandle, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
+    WindowControlArea, deferred, div, prelude::*, px,
 };
 
 use crate::tab_bar::{
@@ -67,6 +67,22 @@ pub enum TitlebarEvent {
     Equalize,
     /// A window-control button was clicked.
     WindowControl(WindowControlKind),
+}
+
+/// Marker value handed to GPUI's native drag system when a tab press turns
+/// into a drag. Its presence as the active drag keeps mouse-move events
+/// flowing to [`TitlebarView`]'s `on_drag_move` listener anywhere in the
+/// window, so the drag survives the cursor leaving the titlebar band.
+struct TabDrag;
+
+/// Invisible view for the native drag's cursor-following overlay. The real tab
+/// is rendered offset inside the strip instead, so the overlay paints nothing.
+struct TabDragGhost;
+
+impl Render for TabDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 /// In-flight tab drag.
@@ -264,13 +280,19 @@ impl TitlebarView {
         cx.notify();
     }
 
-    /// Update the active drag to `cursor_x`, reordering when the cursor crosses a
-    /// neighbour. Emits [`TitlebarEvent::ReorderTab`] on each swap.
+    /// Update the active drag to `cursor_x`, reordering when the dragged tab's
+    /// centre crosses into a neighbour's slot. Emits
+    /// [`TitlebarEvent::ReorderTab`] on each swap.
     pub fn update_drag(&mut self, cursor_x: f32, cx: &mut Context<Self>) {
         let Some(mut drag) = self.drag else { return };
         drag.cursor_x = cursor_x;
+        // Resolve the slot from the dragged tab's centre, not the raw cursor:
+        // a swap then always requires half a tab of overlap regardless of
+        // where inside the tab the grab landed, so slots cannot thrash when
+        // the pointer sits near a boundary.
+        let center = cursor_x - drag.grab_offset + TAB_WIDTH / 2.0;
         let target =
-            reorder_target_index(cursor_x, drag.origin_x, TAB_WIDTH, self.tabs.len(), drag.source);
+            reorder_target_index(center, drag.origin_x, TAB_WIDTH, self.tabs.len(), drag.source);
         if target != drag.source {
             self.move_tab(drag.source, target);
             cx.emit(TitlebarEvent::ReorderTab { from: drag.source, to: target });
@@ -484,12 +506,16 @@ impl TitlebarView {
         }
     }
 
-    /// Drag slide offset for the dragged tab (it follows the cursor).
+    /// Drag slide offset for the dragged tab (it follows the cursor), clamped
+    /// so the tab never slides out of the strip.
     fn tab_slide_offset(&self, index: usize) -> Option<f32> {
         self.drag.and_then(|d| {
             (d.source == index).then(|| {
-                let tab_x = self.tabs_origin_x() + px_units(index) * TAB_WIDTH;
-                d.cursor_x - d.grab_offset - tab_x
+                let origin = self.tabs_origin_x();
+                let max_left = origin + px_units(self.tabs.len().saturating_sub(1)) * TAB_WIDTH;
+                let left = (d.cursor_x - d.grab_offset).clamp(origin, max_left);
+                let tab_x = origin + px_units(index) * TAB_WIDTH;
+                left - tab_x
             })
         })
     }
@@ -613,11 +639,12 @@ impl TitlebarView {
         if focused {
             tab_el = tab_el.border_2().border_color(self.colors.accent);
         }
-        if let Some(dx) = self.tab_slide_offset(index) {
+        let slide = self.tab_slide_offset(index);
+        if let Some(dx) = slide {
             tab_el = tab_el.left(px(dx));
         }
 
-        tab_el
+        let tab_el = tab_el
             .children(children.ai_dot)
             .child(div().flex_1().overflow_hidden().child(children.display))
             .children(children.suffix)
@@ -635,6 +662,10 @@ impl TitlebarView {
                     this.begin_drag(index, cursor_x, origin_x, ctx);
                 }),
             )
+            // Registers [`TabDrag`] as GPUI's active drag once the pressed
+            // pointer travels past the drag threshold; from then on the root's
+            // `on_drag_move` receives every mouse move in the window.
+            .on_drag(TabDrag, |_, _, _, cx| cx.new(|_| TabDragGhost))
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 if !this.drag.as_ref().is_some_and(|drag| drag.reordered) {
                     this.select(index, TabActivationSource::Pointer, ctx);
@@ -643,8 +674,14 @@ impl TitlebarView {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, ctx| {
                 ctx.stop_propagation();
                 this.tab_key(index, event, window, ctx);
-            }))
-            .into_any_element()
+            }));
+        if slide.is_some() {
+            // Defer the dragged tab's paint past its siblings so it slides
+            // over them instead of underneath the tabs to its right.
+            deferred(tab_el).with_priority(1).into_any_element()
+        } else {
+            tab_el.into_any_element()
+        }
     }
 
     fn render_icon_button(
@@ -858,15 +895,26 @@ impl Render for TitlebarView {
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _win, _ctx| {
                 this.move_arm = None;
             }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, win, ctx| {
-                if this.advance_move_arm(event, win) {
-                    return;
-                }
-                if this.drag.is_some() && event.pressed_button == Some(MouseButton::Left) {
-                    this.update_drag(f32::from(event.position.x), ctx);
-                }
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, win, _ctx| {
+                this.advance_move_arm(event, win);
+            }))
+            // Fires for every mouse move anywhere in the window while a
+            // [`TabDrag`] is active, so the drag keeps tracking the cursor
+            // after it leaves the titlebar band.
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _win, ctx| {
+                this.update_drag(f32::from(event.event.position.x), ctx);
             }))
             .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
+                    this.move_arm = None;
+                    this.end_drag(ctx);
+                }),
+            )
+            // A release outside the titlebar still ends the drag: the reorders
+            // already committed while dragging stay, and no stale drag state
+            // can pin the dragged tab off its slot.
+            .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
                     this.move_arm = None;
@@ -991,6 +1039,64 @@ mod tests {
         bar.read_with(cx, |bar, _| {
             assert_eq!(bar.tabs()[2].title, "tab-0");
         });
+        assert!(log.lock().unwrap().iter().any(|e| matches!(e, TitlebarEvent::ReorderTab { .. })));
+    }
+
+    // @lat: [[client#GPUI Titlebar#Slot swaps track the dragged tab's centre]]
+    #[gpui::test]
+    fn slot_swaps_track_the_dragged_tabs_centre(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(3, cx);
+        // Grab tab 0 near its right edge: the cursor enters tab 1's slot
+        // almost immediately, but the tab's centre has barely moved.
+        bar.update(cx, |bar, cx| {
+            bar.begin_drag(0, super::TAB_WIDTH - 6.0, 0.0, cx);
+            bar.update_drag(super::TAB_WIDTH + 40.0, cx);
+        });
+        bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[0].title, "tab-0"));
+        assert!(log.lock().unwrap().is_empty());
+        // Once the centre crosses into slot 1 (tab left past half a width),
+        // the swap happens.
+        bar.update(cx, |bar, cx| {
+            bar.update_drag(super::TAB_WIDTH * 1.5 - 5.0, cx);
+            bar.end_drag(cx);
+        });
+        bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[1].title, "tab-0"));
+        assert_eq!(log.lock().unwrap().as_slice(), &[TitlebarEvent::ReorderTab { from: 0, to: 1 }]);
+    }
+
+    // @lat: [[client#GPUI Titlebar#A drag survives leaving the tab strip]]
+    #[gpui::test]
+    fn drag_survives_positions_outside_the_strip(cx: &mut TestAppContext) {
+        let (bar, _) = titlebar_with_tabs(3, cx);
+        bar.update(cx, |bar, cx| {
+            bar.begin_drag(0, 0.0, 0.0, cx);
+            // Way past the strip's right edge: the drag stays live, the target
+            // clamps to the last slot, and the slide keeps the tab in-strip.
+            bar.update_drag(super::TAB_WIDTH * 40.0, cx);
+            assert!(bar.drag.is_some());
+            assert_eq!(bar.tab_slide_offset(2), Some(0.0));
+            // And back past the left edge: clamped to the first slot.
+            bar.update_drag(-500.0, cx);
+            assert!(bar.drag.is_some());
+            assert_eq!(bar.tab_slide_offset(0), Some(0.0));
+            bar.end_drag(cx);
+        });
+        bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[0].title, "tab-0"));
+    }
+
+    // @lat: [[client#GPUI Titlebar#Release outside the strip commits the reorder]]
+    #[gpui::test]
+    fn release_outside_the_strip_commits_the_reorder(cx: &mut TestAppContext) {
+        let (bar, log) = titlebar_with_tabs(3, cx);
+        bar.update(cx, |bar, cx| {
+            bar.begin_drag(0, 0.0, 0.0, cx);
+            // The pointer wanders below the titlebar band mid-drag...
+            bar.update_drag(super::TAB_WIDTH * 2.5, cx);
+            // ...and the mouse-up lands there too (the root's `up_out` path).
+            bar.end_drag(cx);
+            assert!(bar.drag.is_none());
+        });
+        bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[2].title, "tab-0"));
         assert!(log.lock().unwrap().iter().any(|e| matches!(e, TitlebarEvent::ReorderTab { .. })));
     }
 
