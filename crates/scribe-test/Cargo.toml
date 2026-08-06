@@ -34,7 +34,7 @@ serde_json.workspace = true
 rmp-serde.workspace = true
 clap.workspace = true
 regex.workspace = true
-cosmic-text = { version = "0.17", features = [
+cosmic-text = { version = "0.19", features = [
   "shape-run-cache",
   "monospace_fallback",
 ] }

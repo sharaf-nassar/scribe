@@ -1491,37 +1491,13 @@ dependencies = [
 
 [[package]]
 name = "cosmic-text"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54144dcf32570e159a20c4e77e0b2540665b0917096b4fc4f242def6db97b362"
-dependencies = [
- "bitflags 2.11.0",
- "fontdb",
- "harfrust 0.2.1",
- "linebender_resource_handle",
- "log",
- "rangemap",
- "rustc-hash 2.1.1",
- "self_cell",
- "skrifa 0.36.0",
- "smol_str",
- "swash",
- "sys-locale",
- "unicode-bidi",
- "unicode-linebreak",
- "unicode-script",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "cosmic-text"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags 2.11.0",
  "fontdb",
- "harfrust 0.5.2",
+ "harfrust",
  "linebender_resource_handle",
  "log",
  "rangemap",
@@ -2780,7 +2756,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "collections",
- "cosmic-text 0.19.0",
+ "cosmic-text",
  "etagere",
  "gpui",
  "gpui_util",
@@ -2845,19 +2821,6 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
-]
-
-[[package]]
-name = "harfrust"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a4c970f1a00edc1626f1e3cc039492b15b73df28b9fff70f95404a571b4fae"
-dependencies = [
- "bitflags 2.11.0",
- "bytemuck",
- "core_maths",
- "read-fonts 0.34.0",
- "smallvec",
 ]
 
 [[package]]
@@ -5556,7 +5519,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8941f8e9d5f8ad3aebea330d01ac68c0167600eb31a86ecd86e97be4d13b51f5"
 dependencies = [
  "bytemuck",
- "core_maths",
  "font-types 0.9.0",
 ]
 
@@ -6171,7 +6133,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
- "cosmic-text 0.17.0",
+ "cosmic-text",
  "flate2",
  "icy-sixel-decoder",
  "nix 0.31.2",
