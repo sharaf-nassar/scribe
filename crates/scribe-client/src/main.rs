@@ -22,7 +22,7 @@ use std::{
 
 use gpui::{
     App, AppContext as _, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*,
     px, relative, size,
@@ -305,6 +305,8 @@ struct Shared {
     /// `PtyOutput` the reader lets through. A split window streams several
     /// panes at once, so this replaces the single-attached-session gate.
     attached: Arc<Mutex<HashSet<SessionId>>>,
+    /// Actionable warning/error shown in the existing window status bar. Empty
+    /// means routine healthy state, which leaves the normal path visible.
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     /// The session in the focused pane: what keystrokes reach and what the
@@ -5624,11 +5626,11 @@ impl TerminalView {
         scribe_common::perf_probe::record_input_sent(session_id);
     }
 
-    /// Put a refused input frame on the pane status strip.
+    /// Put a refused input frame on the window status bar.
     ///
     /// The bounded outbound queue refuses rather than evicts, so a refusal is a
     /// keystroke the user typed and the server will never see. Logging it is not
-    /// enough: the status strip is a live region, so the refusal is announced as
+    /// enough: the status bar is a live region, so the refusal is announced as
     /// well as painted, and the user learns the pane is deaf instead of assuming
     /// the command they typed went through.
     fn report_refused_input(&self, error: SinkError) {
@@ -5973,9 +5975,16 @@ impl TerminalView {
     /// segment is absent only when the server has nothing to report.
     fn build_status_model(&mut self) -> status_bar::StatusBarModel {
         let connected = self.shared.connected.load(Ordering::Acquire);
+        let status_message = self
+            .shared
+            .status
+            .lock()
+            .ok()
+            .map(|status| status.clone())
+            .filter(|status| !status.is_empty());
         let active_session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         let session_count = usize::from(active_session.is_some());
-        // The strip is the only place the attached pane's workspace is known,
+        // The tab strip is the only place the attached pane's workspace is known,
         // and it is a different lock from the metadata store, so resolve the id
         // (a `Copy`) and release it before reading the names.
         let workspace_id = active_session.and_then(|session_id| {
@@ -6009,6 +6018,7 @@ impl TerminalView {
         status_bar::build_model(
             &StatusBarData {
                 connected,
+                status_message: status_message.as_deref(),
                 workspace_name: workspace_id
                     .zip(metadata)
                     .and_then(|(id, store)| store.workspace_name(id)),
@@ -6267,40 +6277,38 @@ impl TerminalView {
         }
     }
 
+    /// Whether chrome Tab traversal claims this keystroke.
+    ///
+    /// Plain Tab / Shift+Tab continue the tab-stop order only while a chrome
+    /// control already owns keyboard focus. With the terminal root focused the
+    /// keystroke belongs to the PTY — Tab completion is core terminal
+    /// behavior — so it falls through to the encoder (`\t`, `ESC [ Z` for
+    /// Shift+Tab). Modified Tab chords (and Ctrl+I, a distinct keystroke that
+    /// encodes to the same byte) never mean traversal.
+    fn traversal_claims_tab(event: &KeyDownEvent, terminal_focused: bool) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        !terminal_focused
+            && event.keystroke.key == "tab"
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+    }
+
     fn focus_next_titlebar_control(
+        &self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let modifiers = event.keystroke.modifiers;
-        if event.keystroke.key != "tab" || modifiers.control || modifiers.alt || modifiers.platform
-        {
+        if !Self::traversal_claims_tab(event, self.focus.root.is_focused(window)) {
             return false;
         }
-        if modifiers.shift {
+        if event.keystroke.modifiers.shift {
             window.focus_prev(cx);
         } else {
             window.focus_next(cx);
         }
         true
-    }
-
-    /// Render the one concise status node for transient pane connection and
-    /// error feedback, without exposing its decorative visual container.
-    fn render_pane_status(&self, status: String) -> impl IntoElement {
-        div()
-            .id("pane-status-strip")
-            .role(Role::Status)
-            .aria_label(format!("Pane status: {status}"))
-            .flex_none()
-            .h(px(window_chrome::STATUS_STRIP_HEIGHT))
-            .px_2()
-            .flex()
-            .items_center()
-            .bg(surface(self.chrome.status_bar_bg, self.opacity))
-            .text_color(opaque_slot(self.chrome.status_bar_text))
-            .text_xs()
-            .child(status)
     }
 }
 
@@ -6319,11 +6327,6 @@ impl Render for TerminalView {
         self.sync_grid_geometry(cx);
         let ime = self.sync_ime(cx);
         let grid = self.render_grid(ime, cx);
-        let status = self
-            .shared
-            .status
-            .lock()
-            .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
         let status_bar = self.render_status_bar(cx);
         let prompt_model = self.build_prompt_model();
         let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
@@ -6372,12 +6375,16 @@ impl Render for TerminalView {
                     return;
                 }
                 // An active overlay owns every key, including plain Tab. With
-                // no overlay, plain Tab enters the titlebar order; modified
-                // Tab chords continue to configured bindings below.
+                // no overlay, plain Tab continues the chrome tab-stop order
+                // only while chrome already has focus (the status-bar update
+                // CTA is the one stop that bubbles here — titlebar controls
+                // stop propagation in their own handlers). A focused terminal
+                // keeps Tab for the PTY; modified Tab chords continue to
+                // configured bindings below.
                 if view.handle_overlay_key(event, ctx) {
                     return;
                 }
-                if Self::focus_next_titlebar_control(event, win, ctx) {
+                if view.focus_next_titlebar_control(event, win, ctx) {
                     return;
                 }
                 // Vi mode and configured bindings run before the generic PTY
@@ -6405,7 +6412,6 @@ impl Render for TerminalView {
             // flex-grown child, so without it a window shorter than the grid's
             // painted height would shrink the bands away instead of clipping
             // the grid, taking the status surfaces off screen.
-            .child(self.render_pane_status(status))
             .child(status_bar)
             .children(self.command_palette.clone())
             .children(self.find_overlay.clone())
@@ -6604,9 +6610,9 @@ fn default_terminal_size() -> TerminalSize {
 /// [`COLUMNS`]x[`ROWS`] grid *at the metrics the grid is painted with* plus
 /// every chrome band, otherwise the flex column silently clips whichever comes
 /// last. The old fixed 960x680 was the grid's painted height alone (36 rows x
-/// 18.9 px) with nothing left for the 84 px of titlebar, status strip and
-/// status bar, so the bottom five rows were cut off and a slightly smaller
-/// window would have taken the bands with them. The result is clamped to the
+/// 18.9 px) with nothing left for the titlebar and status bar, so the bottom
+/// rows were cut off and a slightly smaller window would have taken the bands
+/// with them. The result is clamped to the
 /// display so a large `appearance.font_size` cannot push the status bar off the
 /// screen instead of off the window.
 fn startup_window_size(cx: &App) -> Size<Pixels> {
@@ -6646,7 +6652,7 @@ fn start_window_backend(
     let shared = Shared {
         panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
         attached: Arc::new(Mutex::new(HashSet::new())),
-        status: Arc::new(Mutex::new("connecting to Scribe server…".to_owned())),
+        status: Arc::new(Mutex::new(String::new())),
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
         focused_size: Arc::new(Mutex::new(terminal_size)),
@@ -7082,6 +7088,8 @@ async fn run_local_connection(ctx: &mut IpcThread) -> Result<(), String> {
             &ctx.shared.generation,
             format!("stale scribe-server: {reason}"),
         );
+    } else {
+        set_status(&ctx.shared.status, &ctx.shared.generation, String::new());
     }
     // Socket is up: light the status-bar connection dot green.
     ctx.shared.connected.store(true, Ordering::Release);
@@ -7110,7 +7118,15 @@ async fn run_remote_connection(ctx: &mut IpcThread, host: String, port: u16) -> 
         remote_handshake::local_device_name(),
     )
     .await;
-    publish_remote_status(&remote, &status, &generation, |chrome| chrome.settle_dial(outcome));
+    publish_remote_status(
+        &remote,
+        &status,
+        &generation,
+        outcome != RemoteConnectOutcome::Accepted,
+        |chrome| {
+            chrome.settle_dial(outcome);
+        },
+    );
     if outcome != RemoteConnectOutcome::Accepted {
         let (peer_host, peer_port) = dialer.target();
         return Err(format!("tailnet dial to {peer_host}:{peer_port} was not accepted"));
@@ -7132,8 +7148,7 @@ async fn run_remote_connection(ctx: &mut IpcThread, host: String, port: u16) -> 
     .await
 }
 
-/// Apply `mutate` to the tailnet chrome and mirror the resulting summary onto
-/// the status bar.
+/// Apply `mutate` to the tailnet chrome, publishing only warning/error copy.
 ///
 /// The dial path runs before any [`ReaderCtx`] exists, so it holds the three
 /// shared handles directly rather than going through [`update_remote_chrome`].
@@ -7141,6 +7156,7 @@ fn publish_remote_status(
     remote: &Arc<Mutex<RemoteChrome>>,
     status: &Arc<Mutex<String>>,
     generation: &Arc<AtomicU64>,
+    publish: bool,
     mutate: impl FnOnce(&mut RemoteChrome),
 ) {
     let Ok(mut guard) = remote.lock() else {
@@ -7148,11 +7164,9 @@ fn publish_remote_status(
         return;
     };
     mutate(&mut guard);
-    let line = guard.status_line();
+    let line = publish.then(|| guard.status_line()).flatten();
     drop(guard);
-    if let Some(line) = line {
-        set_status(status, generation, line);
-    }
+    set_status(status, generation, line.unwrap_or_default());
 }
 
 /// Dial a LAN peer over TCP + pinned mutual TLS, run the `LanHello` preamble and
@@ -7181,12 +7195,19 @@ async fn run_lan_connection(ctx: &mut IpcThread, host: String, port: u16) -> Res
             &pending_lan,
             &pending_status,
             &pending_generation,
+            true,
             LanChrome::awaiting_approval,
         );
     })
     .await;
 
-    publish_lan_status(&lan, &status, &generation, |chrome| chrome.settle_dial(outcome));
+    publish_lan_status(
+        &lan,
+        &status,
+        &generation,
+        outcome != LanConnectOutcome::Accepted,
+        |chrome| chrome.settle_dial(outcome),
+    );
     if outcome != LanConnectOutcome::Accepted {
         let (peer_host, peer_port) = dialer.target();
         return Err(format!("LAN dial to {peer_host}:{peer_port} was not accepted"));
@@ -7198,8 +7219,7 @@ async fn run_lan_connection(ctx: &mut IpcThread, host: String, port: u16) -> Res
     serve_connection(ctx, reader, writer, Transport::Lan).await
 }
 
-/// Apply `mutate` to the LAN chrome and mirror the resulting summary onto the
-/// status bar.
+/// Apply `mutate` to the LAN chrome, publishing only warning/error copy.
 ///
 /// The dial path runs before any [`ReaderCtx`] exists, so it holds the three
 /// shared handles directly rather than going through [`update_lan_chrome`].
@@ -7207,6 +7227,7 @@ fn publish_lan_status(
     lan: &Arc<Mutex<LanChrome>>,
     status: &Arc<Mutex<String>>,
     generation: &Arc<AtomicU64>,
+    publish: bool,
     mutate: impl FnOnce(&mut LanChrome),
 ) {
     let Ok(mut guard) = lan.lock() else {
@@ -7214,11 +7235,9 @@ fn publish_lan_status(
         return;
     };
     mutate(&mut guard);
-    let line = guard.status_line();
+    let line = publish.then(|| guard.status_line()).flatten();
     drop(guard);
-    if let Some(line) = line {
-        set_status(status, generation, line);
-    }
+    set_status(status, generation, line.unwrap_or_default());
 }
 
 /// The pre-`Hello` environment answers a LOCAL connection carries in from its
@@ -7609,8 +7628,9 @@ fn resolve_batch_panes(
 /// The arms share the stream because they are ordered against each other:
 /// output advances the grid, a prompt mark reads the row the output left the
 /// cursor on, and the suppressed-ED-3 snap resets the offset the output
-/// scrolled. A rebuild is the one arm that reshapes the grid before it writes,
-/// because it is state rather than a delta — see [`reshape_for_rebuild`].
+/// scrolled. A rebuild is the one arm that reshapes the grid before it writes
+/// and normalizes legacy replay history afterwards, because it is state rather
+/// than a delta — see [`reshape_for_rebuild`].
 fn apply_pane_op(
     op: &PaneOp,
     session: SessionId,
@@ -7623,9 +7643,12 @@ fn apply_pane_op(
             queue.queue_output_frames(bytes);
             usize::from(present_next_burst(queue, grid))
         }
-        PaneOp::Rebuild { bytes, cols, rows } => {
+        PaneOp::Rebuild { bytes, cols, rows, scrollback_rows } => {
             reshape_for_rebuild(session, grid, *cols, *rows);
-            usize::from(present_rebuild(queue, grid, bytes))
+            let rebuilt = present_rebuild(queue, grid, bytes);
+            let kept_rows = usize::try_from(*scrollback_rows).unwrap_or(usize::MAX);
+            let trimmed = grid.trim_history(kept_rows);
+            usize::from(rebuilt || trimmed > 0)
         }
         PaneOp::PromptMark { kind, exit_code } => {
             apply_prompt_mark(prompt_marks, session, *kind, *exit_code, grid);
@@ -8027,8 +8050,7 @@ fn update_lan_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
-/// Fold a LAN change and mirror the resulting one-line summary onto the status
-/// bar, so every LAN transition the reader applies is also visible on screen.
+/// Fold a LAN warning/error and mirror it onto the status bar.
 fn update_lan_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
     update_lan_chrome(ctx, mutate);
     let line = ctx.lan.lock().ok().and_then(|lan| lan.status_line());
@@ -8052,9 +8074,7 @@ fn update_remote_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut RemoteChrome))
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
-/// Fold a tailnet change and mirror the resulting one-line summary onto the
-/// status bar, so every remote transition the reader applies is also visible on
-/// screen.
+/// Fold a tailnet warning/error and mirror it onto the status bar.
 fn update_remote_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut RemoteChrome)) {
     update_remote_chrome(ctx, mutate);
     let line = ctx.remote.lock().ok().and_then(|remote| remote.status_line());
@@ -8257,18 +8277,32 @@ fn on_session_exited(
 
 /// Repaint the attached pane from a `ScreenSnapshot` the client asked for.
 ///
-/// The bytes are RIS followed by the snapshot's own ANSI, so the pane is
-/// replaced rather than appended onto — everything on screen afterwards came
-/// out of this snapshot. That is also what makes the repaint assertable from
+/// The snapshot's ANSI starts with RIS, so the pane is replaced rather than
+/// appended onto — everything on screen afterwards came out of this snapshot.
+/// That is also what makes the repaint assertable from
 /// outside the process, which the `RequestSnapshot` E2E relies on, so the
 /// applied grid's dimensions are logged alongside the session.
 ///
-/// The snapshot's own `cols`/`rows` go with the bytes rather than being dropped
-/// here: they are the geometry the ANSI is valid at, and the drain reshapes the
-/// pane grid to them before replaying it.
+/// The snapshot's own `cols`/`rows` and `scrollback_rows` go with the bytes
+/// rather than being dropped here: they are the geometry and history count the
+/// ANSI must reproduce, so the drain reshapes before replay and normalizes any
+/// synthetic history carried by a legacy pre-RIS replay afterwards. The
+/// client's own grid has usually already moved on:
+/// [`TerminalView::publish_pane_sizes`] reshapes the local grid the moment the
+/// window changes size, while the server still answers the `RequestSnapshot`
+/// from the size its `Term` had before its own resize landed.
 fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &ScreenSnapshot) {
-    let bytes = session_lifecycle::snapshot_reset_bytes(snapshot);
-    forward_rebuild(&ctx.in_tx, session_id, bytes, snapshot.cols, snapshot.rows);
+    let bytes = scribe_common::screen_replay::snapshot_to_ansi(snapshot);
+    forward_inbound(
+        &ctx.in_tx,
+        InboundEvent::PaneRebuild {
+            session_id,
+            bytes,
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            scrollback_rows: snapshot.scrollback_rows,
+        },
+    );
     tracing::info!(
         %session_id,
         cols = snapshot.cols,
@@ -8292,9 +8326,14 @@ fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &Scre
 /// owns the writer and the drain, so a large replay decoded inline would hold
 /// back keystrokes and pane repaints for as long as zstd ran.
 async fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: SessionReplay) {
-    let (cols, rows) = (replay.cols, replay.rows);
+    let (cols, rows, scrollback_rows) = (replay.cols, replay.rows, replay.scrollback_rows);
     match session_lifecycle::decode_replay_off_thread(session_id, replay).await {
-        Ok(bytes) => forward_rebuild(&ctx.in_tx, session_id, bytes, cols, rows),
+        Ok(bytes) => {
+            forward_inbound(
+                &ctx.in_tx,
+                InboundEvent::PaneRebuild { session_id, bytes, cols, rows, scrollback_rows },
+            );
+        }
         Err(error) => {
             set_status(&ctx.status, &ctx.generation, error.to_string());
             if let Err(sink_error) = ctx.sink.request_snapshot(session_id) {
@@ -8801,7 +8840,7 @@ async fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
 }
 
 /// Route live image records through the pane FIFO and show typed attach
-/// mismatches in the existing visible status strip.
+/// mismatches in the existing window status bar.
 fn on_terminal_image_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::TerminalImageLive { session_id, message } => {
@@ -8998,15 +9037,10 @@ fn on_lan_message(ctx: &ReaderCtx, message: ServerMessage) {
                     name_collision,
                 ));
             });
-            set_status(
-                &ctx.status,
-                &ctx.generation,
-                "a device on your local network wants to connect".to_owned(),
-            );
         }
         ServerMessage::LanPeerList { peers } => {
             tracing::info!(count = peers.len(), "server LAN peer list");
-            update_lan_chrome_and_status(ctx, |lan| lan.set_peers(peers));
+            update_lan_chrome(ctx, |lan| lan.set_peers(peers));
         }
         ServerMessage::LanEnv {
             device_id_hex,
@@ -9019,14 +9053,20 @@ fn on_lan_message(ctx: &ReaderCtx, message: ServerMessage) {
                 current_network_addable,
                 "server LAN environment"
             );
-            update_lan_chrome_and_status(ctx, |lan| {
+            let update = |lan: &mut LanChrome| {
                 lan.set_env(LanEnvSummary {
                     device_id_hex,
                     fingerprint_words,
                     current_network_addable,
                     current_network_reason,
                 });
-            });
+            };
+            if current_network_addable {
+                update_lan_chrome(ctx, update);
+                set_status(&ctx.status, &ctx.generation, String::new());
+            } else {
+                update_lan_chrome_and_status(ctx, update);
+            }
         }
         ServerMessage::LanApprovalPending => {
             // Normally consumed by `lan_dial::handshake` before this reader
@@ -9038,7 +9078,12 @@ fn on_lan_message(ctx: &ReaderCtx, message: ServerMessage) {
         ServerMessage::LanApprovalResult { approved, refusal } => {
             tracing::info!(approved, ?refusal, "LAN approval result");
             let outcome = lan_approval_outcome(approved, refusal);
-            update_lan_chrome_and_status(ctx, |lan| lan.settle_dial(outcome));
+            if outcome == LanConnectOutcome::Accepted {
+                update_lan_chrome(ctx, |lan| lan.settle_dial(outcome));
+                set_status(&ctx.status, &ctx.generation, String::new());
+            } else {
+                update_lan_chrome_and_status(ctx, |lan| lan.settle_dial(outcome));
+            }
         }
         ServerMessage::LanDialIdentity { available, .. } => {
             // PRIVATE key material. The dialer fetches it on its own transient
@@ -9092,13 +9137,19 @@ fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
                 tailscale_detected,
                 "server tailnet environment"
             );
-            update_remote_chrome_and_status(ctx, |remote| {
+            let update = |remote: &mut RemoteChrome| {
                 remote.set_env(RemoteEnvSummary { account, tailscale_detected });
-            });
+            };
+            if tailscale_detected {
+                update_remote_chrome(ctx, update);
+                set_status(&ctx.status, &ctx.generation, String::new());
+            } else {
+                update_remote_chrome_and_status(ctx, update);
+            }
         }
         ServerMessage::RemotePeerList { peers } => {
             tracing::info!(count = peers.len(), "server tailnet peer list");
-            update_remote_chrome_and_status(ctx, |remote| remote.set_peers(peers));
+            update_remote_chrome(ctx, |remote| remote.set_peers(peers));
         }
         ServerMessage::RemoteHandshakeReply {
             accepted,
@@ -9119,7 +9170,12 @@ fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
                 "remote handshake reply"
             );
             let outcome = remote_handshake_outcome(accepted, refusal);
-            update_remote_chrome_and_status(ctx, |remote| remote.settle_dial(outcome));
+            if outcome == RemoteConnectOutcome::Accepted {
+                update_remote_chrome(ctx, |remote| remote.settle_dial(outcome));
+                set_status(&ctx.status, &ctx.generation, String::new());
+            } else {
+                update_remote_chrome_and_status(ctx, |remote| remote.settle_dial(outcome));
+            }
         }
         ServerMessage::RemoteDisconnect { reason } => {
             // Best-effort final frame: the peer closes the link right after it,
@@ -9132,7 +9188,7 @@ fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
             // Logged because the banner is pixels only: a scripted E2E can then
             // prove the notice reached the chrome and not just the socket.
             tracing::info!(%device_name, %login_name, "window taken over by another controller");
-            update_remote_chrome_and_status(ctx, |remote| {
+            update_remote_chrome(ctx, |remote| {
                 remote.displace(LostControlState::new(device_name, login_name));
             });
         }
@@ -9369,7 +9425,6 @@ fn open_created_tab(
         } else {
             attach_session(ctx, session_id)?;
         }
-        set_status(&ctx.status, &ctx.generation, "opened a new tab".to_owned());
         // The tab strip is pixels only; log the insert so a scripted E2E can
         // assert that an action really produced a session round trip.
         tracing::info!(session = %session_id, "opened a new tab");
@@ -9392,22 +9447,13 @@ fn sync_tab_strip(
     match focused {
         Some(session_id) if Some(session_id) != attached => {
             attach_session(ctx, session_id)?;
-            set_status(
-                &ctx.status,
-                &ctx.generation,
-                format!("attached; {} live pane(s)", sessions.len()),
-            );
-        }
-        // Already attached to the focused tab; just repaint so any label change
-        // carried by the list lands in the tab row.
-        Some(_) => {
             ctx.generation.fetch_add(1, Ordering::Release);
         }
-        None => set_status(
-            &ctx.status,
-            &ctx.generation,
-            "connected; server has no live panes".to_owned(),
-        ),
+        // Already attached to the focused tab (or nothing focused); just
+        // repaint so any label change carried by the list lands in the tab row.
+        Some(_) | None => {
+            ctx.generation.fetch_add(1, Ordering::Release);
+        }
     }
     Ok(())
 }
@@ -9472,9 +9518,9 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
 ///
 /// Deliberately sends neither `AttachSessions` nor `Resize`. The attach would
 /// re-point a sink that is already this connection's and pay for a full
-/// `SessionReplay` of a terminal that has emitted nothing, whose leading ED 2
-/// can erase the shell's own startup bytes; the resize would drive the PTY off
-/// the geometry the create just spawned it at and back again.
+/// redundant full-state replay that can overwrite shell startup bytes already
+/// delivered to the pane; the resize would drive the PTY off the geometry the
+/// create just spawned it at and back again.
 fn adopt_created_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> {
     tracing::info!(%session_id, "adopting a freshly created session; already attached");
     ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
@@ -9494,31 +9540,6 @@ fn adopt_attached_session(ctx: &ReaderCtx, session_id: SessionId) {
 
 fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {
     forward_inbound(in_tx, InboundEvent::PaneOutput { session_id, bytes });
-}
-
-/// Hand the drain a whole-pane rebuild — a decoded `SessionReplay` or a
-/// `ScreenSnapshot`'s RIS-prefixed ANSI — together with the geometry the server
-/// rendered it at.
-///
-/// It rides the same FIFO as output, because its position in the byte stream is
-/// exactly what makes it correct: everything the server sent before it is
-/// already folded into the state it carries. It is *not* output, though, so it
-/// enters as its own event and the drain applies it as its own burst boundary
-/// rather than concatenating it into the runs around it.
-///
-/// `cols`/`rows` travel with the bytes because a rebuild is only correct at the
-/// geometry it was rendered at, and the client's own grid has usually already
-/// moved on: [`TerminalView::publish_pane_sizes`] reshapes the local grid the moment the
-/// window changes size, while the server still answers the `RequestSnapshot`
-/// from the size its `Term` had before its own resize landed.
-fn forward_rebuild(
-    in_tx: &InboundSender,
-    session_id: SessionId,
-    bytes: Vec<u8>,
-    cols: u16,
-    rows: u16,
-) {
-    forward_inbound(in_tx, InboundEvent::PaneRebuild { session_id, bytes, cols, rows });
 }
 
 /// Hand one event to the coalescing drain, preserving arrival order.
@@ -9564,6 +9585,47 @@ mod tests {
         assert!(!bootstrap.claim(true, 0));
     }
 
+    /// Build a plain key-down event for `key` with `modifiers` held.
+    fn key_down(key: &str, modifiers: gpui::Modifiers) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke { modifiers, key: key.into(), key_char: None },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    // @lat: [[client#Input#Terminal focus keeps Tab for the PTY]]
+    #[test]
+    fn focused_terminal_keeps_tab_for_the_pty() {
+        let tab = key_down("tab", gpui::Modifiers::default());
+        assert!(!TerminalView::traversal_claims_tab(&tab, true));
+        assert_eq!(encode_key(&tab).as_deref(), Some(b"\t".as_slice()));
+
+        let shift = gpui::Modifiers { shift: true, ..gpui::Modifiers::default() };
+        let shift_tab = key_down("tab", shift);
+        assert!(!TerminalView::traversal_claims_tab(&shift_tab, true));
+        assert_eq!(encode_key(&shift_tab).as_deref(), Some(b"\x1b[Z".as_slice()));
+    }
+
+    // @lat: [[client#Input#Chrome focus keeps Tab traversal]]
+    #[test]
+    fn chrome_focus_keeps_tab_traversal() {
+        let tab = key_down("tab", gpui::Modifiers::default());
+        assert!(TerminalView::traversal_claims_tab(&tab, false));
+
+        let shift = gpui::Modifiers { shift: true, ..gpui::Modifiers::default() };
+        assert!(TerminalView::traversal_claims_tab(&key_down("tab", shift), false));
+
+        // Modified Tab chords stay with the bindings (`ctrl+tab` cycles panes),
+        // and Ctrl+I — the same byte as Tab on the wire — is a different
+        // keystroke that must never move focus.
+        let ctrl = gpui::Modifiers { control: true, ..gpui::Modifiers::default() };
+        assert!(!TerminalView::traversal_claims_tab(&key_down("tab", ctrl), false));
+        let ctrl_i = key_down("i", ctrl);
+        assert!(!TerminalView::traversal_claims_tab(&ctrl_i, false));
+        assert_eq!(encode_key(&ctrl_i).as_deref(), Some(b"\t".as_slice()));
+    }
+
     #[test]
     fn disabled_or_claimed_window_never_bootstraps_a_session() {
         let cold_restore = InitialSessionBootstrap::new(false);
@@ -9577,14 +9639,17 @@ mod tests {
     /// A snapshot whose rows each carry their own index, so a row that landed
     /// on the wrong line — or scrolled off into scrollback — is visible in the
     /// assertion rather than hidden behind identical filler.
-    fn numbered_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
-        let blank = ScreenCell {
+    fn blank_screen_cell() -> ScreenCell {
+        ScreenCell {
             c: ' ',
             fg: ScreenColor::Named(256),
             bg: ScreenColor::Named(257),
             flags: CellFlags::default(),
-        };
-        let mut cells = vec![blank; usize::from(cols) * usize::from(rows)];
+        }
+    }
+
+    fn numbered_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
+        let mut cells = vec![blank_screen_cell(); usize::from(cols) * usize::from(rows)];
         for row in 0..usize::from(rows) {
             for (col, ch) in format!("row {row:02}").chars().enumerate() {
                 cells[row * usize::from(cols) + col].c = ch;
@@ -9605,6 +9670,17 @@ mod tests {
         }
     }
 
+    /// Recreate the primary-screen prefix emitted before replay bytes became
+    /// self-resetting. New clients prepend RIS before applying this form, then
+    /// normalize the one blank history row its ED 2 creates.
+    fn legacy_snapshot_bytes(snapshot: &ScreenSnapshot) -> Vec<u8> {
+        let modern = scribe_common::screen_replay::snapshot_to_ansi(snapshot);
+        let body = modern.strip_prefix(b"\x1bc\x1b[?25l\x1b[0m").expect("primary replay prefix");
+        let mut legacy = b"\x1b[?25l\x1b[H\x1b[2J\x1b[0m".to_vec();
+        legacy.extend_from_slice(body);
+        session_lifecycle::ensure_replay_reset(legacy)
+    }
+
     // @lat: [[client#Input#Resize Coordination#Rebuild applies at its own geometry]]
     #[gpui::test]
     fn rebuild_replays_at_the_geometry_it_was_rendered_at(_cx: &mut gpui::TestAppContext) {
@@ -9616,9 +9692,10 @@ mod tests {
         let pane = grids.pane(session);
         let snapshot = numbered_snapshot(120, 36);
         let op = PaneOp::Rebuild {
-            bytes: session_lifecycle::snapshot_reset_bytes(&snapshot),
+            bytes: scribe_common::screen_replay::snapshot_to_ansi(&snapshot),
             cols: snapshot.cols,
             rows: snapshot.rows,
+            scrollback_rows: snapshot.scrollback_rows,
         };
         let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
 
@@ -9627,11 +9704,61 @@ mod tests {
 
         let frame = pane.frame().expect("the pane republishes its projection");
         assert_eq!(frame.dimensions, (120, 36));
+        assert_eq!(frame.metrics.history_size, 0);
+        assert_eq!(pane.with_terminal(|terminal| terminal.scroll(Scroll::Delta(1))), Some(false));
         // Every snapshot row is on its own line: at the stale width each row
         // autowrapped, pushing the whole screen into scrollback and leaving a
         // blank viewport behind.
         for row in 0..36 {
             assert_eq!(frame.content.row_text(row).trim_end(), format!("row {row:02}"));
         }
+    }
+
+    #[gpui::test]
+    fn rebuild_normalizes_legacy_zero_scrollback(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let snapshot = numbered_snapshot(80, 24);
+        let op = PaneOp::Rebuild {
+            bytes: legacy_snapshot_bytes(&snapshot),
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            scrollback_rows: 0,
+        };
+        let mut grids = PaneGrids::new(80, 24);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| apply_pane_op(&op, session, stream, &prompt_marks))
+            .expect("pane stream applies the legacy rebuild");
+
+        let frame = pane.frame().expect("the pane republishes its projection");
+        assert_eq!(frame.metrics.history_size, 0);
+        assert_eq!(pane.with_terminal(|terminal| terminal.scroll(Scroll::Delta(1))), Some(false));
+    }
+
+    // @lat: [[client#Input#Resize Coordination#Rebuild retains authoritative scrollback]]
+    #[gpui::test]
+    fn legacy_rebuild_retains_authoritative_scrollback(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut snapshot = numbered_snapshot(80, 24);
+        snapshot.scrollback_rows = 3;
+        snapshot.scrollback = vec![blank_screen_cell(); usize::from(snapshot.cols) * 3];
+        let op = PaneOp::Rebuild {
+            bytes: legacy_snapshot_bytes(&snapshot),
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            scrollback_rows: snapshot.scrollback_rows,
+        };
+        let mut grids = PaneGrids::new(80, 24);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| apply_pane_op(&op, session, stream, &prompt_marks))
+            .expect("pane stream applies the rebuild");
+
+        let frame = pane.frame().expect("the pane republishes its projection");
+        assert_eq!(frame.metrics.history_size, 3);
+        assert_eq!(pane.with_terminal(|terminal| terminal.scroll(Scroll::Delta(1))), Some(true));
+        assert_eq!(pane.frame().unwrap().metrics.display_offset, 1);
     }
 }

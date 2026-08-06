@@ -177,7 +177,7 @@ replay and atomic client staging.
 | Variant | Surface | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
 | `PtyOutput` | terminal stream | golden | `main.rs::dispatch_server_message` → `main.rs::on_pane_output_message` → `main.rs::forward_output` (gated on the attached session) | required |
-| `ScreenSnapshot` | tooling snapshot | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::apply_screen_snapshot` → `session_lifecycle::snapshot_reset_bytes` | required |
+| `ScreenSnapshot` | tooling snapshot | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::apply_screen_snapshot` → `screen_replay::snapshot_to_ansi` | required |
 | `SessionReplay` | reconnect replay | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::forward_replay` → `session_lifecycle::decode_replay` | required |
 | `AiStateChanged` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `ai_indicator::AiStateTracker::update` | required |
 | `AiStateCleared` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
@@ -201,7 +201,7 @@ replay and atomic client staging.
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_welcome` → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `TerminalImageLive` | ordered image scene updates | scripted-E2E | `main.rs::on_terminal_image_message` → `ipc_bridge::InboundEvent::TerminalImageLive` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::apply_image_live` → `terminal_image_scene::LiveImageScene::apply` (`tests/e2e/terminal-image-client-scene.sh`) | required |
 | `TerminalImageReplay` | generation-tagged image snapshot | scripted-E2E | `main.rs::on_terminal_image_message` → `ipc_bridge::InboundEvent::TerminalImageReplay` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::apply_image_replay` → `terminal_image_scene::LiveImageScene::apply_replay` (`tests/e2e/terminal-image-client-replay.sh`) | required |
-| `TerminalImageCapabilityMismatch` | incapable-viewer refusal | scripted-E2E | `main.rs::on_terminal_image_message` → `terminal_image_scene::capability_mismatch_message` → visible pane status strip (`tests/e2e/terminal-image-client-scene.sh`) | required |
+| `TerminalImageCapabilityMismatch` | incapable-viewer refusal | scripted-E2E | `main.rs::on_terminal_image_message` → `terminal_image_scene::capability_mismatch_message` → visible window status bar (`tests/e2e/terminal-image-client-scene.sh`) | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
 | `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
@@ -221,8 +221,8 @@ replay and atomic client staging.
 | `ClipboardBridgeReadRequest` | OSC 52 bridge | scripted-E2E | `main.rs::on_clipboard_message` → `clipboard::ClipboardBridge::push_job` → `TerminalView::run_bridge_job` → `clipboard::read_reply`, answered on the wire by `IpcSink::clipboard_answer` (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
 | `RemoteHandshakeReply` | tailnet connect | scripted-E2E | `remote_handshake.rs::perform_remote_handshake` during the preamble; `main.rs::on_remote_message` on the live reader | required |
 | `WindowTakenOver` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::displace` → `lost_control.rs::lost_control_overlay` freezes the window under the reclaim banner | required |
-| `RemoteDisconnect` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::sever` → the status strip's typed reason | required |
-| `RemotePeerList` | remote connect picker | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::set_peers` → the status strip's online-peer count (the picker overlay is a tracked follow-on) | required |
+| `RemoteDisconnect` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::sever` → the status bar's typed reason | required |
+| `RemotePeerList` | remote connect picker | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::set_peers` → picker overlay | required |
 | `RemoteEnv` | remote settings | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::set_env`; also parsed in `settings/server_action.rs` for the Remote page's Tailscale note | required |
 | `LanApprovalPending` | cancelable connecting-side waiting-for-approval overlay | visual-E2E | `lan_dial.rs::handshake` during the preamble; `main.rs::on_lan_message` on the live reader | required |
 | `LanApprovalResult` | terminal LAN dial acceptance/refusal outcome | visual-E2E | `lan_dial.rs::handshake` during the preamble; `main.rs::on_lan_message` on the live reader | required |

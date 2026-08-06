@@ -83,7 +83,7 @@
 ## Build environment
 
 - Use Rust 1.95.0 or newer.
-- On Debian/Ubuntu, install `clang`, `libfontconfig-dev`, `libssl-dev`,
+- On Debian/Ubuntu, install `clang`, `libdbus-1-dev`, `libfontconfig-dev`, `libssl-dev`,
   `libvulkan1`, `libwayland-dev`, `libx11-xcb-dev`,
   `libxkbcommon-x11-dev`, and `libzstd-dev`. A Vulkan ICD is also required
   to run the client; `mesa-vulkan-drivers` provides Lavapipe when needed.

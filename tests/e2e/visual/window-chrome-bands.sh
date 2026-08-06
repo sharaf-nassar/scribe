@@ -4,9 +4,9 @@
 # above them.
 #
 # The window used to open at a hardcoded 960x680 — exactly the painted height of
-# the 36-row grid (36 x 18.9 px) and nothing more. The titlebar, the pane status
-# strip and the window status bar are stacked in the same flex column, so those
-# 84 px came out of the grid: the bottom five rows were clipped, and a window
+# the 36-row grid (36 x 18.9 px) and nothing more. The titlebar and window status
+# bar are stacked in the same flex column, so those 58 px came out of the grid:
+# the bottom rows were clipped, and a window
 # only slightly shorter would have squeezed the bands themselves away because
 # they were flex-shrinkable under a flex-grown grid.
 #
@@ -17,10 +17,9 @@
 #   * the window opens at the derived size and sits entirely on the screen;
 #   * the grid viewport is tall enough for all ROWS rows;
 #   * the grid's LAST row carries ink after the pane is filled;
-#   * the pane status strip and the window status bar both carry ink, in their
-#     own bands at the bottom of the window;
+#   * the window status bar carries ink at the bottom of the window;
 #   * a real `PromptReceived` hook makes the prompt strip appear between the
-#     grid and the status strip WITHOUT pushing either band off screen.
+#     grid and status bar WITHOUT pushing the bar off screen.
 #
 # Every crop is taken from `import -window`, which captures the client window's
 # own pixels, so all offsets below are window-relative and no WM decoration can
@@ -36,20 +35,18 @@ HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 # Layout constants, mirrored from the client so a drift shows up as a failure
 # here rather than as silently clipped pixels:
 #   TITLEBAR_HEIGHT      titlebar.rs
-#   STATUS_STRIP_HEIGHT  window_chrome.rs
 #   STATUS_BAR_HEIGHT    window_chrome.rs
 #   COLUMNS / ROWS       main.rs
 #   line height / cell width  terminal_element.rs at the default font size 14
 #                             (14 * 1.35 = 18.9 and 14 * 0.6 = 8.4)
 TITLEBAR_H=34
-STRIP_H=26
 BAR_H=24
 ROWS=36
 COLUMNS=120
 # ceil(36 * 18.9) and ceil(120 * 8.4)
 GRID_H_MIN=681
 EXPECTED_W=1008
-EXPECTED_H=$(( TITLEBAR_H + GRID_H_MIN + STRIP_H + BAR_H ))
+EXPECTED_H=$(( TITLEBAR_H + GRID_H_MIN + BAR_H ))
 # Painted row height x10, so the last row's top edge can be computed in integer
 # arithmetic (14 * 1.35 = 18.9 px). ROW_CROP_H stays under it so the crop cannot
 # spill into the band below.
@@ -133,10 +130,10 @@ echo "window geometry: ${WIN_W}x${WIN_H} at ${X},${Y}"
 [ "$WIN_W" -eq "$EXPECTED_W" ] \
     || fail "window width $WIN_W != $EXPECTED_W (COLUMNS=$COLUMNS at 8.4 px/cell)"
 [ "$WIN_H" -eq "$EXPECTED_H" ] \
-    || fail "window height $WIN_H != $EXPECTED_H (titlebar+grid+strip+bar)"
+    || fail "window height $WIN_H != $EXPECTED_H (titlebar+grid+bar)"
 
 GRID_Y="$TITLEBAR_H"
-GRID_H=$(( WIN_H - TITLEBAR_H - STRIP_H - BAR_H ))
+GRID_H=$(( WIN_H - TITLEBAR_H - BAR_H ))
 [ "$GRID_H" -ge "$GRID_H_MIN" ] \
     || fail "grid viewport $GRID_H px cannot show $ROWS rows (needs $GRID_H_MIN)"
 
@@ -156,7 +153,6 @@ echo "PHASE 1 PASS: ${WIN_W}x${WIN_H} window, ${GRID_H}px grid viewport, all on 
 # ── Phase 2: fill the grid, then prove its LAST row is on screen ──────────────
 # `seq 1 40` overflows a 36-row grid, so the bottom rows are guaranteed to hold
 # scrolled-in output rather than blank cells below a short command.
-STRIP_Y=$(( WIN_H - STRIP_H - BAR_H ))
 BAR_Y=$(( WIN_H - BAR_H ))
 LAST_ROW_Y=$(( GRID_Y + (ROWS - 1) * ROW_H_X10 / 10 ))
 
@@ -174,21 +170,18 @@ echo "  last grid row ink: $BEFORE_LAST_ROW -> $LAST_ROW_INK"
     || fail "grid row $ROWS (y=$LAST_ROW_Y) is blank: the grid is still clipped"
 echo "PHASE 2 PASS: grid row $ROWS renders inside the window"
 
-# ── Phase 3: both status bands carry ink, in their own bands ──────────────────
-STRIP_INK=$(band_ink /output/chrome-bands-01-filled.png "$STRIP_Y" "$STRIP_H")
+# ── Phase 3: the status bar carries ink at the window bottom ─────────────────
 BAR_INK=$(band_ink /output/chrome-bands-01-filled.png "$BAR_Y" "$BAR_H")
-echo "  status strip ink: $STRIP_INK   status bar ink: $BAR_INK"
-[ "${STRIP_INK:-0}" -ge "$INK_MIN" ] \
-    || fail "the pane status strip (y=$STRIP_Y) is not on screen"
+echo "  status bar ink: $BAR_INK"
 [ "${BAR_INK:-0}" -ge "$INK_MIN" ] \
     || fail "the window status bar (y=$BAR_Y) is not on screen"
-echo "PHASE 3 PASS: status strip and status bar both render at the window bottom"
+echo "PHASE 3 PASS: status bar renders at the window bottom"
 
 # ── Phase 4: a real prompt makes the prompt strip appear, bands survive ───────
 # One prompt row is max(cell_height + 10, 28) = 28 px (prompt_bar.rs), taken out
 # of the flex-grown grid — the bands below it must not move off screen.
 PROMPT_H=28
-PROMPT_Y=$(( STRIP_Y - PROMPT_H ))
+PROMPT_Y=$(( BAR_Y - PROMPT_H ))
 crop_band /output/chrome-bands-01-filled.png /output/chrome-bands-prompt-before.png \
     "$PROMPT_Y" "$PROMPT_H"
 
@@ -202,10 +195,9 @@ crop_band /output/chrome-bands-02-prompt.png /output/chrome-bands-prompt-after.p
 PROMPT_INK=$(band_ink /output/chrome-bands-02-prompt.png "$PROMPT_Y" "$PROMPT_H")
 PROMPT_DELTA=$(band_delta /output/chrome-bands-prompt-before.png \
     /output/chrome-bands-prompt-after.png)
-STRIP_AFTER=$(band_ink /output/chrome-bands-02-prompt.png "$STRIP_Y" "$STRIP_H")
 BAR_AFTER=$(band_ink /output/chrome-bands-02-prompt.png "$BAR_Y" "$BAR_H")
 echo "  prompt band ink: $PROMPT_INK   repaint delta: $PROMPT_DELTA"
-echo "  strip ink after prompt: $STRIP_AFTER   bar ink after prompt: $BAR_AFTER"
+echo "  bar ink after prompt: $BAR_AFTER"
 # The band under the grid was grid content before the prompt arrived, so ink
 # alone proves nothing: the band has to have REPAINTED, and the client has to
 # have logged the notice that made it repaint.
@@ -213,15 +205,13 @@ echo "  strip ink after prompt: $STRIP_AFTER   bar ink after prompt: $BAR_AFTER"
     || fail "the prompt strip (y=$PROMPT_Y) never rendered"
 [ "${PROMPT_DELTA:-0}" -ge "$PROMPT_DELTA_MIN" ] \
     || fail "the band at y=$PROMPT_Y did not repaint: no prompt strip appeared"
-[ "${STRIP_AFTER:-0}" -ge "$INK_MIN" ] \
-    || fail "the prompt strip pushed the pane status strip off screen"
 [ "${BAR_AFTER:-0}" -ge "$INK_MIN" ] \
     || fail "the prompt strip pushed the window status bar off screen"
-echo "PHASE 4 PASS: prompt strip renders above both status bands, none pushed off"
+echo "PHASE 4 PASS: prompt strip renders above the status bar, neither is pushed off"
 
 echo ""
 echo "PASS: window chrome bands are all on screen at the default window size"
 echo "  Inspect screenshots in test-output/:"
 echo "    chrome-bands-00-empty.png   — window at rest"
-echo "    chrome-bands-01-filled.png  — 36-row grid + both status bands"
-echo "    chrome-bands-02-prompt.png  — prompt strip added, bands still on screen"
+echo "    chrome-bands-01-filled.png  — 36-row grid + status bar"
+echo "    chrome-bands-02-prompt.png  — prompt strip added, bar still on screen"

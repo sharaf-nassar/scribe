@@ -113,7 +113,7 @@ impl ReplayView {
         };
 
         view.feed(&ansi);
-        view.trim_pseudo_scrollback(replay.scrollback_rows);
+        view.normalize_legacy_scrollback(replay.scrollback_rows);
         Ok((view, ansi.len()))
     }
 
@@ -138,13 +138,12 @@ impl ReplayView {
         snapshot_term(&self.term)
     }
 
-    /// Drop the blank history the replay's own `ESC [ 2J` scrolls into a fresh
-    /// grid, leaving only the rows the frame actually carried.
+    /// Normalize history to the frame's authoritative count.
     ///
-    /// A real client reaches the same state through the server's
-    /// `TrimScrollback`; without the trim the replayed view reports scrollback
-    /// the session never had, and every history-sensitive comparison drifts.
-    fn trim_pseudo_scrollback(&mut self, replay_scrollback_rows: u32) {
+    /// Modern replay bytes start with RIS and need no correction. Keeping this
+    /// normalization lets the harness observe N-1 payloads whose ED 2 created a
+    /// synthetic blank row, matching the real client's compatibility path.
+    fn normalize_legacy_scrollback(&mut self, replay_scrollback_rows: u32) {
         let kept = usize::try_from(replay_scrollback_rows)
             .unwrap_or(VIEW_SCROLLBACK_ROWS)
             .min(VIEW_SCROLLBACK_ROWS);

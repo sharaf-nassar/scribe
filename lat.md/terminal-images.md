@@ -753,6 +753,25 @@ through untouched, and a disabled or unlatched session gains nothing, so
 discovery stays truthful in both directions. `$TERM` and `TERM_PROGRAM` are
 never spoofed.
 
+## Kitty Environment Marker
+
+Spawned PTYs carry `KITTY_WINDOW_ID=1` while the image master switch is on, so applications that sniff the environment instead of probing can discover graphics support.
+
+[[crates/scribe-server/src/session_manager.rs#build_pty_options]] sets the
+variable only when
+[[crates/scribe-server/src/terminal_image_sharing.rs#images_master_enabled]]
+reads on at spawn, so a disabled Scribe never claims image capability — the
+same honesty [[terminal-images#Terminal Images#Sixel DA1 Advertisement]] keeps
+on the probe side. Codex-style tools check `KITTY_WINDOW_ID` first and never
+send an escape-sequence probe, so without the marker they cannot see Scribe's
+image support at all.
+
+The marker is a static spawn-time hint, not a capability guarantee. A later
+config reload binds newly spawned sessions only — inherent to environment
+variables — and whether images actually render still requires an image-capable
+viewer to latch the session, which the environment cannot know at spawn.
+`$TERM` and `TERM_PROGRAM` are still never spoofed.
+
 ## Capable-Sink Image Fanout
 
 Typed image records reach the attached sinks that can render them and no others, so one incapable connection cannot suppress or corrupt a capable viewer's convergence.

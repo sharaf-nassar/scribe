@@ -1,10 +1,9 @@
 //! Vertical geometry of the terminal window: the chrome bands and the default
 //! window size that leaves room for both them and the whole terminal grid.
 //!
-//! The shell stacks four things in a flex column — the custom
-//! [titlebar](crate::titlebar), the terminal grid, the pane status strip, and
-//! the window [status bar](crate::status_bar) — plus the optional
-//! [prompt bar](crate::prompt_bar) between the grid and the strip. The grid is
+//! The shell stacks the custom [titlebar](crate::titlebar), terminal grid, and
+//! window [status bar](crate::status_bar) in a flex column, plus the optional
+//! [prompt bar](crate::prompt_bar) between the grid and status bar. The grid is
 //! the only flex-grown band, so every pixel the chrome takes is a pixel the grid
 //! does not get; sizing the window from the grid alone therefore pushed the
 //! bottom rows (and, on a smaller window, the bands themselves) off screen.
@@ -13,9 +12,6 @@
 //! render path and the startup window size cannot drift apart.
 
 use crate::titlebar::TITLEBAR_HEIGHT;
-
-/// Height of the pane status strip drawn directly under the terminal grid.
-pub const STATUS_STRIP_HEIGHT: f32 = 26.0;
 
 /// Height of the window status bar band, including its 1px top hairline —
 /// GPUI lays divs out border-box, so the border is inside this number.
@@ -57,7 +53,7 @@ pub struct WindowSize {
 /// laid out `flex_none`.
 #[must_use]
 pub fn chrome_height() -> f32 {
-    TITLEBAR_HEIGHT + STATUS_STRIP_HEIGHT + STATUS_BAR_HEIGHT
+    TITLEBAR_HEIGHT + STATUS_BAR_HEIGHT
 }
 
 /// The startup window's inner size: the whole `cols`x`rows` grid at these cell
@@ -90,8 +86,8 @@ pub fn clamp_to_display(size: WindowSize, display: WindowSize) -> WindowSize {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_WINDOW_EDGE, STATUS_BAR_HEIGHT, STATUS_STRIP_HEIGHT, WindowSize, chrome_height,
-        clamp_to_display, default_window_size,
+        MIN_WINDOW_EDGE, STATUS_BAR_HEIGHT, WindowSize, chrome_height, clamp_to_display,
+        default_window_size,
     };
     use crate::titlebar::TITLEBAR_HEIGHT;
 
@@ -109,10 +105,7 @@ mod tests {
         );
         assert!(size.width >= 120.0 * 8.4, "all 120 columns must fit: {}", size.width);
         // The bands themselves are what the grid has to clear.
-        assert!(
-            (chrome_height() - (TITLEBAR_HEIGHT + STATUS_STRIP_HEIGHT + STATUS_BAR_HEIGHT)).abs()
-                < f32::EPSILON
-        );
+        assert!((chrome_height() - (TITLEBAR_HEIGHT + STATUS_BAR_HEIGHT)).abs() < f32::EPSILON);
         // Float noise must not buy a whole extra pixel: the shipped metrics are
         // 14 * 0.6 and 14 * 1.35, whose products land just either side of a
         // whole pixel in f32.

@@ -16,7 +16,7 @@
 //! however many frames it had to parse to get there, so the snapshot is
 //! rebuilt once per pass rather than once per frame the pacer skips.
 //!
-//! A whole-pane rebuild — a decoded `SessionReplay`, or the RIS-prefixed ANSI of
+//! A whole-pane rebuild — a decoded `SessionReplay`, or self-resetting ANSI from
 //! a `ScreenSnapshot` — is not output in this sense: it replaces the pane rather
 //! than advancing it. [`present_rebuild`] therefore applies it as a burst
 //! boundary of its own, never folded into the commit on either side of it.

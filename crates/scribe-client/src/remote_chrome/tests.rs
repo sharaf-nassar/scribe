@@ -1,7 +1,7 @@
 //! Headless tests for the shared tailnet chrome state.
 //!
 //! Cover the four directions the remote surface reaches the client from: the
-//! discovery/environment summary the status line derives from, the dialing
+//! actionable environment feedback, the dialing
 //! side's settled outcome, the displaced-client freeze a `WindowTakenOver`
 //! raises, and the bounded automation queue a `RunAction` lands in.
 
@@ -15,9 +15,9 @@ fn peer(name: &str, online: bool) -> RemotePeerInfo {
     RemotePeerInfo { name: name.to_owned(), addr: format!("100.64.0.{}", name.len()), online }
 }
 
-// @lat: [[test#GPUI Client Headless Suites#GPUI remote chrome#Status line reports the tailnet account]]
+// @lat: [[test#GPUI Client Headless Suites#GPUI remote chrome#Status line reports actionable tailnet states]]
 #[test]
-fn status_line_reports_the_tailnet_account_and_peers() {
+fn status_line_reports_actionable_tailnet_states() {
     let mut remote = RemoteChrome::new();
     // Nothing probed yet: no line at all rather than a misleading "0 peers".
     assert!(remote.status_line().is_none());
@@ -32,7 +32,7 @@ fn status_line_reports_the_tailnet_account_and_peers() {
     remote.set_peers(vec![peer("desk", true), peer("old", false), peer("laptop", true)]);
     assert_eq!(remote.online_peer_count(), 2);
     assert_eq!(remote.peers().len(), 3);
-    assert_eq!(remote.status_line().as_deref(), Some("Tailnet user@example.com: 2 peer(s) online"));
+    assert!(remote.status_line().is_none());
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI remote chrome#Dial and severance outrank the environment]]
@@ -47,13 +47,13 @@ fn dial_and_severance_outrank_the_environment_line() {
     assert!(remote.transport_label().is_none());
 
     remote.settle_dial(RemoteConnectOutcome::Refused(RemoteRefusal::Unauthorized));
-    let refused = remote.status_line().expect("a settled dial always says something");
+    let refused = remote.status_line().expect("a refused dial says why");
     assert!(refused.contains("not authorized"), "{refused}");
     // A refused dial is not a transport this window reached anything over.
     assert!(remote.transport_label().is_none());
 
     remote.settle_dial(RemoteConnectOutcome::Accepted);
-    assert_eq!(remote.status_line().as_deref(), Some("Connected over Tailscale"));
+    assert!(remote.status_line().is_none());
     assert_eq!(remote.transport_label(), Some("Tailscale"));
 
     // A severed link is more urgent than the dial that established it.
@@ -78,8 +78,8 @@ fn displacement_freezes_and_reclaims_exactly_once() {
         remote.displaced().map(LostControlState::headline).as_deref(),
         Some("Controlled by desk-mini (user@example.com)")
     );
-    // Displacement outranks even a severed link.
-    assert_eq!(remote.status_line().as_deref(), Some("Controlled by desk-mini (user@example.com)"));
+    // Displacement has its own banner; the status bar keeps the severance reason.
+    assert!(remote.status_line().is_some_and(|line| line.contains("connection limit")));
 
     assert!(remote.reclaim());
     assert!(remote.displaced().is_none());

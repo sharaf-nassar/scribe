@@ -33,7 +33,7 @@
 #      and the client acts on both replies;
 #   2. an injected WindowTakenOver freezes the window under the displaced banner,
 #      suppresses input, and Enter reclaims with ControlClaim on the wire;
-#   3. an injected RemoteDisconnect names the typed reason on the status strip;
+#   3. an injected RemoteDisconnect names the typed reason on the status bar;
 #   4. a viewer's palette row leaves as DispatchAction and comes back as
 #      ActionDispatched, and an injected RunAction is executed by the window;
 #   5. a client launched with SCRIBE_REMOTE_DIAL puts a real RemoteHandshake on
@@ -217,6 +217,14 @@ crop_body() {
     convert "$1" -crop "${WIN_W}x$(( WIN_H - 60 ))+${WIN_X}+${WIN_Y}" +repage "$2"
 }
 
+status_bar_shot() {
+    local wid
+    wid=$(find_window)
+    [ -n "$wid" ] || fail "no Scribe window found"
+    import -window "$wid" +repage miff:- \
+        | convert - -gravity South -crop "${WIN_W}x24+0+0" +repage "$1"
+}
+
 assert_pixels_changed() {
     local before="$1" after="$2" what="$3"
     local diff
@@ -368,6 +376,7 @@ wait_for "$RECORD" client "$CLAIM_BEFORE" 15 ControlClaim "window_id=\"$WIN\"" \
 sleep 1.0
 shot /output/04-after-reclaim.png
 crop_body /output/04-after-reclaim.png /output/04-body.png
+status_bar_shot /output/04-status-bar.png
 assert_pixels_changed /output/02-body.png /output/04-body.png "PHASE 2: reclaiming the window"
 echo "PHASE 2 PASS: the banner froze the window and Enter reclaimed it on the wire"
 
@@ -375,8 +384,8 @@ echo "PHASE 2 PASS: the banner froze the window and Enter reclaimed it on the wi
 inject '{"type":"RemoteDisconnect","reason":"disabled"}'
 sleep 1.5
 shot /output/05-remote-disconnect.png
-crop_body /output/05-remote-disconnect.png /output/05-body.png
-assert_pixels_changed /output/04-body.png /output/05-body.png \
+status_bar_shot /output/05-status-bar.png
+assert_pixels_changed /output/04-status-bar.png /output/05-status-bar.png \
     "PHASE 3: the injected RemoteDisconnect"
 grep -q "remote peer severed the connection" "$CLIENT_LOG" \
     || fail "PHASE 3: the client never recorded the severed connection"
@@ -451,7 +460,7 @@ echo "    01a-before-takeover.png         — the window just before the notice 
 echo "    02-taken-over.png               — the displaced banner over the frozen grid"
 echo "    03-frozen-input-suppressed.png  — a keystroke that reached nothing"
 echo "    04-after-reclaim.png            — the window after the one-action reclaim"
-echo "    05-remote-disconnect.png        — the typed severance reason on the strip"
+echo "    05-remote-disconnect.png        — the typed severance reason on the status bar"
 echo "    06-viewer-palette.png           — a viewer's palette filtered to 'New Tab'"
 echo "    07-run-action-tab.png           — the tab an injected RunAction opened"
 echo "    08-tailnet-attached.png         — the session reached over the tailnet dial"

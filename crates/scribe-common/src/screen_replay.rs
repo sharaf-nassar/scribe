@@ -243,6 +243,12 @@ pub fn snapshot_to_ansi(snapshot: &ScreenSnapshot) -> Vec<u8> {
 
     let mut buf = String::with_capacity((scrollback_rows + visible_rows) * cols * 4);
 
+    // A replay replaces terminal state, so reset both screen buffers, history,
+    // modes, margins, attributes, and cursor before reconstructing the snapshot.
+    // ED 2 is deliberately not used: Alacritty's primary-screen implementation
+    // scrolls one blank row into history even on a fresh grid.
+    buf.push_str("\x1bc");
+
     // If the server was in alternate screen mode, switch the client into it
     // so that subsequent PTY output (which assumes alt screen) lands in the
     // correct buffer.  Without this, apps like Claude Code that use alt screen
@@ -258,8 +264,9 @@ pub fn snapshot_to_ansi(snapshot: &ScreenSnapshot) -> Vec<u8> {
         buf.push_str(mode.set_sequence());
     }
 
-    // Hide cursor, move home, clear screen, reset attributes.
-    buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
+    // Hide the cursor while painting and start from known attributes. RIS left
+    // the cursor at home, and entering the alternate screen preserves that.
+    buf.push_str("\x1b[?25l\x1b[0m");
 
     let mut wrote_row = false;
     let mut previous_row_wrapped = false;
@@ -614,6 +621,11 @@ mod tests {
         let replay = build_session_replay(&snapshot).expect("build_session_replay");
         let decoded = decompress_session_replay(&replay).expect("decompress");
         let direct = snapshot_to_ansi(&snapshot);
+        assert!(direct.starts_with(b"\x1bc"), "replay must hard-reset the destination");
+        assert!(
+            !direct.windows(b"\x1b[2J".len()).any(|window| window == b"\x1b[2J"),
+            "ED 2 would recreate synthetic history after RIS"
+        );
         assert_eq!(decoded, direct);
     }
 

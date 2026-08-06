@@ -136,17 +136,24 @@ pub enum InboundEvent {
     /// Output bytes destined for the named pane's `write_output`.
     PaneOutput { session_id: SessionId, bytes: Vec<u8> },
     /// A whole-pane rebuild: the ANSI a `SessionReplay` decompressed to, or a
-    /// `ScreenSnapshot`'s RIS-prefixed replay. Kept apart from
+    /// `ScreenSnapshot`'s self-resetting replay. Kept apart from
     /// [`Self::PaneOutput`] because it replaces the pane rather than advancing
     /// it, so it must never be folded into a neighbouring output run.
     ///
-    /// `cols`/`rows` are the geometry the server rendered those bytes at.
-    /// They ride along because the bytes are only correct at that geometry:
+    /// `cols`/`rows` are the geometry the server rendered those bytes at, and
+    /// `scrollback_rows` is the authoritative history size. They ride along
+    /// because the bytes are only correct at that geometry:
     /// every row is emitted as exactly `cols` printable characters and the
     /// stream ends on an absolute CUP in snapshot coordinates, so replaying
     /// them into a grid of a different width autowraps every row into
     /// scrollback and leaves the viewport blank.
-    PaneRebuild { session_id: SessionId, bytes: Vec<u8>, cols: u16, rows: u16 },
+    PaneRebuild {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        scrollback_rows: u32,
+    },
     /// An OSC 133 prompt mark for the named pane. The wire message's
     /// `click_events` flag is dropped at the reader: click-to-move has no
     /// surface in this client, so carrying it here would be dead state.
@@ -174,8 +181,10 @@ pub enum PaneOp {
     /// A whole-pane rebuild, applied as its own burst boundary: the output runs
     /// on either side of it stay separate ops, so no committed frame can span
     /// it. `cols`/`rows` name the geometry the bytes were rendered at, which
-    /// the drain reshapes the pane grid to before replaying them.
-    Rebuild { bytes: Vec<u8>, cols: u16, rows: u16 },
+    /// the drain reshapes the pane grid to before replaying them;
+    /// `scrollback_rows` normalizes legacy pre-RIS replay history back to the
+    /// server's authoritative count.
+    Rebuild { bytes: Vec<u8>, cols: u16, rows: u16, scrollback_rows: u32 },
     /// An OSC 133 mark to anchor against the grid as it stands after every
     /// preceding [`PaneOp::Output`] in this batch.
     PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
@@ -242,9 +251,9 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
             InboundEvent::PaneOutput { session_id, bytes } => {
                 append_pane_output(&mut open, &mut entries, session_id, bytes);
             }
-            InboundEvent::PaneRebuild { session_id, bytes, cols, rows } => {
+            InboundEvent::PaneRebuild { session_id, bytes, cols, rows, scrollback_rows } => {
                 open.remove(&session_id);
-                entries.push((session_id, PaneOp::Rebuild { bytes, cols, rows }));
+                entries.push((session_id, PaneOp::Rebuild { bytes, cols, rows, scrollback_rows }));
             }
             InboundEvent::PromptMark { session_id, kind, exit_code } => {
                 open.remove(&session_id);
@@ -294,8 +303,8 @@ fn append_pane_output(
 fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
     match op {
         PaneOp::Output(bytes) => InboundEvent::PaneOutput { session_id, bytes },
-        PaneOp::Rebuild { bytes, cols, rows } => {
-            InboundEvent::PaneRebuild { session_id, bytes, cols, rows }
+        PaneOp::Rebuild { bytes, cols, rows, scrollback_rows } => {
+            InboundEvent::PaneRebuild { session_id, bytes, cols, rows, scrollback_rows }
         }
         PaneOp::PromptMark { kind, exit_code } => {
             InboundEvent::PromptMark { session_id, kind, exit_code }
@@ -751,7 +760,7 @@ enum TearRequest {
 struct OutboundState {
     frames: VecDeque<ClientMessage>,
     /// True from the first refusal until the writer has pulled the backlog back
-    /// under half the cap. The hysteresis is what keeps the status strip from
+    /// under half the cap. The hysteresis is what keeps status feedback from
     /// alternating between refusing and clear once per frame at the boundary.
     refusing: bool,
     tear: TearRequest,
@@ -1235,7 +1244,7 @@ impl IpcSink {
     /// after a reattach replay failed to decode — the only way back to a
     /// correct pane is to ask for the server's current state. The reply is a
     /// `ScreenSnapshot` carrying the visible grid *and* the scrollback, which
-    /// the reader applies through `session_lifecycle::snapshot_reset_bytes`.
+    /// the reader applies through the common self-resetting replay encoder.
     ///
     /// # Errors
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
@@ -1713,6 +1722,7 @@ mod tests {
             bytes: b"\x1bcreplay".to_vec(),
             cols: 80,
             rows: 24,
+            scrollback_rows: 7,
         };
         let batch = coalesce([
             output(pane, b"before"),
@@ -1728,7 +1738,15 @@ mod tests {
             entries,
             vec![
                 (pane, PaneOp::Output(b"before".to_vec())),
-                (pane, PaneOp::Rebuild { bytes: b"\x1bcreplay".to_vec(), cols: 80, rows: 24 }),
+                (
+                    pane,
+                    PaneOp::Rebuild {
+                        bytes: b"\x1bcreplay".to_vec(),
+                        cols: 80,
+                        rows: 24,
+                        scrollback_rows: 7,
+                    },
+                ),
                 (pane, PaneOp::Output(b"aftermore".to_vec())),
             ]
         );

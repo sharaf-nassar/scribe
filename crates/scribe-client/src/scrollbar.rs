@@ -672,9 +672,14 @@ mod tests {
     #[gpui::test]
     fn no_scrollback_yields_no_thumb() {
         // History of zero rows: nothing to scroll, so no thumb geometry.
-        assert!(compute_thumb(&layout(0, 24, 0), WIDTH).is_none());
+        let layout = layout(0, 24, 0);
+        assert!(compute_thumb(&layout, WIDTH).is_none());
         // Hit-testing the right edge still misses because there is no scrollback.
-        assert!(!hit_test_scrollbar(&layout(0, 24, 0), 498.0, 300.0, WIDTH));
+        assert!(!hit_test_scrollbar(&layout, 498.0, 300.0, WIDTH));
+        // Even a wheel/page action that pulses the fade cannot paint a bar.
+        let mut state = ScrollbarState::new();
+        state.on_scroll_action();
+        assert!(build_scrollbar_render(&layout, &[], &mut state, &style()).is_none());
     }
 
     // @lat: [[test#GPUI Command Scrollbar#Thumb sizes and positions from the viewport]]

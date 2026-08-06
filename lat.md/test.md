@@ -1163,7 +1163,7 @@ The daemon inflates every `SessionReplay`, applies it to a local terminal, and k
 
 Before this the daemon logged and dropped the frame, and assertions read `RequestSnapshot` — which the server answers from its own `Term` regardless of what it put on the wire. A replay that was late, lossy, duplicated, or never sent looked exactly like a correct one.
 
-The receiving half mirrors a real client and reuses the server's own machinery — `build_term_config`, `ScribeEventListener`, `vte::ansi::Processor`, and `snapshot_term` — so the replayed view cannot disagree with the server for reasons that live in the harness. Applying a frame inflates the zstd payload, feeds the ANSI into a fresh `Term` at the frame's geometry, then trims the blank history the replay's own `ESC [ 2J` scrolls into a fresh grid (a client reaches the same state through `TrimScrollback`). Later `PtyOutput` bytes and `Resize` requests are applied to the same terminal, so the view stays comparable to the server's screen. A frame that fails to inflate is counted and logged rather than fatal, matching the client's graceful skip.
+The receiving half mirrors a real client and reuses the server's own machinery — `build_term_config`, `ScribeEventListener`, `vte::ansi::Processor`, and `snapshot_term` — so the replayed view cannot disagree with the server for reasons that live in the harness. Applying a frame inflates its self-resetting ANSI into a fresh `Term`, then normalizes history for a possible N-1 pre-RIS payload. Later `PtyOutput` and `Resize` frames keep the view comparable to the server. Inflate failures are counted rather than fatal, matching the client.
 
 Replayed bytes deliberately stay out of the output ring buffer. Keeping that buffer the raw live PTY stream is what lets an assertion separate "this text came back in the replay" from "this text arrived after the replay"; each applied frame instead records the session's `live_bytes` count at its arrival, which is the ordering fact the buffered-flush and paced-replay work has to check.
 
@@ -1172,6 +1172,10 @@ Three CLI surfaces read it back:
 - `scribe-test replay status <session>` prints `frames`, `failed`, `live-bytes`, and a `last-frame` line carrying geometry, cursor, alt-screen flag, compressed and inflated sizes, and the live bytes before and after the frame. `--min-frames` blocks on the `replay` notifier, because the attach reply lands on the reader task and would otherwise race the next CLI invocation; `--expect-frames 0` is how a test states that a session was never sent a replay at all.
 - `scribe-test replay screen <session>` prints the replayed screen as text, or writes it as snapshot JSON with `--json`, so scripts grep replayed content directly.
 - `scribe-test replay assert-matches <session>` requests a fresh server snapshot and compares it against the replayed view read back under the same lock — the losslessness oracle for an attach. Cursor *visibility* is excluded, because the encoder deliberately leaves the cursor hidden on alt-screen replays so the app's own output owns it. Callers settle the session with `wait-idle` first, since output arriving while the request is in flight legitimately moves the view ahead.
+
+### Replay replaces terminal state
+
+Raw replay into blank or dirty primary and alternate terminals reproduces exactly zero or N history rows without receiver trimming, resets stale margins and modes, and leaves omitted malformed cells blank.
 
 ## Server Lifecycle
 
@@ -1658,7 +1662,7 @@ Every assertion above is about geometry, and geometry is not integrity: a pane c
 
 They seed five marker commands whose "command not found" line is 125 columns wide, then compare the window against `scribe-test snapshot` row for row. The server's snapshot is the oracle for what should be on screen; the window is read back as per-row ink from an `import -window` crop of the grid band, so every row the server calls non-empty has to carry ink at the same row index and at most a slack of two rows may carry ink the server does not have. Phase 5 runs the comparison with **no** resize at all, which is what separates a rest-state corruption from a resize defect. Phase 6 drags the window narrow in eight `xdotool windowsize` steps — a drag's cadence, so each configure event lands while the previous round trip is still in flight — and requires both that the reflow onto two rows per marker reached the screen and that no row was lost. Phase 7 drags back out, replaying rebuilds *wider* than the grid the client is leaving, which wraps in the opposite direction.
 
-The seed length is what makes the comparison sharp. At 178 columns each marker occupies one row and at 107 it occupies two, so a client still painting the shape a rebuild was rendered at keeps the old row profile and fails even though its published `cols`x`rows`, its `stty size` and its pixel diff are all perfect. No keyboard input is sent during any content phase, so nothing but the resize pipeline can be repairing the screen. The row arithmetic mirrors the client's own layout constants (`TITLEBAR_HEIGHT`, `STATUS_STRIP_HEIGHT`, `STATUS_BAR_HEIGHT`, and the 1.35 line-height ratio at font size 14), with each band inset by 3 px so the focused pane's 2 px accent border is never mistaken for text.
+The seed length is what makes the comparison sharp. At 178 columns each marker occupies one row and at 107 it occupies two, so a client still painting the shape a rebuild was rendered at keeps the old row profile and fails even though its published `cols`x`rows`, its `stty size` and its pixel diff are all perfect. No keyboard input is sent during any content phase, so nothing but the resize pipeline can be repairing the screen. The row arithmetic mirrors the client's own layout constants (`TITLEBAR_HEIGHT`, `STATUS_BAR_HEIGHT`, and the 1.35 line-height ratio at font size 14), with each band inset by 3 px so the focused pane's 2 px accent border is never mistaken for text.
 
 ### Prompt marks and mark-relative jumps
 
@@ -1800,9 +1804,9 @@ Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` tha
 
 `tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level oracle for : it measures, on the running client, that the derived window size really does fit the whole terminal grid *and* every chrome band.
 
-The measurement is geometric rather than golden-image. Phase 1 reads the client window's own size with `xdotool getwindowgeometry` and asserts it is the derived 1008x765 — the same arithmetic the crate does, restated in the script so a drift fails here instead of silently clipping pixels — then confirms the whole window is on the Xvfb screen by trimming a full-screen capture. Phases 2-4 crop window-relative bands out of `import -window` captures, so no WM decoration can shift an offset.
+The measurement is geometric rather than golden-image. Phase 1 reads the client window's own size with `xdotool getwindowgeometry` and asserts it is the derived 1008x739 — the same arithmetic the crate does, restated in the script so a drift fails here instead of silently clipping pixels — then confirms the whole window is on the Xvfb screen by trimming a full-screen capture. Phases 2-4 crop window-relative bands out of `import -window` captures, so no WM decoration can shift an offset.
 
-Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom five rows fell outside the 596 px viewport, and this is the assertion that catches it. Phase 3 asserts the pane status strip and the window status bar each carry ink in their own band at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the strip *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while both status bands below it keep their ink, which is what the bands' `flex_none` layout guarantees.
+Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom rows fell outside the viewport, and this is the assertion that catches it. Phase 3 asserts the window status bar carries ink at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the bar *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while the status bar keeps its ink, which is what the bands' `flex_none` layout guarantees.
 
 ## Sandbox limits
 
@@ -2929,9 +2933,9 @@ The suite asserts Decline is the initial focus (so an unexpected prompt never si
 
 ### GPUI LAN chrome
 
-Confirms  — the state the IPC reader folds every feature-014 answer into and the window renders from — hands an approval prompt to the foreground exactly once and derives the right status line.
+Confirms  — the state the IPC reader folds every feature-014 answer into and the window renders from — hands an approval prompt to the foreground exactly once and derives actionable status feedback.
 
-The suite is the headless half of a hand-off that spans two threads, so the take-once rule is what it asserts hardest: a parked prompt is returned by the first  and never again, so a later tick cannot raise a duplicate modal for a `request_id` already being answered, and a second request arriving before the first is raised replaces it rather than stacking. It also asserts the derived line: nothing at all before the environment is probed (rather than a misleading "0 peers"), the dormancy note with the server's own reason when the current network cannot be fingerprinted, the online-only peer count otherwise, and that a non-idle  outranks all of it.
+The suite is the headless half of a hand-off that spans two threads, so the take-once rule is what it asserts hardest: a parked prompt is returned by the first  and never again, so a later tick cannot raise a duplicate modal for a `request_id` already being answered, and a second request arriving before the first is raised replaces it rather than stacking. It also asserts the derived line: nothing for routine healthy state, the dormancy note with the server's own reason when the current network cannot be fingerprinted, and pending/refused dial feedback.
 
 #### Approval hand-off is take-once
 
@@ -2941,31 +2945,31 @@ A parked prompt is returned once and then gone, so the foreground tick cannot ra
 
 A second `LanApprovalRequest` arriving before the first was raised replaces it, keeping at most one modal; the displaced peer is still held by the server until its own approval timeout.
 
-#### Status line reports peers and dormancy
+#### Status line reports actionable LAN states
 
-An unprobed environment yields no line; an unfingerprintable network yields the server's dormancy reason; otherwise the line counts only currently-advertised peers.
+An unfingerprintable network yields the server's dormancy reason; routine peer counts and accepted connections add no status copy.
 
 #### Dial status outranks the environment
 
-A client waiting on — or refused by — a peer reports that instead of the local peer count, and each typed  maps to its own copy.
+A client waiting on — or refused by — a peer reports that warning, and each typed  maps to its own copy; acceptance renders nothing.
 
 ### GPUI remote chrome
 
-Confirms  — the state the IPC reader folds every feature-013 answer into and the window renders from — derives the right status line, freezes and reclaims exactly once, and bounds its automation queue.
+Confirms  — the state the IPC reader folds every feature-013 answer into and the window renders from — derives actionable feedback, freezes and reclaims exactly once, and bounds its automation queue.
 
-The suite is the headless half of two cross-thread hand-offs. The displacement one is asserted hardest: a window is frozen until  returns `true` exactly once, so the key path can never put a second `ControlClaim` on the wire for a banner that is already gone, and it returns `false` when nothing was displaced so an Enter on a normal window is not mistaken for a reclaim. The automation one asserts FIFO order and the overflow rule: past the bound the OLDEST request is dropped, because the newest is the one the user just typed and a wedged window must not replay a minute of stale actions. It also asserts the derived line's precedence — nothing at all before the environment is probed, the passive "not detected" note when `tailscaled` was unreachable, the online-only peer count otherwise, and displacement outranking even a severed link.
+The suite is the headless half of two cross-thread hand-offs. The displacement one is asserted hardest: a window is frozen until  returns `true` exactly once, so the key path can never put a second `ControlClaim` on the wire for a banner that is already gone, and it returns `false` when nothing was displaced so an Enter on a normal window is not mistaken for a reclaim. The automation one asserts FIFO order and the overflow rule: past the bound the OLDEST request is dropped, because the newest is the one the user just typed and a wedged window must not replay a minute of stale actions. It also asserts that healthy peer discovery is silent while missing Tailscale, refusal, and severance remain visible.
 
-#### Status line reports the tailnet account
+#### Status line reports actionable tailnet states
 
-An unprobed environment yields no line; a fail-closed reply yields the passive "not detected" note; otherwise the line names the signed-in account and counts only online peers.
+An unprobed or healthy environment yields no line; a fail-closed reply keeps the actionable "Tailscale not detected" warning.
 
 #### Dial and severance outrank the environment
 
-A client refused by — or connected to — a peer reports that instead of the local peer count, each typed  maps to its own copy, and a severed link outranks the dial that established it. Only an accepted dial lights the transport indicator.
+A client refused by a peer reports the typed reason, a severed link outranks the dial that established it, and an accepted dial stays silent while lighting the transport indicator.
 
 #### Displacement freezes and reclaims once
 
-A `WindowTakenOver` stores the banner headline and outranks every other status; the reclaim clears it exactly once and is a no-op on a window that was never displaced.
+A `WindowTakenOver` stores its own banner headline without duplicating it in the status bar; reclaim clears it exactly once and is a no-op on a window that was never displaced.
 
 #### Automation queue is bounded and FIFO
 
@@ -3185,7 +3189,11 @@ The running client's use of that core is asserted separately, in .
 
 ### No scrollback yields no thumb
 
- returns nothing and  never matches when the pane has zero scrollback rows, so an unscrolled pane shows no overlay.
+ returns nothing and  never matches when the pane has zero scrollback rows; even pulsing the fade for a wheel action cannot make the empty pane paint an overlay.
+
+### New tab wheel stays hidden
+
+The visual scrollbar E2E creates a real tab, wheels it before any switch or generated history, and requires offset zero plus an unchanged right-edge strip; it then returns to the harness pane and proves real history exposes the thumb.
 
 ### Thumb sizes and positions from the viewport
 
@@ -3249,11 +3257,15 @@ Repeated  and  calls saturate at the `+7` / `-7` point bounds rather than overfl
 
 ## GPUI Status Bar
 
-Unit tests for , the ported window-status-bar segment model, proving every parity segment (connection, command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds with the right text and colour without a live window.
+Unit tests for , the ported window-status-bar segment model, proving connection/pane feedback and every parity segment (command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds correctly without a live window.
 
 ### Connection dot reflects connection state
 
  paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.
+
+### Pane feedback shares the window status bar
+
+Connection and pane errors render in the existing window status bar and its single accessible status node; empty feedback adds no visual copy.
 
 ### Command status glyphs distinguish outcomes
 

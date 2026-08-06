@@ -26,8 +26,8 @@
 //!   the window.
 //!
 //! Everything here is display-independent: the state is a set of plain values
-//! plus one derived [`RemoteChrome::status_line`], so the whole module is
-//! testable without a window.
+//! plus one derived actionable [`RemoteChrome::status_line`], so the whole
+//! module is testable without a window.
 
 use std::collections::VecDeque;
 
@@ -199,41 +199,33 @@ impl RemoteChrome {
         self.actions.pop_front()
     }
 
-    /// One line of user-facing tailnet status, or `None` while there is nothing
-    /// to say (an idle dial on a machine with no tailnet environment probed).
-    ///
-    /// Displacement wins over everything: a window someone else is driving has
-    /// nothing more urgent to report. A severed link comes next, then this
-    /// client's own dial, and only then the passive environment summary.
+    /// One actionable tailnet warning/error, or `None` for routine healthy
+    /// state. Displacement has its own modal banner and is not duplicated here.
     #[must_use]
     pub fn status_line(&self) -> Option<String> {
-        if let Some(state) = &self.displaced {
-            return Some(state.headline());
-        }
         if let Some(reason) = self.severed {
             return Some(format!("Remote connection closed: {}", refusal_text(reason)));
         }
         if let RemoteDialStatus::Settled(outcome) = self.dial {
-            return Some(dial_outcome_line(outcome));
+            return dial_outcome_line(outcome);
         }
         let env = self.env.as_ref()?;
         if !env.tailscale_detected {
             return Some(String::from("Tailscale not detected"));
         }
-        let account = env.account.as_deref().unwrap_or("unknown account");
-        Some(format!("Tailnet {account}: {} peer(s) online", self.online_peer_count()))
+        None
     }
 }
 
 /// User-facing copy for a settled tailnet dial, one distinct line per typed
 /// refusal so a user can tell "you are not allowed" from "we disagree about
 /// versions" (UX-002).
-fn dial_outcome_line(outcome: RemoteConnectOutcome) -> String {
+fn dial_outcome_line(outcome: RemoteConnectOutcome) -> Option<String> {
     match outcome {
-        RemoteConnectOutcome::Accepted => String::from("Connected over Tailscale"),
-        RemoteConnectOutcome::ConnectionFailure => String::from("Tailnet connection failed"),
+        RemoteConnectOutcome::Accepted => None,
+        RemoteConnectOutcome::ConnectionFailure => Some(String::from("Tailnet connection failed")),
         RemoteConnectOutcome::Refused(reason) => {
-            format!("Tailnet connection refused: {}", refusal_text(reason))
+            Some(format!("Tailnet connection refused: {}", refusal_text(reason)))
         }
     }
 }

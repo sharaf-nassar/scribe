@@ -126,7 +126,7 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 Unified primitive for rebuilding a client's Term on reattach, defined in [[crates/scribe-common/src/screen_replay.rs#SessionReplay]].
 
-Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-screen flag, and a zstd-compressed ANSI byte stream. Clients decompress and feed the bytes through their VTE processor — the same primitive the server uses for hot-reload handoff, so one encoding serves both the server-to-server and server-to-client paths.
+Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-screen flag, and a zstd-compressed ANSI byte stream. New streams begin with RIS and reconstruct captured screen/mode state; clients conditionally add RIS for old-server payloads, then feed either form through VTE. The same primitive serves hot-reload handoff and client reattach.
 
 The `scribe-test` daemon implements that same receiving half rather than skipping the frame, so e2e assertions can observe replay content and its position in a session's frame order instead of inferring the attach path from `RequestSnapshot` (see [[lat.md/test#Test Harness#Replay Observation]]).
 
