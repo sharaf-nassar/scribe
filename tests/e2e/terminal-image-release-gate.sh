@@ -75,8 +75,8 @@ marker_for() {
         linux/gpui-spike.json) printf '"render_image_reuse": true' ;;
         linux/renderer/renderer.json) printf '"renderer_boundary": "production-committed-image-scene"' ;;
         linux/apps/apps.json) printf '"terminal_spoofing": false' ;;
-        linux/client/client.json) printf '"terminal_spoofing": false' ;;
-        linux/client/frame-stability.json) printf '"platform": "linux"' ;;
+        linux/client/client.json) printf '"surface": "running_client"' ;;
+        linux/client/frame-stability.json) printf '"scene_present_in_every_idle_frame": true' ;;
         macos/metal.json) printf '"candidate_sha": "%s"' "$CANDIDATE" ;;
         *) printf '"status": "pass"' ;;
     esac
