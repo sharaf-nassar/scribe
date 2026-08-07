@@ -136,6 +136,50 @@ else
 fi
 rm -rf "$probe_fixture"
 
+# ── Upgrade log survives the readiness check and post-upgrade cleanup ────
+upgrade_fixture=$(mktemp -d)
+PRIVILEGED_USER_UID=""
+TARGET_UID="$(id -u)"
+STATE_DIR="$upgrade_fixture/state"
+HOT_RELOAD_READY_TIMEOUT_SECS=10
+mkdir -p "$STATE_DIR"
+fake_server="$upgrade_fixture/scribe-server"
+cat > "$fake_server" <<'EOF'
+#!/bin/sh
+echo "IPC server listening"
+# Keep writing after handoff like a real successor server, so a log that is
+# unlinked after the readiness check grows into an invisible tmpfs inode.
+while :; do
+    echo "post-handoff output"
+    sleep 1
+done
+EOF
+chmod +x "$fake_server"
+
+UPGRADE_PID=""
+if ! spawn_upgrade_server "$fake_server"; then
+    echo "FAIL: spawn_upgrade_server never observed the bind-ready log line"
+    failures=$((failures + 1))
+else
+    LAUNCHER_PIDS+=("$UPGRADE_PID")
+    cleanup_upgrade_state
+    # readlink appends " (deleted)" for an unlinked target, so this single
+    # comparison catches both a moved log and a log removed underneath the
+    # still-running successor.
+    server_stdout=$(readlink "/proc/${UPGRADE_PID}/fd/1" 2>/dev/null || true)
+    if [ "$server_stdout" != "${STATE_DIR}/upgrade.log" ]; then
+        echo "FAIL: upgrade server stdout points at '${server_stdout}', not the state-dir log"
+        failures=$((failures + 1))
+    elif [ ! -f "${STATE_DIR}/upgrade.log" ]; then
+        echo "FAIL: upgrade log was removed while the server still writes to it"
+        failures=$((failures + 1))
+    else
+        echo "PASS: upgrade server keeps a live state-dir log after cleanup"
+    fi
+fi
+kill "$UPGRADE_PID" 2>/dev/null
+rm -rf "$upgrade_fixture"
+
 if [ "$failures" -gt 0 ]; then
     echo "${failures} postinst regression test(s) failed."
     exit 1

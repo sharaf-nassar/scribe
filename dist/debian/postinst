@@ -661,6 +661,78 @@ stop_client_processes() {
     sleep 1
 }
 
+# spawn_upgrade_server BINARY
+# Launch `BINARY --upgrade` detached and wait for the successor to bind its
+# IPC socket. Sets UPGRADE_PID and UPGRADE_LOG. Returns 0 once the readiness
+# line appears, 1 if the watchdog expires or the process dies first.
+spawn_upgrade_server() {
+    local binary="$1"
+    local elapsed=0
+
+    # The successor inherits this file as its stdio and keeps that fd for its
+    # whole life, so the log has to outlive the readiness check. An earlier
+    # revision used `mktemp` here and deleted the file afterwards, leaving the
+    # new server appending to an unlinked tmpfs inode — invisible output that
+    # only process exit could reclaim. A fixed name is safe because
+    # ensure_state_dir keeps STATE_DIR 0700 and user-owned, which is how every
+    # other upgrade state file in here is handled; truncating at spawn drops
+    # the previous successor's output.
+    #
+    # ponytail: the log still grows for that server's whole lifetime and is
+    # only reclaimed by the next upgrade's truncation — the same ceiling the
+    # durable state-dir server.log already accepts; add rotation to both
+    # together if it ever matters.
+    UPGRADE_LOG="${STATE_DIR}/upgrade.log"
+    : > "${UPGRADE_LOG}" 2>/dev/null || UPGRADE_LOG=$(mktemp)
+    chmod 0600 "${UPGRADE_LOG}" 2>/dev/null || true
+    # The redirect is opened by the target user; chown so it can write.
+    chown "${TARGET_UID}:${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
+
+    # Launch the upgrade server detached from sudo.
+    #
+    # Plain `sudo -u user server &` makes sudo wait for the long-lived server
+    # child — it never exits, leaving zombie sudo processes after every
+    # install.  Using `sh -c '... &'` backgrounds the server *inside* the sh,
+    # so sh exits, sudo exits, and the server is reparented to init.  The PID
+    # is captured via stdout.
+    if [ -n "$PRIVILEGED_USER_UID" ]; then
+        UPGRADE_PID=$(run_user_command sh -c '
+            "$1" --upgrade >"$2" 2>&1 &
+            echo $!
+        ' _ "${binary}" "${UPGRADE_LOG}")
+    else
+        "${binary}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
+        UPGRADE_PID=$!
+    fi
+
+    # Wait for the new server to be fully ready. We check for "IPC server
+    # listening" (emitted after socket bind) rather than "session restoration
+    # complete" to ensure the new server is accepting connections before we
+    # declare success. Large live scrollback snapshots can make handoff
+    # restoration take much longer than 5 seconds, so use a longer watchdog.
+    while [ "$elapsed" -lt "$HOT_RELOAD_READY_TIMEOUT_SECS" ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
+            return 0
+        fi
+        # Check if the upgrade process died
+        if ! kill -0 "$UPGRADE_PID" 2>/dev/null; then
+            return 1
+        fi
+    done
+
+    return 1
+}
+
+cleanup_upgrade_state() {
+    rm -f "${STATE_DIR}/upgrade-client-pids" 2>/dev/null || true
+    # `upgrade.log` is deliberately kept: the successor server is still
+    # writing to it. This glob only clears the mktemp logs left behind by
+    # packages that predate the fixed-name log.
+    rm -f "${STATE_DIR}"/upgrade-log.* 2>/dev/null || true
+}
+
 SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"
 
 case "$MAINTSCRIPT_PACKAGE" in
@@ -757,51 +829,10 @@ case "$1" in
                 else
                     echo "${APP_DISPLAY_NAME} server runtime changed. Starting hot-reload..."
                 fi
-                # Use mktemp instead of predictable /tmp paths to prevent
-                # TOCTOU symlink attacks from other local users.
-                UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/"${APP_SLUG}"/upgrade-log.XXXXXX) || \
-                    UPGRADE_LOG=$(mktemp)
-                # mktemp runs as root; chown so the user subprocess can write.
-                chown "${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
-
-                # Launch the upgrade server detached from sudo.
-                #
-                # Plain `sudo -u user server &` makes sudo wait for the
-                # long-lived server child — it never exits, leaving zombie
-                # sudo processes after every install.  Using `sh -c '... &'`
-                # backgrounds the server *inside* the sh, so sh exits
-                # immediately, sudo exits, and the server is reparented to
-                # init.  The PID is captured via stdout.
-                if [ -n "$PRIVILEGED_USER_UID" ]; then
-                    UPGRADE_PID=$(run_user_command sh -c '
-                        "$1" --upgrade >"$2" 2>&1 &
-                        echo $!
-                    ' _ "${UPGRADE_BIN}" "${UPGRADE_LOG}")
-                else
-                    "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
-                    UPGRADE_PID=$!
-                fi
-
-                # Wait for the new server to be fully ready. We check for
-                # "IPC server listening" (emitted after socket bind) rather than
-                # "session restoration complete" to ensure the new server is
-                # accepting connections before we declare success. Large live
-                # scrollback snapshots can make handoff restoration take much
-                # longer than 5 seconds, so use a longer watchdog here.
                 UPGRADE_OK=0
-                ELAPSED=0
-                while [ "$ELAPSED" -lt "$HOT_RELOAD_READY_TIMEOUT_SECS" ]; do
-                    sleep 1
-                    ELAPSED=$((ELAPSED + 1))
-                    if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
-                        UPGRADE_OK=1
-                        break
-                    fi
-                    # Check if the upgrade process died
-                    if ! kill -0 "$UPGRADE_PID" 2>/dev/null; then
-                        break
-                    fi
-                done
+                if spawn_upgrade_server "$UPGRADE_BIN"; then
+                    UPGRADE_OK=1
+                fi
 
                 if [ "$UPGRADE_OK" = "1" ]; then
                     record_server_runtime_generation
@@ -933,9 +964,7 @@ case "$1" in
                 echo "  Skipping client restart because the server restart failed."
             fi
 
-            # Clean up all upgrade state files and logs.
-            rm -f "${STATE_DIR}/upgrade-client-pids" 2>/dev/null || true
-            rm -f /run/user/"${TARGET_UID}"/"${APP_SLUG}"/upgrade-log.* 2>/dev/null || true
+            cleanup_upgrade_state
             echo ""
         else
             # Fresh install: clean up any stale socket and start the service

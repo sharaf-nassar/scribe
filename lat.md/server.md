@@ -30,7 +30,9 @@ When launched with `--upgrade`, the server restores handoff state and received f
 
 It rebuilds the session and workspace managers, filtering workspace and window membership against the received live-session set so stale IDs from older servers are dropped before serving. An empty-workspace payload or any dropped sessions are logged at WARN with counts by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#restore_from_handoff]].
 
-An upgrade-spawned server has no durable stdio — the Debian `postinst` redirects it to a temp log it deletes after its ready check, and the macOS fallback spawn nulls stdio — so `--upgrade` startup mirrors tracing into `server.log` under the app state dir via [[crates/scribe-server/src/main.rs#open_server_log_file]], rotated once to `server.log.1` when it exceeds 8 MiB.
+An upgrade-spawned server has no durable stdio of its own — the Debian `postinst` redirects it to a state-dir `upgrade.log`, and the macOS fallback spawn nulls stdio — so `--upgrade` startup mirrors tracing into `server.log` under the app state dir via [[crates/scribe-server/src/main.rs#open_server_log_file]], rotated once to `server.log.1` when it exceeds 8 MiB.
+
+`upgrade.log` is the postinst watchdog's readiness channel and stays the successor's stdio for the rest of its life, so `postinst` truncates it at spawn instead of deleting it after the ready check. Deleting it left the new server appending to an unlinked tmpfs inode.
 
 ## Sessions
 
@@ -263,7 +265,7 @@ The new server (with `--upgrade`) connects to the old server's handoff socket, s
 
 On Linux and macOS, the old server also verifies that the peer PID is a permitted Scribe server executable running with `--upgrade` before sending state or PTY fds. This prevents arbitrary same-UID clients from speaking the raw handoff protocol.
 
-An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see ), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work. Because that watchdog's temp log is deleted after the check, the upgraded server's durable tracing lives in the state-dir `server.log` (see [[server#Server#Startup#Upgrade Path]]).
+An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see ), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work. The watchdog reads that line from the state-dir `upgrade.log` it truncated at spawn, while the upgraded server's durable tracing lives in the state-dir `server.log` (see [[server#Server#Startup#Upgrade Path]]).
 
 ### State Transfer
 

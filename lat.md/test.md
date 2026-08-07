@@ -1231,7 +1231,11 @@ Offline shell harness for Debian `postinst` behavior so packaging regressions ca
 `dist/debian/postinst`, then tests fixtures without a live user session. It
 checks zombie client exits and the Vulkan-less upgrade guard: a failed probe
 restores the preinst stash, leaves a running session alive, emits a warning,
-and disables relaunch. `just test-install-vulkan-guard` runs this guard in a
+and disables relaunch. It also drives `spawn_upgrade_server` against a fake
+server that keeps writing after its bind-ready line, then runs
+`cleanup_upgrade_state` and asserts the successor's stdout still resolves to
+the state-dir `upgrade.log` — `readlink` reports ` (deleted)` if the log was
+unlinked underneath it. `just test-install-vulkan-guard` runs the harness in a
 disposable Debian container.
 
 ## E2E Recipe Contract

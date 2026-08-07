@@ -93,11 +93,12 @@ fn main() -> Result<(), ScribeError> {
 
     let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
-    // An updater-spawned `--upgrade` server has no durable stdio: the Debian
-    // postinst redirects it to a temp file it deletes after its ready check,
-    // and the macOS fallback spawn uses Stdio::null(). Mirror tracing into a
-    // file under the state dir so the successor's logs survive; stdout stays
-    // active because the postinst watchdog greps it for "IPC server listening".
+    // An updater-spawned `--upgrade` server has no durable stdio of its own:
+    // the Debian postinst redirects it to a state-dir `upgrade.log` that the
+    // next upgrade truncates, and the macOS fallback spawn uses Stdio::null().
+    // Mirror tracing into a file under the state dir so the successor's logs
+    // survive; stdout stays active because the postinst watchdog greps it for
+    // "IPC server listening".
     let log_file = if upgrade_mode { open_server_log_file() } else { None };
     let (file, log_path) = match log_file {
         Some((file, path)) => (Some(file), Some(path)),
