@@ -28,8 +28,8 @@
 # re-laid-out without touching this file, and no production layout
 # constant exists to keep a click landing here.
 #
-# The one pointer gesture is a click on the empty sidebar background below the
-# last nav item. It is deliberately inert — it hands the GPUI root its focus
+# The one pointer gesture is a click on the sidebar's version footer, below the
+# scrolling nav list. It is deliberately inert — it hands the GPUI root its focus
 # handle (nothing is focused when the window opens) and resets `focus_index` to
 # 0 through `clear_keyboard_navigation`, so every phase counts its Down presses
 # from a known origin. Phase 0 asserts it puts nothing on the wire.
@@ -37,15 +37,21 @@
 # The container seeds one trusted network and one approved device before the
 # server starts (SCRIBE_SEED_TRUST=1, see docker/entrypoint-visual.sh): a single
 # machine has no peer to approve and no fingerprintable Wi-Fi, so without the
-# seed the Remove/Revoke rows would never exist to reach.
+# seed the Remove/Revoke rows would never exist to reach. It also builds a
+# synthetic physical LAN inside its own network namespace
+# (SCRIBE_SEED_LAN_IFACE=1), because `--network none` otherwise leaves nothing
+# for the production fingerprint to read; see `assert_seeded_gateway` below.
 #
 # Requires: visual container with SCRIBE_VISUAL_APP=settings, SCRIBE_SHARE_TAP=1,
-# SCRIBE_SEED_TRUST=1, xdotool, scrot, python3.
+# SCRIBE_SEED_TRUST=1, SCRIBE_SEED_LAN_IFACE=1, xdotool, scrot, python3.
 set -e
 
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 SEEDED_NETWORK_ID="seeded-network-1"
 SEEDED_DEVICE_ID="1f2e3d4c5b6a798877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0"
+# `seed_lan_iface` in docker/entrypoint-visual.sh; deliberately NOT the seeded
+# trusted network's gateway, so the current network stays addable-not-trusted.
+SEEDED_GATEWAY_MAC="aa:bb:cc:dd:ee:02"
 
 # ── Focus-order targets ───────────────────────────────────────────────────────
 # Offsets into `SettingsWindow::focus_targets`, i.e. how many Down presses to
@@ -101,59 +107,43 @@ assert_titled() {
     fi
 }
 
-# Pick the inert sidebar point used to seed focus. The sidebar is the window's
-# left column and its nav list is top-aligned, so a point near the bottom of the
-# left edge is background under any plausible grouping — the list would have to
-# more than double in height before it reached this far.
+# Pick the inert sidebar point used to seed focus: the middle of the sidebar's
+# 36px version footer (`SettingsWindow::render_nav`'s
+# `settings-sidebar-footer`). That band is the one part of the sidebar that
+# cannot become a control by accident — it is a `flex_none` `Role::Note` pinned
+# BELOW the nav list, and the nav list is its own `overflow_y_scroll` region, so
+# adding pages scrolls them rather than pushing anything down here. Measuring
+# from the bottom of the nav list instead is what broke when the redesign
+# grouped the nav: the last page moved under the old point and the seed click
+# started selecting it.
+#
+# The point is window-RELATIVE (`xdotool mousemove --window`). Under a
+# reparenting WM `getwindowgeometry`'s absolute Y is offset by the frame, so
+# absolute arithmetic silently aims ~16px low.
 locate_seed_point() {
     local X=0 Y=0 WIDTH=0 HEIGHT=0
     eval "$(xdotool getwindowgeometry --shell "$WIN")"
-    SEED_X=$(( X + 60 ))
-    SEED_Y=$(( Y + HEIGHT - 100 ))
-    echo "window ${WIDTH}x${HEIGHT} at ${X},${Y}; focus seed at ${SEED_X},${SEED_Y}"
+    SEED_X=60
+    SEED_Y=$(( HEIGHT - 18 ))
+    echo "window ${WIDTH}x${HEIGHT} at ${X},${Y}; focus seed at ${SEED_X},${SEED_Y} (window-relative)"
 }
 
-# Resolve the Docker bridge's real default-gateway MAC before the first
-# `GetLanEnv`. A fresh network namespace has an empty neighbour table, so
-# netdev otherwise reports the gateway MAC as zero and the production settings
-# model correctly omits the unavailable "Trust it" focus target. That shifts
-# every later semantic target by one and makes four Down presses pass Revoke.
-# A refused TCP connect is sufficient: ARP resolution happens before the port
-# result, and the `/proc/net/arp` check makes the fixture precondition explicit.
-prime_gateway_neighbor() {
-    python3 - <<'PY'
-import socket
-import time
-
-gateway = None
-with open("/proc/net/route") as routes:
-    next(routes, None)
-    for line in routes:
-        fields = line.split()
-        if len(fields) >= 3 and fields[1] == "00000000":
-            gateway = socket.inet_ntoa(bytes.fromhex(fields[2])[::-1])
-            break
-
-if gateway is None:
-    raise SystemExit("FAIL: Docker E2E has no default gateway to fingerprint")
-
-for _ in range(10):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(0.2)
-        try:
-            probe.connect((gateway, 9))
-        except OSError:
-            pass
-    with open("/proc/net/arp") as neighbors:
-        for line in neighbors:
-            fields = line.split()
-            if len(fields) >= 4 and fields[0] == gateway and fields[3] != "00:00:00:00:00:00":
-                print(f"primed Docker gateway neighbor {gateway} at {fields[3]}")
-                raise SystemExit(0)
-    time.sleep(0.1)
-
-raise SystemExit(f"FAIL: Docker gateway {gateway} did not resolve to a MAC")
-PY
+# Assert the synthetic LAN the entrypoint built is present before the first
+# `GetLanEnv`. The container runs with `--network none`, so its namespace holds
+# nothing but `lo` until `seed_lan_iface` (SCRIBE_SEED_LAN_IFACE=1) adds a veth
+# with a default route and a permanent gateway neighbour. Without it netdev
+# finds no default route at all, the production settings model correctly omits
+# the unavailable "Trust it" focus target, and every later semantic target
+# shifts by one — four Down presses would pass Revoke. This is a precondition
+# check, not a fixup: the fingerprint itself is produced by the real production
+# `netdev` read.
+assert_seeded_gateway() {
+    if ! grep -qiF "$SEEDED_GATEWAY_MAC" /proc/net/arp; then
+        echo "FAIL: no seeded LAN gateway ($SEEDED_GATEWAY_MAC) to fingerprint;" >&2
+        echo "      run through 'just e2e-visual-settings-trust'" >&2
+        exit 1
+    fi
+    echo "seeded LAN gateway $SEEDED_GATEWAY_MAC is in the neighbour table"
 }
 
 shot() {
@@ -167,7 +157,7 @@ shot() {
 # first target. Nothing else is ever clicked in this script.
 reset_focus() {
     raise_window
-    xdotool mousemove "$SEED_X" "$SEED_Y"
+    xdotool mousemove --window "$WIN" "$SEED_X" "$SEED_Y"
     sleep 0.2
     xdotool click 1
     sleep 0.4
@@ -339,7 +329,7 @@ assert_client_grew_once() {
     fi
 }
 
-prime_gateway_neighbor
+assert_seeded_gateway
 sleep 1.5
 raise_window
 assert_titled

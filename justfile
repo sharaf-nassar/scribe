@@ -264,8 +264,12 @@ e2e-visual-session-tooling:
 # Run the feature-014 settings trust/preflight E2E. Drives the real settings
 # window (`--settings`) against the real server through the wire tap, with one
 # trusted network and one approved device seeded into the server's stores.
+# SCRIBE_SEED_LAN_IFACE=1 additionally builds a synthetic physical LAN inside
+# the container's own netns so the production network-fingerprint gate has a
+# real default gateway to read; NET_ADMIN is namespaced and `--network none`
+# still holds, so the host's routing and iptables state is never touched.
 e2e-visual-settings-trust:
-    docker run --rm --network none {{gpu_flags}} -e SCRIBE_VISUAL_APP=settings -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SEED_TRUST=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/settings-trust.sh
+    docker run --rm --network none --cap-add NET_ADMIN {{gpu_flags}} -e SCRIBE_VISUAL_APP=settings -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SEED_TRUST=1 -e SCRIBE_SEED_LAN_IFACE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/settings-trust.sh
 
 # Run the in-app settings entry-point E2E. Drives the running terminal window
 # with the settings chord, the palette row, and the status-bar gear, and

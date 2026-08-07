@@ -61,6 +61,10 @@ RUN apt-get update && \
         # half of that corpus needs a real sshd in the container.
         file \
         openssh-server \
+        # The settings-trust E2E builds a synthetic physical LAN inside the
+        # container's own (still `--network none`) netns so the production
+        # network-fingerprint gate has a real route/neighbour pair to read.
+        iproute2 \
         xz-utils \
         libglib2.0-dev \
         libpng-dev \
