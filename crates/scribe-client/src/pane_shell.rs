@@ -764,6 +764,16 @@ impl PaneShell {
         tree.update(cx, |pane_tree, ctx| pane_tree.set_ratio(pane_id, ratio, ctx))
     }
 
+    /// Reset every workspace-region and pane split so all surfaces share the
+    /// window evenly — the balance affordance behind the status-bar button
+    /// and the titlebar equalize icon.
+    pub fn equalize_all(&mut self, cx: &mut App) {
+        self.workspace.update(cx, WorkspaceTree::equalize_ratios);
+        for tree in self.trees.values() {
+            tree.update(cx, PaneTree::equalize);
+        }
+    }
+
     /// Total number of live panes across every region.
     pub fn pane_count(&self, cx: &App) -> usize {
         self.trees.values().map(|tree| tree.read(cx).all_pane_ids().len()).sum()

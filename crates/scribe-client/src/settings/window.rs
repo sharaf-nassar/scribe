@@ -8,9 +8,10 @@
 //! immediately, mirroring the old webview's live-apply behaviour; the file
 //! watcher in the running client picks the change up as a `ConfigReloaded`.
 //!
-//! Color and free-text controls render their current value read-only — inline
-//! hex/text entry is a tracked follow-on — while keybinding rows list every
-//! action's current combos so the full shortcut inventory stays visible.
+//! Color controls edit inline with validation and a live swatch; general
+//! free-text controls render read-only — inline text entry is a tracked
+//! follow-on — while keybinding rows list every action's current combos so
+//! the full shortcut inventory stays visible.
 //!
 //! Two pages additionally talk to the local server through
 //! [`crate::settings::server_action`]: `Environment` gates its env-persistence
@@ -20,16 +21,24 @@
 //! mutations, plus the feature-013 tailnet summary (`GetRemoteEnv`). Every one
 //! of those calls is reached from [`SettingsWindow::run_action`].
 //!
-//! THESIS: Settings is a quiet professional instrument: dense, exact, and fast
-//! to scan without looking like a terminal-themed novelty.
-//! OWN-WORLD: Obsidian tonal layers, warm type, graphite seams, and one sparse
-//! theme accent create Native Precision.
-//! STORY: Grouped navigation establishes scope; search shortens retrieval; a
-//! spacious section rhythm and aligned controls carry the user to live values.
-//! FIRST VIEWPORT: The active destination, page purpose, and highest-frequency
-//! controls remain legible at the compact 1040×720 composition.
-//! FORM: Contemporary native settings workspace in fixed Obsidian Amber.
-//! No dealt staging was adopted because it did not fit settings truth.
+//! THESIS: Settings reads like impeccably typeset technical documentation —
+//! the man-page tradition of the audience's own world — refusing the boxed
+//! line-soup of category-default settings chrome.
+//! OWN-WORLD: Typeset Ink. One unified deep-ink ground; hierarchy carried by
+//! type scale and spacing, not containers; hairline seams only at structural
+//! boundaries; monospace reserved for real data (paths, hex, combos, numbers);
+//! amber reserved for live state (selection, focus, on, status).
+//! STORY: Grouped contents establish scope, search shortens retrieval, and
+//! each page reads as one typeset column of term–value entries whose controls
+//! commit instantly.
+//! FIRST VIEWPORT: Titlebar, contents column with search, page title with its
+//! config-source line, and the first two sections legible at 1040×720.
+//! FORM: Typeset documentation grammar — candidate 7 of the grounded list,
+//! seed 8145ae64. Dealt challengers (desk instrument, tape deck, dive,
+//! origami) lost on Operate product clarity; the desk instrument survives as
+//! control-precision detail only.
+//! FINISH: unreviewed and undocumented is unfinished; this build ends with
+//! the finish review, the verdict, and DESIGN.md.
 
 use std::{ops::Range, time::Duration};
 
@@ -39,7 +48,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, ResizeEdge, Rgba, Role,
     ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled, UTF16Selection, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle,
-    WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
+    WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba, size,
 };
 use scribe_common::config::{ScribeConfig, load_config};
 use scribe_common::protocol::{
@@ -84,9 +93,9 @@ const RESIZE_GUTTER: Pixels = px(6.0);
 const SETTINGS_MIN_WIDTH: f32 = 1040.0;
 const SETTINGS_MIN_HEIGHT: f32 = 720.0;
 
-/// Native macOS traffic lights occupy a 28px titlebar band. Four extra pixels
-/// add breathing room while keeping the custom cross-platform chrome dense.
-const SETTINGS_TITLEBAR_HEIGHT: f32 = 32.0;
+/// Native macOS traffic lights occupy a 28px titlebar band; 38px clears them
+/// and gives the seamless ground-colored band a calm cross-platform height.
+const SETTINGS_TITLEBAR_HEIGHT: f32 = 38.0;
 
 /// The feature-014 LAN trust state the Remote page renders, refreshed from the
 /// local server by [`SettingsWindow::refresh_trust`].
@@ -144,28 +153,43 @@ fn preflight_reason(error: &PreflightError) -> String {
     }
 }
 
-/// Fixed GPUI colors for the settings chrome.
+/// Fixed GPUI colors for the settings chrome — the Typeset Ink palette.
+///
+/// One unified ground carries the titlebar, sidebar, and content; hairline
+/// alpha strokes mark structural boundaries; amber is spent only on live
+/// state. Hover and selection washes are white-alpha tints so they read
+/// identically over every surface.
 #[derive(Clone, Copy)]
 struct SettingsColors {
+    /// The single interior ground every region shares.
     page_bg: Rgba,
-    /// Fill for the client-decoration resize gutter — a graphite matte one step
-    /// below every interior surface so the frame reads as window chrome.
+    /// Fill for the client-decoration resize gutter — a matte one step below
+    /// the ground so the frame reads as window chrome.
     frame_bg: Rgba,
-    nav_bg: Rgba,
+    /// Selected contents-row wash.
     nav_active_bg: Rgba,
+    /// Hovered contents-row wash.
     nav_hover_bg: Rgba,
-    header_bg: Rgba,
+    /// Hovered settings-row wash.
     row_hover_bg: Rgba,
+    /// Raised surface for click targets (choices, steppers, buttons).
     control_bg: Rgba,
     control_hover_bg: Rgba,
     control_pressed_bg: Rgba,
-    read_only_bg: Rgba,
+    /// Engraved inset for text entry (search, paths, hex fields).
+    input_bg: Rgba,
+    /// Elevated surface for the anchored choice menu.
+    menu_bg: Rgba,
+    /// Ground for the pinned status bar.
     status_bg: Rgba,
+    /// Hairline stroke for structural seams and control outlines.
     border: Rgba,
+    /// One step firmer hairline for the window edge and emphasized outlines.
     strong_border: Rgba,
     accent: Rgba,
-    accent_soft: Rgba,
-    accent_text: Rgba,
+    /// Ink for validation failures — a separate channel from amber, so a
+    /// rejected edit never scans like live state.
+    error: Rgba,
     text: Rgba,
     dim_text: Rgba,
     quiet_text: Rgba,
@@ -175,31 +199,28 @@ impl SettingsColors {
     fn resolve(_config: &ScribeConfig) -> Self {
         // Settings must remain a stable instrument while the user edits the
         // terminal theme, so none of these roles derive from the active preset.
-        let page_bg = rgb(0x0016_1719);
-        let nav_bg = rgb(0x001e_1f20);
+        let page_bg = rgb(0x0014_1518);
         let accent = rgb(0x00f5_b83a);
-        let text = rgb(0x00ef_ede8);
+        let text = rgb(0x00e9_e8e4);
         Self {
             page_bg,
-            frame_bg: rgb(0x000c_0d0e),
-            nav_bg,
-            nav_active_bg: rgb(0x002b_2925),
-            nav_hover_bg: rgb(0x0023_2426),
-            header_bg: rgb(0x0019_1a1c),
-            row_hover_bg: rgb(0x001e_1f21),
-            control_bg: rgb(0x0027_2829),
-            control_hover_bg: rgb(0x0030_3133),
-            control_pressed_bg: rgb(0x0038_3327),
-            read_only_bg: rgb(0x001e_1f20),
-            status_bg: rgb(0x002b_261b),
-            border: rgb(0x0038_393b),
-            strong_border: rgb(0x004f_4f51),
+            frame_bg: rgb(0x000b_0c0e),
+            nav_active_bg: rgba(0xffff_ff0f),
+            nav_hover_bg: rgba(0xffff_ff08),
+            row_hover_bg: rgba(0xffff_ff06),
+            control_bg: rgb(0x001d_1f24),
+            control_hover_bg: rgb(0x0026_2931),
+            control_pressed_bg: rgb(0x0019_1b1f),
+            input_bg: rgb(0x0010_1114),
+            menu_bg: rgb(0x0022_242a),
+            status_bg: rgb(0x001a_1b1f),
+            border: rgba(0xffff_ff14),
+            strong_border: rgba(0xffff_ff1f),
             accent,
-            accent_soft: rgb(0x0038_3020),
-            accent_text: page_bg,
+            error: rgb(0x00e0_584c),
             text,
-            dim_text: rgb(0x00b8_b6b1),
-            quiet_text: rgb(0x0097_9692),
+            dim_text: rgb(0x00a6_a5a0),
+            quiet_text: rgb(0x0083_827b),
         }
     }
 }
@@ -415,6 +436,36 @@ impl SettingsWindow {
         }
     }
 
+    /// The product-language name of a committed key for the status line: the
+    /// control's own label when the selected page declares one, a plain name
+    /// for the structural workspace mutations that have no control row, and a
+    /// humanized last key segment as the fallback.
+    fn commit_label(&self, key: &str) -> String {
+        match key {
+            "workspaces.add_root" | "workspaces.remove_root" => "Workspace root".to_owned(),
+            "workspaces.reset_badge_colors" => "Badge colors".to_owned(),
+            _ => self
+                .controls_for_page(self.page)
+                .into_iter()
+                .find(|control| control.key == key)
+                .map_or_else(
+                    || humanize_choice_token(key.rsplit('.').next().unwrap_or(key)),
+                    |control| control.label,
+                ),
+        }
+    }
+
+    /// The success line for a committed key, in the product's own words
+    /// rather than the dotted config key the apply path consumes.
+    fn commit_status(&self, key: &str) -> String {
+        match key {
+            "workspaces.add_root" => "Workspace root added.".to_owned(),
+            "workspaces.remove_root" => "Workspace root removed.".to_owned(),
+            "workspaces.reset_badge_colors" => "Badge colors reset to defaults.".to_owned(),
+            _ => format!("Saved {}.", self.commit_label(key)),
+        }
+    }
+
     /// Route a `{key, value}` edit through the ported apply path, then reload.
     ///
     /// Returns whether the edit was accepted. A success used to clear the status
@@ -428,11 +479,11 @@ impl SettingsWindow {
         let applied = match crate::settings::apply::apply_settings_change(&payload) {
             Ok(()) => {
                 self.reload();
-                self.status = Some(format!("Saved {key}."));
+                self.status = Some(self.commit_status(key));
                 true
             }
             Err(e) => {
-                self.status = Some(format!("{key} was not saved — {e}"));
+                self.status = Some(format!("{} was not saved — {e}", self.commit_label(key)));
                 false
             }
         };
@@ -1596,7 +1647,7 @@ impl Render for SettingsWindow {
             Decorations::Server => window.set_client_inset(px(0.0)),
         }
         let client_side = matches!(decorations, Decorations::Client { .. });
-        let nav = self.render_nav(cx);
+        let nav = self.render_nav(window, cx);
         let content = self.render_content(window, cx);
         let body = div()
             .id("settings-root")
@@ -1896,7 +1947,9 @@ impl SettingsWindow {
             .flex_none()
             .flex()
             .items_center()
-            .bg(colors.header_bg)
+            // The titlebar shares the interior ground; only the hairline seam
+            // below it marks the band.
+            .bg(colors.page_bg)
             .border_b_1()
             .border_color(colors.border)
             // `WindowControlArea::Drag` is what makes dragging work on Windows;
@@ -1930,12 +1983,12 @@ impl SettingsWindow {
                     key_window.start_window_move();
                 }
             }))
-            // Balance the three 48px controls on the right. On macOS this also
+            // Balance the three 40px controls on the right. On macOS this also
             // reserves the traffic-light region, keeping the centered title
             // clear of the native buttons without platform-specific offsets.
             .child(
                 div()
-                    .w(px(144.0))
+                    .w(px(120.0))
                     .h_full()
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag)
@@ -1959,12 +2012,11 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_nav(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_nav(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
         // Groups that a search filters away entirely are dropped *before* the
-        // index is assigned. Enumerating the full list instead left the first
-        // surviving group with a non-zero index, so a filtered nav opened with a
-        // separator above its first entry and nothing above the separator.
+        // index is assigned, so a filtered contents list never opens with a
+        // stray group gap above its first entry.
         let items = settings_nav_groups()
             .into_iter()
             .filter(|(_, pages)| pages.iter().any(|page| self.page_matches_search(*page)))
@@ -1972,20 +2024,46 @@ impl SettingsWindow {
             .flat_map(|(index, (group, pages))| self.render_nav_group(index, group, pages, cx))
             .collect::<Vec<_>>();
         div()
-            .id("settings-navigation")
-            .role(Role::TabList)
-            .aria_label("Settings sections")
-            .w(px(314.0))
+            .id("settings-sidebar")
+            .w(px(232.0))
             .flex_none()
             .h_full()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .pt(px(18.0))
-            .bg(colors.nav_bg)
             .border_r_1()
             .border_color(colors.border)
-            .children(items)
+            // Search leads the sidebar — the platform settings idiom — and
+            // stays pinned above the scrolling contents list.
+            .child(self.render_search(window, cx))
+            .child(
+                div()
+                    .id("settings-navigation")
+                    .role(Role::TabList)
+                    .aria_label("Settings sections")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .pt(px(14.0))
+                    .children(items),
+            )
+            .child(
+                div()
+                    .id("settings-sidebar-footer")
+                    .role(Role::Note)
+                    .aria_label(concat!("Scribe v", env!("CARGO_PKG_VERSION")))
+                    .w_full()
+                    .h(px(36.0))
+                    .flex_none()
+                    .px(px(20.0))
+                    .flex()
+                    .items_center()
+                    .font_family("monospace")
+                    .text_xs()
+                    .text_color(colors.quiet_text)
+                    .child(concat!("Scribe v", env!("CARGO_PKG_VERSION"))),
+            )
             .into_any_element()
     }
 
@@ -2001,19 +2079,8 @@ impl SettingsWindow {
         if items.is_empty() {
             return items;
         }
-        let mut group_items = Vec::with_capacity(items.len() + 2);
-        if group_index > 0 {
-            group_items.push(
-                div()
-                    .id(("settings-nav-separator", group_index))
-                    .mx(px(18.0))
-                    .mt(px(12.0))
-                    .h(px(1.0))
-                    .flex_none()
-                    .bg(self.colors.border)
-                    .into_any_element(),
-            );
-        }
+        // Groups separate by air and their quiet label alone — no rules.
+        let mut group_items = Vec::with_capacity(items.len() + 1);
         group_items.push(
             div()
                 .id(("settings-nav-group", group_index))
@@ -2021,12 +2088,13 @@ impl SettingsWindow {
                 .aria_level(2)
                 .aria_label(group)
                 .w_full()
-                .h(px(46.0))
+                .h(px(28.0))
                 .flex_none()
-                .px(px(32.0))
+                .when(group_index > 0, |el| el.mt(px(14.0)))
+                .px(px(20.0))
                 .flex()
                 .items_end()
-                .pb_2()
+                .pb(px(6.0))
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(self.colors.quiet_text)
@@ -2043,10 +2111,12 @@ impl SettingsWindow {
         let focused = self.target_is_focused(&SettingsFocusTarget::Page(page));
         let position =
             settings_nav_pages().iter().position(|candidate| *candidate == page).unwrap_or(0);
-        let weight = if selected { FontWeight::SEMIBOLD } else { FontWeight::NORMAL };
-        let background = if selected { colors.nav_active_bg } else { colors.nav_bg };
+        let weight = if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL };
         let foreground = if selected { colors.text } else { colors.dim_text };
-        let icon_color = if selected { colors.accent } else { colors.dim_text };
+        // Selection is a neutral wash plus the page glyph turning amber —
+        // the only lit state in the column. Keyboard focus is an amber
+        // hairline outline, so the two never look alike.
+        let icon_color = if selected { colors.accent } else { colors.quiet_text };
         div()
             .id(("settings-nav", page as usize))
             .focusable()
@@ -2056,43 +2126,34 @@ impl SettingsWindow {
             .aria_selected(selected)
             .aria_position_in_set(position + 1)
             .aria_size_of_set(settings_nav_pages().len())
-            .w_full()
-            .h(px(44.0))
+            .h(px(32.0))
             .flex_none()
-            .px(px(32.0))
+            .mx(px(8.0))
+            .px(px(12.0))
             .flex()
             .items_center()
             .gap_3()
+            .rounded(px(5.0))
             .text_sm()
             .font_weight(weight)
-            .bg(background)
             .text_color(foreground)
-            .relative()
-            // Selection is the accent bar; keyboard focus is a full outline in a
-            // different colour. Both used to draw the same 4px accent bar, so a
-            // focused row and the selected row were indistinguishable — and two
-            // identical bars appeared whenever they differed.
-            .when(selected, |el| {
-                el.child(
-                    div().absolute().left_0().top_0().bottom_0().w(px(4.0)).bg(colors.accent),
-                )
-            })
-            .when(focused, |el| el.border_1().border_color(colors.text))
+            .when(selected, |el| el.bg(colors.nav_active_bg))
+            .when(focused, |el| el.border_1().border_color(colors.accent))
             .hover(move |style| style.bg(colors.nav_hover_bg).text_color(colors.text))
-            .active(move |style| style.bg(colors.control_pressed_bg))
+            .active(move |style| style.bg(colors.nav_active_bg))
             .on_click(cx.listener(move |this, _, page_window, ctx| {
                 this.begin_pointer_interaction(&SettingsFocusTarget::Page(page));
                 this.select_page(page, page_window, ctx);
             }))
             .child(
                 div()
-                    .size(px(20.0))
+                    .size(px(18.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .font_family("Symbols Nerd Font Mono")
-                    .text_lg()
+                    .text_base()
                     .font_weight(FontWeight::NORMAL)
                     .text_color(icon_color)
                     .child(page_icon(page)),
@@ -2129,17 +2190,13 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .bg(colors.page_bg)
-            // The search field stays pinned above the scroller so a filtered
-            // query never scrolls out of reach of the results it is filtering.
-            .child(self.render_search(window, cx))
             .child(
                 div()
                     .id("settings-scroll")
-                    // `flex_1` claims the space the search field leaves, and the
-                    // zero `min_h` is what actually bounds it: a flex item's
-                    // automatic minimum size is its content height, which on a
-                    // long page would size the viewport to the content and leave
-                    // nothing to scroll.
+                    // `flex_1` claims the pane, and the zero `min_h` is what
+                    // actually bounds it: a flex item's automatic minimum size
+                    // is its content height, which on a long page would size
+                    // the viewport to the content and leave nothing to scroll.
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_x_hidden()
@@ -2150,11 +2207,17 @@ impl SettingsWindow {
                     // so the content never measures as overflowing and the wheel
                     // is clamped to a zero maximum.
                     .track_scroll(&self.scroll_handle)
-                    .px(px(46.0))
+                    .px(px(44.0))
                     .pb(px(48.0))
                     .flex()
                     .flex_col()
-                    .children(children),
+                    // A typeset column keeps a readable measure: every row caps
+                    // at 840px and stays left-aligned when the window grows.
+                    // Capping per row (not via one wrapping column) preserves
+                    // the scroller's content-extent measurement noted above.
+                    .children(children.into_iter().map(|child| {
+                        div().w_full().max_w(px(840.0)).flex_none().child(child)
+                    })),
             )
             // Pinned below the scroller, not appended to it. As the last row of a
             // page taller than the viewport the status line landed off-screen, so
@@ -2177,27 +2240,26 @@ impl SettingsWindow {
             .aria_placeholder("Search settings")
             .aria_value(query.clone())
             .w_full()
-            .max_w(px(580.0))
-            .h(px(42.0))
-            .px_3()
+            .h(px(30.0))
+            .px(px(10.0))
             .flex()
             .items_center()
-            .gap_3()
-            .rounded_sm()
+            .gap_2()
+            .rounded(px(5.0))
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.strong_border })
+            .border_color(if focused { colors.accent } else { colors.border })
             // Focus outranks hover here. The hover rule used to repaint a focused
             // field's border in the dim hover colour, so a focused-and-hovered
             // field looked exactly like an unfocused one.
-            .bg(if focused { colors.control_bg } else { colors.read_only_bg })
+            .bg(colors.input_bg)
             .text_sm()
             .text_color(colors.text)
             .cursor_text()
-            .when(!focused, |el| el.hover(move |style| style.border_color(colors.dim_text)))
+            .when(!focused, |el| el.hover(move |style| style.border_color(colors.strong_border)))
             .on_click(cx.listener(move |_, _, focused_window, ctx| {
                 focused_window.focus(&focus, ctx);
             }))
-            .child(settings_search_icon(colors.dim_text))
+            .child(settings_search_icon(colors.quiet_text))
             .child(
                 div()
                     .flex_1()
@@ -2220,31 +2282,33 @@ impl SettingsWindow {
                             div()
                                 .ml(px(2.0))
                                 .w(px(2.0))
-                                .h(px(18.0))
+                                .h(px(14.0))
                                 .flex_none()
                                 .bg(colors.accent),
                         )
                     }),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family("monospace")
-                    .text_sm()
-                    .text_color(colors.quiet_text)
-                    .child("Ctrl+K"),
-            );
+            // The shortcut hint has done its job once the field is focused.
+            .when(!focused, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font_family("monospace")
+                        .text_xs()
+                        .text_color(colors.quiet_text)
+                        .child("Ctrl+K"),
+                )
+            });
         div()
             .id("settings-search-region")
             .role(Role::Search)
             .aria_label("Settings search")
             .w_full()
-            .h(px(70.0))
             .flex_none()
-            .px(px(22.0))
+            .pt(px(12.0))
+            .px(px(12.0))
             .flex()
             .items_center()
-            .justify_end()
             .child(field)
             .into_any_element()
     }
@@ -2252,39 +2316,48 @@ impl SettingsWindow {
     fn render_page_heading(&self) -> gpui::AnyElement {
         let colors = self.colors;
         let summary = page_summary(self.page);
+        // The Releases page renders server data, not config keys, so the
+        // config-source line would be untrue there.
+        let source = (self.page != SettingsPage::Releases).then_some("config.toml · live apply");
         div()
             .id("settings-page-heading")
             .role(Role::Heading)
             .aria_level(1)
             .aria_label(format!("{} — {summary}", self.page.nav_label()))
             .w_full()
-            .h(px(134.0))
             .flex_none()
-            .mt(px(-8.0))
+            .pt(px(28.0))
             .flex()
             .flex_col()
-            .justify_start()
-            .border_b_1()
-            .border_color(colors.strong_border)
             .text_color(colors.text)
-            .child(div().text_lg().font_weight(FontWeight::BOLD).child(self.page.nav_label()))
             .child(
                 div()
-                    .mt_1()
-                    .text_sm()
-                    .text_color(colors.dim_text)
-                    .child(Text::new_inaccessible(elide(summary, PAGE_SUMMARY_MAX_CHARS).into())),
+                    .w_full()
+                    .flex()
+                    .items_end()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div().text_xl().font_weight(FontWeight::BOLD).child(self.page.nav_label()),
+                    )
+                    // The quiet man-page corner note: where these values
+                    // persist, and that edits commit as they are made.
+                    .children(source.map(|source| {
+                        div()
+                            .flex_none()
+                            .pb(px(2.0))
+                            .font_family("monospace")
+                            .text_xs()
+                            .text_color(colors.quiet_text)
+                            .child(source)
+                    })),
             )
             .child(
                 div()
-                    .mt_4()
-                    .flex()
-                    .items_center()
-                    .gap_3()
+                    .mt(px(6.0))
                     .text_sm()
-                    .text_color(colors.accent)
-                    .child(div().size(px(12.0)).rounded_sm().bg(colors.accent))
-                    .child("Changes apply instantly"),
+                    .text_color(colors.dim_text)
+                    .child(Text::new_inaccessible(elide(summary, PAGE_SUMMARY_MAX_CHARS).into())),
             )
             .into_any_element()
     }
@@ -2334,12 +2407,9 @@ impl SettingsWindow {
                     .role(Role::ListItem)
                     .aria_label("No workspace roots configured")
                     .w_full()
-                    .h(px(54.0))
+                    .h(px(40.0))
                     .flex()
                     .items_center()
-                    .border_b_1()
-                    .border_color(self.colors.border)
-                    .bg(self.colors.read_only_bg)
                     .text_sm()
                     .text_color(self.colors.dim_text)
                     .child("No workspace roots configured.")
@@ -2386,7 +2456,7 @@ impl SettingsWindow {
         let label = format!("Remove workspace root {root}");
         let button = action_button("Remove", &colors)
             .id(("workspace-root-remove", index))
-            .when(focused, |el| el.border_color(colors.text))
+            .when(focused, |el| el.border_color(colors.accent))
             .focusable()
             .tab_stop(true)
             .role(Role::Button)
@@ -2401,14 +2471,14 @@ impl SettingsWindow {
             .aria_label(root.to_owned())
             .aria_position_in_set(set_position.0 + 1)
             .aria_size_of_set(set_position.1)
-            .w_full()
-            .h(px(54.0))
+            .h(px(46.0))
             .flex_none()
             .flex()
             .items_center()
             .gap_6()
-            .border_b_1()
-            .border_color(colors.border)
+            .mx(px(-12.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
             .hover(move |style| style.bg(colors.row_hover_bg))
             .child(
                 div()
@@ -2420,7 +2490,15 @@ impl SettingsWindow {
                     .text_color(colors.text)
                     .child(Text::new_inaccessible(elide(root, NOTE_MAX_CHARS).into())),
             )
-            .child(div().w(px(438.0)).flex_none().flex().items_center().justify_end().child(button))
+            .child(
+                div()
+                    .w(px(VALUE_COLUMN_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(button),
+            )
             .into_any_element()
     }
 
@@ -2442,41 +2520,27 @@ impl SettingsWindow {
                 )
                 .w_full()
                 .text_xs()
-                .text_color(colors.accent)
+                .text_color(colors.error)
                 .child(Text::new_inaccessible(error.into()))
         });
+        // The field spans the row — a path wants the whole measure — with its
+        // actions trailing; the field's own placeholder and ARIA name carry
+        // the label.
         div()
             .id("workspace-root-add-row")
             .role(Role::Group)
             .aria_label("Add workspace root")
             .w_full()
-            .h(px(if self.workspace_root_error.is_some() { 76.0 } else { 54.0 }))
+            .h(px(if self.workspace_root_error.is_some() { 72.0 } else { 46.0 }))
             .flex_none()
             .flex()
-            .items_center()
-            .gap_6()
-            .border_b_1()
-            .border_color(colors.border)
-            .child(row_label("Workspace root path", colors.text))
+            .flex_col()
+            .justify_center()
+            .gap_1()
             .child(
-                div()
-                    .w(px(438.0))
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(field)
-                            .child(browse)
-                            .child(add),
-                    )
-                    .children(error),
+                div().w_full().flex().items_center().gap_2().child(field).child(browse).child(add),
             )
+            .children(error)
             .into_any_element()
     }
 
@@ -2509,32 +2573,40 @@ impl SettingsWindow {
             )
             .flex_1()
             .min_w(px(0.0))
-            .h(px(42.0))
-            .px_3()
+            .h(px(30.0))
+            .px(px(10.0))
             .flex()
             .items_center()
             .overflow_hidden()
-            .rounded_xs()
+            .rounded(px(5.0))
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.strong_border })
-            .bg(colors.control_bg)
+            .border_color(if focused { colors.accent } else { colors.border })
+            .bg(colors.input_bg)
             .font_family("monospace")
             .text_sm()
             .text_color(if value.is_empty() { colors.quiet_text } else { colors.text })
             .cursor_text()
             .relative()
-            .when(!focused, |el| el.hover(move |style| style.border_color(colors.dim_text)))
+            .when(!focused, |el| el.hover(move |style| style.border_color(colors.strong_border)))
             .on_click(cx.listener(move |this, _, input_window, ctx| {
                 this.begin_pointer_interaction(&SettingsFocusTarget::WorkspaceRootInput);
                 this.active_input = Some(NativeInputTarget::WorkspaceRoot);
                 this.input_selection = NativeInputSelection::Caret;
                 input_window.focus(&focus, ctx);
             }))
+            // The placeholder yields to the caret on focus — the same
+            // focused-empty grammar as the search and color fields, so no
+            // field ever looks pre-filled with text the user must delete.
             .child(Text::new_inaccessible(
-                if value.is_empty() { "Absolute path or ~/path".to_owned() } else { value }.into(),
+                if value.is_empty() && !focused {
+                    "Absolute path or ~/path".to_owned()
+                } else {
+                    value
+                }
+                .into(),
             ))
             .when(focused, |el| {
-                el.child(div().ml(px(2.0)).w(px(2.0)).h(px(18.0)).flex_none().bg(colors.accent))
+                el.child(div().ml(px(2.0)).w(px(2.0)).h(px(14.0)).flex_none().bg(colors.accent))
             })
             .child(
                 canvas(
@@ -2562,7 +2634,7 @@ impl SettingsWindow {
         let add_focused = self.target_is_focused(&add_target);
         let add = action_button("Add", &colors)
             .id("workspace-root-add")
-            .when(add_focused, |el| el.border_color(colors.text))
+            .when(add_focused, |el| el.border_color(colors.accent))
             .focusable()
             .tab_stop(true)
             .role(Role::Button)
@@ -2576,7 +2648,7 @@ impl SettingsWindow {
         let browse_focused = self.target_is_focused(&browse_target);
         let browse = action_button("Browse…", &colors)
             .id("workspace-root-browse")
-            .when(browse_focused, |el| el.border_color(colors.text))
+            .when(browse_focused, |el| el.border_color(colors.accent))
             .focusable()
             .tab_stop(true)
             .role(Role::Button)
@@ -2598,19 +2670,20 @@ impl SettingsWindow {
             .id("settings-status")
             .role(Role::Status)
             .aria_label(status.to_owned())
-            .mx_4()
-            .px_3()
-            .py_2()
-            .my_3()
+            .w_full()
+            .px(px(44.0))
+            .py(px(10.0))
             .flex()
             .items_center()
             .gap_3()
-            .rounded_xs()
-            .border_1()
-            .border_color(colors.accent)
+            .border_t_1()
+            .border_color(colors.border)
             .bg(colors.status_bg)
             .text_sm()
             .text_color(colors.text)
+            // The amber point is the live-state mark: this line is the result
+            // of the most recent action, not passive chrome.
+            .child(div().size(px(6.0)).flex_none().rounded_full().bg(colors.accent))
             .child(
                 div()
                     .flex_1()
@@ -2629,7 +2702,9 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_xs()
+                    .rounded(px(4.0))
+                    .font_family("Symbols Nerd Font Mono")
+                    .text_xs()
                     .text_color(colors.dim_text)
                     .cursor_pointer()
                     .hover(move |style| style.bg(colors.control_hover_bg).text_color(colors.text))
@@ -2637,7 +2712,7 @@ impl SettingsWindow {
                         this.status = None;
                         ctx.notify();
                     }))
-                    .child("×"),
+                    .child("\u{f00d}"),
             )
             .into_any_element()
     }
@@ -2800,48 +2875,16 @@ impl SettingsWindow {
             .collect()
     }
 
-    /// A bold-ish sub-heading between the trust lists.
+    /// A man-page section head between the trust lists: small tracked caps
+    /// set off by air above, no rule.
     fn section_heading(&self, text: &str) -> gpui::AnyElement {
-        div()
-            .id(("settings-section-heading", key_hash(text)))
-            .role(Role::Heading)
-            .aria_level(2)
-            .aria_label(text.to_owned())
-            .w_full()
-            .h(px(66.0))
-            .flex_none()
-            .flex()
-            .items_end()
-            .pb_3()
-            .text_lg()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(self.colors.text)
-            .border_b_1()
-            .border_color(self.colors.border)
-            .child(Text::new_inaccessible(text.to_owned().into()))
-            .into_any_element()
+        heading_label("settings-section-heading", text, &self.colors)
     }
 
-    /// Typography-led grouping label for config controls.
+    /// Typography-led grouping label for config controls — the same section
+    /// head, so runtime and config sections read as one system.
     fn control_section_heading(&self, text: &str) -> gpui::AnyElement {
-        div()
-            .id(("settings-control-section-heading", key_hash(text)))
-            .role(Role::Heading)
-            .aria_level(2)
-            .aria_label(text.to_owned())
-            .w_full()
-            .h(px(66.0))
-            .flex_none()
-            .flex()
-            .items_end()
-            .pb_3()
-            .text_lg()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(self.colors.text)
-            .border_b_1()
-            .border_color(self.colors.border)
-            .child(Text::new_inaccessible(text.to_owned().into()))
-            .into_any_element()
+        heading_label("settings-control-section-heading", text, &self.colors)
     }
 
     /// A read-only informational line inside a trust section.
@@ -2851,15 +2894,12 @@ impl SettingsWindow {
             .role(Role::Note)
             .aria_label(text.to_owned())
             .w_full()
-            .h(px(54.0))
+            .h(px(40.0))
             .flex_none()
             .flex()
             .items_center()
             .text_sm()
             .text_color(self.colors.dim_text)
-            .border_b_1()
-            .border_color(self.colors.border)
-            .bg(self.colors.read_only_bg)
             .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
             .into_any_element()
     }
@@ -2874,7 +2914,7 @@ impl SettingsWindow {
         let pointer_target = SettingsFocusTarget::Action(action_key.clone());
         let control = action_button(button, &colors)
             .id(id)
-            .when(focused, |el| el.border_color(colors.text))
+            .when(focused, |el| el.border_color(colors.accent))
             .focusable()
             .tab_stop(true)
             .role(Role::Button)
@@ -2887,18 +2927,24 @@ impl SettingsWindow {
             .id(("settings-trust-row", key_hash(&label)))
             .role(Role::Group)
             .aria_label(label.clone())
-            .w_full()
-            .h(px(54.0))
+            .h(px(46.0))
             .flex_none()
             .flex()
             .items_center()
             .gap_6()
-            .border_b_1()
-            .border_color(colors.border)
+            .mx(px(-12.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
             .hover(move |style| style.bg(colors.row_hover_bg))
             .child(row_label(&label, colors.text))
             .child(
-                div().w(px(438.0)).flex_none().flex().items_center().justify_end().child(control),
+                div()
+                    .w(px(VALUE_COLUMN_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(control),
             )
             .into_any_element()
     }
@@ -2924,30 +2970,32 @@ impl SettingsWindow {
             .aria_label(control.label.clone())
             .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
-            .w_full()
             .h(px(
                 if self.color_key.as_deref() == Some(control.key.as_str())
                     && self.color_error.is_some()
                 {
-                    76.0
+                    78.0
                 } else if description.is_some() {
-                    66.0
+                    62.0
                 } else {
-                    54.0
+                    46.0
                 },
             ))
             .flex_none()
             .flex()
             .items_center()
             .gap_6()
-            .border_b_1()
-            .border_color(colors.border)
+            // Rows separate by rhythm alone; the hover wash bleeds past the
+            // text margin so the pill reads as a surface, not a stripe.
+            .mx(px(-12.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
             .when(!enabled, |el| el.opacity(GATED_OPACITY))
             .when(enabled, |el| el.hover(move |style| style.bg(colors.row_hover_bg)))
             .child(label)
             .child(
                 div()
-                    .w(px(438.0))
+                    .w(px(VALUE_COLUMN_WIDTH))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -3025,10 +3073,12 @@ impl SettingsWindow {
         let key = control.key.clone();
         let track_bg = if on { colors.accent } else { colors.control_bg };
         let track_border = if on { colors.accent } else { colors.strong_border };
-        let hover_bg = if on { rgb(0x00ff_c24a) } else { colors.control_hover_bg };
-        let pressed_bg = if on { rgb(0x00d7_aa47) } else { colors.control_pressed_bg };
+        let hover_bg = if on { rgb(0x00ff_c85c) } else { colors.control_hover_bg };
+        let pressed_bg = if on { rgb(0x00df_a42f) } else { colors.control_pressed_bg };
         let pointer_target = SettingsFocusTarget::Control(control.clone());
-        let knob = div().size(px(22.0)).rounded_full().bg(colors.text);
+        // The knob is warm white over amber and neutral white over ink, so the
+        // on state reads at a glance even in a long column of switches.
+        let knob = div().size(px(16.0)).rounded_full().bg(colors.text);
         div()
             .id(("toggle", key_hash(&control.key)))
             .focusable()
@@ -3036,14 +3086,16 @@ impl SettingsWindow {
             .role(Role::Switch)
             .aria_label(control.label.clone())
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
-            .w(px(52.0))
-            .h(px(30.0))
-            .p(px(3.0))
+            .w(px(38.0))
+            .h(px(22.0))
+            .p(px(2.0))
             .flex()
             .items_center()
             .when(on, gpui::Styled::justify_end)
             .rounded_full()
             .border_1()
+            // A white ring, not amber: the focused ON track is already amber,
+            // so an amber ring would make keyboard focus invisible there.
             .border_color(if focused { colors.text } else { track_border })
             .bg(track_bg)
             .cursor_pointer()
@@ -3086,42 +3138,46 @@ impl SettingsWindow {
             .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .aria_value(display.clone())
             .aria_expanded(open)
-            .w(px(438.0))
-            .h(px(42.0))
-            .px_4()
+            .w(px(CHOICE_WIDTH))
+            .h(px(30.0))
+            .px(px(10.0))
             .flex()
             .items_center()
             .justify_between()
             .gap_3()
-            .rounded_xs()
+            .rounded(px(5.0))
             .border_1()
-            .border_color(if focused || open { colors.accent } else { colors.strong_border })
+            .border_color(if focused || open { colors.accent } else { colors.border })
             .bg(colors.control_bg)
             .text_sm()
             .text_color(colors.text)
             .cursor_pointer()
-            .hover(move |style| style.bg(colors.control_hover_bg).border_color(colors.accent))
+            .hover(move |style| {
+                style.bg(colors.control_hover_bg).border_color(colors.strong_border)
+            })
             .active(move |style| style.bg(colors.control_pressed_bg))
             .on_click(cx.listener(move |this, _, _win, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
                 this.toggle_choice_menu(&key, &declared, ctx);
             }))
             .child(Text::new_inaccessible(display.into()))
-            .child(div().text_base().text_color(colors.dim_text).child(if open {
-                "⌃"
-            } else {
-                "⌄"
-            }));
+            .child(
+                div()
+                    .font_family("Symbols Nerd Font Mono")
+                    .text_sm()
+                    .text_color(colors.quiet_text)
+                    .child(if open { "\u{f106}" } else { "\u{f107}" }),
+            );
         let close_key = control.key.clone();
         div()
             .id(("choice-shell", key_hash(&control.key)))
             .relative()
-            .w(px(438.0))
+            .w(px(CHOICE_WIDTH))
             // The height is load-bearing, not decoration: the anchored menu is
             // absolutely positioned, so with an automatic height this shell
             // measures as zero-height and the hit test never reaches the button
             // inside it — the control stops responding to clicks entirely.
-            .h(px(42.0))
+            .h(px(30.0))
             .flex_none()
             .when(open, |el| {
                 el.on_mouse_down_out(cx.listener(move |this, _, _win, ctx| {
@@ -3171,7 +3227,7 @@ impl SettingsWindow {
                     .w_full()
                     .h(px(CHOICE_OPTION_HEIGHT))
                     .flex_none()
-                    .px_4()
+                    .px(px(10.0))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -3186,7 +3242,13 @@ impl SettingsWindow {
                         this.commit(&commit_key, Value::String(commit_value.clone()), ctx);
                     }))
                     .child(Text::new_inaccessible(label.clone().into()))
-                    .child(if selected { "✓" } else { "" })
+                    .child(
+                        div()
+                            .font_family("Symbols Nerd Font Mono")
+                            .text_xs()
+                            .text_color(colors.accent)
+                            .child(if selected { "\u{f00c}" } else { "" }),
+                    )
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -3196,8 +3258,8 @@ impl SettingsWindow {
                     .id(("choice-menu", key_hash(key)))
                     .role(Role::Menu)
                     .aria_label(control.label.clone())
-                    .w(px(438.0))
-                    .mt(px(46.0))
+                    .w(px(CHOICE_WIDTH))
+                    .mt(px(34.0))
                     .max_h(px(CHOICE_MENU_MAX_HEIGHT))
                     // The option rows are direct children of the scroller: an
                     // intermediate wrapper would report its own box as the
@@ -3206,10 +3268,12 @@ impl SettingsWindow {
                     .track_scroll(&self.choice_scroll)
                     .flex()
                     .flex_col()
-                    .rounded_xs()
+                    .py(px(4.0))
+                    .rounded(px(6.0))
                     .border_1()
-                    .border_color(colors.accent)
-                    .bg(colors.nav_active_bg)
+                    .border_color(colors.strong_border)
+                    .bg(colors.menu_bg)
+                    .shadow_lg()
                     .children(rows),
             ),
         )
@@ -3273,7 +3337,7 @@ impl SettingsWindow {
         let pointer_target = SettingsFocusTarget::Control(control.clone());
         action_button(&control.label, &colors)
             .id(("action", key_hash(&control.key)))
-            .when(focused, |el| el.border_color(colors.text))
+            .when(focused, |el| el.border_color(colors.accent))
             .focusable()
             .tab_stop(true)
             .role(Role::Button)
@@ -3324,12 +3388,13 @@ impl SettingsWindow {
             )
             .flex()
             .items_center()
-            .w(px(207.0))
-            .h(px(38.0))
-            .rounded_xs()
+            .w(px(152.0))
+            .h(px(30.0))
+            .rounded(px(5.0))
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.strong_border })
+            .border_color(if focused { colors.accent } else { colors.border })
             .bg(colors.control_bg)
+            .overflow_hidden()
             .child(minus)
             .child(
                 div()
@@ -3418,7 +3483,7 @@ impl SettingsWindow {
         let value = if editing { self.color_input.clone() } else { saved.clone() };
         let swatch_color = color_swatch(&self.config, &control.key, &value)
             .or_else(|| color_swatch(&self.config, &control.key, &saved))
-            .map_or(colors.read_only_bg, srgba);
+            .map_or(colors.input_bg, srgba);
         let field = self.render_color_field(control, window, cx);
         let error = (self.color_key.as_deref() == Some(control.key.as_str()))
             .then(|| self.color_error.clone())
@@ -3429,14 +3494,14 @@ impl SettingsWindow {
                     .role(Role::Alert)
                     .aria_label(error.clone())
                     .text_xs()
-                    .text_color(colors.accent)
+                    .text_color(colors.error)
                     .child(Text::new_inaccessible(error.into()))
             });
         div()
             .id(("settings-color-value", key_hash(&control.key)))
             .role(Role::Group)
             .aria_label(format!("{} color editor", control.label))
-            .w(px(438.0))
+            .w(px(VALUE_COLUMN_WIDTH))
             .flex()
             .flex_col()
             .gap_1()
@@ -3444,15 +3509,15 @@ impl SettingsWindow {
             .child(
                 div()
                     .w_full()
-                    .h(px(42.0))
+                    .h(px(30.0))
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
-                            .size(px(20.0))
+                            .size(px(16.0))
                             .flex_none()
-                            .rounded_xs()
+                            .rounded(px(4.0))
                             .border_1()
                             .border_color(colors.strong_border)
                             .bg(swatch_color),
@@ -3494,21 +3559,21 @@ impl SettingsWindow {
             .focusable()
             .tab_stop(true)
             .w_full()
-            .h(px(42.0))
-            .px_3()
+            .h(px(30.0))
+            .px(px(10.0))
             .flex()
             .items_center()
             .overflow_hidden()
             .relative()
-            .rounded_xs()
+            .rounded(px(5.0))
             .border_1()
-            .border_color(if editing { colors.accent } else { colors.strong_border })
-            .bg(colors.control_bg)
+            .border_color(if editing { colors.accent } else { colors.border })
+            .bg(colors.input_bg)
             .font_family("monospace")
             .text_sm()
             .text_color(if value.is_empty() { colors.quiet_text } else { colors.text })
             .cursor_text()
-            .when(!editing, |el| el.hover(move |style| style.border_color(colors.accent)))
+            .when(!editing, |el| el.hover(move |style| style.border_color(colors.strong_border)))
             .on_click(cx.listener(move |this, _, input_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
                 this.begin_color_edit(&edit_control);
@@ -3518,7 +3583,7 @@ impl SettingsWindow {
             .child(Text::new_inaccessible(shown.into()))
             .when(editing, |el| {
                 el.track_focus(&input_focus)
-                    .child(div().ml(px(2.0)).w(px(2.0)).h(px(18.0)).flex_none().bg(colors.accent))
+                    .child(div().ml(px(2.0)).w(px(2.0)).h(px(14.0)).flex_none().bg(colors.accent))
                     .child(
                         canvas(
                             |_bounds, _window, _cx| {},
@@ -3538,16 +3603,23 @@ impl SettingsWindow {
     }
 }
 
+/// Fixed width of the right-hand value column, the vertical rule that aligns
+/// every control on a page.
+const VALUE_COLUMN_WIDTH: f32 = 300.0;
+
+/// Width of a choice button and its anchored menu inside the value column.
+const CHOICE_WIDTH: f32 = 240.0;
+
 /// Height of one dropdown option row, also the unit the open-scroll uses to put
 /// the live value on screen.
-const CHOICE_OPTION_HEIGHT: f32 = 40.0;
+const CHOICE_OPTION_HEIGHT: f32 = 30.0;
 
 /// How much of a dropdown is kept visible above the live value when it opens.
-const CHOICE_MENU_LEAD: f32 = 120.0;
+const CHOICE_MENU_LEAD: f32 = 90.0;
 
 /// Tallest a dropdown grows before it scrolls internally — the theme preset list
 /// has close to 190 entries.
-const CHOICE_MENU_MAX_HEIGHT: f32 = 400.0;
+const CHOICE_MENU_MAX_HEIGHT: f32 = 360.0;
 
 /// Shared pending line for both keystore probes (the manual action and the
 /// toggle's gated ON transition), so the two surfaces say the same thing.
@@ -3700,6 +3772,25 @@ fn elide(text: &str, max: usize) -> String {
     out
 }
 
+/// One section head: uppercase tracked caps in the quiet ink, more air above
+/// than below — the typeset grammar's only grouping device.
+fn heading_label(id: &'static str, text: &str, colors: &SettingsColors) -> gpui::AnyElement {
+    div()
+        .id((id, key_hash(text)))
+        .role(Role::Heading)
+        .aria_level(2)
+        .aria_label(text.to_owned())
+        .w_full()
+        .flex_none()
+        .pt(px(34.0))
+        .pb(px(10.0))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.quiet_text)
+        .child(Text::new_inaccessible(text.to_uppercase().into()))
+        .into_any_element()
+}
+
 /// The left-hand label of a settings row: it takes the leftover width but never
 /// forces the row wider than the pane, so the right-aligned control stays on
 /// screen no matter how long the text is.
@@ -3764,6 +3855,11 @@ fn choice_description(key: &str, value: &str) -> Option<&'static str> {
 
 /// A read-only current value still needs a semantic node: visual text alone is
 /// otherwise absent from AccessKit's tree.
+///
+/// Visually it is plain right-aligned monospace in the dim ink — the typeset
+/// grammar's mark for data that is stated, not edited. The absence of a
+/// control outline is what says "not interactive"; the ARIA description says
+/// it explicitly.
 fn read_only_value(
     key: &str,
     label: &str,
@@ -3775,41 +3871,17 @@ fn read_only_value(
         .role(Role::Label)
         .aria_label(format!("{label}: {value}"))
         .aria_description("Read-only value")
-        .w(px(438.0))
-        .h(px(42.0))
-        .px_4()
+        .w(px(VALUE_COLUMN_WIDTH))
+        .h(px(30.0))
         .flex()
         .items_center()
-        .gap_3()
+        .justify_end()
         .overflow_hidden()
-        .border_b_1()
-        .border_color(colors.border)
-        .bg(colors.read_only_bg)
-        .child(read_only_marker(colors))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .flex()
-                .justify_end()
-                .font_family("monospace")
-                .text_sm()
-                .text_color(colors.dim_text)
-                .child(Text::new_inaccessible(elide(value, READ_ONLY_MAX_CHARS).into())),
-        )
+        .font_family("monospace")
+        .text_sm()
+        .text_color(colors.dim_text)
+        .child(Text::new_inaccessible(elide(value, READ_ONLY_MAX_CHARS).into()))
         .into_any_element()
-}
-
-/// Compact status text that distinguishes inert values from bordered,
-/// hoverable controls without changing the aligned value-column geometry.
-fn read_only_marker(colors: &SettingsColors) -> gpui::Div {
-    div()
-        .flex_none()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(colors.quiet_text)
-        .child(Text::new_inaccessible("READ ONLY".into()))
 }
 
 /// Route AccessKit text-input actions back into the settings entity.
@@ -3874,57 +3946,40 @@ fn a11y_step_handler(
     }
 }
 
-/// Quiet rectangular action silhouette with an accent seam.
+/// Quiet neutral action button: amber stays reserved for live state, so an
+/// idle action reads at the same volume as the rest of the page.
 fn action_button(text: &str, colors: &SettingsColors) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = colors.accent;
-    let hover_text = colors.accent_text;
+    let hover_bg = colors.control_hover_bg;
+    let hover_border = colors.strong_border;
     let pressed_bg = colors.control_pressed_bg;
-    let pressed_text = colors.text;
     div()
-        .id("settings-pill")
-        .h(px(40.0))
-        .px_4()
+        .id("settings-action-button")
+        .h(px(30.0))
+        .px(px(12.0))
         .flex()
         .items_center()
-        .rounded_xs()
+        .rounded(px(5.0))
         .border_1()
-        .border_color(colors.accent)
+        .border_color(colors.border)
         .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
-        .bg(colors.accent_soft)
-        .text_color(colors.accent)
+        .font_weight(FontWeight::MEDIUM)
+        .bg(colors.control_bg)
+        .text_color(colors.text)
         .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg).text_color(hover_text))
-        .active(move |style| style.bg(pressed_bg).text_color(pressed_text))
+        .hover(move |style| style.bg(hover_bg).border_color(hover_border))
+        .active(move |style| style.bg(pressed_bg))
         .child(text.to_owned())
 }
 
 fn settings_search_icon(color: Rgba) -> gpui::AnyElement {
+    // The magnifier from the embedded icon font — the same vocabulary as the
+    // sidebar page glyphs — rather than a hand-assembled circle and slash.
     div()
-        .size(px(20.0))
         .flex_none()
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .left(px(1.0))
-                .top(px(1.0))
-                .size(px(13.0))
-                .rounded_full()
-                .border_1()
-                .border_color(color),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(10.0))
-                .top(px(8.0))
-                .font_family("monospace")
-                .text_sm()
-                .font_weight(FontWeight::NORMAL)
-                .text_color(color)
-                .child("╲"),
-        )
+        .font_family("Symbols Nerd Font Mono")
+        .text_xs()
+        .text_color(color)
+        .child("\u{f002}")
         .into_any_element()
 }
 
@@ -3937,21 +3992,21 @@ fn settings_window_control(
     let (id, glyph, label, area, hover) = match kind {
         SettingsWindowControl::Minimize => (
             "settings-window-minimize",
-            "–",
+            "\u{f2d1}",
             "Minimize window",
             WindowControlArea::Min,
             colors.control_hover_bg,
         ),
         SettingsWindowControl::Maximize => (
             "settings-window-maximize",
-            "□",
+            "\u{f2d0}",
             "Maximize window",
             WindowControlArea::Max,
             colors.control_hover_bg,
         ),
         SettingsWindowControl::Close => (
             "settings-window-close",
-            "×",
+            "\u{f00d}",
             "Close window",
             WindowControlArea::Close,
             rgb(0x00c8_3030),
@@ -3963,14 +4018,15 @@ fn settings_window_control(
         .tab_stop(true)
         .role(Role::Button)
         .aria_label(label)
-        .w(px(48.0))
+        .w(px(40.0))
         .h_full()
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .window_control_area(area)
-        .text_sm()
+        .font_family("Symbols Nerd Font Mono")
+        .text_xs()
         .font_weight(FontWeight::NORMAL)
         .text_color(colors.quiet_text)
         .hover(move |style| style.bg(hover).text_color(colors.text))
@@ -4009,14 +4065,14 @@ fn stepper_button(
     let pressed_bg = colors.control_pressed_bg;
     div()
         .id("settings-stepper-button")
-        .w(px(48.0))
+        .w(px(36.0))
         .h_full()
         .flex()
         .items_center()
         .justify_center()
-        .text_lg()
+        .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if disabled { colors.quiet_text } else { colors.text })
+        .text_color(if disabled { colors.quiet_text } else { colors.dim_text })
         .when(disabled, |el| el.cursor_not_allowed().opacity(0.55))
         .when(!disabled, |el| {
             el.cursor_pointer()
@@ -4273,7 +4329,7 @@ fn remote_section(key: &str) -> &'static str {
     }
 }
 
-const READ_ONLY_MAX_CHARS: usize = 42;
+const READ_ONLY_MAX_CHARS: usize = 34;
 
 /// Stable per-key element id seed so GPUI can track click targets across
 /// re-renders without colliding between controls on the same page.

@@ -231,6 +231,8 @@ impl WindowLayout {
         if !remove_workspace_node(&mut self.root, workspace_id) {
             return false;
         }
+        // The survivors share the freed space evenly, matching pane close.
+        self.equalize_all_workspace_ratios();
 
         // If we removed the focused workspace, pick a new focus target.
         if self.focused_workspace == workspace_id {
@@ -325,10 +327,12 @@ impl WindowLayout {
         split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
     }
 
-    /// Split the focused workspace region, creating a new workspace alongside it.
+    /// Split the focused workspace region, creating a new workspace alongside
+    /// it, then re-equalize all region ratios.
     ///
     /// Returns the new workspace ID, or `None` if the focused workspace was
-    /// not found in the tree.
+    /// not found in the tree. Restoration goes through
+    /// [`Self::split_workspace_with_id`] instead, which preserves ratios.
     pub fn split_workspace(
         &mut self,
         direction: SplitDirection,
@@ -346,6 +350,7 @@ impl WindowLayout {
 
         if split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
         {
+            self.equalize_all_workspace_ratios();
             self.focused_workspace = new_id;
             Some(new_id)
         } else {
@@ -913,7 +918,8 @@ impl WindowLayout {
         set_workspace_ratio_in(&mut self.root, first_ws, second_ws, new_ratio)
     }
 
-    /// Set every split node's ratio to 0.5 recursively.
+    /// Reset every split ratio so all workspace regions get equal space,
+    /// weighting each split by the leaf count on either side.
     pub fn equalize_all_workspace_ratios(&mut self) {
         equalize_workspace_node(&mut self.root);
     }
@@ -1268,25 +1274,56 @@ mod tests {
         let ids = restored.workspace_ids_in_order();
         assert_eq!(ids, vec![ws_a, ws_b, ws_c]);
 
-        // Verify the tree structure via rects: A gets the full top half,
-        // B and C split the bottom half side-by-side.
+        // Verify the tree structure via rects. Interactive splits equalize,
+        // so A keeps a third of the height while B and C split the rest
+        // side-by-side.
         let viewport = Rect { x: 0.0, y: 0.0, width: 1000.0, height: 1000.0 };
         let rects = restored.compute_workspace_rects(viewport);
 
-        // A: full width, top half.
+        // A: full width, top third.
         let a_rect = rects.iter().find(|(id, _)| *id == ws_a).map(|(_, r)| *r).unwrap();
         assert!((a_rect.width - 1000.0).abs() < 1.0);
-        assert!((a_rect.height - 500.0).abs() < 1.0);
+        assert!((a_rect.height - 1000.0 / 3.0).abs() < 1.0);
 
-        // B: left half of bottom.
+        // B: left half of the remaining two thirds.
         let b_rect = rects.iter().find(|(id, _)| *id == ws_b).map(|(_, r)| *r).unwrap();
         assert!((b_rect.width - 500.0).abs() < 1.0);
-        assert!((b_rect.height - 500.0).abs() < 1.0);
+        assert!((b_rect.height - 2000.0 / 3.0).abs() < 1.0);
 
-        // C: right half of bottom.
+        // C: right half of the remaining two thirds.
         let c_rect = rects.iter().find(|(id, _)| *id == ws_c).map(|(_, r)| *r).unwrap();
         assert!((c_rect.width - 500.0).abs() < 1.0);
         assert!((c_rect.x - 500.0).abs() < 1.0);
+    }
+
+    /// Interactive splits auto-balance: three same-direction splits leave
+    /// every region with a third of the window.
+    #[test]
+    fn split_workspace_equalizes_ratios() {
+        let ws_a = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws_a, None);
+        layout.split_workspace(SplitDirection::Horizontal, None).expect("first split");
+        layout.split_workspace(SplitDirection::Horizontal, None).expect("second split");
+
+        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
+        for (_, rect) in layout.compute_workspace_rects(viewport) {
+            assert!((rect.width - 300.0).abs() < 1.0, "each region gets a third");
+        }
+    }
+
+    /// A removed region hands its space back evenly to the survivors.
+    #[test]
+    fn remove_workspace_reequalizes_ratios() {
+        let ws_a = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws_a, None);
+        layout.split_workspace(SplitDirection::Horizontal, None).expect("first split");
+        let ws_c = layout.split_workspace(SplitDirection::Horizontal, None).expect("second split");
+
+        assert!(layout.remove_workspace(ws_c));
+        let viewport = Rect { x: 0.0, y: 0.0, width: 900.0, height: 300.0 };
+        for (_, rect) in layout.compute_workspace_rects(viewport) {
+            assert!((rect.width - 450.0).abs() < 1.0, "survivors split the window evenly");
+        }
     }
 
     /// `to_tree` → `from_tree` preserves a non-default split ratio.

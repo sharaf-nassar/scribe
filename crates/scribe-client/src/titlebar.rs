@@ -433,6 +433,15 @@ pub fn badge_width_px(label: &str) -> f32 {
     px_units(label.chars().count() + 2) * CHAR_WIDTH + 16.0
 }
 
+/// Label columns left for a tab title once padding and the close button
+/// (4 columns), the context-% suffix, and the AI dot (6px + margin ≈ 2
+/// columns) are reserved. Under-reserving here makes the title overflow its
+/// slot at full tab width, which used to wrap it onto a hidden second line.
+fn title_columns(suffix_len: usize, has_ai_dot: bool) -> usize {
+    let dot_cols = if has_ai_dot { 2 } else { 0 };
+    TAB_COLS.saturating_sub(4).saturating_sub(suffix_len).saturating_sub(dot_cols)
+}
+
 /// Half-open tab ranges split at workspace-region boundaries.
 fn workspace_group_ranges(tabs: &[TabData]) -> Vec<(usize, usize)> {
     let mut groups = Vec::new();
@@ -537,7 +546,7 @@ impl TitlebarView {
     fn render_tab_children(&self, render: TabRender<'_>, cx: &mut Context<Self>) -> TabChildren {
         let TabRender { index, tab, foreground, id, focused, close_focused } = render;
         let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
-        let available = TAB_COLS.saturating_sub(4).saturating_sub(suffix_len);
+        let available = title_columns(suffix_len, tab.ai_indicator.is_some());
         let (display, _truncated) = tab_display_title(&tab.title, available);
         let ai_dot = tab
             .ai_indicator
@@ -635,7 +644,11 @@ impl TitlebarView {
 
         let tab_el = tab_el
             .children(children.ai_dot)
-            .child(div().flex_1().overflow_hidden().child(children.display))
+            // `truncate` keeps the title a single clipped line; without it a
+            // title that outgrows the flexed slot (the AI dot appearing, a
+            // narrow group bar) wraps to a second line inside the fixed-height
+            // tab and the visible text rides up.
+            .child(div().flex_1().truncate().child(children.display))
             .children(children.suffix)
             .children(children.close)
             .children(children.underline)
@@ -931,7 +944,8 @@ mod tests {
     use scribe_common::theme::minimal_dark;
 
     use super::{
-        TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px, workspace_group_ranges,
+        TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px, title_columns,
+        workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
@@ -980,6 +994,18 @@ mod tests {
             tabs.iter().map(|tab| tab.title.as_str()).collect::<Vec<_>>(),
             ["one", "two", "three"]
         );
+    }
+
+    // @lat: [[client#GPUI Titlebar#Title budget reserves AI dot columns]]
+    #[test]
+    fn title_budget_reserves_ai_dot_columns() {
+        // Without dot or suffix the title keeps every non-chrome column.
+        assert_eq!(title_columns(0, false), TAB_COLS - 4);
+        // The dot costs two columns, on top of any context suffix.
+        assert_eq!(title_columns(0, true), TAB_COLS - 6);
+        assert_eq!(title_columns(4, true), TAB_COLS - 10);
+        // Degenerate budgets clamp to zero instead of underflowing.
+        assert_eq!(title_columns(TAB_COLS, true), 0);
     }
 
     #[gpui::test]

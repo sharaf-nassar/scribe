@@ -1532,7 +1532,7 @@ It runs on the . The script used to open with a phase 0 that killed the client, 
 
 The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. The phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. Before the first open, the test seeds a 3520×2424 physical-pixel legacy geometry and requires the mapped client to use the compact 1040×720 fallback instead of filling the work area. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
 
-Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin, so a frame-relative gear click would land in the window manager's own title bar. The gear offset is derived from the titlebar's fixed 34px band and its 34/40px buttons, so a titlebar layout change fails the phase rather than missing silently.
+Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin, so a frame-relative gear click would land in the window manager's own title bar. The gear offset is derived from the bottom status bar's fixed 24px band and its 8px edge padding — the gear moved there from the titlebar during the status-bar consolidation — so a status-bar layout change fails the phase rather than missing silently.
 
 #### Workspace roots edit and apply live
 
@@ -2705,6 +2705,12 @@ The reconcile pass adopts whatever the refocus selects into the focused pane, so
 Only when the removed tab was its workspace's last does the selection fall back to the strip-global neighbour: the region is collapsing, and the reconcile pass re-points the selection at whichever region inherits focus.
 
 Every surviving tab keeps its own workspace through the fallback, which the test pins with `workspace_of` checks after both removals.
+
+#### Digit select is workspace-scoped
+
+`select_in_workspace` counts only the active workspace's tabs, so a `select_tab_N` digit lands on that region's Nth tab — never on the window-global strip position, which would always target the first region.
+
+With the selection in the second workspace, digit 2 must pick that workspace's second tab, digit 1 its first, a digit past the workspace's tab count is ignored, and reselecting the active tab reports no change so no redundant attach is issued.
 
 ### GPUI tab task labels
 

@@ -137,8 +137,8 @@ use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{
-        AiContextThresholds, AiTabCwd, SmartSelectionActionKind, SmartSelectionConfig,
-        StatusBarStatsConfig, load_config,
+        AiContextThresholds, AiTabCwd, PromptBarPosition, SmartSelectionActionKind,
+        SmartSelectionConfig, StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
     },
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId},
@@ -878,8 +878,8 @@ struct TerminalView {
     prompt_colors: PromptBarColors,
     /// Warn/danger bands and per-band colours for the AI context-window meter.
     context_thresholds: AiContextThresholds,
-    /// Whether `terminal.prompt_bar` is enabled in config.
-    prompt_bar_enabled: bool,
+    /// The `terminal.prompt_bar` config: enabled flag and strip position.
+    prompt_bar: TerminalPromptBarConfig,
     /// The window's live pane and workspace split layout. Every pane action
     /// mutates it and the render pass resolves it into the grid area's panes.
     shell: PaneShell,
@@ -892,9 +892,15 @@ struct TerminalView {
     /// Geometry of the focused pane, which is where a new tab or a split's
     /// session opens. Starts at the whole window and shrinks with the layout.
     focused_pane_size: TerminalSize,
-    /// The split tree last put on the wire, so a repaint that left the topology
-    /// alone does not re-report it. `None` until the first report.
-    last_reported_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
+    /// The split trees this view recently put on the wire, newest last, so a
+    /// repaint that left the topology alone does not re-report it. Bounded at
+    /// [`Self::REPORTED_TREE_HISTORY`]; empty until the first report. Kept as
+    /// a history rather than one value so a reconnect can tell "the server's
+    /// stored tree is one of ours" (a mid-session redial, possibly a few
+    /// queued reports behind) from "another client reshaped this window since
+    /// we last reported" — the stale-claim case that must adopt the server's
+    /// tree instead of imposing this view's old layout back onto it.
+    reported_trees: VecDeque<scribe_common::protocol::WorkspaceTreeNode>,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
@@ -1031,6 +1037,12 @@ struct RegionBarData {
 }
 
 impl TerminalView {
+    /// How many recently reported split trees are kept for the reconnect
+    /// authorship check in [`Self::adopt_server_topology`]. Deep enough to
+    /// cover a burst of layout edits queued during an outage; a server tree
+    /// older than this window is treated as another client's.
+    const REPORTED_TREE_HISTORY: usize = 8;
+
     /// Start the X11 active-window guard from the live window.
     ///
     /// The Xcb/Xlib window id only exists once the platform window has been
@@ -1138,7 +1150,7 @@ impl TerminalView {
         let terminal = &config.config().config.terminal;
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
-        let prompt_bar_enabled = terminal.prompt_bar.enabled;
+        let prompt_bar = terminal.prompt_bar.clone();
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, cx);
         // One initial pane: the shape the window has before every later split.
@@ -1161,12 +1173,12 @@ impl TerminalView {
             published_grid_area: None,
             prompt_colors: PromptBarColors::from(&chrome),
             context_thresholds,
-            prompt_bar_enabled,
+            prompt_bar,
             shell,
             pane_sizes: HashMap::new(),
             image_cache: Rc::new(RefCell::new(GpuiImageCache::new())),
             focused_pane_size: seed.terminal_size,
-            last_reported_tree: None,
+            reported_trees: VecDeque::new(),
             titlebar,
             chrome,
             terminal_size: seed.terminal_size,
@@ -1419,10 +1431,7 @@ impl TerminalView {
                 }
             }
             TitlebarEvent::CloseTab(index) => this.close_tab_at(this.strip_index(*index)),
-            // Equalize is its own reachability row, outside this entry point.
-            // It is named rather than folded into a `_` arm so a new titlebar
-            // event fails to compile here.
-            TitlebarEvent::Equalize => {}
+            TitlebarEvent::Equalize => this.equalize_layout(ctx),
         })
         .detach();
         bar
@@ -1487,7 +1496,7 @@ impl TerminalView {
         let terminal = &self.config.config().config.terminal;
         self.stats_config = terminal.status_bar_stats.clone();
         self.context_thresholds = terminal.ai_session.context_thresholds.clone();
-        self.prompt_bar_enabled = terminal.prompt_bar.enabled;
+        self.prompt_bar = terminal.prompt_bar.clone();
         self.smart_selection = compile_smart_selection(&terminal.smart_selection);
         let paste_confirmation = terminal.paste_confirmation;
         self.clipboard.gate.update(cx, |gate, _| gate.set_confirmation_enabled(paste_confirmation));
@@ -1785,7 +1794,7 @@ impl TerminalView {
             LayoutAction::NextTab => self.switch_tab(TabSessions::focus_next, cx),
             LayoutAction::PrevTab => self.switch_tab(TabSessions::focus_prev, cx),
             LayoutAction::SelectTab(index) => {
-                self.switch_tab(move |tabs| tabs.select(index), cx);
+                self.switch_tab(move |tabs| tabs.select_in_workspace(index), cx);
             }
             LayoutAction::CloseTab => self.close_active_tab(),
             LayoutAction::NewWindow => self.open_new_window(cx),
@@ -4009,6 +4018,16 @@ impl TerminalView {
         }
     }
 
+    /// Reset every workspace-region and pane split to equal space.
+    ///
+    /// Reached from the status-bar balance button and the titlebar equalize
+    /// icon; splits and closes re-equalize on their own.
+    fn equalize_layout(&mut self, cx: &mut Context<Self>) {
+        self.shell.equalize_all(cx);
+        tracing::info!("equalized the window layout");
+        self.after_layout_change(cx);
+    }
+
     /// Stop streaming a closed pane's session and tell the server to end it.
     fn close_pane_session(&mut self, session_id: SessionId) {
         self.detach_session(session_id);
@@ -4176,14 +4195,17 @@ impl TerminalView {
     /// wire payload.
     fn report_workspace_tree(&mut self, cx: &mut Context<Self>) {
         let tree = self.shell.wire_tree(cx);
-        if self.last_reported_tree.as_ref() == Some(&tree) {
+        if self.reported_trees.back() == Some(&tree) {
             return;
         }
         if let Err(error) = self.sink.report_workspace_tree(tree.clone()) {
             tracing::warn!(%error, "workspace tree report dropped: IPC writer closed");
             return;
         }
-        self.last_reported_tree = Some(tree);
+        if self.reported_trees.len() == Self::REPORTED_TREE_HISTORY {
+            self.reported_trees.pop_front();
+        }
+        self.reported_trees.push_back(tree);
         // Every layout change funnels through here, so this is also where the
         // cold-restart snapshot learns it is stale — the same trigger the winit
         // client debounced its own save on.
@@ -4241,7 +4263,13 @@ impl TerminalView {
             placements.iter().filter_map(|placement| placement.session_id).collect();
         self.pane_sizes.retain(|session, _| live.contains(session));
         for placement in placements {
-            let size = self.grid_size_for(placement.rect);
+            // The prompt strip lives inside the pane, so its rows come out of
+            // that pane's PTY alone — never out of the shared grid band.
+            let mut rect = placement.rect;
+            if let Some(session_id) = placement.session_id {
+                rect.height = (rect.height - self.pane_prompt_bar_height(session_id)).max(0.0);
+            }
+            let size = self.grid_size_for(rect);
             if placement.focused {
                 self.adopt_focused_pane_size(size);
             }
@@ -4304,22 +4332,42 @@ impl TerminalView {
     /// ships it back precisely so a freshly started client can rebuild its
     /// splits instead of flattening every session into one region — which is
     /// what an upgrade restart used to do. The parked tree is taken exactly
-    /// once and adopted only while the shell is still the untouched startup
-    /// layout ([`PaneShell::is_unused`]): a mid-session redial or list refresh
-    /// finds a live layout, and the user's own layout wins. Sessions named in
-    /// the tree but gone from the list are pruned by the shell, as on the cold
+    /// once and adopted when the shell is still the untouched startup layout
+    /// ([`PaneShell::is_unused`]) or when the tree is not one this view
+    /// recently reported (a stale claim; see below). Sessions named in the
+    /// tree but gone from the list are pruned by the shell, as on the cold
     /// path; sessions in the list but not in the tree stay ordinary tabs.
-    fn adopt_server_topology(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Returns `true` when a tree was adopted this frame, so the caller can
+    /// hold its retain/close pass until the tab strip catches up.
+    fn adopt_server_topology(&mut self, cx: &mut Context<Self>) -> bool {
         let parked = self.shared.server_topology.lock().ok().and_then(|mut slot| slot.take());
-        let Some((tree, live)) = parked else { return };
-        if !self.shell.is_unused(cx) || self.restore.replaying {
-            tracing::info!("window already has a layout; ignoring the server workspace tree");
-            return;
+        let Some((tree, live)) = parked else { return false };
+        if self.restore.replaying {
+            tracing::info!("cold-restart replay in flight; ignoring the server workspace tree");
+            return false;
+        }
+        // A live layout wins only while this view is the tree's author: a
+        // mid-session redial parks the very tree we last reported (possibly a
+        // few queued reports back), so keeping the local layout is keeping the
+        // truth. A parked tree we never reported means another client owned
+        // and reshaped this window since — a stale claim. Imposing our layout
+        // then is how a leftover pre-update client once closed every rebuilt
+        // workspace of the reconnecting window; adopt the server's tree
+        // instead.
+        if !self.shell.is_unused(cx) {
+            if self.reported_trees.contains(&tree) {
+                tracing::info!("window already has a layout; ignoring the server workspace tree");
+                return false;
+            }
+            tracing::warn!(
+                "another client reshaped this window; adopting the server tree over the stale local layout"
+            );
         }
         let visible = self.shell.adopt_server_tree(&tree, &live, cx);
         if visible.is_empty() {
             tracing::info!("server workspace tree pruned to nothing; keeping the flat layout");
-            return;
+            return false;
         }
         // The reader filled the strip in `SessionList` order, which is not the
         // layout's left-to-right region order; regroup so each workspace's tab
@@ -4370,6 +4418,7 @@ impl TerminalView {
         self.report_workspace_tree(cx);
         self.restore.mark_layout_dirty();
         cx.notify();
+        true
     }
 
     /// Reconcile the pane layout with the sessions the server actually has.
@@ -4386,7 +4435,7 @@ impl TerminalView {
         // (re)connect it rebuilds regions and splits that everything below —
         // the root-region adoption, the metadata drain, and the active-session
         // placement — then operates on instead of flattening.
-        self.adopt_server_topology(cx);
+        let adopted = self.adopt_server_topology(cx);
         // The root region must adopt the active server id before metadata is
         // drained: `SessionCreated` and its following `WorkspaceInfo` can both
         // land before one frame, and applying the latter against the original
@@ -4412,7 +4461,12 @@ impl TerminalView {
                 )
             },
         );
-        if !live.is_empty() {
+        // The retain pass is skipped on the frame an adoption rebuilt the
+        // regions: the reader parks the tree before it rebuilds the strip, so
+        // this frame's strip can predate the adopted layout, and judging fresh
+        // regions against a stale strip is how workspaces get closed on the
+        // server they were just restored from. Next frame both are current.
+        if !live.is_empty() && !adopted {
             self.retire_scrollbars(&live);
             let retired = self.shell.retain_sessions(&live, &workspaces_with_tabs, cx);
             for workspace_id in retired.closed_regions {
@@ -4821,13 +4875,37 @@ impl TerminalView {
                 {
                     element = element.with_ime(ime);
                 }
-                let mut pane = pane.child(element.paint());
+                let mut pane = self.compose_pane_content(pane, element.paint(), session_id);
                 if let Some(color) = ai_border {
                     pane = pane.children(ai_pane_border(placement.rect, color));
                 }
                 pane.into_any_element()
             })
             .collect()
+    }
+
+    /// Stack a pane's grid and its optional prompt strip inside the pane div.
+    ///
+    /// The prompt strip is pane chrome: it renders inside the pane that runs
+    /// the AI session, above or below that pane's grid per
+    /// `terminal.prompt_bar_position`, never spanning its neighbours.
+    fn compose_pane_content(
+        &self,
+        pane: gpui::Div,
+        grid: impl IntoElement,
+        session_id: Option<SessionId>,
+    ) -> gpui::Div {
+        let colors = self.prompt_colors.with_opacity(self.opacity);
+        let strip = session_id.and_then(|s| self.prompt_model_for(s)).map(|model| {
+            prompt_bar::render(&model, &colors, f32::from(CELL_HEIGHT), None).into_any_element()
+        });
+        let grid_slot = div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid);
+        let pane = pane.flex().flex_col();
+        if self.prompt_bar.position == PromptBarPosition::Top {
+            pane.children(strip).child(grid_slot)
+        } else {
+            pane.child(grid_slot).children(strip)
+        }
     }
 
     /// Paint each live pane divider above the grids it separates.
@@ -6655,6 +6733,16 @@ impl TerminalView {
                 tracing::debug!(?error, "settings gear activation dropped with its view");
             }
         });
+        // The balance button only earns its corner once there is more than
+        // one surface to balance.
+        let equalize_view = cx.entity().downgrade();
+        let equalize_action: status_bar::UpdateActionHandler =
+            Box::new(move |_window: &mut Window, app: &mut App| {
+                if let Err(error) = equalize_view.update(app, TerminalView::equalize_layout) {
+                    tracing::debug!(?error, "balance button activation dropped with its view");
+                }
+            });
+        let on_equalize = (self.shell.pane_count(cx) >= 2).then_some(equalize_action);
         status_bar::render(
             &model,
             window_chrome::STATUS_BAR_HEIGHT,
@@ -6662,24 +6750,28 @@ impl TerminalView {
             status_bar::StatusBarActions {
                 update_focus: Some(&self.focus.update),
                 on_update: Some(on_update),
+                on_equalize,
                 on_settings: Some(on_settings),
             },
         )
         .into_any_element()
     }
 
-    /// Build the attached pane's prompt-bar model, or `None` when the bar is
-    /// disabled, no pane is attached, or that pane has no prompts yet.
+    /// Build one pane's prompt-bar model, or `None` when the bar is disabled
+    /// or that pane's session has no prompts yet.
+    ///
+    /// The bar is per-pane chrome: [`Self::render_panes`] calls this for every
+    /// visible pane so each AI session's prompts render inside the pane that
+    /// runs it, never across its neighbours.
     ///
     /// The context meter is attached whenever the tracker holds a percentage for
     /// the pane, independent of the warn band — the prompt bar is the surface
     /// that always shows the Ok band, while the tab suffix suppresses it (see
     /// [`Self::sync_tab_context_suffix`]).
-    fn build_prompt_model(&self) -> Option<prompt_bar::PromptBarModel> {
-        if !self.prompt_bar_enabled {
+    fn prompt_model_for(&self, session_id: SessionId) -> Option<prompt_bar::PromptBarModel> {
+        if !self.prompt_bar.enabled {
             return None;
         }
-        let session_id = (*self.shared.active_session.lock().ok()?)?;
         let ai = self.shared.ai.lock().ok()?;
         let data = ai.prompts.get(&session_id)?;
         let indicator = ai.tracker.context_for(session_id).map(|percent| {
@@ -6692,13 +6784,30 @@ impl TerminalView {
         prompt_bar::build_model(data, std::time::SystemTime::now(), indicator)
     }
 
+    /// Height of the prompt strip `session_id`'s pane reserves, or zero when
+    /// the feature is off or the session has no prompts.
+    ///
+    /// [`Self::publish_pane_sizes`] subtracts this from the pane rect before
+    /// deriving the PTY grid, so the terminal is exactly the rows the strip
+    /// leaves visible — the winit client's resize-on-bar-change behaviour.
+    fn pane_prompt_bar_height(&self, session_id: SessionId) -> f32 {
+        if !self.prompt_bar.enabled {
+            return 0.0;
+        }
+        let Ok(ai) = self.shared.ai.lock() else { return 0.0 };
+        ai.prompts.get(&session_id).map_or(0.0, |data| {
+            prompt_bar::prompt_bar_height(data.prompt_count, f32::from(CELL_HEIGHT))
+        })
+    }
+
     /// The invisible canvas that measures the grid band and republishes the
     /// pane geometry whenever the band moved.
     ///
     /// The band's height is whatever the chrome bands leave over, which no
-    /// arithmetic on the window size can predict (the prompt strip comes and
-    /// goes with the pane's prompts), so the painted rect is the only honest
-    /// source for the cell counts the server is told about.
+    /// arithmetic on the window size can predict, so the painted rect is the
+    /// only honest source for the cell counts the server is told about. (The
+    /// prompt strip is pane-internal chrome and never moves this band; its
+    /// height is folded in per pane by [`Self::publish_pane_sizes`].)
     ///
     /// The rect lands during prepaint, i.e. *after* the `render` that built
     /// this canvas already ran [`Self::sync_grid_geometry`] against the
@@ -6923,15 +7032,14 @@ impl Render for TerminalView {
         self.reconcile_panes(cx);
         self.sync_equalize_visibility(cx);
         self.sync_grid_geometry(cx);
+        // A prompt arriving or clearing changes one pane's strip height without
+        // moving the grid band, so the band probe never notices; republishing
+        // here keeps that pane's PTY exactly the rows the strip leaves visible.
+        // Per-session no-change checks inside make this idempotent.
+        self.publish_pane_sizes(cx);
         let ime = self.sync_ime(cx);
         let grid = self.render_grid(ime, cx);
         let status_bar = self.render_status_bar(cx);
-        let prompt_model = self.build_prompt_model();
-        let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
-        let prompt_strip = prompt_model.map(|prompt| {
-            prompt_bar::render(&prompt, &prompt_colors, f32::from(CELL_HEIGHT), None)
-                .into_any_element()
-        });
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
         let remote_picker = self.build_remote_picker_overlay();
@@ -7005,7 +7113,6 @@ impl Render for TerminalView {
             .flex_col()
             .child(self.titlebar.clone())
             .child(grid)
-            .children(prompt_strip)
             // `flex_none` on every band below the grid: the grid is the one
             // flex-grown child, so without it a window shorter than the grid's
             // painted height would shrink the bands away instead of clipping
@@ -8566,10 +8673,10 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
         ServerMessage::AiStateCleared { session_id } => {
             queue_ai_notice(ctx, AiNotice::Cleared { session_id });
-            update_ai_chrome(ctx, |ai| {
-                ai.tracker.remove(session_id);
-                ai.tracker.clear_context(session_id);
-            });
+            // `forget`, not just the tracker halves: the provider exiting must
+            // also take the prompt bar down with it, or the pane keeps a stale
+            // prompt history the next conversation never clears.
+            update_ai_chrome(ctx, |ai| ai.forget(session_id));
         }
         ServerMessage::PromptReceived { session_id, text, .. } => {
             let at = std::time::SystemTime::now();

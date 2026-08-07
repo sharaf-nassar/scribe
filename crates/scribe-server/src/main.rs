@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,19 +236,14 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     // Read back from the manager rather than from the payload: the restore
     // admits at most `MAX_SESSIONS` sessions, and a workspace tree that still
     // named a refused one would advertise a session nothing can attach to.
-    let live_session_ids: HashSet<_> = session_manager
-        .pending_session_ids()
-        .await
-        .into_iter()
-        .map(|(session_id, _workspace_id)| session_id)
-        .collect();
+    let live_sessions = session_manager.pending_session_ids().await;
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::restore_from_handoff(
             cfg.workspace_roots,
             &state.workspaces,
             state.workspace_tree,
             &state.windows,
-            &live_session_ids,
+            &live_sessions,
         )));
 
     info!("session restoration complete — starting IPC server");

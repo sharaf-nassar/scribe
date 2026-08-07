@@ -155,6 +155,19 @@ fn last_tab_of_a_workspace_falls_back_across_the_strip() {
     assert_eq!(tabs.workspace_of(ids[0]), Some(ws_a));
 }
 
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Digit select is workspace-scoped]]
+#[test]
+fn digit_select_is_workspace_scoped() {
+    // Selection sits on b1, so digit 2 must land on b2 — not a2, the strip's
+    // second tab.
+    let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
+    assert_eq!(tabs.select_in_workspace(1), Some(ids[3]));
+    assert_eq!(tabs.active_workspace(), Some(ws_b));
+    assert_eq!(tabs.select_in_workspace(0), Some(ids[2]), "digit 1 targets b1");
+    assert_eq!(tabs.select_in_workspace(2), None, "digits past the workspace are ignored");
+    assert_eq!(tabs.select_in_workspace(0), None, "reselecting the active tab is a no-op");
+}
+
 #[test]
 fn session_list_rebuild_preserves_active_session() {
     let (mut tabs, workspace_id, ids) = strip(3);

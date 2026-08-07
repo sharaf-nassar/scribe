@@ -209,6 +209,25 @@ impl TabSessions {
         self.active_session()
     }
 
+    /// Focus the `index`-th tab (0-based) of the active workspace.
+    ///
+    /// The strip is window-global, so `select_tab_N` shortcuts must not index
+    /// it directly: with two workspaces the low digits would always land in
+    /// the first region's tabs. This counts only tabs filed under the active
+    /// workspace — the one holding the focused pane, kept current by every
+    /// focus move — and ignores out-of-range digits like [`Self::select`].
+    pub fn select_in_workspace(&mut self, index: usize) -> Option<SessionId> {
+        let workspace_id = self.active_workspace()?;
+        let strip_index = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.workspace_id == workspace_id)
+            .nth(index)
+            .map(|(i, _)| i)?;
+        self.select(strip_index)
+    }
+
     /// Move a tab within the strip while keeping the same session active.
     ///
     /// Returns `false` for an out-of-range or unchanged move so callers can

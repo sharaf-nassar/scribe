@@ -10,7 +10,7 @@ The retired GTK/wry settings application is gone. `crates/scribe-client/src/sett
 [[crates/scribe-client/src/settings/window.rs#open_settings_window]] is the only
 place the window is created. It sets the app id `scribe-client` so panels that
 match by WM_CLASS group it with the terminal window, titles it `Scribe
-Settings` with `appears_transparent` so the custom 54px titlebar replaces the
+Settings` with `appears_transparent` so the custom 38px titlebar replaces the
 system one, and passes the geometry described in
 [[settings#State Persistence]] — including `window_min_size`, which the
 compositor keeps enforcing during an interactive resize.
@@ -37,8 +37,8 @@ The window background stays `WindowBackgroundAppearance::Opaque`. Resize does
 not need transparency (both backends delegate the drag to the compositor), and
 an opaque window is the safer default on an X11 session with no compositor, so
 the gutter is painted as deliberate chrome instead of Zed-style drop shadow: a
-`#0c0d0e` graphite matte one step below every interior surface, with the body
-carrying a one-pixel `#4f4f51` seam against it. It reads as a window frame
+`#0b0c0e` matte one step below the interior ground, with the body carrying a
+one-pixel white-alpha hairline seam against it. It reads as a window frame
 rather than as stray padding.
 
 ### Resize contract
@@ -240,9 +240,9 @@ Loading shows a non-blocking "Loading releases…" message (class `is-loading`).
 
 ## Sidebar Footer
 
-The settings sidebar footer displays the running Scribe version, sourced at build time from `env!("CARGO_PKG_VERSION")` and injected into the webview via  as `window.SCRIBE_BOOTSTRAP.version`.
+The settings sidebar footer displays the running Scribe version as quiet monospace text pinned under the contents list, compiled in from `env!("CARGO_PKG_VERSION")`.
 
-The `settings.js` `DOMContentLoaded` handler reads that value and writes `Scribe v<version>` into `#sidebar-footer`; a missing or falsy value degrades to just `Scribe` so the footer never shows a broken interpolation. The injection runs as a pre-page-load script so the bootstrap object is already defined before any other JS on the page runs.
+The GPUI window renders `Scribe v<version>` directly in [[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_nav]]; because the string is baked at compile time there is no runtime injection step and no degraded state to handle.
 
 ## Singleton
 
@@ -265,42 +265,51 @@ legacy physical-pixel geometry migrates to the compact centered composition.
 
 The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process, opened from a running terminal window or from `scribe-client --settings`.
 
-### Native Precision presentation
+### Typeset Ink presentation
 
-The settings window uses a spacious Obsidian Amber native workspace so repeated configuration work scans quickly without changing the underlying feature set.
+The settings window is set like technical documentation: one unified ink ground, hierarchy carried by type and spacing instead of boxed rows, and amber spent only on live state.
 
 [[crates/scribe-client/src/settings/window.rs#SettingsColors#resolve]] fixes the
-settings palette independently from the active terminal theme: `#161719`
-canvas, `#1e1f20` navigation, `#272829` controls, `#4f4f51` strong seams,
-`#efede8` text, `#979692` secondary text, and `#f5b83a` amber. Persistent
-surfaces stay flat; 2–4px corners, one-pixel rules, and monospace technical
-values distinguish controls without cards, shadows, or decorative chrome.
+settings palette independently from the active terminal theme: `#141518`
+unified ground, `#1d1f24` raised controls, `#101114` engraved text inputs,
+`#22242a` menus, white-alpha hairlines (8% seams, 12% emphasis), `#e9e8e4`
+text, `#a6a5a0` secondary, `#83827b` quiet, and `#f5b83a` amber reserved for
+selection glyphs, focused inputs, the on-state, and status. Validation
+failures use a separate `#e0584c` error ink so a rejected edit never scans
+like live state, and the status line speaks product language ("Saved
+Ligatures.", "Workspace root added.") via `commit_status` rather than
+echoing dotted config keys. Rows carry no rules; hovering washes a row in a
+faint bled pill, and the only structural hairlines are the titlebar seam,
+the sidebar seam, and control outlines.
 
-The compact 32px custom titlebar centers `Scribe Settings` between symmetric
-144px chrome reservations, matching the native macOS traffic-light band while
-keeping clear of those buttons and the three right-side actions. Below it, an
-independently scrollable 314px sidebar groups the eleven real pages under
-Terminal, Intelligence, Workflow, System, and Connectivity.
-Non-focusable group labels do not enter keyboard traversal; each 44px page row
-uses a normalized outline glyph and selected rows use a warm fill with a 4px
-amber seam. Inset separators and first-group top air establish group rhythm.
+The 38px titlebar shares the ground and centers `Scribe Settings` between a
+120px macOS traffic-light reservation and three 40px icon-glyph window
+controls. Below it a 232px sidebar leads with the search field, scrolls its
+contents list independently, and ends in a monospace `Scribe v<version>`
+footer. The eleven pages group under Terminal, Intelligence, Workflow,
+System, and Connectivity; groups separate by air under quiet uppercase
+labels, and each 32px inset row rounds at 5px with a neutral selected wash
+whose page glyph turns amber. Non-focusable group labels do not enter
+keyboard traversal.
 
-A real AccessKit search input at the top of the content pane receives focus
-with Ctrl+K and filters page names, summaries, section names, control labels,
-and dotted keys. Matching pages remain navigable, and matching controls filter
+The real AccessKit search input at the top of the sidebar receives focus with
+Ctrl+K and filters page names, summaries, section names, control labels, and
+dotted keys. Matching pages remain navigable, and matching controls filter
 inside the selected page. Its visual placeholder disappears while the empty
 field is focused, while the AccessKit placeholder remains available to
 assistive technology.
 
-Content uses 46px gutters, an 18px bold page title, 14px summary and body
-copy, explicit "Changes apply instantly" status, 18px section headings, and
-54px rows. A
-stable 438px right column aligns values: choices and read-only fields are 42px
-high, steppers are 207×38px with 48px actions, switches are 52×30px, and
-actions are 40px high. Switch tracks and warm-light knobs are fully rounded.
-Read-only text, keybinding, and gated values use a muted fill, open bottom rule,
-and explicit `READ ONLY` marker instead of an interactive control outline.
-Shared colour fields use an interactive RGB editor with a live swatch.
+Content uses 44px gutters and caps every row at an 840px measure. The page
+header pairs a 20px bold title with a monospace `config.toml · live apply`
+corner note (omitted on the server-driven Releases page) over a 14px summary.
+Section heads are quiet uppercase caps with more air above than below, and
+rows run 46px (62px with a description) against a stable 300px value column:
+choices are 240×30 with an anchored 30px-row menu, steppers 152×30 with 36px
+actions, switches 38×22 fully rounded with an amber on-fill, text inputs and
+color editors 30px tall on the engraved inset, and actions 30px neutral
+outline buttons. Read-only, keybinding, and gated values render as plain
+right-aligned dim monospace — the missing control outline is the read-only
+mark, and AccessKit still says `Read-only value` explicitly.
 
 At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 

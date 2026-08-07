@@ -18,8 +18,9 @@
 #   * the grid viewport is tall enough for all ROWS rows;
 #   * the grid's LAST row carries ink after the pane is filled;
 #   * the window status bar carries ink at the bottom of the window;
-#   * a real `PromptReceived` hook makes the prompt strip appear between the
-#     grid and status bar WITHOUT pushing the bar off screen.
+#   * a real `PromptReceived` hook makes the prompt strip appear INSIDE the
+#     pane, at the top of the grid band (`prompt_bar_position` defaults to
+#     Top), without moving the status bar.
 #
 # Every crop is taken from `import -window`, which captures the client window's
 # own pixels, so all offsets below are window-relative and no WM decoration can
@@ -178,10 +179,12 @@ echo "  status bar ink: $BAR_INK"
 echo "PHASE 3 PASS: status bar renders at the window bottom"
 
 # ── Phase 4: a real prompt makes the prompt strip appear, bands survive ───────
-# One prompt row is max(cell_height + 10, 28) = 28 px (prompt_bar.rs), taken out
-# of the flex-grown grid — the bands below it must not move off screen.
+# One prompt row is max(cell_height + 10, 28) = 28 px (prompt_bar.rs). The
+# strip is pane-internal chrome: with `prompt_bar_position` at its default
+# (Top) it renders at the top edge of the pane's grid band and its rows come
+# out of that pane's PTY — the grid band and status bar do not move.
 PROMPT_H=28
-PROMPT_Y=$(( BAR_Y - PROMPT_H ))
+PROMPT_Y="$GRID_Y"
 crop_band /output/chrome-bands-01-filled.png /output/chrome-bands-prompt-before.png \
     "$PROMPT_Y" "$PROMPT_H"
 
@@ -198,16 +201,15 @@ PROMPT_DELTA=$(band_delta /output/chrome-bands-prompt-before.png \
 BAR_AFTER=$(band_ink /output/chrome-bands-02-prompt.png "$BAR_Y" "$BAR_H")
 echo "  prompt band ink: $PROMPT_INK   repaint delta: $PROMPT_DELTA"
 echo "  bar ink after prompt: $BAR_AFTER"
-# The band under the grid was grid content before the prompt arrived, so ink
-# alone proves nothing: the band has to have REPAINTED, and the client has to
-# have logged the notice that made it repaint.
+# The band at the top of the grid was terminal rows before the prompt arrived,
+# so ink alone proves nothing: the band has to have REPAINTED into the strip.
 [ "${PROMPT_INK:-0}" -ge "$INK_MIN" ] \
     || fail "the prompt strip (y=$PROMPT_Y) never rendered"
 [ "${PROMPT_DELTA:-0}" -ge "$PROMPT_DELTA_MIN" ] \
     || fail "the band at y=$PROMPT_Y did not repaint: no prompt strip appeared"
 [ "${BAR_AFTER:-0}" -ge "$INK_MIN" ] \
     || fail "the prompt strip pushed the window status bar off screen"
-echo "PHASE 4 PASS: prompt strip renders above the status bar, neither is pushed off"
+echo "PHASE 4 PASS: prompt strip renders inside the pane, status bar undisturbed"
 
 echo ""
 echo "PASS: window chrome bands are all on screen at the default window size"

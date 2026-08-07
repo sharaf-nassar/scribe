@@ -106,6 +106,12 @@ Metadata events trigger title, provider task label, CWD, AI state, prompt text, 
 
 A shell prompt returning (OSC 133 `A`) while mouse-reporting or focus-event modes are still active means the foreground program died without cleanup — e.g. a force-closed SSH session whose remote TUI never sent DECRST, which otherwise turns every mouse move into `\x1b[<…M` garbage echoed at the prompt until the user runs `reset`.  injects DECRST for the active modes (1000/1002/1003 protocols, 1005/1006 encodings, 1004 focus) into both the server Term and the client-bound `PtyOutput` stream, so attached clients stop forwarding mouse events and replay snapshots no longer restore the stale modes. Bracketed paste and application cursor/keypad are deliberately untouched (shells manage those across prompts), a lingering encoding bit alone does not fire, and a `CommandStart` (133 `C`) later in the same chunk suppresses the reset so a type-ahead-launched TUI that just re-enabled mouse reporting is not clobbered ().
 
+#### Focus State On Reporting Enable
+
+Focus reports become PTY focus events only for sessions with DECSET 1004 active, so [[crates/scribe-server/src/ipc_server.rs#handle_focus_changed]] also records each report in `LiveSession.has_focus`, and the reader replays that state when the mode turns on.
+
+An application that enables focus reporting *after* the client's last focus report — an AI CLI doing so during startup in the already-focused pane — would otherwise never learn it holds focus; Claude Code gates its own input-box cursor on focus-in, so it drew none until some unrelated focus change (the reason clicking into an already-focused Claude pane showed no cursor). After each chunk, [[crates/scribe-server/src/ipc_server.rs#deliver_focus_state_when_reporting_enables]] latches `FOCUS_IN_OUT` against the previous chunk's value via [[crates/scribe-server/src/ipc_server.rs#focus_mode_newly_enabled]] and, on the off→on edge, writes `\x1b[I` or `\x1b[O` — mirroring tmux, which reports the current state at enable time. It runs after the stale-mode reset so a 1004 that reset just cleared is not treated as newly enabled.
+
 Before persisting and broadcasting `AiStateChanged`,  folds optional metadata (`context`, `model`, `tool`, `agent`, `conversation_id`) from the previously-stored live-session state into the incoming event when those fields are `None` and the provider matches. State-only hook OSC sequences (e.g. `ClaudeState=permission_prompt`) therefore preserve the live context-window fill set by the statusLine producer instead of clobbering it.
 
 Shell integration can also emit OSC 1337 `ScribeContext` metadata describing whether the current pane is remote, which host it is attached to, and the current tmux session name. The server stores that session context in the live session registry and rebroadcasts it on reconnect so the client can label panes before the next prompt redraw.
@@ -219,6 +225,12 @@ Sessions join a workspace at creation, `MoveSession` re-keys one into another wo
 
 The client's workspace-split flow seeds its session through the old workspace and re-keys it with `ClientMessage::MoveSession` once the new region's pane adopts it — [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_session]] moves the membership and the live-session record follows, so `SessionList`, CWD auto-naming, and handoff persistence all agree with the client's regions. A collapsed region's `CloseWorkspace` removes the workspace via [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#close_workspace]]. Both variants were protocol TODOs the server silently dropped until 2026-08: every split workspace stayed empty server-side, so an upgrade handoff restored sessions pooled into each window's first workspace and the split layout flattened.
 
+### Destructive close refusal
+
+`CloseWorkspace` naming a workspace that still has sessions is refused rather than honoured: a truthful close only arrives after the region's sessions ended, so a close with live members means the sender's layout is stale.
+
+The failure this guards against is real: a leftover pre-update client redialing across a server upgrade imposed its collapsed layout back onto a reconnecting window and closed seven rebuilt workspaces in one burst, unlinking their live sessions into an unlisted limbo no `SessionList` could show. [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#close_workspace]] now removes only an empty workspace and logs a refusal warning otherwise; the stale sender at worst renders fewer regions than exist, which the next `SessionList` corrects.
+
 ### Auto-Naming
 
 When a session's CWD changes (via OSC 7 or /proc fallback), the server matches it against configured workspace roots and derives the workspace name and project root.
@@ -266,6 +278,12 @@ Each session also carries the child's PID and an additive `#[serde(default)]` ch
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
 
 The per-window workspace tree rides separately in  and carries the per-leaf `active_tab_index` (also `#[serde(default)]` for cross-version compatibility — a pre-active-tab-aware sender degrades to 0, and the next client report restores the correct value). This is why focused-tab state survives `--upgrade` without a dedicated per-window state struct.
+
+#### Membership self-healing
+
+After rebuilding its maps from the handoff payload, [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#restore_from_handoff]] re-files every restored session those maps lost, using the workspace id the session's own record carries.
+
+The maps and the per-session records are separate truths, and only the maps rot: membership lost in one server generation (historically to a stale client's destructive closes) used to survive every later handoff, because restore trusted the maps alone — an unmapped session appears in no window's `SessionList` and is unreachable forever even though its shell keeps running. Healing re-adds the membership, auto-creates a workspace the maps lost entirely, and assigns windowless sessions to a sibling's window or the busiest restored window, so orphans resurface as ordinary tabs the user can re-file instead of leaking invisibly.
 
 ### Session Replay Encoding
 
@@ -599,7 +617,7 @@ The apply file is rendered per `ShellKind` because a single POSIX body restores 
 
 `tests_apply` pins the rendered text per dialect and `tests_apply_shells` round-trips a quote-bearing, multi-line, and backslash-bearing value through each real interpreter — reading the probes back out of a child process, so the assertion covers export and not merely assignment. Text assertions alone cannot catch this finding class: the pwsh case additionally asserts that the same body under a `.sh` name applies nothing.
 
-Round-tripping through real interpreters has to stay hermetic, because pwsh resolving that misnamed file as a native command hands the path to `xdg-open` and opened an editor window on whatever desktop ran `cargo test`. The test-only `desktop_isolation::seal_child` in `shell_integration.rs` therefore strips `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` from every shell child a test spawns and puts a scratch directory of no-op opener stubs ahead of the inherited `PATH`, so the assertion still observes "applies nothing" without the fallback reaching a session.
+Round-tripping through real interpreters has to stay hermetic, because pwsh resolving that misnamed file as a native command hands the path to `xdg-open` and opened an editor window on whatever desktop ran `cargo test`. The test-only `desktop_isolation::seal_child` in `shell_integration.rs` therefore strips `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` from every shell child a test spawns and puts a scratch directory of no-op opener stubs ahead of the inherited `PATH`, so the assertion still observes "applies nothing" without the fallback reaching a session. The scrub also drops `TERM_PROGRAM` and the `SCRIBE_*` live-session exports: a suite run from a terminal *inside* Scribe otherwise leaks them into the drivers, where `SCRIBE_ENV_PERSIST=0` (env persistence disabled in settings) makes the fish spawn gate return before installing any capture state and the emit tests see zero helper calls. A driver that needs one of these sets it explicitly after sealing, which overrides the removal.
 
 [[crates/scribe-server/src/session_manager.rs#runtime_dir_for_env_apply|runtime_dir_for_env_apply]] computes the per-flavor staging directory under `$XDG_RUNTIME_DIR`; absence of that env var disables the apply path (the user-runtime tmpfs is the only sound location for ephemeral 0o600 secrets). The flavor segment matches [[crates/scribe-common/src/app.rs#AppIdentity#slug|AppIdentity::slug]] so stable and `scribe-dev` cannot collide on the same login user. [[crates/scribe-server/src/session_manager.rs#ensure_runtime_subdir|ensure_runtime_subdir]] creates the directory tree with `create_dir_all` and re-applies 0o700 on the leaf for idempotency. [[crates/scribe-server/src/session_manager.rs#write_private_owner_only|write_private_owner_only]] writes the body through `OpenOptions::mode(0o600)` and `fsync`s before returning so the integration script never races a partially-written file.
 
