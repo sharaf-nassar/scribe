@@ -53,12 +53,21 @@ SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
 SETTINGS_CHANGE_MIN="${SETTINGS_CHANGE_MIN:-100}"
 
 # Status bar geometry, from crates/scribe-client/src/status_bar.rs: the gear
-# moved from the titlebar into the `default_status_bar_height`=24px band at
-# the window bottom, where `settings_gear` renders it as the band's last
-# child inside the px_2 (8px) edge padding. A status-bar layout change turns
+# moved out of the retired titlebar button into the
+# `window_chrome::STATUS_BAR_HEIGHT`=24px band at the window bottom, the last
+# `flex_col` child of the window root, where `settings_gear` renders as the
+# band row's last child inside its px_2 (8px) edge padding.
+#
+# The gear div's right edge is therefore `width - 8`, and its left edge is
+# `width - 8 - (8 + glyph_advance)` — pl_2 plus the `⚙` advance. Clicking
+# `width - 8 - GEAR_INSET` with an inset between 1 and 15 lands inside the
+# div's hit rect for ANY glyph advance, so the phase does not depend on how
+# the container's font measures U+2699. Half the 12px `text_xs` cell keeps
+# the click on the painted glyph as well. A status-bar layout change turns
 # into a failing phase here rather than a silent miss.
 STATUS_BAR_HEIGHT=24
 STATUS_BAR_EDGE_PADDING=8
+GEAR_INSET=6
 COMPACT_SETTINGS_WIDTH=1040
 COMPACT_SETTINGS_HEIGHT=720
 SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"
@@ -122,7 +131,7 @@ wait_for_chooser_windows() {
     done
 }
 
-# Focus the terminal window and cache its on-screen geometry, so titlebar
+# Focus the terminal window and cache its on-screen geometry, so window-chrome
 # coordinates can be replayed as absolute XTEST pointer moves.
 #
 # Re-focusing before every phase is load-bearing: the settings window takes the
@@ -138,9 +147,9 @@ focus_terminal() {
         || xdotool windowfocus --sync "$wid" 2>/dev/null || true
     sleep 0.5
     # `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window
-    # into a decorated frame, and xdotool reports that frame's origin. The gear
-    # sits 17px below the *client* origin, so a frame-relative click would land
-    # in the window manager's own title bar instead of the button.
+    # into a decorated frame, and xdotool reports that frame's origin and size.
+    # The gear sits in the last 24px of the *client* box, so a frame-relative
+    # click would be offset by the decoration and miss the band entirely.
     local info
     info=$(xwininfo -id "$wid")
     TERM_X=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
@@ -560,7 +569,7 @@ echo "PHASE 4 PASS: the palette row reached the settings handler"
 # the same open-or-focus path as the chord and the palette row.
 FOCUSES_BEFORE=$(count_log "focused the open settings window")
 focus_terminal
-GEAR_X=$(( TERM_W - STATUS_BAR_EDGE_PADDING - 6 ))
+GEAR_X=$(( TERM_W - STATUS_BAR_EDGE_PADDING - GEAR_INSET ))
 GEAR_Y=$(( TERM_H - STATUS_BAR_HEIGHT / 2 ))
 echo "clicking the gear at window-relative +${GEAR_X}+${GEAR_Y} (client origin ${TERM_X},${TERM_Y})"
 click_terminal_at "$GEAR_X" "$GEAR_Y"
