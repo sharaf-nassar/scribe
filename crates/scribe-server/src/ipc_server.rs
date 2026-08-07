@@ -1270,6 +1270,13 @@ struct PtyReaderState {
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared scrollback limit for trimming duplicate AI redraw history.
     scrollback_lines: Arc<AtomicUsize>,
+    /// Whether a client's last focus report named this session as focused,
+    /// shared with [`LiveSession`]. Read when the application enables focus
+    /// reporting so it learns the state it missed.
+    has_focus: Arc<AtomicBool>,
+    /// `FOCUS_IN_OUT` as of the previous chunk, so the reader can deliver the
+    /// current focus state exactly once per DECSET 1004 enable.
+    focus_mode_was_active: bool,
     /// Duplicate-redraw trim baseline for the current AI scrollback epoch.
     preserved_ai_scrollback: PreservedAiScrollback,
     /// Waiting for the first filtered redraw in the epoch to commit.
@@ -1488,6 +1495,10 @@ pub struct LiveSession {
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared runtime scrollback limit updated by config reloads.
     scrollback_lines: Arc<AtomicUsize>,
+    /// Whether a client's last focus report named this session as focused.
+    /// Shared with the reader task, which delivers the state to the PTY when
+    /// the application enables focus reporting (DECSET 1004).
+    has_focus: Arc<AtomicBool>,
     /// The window that requested this session at create time. Stashed on
     /// the session itself (rather than re-derived from the workspace
     /// manager) so the clean-close path in [`handle_close_session`] can
@@ -6723,6 +6734,10 @@ struct SharedSessionHandles {
     clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
     preserve_ai_scrollback: Arc<AtomicBool>,
     scrollback_lines: Arc<AtomicUsize>,
+    /// Whether a client's last focus report named this session as focused.
+    /// Written by `handle_focus_changed`, read by the reader when the
+    /// application enables focus reporting (DECSET 1004).
+    has_focus: Arc<AtomicBool>,
     exit_gate: Arc<SessionExitGate>,
 }
 
@@ -6747,6 +6762,7 @@ impl SharedSessionHandles {
             clipboard_command_rx,
             preserve_ai_scrollback,
             scrollback_lines,
+            has_focus: Arc::new(AtomicBool::new(false)),
             exit_gate: Arc::new(SessionExitGate::new()),
         }
     }
@@ -6807,19 +6823,15 @@ async fn start_session(
         handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
         scrollback_lines: Arc::clone(&shared.scrollback_lines),
+        has_focus: Arc::clone(&shared.has_focus),
         env_window_id: window_id,
         env_envelope_id,
         clipboard_command_tx: shared.clipboard_command_tx,
         exit_gate: Arc::clone(&shared.exit_gate),
-        // Moved, never cloned: the registry entry is now the sole owner of the
-        // cap slot, so the slot is freed exactly when the entry is dropped.
+        // Moved, never cloned: the entry owns the cap slot, freed on drop.
         _slot: slot,
     };
-    // Cloned before the insert: the child-exit watcher outlives the registry
-    // entry and has to finalize the session after it is gone.
-    let exit_handles = live.exit_handles();
-    runtime.live_sessions.write().await.insert(session_id, live);
-    spawn_child_exit_watcher(child_pidfd, child_pid, session_id, exit_handles, &runtime);
+    register_live_session(&runtime, session_id, child_pidfd, child_pid, live).await;
 
     spawn_pty_reader(
         PtyReaderInputs {
@@ -6843,10 +6855,28 @@ async fn start_session(
             attachment: shared.attachment,
             preserve_ai_scrollback: shared.preserve_ai_scrollback,
             scrollback_lines: shared.scrollback_lines,
+            has_focus: shared.has_focus,
         },
         runtime,
         &shared.exit_gate,
     );
+}
+
+/// Insert the registry entry and arm the child-exit watcher.
+///
+/// The exit handles are cloned before the insert because the watcher
+/// outlives the registry entry and has to finalize the session after it is
+/// gone.
+async fn register_live_session(
+    runtime: &SessionRuntimeContext<'_>,
+    session_id: SessionId,
+    child_pidfd: Option<OwnedFd>,
+    child_pid: u32,
+    live: LiveSession,
+) {
+    let exit_handles = live.exit_handles();
+    runtime.live_sessions.write().await.insert(session_id, live);
+    spawn_child_exit_watcher(child_pidfd, child_pid, session_id, exit_handles, runtime);
 }
 
 /// The `ManagedSession`-derived inputs a PTY reader task needs. Bundled so
@@ -6873,6 +6903,7 @@ struct PtyReaderInputs {
     attachment: SessionAttachment,
     preserve_ai_scrollback: Arc<AtomicBool>,
     scrollback_lines: Arc<AtomicUsize>,
+    has_focus: Arc<AtomicBool>,
 }
 
 /// Build one session's image seam, sized to its cells and carrying whatever a
@@ -6975,6 +7006,8 @@ fn spawn_pty_reader(
         cell_height: inputs.cell_height,
         preserve_ai_scrollback: inputs.preserve_ai_scrollback,
         scrollback_lines: inputs.scrollback_lines,
+        has_focus: inputs.has_focus,
+        focus_mode_was_active: false,
         preserved_ai_scrollback: PreservedAiScrollback::default(),
         pending_ai_scrollback_baseline: false,
         image_evidence: ImageApplicationEvidence::default(),
@@ -7181,13 +7214,15 @@ async fn handle_focus_changed(
         && attached_contains(attached_ids, lost_id).await
         && let Some(session) = sessions.get(&lost_id)
     {
-        send_focus_event(session, b"\x1b[O").await;
+        session.has_focus.store(false, Ordering::Relaxed);
+        send_focus_event(session, FOCUS_LOST).await;
     }
     if let Some(gained_id) = gained
         && attached_contains(attached_ids, gained_id).await
         && let Some(session) = sessions.get(&gained_id)
     {
-        send_focus_event(session, b"\x1b[I").await;
+        session.has_focus.store(true, Ordering::Relaxed);
+        send_focus_event(session, FOCUS_GAINED).await;
     }
 }
 
@@ -9604,6 +9639,10 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     // snapshots all clear together.
     clear_stale_mouse_modes_at_prompt(state).await;
 
+    // Step 2c: runs after the stale-mode reset so a 1004 the reset just
+    // cleared is not treated as newly enabled.
+    deliver_focus_state_when_reporting_enables(state).await;
+
     // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
     process_metadata_events(state).await;
 }
@@ -9847,6 +9886,50 @@ async fn clear_stale_mouse_modes_at_prompt(state: &mut PtyReaderState) {
     )
     .await;
     send_pty_output(&state.client_writer, state.session_id, &resets, commit);
+}
+
+/// Deliver the session's current focus state when the application newly
+/// enables focus reporting (DECSET 1004).
+///
+/// Focus events are relayed only to sessions with the mode active, so an
+/// application that enables it *after* the client's last focus report — an AI
+/// CLI doing so during startup in the already-focused pane — would otherwise
+/// never learn it holds focus, and one that gates its own cursor on focus-in
+/// (Claude Code) draws none until some unrelated focus change. Reporting the
+/// state at enable time mirrors tmux.
+async fn deliver_focus_state_when_reporting_enables(state: &mut PtyReaderState) {
+    let active = {
+        let term_guard = state.term.lock().await;
+        term_guard.mode().contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT)
+    };
+    if !focus_mode_newly_enabled(&mut state.focus_mode_was_active, active) {
+        return;
+    }
+    let focused = state.has_focus.load(Ordering::Relaxed);
+    let event = if focused { FOCUS_GAINED } else { FOCUS_LOST };
+    debug!(
+        session_id = %state.session_id,
+        focused,
+        "focus reporting enabled; delivering current focus state"
+    );
+    let mut pty_write = state.pty_write.lock().await;
+    if let Err(e) = pty_write.write_all(event).await {
+        debug!("initial focus event write failed: {e}");
+    }
+}
+
+const FOCUS_GAINED: &[u8] = b"\x1b[I";
+const FOCUS_LOST: &[u8] = b"\x1b[O";
+
+/// Latch `active` into `was_active`, reporting whether this chunk turned
+/// focus reporting on — the off→on edge that owes the PTY the current focus
+/// state. Every other transition (steady states, the disable edge) owes
+/// nothing: those are either already covered by `handle_focus_changed` or
+/// meaningless to an application that just turned reporting off.
+fn focus_mode_newly_enabled(was_active: &mut bool, active: bool) -> bool {
+    let newly_enabled = active && !*was_active;
+    *was_active = active;
+    newly_enabled
 }
 
 /// `true` when the chunk contains a shell `PromptStart` mark with no
@@ -12871,6 +12954,17 @@ mod tests {
             drained.is_err(),
             "a drained, closed clipboard channel must park the select arm, not complete instantly"
         );
+    }
+
+    // @lat: [[server#Sessions#PTY Reader Task#Focus State On Reporting Enable]]
+    #[test]
+    fn focus_state_is_delivered_only_on_the_enable_edge() {
+        let mut was_active = false;
+        assert!(focus_mode_newly_enabled(&mut was_active, true), "off→on owes the state");
+        assert!(!focus_mode_newly_enabled(&mut was_active, true), "steady on owes nothing");
+        assert!(!focus_mode_newly_enabled(&mut was_active, false), "disable edge owes nothing");
+        assert!(!focus_mode_newly_enabled(&mut was_active, false), "steady off owes nothing");
+        assert!(focus_mode_newly_enabled(&mut was_active, true), "re-enable owes it again");
     }
 
     #[tokio::test]

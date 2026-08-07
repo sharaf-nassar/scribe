@@ -196,6 +196,13 @@ impl WorkspaceTree {
         true
     }
 
+    /// Reset every workspace split ratio so regions share the window evenly,
+    /// then report the tree.
+    pub fn equalize_ratios(&mut self, cx: &mut Context<Self>) {
+        self.layout.equalize_all_workspace_ratios();
+        self.report(cx);
+    }
+
     /// Set the ratio of the split between two workspaces (clamped 0.1..=0.9),
     /// then report the tree.
     pub fn set_workspace_ratio(

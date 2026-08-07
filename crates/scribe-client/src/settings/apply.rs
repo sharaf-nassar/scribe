@@ -596,10 +596,10 @@ fn apply_workspace_key(
 pub(crate) fn workspace_root_from_value(value: &serde_json::Value) -> Result<String, String> {
     let root = value.as_str().ok_or("add_root value must be a string")?.trim();
     if root.is_empty() {
-        return Err(String::from("workspace root must not be empty"));
+        return Err(String::from("Workspace root must not be empty"));
     }
     if !root.starts_with("~/") && !std::path::Path::new(root).is_absolute() {
-        return Err(String::from("workspace root must be absolute or start with ~/"));
+        return Err(String::from("Workspace root must be absolute or start with ~/"));
     }
     Ok(root.to_owned())
 }
@@ -1068,12 +1068,12 @@ mod tests {
         );
         assert_eq!(
             workspace_root_from_value(&serde_json::Value::String(String::from("  "))),
-            Err(String::from("workspace root must not be empty"))
+            Err(String::from("Workspace root must not be empty"))
         );
         for invalid in ["~", "relative/path"] {
             assert_eq!(
                 workspace_root_from_value(&serde_json::Value::String(invalid.to_owned())),
-                Err(String::from("workspace root must be absolute or start with ~/"))
+                Err(String::from("Workspace root must be absolute or start with ~/"))
             );
         }
     }

@@ -27,7 +27,7 @@
 #     the line only the retained `WindowHandle` path writes;
 #   * the palette row "Open Settings" reaches the same handler, proving the
 #     palette and the chord converge (`key_action_for_automation`);
-#   * clicking the titlebar gear does too — its `TitlebarEvent::OpenSettings`
+#   * clicking the status-bar gear does too — its `on_settings` handler
 #     had no subscriber at all before this bead.
 #
 # Input is driven through XTEST (plain `xdotool key` / `click`, no `--window`).
@@ -52,23 +52,23 @@ SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
 # and grows its row, changing comfortably more than this many window pixels.
 SETTINGS_CHANGE_MIN="${SETTINGS_CHANGE_MIN:-100}"
 
-# Titlebar geometry, from crates/scribe-client/src/titlebar.rs: the band is
-# TITLEBAR_HEIGHT=34 tall, and the gear is a 34px icon button sitting directly
-# left of the three 40px window controls (the equalize button next to it is
-# hidden while the window has no split). A titlebar layout change turns into a
-# failing phase here rather than a silent miss.
-TITLEBAR_HEIGHT=34
-WINDOW_CONTROLS_WIDTH=120
-GEAR_WIDTH=34
+# Status bar geometry, from crates/scribe-client/src/status_bar.rs: the gear
+# moved from the titlebar into the `default_status_bar_height`=24px band at
+# the window bottom, where `settings_gear` renders it as the band's last
+# child inside the px_2 (8px) edge padding. A status-bar layout change turns
+# into a failing phase here rather than a silent miss.
+STATUS_BAR_HEIGHT=24
+STATUS_BAR_EDGE_PADDING=8
 COMPACT_SETTINGS_WIDTH=1040
 COMPACT_SETTINGS_HEIGHT=720
 SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"
 # A `workspace` search leaves Keybindings and Workspaces in separate groups.
 # These offsets are the center of the second filtered row, derived from the
-# settings window's 32px titlebar, 18px nav top pad, 46px group headings, 44px
-# rows, and 13px inter-group seam.
+# settings window's 38px titlebar, the sidebar search block (12px top pad +
+# 30px field), the 14px nav top pad, 28px group labels, 32px rows, and the
+# 14px inter-group gap: 38+42+14+28+32+14+28+16 = 212.
 FILTERED_WORKSPACES_X=140
-FILTERED_WORKSPACES_Y=221
+FILTERED_WORKSPACES_Y=212
 
 TERM_X=0
 TERM_Y=0
@@ -554,13 +554,14 @@ if [ "$COUNT" -ne 1 ]; then
 fi
 echo "PHASE 4 PASS: the palette row reached the settings handler"
 
-# ── Phase 5: the titlebar gear is wired too ───────────────────────
-# The gear has been painted since the titlebar landed, but its
-# `TitlebarEvent::OpenSettings` had no subscriber, so clicking it did nothing.
+# ── Phase 5: the status-bar gear is wired too ─────────────────────
+# The settings gear lives at the far right of the bottom status bar
+# (`settings_gear` in status_bar.rs); its `on_settings` handler must reach
+# the same open-or-focus path as the chord and the palette row.
 FOCUSES_BEFORE=$(count_log "focused the open settings window")
 focus_terminal
-GEAR_X=$(( TERM_W - WINDOW_CONTROLS_WIDTH - GEAR_WIDTH / 2 ))
-GEAR_Y=$(( TITLEBAR_HEIGHT / 2 ))
+GEAR_X=$(( TERM_W - STATUS_BAR_EDGE_PADDING - 6 ))
+GEAR_Y=$(( TERM_H - STATUS_BAR_HEIGHT / 2 ))
 echo "clicking the gear at window-relative +${GEAR_X}+${GEAR_Y} (client origin ${TERM_X},${TERM_Y})"
 click_terminal_at "$GEAR_X" "$GEAR_Y"
 if ! wait_for_log_growth "focused the open settings window" "$FOCUSES_BEFORE" 10; then
@@ -571,7 +572,7 @@ if [ "$COUNT" -ne 1 ]; then
     fail "PHASE 5 FAIL: the gear opened a duplicate window ($COUNT total)"
 fi
 shot /output/05-gear-click.png
-echo "PHASE 5 PASS: the titlebar gear reached the settings handler"
+echo "PHASE 5 PASS: the status-bar gear reached the settings handler"
 
 echo ""
 echo "PASS: visual settings-entry test"
@@ -590,4 +591,4 @@ echo "    02-badge-color-saved.png      — canonical #112233 editor and swatch"
 echo "    02-badge-colors-reset.png     — eight default badge colors restored"
 echo "    03-settings-refocused.png     — the same window raised, not duplicated"
 echo "    04-palette-open-settings.png  — palette filtered to 'Open Settings'"
-echo "    05-gear-click.png             — after the titlebar gear click"
+echo "    05-gear-click.png             — after the status-bar gear click"

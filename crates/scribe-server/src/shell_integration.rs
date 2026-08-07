@@ -227,13 +227,34 @@ pub mod desktop_isolation {
     /// `UseShellExecute` is set, in the order it tries them.
     const DESKTOP_OPENERS: [&str; 3] = ["xdg-open", "gnome-open", "kfmclient"];
 
-    /// Scrubs the session handles a desktop opener needs, for probes that
-    /// have no scratch directory to stage stubs in.
+    /// The live-session variables Scribe exports into every shell it hosts.
+    /// A developer (or agent) running the test suite *inside* a Scribe
+    /// session leaks these into the shell drivers, where they change the
+    /// integration scripts' behaviour — `SCRIBE_ENV_PERSIST=0` makes the
+    /// fish spawn gate return before any capture state is installed, so the
+    /// emit tests see zero helper calls. Drivers that need one of these set
+    /// it explicitly inside their own script.
+    const SCRIBE_SESSION_VARS: [&str; 6] = [
+        "SCRIBE_ENV_PERSIST",
+        "SCRIBE_HOOK_HELPER",
+        "SCRIBE_HOOK_SOCK",
+        "SCRIBE_RESTORE_ENV_DELTA_FILE",
+        "SCRIBE_SESSION_ID",
+        "SCRIBE_SHELL_INTEGRATION",
+    ];
+
+    /// Scrubs the session handles a desktop opener needs — plus the host
+    /// Scribe session's own exports, so the drivers behave the same whether
+    /// the suite runs in a plain terminal or inside Scribe itself.
     pub fn scrub_desktop_env(command: &mut Command) {
         command
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
-            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("TERM_PROGRAM");
+        for var in SCRIBE_SESSION_VARS {
+            command.env_remove(var);
+        }
     }
 
     /// Scrubs the session handles and puts no-op opener stubs, staged
@@ -627,6 +648,10 @@ mod tests {
 
         let injected = dir.join("shell-integration");
         let mut command = Command::new("nu");
+        // Sealed first: the scrub drops the host Scribe session's exports,
+        // and the explicit `.env` calls below then re-add exactly the ones
+        // this driver needs, overriding the removal.
+        seal_child(&mut command, &dir);
         command
             .arg("--no-config-file")
             .arg(&driver)
@@ -639,7 +664,6 @@ mod tests {
             .env("XDG_DATA_DIRS", format!("{}:/usr/local/share:/usr/share", injected.display()))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
-        seal_child(&mut command, &dir);
         let result = command.output().expect("run nu driver");
         assert!(
             result.status.success(),

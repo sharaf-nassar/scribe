@@ -169,10 +169,14 @@ impl WorkspaceManager {
     /// Drop a workspace whose last region closed (`ClientMessage::CloseWorkspace`).
     ///
     /// The client closes the region's sessions first, so the workspace is
-    /// normally empty by the time this arrives; any straggler membership is
-    /// unlinked so the reverse map cannot point at a dead workspace.
+    /// empty by the time a truthful close arrives. A close naming a workspace
+    /// that still has sessions is refused outright: it means the sender's
+    /// layout is stale (a client that redialed across an upgrade after another
+    /// client reshaped the window), and honouring it unlinked live sessions
+    /// into an unlisted limbo no later `SessionList` could show — the failure
+    /// that emptied whole windows across a server upgrade.
     pub fn close_workspace(&mut self, workspace_id: WorkspaceId) {
-        let Some(ws) = self.workspaces.remove(&workspace_id) else {
+        let Some(ws) = self.workspaces.get(&workspace_id) else {
             debug!(%workspace_id, "close ignored: unknown workspace");
             return;
         };
@@ -180,12 +184,11 @@ impl WorkspaceManager {
             warn!(
                 %workspace_id,
                 sessions = ws.sessions.len(),
-                "closed a workspace that still had sessions"
+                "workspace close refused: sessions still live here"
             );
+            return;
         }
-        for session_id in ws.sessions {
-            self.session_to_workspace.remove(&session_id);
-        }
+        self.workspaces.remove(&workspace_id);
         info!(%workspace_id, "closed workspace");
     }
 
@@ -470,13 +473,24 @@ impl WorkspaceManager {
     }
 
     /// Reconstruct a `WorkspaceManager` from handoff state.
+    ///
+    /// `valid_sessions` is each admitted session paired with the workspace id
+    /// its own record carries. The maps restored from `workspaces` / `windows`
+    /// are the primary source, but they are self-healed against those records
+    /// afterwards: membership lost in an earlier generation (a stale client's
+    /// refused-today destructive close, a dropped map entry) must not orphan a
+    /// live session forever, because an unmapped session appears in no
+    /// window's `SessionList` and is unreachable by every client.
     pub fn restore_from_handoff(
         roots: Vec<PathBuf>,
         workspaces: &[HandoffWorkspace],
         workspace_tree: Option<WorkspaceTreeNode>,
         windows: &[HandoffWindowState],
-        valid_session_ids: &HashSet<SessionId>,
+        valid_sessions: &[(SessionId, WorkspaceId)],
     ) -> Self {
+        let valid_session_ids: HashSet<SessionId> =
+            valid_sessions.iter().map(|(session_id, _)| *session_id).collect();
+        let valid_session_ids = &valid_session_ids;
         let mut ws_map = HashMap::new();
         let mut session_to_workspace = HashMap::new();
         let mut dropped_session_total = 0usize;
@@ -553,7 +567,7 @@ impl WorkspaceManager {
             );
         }
 
-        Self {
+        let mut manager = Self {
             roots,
             workspaces: ws_map,
             session_to_workspace,
@@ -561,7 +575,70 @@ impl WorkspaceManager {
             workspace_tree,
             window_trees,
             session_to_window,
+        };
+        manager.heal_restored_memberships(valid_sessions);
+        manager
+    }
+
+    /// Re-file every restored session the maps above lost.
+    ///
+    /// A session missing from `session_to_workspace` is re-added under the
+    /// workspace its own record names, auto-creating the workspace when the
+    /// map lost that too. A session missing from `session_to_window` is
+    /// assigned to the window owning a sibling of its workspace, falling back
+    /// to the restored window with the most sessions — a session in the wrong
+    /// window is a tab the user can move; a session in no window is invisible.
+    fn heal_restored_memberships(&mut self, valid_sessions: &[(SessionId, WorkspaceId)]) {
+        let mut healed_workspaces = 0usize;
+        let mut healed_windows = 0usize;
+        for &(session_id, workspace_id) in valid_sessions {
+            if !self.session_to_workspace.contains_key(&session_id) {
+                self.add_session(workspace_id, session_id, None);
+                healed_workspaces += 1;
+            }
+            if self.session_to_window.contains_key(&session_id) {
+                continue;
+            }
+            match self.adoptive_window_for(session_id) {
+                Some(window_id) => {
+                    self.session_to_window.insert(session_id, window_id);
+                    healed_windows += 1;
+                }
+                None => {
+                    warn!(%session_id, "restored session has no window and none exists to adopt it");
+                }
+            }
         }
+        if healed_workspaces > 0 || healed_windows > 0 {
+            warn!(
+                healed_workspaces,
+                healed_windows, "handoff restore re-filed sessions the persisted maps had lost"
+            );
+        }
+    }
+
+    /// The window that should adopt an orphaned session: a sibling from its
+    /// workspace names it directly, otherwise the restored window with the
+    /// most sessions, so orphans surface in the user's main window.
+    fn adoptive_window_for(&self, session_id: SessionId) -> Option<WindowId> {
+        let workspace_id = self.session_to_workspace.get(&session_id)?;
+        let sibling_window = self
+            .workspaces
+            .get(workspace_id)?
+            .sessions
+            .iter()
+            .filter(|&&sibling| sibling != session_id)
+            .find_map(|sibling| self.session_to_window.get(sibling).copied());
+        sibling_window.or_else(|| {
+            let mut counts: HashMap<WindowId, usize> = HashMap::new();
+            for &window_id in self.session_to_window.values() {
+                *counts.entry(window_id).or_default() += 1;
+            }
+            counts
+                .into_iter()
+                .max_by_key(|&(window_id, count)| (count, window_id.to_string()))
+                .map(|(window_id, _)| window_id)
+        })
     }
 }
 
@@ -715,14 +792,20 @@ mod tests {
         assert_eq!(mgr.workspace_for_session(sess), Some(ws_new));
     }
 
+    // @lat: [[server#Workspaces#Destructive close refusal]]
     #[test]
-    fn close_workspace_unlinks_stragglers() {
+    fn close_with_live_sessions_is_refused() {
         let mut mgr = manager_with_roots(vec![]);
         let ws = mgr.create_workspace();
         let sess = SessionId::new();
         mgr.add_session(ws, sess, None);
+        // A stale client's close must not unlink a live session into limbo.
         mgr.close_workspace(ws);
-        assert_eq!(mgr.workspace_for_session(sess), None);
+        assert_eq!(mgr.workspace_for_session(sess), Some(ws));
+        assert!(mgr.workspace_info(ws).is_some());
+        // Once the session is gone the close is truthful and lands.
+        mgr.remove_session(sess);
+        mgr.close_workspace(ws);
         assert!(mgr.workspace_info(ws).is_none());
     }
 
@@ -760,13 +843,12 @@ mod tests {
         assert!(tree_out.is_some(), "tree should be present in handoff");
 
         // Restore from handoff.
-        let valid_session_ids = HashSet::from([sess_a, sess_b]);
         let restored = WorkspaceManager::restore_from_handoff(
             vec![],
             &workspaces,
             tree_out,
             &[],
-            &valid_session_ids,
+            &[(sess_a, ws_a), (sess_b, ws_b)],
         );
 
         // Verify sessions survived.
@@ -782,6 +864,44 @@ mod tests {
             }
             WorkspaceTreeNode::Leaf { .. } => panic!("expected Split, got Leaf"),
         }
+    }
+
+    // @lat: [[server#Handoff#State Transfer#Membership self-healing]]
+    #[test]
+    fn restore_heals_memberships_from_session_records() {
+        // The persisted maps know only `mapped` in `ws_known` / `win_main`;
+        // `orphan_known_ws` lost both maps but names a workspace the maps
+        // still have, and `orphan_lost_ws` names one they lost entirely —
+        // the exact wreckage a stale client's destructive closes left.
+        let mut mgr = manager_with_roots(vec![]);
+        let ws_known = mgr.create_workspace();
+        let mapped = SessionId::new();
+        let orphan_known_ws = SessionId::new();
+        let orphan_lost_ws = SessionId::new();
+        let ws_lost = WorkspaceId::new();
+        let win_main = WindowId::new();
+        mgr.add_session(ws_known, mapped, None);
+        mgr.assign_session_to_window(win_main, mapped);
+
+        let (workspaces, tree, windows) = mgr.serialize_for_handoff();
+        let restored = WorkspaceManager::restore_from_handoff(
+            vec![],
+            &workspaces,
+            tree,
+            &windows,
+            &[(mapped, ws_known), (orphan_known_ws, ws_known), (orphan_lost_ws, ws_lost)],
+        );
+
+        // The mapped session is untouched; both orphans are re-filed under
+        // the workspace their own record names, auto-created when lost.
+        assert_eq!(restored.workspace_for_session(mapped), Some(ws_known));
+        assert_eq!(restored.workspace_for_session(orphan_known_ws), Some(ws_known));
+        assert_eq!(restored.workspace_for_session(orphan_lost_ws), Some(ws_lost));
+        // Every orphan lands in a window again — sibling's window first,
+        // busiest window as the fallback — so `SessionList` can show it.
+        assert_eq!(restored.window_for_session(orphan_known_ws), Some(win_main));
+        assert_eq!(restored.window_for_session(orphan_lost_ws), Some(win_main));
+        assert_eq!(restored.sessions_for_window(win_main).len(), 3);
     }
 
     #[test]

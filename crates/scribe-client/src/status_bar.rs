@@ -685,10 +685,11 @@ fn span_row(spans: &[Span], colors: &StatusBarColors) -> impl IntoElement {
 pub type UpdateActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
 
 /// Interactive wiring for the band's clickable surfaces: the centred update
-/// CTA and the settings gear at the far right.
+/// CTA, and the balance button and settings gear at the far right.
 pub struct StatusBarActions<'a> {
     pub update_focus: Option<&'a FocusHandle>,
     pub on_update: Option<UpdateActionHandler>,
+    pub on_equalize: Option<UpdateActionHandler>,
     pub on_settings: Option<UpdateActionHandler>,
 }
 
@@ -746,7 +747,7 @@ pub fn render(
     colors: &StatusBarColors,
     actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
-    let StatusBarActions { update_focus, on_update, on_settings } = actions;
+    let StatusBarActions { update_focus, on_update, on_equalize, on_settings } = actions;
     let center = model
         .center
         .as_ref()
@@ -774,7 +775,29 @@ pub fn render(
         .child(span_row(&model.left, colors))
         .child(div().flex_1().flex().flex_row().justify_center().children(center))
         .child(span_row(&model.right, colors))
+        .children(on_equalize.map(|action| equalize_button(colors, action)))
         .children(on_settings.map(|action| settings_gear(colors, action)))
+}
+
+/// The balance button at the band's bottom-right corner, beside the gear —
+/// resets every workspace and pane split to equal space when clicked. Only
+/// rendered when the window holds more than one pane.
+fn equalize_button(colors: &StatusBarColors, action: UpdateActionHandler) -> gpui::AnyElement {
+    let accent = rgba(colors.accent);
+    div()
+        .id("status-bar-equalize")
+        .role(Role::Button)
+        .aria_label("Balance panes")
+        .flex()
+        .items_center()
+        .h_full()
+        .pl_2()
+        .cursor_pointer()
+        .text_color(rgba(colors.label))
+        .hover(move |style| style.text_color(accent))
+        .on_click(move |_, window, cx| action(window, cx))
+        .child("\u{229E}")
+        .into_any_element()
 }
 
 /// The settings entry point at the band's far right — the gear moved here
