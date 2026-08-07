@@ -188,6 +188,7 @@ pub fn keybinding_actions() -> Vec<&'static str> {
         "focus_right",
         "focus_up",
         "focus_down",
+        "equalize",
         "workspace_split_vertical",
         "workspace_split_horizontal",
         "workspace_focus_left",

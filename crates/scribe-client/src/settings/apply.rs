@@ -821,6 +821,7 @@ fn apply_keybinding_split_and_focus_actions(
         "focus_right" => kb.focus_right = list.clone(),
         "focus_up" => kb.focus_up = list.clone(),
         "focus_down" => kb.focus_down = list.clone(),
+        "equalize" => kb.equalize = list.clone(),
         "workspace_split_vertical" => kb.workspace_split_vertical = list.clone(),
         "workspace_split_horizontal" => kb.workspace_split_horizontal = list.clone(),
         _ => return false,
