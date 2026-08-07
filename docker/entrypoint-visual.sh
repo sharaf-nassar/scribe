@@ -145,6 +145,49 @@ start_file_chooser_portal() {
     return 1
 }
 
+# Give this container's OWN network namespace one synthetic physical LAN, so the
+# production trust gate has a real default route and a real neighbour entry to
+# fingerprint.
+#
+# Every harness container runs with `--network none` (see CLAUDE.md), so its
+# netns holds nothing but `lo`: no default route, no gateway, no neighbour.
+# `network::current_network_fingerprint` then correctly fails closed, the
+# settings window correctly hides its "Trust it" row, and every focus offset in
+# settings-trust.sh shifts. Nothing in `scribe` is stubbed or given a test-only
+# override to fix that — instead the namespace is made truthful, and the REAL
+# `netdev` route/neighbour read that production performs succeeds on its own.
+#
+# A veth pair is used rather than a `dummy` link because Docker's own bridge
+# networking keeps the `veth` module loaded, while `dummy` would need a host
+# modprobe from inside the container. Both ends stay in this netns and neither
+# is ever attached to anything, so no packet can leave and the host's routing,
+# NAT and iptables state is untouched — `--network none` still holds. Needs
+# `--cap-add NET_ADMIN`, which is namespaced and confers nothing on the host.
+#
+# The gateway MAC and subnet deliberately do NOT match the network
+# `seed_trust_stores` plants: the "Trust it" control exists only while the
+# current network is addable AND not already trusted.
+SEED_LAN_IFACE=lanseed0
+SEED_LAN_IFACE_MAC=aa:bb:cc:dd:ee:03
+SEED_LAN_CIDR=10.88.0.2/24
+SEED_LAN_GATEWAY_IP=10.88.0.1
+SEED_LAN_GATEWAY_MAC=aa:bb:cc:dd:ee:02
+seed_lan_iface() {
+    ip link add "$SEED_LAN_IFACE" type veth peer name "${SEED_LAN_IFACE}p"
+    ip link set "$SEED_LAN_IFACE" address "$SEED_LAN_IFACE_MAC"
+    ip addr add "$SEED_LAN_CIDR" dev "$SEED_LAN_IFACE"
+    # Both ends go up so the link has carrier; a no-carrier link would have its
+    # default route dumped as `linkdown` and could be skipped.
+    ip link set "${SEED_LAN_IFACE}p" up
+    ip link set "$SEED_LAN_IFACE" up
+    ip route add default via "$SEED_LAN_GATEWAY_IP" dev "$SEED_LAN_IFACE"
+    # Nothing behind the peer answers ARP, so the neighbour entry is written
+    # permanently rather than resolved by a probe.
+    ip neigh replace "$SEED_LAN_GATEWAY_IP" lladdr "$SEED_LAN_GATEWAY_MAC" \
+        nud permanent dev "$SEED_LAN_IFACE"
+    echo "seeded synthetic LAN: gateway $SEED_LAN_GATEWAY_IP at $SEED_LAN_GATEWAY_MAC on $SEED_LAN_IFACE"
+}
+
 # Seed the feature-014 LAN trust stores before the server starts.
 #
 # `IpcServerState` loads both TOML stores once at startup, and a single container
@@ -300,6 +343,9 @@ export SCRIBE_RUNTIME_DIR="$UID_DIR"
 prepare_xdg_dirs
 if [ "${SCRIBE_FILE_CHOOSER:-0}" = "1" ]; then
     start_file_chooser_portal
+fi
+if [ "${SCRIBE_SEED_LAN_IFACE:-0}" = "1" ]; then
+    seed_lan_iface
 fi
 if [ "${SCRIBE_SEED_TRUST:-0}" = "1" ]; then
     seed_trust_stores
