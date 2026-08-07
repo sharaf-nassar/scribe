@@ -241,16 +241,16 @@ replay and atomic client staging.
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
-## Input and keybinding checklist (54 named actions)
+## Input and keybinding checklist (55 named actions)
 
 The GPUI port retains every parsed `Bindings` action from
-`crates/scribe-client/src/input.rs`. All 54 are enumerated individually below,
+`crates/scribe-client/src/input.rs`. All 55 are enumerated individually below,
 because the previous per-subsystem grouping hid where they break: parsing was
 never the problem — `keybindings.rs::translate_key_action` maps all 54 onto a
 `KeyAction` — the gap was dispatch, where `main.rs::handle_layout_action`
 implemented nine `LayoutAction` variants and routed the other twenty-six to a
 `tracing::debug!` catch-all that swallowed them. That catch-all is gone: the
-match is exhaustive over all 36 variants, and `tools/check-reachability.sh`
+match is exhaustive over all 37 variants, and `tools/check-reachability.sh`
 fails the build if a new one is ever swallowed again.
 
 Every row's method is `visual-E2E`: each action must be driven through
@@ -268,6 +268,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `focus_right` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Right` | required |
 | `focus_up` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Up` | required |
 | `focus_down` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Down` | required |
+| `equalize` | Pane layout | visual-E2E | `main.rs::handle_layout_action` `Equalize` arm → `TerminalView::equalize_layout` → `PaneShell::equalize_all` — the same handler behind the titlebar icon and the status-bar balance button | required |
 | `workspace_split_vertical` | Workspace layout | visual-E2E | `TerminalView::split_workspace` → `PaneShell::split_workspace` → `WorkspaceTree::split_workspace` (`tests/e2e/visual/pane-workspace-layout.sh` phase 6) | required |
 | `workspace_split_horizontal` | Workspace layout | visual-E2E | as `workspace_split_vertical`, with `SplitDirection::Vertical` | required |
 | `workspace_focus_left` | Workspace layout | visual-E2E | `TerminalView::focus_workspace` → `PaneShell::focus_workspace_in_direction` (`tests/e2e/visual/pane-workspace-layout.sh` phase 7, on a rebound chord: openbox grabs the `ctrl+alt+arrow` default) | required |
@@ -315,23 +316,24 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `line_start` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `line_end` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 
-**Reachability:** 54 of 54 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 55 of 55 rows name a live-path symbol; 0 are unwired and 0
 are missing. The audit's figure at `f56ef95` was 24, with 30 unwired and none
 missing, because every action already parsed and translated and the whole gap
 was dispatch.
 
 `LayoutAction` variants are explicitly: `SplitVertical`, `SplitHorizontal`,
 `ClosePane`, `FocusNext`, `FocusLeft`, `FocusRight`, `FocusUp`, `FocusDown`,
-`WorkspaceSplitVertical`, `WorkspaceSplitHorizontal`, `WorkspaceFocusLeft`,
-`WorkspaceFocusRight`, `WorkspaceFocusUp`, `WorkspaceFocusDown`, `NewTab`,
+`Equalize`, `WorkspaceSplitVertical`, `WorkspaceSplitHorizontal`,
+`WorkspaceFocusLeft`, `WorkspaceFocusRight`, `WorkspaceFocusUp`,
+`WorkspaceFocusDown`, `NewTab`,
 `NewClaudeTab`, `NewClaudeResumeTab`, `NewCodexTab`, `NewCodexResumeTab`,
 `CloseTab`, `NextTab`, `PrevTab`, `SelectTab`, `NewWindow`, `CopySelection`,
 `PasteClipboard`, `ScrollUp`, `ScrollDown`, `ScrollTop`, `ScrollBottom`,
 `PromptJumpUp`, `PromptJumpDown`, `JumpToFailure`, `ZoomIn`, `ZoomOut`, and
-`ZoomReset` — all 36 are executed by `main.rs::handle_layout_action`, whose
-match is exhaustive with no catch-all arm and whose 36/36 figure
-`tools/check-reachability.sh` ratchets. The 54 rows above cover more ground
-than 36 variants because ten of them are not `LayoutAction` at all — the seven
+`ZoomReset` — all 37 are executed by `main.rs::handle_layout_action`, whose
+match is exhaustive with no catch-all arm and whose 37/37 figure
+`tools/check-reachability.sh` ratchets. The 55 rows above cover more ground
+than 37 variants because ten of them are not `LayoutAction` at all — the seven
 terminal shortcuts, `find`, `settings` and `command_palette` — while the nine
 `select_tab_N` bindings collapse onto the single index-carrying `SelectTab`.
 `KeyAction` variants are `Terminal` (reachable via `main.rs::send_key_bytes`),
@@ -458,17 +460,17 @@ with them. They are the launch gate's metric — not the unit-test count.
 | --- | --- | --- | --- | --- |
 | Client messages | 45 | 45 | 0 | 0 |
 | Server messages | 60 | 60 | 0 | 0 |
-| Input and keybinding actions | 54 | 54 | 0 | 0 |
+| Input and keybinding actions | 55 | 55 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **202** | **202** | **0** | **0** |
+| **Total** | **203** | **203** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **193 rows, of which 193 are
-reachable (100%)** and 0 are not. **1 of those 193** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 194 are
+reachable (100%)** and 0 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **192 of 193**.
+the in-client figure is **193 of 194**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

@@ -4259,6 +4259,7 @@ fn pane_keybinding(key: &str) -> bool {
             | "focus_right"
             | "focus_up"
             | "focus_down"
+            | "equalize"
     )
 }
 

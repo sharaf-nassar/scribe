@@ -61,6 +61,7 @@ pub struct Bindings {
     pub focus_right: BindingSet,
     pub focus_up: BindingSet,
     pub focus_down: BindingSet,
+    pub equalize: BindingSet,
 
     // Workspaces
     pub workspace_split_vertical: BindingSet,
@@ -288,6 +289,7 @@ impl Bindings {
             focus_right: parse_set(&config.focus_right),
             focus_up: parse_set(&config.focus_up),
             focus_down: parse_set(&config.focus_down),
+            equalize: parse_set(&config.equalize),
 
             // Workspaces
             workspace_split_vertical: parse_set(&config.workspace_split_vertical),
@@ -392,6 +394,8 @@ pub enum LayoutAction {
     FocusUp,
     /// Move focus to the pane below.
     FocusDown,
+    /// Reset every workspace-region and pane split to equal space.
+    Equalize,
 
     // Workspaces
     /// Split the window to create a workspace side-by-side.
@@ -624,7 +628,7 @@ struct BindingAction<'a, T> {
     action: T,
 }
 
-fn pane_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 8] {
+fn pane_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 9] {
     [
         BindingAction { bindings: &bindings.split_vertical, action: LayoutAction::SplitVertical },
         BindingAction {
@@ -637,6 +641,7 @@ fn pane_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>;
         BindingAction { bindings: &bindings.focus_right, action: LayoutAction::FocusRight },
         BindingAction { bindings: &bindings.focus_up, action: LayoutAction::FocusUp },
         BindingAction { bindings: &bindings.focus_down, action: LayoutAction::FocusDown },
+        BindingAction { bindings: &bindings.equalize, action: LayoutAction::Equalize },
     ]
 }
 

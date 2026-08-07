@@ -1288,6 +1288,8 @@ pub struct KeybindingsConfig {
     pub focus_up: KeyComboList,
     #[serde(default = "default_focus_down")]
     pub focus_down: KeyComboList,
+    #[serde(default = "default_equalize")]
+    pub equalize: KeyComboList,
 
     // Workspaces
     #[serde(default = "default_workspace_split_vertical")]
@@ -1409,6 +1411,7 @@ impl Default for KeybindingsConfig {
             focus_right: default_focus_right(),
             focus_up: default_focus_up(),
             focus_down: default_focus_down(),
+            equalize: default_equalize(),
             workspace_split_vertical: default_workspace_split_vertical(),
             workspace_split_horizontal: default_workspace_split_horizontal(),
             workspace_focus_left: default_workspace_focus_left(),
@@ -1500,6 +1503,13 @@ fn default_focus_up() -> KeyComboList {
 
 fn default_focus_down() -> KeyComboList {
     platform_combo("cmd+alt+down", "shift+ctrl+alt+down")
+}
+
+/// Same combo on every platform: `ctrl+shift+e` is unclaimed by any other
+/// default (and by the shell's overlay chords) on both macOS and Linux, so the
+/// action needs no `platform_combo` split.
+fn default_equalize() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+e")
 }
 
 fn default_workspace_split_vertical() -> KeyComboList {

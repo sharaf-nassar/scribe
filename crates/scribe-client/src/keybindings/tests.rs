@@ -126,7 +126,7 @@ fn shifted_symbol_matches_when_gpui_keeps_shift_set() {
 
 /// The whole point of the port: every named action must still resolve. Drives
 /// each action from its default binding and asserts the exact intercepted
-/// action — 42 layout actions plus palette/settings/find plus 7 terminal
+/// action — 43 layout actions plus palette/settings/find plus 7 terminal
 /// shortcuts, covering the 50+ actions named in the parity inventory.
 // @lat: [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]]
 #[test]
@@ -142,6 +142,7 @@ fn all_layout_actions_resolve_from_defaults() {
         (&bindings.focus_right, LayoutAction::FocusRight),
         (&bindings.focus_up, LayoutAction::FocusUp),
         (&bindings.focus_down, LayoutAction::FocusDown),
+        (&bindings.equalize, LayoutAction::Equalize),
         (&bindings.workspace_split_vertical, LayoutAction::WorkspaceSplitVertical),
         (&bindings.workspace_split_horizontal, LayoutAction::WorkspaceSplitHorizontal),
         (&bindings.workspace_focus_left, LayoutAction::WorkspaceFocusLeft),
@@ -235,6 +236,26 @@ fn terminal_shortcuts_emit_fixed_sequences() {
             Some(KeyAction::Terminal(expected.to_vec())),
         );
     }
+}
+
+/// `equalize` is the one layout action the GPUI rebuild shipped without a
+/// binding, so its default has to be a combo nothing else in the shipped set
+/// already owns. Driving the literal chord proves the choice is unclaimed: any
+/// collision would resolve to the other action instead, whichever dispatch
+/// table it sits in.
+#[test]
+fn equalize_default_chord_is_claimed_by_nothing_else() {
+    let bindings = Bindings::parse(&KeybindingsConfig::default());
+
+    assert_eq!(
+        KeybindingsConfig::default().equalize.as_slice(),
+        ["ctrl+shift+e".to_string()],
+        "the equalize default moved; re-check it against the whole configured set",
+    );
+    assert_eq!(
+        translate_key_action(&pressed_combo("ctrl+shift+e"), &bindings),
+        Some(KeyAction::Layout(LayoutAction::Equalize)),
+    );
 }
 
 #[test]

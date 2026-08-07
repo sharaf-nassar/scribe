@@ -2690,6 +2690,8 @@ Verifies the ported  parser and  dispatch so no configured shortcut regresses ac
 
 Driving each action from its default binding, the suite asserts every one of the 50+  variants resolves to its named value, that command-palette/settings/find produce the right , and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
 
+One case guards the `equalize` default in particular, because it is the action the GPUI rebuild shipped without a binding at all: its `ctrl+shift+e` chord must still resolve to `LayoutAction::Equalize` through the full dispatch order, which only holds while no other configured action claims those keys.
+
 Four cases lock , the rule that kept `close_tab` and `new_window` unreachable until it existed. Every entry in  must resolve to its overlay *and* match no default binding, so a future overlay chord cannot quietly land on a user action; the `close_tab` and `new_window` defaults must resolve to their `LayoutAction` and be declined by ; a config that rebinds `close_tab` onto an overlay's own chord must still reach the action; and a key release matches no overlay chord.
 
 ### GPUI tab session strip
