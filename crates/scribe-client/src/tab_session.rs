@@ -139,8 +139,17 @@ impl TabSessions {
     ///
     /// Returns the session that should now be attached: `None` when the strip
     /// is empty or when the removal did not disturb the active tab.
+    ///
+    /// The refocus is workspace-scoped: an exit hands the selection to the
+    /// nearest surviving tab of the *same* workspace, so a strip-adjacent tab
+    /// from another region can never be pulled across a workspace boundary by
+    /// the reconcile pass that adopts the newly active session. Only when the
+    /// exited tab was its workspace's last does the selection fall back to the
+    /// strip-adjacent neighbour — the region is collapsing, and the reconcile
+    /// pass re-points the selection at whichever region inherits focus.
     pub fn remove(&mut self, session_id: SessionId) -> Option<SessionId> {
         let index = self.tabs.iter().position(|tab| tab.session_id == session_id)?;
+        let workspace_id = self.tabs.get(index)?.workspace_id;
         let was_active = index == self.active;
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -151,7 +160,30 @@ impl TabSessions {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len() - 1);
-        was_active.then(|| self.active_session()).flatten()
+        if !was_active {
+            return None;
+        }
+        if let Some(next) = self.nearest_in_workspace(index, workspace_id) {
+            self.active = next;
+        }
+        self.active_session()
+    }
+
+    /// The surviving tab of `workspace_id` closest to removal point `index`,
+    /// preferring the tab that slid into the removed slot over the one before
+    /// it — the same "next tab wins" rule the strip-global clamp follows.
+    fn nearest_in_workspace(&self, index: usize, workspace_id: WorkspaceId) -> Option<usize> {
+        let distance = |i: usize| {
+            // The slot at `index` now holds the old `index + 1` tab: the
+            // successor. Rank it closest, then earlier tabs by proximity.
+            if i >= index { (i - index) * 2 } else { (index - i) * 2 - 1 }
+        };
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.workspace_id == workspace_id)
+            .min_by_key(|(i, _)| distance(*i))
+            .map(|(i, _)| i)
     }
 
     /// Focus the next tab, wrapping at the end.
@@ -181,6 +213,46 @@ impl TabSessions {
     ///
     /// Returns `false` for an out-of-range or unchanged move so callers can
     /// skip a redundant redraw.
+    /// Reorder the strip so sessions named in `order` come first, in that
+    /// order; everything else keeps its relative order after them.
+    ///
+    /// Used after a reconnect adoption: `order` is the adopted layout's
+    /// left-to-right region order, so each workspace's tab group sits in the
+    /// strip where its region sits in the window.
+    pub fn order_by(&mut self, order: &[SessionId]) {
+        let active_session = self.active_session();
+        let position = |tab: &TabEntry| {
+            order.iter().position(|id| *id == tab.session_id).unwrap_or(usize::MAX)
+        };
+        self.tabs.sort_by_key(position);
+        self.active = active_session
+            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
+            .unwrap_or(0);
+    }
+
+    /// Keep every workspace's tabs in one contiguous run.
+    ///
+    /// New tabs are appended globally, so returning to an earlier workspace
+    /// and opening one can otherwise produce `left, right, left`. The titlebar
+    /// cannot anchor two separate runs at the same region edge without
+    /// overlapping them, so normalize the strip while preserving both
+    /// workspace order and the order of tabs inside each workspace.
+    pub fn group_by_workspace(&mut self) {
+        let active_session = self.active_session();
+        let mut workspaces = Vec::new();
+        for tab in &self.tabs {
+            if !workspaces.contains(&tab.workspace_id) {
+                workspaces.push(tab.workspace_id);
+            }
+        }
+        self.tabs.sort_by_key(|tab| {
+            workspaces.iter().position(|id| *id == tab.workspace_id).unwrap_or(usize::MAX)
+        });
+        self.active = active_session
+            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
+            .unwrap_or(0);
+    }
+
     pub fn reorder(&mut self, from: usize, to: usize) -> bool {
         if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
             return false;
@@ -204,6 +276,12 @@ impl TabSessions {
         }
         tab.title = title;
         true
+    }
+
+    /// The workspace a session's tab is filed under, if the session is open.
+    #[must_use]
+    pub fn workspace_of(&self, session_id: SessionId) -> Option<WorkspaceId> {
+        self.tabs.iter().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
     }
 
     /// Re-file a session under another workspace, returning `true` when the

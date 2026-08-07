@@ -93,9 +93,7 @@ pub const REMOVE_TRUSTED_NETWORK_PREFIX: &str = "action.remove_trusted_network:"
 pub const REVOKE_TRUSTED_DEVICE_PREFIX: &str = "action.revoke_trusted_device:";
 
 /// How a [`Control`] is edited. Interactive kinds map to a concrete gesture the
-/// GPUI window wires to [`crate::settings::apply::apply_settings_change`];
-/// display kinds render the current value read-only (inline text/color entry is
-/// a documented follow-on).
+/// GPUI window wires to [`crate::settings::apply::apply_settings_change`].
 #[derive(Debug, Clone)]
 pub enum ControlKind {
     /// Boolean toggle; click flips it.
@@ -105,7 +103,7 @@ pub enum ControlKind {
     Choice(Vec<(&'static str, &'static str)>),
     /// Numeric stepper with `-`/`+` buttons.
     Stepper { min: f64, max: f64, step: f64, decimals: u8 },
-    /// A hex color value; rendered as a swatch plus its hex (read-only for now).
+    /// A color value; rendered as a swatch plus an editable text field.
     Color,
     /// A free-text value (font family, path); rendered read-only.
     Text,
@@ -421,14 +419,23 @@ fn keybinding_controls() -> Vec<Control> {
         .collect()
 }
 
-/// The Workspaces page.
-///
-/// "Add workspace root" is deliberately absent: it needs inline path entry,
-/// which this window does not have yet, and a button whose only effect was to
-/// print that fact read as a broken control. Roots stay editable in
-/// `config.toml` until the text-input primitive lands.
+/// The Workspaces page's generic controls. The config-backed root collection
+/// renders directly in the settings window because its rows are dynamic.
 fn workspace_controls() -> Vec<Control> {
     vec![action("workspaces.reset_badge_colors", "Reset badge colors")]
+}
+
+/// Build one editable badge-color control per configured palette entry.
+#[must_use]
+pub fn workspace_badge_color_controls(count: usize) -> Vec<Control> {
+    (0..count)
+        .map(|index| {
+            color(
+                &format!("workspaces.badge_colors.{index}"),
+                &format!("Badge color {}", index + 1),
+            )
+        })
+        .collect()
 }
 
 fn update_controls() -> Vec<Control> {

@@ -16,6 +16,12 @@
 #
 #   * Ctrl+, (the `keybindings.settings` default) maps the settings window and
 #     paints it, and the client logs "opened the settings window";
+#   * the Workspaces page preserves an invalid root for correction, persists
+#     the corrected root, removes it again, and reloads the server after both
+#     valid mutations; the native chooser maps and cancellation leaves config
+#     unchanged;
+#   * Badge color 1 rejects invalid RGB text without changing config, saves a
+#     canonical RGB value live, and Reset restores the default palette;
 #   * pressing it again from the terminal window raises the SAME window: the
 #     count stays at one and the client logs "focused the open settings window",
 #     the line only the retained `WindowHandle` path writes;
@@ -34,11 +40,17 @@
 set -e
 
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
+CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
+SERVER_RELOAD_PATTERN="config reloaded successfully via client request"
 
 # Lit pixels the settings window must paint. It draws an eleven-row sidebar and
 # a page of labelled controls in near-white on a dark surface, far more than
 # this; an unpainted or blank window would fall under it.
 SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
+# Ignore caret blink and subpixel noise: rejected input adds an inline message
+# and grows its row, changing comfortably more than this many window pixels.
+SETTINGS_CHANGE_MIN="${SETTINGS_CHANGE_MIN:-100}"
 
 # Titlebar geometry, from crates/scribe-client/src/titlebar.rs: the band is
 # TITLEBAR_HEIGHT=34 tall, and the gear is a 34px icon button sitting directly
@@ -51,6 +63,12 @@ GEAR_WIDTH=34
 COMPACT_SETTINGS_WIDTH=1040
 COMPACT_SETTINGS_HEIGHT=720
 SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"
+# A `workspace` search leaves Keybindings and Workspaces in separate groups.
+# These offsets are the center of the second filtered row, derived from the
+# settings window's 32px titlebar, 18px nav top pad, 46px group headings, 44px
+# rows, and 13px inter-group seam.
+FILTERED_WORKSPACES_X=140
+FILTERED_WORKSPACES_Y=221
 
 TERM_X=0
 TERM_Y=0
@@ -71,12 +89,32 @@ count_settings_windows() {
     list_settings_windows | grep -c . || true
 }
 
+list_chooser_windows() {
+    xdotool search --name '^Open Folder$' 2>/dev/null || true
+}
+
+count_chooser_windows() {
+    list_chooser_windows | grep -c . || true
+}
+
 # Wait until the number of mapped settings windows reaches `want`.
 wait_for_settings_windows() {
     local want="$1" timeout_secs="${2:-15}" started
     started=$(date +%s)
     while true; do
         [ "$(count_settings_windows)" -eq "$want" ] && return 0
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
+wait_for_chooser_windows() {
+    local want="$1" timeout_secs="${2:-15}" started
+    started=$(date +%s)
+    while true; do
+        [ "$(count_chooser_windows)" -eq "$want" ] && return 0
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             return 1
         fi
@@ -142,6 +180,23 @@ settings_size() {
     printf '%s %s' "$w" "$h"
 }
 
+# Count pixels that changed inside the settings window only. A small threshold
+# drops antialiasing noise while retaining the inline validation row.
+settings_changed_pixels() {
+    local before="$1" after="$2" wid info x y w h value
+    wid=$(list_settings_windows | tail -1)
+    [ -z "$wid" ] && { printf '0'; return; }
+    info=$(xwininfo -id "$wid")
+    x=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
+    y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+    w=$(printf '%s\n' "$info" | awk '/^  Width:/ { print $2 }')
+    h=$(printf '%s\n' "$info" | awk '/^  Height:/ { print $2 }')
+    value=$(convert "$before" "$after" -compose difference -composite \
+        -crop "${w}x${h}+${x}+${y}" +repage -colorspace Gray -threshold 3% \
+        -format "%[fx:mean*w*h]" info:)
+    printf '%s' "${value%.*}"
+}
+
 send_keys() {
     xdotool key --clearmodifiers "$@"
     sleep 0.5
@@ -158,6 +213,92 @@ click_terminal_at() {
     sleep 0.3
     xdotool click 1
     sleep 0.6
+}
+
+# Search-filtered sidebar selection is the only intentional settings-window
+# coordinate: it avoids ambiguous keyboard selection when Keybindings also
+# matches `workspace`, then traversal uses semantic focus targets.
+click_filtered_workspaces() {
+    local wid info x y
+    wid=$(list_settings_windows | tail -1)
+    [ -z "$wid" ] && fail "PHASE 2 FAIL: no settings window to select Workspaces"
+    info=$(xwininfo -id "$wid")
+    x=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
+    y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+    xdotool mousemove "$(( x + FILTERED_WORKSPACES_X ))" \
+        "$(( y + FILTERED_WORKSPACES_Y ))"
+    sleep 0.3
+    xdotool click 1
+    sleep 0.6
+}
+
+assert_workspace_roots() {
+    python3 - "$CONFIG_FILE" "$@" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as config_file:
+        config = tomllib.load(config_file)
+except FileNotFoundError:
+    config = {}
+
+actual = config.get("workspaces", {}).get("roots", [])
+expected = sys.argv[2:]
+if actual != expected:
+    print(f"workspace roots mismatch: expected {expected!r}, got {actual!r}")
+    raise SystemExit(1)
+PY
+}
+
+open_workspace_root_chooser() {
+    click_filtered_workspaces
+    send_keys Down
+    send_keys Down
+    send_keys Return
+    if ! wait_for_chooser_windows 1 15; then
+        fail "PHASE 2 FAIL: Browse did not map the native Open Folder chooser"
+    fi
+}
+
+# Read and assert the configured palette with Python's stdlib TOML/JSON support.
+# A missing TOML key means the same eight defaults Rust deserializes.
+workspace_badge_colors() {
+    python3 - "$CONFIG_FILE" "$@" <<'PY'
+import json
+import sys
+import tomllib
+
+defaults = [
+    "#a78bfa", "#38bdf8", "#6ee7b7", "#fb7185",
+    "#fbbf24", "#a3e635", "#f472b6", "#22d3ee",
+]
+try:
+    with open(sys.argv[1], "rb") as config_file:
+        config = tomllib.load(config_file)
+except FileNotFoundError:
+    config = {}
+
+colors = config.get("workspaces", {}).get("badge_colors", defaults)
+command = sys.argv[2]
+if command == "read":
+    print(json.dumps(colors, separators=(",", ":")))
+elif command == "default":
+    print(json.dumps(defaults, separators=(",", ":")))
+elif command == "first":
+    print(colors[0])
+elif command == "assert":
+    expected = json.loads(sys.argv[3])
+    if colors != expected:
+        print(f"workspace badge colors mismatch: expected {expected!r}, got {colors!r}")
+        raise SystemExit(1)
+elif command == "assert-first":
+    if not colors or colors[0] != sys.argv[3]:
+        print(f"workspace badge color 1 mismatch: expected {sys.argv[3]!r}, got {colors!r}")
+        raise SystemExit(1)
+else:
+    raise SystemExit(f"unknown badge color helper command: {command}")
+PY
 }
 
 count_log() {
@@ -179,10 +320,31 @@ wait_for_log_growth() {
     done
 }
 
+count_server_reloads() {
+    grep -acF "$SERVER_RELOAD_PATTERN" "$SERVER_LOG" 2>/dev/null || true
+}
+
+wait_for_server_reload_growth() {
+    local baseline="$1" timeout_secs="${2:-15}" started now
+    started=$(date +%s)
+    while true; do
+        now=$(count_server_reloads)
+        if [ "$now" -gt "$baseline" ]; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
 fail() {
     echo "$1"
     echo "--- client log tail ---"
     tail -40 "$CLIENT_LOG" || true
+    echo "--- server log tail ---"
+    tail -40 "$SERVER_LOG" || true
     exit 1
 }
 
@@ -190,6 +352,15 @@ fail() {
 focus_terminal
 if [ "$(count_settings_windows)" -ne 0 ]; then
     fail "PHASE 0 FAIL: a settings window was already open before any entry point ran"
+fi
+if ! assert_workspace_roots; then
+    fail "PHASE 0 FAIL: settings-entry fixture did not start with zero workspace roots"
+fi
+DEFAULT_BADGE_COLORS=$(workspace_badge_colors default)
+ORIGINAL_BADGE_COLORS=$(workspace_badge_colors read)
+ORIGINAL_BADGE_COLOR_1=$(workspace_badge_colors first)
+if [ "$ORIGINAL_BADGE_COLORS" != "$DEFAULT_BADGE_COLORS" ]; then
+    fail "PHASE 0 FAIL: settings-entry fixture did not start with the default badge palette"
 fi
 # Reproduce the old macOS settings app's physical-pixel Retina geometry. GPUI
 # consumes logical coordinates, so accepting this as-is would clamp the window
@@ -230,42 +401,160 @@ if [ "$INK" -lt "$SETTINGS_INK_MIN" ]; then
 fi
 echo "PHASE 1 PASS: ctrl+, opened the compact $SETTINGS_SIZE settings window (ink $INK)"
 
-# ── Phase 2: the chord again raises it, never duplicates it ───────
+# @lat: [[test#Visual E2E Tests#In-app settings entry points#Workspace roots edit and apply live]]
+# ── Phase 2: workspace roots reject, persist, and remove live ─────
+# `workspace` deliberately matches both Keybindings and Workspaces. Select the
+# visible Workspaces row, then let the window's semantic focus order reach the
+# input. With no roots it is next; with one root, its Remove action is next.
+send_keys ctrl+k
+shot /output/02-search-focused-empty.png
+type_text "workspace"
+click_filtered_workspaces
+send_keys Down
+
+# Rejection must retain the text. Capture before and after Return so the oracle
+# isolates the inline validation change rather than accepting typed glyphs.
+type_text "~"
+shot /output/02-workspace-bare-tilde.png
+send_keys Return
+if ! assert_workspace_roots; then
+    fail "PHASE 2 FAIL: invalid bare ~ changed workspace roots"
+fi
+shot /output/02-workspace-invalid.png
+CHANGED=$(settings_changed_pixels \
+    /output/02-workspace-bare-tilde.png /output/02-workspace-invalid.png)
+if [ "$CHANGED" -lt "$SETTINGS_CHANGE_MIN" ]; then
+    fail "PHASE 2 FAIL: invalid root changed only $CHANGED settings-window pixels (min $SETTINGS_CHANGE_MIN)"
+fi
+
+# Continue in the same input: exact persistence proves the rejected `~` was
+# preserved rather than cleared and replaced by the suffix.
+RELOADS_BEFORE=$(count_server_reloads)
+type_text "/scribe-e2e-workspaces"
+send_keys Return
+if ! assert_workspace_roots "~/scribe-e2e-workspaces"; then
+    fail "PHASE 2 FAIL: corrected workspace root was not persisted exactly once"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: adding a workspace root triggered no server live reload"
+fi
+shot /output/02-workspace-added.png
+
+# Re-selecting Workspaces resets the semantic origin. With one configured root,
+# one Down lands on its first Remove action rather than the input.
+click_filtered_workspaces
+send_keys Down
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Return
+if ! assert_workspace_roots; then
+    fail "PHASE 2 FAIL: keyboard Remove left a configured workspace root"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: removing a workspace root triggered no server live reload"
+fi
+shot /output/02-workspace-removed.png
+
+# Browse uses GPUI's native directory prompt. The Linux implementation reaches
+# the real XDG portal, whose GTK backend maps this Open Folder window. Escape
+# must return cancellation without mutating config or reloading the server.
+open_workspace_root_chooser
+shot /output/02-workspace-chooser.png
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Escape
+if ! wait_for_chooser_windows 0 15; then
+    fail "PHASE 2 FAIL: Escape did not cancel the directory chooser"
+fi
+sleep 1
+if ! assert_workspace_roots; then
+    fail "PHASE 2 FAIL: cancelling the chooser changed workspace roots"
+fi
+if [ "$(count_server_reloads)" -ne "$RELOADS_BEFORE" ]; then
+    fail "PHASE 2 FAIL: cancelling the chooser triggered a server reload"
+fi
+shot /output/02-workspace-chooser-cancelled.png
+echo "PHASE 2 PASS: typed add/remove persisted live; native chooser mapped and cancellation was a no-op ($CHANGED changed px)"
+
+# @lat: [[test#Visual E2E Tests#In-app settings entry points#Workspace badge colors edit and reset live]]
+# The filtered Workspaces page has two matching nav rows. From the clicked
+# Workspaces row, focus order is root input, Browse, Add, eight colors, then Reset.
+click_filtered_workspaces
+send_keys Down
+send_keys Down
+send_keys Down
+send_keys Down
+
+send_keys ctrl+a
+type_text "not-a-color"
+send_keys Return
+if ! workspace_badge_colors assert "$ORIGINAL_BADGE_COLORS"; then
+    fail "PHASE 2 FAIL: invalid badge color changed the configured palette"
+fi
+shot /output/02-badge-color-invalid.png
+
+send_keys ctrl+a
+type_text "112233"
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Return
+if ! workspace_badge_colors assert-first "#112233"; then
+    fail "PHASE 2 FAIL: Badge color 1 was not canonicalized to #112233"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: saving Badge color 1 triggered no server live reload"
+fi
+shot /output/02-badge-color-saved.png
+
+# Exactly 12 Down stops: root input + Browse + Add + 8 colors + Reset.
+click_filtered_workspaces
+for _ in {1..12}; do
+    send_keys Down
+done
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Return
+if ! workspace_badge_colors assert "$DEFAULT_BADGE_COLORS"; then
+    fail "PHASE 2 FAIL: Reset did not restore the default badge palette"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: resetting badge colors triggered no server live reload"
+fi
+shot /output/02-badge-colors-reset.png
+echo "PHASE 2 PASS: Badge color 1 changed from $ORIGINAL_BADGE_COLOR_1 to #112233, then Reset restored defaults"
+
+# ── Phase 3: the chord again raises it, never duplicates it ───────
 # The retained `WindowHandle` is the deduplication. A second open would leave
 # two windows titled "Scribe Settings" both writing config.toml.
 FOCUSES_BEFORE=$(count_log "focused the open settings window")
 focus_terminal
 send_keys ctrl+comma
 if ! wait_for_log_growth "focused the open settings window" "$FOCUSES_BEFORE" 10; then
-    fail "PHASE 2 FAIL: the second chord did not raise the open settings window"
+    fail "PHASE 3 FAIL: the second chord did not raise the open settings window"
 fi
 COUNT=$(count_settings_windows)
 if [ "$COUNT" -ne 1 ]; then
-    fail "PHASE 2 FAIL: expected exactly one settings window, found $COUNT"
+    fail "PHASE 3 FAIL: expected exactly one settings window, found $COUNT"
 fi
-shot /output/02-settings-refocused.png
-echo "PHASE 2 PASS: the chord raised the same window (still $COUNT settings window)"
+shot /output/03-settings-refocused.png
+echo "PHASE 3 PASS: the chord raised the same window (still $COUNT settings window)"
 
-# ── Phase 3: the palette row lands on the same handler ────────────
+# ── Phase 4: the palette row lands on the same handler ────────────
 # "Open Settings" is the palette's first row. It lowers onto the same
 # `KeyAction::OpenSettings` the chord produces, so a routed row raises the open
-# window exactly like phase 2 did.
+# window exactly like phase 3 did.
 FOCUSES_BEFORE=$(count_log "focused the open settings window")
 focus_terminal
 send_keys ctrl+shift+p
 type_text "Open Settings"
-shot /output/03-palette-open-settings.png
+shot /output/04-palette-open-settings.png
 send_keys Return
 if ! wait_for_log_growth "focused the open settings window" "$FOCUSES_BEFORE" 10; then
-    fail "PHASE 3 FAIL: the palette 'Open Settings' row never reached the handler"
+    fail "PHASE 4 FAIL: the palette 'Open Settings' row never reached the handler"
 fi
 COUNT=$(count_settings_windows)
 if [ "$COUNT" -ne 1 ]; then
-    fail "PHASE 3 FAIL: the palette row opened a duplicate window ($COUNT total)"
+    fail "PHASE 4 FAIL: the palette row opened a duplicate window ($COUNT total)"
 fi
-echo "PHASE 3 PASS: the palette row reached the settings handler"
+echo "PHASE 4 PASS: the palette row reached the settings handler"
 
-# ── Phase 4: the titlebar gear is wired too ───────────────────────
+# ── Phase 5: the titlebar gear is wired too ───────────────────────
 # The gear has been painted since the titlebar landed, but its
 # `TitlebarEvent::OpenSettings` had no subscriber, so clicking it did nothing.
 FOCUSES_BEFORE=$(count_log "focused the open settings window")
@@ -275,20 +564,30 @@ GEAR_Y=$(( TITLEBAR_HEIGHT / 2 ))
 echo "clicking the gear at window-relative +${GEAR_X}+${GEAR_Y} (client origin ${TERM_X},${TERM_Y})"
 click_terminal_at "$GEAR_X" "$GEAR_Y"
 if ! wait_for_log_growth "focused the open settings window" "$FOCUSES_BEFORE" 10; then
-    fail "PHASE 4 FAIL: clicking the gear at +${GEAR_X}+${GEAR_Y} reached no handler"
+    fail "PHASE 5 FAIL: clicking the gear at +${GEAR_X}+${GEAR_Y} reached no handler"
 fi
 COUNT=$(count_settings_windows)
 if [ "$COUNT" -ne 1 ]; then
-    fail "PHASE 4 FAIL: the gear opened a duplicate window ($COUNT total)"
+    fail "PHASE 5 FAIL: the gear opened a duplicate window ($COUNT total)"
 fi
-shot /output/04-gear-click.png
-echo "PHASE 4 PASS: the titlebar gear reached the settings handler"
+shot /output/05-gear-click.png
+echo "PHASE 5 PASS: the titlebar gear reached the settings handler"
 
 echo ""
 echo "PASS: visual settings-entry test"
 echo "  Inspect screenshots in test-output/:"
 echo "    00-terminal-only.png          — the client before any settings entry"
 echo "    01-settings-open.png          — the settings window opened by ctrl+,"
-echo "    02-settings-refocused.png     — the same window raised, not duplicated"
-echo "    03-palette-open-settings.png  — palette filtered to 'Open Settings'"
-echo "    04-gear-click.png             — after the titlebar gear click"
+echo "    02-search-focused-empty.png   — focused empty search without visual placeholder"
+echo "    02-workspace-bare-tilde.png   — rejected root before inline validation"
+echo "    02-workspace-invalid.png      — rejected root retained with inline error"
+echo "    02-workspace-added.png        — corrected root rendered from config"
+echo "    02-workspace-removed.png      — root removed through keyboard traversal"
+echo "    02-workspace-chooser.png      — native portal directory chooser"
+echo "    02-workspace-chooser-cancelled.png — cancellation left roots unchanged"
+echo "    02-badge-color-invalid.png    — invalid RGB retained with inline error"
+echo "    02-badge-color-saved.png      — canonical #112233 editor and swatch"
+echo "    02-badge-colors-reset.png     — eight default badge colors restored"
+echo "    03-settings-refocused.png     — the same window raised, not duplicated"
+echo "    04-palette-open-settings.png  — palette filtered to 'Open Settings'"
+echo "    05-gear-click.png             — after the titlebar gear click"

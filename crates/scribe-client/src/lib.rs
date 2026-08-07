@@ -83,6 +83,7 @@ pub mod lan_approval;
 pub mod lan_dial;
 pub mod layout;
 pub mod lost_control;
+pub mod monitor;
 pub mod mouse_reporting;
 pub mod mouse_state;
 pub mod notification_dispatcher;

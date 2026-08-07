@@ -178,6 +178,9 @@ impl ChromeMetadata {
             // dropped path arrives.
             entry.shell_name = Some(info.shell_name.clone());
         }
+        // Workspace rows are authoritative too: rebuilding the map clears a
+        // listed `None` name and prunes workspaces omitted after reconnect.
+        self.workspaces.clear();
         for workspace in workspaces {
             if let Some(name) = workspace.name.clone() {
                 self.name_workspace(workspace.workspace_id, name);

@@ -1530,9 +1530,17 @@ It runs on the . The script used to open with a phase 0 that killed the client, 
 
 `tests/e2e/visual/settings-entry.sh` (`just e2e-visual-settings-entry`) is the app-level oracle for the `settings` parity row: it drives the running terminal window and asserts a second top-level window really maps (see ).
 
-The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. Four phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. Before the first open, the test seeds a 3520×2424 physical-pixel legacy geometry and requires the mapped client to use the compact 1040×720 fallback instead of filling the work area. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
+The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. The phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title  sets. Before the first open, the test seeds a 3520×2424 physical-pixel legacy geometry and requires the mapped client to use the compact 1040×720 fallback instead of filling the work area. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
 
 Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin, so a frame-relative gear click would land in the window manager's own title bar. The gear offset is derived from the titlebar's fixed 34px band and its 34/40px buttons, so a titlebar layout change fails the phase rather than missing silently.
+
+#### Workspace roots edit and apply live
+
+The live regression keeps rejected input editable, proves typed roots persist and remove live, maps the native directory chooser, and verifies cancellation changes neither config nor server reload count.
+
+#### Workspace badge colors edit and reset live
+
+The settings regression rejects invalid RGB without changing config, saves canonical `#rrggbb` live, and restores the eight-colour default palette through keyboard Reset.
 
 ### Tab and window chords reach their actions
 
@@ -1546,11 +1554,15 @@ Both chords were claimed by  before the binding dispatcher ever saw them, so onl
 
 The wire assertion matters because the first symptom was not "the underline failed to move" but "the running pane never switched", and the second was subtler: after a titlebar click, the right session was attached but typing stayed trapped in the chrome. The script starts from the shared-pane rig so the first session id is known up front, opens a second tab through the client's own `ctrl+shift+t`, then requires `ctrl+Prior` / `ctrl+Next` and two titlebar clicks to produce `AttachSessions` for the expected session ids in turn. After each titlebar click it immediately types an `echo` into the active pane without re-focusing the terminal and waits for that output, proving the shell not only switched sessions but also restored terminal focus after pointer activation.
 
+Phases 6–10 extend the oracle to multi-workspace windows, guarding the cross-region selection path end to end. A live `ctrl+alt+backslash` splits the window into a second workspace region (settled on the `MoveSession` frame that re-files the seed session under the new region), after which `alt+1` and a pointer click on the first tab — offset past the workspace badge pill — must each attach the first region's session from focus in the second region. The client is then killed and relaunched so the fresh window rebuilds both regions from the server's persisted workspace tree (`adopt_server_topology` → `PaneShell::adopt_server_tree`), and the same cross-region click must still switch tabs on that adoption-built layout. The adopted strip's order follows the server's `SessionList`, which is not creation order, so the adopted-layout phase asserts order-independently: the click must attach a different session than the preceding `alt+3` did, and every typed key must be routed to the clicked session. Focus assertions for sessions the client created itself run against the wire's per-session `KeyInput` frames rather than `scribe-test wait-output`, which can only observe daemon-owned sessions — a limitation that produced deterministic false failures before the oracle was switched.
+
+Phase 11 covers the one input shape a plain `xdotool click` can never produce: a jittered real-mouse click whose pointer travels a few px between press and release. That travel crosses GPUI's ~2 px native drag threshold (`DRAG_THRESHOLD` in gpui's `div.rs`), which engages the tab's `on_drag` and cancels the element-level click — the mechanism that swallowed every real-mouse tab click while the suite's zero-jitter clicks stayed green. The phase presses on a non-selected tab, moves the pointer 3 px in two steps while held, releases, and requires the resulting `AttachSessions` plus `KeyInput` routing, proving [[crates/scribe-client/src/titlebar.rs#TitlebarView#end_drag]] treats an engaged drag that never reordered as the click it was.
+
 ### Pane and workspace layout is live
 
 `tests/e2e/visual/pane-workspace-layout.sh` is the scripted oracle for the fourteen pane and workspace parity rows, whose models () passed their headless suites for the whole rebuild while the running binary never instantiated them.
 
-A `#[gpui::test]` over the trees cannot tell "the layout is live" from "the action is an intercepted no-op", so each phase drives the real window through XTEST and asserts an effect only a live  can produce. `ctrl+shift+backslash` must log the split, pull a second session off the server, adopt it into the new pane, and republish BOTH panes at about half the window's 120 columns. Typing then has to add ink to the RIGHT half of the grid and not the left — the new pane is focused and is a separate terminal, not a second view of the first — and after `shift+ctrl+alt+Left` the same test has to come out the other way round, which is what proves directional focus moved where keystrokes go. `ctrl+Tab` must reach `cycle_pane` and return typed ink to the right pane, proving titlebar Tab traversal did not intercept the modified chord. `ctrl+shift+w` must both drop the pane locally and make the server log `session closed by client`; `ctrl+alt+backslash` must split the window into a second region and report `regions=2`.
+A `#[gpui::test]` over the trees cannot tell "the layout is live" from "the action is an intercepted no-op", so each phase drives the real window through XTEST and asserts an effect only a live  can produce. `ctrl+shift+backslash` must log the split, pull a second session off the server, adopt it into the new pane, and republish BOTH panes at about half the window's 120 columns. Typing then has to add ink to the RIGHT half of the grid and not the left — the new pane is focused and is a separate terminal, not a second view of the first — and after `shift+ctrl+alt+Left` the same test has to come out the other way round, which is what proves directional focus moved where keystrokes go. `ctrl+Tab` must reach `cycle_pane` and return typed ink to the right pane, proving titlebar Tab traversal did not intercept the modified chord. `ctrl+shift+w` must both drop the pane locally and make the server log `session closed by client`; `ctrl+alt+backslash` must split the window into a second region and report `regions=2`. After focus returns left, `ctrl+shift+t` adds a third tab and captures the unnamed two-region strip, guarding the `left, right, left` order that previously made tab groups flow away from the workspace border.
 
 The ink assertions crop to the grid area only, excluding the titlebar above and the status bands below, and the log assertions run against an ANSI-stripped view of the client log because `tracing_subscriber::fmt` colours field names so `field=value` is never contiguous in the file. One chord is rebound through `SCRIBE_EXTRA_CONFIG`: `workspace_focus_left` defaults to `ctrl+alt+Left`, which openbox — the window manager the container must run so the client's X11 guard sees a real `_NET_ACTIVE_WINDOW` owner — grabs for desktop switching before any application sees it. The workspace *split* on the same layer still fires from its untouched default, so the chord path itself stays proven. The script reuses the session-adoption preamble documented under .
 
@@ -1563,6 +1575,14 @@ The gap those rows had was reachability, not correctness: the window's workspace
 `ctrl+alt+backslash` must put a `CreateWorkspace` on the wire, draw a `WorkspaceInfo` out of the real server, and make the client log that a region adopted that exact id; the same split must then report a `ReportWorkspaceTree` whose tree is a two-leaf split naming it, and the session the split seeded must be reconciled with a `MoveSession` targeting it — the session is created through the *first* region's workspace, so a client that never sends this leaves every pane filed under the window's first workspace. `ctrl+shift+w` collapses the second region and must put `CloseWorkspace` for that id on the wire and re-report a one-leaf tree.
 
 The inbound half is injected rather than provoked, because that is what makes it an assertion about the reader rather than about the split: a `WorkspaceInfo` carrying a display name must repaint the status bar's left group, and the same frame with `name: null` must repaint it back to the original pixels. The injected accent is the server's own, echoed out of the recorded frame, so the name is the only thing that moves between captures. The band is derived from each capture's own content bounding box rather than from `xdotool getwindowgeometry`, whose rectangle does not line up with the client area under openbox, and is cropped to the left quarter so the status bar's own 2 s sparkline resample cannot swamp the comparison.
+
+### Workspace split bars and strip integrity
+
+`tests/e2e/visual/workspace-split.sh` drives both split directions and asserts the two invariants screenshots alone let regress: a stacked lower region always carries its own tab bar, and no exit re-files a session across workspaces.
+
+The bar oracle is the client's own `lower-region tab bars changed` log line — emitted by the strip partition whenever the bar set's shape changes, because the in-region bars paint no other externally observable trace. After `ctrl+alt+-` the latest state must name one bar with one tab, a `ctrl+shift+t` in that region must grow it to two, exiting one tab must shrink it back to one (the region survives on its remaining tab), and exiting the last must report `none` alongside the server-side `CloseWorkspace`. Assertions read the *latest* state line, since earlier states stay in the log.
+
+The integrity oracle counts `moved a session into another workspace region` lines: exactly one per split (each split's seed is created through the previous region's workspace and re-filed once its pane adopts it) and never one more — a growing count is the exit-refocus path dragging a surviving session across a workspace boundary. Clicks warp the pointer window-relative but press through XTEST, because GPUI reads pointer input via XInput2 and never sees the synthetic `XSendEvent` buttons `xdotool click --window` produces — typing works over synthetic events, clicks silently vanish.
 
 ### Config live reload
 
@@ -1748,7 +1768,7 @@ The single pointer gesture is that seed: a click on the empty sidebar background
 
 Nothing is stubbed and nothing is injected. The wire tap (, `SCRIBE_SHARE_TAP=1`) is interposed purely as a recorder, so every server frame the script asserts on is one the real `scribe-server` chose to send in answer to something the real client sent. `tests/e2e/visual/window-lifecycle-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn `remote.enabled` on, because the window-list poll is gated on it exactly as the winit client gates it; the entrypoint writes that file after the server has already started, so only the client's poll is affected and no remote listener is bound.
 
-The five phases each assert a different half of the conversation. A phase-0 preamble hands the client a live pane through the same daemon-stop-and-relaunch trick  documents, asserted on the client's own `AttachSessions` frame. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 4 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
+The six phases each assert a different half of the conversation. Phase 0 reads the client's own nonempty `FocusChanged.gained` to identify the shell fresh-window bootstrap placed in the visible pane; the separate session the entrypoint creates for `scribe-test` is deliberately ignored. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 exits that tab and proves the process stays alive without sending `CloseWindow`, then exits the remaining terminal and requires `CloseWindow`, `WindowClosed`, and process death in order. Phase 4 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 5 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
 
 The one-Tab Quit Scribe path and two-Tab Kill Window path are focus-trap checks as well as action checks: traversal must remain inside the close modal until Enter emits the exact lifecycle frame, while the real server acknowledgement remains the only exit oracle.
 
@@ -2253,6 +2273,12 @@ A record whose `x`/`y` are `None` reopens at the caller's centred fallback origi
 
 Wayland never exposes a window's origin, so the capture stores `None` instead of a bogus `(0, 0)`; honouring the fallback is what stops a later X11 launch from restoring into the screen corner.
 
+### Unknown monitor identity keeps the saved position
+
+The monitor gate drops a saved position only when the record names a monitor that is verifiably no longer connected; unknown identities keep the position.
+
+`None`, the legacy nil-UUID placeholder, and any name when monitor enumeration is unavailable all keep the saved `x`/`y`; only a real connector name absent from a non-empty connected list is gated, and gating strips position while keeping size and maximized state. Guards the regression where every pre-upgrade window (whose records all carried the nil UUID) lost its position on the first restart and side-by-side windows re-opened stacked at the default placement.
+
 ## X11 focus guard
 
 Unit tests for , the pure reactivation state machine backing the ported X11 focus guard, proving the suppression semantics that the visual E2E exercises against the live `_NET_ACTIVE_WINDOW`.
@@ -2636,6 +2662,18 @@ Pending headless suites and the parity rows they will satisfy:
 - Reconnect topology rebuild — `WorkspaceInfo` layout restore beyond the existing  `from_tree` path.
 - Degraded/failure paths — server-down at launch, socket vanish mid-session, adoption failure, replay decode failure (pane error state, no crash), reconnect retry/timeout.
 
+### Hot-reconnect adoption lowering
+
+Unit coverage for the wire→layout lowering `PaneShell::adopt_server_tree` performs when a fresh window rebuilds its regions from the server's persisted workspace tree.
+
+A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to itself and lowers through `WindowLayout::from_tree` to regions sharing y and splitting the width — pinning the orientation convention (`Horizontal` = side-by-side, `Vertical` = stacked) across the report→persist→adopt round trip so a reconnect can never transpose the window layout.
+
+### Lower regions reserve their tab bar
+
+Unit coverage for the region content-rect rule behind the in-region tab bars: a top-row region keeps its full rect, a stacked region cedes `REGION_TAB_BAR_HEIGHT` at its top, and a region shorter than the bar clamps instead of going negative.
+
+Every pane-geometry consumer (`placements`, `dividers`, directional focus) shares this one rule, so painted panes and hit-tests can never disagree about where a lower region's content starts.
+
 ### Pane split-tree logic
 
 The pure  split-tree drives the "Pane layout" keybinding actions (`close_pane`, `cycle_pane`, `focus_left`/`right`/`up`/`down`) beneath the  entity wrapper, so its navigation and mutation logic is asserted directly without a GPUI context.
@@ -2655,6 +2693,18 @@ Four cases lock , the rule that kept `close_tab` and `new_window` unreachable un
 Locks the selection rules of , the ordered strip the shell's tab shortcuts and the IPC reader both mutate, so a tab's label and the attached session can never disagree.
 
 The suite drives the shortcut side —  appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where  preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
+
+#### Exit refocus stays inside the workspace
+
+Removing the active tab hands the selection to the nearest surviving tab of the *same* workspace — successor first, then predecessor — never to a strip neighbour from another region.
+
+The reconcile pass adopts whatever the refocus selects into the focused pane, so a cross-workspace choice here is what dragged sessions between regions; keeping the choice workspace-scoped removes that path entirely.
+
+#### Last tab of a workspace falls back across the strip
+
+Only when the removed tab was its workspace's last does the selection fall back to the strip-global neighbour: the region is collapsing, and the reconcile pass re-points the selection at whichever region inherits focus.
+
+Every surviving tab keeps its own workspace through the fallback, which the test pins with `workspace_of` checks after both removals.
 
 ### GPUI tab task labels
 
@@ -3271,9 +3321,9 @@ Unit tests for , the ported window-status-bar segment model, proving connection/
 
  paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.
 
-### Pane feedback shares the window status bar
+### Pane feedback stays out of the window status bar
 
-Connection and pane errors render in the existing window status bar and its single accessible status node; empty feedback adds no visual copy.
+Transient connection and pane errors are log-only: the band renders no warning glyph and no error copy for them, and the accessible status node omits them too. The only ⚠ the bar may show is the env-capture-degraded one.
 
 ### Command status glyphs distinguish outcomes
 

@@ -347,7 +347,7 @@ fn translate(provider: AiProvider, kind: HookEventKind) -> Option<MetadataEvent>
 
         HookEventKind::PromptReceived { text, conversation_id: _ } => {
             let trimmed = truncate_chars(text.trim(), PROMPT_TEXT_CAP_BYTES);
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || is_machine_injected(&trimmed) {
                 return None;
             }
             Some(MetadataEvent::PromptReceived { provider, text: trimmed })
@@ -355,7 +355,7 @@ fn translate(provider: AiProvider, kind: HookEventKind) -> Option<MetadataEvent>
 
         HookEventKind::TaskLabelChanged { label } => {
             let trimmed = truncate_chars(label.trim(), TASK_LABEL_CAP_BYTES);
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || is_machine_injected(&trimmed) {
                 return None;
             }
             Some(MetadataEvent::TaskLabelChanged { provider, label: trimmed })
@@ -422,6 +422,19 @@ fn sanitize_conversation_id(s: &str) -> String {
 /// making that private helper public for a single caller.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+/// Whether hook text is a machine-injected submission rather than something
+/// the user typed. Harness wakeups, task notifications, and continuity blocks
+/// arrive through `UserPromptSubmit` as user-role turns whose text opens with
+/// a bare XML tag (`<system-reminder>`, `<task-notification>`, …); a typed
+/// prompt essentially never does, so the prompt bar and tab label skip these.
+fn is_machine_injected(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else { return false };
+    let tag: String = rest.chars().take_while(|c| *c != '>').collect();
+    tag.len() < rest.len()
+        && tag.starts_with(|c: char| c.is_ascii_alphabetic())
+        && tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
 }
 
 #[cfg(test)]
@@ -491,6 +504,32 @@ mod tests {
         let event =
             HookEventKind::PromptReceived { text: "   \n  ".to_owned(), conversation_id: None };
         assert!(translate(AiProvider::ClaudeCode, event).is_none());
+    }
+
+    #[test]
+    fn translate_prompt_received_drops_machine_injected() {
+        for text in [
+            "<system-reminder>\nSessionStart hook…\n</system-reminder>",
+            "<task-notification>agent done</task-notification>",
+            "<quill_continuity>resume</quill_continuity>",
+        ] {
+            let event =
+                HookEventKind::PromptReceived { text: text.to_owned(), conversation_id: None };
+            assert!(translate(AiProvider::ClaudeCode, event).is_none(), "kept: {text}");
+        }
+        // Typed prompts that merely mention angle brackets survive.
+        for text in ["fix x < y check", "<- see the arrow", "use <br> tags sparingly? no"] {
+            let event =
+                HookEventKind::PromptReceived { text: text.to_owned(), conversation_id: None };
+            assert!(translate(AiProvider::ClaudeCode, event).is_some(), "dropped: {text}");
+        }
+    }
+
+    #[test]
+    fn translate_task_label_drops_machine_injected() {
+        let event =
+            HookEventKind::TaskLabelChanged { label: "<user_instructions> do x".to_owned() };
+        assert!(translate(AiProvider::CodexCode, event).is_none());
     }
 
     #[test]

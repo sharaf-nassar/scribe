@@ -281,17 +281,17 @@ pub enum ClientMessage {
         session_id: SessionId,
     },
     CreateWorkspace,
-    /// Close a workspace by ID.
-    ///
-    /// TODO: not yet implemented on the server side — the server does not currently
-    /// handle this variant.
+    /// Close a workspace by ID — sent when its last region collapses. The
+    /// client closes the region's sessions first, so this normally names an
+    /// already-empty workspace.
     CloseWorkspace {
         workspace_id: WorkspaceId,
     },
-    /// Move a session to a different workspace.
-    ///
-    /// TODO: not yet implemented on the server side — the server does not currently
-    /// handle this variant.
+    /// Move a session to a different workspace. The workspace-split flow seeds
+    /// its session through the old workspace (the new one does not exist yet)
+    /// and sends this once the new region's pane adopts it, re-keying the
+    /// server's membership so `SessionList`, CWD auto-naming, and handoff
+    /// persistence agree with the client's regions.
     MoveSession {
         session_id: SessionId,
         target_workspace: WorkspaceId,

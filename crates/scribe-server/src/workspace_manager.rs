@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{LayoutDirection, ServerMessage, WorkspaceTreeNode};
@@ -138,6 +138,55 @@ impl WorkspaceManager {
             ws.sessions.push(session_id);
             debug!(%session_id, %workspace_id, "added session to workspace");
         }
+    }
+
+    /// Re-key a session into another workspace (`ClientMessage::MoveSession`).
+    ///
+    /// The split flow seeds its session through the old workspace and moves it
+    /// once the client's pane adopts the new region, so membership here — what
+    /// `SessionList`, CWD auto-naming, and handoff persistence all read — must
+    /// follow. The client only names workspaces the server minted; an unknown
+    /// target is dropped rather than auto-created.
+    pub fn move_session(&mut self, session_id: SessionId, target: WorkspaceId) -> bool {
+        if !self.workspaces.contains_key(&target) {
+            warn!(%session_id, %target, "session move ignored: unknown target workspace");
+            return false;
+        }
+        if let Some(previous) = self.session_to_workspace.insert(session_id, target)
+            && let Some(ws) = self.workspaces.get_mut(&previous)
+        {
+            ws.sessions.retain(|&s| s != session_id);
+        }
+        if let Some(ws) = self.workspaces.get_mut(&target)
+            && !ws.sessions.contains(&session_id)
+        {
+            ws.sessions.push(session_id);
+        }
+        info!(%session_id, %target, "moved session to workspace");
+        true
+    }
+
+    /// Drop a workspace whose last region closed (`ClientMessage::CloseWorkspace`).
+    ///
+    /// The client closes the region's sessions first, so the workspace is
+    /// normally empty by the time this arrives; any straggler membership is
+    /// unlinked so the reverse map cannot point at a dead workspace.
+    pub fn close_workspace(&mut self, workspace_id: WorkspaceId) {
+        let Some(ws) = self.workspaces.remove(&workspace_id) else {
+            debug!(%workspace_id, "close ignored: unknown workspace");
+            return;
+        };
+        if !ws.sessions.is_empty() {
+            warn!(
+                %workspace_id,
+                sessions = ws.sessions.len(),
+                "closed a workspace that still had sessions"
+            );
+        }
+        for session_id in ws.sessions {
+            self.session_to_workspace.remove(&session_id);
+        }
+        info!(%workspace_id, "closed workspace");
     }
 
     /// Remove a session from its workspace.
@@ -430,6 +479,7 @@ impl WorkspaceManager {
     ) -> Self {
         let mut ws_map = HashMap::new();
         let mut session_to_workspace = HashMap::new();
+        let mut dropped_session_total = 0usize;
 
         for hw in workspaces {
             let session_ids: Vec<SessionId> = hw
@@ -455,12 +505,27 @@ impl WorkspaceManager {
                 },
             );
 
+            let dropped = hw.session_ids.len().saturating_sub(session_ids.len());
+            dropped_session_total += dropped;
             info!(
                 workspace_id = %hw.id,
                 name = ?hw.name,
                 sessions = session_ids.len(),
-                dropped_sessions = hw.session_ids.len().saturating_sub(session_ids.len()),
+                dropped_sessions = dropped,
                 "restored workspace from handoff"
+            );
+        }
+
+        // A silent empty or lossy restore is exactly the failure mode a
+        // post-upgrade log inspection needs to see — warn with counts.
+        if workspaces.is_empty() {
+            warn!("handoff restored 0 workspaces — successor starts with an empty layout");
+        }
+        if dropped_session_total > 0 {
+            warn!(
+                dropped_sessions = dropped_session_total,
+                restored_sessions = valid_session_ids.len(),
+                "handoff restore dropped sessions not admitted by the session manager"
             );
         }
 
@@ -506,6 +571,10 @@ impl WorkspaceManager {
 impl WorkspaceManager {
     fn workspace_for_session(&self, session_id: SessionId) -> Option<WorkspaceId> {
         self.session_to_workspace.get(&session_id).copied()
+    }
+
+    fn sessions_in_workspace(&self, workspace_id: WorkspaceId) -> Vec<SessionId> {
+        self.workspaces.get(&workspace_id).map(|ws| ws.sessions.clone()).unwrap_or_default()
     }
 
     fn workspace_tree(&self) -> Option<&WorkspaceTreeNode> {
@@ -624,6 +693,37 @@ mod tests {
         assert_eq!(mgr.workspace_for_session(sess_id), Some(ws_id));
         mgr.remove_session(sess_id);
         assert_eq!(mgr.workspace_for_session(sess_id), None);
+    }
+
+    #[test]
+    fn move_session_rekeys_membership() {
+        let mut mgr = manager_with_roots(vec![]);
+        let ws_old = mgr.create_workspace();
+        let ws_new = mgr.create_workspace();
+        let sess = SessionId::new();
+        mgr.add_session(ws_old, sess, None);
+
+        // The split flow: session seeded through the old workspace, moved once
+        // the new region's pane adopts it.
+        assert!(mgr.move_session(sess, ws_new));
+        assert_eq!(mgr.workspace_for_session(sess), Some(ws_new));
+        assert_eq!(mgr.sessions_in_workspace(ws_old), Vec::new());
+        assert_eq!(mgr.sessions_in_workspace(ws_new), vec![sess]);
+
+        // Unknown target: dropped, membership unchanged.
+        assert!(!mgr.move_session(sess, WorkspaceId::new()));
+        assert_eq!(mgr.workspace_for_session(sess), Some(ws_new));
+    }
+
+    #[test]
+    fn close_workspace_unlinks_stragglers() {
+        let mut mgr = manager_with_roots(vec![]);
+        let ws = mgr.create_workspace();
+        let sess = SessionId::new();
+        mgr.add_session(ws, sess, None);
+        mgr.close_workspace(ws);
+        assert_eq!(mgr.workspace_for_session(sess), None);
+        assert!(mgr.workspace_info(ws).is_none());
     }
 
     #[test]

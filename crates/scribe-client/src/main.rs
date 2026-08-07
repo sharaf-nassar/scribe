@@ -21,8 +21,8 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    App, AppContext as _, AsyncApp, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*,
     px, relative, size,
@@ -66,6 +66,7 @@ use scribe_client::layout::{FocusDirection, PaneId, Rect, SplitDirection};
 use scribe_client::lost_control::{
     LostControlColors, LostControlState, ReclaimKey, lost_control_overlay,
 };
+use scribe_client::monitor;
 use scribe_client::mouse_reporting::{self, MouseModes, ScrollDirection, WheelAction};
 use scribe_client::mouse_state::{ClickKind, MouseClickState};
 use scribe_client::notification_dispatcher::{self, NotifOutput, NotifReq, ShowReq};
@@ -118,16 +119,19 @@ use scribe_client::vi_mode::ViMotion;
 use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client::window_state::{
-    WindowGeometry, WindowRegistry, geometry_from_bounds, geometry_size_is_sane,
-    normalize_legacy_geometry, window_bounds_for,
+    WindowGeometry, WindowRegistry, gate_position_on_monitor, geometry_from_bounds,
+    geometry_size_is_sane, normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::x11_focus::X11FocusGuard;
 use scribe_client::zoom::ZoomState;
 use scribe_client::{
     smart_selection::CompiledSmartSelection,
-    tab_bar::{TabBarColors, badge_label, context_suffix},
+    tab_bar::{
+        GroupBadge, TabBarColors, TabData, accent_tab_tone, badge_label, context_suffix,
+        flash_blend, tab_display_title,
+    },
     tab_session::{TabEntry, TabSessions},
-    titlebar::{TabActivationSource, TitlebarEvent, TitlebarView},
+    titlebar::{TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView},
 };
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
@@ -140,7 +144,7 @@ use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         AiLaunchSpec, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
-        ServerMessage, SessionInfo, TerminalSize, WindowInfo,
+        ServerMessage, SessionInfo, TerminalSize, WindowInfo, WorkspaceTreeNode,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -241,6 +245,11 @@ fn window_bringup_ms() -> Option<f64> {
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
 
+/// Title columns available in a lower region's bar tab before truncation,
+/// matching the titlebar's fixed tab column budget minus its padding/close
+/// reservation.
+const REGION_TAB_TITLE_COLS: usize = 18;
+
 /// Label of the demo smart-selection row in the right-click context menu.
 const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
 
@@ -292,6 +301,11 @@ impl AiChrome {
         self.prompts.remove(&session_id);
     }
 }
+
+/// A parked server workspace tree plus the live session ids of the
+/// `SessionList` that carried it; see the `server_topology` field of
+/// [`Shared`].
+type ServerTopologySlot = Arc<Mutex<Option<(WorkspaceTreeNode, HashSet<SessionId>)>>>;
 
 /// Shared handles threaded from the app entry into the background IPC thread and
 /// the foreground GPUI view.
@@ -391,6 +405,13 @@ struct Shared {
     /// the server's answer and the next reconcile pass applies it on the thread
     /// that owns the layout.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// The server's persisted workspace split tree, parked together with the
+    /// live session ids of the `SessionList` that carried it. The reader parks
+    /// it on the first list of a connection (before it rebuilds the tab
+    /// strip, so no frame can see the sessions without the tree); the GPUI
+    /// thread's reconcile pass adopts it when this window has no layout of its
+    /// own yet, which is what restores splits across a client restart.
+    server_topology: ServerTopologySlot,
     /// Spec-010 OSC 52 state. The IPC reader records the negotiated gating bit,
     /// parks a confirmation request, and queues the host clipboard jobs the
     /// server forwards; the view's lifecycle tick raises the prompt as a modal
@@ -577,7 +598,13 @@ impl ColdStart {
         let geometry = WindowRegistry::new()
             .load_saved(snapshot.window_id)
             .map(|geom| normalize_legacy_geometry(&geom))
-            .filter(geometry_size_is_sane);
+            .filter(geometry_size_is_sane)
+            // Drop the saved position only when the record names a monitor
+            // that is verifiably no longer connected. Unknown identities (the
+            // nil-UUID records legacy captures wrote) keep their position —
+            // dropping them stacked every restored window at the default
+            // placement on the first post-upgrade start.
+            .map(|geom| gate_position_on_monitor(&geom, &monitor::connected_monitor_names()));
         Self { snapshot: Some(snapshot), geometry }
     }
 }
@@ -629,6 +656,10 @@ struct RestoreRuntime {
     /// The snapshot [`ColdStart`] claimed, held until the first `SessionList`
     /// says whether it is needed. Taken (and dropped) either way.
     pending: Option<WindowRestoreState>,
+    /// The window id of the claimed snapshot. The claim leaves the file on
+    /// disk as the last good layout; it is retired here only once this window
+    /// has durably written a fresh snapshot of its own.
+    claimed_window: Option<WindowId>,
     /// Per-session launch bindings — what a snapshot's `LaunchRecord`s are built
     /// from. A session this window did not create itself (a reattach, a share
     /// join) gets a plain shell binding, which is what a cold restart relaunches.
@@ -663,6 +694,7 @@ impl RestoreRuntime {
         Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
+            claimed_window: pending.as_ref().map(|snapshot| snapshot.window_id),
             pending,
             bindings: HashMap::new(),
             requested: VecDeque::new(),
@@ -872,6 +904,15 @@ struct TerminalView {
     /// Last tab strip pushed into the titlebar, so a redraw only re-renders the
     /// tab row when the shared model actually changed.
     rendered_tabs: TabSessions,
+    /// For each titlebar tab position, the strip index it renders. The titlebar
+    /// hosts only top-row regions' tabs — lower regions carry their own bars —
+    /// so its Select/Close/Reorder events arrive in titlebar positions and are
+    /// translated through this map before touching [`TabSessions`].
+    titlebar_index_map: Vec<usize>,
+    /// Tab-bar contents for each workspace region below the window's top row,
+    /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
+    /// region's top strip.
+    region_bars: Vec<RegionBarData>,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
     terminal_colors: GridPalette,
@@ -970,6 +1011,25 @@ impl Focusable for TerminalView {
     }
 }
 
+/// One lower workspace region's tab-bar contents.
+///
+/// The titlebar hosts tabs only for regions on the window's top row; a region
+/// stacked below carries this bar at the top of its own rect instead — the
+/// legacy client's per-workspace tab bar, kept out of [`TitlebarView`] because
+/// it needs no drag-reorder or window-move chrome.
+// ponytail: region-bar tabs skip drag-reorder and AccessKit tab stops; route
+// through TitlebarView if either ever matters here.
+struct RegionBarData {
+    /// The region this bar belongs to, keyed by its (server) workspace.
+    workspace_id: WorkspaceId,
+    /// Region accent, tinting the bar's hairline and active underline.
+    accent: [f32; 4],
+    /// Badge pill, present only when the server named the workspace.
+    badge: Option<GroupBadge>,
+    /// The bar's tabs in strip order, each naming the session it selects.
+    tabs: Vec<(SessionId, TabData)>,
+}
+
 impl TerminalView {
     /// Start the X11 active-window guard from the live window.
     ///
@@ -1022,8 +1082,9 @@ impl TerminalView {
     /// write itself is debounced by the lifecycle tick — a drag-resize would
     /// otherwise rewrite the file once per frame.
     fn capture_geometry(&mut self, window: &Window, cx: &App) {
-        let monitor =
-            window.display(cx).and_then(|display| display.uuid().ok()).map(|id| id.to_string());
+        // RandR connector name where available; GPUI's X11 display uuid is a
+        // nil placeholder and must never be persisted (see `monitor`).
+        let monitor = monitor::persisted_monitor_name(window, cx);
         let geometry = geometry_from_bounds(window.bounds(), window.is_maximized(), monitor);
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
@@ -1113,6 +1174,8 @@ impl TerminalView {
             // `SessionList`; `sync_tabs` pushes it into the titlebar on the
             // next redraw so the tab row always mirrors live server state.
             rendered_tabs: TabSessions::new(),
+            titlebar_index_map: Vec::new(),
+            region_bars: Vec::new(),
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -1324,10 +1387,6 @@ impl TerminalView {
     /// window's collaborators rather than also being the place one of them is
     /// assembled.
     ///
-    /// The gear button is the pointer half of the settings entry point: it has
-    /// always been painted, but its [`TitlebarEvent::OpenSettings`] had no
-    /// subscriber, so clicking it did nothing. It now lands on the same
-    /// [`Self::open_or_focus_settings`] the chord and the palette row use.
     fn build_titlebar(
         chrome: &ChromeColors,
         opacity: f32,
@@ -1340,30 +1399,42 @@ impl TerminalView {
             bar.set_tabs(data, cx);
             bar
         });
+        // Titlebar events carry titlebar positions; with lower regions carrying
+        // their own bars those differ from strip indices, so every index is
+        // translated through the partition map first.
         cx.subscribe(&bar, |this, _bar, event: &TitlebarEvent, ctx| match event {
-            TitlebarEvent::OpenSettings => this.open_or_focus_settings(ctx),
             TitlebarEvent::ReorderTab { from, to } => {
-                if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(*from, *to)) {
+                let from = this.strip_index(*from);
+                let to = this.strip_index(*to);
+                if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(from, to)) {
                     ctx.notify();
                 }
             }
             TitlebarEvent::SelectTab { index, source } => {
-                let index = *index;
+                let index = this.strip_index(*index);
                 let source = *source;
                 this.switch_tab(move |tabs| tabs.select(index), ctx);
                 if source == TabActivationSource::Pointer {
                     this.defer_terminal_focus(ctx);
                 }
             }
-            TitlebarEvent::CloseTab(index) => this.close_tab_at(*index),
-            // The tab-strip and window-control events come from the same view
-            // but are their own reachability rows, outside this entry point.
-            // They are named rather than folded into a `_` arm so a new
-            // titlebar event fails to compile here.
-            TitlebarEvent::WindowControl(_) | TitlebarEvent::Equalize => {}
+            TitlebarEvent::CloseTab(index) => this.close_tab_at(this.strip_index(*index)),
+            // Equalize is its own reachability row, outside this entry point.
+            // It is named rather than folded into a `_` arm so a new titlebar
+            // event fails to compile here.
+            TitlebarEvent::Equalize => {}
         })
         .detach();
         bar
+    }
+
+    /// Translate a titlebar tab position into its strip index.
+    ///
+    /// Identity until the first [`Self::sync_tabs`] partitions the strip; a
+    /// stale position past the map falls back to itself so a racing event
+    /// degrades to the old behaviour instead of hitting the wrong tab.
+    fn strip_index(&self, titlebar_index: usize) -> usize {
+        self.titlebar_index_map.get(titlebar_index).copied().unwrap_or(titlebar_index)
     }
 
     /// Drain a pending config-file change and reapply it to the live window.
@@ -1490,12 +1561,138 @@ impl TerminalView {
         self.titlebar.update(cx, |bar, ctx| bar.set_colors(colors, ctx));
     }
 
-    /// Mirror the shared tab strip into the titlebar when it changed.
+    /// The configured badge colour for a real server-provided workspace name.
+    // @lat: [[lat.md/common#Common#Configuration#Workspaces]]
+    fn workspace_badge_accent(name: &str, palette: &[String], fallback: [f32; 4]) -> gpui::Rgba {
+        if palette.is_empty() {
+            return opaque_slot(fallback);
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(name, &mut hash);
+        let palette_len = u64::try_from(palette.len()).unwrap_or(u64::MAX);
+        let index = usize::try_from(std::hash::Hasher::finish(&hash) % palette_len).unwrap_or(0);
+        palette
+            .get(index)
+            .and_then(|color| scribe_common::theme::hex_to_rgba(color).ok())
+            .map_or_else(|| opaque_slot(fallback), opaque_slot)
+    }
+
+    fn workspace_group_badge(
+        workspace_name: Option<&str>,
+        palette: &[String],
+        fallback: [f32; 4],
+    ) -> Option<GroupBadge> {
+        let label = badge_label(workspace_name, true)?;
+        let accent = Self::workspace_badge_accent(label, palette, fallback);
+        Some(GroupBadge { label: label.to_owned(), accent })
+    }
+
+    fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String> {
+        self.shared
+            .chrome_metadata
+            .lock()
+            .ok()
+            .and_then(|store| store.workspace_name(workspace_id).map(ToOwned::to_owned))
+    }
+
+    /// Mark each multi-workspace titlebar run with its region edge and accent,
+    /// plus a badge only when the server provides a real workspace name.
     ///
-    /// The strip is mutated off the GPUI thread by the IPC reader, so the view
-    /// reconciles it on each redraw rather than being pushed to.
+    /// `strip_indices` names, for each titlebar position, the strip entry it
+    /// renders — the titlebar hosts only top-row regions' tabs, whose left
+    /// edges are distinct by construction, so the aligned layout always
+    /// engages in a multi-region window.
+    fn apply_group_badges(&self, data: &mut [TabData], strip_indices: &[usize], cx: &App) {
+        if self.shell.region_count(cx) <= 1 {
+            return;
+        }
+        let region_x = self.shell.region_left_edges(self.pane_viewport(), cx);
+        let mut previous = None;
+        for (tab, strip_index) in data.iter_mut().zip(strip_indices) {
+            let Some(entry) = self.rendered_tabs.tabs().get(*strip_index) else { continue };
+            let accent = self.shell.workspace_accent(entry.workspace_id, cx);
+            tab.group_accent = Some(opaque_slot(accent));
+            if previous != Some(entry.workspace_id) {
+                tab.group_region_x =
+                    Some(region_x.get(&entry.workspace_id).copied().unwrap_or(0.0));
+                let workspace_name = self.workspace_name(entry.workspace_id);
+                tab.badge = Self::workspace_group_badge(
+                    workspace_name.as_deref(),
+                    &self.config.config().config.workspaces.badge_colors,
+                    accent,
+                );
+            }
+            previous = Some(entry.workspace_id);
+        }
+    }
+
+    /// Split the decorated strip between the titlebar and the lower regions'
+    /// own bars.
+    ///
+    /// Tabs of a region below the window's top row go to that region's
+    /// [`RegionBarData`] (stored on `self`), where "active" means the session
+    /// the region is showing. Everything else stays in the titlebar, and the
+    /// returned map records each titlebar position's strip index so titlebar
+    /// events can be translated back.
+    fn partition_tab_strip(&mut self, data: Vec<TabData>, cx: &App) -> (Vec<TabData>, Vec<usize>) {
+        let viewport = self.pane_viewport();
+        let badge_palette = &self.config.config().config.workspaces.badge_colors;
+        let mut bars: Vec<RegionBarData> = self
+            .shell
+            .region_bar_rects(viewport, cx)
+            .into_iter()
+            .map(|(workspace_id, _)| {
+                let accent = self.shell.workspace_accent(workspace_id, cx);
+                RegionBarData {
+                    workspace_id,
+                    accent,
+                    badge: Self::workspace_group_badge(
+                        self.workspace_name(workspace_id).as_deref(),
+                        badge_palette,
+                        accent,
+                    ),
+                    tabs: Vec::new(),
+                }
+            })
+            .collect();
+        let mut titlebar_data = Vec::new();
+        let mut strip_indices = Vec::new();
+        for (index, (mut tab, entry)) in data.into_iter().zip(self.rendered_tabs.tabs()).enumerate()
+        {
+            let Some(bar) = bars.iter_mut().find(|bar| bar.workspace_id == entry.workspace_id)
+            else {
+                titlebar_data.push(tab);
+                strip_indices.push(index);
+                continue;
+            };
+            tab.is_active =
+                self.shell.region_shown_session(entry.workspace_id) == Some(entry.session_id);
+            tab.group_accent = Some(opaque_slot(bar.accent));
+            bar.tabs.push((entry.session_id, tab));
+        }
+        // Logged on shape changes only: this is the scripted oracle for the
+        // in-region bars, which paint no other externally observable trace.
+        let signature = |set: &[RegionBarData]| {
+            set.iter()
+                .map(|bar| format!("{}:{}", bar.workspace_id, bar.tabs.len()))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (old, new) = (signature(&self.region_bars), signature(&bars));
+        if old != new {
+            let state = if new.is_empty() { "none" } else { new.as_str() };
+            tracing::info!(bars = %state, "lower-region tab bars changed");
+        }
+        self.region_bars = bars;
+        (titlebar_data, strip_indices)
+    }
+
     fn sync_tabs(&mut self, cx: &mut Context<Self>) {
-        let Ok(tabs) = self.shared.tabs.lock() else { return };
+        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
+        // A tab created after returning to an earlier workspace is appended to
+        // the window-level strip. Collapse repeated workspace runs before the
+        // titlebar derives group edges so each region has exactly one bar.
+        tabs.group_by_workspace();
         self.rendered_tabs = tabs.clone();
         drop(tabs);
         let mut data = self.rendered_tabs.to_tab_data();
@@ -1511,9 +1708,12 @@ impl TerminalView {
                     tab_context_suffix_for(&ai.tracker, entry.session_id, &self.context_thresholds);
             }
         }
+        let (mut titlebar_data, strip_indices) = self.partition_tab_strip(data, cx);
+        self.apply_group_badges(&mut titlebar_data, &strip_indices, cx);
+        self.titlebar_index_map = strip_indices;
         self.titlebar.update(cx, |bar, ctx| {
-            if bar.tabs() != data {
-                bar.set_tabs(data, ctx);
+            if bar.tabs() != titlebar_data {
+                bar.set_tabs(titlebar_data, ctx);
             }
         });
     }
@@ -1527,26 +1727,6 @@ impl TerminalView {
     fn sync_equalize_visibility(&mut self, cx: &mut Context<Self>) {
         let show = self.shell.focused_region_pane_count(cx) >= 2;
         self.titlebar.update(cx, |bar, ctx| bar.set_show_equalize(show, ctx));
-    }
-
-    /// Project the focused workspace's live name and accent into the titlebar.
-    ///
-    /// [`PaneShell`] owns region identity, count, focus, and accent. The IPC reader
-    /// owns the authoritative name in shared chrome metadata, so copy that name
-    /// and release its mutex before touching the GPUI titlebar entity.
-    fn sync_workspace_badge(&mut self, cx: &mut Context<Self>) {
-        let workspace_id = self.shell.focused_workspace_id(cx);
-        let multi_workspace = self.shell.region_count(cx) > 1;
-        let accent = opaque_slot(self.shell.focused_workspace_accent(cx));
-        let name = self
-            .shared
-            .chrome_metadata
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.workspace_name(workspace_id).map(ToOwned::to_owned));
-        let badge =
-            badge_label(name.as_deref(), multi_workspace).map(|label| (label.to_owned(), accent));
-        self.titlebar.update(cx, |bar, ctx| bar.set_badge(badge, ctx));
     }
 
     /// Run one [`LayoutAction`] intercepted from the key path.
@@ -2826,22 +3006,7 @@ impl TerminalView {
     /// Ask the server to destroy this window and its sessions, then wait for
     /// the matching `WindowClosed`.
     fn request_close_window(&self) {
-        let Ok(mut lifecycle) = self.shared.lifecycle.lock() else {
-            tracing::warn!("close window dropped: window lifecycle mutex poisoned");
-            return;
-        };
-        let Some(window_id) = lifecycle.begin_close_window() else {
-            tracing::warn!(
-                "close window ignored: no window id from Welcome yet, or a shutdown is in flight"
-            );
-            return;
-        };
-        drop(lifecycle);
-        tracing::info!(%window_id, "closing window permanently — awaiting server acknowledgment");
-        if let Err(error) = self.sink.close_window(window_id) {
-            tracing::warn!(%error, "close window dropped: IPC writer closed");
-            self.abandon_shutdown();
-        }
+        request_permanent_window_close(&self.shared.lifecycle, &self.sink);
     }
 
     /// Release the shutdown slot after a request that never reached the wire.
@@ -3273,9 +3438,12 @@ impl TerminalView {
         }
         let live = self.shared.tabs.lock().map_or(0, |tabs| tabs.tabs().len());
         if live > 0 {
+            // The claimed snapshot file stays on disk (claim is
+            // non-destructive) until this window durably writes a fresh
+            // snapshot of the server-restored layout.
             tracing::info!(
                 live,
-                "server kept this window's sessions — dropping the cold-restart snapshot"
+                "server kept this window's sessions — skipping the cold-restart replay"
             );
             self.restore.pending = None;
             self.restore.mark_layout_dirty();
@@ -3396,6 +3564,18 @@ impl TerminalView {
         if let Err(error) = self.restore.store.upsert_index(window_id) {
             tracing::warn!(%error, "failed to update the restore index");
         }
+        // Only now that a replacement snapshot is durably on disk may the
+        // claimed pre-restart snapshot be retired; until this point it stayed
+        // behind as the last good layout.
+        if let Some(claimed) = self.restore.claimed_window.take()
+            && claimed != window_id
+        {
+            tracing::info!(%claimed, "fresh snapshot written; retiring the claimed snapshot");
+            if let Err(error) = self.restore.store.remove_from_index(claimed) {
+                tracing::warn!(%error, "failed to drop the claimed snapshot from the index");
+            }
+            self.restore.store.remove_window(claimed);
+        }
     }
 
     /// Drop this window's snapshot and index entry.
@@ -3418,6 +3598,11 @@ impl TerminalView {
         self.restore.cleared = true;
         self.restore.layout_dirty_since = None;
         self.restore.geometry_dirty_since = None;
+        // A deliberate exit also retires the claimed pre-restart snapshot:
+        // the user is saying none of these panes should come back.
+        if let Some(claimed) = self.restore.claimed_window.take() {
+            self.forget_restore_entry(claimed);
+        }
         let Some(window_id) = self.restore.window_id else { return };
         self.forget_restore_entry(window_id);
         if drop_geometry {
@@ -3606,13 +3791,18 @@ impl TerminalView {
         let Ok(mut tabs) = self.shared.tabs.lock() else { return };
         let Some(session_id) = move_selection(&mut tabs) else { return };
         drop(tabs);
+        // Attach before any adoption: the adopt branch's publish enqueues
+        // `Resize` + `RequestSnapshot` for the adopted pane on the same
+        // ordered channel, and the server denies both for a session whose
+        // `AttachSessions` has not landed yet ("RequestSnapshot denied for
+        // unattached session" in the window status bar).
+        self.attach(session_id);
         if let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx) {
             self.shell.focus_pane(workspace_id, pane, cx);
         } else if let Some(pane) = self.shell.focused_pane(cx) {
             self.adopt_session(pane, session_id);
             self.publish_pane_sizes(cx);
         }
-        self.attach(session_id);
         // A tab switch moves the focused pane, which the server relays to PTY
         // applications as a CSI focus event — reported here rather than on the
         // next tick so the switched-to pane learns about it immediately.
@@ -3647,6 +3837,13 @@ impl TerminalView {
         if let Ok(mut guard) = self.shared.active_session.lock() {
             *guard = Some(session_id);
         }
+        self.stream_session(session_id);
+    }
+
+    /// Attach and subscribe `session_id` without making it the active session,
+    /// so a pane in an unfocused region can stream a freshly adopted tab while
+    /// the user keeps typing wherever they are.
+    fn stream_session(&self, session_id: SessionId) {
         if let Ok(mut attached) = self.shared.attached.lock() {
             attached.insert(session_id);
         }
@@ -4099,6 +4296,82 @@ impl TerminalView {
         });
     }
 
+    /// Rebuild this window's regions, splits, and pane sessions from the
+    /// workspace tree the server shipped with the first `SessionList` of a
+    /// (re)connect.
+    ///
+    /// The server persists each window's tree from `ReportWorkspaceTree` and
+    /// ships it back precisely so a freshly started client can rebuild its
+    /// splits instead of flattening every session into one region — which is
+    /// what an upgrade restart used to do. The parked tree is taken exactly
+    /// once and adopted only while the shell is still the untouched startup
+    /// layout ([`PaneShell::is_unused`]): a mid-session redial or list refresh
+    /// finds a live layout, and the user's own layout wins. Sessions named in
+    /// the tree but gone from the list are pruned by the shell, as on the cold
+    /// path; sessions in the list but not in the tree stay ordinary tabs.
+    fn adopt_server_topology(&mut self, cx: &mut Context<Self>) {
+        let parked = self.shared.server_topology.lock().ok().and_then(|mut slot| slot.take());
+        let Some((tree, live)) = parked else { return };
+        if !self.shell.is_unused(cx) || self.restore.replaying {
+            tracing::info!("window already has a layout; ignoring the server workspace tree");
+            return;
+        }
+        let visible = self.shell.adopt_server_tree(&tree, &live, cx);
+        if visible.is_empty() {
+            tracing::info!("server workspace tree pruned to nothing; keeping the flat layout");
+            return;
+        }
+        // The reader filled the strip in `SessionList` order, which is not the
+        // layout's left-to-right region order; regroup so each workspace's tab
+        // run sits in the strip where its region sits in the window.
+        if let Ok(mut tabs) = self.shared.tabs.lock() {
+            tabs.order_by(&visible);
+        }
+        tracing::info!(
+            panes = visible.len(),
+            regions = self.shell.region_count(cx),
+            "rebuilt workspace splits from the server's tree"
+        );
+        // Size each pane from the measured layout before attaching, so every
+        // attach announces the grid its pane will actually render at instead
+        // of the window-wide fallback. Resize frames themselves wait for
+        // `publish_pane_sizes` below, after the attaches that authorise them.
+        let viewport = self.pane_viewport();
+        for placement in self.shell.placements(viewport, cx) {
+            if let Some(session_id) = placement.session_id {
+                self.pane_sizes.insert(session_id, self.grid_size_for(placement.rect));
+            }
+        }
+        // The pane holding the tab strip's focused session keeps focus, so the
+        // reader's own reattach and this rebuild agree on the active pane.
+        let active = self.shared.tabs.lock().ok().and_then(|tabs| tabs.active_session());
+        if let Some(session_id) = active
+            && let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx)
+        {
+            self.shell.focus_pane(workspace_id, pane, cx);
+        }
+        // Attach every visible pane's session; the focused pane's goes last so
+        // it ends up as the active (typed-into) session.
+        let focused = self.shell.focused_session(cx);
+        for session_id in visible.iter().filter(|id| Some(**id) != focused) {
+            self.attach(*session_id);
+        }
+        if let Some(session_id) = focused {
+            self.attach(session_id);
+        }
+        // Now that every pane session is attached, the publish's resize and
+        // snapshot frames are authorised; sizes already cached above are
+        // skipped, so this mostly settles the shared focused-pane size.
+        self.publish_pane_sizes(cx);
+        self.sync_tabs(cx);
+        // Report the (possibly pruned) adopted layout back so the server's
+        // tree matches what the window actually shows, and persist it as this
+        // window's fresh cold-restart snapshot.
+        self.report_workspace_tree(cx);
+        self.restore.mark_layout_dirty();
+        cx.notify();
+    }
+
     /// Reconcile the pane layout with the sessions the server actually has.
     ///
     /// Runs once per frame because both halves of the truth move on their own
@@ -4109,6 +4382,11 @@ impl TerminalView {
     /// yet — and each is settled here rather than from the reader, which must
     /// never touch GPUI entities.
     fn reconcile_panes(&mut self, cx: &mut Context<Self>) {
+        // The server's persisted split tree is folded in first: on a fresh
+        // (re)connect it rebuilds regions and splits that everything below —
+        // the root-region adoption, the metadata drain, and the active-session
+        // placement — then operates on instead of flattening.
+        self.adopt_server_topology(cx);
         // The root region must adopt the active server id before metadata is
         // drained: `SessionCreated` and its following `WorkspaceInfo` can both
         // land before one frame, and applying the latter against the original
@@ -4122,13 +4400,21 @@ impl TerminalView {
         // answering `CreateWorkspace` therefore re-keys the split region before
         // its session is adopted below and moved into that server workspace.
         changed |= self.adopt_workspace_info(cx);
-        let live: HashSet<SessionId> = self.shared.tabs.lock().map_or_else(
-            |_| HashSet::new(),
-            |tabs| tabs.tabs().iter().map(|tab| tab.session_id).collect(),
+        let (live, workspaces_with_tabs) = self.shared.tabs.lock().map_or_else(
+            |_| (HashSet::new(), HashSet::new()),
+            |tabs| {
+                (
+                    tabs.tabs().iter().map(|tab| tab.session_id).collect::<HashSet<SessionId>>(),
+                    tabs.tabs()
+                        .iter()
+                        .map(|tab| tab.workspace_id)
+                        .collect::<HashSet<WorkspaceId>>(),
+                )
+            },
         );
         if !live.is_empty() {
             self.retire_scrollbars(&live);
-            let retired = self.shell.retain_sessions(&live, cx);
+            let retired = self.shell.retain_sessions(&live, &workspaces_with_tabs, cx);
             for workspace_id in retired.closed_regions {
                 self.close_workspace(workspace_id);
             }
@@ -4141,18 +4427,53 @@ impl TerminalView {
             // A split queued the pane that asked for this session; anything
             // else (a new tab, a reattach, a refocus after an exit) belongs in
             // the pane the user is looking at.
-            let target = self.shell.take_pending(cx).or_else(|| self.shell.focused_pane(cx));
-            if let Some(pane) = target {
+            if let Some(pane) = self.shell.take_pending(cx) {
                 self.adopt_session(pane, session_id);
                 self.follow_session_to_region(pane, session_id, cx);
                 changed = true;
+            } else if let Some(pane) = self.shell.focused_pane(cx) {
+                changed |= self.adopt_into_focused_pane(pane, session_id, cx);
             }
         }
+        changed |= self.fill_empty_region_panes(cx);
         changed |= self.fill_pending_panes(cx);
         if changed {
             self.publish_pane_sizes(cx);
             self.report_workspace_tree(cx);
         }
+    }
+
+    /// Hand each surviving empty pane an unshown tab of its own workspace.
+    ///
+    /// A region whose only pane's session exited keeps that pane when its
+    /// workspace still has tabs ([`PaneShell::retain_sessions`]); this is the
+    /// pass that fills it back in, strictly workspace-scoped so a refill can
+    /// never move a tab between regions. Streaming (attach + subscribe) is
+    /// done without touching the active session, because the refilled region
+    /// may not be the one the user is typing in.
+    fn fill_empty_region_panes(&mut self, cx: &mut Context<Self>) -> bool {
+        let empties = self.shell.empty_unpending_panes(cx);
+        if empties.is_empty() {
+            return false;
+        }
+        let entries: Vec<(WorkspaceId, SessionId)> = self.shared.tabs.lock().map_or_else(
+            |_| Vec::new(),
+            |tabs| tabs.tabs().iter().map(|tab| (tab.workspace_id, tab.session_id)).collect(),
+        );
+        let mut changed = false;
+        for (workspace_id, pane) in empties {
+            let shown = self.shell.shown_sessions();
+            let refill = entries
+                .iter()
+                .find(|(tab_ws, session)| *tab_ws == workspace_id && !shown.contains(session))
+                .map(|(_, session)| *session);
+            let Some(session_id) = refill else { continue };
+            self.adopt_session(pane, session_id);
+            self.stream_session(session_id);
+            tracing::info!(%session_id, %workspace_id, "refilled an emptied pane from its workspace's tabs");
+            changed = true;
+        }
+        changed
     }
 
     /// Hand every still-queued pane one of the sessions that has arrived but is
@@ -4233,6 +4554,61 @@ impl TerminalView {
             attached.insert(session_id);
         }
         tracing::info!(%session_id, pane = pane.raw(), "pane adopted a session");
+    }
+
+    /// Show an unshown active session in the focused pane — unless that would
+    /// drag it across a workspace boundary.
+    ///
+    /// The reader's exit refocus is workspace-scoped, but when a region
+    /// collapses with its last tab the strip's fallback selection can name a
+    /// session filed under another workspace. Adopting it here would displace
+    /// the focused pane's own session and, through
+    /// [`Self::follow_session_to_region`], permanently re-file the adopted
+    /// session on the server. So a cross-workspace selection is resolved the
+    /// other way around: the strip re-points at the session the focused pane
+    /// is already showing, and every session keeps its workspace.
+    ///
+    /// An *empty* focused pane has nothing to protect, so it adopts the
+    /// session regardless — that is the reattach path filling a surviving
+    /// window back in.
+    fn adopt_into_focused_pane(
+        &mut self,
+        pane: PaneId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let pane_session = self.shell.session_of(pane);
+        let pane_region = self.shell.region_for_pane(pane, cx);
+        let tab_workspace = self.shared.tabs.lock().ok().and_then(|t| t.workspace_of(session_id));
+        // Only a workspace this window shows a region for can be "crossed
+        // into": a tab filed under a region-less workspace (a reattach after
+        // reconnect, or a strip that outlived its region) has nowhere else to
+        // render, so the focused pane takes it exactly as before.
+        let crosses_regions = match (pane_session, pane_region, tab_workspace) {
+            (Some(_), Some(region), Some(workspace)) => {
+                region != workspace && self.shell.has_region(workspace)
+            }
+            _ => false,
+        };
+        if !crosses_regions {
+            self.adopt_session(pane, session_id);
+            self.follow_session_to_region(pane, session_id, cx);
+            return true;
+        }
+        let Some(shown) = pane_session else { return false };
+        tracing::info!(
+            %session_id,
+            %shown,
+            "kept a cross-workspace session out of the focused pane; strip follows the pane"
+        );
+        self.switch_tab(
+            move |tabs| {
+                let index = tabs.tabs().iter().position(|tab| tab.session_id == shown)?;
+                tabs.select(index)
+            },
+            cx,
+        );
+        true
     }
 
     /// Tell the server a session changed workspace regions.
@@ -4373,6 +4749,7 @@ impl TerminalView {
         let opacity = self.opacity;
         let background = surface(self.terminal_colors.background, opacity);
         let idle_border = surface(self.chrome.divider, opacity);
+        let chrome_bg = scribe_client::tab_bar::srgba(self.chrome.tab_bar_bg);
         let mut focused = Some(focused);
         placements
             .into_iter()
@@ -4398,8 +4775,8 @@ impl TerminalView {
                     .h(relative(placement.rect.height / viewport.height))
                     .overflow_hidden();
                 if split {
-                    pane =
-                        pane.border_1().border_color(pane_border(&placement, idle_border, opacity));
+                    let border = pane_border(&placement, idle_border, chrome_bg, opacity);
+                    pane = pane.border_1().border_color(border);
                 }
                 let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
                 // Only the focused pane publishes its painted bounds: they are
@@ -4471,6 +4848,181 @@ impl TerminalView {
             .collect()
     }
 
+    /// Paint each lower region's tab bar over the strip it reserved.
+    ///
+    /// Regions on the window's top row keep their tabs in the titlebar; a
+    /// region stacked below gets the legacy client's in-region bar here, at
+    /// the top of its rect, above the panes [`PaneShell::placements`] already
+    /// shrank to make room.
+    fn render_region_tab_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let bar_rects = self.shell.region_bar_rects(self.pane_viewport(), cx);
+        if bar_rects.is_empty() {
+            return Vec::new();
+        }
+        let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        bar_rects
+            .into_iter()
+            .map(|(workspace_id, rect)| self.render_region_bar(workspace_id, rect, &colors, cx))
+            .collect()
+    }
+
+    /// One lower region's bar: badge pill, then its tabs, over a hairline in
+    /// the region's tab tone — the same shape the titlebar draws for a
+    /// top-row region's group.
+    fn render_region_bar(
+        &self,
+        workspace_id: WorkspaceId,
+        rect: Rect,
+        colors: &TabBarColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let bar = self.region_bars.iter().find(|bar| bar.workspace_id == workspace_id);
+        let accent =
+            bar.map_or_else(|| self.shell.workspace_accent(workspace_id, cx), |bar| bar.accent);
+        let tone = accent_tab_tone(opaque_slot(accent), colors.bg);
+        let mut row = div()
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.width))
+            .h(px(rect.height))
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .bg(colors.bg)
+            .border_b_1()
+            .border_color(tone);
+        let Some(bar) = bar else {
+            // A region whose seed session is still in flight: bare bar, so the
+            // reserved strip never flashes terminal background.
+            return row.into_any_element();
+        };
+        // The workspace pill opening this bar: clicking it selects the bar's
+        // first tab, which focuses the region. A badge with no tabs yet has
+        // nothing to select, so it waits for the seed session.
+        let first_session = bar.tabs.first().map(|(session_id, _)| *session_id);
+        if let Some((badge, first)) = bar.badge.as_ref().zip(first_session) {
+            let pill = div()
+                .id(ElementId::from(format!("region-badge-{workspace_id}")))
+                .flex()
+                .flex_none()
+                .items_center()
+                .px_2()
+                .h_full()
+                .bg(tone)
+                .text_color(colors.active_text)
+                .text_xs()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                .on_click(cx.listener(move |view, _, _window, ctx| {
+                    view.select_session_tab(first, ctx);
+                }))
+                .child(badge.label.clone());
+            row = row.child(pill);
+        }
+        row =
+            row.children(bar.tabs.iter().map(|(session_id, tab)| {
+                Self::render_region_bar_tab(*session_id, tab, colors, cx)
+            }));
+        row.into_any_element()
+    }
+
+    /// One tab in a lower region's bar: the titlebar tab's look (flash blend,
+    /// AI dot, context suffix, active underline) minus its drag-reorder and
+    /// keyboard chrome.
+    fn render_region_bar_tab(
+        session_id: SessionId,
+        tab: &TabData,
+        colors: &TabBarColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let base_bg = if tab.is_active { colors.active_bg } else { colors.bg };
+        let bg = flash_blend(base_bg, colors.accent, tab.tab_flash);
+        let fg = if tab.is_active { colors.active_text } else { colors.text };
+        let hover_bg = gpui::Rgba {
+            r: (colors.bg.r + 0.04).min(1.0),
+            g: (colors.bg.g + 0.04).min(1.0),
+            b: (colors.bg.b + 0.04).min(1.0),
+            a: colors.bg.a,
+        };
+        let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
+        let (display, _truncated) =
+            tab_display_title(&tab.title, REGION_TAB_TITLE_COLS.saturating_sub(suffix_len));
+        let ai_dot = tab
+            .ai_indicator
+            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_1().into_any_element());
+        let suffix = tab.context_suffix.as_ref().map(|suffix| {
+            div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
+        });
+        let underline = tab.is_active.then(|| {
+            let tone =
+                tab.group_accent.map_or(colors.accent, |accent| accent_tab_tone(accent, colors.bg));
+            div().absolute().bottom_0().left_0().right_0().h(px(2.0)).bg(tone).into_any_element()
+        });
+        let close = tab.is_active.then(|| {
+            div()
+                .id(ElementId::from(format!("region-tab-close-{session_id}")))
+                .flex_none()
+                .ml_1()
+                .px_0p5()
+                .text_color(fg)
+                .cursor_pointer()
+                .child("\u{00D7}")
+                .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                .on_click(cx.listener(move |view, _, _window, _ctx| {
+                    view.close_session(session_id, "tab close dropped");
+                }))
+                .into_any_element()
+        });
+        div()
+            .id(ElementId::from(format!("region-tab-{session_id}")))
+            .relative()
+            .flex()
+            .items_center()
+            .flex_grow_0()
+            .flex_shrink_1()
+            .flex_basis(px(TAB_WIDTH))
+            .min_w(px(TAB_MIN_WIDTH))
+            .overflow_hidden()
+            .h_full()
+            .px_2()
+            .bg(bg)
+            .text_color(fg)
+            .text_sm()
+            .border_r_1()
+            .border_color(colors.separator)
+            .cursor_pointer()
+            .when(!tab.is_active, |this| this.hover(move |s| s.bg(hover_bg)))
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(cx.listener(move |view, _, _window, ctx| {
+                view.select_session_tab(session_id, ctx);
+            }))
+            .children(ai_dot)
+            .child(div().flex_1().overflow_hidden().child(display))
+            .children(suffix)
+            .children(close)
+            .children(underline)
+            .into_any_element()
+    }
+
+    /// Focus the tab attached to `session_id`, wherever it sits in the strip.
+    ///
+    /// Logged because this is the only pointer entry point the in-region bars
+    /// have, and the switch it triggers is otherwise indistinguishable on the
+    /// wire from a titlebar click — the log is what lets a scripted E2E
+    /// attribute the attach to the bar.
+    fn select_session_tab(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        tracing::info!(%session_id, "region bar selected a tab");
+        self.switch_tab(
+            move |tabs| {
+                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
+                tabs.select(index)
+            },
+            cx,
+        );
+    }
+
     /// Translate a window pointer position into the grid band's local space.
     fn grid_local_position(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
         let bounds = self.grid_area.get()?;
@@ -4515,12 +5067,50 @@ impl TerminalView {
     /// next, and only when it declines does the press mean selection.
     fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if self.press_divider(event.position, cx)
+            || self.press_focuses_pane(event.position, cx)
             || self.press_scrollbar(event.position, cx)
             || self.forward_mouse_press(event)
         {
             return;
         }
         self.click_grid(event.position, cx);
+    }
+
+    /// Focus the unfocused pane under a press, so clicking into any visible
+    /// terminal focuses it directly instead of requiring its tab first.
+    ///
+    /// Runs after the divider hit test (a boundary press must stay a resize)
+    /// and consumes the gesture: the first click into a pane focuses it, and
+    /// the next press interacts with its content, matching common tiling UX.
+    fn press_focuses_pane(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((x, y)) = self.grid_local_position(position) else { return false };
+        let viewport = self.pane_viewport();
+        let pressed = self.shell.placements(viewport, cx).into_iter().find(|placement| {
+            x >= placement.rect.x
+                && x < placement.rect.x + placement.rect.width
+                && y >= placement.rect.y
+                && y < placement.rect.y + placement.rect.height
+        });
+        let Some(placement) = pressed else { return false };
+        if placement.focused {
+            return false;
+        }
+        let Some(session_id) = placement.session_id else {
+            self.shell.focus_pane(placement.workspace_id, placement.pane_id, cx);
+            cx.notify();
+            return true;
+        };
+        // Route through the tab-switch path so the strip's active tab, the
+        // attach, and the focus report all follow the pane focus.
+        self.switch_tab(
+            move |tabs| {
+                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
+                tabs.select(index)
+            },
+            cx,
+        );
+        cx.notify();
+        true
     }
 
     /// Resolve pointer motion over the grid band.
@@ -5975,22 +6565,21 @@ impl TerminalView {
     /// segment is absent only when the server has nothing to report.
     fn build_status_model(&mut self) -> status_bar::StatusBarModel {
         let connected = self.shared.connected.load(Ordering::Acquire);
-        let status_message = self
-            .shared
-            .status
-            .lock()
-            .ok()
-            .map(|status| status.clone())
-            .filter(|status| !status.is_empty());
         let active_session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
-        let session_count = usize::from(active_session.is_some());
-        // The tab strip is the only place the attached pane's workspace is known,
-        // and it is a different lock from the metadata store, so resolve the id
-        // (a `Copy`) and release it before reading the names.
-        let workspace_id = active_session.and_then(|session_id| {
-            let tabs = self.shared.tabs.lock().ok()?;
-            let entry = tabs.tabs().iter().find(|tab| tab.session_id == session_id)?;
-            Some(entry.workspace_id)
+        // The tab strip is the only place the window's live session count and
+        // the attached pane's workspace are both known, and it is a different
+        // lock from the metadata store, so resolve the count and the id (a
+        // `Copy`) and release it before reading the names. The count mirrors
+        // the legacy client's pane count: every session open in this window,
+        // not just the attached one.
+        let (session_count, workspace_id) = self.shared.tabs.lock().map_or((0, None), |tabs| {
+            let workspace_id = active_session.and_then(|session_id| {
+                tabs.tabs()
+                    .iter()
+                    .find(|tab| tab.session_id == session_id)
+                    .map(|entry| entry.workspace_id)
+            });
+            (tabs.tabs().len(), workspace_id)
         });
         // Feature 013/014: the transport label is a `&'static str`, so the
         // tailnet chrome lock is released before `build_model` borrows anything
@@ -6018,7 +6607,6 @@ impl TerminalView {
         status_bar::build_model(
             &StatusBarData {
                 connected,
-                status_message: status_message.as_deref(),
                 workspace_name: workspace_id
                     .zip(metadata)
                     .and_then(|(id, store)| store.workspace_name(id)),
@@ -6061,12 +6649,21 @@ impl TerminalView {
                 tracing::debug!(?error, "update CTA activation dropped with its view");
             }
         });
+        let settings_view = cx.entity().downgrade();
+        let on_settings = Box::new(move |_window: &mut Window, app: &mut App| {
+            if let Err(error) = settings_view.update(app, TerminalView::open_or_focus_settings) {
+                tracing::debug!(?error, "settings gear activation dropped with its view");
+            }
+        });
         status_bar::render(
             &model,
             window_chrome::STATUS_BAR_HEIGHT,
             &colors,
-            Some(&self.focus.update),
-            Some(on_update),
+            status_bar::StatusBarActions {
+                update_focus: Some(&self.focus.update),
+                on_update: Some(on_update),
+                on_settings: Some(on_settings),
+            },
         )
         .into_any_element()
     }
@@ -6148,6 +6745,7 @@ impl TerminalView {
         };
         let panes = self.render_panes(focused, ime, cursor, cx);
         let dividers = self.render_dividers(cx);
+        let region_bars = self.render_region_tab_bars(cx);
         div()
             .flex_1()
             .relative()
@@ -6155,6 +6753,7 @@ impl TerminalView {
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(dividers)
+            .children(region_bars)
             // The wheel is claimed by the application when it tracks the mouse,
             // by the alternate screen's 1007 fallback, or — the ordinary case —
             // by this client's own scrollback viewport.
@@ -6322,7 +6921,6 @@ impl Render for TerminalView {
         self.sync_find_results(cx);
         self.sync_remote_connect();
         self.reconcile_panes(cx);
-        self.sync_workspace_badge(cx);
         self.sync_equalize_visibility(cx);
         self.sync_grid_geometry(cx);
         let ime = self.sync_ime(cx);
@@ -6674,6 +7272,7 @@ fn start_window_backend(
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
         workspaces: Arc::new(Mutex::new(Vec::new())),
+        server_topology: Arc::new(Mutex::new(None)),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
     };
@@ -7380,6 +7979,7 @@ fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
         lan: Arc::clone(&ctx.shared.lan),
         prompt_marks: Arc::clone(&ctx.shared.prompt_marks),
         workspaces: Arc::clone(&ctx.shared.workspaces),
+        server_topology: Arc::clone(&ctx.shared.server_topology),
         clipboard: Arc::clone(&ctx.shared.clipboard),
         remote: Arc::clone(&ctx.shared.remote),
         out_tx: ctx.out_tx.clone(),
@@ -7877,6 +8477,9 @@ struct ReaderCtx {
     /// `WorkspaceInfo` answers the reader parks for the shell's reconcile pass;
     /// see the `workspaces` field of `Shared`.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// The server's persisted workspace tree parked for the shell's reconcile
+    /// pass; see the `server_topology` field of `Shared`.
+    server_topology: ServerTopologySlot,
     /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
@@ -8035,6 +8638,30 @@ fn update_lifecycle(ctx: &ReaderCtx, mutate: impl FnOnce(&mut WindowLifecycle)) 
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
+/// Ask the server to permanently close this window through the one shared
+/// request/acknowledgement gate used by UI close actions and a final PTY exit.
+// @lat: [[client#Client#Dialogs#Close Dialog]]
+fn request_permanent_window_close(lifecycle: &Mutex<WindowLifecycle>, sink: &IpcSink) {
+    let Ok(mut lifecycle_state) = lifecycle.lock() else {
+        tracing::warn!("close window dropped: window lifecycle mutex poisoned");
+        return;
+    };
+    let Some(window_id) = lifecycle_state.begin_close_window() else {
+        tracing::warn!(
+            "close window ignored: no window id from Welcome yet, or a shutdown is in flight"
+        );
+        return;
+    };
+    drop(lifecycle_state);
+    tracing::info!(%window_id, "closing window permanently — awaiting server acknowledgment");
+    if let Err(error) = sink.close_window(window_id) {
+        tracing::warn!(%error, "close window dropped: IPC writer closed");
+        if let Ok(mut retry_state) = lifecycle.lock() {
+            retry_state.abandon_shutdown();
+        }
+    }
+}
+
 /// Apply `mutate` to the shared feature-014 LAN chrome and request a repaint.
 ///
 /// Same failure contract as [`update_ai_chrome`]. The repaint matters here for
@@ -8121,9 +8748,18 @@ static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
 fn pane_border(
     placement: &pane_shell::PanePlacement,
     idle: gpui::Rgba,
+    chrome_bg: gpui::Rgba,
     opacity: f32,
 ) -> gpui::Rgba {
-    if placement.focused { surface(placement.accent, opacity) } else { idle }
+    if placement.focused {
+        // The region's darker tab tone, matching the workspace tag and the
+        // strip hairline, rather than the raw accent.
+        let tone =
+            scribe_client::tab_bar::accent_tab_tone(opaque_slot(placement.accent), chrome_bg);
+        scribe_client::opacity::scale_alpha(tone, opacity)
+    } else {
+        idle
+    }
 }
 
 /// Paintable AI border strips inset into one pane's local coordinate space.
@@ -8265,8 +8901,13 @@ fn on_session_exited(
     if let Ok(mut marks) = ctx.prompt_marks.lock() {
         marks.forget(session_id);
     }
-    let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
-    if let Some(next) = refocused {
+    let (refocused, tabs_empty) = ctx.tabs.lock().map_or((None, false), |mut tabs| {
+        let refocused = tabs.remove(session_id);
+        (refocused, tabs.tabs().is_empty())
+    });
+    if existed && tabs_empty {
+        request_permanent_window_close(&ctx.lifecycle, &ctx.sink);
+    } else if let Some(next) = refocused {
         attach_session(ctx, next)?;
     }
     if existed && Some(session_id) == attached {
@@ -8387,7 +9028,8 @@ async fn dispatch_server_message(
         ServerMessage::Welcome { window_id, participant_id, clipboard_gating, .. } => {
             on_welcome(ctx, registry, window_id, participant_id, clipboard_gating);
         }
-        ServerMessage::SessionList { sessions, workspaces, .. } => {
+        ServerMessage::SessionList { sessions, workspaces, workspace_tree } => {
+            park_server_topology(ctx, &sessions, workspace_tree, first_session_list);
             on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
@@ -8503,6 +9145,33 @@ async fn dispatch_server_message(
         other => unhandled_server_message(&other),
     }
     Ok(())
+}
+
+/// Park the server's persisted split tree for the GPUI thread's reconcile
+/// pass.
+///
+/// Runs *before* [`on_session_list`] rebuilds the tab strip, so no reconcile
+/// pass can see the sessions without the tree and lay them out flat first.
+/// Only the first list of a connection carries a layout worth adopting — a
+/// later refresh describes sessions the window already shows — and the GPUI
+/// thread additionally ignores the tree when the window already has a layout
+/// of its own.
+fn park_server_topology(
+    ctx: &ReaderCtx,
+    sessions: &[SessionInfo],
+    workspace_tree: Option<WorkspaceTreeNode>,
+    first_on_connection: bool,
+) {
+    if !first_on_connection || sessions.is_empty() {
+        return;
+    }
+    let Some(tree) = workspace_tree else { return };
+    let live: HashSet<SessionId> = sessions.iter().map(|session| session.session_id).collect();
+    if let Ok(mut parked) = ctx.server_topology.lock() {
+        *parked = Some((tree, live));
+    } else {
+        tracing::warn!("server topology mutex poisoned; dropping workspace tree");
+    }
 }
 
 /// Adopt the server's session inventory: rebuild the reconnect topology, park
@@ -9556,6 +10225,12 @@ fn forward_inbound(in_tx: &InboundSender, event: InboundEvent) {
 }
 
 fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: String) {
+    // The status string is deliberately not rendered anywhere: transient
+    // connection / pane errors are internal plumbing noise, so the log is
+    // their only user-reachable surface.
+    if !message.is_empty() {
+        tracing::warn!(%message, "window status");
+    }
     if let Ok(mut status) = status.lock() {
         *status = message;
         generation.fetch_add(1, Ordering::Release);
@@ -9583,6 +10258,53 @@ mod tests {
 
         assert!(!bootstrap.claim(true, 1));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[test]
+    fn workspace_badge_palette_is_stable_for_name() {
+        let palette = vec!["#112233".to_owned(), "#445566".to_owned()];
+        let fallback = [1.0, 0.0, 0.0, 1.0];
+
+        assert_eq!(
+            TerminalView::workspace_badge_accent("scribe", &palette, fallback),
+            TerminalView::workspace_badge_accent("scribe", &palette, fallback)
+        );
+    }
+
+    #[test]
+    fn workspace_badge_accent_comes_from_configured_palette() {
+        let palette = vec!["#112233".to_owned(), "#445566".to_owned()];
+        let selected =
+            TerminalView::workspace_badge_accent("scribe", &palette, [1.0, 0.0, 0.0, 1.0]);
+
+        assert!(palette.iter().any(|hex| {
+            scribe_common::theme::hex_to_rgba(hex).is_ok_and(|rgba| opaque_slot(rgba) == selected)
+        }));
+    }
+
+    #[test]
+    fn workspace_badge_accent_falls_back_for_empty_or_invalid_palette() {
+        let fallback = [0.25, 0.5, 0.75, 1.0];
+
+        assert_eq!(
+            TerminalView::workspace_badge_accent("scribe", &[], fallback),
+            opaque_slot(fallback)
+        );
+        assert_eq!(
+            TerminalView::workspace_badge_accent("scribe", &["invalid".to_owned()], fallback),
+            opaque_slot(fallback)
+        );
+    }
+
+    #[test]
+    fn workspace_group_badge_requires_a_real_name() {
+        let fallback = [0.25, 0.5, 0.75, 1.0];
+        let badge = TerminalView::workspace_group_badge(Some(" scribe "), &[], fallback)
+            .expect("named workspace has a badge");
+
+        assert_eq!(badge.label, "scribe");
+        assert!(TerminalView::workspace_group_badge(None, &[], fallback).is_none());
+        assert!(TerminalView::workspace_group_badge(Some("  "), &[], fallback).is_none());
     }
 
     /// Build a plain key-down event for `key` with `modifiers` held.

@@ -186,9 +186,15 @@ Desktop notification settings cover enablement, focus suppression, and Linux-onl
 
 ### Workspace Keys
 
-Add/remove root directories and badge colour customization per index with reset-to-defaults.
+Workspace roots and indexed badge colours can be edited in place and applied without restarting Scribe.
 
-The workspace add row in  accepts absolute paths or `~/` roots, updates the displayed list immediately, and sends `workspaces.add_root`. Submitting an empty row asks the host to open a native directory chooser, then the selected path is injected back into the same add flow. The apply path in  trims, deduplicates, and persists accepted roots.
+The GPUI Workspaces page renders the current root list, a path input with Add and Browse actions, a Remove action for each row, and the existing badge-colour reset. Browse opens the platform directory chooser and adds its selection; cancellation is a no-op. Paths must be absolute or start with `~/`. Rejected text stays in the input with an inline error so it can be corrected instead of retyped.
+
+Accepted additions and removals use the existing `workspaces.add_root` and `workspaces.remove_root` apply paths, which deduplicate and persist the TOML list. Each mutation refreshes the rendered list and requests a live server config reload without restarting it.
+
+One shared colour editor renders for each configured `workspaces.badge_colors` entry. It accepts RGB as `#rrggbb` or `rrggbb`, then persists the canonical lowercase `#rrggbb` form. Invalid input and config stay unchanged while an inline error leaves the text editable.
+
+Reset badge colors restores the eight default palette entries and releases any active colour editor safely before the controls rerender.
 
 ### Remote Keys
 
@@ -282,7 +288,9 @@ amber seam. Inset separators and first-group top air establish group rhythm.
 A real AccessKit search input at the top of the content pane receives focus
 with Ctrl+K and filters page names, summaries, section names, control labels,
 and dotted keys. Matching pages remain navigable, and matching controls filter
-inside the selected page; the field is never a decorative placeholder.
+inside the selected page. Its visual placeholder disappears while the empty
+field is focused, while the AccessKit placeholder remains available to
+assistive technology.
 
 Content uses 46px gutters, an 18px bold page title, 14px summary and body
 copy, explicit "Changes apply instantly" status, 18px section headings, and
@@ -290,9 +298,9 @@ copy, explicit "Changes apply instantly" status, 18px section headings, and
 stable 438px right column aligns values: choices and read-only fields are 42px
 high, steppers are 207×38px with 48px actions, switches are 52×30px, and
 actions are 40px high. Switch tracks and warm-light knobs are fully rounded.
-Read-only color, text, keybinding, and gated values use a muted fill, open
-bottom rule, and explicit `READ ONLY` marker instead of an interactive
-control outline.
+Read-only text, keybinding, and gated values use a muted fill, open bottom rule,
+and explicit `READ ONLY` marker instead of an interactive control outline.
+Shared colour fields use an interactive RGB editor with a live swatch.
 
 At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 
@@ -312,7 +320,7 @@ The eleven settings pages are described in : each owns an ordered control list k
 
 The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
- renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Color and free-text controls render their current value read-only, and keybinding rows list every action's combos via ; inline hex/text/path entry is a tracked follow-on.
+ renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Shared colour controls edit inline, general free-text controls remain read-only, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
 
 The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, or action; Left/Right adjust toggles, choices, and steppers. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
@@ -338,7 +346,7 @@ The section's mutations are the three fire-and-forget frames, each followed by a
 
 Three surfaces in the running terminal window open the settings window, and all three end at  — the same call the `--settings` launch makes.
 
- is that single handler. The `settings` keybinding reaches it through ; the palette's "Open Settings" row lowers onto the same  via ; and the titlebar gear's `TitlebarEvent::OpenSettings` is subscribed in . Because GPUI is multi-window in one process, the window is opened in place rather than by spawning a second binary the way the winit client had to.
+ is that single handler. The `settings` keybinding reaches it through ; the palette's "Open Settings" row lowers onto the same  via ; and the status bar's far-right settings gear activates it through the `on_settings` handler wired in `render_status_bar`. Because GPUI is multi-window in one process, the window is opened in place rather than by spawning a second binary the way the winit client had to.
 
 The handle the open returns is retained on the view, and that handle *is* the deduplication: a later request updates it, which fails once the window has been closed, and a live update activates the existing window instead of stacking a duplicate. The cross-process singleton below is deliberately not consulted from this path — its primary holds an exclusive `flock` for the settings window's whole lifetime, so acquiring it from the terminal window would park the live shell on a lock rather than answer a keystroke.
 

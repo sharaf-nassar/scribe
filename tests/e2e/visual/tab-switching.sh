@@ -19,6 +19,19 @@
 # only `AttachSessions` proves the shell asked the server to make a different
 # terminal session live.
 #
+# Phases 6-10 extend the oracle to multi-workspace windows: a live
+# ctrl+alt+backslash workspace split, then keyboard (alt+1) and pointer tab
+# selection across workspace regions, then a client relaunch that rebuilds
+# the two regions from the server's persisted workspace tree
+# (adopt_server_topology) and the same cross-region click on that adopted
+# layout. Sessions the client created itself are asserted through the wire's
+# KeyInput frames rather than `scribe-test wait-output`, which can only
+# observe daemon-owned sessions.
+#
+# Phase 11 replays the one thing a plain `xdotool click` can never produce:
+# a real-mouse click whose pointer travels a few px between press and
+# release, crossing GPUI's native drag threshold.
+#
 # Requires: visual container with SCRIBE_SHARED_PANE=1 and SCRIBE_SHARE_TAP=1.
 set -euo pipefail
 
@@ -68,6 +81,39 @@ PY
 
 count_client() { count_frames client "$1"; }
 count_server() { count_frames server "$1"; }
+
+# Count client KeyInput frames addressed to one session. This is the focus
+# oracle for sessions the client itself created: `scribe-test wait-output`
+# can only observe sessions the test daemon owns, but the wire record shows
+# exactly which session the client's encoder routed each keystroke to.
+count_keys_to() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+total = 0
+try:
+    handle = open(path)
+except OSError:
+    print(0)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != "client":
+            continue
+        message = row.get("message", {})
+        if message.get("type") != "KeyInput":
+            continue
+        if message.get("session_id") == session_id:
+            total += 1
+print(total)
+PY
+}
 
 count_attach_to() {
     python3 - "$RECORD" "$1" <<'PY'
@@ -192,6 +238,26 @@ click_terminal_at() {
     sleep 0.8
 }
 
+# Press-move-release with a few px of pointer travel between press and
+# release, like every real human click. The travel crosses GPUI's ~2 px
+# native drag threshold (DRAG_THRESHOLD in gpui's div.rs), which engages the
+# tab's drag and cancels the element-level click, so the titlebar's release
+# path must select the pressed tab itself. `xdotool click` cannot cover this:
+# it presses and releases at one exact point.
+jitter_click_terminal_at() {
+    focus_terminal
+    xdotool mousemove "$(( TERM_X + $1 ))" "$(( TERM_Y + $2 ))"
+    sleep 0.3
+    xdotool mousedown 1
+    sleep 0.1
+    xdotool mousemove_relative -- 2 1
+    sleep 0.1
+    xdotool mousemove_relative -- 1 0
+    sleep 0.1
+    xdotool mouseup 1
+    sleep 0.8
+}
+
 shot() {
     sleep 0.3
     scrot -o "$1"
@@ -255,7 +321,7 @@ if ! wait_for_attach_to "$SESSION" "$ATTACH_ORIGINAL_CLICK_BEFORE" 15; then
 fi
 type_text "echo TAB_CLICK_FIRST_FOCUS"
 press_keys Return
-if ! scribe-test wait-output "$SESSION" "TAB_CLICK_FIRST_FOCUS" --timeout 8000 >/dev/null 2>&1; then
+if ! scribe-test wait-output "$SESSION" "TAB_CLICK_FIRST_FOCUS" --timeout 15000 >/dev/null 2>&1; then
     fail "phase 4: the first tab click switched tabs but left keyboard focus outside the terminal"
 fi
 shot /output/04-tab-switching-click-first.png
@@ -267,13 +333,183 @@ click_terminal_at "$SECOND_TAB_X" "$TITLEBAR_Y"
 if ! wait_for_attach_to "$NEW_SESSION" "$ATTACH_NEW_CLICK_BEFORE" 15; then
     fail "phase 5: clicking the second titlebar tab never attached $NEW_SESSION"
 fi
+# `wait-output` cannot observe this session — the client created it, so the
+# test daemon does not own it. The wire record is the focus oracle instead:
+# every typed key must be routed to $NEW_SESSION by the client's encoder.
+KEYS_NEW_BEFORE=$(count_keys_to "$NEW_SESSION")
 type_text "echo TAB_CLICK_SECOND_FOCUS"
 press_keys Return
-if ! scribe-test wait-output "$NEW_SESSION" "TAB_CLICK_SECOND_FOCUS" --timeout 8000 >/dev/null 2>&1; then
+if ! wait_for_count_growth "count_keys_to '$NEW_SESSION'" "$(( KEYS_NEW_BEFORE + 20 ))" 15; then
     fail "phase 5: the second tab click switched tabs but left keyboard focus outside the terminal"
 fi
 shot /output/05-tab-switching-click-second.png
 echo "PHASE 5 PASS: second titlebar tab attached $NEW_SESSION and kept typing live"
+
+# ── Phase 6: split into a second workspace region ─────────────────
+# ctrl+alt+backslash is the shipped workspace_split_vertical default. The new
+# region asks the server for its own workspace and a session to seed it, so
+# both a CreateWorkspace and a SessionCreated must land on the wire.
+CREATE_WS_BEFORE=$(count_client CreateWorkspace)
+CREATED_WS_BEFORE=$(count_server SessionCreated)
+send_keys ctrl+alt+backslash
+if ! wait_for_count_growth "count_client CreateWorkspace" "$CREATE_WS_BEFORE" 15; then
+    fail "phase 6: ctrl+alt+backslash never sent CreateWorkspace"
+fi
+if ! wait_for_count_growth "count_server SessionCreated" "$CREATED_WS_BEFORE" 15; then
+    fail "phase 6: the workspace split never created its seed session"
+fi
+WS_SESSION=$(latest_created_session_after "$CREATED_WS_BEFORE") \
+    || fail "phase 6: could not identify the workspace-split seed session"
+# The seed session is created through the old workspace and only moved into
+# the new region once the pane adopts it and the server's WorkspaceInfo has
+# re-keyed the region; the MoveSession frame is that settled point.
+if ! wait_for_count_growth "count_client MoveSession" 0 15; then
+    fail "phase 6: the seed session was never moved into the new workspace region"
+fi
+shot /output/06-tab-switching-workspace-split.png
+echo "PHASE 6 PASS: workspace split created region session $WS_SESSION"
+
+# ── Phase 7: keyboard-select tab 1 across workspace regions ───────
+# Focus sits in the new (second) region; alt+1 targets the strip's first tab,
+# whose session lives in the FIRST region. The switch must cross regions and
+# attach the original session.
+ATTACH_XREGION_KEY_BEFORE=$(count_attach_to "$SESSION")
+send_keys alt+1
+if ! wait_for_attach_to "$SESSION" "$ATTACH_XREGION_KEY_BEFORE" 15; then
+    fail "phase 7: alt+1 never attached the first region's session $SESSION"
+fi
+shot /output/07-tab-switching-key-cross-region.png
+echo "PHASE 7 PASS: alt+1 attached $SESSION across workspace regions"
+
+# ── Phase 8: click the first tab across workspace regions ─────────
+# Move focus back to the second region's session first (alt+3), then click the
+# first tab. In multi-workspace mode the badge pill shifts the strip right by
+# its rendered width; 135 px sits inside the first tab for any badge label up
+# to ~19 characters (badge <= ~134 px, tab spans [badge, badge+176]).
+ATTACH_WS_BEFORE=$(count_attach_to "$WS_SESSION")
+send_keys alt+3
+if ! wait_for_attach_to "$WS_SESSION" "$ATTACH_WS_BEFORE" 15; then
+    fail "phase 8: alt+3 never re-attached the second region's session $WS_SESSION"
+fi
+BADGED_FIRST_TAB_X=135
+ATTACH_XREGION_CLICK_BEFORE=$(count_attach_to "$SESSION")
+click_terminal_at "$BADGED_FIRST_TAB_X" "$TITLEBAR_Y"
+if ! wait_for_attach_to "$SESSION" "$ATTACH_XREGION_CLICK_BEFORE" 15; then
+    fail "phase 8: clicking the first titlebar tab never attached $SESSION across regions"
+fi
+type_text "echo TAB_CLICK_XREGION_FOCUS"
+press_keys Return
+if ! scribe-test wait-output "$SESSION" "TAB_CLICK_XREGION_FOCUS" --timeout 15000 >/dev/null 2>&1; then
+    fail "phase 8: the cross-region tab click switched tabs but left keyboard focus outside the terminal"
+fi
+shot /output/08-tab-switching-click-cross-region.png
+echo "PHASE 8 PASS: first titlebar tab attached $SESSION across regions and kept typing live"
+
+# ── Phase 9: relaunch the client and adopt the server topology ────
+# The user-visible regression surfaced after a client restart, when the fresh
+# window rebuilds its regions from the server's persisted workspace tree
+# (adopt_server_topology → PaneShell::adopt_server_tree). Kill the running
+# client and relaunch it so the new window goes through that adoption path
+# with two regions and three sessions.
+kill "${SCRIBE_CLIENT_PID:?the entrypoint must export SCRIBE_CLIENT_PID}" 2>/dev/null || true
+for _ in $(seq 1 30); do
+    kill -0 "$SCRIBE_CLIENT_PID" 2>/dev/null || break
+    sleep 0.2
+done
+ADOPT_BEFORE=$(grep -ac "rebuilt workspace splits from the server's tree" "$CLIENT_LOG" 2>/dev/null || true)
+scribe-client >>"$CLIENT_LOG" 2>&1 &
+RELAUNCHED_CLIENT_PID=$!
+trap 'kill "${RELAUNCHED_CLIENT_PID:-0}" 2>/dev/null || true' EXIT
+if ! wait_for_count_growth "grep -ac \"rebuilt workspace splits from the server's tree\" '$CLIENT_LOG' 2>/dev/null || true" "$ADOPT_BEFORE" 25; then
+    fail "phase 9: the relaunched client never adopted the server workspace tree"
+fi
+sleep 2
+shot /output/09-tab-switching-adopted.png
+echo "PHASE 9 PASS: relaunched client rebuilt two regions from the server tree"
+
+# ── Phase 10: cross-region tab click on the adopted layout ────────
+# The adopted strip's order follows the server's SessionList, which is not
+# guaranteed to be creation order, so this phase is order-independent: alt+3
+# moves the selection off the first tab (a fresh SessionList always activates
+# tab 0), the click on tab 0 must then attach a DIFFERENT session, and every
+# typed key must be routed to that clicked session.
+latest_attach_session() {
+    python3 - "$RECORD" <<'PY'
+import json
+import sys
+
+found = None
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != "client":
+            continue
+        message = row.get("message", {})
+        if message.get("type") == "AttachSessions" and message.get("session_ids"):
+            found = message["session_ids"][0]
+if found is None:
+    sys.exit(1)
+print(found)
+PY
+}
+ATTACH_ANY_BEFORE=$(count_client AttachSessions)
+send_keys alt+3
+if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
+    fail "phase 10: alt+3 never switched tabs on the adopted layout"
+fi
+ALT3_SESSION=$(latest_attach_session) || fail "phase 10: no attach recorded after alt+3"
+ATTACH_ANY_BEFORE=$(count_client AttachSessions)
+click_terminal_at "$BADGED_FIRST_TAB_X" "$TITLEBAR_Y"
+if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
+    fail "phase 10: clicking the first titlebar tab attached nothing on the adopted layout"
+fi
+CLICKED_SESSION=$(latest_attach_session) || fail "phase 10: no attach recorded after the click"
+if [ "$CLICKED_SESSION" = "$ALT3_SESSION" ]; then
+    fail "phase 10: the tab click re-attached $ALT3_SESSION instead of switching tabs"
+fi
+KEYS_CLICKED_BEFORE=$(count_keys_to "$CLICKED_SESSION")
+type_text "echo TAB_CLICK_ADOPTED_FOCUS"
+press_keys Return
+if ! wait_for_count_growth "count_keys_to '$CLICKED_SESSION'" "$(( KEYS_CLICKED_BEFORE + 20 ))" 15; then
+    fail "phase 10: the adopted-layout tab click switched tabs but left keyboard focus outside the terminal"
+fi
+shot /output/10-tab-switching-click-adopted.png
+echo "PHASE 10 PASS: cross-region tab click stays live on the adopted layout (clicked $CLICKED_SESSION)"
+
+# ── Phase 11: a jittered pointer click still selects a tab ────────
+# Real mouse clicks always travel a few px between press and release; that
+# travel engages GPUI's native tab drag and cancels the element-level click
+# (this swallowed every real-mouse tab click while the suite's zero-jitter
+# clicks stayed green). An engaged drag that never reordered must select the
+# pressed tab on release.
+ATTACH_ANY_BEFORE=$(count_client AttachSessions)
+send_keys alt+3
+if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
+    fail "phase 11: alt+3 never moved the selection off the first tab"
+fi
+JITTER_BASE_SESSION=$(latest_attach_session) \
+    || fail "phase 11: no attach recorded after alt+3"
+ATTACH_ANY_BEFORE=$(count_client AttachSessions)
+jitter_click_terminal_at "$BADGED_FIRST_TAB_X" "$TITLEBAR_Y"
+if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
+    fail "phase 11: the jittered first-tab click attached nothing (click swallowed by the drag system)"
+fi
+JITTER_SESSION=$(latest_attach_session) \
+    || fail "phase 11: no attach recorded after the jittered click"
+if [ "$JITTER_SESSION" = "$JITTER_BASE_SESSION" ]; then
+    fail "phase 11: the jittered click re-attached $JITTER_BASE_SESSION instead of selecting the clicked tab"
+fi
+KEYS_JITTER_BEFORE=$(count_keys_to "$JITTER_SESSION")
+type_text "echo TAB_JITTER_CLICK_FOCUS"
+press_keys Return
+if ! wait_for_count_growth "count_keys_to '$JITTER_SESSION'" "$(( KEYS_JITTER_BEFORE + 20 ))" 15; then
+    fail "phase 11: the jittered click selected a tab but left keyboard focus outside the terminal"
+fi
+shot /output/11-tab-switching-jitter-click.png
+echo "PHASE 11 PASS: jittered pointer click still selects (attached $JITTER_SESSION)"
 
 echo ""
 echo "PASS: tab switching and post-click typing stay live for keyboard and titlebar"

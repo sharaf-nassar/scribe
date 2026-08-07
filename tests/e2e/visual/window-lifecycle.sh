@@ -16,21 +16,20 @@
 # round trip, not a replay.
 #
 # Phases:
-#   0. hand the client a live pane (see the preamble note below);
+#   0. discover the live pane the client bootstrapped and focused;
 #   1. the window-list poll leaves the client and the reply is acted on;
 #   2. an OS focus change and a new tab each put a `FocusChanged` on the wire;
-#   3. the WM's close button raises the close dialog, "Quit Scribe" puts
+#   3. exiting one of two terminals keeps the window open, while exiting the
+#      last sends `CloseWindow` and exits after `WindowClosed`;
+#   4. the WM's close button raises the close dialog, "Quit Scribe" puts
 #      `QuitAll` on the wire, and the server's `QuitRequested` exits the client;
-#   4. a relaunched client's "Kill Window" puts `CloseWindow` on the wire and
+#   5. a relaunched client's "Kill Window" puts `CloseWindow` on the wire and
 #      the server's `WindowClosed` exits it.
 #
-# Phase 0 exists for the same reason it does in overlay-actions.sh: the
-# entrypoint creates $SESSION through `scribe-test` *after* launching the
-# client, the server sends `SessionCreated` only to the connection that asked,
-# and `handle_list_sessions` hides sessions owned by another window — so the
-# running client never learns the session exists. Stopping the test daemon
-# releases that ownership, after which a relaunched client picks the session up
-# over the normal `ListSessions` path.
+# Phase 0 reads the client's own `FocusChanged` frame rather than the separate
+# session the entrypoint creates for `scribe-test`. Fresh-window bootstrap gives
+# the client a real shell before the script starts; a newly created shell is
+# already attached, so its focus report is the exact visible-session oracle.
 #
 # `remote.enabled = true` is seeded through SCRIBE_EXTRA_CONFIG because the
 # window-list poll is gated on it, exactly as the winit client gates it: the
@@ -48,7 +47,7 @@ set -e
 
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
-SESSION="${SESSION:?the entrypoint must export a created SESSION}"
+SESSION=""
 
 fail() {
     echo "FAIL: $1" >&2
@@ -143,6 +142,27 @@ print(found)
 PY
 }
 
+last_focused_session() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+
+found = None
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        gained = message.get("gained")
+        if row.get("dir") == "client" and message.get("type") == "FocusChanged" and gained:
+            found = gained
+if found is None:
+    sys.exit(1)
+print(found)
+PY
+}
+
 # A `FocusChanged` that moved focus off `$SESSION` onto some *other* pane. The
 # new session's id is minted by the server when the tab is created, so it
 # cannot be spelled out in advance — only its shape can.
@@ -221,6 +241,11 @@ send_keys() {
     sleep 0.5
 }
 
+type_text() {
+    xdotool type --clearmodifiers --delay 40 "$1"
+    sleep 0.3
+}
+
 # Wait for every scribe-client process to be gone.
 wait_for_client_exit() {
     local timeout_secs="$1" started
@@ -240,16 +265,9 @@ launch_client() {
     sleep 2
 }
 
-# ── Phase 0: hand the client a live pane to act in ────────────────
+# ── Phase 0: identify the client's live pane ──────────────────────
 sleep 1.0
-kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
-wait_for_client_exit 15 || fail "PHASE 0: the original client did not exit"
-scribe-test daemon stop >/dev/null 2>&1 || true
-sleep 1.0
-ATTACHED_BEFORE=$(count_client AttachSessions "session_ids=[\"$SESSION\"]")
-launch_client
-wait_for_frames client "$ATTACHED_BEFORE" 30 AttachSessions "session_ids=[\"$SESSION\"]" \
-    || fail "PHASE 0: the relaunched client never attached to $SESSION"
+SESSION=$(last_focused_session) || fail "PHASE 0: the client never focused a live session"
 focus
 shot /output/00-attached.png
 echo "PHASE 0 PASS: the client attached to session $SESSION"
@@ -304,13 +322,43 @@ done
 shot /output/02-second-tab.png
 echo "PHASE 2b PASS: moving the focused pane reported gained and lost together"
 
-# ── Phase 3: the close dialog's Quit Scribe quits every window ────
+# ── Phase 3: the final terminal exit closes its window ───────────
+WIN=$(last_welcome_window) || fail "PHASE 3: the client never got a Welcome"
+CLOSE_BEFORE=$(count_client CloseWindow "window_id=$WIN")
+EXIT_BEFORE=$(count_server SessionExited)
+type_text "exit"
+send_keys Return
+wait_for_frames server "$EXIT_BEFORE" 15 SessionExited \
+    || fail "PHASE 3: the second terminal never exited"
+sleep 1.0
+pgrep -f 'scribe-client' >/dev/null 2>&1 \
+    || fail "PHASE 3: exiting one of two terminals closed the window"
+[ "$(count_client CloseWindow "window_id=$WIN")" -eq "$CLOSE_BEFORE" ] \
+    || fail "PHASE 3: exiting one of two terminals sent CloseWindow"
+focus
+shot /output/03-one-terminal-left.png
+
+EXIT_BEFORE=$(count_server SessionExited)
+CLOSED_BEFORE=$(count_server WindowClosed "window_id=$WIN")
+type_text "exit"
+send_keys Return
+wait_for_frames server "$EXIT_BEFORE" 15 SessionExited \
+    || fail "PHASE 3: the final terminal never exited"
+wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$WIN" \
+    || fail "PHASE 3: final terminal exit put no CloseWindow on the wire"
+wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$WIN" \
+    || fail "PHASE 3: server never acknowledged the empty window's close"
+wait_for_client_exit 20 || fail "PHASE 3: final terminal exit left the client running"
+echo "PHASE 3 PASS: one exit kept the window open; the final exit closed it after the ack"
+
+# ── Phase 4: the close dialog's Quit Scribe quits every window ────
 # Alt+F4 is openbox's Close action, which sends WM_DELETE_WINDOW — the same
 # message the decoration's close button sends, and the one GPUI turns into the
 # client's `on_window_should_close` hook. (`xdotool windowclose` is *not* used:
 # it calls XDestroyWindow and bypasses the WM protocol entirely.) The client
 # must veto that close and raise its own dialog instead, because the server owns
 # this window's sessions.
+launch_client
 focus
 measure_window
 shot /output/03a-before-close.png
@@ -319,14 +367,14 @@ send_keys alt+F4
 sleep 1.0
 shot /output/03-close-dialog.png
 pgrep -f 'scribe-client' >/dev/null 2>&1 \
-    || fail "PHASE 3: the client closed on WM_DELETE_WINDOW instead of asking"
+    || fail "PHASE 4: the client closed on WM_DELETE_WINDOW instead of asking"
 # The modal dims and covers the grid, so a changed body crop is the dialog and
 # nothing else; the crop excludes the status bar, whose sparklines resample
 # every 2 s and would change pixels on their own.
 crop_body /output/03-close-dialog.png /output/03-body.png
 DIALOG_DIFF=$(compare -metric AE /output/03a-body.png /output/03-body.png null: 2>&1 || true)
 [ "${DIALOG_DIFF%% *}" != "0" ] \
-    || fail "PHASE 3: WM_DELETE_WINDOW painted no close dialog"
+    || fail "PHASE 4: WM_DELETE_WINDOW painted no close dialog"
 QUIT_BEFORE=$(count_client QuitAll)
 ACK_BEFORE=$(count_server QuitRequested)
 # Cancel holds default focus, so one Tab lands on the accent Quit Scribe button.
@@ -334,17 +382,17 @@ send_keys Tab
 shot /output/04-quit-focused.png
 send_keys Return
 wait_for_frames client "$QUIT_BEFORE" 15 QuitAll \
-    || fail "PHASE 3: Quit Scribe put no QuitAll on the wire"
+    || fail "PHASE 4: Quit Scribe put no QuitAll on the wire"
 wait_for_frames server "$ACK_BEFORE" 15 QuitRequested \
-    || fail "PHASE 3: the server never broadcast QuitRequested"
-wait_for_client_exit 20 || fail "PHASE 3: the client ignored QuitRequested and stayed up"
-echo "PHASE 3 PASS: WM close raised the dialog, Quit Scribe sent QuitAll, the ack exited the app"
+    || fail "PHASE 4: the server never broadcast QuitRequested"
+wait_for_client_exit 20 || fail "PHASE 4: the client ignored QuitRequested and stayed up"
+echo "PHASE 4 PASS: WM close raised the dialog, Quit Scribe sent QuitAll, the ack exited the app"
 
-# ── Phase 4: Kill Window closes this window only ──────────────────
+# ── Phase 5: Kill Window closes this window only ──────────────────
 # Sessions survived the quit-all, but this phase needs no pane: `CloseWindow`
 # names the window the fresh `Welcome` assigns and destroys whatever it owns.
 launch_client
-WIN=$(last_welcome_window) || fail "PHASE 4: the relaunched client never got a Welcome"
+WIN=$(last_welcome_window) || fail "PHASE 5: the relaunched client never got a Welcome"
 echo "relaunched client window id: $WIN"
 focus
 CLOSE_BEFORE=$(count_client CloseWindow "window_id=$WIN")
@@ -357,11 +405,11 @@ send_keys Tab
 shot /output/06-kill-window-focused.png
 send_keys Return
 wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$WIN" \
-    || fail "PHASE 4: Kill Window put no CloseWindow for $WIN on the wire"
+    || fail "PHASE 5: Kill Window put no CloseWindow for $WIN on the wire"
 wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$WIN" \
-    || fail "PHASE 4: the server never acknowledged with WindowClosed"
-wait_for_client_exit 20 || fail "PHASE 4: the client ignored WindowClosed and stayed up"
-echo "PHASE 4 PASS: Kill Window sent CloseWindow and its ack exited the app"
+    || fail "PHASE 5: the server never acknowledged with WindowClosed"
+wait_for_client_exit 20 || fail "PHASE 5: the client ignored WindowClosed and stayed up"
+echo "PHASE 5 PASS: Kill Window sent CloseWindow and its ack exited the app"
 
 echo ""
 echo "PASS: visual window-lifecycle test"
@@ -369,6 +417,7 @@ echo "  Inspect screenshots in test-output/:"
 echo "    00-attached.png            — the adopted pane before any action"
 echo "    01-refocused.png           — the window after a blur/focus round trip"
 echo "    02-second-tab.png          — the second tab that moved pane focus"
+echo "    03-one-terminal-left.png   — one terminal exit kept the window open"
 echo "    03a-before-close.png       — the window just before the close request"
 echo "    03-close-dialog.png        — WM close raised the in-app dialog"
 echo "    04-quit-focused.png        — Tab moved focus onto Quit Scribe"

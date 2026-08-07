@@ -418,6 +418,22 @@ focus
 shot /output/08-workspace-focus-left.png
 echo "PHASE 8 PASS: $WORKSPACE_FOCUS_LEFT_CHORD moved focus to the first workspace region"
 
+# ── Phase 9: a new tab in the first region stays over that region ──
+# Creating the third tab after returning left used to append it after the right
+# region's tab, producing left/right/left runs. Duplicate region edges made the
+# titlebar abandon absolute placement and flow every tab from x=0, visibly
+# disconnecting the second group's tab from the workspace divider below it.
+TABS_BEFORE=$(count_log "opened a new tab")
+focus
+send_keys ctrl+shift+t
+if ! wait_for_log_growth "opened a new tab" "$TABS_BEFORE" 15; then
+    fail "PHASE 9 FAIL: ctrl+shift+t did not create a tab in the first workspace"
+fi
+sleep 1.0
+focus
+shot /output/09-unnamed-tab-groups-aligned.png
+echo "PHASE 9 PASS: a third tab in the first workspace kept one tab run per region"
+
 echo ""
 echo "PASS: visual pane-workspace-layout test"
 echo "  Inspect screenshots in test-output/:"
@@ -432,3 +448,4 @@ echo "    05-after-close.png             — back to one pane after close_pane"
 echo "    06-before-workspace-split.png  — the window before the workspace split"
 echo "    07-after-workspace-split.png   — two workspace regions"
 echo "    08-workspace-focus-left.png    — focus back in the first workspace region"
+echo "    09-unnamed-tab-groups-aligned.png — left tabs grouped before right region"

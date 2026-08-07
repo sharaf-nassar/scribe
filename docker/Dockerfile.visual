@@ -50,6 +50,8 @@ RUN apt-get update && \
         openbox \
         libwebkit2gtk-4.1-0 \
         dbus-x11 \
+        xdg-desktop-portal \
+        xdg-desktop-portal-gtk \
         gnome-keyring \
         ibus \
         ibus-table \

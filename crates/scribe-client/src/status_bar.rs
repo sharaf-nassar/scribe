@@ -73,9 +73,6 @@ pub struct RemoteStatusData<'a> {
 /// Data needed to render the window-level status bar.
 pub struct StatusBarData<'a> {
     pub connected: bool,
-    /// Connection or pane warning/error surfaced in this existing band rather
-    /// than a separate band. Empty or absent copy renders nothing.
-    pub status_message: Option<&'a str>,
     /// Name of the focused workspace (shown when multiple workspaces exist).
     pub workspace_name: Option<&'a str>,
     /// CWD of the focused pane, displayed as a shortened path.
@@ -173,11 +170,19 @@ impl StatusBarColors {
 pub struct Span {
     pub text: String,
     pub color: [f32; 4],
+    /// Full copy revealed on hover when the visible text is a compact glyph,
+    /// so long error strings do not crowd the band inline.
+    pub tooltip: Option<String>,
 }
 
 impl Span {
     fn new(text: impl Into<String>, color: [f32; 4]) -> Self {
-        Self { text: text.into(), color }
+        Self { text: text.into(), color, tooltip: None }
+    }
+
+    fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
     }
 }
 
@@ -216,9 +221,6 @@ pub fn build_model(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Status
 /// separately announced accessibility nodes.
 fn accessibility_label(data: &StatusBarData<'_>) -> String {
     let mut states = vec![if data.connected { "Connected" } else { "Disconnected" }.to_owned()];
-    if let Some(message) = data.status_message.filter(|message| !message.is_empty()) {
-        states.push(message.to_owned());
-    }
     match data.last_command_status {
         Some(CommandStatus::Success) => states.push("Last command succeeded".to_owned()),
         Some(CommandStatus::Failure) => states.push("Last command failed".to_owned()),
@@ -260,11 +262,6 @@ fn build_left(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<Span> {
     spans.push(Span::new("\u{25CF}", dot_color));
     spans.push(Span::new(" ", colors.text));
 
-    if let Some(message) = data.status_message.filter(|message| !message.is_empty()) {
-        spans.push(Span::new(message, colors.text));
-        spans.push(Span::new("  ", colors.text));
-    }
-
     push_command_status(&mut spans, colors, data.last_command_status);
     push_env_status_warning(&mut spans, colors, data.env_status);
     push_remote_status(&mut spans, colors, data);
@@ -305,7 +302,11 @@ fn push_env_status_warning(
     env_status: Option<&EnvStatusState>,
 ) {
     let Some(EnvStatusState::Degraded { .. }) = env_status else { return };
-    spans.push(Span::new("\u{26A0}", colors.warning));
+    spans.push(
+        Span::new("\u{26A0}", colors.warning).with_tooltip(
+            "Environment capture degraded — retry from Settings → Terminal → General",
+        ),
+    );
     spans.push(Span::new(" ", colors.text));
 }
 
@@ -641,16 +642,55 @@ fn rgba(color: [f32; 4]) -> Rgba {
 }
 
 /// Render one span group as an inline flex row of coloured text runs.
-fn span_row(spans: &[Span]) -> impl IntoElement {
-    div().flex().flex_row().items_center().children(
-        spans.iter().map(|span| {
-            div().text_color(rgba(span.color)).child(span.text.clone()).into_any_element()
-        }),
-    )
+/// Hover tooltip carrying a span's full copy (the status-message glyph). Uses
+/// the band's own palette so it reads as part of the bar.
+struct SpanTooltip {
+    text: String,
+    colors: StatusBarColors,
+}
+
+impl gpui::Render for SpanTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(480.0))
+            .bg(rgba(self.colors.bg))
+            .border_1()
+            .border_color(rgba(self.colors.separator))
+            .font_family("monospace")
+            .text_xs()
+            .text_color(rgba(self.colors.text))
+            .child(self.text.clone())
+    }
+}
+
+fn span_row(spans: &[Span], colors: &StatusBarColors) -> impl IntoElement {
+    let colors = *colors;
+    div().flex().flex_row().items_center().children(spans.iter().enumerate().map(|(ix, span)| {
+        let base = div().text_color(rgba(span.color)).child(span.text.clone());
+        if let Some(tooltip) = span.tooltip.clone() {
+            base.id(("status-span", ix))
+                .tooltip(move |_window, cx| {
+                    cx.new(|_| SpanTooltip { text: tooltip.clone(), colors }).into()
+                })
+                .into_any_element()
+        } else {
+            base.into_any_element()
+        }
+    }))
 }
 
 /// Shared update callback used by pointer and AccessKit activation.
 pub type UpdateActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+/// Interactive wiring for the band's clickable surfaces: the centred update
+/// CTA and the settings gear at the far right.
+pub struct StatusBarActions<'a> {
+    pub update_focus: Option<&'a FocusHandle>,
+    pub on_update: Option<UpdateActionHandler>,
+    pub on_settings: Option<UpdateActionHandler>,
+}
 
 /// Render the centred CTA, wiring the click listener when the model says the
 /// update is actionable and the caller supplied one.
@@ -704,9 +744,9 @@ pub fn render(
     model: &StatusBarModel,
     height_px: f32,
     colors: &StatusBarColors,
-    update_focus: Option<&FocusHandle>,
-    on_update: Option<UpdateActionHandler>,
+    actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
+    let StatusBarActions { update_focus, on_update, on_settings } = actions;
     let center = model
         .center
         .as_ref()
@@ -731,9 +771,30 @@ pub fn render(
         .font_family("monospace")
         .text_xs()
         .text_color(rgba(colors.text))
-        .child(span_row(&model.left))
+        .child(span_row(&model.left, colors))
         .child(div().flex_1().flex().flex_row().justify_center().children(center))
-        .child(span_row(&model.right))
+        .child(span_row(&model.right, colors))
+        .children(on_settings.map(|action| settings_gear(colors, action)))
+}
+
+/// The settings entry point at the band's far right — the gear moved here
+/// from the titlebar, which now holds only tabs and the equalize icon.
+fn settings_gear(colors: &StatusBarColors, action: UpdateActionHandler) -> gpui::AnyElement {
+    let accent = rgba(colors.accent);
+    div()
+        .id("status-bar-settings")
+        .role(Role::Button)
+        .aria_label("Open settings")
+        .flex()
+        .items_center()
+        .h_full()
+        .pl_2()
+        .cursor_pointer()
+        .text_color(rgba(colors.label))
+        .hover(move |style| style.text_color(accent))
+        .on_click(move |_, window, cx| action(window, cx))
+        .child("\u{2699}")
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -777,7 +838,6 @@ mod tests {
     fn data() -> StatusBarData<'static> {
         StatusBarData {
             connected: true,
-            status_message: None,
             workspace_name: None,
             cwd: None,
             git_branch: None,
@@ -817,15 +877,18 @@ mod tests {
         crate::assert_rgba_eq(dot_disconnected.color, colors.disconnected_dot);
     }
 
-    // @lat: [[test#GPUI Status Bar#Pane feedback shares the window status bar]]
+    // @lat: [[test#GPUI Status Bar#Pane feedback stays out of the window status bar]]
     #[test]
-    fn pane_feedback_shares_the_window_status_bar() {
+    fn pane_feedback_stays_out_of_the_window_status_bar() {
         let colors = colors();
-        let mut d = data();
-        d.status_message = Some("input refused: queue full");
+        let d = data();
 
-        assert!(joined(&build_left(&d, &colors)).contains("input refused: queue full"));
-        assert!(accessibility_label(&d).contains("input refused: queue full"));
+        // Transient connection / pane errors are log-only: no warning glyph
+        // and no error copy anywhere in the band. The only ⚠ the bar may show
+        // is the env-capture one, absent here because env status is `None`.
+        let left = build_left(&d, &colors);
+        assert!(left.iter().all(|s| s.text != "\u{26A0}"));
+        assert_eq!(accessibility_label(&d), "Terminal status: Connected");
     }
 
     // @lat: [[test#GPUI Status Bar#Command status glyphs distinguish outcomes]]
