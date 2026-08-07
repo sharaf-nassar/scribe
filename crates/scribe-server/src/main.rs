@@ -79,6 +79,10 @@ mod handoff_tests;
 /// env-store writes — that could otherwise park exit indefinitely.
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Size cap for the state-dir server log. On overflow at startup the file is
+/// rotated once to `server.log.1`, so disk use stays bounded at ~2x the cap.
+const SERVER_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Entry point. Calls `setup_env()` before spawning the tokio runtime so that
 /// `env::set_var("TERM", …)` runs while the process is still single-threaded.
 /// `env::set_var` is unsound in multi-threaded contexts (Rust 1.81+).
@@ -86,11 +90,29 @@ fn main() -> Result<(), ScribeError> {
     // Set TERM/COLORTERM before any threads are spawned.
     alacritty_terminal::tty::setup_env();
 
+    let upgrade_mode = std::env::args().nth(1).is_some_and(|a| a == "--upgrade");
+
     let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
-    fmt().with_env_filter(filter).init();
+    // An updater-spawned `--upgrade` server has no durable stdio: the Debian
+    // postinst redirects it to a temp file it deletes after its ready check,
+    // and the macOS fallback spawn uses Stdio::null(). Mirror tracing into a
+    // file under the state dir so the successor's logs survive; stdout stays
+    // active because the postinst watchdog greps it for "IPC server listening".
+    let log_file = if upgrade_mode { open_server_log_file() } else { None };
+    let (file, log_path) = match log_file {
+        Some((file, path)) => (Some(file), Some(path)),
+        None => (None, None),
+    };
+    init_tracing(filter, file);
 
-    let upgrade_mode = std::env::args().nth(1).is_some_and(|a| a == "--upgrade");
+    if upgrade_mode {
+        if let Some(path) = &log_path {
+            info!(path = %path.display(), "upgrade-mode logs mirrored to state-dir file");
+        } else {
+            warn!("could not open state-dir log file; upgrade-mode logs go to stdio only");
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -112,6 +134,42 @@ fn main() -> Result<(), ScribeError> {
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
 
     result
+}
+
+/// Install the global tracing subscriber: a stdout fmt layer always, plus a
+/// second fmt layer appending to `file` when one is provided.
+fn init_tracing(filter: EnvFilter, file: Option<std::fs::File>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt::layer());
+    match file {
+        Some(file) => registry
+            .with(fmt::layer().with_ansi(false).with_writer(std::sync::Arc::new(file)))
+            .init(),
+        None => registry.init(),
+    }
+}
+
+/// Open (creating and rotating as needed) the append-mode `server.log` in the
+/// app state dir. Returns `None` when the state dir is unavailable or the
+/// file cannot be opened — tracing then stays on stdio alone.
+fn open_server_log_file() -> Option<(std::fs::File, std::path::PathBuf)> {
+    let dir = scribe_common::app::current_state_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("server.log");
+    rotate_if_oversized(&path, SERVER_LOG_MAX_BYTES);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    Some((file, path))
+}
+
+/// Startup-time size cap: rename `server.log` to `server.log.1` (replacing
+/// any previous rotation) once it exceeds `max_bytes`. Best-effort — a failed
+/// rename just keeps appending to the oversized file.
+fn rotate_if_oversized(path: &Path, max_bytes: u64) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
+        drop(std::fs::rename(path, path.with_extension("log.1")));
+    }
 }
 
 /// Normal server mode: start IPC server + handoff listener, run until shutdown.
@@ -362,5 +420,33 @@ fn load_env_persistence_seed() -> bool {
             warn!(error = %e, "failed to load config for env_persistence seed; defaulting to false");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod server_log_tests {
+    use super::rotate_if_oversized;
+
+    #[test]
+    fn rotates_only_when_over_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("scribe-server-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.log");
+        let rotated = dir.join("server.log.1");
+
+        // Under the cap: untouched, no rotation file appears.
+        std::fs::write(&path, b"small").unwrap();
+        rotate_if_oversized(&path, 16);
+        assert!(path.exists());
+        assert!(!rotated.exists());
+
+        // Over the cap: renamed aside, replacing any prior rotation.
+        std::fs::write(&path, vec![b'x'; 32]).unwrap();
+        rotate_if_oversized(&path, 16);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&rotated).unwrap().len(), 32);
+
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

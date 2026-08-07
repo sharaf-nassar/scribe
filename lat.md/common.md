@@ -104,6 +104,8 @@ Both the server and client terminal cores inherit width from alacritty_terminal'
 
  holds a list of root directory paths scanned for projects and a badge color palette used to visually distinguish workspaces.
 
+When a session leaves every configured root, the server clears its workspace name and the client removes the badge, leaving only terminal tabs. A nonempty published name selects its badge colour from the configured palette; region accents still style borders and active underlines.
+
 ### Update
 
  controls auto-update behavior: `enabled` flag, `check_interval_secs` (default 86 400 s), and  (`Stable` or `Beta`).

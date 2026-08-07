@@ -270,14 +270,15 @@ e2e-visual-settings-trust:
 # Run the in-app settings entry-point E2E. Drives the running terminal window
 # with the settings chord, the palette row, and the titlebar gear, and asserts
 # the "Scribe Settings" window maps exactly once.
+# SCRIBE_FILE_CHOOSER=1 starts the desktop chooser portal for workspace roots.
 e2e-visual-settings-entry:
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/settings-entry.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_FILE_CHOOSER=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/settings-entry.sh
 
 # Run the live tab-switching E2E through the shared-pane rig and the wire tap.
 # The client creates its own second tab, then keyboard and titlebar selection
 # changes are asserted on the recorded `AttachSessions` frames.
 e2e-visual-tab-switching:
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/tab-switching.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/tab-switching.sh
 
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll

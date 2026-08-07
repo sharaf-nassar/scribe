@@ -5,6 +5,10 @@
 //! avoid save races between window processes). Ported from the legacy winit
 //! client's `window_state.rs`; the winit `capture`/`apply` glue is replaced by
 //! GPUI-native bounds conversion (the shell bead) since GPUI owns the window.
+//! `monitor_name` is the `RandR` connector name resolved by [`crate::monitor`]
+//! (GPUI's X11 display uuid is a nil placeholder — [`NIL_MONITOR_ID`]), and
+//! [`gate_position_on_monitor`] drops a saved position whose monitor is
+//! unknown or no longer connected.
 //!
 //! It also adds the first-launch **geometry-compat normalization**
 //! ([`normalize_legacy_geometry`]): geometry persisted by the OS-decorated old
@@ -81,6 +85,49 @@ impl Default for WindowGeometry {
             // A freshly-created default is already in the new coordinate system.
             titlebar_normalized: true,
         }
+    }
+}
+
+/// The nil UUID string GPUI's X11 backend reports as its display "uuid".
+///
+/// v0.1.0 cutover clients persisted this verbatim as `monitor_name`, so every
+/// pre-connector-name record on X11 carries it. Restore treats it as "monitor
+/// identity unknown" — the position is kept, because dropping it would discard
+/// every such window's placement on the first post-upgrade start (the
+/// side-by-side-windows-became-stacked regression). The record self-heals to a
+/// `RandR` connector name on the next geometry capture.
+pub const NIL_MONITOR_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Decide whether a saved absolute position may be applied on restore.
+///
+/// The position is dropped only when the record names a real monitor identity
+/// that is verifiably no longer connected. `None` and the nil-UUID placeholder
+/// mean the identity is unknown — it cannot be disproven, so the position is
+/// kept (matching pre-gate behavior for legacy records). An empty `connected`
+/// list means the platform cannot enumerate monitors (macOS, pure Wayland) —
+/// likewise unverifiable, so the position is kept.
+#[must_use]
+pub fn saved_monitor_allows_position(saved: Option<&str>, connected: &[String]) -> bool {
+    match saved {
+        None | Some(NIL_MONITOR_ID) => true,
+        Some(name) => connected.is_empty() || connected.iter().any(|c| c == name),
+    }
+}
+
+/// Drop the saved position when [`saved_monitor_allows_position`] rejects the
+/// record's monitor, keeping size and maximized state. The restore path then
+/// opens the window at its default placement — the legacy client's "saved
+/// monitor not found, letting OS place window" behavior.
+#[must_use]
+pub fn gate_position_on_monitor(geom: &WindowGeometry, connected: &[String]) -> WindowGeometry {
+    if saved_monitor_allows_position(geom.monitor_name.as_deref(), connected) {
+        geom.clone()
+    } else {
+        tracing::info!(
+            monitor = geom.monitor_name.as_deref().unwrap_or("<none>"),
+            "saved monitor no longer connected; dropping the saved window position"
+        );
+        WindowGeometry { x: None, y: None, ..geom.clone() }
     }
 }
 
@@ -417,5 +464,28 @@ maximized = false
         assert!(!geometry_size_is_sane(&legacy_geom(1200, 16385, false)));
         assert!(geometry_size_is_sane(&legacy_geom(40, 40, false)));
         assert!(geometry_size_is_sane(&legacy_geom(16384, 16384, false)));
+    }
+
+    // @lat: [[test#Window geometry compat#Unknown monitor identity keeps the saved position]]
+    #[test]
+    fn unknown_monitor_identity_keeps_position() {
+        let connected = vec!["DP-2".to_owned(), "DP-4".to_owned()];
+        // Legacy nil-UUID and absent identities are unverifiable → keep.
+        assert!(saved_monitor_allows_position(Some(NIL_MONITOR_ID), &connected));
+        assert!(saved_monitor_allows_position(None, &connected));
+        // A real name still connected → keep; verifiably gone → drop.
+        assert!(saved_monitor_allows_position(Some("DP-4"), &connected));
+        assert!(!saved_monitor_allows_position(Some("DP-7"), &connected));
+        // No enumeration available (macOS, pure Wayland) → keep.
+        assert!(saved_monitor_allows_position(Some("DP-7"), &[]));
+
+        // The gate strips only x/y, and only for a verifiably gone monitor.
+        let mut geom = legacy_geom(1200, 800, true);
+        geom.monitor_name = Some(NIL_MONITOR_ID.to_owned());
+        assert_eq!(gate_position_on_monitor(&geom, &connected), geom);
+        geom.monitor_name = Some("DP-7".to_owned());
+        let gated = gate_position_on_monitor(&geom, &connected);
+        assert_eq!((gated.x, gated.y), (None, None));
+        assert_eq!((gated.width, gated.height, gated.maximized), (1200, 800, true));
     }
 }

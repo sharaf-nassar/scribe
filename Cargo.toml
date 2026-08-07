@@ -90,7 +90,10 @@ socket2 = "0.6"
 rustix = { version = "1.1", features = ["net", "process"] }
 libc = "0.2"
 unix-ancillary = "0.1"
-x11rb = { version = "0.13", default-features = false }
+# `randr` names the monitor under a window for geometry persistence
+# (`scribe-client/src/monitor.rs`); GPUI's X11 display uuid is a nil
+# placeholder, so the connector name has to come from RandR directly.
+x11rb = { version = "0.13", default-features = false, features = ["randr"] }
 raw-window-handle = "0.6"
 
 # GPUI client

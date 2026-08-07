@@ -106,6 +106,55 @@ fn removing_active_tab_clamps_selection() {
     assert_eq!(tabs.active_workspace(), None);
 }
 
+/// Two-workspace strip `[a1, a2 | b1, b2]`, selection on `b1` (index 2).
+fn two_workspace_strip() -> (TabSessions, (WorkspaceId, WorkspaceId), Vec<SessionId>) {
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    let ids: Vec<SessionId> = (0..4).map(|_| SessionId::new()).collect();
+    let mut tabs = TabSessions::new();
+    tabs.replace_all(vec![
+        TabEntry::new(ids[0], ws_a, "a1".to_owned()),
+        TabEntry::new(ids[1], ws_a, "a2".to_owned()),
+        TabEntry::new(ids[2], ws_b, "b1".to_owned()),
+        TabEntry::new(ids[3], ws_b, "b2".to_owned()),
+    ]);
+    tabs.select(2);
+    (tabs, (ws_a, ws_b), ids)
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Exit refocus stays inside the workspace]]
+#[test]
+fn exit_refocus_stays_inside_the_workspace() {
+    // Removing b1 must refocus b2 (same workspace), not a2 (strip neighbour).
+    let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
+    assert_eq!(tabs.remove(ids[2]), Some(ids[3]));
+    assert_eq!(tabs.active_workspace(), Some(ws_b));
+}
+
+/// The predecessor wins when the removed tab was its workspace's last in
+/// strip order.
+#[test]
+fn exit_refocus_prefers_the_workspace_predecessor() {
+    let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
+    tabs.select(3);
+    assert_eq!(tabs.remove(ids[3]), Some(ids[2]));
+    assert_eq!(tabs.active_workspace(), Some(ws_b));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Last tab of a workspace falls back across the strip]]
+#[test]
+fn last_tab_of_a_workspace_falls_back_across_the_strip() {
+    let (mut tabs, (ws_a, _), ids) = two_workspace_strip();
+    assert_eq!(tabs.remove(ids[2]), Some(ids[3]));
+    // Removing the workspace's last tab has nowhere same-workspace to go, so
+    // the strip-global clamp applies and the region collapse takes over.
+    assert_eq!(tabs.remove(ids[3]), Some(ids[1]));
+    assert_eq!(tabs.active_workspace(), Some(ws_a));
+    assert_eq!(tabs.workspace_of(ids[1]), Some(ws_a), "survivors keep their workspace");
+    assert_eq!(tabs.workspace_of(ids[3]), None, "removed sessions are gone");
+    assert_eq!(tabs.workspace_of(ids[0]), Some(ws_a));
+}
+
 #[test]
 fn session_list_rebuild_preserves_active_session() {
     let (mut tabs, workspace_id, ids) = strip(3);
@@ -129,6 +178,30 @@ fn session_list_rebuild_preserves_active_session() {
 fn new_tab_targets_the_active_workspace() {
     let (tabs, workspace_id, _) = strip(2);
     assert_eq!(tabs.active_workspace(), Some(workspace_id));
+}
+
+#[test]
+fn workspace_tabs_form_one_run_without_losing_the_active_session() {
+    let left = WorkspaceId::new();
+    let right = WorkspaceId::new();
+    let left_first = SessionId::new();
+    let right_first = SessionId::new();
+    let left_new = SessionId::new();
+    let mut tabs = TabSessions::new();
+    tabs.replace_all(vec![
+        TabEntry::new(left_first, left, "left-1".to_owned()),
+        TabEntry::new(right_first, right, "right-1".to_owned()),
+        TabEntry::new(left_new, left, "left-2".to_owned()),
+    ]);
+    tabs.select(2);
+
+    tabs.group_by_workspace();
+
+    assert_eq!(
+        tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(),
+        [left_first, left_new, right_first]
+    );
+    assert_eq!(tabs.active_session(), Some(left_new));
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab task labels]]

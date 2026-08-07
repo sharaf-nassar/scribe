@@ -768,8 +768,10 @@ fn layout_node_to_pane_tree(
 /// Convert a `PaneTreeNode` to a `LayoutNode`, allocating new `PaneId`s.
 ///
 /// Returns the layout node and a parallel list of `(SessionId, PaneId)` pairs
-/// in depth-first order.
-fn pane_tree_to_layout_node(tree: &PaneTreeNode) -> (LayoutNode, Vec<(SessionId, PaneId)>) {
+/// in depth-first order. Public because the running shell rebuilds its pane
+/// trees from the server's persisted workspace tree on a hot reconnect, which
+/// needs the same wire→layout lowering the tab restore path uses.
+pub fn pane_tree_to_layout_node(tree: &PaneTreeNode) -> (LayoutNode, Vec<(SessionId, PaneId)>) {
     match tree {
         PaneTreeNode::Leaf { session_id } => {
             let pane_id = alloc_pane_id();

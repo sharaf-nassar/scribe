@@ -81,23 +81,48 @@ fn theme_color_value(config: &ScribeConfig, key: &str) -> Option<Value> {
     if !key.starts_with("theme.") {
         return None;
     }
-    let Some(theme) = config.theme.as_ref() else {
-        return Some(Value::String(String::new()));
-    };
+    let resolved;
+    let (foreground, background, cursor, cursor_accent, selection, selection_foreground, colors) =
+        if let Some(theme) = config.theme.as_ref() {
+            (
+                theme.foreground.clone(),
+                theme.background.clone(),
+                theme.cursor.clone(),
+                theme.cursor_accent.clone(),
+                theme.selection.clone(),
+                theme.selection_foreground.clone(),
+                theme.colors.clone(),
+            )
+        } else {
+            resolved = scribe_common::config::resolve_theme(config);
+            (
+                scribe_common::theme::rgba_to_hex(resolved.foreground),
+                scribe_common::theme::rgba_to_hex(resolved.background),
+                scribe_common::theme::rgba_to_hex(resolved.cursor),
+                scribe_common::theme::rgba_to_hex(resolved.cursor_accent),
+                scribe_common::theme::rgba_to_hex(resolved.selection),
+                scribe_common::theme::rgba_to_hex(resolved.selection_foreground),
+                resolved
+                    .ansi_colors
+                    .iter()
+                    .map(|color| scribe_common::theme::rgba_to_hex(*color))
+                    .collect(),
+            )
+        };
     let v = match key {
-        "theme.foreground" => theme.foreground.clone(),
-        "theme.background" => theme.background.clone(),
-        "theme.cursor" => theme.cursor.clone(),
-        "theme.cursor_text" => theme.cursor_accent.clone(),
-        "theme.selection" => theme.selection.clone(),
-        "theme.selection_text" => theme.selection_foreground.clone(),
+        "theme.foreground" => foreground,
+        "theme.background" => background,
+        "theme.cursor" => cursor,
+        "theme.cursor_text" => cursor_accent,
+        "theme.selection" => selection,
+        "theme.selection_text" => selection_foreground,
         _ => {
             if let Some(idx) = key.strip_prefix("theme.ansi_normal.").and_then(|s| s.parse().ok()) {
-                theme.colors.get::<usize>(idx).cloned().unwrap_or_default()
+                colors.get::<usize>(idx).cloned().unwrap_or_default()
             } else if let Some(idx) =
                 key.strip_prefix("theme.ansi_bright.").and_then(|s| s.parse::<usize>().ok())
             {
-                theme.colors.get(idx + 8).cloned().unwrap_or_default()
+                colors.get(idx + 8).cloned().unwrap_or_default()
             } else {
                 return Some(Value::Null);
             }
@@ -161,6 +186,13 @@ fn ai_value(config: &ScribeConfig, key: &str) -> Option<Value> {
 }
 
 fn misc_value(config: &ScribeConfig, key: &str) -> Option<Value> {
+    if let Some(index) =
+        key.strip_prefix("workspaces.badge_colors.").and_then(|index| index.parse::<usize>().ok())
+    {
+        return Some(
+            config.workspaces.badge_colors.get(index).cloned().map_or(Value::Null, Value::String),
+        );
+    }
     let v = match key {
         "update.enabled" => Value::Bool(config.update.enabled),
         "update.check_interval_hours" => json!(config.update.check_interval_secs / 3600),
@@ -198,5 +230,20 @@ pub fn keybinding_combos(config: &ScribeConfig, action: &str) -> Vec<String> {
         }
         Some(Value::String(s)) => vec![s.clone()],
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_value;
+
+    #[test]
+    fn reads_dynamic_workspace_badge_colors() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        config.workspaces.badge_colors = vec!["#112233".to_owned(), "#abcdef".to_owned()];
+
+        assert_eq!(current_value(&config, "workspaces.badge_colors.1"), "#abcdef");
+        assert!(current_value(&config, "workspaces.badge_colors.2").is_null());
+        assert!(current_value(&config, "workspaces.badge_colors.nope").is_null());
     }
 }

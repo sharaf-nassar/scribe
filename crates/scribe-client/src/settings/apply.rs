@@ -241,14 +241,7 @@ fn apply_appearance_color_key(
 ) -> Result<(), String> {
     match key {
         "appearance.focus_border_color" => {
-            let hex = value.as_str().ok_or("focus_border_color must be a string")?;
-            if hex.is_empty() {
-                config.appearance.focus_border_color = None;
-            } else {
-                scribe_common::theme::hex_to_rgba(hex)
-                    .map_err(|e| format!("invalid focus_border_color: {e}"))?;
-                config.appearance.focus_border_color = Some(hex.to_owned());
-            }
+            apply_optional_hex_color(value, &mut config.appearance.focus_border_color, key)?;
         }
         "appearance.prompt_bar_second_row_bg" | "appearance.prompt_bar_bg" => {
             apply_optional_hex_color(value, &mut config.appearance.prompt_bar_second_row_bg, key)?;
@@ -582,13 +575,17 @@ fn apply_workspace_key(
                 scribe_common::config::WorkspacesConfig::default().badge_colors;
         }
         key if key.starts_with("workspaces.badge_colors.") => {
-            let index_str = key.trim_start_matches("workspaces.badge_colors.");
+            let index_str =
+                key.strip_prefix("workspaces.badge_colors.").ok_or("invalid badge color key")?;
             let index: usize =
                 index_str.parse().map_err(|_| String::from("invalid badge color index"))?;
-            let color = value.as_str().ok_or("badge color must be a string")?;
-            if let Some(slot) = config.workspaces.badge_colors.get_mut(index) {
-                color.clone_into(slot);
-            }
+            let color = canonical_color_value(key, value)?;
+            let slot = config
+                .workspaces
+                .badge_colors
+                .get_mut(index)
+                .ok_or_else(|| format!("badge color index {index} is out of range"))?;
+            color.clone_into(slot);
         }
         _ => return Err(format!("unhandled workspace key: {key}")),
     }
@@ -596,10 +593,10 @@ fn apply_workspace_key(
     Ok(())
 }
 
-fn workspace_root_from_value(value: &serde_json::Value) -> Result<String, String> {
+pub(crate) fn workspace_root_from_value(value: &serde_json::Value) -> Result<String, String> {
     let root = value.as_str().ok_or("add_root value must be a string")?.trim();
     if root.is_empty() {
-        return Err(String::from("add_root value must not be empty"));
+        return Err(String::from("workspace root must not be empty"));
     }
     if !root.starts_with("~/") && !std::path::Path::new(root).is_absolute() {
         return Err(String::from("workspace root must be absolute or start with ~/"));
@@ -769,8 +766,8 @@ fn apply_ai_state_key(
             entry.pane_border = value.as_bool().ok_or("pane_border must be a boolean")?;
         }
         "color" => {
-            let color_str = value.as_str().ok_or("color must be a string")?;
-            entry.color = serde_json::from_value(serde_json::Value::String(color_str.to_owned()))
+            let color = canonical_color_value(key, value)?;
+            entry.color = serde_json::from_value(serde_json::Value::String(color))
                 .map_err(|e| format!("invalid color: {e}"))?;
         }
         "pulse_ms" => {
@@ -914,14 +911,44 @@ fn apply_optional_hex_color(
     field: &mut Option<String>,
     key: &str,
 ) -> Result<(), String> {
-    let hex = value.as_str().ok_or(format!("{key} must be a string"))?;
-    if hex.is_empty() {
+    let color = canonical_color_value(key, value)?;
+    if color.is_empty() {
         *field = None;
     } else {
-        scribe_common::theme::hex_to_rgba(hex).map_err(|e| format!("invalid {key}: {e}"))?;
-        *field = Some(hex.to_owned());
+        *field = Some(color);
     }
     Ok(())
+}
+
+/// Validate and canonicalize every editable color family before config mutation.
+pub(crate) fn canonical_color_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<String, String> {
+    let raw = value.as_str().ok_or_else(|| format!("{key} must be a string"))?;
+    if key.starts_with("appearance.") && raw.is_empty() {
+        return Ok(String::new());
+    }
+    if (key.starts_with("ai_states.") || key.starts_with("claude_states."))
+        && key.strip_suffix(".color").is_some()
+    {
+        let color: scribe_common::config::AiColor =
+            serde_json::from_value(serde_json::Value::String(raw.to_owned()))
+                .map_err(|_| format!("{key} must be #rrggbb or ansi:0–15"))?;
+        return serde_json::to_value(color)
+            .ok()
+            .and_then(|stored| stored.as_str().map(str::to_owned))
+            .ok_or_else(|| format!("failed to canonicalize {key}"));
+    }
+    if !key.starts_with("theme.")
+        && !key.starts_with("appearance.")
+        && !key.starts_with("workspaces.badge_colors.")
+    {
+        return Err(format!("unsupported color key: {key}"));
+    }
+    let rgba = scribe_common::theme::hex_to_rgba(raw)
+        .map_err(|_| format!("{key} must be six hex digits, with an optional #"))?;
+    Ok(scribe_common::theme::rgba_to_hex(rgba))
 }
 
 /// Apply a `theme.<field>` color key to the config's inline theme.
@@ -930,22 +957,19 @@ fn apply_theme_color_key(
     key: &str,
     value: &serde_json::Value,
 ) -> Result<(), String> {
-    let hex = value.as_str().ok_or("theme color value must be a string")?;
-    scribe_common::theme::hex_to_rgba(hex).map_err(|e| format!("invalid hex color: {e}"))?;
+    let color = canonical_color_value(key, value)?;
 
-    if config.theme.is_none() {
-        config.theme = Some(seed_theme_config(&config.appearance.theme));
-    }
-
-    let tc = config.theme.as_mut().ok_or("theme config unexpectedly missing")?;
+    let mut theme =
+        config.theme.clone().unwrap_or_else(|| seed_theme_config(&config.appearance.theme));
+    let tc = &mut theme;
 
     match key {
-        "theme.foreground" => hex.clone_into(&mut tc.foreground),
-        "theme.background" => hex.clone_into(&mut tc.background),
-        "theme.cursor" => hex.clone_into(&mut tc.cursor),
-        "theme.cursor_text" => hex.clone_into(&mut tc.cursor_accent),
-        "theme.selection" => hex.clone_into(&mut tc.selection),
-        "theme.selection_text" => hex.clone_into(&mut tc.selection_foreground),
+        "theme.foreground" => color.clone_into(&mut tc.foreground),
+        "theme.background" => color.clone_into(&mut tc.background),
+        "theme.cursor" => color.clone_into(&mut tc.cursor),
+        "theme.cursor_text" => color.clone_into(&mut tc.cursor_accent),
+        "theme.selection" => color.clone_into(&mut tc.selection),
+        "theme.selection_text" => color.clone_into(&mut tc.selection_foreground),
         key if key.starts_with("theme.ansi_normal.") => {
             let idx_str = key.get("theme.ansi_normal.".len()..).ok_or("invalid ansi_normal key")?;
             let idx: usize =
@@ -957,7 +981,7 @@ fn apply_theme_color_key(
                 .colors
                 .get_mut(idx)
                 .ok_or_else(|| format!("ansi_normal index {idx} out of range"))?;
-            hex.clone_into(slot);
+            color.clone_into(slot);
         }
         key if key.starts_with("theme.ansi_bright.") => {
             let idx_str = key.get("theme.ansi_bright.".len()..).ok_or("invalid ansi_bright key")?;
@@ -970,11 +994,12 @@ fn apply_theme_color_key(
                 .colors
                 .get_mut(idx + 8)
                 .ok_or_else(|| format!("ansi_bright index {idx} out of range"))?;
-            hex.clone_into(slot);
+            color.clone_into(slot);
         }
         _ => return Err(format!("unhandled theme color key: {key}")),
     }
 
+    config.theme = Some(theme);
     config.appearance.theme = String::from("custom");
     Ok(())
 }
@@ -1001,7 +1026,7 @@ fn seed_theme_config(preset_name: &str) -> scribe_common::config::ThemeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_config_key;
+    use super::{apply_config_key, canonical_color_value, workspace_root_from_value};
 
     #[test]
     fn applies_codex_integration_toggle() {
@@ -1029,5 +1054,74 @@ mod tests {
         .expect("workspace root should apply");
 
         assert_eq!(config.workspaces.roots, vec![String::from("/home/user/work")]);
+    }
+
+    #[test]
+    fn validates_workspace_root_paths() {
+        assert_eq!(
+            workspace_root_from_value(&serde_json::Value::String(String::from("  /srv/work  "))),
+            Ok(String::from("/srv/work"))
+        );
+        assert_eq!(
+            workspace_root_from_value(&serde_json::Value::String(String::from("~/work"))),
+            Ok(String::from("~/work"))
+        );
+        assert_eq!(
+            workspace_root_from_value(&serde_json::Value::String(String::from("  "))),
+            Err(String::from("workspace root must not be empty"))
+        );
+        for invalid in ["~", "relative/path"] {
+            assert_eq!(
+                workspace_root_from_value(&serde_json::Value::String(invalid.to_owned())),
+                Err(String::from("workspace root must be absolute or start with ~/"))
+            );
+        }
+    }
+
+    #[test]
+    fn validates_and_canonicalizes_color_families() {
+        assert_eq!(
+            canonical_color_value("workspaces.badge_colors.0", &serde_json::json!("A1b2C3")),
+            Ok("#a1b2c3".to_owned())
+        );
+        assert_eq!(
+            canonical_color_value("appearance.focus_border_color", &serde_json::json!("")),
+            Ok(String::new())
+        );
+        assert_eq!(
+            canonical_color_value("ai_states.processing.color", &serde_json::json!("ansi:03")),
+            Ok("ansi:3".to_owned())
+        );
+        assert!(
+            canonical_color_value("workspaces.badge_colors.0", &serde_json::json!("#12345"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_workspace_color_without_mutating_config() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        let before = config.workspaces.badge_colors.clone();
+
+        assert!(
+            apply_config_key(
+                &mut config,
+                "workspaces.badge_colors.999",
+                &serde_json::json!("#112233"),
+            )
+            .is_err()
+        );
+        assert_eq!(config.workspaces.badge_colors, before);
+    }
+
+    #[test]
+    fn theme_color_edit_selects_custom_theme() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+
+        apply_config_key(&mut config, "theme.foreground", &serde_json::json!("ABCDEF"))
+            .expect("theme color should apply");
+
+        assert_eq!(config.appearance.theme, "custom");
+        assert_eq!(config.theme.expect("inline theme").foreground, "#abcdef");
     }
 }

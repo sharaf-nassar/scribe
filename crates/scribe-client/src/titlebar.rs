@@ -2,10 +2,11 @@
 //!
 //! The rebuild has a no-native-decorations mandate: the window is undecorated
 //! and this [`TitlebarView`] draws the entire top chrome — a draggable move
-//! region, the workspace-badge pill, the tab strip (active accent, per-tab close
-//! button, drag-reorder slide, attention flash, AI activity dot, and the
-//! context-% suffix), the equalize and gear icons, and the min/maximize/close
-//! window controls. It is a `gpui::Entity` so its interactions mutate state and
+//! region, the workspace-badge pills, the tab strip (active accent, per-tab
+//! close button, drag-reorder slide, attention flash, AI activity dot, and the
+//! context-% suffix), and the equalize icon. Window controls belong to the
+//! native decorations and settings lives in the bottom status bar, so neither
+//! is drawn here. It is a `gpui::Entity` so its interactions mutate state and
 //! emit [`TitlebarEvent`]s the shell reacts to; the pure layout/decay math lives
 //! in [`crate::tab_bar`].
 
@@ -16,7 +17,8 @@ use gpui::{
 };
 
 use crate::tab_bar::{
-    TabBarColors, TabData, flash_blend, px_units, reorder_target_index, tab_display_title,
+    GroupBadge, TabBarColors, TabData, accent_tab_tone, flash_blend, px_units,
+    reorder_target_index, tab_display_title,
 };
 
 /// Height of the titlebar in pixels.
@@ -32,18 +34,16 @@ const CHAR_WIDTH: f32 = 8.0;
 /// legacy fixed-column tab layout keeps the drag-reorder geometry deterministic.
 pub const TAB_WIDTH: f32 = 176.0;
 
+/// Floor a shrinking tab stops at: room for the close button plus a few title
+/// characters, so a crowded group bar compresses tabs instead of slicing
+/// their glyphs at the clip edge. Shared with the shell's in-region bars so a
+/// crowded lower region compresses identically.
+pub const TAB_MIN_WIDTH: f32 = 56.0;
+
 /// Pointer travel, in pixels, required before an armed press on the move region
 /// hands the window to the compositor. Absorbs the jitter of an ordinary click
 /// so a wobbly press on empty chrome does not turn into a window move.
 const WINDOW_MOVE_THRESHOLD: f32 = 4.0;
-
-/// A window-control button on the right edge of the titlebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowControlKind {
-    Minimize,
-    Maximize,
-    Close,
-}
 
 /// How a tab activation was triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,12 +61,8 @@ pub enum TitlebarEvent {
     CloseTab(usize),
     /// A tab finished a drag-reorder from `from` to `to`.
     ReorderTab { from: usize, to: usize },
-    /// The gear icon was clicked (open settings).
-    OpenSettings,
     /// The equalize icon was clicked (equalize the active tab's panes).
     Equalize,
-    /// A window-control button was clicked.
-    WindowControl(WindowControlKind),
 }
 
 /// Marker value handed to GPUI's native drag system when a tab press turns
@@ -139,9 +135,6 @@ struct TabRender<'a> {
 pub struct TitlebarView {
     colors: TabBarColors,
     tabs: Vec<TabData>,
-    /// Workspace badge label + its accent color. `None` in single-workspace mode.
-    badge: Option<(String, Rgba)>,
-    show_gear: bool,
     show_equalize: bool,
     hovered_tab: Option<usize>,
     drag: Option<DragState>,
@@ -154,10 +147,6 @@ pub struct TitlebarView {
     tab_focus_handles: Vec<FocusHandle>,
     tab_close_focus_handles: Vec<FocusHandle>,
     equalize_focus_handle: FocusHandle,
-    gear_focus_handle: FocusHandle,
-    minimize_focus_handle: FocusHandle,
-    maximize_focus_handle: FocusHandle,
-    close_focus_handle: FocusHandle,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -168,8 +157,6 @@ impl TitlebarView {
         Self {
             colors,
             tabs: Vec::new(),
-            badge: None,
-            show_gear: true,
             show_equalize: false,
             hovered_tab: None,
             drag: None,
@@ -178,10 +165,6 @@ impl TitlebarView {
             tab_focus_handles: Vec::new(),
             tab_close_focus_handles: Vec::new(),
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
-            gear_focus_handle: cx.focus_handle().tab_stop(true),
-            minimize_focus_handle: cx.focus_handle().tab_stop(true),
-            maximize_focus_handle: cx.focus_handle().tab_stop(true),
-            close_focus_handle: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -211,15 +194,6 @@ impl TitlebarView {
     /// Borrow the current tabs.
     pub fn tabs(&self) -> &[TabData] {
         &self.tabs
-    }
-
-    /// Set the workspace badge (label + accent), or clear it with `None`.
-    pub fn set_badge(&mut self, badge: Option<(String, Rgba)>, cx: &mut Context<Self>) {
-        if self.badge == badge {
-            return;
-        }
-        self.badge = badge;
-        cx.notify();
     }
 
     /// Toggle the equalize icon (shown only when the active tab has 2+ panes).
@@ -303,9 +277,16 @@ impl TitlebarView {
         cx.notify();
     }
 
-    /// End the active drag.
-    pub fn end_drag(&mut self, cx: &mut Context<Self>) {
-        if self.drag.take().is_some() {
+    /// End the active drag. `click_swallowed` reports whether GPUI's native
+    /// drag engaged for this press (any pressed movement past its ~2 px
+    /// threshold): engaging cancels the element's pending click, so an
+    /// engaged press that never reordered was a jittered real-mouse click
+    /// and must still select the pressed tab here.
+    pub fn end_drag(&mut self, click_swallowed: bool, cx: &mut Context<Self>) {
+        if let Some(drag) = self.drag.take() {
+            if click_swallowed && !drag.reordered {
+                self.select(drag.source, TabActivationSource::Pointer, cx);
+            }
             cx.notify();
         }
     }
@@ -351,9 +332,15 @@ impl TitlebarView {
         self.tab_close_focus_handles.insert(to, close_focus);
     }
 
-    /// Left edge of the first tab, in pixels: after the badge pill.
+    /// Left edge of the first tab: region edge plus an optional badge pill.
+    // ponytail: spacers and badges between later workspace runs skew drag
+    // targeting by their width; per-slot offsets if cross-group reorder ever
+    // matters.
     fn tabs_origin_x(&self) -> f32 {
-        self.badge.as_ref().map_or(0.0, |(label, _)| badge_width_px(label))
+        self.tabs.first().map_or(0.0, |tab| {
+            tab.group_region_x.unwrap_or(0.0)
+                + tab.badge.as_ref().map_or(0.0, |badge| badge_width_px(&badge.label))
+        })
     }
 
     /// Whether a titlebar control owns keyboard focus. The shell uses this to
@@ -362,10 +349,6 @@ impl TitlebarView {
         self.tab_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.tab_close_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.equalize_focus_handle.is_focused(window)
-            || self.gear_focus_handle.is_focused(window)
-            || self.minimize_focus_handle.is_focused(window)
-            || self.maximize_focus_handle.is_focused(window)
-            || self.close_focus_handle.is_focused(window)
     }
 
     fn focus_next_or_previous(
@@ -450,6 +433,18 @@ pub fn badge_width_px(label: &str) -> f32 {
     px_units(label.chars().count() + 2) * CHAR_WIDTH + 16.0
 }
 
+/// Half-open tab ranges split at workspace-region boundaries.
+fn workspace_group_ranges(tabs: &[TabData]) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    for (index, tab) in tabs.iter().enumerate() {
+        match groups.last_mut() {
+            Some((_, end)) if tab.group_region_x.is_none() => *end = index + 1,
+            _ => groups.push((index, index + 1)),
+        }
+    }
+    groups
+}
+
 /// Build the semi-transparent per-pane title pill element.
 ///
 /// Rendered by the shell over the top-right of a split pane's content; exposed
@@ -470,25 +465,6 @@ pub fn pane_title_pill(title: &str, colors: &TabBarColors, max_cols: usize) -> A
 }
 
 impl TitlebarView {
-    fn render_badge(&self) -> Option<AnyElement> {
-        let (label, accent) = self.badge.as_ref()?;
-        let pill_bg = Rgba { r: accent.r, g: accent.g, b: accent.b, a: 0.25 };
-        Some(
-            div()
-                .flex()
-                .items_center()
-                .h_full()
-                .px_2()
-                .mr_1()
-                .bg(pill_bg)
-                .rounded_sm()
-                .text_color(self.colors.active_text)
-                .text_xs()
-                .child(label.clone())
-                .into_any_element(),
-        )
-    }
-
     /// Base tab background before the attention flash is blended in.
     fn tab_base_bg(&self, tab: &TabData, is_hovered: bool) -> Rgba {
         if tab.is_active {
@@ -530,6 +506,9 @@ impl TitlebarView {
             .role(Role::Button)
             .aria_label(format!("Close {title}"))
             .track_focus(&focus)
+            // The close glyph never shrinks: a narrowing tab compresses its
+            // title instead, so the × stays whole.
+            .flex_none()
             .ml_1()
             .px_0p5()
             .opacity(if visible { 1.0 } else { 0.0 })
@@ -585,7 +564,11 @@ impl TitlebarView {
                 .left_0()
                 .right_0()
                 .h(px(2.0))
-                .bg(self.colors.accent)
+                // The region's tab tone in a multi-workspace window, so the
+                // underline meets the region border below in one colour.
+                .bg(tab
+                    .group_accent
+                    .map_or(self.colors.accent, |accent| accent_tab_tone(accent, self.colors.bg)))
                 .into_any_element()
         });
         TabChildren { display, ai_dot, suffix, close, underline }
@@ -627,8 +610,14 @@ impl TitlebarView {
             .relative()
             .flex()
             .items_center()
-            .flex_none()
-            .w(px(TAB_WIDTH))
+            // A tab wants its fixed slot but shrinks inside a narrow group
+            // bar, truncating its flexed title while the close button stays
+            // whole — instead of the bar's clip slicing glyphs in half.
+            .flex_grow_0()
+            .flex_shrink_1()
+            .flex_basis(px(TAB_WIDTH))
+            .min_w(px(TAB_MIN_WIDTH))
+            .overflow_hidden()
             .h_full()
             .px_2()
             .bg(bg)
@@ -725,96 +714,91 @@ impl TitlebarView {
             .into_any_element()
     }
 
-    fn render_window_control(
-        &self,
-        kind: WindowControlKind,
-        focused_window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (id, glyph, label, area, hover_bg) = match kind {
-            WindowControlKind::Minimize => (
-                "wc-min",
-                "\u{2013}",
-                "Minimize window",
-                WindowControlArea::Min,
-                self.colors.gradient_top,
-            ),
-            WindowControlKind::Maximize => (
-                "wc-max",
-                "\u{25A1}",
-                "Maximize window",
-                WindowControlArea::Max,
-                self.colors.gradient_top,
-            ),
-            // Close hovers red for the destructive affordance.
-            WindowControlKind::Close => (
-                "wc-close",
-                "\u{00D7}",
-                "Close window",
-                WindowControlArea::Close,
-                Rgba { r: 0.784, g: 0.188, b: 0.188, a: 1.0 },
-            ),
-        };
-        let focus = match kind {
-            WindowControlKind::Minimize => self.minimize_focus_handle.clone(),
-            WindowControlKind::Maximize => self.maximize_focus_handle.clone(),
-            WindowControlKind::Close => self.close_focus_handle.clone(),
-        };
-        div()
-            .id(id)
-            .role(Role::Button)
-            .aria_label(label)
-            .track_focus(&focus)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(40.0))
-            .h_full()
-            .text_color(self.colors.text)
-            .hover(move |s| s.bg(hover_bg))
-            .when(focus.is_focused(focused_window), |this| {
-                this.bg(self.colors.accent).text_color(self.colors.active_text)
-            })
-            .window_control_area(area)
-            .child(glyph)
-            // Swallow the press so pointer jitter cannot arm a window move.
-            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-            .on_click(cx.listener(move |_, _, win, ctx| {
-                win.focus(&focus, ctx);
-                Self::activate_window_control(kind, win, ctx);
-            }))
-            .on_key_down(cx.listener(move |_, event: &KeyDownEvent, win, ctx| {
-                ctx.stop_propagation();
-                if Self::focus_next_or_previous(event, win, ctx) {
-                    return;
-                }
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    Self::activate_window_control(kind, win, ctx);
-                }
-            }))
-            .into_any_element()
-    }
-
-    fn activate_window_control(
-        kind: WindowControlKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match kind {
-            WindowControlKind::Minimize => window.minimize_window(),
-            WindowControlKind::Maximize => window.zoom_window(),
-            WindowControlKind::Close => window.remove_window(),
-        }
-        cx.emit(TitlebarEvent::WindowControl(kind));
-    }
-
+    /// Lower the strip into workspace-group elements.
+    ///
+    /// When every group has a region edge and those edges strictly
+    /// ascend (side-by-side regions), each group is absolutely positioned at
+    /// its region's edge and clipped to its region's width, so the strip
+    /// aligns with the regions below it by construction — no estimated text
+    /// widths. Otherwise (single workspace, or stacked regions sharing an
+    /// edge) the groups flow left-to-right as one row.
     fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        self.tabs
-            .clone()
+        let tabs = self.tabs.clone();
+        let groups = workspace_group_ranges(&tabs);
+        let edges: Vec<Option<f32>> = groups
+            .iter()
+            .map(|&(start, _)| tabs.get(start).and_then(|tab| tab.group_region_x))
+            .collect();
+        // Aligned placement needs every group to name a distinct region edge;
+        // group order in the strip does not matter, since each group anchors
+        // at its own edge independently. Stacked regions share an edge, so
+        // duplicates fall back to one flowed row.
+        let mut sorted_edges: Vec<f32> = edges.iter().copied().flatten().collect();
+        sorted_edges.sort_by(f32::total_cmp);
+        let aligned = edges.iter().all(Option::is_some)
+            && sorted_edges.windows(2).all(|pair| matches!(pair, [a, b] if b > a));
+        groups
             .iter()
             .enumerate()
-            .map(|(index, tab)| self.render_tab(index, tab, window, cx))
+            .map(|(group, &(start, end))| {
+                let mut row = div().flex().flex_row().items_center().h_full();
+                // The group is a bar spanning its whole region, closed off by
+                // a 1px bottom hairline in the region's tab tone so the bar
+                // meets the region border below in the same colour.
+                if let Some(accent) = tabs.get(start).and_then(|tab| tab.group_accent) {
+                    row = row.border_b_1().border_color(accent_tab_tone(accent, self.colors.bg));
+                }
+                if let Some(badge) = tabs.get(start).and_then(|tab| tab.badge.as_ref()) {
+                    row = row.child(self.render_group_badge(start, badge, cx));
+                }
+                let row = row.children((start..end).filter_map(|index| {
+                    tabs.get(index).map(|tab| self.render_tab(index, tab, window, cx))
+                }));
+                if !aligned {
+                    return row.into_any_element();
+                }
+                let left = edges.get(group).copied().flatten().unwrap_or(0.0);
+                let row = row.absolute().top_0().left(px(left)).overflow_hidden();
+                // The bar fills its region: clip at the next region's edge,
+                // whichever group owns it, and the rightmost bar runs to the
+                // window edge.
+                match sorted_edges.iter().find(|edge| **edge > left) {
+                    Some(next) => row.w(px((next - left).max(0.0))).into_any_element(),
+                    None => row.right_0().into_any_element(),
+                }
+            })
             .collect()
+    }
+
+    /// The workspace pill opening `index`'s group. Clicking it selects the
+    /// group's first tab, which focuses that workspace's region.
+    fn render_group_badge(
+        &self,
+        index: usize,
+        badge: &GroupBadge,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // A full-height tag flush with the bar's left edge, filled with the
+        // darker tab-tone of the region accent — the same colour the group
+        // hairline and the region border wear, so all three read as one shape.
+        let tag_bg = accent_tab_tone(badge.accent, self.colors.bg);
+        div()
+            .id(ElementId::from(format!("workspace-badge-{index}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .px_2()
+            .h_full()
+            .bg(tag_bg)
+            .text_color(self.colors.active_text)
+            .text_xs()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _window, ctx| {
+                this.select(index, TabActivationSource::Pointer, ctx);
+            }))
+            .child(badge.label.clone())
+            .into_any_element()
     }
 
     fn render_equalize_button(
@@ -836,22 +820,6 @@ impl TitlebarView {
             )
         })
     }
-
-    fn render_gear_button(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.show_gear.then(|| {
-            self.render_icon_button(
-                IconButton {
-                    id: ElementId::from("gear"),
-                    glyph: "\u{2699}",
-                    label: "Open settings",
-                    focus: self.gear_focus_handle.clone(),
-                    focused: self.gear_focus_handle.is_focused(window),
-                },
-                cx,
-                |ctx| ctx.emit(TitlebarEvent::OpenSettings),
-            )
-        })
-    }
 }
 
 impl Render for TitlebarView {
@@ -862,7 +830,6 @@ impl Render for TitlebarView {
     ) -> impl IntoElement {
         let tabs = self.render_tabs(focused_window, cx);
         let equalize = self.render_equalize_button(focused_window, cx);
-        let gear = self.render_gear_button(focused_window, cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -904,11 +871,15 @@ impl Render for TitlebarView {
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabDrag>, _win, ctx| {
                 this.update_drag(f32::from(event.event.position.x), ctx);
             }))
+            // `has_active_drag` is read before GPUI clears the drag (that
+            // happens only after event dispatch), so it tells `end_drag`
+            // whether this press's click was swallowed by the drag system.
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
                     this.move_arm = None;
-                    this.end_drag(ctx);
+                    let click_swallowed = ctx.has_active_drag();
+                    this.end_drag(click_swallowed, ctx);
                 }),
             )
             // A release outside the titlebar still ends the drag: the reorders
@@ -918,28 +889,34 @@ impl Render for TitlebarView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
                     this.move_arm = None;
-                    this.end_drag(ctx);
+                    let click_swallowed = ctx.has_active_drag();
+                    this.end_drag(click_swallowed, ctx);
                 }),
             )
-            .children(self.render_badge())
             .child(
                 div()
                     .id("terminal-tabs")
                     .role(Role::TabList)
                     .aria_label("Terminal tabs")
+                    .relative()
                     .flex()
                     .items_center()
                     .h_full()
-                    .flex_none()
+                    // Spans the whole band and clips, so a long strip slides
+                    // under nothing: tabs cut off at the container edge.
+                    .flex_1()
+                    .overflow_hidden()
+                    // Draggable backdrop under the groups — the old spacer,
+                    // now covering every empty part of the strip.
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
                     .children(tabs),
             )
-            // Draggable spacer fills the gap between tabs and the right controls.
-            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .children(equalize)
-            .children(gear)
-            .child(self.render_window_control(WindowControlKind::Minimize, focused_window, cx))
-            .child(self.render_window_control(WindowControlKind::Maximize, focused_window, cx))
-            .child(self.render_window_control(WindowControlKind::Close, focused_window, cx))
     }
 }
 
@@ -953,8 +930,10 @@ mod tests {
     use gpui::{AppContext as _, Entity, TestAppContext};
     use scribe_common::theme::minimal_dark;
 
-    use super::{TabActivationSource, TitlebarEvent, TitlebarView};
-    use crate::tab_bar::{TabBarColors, TabData};
+    use super::{
+        TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px, workspace_group_ranges,
+    };
+    use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
     /// Create a titlebar seeded with `n` tabs (the first active) and a captured
     /// event log.
@@ -987,6 +966,33 @@ mod tests {
         });
         cx.update(|_| {});
         (bar, log)
+    }
+
+    #[test]
+    fn unnamed_workspace_regions_keep_separate_tab_groups() {
+        let mut tabs = vec![TabData::new("one"), TabData::new("two"), TabData::new("three")];
+        tabs[0].group_region_x = Some(0.0);
+        tabs[2].group_region_x = Some(320.0);
+
+        assert!(tabs.iter().all(|tab| tab.badge.is_none()));
+        assert_eq!(workspace_group_ranges(&tabs), vec![(0, 2), (2, 3)]);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.title.as_str()).collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+    }
+
+    #[gpui::test]
+    fn first_tab_origin_uses_region_edge_with_optional_badge(cx: &mut TestAppContext) {
+        let (bar, _) = titlebar_with_tabs(1, cx);
+        bar.update(cx, |bar, _| {
+            bar.tabs[0].group_region_x = Some(24.0);
+            assert!((bar.tabs_origin_x() - 24.0).abs() < f32::EPSILON);
+
+            bar.tabs[0].badge =
+                Some(GroupBadge { label: "scribe".to_owned(), accent: bar.colors.accent });
+            assert!((bar.tabs_origin_x() - 24.0 - badge_width_px("scribe")).abs() < f32::EPSILON);
+        });
     }
 
     // @lat: [[client#GPUI Titlebar#Selecting a tab activates it and emits]]
@@ -1034,7 +1040,7 @@ mod tests {
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
             bar.update_drag(super::TAB_WIDTH * 2.5, cx);
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {
             assert_eq!(bar.tabs()[2].title, "tab-0");
@@ -1058,7 +1064,7 @@ mod tests {
         // the swap happens.
         bar.update(cx, |bar, cx| {
             bar.update_drag(super::TAB_WIDTH * 1.5 - 5.0, cx);
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[1].title, "tab-0"));
         assert_eq!(log.lock().unwrap().as_slice(), &[TitlebarEvent::ReorderTab { from: 0, to: 1 }]);
@@ -1079,7 +1085,7 @@ mod tests {
             bar.update_drag(-500.0, cx);
             assert!(bar.drag.is_some());
             assert_eq!(bar.tab_slide_offset(0), Some(0.0));
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[0].title, "tab-0"));
     }
@@ -1093,7 +1099,7 @@ mod tests {
             // The pointer wanders below the titlebar band mid-drag...
             bar.update_drag(super::TAB_WIDTH * 2.5, cx);
             // ...and the mouse-up lands there too (the root's `up_out` path).
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
             assert!(bar.drag.is_none());
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs()[2].title, "tab-0"));
@@ -1105,13 +1111,14 @@ mod tests {
     fn drag_arm_without_reorder_keeps_click_selection_live(cx: &mut TestAppContext) {
         let (bar, log) = titlebar_with_tabs(3, cx);
         bar.update(cx, |bar, cx| {
+            // A jittered real-mouse click: GPUI's native drag engages after a
+            // couple of px of pressed movement and cancels the element's
+            // pending click, so the release itself must select the pressed
+            // tab (`click_swallowed = true`, no reorder).
             bar.begin_drag(1, super::TAB_WIDTH + 4.0, 0.0, cx);
             bar.update_drag(super::TAB_WIDTH + 20.0, cx);
             assert!(bar.drag.as_ref().is_some_and(|drag| !drag.reordered));
-            if !bar.drag.as_ref().is_some_and(|drag| drag.reordered) {
-                bar.select(1, TabActivationSource::Pointer, cx);
-            }
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {
             assert!(bar.tabs()[1].is_active);
@@ -1148,7 +1155,7 @@ mod tests {
         bar.update(cx, |bar, cx| {
             bar.begin_drag(0, 0.0, 0.0, cx);
             bar.update_drag(super::TAB_WIDTH * 2.5, cx);
-            bar.end_drag(cx);
+            bar.end_drag(true, cx);
         });
         bar.read_with(cx, |bar, _| {
             assert_eq!(bar.tabs()[2].accessibility_id, original_ids[0]);

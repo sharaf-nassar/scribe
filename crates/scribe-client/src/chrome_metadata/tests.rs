@@ -135,4 +135,17 @@ fn session_list_seeds_and_prunes() {
     // An empty rename clears the segment instead of blanking it.
     chrome.name_workspace(workspace_id, "  ".to_owned());
     assert_eq!(chrome.workspace_name(workspace_id), None);
+
+    // A reconnect snapshot clears a listed unnamed workspace and prunes names
+    // for workspaces omitted from the authoritative list.
+    let omitted = WorkspaceId::new();
+    chrome.name_workspace(workspace_id, "stale".to_owned());
+    chrome.name_workspace(omitted, "gone".to_owned());
+    chrome.seed_from_session_list(&[info(live, workspace_id)], &[workspace(workspace_id, None)]);
+    assert_eq!(chrome.workspace_name(workspace_id), None);
+    assert_eq!(chrome.workspace_name(omitted), None);
+    // Workspace-name replacement does not discard independent session chrome.
+    let retained = chrome.session(live).expect("session metadata retained");
+    assert_eq!(retained.cwd.as_deref(), Some(Path::new("/srv/app")));
+    assert_eq!(retained.git_branch.as_deref(), Some("feature"));
 }

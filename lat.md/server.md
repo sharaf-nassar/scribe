@@ -28,7 +28,9 @@ Both [[crates/scribe-server/src/ipc_server.rs#establish_client_window]] and [[cr
 
 When launched with `--upgrade`, the server restores handoff state and received file descriptors from the old instance instead of starting fresh.
 
-It rebuilds the session and workspace managers, filtering workspace and window membership against the received live-session set so stale IDs from older servers are dropped before serving.
+It rebuilds the session and workspace managers, filtering workspace and window membership against the received live-session set so stale IDs from older servers are dropped before serving. An empty-workspace payload or any dropped sessions are logged at WARN with counts by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#restore_from_handoff]].
+
+An upgrade-spawned server has no durable stdio — the Debian `postinst` redirects it to a temp log it deletes after its ready check, and the macOS fallback spawn nulls stdio — so `--upgrade` startup mirrors tracing into `server.log` under the app state dir via [[crates/scribe-server/src/main.rs#open_server_log_file]], rotated once to `server.log.1` when it exceeds 8 MiB.
 
 ## Sessions
 
@@ -211,6 +213,12 @@ The X11 primary-selection branch and the FR-019 focus-gate-for-writes opt-in lan
 
 Managed by , workspaces group sessions and track per-window split layouts.
 
+### Session Membership
+
+Sessions join a workspace at creation, `MoveSession` re-keys one into another workspace, and `CloseWorkspace` removes a collapsed region's workspace.
+
+The client's workspace-split flow seeds its session through the old workspace and re-keys it with `ClientMessage::MoveSession` once the new region's pane adopts it — [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#move_session]] moves the membership and the live-session record follows, so `SessionList`, CWD auto-naming, and handoff persistence all agree with the client's regions. A collapsed region's `CloseWorkspace` removes the workspace via [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#close_workspace]]. Both variants were protocol TODOs the server silently dropped until 2026-08: every split workspace stayed empty server-side, so an upgrade handoff restored sessions pooled into each window's first workspace and the split layout flattened.
+
 ### Auto-Naming
 
 When a session's CWD changes (via OSC 7 or /proc fallback), the server matches it against configured workspace roots and derives the workspace name and project root.
@@ -243,7 +251,7 @@ The new server (with `--upgrade`) connects to the old server's handoff socket, s
 
 On Linux and macOS, the old server also verifies that the peer PID is a permitted Scribe server executable running with `--upgrade` before sending state or PTY fds. This prevents arbitrary same-UID clients from speaking the raw handoff protocol.
 
-An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see ), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work.
+An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see ), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work. Because that watchdog's temp log is deleted after the check, the upgraded server's durable tracing lives in the state-dir `server.log` (see [[server#Server#Startup#Upgrade Path]]).
 
 ### State Transfer
 
@@ -424,6 +432,8 @@ Claude Code and Codex `UserPromptSubmit` adapters both emit `StateChanged { Proc
 The server dispatches `ClientMessage::HookEvent` on a transient connection (no `Hello`, no `Welcome`, no reply), charged to the separate 16-slot transient pool described in [[server#Startup#Local Admission]].
 
 The pattern mirrors `CheckForUpdates` / `ListReleases` at `ipc_server.rs` `establish_client_window`. `hook_ingress::handle` looks up the session in `LiveSessionRegistry`, translates the `HookEventKind` to a `MetadataEvent`, and forwards into  — the same downstream pipeline the deleted OSC parser used, unchanged.
+
+`PromptReceived` and `TaskLabelChanged` payloads are additionally screened by [[crates/scribe-server/src/hook_ingress.rs#is_machine_injected|is_machine_injected]]: harness wakeups, task notifications, and continuity blocks arrive through `UserPromptSubmit` as user-role turns whose text opens with a bare XML tag (`<system-reminder>`, `<task-notification>`, …). Those events are dropped so the prompt bar and tab label only ever show text the user actually typed; the accompanying `StateChanged { Processing }` still flows, since the AI really is processing the injected turn.
 
 `HookEventKind::EnvChanged` events take a separate path: they have no `MetadataEvent` representation and instead route to , which folds them into the server-owned  registry. `baseline_ready: true` records a ; `baseline_ready: false` builds an , folds it via , and (if the session has an `env_envelope_id`) arms the 100 ms persist debounce via . The entire path is gated on `terminal.env_persistence.enabled` — when off, the event is dropped with a debug log before any state mutation. A session that arrives without an `env_envelope_id` has one minted in place by [[crates/scribe-server/src/hook_ingress.rs#bootstrap_envelope_id|bootstrap_envelope_id]] on its first foldable delta, so persistence starts without waiting for a restart; see [[server#Server#Env Persistence#Envelope Id Minting|Envelope Id Minting]].
 

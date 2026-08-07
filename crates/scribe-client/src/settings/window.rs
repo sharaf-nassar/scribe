@@ -31,12 +31,13 @@
 //! FORM: Contemporary native settings workspace in fixed Obsidian Amber.
 //! No dealt staging was adopted because it did not fit settings truth.
 
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use gpui::{
-    AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, FocusHandle, FontWeight,
-    HitboxBehavior, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled, Window,
+    AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
+    EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, ResizeEdge, Rgba, Role,
+    ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled, UTF16Selection, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle,
     WindowOptions, canvas, div, point, prelude::*, px, rgb, size,
 };
@@ -48,10 +49,11 @@ use scribe_common::protocol::{
 use serde_json::{Value, json};
 
 use crate::app_shortcuts::CloseWindow;
+use crate::settings::apply::{canonical_color_value, workspace_root_from_value};
 use crate::settings::model::{
     ADD_CURRENT_NETWORK_ACTION, Control, ControlKind, ENV_PERSISTENCE_KEY, ENV_PREFLIGHT_ACTION,
     REFRESH_TRUST_ACTION, REMOVE_TRUSTED_NETWORK_PREFIX, REVOKE_TRUSTED_DEVICE_PREFIX,
-    SettingsPage, page_controls,
+    SettingsPage, page_controls, workspace_badge_color_controls,
 };
 use crate::settings::server_action::{self, EnvPreflightOutcome, LanEnvOutcome, RemoteEnvOutcome};
 use crate::settings::values::{current_value, keybinding_combos};
@@ -215,6 +217,18 @@ pub struct SettingsWindow {
     focus_handle: FocusHandle,
     search_handle: FocusHandle,
     search_query: String,
+    workspace_root_handle: FocusHandle,
+    workspace_root_input: String,
+    workspace_root_marked_range: Option<Range<usize>>,
+    workspace_root_error: Option<String>,
+    color_handle: FocusHandle,
+    color_input: String,
+    color_original: String,
+    color_key: Option<String>,
+    color_marked_range: Option<Range<usize>>,
+    color_error: Option<String>,
+    active_input: Option<NativeInputTarget>,
+    input_selection: NativeInputSelection,
     /// Keyboard traversal is deliberately window-local: Settings claims only
     /// keys while its own window is focused, never terminal-window shortcuts.
     focus_index: usize,
@@ -249,6 +263,22 @@ enum SettingsFocusTarget {
     Page(SettingsPage),
     Control(Control),
     Action(String),
+    WorkspaceRootInput,
+    WorkspaceRootBrowse,
+    WorkspaceRootAdd,
+    WorkspaceRootRemove { index: usize, root: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeInputTarget {
+    WorkspaceRoot,
+    Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeInputSelection {
+    Caret,
+    All,
 }
 
 #[derive(Clone, Copy)]
@@ -277,8 +307,55 @@ fn focus_targets_match(a: &SettingsFocusTarget, b: &SettingsFocusTarget) -> bool
         (SettingsFocusTarget::Page(a), SettingsFocusTarget::Page(b)) => a == b,
         (SettingsFocusTarget::Control(a), SettingsFocusTarget::Control(b)) => a.key == b.key,
         (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b)) => a == b,
+        (SettingsFocusTarget::WorkspaceRootInput, SettingsFocusTarget::WorkspaceRootInput)
+        | (SettingsFocusTarget::WorkspaceRootBrowse, SettingsFocusTarget::WorkspaceRootBrowse)
+        | (SettingsFocusTarget::WorkspaceRootAdd, SettingsFocusTarget::WorkspaceRootAdd) => true,
+        (
+            SettingsFocusTarget::WorkspaceRootRemove { index: a, root: a_root },
+            SettingsFocusTarget::WorkspaceRootRemove { index: b, root: b_root },
+        ) => a == b && a_root == b_root,
         _ => false,
     }
+}
+
+fn workspace_root_focus_index(
+    targets: &[SettingsFocusTarget],
+    intended: &SettingsFocusTarget,
+) -> Option<usize> {
+    targets
+        .iter()
+        .position(|target| focus_targets_match(target, intended))
+        .or_else(|| {
+            let SettingsFocusTarget::WorkspaceRootRemove { index, .. } = intended else {
+                return None;
+            };
+            targets.iter().position(|target| {
+                matches!(
+                    target,
+                    SettingsFocusTarget::WorkspaceRootRemove { index: candidate, .. }
+                        if candidate == index
+                )
+            })
+        })
+        .or_else(|| {
+            matches!(intended, SettingsFocusTarget::WorkspaceRootRemove { .. }).then(|| {
+                targets
+                    .iter()
+                    .position(|target| matches!(target, SettingsFocusTarget::WorkspaceRootInput))
+            })?
+        })
+}
+
+fn release_color_input(
+    active_input: &mut Option<NativeInputTarget>,
+    input_selection: &mut NativeInputSelection,
+) -> bool {
+    if *active_input != Some(NativeInputTarget::Color) {
+        return false;
+    }
+    *active_input = None;
+    *input_selection = NativeInputSelection::Caret;
+    true
 }
 
 impl SettingsWindow {
@@ -295,6 +372,18 @@ impl SettingsWindow {
             focus_handle: cx.focus_handle(),
             search_handle: cx.focus_handle().tab_index(0),
             search_query: String::new(),
+            workspace_root_handle: cx.focus_handle().tab_index(0),
+            workspace_root_input: String::new(),
+            workspace_root_marked_range: None,
+            workspace_root_error: None,
+            color_handle: cx.focus_handle().tab_index(0),
+            color_input: String::new(),
+            color_original: String::new(),
+            color_key: None,
+            color_marked_range: None,
+            color_error: None,
+            active_input: None,
+            input_selection: NativeInputSelection::Caret,
             focus_index: 0,
             keyboard_navigation: false,
             resize_edge: None,
@@ -311,6 +400,18 @@ impl SettingsWindow {
         if let Ok(config) = load_config() {
             self.colors = SettingsColors::resolve(&config);
             self.config = config;
+        }
+    }
+
+    fn controls_for_page(&self, page: SettingsPage) -> Vec<Control> {
+        let mut controls = page_controls(page);
+        if page == SettingsPage::Workspaces {
+            let mut badge_colors =
+                workspace_badge_color_controls(self.config.workspaces.badge_colors.len());
+            badge_colors.append(&mut controls);
+            badge_colors
+        } else {
+            controls
         }
     }
 
@@ -339,7 +440,14 @@ impl SettingsWindow {
         applied
     }
 
-    fn select_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+    fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        if page != self.page {
+            let color_was_focused = self.color_handle.is_focused(window);
+            let color_was_active = self.clear_color_edit();
+            if (color_was_focused || color_was_active) && !self.search_handle.is_focused(window) {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
         self.page = page;
         self.status = None;
         // A dropdown belongs to one control on one page; leaving the page must
@@ -358,7 +466,7 @@ impl SettingsWindow {
         // before the user reaches for Remove/Revoke. Only the first visit auto-
         // refreshes; afterwards the explicit "Refresh trust state" action drives it.
         if page == SettingsPage::Remote && !self.trust.loaded {
-            self.run_action(REFRESH_TRUST_ACTION, cx);
+            self.run_action(REFRESH_TRUST_ACTION, window, cx);
             return;
         }
         cx.notify();
@@ -388,7 +496,26 @@ impl SettingsWindow {
                 ))
             }));
         }
-        targets.extend(page_controls(self.page).into_iter().filter_map(|control| {
+        if self.page == SettingsPage::Workspaces && self.workspace_roots_match_search() {
+            targets.extend(
+                self.config
+                    .workspaces
+                    .roots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, root)| self.workspace_root_matches_search(root))
+                    .map(|(index, root)| SettingsFocusTarget::WorkspaceRootRemove {
+                        index,
+                        root: root.clone(),
+                    }),
+            );
+            if self.workspace_root_controls_match_search() {
+                targets.push(SettingsFocusTarget::WorkspaceRootInput);
+                targets.push(SettingsFocusTarget::WorkspaceRootBrowse);
+                targets.push(SettingsFocusTarget::WorkspaceRootAdd);
+            }
+        }
+        targets.extend(self.controls_for_page(self.page).into_iter().filter_map(|control| {
             // A control its parent toggle has gated renders inert, so keyboard
             // traversal must skip it too rather than stop on a dead stop.
             if !self.control_matches_search(&control) || !self.control_is_enabled(&control.key) {
@@ -398,8 +525,9 @@ impl SettingsWindow {
                 ControlKind::Toggle
                 | ControlKind::Choice(_)
                 | ControlKind::Stepper { .. }
-                | ControlKind::Action => Some(SettingsFocusTarget::Control(control)),
-                ControlKind::Color | ControlKind::Text | ControlKind::Keybinding => None,
+                | ControlKind::Action
+                | ControlKind::Color => Some(SettingsFocusTarget::Control(control)),
+                ControlKind::Text | ControlKind::Keybinding => None,
             }
         }));
         targets
@@ -438,7 +566,7 @@ impl SettingsWindow {
         }
     }
 
-    fn move_focus(&mut self, direction: isize, cx: &mut Context<Self>) {
+    fn move_focus(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.focus_targets().len();
         if count > 0 {
             self.focus_index = if direction.is_negative() {
@@ -447,13 +575,75 @@ impl SettingsWindow {
                 (self.focus_index + 1) % count
             };
             self.keyboard_navigation = true;
+            self.sync_focus_handle(window, cx);
             cx.notify();
         }
     }
 
-    fn activate_target(&mut self, target: SettingsFocusTarget, cx: &mut Context<Self>) {
+    fn sync_focus_handle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.focused_target() {
+            Some(SettingsFocusTarget::WorkspaceRootInput) => {
+                self.active_input = Some(NativeInputTarget::WorkspaceRoot);
+                self.input_selection = NativeInputSelection::Caret;
+                window.focus(&self.workspace_root_handle, cx);
+            }
+            Some(SettingsFocusTarget::Control(control))
+                if matches!(control.kind, ControlKind::Color) =>
+            {
+                self.begin_color_edit(&control);
+                window.focus(&self.color_handle, cx);
+            }
+            _ => {
+                self.active_input = None;
+                self.input_selection = NativeInputSelection::Caret;
+                window.focus(&self.focus_handle, cx);
+            }
+        }
+    }
+
+    fn begin_color_edit(&mut self, control: &Control) {
+        if self.color_key.as_deref() != Some(control.key.as_str()) {
+            let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+            self.color_input.clone_from(&value);
+            self.color_original = value;
+            self.color_key = Some(control.key.clone());
+            self.color_marked_range = None;
+            self.color_error = None;
+        }
+        self.active_input = Some(NativeInputTarget::Color);
+        self.input_selection = NativeInputSelection::Caret;
+    }
+
+    fn clear_color_edit(&mut self) -> bool {
+        let was_active = release_color_input(&mut self.active_input, &mut self.input_selection);
+        self.color_key = None;
+        self.color_input.clear();
+        self.color_original.clear();
+        self.color_marked_range = None;
+        self.color_error = None;
+        was_active
+    }
+
+    fn restore_workspace_root_focus(
+        &mut self,
+        intended: &SettingsFocusTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.focus_targets();
+        self.focus_index = workspace_root_focus_index(&targets, intended)
+            .unwrap_or_else(|| self.focus_index.min(targets.len().saturating_sub(1)));
+        self.sync_focus_handle(window, cx);
+    }
+
+    fn activate_target(
+        &mut self,
+        target: SettingsFocusTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match target {
-            SettingsFocusTarget::Page(page) => self.select_page(page, cx),
+            SettingsFocusTarget::Page(page) => self.select_page(page, window, cx),
             SettingsFocusTarget::Control(control) => match control.kind {
                 ControlKind::Toggle => self.toggle(&control.key, cx),
                 // Keyboard activation opens the same dropdown a click opens, so
@@ -465,10 +655,30 @@ impl SettingsWindow {
                 ControlKind::Stepper { min, max, step, .. } => {
                     self.step(&control.key, (min, max), step, cx);
                 }
-                ControlKind::Action => self.run_action(&control.key, cx),
-                ControlKind::Color | ControlKind::Text | ControlKind::Keybinding => {}
+                ControlKind::Action => self.run_action(&control.key, window, cx),
+                ControlKind::Color => {
+                    self.begin_color_edit(&control);
+                    window.focus(&self.color_handle, cx);
+                    cx.notify();
+                }
+                ControlKind::Text | ControlKind::Keybinding => {}
             },
-            SettingsFocusTarget::Action(key) => self.run_action(&key, cx),
+            SettingsFocusTarget::Action(key) => self.run_action(&key, window, cx),
+            SettingsFocusTarget::WorkspaceRootInput => {
+                self.active_input = Some(NativeInputTarget::WorkspaceRoot);
+                self.input_selection = NativeInputSelection::Caret;
+                window.focus(&self.workspace_root_handle, cx);
+                cx.notify();
+            }
+            SettingsFocusTarget::WorkspaceRootBrowse => {
+                Self::browse_workspace_root(window, cx);
+            }
+            SettingsFocusTarget::WorkspaceRootAdd => {
+                self.add_workspace_root(&SettingsFocusTarget::WorkspaceRootAdd, window, cx);
+            }
+            target @ SettingsFocusTarget::WorkspaceRootRemove { .. } => {
+                self.remove_workspace_root(&target, window, cx);
+            }
         }
     }
 
@@ -504,7 +714,9 @@ impl SettingsWindow {
         }
         page.nav_label().to_lowercase().contains(&query)
             || page_summary(page).to_lowercase().contains(&query)
-            || page_controls(page).iter().any(|control| {
+            || (page == SettingsPage::Workspaces
+                && workspace_roots_match_query(&query, &self.config.workspaces.roots))
+            || self.controls_for_page(page).iter().any(|control| {
                 control.label.to_lowercase().contains(&query)
                     || control.key.to_lowercase().contains(&query)
                     || control_section(page, &control.key).to_lowercase().contains(&query)
@@ -520,11 +732,27 @@ impl SettingsWindow {
             || control_section(self.page, &control.key).to_lowercase().contains(&query)
     }
 
+    fn workspace_roots_match_search(&self) -> bool {
+        workspace_roots_match_query(
+            &self.search_query.trim().to_lowercase(),
+            &self.config.workspaces.roots,
+        )
+    }
+
+    fn workspace_root_controls_match_search(&self) -> bool {
+        workspace_root_controls_match_query(&self.search_query.trim().to_lowercase())
+    }
+
+    fn workspace_root_matches_search(&self, root: &str) -> bool {
+        workspace_root_matches_query(&self.search_query.trim().to_lowercase(), root)
+    }
+
     fn align_page_to_search(&mut self) {
         if !self.page_matches_search(self.page)
             && let Some(page) =
                 settings_nav_pages().into_iter().find(|page| self.page_matches_search(*page))
         {
+            self.clear_color_edit();
             self.page = page;
             self.status = None;
             // Jumping to a different page for a match must rewind the shared
@@ -573,6 +801,153 @@ impl SettingsWindow {
         cx.stop_propagation();
     }
 
+    fn active_input_text(&self) -> &str {
+        match self.active_input {
+            Some(NativeInputTarget::WorkspaceRoot) => &self.workspace_root_input,
+            Some(NativeInputTarget::Color) => &self.color_input,
+            None => "",
+        }
+    }
+
+    fn active_input_marked_range(&self) -> Option<&Range<usize>> {
+        match self.active_input {
+            Some(NativeInputTarget::WorkspaceRoot) => self.workspace_root_marked_range.as_ref(),
+            Some(NativeInputTarget::Color) => self.color_marked_range.as_ref(),
+            None => None,
+        }
+    }
+
+    fn active_input_state_mut(&mut self) -> Option<(&mut String, &mut Option<Range<usize>>)> {
+        match self.active_input {
+            Some(NativeInputTarget::WorkspaceRoot) => {
+                Some((&mut self.workspace_root_input, &mut self.workspace_root_marked_range))
+            }
+            Some(NativeInputTarget::Color) => {
+                Some((&mut self.color_input, &mut self.color_marked_range))
+            }
+            None => None,
+        }
+    }
+
+    fn clear_active_input_error(&mut self) {
+        match self.active_input {
+            Some(NativeInputTarget::WorkspaceRoot) => self.workspace_root_error = None,
+            Some(NativeInputTarget::Color) => self.color_error = None,
+            None => {}
+        }
+    }
+
+    fn append_active_input(&mut self, text: &str) {
+        let select_all = self.input_selection == NativeInputSelection::All;
+        if let Some((input, marked_range)) = self.active_input_state_mut() {
+            if select_all {
+                input.clear();
+            }
+            input.push_str(text);
+            *marked_range = None;
+        }
+        self.input_selection = NativeInputSelection::Caret;
+        self.clear_active_input_error();
+    }
+
+    fn backspace_active_input(&mut self) {
+        let select_all = self.input_selection == NativeInputSelection::All;
+        if let Some((input, marked_range)) = self.active_input_state_mut() {
+            if select_all {
+                input.clear();
+            } else {
+                input.pop();
+            }
+            *marked_range = None;
+        }
+        self.input_selection = NativeInputSelection::Caret;
+        self.clear_active_input_error();
+    }
+
+    fn handle_native_input_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && event.keystroke.key == "a"
+        {
+            self.input_selection = NativeInputSelection::All;
+            cx.notify();
+            return true;
+        }
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && event.keystroke.key == "v"
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.append_active_input(&text);
+                cx.notify();
+            }
+            return true;
+        }
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.active_input == Some(NativeInputTarget::Color) {
+                    self.color_input.clone_from(&self.color_original);
+                    self.color_marked_range = None;
+                    self.color_error = None;
+                    self.input_selection = NativeInputSelection::Caret;
+                } else {
+                    self.dismiss_transient_state(cx);
+                    window.focus(&self.focus_handle, cx);
+                    self.keyboard_navigation = true;
+                }
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                self.backspace_active_input();
+                cx.notify();
+                true
+            }
+            // Input is append-only, matching settings search: the caret is at
+            // the end, so forward Delete has nothing to remove.
+            "delete" => true,
+            "enter" => {
+                match self.active_input {
+                    Some(NativeInputTarget::WorkspaceRoot) => self.add_workspace_root(
+                        &SettingsFocusTarget::WorkspaceRootInput,
+                        window,
+                        cx,
+                    ),
+                    Some(NativeInputTarget::Color) => {
+                        self.save_color(cx);
+                    }
+                    None => {}
+                }
+                true
+            }
+            "tab" if event.keystroke.modifiers.shift => {
+                self.move_focus(-1, window, cx);
+                true
+            }
+            "tab" | "down" => {
+                self.move_focus(1, window, cx);
+                true
+            }
+            "up" => {
+                self.move_focus(-1, window, cx);
+                true
+            }
+            // Printable text, including Option/AltGr and IME commits, belongs
+            // to the registered `EntityInputHandler`; it must keep propagating
+            // or GPUI cannot deliver the platform text event.
+            _ => false,
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
             && event.keystroke.key == "k"
@@ -587,6 +962,12 @@ impl SettingsWindow {
             self.handle_search_key(event, window, cx);
             return;
         }
+        if (self.workspace_root_handle.is_focused(window) || self.color_handle.is_focused(window))
+            && self.handle_native_input_key(event, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.modifiers.modified() {
             return;
         }
@@ -596,17 +977,17 @@ impl SettingsWindow {
             // filtered UI with no visible way out.
             "escape" => self.dismiss_transient_state(cx),
             "tab" | "down" => {
-                self.move_focus(1, cx);
+                self.move_focus(1, window, cx);
                 true
             }
             "up" => {
-                self.move_focus(-1, cx);
+                self.move_focus(-1, window, cx);
                 true
             }
             "left" => self.adjust_target(-1.0, cx),
             "right" => self.adjust_target(1.0, cx),
             "enter" | "space" => self.focused_target().is_some_and(|target| {
-                self.activate_target(target, cx);
+                self.activate_target(target, window, cx);
                 true
             }),
             _ => false,
@@ -644,6 +1025,128 @@ impl SettingsWindow {
             return;
         }
         self.commit(key, Value::Bool(next), cx);
+    }
+
+    fn save_color(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(key) = self.color_key.clone() else {
+            return false;
+        };
+        let color = match canonical_color_value(&key, &Value::String(self.color_input.clone())) {
+            Ok(color) => color,
+            Err(error) => {
+                self.color_error = Some(error);
+                cx.notify();
+                return false;
+            }
+        };
+        if self.commit(&key, Value::String(color.clone()), cx) {
+            self.color_input.clone_from(&color);
+            self.color_original = color;
+            self.color_marked_range = None;
+            self.color_error = None;
+            self.input_selection = NativeInputSelection::Caret;
+            true
+        } else {
+            self.color_error = Some("Color was not saved — check the status below.".to_owned());
+            cx.notify();
+            false
+        }
+    }
+
+    fn add_workspace_root(
+        &mut self,
+        intended_focus: &SettingsFocusTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = Value::String(self.workspace_root_input.clone());
+        let root = match workspace_root_from_value(&value) {
+            Ok(root) => root,
+            Err(error) => {
+                self.workspace_root_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        if self.commit("workspaces.add_root", Value::String(root), cx) {
+            self.workspace_root_input.clear();
+            self.workspace_root_marked_range = None;
+            self.workspace_root_error = None;
+            self.restore_workspace_root_focus(intended_focus, window, cx);
+        } else {
+            self.workspace_root_error = Some(
+                "Workspace root was not saved — check the status below and try again.".to_owned(),
+            );
+        }
+        cx.notify();
+    }
+
+    fn browse_workspace_root(window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(workspace_root_prompt_options());
+        cx.spawn_in(window, async move |settings, async_cx| {
+            let selection = match paths.await {
+                Ok(Ok(None)) => return,
+                Ok(Ok(Some(paths))) => match paths.as_slice() {
+                    [path] => path.clone().into_os_string().into_string().map_err(|_| {
+                        "Selected directory path is not valid UTF-8. Choose another directory or \
+                         enter a UTF-8 path manually."
+                            .to_owned()
+                    }),
+                    [] => {
+                        Err("Directory chooser returned no directory. Try again or enter the path \
+                         manually."
+                            .to_owned())
+                    }
+                    _ => Err(
+                        "Directory chooser returned multiple directories. Choose one directory or \
+                         enter the path manually."
+                            .to_owned(),
+                    ),
+                },
+                Ok(Err(error)) => Err(format!(
+                    "Could not open the directory chooser: {error}. Try again or enter the path \
+                     manually."
+                )),
+                Err(error) => Err(format!(
+                    "Directory chooser closed unexpectedly: {error}. Try again or enter the path \
+                     manually."
+                )),
+            };
+
+            settings
+                .update_in(async_cx, |settings, prompt_window, prompt_cx| match selection {
+                    Ok(path) => {
+                        settings.workspace_root_input = path;
+                        settings.workspace_root_marked_range = None;
+                        settings.workspace_root_error = None;
+                        settings.add_workspace_root(
+                            &SettingsFocusTarget::WorkspaceRootBrowse,
+                            prompt_window,
+                            prompt_cx,
+                        );
+                    }
+                    Err(error) => {
+                        settings.workspace_root_error = Some(error);
+                        prompt_cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn remove_workspace_root(
+        &mut self,
+        target: &SettingsFocusTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SettingsFocusTarget::WorkspaceRootRemove { root, .. } = target else {
+            return;
+        };
+        if self.commit("workspaces.remove_root", Value::String(root.clone()), cx) {
+            self.restore_workspace_root_focus(target, window, cx);
+        }
     }
 
     /// Run `work` after the pending status line the caller just set has been
@@ -920,9 +1423,13 @@ impl SettingsWindow {
     /// Dispatch an action button.
     ///
     /// Anything that talks to the local server paints a pending line first and
-    /// runs on the next frame; purely local actions run inline. Every rendered
-    /// action key reaches a real arm of [`Self::perform_action`].
-    fn run_action(&mut self, key: &str, cx: &mut Context<Self>) {
+    /// runs on the next frame; purely local actions run inline. Resetting badge
+    /// colors stays here because it also repairs the native input focus.
+    fn run_action(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if key == "workspaces.reset_badge_colors" {
+            self.reset_badge_colors(key, window, cx);
+            return;
+        }
         let Some(pending) = action_pending_message(key) else {
             self.perform_action(key, cx);
             return;
@@ -931,6 +1438,24 @@ impl SettingsWindow {
         cx.notify();
         let key = key.to_owned();
         Self::after_paint(cx, move |this, ctx| this.perform_action(&key, ctx));
+    }
+
+    fn reset_badge_colors(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let color_was_focused = self.color_handle.is_focused(window);
+        if !self.commit(key, Value::Bool(true), cx) {
+            return;
+        }
+        let color_was_active = self.clear_color_edit();
+        self.focus_index = self
+            .focus_targets()
+            .iter()
+            .position(|target| {
+                matches!(target, SettingsFocusTarget::Control(control) if control.key == key)
+            })
+            .unwrap_or(self.focus_index);
+        if color_was_focused || color_was_active {
+            window.focus(&self.focus_handle, cx);
+        }
     }
 
     fn perform_action(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -973,7 +1498,7 @@ impl SettingsWindow {
                 let state = server_action::request_release_list(SERVER_ACTION_TIMEOUT);
                 self.status = Some(release_list_summary(&state));
             }
-            "workspaces.reset_badge_colors" | "terminal.smart_selection.reset" => {
+            "terminal.smart_selection.reset" => {
                 self.commit(key, Value::Bool(true), cx);
                 return;
             }
@@ -1099,6 +1624,130 @@ impl Render for SettingsWindow {
             .child(self.render_titlebar(window, cx))
             .child(div().flex_1().min_h(px(0.0)).w_full().flex().child(nav).child(content));
         self.render_window_frame(decorations, tiling, body, cx)
+    }
+}
+
+impl EntityInputHandler for SettingsWindow {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let input = self.active_input_text();
+        let range = utf16_range_to_utf8(input, range);
+        actual_range.replace(utf8_range_to_utf16(input, &range));
+        Some(input[range].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.active_input_text().encode_utf16().count();
+        let range =
+            if self.input_selection == NativeInputSelection::All { 0..end } else { end..end };
+        Some(UTF16Selection { range, reversed: false })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.active_input_marked_range()
+            .map(|range| utf8_range_to_utf16(self.active_input_text(), range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .active_input_state_mut()
+            .is_some_and(|(_, marked_range)| marked_range.take().is_some())
+        {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let select_all = self.input_selection == NativeInputSelection::All;
+        if let Some((input, marked_range)) = self.active_input_state_mut() {
+            let range = if select_all {
+                0..input.len()
+            } else {
+                range
+                    .map(|range| utf16_range_to_utf8(input, range))
+                    .or_else(|| marked_range.take())
+                    .unwrap_or(input.len()..input.len())
+            };
+            input.replace_range(range, text);
+            *marked_range = None;
+        }
+        self.input_selection = NativeInputSelection::Caret;
+        self.clear_active_input_error();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let select_all = self.input_selection == NativeInputSelection::All;
+        if let Some((input, marked_range)) = self.active_input_state_mut() {
+            let range = if select_all {
+                0..input.len()
+            } else {
+                range
+                    .map(|range| utf16_range_to_utf8(input, range))
+                    .or_else(|| marked_range.take())
+                    .unwrap_or(input.len()..input.len())
+            };
+            let start = range.start;
+            input.replace_range(range, new_text);
+            *marked_range = (!new_text.is_empty()).then_some(start..start + new_text.len());
+        }
+        self.input_selection = NativeInputSelection::Caret;
+        self.clear_active_input_error();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.active_input_text().encode_utf16().count())
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.active_input_text().encode_utf16().count())
     }
 }
 
@@ -1431,9 +2080,9 @@ impl SettingsWindow {
             .when(focused, |el| el.border_1().border_color(colors.text))
             .hover(move |style| style.bg(colors.nav_hover_bg).text_color(colors.text))
             .active(move |style| style.bg(colors.control_pressed_bg))
-            .on_click(cx.listener(move |this, _, _win, ctx| {
+            .on_click(cx.listener(move |this, _, page_window, ctx| {
                 this.begin_pointer_interaction(&SettingsFocusTarget::Page(page));
-                this.select_page(page, ctx);
+                this.select_page(page, page_window, ctx);
             }))
             .child(
                 div()
@@ -1461,7 +2110,10 @@ impl SettingsWindow {
         if self.page == SettingsPage::Remote {
             children.extend(self.render_trust_sections(cx));
         }
-        children.extend(self.render_control_rows(cx));
+        if self.page == SettingsPage::Workspaces && self.workspace_roots_match_search() {
+            children.extend(self.render_workspace_root_sections(window, cx));
+        }
+        children.extend(self.render_control_rows(window, cx));
 
         div()
             .id("settings-content")
@@ -1516,11 +2168,13 @@ impl SettingsWindow {
         let focus = self.search_handle.clone();
         let focused = self.search_handle.is_focused(window);
         let query = self.search_query.clone();
+        let shown = search_display_text(&query, focused);
         let field = div()
             .id("settings-search-input")
             .track_focus(&focus)
             .role(Role::SearchInput)
             .aria_label("Search settings")
+            .aria_placeholder("Search settings")
             .aria_value(query.clone())
             .w_full()
             .max_w(px(580.0))
@@ -1551,8 +2205,12 @@ impl SettingsWindow {
                     .overflow_hidden()
                     .flex()
                     .items_center()
-                    .text_color(if query.is_empty() { colors.quiet_text } else { colors.text })
-                    .child(if query.is_empty() { "Search settings".to_owned() } else { query })
+                    .text_color(if shown == "Search settings" {
+                        colors.quiet_text
+                    } else {
+                        colors.text
+                    })
+                    .child(shown)
                     // The insertion point is always at the end of the query, so a
                     // static bar there is the honest caret: it says the field
                     // takes typing without implying a movable cursor it has not
@@ -1631,10 +2289,15 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_control_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_control_rows(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let mut rows = Vec::new();
         let mut previous_section = None;
-        for control in page_controls(self.page)
+        for control in self
+            .controls_for_page(self.page)
             .into_iter()
             .filter(|control| self.control_matches_search(control))
         {
@@ -1643,12 +2306,287 @@ impl SettingsWindow {
                 rows.push(self.control_section_heading(section));
                 previous_section = Some(section);
             }
-            rows.push(self.render_control(&control, cx));
+            rows.push(self.render_control(&control, window, cx));
         }
-        if rows.is_empty() {
+        if rows.is_empty()
+            && !(self.page == SettingsPage::Workspaces && self.workspace_roots_match_search())
+        {
             rows.push(self.note_row("No settings match this search."));
         }
         rows
+    }
+
+    fn render_workspace_root_sections(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let roots = &self.config.workspaces.roots;
+        let matching_roots = roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| self.workspace_root_matches_search(root))
+            .collect::<Vec<_>>();
+        let rows = if roots.is_empty() {
+            vec![
+                div()
+                    .id("workspace-roots-empty")
+                    .role(Role::ListItem)
+                    .aria_label("No workspace roots configured")
+                    .w_full()
+                    .h(px(54.0))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(self.colors.border)
+                    .bg(self.colors.read_only_bg)
+                    .text_sm()
+                    .text_color(self.colors.dim_text)
+                    .child("No workspace roots configured.")
+                    .into_any_element(),
+            ]
+        } else {
+            let count = matching_roots.len();
+            matching_roots
+                .into_iter()
+                .enumerate()
+                .map(|(position, (index, root))| {
+                    self.render_workspace_root(index, root, (position, count), cx)
+                })
+                .collect()
+        };
+        let mut sections = vec![
+            self.control_section_heading("Workspace roots"),
+            div()
+                .id("workspace-roots-list")
+                .role(Role::List)
+                .aria_label("Configured workspace roots")
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(rows)
+                .into_any_element(),
+        ];
+        if self.workspace_root_controls_match_search() {
+            sections.push(self.render_workspace_root_input(window, cx));
+        }
+        sections
+    }
+
+    fn render_workspace_root(
+        &self,
+        index: usize,
+        root: &str,
+        set_position: (usize, usize),
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let target = SettingsFocusTarget::WorkspaceRootRemove { index, root: root.to_owned() };
+        let focused = self.target_is_focused(&target);
+        let label = format!("Remove workspace root {root}");
+        let button = action_button("Remove", &colors)
+            .id(("workspace-root-remove", index))
+            .when(focused, |el| el.border_color(colors.text))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(label)
+            .on_click(cx.listener(move |this, _, root_window, ctx| {
+                this.begin_pointer_interaction(&target);
+                this.remove_workspace_root(&target, root_window, ctx);
+            }));
+        div()
+            .id(("workspace-root", index))
+            .role(Role::ListItem)
+            .aria_label(root.to_owned())
+            .aria_position_in_set(set_position.0 + 1)
+            .aria_size_of_set(set_position.1)
+            .w_full()
+            .h(px(54.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_6()
+            .border_b_1()
+            .border_color(colors.border)
+            .hover(move |style| style.bg(colors.row_hover_bg))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_family("monospace")
+                    .text_sm()
+                    .text_color(colors.text)
+                    .child(Text::new_inaccessible(elide(root, NOTE_MAX_CHARS).into())),
+            )
+            .child(div().w(px(438.0)).flex_none().flex().items_center().justify_end().child(button))
+            .into_any_element()
+    }
+
+    fn render_workspace_root_input(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let field = self.render_workspace_root_field(window, cx);
+        let (browse, add) = self.render_workspace_root_actions(cx);
+        let error = self.workspace_root_error.clone().map(|error| {
+            div()
+                .id("workspace-root-error")
+                .role(Role::Alert)
+                .aria_label(format!("Workspace root error: {error}"))
+                .aria_description(
+                    "Enter an absolute path or a path starting with ~/, then try again.",
+                )
+                .w_full()
+                .text_xs()
+                .text_color(colors.accent)
+                .child(Text::new_inaccessible(error.into()))
+        });
+        div()
+            .id("workspace-root-add-row")
+            .role(Role::Group)
+            .aria_label("Add workspace root")
+            .w_full()
+            .h(px(if self.workspace_root_error.is_some() { 76.0 } else { 54.0 }))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_6()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(row_label("Workspace root path", colors.text))
+            .child(
+                div()
+                    .w(px(438.0))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(field)
+                            .child(browse)
+                            .child(add),
+                    )
+                    .children(error),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_root_field(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let focus = self.workspace_root_handle.clone();
+        let input_focus = focus.clone();
+        let settings_entity = cx.entity();
+        let focused = self.workspace_root_handle.is_focused(window);
+        let value = self.workspace_root_input.clone();
+        let description = self
+            .workspace_root_error
+            .as_deref()
+            .unwrap_or("Enter an absolute path or a home-relative path starting with ~/.");
+        div()
+            .id("workspace-root-input")
+            .track_focus(&focus)
+            .role(Role::TextInput)
+            .aria_label("Workspace root path")
+            .aria_description(description.to_owned())
+            .aria_placeholder("Absolute path or ~/path")
+            .aria_value(value.clone())
+            .on_a11y_action(
+                AccessibleAction::SetValue,
+                a11y_workspace_root_handler(cx.entity().downgrade()),
+            )
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(42.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded_xs()
+            .border_1()
+            .border_color(if focused { colors.accent } else { colors.strong_border })
+            .bg(colors.control_bg)
+            .font_family("monospace")
+            .text_sm()
+            .text_color(if value.is_empty() { colors.quiet_text } else { colors.text })
+            .cursor_text()
+            .relative()
+            .when(!focused, |el| el.hover(move |style| style.border_color(colors.dim_text)))
+            .on_click(cx.listener(move |this, _, input_window, ctx| {
+                this.begin_pointer_interaction(&SettingsFocusTarget::WorkspaceRootInput);
+                this.active_input = Some(NativeInputTarget::WorkspaceRoot);
+                this.input_selection = NativeInputSelection::Caret;
+                input_window.focus(&focus, ctx);
+            }))
+            .child(Text::new_inaccessible(
+                if value.is_empty() { "Absolute path or ~/path".to_owned() } else { value }.into(),
+            ))
+            .when(focused, |el| {
+                el.child(div().ml(px(2.0)).w(px(2.0)).h(px(18.0)).flex_none().bg(colors.accent))
+            })
+            .child(
+                canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds, (), input_window, app| {
+                        input_window.handle_input(
+                            &input_focus,
+                            ElementInputHandler::new(bounds, settings_entity),
+                            app,
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_root_actions(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> (gpui::AnyElement, gpui::AnyElement) {
+        let colors = self.colors;
+        let add_target = SettingsFocusTarget::WorkspaceRootAdd;
+        let add_focused = self.target_is_focused(&add_target);
+        let add = action_button("Add", &colors)
+            .id("workspace-root-add")
+            .when(add_focused, |el| el.border_color(colors.text))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Add workspace root")
+            .on_click(cx.listener(move |this, _, add_window, ctx| {
+                this.begin_pointer_interaction(&add_target);
+                this.add_workspace_root(&add_target, add_window, ctx);
+            }))
+            .into_any_element();
+        let browse_target = SettingsFocusTarget::WorkspaceRootBrowse;
+        let browse_focused = self.target_is_focused(&browse_target);
+        let browse = action_button("Browse…", &colors)
+            .id("workspace-root-browse")
+            .when(browse_focused, |el| el.border_color(colors.text))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Browse for workspace root directory")
+            .on_click(cx.listener(move |this, _, browse_window, ctx| {
+                this.begin_pointer_interaction(&browse_target);
+                Self::browse_workspace_root(browse_window, ctx);
+            }))
+            .into_any_element();
+        (browse, add)
     }
 
     /// The pinned result line under the content pane, with an explicit dismiss
@@ -1941,9 +2879,9 @@ impl SettingsWindow {
             .tab_stop(true)
             .role(Role::Button)
             .aria_label(format!("{button} {label}"))
-            .on_click(cx.listener(move |this, _, _win, ctx| {
+            .on_click(cx.listener(move |this, _, action_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
-                this.run_action(&action_key, ctx);
+                this.run_action(&action_key, action_window, ctx);
             }));
         div()
             .id(("settings-trust-row", key_hash(&label)))
@@ -1965,13 +2903,18 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_control(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_control(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = self.colors;
         let enabled = self.control_is_enabled(&control.key);
         let description = control_description(&self.config, &control.key);
         let label = row_label_with_description(&control.label, description, &colors);
         let value_widget = if enabled {
-            self.render_value_widget(control, cx)
+            self.render_value_widget(control, window, cx)
         } else {
             self.render_gated_value(control)
         };
@@ -1982,7 +2925,17 @@ impl SettingsWindow {
             .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
             .w_full()
-            .h(px(if description.is_some() { 66.0 } else { 54.0 }))
+            .h(px(
+                if self.color_key.as_deref() == Some(control.key.as_str())
+                    && self.color_error.is_some()
+                {
+                    76.0
+                } else if description.is_some() {
+                    66.0
+                } else {
+                    54.0
+                },
+            ))
             .flex_none()
             .flex()
             .items_center()
@@ -2046,14 +2999,19 @@ impl SettingsWindow {
         read_only_value(&control.key, &control.label, &shown, &self.colors)
     }
 
-    fn render_value_widget(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_value_widget(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         match &control.kind {
             ControlKind::Toggle => self.render_toggle(control, cx),
             ControlKind::Choice(options) => self.render_choice(control, options, cx),
             ControlKind::Stepper { min, max, step, decimals } => {
                 self.render_stepper(control, (*min, *max, *step), *decimals, cx)
             }
-            ControlKind::Color => self.render_color(control),
+            ControlKind::Color => self.render_color(control, window, cx),
             ControlKind::Text => self.render_text_value(control),
             ControlKind::Keybinding => self.render_keybinding_value(control),
             ControlKind::Action => self.render_action_control(control, cx),
@@ -2320,9 +3278,9 @@ impl SettingsWindow {
             .tab_stop(true)
             .role(Role::Button)
             .aria_label(control.label.clone())
-            .on_click(cx.listener(move |this, _, _win, ctx| {
+            .on_click(cx.listener(move |this, _, action_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
-                this.run_action(&key, ctx);
+                this.run_action(&key, action_window, ctx);
             }))
             .into_any_element()
     }
@@ -2445,51 +3403,137 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// Render a color control: an optional swatch of the current hex plus the
-    /// hex text (read-only; inline hex entry is a tracked follow-on).
-    fn render_color(&self, control: &Control) -> gpui::AnyElement {
+    /// Render the shared color editor used by theme, AI, appearance, and
+    /// workspace badge colors.
+    fn render_color(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = self.colors;
-        let value = current_value(&self.config, &control.key);
-        let hex = value.as_str().unwrap_or("").to_owned();
-        let shown = if hex.is_empty() { "(theme default)".to_owned() } else { hex.clone() };
-        let swatch = scribe_common::theme::hex_to_rgba(&hex).ok().map(|rgba| {
-            div()
-                .size(px(20.0))
-                .flex_none()
-                .rounded_xs()
-                .border_1()
-                .border_color(colors.strong_border)
-                .bg(srgba(rgba))
-                .into_any_element()
-        });
+        let editing = self.color_key.as_deref() == Some(control.key.as_str())
+            && self.color_handle.is_focused(window);
+        let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let value = if editing { self.color_input.clone() } else { saved.clone() };
+        let swatch_color = color_swatch(&self.config, &control.key, &value)
+            .or_else(|| color_swatch(&self.config, &control.key, &saved))
+            .map_or(colors.read_only_bg, srgba);
+        let field = self.render_color_field(control, window, cx);
+        let error = (self.color_key.as_deref() == Some(control.key.as_str()))
+            .then(|| self.color_error.clone())
+            .flatten()
+            .map(|error| {
+                div()
+                    .id(("settings-color-error", key_hash(&control.key)))
+                    .role(Role::Alert)
+                    .aria_label(error.clone())
+                    .text_xs()
+                    .text_color(colors.accent)
+                    .child(Text::new_inaccessible(error.into()))
+            });
         div()
             .id(("settings-color-value", key_hash(&control.key)))
-            .role(Role::Label)
-            .aria_label(format!("{}: {shown}", control.label))
-            .aria_description("Read-only value")
+            .role(Role::Group)
+            .aria_label(format!("{} color editor", control.label))
             .w(px(438.0))
-            .h(px(42.0))
-            .px_4()
             .flex()
-            .items_center()
-            .gap_3()
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.read_only_bg)
-            .children(swatch)
-            .child(read_only_marker(&colors))
+            .flex_col()
+            .gap_1()
+            .children(error)
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
+                    .w_full()
+                    .h(px(42.0))
                     .flex()
-                    .justify_end()
-                    .font_family("monospace")
-                    .text_sm()
-                    .text_color(colors.dim_text)
-                    .child(Text::new_inaccessible(elide(&shown, READ_ONLY_MAX_CHARS).into())),
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex_none()
+                            .rounded_xs()
+                            .border_1()
+                            .border_color(colors.strong_border)
+                            .bg(swatch_color),
+                    )
+                    .child(field),
             )
+            .into_any_element()
+    }
+
+    fn render_color_field(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let editing = self.color_key.as_deref() == Some(control.key.as_str())
+            && self.color_handle.is_focused(window);
+        let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let value = if editing { self.color_input.clone() } else { saved };
+        let placeholder = color_placeholder(&control.key);
+        let shown =
+            if value.is_empty() && !editing { placeholder.to_owned() } else { value.clone() };
+        let focus = self.color_handle.clone();
+        let input_focus = focus.clone();
+        let settings_entity = cx.entity();
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let edit_control = control.clone();
+        div()
+            .id(("settings-color-input", key_hash(&control.key)))
+            .role(Role::TextInput)
+            .aria_label(control.label.clone())
+            .aria_placeholder(placeholder)
+            .aria_value(value.clone())
+            .on_a11y_action(
+                AccessibleAction::SetValue,
+                a11y_color_handler(cx.entity().downgrade(), control.key.clone()),
+            )
+            .focusable()
+            .tab_stop(true)
+            .w_full()
+            .h(px(42.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .relative()
+            .rounded_xs()
+            .border_1()
+            .border_color(if editing { colors.accent } else { colors.strong_border })
+            .bg(colors.control_bg)
+            .font_family("monospace")
+            .text_sm()
+            .text_color(if value.is_empty() { colors.quiet_text } else { colors.text })
+            .cursor_text()
+            .when(!editing, |el| el.hover(move |style| style.border_color(colors.accent)))
+            .on_click(cx.listener(move |this, _, input_window, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.begin_color_edit(&edit_control);
+                input_window.focus(&focus, ctx);
+                ctx.notify();
+            }))
+            .child(Text::new_inaccessible(shown.into()))
+            .when(editing, |el| {
+                el.track_focus(&input_focus)
+                    .child(div().ml(px(2.0)).w(px(2.0)).h(px(18.0)).flex_none().bg(colors.accent))
+                    .child(
+                        canvas(
+                            |_bounds, _window, _cx| {},
+                            move |bounds, (), input_window, app| {
+                                input_window.handle_input(
+                                    &input_focus,
+                                    ElementInputHandler::new(bounds, settings_entity),
+                                    app,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+            })
             .into_any_element()
     }
 }
@@ -2526,6 +3570,92 @@ fn gating_toggle(key: &str) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+fn workspace_roots_match_query(query: &str, roots: &[String]) -> bool {
+    workspace_root_controls_match_query(query)
+        || roots.iter().any(|root| workspace_root_matches_query(query, root))
+}
+
+fn workspace_root_prompt_options() -> PathPromptOptions {
+    PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Choose".into()),
+    }
+}
+
+fn search_display_text(query: &str, focused: bool) -> String {
+    if query.is_empty() && !focused { "Search settings".to_owned() } else { query.to_owned() }
+}
+
+fn color_placeholder(key: &str) -> &'static str {
+    if key.starts_with("appearance.") {
+        "Theme default"
+    } else if key.starts_with("ai_states.") || key.starts_with("claude_states.") {
+        "#rrggbb or ansi:0–15"
+    } else {
+        "#rrggbb"
+    }
+}
+
+fn color_swatch(config: &ScribeConfig, key: &str, value: &str) -> Option<[f32; 4]> {
+    if key.starts_with("ai_states.") || key.starts_with("claude_states.") {
+        let color: scribe_common::config::AiColor =
+            serde_json::from_value(Value::String(value.to_owned())).ok()?;
+        return Some(color.resolve(&scribe_common::config::resolve_theme(config).ansi_colors));
+    }
+    scribe_common::theme::hex_to_rgba(value).ok()
+}
+
+fn workspace_root_controls_match_query(query: &str) -> bool {
+    query.is_empty()
+        || query == "workspaces"
+        || [
+            "workspace roots",
+            "configured workspace roots",
+            "workspace root path",
+            "add workspace root",
+            "browse for workspace root directory",
+            "workspaces.add_root",
+        ]
+        .iter()
+        .any(|label| label.contains(query))
+}
+
+fn workspace_root_matches_query(query: &str, root: &str) -> bool {
+    query.is_empty()
+        || query == "workspaces"
+        || [
+            "workspace roots",
+            "configured workspace roots",
+            "remove workspace root",
+            "workspaces.remove_root",
+        ]
+        .iter()
+        .any(|label| label.contains(query))
+        || root.to_lowercase().contains(query)
+}
+
+fn utf16_range_to_utf8(text: &str, range: Range<usize>) -> Range<usize> {
+    utf16_offset_to_utf8(text, range.start)..utf16_offset_to_utf8(text, range.end)
+}
+
+fn utf16_offset_to_utf8(text: &str, offset: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (utf8_offset, ch) in text.char_indices() {
+        if utf16_offset >= offset {
+            return utf8_offset;
+        }
+        utf16_offset += ch.len_utf16();
+    }
+    text.len()
+}
+
+fn utf8_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    let to_utf16 = |offset: usize| text[..offset.min(text.len())].encode_utf16().count();
+    to_utf16(range.start)..to_utf16(range.end)
 }
 
 const NOTE_MAX_CHARS: usize = 120;
@@ -2680,6 +3810,56 @@ fn read_only_marker(colors: &SettingsColors) -> gpui::Div {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(colors.quiet_text)
         .child(Text::new_inaccessible("READ ONLY".into()))
+}
+
+/// Route AccessKit text-input actions back into the settings entity.
+fn a11y_workspace_root_handler(
+    weak_settings: gpui::WeakEntity<SettingsWindow>,
+) -> impl FnMut(Option<&gpui::accesskit::ActionData>, &mut Window, &mut App) {
+    move |data, _, app| {
+        let Some(gpui::accesskit::ActionData::Value(action_value)) = data else {
+            return;
+        };
+        let input = action_value.to_string();
+        weak_settings
+            .update(app, move |this, ctx| {
+                this.workspace_root_input = input;
+                this.workspace_root_marked_range = None;
+                this.workspace_root_error = None;
+                this.active_input = Some(NativeInputTarget::WorkspaceRoot);
+                this.input_selection = NativeInputSelection::Caret;
+                ctx.notify();
+            })
+            .ok();
+    }
+}
+
+fn a11y_color_handler(
+    weak_settings: gpui::WeakEntity<SettingsWindow>,
+    set_key: String,
+) -> impl FnMut(Option<&gpui::accesskit::ActionData>, &mut Window, &mut App) {
+    move |data, _, app| {
+        let Some(gpui::accesskit::ActionData::Value(action_value)) = data else {
+            return;
+        };
+        let input = action_value.to_string();
+        let control_key = set_key.clone();
+        weak_settings
+            .update(app, move |this, ctx| {
+                this.color_key = Some(control_key.clone());
+                this.color_input = input;
+                current_value(&this.config, &control_key)
+                    .as_str()
+                    .unwrap_or("")
+                    .clone_into(&mut this.color_original);
+                this.color_marked_range = None;
+                this.color_error = None;
+                this.active_input = Some(NativeInputTarget::Color);
+                this.input_selection = NativeInputSelection::Caret;
+                ctx.notify();
+            })
+            .ok();
+    }
 }
 
 /// Route an AccessKit spin-button action back into the settings entity.
@@ -2928,6 +4108,7 @@ fn control_section(page: SettingsPage, key: &str) -> &'static str {
         SettingsPage::Terminal => terminal_section(key),
         SettingsPage::Environment => "Environment persistence",
         SettingsPage::Keybindings => keybinding_section(key),
+        SettingsPage::Workspaces if key.starts_with("workspaces.badge_colors.") => "Badge colors",
         SettingsPage::Workspaces => "Workspace configuration",
         SettingsPage::Updates => "Automatic updates",
         SettingsPage::Releases => "Release service",
@@ -3198,4 +4379,139 @@ fn saved_settings_geometry_fits(
 
 fn logical_i32(value: i32) -> f32 {
     f32::from(i16::try_from(value.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NativeInputSelection, NativeInputTarget, SettingsFocusTarget, focus_targets_match,
+        release_color_input, search_display_text, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
+        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
+        workspace_roots_match_query,
+    };
+
+    #[test]
+    fn search_placeholder_hides_only_for_focused_empty_input() {
+        assert_eq!(search_display_text("", false), "Search settings");
+        assert_eq!(search_display_text("", true), "");
+        assert_eq!(search_display_text("colors", true), "colors");
+    }
+
+    #[test]
+    fn workspace_badge_controls_follow_configured_palette_length() {
+        let controls = workspace_badge_color_controls(2);
+
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0].key, "workspaces.badge_colors.0");
+        assert_eq!(controls[1].label, "Badge color 2");
+    }
+
+    #[test]
+    fn workspace_root_search_matches_controls_and_paths() {
+        let roots = vec![String::from("/srv/Projects")];
+
+        assert!(workspace_roots_match_query("add workspace", &roots));
+        assert!(workspace_roots_match_query("browse for workspace", &roots));
+        assert!(workspace_roots_match_query("projects", &roots));
+        assert!(workspace_roots_match_query("workspaces", &roots));
+        assert!(workspace_root_controls_match_query("workspaces"));
+        assert!(!workspace_root_controls_match_query("projects"));
+        assert!(workspace_root_matches_query("projects", &roots[0]));
+        assert!(!workspace_root_matches_query("projects", "/srv/other"));
+        assert!(!workspace_roots_match_query("badge colors", &roots));
+    }
+
+    #[test]
+    fn workspace_root_focus_targets_match_stable_rows() {
+        let first =
+            SettingsFocusTarget::WorkspaceRootRemove { index: 0, root: String::from("/srv/work") };
+        let same = first.clone();
+        let next =
+            SettingsFocusTarget::WorkspaceRootRemove { index: 1, root: String::from("/srv/work") };
+
+        assert!(focus_targets_match(&first, &same));
+        assert!(!focus_targets_match(&first, &next));
+        assert!(focus_targets_match(
+            &SettingsFocusTarget::WorkspaceRootInput,
+            &SettingsFocusTarget::WorkspaceRootInput,
+        ));
+        assert!(focus_targets_match(
+            &SettingsFocusTarget::WorkspaceRootBrowse,
+            &SettingsFocusTarget::WorkspaceRootBrowse,
+        ));
+        assert!(!focus_targets_match(
+            &SettingsFocusTarget::WorkspaceRootInput,
+            &SettingsFocusTarget::WorkspaceRootBrowse,
+        ));
+    }
+
+    #[test]
+    fn workspace_root_focus_re_resolves_after_rows_change() {
+        let targets = vec![
+            SettingsFocusTarget::WorkspaceRootRemove { index: 0, root: String::from("/srv/next") },
+            SettingsFocusTarget::WorkspaceRootInput,
+            SettingsFocusTarget::WorkspaceRootBrowse,
+            SettingsFocusTarget::WorkspaceRootAdd,
+        ];
+
+        assert_eq!(
+            workspace_root_focus_index(&targets, &SettingsFocusTarget::WorkspaceRootInput),
+            Some(1)
+        );
+        assert_eq!(
+            workspace_root_focus_index(&targets, &SettingsFocusTarget::WorkspaceRootBrowse),
+            Some(2)
+        );
+        assert_eq!(
+            workspace_root_focus_index(
+                &targets,
+                &SettingsFocusTarget::WorkspaceRootRemove {
+                    index: 0,
+                    root: String::from("/srv/removed"),
+                },
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            workspace_root_focus_index(
+                &targets[1..],
+                &SettingsFocusTarget::WorkspaceRootRemove {
+                    index: 0,
+                    root: String::from("/srv/removed"),
+                },
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn workspace_root_input_ranges_follow_utf16_offsets() {
+        assert_eq!(utf16_range_to_utf8("a😀b", 1..3), 1..5);
+    }
+
+    #[test]
+    fn workspace_root_chooser_selects_one_directory() {
+        let options = workspace_root_prompt_options();
+
+        assert!(!options.files);
+        assert!(options.directories);
+        assert!(!options.multiple);
+        assert_eq!(options.prompt.as_deref(), Some("Choose"));
+    }
+
+    #[test]
+    fn releasing_color_input_preserves_workspace_root_input() {
+        let mut active = Some(NativeInputTarget::WorkspaceRoot);
+        let mut selection = NativeInputSelection::All;
+
+        assert!(!release_color_input(&mut active, &mut selection));
+        assert!(matches!(active, Some(NativeInputTarget::WorkspaceRoot)));
+        assert_eq!(selection, NativeInputSelection::All);
+
+        active = Some(NativeInputTarget::Color);
+        assert!(release_color_input(&mut active, &mut selection));
+        assert!(active.is_none());
+        assert_eq!(selection, NativeInputSelection::Caret);
+    }
 }

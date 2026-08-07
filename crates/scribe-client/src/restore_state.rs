@@ -30,6 +30,13 @@ pub struct RestoreIndex {
     pub version: u32,
     pub updated_at_ms: u64,
     pub windows: Vec<WindowId>,
+    /// Windows whose snapshot has been claimed for replay but not yet
+    /// superseded by a fresh snapshot. A claimed entry keeps its file on disk
+    /// — the last good layout must survive until a replacement is durably
+    /// written — but is never claimed again, so a crash loop cannot
+    /// double-replay it. Absent in indexes written by older clients.
+    #[serde(default)]
+    pub claimed: Vec<WindowId>,
 }
 
 /// Persisted logical state for one client window.
@@ -294,6 +301,8 @@ impl RestoreStore {
         if !index.windows.contains(&window_id) {
             index.windows.push(window_id);
         }
+        // A fresh snapshot supersedes any earlier claim of the same window.
+        index.claimed.retain(|id| *id != window_id);
         index.updated_at_ms = unix_time_ms();
         self.save_index(&index)
     }
@@ -310,6 +319,7 @@ impl RestoreStore {
         let _lock = self.acquire_index_lock()?;
         let mut index = self.read_index_for_update()?;
         index.windows.retain(|id| *id != window_id);
+        index.claimed.retain(|id| *id != window_id);
         index.updated_at_ms = unix_time_ms();
         self.save_index(&index)
     }
@@ -347,7 +357,10 @@ impl RestoreStore {
     /// cold-restart replay. Returns the claimed window's state and the number
     /// of remaining unclaimed windows (so the caller can spawn additional
     /// client processes). Corrupted entries are skipped and removed. The
-    /// claimed entry and its on-disk file are cleaned up.
+    /// claimed entry moves to the index's `claimed` list — never claimable
+    /// again, so a crash loop cannot double-replay it — but its on-disk file
+    /// survives until a fresh snapshot supersedes it via [`Self::upsert_index`]
+    /// or the claimant discards it via [`Self::remove_from_index`].
     #[must_use]
     pub fn claim_first_window(&self) -> Option<(WindowRestoreState, usize)> {
         let _lock = self.acquire_index_lock().ok()?;
@@ -366,7 +379,10 @@ impl RestoreStore {
                     );
                 }
                 Some(state) if claimed.is_none() => {
-                    self.remove_window(window_id);
+                    // The file stays on disk: it is the last good layout for
+                    // this window and only a durably written replacement may
+                    // retire it.
+                    index.claimed.push(window_id);
                     claimed = Some(state);
                 }
                 Some(_) => {
@@ -445,9 +461,12 @@ impl RestoreStore {
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 Ok(index)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(RestoreIndex { version: 1, updated_at_ms: 0, windows: Vec::new() })
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RestoreIndex {
+                version: 1,
+                updated_at_ms: 0,
+                windows: Vec::new(),
+                claimed: Vec::new(),
+            }),
             Err(error) => Err(error.into()),
         }
     }
@@ -625,15 +644,25 @@ mod tests {
         // and win_b remains for a --restore-child fan-out.
         assert_eq!(claimed.window_id, win_a);
         assert_eq!(remaining, 1);
-        // The claimed window's file is removed.
-        assert!(store.load_window(win_a).is_none());
-        // The blank window's file is removed too.
+        // The claimed window's file survives the claim: it is the last good
+        // layout until a replacement snapshot is durably written.
+        assert!(store.load_window(win_a).is_some());
+        // The blank (non-replayable) window's file is still pruned.
         assert!(store.load_window(win_blank).is_none());
 
+        // A second claim skips the already-claimed win_a — a crash loop must
+        // never replay the same snapshot twice — and takes win_b instead.
         let (claimed_b, remaining_b) = store.claim_first_window().expect("claim second");
         assert_eq!(claimed_b.window_id, win_b);
         assert_eq!(remaining_b, 0);
         assert!(store.claim_first_window().is_none());
+
+        // Writing a fresh snapshot supersedes the claim: the id becomes
+        // claimable again and later claims replay the new file.
+        store.save_window(&snap_a).expect("save replacement");
+        store.upsert_index(win_a).expect("re-index a");
+        let (reclaimed, _) = store.claim_first_window().expect("claim replacement");
+        assert_eq!(reclaimed.window_id, win_a);
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale lock reclaimed]]

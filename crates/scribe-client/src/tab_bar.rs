@@ -182,6 +182,26 @@ pub struct TabData {
     /// active. Blended additively over the tab background without overriding
     /// active-tab or AI-indicator styling.
     pub tab_flash: Option<f32>,
+    /// Workspace pill rendered before a multi-workspace group's first tab
+    /// when the server provides a real workspace name.
+    pub badge: Option<GroupBadge>,
+    /// Window-relative left edge of a workspace group's region. Set only on
+    /// the group's first tab, independently of whether the workspace is named
+    /// and therefore has a badge.
+    pub group_region_x: Option<f32>,
+    /// The owning region's accent in a multi-workspace window, tinting the
+    /// active-tab underline so it meets the region border below in the same
+    /// colour. `None` (single workspace) falls back to the theme accent.
+    pub group_accent: Option<Rgba>,
+}
+
+/// Workspace pill prefixed to a group's first tab in a multi-workspace strip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupBadge {
+    /// Server-provided workspace name.
+    pub label: String,
+    /// The workspace's region accent, tinting the pill.
+    pub accent: Rgba,
 }
 
 impl TabData {
@@ -199,6 +219,9 @@ impl TabData {
             ai_indicator: None,
             context_suffix: None,
             tab_flash: None,
+            badge: None,
+            group_region_x: None,
+            group_accent: None,
         }
     }
 }
@@ -232,7 +255,7 @@ pub fn tab_display_title(title: &str, available: usize) -> (String, bool) {
 #[must_use]
 pub fn badge_label(ws_name: Option<&str>, multi_workspace: bool) -> Option<&str> {
     match (multi_workspace, ws_name) {
-        (true, Some(name)) if !name.is_empty() => Some(name),
+        (true, Some(name)) if !name.trim().is_empty() => Some(name.trim()),
         _ => None,
     }
 }
@@ -271,6 +294,19 @@ pub fn reorder_target_index(
         edge += tab_width;
     }
     idx
+}
+/// The darker "tab tone" of a workspace accent: the accent washed at 25%
+/// over the chrome background, matching the workspace tag fill — so tags,
+/// group hairlines, active-tab underlines, and region borders all share one
+/// colour.
+#[must_use]
+pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
+    Rgba {
+        r: accent.r.mul_add(0.25, bg.r * 0.75),
+        g: accent.g.mul_add(0.25, bg.g * 0.75),
+        b: accent.b.mul_add(0.25, bg.b * 0.75),
+        a: 1.0,
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +392,8 @@ mod tests {
         assert_eq!(badge_label(Some("work"), false), None);
         assert_eq!(badge_label(None, true), None);
         assert_eq!(badge_label(Some(""), true), None);
+        assert_eq!(badge_label(Some("  "), true), None);
+        assert_eq!(badge_label(Some(" work "), true), Some("work"));
     }
 
     // @lat: [[client#GPUI Titlebar#Drag reorder resolves the target slot]]

@@ -14,12 +14,27 @@ TEST_HOME="${TEST_HOME:-/tmp/scribe-visual-home}"
 DAEMON_STARTED=0
 SERVER_STARTED=0
 
+# Opt-in desktop integrations share one disposable session bus. dbus-run-session
+# owns its daemon's lifecycle and tears it down after this re-exec exits.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
+    && { [ "${SCRIBE_KEYRING:-0}" = "1" ] \
+        || [ "${SCRIBE_NOTIFY:-0}" = "1" ] \
+        || [ "${SCRIBE_IME:-0}" = "1" ] \
+        || [ "${SCRIBE_FILE_CHOOSER:-0}" = "1" ]; }; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/scribe-visual-runtime-$(id -u)}"
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod 700 "$XDG_RUNTIME_DIR"
+    exec dbus-run-session -- "$0" "$@"
+fi
+
 cleanup() {
     kill "${APP_PID:-}" 2>/dev/null || true
     kill "${TAIL_PID:-}" 2>/dev/null || true
     kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
     kill "${NOTIFYD_PID:-}" 2>/dev/null || true
+    kill "${PORTAL_PID:-}" 2>/dev/null || true
+    kill "${PORTAL_GTK_PID:-}" 2>/dev/null || true
     pkill -f ibus-daemon 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
         scribe-test daemon stop >/dev/null 2>&1 || true
@@ -72,6 +87,64 @@ prepare_xdg_dirs() {
     mkdir -p "$XDG_CONFIG_HOME/scribe" "$XDG_DATA_HOME/scribe" "$XDG_STATE_HOME/scribe"
 }
 
+# Start the GTK directory chooser backend and its public portal frontend.
+start_file_chooser_portal() {
+    local backend_probe=/output/xdg-desktop-portal-gtk.introspection
+    local portal_probe=/output/xdg-desktop-portal.introspection
+    local backend_ready=0
+
+    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
+    printf '[preferred]\ndefault=gtk\n' \
+        >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+
+    G_MESSAGES_DEBUG=all /usr/libexec/xdg-desktop-portal-gtk \
+        >/output/xdg-desktop-portal-gtk.log 2>&1 &
+    PORTAL_GTK_PID=$!
+    for _ in {1..50}; do
+        if gdbus call --session --dest org.freedesktop.DBus \
+            --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.NameHasOwner \
+            org.freedesktop.impl.portal.desktop.gtk | grep -q true \
+            && gdbus introspect --session \
+            --dest org.freedesktop.impl.portal.desktop.gtk \
+            --object-path /org/freedesktop/portal/desktop \
+            >"$backend_probe" 2>>/output/xdg-desktop-portal-gtk.log \
+            && grep -q 'org.freedesktop.impl.portal.FileChooser' "$backend_probe"; then
+            backend_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$backend_ready" -ne 1 ]; then
+        echo 'GTK FileChooser portal backend failed to become ready; backend log:' >&2
+        tail -n 40 /output/xdg-desktop-portal-gtk.log >&2 || true
+        return 1
+    fi
+
+    G_MESSAGES_DEBUG=all /usr/libexec/xdg-desktop-portal \
+        >/output/xdg-desktop-portal.log 2>&1 &
+    PORTAL_PID=$!
+    for _ in {1..50}; do
+        if gdbus call --session --dest org.freedesktop.DBus \
+            --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.NameHasOwner \
+            org.freedesktop.portal.Desktop | grep -q true \
+            && gdbus introspect --session \
+            --dest org.freedesktop.portal.Desktop \
+            --object-path /org/freedesktop/portal/desktop \
+            >"$portal_probe" 2>>/output/xdg-desktop-portal.log \
+            && grep -q 'org.freedesktop.portal.FileChooser' "$portal_probe"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo 'FileChooser portal failed to become ready; portal logs:' >&2
+    tail -n 40 /output/xdg-desktop-portal-gtk.log \
+        /output/xdg-desktop-portal.log >&2 || true
+    return 1
+}
+
 # Seed the feature-014 LAN trust stores before the server starts.
 #
 # `IpcServerState` loads both TOML stores once at startup, and a single container
@@ -109,7 +182,7 @@ TOML
         "$XDG_STATE_HOME/scribe/lan_trusted_devices.toml"
 }
 
-# Start a session D-Bus and an unlocked gnome-keyring, then re-exec.
+# Start an unlocked gnome-keyring on the harness session bus.
 #
 # The feature-014 LAN device key is sealed in the OS keyring (Secret Service on
 # Linux), and `scribe-server` fails closed without one — so `GetLanDialIdentity`
@@ -117,17 +190,13 @@ TOML
 # LAN dial test needs this, so it is opt-in: every other visual test keeps the
 # lighter, keyring-free container.
 start_session_keyring() {
-    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        return 0
-    fi
-    export $(dbus-launch)
     # `--unlock` reads the (empty) password on stdin and prints the environment
     # of the daemon it started; only the secrets component is needed.
     eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
     export GNOME_KEYRING_CONTROL
 }
 
-# Start a session D-Bus and a REAL freedesktop notification service on it.
+# Start a REAL freedesktop notification service on the harness session bus.
 #
 # The client's dispatcher talks raw zbus to `org.freedesktop.Notifications`; with
 # nothing owning that name its `Notify` call fails at the bus and the delivery
@@ -136,9 +205,6 @@ start_session_keyring() {
 # can emit `ActionInvoked` on demand, which is what makes click-to-focus
 # assertable. Opt-in: every other visual test keeps the lighter container.
 start_notification_daemon() {
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        export $(dbus-launch)
-    fi
     export SCRIBE_NOTIFY_RECORD="${SCRIBE_NOTIFY_RECORD:-/output/notifications.jsonl}"
     export SCRIBE_NOTIFY_CONTROL="${SCRIBE_NOTIFY_CONTROL:-/tmp/scribe-notify.ctl}"
     python3 /tests/visual/notify-daemon.py \
@@ -165,9 +231,6 @@ start_notification_daemon() {
 # table-driven CJK method whose composition is deterministic, so a fixed key
 # sequence always produces the same candidate.
 start_input_method() {
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        export $(dbus-launch)
-    fi
     export XMODIFIERS='@im=ibus'
     export GTK_IM_MODULE=ibus
     export QT_IM_MODULE=ibus
@@ -235,6 +298,9 @@ chmod 700 "$UID_DIR"
 export SCRIBE_RUNTIME_DIR="$UID_DIR"
 
 prepare_xdg_dirs
+if [ "${SCRIBE_FILE_CHOOSER:-0}" = "1" ]; then
+    start_file_chooser_portal
+fi
 if [ "${SCRIBE_SEED_TRUST:-0}" = "1" ]; then
     seed_trust_stores
 fi

@@ -6251,6 +6251,8 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         msg @ (ClientMessage::Subscribe { .. }
         | ClientMessage::RequestSnapshot { .. }
         | ClientMessage::CreateWorkspace
+        | ClientMessage::CloseWorkspace { .. }
+        | ClientMessage::MoveSession { .. }
         | ClientMessage::ListSessions
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
@@ -6476,6 +6478,24 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
         }
         ClientMessage::CreateWorkspace => {
             handle_create_workspace(&context.server.workspace_manager, context.writer).await;
+        }
+        ClientMessage::MoveSession { session_id, target_workspace } => {
+            let moved = context
+                .server
+                .workspace_manager
+                .write()
+                .await
+                .move_session(session_id, target_workspace);
+            // The live-session record is what `SessionList` and handoff
+            // serialize, so it must follow the membership move.
+            if moved
+                && let Some(live) = context.server.live_sessions.write().await.get_mut(&session_id)
+            {
+                live.workspace_id = target_workspace;
+            }
+        }
+        ClientMessage::CloseWorkspace { workspace_id } => {
+            context.server.workspace_manager.write().await.close_workspace(workspace_id);
         }
         ClientMessage::ListSessions => {
             handle_list_sessions(
