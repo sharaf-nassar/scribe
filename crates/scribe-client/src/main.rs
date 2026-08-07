@@ -429,9 +429,11 @@ struct Shared {
 /// State shared across the IPC reader and GPUI view for a fresh window's first
 /// login shell.
 struct InitialSessionBootstrap {
-    /// Armed only when startup has no cold snapshot. The first authoritative
-    /// list consumes it even when non-empty, preventing later reconnects from
-    /// creating a surprise session after the original sessions disappear.
+    /// Armed only for a window that is meant to bring its own first shell: no
+    /// cold snapshot to replay, no window claimed from the server or shared with
+    /// another process. The first authoritative list consumes it even when
+    /// non-empty, preventing later reconnects from creating a surprise session
+    /// after the original sessions disappear.
     armed: AtomicBool,
     /// Launch metadata staged before `CreateSession` is enqueued. The view
     /// claims it once `SessionCreated` adds the new tab, preserving the launch
@@ -447,14 +449,6 @@ impl InitialSessionBootstrap {
     /// Consume the one-shot decision on the first list for a connection.
     fn claim(&self, first_on_connection: bool, session_count: usize) -> bool {
         first_on_connection && self.armed.swap(false, Ordering::AcqRel) && session_count == 0
-    }
-
-    /// Prevent a shared-window or remote-window claim from creating anything.
-    fn disarm(&self) {
-        self.armed.store(false, Ordering::Release);
-        if let Ok(mut binding) = self.binding.lock() {
-            *binding = None;
-        }
     }
 }
 
@@ -569,14 +563,27 @@ struct ColdStart {
     /// The geometry persisted for the claimed snapshot's window, normalized and
     /// range-checked.
     geometry: Option<WindowGeometry>,
+    /// Snapshots still unclaimed in the restore index after this process took
+    /// one. Fanned out as `--restore-child` processes only if the server turns
+    /// out to have lost its sessions — see
+    /// [`TerminalView::replay_cold_restart`]. A server that kept them restores
+    /// its own windows through `Welcome`'s `other_windows` instead, and fanning
+    /// out both would open every window twice.
+    siblings: usize,
 }
 
 impl ColdStart {
-    /// Claim one restore entry, fan out siblings for the rest, and load the
-    /// claimed window's geometry.
+    /// A window this process opens itself — a deliberate new window, or one the
+    /// server named in `other_windows`. Nothing to replay and no siblings to fan
+    /// out; only the geometry the named window was last seen at.
+    fn for_window(window_id: Option<WindowId>) -> Self {
+        Self { snapshot: None, geometry: window_id.and_then(saved_geometry_for), siblings: 0 }
+    }
+
+    /// Claim one restore entry and load the claimed window's geometry.
     fn resolve() -> Self {
         let Some((snapshot, remaining)) = RestoreStore::new().claim_first_window() else {
-            return Self { snapshot: None, geometry: None };
+            return Self::for_window(None);
         };
         tracing::info!(
             window_id = %snapshot.window_id,
@@ -587,26 +594,32 @@ impl ColdStart {
         // A fanned-out child claims exactly one entry and must never fan out
         // again: otherwise one crashed multi-window session would spawn windows
         // without bound.
-        if restore_replay::is_restore_child(std::env::args()) {
+        let siblings = if restore_replay::is_restore_child(std::env::args()) {
             tracing::info!("restore child — not fanning out further windows");
+            0
         } else {
-            restore_replay::spawn_restore_children(remaining);
-        }
+            remaining
+        };
         // Geometry is keyed by the PRE-CRASH window id. A true cold restart
         // reaches a fresh server that has not named this window yet, and by the
         // time `Welcome` does the window is already on screen.
-        let geometry = WindowRegistry::new()
-            .load_saved(snapshot.window_id)
-            .map(|geom| normalize_legacy_geometry(&geom))
-            .filter(geometry_size_is_sane)
-            // Drop the saved position only when the record names a monitor
-            // that is verifiably no longer connected. Unknown identities (the
-            // nil-UUID records legacy captures wrote) keep their position —
-            // dropping them stacked every restored window at the default
-            // placement on the first post-upgrade start.
-            .map(|geom| gate_position_on_monitor(&geom, &monitor::connected_monitor_names()));
-        Self { snapshot: Some(snapshot), geometry }
+        let geometry = saved_geometry_for(snapshot.window_id);
+        Self { snapshot: Some(snapshot), geometry, siblings }
     }
+}
+
+/// The persisted geometry for one window id, normalized and range-checked.
+fn saved_geometry_for(window_id: WindowId) -> Option<WindowGeometry> {
+    WindowRegistry::new()
+        .load_saved(window_id)
+        .map(|geom| normalize_legacy_geometry(&geom))
+        .filter(geometry_size_is_sane)
+        // Drop the saved position only when the record names a monitor that is
+        // verifiably no longer connected. Unknown identities (the nil-UUID
+        // records legacy captures wrote) keep their position — dropping them
+        // stacked every restored window at the default placement on the first
+        // post-upgrade start.
+        .map(|geom| gate_position_on_monitor(&geom, &monitor::connected_monitor_names()))
 }
 
 /// The per-window inputs resolved before GPUI builds the root view.
@@ -619,6 +632,8 @@ struct WindowSeed {
     /// The cold-restart snapshot this window is responsible for replaying, if
     /// this process claimed one.
     restored: Option<WindowRestoreState>,
+    /// Snapshots left for `--restore-child` siblings; see [`ColdStart::siblings`].
+    restore_siblings: usize,
 }
 
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
@@ -687,15 +702,20 @@ struct RestoreRuntime {
     /// True from the moment a replay dispatches its launches until every
     /// restored pane has adopted one of the answers.
     replaying: bool,
+    /// Snapshots still to be fanned out as `--restore-child` processes, spawned
+    /// once — and only if — this window's own replay confirms the server is
+    /// cold. Zeroed on the way out so a redial cannot spawn them twice.
+    siblings: usize,
 }
 
 impl RestoreRuntime {
-    fn new(pending: Option<WindowRestoreState>) -> Self {
+    fn new(pending: Option<WindowRestoreState>, siblings: usize) -> Self {
         Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
             claimed_window: pending.as_ref().map(|snapshot| snapshot.window_id),
             pending,
+            siblings,
             bindings: HashMap::new(),
             requested: VecDeque::new(),
             window_id: None,
@@ -1214,7 +1234,7 @@ impl TerminalView {
             _lifecycle_task: drivers.0,
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
-            restore: RestoreRuntime::new(seed.restored),
+            restore: RestoreRuntime::new(seed.restored, seed.restore_siblings),
             _bounds_observer: bounds_observer,
         }
     }
@@ -3311,11 +3331,15 @@ impl TerminalView {
             match reason {
                 ExitReason::QuitRequested => {
                     tracing::info!("quit requested by server — exiting");
-                    // A quit is deliberate, so the panes must not come back —
-                    // but the window's size and place should, which is why the
-                    // geometry is flushed here and only the snapshot cleared.
+                    // A quit ends the CLIENT, not the sessions: every pane in
+                    // this window is still running on the server and comes back
+                    // on the next launch. So the snapshot is flushed, not
+                    // dropped — it is this window's layout, its geometry, and
+                    // the id the next launch claims the window back by. Dropping
+                    // it is what left a restart with no record of the windows it
+                    // had, able to reclaim only the one the server volunteered.
                     self.flush_geometry_now();
-                    self.clear_restore_state(false);
+                    self.flush_snapshot_now(cx);
                 }
                 ExitReason::WindowClosed => {
                     tracing::info!("window close acknowledged by server — exiting");
@@ -3330,11 +3354,39 @@ impl TerminalView {
             return;
         }
         self.report_focus();
+        self.poll_sibling_windows(cx);
         self.poll_window_list();
         self.poll_lan_approval(cx);
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
         self.poll_restore(cx);
+    }
+
+    /// Reopen the windows `Welcome` reported the server still holds sessions
+    /// for.
+    ///
+    /// The reader parked them because opening a window is foreground work. Only
+    /// the bootstrap connection ever parks any (see
+    /// [`ReaderCtx::fan_out_other_windows`]), so a window opened from here never
+    /// fans out again and the count can never compound.
+    fn poll_sibling_windows(&mut self, cx: &mut Context<Self>) {
+        let siblings = self
+            .shared
+            .lifecycle
+            .lock()
+            .map(|mut lifecycle| lifecycle.take_sibling_windows())
+            .unwrap_or_default();
+        if siblings.is_empty() {
+            return;
+        }
+        // The server named windows it still holds sessions for, so this is not a
+        // cold restart. The snapshots those windows also have on disk describe
+        // the same windows, and fanning them out as `--restore-child` processes
+        // would open every one of them twice.
+        self.restore.siblings = 0;
+        for window_id in siblings {
+            self.open_restored_window(window_id, cx);
+        }
     }
 
     /// Advance an active AI pulse on the foreground redraw clock.
@@ -3456,6 +3508,18 @@ impl TerminalView {
                 "server kept this window's sessions — skipping the cold-restart replay"
             );
             self.restore.pending = None;
+            // The snapshot was never consumed, so this window's flush must not
+            // retire it: on the normal path the id it names is the id this
+            // window was just given and the flush supersedes it, but a claim the
+            // server refused (that window is live under another process) names
+            // somebody else's layout, and deleting it is how a layout gets lost.
+            self.restore.claimed_window = None;
+            // The remaining snapshots describe windows this server also kept,
+            // and `Welcome`'s `other_windows` is already reopening them from
+            // live state. Spawning restore children on top would open each of
+            // those windows a second time, replaying stale panes beside the
+            // real ones.
+            self.restore.siblings = 0;
             self.restore.mark_layout_dirty();
             return;
         }
@@ -3487,6 +3551,11 @@ impl TerminalView {
         for launch in &launches {
             self.dispatch_replay_launch(launch, bindings.get(&launch.pane_id), &sizes);
         }
+        // Only now is the server known to have lost its sessions, which is the
+        // one case the remaining snapshots are the truth about the user's other
+        // windows. A server that kept them hands them back through `Welcome`
+        // instead, and fanning out here as well would double every window.
+        restore_replay::spawn_restore_children(std::mem::take(&mut self.restore.siblings));
         self.report_workspace_tree(cx);
         self.restore.mark_layout_dirty();
         cx.notify();
@@ -3596,14 +3665,12 @@ impl TerminalView {
         self.restore.store.remove_window(window_id);
     }
 
-    /// Clear the persisted restore state on a deliberate exit.
+    /// Clear the persisted restore state when this window is destroyed.
     ///
-    /// An explicit quit or window close is the user saying these panes should
-    /// not come back, so the snapshot goes; only a crash (this process dying
-    /// without reaching here) leaves one behind to replay. `drop_geometry` is
-    /// set for a permanent window close, where the window itself is gone and its
-    /// size is no longer meaningful — a quit keeps it so the next launch reopens
-    /// where the user left off.
+    /// Only a `CloseWindow` reaches here: the user asked for this window and its
+    /// sessions to be gone, so nothing about it should survive — including its
+    /// size, hence `drop_geometry`. A quit is the opposite (the sessions live
+    /// on) and flushes instead, and a crash leaves whatever was last flushed.
     fn clear_restore_state(&mut self, drop_geometry: bool) {
         self.restore.cleared = true;
         self.restore.layout_dirty_since = None;
@@ -3859,7 +3926,16 @@ impl TerminalView {
         }
         // A pane owns only its slice of the window, so the size announced here
         // is the one the layout published for this session, not the window's.
-        let size = self.pane_sizes.get(&session_id).copied().unwrap_or(self.terminal_size);
+        //
+        // An unshown tab has no placement, so `publish_pane_sizes` has already
+        // dropped its entry — that is the common case on every tab switch, not
+        // a rare one. The fallback therefore has to be the live size of the
+        // pane the tab is about to be adopted into, never `terminal_size`:
+        // that is the `WindowSeed` startup default (`COLUMNS`x`ROWS`), fixed
+        // for the window's whole life, so announcing it resized the PTY to 120
+        // columns and the switched-to tab painted its replay wrapped at 120
+        // before the layout's own publish corrected it one round trip later.
+        let size = self.pane_sizes.get(&session_id).copied().unwrap_or(self.focused_pane_size);
         let result = self
             .sink
             .attach_sessions(vec![session_id], vec![size])
@@ -3914,19 +3990,42 @@ impl TerminalView {
     /// [`start_window_backend`], so it is a genuinely separate client: the
     /// server registers a fresh window for it and its tab strip, status line,
     /// and grid are independent of this one's.
+    ///
+    /// The id is minted here rather than left to the server. An unnamed `Hello`
+    /// is the *restart* claim — the server answers it with one of the windows
+    /// whose sessions outlived their client — so a new window that sent one
+    /// would open showing a window the user had before, and the real one would
+    /// stay unopenable. A fresh UUID is by construction not a window the server
+    /// knows, so it is assigned verbatim and the window is genuinely empty.
     fn open_new_window(&mut self, cx: &mut Context<Self>) {
         let terminal_size = self.terminal_size;
-        let (shared, sink) = start_window_backend(terminal_size, true);
-        // A deliberately opened window starts fresh rather than claiming a
-        // restore entry, then its backend creates its own first login shell.
-        open_window(
-            cx,
-            &shared,
-            &sink,
+        let window_id = WindowId::new();
+        let (shared, sink) = start_window_backend(
             terminal_size,
-            ColdStart { snapshot: None, geometry: None },
+            WindowBackend { claim: Some(window_id), initial_session: true, fan_out: false },
         );
-        tracing::info!("opened a new terminal window");
+        // A deliberately opened window replays no snapshot and inherits no
+        // geometry, then its backend creates its own first login shell.
+        open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(None));
+        tracing::info!(%window_id, "opened a new terminal window");
+    }
+
+    /// Reopen a window the server still holds sessions for.
+    ///
+    /// Named in this window's `Welcome` as one of `other_windows`: the user had
+    /// it open when the client last exited, the server kept its sessions, and
+    /// only one window can be handed back per connection. It claims that exact
+    /// id — so it adopts *its own* sessions rather than racing the other
+    /// restored windows for them — creates no first shell, and opens at the
+    /// geometry that window was last seen at.
+    fn open_restored_window(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        let terminal_size = self.terminal_size;
+        let (shared, sink) = start_window_backend(
+            terminal_size,
+            WindowBackend { claim: Some(window_id), initial_session: false, fan_out: false },
+        );
+        open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(Some(window_id)));
+        tracing::info!(%window_id, "reopened a window the server kept sessions for");
     }
 
     /// The grid area every pane rect is resolved against, in real pixels.
@@ -7340,22 +7439,38 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
     size(px(wanted.width), px(wanted.height))
 }
 
+/// Which window a backend is being started for.
+///
+/// The three answers travel together because they are one decision: a window
+/// that names an existing window inherits its sessions and must not add a shell,
+/// and only the process bootstrap — the one window that stands for the whole
+/// client — speaks for the windows it did not open.
+#[derive(Clone, Copy)]
+struct WindowBackend {
+    /// The window this connection's `Hello` claims: the resumed window's id for
+    /// the bootstrap, a freshly minted one for a deliberate new window, the id
+    /// the server named in `other_windows` for a restored sibling, or
+    /// `SCRIBE_JOIN_WINDOW`'s for a share join. `None` asks the server to hand
+    /// back any window whose sessions outlived their client.
+    claim: Option<WindowId>,
+    /// Whether this window brings its own first login shell.
+    initial_session: bool,
+    /// Whether this connection may reopen the other windows `Welcome` reports.
+    fan_out: bool,
+}
+
 /// Build one terminal window's backend: fresh shared state plus its own IPC
 /// connection to the server, with the reader/writer thread already running.
 ///
 /// Every window owns an independent [`Shared`] — its own grid, status line, tab
 /// strip, and chrome — because a window is a separate client from the server's
-/// point of view: the `Hello` this connection sends carries no `window_id`, so
-/// the server registers a *new* window and attaches its own sessions to it.
-/// Sharing one `Shared` between windows would instead mirror a single session
-/// strip into both, which is not what "new window" means.
+/// point of view. Sharing one `Shared` between windows would instead mirror a
+/// single session strip into both, which is not what "new window" means.
 ///
-/// Called once from [`main`] for the startup window and again for every
-/// [`LayoutAction::NewWindow`], so the two paths cannot drift.
-fn start_window_backend(
-    terminal_size: TerminalSize,
-    bootstrap_initial_session: bool,
-) -> (Shared, IpcSink) {
+/// Called once from [`main`] for the startup window and again for every window
+/// this process opens afterwards, so the paths cannot drift.
+fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
+    let WindowBackend { claim, initial_session, fan_out } = window;
     let shared = Shared {
         panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
         attached: Arc::new(Mutex::new(HashSet::new())),
@@ -7366,7 +7481,7 @@ fn start_window_backend(
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
-        initial_session: Arc::new(InitialSessionBootstrap::new(bootstrap_initial_session)),
+        initial_session: Arc::new(InitialSessionBootstrap::new(initial_session)),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
@@ -7396,6 +7511,8 @@ fn start_window_backend(
         out_rx,
         in_tx,
         in_rx: Some(in_rx),
+        claim,
+        fan_out,
     });
 
     (shared, sink)
@@ -7434,13 +7551,36 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    // Claimed before the backend connects: the claim decides how many
-    // `--restore-child` siblings this process fans out, and its geometry is what
-    // the window is opened at.
+    // Claimed before the backend connects: the claimed snapshot's geometry is
+    // what the window is opened at, and it is only findable under that
+    // snapshot's own (pre-crash) window id.
     let cold_start = ColdStart::resolve();
     let terminal_size = default_terminal_size();
-    let bootstrap_initial_session = cold_start.snapshot.is_none();
-    let (shared, sink) = start_window_backend(terminal_size, bootstrap_initial_session);
+    // `SCRIBE_JOIN_WINDOW` (unset for a user-launched client) names a window
+    // another local process already holds: the server resolves that non-takeover
+    // claim as an additive share join under any non-`single_controller` sharing
+    // mode, so this client renders and types into the SAME panes instead of
+    // opening an empty window of its own — and must not create a shell there.
+    let join_window = scribe_client::share_join::join_window_from_env();
+    let bootstrap_initial_session = cold_start.snapshot.is_none() && join_window.is_none();
+    // The claimed snapshot names the window this process is resuming. Claiming
+    // it back is what makes the resume line up: a server that kept the window
+    // hands back *its* sessions rather than whichever window it happened to
+    // offer, and a server that lost them assigns the id verbatim, so the replay
+    // and the geometry this window is opening at belong to the same window. With
+    // nothing claimed there is no id to name, and the unnamed `Hello` asks the
+    // server for any window whose sessions outlived their client.
+    let (shared, sink) = start_window_backend(
+        terminal_size,
+        WindowBackend {
+            claim: join_window.or_else(|| cold_start.snapshot.as_ref().map(|snap| snap.window_id)),
+            initial_session: bootstrap_initial_session,
+            // The bootstrap reopens the server's other windows; a
+            // `--restore-child` is already the other half of the client-side
+            // cold-restart fan-out.
+            fan_out: !restore_replay::is_restore_child(std::env::args()),
+        },
+    );
 
     application().run(move |cx: &mut App| {
         // Picker probes use Tokio networking while all view mutations return
@@ -7578,6 +7718,7 @@ fn open_window(
         );
     }
     let restored = cold_start.snapshot;
+    let restore_siblings = cold_start.siblings;
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -7607,7 +7748,13 @@ fn open_window(
             let bringup_ms = bringup_start.elapsed().as_secs_f64() * 1000.0;
             WINDOW_BRINGUP_MS_BITS.store(bringup_ms.to_bits(), Ordering::Release);
             cx.new(|cx| {
-                TerminalView::new(shared, sink, WindowSeed { terminal_size, restored }, window, cx)
+                TerminalView::new(
+                    shared,
+                    sink,
+                    WindowSeed { terminal_size, restored, restore_siblings },
+                    window,
+                    cx,
+                )
             })
         },
     ) {
@@ -7627,6 +7774,29 @@ struct IpcThread {
     out_rx: OutboundReceiver,
     in_tx: InboundSender,
     in_rx: Option<InboundReceiver>,
+    /// The window this backend was told to claim before it ever handshook: the
+    /// resumed window's id for the bootstrap, a freshly minted one for a
+    /// deliberate new window, the id the server named in `other_windows` for a
+    /// restored sibling, or `SCRIBE_JOIN_WINDOW`'s for a share join. `None` asks
+    /// the server to hand back any window whose sessions outlived their client.
+    claim: Option<WindowId>,
+    /// Whether this connection may act on `Welcome`'s `other_windows`. Set for
+    /// the process bootstrap and consumed by its first handshake: a redial sees
+    /// the same list while those windows' own processes are reconnecting too,
+    /// and reopening one would race its real client for the claim.
+    fan_out: bool,
+}
+
+impl IpcThread {
+    /// The window this connection's `Hello` claims.
+    ///
+    /// Once `Welcome` has named this window the id is binding: every redial
+    /// claims it back, so a hot upgrade — which drops every stream and lets all
+    /// windows redial at once — cannot shuffle two windows' session sets
+    /// through the server's "adopt any unconnected window" path.
+    fn window_claim(&self) -> Option<WindowId> {
+        self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id()).or(self.claim)
+    }
 }
 
 fn start_ipc_thread(ctx: IpcThread) {
@@ -7997,23 +8167,22 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     // Handshake is queued ahead of any sink traffic on the same ordered channel.
-    // `SCRIBE_JOIN_WINDOW` (unset for a user-launched client) names a window
-    // another local process already holds: the server resolves that non-takeover
-    // claim as an additive share join under any non-`single_controller` sharing
-    // mode, so this client renders and types into the SAME panes instead of
-    // opening an empty window of its own. A tailnet dial instead carries the
-    // claim the connect picker made, including the explicit-attach takeover that
-    // may displace a connected controller.
+    // A local or LAN connection claims the window this backend was started for
+    // (see [`IpcThread::window_claim`]) — `SCRIBE_JOIN_WINDOW`'s share join, a
+    // deliberate new window's freshly minted id, a restored sibling's id, or the
+    // id a previous `Welcome` already assigned this connection. A tailnet dial
+    // instead carries the claim the connect picker made, including the
+    // explicit-attach takeover that may displace a connected controller.
     let (claim_window, takeover) = match &transport {
-        Transport::Local(_) | Transport::Lan => {
-            (scribe_client::share_join::join_window_from_env(), false)
-        }
+        Transport::Local(_) | Transport::Lan => (ctx.window_claim(), false),
         Transport::Remote { window_id, takeover } => (*window_id, *takeover),
     };
     if let Some(window_id) = claim_window {
-        ctx.shared.initial_session.disarm();
         tracing::info!(%window_id, takeover, "claiming an existing window");
     }
+    // One-shot: the bootstrap's first handshake reopens the server's other
+    // windows, and no later handshake on this or any other connection does.
+    let fan_out_other_windows = std::mem::take(&mut ctx.fan_out);
     // Write the connection handshake directly before draining the shared
     // outbound queue. A reconnect may have queued UI work while no stream was
     // alive; allowing that work ahead of `Hello` would violate the protocol.
@@ -8051,7 +8220,7 @@ where
     // asked for, so the redial sends it rather than pruning it.
     let _ = ctx.out_rx.take_tear_request();
 
-    let reader_ctx = reader_ctx(ctx);
+    let reader_ctx = reader_ctx(ctx, fan_out_other_windows);
     if let Transport::Local(probes) = transport {
         adopt_lan_surface(&reader_ctx, probes.lan_env);
         adopt_remote_surface(&reader_ctx, probes.remote_env);
@@ -8066,8 +8235,9 @@ where
 ///
 /// The supervisor keeps the channels themselves so a writer that stops during
 /// an upgrade can resume draining the same ordered queue after the redial.
-fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
+fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
     ReaderCtx {
+        fan_out_other_windows,
         panes: Arc::clone(&ctx.shared.panes),
         attached: Arc::clone(&ctx.shared.attached),
         status: Arc::clone(&ctx.shared.status),
@@ -8542,6 +8712,9 @@ fn live_panes(panes: &Arc<Mutex<PaneGrids>>) -> Vec<Arc<PaneGrid>> {
 
 /// Handles owned by the inbound read loop.
 struct ReaderCtx {
+    /// Whether this connection may act on `Welcome`'s `other_windows` — true
+    /// only for the process bootstrap's first, window-less claim.
+    fan_out_other_windows: bool,
     /// Per-session display grids, so an exited session's grid can be dropped.
     panes: Arc<Mutex<PaneGrids>>,
     /// Sessions the client has attached; the pane-output gate reads it.
@@ -9134,9 +9307,7 @@ async fn dispatch_server_message(
     first_session_list: bool,
 ) -> Result<(), String> {
     match message {
-        ServerMessage::Welcome { window_id, participant_id, clipboard_gating, .. } => {
-            on_welcome(ctx, registry, window_id, participant_id, clipboard_gating);
-        }
+        welcome @ ServerMessage::Welcome { .. } => on_welcome(ctx, registry, welcome),
         ServerMessage::SessionList { sessions, workspaces, workspace_tree } => {
             park_server_topology(ctx, &sessions, workspace_tree, first_session_list);
             on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
@@ -10012,15 +10183,31 @@ fn remote_handshake_outcome(
 /// out of the reader's registry. The additive v3 `participant_id` names this
 /// connection's own share seat so a later roster matches it exactly rather than
 /// by device name.
+///
+/// `other_windows` is the rest of the user's windows: the server kept their
+/// sessions when the client exited and handed this connection only one of them,
+/// so the remainder have to be reopened or they simply do not come back. They
+/// are parked for the foreground, which owns window creation.
 fn on_welcome(
     ctx: &ReaderCtx,
     registry: &mut session_lifecycle::SessionRegistry,
-    window_id: scribe_common::ids::WindowId,
-    participant_id: Option<u64>,
-    clipboard_gating: bool,
+    welcome: ServerMessage,
 ) {
+    let ServerMessage::Welcome {
+        window_id, other_windows, participant_id, clipboard_gating, ..
+    } = welcome
+    else {
+        return;
+    };
     registry.adopt_window(window_id);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
+    if ctx.fan_out_other_windows && !other_windows.is_empty() {
+        tracing::info!(
+            count = other_windows.len(),
+            "welcome: reopening the server's other windows"
+        );
+        update_lifecycle(ctx, |lifecycle| lifecycle.park_sibling_windows(other_windows));
+    }
     update_share_chrome(ctx, |share| share.set_self_id(participant_id));
     // Spec 010 C7: the server echoes back whether it will route OSC 52 through
     // this client. Recording it here is what lets the clipboard arms below
@@ -10459,12 +10646,17 @@ mod tests {
 
     #[test]
     fn disabled_or_claimed_window_never_bootstraps_a_session() {
+        // A cold restore replays its own panes, and a window claimed from the
+        // server (a share join, a restored sibling) already has its sessions —
+        // both are constructed disarmed, and nothing can re-arm them.
         let cold_restore = InitialSessionBootstrap::new(false);
         assert!(!cold_restore.claim(true, 0));
+        assert!(!cold_restore.claim(true, 0));
 
-        let claimed_window = InitialSessionBootstrap::new(true);
-        claimed_window.disarm();
-        assert!(!claimed_window.claim(true, 0));
+        // A deliberate new window brings exactly one shell, once.
+        let fresh = InitialSessionBootstrap::new(true);
+        assert!(fresh.claim(true, 0));
+        assert!(!fresh.claim(true, 0));
     }
 
     /// A snapshot whose rows each carry their own index, so a row that landed

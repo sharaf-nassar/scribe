@@ -307,9 +307,22 @@ rows run 46px (62px with a description) against a stable 300px value column:
 choices are 240×30 with an anchored 30px-row menu, steppers 152×30 with 36px
 actions, switches 38×22 fully rounded with an amber on-fill, text inputs and
 color editors 30px tall on the engraved inset, and actions 30px neutral
-outline buttons. Read-only, keybinding, and gated values render as plain
-right-aligned dim monospace — the missing control outline is the read-only
-mark, and AccessKit still says `Read-only value` explicitly.
+outline buttons. Keybinding and gated values render as plain right-aligned
+dim monospace — the missing control outline is the read-only mark, and
+AccessKit still says `Read-only value` explicitly.
+
+The content pane's page-length affordance is the terminal's own overlay
+scrollbar rather than a second one: [[crates/scribe-client/src/settings/window.rs#SettingsWindow#tick_content_scrollbar]]
+drives [[crates/scribe-client/src/scrollbar.rs#ScrollbarState]] on the render
+pass, so the same 6px thumb fades in on scroll and out after 1.5s of idle. It
+also shows once on open and on every page switch, which is when page length
+is the thing the reader needs told. The thumb is a quiet 24% white wash, not
+amber — length is structure, not live state — and it is painted absolutely
+over the scroller, reserving no column. Under `reduce_motion` it simply stays
+put on an overflowing page instead of animating. Pixels are the scroll unit
+the pure geometry counts in, converted through
+[[crates/scribe-client/src/scrollbar.rs#round_scroll_units]] because the
+workspace denies lossy float-to-int casts.
 
 At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 
@@ -329,13 +342,40 @@ The eleven settings pages are described in : each owns an ordered control list k
 
 The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
- renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Shared colour controls edit inline, general free-text controls remain read-only, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
+ renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Shared colour controls and general free-text controls both edit inline through the one editor below, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
 
 The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, or action; Left/Right adjust toggles, choices, and steppers. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
 The root takes focus when the window opens, so Ctrl+K and traversal work before any click. Escape clears transient menus or an active search from every focus stop; titlebar window controls claim Enter/Space only, letting settings-wide keys continue to the root.
 
 Action controls route through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#run_action]], which is the single live entry point into [[crates/scribe-client/src/settings/server_action.rs]] — the update check, the release list, the keystore preflight, and the whole LAN trust surface below.
+
+### Inline editing
+
+Colour rows and general free-text rows share one inline editor, so there is a
+single field, a single native-input target, and a single commit path rather
+than one editor per control kind.
+
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#begin_inline_edit]]
+opens it on the focused control — click or Enter/Space from keyboard traversal
+— seeding the field from the saved value and retaining the whole
+[[crates/scribe-client/src/settings/model.rs#Control]], because the commit
+needs its kind. Enter commits through
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#save_inline_edit]],
+which routes the typed text into the same `{key, value}` apply path every
+other control uses; there is no parallel persistence route. Escape cancels.
+Free-text rows are therefore focusable and tab-stop, where they previously
+rendered read-only.
+
+#### Commit routes by control kind
+
+[[crates/scribe-client/src/settings/window.rs#inline_commit_value]] canonicalizes a colour through the apply path's own hex/ansi validator, so a rejected colour never reaches the config writer, and commits general free text verbatim.
+
+The apply path stays the single authority on what each key accepts, so no second validator exists here.
+
+#### Escape cancels the edit
+
+[[crates/scribe-client/src/settings/window.rs#revert_inline_input]] restores the value the edit opened with and clears the rejection ink with it, so an abandoned edit leaves nothing of itself on screen and the config is never touched.
 
 ### Environment preflight
 

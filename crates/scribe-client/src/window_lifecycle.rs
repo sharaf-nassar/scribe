@@ -82,6 +82,7 @@ pub struct WindowLifecycle {
     controllers: Vec<ControllerInfo>,
     window_active: bool,
     focus: Option<SessionId>,
+    siblings: Vec<WindowId>,
 }
 
 impl Default for WindowLifecycle {
@@ -96,6 +97,7 @@ impl Default for WindowLifecycle {
             controllers: Vec::new(),
             window_active: true,
             focus: None,
+            siblings: Vec::new(),
         }
     }
 }
@@ -119,6 +121,28 @@ impl WindowLifecycle {
     #[must_use]
     pub const fn window_id(&self) -> Option<WindowId> {
         self.window_id
+    }
+
+    /// Park the other windows `Welcome` reported as still having sessions but no
+    /// client.
+    ///
+    /// These are the user's other windows from before the client exited: the
+    /// server keeps a window's sessions when the client goes away, so a restart
+    /// adopts one of them and is handed the rest to reopen. Parked rather than
+    /// acted on because the reader thread cannot open a window; the foreground
+    /// drains this with [`Self::take_sibling_windows`]. Ids already parked are
+    /// not re-added, so a repeated report cannot queue a window twice.
+    pub fn park_sibling_windows(&mut self, windows: Vec<WindowId>) {
+        for window_id in windows {
+            if !self.siblings.contains(&window_id) {
+                self.siblings.push(window_id);
+            }
+        }
+    }
+
+    /// Take the parked sibling windows, leaving none behind.
+    pub fn take_sibling_windows(&mut self) -> Vec<WindowId> {
+        std::mem::take(&mut self.siblings)
     }
 
     /// The shutdown currently awaiting a server acknowledgement.
@@ -377,5 +401,22 @@ mod tests {
         assert!(!lifecycle.set_windows(vec![window(Some("laptop")), window(None)]));
         assert!(lifecycle.set_windows(vec![window(None)]));
         assert!(lifecycle.controllers().is_empty());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Window Lifecycle#Sibling windows are parked once and drained once]]
+    #[test]
+    fn sibling_windows_are_parked_once_and_drained_once() {
+        let mut lifecycle = WindowLifecycle::new();
+        assert!(lifecycle.take_sibling_windows().is_empty());
+
+        let (first, second) = (WindowId::new(), WindowId::new());
+        lifecycle.park_sibling_windows(vec![first, second]);
+        // A redial re-reports the windows still waiting for a client; the ones
+        // already queued must not be queued a second time.
+        lifecycle.park_sibling_windows(vec![second]);
+        assert_eq!(lifecycle.take_sibling_windows(), vec![first, second]);
+
+        // Draining empties the queue, so a later tick cannot reopen them.
+        assert!(lifecycle.take_sibling_windows().is_empty());
     }
 }

@@ -161,13 +161,22 @@ fail() {
 
 # ── Phase 0: hand the client a live pane to act in ────────────────
 sleep 1.0
-kill "$SCRIBE_CLIENT_PID" 2>/dev/null || true
-for _ in $(seq 1 40); do
+# CLOSED, not killed. A killed client leaves its own login shell running in a
+# window the server keeps, and the relaunch below reopens every window the
+# server still holds sessions for — so a kill here would leave two windows and
+# break the count this phase establishes. "Kill Window" (ctrl+shift+d, then Tab
+# twice off the safe Cancel default) destroys it on the server instead.
+focus
+send_keys ctrl+shift+d
+send_keys Tab
+send_keys Tab
+send_keys Return
+for _ in $(seq 1 80); do
     pgrep -f 'scribe-client' >/dev/null 2>&1 || break
     sleep 0.25
 done
 if pgrep -f 'scribe-client' >/dev/null 2>&1; then
-    fail "PHASE 0 FAIL: the original client did not exit"
+    fail "PHASE 0 FAIL: the original client did not close"
 fi
 scribe-test daemon stop >/dev/null 2>&1 || true
 sleep 1.0

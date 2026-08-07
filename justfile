@@ -297,6 +297,13 @@ e2e-visual-window-lifecycle:
 e2e-visual-cold-restart:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/cold-restart.sh
 
+# Run the warm multi-window restore E2E against the real client. No wire tap:
+# it quits and relaunches the client several times, which the tap's renamed
+# socket does not survive. It opens a second window, quits, relaunches, and
+# opens a third, so it needs a longer budget.
+e2e-visual-multi-window-restore:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/multi-window-restore.sh
+
 # Run the find-overlay E2E. It needs the shared pane (so the harness can put
 # the searched text on the real PTY the client renders) AND the wire tap (so
 # SearchRequest leaving the client and SearchResults coming back can both be

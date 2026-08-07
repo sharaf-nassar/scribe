@@ -155,8 +155,18 @@ geometry_field() {
 # daemon's ownership and relaunching gets the client a pane over the ordinary
 # `ListSessions` path.
 sleep 1.0
-kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
-wait_for_client_exit 15 || fail "PHASE 0: the original client did not exit"
+# The entrypoint's client is CLOSED, not killed. A killed client leaves its own
+# login shell running in a window the server keeps, and the relaunch below now
+# reopens every such window — two windows and two snapshots, so every assertion
+# here would be ambiguous about which one it means. "Kill Window" (ctrl+shift+d,
+# then Tab twice off the safe Cancel default onto the second button) destroys it
+# on the server, leaving only the daemon's released session to adopt.
+focus
+send_keys ctrl+shift+d
+send_keys Tab
+send_keys Tab
+send_keys Return
+wait_for_client_exit 20 || fail "PHASE 0: the original client did not close"
 scribe-test daemon stop >/dev/null 2>&1 || true
 sleep 1.0
 launch_client

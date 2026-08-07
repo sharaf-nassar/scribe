@@ -156,7 +156,12 @@ fn scroll_units_f32(units: usize) -> f32 {
 
 /// Round an `f32` scroll target back to the nearest integer scroll-unit count,
 /// clamped to `max_units`, using a binary search over the lossless conversion.
-fn round_scroll_units(value: f32, max_units: usize) -> usize {
+///
+/// Public because a pixel scroller (the settings content pane) reuses this
+/// geometry with pixels as its scroll unit, and the workspace denies the lossy
+/// float-to-int casts that would otherwise do the conversion.
+#[must_use]
+pub fn round_scroll_units(value: f32, max_units: usize) -> usize {
     if max_units == 0 || !value.is_finite() || value <= 0.0 {
         return 0;
     }

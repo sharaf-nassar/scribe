@@ -50,6 +50,11 @@ TITLEBAR_Y=$(( TITLEBAR_HEIGHT / 2 ))
 FIRST_TAB_X=$(( TAB_WIDTH / 2 ))
 SECOND_TAB_X=$(( TAB_WIDTH + TAB_WIDTH / 2 ))
 
+# `COLUMNS` in crates/scribe-client/src/main.rs — the fixed `WindowSeed`
+# startup grid. Named here only so phase 3 can refuse to run its size
+# assertion on a rig where the real pane happens to measure the same width.
+SEED_COLUMNS=120
+
 TERM_X=0
 TERM_Y=0
 
@@ -142,6 +147,59 @@ with handle:
             total += 1
 print(total)
 PY
+}
+
+# Columns announced by the most recent client `AttachSessions` naming a
+# session. The frame carries per-session `dimensions` parallel to
+# `session_ids`, so this is literally the grid the client asked the server to
+# give that tab's PTY — the size its replay is then rendered at.
+attach_cols_for() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+cols = ""
+try:
+    handle = open(path)
+except OSError:
+    print(cols)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != "client":
+            continue
+        message = row.get("message", {})
+        if message.get("type") != "AttachSessions":
+            continue
+        ids = message.get("session_ids", [])
+        dimensions = message.get("dimensions", [])
+        if session_id in ids:
+            index = ids.index(session_id)
+            if index < len(dimensions):
+                cols = dimensions[index].get("cols", "")
+print(cols)
+PY
+}
+
+# Columns the client's own layout pass last published for a pane. This is the
+# measured truth the announced size is checked against: `publish_pane_sizes`
+# logs it after dividing the painted pane rect by the live cell box.
+#
+# The client logs with ANSI colour, so the field reads `cols<ESC>[0m<ESC>[2m=`
+# rather than a literal `cols=` — the escapes are stripped first. The capture
+# is also kept off `set -o pipefail`'s path: a no-match here must surface as an
+# empty string the caller reports, never as a silent mid-phase exit.
+published_cols() {
+    local line
+    line=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" 2>/dev/null \
+        | grep -a "published a pane's grid size" \
+        | tail -1) || true
+    printf '%s' "$line" | sed -n 's/.*cols=\([0-9][0-9]*\).*/\1/p'
 }
 
 wait_for_count_growth() {
@@ -311,7 +369,29 @@ if ! wait_for_attach_to "$NEW_SESSION" "$ATTACH_NEW_BEFORE" 15; then
     fail "phase 3: ctrl+Next never switched forward to $NEW_SESSION"
 fi
 shot /output/03-tab-switching-key-next.png
-echo "PHASE 3 PASS: ctrl+Next attached $NEW_SESSION"
+# Both tabs share this rig's single pane, so each switch must announce that
+# pane's own grid. An unshown tab has no placement, so `publish_pane_sizes`
+# has already dropped its `pane_sizes` entry; falling back to the window's
+# fixed `WindowSeed` default resized the PTY to COLUMNS (120) and the
+# switched-to tab painted its replay wrapped at 120 before the layout's own
+# publish corrected it one round trip later — a visible reflow on every
+# single tab switch.
+NEW_COLS=$(attach_cols_for "$NEW_SESSION")
+PANE_COLS=$(published_cols)
+if [ -z "$NEW_COLS" ] || [ -z "$PANE_COLS" ]; then
+    fail "phase 3: no size to compare (announced=${NEW_COLS:-none}, published=${PANE_COLS:-none})"
+fi
+# Guard the oracle itself. The defect announced exactly SEED_COLUMNS, so a rig
+# whose pane happens to measure that width cannot tell a fixed client from a
+# broken one. Fail loudly instead of passing vacuously: change the window
+# geometry rather than deleting this check.
+if [ "$PANE_COLS" = "$SEED_COLUMNS" ]; then
+    fail "phase 3: this rig's pane is $PANE_COLS columns, the same as the COLUMNS seed — the assertion below cannot discriminate; widen or narrow the container window"
+fi
+if [ "$NEW_COLS" != "$PANE_COLS" ]; then
+    fail "phase 3: the switch announced $NEW_COLS columns for $NEW_SESSION but the layout published $PANE_COLS for its pane"
+fi
+echo "PHASE 3 PASS: ctrl+Next attached $NEW_SESSION at the pane's own $NEW_COLS columns"
 
 # ── Phase 4: clicking the first titlebar tab switches back ────────
 ATTACH_ORIGINAL_CLICK_BEFORE=$(count_attach_to "$SESSION")
