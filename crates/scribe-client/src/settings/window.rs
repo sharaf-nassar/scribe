@@ -8,10 +8,17 @@
 //! immediately, mirroring the old webview's live-apply behaviour; the file
 //! watcher in the running client picks the change up as a `ConfigReloaded`.
 //!
-//! Color controls edit inline with validation and a live swatch; general
-//! free-text controls render read-only — inline text entry is a tracked
-//! follow-on — while keybinding rows list every action's current combos so
-//! the full shortcut inventory stays visible.
+//! Color and general free-text controls share one inline editor: click or
+//! keyboard-activate a row to open it, Enter commits through the same apply
+//! path every other control uses, Escape restores the value the edit opened
+//! with. Only colors validate (and carry the live swatch). Keybinding rows
+//! stay read-only, listing every action's current combos so the full shortcut
+//! inventory remains visible.
+//!
+//! The content pane carries the terminal's own overlay scrollbar
+//! ([`crate::scrollbar`]) as its page-length affordance: the same thumb
+//! geometry and the same fade-in-on-scroll, fade-out-after-idle state, driven
+//! from [`SettingsWindow::tick_content_scrollbar`] on the render pass.
 //!
 //! Two pages additionally talk to the local server through
 //! [`crate::settings::server_action`]: `Environment` gates its env-persistence
@@ -58,6 +65,11 @@ use scribe_common::protocol::{
 use serde_json::{Value, json};
 
 use crate::app_shortcuts::CloseWindow;
+use crate::layout::Rect;
+use crate::scrollbar::{
+    SCROLLBAR_WIDTH, ScrollMetrics, ScrollbarLayout, ScrollbarState, ThumbGeometry, compute_thumb,
+    round_scroll_units,
+};
 use crate::settings::apply::{canonical_color_value, workspace_root_from_value};
 use crate::settings::model::{
     ADD_CURRENT_NETWORK_ACTION, Control, ControlKind, ENV_PERSISTENCE_KEY, ENV_PREFLIGHT_ACTION,
@@ -87,6 +99,11 @@ const PENDING_PAINT_DELAY: Duration = Duration::from_millis(34);
 /// not Zed's translucent drop shadow, so it has to read as chrome rather than as
 /// stray padding.
 const RESIZE_GUTTER: Pixels = px(6.0);
+
+/// Ceiling on the whole-pixel scroll units the content pane's scrollbar
+/// geometry counts in. A settings page is nowhere near 65 535 pixels tall, and
+/// the cap is what keeps the pixel-to-unit conversion cast-free.
+const UNIT_CAP: usize = 65_535;
 
 /// Smallest composition that keeps the fixed navigation and control columns
 /// visible without clipping their labels.
@@ -193,6 +210,9 @@ struct SettingsColors {
     text: Rgba,
     dim_text: Rgba,
     quiet_text: Rgba,
+    /// The content pane's overlay scrollbar thumb — a quiet white wash, not
+    /// amber: page length is structure, not live state.
+    scrollbar: Rgba,
 }
 
 impl SettingsColors {
@@ -221,6 +241,7 @@ impl SettingsColors {
             text,
             dim_text: rgb(0x00a6_a5a0),
             quiet_text: rgb(0x0083_827b),
+            scrollbar: rgba(0xffff_ff3d),
         }
     }
 }
@@ -242,12 +263,18 @@ pub struct SettingsWindow {
     workspace_root_input: String,
     workspace_root_marked_range: Option<Range<usize>>,
     workspace_root_error: Option<String>,
-    color_handle: FocusHandle,
-    color_input: String,
-    color_original: String,
-    color_key: Option<String>,
-    color_marked_range: Option<Range<usize>>,
-    color_error: Option<String>,
+    /// The one inline text editor, shared by every color and free-text control:
+    /// at most one row is in edit at a time, so the field, its opening value
+    /// (the Escape target), and its rejection ink are single-slot state.
+    edit_handle: FocusHandle,
+    edit_input: String,
+    edit_original: String,
+    /// The control the open edit belongs to. The whole control rather than its
+    /// key, because the commit path needs its kind: a color canonicalizes
+    /// before it is written, general free text does not.
+    edit_control: Option<Control>,
+    edit_marked_range: Option<Range<usize>>,
+    edit_error: Option<String>,
     active_input: Option<NativeInputTarget>,
     input_selection: NativeInputSelection,
     /// Keyboard traversal is deliberately window-local: Settings claims only
@@ -273,6 +300,14 @@ pub struct SettingsWindow {
     /// and rewound on open so the live value is on screen even in the ~190-entry
     /// theme preset list.
     choice_scroll: ScrollHandle,
+    /// The content pane's page-length affordance: the terminal's own overlay
+    /// scrollbar state, so the thumb fades in on scroll and out after idle
+    /// exactly as it does in a pane.
+    content_scrollbar: ScrollbarState,
+    /// Scroll distance from the top, in whole pixels, as of the last render.
+    /// A change is what pulses the thumb — the scroller applies the wheel
+    /// itself, so there is no scroll event to hang the pulse off.
+    content_scrolled: usize,
 }
 
 /// One focus stop in the settings window's stable keyboard traversal order.
@@ -293,7 +328,8 @@ enum SettingsFocusTarget {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeInputTarget {
     WorkspaceRoot,
-    Color,
+    /// The shared inline editor behind every color and free-text control row.
+    Inline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,11 +403,11 @@ fn workspace_root_focus_index(
         })
 }
 
-fn release_color_input(
+fn release_inline_input(
     active_input: &mut Option<NativeInputTarget>,
     input_selection: &mut NativeInputSelection,
 ) -> bool {
-    if *active_input != Some(NativeInputTarget::Color) {
+    if *active_input != Some(NativeInputTarget::Inline) {
         return false;
     }
     *active_input = None;
@@ -379,12 +415,39 @@ fn release_color_input(
     true
 }
 
+/// The value an inline edit commits: a color canonicalizes through the apply
+/// path's own hex/ansi validator (so a rejected color never reaches the config
+/// writer), and a general free-text value commits verbatim — the apply path is
+/// the single authority on what each key accepts, so there is no second
+/// validator here.
+fn inline_commit_value(is_color: bool, key: &str, input: &str) -> Result<String, String> {
+    if is_color {
+        canonical_color_value(key, &Value::String(input.to_owned()))
+    } else {
+        Ok(input.to_owned())
+    }
+}
+
+/// Cancel an inline edit: the field returns to the value it opened with, and
+/// the rejection ink clears with it, so an abandoned edit leaves nothing of
+/// itself on screen.
+fn revert_inline_input(
+    input: &mut String,
+    original: &str,
+    marked_range: &mut Option<Range<usize>>,
+    error: &mut Option<String>,
+) {
+    original.clone_into(input);
+    *marked_range = None;
+    *error = None;
+}
+
 impl SettingsWindow {
     /// Build the view, loading the current config (or defaults on failure).
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config = load_config().unwrap_or_default();
         let colors = SettingsColors::resolve(&config);
-        Self {
+        let mut settings = Self {
             config,
             colors,
             page: SettingsPage::Appearance,
@@ -397,12 +460,12 @@ impl SettingsWindow {
             workspace_root_input: String::new(),
             workspace_root_marked_range: None,
             workspace_root_error: None,
-            color_handle: cx.focus_handle().tab_index(0),
-            color_input: String::new(),
-            color_original: String::new(),
-            color_key: None,
-            color_marked_range: None,
-            color_error: None,
+            edit_handle: cx.focus_handle().tab_index(0),
+            edit_input: String::new(),
+            edit_original: String::new(),
+            edit_control: None,
+            edit_marked_range: None,
+            edit_error: None,
             active_input: None,
             input_selection: NativeInputSelection::Caret,
             focus_index: 0,
@@ -412,7 +475,68 @@ impl SettingsWindow {
             scroll_handle: ScrollHandle::new(),
             open_choice: None,
             choice_scroll: ScrollHandle::new(),
+            content_scrollbar: ScrollbarState::new(),
+            content_scrolled: 0,
+        };
+        // Show the thumb once on open, the way a page switch does: the whole
+        // point of the affordance is telling the reader the page runs past the
+        // fold before they have scrolled to find out.
+        settings.pulse_content_scrollbar();
+        settings
+    }
+
+    /// Reveal the content pane's scrollbar and re-arm its idle timer.
+    fn pulse_content_scrollbar(&mut self) {
+        self.content_scrollbar.on_scroll_action();
+    }
+
+    /// Advance the content pane's overlay-scrollbar fade and return the thumb
+    /// geometry, in coordinates relative to the scroller, or `None` while it is
+    /// invisible or the page fits.
+    ///
+    /// The pure geometry counts scroll units from the live bottom; a pixel
+    /// scroller is that same shape with one pixel as the unit. The fade is
+    /// wall-clock, so a visible thumb asks for the next animation frame — the
+    /// scroller itself only repaints when the offset changes.
+    fn tick_content_scrollbar(&mut self, window: &Window, cx: &App) -> Option<ThumbGeometry> {
+        let viewport = self.scroll_handle.bounds().size;
+        let overflow = round_scroll_units(f32::from(self.scroll_handle.max_offset().y), UNIT_CAP);
+        let scrolled = round_scroll_units(f32::from(-self.scroll_handle.offset().y), overflow);
+        if scrolled != self.content_scrolled {
+            self.content_scrolled = scrolled;
+            self.pulse_content_scrollbar();
         }
+        let metrics = ScrollMetrics {
+            history_size: overflow,
+            screen_lines: round_scroll_units(f32::from(viewport.height), UNIT_CAP),
+            display_offset: overflow.saturating_sub(scrolled),
+        };
+        if cx.reduce_motion() {
+            // Reduced motion keeps the affordance rather than the animation:
+            // the thumb simply stays on an overflowing page, so nothing moves
+            // and no animation frames are requested.
+            self.content_scrollbar.opacity = 1.0;
+        } else if self.content_scrollbar.tick_fade(metrics.display_offset) {
+            window.request_animation_frame();
+        }
+        if self.content_scrollbar.opacity <= 0.0 {
+            return None;
+        }
+        // ponytail: display-only thumb — no hover widen, click-to-jump, or
+        // drag. The pure module already has `hit_test_scrollbar` and
+        // `ScrollbarDrag`; wire them through a mouse handler on the overlay if
+        // grabbing the settings thumb is ever wanted.
+        let layout = ScrollbarLayout {
+            pane_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: f32::from(viewport.width),
+                height: f32::from(viewport.height),
+            },
+            metrics,
+            tab_bar_height: 0.0,
+        };
+        compute_thumb(&layout, SCROLLBAR_WIDTH)
     }
 
     /// Reload the config from disk after an edit so the UI reflects the saved
@@ -493,9 +617,9 @@ impl SettingsWindow {
 
     fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         if page != self.page {
-            let color_was_focused = self.color_handle.is_focused(window);
-            let color_was_active = self.clear_color_edit();
-            if (color_was_focused || color_was_active) && !self.search_handle.is_focused(window) {
+            let edit_was_focused = self.edit_handle.is_focused(window);
+            let edit_was_active = self.clear_inline_edit();
+            if (edit_was_focused || edit_was_active) && !self.search_handle.is_focused(window) {
                 window.focus(&self.focus_handle, cx);
             }
         }
@@ -508,6 +632,8 @@ impl SettingsWindow {
         // explicit rewind a short page inherits the previous page's offset and
         // opens blank below its own content.
         self.scroll_handle.set_offset(Point::default());
+        self.content_scrolled = 0;
+        self.pulse_content_scrollbar();
         if self.keyboard_navigation {
             self.focus_index =
                 settings_nav_pages().iter().position(|candidate| *candidate == page).unwrap_or(0);
@@ -577,8 +703,9 @@ impl SettingsWindow {
                 | ControlKind::Choice(_)
                 | ControlKind::Stepper { .. }
                 | ControlKind::Action
-                | ControlKind::Color => Some(SettingsFocusTarget::Control(control)),
-                ControlKind::Text | ControlKind::Keybinding => None,
+                | ControlKind::Color
+                | ControlKind::Text => Some(SettingsFocusTarget::Control(control)),
+                ControlKind::Keybinding => None,
             }
         }));
         targets
@@ -639,10 +766,10 @@ impl SettingsWindow {
                 window.focus(&self.workspace_root_handle, cx);
             }
             Some(SettingsFocusTarget::Control(control))
-                if matches!(control.kind, ControlKind::Color) =>
+                if matches!(control.kind, ControlKind::Color | ControlKind::Text) =>
             {
-                self.begin_color_edit(&control);
-                window.focus(&self.color_handle, cx);
+                self.begin_inline_edit(&control);
+                window.focus(&self.edit_handle, cx);
             }
             _ => {
                 self.active_input = None;
@@ -652,26 +779,33 @@ impl SettingsWindow {
         }
     }
 
-    fn begin_color_edit(&mut self, control: &Control) {
-        if self.color_key.as_deref() != Some(control.key.as_str()) {
+    /// The config key of the control the open inline edit belongs to.
+    fn edit_key(&self) -> Option<&str> {
+        self.edit_control.as_ref().map(|control| control.key.as_str())
+    }
+
+    /// Open the shared inline editor on a color or free-text control, seeding it
+    /// with the saved value that Escape later restores.
+    fn begin_inline_edit(&mut self, control: &Control) {
+        if self.edit_key() != Some(control.key.as_str()) {
             let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
-            self.color_input.clone_from(&value);
-            self.color_original = value;
-            self.color_key = Some(control.key.clone());
-            self.color_marked_range = None;
-            self.color_error = None;
+            self.edit_input.clone_from(&value);
+            self.edit_original = value;
+            self.edit_control = Some(control.clone());
+            self.edit_marked_range = None;
+            self.edit_error = None;
         }
-        self.active_input = Some(NativeInputTarget::Color);
+        self.active_input = Some(NativeInputTarget::Inline);
         self.input_selection = NativeInputSelection::Caret;
     }
 
-    fn clear_color_edit(&mut self) -> bool {
-        let was_active = release_color_input(&mut self.active_input, &mut self.input_selection);
-        self.color_key = None;
-        self.color_input.clear();
-        self.color_original.clear();
-        self.color_marked_range = None;
-        self.color_error = None;
+    fn clear_inline_edit(&mut self) -> bool {
+        let was_active = release_inline_input(&mut self.active_input, &mut self.input_selection);
+        self.edit_control = None;
+        self.edit_input.clear();
+        self.edit_original.clear();
+        self.edit_marked_range = None;
+        self.edit_error = None;
         was_active
     }
 
@@ -707,12 +841,12 @@ impl SettingsWindow {
                     self.step(&control.key, (min, max), step, cx);
                 }
                 ControlKind::Action => self.run_action(&control.key, window, cx),
-                ControlKind::Color => {
-                    self.begin_color_edit(&control);
-                    window.focus(&self.color_handle, cx);
+                ControlKind::Color | ControlKind::Text => {
+                    self.begin_inline_edit(&control);
+                    window.focus(&self.edit_handle, cx);
                     cx.notify();
                 }
-                ControlKind::Text | ControlKind::Keybinding => {}
+                ControlKind::Keybinding => {}
             },
             SettingsFocusTarget::Action(key) => self.run_action(&key, window, cx),
             SettingsFocusTarget::WorkspaceRootInput => {
@@ -803,12 +937,14 @@ impl SettingsWindow {
             && let Some(page) =
                 settings_nav_pages().into_iter().find(|page| self.page_matches_search(*page))
         {
-            self.clear_color_edit();
+            self.clear_inline_edit();
             self.page = page;
             self.status = None;
             // Jumping to a different page for a match must rewind the shared
             // scroller too, or the match lands above the retained offset.
             self.scroll_handle.set_offset(Point::default());
+            self.content_scrolled = 0;
+            self.pulse_content_scrollbar();
         }
     }
 
@@ -855,7 +991,7 @@ impl SettingsWindow {
     fn active_input_text(&self) -> &str {
         match self.active_input {
             Some(NativeInputTarget::WorkspaceRoot) => &self.workspace_root_input,
-            Some(NativeInputTarget::Color) => &self.color_input,
+            Some(NativeInputTarget::Inline) => &self.edit_input,
             None => "",
         }
     }
@@ -863,7 +999,7 @@ impl SettingsWindow {
     fn active_input_marked_range(&self) -> Option<&Range<usize>> {
         match self.active_input {
             Some(NativeInputTarget::WorkspaceRoot) => self.workspace_root_marked_range.as_ref(),
-            Some(NativeInputTarget::Color) => self.color_marked_range.as_ref(),
+            Some(NativeInputTarget::Inline) => self.edit_marked_range.as_ref(),
             None => None,
         }
     }
@@ -873,8 +1009,8 @@ impl SettingsWindow {
             Some(NativeInputTarget::WorkspaceRoot) => {
                 Some((&mut self.workspace_root_input, &mut self.workspace_root_marked_range))
             }
-            Some(NativeInputTarget::Color) => {
-                Some((&mut self.color_input, &mut self.color_marked_range))
+            Some(NativeInputTarget::Inline) => {
+                Some((&mut self.edit_input, &mut self.edit_marked_range))
             }
             None => None,
         }
@@ -883,7 +1019,7 @@ impl SettingsWindow {
     fn clear_active_input_error(&mut self) {
         match self.active_input {
             Some(NativeInputTarget::WorkspaceRoot) => self.workspace_root_error = None,
-            Some(NativeInputTarget::Color) => self.color_error = None,
+            Some(NativeInputTarget::Inline) => self.edit_error = None,
             None => {}
         }
     }
@@ -945,10 +1081,13 @@ impl SettingsWindow {
         }
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.active_input == Some(NativeInputTarget::Color) {
-                    self.color_input.clone_from(&self.color_original);
-                    self.color_marked_range = None;
-                    self.color_error = None;
+                if self.active_input == Some(NativeInputTarget::Inline) {
+                    revert_inline_input(
+                        &mut self.edit_input,
+                        &self.edit_original,
+                        &mut self.edit_marked_range,
+                        &mut self.edit_error,
+                    );
                     self.input_selection = NativeInputSelection::Caret;
                 } else {
                     self.dismiss_transient_state(cx);
@@ -973,8 +1112,8 @@ impl SettingsWindow {
                         window,
                         cx,
                     ),
-                    Some(NativeInputTarget::Color) => {
-                        self.save_color(cx);
+                    Some(NativeInputTarget::Inline) => {
+                        self.save_inline_edit(cx);
                     }
                     None => {}
                 }
@@ -1013,7 +1152,7 @@ impl SettingsWindow {
             self.handle_search_key(event, window, cx);
             return;
         }
-        if (self.workspace_root_handle.is_focused(window) || self.color_handle.is_focused(window))
+        if (self.workspace_root_handle.is_focused(window) || self.edit_handle.is_focused(window))
             && self.handle_native_input_key(event, window, cx)
         {
             cx.stop_propagation();
@@ -1078,27 +1217,35 @@ impl SettingsWindow {
         self.commit(key, Value::Bool(next), cx);
     }
 
-    fn save_color(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(key) = self.color_key.clone() else {
+    /// Commit the open inline edit through the one shared apply path, then
+    /// re-seed the field from what was actually stored so a later Escape
+    /// restores the saved value rather than the pre-edit one.
+    fn save_inline_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(control) = self.edit_control.clone() else {
             return false;
         };
-        let color = match canonical_color_value(&key, &Value::String(self.color_input.clone())) {
-            Ok(color) => color,
+        let key = control.key;
+        let is_color = matches!(control.kind, ControlKind::Color);
+        let stored = match inline_commit_value(is_color, &key, &self.edit_input) {
+            Ok(stored) => stored,
             Err(error) => {
-                self.color_error = Some(error);
+                self.edit_error = Some(error);
                 cx.notify();
                 return false;
             }
         };
-        if self.commit(&key, Value::String(color.clone()), cx) {
-            self.color_input.clone_from(&color);
-            self.color_original = color;
-            self.color_marked_range = None;
-            self.color_error = None;
+        if self.commit(&key, Value::String(stored.clone()), cx) {
+            self.edit_input.clone_from(&stored);
+            self.edit_original = stored;
+            self.edit_marked_range = None;
+            self.edit_error = None;
             self.input_selection = NativeInputSelection::Caret;
             true
         } else {
-            self.color_error = Some("Color was not saved — check the status below.".to_owned());
+            self.edit_error = Some(format!(
+                "{} was not saved — check the status below.",
+                self.commit_label(&key)
+            ));
             cx.notify();
             false
         }
@@ -1492,11 +1639,11 @@ impl SettingsWindow {
     }
 
     fn reset_badge_colors(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let color_was_focused = self.color_handle.is_focused(window);
+        let edit_was_focused = self.edit_handle.is_focused(window);
         if !self.commit(key, Value::Bool(true), cx) {
             return;
         }
-        let color_was_active = self.clear_color_edit();
+        let edit_was_active = self.clear_inline_edit();
         self.focus_index = self
             .focus_targets()
             .iter()
@@ -1504,7 +1651,7 @@ impl SettingsWindow {
                 matches!(target, SettingsFocusTarget::Control(control) if control.key == key)
             })
             .unwrap_or(self.focus_index);
-        if color_was_focused || color_was_active {
+        if edit_was_focused || edit_was_active {
             window.focus(&self.focus_handle, cx);
         }
     }
@@ -1648,7 +1795,8 @@ impl Render for SettingsWindow {
         }
         let client_side = matches!(decorations, Decorations::Client { .. });
         let nav = self.render_nav(window, cx);
-        let content = self.render_content(window, cx);
+        let thumb = self.tick_content_scrollbar(window, cx);
+        let content = self.render_content(thumb, window, cx);
         let body = div()
             .id("settings-root")
             .role(Role::Application)
@@ -2162,8 +2310,15 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_content(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_content(
+        &self,
+        thumb: Option<ThumbGeometry>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = self.colors;
+        let mut thumb_color = colors.scrollbar;
+        thumb_color.a *= self.content_scrollbar.opacity;
         let mut children = vec![self.render_page_heading()];
         // The Remote page leads with the runtime "Local network" trust surface so
         // its lists and their Remove/Revoke buttons sit above the fold; the static
@@ -2190,33 +2345,57 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .bg(colors.page_bg)
+            // The overlay thumb is positioned against this wrapper rather than
+            // appended to the scroller, so it neither scrolls with the content
+            // nor reserves a column from it.
             .child(
                 div()
-                    .id("settings-scroll")
-                    // `flex_1` claims the pane, and the zero `min_h` is what
-                    // actually bounds it: a flex item's automatic minimum size
-                    // is its content height, which on a long page would size
-                    // the viewport to the content and leave nothing to scroll.
+                    .id("settings-scroll-track")
+                    .relative()
                     .flex_1()
                     .min_h(px(0.0))
-                    .overflow_x_hidden()
-                    .overflow_y_scroll()
-                    // The rows are children of the scroller itself. Wrapping them
-                    // in an intermediate div makes the scroller see one flex item
-                    // that reports its own box rather than its children's extent,
-                    // so the content never measures as overflowing and the wheel
-                    // is clamped to a zero maximum.
-                    .track_scroll(&self.scroll_handle)
-                    .px(px(44.0))
-                    .pb(px(48.0))
                     .flex()
                     .flex_col()
-                    // A typeset column keeps a readable measure: every row caps
-                    // at 840px and stays left-aligned when the window grows.
-                    // Capping per row (not via one wrapping column) preserves
-                    // the scroller's content-extent measurement noted above.
-                    .children(children.into_iter().map(|child| {
-                        div().w_full().max_w(px(840.0)).flex_none().child(child)
+                    .child(
+                        div()
+                            .id("settings-scroll")
+                            // `flex_1` claims the pane, and the zero `min_h` is what
+                            // actually bounds it: a flex item's automatic minimum size
+                            // is its content height, which on a long page would size
+                            // the viewport to the content and leave nothing to scroll.
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_x_hidden()
+                            .overflow_y_scroll()
+                            // The rows are children of the scroller itself. Wrapping them
+                            // in an intermediate div makes the scroller see one flex item
+                            // that reports its own box rather than its children's extent,
+                            // so the content never measures as overflowing and the wheel
+                            // is clamped to a zero maximum.
+                            .track_scroll(&self.scroll_handle)
+                            .px(px(44.0))
+                            .pb(px(48.0))
+                            .flex()
+                            .flex_col()
+                            // A typeset column keeps a readable measure: every row caps
+                            // at 840px and stays left-aligned when the window grows.
+                            // Capping per row (not via one wrapping column) preserves
+                            // the scroller's content-extent measurement noted above.
+                            .children(children.into_iter().map(|child| {
+                                div().w_full().max_w(px(840.0)).flex_none().child(child)
+                            })),
+                    )
+                    // Painted after the scroller so the overlay reads as an
+                    // overlay; it is out of flow, so it reserves no column.
+                    .children(thumb.map(|thumb| {
+                        div()
+                            .absolute()
+                            .left(px(thumb.x))
+                            .top(px(thumb.y))
+                            .w(px(thumb.width))
+                            .h(px(thumb.height))
+                            .rounded(px(thumb.width / 2.0))
+                            .bg(thumb_color)
                     })),
             )
             // Pinned below the scroller, not appended to it. As the last row of a
@@ -2971,8 +3150,8 @@ impl SettingsWindow {
             .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
             .h(px(
-                if self.color_key.as_deref() == Some(control.key.as_str())
-                    && self.color_error.is_some()
+                if self.edit_key() == Some(control.key.as_str())
+                    && self.edit_error.is_some()
                 {
                     78.0
                 } else if description.is_some() {
@@ -3059,8 +3238,7 @@ impl SettingsWindow {
             ControlKind::Stepper { min, max, step, decimals } => {
                 self.render_stepper(control, (*min, *max, *step), *decimals, cx)
             }
-            ControlKind::Color => self.render_color(control, window, cx),
-            ControlKind::Text => self.render_text_value(control),
+            ControlKind::Color | ControlKind::Text => self.render_inline_edit(control, window, cx),
             ControlKind::Keybinding => self.render_keybinding_value(control),
             ControlKind::Action => self.render_action_control(control, cx),
         }
@@ -3319,11 +3497,6 @@ impl SettingsWindow {
         was_open
     }
 
-    fn render_text_value(&self, control: &Control) -> gpui::AnyElement {
-        let value = current_value(&self.config, &control.key);
-        read_only_value(&control.key, &control.label, value.as_str().unwrap_or(""), &self.colors)
-    }
-
     fn render_keybinding_value(&self, control: &Control) -> gpui::AnyElement {
         let combos = keybinding_combos(&self.config, &control.key);
         let shown = if combos.is_empty() { "—".to_owned() } else { combos.join(", ") };
@@ -3468,29 +3641,31 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// Render the shared color editor used by theme, AI, appearance, and
-    /// workspace badge colors.
-    fn render_color(
+    /// Render the shared inline editor: the color fields on theme, AI,
+    /// appearance, and workspace badge rows, and the general free-text fields.
+    /// Only a color carries the live swatch; everything else is the field alone.
+    fn render_inline_edit(
         &self,
         control: &Control,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = self.colors;
-        let editing = self.color_key.as_deref() == Some(control.key.as_str())
-            && self.color_handle.is_focused(window);
+        let is_color = matches!(control.kind, ControlKind::Color);
+        let editing =
+            self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window);
         let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
-        let value = if editing { self.color_input.clone() } else { saved.clone() };
+        let value = if editing { self.edit_input.clone() } else { saved.clone() };
         let swatch_color = color_swatch(&self.config, &control.key, &value)
             .or_else(|| color_swatch(&self.config, &control.key, &saved))
             .map_or(colors.input_bg, srgba);
-        let field = self.render_color_field(control, window, cx);
-        let error = (self.color_key.as_deref() == Some(control.key.as_str()))
-            .then(|| self.color_error.clone())
+        let field = self.render_inline_field(control, window, cx);
+        let error = (self.edit_key() == Some(control.key.as_str()))
+            .then(|| self.edit_error.clone())
             .flatten()
             .map(|error| {
                 div()
-                    .id(("settings-color-error", key_hash(&control.key)))
+                    .id(("settings-inline-error", key_hash(&control.key)))
                     .role(Role::Alert)
                     .aria_label(error.clone())
                     .text_xs()
@@ -3498,9 +3673,13 @@ impl SettingsWindow {
                     .child(Text::new_inaccessible(error.into()))
             });
         div()
-            .id(("settings-color-value", key_hash(&control.key)))
+            .id(("settings-inline-value", key_hash(&control.key)))
             .role(Role::Group)
-            .aria_label(format!("{} color editor", control.label))
+            .aria_label(if is_color {
+                format!("{} color editor", control.label)
+            } else {
+                format!("{} editor", control.label)
+            })
             .w(px(VALUE_COLUMN_WIDTH))
             .flex()
             .flex_col()
@@ -3513,48 +3692,51 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .size(px(16.0))
-                            .flex_none()
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(colors.strong_border)
-                            .bg(swatch_color),
-                    )
+                    .when(is_color, |el| {
+                        el.child(
+                            div()
+                                .size(px(16.0))
+                                .flex_none()
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(colors.strong_border)
+                                .bg(swatch_color),
+                        )
+                    })
                     .child(field),
             )
             .into_any_element()
     }
 
-    fn render_color_field(
+    fn render_inline_field(
         &self,
         control: &Control,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = self.colors;
-        let editing = self.color_key.as_deref() == Some(control.key.as_str())
-            && self.color_handle.is_focused(window);
+        let editing =
+            self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window);
         let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
-        let value = if editing { self.color_input.clone() } else { saved };
-        let placeholder = color_placeholder(&control.key);
+        let value = if editing { self.edit_input.clone() } else { saved };
+        let is_color = matches!(control.kind, ControlKind::Color);
+        let placeholder = inline_placeholder(&control.key, is_color);
         let shown =
             if value.is_empty() && !editing { placeholder.to_owned() } else { value.clone() };
-        let focus = self.color_handle.clone();
+        let focus = self.edit_handle.clone();
         let input_focus = focus.clone();
         let settings_entity = cx.entity();
         let pointer_target = SettingsFocusTarget::Control(control.clone());
         let edit_control = control.clone();
         div()
-            .id(("settings-color-input", key_hash(&control.key)))
+            .id(("settings-inline-input", key_hash(&control.key)))
             .role(Role::TextInput)
             .aria_label(control.label.clone())
             .aria_placeholder(placeholder)
             .aria_value(value.clone())
             .on_a11y_action(
                 AccessibleAction::SetValue,
-                a11y_color_handler(cx.entity().downgrade(), control.key.clone()),
+                a11y_inline_edit_handler(cx.entity().downgrade(), control.clone()),
             )
             .focusable()
             .tab_stop(true)
@@ -3576,7 +3758,7 @@ impl SettingsWindow {
             .when(!editing, |el| el.hover(move |style| style.border_color(colors.strong_border)))
             .on_click(cx.listener(move |this, _, input_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
-                this.begin_color_edit(&edit_control);
+                this.begin_inline_edit(&edit_control);
                 input_window.focus(&focus, ctx);
                 ctx.notify();
             }))
@@ -3662,7 +3844,10 @@ fn search_display_text(query: &str, focused: bool) -> String {
     if query.is_empty() && !focused { "Search settings".to_owned() } else { query.to_owned() }
 }
 
-fn color_placeholder(key: &str) -> &'static str {
+fn inline_placeholder(key: &str, is_color: bool) -> &'static str {
+    if !is_color {
+        return "Not set";
+    }
     if key.starts_with("appearance.") {
         "Theme default"
     } else if key.starts_with("ai_states.") || key.starts_with("claude_states.") {
@@ -3906,27 +4091,27 @@ fn a11y_workspace_root_handler(
     }
 }
 
-fn a11y_color_handler(
+fn a11y_inline_edit_handler(
     weak_settings: gpui::WeakEntity<SettingsWindow>,
-    set_key: String,
+    set_control: Control,
 ) -> impl FnMut(Option<&gpui::accesskit::ActionData>, &mut Window, &mut App) {
     move |data, _, app| {
         let Some(gpui::accesskit::ActionData::Value(action_value)) = data else {
             return;
         };
         let input = action_value.to_string();
-        let control_key = set_key.clone();
+        let control = set_control.clone();
         weak_settings
             .update(app, move |this, ctx| {
-                this.color_key = Some(control_key.clone());
-                this.color_input = input;
-                current_value(&this.config, &control_key)
+                this.edit_input = input;
+                current_value(&this.config, &control.key)
                     .as_str()
                     .unwrap_or("")
-                    .clone_into(&mut this.color_original);
-                this.color_marked_range = None;
-                this.color_error = None;
-                this.active_input = Some(NativeInputTarget::Color);
+                    .clone_into(&mut this.edit_original);
+                this.edit_control = Some(control);
+                this.edit_marked_range = None;
+                this.edit_error = None;
+                this.active_input = Some(NativeInputTarget::Inline);
                 this.input_selection = NativeInputSelection::Caret;
                 ctx.notify();
             })
@@ -4442,10 +4627,10 @@ fn logical_i32(value: i32) -> f32 {
 mod tests {
     use super::{
         NativeInputSelection, NativeInputTarget, SettingsFocusTarget, focus_targets_match,
-        release_color_input, search_display_text, utf16_range_to_utf8,
-        workspace_badge_color_controls, workspace_root_controls_match_query,
-        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
-        workspace_roots_match_query,
+        inline_commit_value, inline_placeholder, release_inline_input, revert_inline_input,
+        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
+        workspace_root_controls_match_query, workspace_root_focus_index,
+        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
     };
 
     #[test]
@@ -4558,17 +4743,49 @@ mod tests {
     }
 
     #[test]
-    fn releasing_color_input_preserves_workspace_root_input() {
+    fn releasing_inline_input_preserves_workspace_root_input() {
         let mut active = Some(NativeInputTarget::WorkspaceRoot);
         let mut selection = NativeInputSelection::All;
 
-        assert!(!release_color_input(&mut active, &mut selection));
+        assert!(!release_inline_input(&mut active, &mut selection));
         assert!(matches!(active, Some(NativeInputTarget::WorkspaceRoot)));
         assert_eq!(selection, NativeInputSelection::All);
 
-        active = Some(NativeInputTarget::Color);
-        assert!(release_color_input(&mut active, &mut selection));
+        active = Some(NativeInputTarget::Inline);
+        assert!(release_inline_input(&mut active, &mut selection));
         assert!(active.is_none());
         assert_eq!(selection, NativeInputSelection::Caret);
+    }
+
+    // @lat: [[settings#GPUI Settings Window#Inline editing#Commit routes by control kind]]
+    #[test]
+    fn inline_commit_routes_color_and_free_text_differently() {
+        assert_eq!(
+            inline_commit_value(true, "theme.background", "#ABCDEF"),
+            Ok(String::from("#abcdef"))
+        );
+        assert!(inline_commit_value(true, "theme.background", "not a color").is_err());
+        // Free text commits verbatim — no colour validator stands between a
+        // font name and the apply path.
+        assert_eq!(
+            inline_commit_value(false, "appearance.font_family", "not a color"),
+            Ok(String::from("not a color"))
+        );
+        assert_eq!(inline_placeholder("appearance.font_family", false), "Not set");
+        assert_eq!(inline_placeholder("theme.background", true), "#rrggbb");
+    }
+
+    // @lat: [[settings#GPUI Settings Window#Inline editing#Escape cancels the edit]]
+    #[test]
+    fn cancelling_an_inline_edit_restores_the_opening_value() {
+        let mut input = String::from("Half-typed Fon");
+        let mut marked = Some(3..7);
+        let mut error = Some(String::from("rejected"));
+
+        revert_inline_input(&mut input, "JetBrains Mono", &mut marked, &mut error);
+
+        assert_eq!(input, "JetBrains Mono");
+        assert!(marked.is_none());
+        assert!(error.is_none());
     }
 }

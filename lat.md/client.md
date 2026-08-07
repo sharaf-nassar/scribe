@@ -268,11 +268,23 @@ Rendering has two halves.  draws the roster panel, the hint strip, and the dimme
 
 The surface is verified against the running app, not headlessly: see .
 
+### Window Identity And Warm Restart
+
+Every connection names the window it wants. The server keeps a window's sessions when its client goes away, so which window a `Hello` claims is what decides whether a restart resumes the user's windows or scatters them.
+
+An unnamed `Hello` is a *request to be given* one of the windows whose sessions outlived their client: [[crates/scribe-server/src/ipc_server.rs#resolve_window_assignment]] hands back one of them and reports the rest as `Welcome`'s `other_windows`. That makes it exactly the wrong frame for a deliberate new window — a `None` claim from [[crates/scribe-client/src/main.rs#TerminalView#open_new_window]] opened a window the user already had, while the real one stayed unopenable — so a new window mints its own `WindowId` instead. A freshly minted id is by construction not a window the server knows, so it is assigned verbatim and the window is genuinely empty.
+
+The claim is carried on [[crates/scribe-client/src/main.rs#WindowBackend]], one per window backend, and resolved per handshake by [[crates/scribe-client/src/main.rs#IpcThread#window_claim]]: the id a previous `Welcome` already assigned this connection wins over the seed, so a redial claims its own window back. Without that, a hot upgrade — which drops every stream at once and lets all windows redial together — could hand two windows each other's session sets, because the server's "any unconnected window" pick walks a `HashSet`.
+
+`other_windows` is what makes a restart bring *all* the windows back rather than one. [[crates/scribe-client/src/main.rs#on_welcome]] parks the ids and [[crates/scribe-client/src/main.rs#TerminalView#poll_sibling_windows]] reopens one window per id on the foreground, each claiming its own id and creating no first shell, so each adopts its own sessions instead of racing the others for them. Only the process bootstrap's first handshake may fan out: the flag is consumed there, so a redial cannot reopen a window whose own process is mid-reconnect, and a reopened window cannot fan out again.
+
+The two fan-outs are mutually exclusive by construction. `other_windows` restores windows the server still holds sessions for; the `--restore-child` processes restore snapshots after the server itself died. Whichever one fires zeroes the other's count, so no window is ever opened twice.
+
 ### Cold Restart Restore
 
 The GPUI client ports cold-restart recovery: after a server crash the bootstrap window rebuilds its windows, workspaces, tabs, and panes from persisted snapshots and re-creates each saved session at the correct geometry.
 
- persists one TOML snapshot per window under `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared `index.toml`, all hardened to `0700`/`0600` because launch bindings can carry prompt text and provider conversation IDs. A bootstrap lock serialises multi-process index mutations and stale locks (>30 s) are reclaimed.  atomically claims the first replayable  entry, skips non-replayable and unreadable entries, and reports how many windows remain so the caller fans out `--restore-child` processes via  — each child claims exactly one more entry and, gated by , never fans out again. A claim is non-destructive: the snapshot file stays on disk as the window's last good layout, its id parked in the index's `claimed` list so it can never be claimed twice, and it is retired only when the claiming window durably writes a fresh snapshot of its own (or the user explicitly quits or closes the window).
+ persists one TOML snapshot per window under `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared `index.toml`, all hardened to `0700`/`0600` because launch bindings can carry prompt text and provider conversation IDs. A bootstrap lock serialises multi-process index mutations and stale locks (>30 s) are reclaimed.  atomically claims the first replayable  entry, skips non-replayable and unreadable entries, and reports how many windows remain. Those are fanned out as `--restore-child` processes via  only once the server's first `SessionList` proves it lost its sessions, because a server that kept them restores its own windows through `Welcome`'s `other_windows` and fanning out both would open every window twice; each child claims exactly one more entry and, gated by , never fans out again. A claim is non-destructive: the snapshot file stays on disk as the window's last good layout, its id parked in the index's `claimed` list so it can never be claimed twice, and it is retired only when the claiming window durably writes a fresh snapshot of its own, or the user explicitly closes the window. A claim the window never consumed — the server kept its sessions, so nothing was replayed — is released rather than retired, because a claim the server refused names another live window's layout and deleting it is how a layout gets lost.
 
  rebuilds a  — the , a  map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered  queue that re-creates each session. Before the launches dispatch,  sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized.  preserves the Codex 0x0 exception: reattaching a Codex session sends a zero-sized `TerminalSize` so the server does not pre-size its Ink-rendered PTY.  serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
 
@@ -280,7 +292,7 @@ The GPUI client ports cold-restart recovery: after a server crash the bootstrap 
 
 The two persisted files are driven from the running window: `ColdStart` claims and geometry before the window opens, and `RestoreRuntime` writes, replays, and clears them for its lifetime.
 
- runs in `main` *before* the backend connects, because the index claim decides how many `--restore-child` siblings this process fans out and must happen once per process rather than once per reconnect, and because the claimed snapshot's **pre-crash** window id is the only key the geometry record can be found under. A true cold restart reaches a fresh server that has not named this window yet, and by the time `Welcome` does the window is already on screen. The loaded record goes through  and , then  turns it into the `WindowBounds` handed to `open_window` — so unlike the winit port there is no post-creation move/resize/maximize sequence to race the compositor, and no flash at the default size.  distinguishes "nothing persisted" from the default geometry, because the default is a size *hint*: opening at it would override the grid-derived startup size on every launch that never saved anything.
+ runs in `main` *before* the backend connects, because the claim must happen once per process rather than once per reconnect, and because the claimed snapshot's window id is both the only key the geometry record can be found under and the window this process claims in its `Hello`. A true cold restart reaches a fresh server that has not named this window yet, and by the time `Welcome` does the window is already on screen. The loaded record goes through  and , then  turns it into the `WindowBounds` handed to `open_window` — so unlike the winit port there is no post-creation move/resize/maximize sequence to race the compositor, and no flash at the default size.  distinguishes "nothing persisted" from the default geometry, because the default is a size *hint*: opening at it would override the grid-derived startup size on every launch that never saved anything.
 
 Geometry is read back off the live window by  through  — GPUI bounds are already logical pixels, so no scale-factor division is needed. It runs from an `observe_window_bounds` subscription (the GPUI equivalent of winit's `Moved`/`Resized`) and again on every paint, so a window that is opened and never touched still persists the size it came up at. Both files are written on a 500 ms debounce (`RESTORE_DEBOUNCE`), since a drag-resize emits a bounds change per frame and a split re-reports the tree several times while sessions arrive.
 
@@ -292,7 +304,7 @@ What a pane relaunches as is decided by its . AI shortcuts construct `LaunchKind
 
  drains the answers. The ordinary reconcile pass adopts one arriving session per tick, which is enough for a split but not for a replay: five `CreateSession` frames come back faster than five ticks, so four panes would stay empty while their sessions lived on as tabs with nowhere to render. It is gated on a replay being in flight, because outside one the pairing would be wrong — a split's pending pane must get the session that split asked for, not whichever older tab happens to have no pane.
 
-Clearing follows intent. An explicit quit flushes the geometry and drops only the snapshot, so the next launch reopens where the user left off with fresh panes; a window close drops both, since the window itself is gone. Only a crash — this process dying before either path runs — leaves a snapshot behind to replay. The whole path is asserted against the running app by .
+Clearing follows intent, and only a window close is destruction. A quit ends the client while every session keeps running on the server, so it flushes the geometry *and* the snapshot: they are the window's layout and the id the next launch reclaims it by. A `CloseWindow` drops both, since the window and its sessions are gone. The whole path is asserted against the running app by .
 
 `LaunchKind::Ai` persists the shared [[crates/scribe-common/src/protocol.rs#AiResumeMode]] directly. Moving that type out of the client does not migrate snapshots: serialized mode names remain exactly `New` and `Resume`.
 
@@ -1487,6 +1499,14 @@ Pane geometry is published from the GPUI layout pass, once per frame, and every 
 
 The two sides are therefore routinely out of step for the length of one round trip: the client narrows its grid immediately, while the server debounces its own `Term` resize and answers `RequestSnapshot` from the size it still has. That gap is what makes rebuild geometry load-bearing.
 
+#### Attach announces the adopting pane's grid
+
+A tab switch has to announce a size before the layout has placed the tab, so the announced value is the adopting pane's live grid rather than the window's startup default.
+
+[[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes]] drops the `pane_sizes` entry of every session it finds no placement for, and an unshown tab has no placement — so the entry is missing on every ordinary tab switch, not rarely. [[crates/scribe-client/src/main.rs#TerminalView#switch_tab]] must still attach before it can resize, because the server denies `Resize` and `RequestSnapshot` for a session whose `AttachSessions` has not landed yet. [[crates/scribe-client/src/main.rs#TerminalView#stream_session]] therefore always reaches for that missing entry and falls back to `focused_pane_size` — the grid [[crates/scribe-client/src/main.rs#TerminalView#adopt_focused_pane_size]] refreshes from the focused placement on every publish — because the switched-to tab is adopted into exactly that pane.
+
+The seed `terminal_size` is the wrong fallback and was the defect: it is the `WindowSeed` startup default (`COLUMNS`x`ROWS`), fixed for the window's whole life and never re-measured. Announcing it resized the PTY to 120 columns, so the switched-to tab painted its `SessionReplay` wrapped at 120 and the layout's own publish reflowed it to the real width one round trip later — a visible reflow on every single tab switch. `terminal_size` still legitimately seeds a brand-new window and the cold-restart launch path, where no measured pane exists yet.
+
 #### Rebuild Geometry
 
 A rebuild is state, not a delta, so it is only correct at the geometry and scrollback size it was rendered with — carried on [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]]`::PaneRebuild` and [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` alongside the bytes.
@@ -1690,6 +1710,8 @@ Selection coordinates are adjusted when PTY output or resize shifts grid content
 An overlay scrollbar in  that fades in on scroll and fades out after 1.5s of inactivity.
 
 Width animates on hover via lerp expansion. The hit zone is 3x the visible width for easy targeting. Drag-to-scroll computes offset from mouse delta relative to track height. Fade-out duration is 0.3 seconds.
+
+The pure module has a second consumer: the settings window's content pane reuses the same fade state and thumb geometry as its page-length affordance, in display-only form, counting whole pixels as its scroll unit. See [[lat.md/settings#Settings#GPUI Settings Window#Typeset Ink presentation]].
 
 ### Prompt Mark Indicators
 
