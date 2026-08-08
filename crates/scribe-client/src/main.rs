@@ -766,6 +766,20 @@ fn saved_geometry_for(window_id: WindowId) -> Option<WindowGeometry> {
         .map(|geom| clamp_geometry_to_layout(&geom, &monitor::connected_monitors()))
 }
 
+/// The grid font one appearance config yields at a zoom level.
+///
+/// The step is folded into the font size here rather than into the config, so
+/// every later `appearance.font_size` edit rebases the delta instead of
+/// discarding it. Shared by the live zoom step, the config reload, and the
+/// restored level a window opens at — three callers that must agree on what a
+/// level means or a restart would render at a different size than the zoom did.
+fn zoomed_font(appearance: &scribe_common::config::AppearanceConfig, zoom: ZoomState) -> GridFont {
+    GridFont::from_appearance(&scribe_common::config::AppearanceConfig {
+        font_size: zoom.effective_font_size(appearance.font_size),
+        ..appearance.clone()
+    })
+}
+
 /// The per-window inputs resolved before GPUI builds the root view.
 ///
 /// Both are decided outside the view: the terminal size by the process-wide
@@ -1659,7 +1673,12 @@ impl TerminalView {
         // EWMH `_NET_WM_DESKTOP` is WM-owned the same way `_NET_WM_STATE` is; a
         // window manager without virtual desktops publishes none and the record
         // simply carries no desktop to restore.
-        .on_desktop(monitor::window_desktop(window));
+        .on_desktop(monitor::window_desktop(window))
+        // The zoom level is captured here rather than written from the zoom
+        // step itself: this runs on every frame, so a step's `cx.notify()`
+        // brings the new level through the same equality check that arms the
+        // debounce for a move or a resize, and there is no second write path.
+        .at_zoom(self.zoom.level());
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -1675,6 +1694,18 @@ impl TerminalView {
         if self.restore.geometry_dirty_since.is_none() {
             self.restore.geometry_dirty_since = Some(Instant::now());
         }
+    }
+
+    /// The zoom level a window opens at, and the grid font that level yields.
+    ///
+    /// A restored window comes back at the level it was left at: zoom is
+    /// per-window state the user set deliberately, and the geometry record is
+    /// the only place it survived the quit. The font is built at the effective
+    /// size here rather than rebuilt a frame later, so the window never paints
+    /// a frame at the configured size on its way to the restored one.
+    fn opening_font(config: &ConfigRuntime, seed: &WindowSeed) -> (ZoomState, GridFont) {
+        let zoom = ZoomState::at_level(seed.restore_geometry.as_ref().map_or(0, |geom| geom.zoom));
+        (zoom, zoomed_font(&config.config().config.appearance, zoom))
     }
 
     /// Start the three background pollers the window owns: the lifecycle tick,
@@ -1715,7 +1746,7 @@ impl TerminalView {
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
-        let font = GridFont::from_appearance(&config.config().config.appearance);
+        let (zoom, font) = Self::opening_font(&config, &seed);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
@@ -1734,7 +1765,7 @@ impl TerminalView {
             status_colors,
             stats_config,
             font,
-            zoom: ZoomState::new(),
+            zoom,
             smart_selection,
             split_scroll: SplitScrollState::new(),
             grid_bounds: GridBounds::default(),
@@ -2546,10 +2577,7 @@ impl TerminalView {
     /// zoom step, then tell the server what the new cell box measures.
     fn rebuild_font(&mut self, cx: &mut Context<Self>) {
         let appearance = self.config.config().config.appearance.clone();
-        self.font = GridFont::from_appearance(&scribe_common::config::AppearanceConfig {
-            font_size: self.zoom.effective_font_size(appearance.font_size),
-            ..appearance
-        });
+        self.font = zoomed_font(&appearance, self.zoom);
         self.report_cell_metrics(cx);
         cx.notify();
     }
@@ -3995,7 +4023,7 @@ impl TerminalView {
             self.restore.window_id =
                 self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id());
             if let Some(window_id) = self.restore.window_id {
-                self.adopt_assigned_geometry(window_id);
+                self.adopt_assigned_geometry(window_id, cx);
             }
         }
         self.sync_launch_bindings();
@@ -4017,14 +4045,22 @@ impl TerminalView {
     /// record is taken as the baseline instead: its position is re-asserted
     /// like any restore's, and the placement is held open so no capture taken
     /// on the way there is persisted over the record it is aiming at.
-    fn adopt_assigned_geometry(&mut self, window_id: WindowId) {
+    fn adopt_assigned_geometry(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
         if self.restore.assigned_geometry == AssignedGeometry::Adopted {
             return;
         }
         self.restore.assigned_geometry = AssignedGeometry::Adopted;
         let Some(geometry) = saved_geometry_for(window_id) else { return };
         tracing::info!(%window_id, "adopting the assigned window's saved geometry");
+        let level = geometry.zoom;
         self.restore.adopt_geometry_record(geometry);
+        // This process built its font before it knew which window it was
+        // holding, so the record's zoom level is applied here rather than at
+        // construction. Without it the next capture would write level 0 over
+        // the level the adopted window was left at.
+        if level != self.zoom.level() {
+            self.apply_zoom(move |zoom| *zoom = ZoomState::at_level(level), cx);
+        }
         // Unlike a seeded restore this window is NOT at the record's bounds, so
         // the placement stays open even when there is no position to re-assert:
         // it is what keeps the opening default off the record.
@@ -8641,6 +8677,7 @@ fn open_window(
             height = geom.height,
             state = ?geom.state,
             restore_state = ?geom.restore_state,
+            zoom = geom.zoom,
             "restoring persisted window geometry"
         );
     }
