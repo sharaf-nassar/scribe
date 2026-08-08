@@ -50,7 +50,7 @@ A load failure is not cached, so a transiently unreadable config does not pin an
 
 ### Appearance
 
-Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, status bar height, and content padding are all in .
+Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, and status bar height are all in .
 
  provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range.  is a three-variant enum (`Block`, `Beam`, `Underline`).
 

@@ -16,13 +16,12 @@ use std::hash::BuildHasher;
 use std::path::PathBuf;
 
 use scribe_common::ai_state::AiProvider;
-use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
     AiLaunchSpec, AiResumeMode, LayoutDirection, PaneTreeNode, TerminalSize, WorkspaceTreeNode,
 };
 
-use crate::layout::{LayoutNode, PaneEdges, PaneId, Rect, SplitDirection};
+use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
 use crate::prompt_bar::PromptBarData;
 use crate::restore_state::{
     LaunchBinding, LaunchKind, LaunchRecord, PaneSnapshot, TabSnapshot, WindowRestoreState,
@@ -93,9 +92,6 @@ pub struct PaneRestore {
     /// straight in and replay can hand it straight back.
     pub prompts: PromptBarData,
     pub last_conversation_id: Option<String>,
-    /// Grid dimensions assigned by [`size_replay_pane_grids`]; `None` until the
-    /// geometry pass runs.
-    pub grid: Option<GridSize>,
 }
 
 /// A window rebuilt from a cold-restart snapshot.
@@ -226,58 +222,28 @@ pub fn next_launch(replay: &mut ReplayState) -> Option<ReplayLaunch> {
 }
 
 // ---------------------------------------------------------------------------
-// Grid sizing (ported from the legacy `recompute_replay_pane_geometry`)
+// Grid sizing
 // ---------------------------------------------------------------------------
 
-/// Inputs to the pre-launch pane grid sizing pass.
+/// The terminal grid that fits inside `rect` at `cell_size`, in whole cells.
 ///
-/// The legacy client sized each restored pane's grid from the geometry it had
-/// just re-applied (rather than the pre-restore window hint) so maximized
-/// windows did not create PTYs at the startup size and stay undersized.
-pub struct ReplayGridParams<'a> {
-    /// Content viewport (window size minus status bar), in physical pixels.
-    pub viewport: Rect,
-    /// Terminal cell size `(width, height)` in physical pixels.
-    pub cell_size: (f32, f32),
-    /// Height of a workspace's tab bar row, in physical pixels.
-    pub tab_bar_height: f32,
-    /// Configured content padding (logical pixels; scaled by `scale_factor`).
-    pub content_padding: &'a ContentPadding,
-    /// Device scale factor applied to the padding.
-    pub scale_factor: f32,
-}
-
-/// Restrict `padding` to the edges that border the viewport, scaled to physical
-/// pixels. Ported from the legacy `pane::effective_padding`.
+/// The one grid formula in the client: the live republish
+/// (`TerminalView::grid_size_for`) and the cold-restart replay both resolve a
+/// pane through here, so the size a PTY is created at and the size it is
+/// resized to can never come from different arithmetic.
+///
+/// `rect` is the rect the pane actually *paints* into — every chrome band
+/// (region tab bar, pane border, prompt strip) is subtracted by the caller that
+/// owns it, because only that caller knows whether the band is there. What this
+/// function guarantees is the rendering invariant the PTY depends on:
+/// `cols * cell_width <= rect.width`, so a line of exactly `cols` characters
+/// occupies exactly one painted row. Dividing and flooring does not guarantee
+/// that — at `cell_width = 6.3` and `rect.width = 428.4` the `f32` quotient
+/// floors to 68 while only 67 columns fit, and the application then pads every
+/// status line one column past the right edge.
 #[must_use]
-pub fn effective_padding(
-    padding: &ContentPadding,
-    edges: PaneEdges,
-    scale_factor: f32,
-) -> ContentPadding {
-    ContentPadding {
-        top: if edges.top() { padding.top * scale_factor } else { 0.0 },
-        right: if edges.right() { padding.right * scale_factor } else { 0.0 },
-        bottom: if edges.bottom() { padding.bottom * scale_factor } else { 0.0 },
-        left: if edges.left() { padding.left * scale_factor } else { 0.0 },
-    }
-}
-
-/// Compute a pane's terminal grid from its rect, chrome heights, and padding.
-/// Ported byte-for-byte from the legacy `pane::compute_pane_grid`.
-#[must_use]
-pub fn compute_pane_grid(
-    rect: Rect,
-    cell_size: (f32, f32),
-    tab_bar_height: f32,
-    prompt_bar_height: f32,
-    padding: &ContentPadding,
-) -> GridSize {
-    let (cell_width, cell_height) = cell_size;
-    let content_w = (rect.width - padding.left - padding.right).max(1.0);
-    let content_h =
-        (rect.height - tab_bar_height - prompt_bar_height - padding.top - padding.bottom).max(1.0);
-    grid_from_pixels(content_w, content_h, cell_width, cell_height)
+pub fn grid_for_rect(rect: Rect, cell_size: (f32, f32)) -> GridSize {
+    grid_from_pixels(rect.width, rect.height, cell_size.0, cell_size.1)
 }
 
 fn grid_axis_units(extent: f32, cell_size: f32) -> u16 {
@@ -301,59 +267,6 @@ fn grid_axis_units(extent: f32, cell_size: f32) -> u16 {
 
 fn grid_from_pixels(width: f32, height: f32, cell_w: f32, cell_h: f32) -> GridSize {
     GridSize { cols: grid_axis_units(width, cell_w), rows: grid_axis_units(height, cell_h) }
-}
-
-/// Size every restored pane's grid from the re-applied window geometry, writing
-/// the result into each [`PaneRestore::grid`] and returning the map.
-///
-/// The prompt bar reserves no space here — cold-restart panes have no live
-/// prompt state until the session reattaches, mirroring the legacy behaviour of
-/// sizing from the pane's current (zero) prompt-bar height.
-pub fn size_replay_pane_grids<S: BuildHasher>(
-    layout: &WindowLayout,
-    panes: &mut HashMap<PaneId, PaneRestore, S>,
-    params: &ReplayGridParams<'_>,
-) -> HashMap<PaneId, GridSize> {
-    // Collect (pane_id, grid) first to avoid borrowing the layout while
-    // mutating the pane map, keeping the per-pane computation shallow.
-    let sized: Vec<(PaneId, GridSize)> = layout
-        .compute_workspace_rects(params.viewport)
-        .into_iter()
-        .filter_map(|(ws_id, ws_rect)| layout.find_workspace(ws_id).map(|ws| (ws, ws_rect)))
-        .flat_map(|(workspace, ws_rect)| {
-            workspace.tabs.iter().flat_map(move |tab| {
-                tab.pane_layout
-                    .compute_rects(ws_rect)
-                    .into_iter()
-                    .map(|geom| size_one_pane(geom, params))
-            })
-        })
-        .collect();
-
-    let mut grids = HashMap::new();
-    for (pane_id, grid) in sized {
-        grids.insert(pane_id, grid);
-        if let Some(pane) = panes.get_mut(&pane_id) {
-            pane.grid = Some(grid);
-        }
-    }
-    grids
-}
-
-/// Compute one pane's grid from its rect, edges, and the shared params.
-fn size_one_pane(
-    (pane_id, pane_rect, pane_edges): (PaneId, Rect, PaneEdges),
-    params: &ReplayGridParams<'_>,
-) -> (PaneId, GridSize) {
-    let eff_tbh = if pane_edges.top() { params.tab_bar_height } else { 0.0 };
-    let grid = compute_pane_grid(
-        pane_rect,
-        params.cell_size,
-        eff_tbh,
-        0.0,
-        &effective_padding(params.content_padding, pane_edges, params.scale_factor),
-    );
-    (pane_id, grid)
 }
 
 /// Convert a pane grid to a [`TerminalSize`] carrying cell dimensions.
@@ -597,7 +510,6 @@ fn queue_from_launch_record(
         // live-session gesture and is not carried in the launch record.
         prompts: PromptBarData::from(record.prompts.clone()),
         last_conversation_id,
-        grid: None,
     };
     context.panes.insert(pane_id, pane);
     let command = replay_command_from_record(record);
@@ -786,7 +698,6 @@ mod tests {
         // The pane metadata is keyed by the same pane id as the launch.
         let pane = rebuilt.panes.get(&launch.pane_id).expect("pane restored");
         assert_eq!(pane.workspace_id, workspace_id);
-        assert!(pane.grid.is_none());
         // The focused workspace and its accent survive the round trip.
         assert_eq!(rebuilt.layout.focused_workspace_id(), workspace_id);
         assert_eq!(
@@ -846,26 +757,48 @@ mod tests {
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Grid sized before launch]]
     #[test]
     fn grids_sized_from_restored_geometry() {
-        let window_id = WindowId::new();
-        let workspace_id = WorkspaceId::new();
-        let snapshot = single_pane_snapshot(window_id, workspace_id, "launch-a");
-        let mut rebuilt = prepare_replay(&snapshot);
+        let rect = Rect { x: 0.0, y: 0.0, width: 800.0, height: 480.0 };
+        assert_eq!(grid_for_rect(rect, (8.0, 16.0)), GridSize { cols: 100, rows: 30 });
+    }
 
-        let padding = ContentPadding { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 };
-        let params = ReplayGridParams {
-            viewport: Rect { x: 0.0, y: 0.0, width: 800.0, height: 480.0 },
-            cell_size: (8.0, 16.0),
-            tab_bar_height: 0.0,
-            content_padding: &padding,
-            scale_factor: 1.0,
-        };
-        let grids = size_replay_pane_grids(&rebuilt.layout, &mut rebuilt.panes, &params);
+    // @lat: [[client#GPUI Client Spike#Pane Grid Sizing#Published grid fits the painted pane]]
+    #[test]
+    fn published_grid_never_overruns_the_painted_rect() {
+        // Fractional cell metrics are the norm: a font's advance width is
+        // whatever the rasteriser reports, not a whole pixel.
+        let cells = [(6.3_f32, 13.0_f32), (8.0, 16.0), (9.916_667, 21.5), (7.203_1, 17.4)];
+        for (cell_w, cell_h) in cells {
+            let mut width = 400.0_f32;
+            while width < 460.0 {
+                width += 0.1;
+                let rect = Rect { x: 0.0, y: 0.0, width, height: width };
+                let grid = grid_for_rect(rect, (cell_w, cell_h));
+                // A line of exactly `cols` characters has to fit on one
+                // painted row: the application right-pads to the width the
+                // PTY reports, so one column of overrun wraps every status
+                // line onto the next row.
+                assert!(
+                    f32::from(grid.cols) * cell_w <= width,
+                    "cols {} overruns width {width} at cell width {cell_w}",
+                    grid.cols
+                );
+                assert!(f32::from(grid.rows) * cell_h <= width);
+                // ...and the grid is the largest one that does fit, so the
+                // rightmost painted column is never left dead.
+                assert!(f32::from(grid.cols + 1) * cell_w > width || grid.cols == u16::MAX);
+            }
+        }
+    }
 
-        let launch = &rebuilt.launches[0];
-        let grid = grids.get(&launch.pane_id).copied().expect("grid computed");
-        assert_eq!(grid, GridSize { cols: 100, rows: 30 });
-        // The grid is written back onto the pane before the launch dispatches.
-        assert_eq!(rebuilt.panes[&launch.pane_id].grid, Some(grid));
+    // @lat: [[client#GPUI Client Spike#Pane Grid Sizing#Divide and floor overruns the pane]]
+    #[test]
+    fn exact_fit_beats_divide_and_floor() {
+        // `(428.4 / 6.3).floor()` is 68 in `f32`, but 68 cells span 428.4004
+        // pixels — one column more than the pane can paint. This pair is the
+        // regression that made every right-padded status line wrap.
+        let rect = Rect { x: 0.0, y: 0.0, width: 428.4, height: 100.0 };
+        assert_eq!(grid_for_rect(rect, (6.3, 10.0)).cols, 67);
+        assert!(((428.4_f32 / 6.3_f32).floor() - 68.0).abs() < f32::EPSILON);
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Codex reattach sends zero size]]

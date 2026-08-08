@@ -97,10 +97,6 @@ fn apply_appearance_key(
         | "appearance.tab_width"
         | "appearance.status_bar_height"
         | "appearance.tab_height" => apply_appearance_size_key(config, key, value),
-        "appearance.content_padding_top"
-        | "appearance.content_padding_right"
-        | "appearance.content_padding_bottom"
-        | "appearance.content_padding_left" => apply_appearance_padding_key(config, key, value),
         "appearance.focus_border_width" => apply_appearance_focus_width_key(config, value),
         "appearance.focus_border_color"
         | "appearance.prompt_bar_second_row_bg"
@@ -192,34 +188,6 @@ fn apply_appearance_size_key(
             config.appearance.tab_height = v.clamp(16.0, 60.0);
         }
         _ => return Err(format!("unhandled appearance layout key: {key}")),
-    }
-
-    Ok(())
-}
-
-fn apply_appearance_padding_key(
-    config: &mut scribe_common::config::ScribeConfig,
-    key: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    match key {
-        "appearance.content_padding_top" => {
-            let v: f32 = parse_number(value, "content_padding_top")?;
-            config.appearance.content_padding.top = v.clamp(0.0, 50.0);
-        }
-        "appearance.content_padding_right" => {
-            let v: f32 = parse_number(value, "content_padding_right")?;
-            config.appearance.content_padding.right = v.clamp(0.0, 50.0);
-        }
-        "appearance.content_padding_bottom" => {
-            let v: f32 = parse_number(value, "content_padding_bottom")?;
-            config.appearance.content_padding.bottom = v.clamp(0.0, 50.0);
-        }
-        "appearance.content_padding_left" => {
-            let v: f32 = parse_number(value, "content_padding_left")?;
-            config.appearance.content_padding.left = v.clamp(0.0, 50.0);
-        }
-        _ => return Err(format!("unhandled appearance padding key: {key}")),
     }
 
     Ok(())

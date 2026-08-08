@@ -13,8 +13,6 @@ use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Column, Line};
 use alacritty_terminal_gpui::term::cell::{Cell, Flags};
 
-use scribe_common::config::ContentPadding;
-
 use crate::layout::Rect;
 
 /// Granularity of a terminal selection.
@@ -131,7 +129,7 @@ impl SelectionRange {
 }
 
 #[derive(Clone, Copy)]
-pub struct PixelToGridRequest<'a> {
+pub struct PixelToGridRequest {
     pub x: f32,
     pub y: f32,
     pub pane_rect: Rect,
@@ -140,7 +138,6 @@ pub struct PixelToGridRequest<'a> {
     pub prompt_bar_height: f32,
     pub prompt_bar_at_top: bool,
     pub display_offset: usize,
-    pub padding: &'a ContentPadding,
 }
 
 #[derive(Clone, Copy)]
@@ -201,31 +198,28 @@ fn selection_grid_i32(units: usize) -> i32 {
 /// viewport, negative values point into scrollback history.  The
 /// `display_offset` parameter is subtracted from the screen row so that
 /// the selection tracks content rather than screen position.
-pub fn pixel_to_grid(request: PixelToGridRequest<'_>) -> Option<SelectionPoint> {
+pub fn pixel_to_grid(request: PixelToGridRequest) -> Option<SelectionPoint> {
     pixel_to_grid_impl(request, ContentBoundsMode::RejectOutsideContent)
 }
 
 /// Convert pixel coordinates to an absolute grid position, clamping points
 /// outside the content area to the nearest visible cell.
-pub fn pixel_to_grid_clamped(request: PixelToGridRequest<'_>) -> Option<SelectionPoint> {
+pub fn pixel_to_grid_clamped(request: PixelToGridRequest) -> Option<SelectionPoint> {
     pixel_to_grid_impl(request, ContentBoundsMode::ClampToContent)
 }
 
 fn pixel_to_grid_impl(
-    request: PixelToGridRequest<'_>,
+    request: PixelToGridRequest,
     bounds_mode: ContentBoundsMode,
 ) -> Option<SelectionPoint> {
     let (cell_w, cell_h) = request.cell_size;
     let chrome_above = request.tab_bar_height
         + if request.prompt_bar_at_top { request.prompt_bar_height } else { 0.0 };
     let total_chrome = request.tab_bar_height + request.prompt_bar_height;
-    let content_x = request.pane_rect.x + request.padding.left;
-    let content_y = request.pane_rect.y + chrome_above + request.padding.top;
-    let content_w =
-        (request.pane_rect.width - request.padding.left - request.padding.right).max(0.0);
-    let content_h =
-        (request.pane_rect.height - total_chrome - request.padding.top - request.padding.bottom)
-            .max(0.0);
+    let content_x = request.pane_rect.x;
+    let content_y = request.pane_rect.y + chrome_above;
+    let content_w = request.pane_rect.width.max(0.0);
+    let content_h = (request.pane_rect.height - total_chrome).max(0.0);
 
     if content_w <= 0.0 || content_h <= 0.0 {
         return None;
@@ -688,7 +682,6 @@ mod tests {
     use alacritty_terminal_gpui::event::VoidListener;
     use alacritty_terminal_gpui::grid::Dimensions;
     use alacritty_terminal_gpui::term::{Config, Term};
-    use scribe_common::config::ContentPadding;
     use vte::ansi::Processor;
 
     use super::{
@@ -868,7 +861,6 @@ mod tests {
     // @lat: [[test#GPUI Terminal Selection#Pixel mapping resolves grid cells]]
     #[gpui::test]
     fn pixel_mapping_resolves_grid_cells() {
-        let padding = ContentPadding { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 };
         let request = PixelToGridRequest {
             x: 25.0,
             y: 14.0,
@@ -878,7 +870,6 @@ mod tests {
             prompt_bar_height: 0.0,
             prompt_bar_at_top: false,
             display_offset: 0,
-            padding: &padding,
         };
         let resolved = pixel_to_grid(request).expect("inside content area");
         assert_eq!(resolved, point(0, 2));

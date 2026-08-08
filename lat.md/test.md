@@ -1904,6 +1904,14 @@ The measurement is geometric rather than golden-image. Phase 1 reads the client 
 
 Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom rows fell outside the viewport, and this is the assertion that catches it. Phase 3 asserts the window status bar carries ink at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the bar *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while the status bar keeps its ink, which is what the bands' `flex_none` layout guarantees.
 
+### Published columns fit one rendered row
+
+`tests/e2e/visual/pane-grid-width.sh` (`just e2e-visual-shared visual/pane-grid-width.sh`) is the app-level oracle for [[client#GPUI Client Spike#Pane Grid Sizing]]: the columns the client publishes must be the columns it paints.
+
+The client owns no PTY, so nothing local contradicts an over-reported width — the extra column is clipped by the pane's `overflow_hidden` box and the application wraps the line. Only pixels can tell. Phase 0 reads the published `cols` out of the client log and confirms the PTY runs at it. Phase 1 prints a line of exactly that many characters and asserts it paints the same number of ink rows as a line one character shorter. Phase 2 prints one character more and asserts the row count *rises* — the positive control, without which phase 1 would pass over a measurement that cannot see a wrap at all.
+
+The oracle is ink rows compared against themselves rather than a golden image or an absolute pixel budget, so it needs no per-font tuning. The script is UNVERIFIED: it was written alongside the fix and never executed, because the harness was held by another run.
+
 ## Sandbox limits
 
 The Docker harness keeps host services isolated, but unsupported hardware, platforms, topologies, profiles, and workflows require the sanctioned alternatives below.
@@ -3246,10 +3254,6 @@ A tree with an outer split whose second child is itself a split emits exactly on
 ### Drag on degenerate parent extent falls back to half
 
 A drag whose captured parent extent is zero returns a neutral 0.5 ratio instead of dividing by zero, keeping the layout stable during a zero-area transient.
-
-### Viewport insets clip vertical dividers below the tab bar
-
- clips a vertical divider below the tab bar and insets its top/bottom edges by the content padding when they touch the viewport boundary.
 
 ## GPUI Focus Borders
 
