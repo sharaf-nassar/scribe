@@ -2199,10 +2199,6 @@ A selection spanning two rows separated by a hard line break (no `WRAPLINE`) is 
 
  in word mode extends the range by whole words from the double-click anchor to the drag point.
 
-### Pixel mapping resolves grid cells
-
- maps a pointer pixel inside the content area to the correct grid cell and rejects pixels above the content area.
-
 ### Vi mode toggles and moves the cursor
 
  enters copy mode,  moves the vi cursor, and motions are no-ops while vi mode is inactive.

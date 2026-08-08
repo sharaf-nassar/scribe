@@ -412,7 +412,9 @@ A session seeded with a replayed pane's prompt history keeps its rows when the r
 
 #### Codex reattach sends zero size
 
-`attach_dimensions_for_session` returns the sized grid for a normal session but a zero-sized `TerminalSize` for a Codex session, preserving the exception that leaves Codex PTY sizing to its own SIGWINCH.
+`attach_dimensions_for_session` returns the sized grid for a normal session but a zero-sized `TerminalSize` for a Codex session, encoding the exception that leaves Codex PTY sizing to its own SIGWINCH.
+
+The helper is not on a live path: the two attach sites in the client send the pane grid unconditionally, so the exception the retired client applied is currently lost and Codex panes reattach pre-sized. Tracked as `scribe-gnh`.
 
 #### Restore child never fans out
 

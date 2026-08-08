@@ -1,19 +1,19 @@
-//! Terminal text selection: grid coordinate mapping, text extraction, and
-//! interactive selection state with copy-on-select.
+//! Terminal text selection: range tracking, text extraction, and interactive
+//! selection state with copy-on-select.
 //!
 //! Ported from the winit client's `crates/scribe-client/src/selection.rs` onto
 //! Zed's Alacritty fork (`alacritty_terminal_gpui`). Provides types for
-//! tracking a selection range on the terminal grid, converting pixel
-//! coordinates to grid cells, extracting selected text (WRAPLINE-aware), and
-//! resolving cell/word/line granularity during a mouse drag.
+//! tracking a selection range on the terminal grid, extracting selected text
+//! (WRAPLINE-aware), and resolving cell/word/line granularity during a mouse
+//! drag. Lowering a pointer position onto a cell is not done here: the paint
+//! path owns the grid rect, so `terminal_element::cell_at` is the hit test and
+//! `terminal::TerminalView::selection_point` applies the display offset.
 
 use alacritty_terminal_gpui::Term;
 use alacritty_terminal_gpui::event::VoidListener;
 use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Column, Line};
 use alacritty_terminal_gpui::term::cell::{Cell, Flags};
-
-use crate::layout::Rect;
 
 /// Granularity of a terminal selection.
 ///
@@ -128,143 +128,10 @@ impl SelectionRange {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct PixelToGridRequest {
-    pub x: f32,
-    pub y: f32,
-    pub pane_rect: Rect,
-    pub cell_size: (f32, f32),
-    pub tab_bar_height: f32,
-    pub prompt_bar_height: f32,
-    pub prompt_bar_at_top: bool,
-    pub display_offset: usize,
-}
-
-#[derive(Clone, Copy)]
-enum ContentBoundsMode {
-    RejectOutsideContent,
-    ClampToContent,
-}
-
-const MAX_SELECTION_GRID_UNITS: usize = 65_535;
-
-fn selection_grid_units(units: usize) -> u16 {
-    u16::try_from(units.min(MAX_SELECTION_GRID_UNITS)).unwrap_or(u16::MAX)
-}
-
-fn selection_grid_pixels(units: usize, cell_size: f32) -> f32 {
-    f32::from(selection_grid_units(units)) * cell_size
-}
-
-fn selection_units_in_extent(extent: f32, cell_size: f32) -> usize {
-    if cell_size <= 0.0 || !extent.is_finite() || extent <= 0.0 {
-        return 0;
-    }
-
-    let mut low = 0usize;
-    let mut high = 1usize;
-    while high < MAX_SELECTION_GRID_UNITS && selection_grid_pixels(high, cell_size) <= extent {
-        low = high;
-        high = high.saturating_mul(2).min(MAX_SELECTION_GRID_UNITS);
-        if high == low {
-            break;
-        }
-    }
-
-    while low < high {
-        let mid = low + (high - low).saturating_add(1) / 2;
-        if selection_grid_pixels(mid, cell_size) <= extent {
-            low = mid;
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-
-    low
-}
-
+/// Narrow a grid unit count to the `i32` grid-line space
+/// `alacritty_terminal` indexes rows in, saturating rather than wrapping.
 fn selection_grid_i32(units: usize) -> i32 {
     i32::try_from(units).unwrap_or(i32::MAX)
-}
-
-/// Convert pixel coordinates to an absolute grid position within a pane.
-///
-/// The content area excludes the tab bar at the top and the status bar at the
-/// bottom.  Returns `None` when the pixel position falls outside the content
-/// area.
-///
-/// The returned `row` is an **absolute grid line** (matching
-/// `alacritty_terminal`'s `Line` index): 0 is the top of the current
-/// viewport, negative values point into scrollback history.  The
-/// `display_offset` parameter is subtracted from the screen row so that
-/// the selection tracks content rather than screen position.
-pub fn pixel_to_grid(request: PixelToGridRequest) -> Option<SelectionPoint> {
-    pixel_to_grid_impl(request, ContentBoundsMode::RejectOutsideContent)
-}
-
-/// Convert pixel coordinates to an absolute grid position, clamping points
-/// outside the content area to the nearest visible cell.
-pub fn pixel_to_grid_clamped(request: PixelToGridRequest) -> Option<SelectionPoint> {
-    pixel_to_grid_impl(request, ContentBoundsMode::ClampToContent)
-}
-
-fn pixel_to_grid_impl(
-    request: PixelToGridRequest,
-    bounds_mode: ContentBoundsMode,
-) -> Option<SelectionPoint> {
-    let (cell_w, cell_h) = request.cell_size;
-    let chrome_above = request.tab_bar_height
-        + if request.prompt_bar_at_top { request.prompt_bar_height } else { 0.0 };
-    let total_chrome = request.tab_bar_height + request.prompt_bar_height;
-    let content_x = request.pane_rect.x;
-    let content_y = request.pane_rect.y + chrome_above;
-    let content_w = request.pane_rect.width.max(0.0);
-    let content_h = (request.pane_rect.height - total_chrome).max(0.0);
-
-    if content_w <= 0.0 || content_h <= 0.0 {
-        return None;
-    }
-
-    // Pixel offset relative to the content area origin.
-    let raw_rel_x = request.x - content_x;
-    let raw_rel_y = request.y - content_y;
-
-    // Reject clicks outside the content area.
-    if matches!(bounds_mode, ContentBoundsMode::RejectOutsideContent)
-        && (raw_rel_x < 0.0 || raw_rel_y < 0.0 || raw_rel_x >= content_w || raw_rel_y >= content_h)
-    {
-        return None;
-    }
-
-    if cell_w <= 0.0 || cell_h <= 0.0 {
-        return None;
-    }
-
-    let rel_x = if matches!(bounds_mode, ContentBoundsMode::ClampToContent) {
-        raw_rel_x.clamp(0.0, (content_w - f32::EPSILON).max(0.0))
-    } else {
-        raw_rel_x
-    };
-    let rel_y = if matches!(bounds_mode, ContentBoundsMode::ClampToContent) {
-        raw_rel_y.clamp(0.0, (content_h - f32::EPSILON).max(0.0))
-    } else {
-        raw_rel_y
-    };
-
-    // Clamp to the valid grid range — the content area may contain a
-    // fractional cell at the right/bottom edge, so `floor(content / cell)`
-    // could exceed the last valid index.
-    let max_col = selection_units_in_extent(content_w, cell_w);
-    let max_row = selection_grid_i32(selection_units_in_extent(content_h, cell_h));
-    let col = selection_units_in_extent(rel_x, cell_w).min(max_col.saturating_sub(1));
-    let screen_row =
-        selection_grid_i32(selection_units_in_extent(rel_y, cell_h)).min(max_row.saturating_sub(1));
-
-    // Convert screen row to absolute grid line: subtract display_offset so
-    // that scrollback lines get negative indices matching alacritty_terminal.
-    let row = screen_row.saturating_sub(selection_grid_i32(request.display_offset));
-
-    Some(SelectionPoint { row, col })
 }
 
 /// Extract the selected text from the terminal grid.
@@ -685,11 +552,9 @@ mod tests {
     use vte::ansi::Processor;
 
     use super::{
-        PixelToGridRequest, SelectionMode, SelectionPoint, SelectionRange, SelectionSpan,
-        SelectionState, extract_text, line_bounds_at, pixel_to_grid, viewport_spans,
-        word_bounds_at,
+        SelectionMode, SelectionPoint, SelectionRange, SelectionSpan, SelectionState, extract_text,
+        line_bounds_at, viewport_spans, word_bounds_at,
     };
-    use crate::layout::Rect;
 
     #[derive(Clone, Copy)]
     struct TestDims {
@@ -856,28 +721,6 @@ mod tests {
         state.start_word(&term, point(0, 1)); // "alpha"
         state.drag_to(&term, point(0, 12)); // into "gamma"
         assert_eq!(state.copy_text(&term).as_deref(), Some("alpha beta gamma"));
-    }
-
-    // @lat: [[test#GPUI Terminal Selection#Pixel mapping resolves grid cells]]
-    #[gpui::test]
-    fn pixel_mapping_resolves_grid_cells() {
-        let request = PixelToGridRequest {
-            x: 25.0,
-            y: 14.0,
-            pane_rect: Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 },
-            cell_size: (10.0, 20.0),
-            tab_bar_height: 0.0,
-            prompt_bar_height: 0.0,
-            prompt_bar_at_top: false,
-            display_offset: 0,
-        };
-        let resolved = pixel_to_grid(request).expect("inside content area");
-        assert_eq!(resolved, point(0, 2));
-
-        // A click above the content area is rejected.
-        let mut outside = request;
-        outside.y = -5.0;
-        assert_eq!(pixel_to_grid(outside), None);
     }
 
     // @lat: [[test#GPUI Terminal Selection#Selection projects onto visible rows]]
