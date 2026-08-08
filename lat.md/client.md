@@ -322,6 +322,22 @@ The claim is carried on [[crates/scribe-client/src/main.rs#WindowBackend]], one 
 
 The two fan-outs are mutually exclusive by construction. `other_windows` restores windows the server still holds sessions for; the `--restore-child` processes restore snapshots after the server itself died. Whichever one fires zeroes the other's count, so no window is ever opened twice.
 
+### Hot Restart Reattach
+
+When only the client restarts and the server survives, the whole window is rebuilt from the server's `SessionList` — and the AI half of the chrome is rebuilt there too, not left blank until the next hook event.
+
+[[crates/scribe-client/src/main.rs#on_session_list|on_session_list]] already seeded [[crates/scribe-client/src/chrome_metadata.rs#ChromeMetadata|ChromeMetadata]] (cwd, git branch, context, shell name) and the tab strip from the list; nothing read its AI fields, so `SessionInfo.ai_state` and `ai_provider_hint` had zero consumers and a reattached client came up with no prompt bar and no indicator. [[crates/scribe-client/src/main.rs#AiChrome#seed_from_session_list|AiChrome::seed_from_session_list]] closes that: prompt history goes through [[crates/scribe-client/src/main.rs#AiChrome#restore_prompts|restore_prompts]] (so a `PromptReceived` that beat the list still wins), the retained state goes to the tracker, and the provider hint is applied last as the fallback for a session whose visible state is gone but whose provider-aware behaviour must survive the reattach. The history itself is retained server-side; see [[server#Server#Sessions#Retained Prompt History]].
+
+Only the *first* list of a connection seeds. A later list is a topology refresh, and re-applying `ai_state` there would resurrect an attention state the user has already dismissed with a keystroke through [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_attention_states|clear_attention_states]] — a purely local clear the server never hears about.
+
+The conversation id the seeded prompts are filed under comes from the retained `ai_state`, so the running provider's first live `AiStateChanged` re-announces an id the chrome already knows and does not read as a switch. `dismissed` has no wire counterpart on purpose: dismissal is a local gesture against a pane, so a reattaching client starts with the bar shown, exactly as a fresh window would.
+
+This path is independent of the cold-restart snapshot below and never touches it. A surviving server means the snapshot is not replayed at all, and burning a claim to read prompt text out of it would cost a later cold restart the layout it needs.
+
+#### Session list seeds the AI chrome
+
+A `SessionInfo` carrying retained prompt history, an AI state, and a provider hint paints its prompt bar and restores the tracker's provider on seeding, and the seeded bar survives the resumed provider re-announcing its own conversation id.
+
 ### Cold Restart Restore
 
 The GPUI client ports cold-restart recovery: after a server crash the bootstrap window rebuilds its windows, workspaces, tabs, and panes from persisted snapshots and re-creates each saved session at the correct geometry.

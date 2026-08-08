@@ -28,6 +28,7 @@ fn info(session_id: SessionId, workspace_id: WorkspaceId) -> SessionInfo {
         git_branch: None,
         ai_state: None,
         ai_provider_hint: None,
+        prompt_state: None,
     }
 }
 

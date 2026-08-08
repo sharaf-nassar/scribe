@@ -1154,6 +1154,30 @@ pub struct WorkspaceListEntry {
     pub project_root: Option<PathBuf>,
 }
 
+/// Prompt-bar history the server retains for a session, so a client that
+/// attaches later can paint the bar immediately instead of waiting for the
+/// next `PromptReceived` hook.
+///
+/// Mirrors the client's `PromptBarData` minus its purely local `dismissed`
+/// flag. Instants travel as Unix-epoch seconds rather than `SystemTime`,
+/// matching how the restore snapshot already persists them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPromptState {
+    /// Number of prompts submitted in the current conversation.
+    pub prompt_count: u32,
+    /// Text of the first prompt in the conversation.
+    pub first_prompt: Option<String>,
+    /// Text of the most recent prompt.
+    pub latest_prompt: Option<String>,
+    /// When the latest prompt was submitted (the bar's timer origin).
+    pub latest_prompt_at: Option<u64>,
+    /// When the AI last finished, freezing the bar's elapsed timer. Stamped
+    /// on the first state edge that leaves `Processing`, so a reattaching
+    /// client reads back the frozen figure rather than a timer that starts
+    /// running again from the original prompt instant.
+    pub latest_prompt_finished_at: Option<u64>,
+}
+
 /// Summary of a live session, sent in `SessionList` responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -1187,6 +1211,11 @@ pub struct SessionInfo {
     /// reconnect after an attention state was dismissed locally.
     #[serde(default)]
     pub ai_provider_hint: Option<AiProvider>,
+    /// Prompt history retained for the session. `None` when the session has
+    /// submitted no prompt, and absent entirely on payloads from servers that
+    /// predate the field.
+    #[serde(default)]
+    pub prompt_state: Option<SessionPromptState>,
 }
 
 /// A single search match location in the terminal grid.

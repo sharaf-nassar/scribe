@@ -62,6 +62,26 @@ pub struct PromptBarData {
     pub dismissed: bool,
 }
 
+impl From<scribe_common::protocol::SessionPromptState> for PromptBarData {
+    /// Adopt the prompt history the server retained for a session.
+    ///
+    /// `dismissed` has no wire counterpart on purpose: dismissal is a local
+    /// gesture against a pane, so a reattaching client starts with the bar
+    /// shown, exactly as a fresh window would.
+    fn from(state: scribe_common::protocol::SessionPromptState) -> Self {
+        let from_epoch =
+            |secs: Option<u64>| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs?));
+        Self {
+            prompt_count: state.prompt_count,
+            first_prompt: state.first_prompt,
+            latest_prompt: state.latest_prompt,
+            latest_prompt_at: from_epoch(state.latest_prompt_at),
+            latest_prompt_finished_at: from_epoch(state.latest_prompt_finished_at),
+            dismissed: false,
+        }
+    }
+}
+
 /// Configurable colours for the prompt bar, derived from the theme with
 /// optional user overrides. Colours are sRGB `[f32; 4]`; GPUI does its own
 /// linear conversion at paint time (unlike the legacy pre-multiplied renderer).

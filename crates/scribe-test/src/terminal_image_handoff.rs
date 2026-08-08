@@ -718,6 +718,7 @@ fn session_stub(image_state: Option<SessionImageHandoff>) -> HandoffSession {
         context: None,
         ai_state: None,
         ai_provider_hint: None,
+        prompt_state: None,
         image_state,
     }
 }

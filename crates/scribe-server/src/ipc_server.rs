@@ -1472,6 +1472,11 @@ pub struct LiveSession {
     /// Launch-time AI provider hint used when the session CLI does not emit
     /// explicit provider metadata.
     ai_provider_hint: Option<AiProvider>,
+    /// Prompt history for the running conversation, retained alongside
+    /// `ai_state` so a client that attaches after the prompts were submitted
+    /// still gets a prompt bar. Cleared with `ai_state`: the provider exiting
+    /// ends the conversation the history belongs to.
+    prompt_state: Option<scribe_common::protocol::SessionPromptState>,
     /// Latest known terminal cell size in pixels.
     cell_width: u16,
     cell_height: u16,
@@ -6725,7 +6730,14 @@ async fn initial_client_writer(writer: Option<&SharedWriter>) -> ClientWriter {
 /// of a channel that connects them, so building it in one place keeps the
 /// split itself readable and keeps [`start_session`] a wiring step.
 struct SharedSessionHandles {
+    /// The reader half of the session's PTY. Not shared — it is moved straight
+    /// into the reader task — but the split that produces it also produces
+    /// `pty_write`, so both ends are made here rather than one being made
+    /// twice over.
+    pty_read: tokio::io::ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
+    /// Server-owned image capability, cloned into both halves.
+    image_sharing: SharedImageSharing,
     client_writer: ClientWriter,
     term_commit: SessionCommit,
     search_cache: SessionSearchCache,
@@ -6743,17 +6755,20 @@ struct SharedSessionHandles {
 
 impl SharedSessionHandles {
     async fn new(
-        pty_write: WriteHalf<scribe_pty::async_fd::AsyncPtyFd>,
+        pty_fd: scribe_pty::async_fd::AsyncPtyFd,
         initial_attachment: InitialAttachment<'_>,
     ) -> Self {
         // Seed the session's attached-sink set with the initial client (if any) so
         // the reader task keeps running detached when empty. A single sink here is
         // byte-identical to the pre-015 `Some(writer)` slot.
         let client_writer = initial_client_writer(initial_attachment.writer).await;
+        let (pty_read, pty_write) = tokio::io::split(pty_fd);
         let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
         let (preserve_ai_scrollback, scrollback_lines) = load_shared_scrollback_state();
         Self {
+            pty_read,
             pty_write: Arc::new(Mutex::new(pty_write)),
+            image_sharing: new_session_image_sharing(),
             client_writer,
             term_commit: Arc::default(),
             search_cache: Arc::default(),
@@ -6785,14 +6800,13 @@ async fn start_session(
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd, context,
-        ai_state, ai_provider_hint, cell_width, cell_height, env_envelope_id, image_state, ..
+        ai_state, ai_provider_hint, prompt_state, cell_width, cell_height, env_envelope_id,
+        image_state, ..
     } = session;
-    let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
-    let shared = SharedSessionHandles::new(pty_write, initial_attachment).await;
+    let shared = SharedSessionHandles::new(pty_fd, initial_attachment).await;
     let (terminal_images, terminal_grid_observer) =
         new_session_image_seam(session_id, cell_width, cell_height, image_state.as_deref());
-    let image_sharing = new_session_image_sharing();
     let live = LiveSession {
         pty_write: Arc::clone(&shared.pty_write),
         resize_fd: Arc::new(resize_fd),
@@ -6804,7 +6818,7 @@ async fn start_session(
         child_pid,
         child_identity,
         client_writer: Arc::clone(&shared.client_writer),
-        image_sharing: Arc::clone(&image_sharing),
+        image_sharing: Arc::clone(&shared.image_sharing),
         attachment: Arc::clone(&shared.attachment),
         workspace_id,
         shell_name,
@@ -6816,6 +6830,7 @@ async fn start_session(
         context,
         ai_state,
         ai_provider_hint,
+        prompt_state,
         cell_width,
         cell_height,
         resize_pacer: std::sync::Mutex::default(),
@@ -6840,7 +6855,7 @@ async fn start_session(
             ai_provider,
             cell_width,
             cell_height,
-            pty_read,
+            pty_read: shared.pty_read,
             pty_write: shared.pty_write,
             term,
             term_commit: shared.term_commit,
@@ -6851,7 +6866,7 @@ async fn start_session(
             clipboard_command_rx: shared.clipboard_command_rx,
             client_writer: shared.client_writer,
             terminal_images,
-            image_sharing,
+            image_sharing: shared.image_sharing,
             attachment: shared.attachment,
             preserve_ai_scrollback: shared.preserve_ai_scrollback,
             scrollback_lines: shared.scrollback_lines,
@@ -8221,6 +8236,7 @@ async fn handle_list_sessions(
         }),
         ai_state: s.ai_state.clone(),
         ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
+        prompt_state: s.prompt_state.clone(),
     };
 
     let mut infos: Vec<SessionInfo> = if has_window_sessions {
@@ -11458,7 +11474,9 @@ async fn persist_session_metadata(
             .await;
         }
         ServerMessage::AiStateChanged { ai_state, .. } => {
+            let at = std::time::SystemTime::now();
             update_live_session(session_id, live_sessions, |session| {
+                note_prompt_progress(&mut session.prompt_state, &ai_state.state, at);
                 session.ai_state = Some(ai_state.clone());
             })
             .await;
@@ -11466,11 +11484,68 @@ async fn persist_session_metadata(
         ServerMessage::AiStateCleared { .. } => {
             update_live_session(session_id, live_sessions, |session| {
                 session.ai_state = None;
+                // Same boundary the client's `AiChrome::forget` uses: the
+                // provider exiting must take the prompt bar with it, or the
+                // next client to attach paints a bar for a dead conversation.
+                session.prompt_state = None;
+            })
+            .await;
+        }
+        ServerMessage::PromptReceived { text, .. } => {
+            update_live_session(session_id, live_sessions, |session| {
+                record_prompt(&mut session.prompt_state, text, std::time::SystemTime::now());
             })
             .await;
         }
         _ => {}
     }
+}
+
+/// Fold one submitted prompt onto a session's retained history.
+///
+/// Mirrors the client's `AiChrome::record_prompt` so a bar painted from a
+/// `SessionList` is the same bar the live `PromptReceived` path would have
+/// built: the first prompt is latched once, the latest one is replaced, and
+/// the elapsed timer restarts.
+fn record_prompt(
+    state: &mut Option<scribe_common::protocol::SessionPromptState>,
+    text: &str,
+    at: std::time::SystemTime,
+) {
+    let prompts = state.get_or_insert_with(Default::default);
+    prompts.prompt_count = prompts.prompt_count.saturating_add(1);
+    if prompts.first_prompt.is_none() {
+        prompts.first_prompt = Some(text.to_owned());
+    }
+    prompts.latest_prompt = Some(text.to_owned());
+    prompts.latest_prompt_at = epoch_secs(at);
+    prompts.latest_prompt_finished_at = None;
+}
+
+/// Freeze or resume a session's elapsed prompt timer for one AI state edge.
+///
+/// Mirrors the client's `AiChrome::note_prompt_progress`, so the frozen figure
+/// a pane is showing is the one a reattaching client reads back rather than a
+/// timer that starts running again from the original prompt instant. The stamp
+/// is taken once per run — an idle provider keeps emitting non-`Processing`
+/// edges and each one would push the frozen figure forward.
+fn note_prompt_progress(
+    state: &mut Option<scribe_common::protocol::SessionPromptState>,
+    ai_state: &AiState,
+    at: std::time::SystemTime,
+) {
+    let Some(prompts) = state.as_mut() else { return };
+    if matches!(ai_state, AiState::Processing) {
+        prompts.latest_prompt_finished_at = None;
+    } else if prompts.latest_prompt_finished_at.is_none() {
+        prompts.latest_prompt_finished_at = epoch_secs(at);
+    }
+}
+
+/// Unix-epoch seconds for a wall-clock instant, the wire form both prompt
+/// timestamps travel in.
+fn epoch_secs(at: std::time::SystemTime) -> Option<u64> {
+    at.duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_secs())
 }
 
 async fn update_live_session(
@@ -11732,6 +11807,7 @@ pub async fn serialize_live_for_handoff(
                 .as_ref()
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
+            prompt_state: live.prompt_state.clone(),
             image_state,
         });
 
@@ -12006,6 +12082,35 @@ mod tests {
     use scribe_common::framing::read_message;
     use std::os::unix::net::UnixStream as StdUnixStream;
 
+    // @lat: [[lat.md/server#Server#Sessions#Retained Prompt History#Retained prompt history]]
+    #[test]
+    fn retained_prompt_history_latches_the_first_and_tracks_the_latest() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let mut state = None;
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        record_prompt(&mut state, "build the thing", at);
+        record_prompt(&mut state, "now ship it", at + Duration::from_secs(30));
+
+        let prompts = state.expect("a submitted prompt creates the record");
+        assert_eq!(prompts.prompt_count, 2);
+        assert_eq!(prompts.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(prompts.latest_prompt.as_deref(), Some("now ship it"));
+        assert_eq!(prompts.latest_prompt_at, Some(1_700_000_030));
+
+        // The run ends: the timer freezes once and idle edges do not push it.
+        let mut frozen = Some(prompts);
+        note_prompt_progress(&mut frozen, &AiState::IdlePrompt, at + Duration::from_secs(75));
+        note_prompt_progress(&mut frozen, &AiState::WaitingForInput, at + Duration::from_mins(10));
+        let stamp = frozen.as_ref().and_then(|p| p.latest_prompt_finished_at);
+        assert_eq!(stamp, Some(1_700_000_075));
+
+        // Back to work: the timer runs again.
+        note_prompt_progress(&mut frozen, &AiState::Processing, at + Duration::from_mins(12));
+        assert_eq!(frozen.and_then(|p| p.latest_prompt_finished_at), None);
+    }
+
     fn unix_stream_pair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
         let (left, right) = StdUnixStream::pair().unwrap();
         left.set_nonblocking(true).unwrap();
@@ -12165,6 +12270,7 @@ mod tests {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                prompt_state: None,
                 image_state: None,
             }],
             workspaces: vec![],

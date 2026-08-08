@@ -231,6 +231,12 @@ pub struct HandoffSession {
     /// Launch-time AI provider hint. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub ai_provider_hint: Option<AiProvider>,
+    /// Prompt history for the running conversation, carried so a server
+    /// upgrade leaves every AI pane's prompt bar intact. `#[serde(default)]`
+    /// for backward compat: a sender that predates the field just means the
+    /// first prompt after the upgrade rebuilds the history.
+    #[serde(default)]
+    pub prompt_state: Option<scribe_common::protocol::SessionPromptState>,
     /// Committed image scene, paused framing, and any in-flight chunked
     /// transfer (spec 020). `#[serde(default)]` so a pre-image sender restores
     /// as a session with an empty scene rather than failing to decode.

@@ -187,6 +187,20 @@ Shells emit OSC 7 from their prompt hook, so the same directory is reported on e
 
 Suppression runs ahead of the registry write, the `CwdChanged` and `GitBranch` frames, the `.git/HEAD` walk and the workspace-manager write lock, so an unchanged directory costs one registry compare per prompt instead of two client frames and a filesystem walk. A report that survives the check is the invalidation signal for anything caching per-CWD state. The tracked value is per server process and is not carried in handoff state, so the first report after a hot reload still reaches clients that only saw the previous process. The `/proc` fallback and the hook channel feed the same pipeline and are deduplicated by the same check.
 
+### Retained Prompt History
+
+The server keeps each session's prompt-bar history next to its AI state, so a client that attaches after the prompts were submitted gets the bar from `SessionList` instead of waiting for the provider's next hook event.
+
+`MetadataEvent::PromptReceived` used to be forwarded and forgotten: the only copy of a session's prompt history lived in the client that happened to be attached when the prompt was typed, and a client restart against a surviving server therefore lost every prompt bar with no path back — an idle conversation emits no further hook events, so "wait for the next one" can mean forever. [[crates/scribe-server/src/ipc_server.rs#record_prompt|record_prompt]] now folds each prompt onto the live session's [[crates/scribe-common/src/protocol.rs#SessionPromptState|SessionPromptState]] from the same [[crates/scribe-server/src/ipc_server.rs#persist_session_metadata|persist_session_metadata]] funnel that already retains title, CWD, context, and AI state, and [[crates/scribe-server/src/ipc_server.rs#handle_list_sessions|handle_list_sessions]] ships it on `SessionInfo.prompt_state`.
+
+The fold mirrors the client's `AiChrome::record_prompt` exactly — the first prompt is latched once, the latest is replaced, the timer restarts — so a bar painted from a session list is the same bar the live path would have built. `AiStateCleared` clears the history along with `ai_state`, matching the client's own `forget` boundary: the provider exiting ends the conversation the history belongs to, and keeping it would paint a dead conversation's bar for the next client to attach. Conversation *switches* are still arbitrated client-side, since the server never sees a conversation id it could compare.
+
+Instants travel as Unix-epoch seconds rather than `SystemTime`, matching how the restore snapshot already persists them. The elapsed timer's freeze is mirrored too: [[crates/scribe-server/src/ipc_server.rs#note_prompt_progress|note_prompt_progress]] stamps `latest_prompt_finished_at` on the first state edge that leaves `Processing` and clears it on the way back in, exactly as the client's own `note_prompt_progress` does, so a reattaching client reads back the frozen figure instead of a timer that starts running again from the original prompt instant.
+
+#### Retained prompt history
+
+Two prompts folded onto an empty record latch the first, track the latest, and count both; the AI state edges that follow freeze the elapsed timer once and release it when work resumes.
+
 ### Git Branch Detection
 
 On a CWD change that survives suppression, the server walks up from the working directory (depth limit 50) looking for `.git/HEAD`. It extracts the branch name from `ref: refs/heads/...` or returns the first 8 characters of a detached HEAD commit.
@@ -284,6 +298,8 @@ An ACK confirms receipt. If the ACK is not received (version mismatch, peer cras
 The HandoffState contains per-session metadata, per-session replay payload, and workspace layout state for restart handoff.
 
 Per-session payloads include title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a  carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
+
+Each session also carries an additive `#[serde(default)]` prompt-history payload, so a server upgrade leaves every AI pane's prompt bar standing; see [[server#Server#Sessions#Retained Prompt History]]. A sender that predates the field just means the first prompt after the upgrade rebuilds the history.
 
 Each session also carries an additive `#[serde(default)]` image-state payload — the committed scene as a bounded replay burst, the framer's paused control-string prefix, and any chunked transfer still accumulating — so a hot reload does not blank a session's images; see [[terminal-images#Terminal Images#Image State Across Handoff]].
 

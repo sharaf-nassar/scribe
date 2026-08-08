@@ -194,6 +194,10 @@ pub struct ManagedSession {
     pub ai_state: Option<AiProcessState>,
     /// Launch-time AI provider hint derived from the session command.
     pub ai_provider_hint: Option<AiProvider>,
+    /// Prompt history from handoff, kept next to `ai_state` so a restored
+    /// session still answers `SessionList` with the bar the client had.
+    /// `None` for fresh sessions.
+    pub prompt_state: Option<scribe_common::protocol::SessionPromptState>,
     /// Latest known terminal cell size in pixels for PTY winsize replies.
     pub cell_width: u16,
     pub cell_height: u16,
@@ -269,6 +273,7 @@ fn restored_managed_session(
         context: handoff_session.context.clone(),
         ai_state: handoff_session.ai_state.clone(),
         ai_provider_hint: handoff_session.ai_provider_hint,
+        prompt_state: handoff_session.prompt_state.clone(),
         cell_width: handoff_session.cell_width.max(1),
         cell_height: handoff_session.cell_height.max(1),
         // Handoff keeps env on the existing PTY; no envelope is written for
@@ -395,6 +400,7 @@ impl PreparedSessionLaunch {
             context: None,
             ai_state: None,
             ai_provider_hint: self.ai_provider_hint,
+            prompt_state: None,
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
             env_envelope_id: self.env_envelope_id,
@@ -1349,6 +1355,7 @@ mod tests_session_cap {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                prompt_state: None,
                 image_state: None,
             });
             masters.push(pty.master);
