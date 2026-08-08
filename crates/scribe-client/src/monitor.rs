@@ -12,7 +12,7 @@
 
 use gpui::{App, Window};
 
-use crate::window_state::ObservedWindowState;
+use crate::window_state::{ObservedWindowState, WindowState};
 
 /// Read the live window state off the window manager, falling back to GPUI.
 ///
@@ -92,12 +92,21 @@ pub fn connected_monitor_names() -> Vec<String> {
 /// titlebar-sized residual to measure and correct. Window managers that do not
 /// advertise the message fall back to that `ConfigureRequest`.
 ///
+/// A window in `state` is placed by unmaximizing it first: the window manager
+/// owns a maximized or fullscreen window's geometry, so a move sent while the
+/// state is set is ignored. `_NET_WM_STATE_REMOVE` of the atoms that own the
+/// placement, the move, then `_NET_WM_STATE_ADD` of the same atoms puts the
+/// window back in its state on the monitor the move chose. EWMH 5.7 allows one
+/// message to carry both maximize atoms "specifically to allow both horizontal
+/// and vertical maximization to be altered together", so the window never
+/// passes through a half-maximized frame.
+///
 /// Returns whether a request was actually sent (false off X11). Where the
 /// window ends up is still the window manager's answer, not ours: struts,
 /// snapping, or an off-screen clamp can move it further, which is why the
 /// caller verifies the monitor it landed on.
-pub fn apply_saved_position(window: &Window, x: i32, y: i32) -> bool {
-    x11::move_window(window, x, y)
+pub fn apply_saved_position(window: &Window, x: i32, y: i32, state: WindowState) -> bool {
+    x11::move_window(window, x, y, state)
 }
 
 #[cfg(target_os = "linux")]
@@ -232,17 +241,97 @@ mod x11 {
     /// reports where the window still is. Where it landed is observed later,
     /// from the window's own bounds change — see
     /// `TerminalView::verify_restored_position`.
-    pub(super) fn move_window(window: &Window, x: i32, y: i32) -> bool {
+    ///
+    /// A window whose `state` hands its geometry to the window manager is
+    /// unmaximized around the move and put back afterwards; the three messages
+    /// reach the window manager in the order they are sent.
+    pub(super) fn move_window(window: &Window, x: i32, y: i32, state: WindowState) -> bool {
         let Some(xid) = xcb_window_id(window) else { return false };
         with_connection(|conn| {
             let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
-            if !move_resize_window(conn, root, xid, x, y) {
-                let aux = x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y);
-                conn.configure_window(xid, &aux).ok()?.check().ok()?;
+            let held = placement_atoms(conn, root, state);
+            let lifted = set_wm_state(conn, root, xid, WM_STATE_REMOVE, &held);
+            let moved =
+                move_resize_window(conn, root, xid, x, y) || configure_position(conn, xid, x, y);
+            // Put back even when the move failed: a lifted state that is not
+            // restored would leave the window unmaximized.
+            if lifted {
+                set_wm_state(conn, root, xid, WM_STATE_ADD, &held);
             }
-            Some(())
+            moved.then_some(())
         })
         .is_some()
+    }
+
+    /// The ICCCM `ConfigureRequest` fallback, for a window manager that does
+    /// not advertise `_NET_MOVERESIZE_WINDOW`.
+    fn configure_position(conn: &RustConnection, xid: u32, x: i32, y: i32) -> bool {
+        let aux = x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y);
+        conn.configure_window(xid, &aux).is_ok_and(|cookie| cookie.check().is_ok())
+    }
+
+    const WM_STATE_REMOVE: u32 = 0;
+    const WM_STATE_ADD: u32 = 1;
+    /// EWMH source indication for "a normal application" (2 is a pager).
+    const SOURCE_APPLICATION: u32 = 1;
+
+    /// The `_NET_WM_STATE` atoms that take a window's placement away from the
+    /// client, empty when `state` leaves the client its own geometry or the
+    /// window manager does not advertise the whole set.
+    ///
+    /// All-or-nothing on purpose: removing one of the two maximize atoms would
+    /// leave a half-maximized window behind.
+    fn placement_atoms(conn: &RustConnection, root: u32, state: WindowState) -> Vec<Atom> {
+        let names: &[&[u8]] = match state {
+            WindowState::Maximized => {
+                &[b"_NET_WM_STATE_MAXIMIZED_VERT", b"_NET_WM_STATE_MAXIMIZED_HORZ"]
+            }
+            WindowState::Fullscreen => &[b"_NET_WM_STATE_FULLSCREEN"],
+            WindowState::Windowed | WindowState::Minimized => &[],
+        };
+        names
+            .iter()
+            .map(|name| supported_atom(conn, root, name))
+            .collect::<Option<Vec<Atom>>>()
+            .unwrap_or_default()
+    }
+
+    /// Add or remove up to two `_NET_WM_STATE` properties in one client
+    /// message, the pair EWMH 5.7 allows so both maximize axes change together.
+    /// Reports whether the message went out; `false` for an empty atom set.
+    fn set_wm_state(
+        conn: &RustConnection,
+        root: u32,
+        xid: u32,
+        action: u32,
+        atoms: &[Atom],
+    ) -> bool {
+        if atoms.is_empty() {
+            return false;
+        }
+        let Some(message) = supported_atom(conn, root, b"_NET_WM_STATE") else { return false };
+        let first = atoms.first().copied().unwrap_or(0);
+        let second = atoms.get(1).copied().unwrap_or(0);
+        send_to_wm(conn, root, xid, message, [action, first, second, SOURCE_APPLICATION, 0])
+    }
+
+    /// Send a client message the window manager, not the X server, answers:
+    /// addressed to the root window, with the substructure-redirect mask.
+    fn send_to_wm(
+        conn: &RustConnection,
+        root: u32,
+        xid: u32,
+        message: Atom,
+        data: [u32; 5],
+    ) -> bool {
+        let event = ClientMessageEvent::new(32, xid, message, data);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .is_ok_and(|cookie| cookie.check().is_ok())
     }
 
     /// Place the window with EWMH `_NET_MOVERESIZE_WINDOW` and `StaticGravity`,
@@ -259,22 +348,7 @@ mod x11 {
         let Some(message) = supported_atom(conn, root, b"_NET_MOVERESIZE_WINDOW") else {
             return false;
         };
-        let event = ClientMessageEvent::new(
-            32,
-            xid,
-            message,
-            [FLAGS, x.cast_unsigned(), y.cast_unsigned(), 0, 0],
-        );
-        // Addressed to the root window: the substructure-redirect mask is how
-        // the window manager, not the X server, gets to answer it.
-        conn.send_event(
-            false,
-            root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
-        )
-        .ok()
-        .is_some_and(|cookie| cookie.check().is_ok())
+        send_to_wm(conn, root, xid, message, [FLAGS, x.cast_unsigned(), y.cast_unsigned(), 0, 0])
     }
 
     /// The atom for `name`, but only when the window manager lists it in
@@ -295,7 +369,7 @@ mod x11 {
 mod x11 {
     use gpui::Window;
 
-    use crate::window_state::ObservedWindowState;
+    use crate::window_state::{ObservedWindowState, WindowState};
 
     pub(super) fn observed_window_state(_window: &Window) -> Option<ObservedWindowState> {
         None
@@ -309,7 +383,7 @@ mod x11 {
         Vec::new()
     }
 
-    pub(super) fn move_window(_window: &Window, _x: i32, _y: i32) -> bool {
+    pub(super) fn move_window(_window: &Window, _x: i32, _y: i32, _state: WindowState) -> bool {
         false
     }
 }
