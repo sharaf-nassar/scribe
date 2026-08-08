@@ -271,13 +271,23 @@ const CELL_HEIGHT: u16 = 18;
 struct AiChrome {
     tracker: AiStateTracker,
     prompts: HashMap<SessionId, PromptBarData>,
+    /// Provider conversation id each session was last seen in, so a genuine
+    /// conversation switch can retire the previous conversation's prompt
+    /// history and context percent. Seeded by a cold-restart replay from the
+    /// snapshot's launch record, because the resumed provider re-announces the
+    /// id it was resumed with and that must not read as a switch.
+    conversations: HashMap<SessionId, String>,
 }
 
 impl AiChrome {
     /// Build the chrome state from the per-state style config that governs
     /// which AI states are tracked at all.
     fn new(styles: scribe_common::config::AiStateStylesConfig) -> Self {
-        Self { tracker: AiStateTracker::new(styles), prompts: HashMap::new() }
+        Self {
+            tracker: AiStateTracker::new(styles),
+            prompts: HashMap::new(),
+            conversations: HashMap::new(),
+        }
     }
 
     /// Record a prompt submission for `session_id`, seeding the first-prompt row
@@ -293,12 +303,47 @@ impl AiChrome {
         data.latest_prompt_finished_at = None;
     }
 
+    /// Adopt a replayed pane's persisted prompt history, filed under the
+    /// session the restored pane has just been given.
+    ///
+    /// Only a session that has said nothing yet is seeded: a `PromptReceived`
+    /// that arrived before the pane adopted its session is newer than anything
+    /// on disk, and the snapshot must not overwrite it.
+    fn restore_prompts(
+        &mut self,
+        session_id: SessionId,
+        prompts: PromptBarData,
+        conversation_id: Option<String>,
+    ) {
+        if let Some(conversation_id) = conversation_id {
+            self.conversations.insert(session_id, conversation_id);
+        }
+        self.prompts.entry(session_id).or_insert(prompts);
+    }
+
+    /// Note the conversation an AI state edge belongs to, retiring the session's
+    /// prompt history when it names a *different* conversation than the last
+    /// one seen.
+    ///
+    /// A first sighting is never a change: the history either belongs to this
+    /// conversation or was seeded from the snapshot that resumed it. A new
+    /// conversation also starts a fresh context window, so the previous
+    /// percent must not bleed into the new bar.
+    fn note_conversation(&mut self, session_id: SessionId, conversation_id: &str) {
+        let previous = self.conversations.insert(session_id, conversation_id.to_owned());
+        if previous.is_some_and(|old| old != conversation_id) {
+            self.prompts.remove(&session_id);
+            self.tracker.clear_context(session_id);
+        }
+    }
+
     /// Drop every trace of a session, so a closed pane leaves no orphaned
     /// percentage or prompt history behind.
     fn forget(&mut self, session_id: SessionId) {
         self.tracker.remove(session_id);
         self.tracker.clear_context(session_id);
         self.prompts.remove(&session_id);
+        self.conversations.remove(&session_id);
     }
 }
 
@@ -707,6 +752,12 @@ struct RestoreRuntime {
     /// True from the moment a replay dispatches its launches until every
     /// restored pane has adopted one of the answers.
     replaying: bool,
+    /// Prompt history the replay read back out of the snapshot, keyed by the
+    /// pane it was saved for and drained by [`TerminalView::adopt_session`].
+    /// It is parked here because a snapshot files prompts under a pane while
+    /// [`AiChrome`] files them under a session, and the session does not exist
+    /// until the server answers the pane's replayed launch.
+    restored_prompts: HashMap<PaneId, RestoredPrompts>,
     /// Snapshots still to be fanned out as `--restore-child` processes, spawned
     /// once — and only if — this window's own replay confirms the server is
     /// cold. Zeroed on the way out so a redial cannot spawn them twice.
@@ -720,6 +771,16 @@ struct RestoreRuntime {
     /// How far the restore's placement has got. Gates geometry persistence so a
     /// restore cannot save over the record it was aiming at.
     placement: RestorePlacement,
+}
+
+/// One replayed pane's persisted AI history, held from the replay dispatch
+/// until the pane adopts the session its launch was answered with.
+struct RestoredPrompts {
+    prompts: PromptBarData,
+    /// The conversation the prompts were recorded in, taken from the launch
+    /// record's `LaunchKind::Ai`. Seeding it is what keeps the resumed
+    /// provider's first state edge from reading as a conversation switch.
+    conversation_id: Option<String>,
 }
 
 /// How far a restored window's placement has got, which is what decides whether
@@ -789,6 +850,7 @@ impl RestoreRuntime {
             geometry_dirty_since: None,
             cleared: false,
             replaying: false,
+            restored_prompts: HashMap::new(),
         }
     }
 
@@ -3752,6 +3814,18 @@ impl TerminalView {
             .iter()
             .map(|(pane_id, pane)| (*pane_id, pane.launch_binding.clone()))
             .collect();
+        self.restore.restored_prompts = rebuilt
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.prompts.prompt_count > 0)
+            .map(|(pane_id, pane)| {
+                let restored = RestoredPrompts {
+                    prompts: pane.prompts.clone(),
+                    conversation_id: pane.last_conversation_id.clone(),
+                };
+                (*pane_id, restored)
+            })
+            .collect();
         let launches = self.shell.adopt_restored(rebuilt, cx);
         let viewport = self.pane_viewport();
         let sizes: HashMap<PaneId, TerminalSize> = self
@@ -4954,7 +5028,28 @@ impl TerminalView {
         if let Ok(mut attached) = self.shared.attached.lock() {
             attached.insert(session_id);
         }
+        self.seed_restored_prompts(pane, session_id);
         tracing::info!(%session_id, pane = pane.raw(), "pane adopted a session");
+    }
+
+    /// Hand a replayed pane's persisted prompt history to the session it has
+    /// just adopted.
+    ///
+    /// This is the wire between the two halves of prompt-bar persistence: the
+    /// snapshot files prompts under a pane, the bar reads them out of
+    /// [`AiChrome`] under a session, and only an adoption knows both. Without
+    /// it a correctly saved snapshot is read back, written straight out again,
+    /// and never rendered — the bar does not exist at `prompt_count == 0`.
+    /// Every adoption path routes through [`Self::adopt_session`], so a
+    /// restored pane is seeded whether the replay's own fill or the ordinary
+    /// active-session path gets to it first.
+    fn seed_restored_prompts(&mut self, pane: PaneId, session_id: SessionId) {
+        let Some(restored) = self.restore.restored_prompts.remove(&pane) else { return };
+        let Ok(mut ai) = self.shared.ai.lock() else {
+            tracing::warn!(%session_id, "AI chrome mutex poisoned; restored prompt bar stays empty");
+            return;
+        };
+        ai.restore_prompts(session_id, restored.prompts, restored.conversation_id);
     }
 
     /// Show an unshown active session in the focused pane — unless that would
@@ -9229,6 +9324,12 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
             );
             update_ai_chrome(ctx, |ai| {
                 let provider = ai_state.provider;
+                // Before the tracker takes ownership: a state edge is the only
+                // frame that names the provider's conversation, and a switch
+                // must take the previous conversation's prompt bar with it.
+                if let Some(conversation_id) = ai_state.conversation_id.as_deref() {
+                    ai.note_conversation(session_id, conversation_id);
+                }
                 ai.tracker.update(session_id, ai_state);
                 ai.tracker.remember_provider(session_id, provider);
             });
@@ -10933,6 +11034,51 @@ mod tests {
 
         assert!(bootstrap.claim(true, 0));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    // @lat: [[lat.md/client#Client#GPUI Client Spike#Cold Restart Restore#Replayed prompts reach the live AI chrome]]
+    #[test]
+    fn restored_prompts_outlive_the_resumed_conversation_edge() {
+        let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        let restored = PromptBarData {
+            prompt_count: 3,
+            first_prompt: Some("build the thing".to_owned()),
+            latest_prompt: Some("now ship it".to_owned()),
+            ..PromptBarData::default()
+        };
+
+        ai.restore_prompts(session, restored, Some("conv-42".to_owned()));
+        // The resumed provider re-announces the id it was resumed with.
+        ai.note_conversation(session, "conv-42");
+        let kept = ai.prompts.get(&session).expect("restored prompts survive the resume edge");
+        assert_eq!(kept.prompt_count, 3);
+        assert_eq!(kept.first_prompt.as_deref(), Some("build the thing"));
+
+        // A genuinely new conversation retires the previous one's bar.
+        ai.note_conversation(session, "conv-43");
+        assert!(!ai.prompts.contains_key(&session));
+    }
+
+    #[test]
+    fn restore_prompts_never_overwrites_a_live_prompt() {
+        let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        // The replayed launch answered before the pane adopted the session, so
+        // this prompt is newer than anything the snapshot holds.
+        ai.record_prompt(
+            session,
+            "typed after the restart".to_owned(),
+            std::time::SystemTime::now(),
+        );
+
+        ai.restore_prompts(
+            session,
+            PromptBarData { prompt_count: 9, ..PromptBarData::default() },
+            Some("conv-42".to_owned()),
+        );
+
+        assert_eq!(ai.prompts.get(&session).map(|data| data.prompt_count), Some(1));
     }
 
     #[test]
