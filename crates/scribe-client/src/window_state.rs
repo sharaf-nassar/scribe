@@ -7,8 +7,8 @@
 //! GPUI-native bounds conversion (the shell bead) since GPUI owns the window.
 //! `monitor_name` is the `RandR` connector name resolved by [`crate::monitor`]
 //! (GPUI's X11 display uuid is a nil placeholder — [`NIL_MONITOR_ID`]), and
-//! [`gate_position_on_monitor`] drops a saved position whose monitor is
-//! unknown or no longer connected.
+//! [`clamp_geometry_to_layout`] moves a saved rect back into the monitor
+//! layout the window is about to reopen on.
 //!
 //! It also adds the first-launch **geometry-compat normalization**
 //! ([`normalize_legacy_geometry`]): geometry persisted by the OS-decorated old
@@ -237,44 +237,160 @@ fn adopt_legacy_state(geom: WindowGeometry) -> WindowGeometry {
 /// The nil UUID string GPUI's X11 backend reports as its display "uuid".
 ///
 /// v0.1.0 cutover clients persisted this verbatim as `monitor_name`, so every
-/// pre-connector-name record on X11 carries it. Restore treats it as "monitor
-/// identity unknown" — the position is kept, because dropping it would discard
-/// every such window's placement on the first post-upgrade start (the
-/// side-by-side-windows-became-stacked regression). The record self-heals to a
-/// `RandR` connector name on the next geometry capture.
+/// pre-connector-name record on X11 carries it. It is not a connector name and
+/// can never match one, so restore treats it as "monitor identity unknown" and
+/// skips the post-move monitor check rather than warning on every such start.
+/// The record self-heals to a `RandR` connector name on the next geometry
+/// capture.
 pub const NIL_MONITOR_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// Decide whether a saved absolute position may be applied on restore.
+/// A connected monitor and the area of it a window may occupy.
 ///
-/// The position is dropped only when the record names a real monitor identity
-/// that is verifiably no longer connected. `None` and the nil-UUID placeholder
-/// mean the identity is unknown — it cannot be disproven, so the position is
-/// kept (matching pre-gate behavior for legacy records). An empty `connected`
-/// list means the platform cannot enumerate monitors (macOS, pure Wayland) —
-/// likewise unverifiable, so the position is kept.
-#[must_use]
-pub fn saved_monitor_allows_position(saved: Option<&str>, connected: &[String]) -> bool {
-    match saved {
-        None | Some(NIL_MONITOR_ID) => true,
-        Some(name) => connected.is_empty() || connected.iter().any(|c| c == name),
+/// The rect is the *work area*, not the whole monitor: the `RandR` rect minus
+/// the struts panels and docks reserve (`_NET_WORKAREA`), so a window clamped
+/// into it clears the panel instead of merely landing on screen.
+/// [`crate::monitor::connected_monitors`] resolves the list, and an empty one
+/// means the platform cannot enumerate monitors at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorWorkArea {
+    /// `RandR` connector name — the identity a record's `monitor_name` holds.
+    pub name: String,
+    /// Root-relative work-area origin and size, in logical pixels.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl MonitorWorkArea {
+    fn bounds(&self) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(i32_to_logical_px(self.x)), px(i32_to_logical_px(self.y))),
+            size: size(px(u32_to_logical_px(self.width)), px(u32_to_logical_px(self.height))),
+        }
     }
 }
 
-/// Drop the saved position when [`saved_monitor_allows_position`] rejects the
-/// record's monitor, keeping size and window state. The restore path then
-/// opens the window at its default placement — the legacy client's "saved
-/// monitor not found, letting OS place window" behavior.
+/// Move a saved record into the monitor layout it is about to reopen on.
+///
+/// This replaces the older gate, which dropped `x`/`y` outright once the record
+/// named a monitor that was verifiably gone. Dropping the position hands the
+/// window back to the window manager's default placement *and* keeps a size the
+/// remaining screen cannot hold — a 3840-wide window reopening on a 1920-wide
+/// screen, with whatever the window manager settled on persisted afterwards.
+/// What toolkits do instead, and what Zed is missing in zed-industries/zed#12521
+/// and #47231, is clamp the saved rect into the current layout: the window comes
+/// back as close to where the user left it as the layout allows, and reachable.
+///
+/// A rect that still touches a work area is clamped into the union of the areas
+/// it touches, so a window deliberately spanning two monitors keeps spanning
+/// them and only an oversized one is shrunk. A rect that touches none is moved
+/// onto the monitor nearest its centre and adopts that monitor's name, which is
+/// also what stops `TerminalView::verify_restored_position` from reporting the
+/// deliberate move as the window manager picking the wrong screen.
+///
+/// An empty `connected` means the platform cannot enumerate monitors (macOS,
+/// pure Wayland, no `RandR`): nothing is verifiable, so the record is returned
+/// untouched, exactly as those platforms behaved before any of this existed.
 #[must_use]
-pub fn gate_position_on_monitor(geom: &WindowGeometry, connected: &[String]) -> WindowGeometry {
-    if saved_monitor_allows_position(geom.monitor_name.as_deref(), connected) {
-        geom.clone()
-    } else {
+pub fn clamp_geometry_to_layout(
+    geom: &WindowGeometry,
+    connected: &[MonitorWorkArea],
+) -> WindowGeometry {
+    // A record with no origin — captured where the platform hides window
+    // positions — opens at GPUI's default placement, which lands on the primary
+    // monitor (`RandR` lists it first), so that is where its size is measured.
+    let Some(default_placement) = connected.first().map(MonitorWorkArea::bounds) else {
+        return geom.clone();
+    };
+    let own = SavedRect { x: geom.x, y: geom.y, width: geom.width, height: geom.height };
+    let (fitted, moved_to) = clamp_saved_rect(own, connected, default_placement);
+    let clamped = WindowGeometry {
+        x: fitted.x,
+        y: fitted.y,
+        width: fitted.width,
+        height: fitted.height,
+        monitor_name: moved_to
+            .map_or_else(|| geom.monitor_name.clone(), |area| Some(area.name.clone())),
+        restore_rect: geom
+            .restore_rect
+            .map(|rect| clamp_saved_rect(rect, connected, default_placement).0),
+        ..geom.clone()
+    };
+    if clamped != *geom {
         tracing::info!(
-            monitor = geom.monitor_name.as_deref().unwrap_or("<none>"),
-            "saved monitor no longer connected; dropping the saved window position"
+            saved_monitor = geom.monitor_name.as_deref().unwrap_or("<none>"),
+            monitor = clamped.monitor_name.as_deref().unwrap_or("<none>"),
+            width = clamped.width,
+            height = clamped.height,
+            "clamped the restored window into the current monitor layout"
         );
-        WindowGeometry { x: None, y: None, ..geom.clone() }
     }
+    clamped
+}
+
+/// Clamp one rect into the layout, reporting the monitor it had to be moved
+/// onto when it touched none of them.
+///
+/// `default_placement` stands in for a rect with no origin: such a record
+/// cannot say where its window will be, so it is measured where the window will
+/// open. The origin stays `None` either way — inventing one is the bug
+/// [`geometry_from_bounds`] exists to avoid — and only the size can come back
+/// changed.
+fn clamp_saved_rect(
+    rect: SavedRect,
+    connected: &[MonitorWorkArea],
+    default_placement: Bounds<Pixels>,
+) -> (SavedRect, Option<&MonitorWorkArea>) {
+    let bounds = logical_bounds(rect.x, rect.y, rect.width, rect.height, default_placement);
+    let touched = connected
+        .iter()
+        .map(MonitorWorkArea::bounds)
+        .filter(|area| area.intersects(&bounds))
+        .reduce(|spanned, area| spanned.union(&area));
+    let moved_to = if touched.is_some() { None } else { nearest_monitor(bounds, connected) };
+    let Some(area) = touched.or_else(|| moved_to.map(MonitorWorkArea::bounds)) else {
+        return (rect, None);
+    };
+    let fitted = fit_into(bounds, area);
+    (
+        SavedRect {
+            x: rect.x.map(|_| logical_px_to_i32(f32::from(fitted.origin.x))),
+            y: rect.y.map(|_| logical_px_to_i32(f32::from(fitted.origin.y))),
+            width: u32::from(round_positive_f32_to_u16(f32::from(fitted.size.width))),
+            height: u32::from(round_positive_f32_to_u16(f32::from(fitted.size.height))),
+        },
+        moved_to,
+    )
+}
+
+/// Shrink a rect to `area` and slide it fully inside, keeping its origin as
+/// close to where the user left it as the area allows.
+fn fit_into(rect: Bounds<Pixels>, area: Bounds<Pixels>) -> Bounds<Pixels> {
+    let fitted = size(rect.size.width.min(area.size.width), rect.size.height.min(area.size.height));
+    let last_origin = point(area.right() - fitted.width, area.bottom() - fitted.height);
+    Bounds { origin: rect.origin.clamp(&area.origin, &last_origin), size: fitted }
+}
+
+/// The monitor whose work-area centre is closest to the rect's — the standard
+/// "put it back on the nearest screen" answer for a rect that is off the layout
+/// entirely, and the one that keeps a window from a disconnected monitor next
+/// to where its neighbours are.
+fn nearest_monitor(
+    rect: Bounds<Pixels>,
+    connected: &[MonitorWorkArea],
+) -> Option<&MonitorWorkArea> {
+    let center = rect.center();
+    connected.iter().min_by(|a, b| center_gap(a, center).total_cmp(&center_gap(b, center)))
+}
+
+/// Squared distance between a work area's centre and `center`; squared because
+/// only the ordering is ever read.
+fn center_gap(area: &MonitorWorkArea, center: Point<Pixels>) -> f32 {
+    let area_center = area.bounds().center();
+    let dx = f32::from(area_center.x) - f32::from(center.x);
+    let dy = f32::from(area_center.y) - f32::from(center.y);
+    dx.mul_add(dx, dy * dy)
 }
 
 /// Returns `true` if `geom` is within the safe size range. Sizes outside the
@@ -780,9 +896,9 @@ titlebar_normalized = true
         assert_eq!((geom.width, geom.height), (1440, 900), "the size is still real");
         assert_eq!(geom.restore_origin(), None, "there is no placement to re-assert");
 
-        // The monitor gate cannot resurrect it: off X11 the connected list is
-        // empty, which the gate reads as "unverifiable, keep the record".
-        let gated = gate_position_on_monitor(&geom, &[]);
+        // The layout clamp cannot resurrect it: off X11 the connected list is
+        // empty, which it reads as "unverifiable, keep the record".
+        let gated = clamp_geometry_to_layout(&geom, &[]);
         assert_eq!((gated.x, gated.y), (None, None));
         // So a later X11 start opens at the default placement, not the corner.
         let fallback = test_bounds(300.0, 200.0, 10.0, 10.0);
@@ -845,27 +961,65 @@ titlebar_normalized = true
         assert!(geometry_size_is_sane(&legacy_geom(16384, 16384, windowed)));
     }
 
-    // @lat: [[test#Window geometry compat#Unknown monitor identity keeps the saved position]]
-    #[test]
-    fn unknown_monitor_identity_keeps_position() {
-        let connected = vec!["DP-2".to_owned(), "DP-4".to_owned()];
-        // Legacy nil-UUID and absent identities are unverifiable → keep.
-        assert!(saved_monitor_allows_position(Some(NIL_MONITOR_ID), &connected));
-        assert!(saved_monitor_allows_position(None, &connected));
-        // A real name still connected → keep; verifiably gone → drop.
-        assert!(saved_monitor_allows_position(Some("DP-4"), &connected));
-        assert!(!saved_monitor_allows_position(Some("DP-7"), &connected));
-        // No enumeration available (macOS, pure Wayland) → keep.
-        assert!(saved_monitor_allows_position(Some("DP-7"), &[]));
+    fn work_area(name: &str, x: i32, y: i32, width: u32, height: u32) -> MonitorWorkArea {
+        MonitorWorkArea { name: name.to_owned(), x, y, width, height }
+    }
 
-        // The gate strips only x/y, and only for a verifiably gone monitor.
-        let mut geom = legacy_geom(1200, 800, WindowState::Maximized);
+    // @lat: [[test#Window geometry compat#A window off the layout is clamped back onto it]]
+    #[test]
+    fn window_off_the_layout_is_clamped_back_onto_it() {
+        // One 1920x1080 monitor left, with a 27px panel across its top.
+        let connected = vec![work_area("DP-2", 0, 27, 1920, 1053)];
+
+        // The window was 3840 wide on a monitor that is now gone.
+        let mut geom = legacy_geom(3840, 2160, WindowState::Windowed);
+        geom.x = Some(3840);
+        geom.y = Some(0);
+        geom.monitor_name = Some("DP-4".to_owned());
+        let clamped = clamp_geometry_to_layout(&geom, &connected);
+        assert_eq!((clamped.x, clamped.y), (Some(0), Some(27)), "moved onto the remaining monitor");
+        assert_eq!((clamped.width, clamped.height), (1920, 1053), "and shrunk to its work area");
+        assert_eq!(
+            clamped.monitor_name.as_deref(),
+            Some("DP-2"),
+            "the record names the monitor it was moved onto, so the landing check agrees"
+        );
+
+        // A maximized record's pre-maximize rect is clamped with it: that is
+        // the rect the placement move aims at and the window returns to.
+        geom.state = WindowState::Maximized;
+        geom.restore_rect =
+            Some(SavedRect { x: Some(4000), y: Some(200), width: 2400, height: 1400 });
+        let maximized = clamp_geometry_to_layout(&geom, &connected);
+        assert_eq!(
+            maximized.restore_rect,
+            Some(SavedRect { x: Some(0), y: Some(27), width: 1920, height: 1053 })
+        );
+        assert_eq!(maximized.state, WindowState::Maximized, "only the geometry is touched");
+    }
+
+    // @lat: [[test#Window geometry compat#A reachable window is left where it is]]
+    #[test]
+    fn reachable_window_is_left_where_it_is() {
+        let connected =
+            vec![work_area("DP-2", 0, 27, 1920, 1053), work_area("DP-4", 1920, 27, 1920, 1053)];
+
+        // Fully on a monitor: untouched, nil-UUID identity and all.
+        let mut geom = legacy_geom(1200, 800, WindowState::Windowed);
+        geom.x = Some(100);
+        geom.y = Some(200);
         geom.monitor_name = Some(NIL_MONITOR_ID.to_owned());
-        assert_eq!(gate_position_on_monitor(&geom, &connected), geom);
-        geom.monitor_name = Some("DP-7".to_owned());
-        let gated = gate_position_on_monitor(&geom, &connected);
-        assert_eq!((gated.x, gated.y), (None, None));
-        assert_eq!((gated.width, gated.height), (1200, 800));
-        assert_eq!(gated.state, WindowState::Maximized);
+        assert_eq!(clamp_geometry_to_layout(&geom, &connected), geom);
+
+        // Deliberately spanning both monitors: still untouched, because the
+        // clamp target is the union of the work areas the rect touches.
+        geom.width = 2400;
+        geom.x = Some(1200);
+        assert_eq!(clamp_geometry_to_layout(&geom, &connected), geom);
+
+        // No enumeration available (macOS, pure Wayland): nothing to verify
+        // against, so even an absurd rect survives.
+        geom.x = Some(9000);
+        assert_eq!(clamp_geometry_to_layout(&geom, &[]), geom);
     }
 }
