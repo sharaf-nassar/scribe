@@ -27,6 +27,18 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
     exec dbus-run-session -- "$0" "$@"
 fi
 
+# The bind-mounted /output is the caller's ./test-output. This container is
+# root under the default profile, so screenshots and logs come back root-owned
+# and strand the directory in the caller's checkout — enough to fail
+# `git worktree remove`. Hand the tree back before exiting. Under the hardened
+# profile the container is already the caller's uid and the chown is a
+# harmless no-op.
+release_output() {
+    if [ -n "${HOST_UID:-}" ]; then
+        chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" /output 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     kill "${APP_PID:-}" 2>/dev/null || true
     kill "${TAIL_PID:-}" 2>/dev/null || true
@@ -43,6 +55,7 @@ cleanup() {
         scribe-test server stop >/dev/null 2>&1 || true
     fi
     kill "${XVFB_PID:-}" 2>/dev/null || true
+    release_output
 }
 trap cleanup EXIT
 
