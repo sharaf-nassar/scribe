@@ -28,6 +28,16 @@ pub fn persisted_monitor_name(window: &Window, cx: &App) -> Option<String> {
     })
 }
 
+/// `RandR` connector name of the monitor the window is on right now.
+///
+/// Unlike [`persisted_monitor_name`] there is no display-UUID fallback: this is
+/// the post-condition check restore compares against the record's
+/// `monitor_name`, and only the connector name is comparable to it.
+#[must_use]
+pub fn window_monitor_name(window: &Window) -> Option<String> {
+    x11::window_monitor_name(window)
+}
+
 /// Connector names of every currently connected monitor, best effort.
 ///
 /// Empty when the platform cannot enumerate monitors (pure Wayland, macOS,
@@ -50,11 +60,17 @@ pub fn connected_monitor_names() -> Vec<String> {
 /// `Window::resize` but no way to move a window, so the position is applied
 /// through the same X11 connection this module already keeps for `RandR`.
 ///
+/// The move goes out as an EWMH `_NET_MOVERESIZE_WINDOW` with `StaticGravity`,
+/// which is the standard way to place a window *including its decorations*
+/// without knowing their size (EWMH 4.2). A plain `ConfigureRequest` is
+/// ambiguous about frame versus client origin, which is what used to leave a
+/// titlebar-sized residual to measure and correct. Window managers that do not
+/// advertise the message fall back to that `ConfigureRequest`.
+///
 /// Returns whether a request was actually sent (false off X11). Where the
-/// window ends up is the window manager's answer, not ours: a reparenting frame
-/// offsets it, and struts, snapping, or an off-screen clamp can move it further.
-/// The caller measures the result from the window's next bounds change and
-/// corrects once.
+/// window ends up is still the window manager's answer, not ours: struts,
+/// snapping, or an off-screen clamp can move it further, which is why the
+/// caller verifies the monitor it landed on.
 pub fn apply_saved_position(window: &Window, x: i32, y: i32) -> bool {
     x11::move_window(window, x, y)
 }
@@ -66,7 +82,9 @@ mod x11 {
     use gpui::Window;
     use x11rb::connection::Connection as _;
     use x11rb::protocol::randr::ConnectionExt as _;
-    use x11rb::protocol::xproto::{Atom, ConnectionExt as _};
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask,
+    };
     use x11rb::rust_connection::RustConnection;
 
     use crate::x11_focus::xcb_window_id;
@@ -138,20 +156,70 @@ mod x11 {
     /// Ask the window manager to put a mapped window at a root-relative
     /// position.
     ///
-    /// Only a request. The reply is deliberately NOT read back here: a
-    /// `ConfigureRequest` is answered asynchronously, so a `get_geometry` issued
-    /// in the same breath reports where the window still is, and a correction
-    /// computed from that reading sends the window somewhere arbitrary. Where it
-    /// landed is observed later, from the window's own bounds change — see
-    /// `TerminalView::correct_restored_position`.
+    /// Only a request, answered asynchronously: the reply is deliberately NOT
+    /// read back here, because a `get_geometry` issued in the same breath
+    /// reports where the window still is. Where it landed is observed later,
+    /// from the window's own bounds change — see
+    /// `TerminalView::verify_restored_position`.
     pub(super) fn move_window(window: &Window, x: i32, y: i32) -> bool {
         let Some(xid) = xcb_window_id(window) else { return false };
         with_connection(|conn| {
-            let aux = x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y);
-            conn.configure_window(xid, &aux).ok()?.check().ok()?;
+            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            if !move_resize_window(conn, root, xid, x, y) {
+                let aux = x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y);
+                conn.configure_window(xid, &aux).ok()?.check().ok()?;
+            }
             Some(())
         })
         .is_some()
+    }
+
+    /// Place the window with EWMH `_NET_MOVERESIZE_WINDOW` and `StaticGravity`,
+    /// reporting whether the message went out.
+    ///
+    /// `StaticGravity` makes the coordinates the *client* origin whatever frame
+    /// the window manager drew around it, so there is no decoration residual to
+    /// measure afterwards. `false` when the window manager does not advertise
+    /// the message, which leaves the caller on the `ConfigureRequest` path.
+    fn move_resize_window(conn: &RustConnection, root: u32, xid: u32, x: i32, y: i32) -> bool {
+        // Gravity `StaticGravity` (0xa) in the low byte, bits 8 and 9 marking x
+        // and y as present, bit 12 the "application" source indication.
+        const FLAGS: u32 = 0x0000_130a;
+        let Some(message) = supported_atom(conn, root, b"_NET_MOVERESIZE_WINDOW") else {
+            return false;
+        };
+        let event = ClientMessageEvent::new(
+            32,
+            xid,
+            message,
+            [FLAGS, x.cast_unsigned(), y.cast_unsigned(), 0, 0],
+        );
+        // Addressed to the root window: the substructure-redirect mask is how
+        // the window manager, not the X server, gets to answer it.
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .ok()
+        .is_some_and(|cookie| cookie.check().is_ok())
+    }
+
+    /// The atom for `name`, but only when the window manager lists it in
+    /// `_NET_SUPPORTED`.
+    fn supported_atom(conn: &RustConnection, root: u32, name: &[u8]) -> Option<Atom> {
+        let wanted = conn.intern_atom(true, name).ok()?.reply().ok()?.atom;
+        let supported = conn.intern_atom(true, b"_NET_SUPPORTED").ok()?.reply().ok()?.atom;
+        if wanted == 0 || supported == 0 {
+            return None;
+        }
+        let reply = conn
+            .get_property(false, root, supported, AtomEnum::ATOM, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?;
+        reply.value32()?.any(|atom| atom == wanted).then_some(wanted)
     }
 }
 

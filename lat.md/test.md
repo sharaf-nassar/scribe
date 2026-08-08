@@ -1812,11 +1812,11 @@ Phase 0 leaves one window with one adopted tab. Phase 1 opens two more and requi
 
 `tests/e2e/visual/geometry-capture-probe.sh` (`just e2e-visual-geometry-capture-probe`) resizes the window rather than only moving it, and asserts the record-to-window offset stays constant across that resize — a gap layout-restore cannot cover.
 
-The offset in question is what [[crates/scribe-client/src/main.rs#TerminalView#correct_restored_position]] compensates for on every restore.
+The offset in question is between the root-relative reading `xdotool` takes and what the capture path persists; whether it is zero matters far less than whether it is stable.
 
 Layout-restore only ever moves the window, and a reparenting window manager answers a move with the synthetic, root-relative `ConfigureNotify` ICCCM requires — the one case that cannot expose a parent-relative reading. A resize instead earns a real `ConfigureNotify` whose `x`/`y` are relative to the WM frame, and GPUI's X11 backend stores that value verbatim without checking whether the event was synthetic. If that reading ever won, `capture_geometry` would persist the frame's border/titlebar offset instead of the window's desktop position, and the next start would land the window at the primary monitor's top-left regardless of which screen it came from. The hypothesis that this happens under the openbox test WM was disproven, but the invariant the probe locks — the offset must not move on a resize — is real and worth guarding regardless of which window manager exposed it.
 
-Phase 0 moves the window and records the offset between the live, root-relative `xdotool` reading and the persisted record (which holds the frame origin, one decoration off from the content origin `xdotool` reports). Phase 1 resizes without moving and requires that offset to be bit-for-bit the same; a parent-relative capture would collapse it to the whole frame offset instead. Phase 2 restarts the client and requires it to land exactly where phase 1 left it.
+Phase 0 moves the window and records the offset between the live, root-relative `xdotool` reading and the persisted record. Phase 1 resizes without moving and requires that offset to be bit-for-bit the same; a parent-relative capture would collapse it to the whole frame offset instead. Phase 2 restarts the client and requires it to land exactly where phase 1 left it.
 
 ### Tab drag reorders in every bar
 
