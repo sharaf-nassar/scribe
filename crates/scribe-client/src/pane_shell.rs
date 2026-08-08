@@ -26,6 +26,7 @@ use gpui::{App, AppContext as _, Entity};
 use scribe_client::divider::{self, Divider};
 use scribe_client::layout::{FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
 use scribe_client::pane_tree::PaneTree;
+use scribe_client::prompt_bar::PromptBarData;
 use scribe_client::restore_replay::{
     PaneRestore, RebuiltWindow, ReplayLaunch, new_shell_binding, snapshot_window_restore,
 };
@@ -143,6 +144,16 @@ pub struct RetiredPanes {
 struct SnapshotTarget<'a> {
     layout: &'a mut WindowLayout,
     panes: &'a mut HashMap<PaneId, PaneRestore>,
+}
+
+/// The live per-session state a restore snapshot reads, keyed by session id.
+///
+/// Neither map lives on the shell — launch bindings sit on the restore runtime
+/// and prompt history in the IPC-written `AiChrome` — so both are handed in
+/// together rather than looked up per pane.
+struct SnapshotSources<'a> {
+    bindings: &'a HashMap<SessionId, LaunchBinding>,
+    prompts: &'a HashMap<SessionId, PromptBarData>,
 }
 
 /// Build the slot edit that reapplies a restored region's name and accent.
@@ -823,10 +834,17 @@ impl PaneShell {
     /// [`snapshot_window_restore`]. Panes still waiting for a session are
     /// pruned, exactly as they are on the wire: replaying a pane whose session
     /// never existed would recreate a launch the user never made.
+    ///
+    /// `prompts` is the live prompt-bar history keyed by session. It is passed
+    /// in rather than read from the shell because the GPUI client keeps it in
+    /// the IPC-written `AiChrome` map instead of on the pane, and a snapshot
+    /// that cannot see it persists `prompt_count: 0` for every AI pane — which
+    /// is enough to make the restored bar render as absent.
     pub fn restore_snapshot(
         &self,
         window_id: WindowId,
         bindings: &HashMap<SessionId, LaunchBinding>,
+        prompts: &HashMap<SessionId, PromptBarData>,
         cx: &App,
     ) -> WindowRestoreState {
         let workspace = self.workspace.read(cx);
@@ -842,7 +860,7 @@ impl PaneShell {
             self.snapshot_region(
                 workspace_id,
                 &mut SnapshotTarget { layout: &mut layout, panes: &mut panes },
-                bindings,
+                &SnapshotSources { bindings, prompts },
                 cx,
             );
         }
@@ -856,7 +874,7 @@ impl PaneShell {
         &self,
         workspace_id: WorkspaceId,
         target: &mut SnapshotTarget<'_>,
-        bindings: &HashMap<SessionId, LaunchBinding>,
+        sources: &SnapshotSources<'_>,
         cx: &App,
     ) {
         let SnapshotTarget { layout, panes } = target;
@@ -875,8 +893,11 @@ impl PaneShell {
             if Some(session_id) == focused_session {
                 focused_pane = Some(pane_id);
             }
-            let launch_binding =
-                bindings.get(&session_id).cloned().unwrap_or_else(|| new_shell_binding(None));
+            let launch_binding = sources
+                .bindings
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| new_shell_binding(None));
             panes.insert(
                 pane_id,
                 PaneRestore {
@@ -884,9 +905,7 @@ impl PaneShell {
                     workspace_id,
                     cwd: launch_binding.fallback_cwd.clone(),
                     launch_binding,
-                    first_prompt: None,
-                    latest_prompt: None,
-                    prompt_count: 0,
+                    prompts: sources.prompts.get(&session_id).cloned().unwrap_or_default(),
                     last_conversation_id: None,
                     grid: None,
                 },

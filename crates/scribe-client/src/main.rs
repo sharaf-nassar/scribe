@@ -3848,7 +3848,12 @@ impl TerminalView {
         let Some(window_id) = self.restore.window_id.filter(|_| !self.restore.cleared) else {
             return;
         };
-        let snapshot = self.shell.restore_snapshot(window_id, &self.restore.bindings, cx);
+        // Cloned rather than held: the IPC reader writes this mutex on every
+        // `PromptReceived`, and the snapshot walk below is long enough that
+        // holding the lock across it would stall the reader. A poisoned mutex
+        // costs this snapshot its prompt rows, never the snapshot itself.
+        let prompts = self.shared.ai.lock().map(|ai| ai.prompts.clone()).unwrap_or_default();
+        let snapshot = self.shell.restore_snapshot(window_id, &self.restore.bindings, &prompts, cx);
         if !snapshot.is_replayable() {
             self.forget_restore_entry(window_id);
             return;
