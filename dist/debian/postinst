@@ -678,10 +678,13 @@ spawn_upgrade_server() {
     # other upgrade state file in here is handled; truncating at spawn drops
     # the previous successor's output.
     #
-    # ponytail: the log still grows for that server's whole lifetime and is
-    # only reclaimed by the next upgrade's truncation — the same ceiling the
-    # durable state-dir server.log already accepts; add rotation to both
-    # together if it ever matters.
+    # This log still grows for that server's whole lifetime and is only
+    # reclaimed by the next upgrade's truncation. Unlike this file, the
+    # durable state-dir server.log is bounded: main.rs caps it at
+    # SERVER_LOG_MAX_BYTES (8 MiB) and rotates it once to server.log.1 at
+    # startup via rotate_if_oversized, and the --upgrade server mirrors its
+    # tracing there too. So upgrade.log duplicates an already-bounded
+    # stream — rotating it as well was evaluated and ruled a non-goal.
     UPGRADE_LOG="${STATE_DIR}/upgrade.log"
     : > "${UPGRADE_LOG}" 2>/dev/null || UPGRADE_LOG=$(mktemp)
     chmod 0600 "${UPGRADE_LOG}" 2>/dev/null || true
