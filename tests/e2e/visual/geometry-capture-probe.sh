@@ -67,7 +67,7 @@ live_geometry() {
     printf '%s %s %s %s' "$X" "$Y" "$WIDTH" "$HEIGHT"
 }
 
-# The newest persisted record, as `x y width height maximized`.
+# The newest persisted record, as `x y width height state`.
 record_geometry() {
     local newest
     newest=$(ls -t "$GEOMETRY_DIR"/*.toml 2>/dev/null | head -1)
@@ -80,7 +80,7 @@ for line in open(sys.argv[1]):
         key, _, raw = line.partition("=")
         values[key.strip()] = raw.strip()
 print(values.get("x"), values.get("y"), values.get("width"),
-      values.get("height"), values.get("maximized"))
+      values.get("height"), values.get("state"))
 PY
 }
 

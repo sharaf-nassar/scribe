@@ -12,6 +12,31 @@
 
 use gpui::{App, Window};
 
+use crate::window_state::ObservedWindowState;
+
+/// Read the live window state off the window manager, falling back to GPUI.
+///
+/// `_NET_WM_STATE` is WM-owned: EWMH 5.7 says `_NET_WM_STATE_HIDDEN` "is a
+/// function of some other aspect of the window such as minimization, rather
+/// than an independent state", so it is only ever read here, never written.
+/// ICCCM `WM_STATE == IconicState` is the pre-EWMH equivalent and answers for a
+/// window manager that does not publish the atom.
+///
+/// This read exists because GPUI cannot answer the question: it exposes no
+/// `is_minimized()` at all, and its X11 `is_maximized()` is
+/// `!hidden && maximized_vertical && maximized_horizontal`, so a window
+/// minimized from maximized reports plain windowed — quitting there used to
+/// persist the wrong state and bring the window back unmaximized. `fallback`
+/// (GPUI's own answer) is returned off X11 and on any protocol failure, which
+/// is what keeps Wayland and macOS behaving as they did.
+#[must_use]
+pub fn observed_window_state(
+    window: &Window,
+    fallback: ObservedWindowState,
+) -> ObservedWindowState {
+    x11::observed_window_state(window).unwrap_or(fallback)
+}
+
 /// Resolve the monitor identity persisted with window geometry.
 ///
 /// Fallback chain: X11 `RandR` connector name of the monitor containing the
@@ -87,6 +112,7 @@ mod x11 {
     };
     use x11rb::rust_connection::RustConnection;
 
+    use crate::window_state::{ObservedWindowState, WindowState};
     use crate::x11_focus::xcb_window_id;
 
     thread_local! {
@@ -130,6 +156,51 @@ mod x11 {
                 .or_else(|| monitors.monitors.first())?;
             atom_name(conn, monitor.name)
         })
+    }
+
+    /// The window's EWMH state, or `None` when the window manager publishes no
+    /// `_NET_WM_STATE` for it (no EWMH, or not X11 at all).
+    pub(super) fn observed_window_state(window: &Window) -> Option<ObservedWindowState> {
+        let xid = xcb_window_id(window)?;
+        with_connection(|conn| {
+            let property = intern(conn, b"_NET_WM_STATE")?;
+            let reply = conn
+                .get_property(false, xid, property, AtomEnum::ATOM, 0, 64)
+                .ok()?
+                .reply()
+                .ok()?;
+            // Absent (format 0) rather than merely empty: no EWMH answer to
+            // read, so the caller keeps GPUI's.
+            let set: Vec<Atom> = reply.value32()?.collect();
+            let holds = |name: &[u8]| intern(conn, name).is_some_and(|atom| set.contains(&atom));
+            let maximized =
+                || holds(b"_NET_WM_STATE_MAXIMIZED_VERT") && holds(b"_NET_WM_STATE_MAXIMIZED_HORZ");
+            let visible = holds(b"_NET_WM_STATE_FULLSCREEN")
+                .then_some(WindowState::Fullscreen)
+                .or_else(|| maximized().then_some(WindowState::Maximized))
+                .unwrap_or_default();
+            let hidden = holds(b"_NET_WM_STATE_HIDDEN") || wm_state_is_iconic(conn, xid);
+            Some(ObservedWindowState::from_wm_state(hidden, visible))
+        })
+    }
+
+    /// ICCCM 4.1.3.1 `WM_STATE`, whose first word is the state and whose type
+    /// atom is the property atom. `IconicState` is the pre-EWMH "minimized".
+    fn wm_state_is_iconic(conn: &RustConnection, xid: u32) -> bool {
+        const ICONIC_STATE: u32 = 3;
+        let Some(property) = intern(conn, b"WM_STATE") else { return false };
+        conn.get_property(false, xid, property, property, 0, 2)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32()?.next())
+            .is_some_and(|state| state == ICONIC_STATE)
+    }
+
+    /// An already-interned atom by name, or `None` when nothing has interned it
+    /// (`only_if_exists`), which for a WM-owned atom means "not in that state".
+    fn intern(conn: &RustConnection, name: &[u8]) -> Option<Atom> {
+        let atom = conn.intern_atom(true, name).ok()?.reply().ok()?.atom;
+        (atom != 0).then_some(atom)
     }
 
     /// Connector names of all active `RandR` monitors across every X screen.
@@ -209,11 +280,8 @@ mod x11 {
     /// The atom for `name`, but only when the window manager lists it in
     /// `_NET_SUPPORTED`.
     fn supported_atom(conn: &RustConnection, root: u32, name: &[u8]) -> Option<Atom> {
-        let wanted = conn.intern_atom(true, name).ok()?.reply().ok()?.atom;
-        let supported = conn.intern_atom(true, b"_NET_SUPPORTED").ok()?.reply().ok()?.atom;
-        if wanted == 0 || supported == 0 {
-            return None;
-        }
+        let wanted = intern(conn, name)?;
+        let supported = intern(conn, b"_NET_SUPPORTED")?;
         let reply = conn
             .get_property(false, root, supported, AtomEnum::ATOM, 0, 1024)
             .ok()?
@@ -226,6 +294,12 @@ mod x11 {
 #[cfg(not(target_os = "linux"))]
 mod x11 {
     use gpui::Window;
+
+    use crate::window_state::ObservedWindowState;
+
+    pub(super) fn observed_window_state(_window: &Window) -> Option<ObservedWindowState> {
+        None
+    }
 
     pub(super) fn window_monitor_name(_window: &Window) -> Option<String> {
         None

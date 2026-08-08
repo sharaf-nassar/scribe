@@ -2303,7 +2303,9 @@ Unit tests for , the ported shell-aware quoting for dropped file paths, proving 
 
 ## Window geometry compat
 
-Unit tests for  and for the live-window capture/restore pair that persists geometry across restarts. Together they prove old-client geometry insets correctly under the new custom titlebar and that a GPUI window round-trips through a record.
+Unit tests for  and for the live-window capture/restore pair that persists geometry across restarts. They prove old-client geometry insets correctly under the new titlebar, and that each window state survives a quit.
+
+A GPUI window round-trips through a record, and windowed, maximized, minimized, and fullscreen are each restored as themselves rather than collapsing to the `maximized: bool` the record used to carry.
 
 ### Legacy geometry gains titlebar inset
 
@@ -2341,7 +2343,31 @@ The record is also already marked normalized: a capture off a GPUI window is in 
 
 ### Maximized record reopens maximized
 
-A record with `maximized = true` yields `WindowBounds::Maximized`, so the window is maximized from its first frame instead of being resized a frame later the way the winit client's async `set_maximized` was.
+A record whose state is `maximized` yields `WindowBounds::Maximized`, so the window is maximized from its first frame instead of being resized a frame later the way the winit client's async `set_maximized` was.
+
+### Legacy maximized bool folds into the state
+
+A record written before `WindowState` existed carries `maximized = true|false` and no `state`; the load path folds the bool into `Maximized`/`Windowed` and never writes it back out.
+
+The fold runs on load rather than inside the geometry-compat normalization, which short-circuits on `titlebar_normalized`: records written by the intervening client are already normalized and still carry the bool, so folding there would silently drop their maximized state on the first start after upgrade.
+
+### Minimizing a maximized window keeps it maximized
+
+Observing a window that is both hidden and maximized yields state `minimized` with restore state `maximized`, and that record reopens through `WindowBounds::Maximized` at the pre-maximize rect.
+
+This is the live bug the state model exists for: GPUI's X11 `is_maximized()` is `!hidden && maximized_vertical && maximized_horizontal`, so minimizing a maximized window and quitting used to persist "windowed" and bring the window back unmaximized. Minimizing from plain windowed still restores to windowed, and fullscreen still wins over the maximized bits a window manager leaves set underneath it.
+
+### Fullscreen record reopens fullscreen
+
+A record whose state is `fullscreen` yields `WindowBounds::Fullscreen`, which the old `maximized` bool could not express at all — a fullscreen window used to come back windowed at the fullscreen rect.
+
+A hand-broken record that claims to unminimize into minimization is read as windowed rather than looping.
+
+### Pre-maximize rect survives the transition
+
+The capture that first sees a window maximized reads the windowed rect off the previous record and stores it as the restore rect; later maximized captures carry it forward unchanged, and unmaximizing drops it.
+
+EWMH 5.7 makes restoring the pre-fullscreen geometry the window manager's job, and a maximized window's own bounds are the work area, so the rect to return to can only come from the reading taken before the transition. It is what `WindowBounds::Maximized`/`Fullscreen` are handed, since GPUI documents those bounds as the restore size.
 
 ### Position-less record keeps the fallback origin
 
@@ -2353,7 +2379,7 @@ Wayland never exposes a window's origin, so the capture stores `None` instead of
 
 The monitor gate drops a saved position only when the record names a monitor that is verifiably no longer connected; unknown identities keep the position.
 
-`None`, the legacy nil-UUID placeholder, and any name when monitor enumeration is unavailable all keep the saved `x`/`y`; only a real connector name absent from a non-empty connected list is gated, and gating strips position while keeping size and maximized state. Guards the regression where every pre-upgrade window (whose records all carried the nil UUID) lost its position on the first restart and side-by-side windows re-opened stacked at the default placement.
+`None`, the legacy nil-UUID placeholder, and any name when monitor enumeration is unavailable all keep the saved `x`/`y`; only a real connector name absent from a non-empty connected list is gated, and gating strips position while keeping size and window state. Guards the regression where every pre-upgrade window (whose records all carried the nil UUID) lost its position on the first restart and side-by-side windows re-opened stacked at the default placement.
 
 ## X11 focus guard
 
