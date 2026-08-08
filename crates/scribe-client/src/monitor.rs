@@ -8,7 +8,9 @@
 //! display UUID where it is real (Wayland derives a stable v5 UUID from the
 //! output name; macOS uses the `CGDisplay` UUID) → `None` (unknown). It also
 //! enumerates the live monitor layout ([`connected_monitors`]) that
-//! [`crate::window_state::clamp_geometry_to_layout`] clamps a saved rect into.
+//! [`crate::window_state::clamp_geometry_to_layout`] clamps a saved rect into,
+//! and reads and re-asserts the window's virtual desktop
+//! ([`window_desktop`]/[`apply_saved_desktop`]).
 
 use gpui::{App, Window};
 
@@ -62,6 +64,30 @@ pub fn persisted_monitor_name(window: &Window, cx: &App) -> Option<String> {
 #[must_use]
 pub fn window_monitor_name(window: &Window) -> Option<String> {
     x11::window_monitor_name(window)
+}
+
+/// The virtual desktop the window is on right now, as EWMH `_NET_WM_DESKTOP`.
+///
+/// `0xFFFF_FFFF` means the window is on all desktops. `None` off X11 and
+/// wherever the window manager publishes no desktop for the window, which is
+/// also what a window manager with a single desktop looks like.
+#[must_use]
+pub fn window_desktop(window: &Window) -> Option<u32> {
+    x11::window_desktop(window)
+}
+
+/// Put a restored window back on the virtual desktop it was saved on.
+///
+/// EWMH 5.5 makes this the window manager's job "whenever a withdrawn window
+/// requests to be mapped", through the `_NET_WM_DESKTOP` property set before
+/// the map. GPUI maps inside `Window::new`, so nothing pre-map is reachable
+/// from here and the post-map form — the `_NET_WM_DESKTOP` client message to
+/// the root, the same shape as the placement path — is what is sent instead.
+///
+/// Returns whether the message went out; `false` off X11 and when the window
+/// manager does not advertise the atom in `_NET_SUPPORTED`.
+pub fn apply_saved_desktop(window: &Window, desktop: u32) -> bool {
+    x11::move_to_desktop(window, desktop)
 }
 
 /// Whether the platform reports this window's real origin.
@@ -205,6 +231,37 @@ mod x11 {
             let hidden = holds(b"_NET_WM_STATE_HIDDEN") || wm_state_is_iconic(conn, xid);
             Some(ObservedWindowState::from_wm_state(hidden, visible))
         })
+    }
+
+    /// EWMH `_NET_WM_DESKTOP` on the window, or `None` when the window manager
+    /// publishes none (no EWMH desktops, or not X11 at all).
+    pub(super) fn window_desktop(window: &Window) -> Option<u32> {
+        let xid = xcb_window_id(window)?;
+        with_connection(|conn| {
+            let property = intern(conn, b"_NET_WM_DESKTOP")?;
+            conn.get_property(false, xid, property, AtomEnum::CARDINAL, 0, 1)
+                .ok()?
+                .reply()
+                .ok()?
+                .value32()?
+                .next()
+        })
+    }
+
+    /// Ask the window manager to move a mapped window to a virtual desktop.
+    ///
+    /// Like [`move_window`] this is only a request, answered asynchronously;
+    /// where the window ends up is read back by the next capture rather than
+    /// here.
+    pub(super) fn move_to_desktop(window: &Window, desktop: u32) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            let message = supported_atom(conn, root, b"_NET_WM_DESKTOP")?;
+            send_to_wm(conn, root, xid, message, [desktop, SOURCE_APPLICATION, 0, 0, 0])
+                .then_some(())
+        })
+        .is_some()
     }
 
     /// ICCCM 4.1.3.1 `WM_STATE`, whose first word is the state and whose type
@@ -473,6 +530,14 @@ mod x11 {
     }
 
     pub(super) fn move_window(_window: &Window, _x: i32, _y: i32, _state: WindowState) -> bool {
+        false
+    }
+
+    pub(super) fn window_desktop(_window: &Window) -> Option<u32> {
+        None
+    }
+
+    pub(super) fn move_to_desktop(_window: &Window, _desktop: u32) -> bool {
         false
     }
 }

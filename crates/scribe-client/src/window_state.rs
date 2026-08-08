@@ -143,6 +143,12 @@ pub struct WindowGeometry {
     #[serde(default)]
     pub restore_state: WindowState,
     pub monitor_name: Option<String>,
+    /// EWMH `_NET_WM_DESKTOP`: the virtual desktop the window was on, with
+    /// `0xFFFF_FFFF` meaning "all desktops". `None` when the platform or window
+    /// manager does not publish one, and in records written before this field
+    /// existed.
+    #[serde(default)]
+    pub desktop: Option<u32>,
     /// Whether the geometry-compat titlebar inset has already been applied.
     /// Absent in legacy files (`serde(default)` → `false`).
     #[serde(default)]
@@ -167,6 +173,7 @@ impl Default for WindowGeometry {
             state: WindowState::Windowed,
             restore_state: WindowState::Windowed,
             monitor_name: None,
+            desktop: None,
             // A freshly-created default is already in the new coordinate system.
             titlebar_normalized: true,
             legacy_maximized: None,
@@ -190,6 +197,18 @@ impl WindowGeometry {
             (WindowState::Minimized, restore) => restore,
             (state, _) => state,
         }
+    }
+
+    /// The same record with its virtual desktop filled in.
+    ///
+    /// The desktop is not part of the bounds conversion, so
+    /// [`geometry_from_bounds`] leaves it to the caller; this exists because
+    /// the private legacy-`maximized` field blocks struct-update syntax from
+    /// outside this module and adding a sixth parameter pushes
+    /// `geometry_from_bounds` past Clippy's argument limit.
+    #[must_use]
+    pub fn on_desktop(self, desktop: Option<u32>) -> Self {
+        Self { desktop, ..self }
     }
 
     /// The origin a restore re-asserts, or `None` when none was captured.
@@ -450,6 +469,9 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
 /// [`crate::monitor::window_origin_is_exposed`]; the `Option` is what keeps the
 /// decision from being quietly dropped here.
 ///
+/// The virtual desktop is left `None` for the caller to fill in with
+/// [`WindowGeometry::on_desktop`]; it is not part of the bounds conversion.
+///
 /// `previous` is the last record this window produced. It is what carries the
 /// pre-maximize/pre-fullscreen rect: once the window is no longer windowed its
 /// own bounds are the work area, so the rect to return to can only come from
@@ -475,6 +497,7 @@ pub fn geometry_from_bounds(
         state: observed.state,
         restore_state: observed.restore_state,
         monitor_name,
+        desktop: None,
         // Anything captured from a live GPUI window is already in the new
         // coordinate system: the custom titlebar is inside these bounds.
         titlebar_normalized: true,
@@ -959,6 +982,42 @@ titlebar_normalized = true
         assert!(!geometry_size_is_sane(&legacy_geom(1200, 16385, windowed)));
         assert!(geometry_size_is_sane(&legacy_geom(40, 40, windowed)));
         assert!(geometry_size_is_sane(&legacy_geom(16384, 16384, windowed)));
+    }
+
+    // @lat: [[test#Window geometry compat#The virtual desktop round-trips]]
+    #[test]
+    fn virtual_desktop_round_trips() {
+        // The capture leaves the field to the caller, who fills it from the
+        // window manager's `_NET_WM_DESKTOP`.
+        let captured = capture(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::default(),
+            None,
+            None,
+        );
+        assert_eq!(captured.desktop, None);
+        let geom = captured.on_desktop(Some(3));
+        let round_trip = |record: &WindowGeometry| {
+            let text = toml::to_string_pretty(record).expect("serialize");
+            toml::from_str::<WindowGeometry>(&text).expect("round-trip").desktop
+        };
+        assert_eq!(round_trip(&geom), Some(3));
+
+        // 0xFFFFFFFF is EWMH's "all desktops"; it is a desktop id like any
+        // other here, so a sticky window comes back sticky.
+        assert_eq!(round_trip(&geom.clone().on_desktop(Some(u32::MAX))), Some(u32::MAX));
+
+        // The layout clamp only touches geometry.
+        assert_eq!(
+            clamp_geometry_to_layout(&geom, &[work_area("DP-1", 0, 0, 1920, 1080)]).desktop,
+            Some(3)
+        );
+
+        // A record written before the field existed, and a window manager with
+        // no virtual desktops, both answer "nothing to restore".
+        let legacy: WindowGeometry =
+            toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
+        assert_eq!(legacy.desktop, None);
     }
 
     fn work_area(name: &str, x: i32, y: i32, width: u32, height: u32) -> MonitorWorkArea {

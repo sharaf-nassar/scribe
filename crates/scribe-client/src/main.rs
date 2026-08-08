@@ -872,6 +872,10 @@ struct RestoreRuntime {
     /// taken by the first paint. `None` once applied, or when the record was
     /// not captured minimized.
     pending_minimize: Option<WindowState>,
+    /// The virtual desktop the restored window still has to be sent back to,
+    /// taken by the first paint. `None` once applied, or when the record names
+    /// no desktop.
+    pending_desktop: Option<u32>,
     /// Whether the record of the window the server assigns is still owed a
     /// read; see [`TerminalView::adopt_assigned_geometry`].
     assigned_geometry: AssignedGeometry,
@@ -962,6 +966,7 @@ impl RestoreRuntime {
             position_target: None,
             monitor: None,
             pending_minimize: None,
+            pending_desktop: None,
             assigned_geometry: if restore_geometry.is_none() {
                 AssignedGeometry::Unread
             } else {
@@ -999,6 +1004,11 @@ impl RestoreRuntime {
         // would unminimize to and is re-minimized from the first frame.
         self.pending_minimize = (geometry.state == WindowState::Minimized)
             .then(|| WindowGeometry::effective_state(&geometry));
+        // EWMH 5.5 puts the virtual desktop in the same class: it is honoured
+        // for a withdrawn window through a pre-map property, which the in-
+        // `Window::new` map likewise puts out of reach, so it is re-asserted
+        // from the first frame too.
+        self.pending_desktop = geometry.desktop;
         // A maximized or fullscreen window has a placement too: the window
         // manager owns its size, but the monitor it fills follows the origin,
         // and that origin is exactly the hint Mutter ignores. It is re-asserted
@@ -1493,6 +1503,31 @@ impl TerminalView {
         }
     }
 
+    /// Put a restored window back on its saved virtual desktop, once.
+    ///
+    /// EWMH 5.5 says the window manager "should honor `_NET_WM_DESKTOP`
+    /// whenever a withdrawn window requests to be mapped" — a property written
+    /// before the map, which GPUI's map inside `Window::new` puts out of reach
+    /// exactly as it does ICCCM's "map me iconified". The post-map form is the
+    /// `_NET_WM_DESKTOP` client message to the root, so the window appears on
+    /// the current desktop for a frame and is then sent away, the same visible
+    /// flash [`Self::apply_pending_minimize`] leaves behind.
+    ///
+    /// Issued after [`Self::apply_saved_position`]: a window sent to another
+    /// desktop is unmapped and stops painting, so the placement check the
+    /// restore is waiting on would never run if the move had not gone out
+    /// first. It still only completes once the user comes back to that
+    /// desktop, which is also the first moment the geometry is worth
+    /// re-persisting.
+    fn apply_saved_desktop(&mut self, window: &Window) {
+        let Some(desktop) = self.restore.pending_desktop.take() else { return };
+        if monitor::apply_saved_desktop(window, desktop) {
+            tracing::info!(desktop, "sending the restored window back to its saved desktop");
+        } else {
+            tracing::debug!(desktop, "no EWMH desktop support; keeping the current desktop");
+        }
+    }
+
     /// Put a restored window back into its minimized state, once.
     ///
     /// ICCCM 4.1.2.4's "map me iconified" is `WM_HINTS.initial_state`, set
@@ -1613,7 +1648,11 @@ impl TerminalView {
             observed,
             monitor,
             self.restore.geometry.as_ref(),
-        );
+        )
+        // EWMH `_NET_WM_DESKTOP` is WM-owned the same way `_NET_WM_STATE` is; a
+        // window manager without virtual desktops publishes none and the record
+        // simply carries no desktop to restore.
+        .on_desktop(monitor::window_desktop(window));
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -7990,6 +8029,7 @@ impl Render for TerminalView {
         self.report_perf_frame();
         self.ensure_focus(window, cx);
         self.apply_saved_position(window);
+        self.apply_saved_desktop(window);
         self.apply_pending_minimize(window);
         // Driven from the frame loop rather than only from the bounds observer:
         // the observer stops firing once the window settles, and the check
@@ -11450,6 +11490,7 @@ mod tests {
         record.width = 2000;
         record.height = 1200;
         record.monitor_name = Some("DP-1".to_owned());
+        record.desktop = Some(3);
 
         // Opened at the default: no placement to reach, so its own bounds are
         // persisted — but the window the server assigns has yet to be read.
@@ -11462,6 +11503,7 @@ mod tests {
         runtime.adopt_geometry_record(record.clone());
         assert_eq!(runtime.pending_position, Some(((64, 48), WindowState::Windowed)));
         assert_eq!(runtime.monitor.as_deref(), Some("DP-1"));
+        assert_eq!(runtime.pending_desktop, Some(3));
         assert_eq!(runtime.geometry.as_ref(), Some(&record));
 
         // A window opened at its record named that window in `Hello`; there is
