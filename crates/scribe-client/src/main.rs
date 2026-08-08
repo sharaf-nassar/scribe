@@ -717,6 +717,50 @@ struct RestoreRuntime {
     /// Where that move was aiming, and when it was asked for. Kept until the
     /// request has had time to be answered and one correction has run.
     position_target: Option<((i32, i32), Instant)>,
+    /// How far the restore's placement has got. Gates geometry persistence so a
+    /// restore cannot save over the record it was aiming at.
+    placement: RestorePlacement,
+}
+
+/// How far a restored window's placement has got, which is what decides whether
+/// the window's current bounds are the user's layout or the restore's.
+///
+/// A restored window is moved twice — once to the saved position, once to
+/// correct for the frame the window manager drew around it — and both moves are
+/// asynchronous `ConfigureRequest`s. Every reading taken before the last one has
+/// been answered is the placement the restore is trying to undo, and persisting
+/// it overwrites the only record the next start has to aim at. That is what
+/// turned a single misplaced restore into a permanent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestorePlacement {
+    /// A saved position is still to be applied, or its correction still to be
+    /// computed.
+    Restoring,
+    /// The corrective move went out at this instant and has [`RESTORE_DEBOUNCE`]
+    /// to be answered, the same wait the correction itself was computed after.
+    Correcting(Instant),
+    /// The restore is over; bounds changes from here are the user's.
+    Settled,
+}
+
+impl RestorePlacement {
+    /// Advance the placement and report whether the restore has converged.
+    ///
+    /// `position_pending` is true while [`RestoreRuntime::pending_position`] or
+    /// [`RestoreRuntime::position_target`] still hold work.
+    /// [`TerminalView::correct_restored_position`] runs immediately before every
+    /// geometry capture, so both being empty means the one correction has just
+    /// gone out — or that there was never a position to restore, which is why a
+    /// window opened without one starts [`Self::Settled`].
+    fn settled(&mut self, position_pending: bool) -> bool {
+        *self = match *self {
+            Self::Restoring if position_pending => Self::Restoring,
+            Self::Restoring => Self::Correcting(Instant::now()),
+            Self::Correcting(at) if at.elapsed() < RESTORE_DEBOUNCE => Self::Correcting(at),
+            _ => Self::Settled,
+        };
+        *self == Self::Settled
+    }
 }
 
 impl RestoreRuntime {
@@ -729,6 +773,11 @@ impl RestoreRuntime {
             claimed_window: pending.as_ref().map(|snapshot| snapshot.window_id),
             pending,
             siblings: restore_siblings,
+            placement: if restore_position.is_some() {
+                RestorePlacement::Restoring
+            } else {
+                RestorePlacement::Settled
+            },
             pending_position: restore_position,
             position_target: None,
             bindings: HashMap::new(),
@@ -1260,7 +1309,15 @@ impl TerminalView {
     /// GPUI equivalent of the winit client's `Moved`/`Resized` handlers. The
     /// write itself is debounced by the lifecycle tick — a drag-resize would
     /// otherwise rewrite the file once per frame.
+    ///
+    /// Nothing is persisted until the restore's own moves have converged (see
+    /// [`RestorePlacement`]). Until then the reading is tracked but adopted as
+    /// the baseline, so a restore that landed on the wrong monitor leaves the
+    /// record it was aiming at intact for the next start to try again from.
     fn capture_geometry(&mut self, window: &Window, cx: &App) {
+        let settled = self.restore.placement.settled(
+            self.restore.pending_position.is_some() || self.restore.position_target.is_some(),
+        );
         // RandR connector name where available; GPUI's X11 display uuid is a
         // nil placeholder and must never be persisted (see `monitor`).
         let monitor = monitor::persisted_monitor_name(window, cx);
@@ -1268,7 +1325,15 @@ impl TerminalView {
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
-        self.restore.geometry = Some(geometry);
+        self.restore.geometry = Some(geometry.clone());
+        if !settled {
+            // Where the restore itself left the window is not a layout the user
+            // chose. Recording it as already-persisted keeps both the debounced
+            // flush and the quit-time flush off the saved record, while the
+            // user's next move still differs from it and arms normally.
+            self.restore.saved_geometry = Some(geometry);
+            return;
+        }
         if self.restore.geometry_dirty_since.is_none() {
             self.restore.geometry_dirty_since = Some(Instant::now());
         }
@@ -10845,6 +10910,29 @@ mod tests {
 
         assert!(bootstrap.claim(true, 0));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[test]
+    fn restore_placement_suppresses_capture_until_the_correction_settles() {
+        let mut placement = RestorePlacement::Restoring;
+
+        // The move and its correction are both still outstanding.
+        assert!(!placement.settled(true));
+        // The correction has just gone out and needs the same debounce.
+        assert!(!placement.settled(false));
+        assert!(matches!(placement, RestorePlacement::Correcting(_)));
+        // Rewind past the debounce rather than sleeping through it.
+        placement = RestorePlacement::Correcting(
+            Instant::now().checked_sub(RESTORE_DEBOUNCE).expect("monotonic clock past the wait"),
+        );
+        assert!(placement.settled(false));
+        assert!(placement.settled(false));
+    }
+
+    #[test]
+    fn restore_placement_starts_settled_without_a_saved_position() {
+        // A window that was never restoring must persist the size it came up at.
+        assert!(RestorePlacement::Settled.settled(false));
     }
 
     #[test]
