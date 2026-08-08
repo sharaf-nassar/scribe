@@ -20,9 +20,22 @@ start_session_keyring() {
     export GNOME_KEYRING_CONTROL
 }
 
+# The bind-mounted /output is the caller's ./test-output. This container is
+# root under the default profile, so anything it writes there comes back
+# root-owned and strands the directory in the caller's checkout — enough to
+# fail `git worktree remove`. Hand the tree back before exiting. Under the
+# hardened profile the container is already the caller's uid and the chown is
+# a harmless no-op.
+release_output() {
+    if [ -n "${HOST_UID:-}" ]; then
+        chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" /output 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     scribe-test daemon stop || true
     scribe-test server stop || true
+    release_output
 }
 trap cleanup EXIT
 
