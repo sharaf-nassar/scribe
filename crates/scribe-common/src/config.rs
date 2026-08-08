@@ -159,8 +159,6 @@ pub struct AppearanceConfig {
     pub status_bar_height: f32,
     #[serde(default = "default_tab_height")]
     pub tab_height: f32,
-    #[serde(default)]
-    pub content_padding: ContentPadding,
     /// Override color for the second prompt bar row background (`#rrggbb`).
     #[serde(default, alias = "prompt_bar_bg")]
     pub prompt_bar_second_row_bg: Option<String>,
@@ -200,7 +198,6 @@ impl Default for AppearanceConfig {
             tab_width: default_tab_width(),
             status_bar_height: default_status_bar_height(),
             tab_height: default_tab_height(),
-            content_padding: ContentPadding::default(),
             prompt_bar_second_row_bg: None,
             prompt_bar_first_row_bg: None,
             prompt_bar_text: None,
@@ -266,48 +263,12 @@ fn default_tab_height() -> f32 {
     28.0
 }
 
-fn default_content_padding_side() -> f32 {
-    8.0
-}
-
 // ---------------------------------------------------------------------------
 // Content padding
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentPadding {
-    #[serde(default = "default_content_padding_side")]
-    pub top: f32,
-    #[serde(default = "default_content_padding_side")]
-    pub right: f32,
-    #[serde(default = "default_content_padding_side")]
-    pub bottom: f32,
-    #[serde(default = "default_content_padding_side")]
-    pub left: f32,
-}
-
-impl ContentPadding {
-    /// Clamp all sides to the valid range `0.0..=50.0`.
-    #[must_use]
-    pub fn clamped(self) -> Self {
-        Self {
-            top: self.top.clamp(0.0, 50.0),
-            right: self.right.clamp(0.0, 50.0),
-            bottom: self.bottom.clamp(0.0, 50.0),
-            left: self.left.clamp(0.0, 50.0),
-        }
-    }
-}
-
-impl Default for ContentPadding {
-    fn default() -> Self {
-        Self {
-            top: default_content_padding_side(),
-            right: default_content_padding_side(),
-            bottom: default_content_padding_side(),
-            left: default_content_padding_side(),
-        }
-    }
-}
+//
+// The GPUI client paints a pane's grid edge to edge, so there is no
+// `content_padding` setting: reserving pixels the paint path never inset was
+// how the reported grid came to be wider than the rendered one.
 
 impl AppearanceConfig {
     /// Return a copy of this config with all float fields clamped to valid ranges.
@@ -315,7 +276,6 @@ impl AppearanceConfig {
     /// - `font_size`: clamped to `[4.0, 72.0]`
     /// - `opacity`: clamped to `[0.0, 1.0]`
     /// - `scrollbar_width`: clamped to `[0.0, 20.0]`
-    /// - `content_padding`: each side clamped to `[0.0, 50.0]`
     #[must_use]
     pub fn clamped(self) -> Self {
         Self {
@@ -323,7 +283,6 @@ impl AppearanceConfig {
             opacity: self.opacity.clamp(0.0, 1.0),
             scrollbar_width: self.scrollbar_width.clamp(0.0, 20.0),
             focus_border_width: self.focus_border_width.clamp(1.0, 10.0),
-            content_padding: self.content_padding.clamped(),
             ..self
         }
     }

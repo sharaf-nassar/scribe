@@ -4690,7 +4690,7 @@ fn control_section(page: SettingsPage, key: &str) -> &'static str {
 }
 
 fn appearance_section(key: &str) -> &'static str {
-    if key.starts_with("appearance.content_padding") || key.starts_with("appearance.focus_border") {
+    if key.starts_with("appearance.focus_border") {
         "Content frame"
     } else if key.starts_with("appearance.cursor") {
         "Cursor"

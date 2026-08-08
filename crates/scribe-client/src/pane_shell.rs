@@ -907,7 +907,6 @@ impl PaneShell {
                     launch_binding,
                     prompts: sources.prompts.get(&session_id).cloned().unwrap_or_default(),
                     last_conversation_id: None,
-                    grid: None,
                 },
             );
         }

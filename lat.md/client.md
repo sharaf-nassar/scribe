@@ -346,7 +346,7 @@ The GPUI client ports cold-restart recovery: after a server crash the bootstrap 
 
  persists one TOML snapshot per window under `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared `index.toml`, all hardened to `0700`/`0600` because launch bindings can carry prompt text and provider conversation IDs. A bootstrap lock serialises multi-process index mutations and stale locks (>30 s) are reclaimed.  atomically claims the first replayable  entry, skips non-replayable and unreadable entries, and reports how many windows remain. Those are fanned out as `--restore-child` processes via  only once the server's first `SessionList` proves it lost its sessions, because a server that kept them restores its own windows through `Welcome`'s `other_windows` and fanning out both would open every window twice; each child claims exactly one more entry and, gated by , never fans out again. A claim is non-destructive: the snapshot file stays on disk as the window's last good layout, its id parked in the index's `claimed` list so it can never be claimed twice, and it is retired only when the claiming window durably writes a fresh snapshot of its own, or the user explicitly closes the window. A claim the window never consumed — the server kept its sessions, so nothing was replayed — is released rather than retired, because a claim the server refused names another live window's layout and deleting it is how a layout gets lost.
 
- rebuilds a  — the , a  map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered  queue that re-creates each session. Before the launches dispatch,  sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized.  preserves the Codex 0x0 exception: reattaching a Codex session sends a zero-sized `TerminalSize` so the server does not pre-size its Ink-rendered PTY.  serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
+ rebuilds a  — the , a  map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered  queue that re-creates each session. Before the launches dispatch, the replay sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized, through the same [[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] the live republish uses.  preserves the Codex 0x0 exception: reattaching a Codex session sends a zero-sized `TerminalSize` so the server does not pre-size its Ink-rendered PTY.  serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
 
 #### Live wiring in the GPUI shell
 
@@ -408,7 +408,7 @@ A session seeded with a replayed pane's prompt history keeps its rows when the r
 
 #### Grid sized before launch
 
-`size_replay_pane_grids` computes each pane's terminal grid from the restored viewport and cell size and writes it back onto the pane before any launch dispatches.
+[[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] computes a pane's terminal grid from the restored viewport and cell size, so a replayed pane launches at the grid it will paint at rather than at the startup fallback.
 
 #### Codex reattach sends zero size
 
@@ -429,6 +429,28 @@ A region rebuilt from a snapshot starts with no project root — [[crates/scribe
 The root is derived, not authored: [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#on_cwd_changed|on_cwd_changed]] sets it whenever a session's CWD falls under a configured `workspaces.roots` entry and clears it on the way out. Persisting it would freeze a value the server recomputes on the next CWD report, so a `workspaces.roots` edit between the snapshot and the restart would replay a root the server immediately contradicts.
 
 Recovery needs no OSC 7. The `Subscribe` [[crates/scribe-client/src/main.rs#adopt_created_session|adopt_created_session]] sends for every replayed pane reaches `handle_subscribe`, which runs `WorkspaceManager::check_cwd_fallback` against the new child's `/proc/<pid>/cwd` and answers with `WorkspaceNamed { project_root }`; the reader parks it as a [[crates/scribe-client/src/pane_shell.rs#WorkspaceInfo|WorkspaceInfo]] and [[crates/scribe-client/src/pane_shell.rs#PaneShell#apply_workspace_info|apply_workspace_info]] writes it onto the replayed slot. Only [[crates/scribe-client/src/main.rs#TerminalView#create_ai_tab|create_ai_tab]] reads the root, and it falls back to the focused pane's CWD, so the window is never wrong in the interval — just less specific.
+
+### Pane Grid Sizing
+
+The client owns no PTY, so the `cols`x`rows` it publishes *is* the terminal's width, and it must equal the grid the pane paints down to the column.
+
+An application right-pads to what the ioctl reports, so one column of overspend wraps every full-width line.
+
+[[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] is the one grid formula in the client. The live republish ([[crates/scribe-client/src/main.rs#TerminalView#grid_size_for|grid_size_for]]) and the cold-restart replay both resolve a pane through it, so the size a PTY is created at and the size it is later resized to cannot come from different arithmetic. It takes the largest whole cell count that *fits* — `cols * cell_width <= width` — rather than dividing and flooring, because at fractional cell metrics the `f32` quotient can round up over the boundary: at `cell_width = 6.3` and `width = 428.4` the quotient floors to 68 while only 67 columns fit.
+
+What it is handed is the rect the pane *paints* into, produced by [[crates/scribe-client/src/main.rs#TerminalView#painted_pane_rect|painted_pane_rect]]. Three bands live inside a placement rect and none of them belong to the PTY: a lower region's tab bar (already taken off by [[crates/scribe-client/src/pane_shell.rs#PaneShell#content_rect|content_rect]] before placements are returned), the one-pixel border a split window draws around every pane (GPUI hands taffy the border as a box inset, so the child's content box is two pixels smaller on each axis), and the pane-internal prompt strip. Reserving neither the border nor the strip is how the client came to report more columns than it renders.
+
+Nothing derived from the [[crates/scribe-client/src/main.rs#TerminalView#pane_viewport|pane_viewport]] fallback may be published. Before the measuring canvas has reported a rect, the only viewport on offer is the nominal `COLUMNS`x`ROWS` box, which differs from the real band by whatever the chrome takes; publishing it announced a grid the window never had and corrected it a frame later, and every application that had already padded a line to the first width wrapped it against the second. [[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes|publish_pane_sizes]] reads [[crates/scribe-client/src/main.rs#TerminalView#measured_pane_viewport|measured_pane_viewport]] and says nothing until the probe has measured one. The fallback stays for the paint path alone, which has to draw something on the first frame.
+
+#### Published grid fits the painted pane
+
+Across fractional cell metrics and a sweep of pane widths, the computed grid always satisfies `cols * cell_width <= width` and is the largest one that does.
+
+So a line of exactly `cols` characters occupies one painted row, with no dead column left at the right edge.
+
+#### Divide and floor overruns the pane
+
+At `cell_width = 6.3` and a pane 428.4 pixels wide the `f32` quotient floors to 68 columns, one more than fits; the exact-fit search returns 67. This is the regression that made right-padded status output wrap.
 
 ### GPUI Layout Entities
 
@@ -1336,12 +1358,15 @@ Codex panes still keep `last_sent_grid = None` during reconnect, but they only q
 
 ### Padding
 
-Padding is computed per-pane based on edge adjacency via . Internal edges get zero padding; external edges use configured values.
+There is no content padding. A pane paints its grid edge to edge, and the only
+insets the sizing path reserves are ones the paint path actually applies.
 
-Live GPUI layout passes configured padding through as logical pixels and lets
-GPUI own DPI scaling. The sole app-level scale-factor multiplication is
-[[crates/scribe-client/src/restore_replay.rs#effective_padding]] during
-saved-layout geometry replay; see [[rendering#Glyph Atlas#DPI Scaling]].
+The legacy client had an `appearance.content_padding` setting and computed it
+per pane from edge adjacency. The GPUI client never inset anything by it, so
+the knob only ever showed up as a grid the client reported wider than it
+rendered — the setting and its geometry helpers were removed rather than left
+as a control that silently did nothing. See
+[[client#GPUI Client Spike#Pane Grid Sizing]].
 
 ## Layout
 
@@ -1803,7 +1828,7 @@ The owning side of feature 014: when this machine's server holds an unknown LAN 
 
 Text selection in  supports three modes: Cell, Word, and Line. Coordinates are absolute grid positions.
 
-Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals, and double-click word scans cross WRAPLINE-connected rows so soft-wrapped paths or commands stay contiguous. Line mode follows WRAPLINE flags for logical lines.  converts mouse pixel coordinates to grid positions, subtracting tab bar height, prompt bar height (position-aware), and content padding before dividing by cell size. During an active drag,  clamps points that stray into prompt-bar chrome or outside the pane back to the nearest visible terminal cell so the last visible row still highlights.
+Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals, and double-click word scans cross WRAPLINE-connected rows so soft-wrapped paths or commands stay contiguous. Line mode follows WRAPLINE flags for logical lines.  converts mouse pixel coordinates to grid positions, subtracting tab bar height and prompt bar height (position-aware) before dividing by cell size. During an active drag,  clamps points that stray into prompt-bar chrome or outside the pane back to the nearest visible terminal cell so the last visible row still highlights.
 
 ### Smart Selection
 

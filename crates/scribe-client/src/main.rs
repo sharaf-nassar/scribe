@@ -85,7 +85,7 @@ use scribe_client::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client::remote_handshake::{self, RemoteDialer};
 use scribe_client::remote_picker::{RemotePickerColors, remote_picker_overlay};
 use scribe_client::restore_replay::{
-    self, ReplayLaunch, prepare_replay, round_positive_f32_to_u16,
+    self, ReplayLaunch, grid_for_rect, prepare_replay, round_positive_f32_to_u16,
 };
 use scribe_client::restore_state::{AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState};
 use scribe_client::scrollbar::{
@@ -168,7 +168,7 @@ use crate::{
         OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, SessionLaunch, SinkError,
         WriteOutcome, inbound_channel, outbound_channel, run_drain, write_or_tear,
     },
-    pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
+    pane_shell::{ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{present_next_burst, present_rebuild},
     terminal::{Content, DisplayOnlyTerminal, PaneFrame, PaneGrid, PaneGrids, PaneStream, Scroll},
@@ -247,6 +247,15 @@ fn window_bringup_ms() -> Option<f64> {
 
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
+
+/// Width of the border a split window draws around every pane, in logical
+/// pixels — `border_1()` in [`TerminalView::render_panes`].
+///
+/// GPUI hands taffy the border as a box inset, so the grid a bordered pane
+/// paints is this much smaller on each side than the pane's placement rect.
+/// [`TerminalView::painted_pane_rect`] takes it back off before the PTY is
+/// told how many columns it has.
+const PANE_BORDER_WIDTH: f32 = 1.0;
 
 /// Label of the demo smart-selection row in the right-click context menu.
 const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
@@ -4009,11 +4018,14 @@ impl TerminalView {
             .collect();
         let launches = self.shell.adopt_restored(rebuilt, cx);
         let viewport = self.pane_viewport();
-        let sizes: HashMap<PaneId, TerminalSize> = self
-            .shell
-            .placements(viewport, cx)
+        let placements = self.shell.placements(viewport, cx);
+        let split = placements.len() > 1;
+        let sizes: HashMap<PaneId, TerminalSize> = placements
             .into_iter()
-            .map(|placement| (placement.pane_id, self.grid_size_for(placement.rect)))
+            .map(|placement| {
+                let rect = self.painted_pane_rect(&placement, split);
+                (placement.pane_id, self.grid_size_for(rect))
+            })
             .collect();
         tracing::info!(
             window_id = %snapshot.window_id,
@@ -4528,21 +4540,33 @@ impl TerminalView {
     /// The fallback is the nominal [`COLUMNS`]x[`ROWS`] box at the current
     /// metrics, which is exactly the size [`startup_window_size`] opens the
     /// window at — it stands in only for the frames before the grid canvas has
-    /// reported its bounds for the first time.
+    /// reported its bounds for the first time. It is a *paint* fallback only:
+    /// nothing derived from it may reach the server, because the window it
+    /// describes is a guess and the PTY it would size is real. Anything that
+    /// publishes goes through [`Self::measured_pane_viewport`] instead.
     fn pane_viewport(&self) -> Rect {
-        if let Some(bounds) = self.grid_area.get() {
-            let width = f32::from(bounds.size.width);
-            let height = f32::from(bounds.size.height);
-            if width > 0.0 && height > 0.0 {
-                return Rect { x: 0.0, y: 0.0, width, height };
-            }
-        }
-        Rect {
+        self.measured_pane_viewport().unwrap_or(Rect {
             x: 0.0,
             y: 0.0,
             width: self.font.cell_width() * f32::from(COLUMNS),
             height: self.font.line_height * f32::from(ROWS),
-        }
+        })
+    }
+
+    /// The grid area as the paint pass actually measured it, or `None` before
+    /// the measuring canvas has reported a positive rect.
+    ///
+    /// The publish path takes this rather than [`Self::pane_viewport`]: the
+    /// nominal fallback differs from the real band by whatever the chrome
+    /// bands take, so publishing it announces a grid the window never had and
+    /// then corrects it one frame later. The server saw both, and every
+    /// application that had already right-padded a line to the first width
+    /// wrapped it against the second.
+    fn measured_pane_viewport(&self) -> Option<Rect> {
+        let bounds = self.grid_area.get()?;
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        (width > 0.0 && height > 0.0).then_some(Rect { x: 0.0, y: 0.0, width, height })
     }
 
     /// Republish the pane geometry when the measured grid area changed.
@@ -4556,7 +4580,10 @@ impl TerminalView {
     /// whenever the rect it wrote actually moved, so the publish still happens
     /// on the view (never mid-paint) but always against a measured area.
     fn sync_grid_geometry(&mut self, cx: &mut Context<Self>) {
-        let viewport = self.pane_viewport();
+        // The fallback rect must never be latched here either: recording it
+        // would mark a size as published that never was, and a later real
+        // measurement that happened to match it would then be skipped.
+        let Some(viewport) = self.measured_pane_viewport() else { return };
         let measured = (viewport.width, viewport.height);
         if self.published_grid_area == Some(measured) {
             return;
@@ -4817,20 +4844,46 @@ impl TerminalView {
         }
     }
 
-    /// The terminal grid a pane rect resolves to at the live font metrics.
+    /// The terminal grid a *painted* pane rect resolves to at the live font
+    /// metrics.
     ///
     /// Shared by the per-frame republish and the cold-restart replay so a
     /// restored PTY is created at exactly the size the pane it lands in will
-    /// report one frame later.
+    /// report one frame later. The arithmetic is
+    /// [`grid_for_rect`](scribe_client::restore_replay::grid_for_rect), the
+    /// client's one grid formula, so neither path can drift from the other.
+    /// Pass the rect the pane paints into — see [`Self::painted_pane_rect`].
     fn grid_size_for(&self, rect: Rect) -> TerminalSize {
         let cell_width = self.font.cell_width();
         let line_height = self.font.line_height;
+        let grid = grid_for_rect(rect, (cell_width, line_height));
         TerminalSize {
-            cols: round_positive_f32_to_u16((rect.width / cell_width).floor()).max(1),
-            rows: round_positive_f32_to_u16((rect.height / line_height).floor()).max(1),
+            cols: grid.cols,
+            rows: grid.rows,
             cell_width: round_positive_f32_to_u16(cell_width).max(1),
             cell_height: round_positive_f32_to_u16(line_height).max(1),
         }
+    }
+
+    /// The rect a pane actually paints its terminal grid into.
+    ///
+    /// The placement rect is the pane's *outer* box, and two bands live inside
+    /// it that the PTY must not be told about. A split window draws a one-pixel
+    /// border on every pane and GPUI insets the child's content box by it, so
+    /// the painted grid is two pixels narrower and shorter than the placement.
+    /// The prompt strip is pane-internal chrome, so its rows come out of that
+    /// pane's own PTY rather than the shared grid band. Reserving neither is
+    /// how the client came to report more columns than it renders.
+    fn painted_pane_rect(&self, placement: &PanePlacement, split: bool) -> Rect {
+        let mut rect = placement.rect;
+        if split {
+            rect.width = (rect.width - 2.0 * PANE_BORDER_WIDTH).max(0.0);
+            rect.height = (rect.height - 2.0 * PANE_BORDER_WIDTH).max(0.0);
+        }
+        if let Some(session_id) = placement.session_id {
+            rect.height = (rect.height - self.pane_prompt_bar_height(session_id)).max(0.0);
+        }
+        rect
     }
 
     /// Tell the server (and each local grid) how big every pane now is.
@@ -4841,24 +4894,23 @@ impl TerminalView {
     /// authoritative screen back. Unchanged panes are skipped, so a redraw
     /// storm never turns into a `RequestSnapshot` storm.
     fn publish_pane_sizes(&mut self, cx: &mut Context<Self>) {
-        let viewport = self.pane_viewport();
+        // Before the first paint the only viewport on offer is the synthetic
+        // COLUMNS x ROWS fallback, which is not the band this window will have.
+        // Say nothing until the canvas has measured one: the probe defers back
+        // here the moment it does.
+        let Some(viewport) = self.measured_pane_viewport() else { return };
         let cell_width = self.font.cell_width();
         let line_height = self.font.line_height;
         if cell_width <= 0.0 || line_height <= 0.0 {
             return;
         }
         let placements = self.shell.placements(viewport, cx);
+        let split = placements.len() > 1;
         let live: HashSet<SessionId> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
         self.pane_sizes.retain(|session, _| live.contains(session));
         for placement in placements {
-            // The prompt strip lives inside the pane, so its rows come out of
-            // that pane's PTY alone — never out of the shared grid band.
-            let mut rect = placement.rect;
-            if let Some(session_id) = placement.session_id {
-                rect.height = (rect.height - self.pane_prompt_bar_height(session_id)).max(0.0);
-            }
-            let size = self.grid_size_for(rect);
+            let size = self.grid_size_for(self.painted_pane_rect(&placement, split));
             if placement.focused {
                 self.adopt_focused_pane_size(size);
             }
@@ -4978,9 +5030,12 @@ impl TerminalView {
         // of the window-wide fallback. Resize frames themselves wait for
         // `publish_pane_sizes` below, after the attaches that authorise them.
         let viewport = self.pane_viewport();
-        for placement in self.shell.placements(viewport, cx) {
+        let placements = self.shell.placements(viewport, cx);
+        let split = placements.len() > 1;
+        for placement in placements {
             if let Some(session_id) = placement.session_id {
-                self.pane_sizes.insert(session_id, self.grid_size_for(placement.rect));
+                let rect = self.painted_pane_rect(&placement, split);
+                self.pane_sizes.insert(session_id, self.grid_size_for(rect));
             }
         }
         // The adopted layout decides which tab is active, not whichever session

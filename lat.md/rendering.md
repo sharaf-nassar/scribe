@@ -32,7 +32,7 @@ GPUI owns DPI scaling. The client supplies logical-pixel sizes only and never mu
 
 Every size the client hands to GPUI is therefore a logical pixel: `px(...)` values, the Tailwind-scale text helpers, and the configured terminal font size. [[crates/scribe-client/src/terminal_element.rs#GridFont#from_appearance]] clamps `appearance.font_size` to `MIN_FONT_SIZE` and passes it through unscaled, and the grid's `shape_line` calls in [[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint_preedit]] and [[crates/scribe-client/src/terminal_element.rs#paint_row_text]] hand that same `px(font.size)` straight to GPUI's text system. `scribe-client` contains no `set_rem_size` and no `text_size(` call, so GPUI's default `px(16.)` rem size is the only rem input to sizing.
 
-The sole remaining app-level use of a scale factor is geometry replay: [[crates/scribe-client/src/restore_replay.rs#effective_padding]] multiplies configured content padding by `scale_factor` when reconstructing a pane's grid from a saved layout. That path scales rectangles, not fonts or chrome typography.
+No app-level scale-factor multiplication remains. The last one was geometry replay, which scaled a configured content padding into a restored pane's grid; the GPUI client paints a pane edge to edge and has no content-padding setting, so [[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] divides the painted rect by the cell box and nothing else.
 
 ## Terminal Image Resources
 

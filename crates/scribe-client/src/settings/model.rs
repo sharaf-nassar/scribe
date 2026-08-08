@@ -271,10 +271,6 @@ fn appearance_controls() -> Vec<Control> {
         stepper("appearance.tab_width", "Tab width", (8.0, 50.0, 1.0, 0)),
         stepper("appearance.status_bar_height", "Status bar height", (8.0, 48.0, 1.0, 0)),
         stepper("appearance.tab_height", "Tab height", (16.0, 60.0, 1.0, 0)),
-        stepper("appearance.content_padding_top", "Content padding top", (0.0, 50.0, 1.0, 0)),
-        stepper("appearance.content_padding_right", "Content padding right", (0.0, 50.0, 1.0, 0)),
-        stepper("appearance.content_padding_bottom", "Content padding bottom", (0.0, 50.0, 1.0, 0)),
-        stepper("appearance.content_padding_left", "Content padding left", (0.0, 50.0, 1.0, 0)),
         stepper("appearance.focus_border_width", "Focus border width", (1.0, 10.0, 1.0, 0)),
         color("appearance.focus_border_color", "Focus border color"),
     ]

@@ -8,8 +8,6 @@
 //! ([`crate::focus_border`]) consume these rects in a later bead; the logic
 //! here stays renderer-independent so it can be exercised by `#[gpui::test]`.
 
-use scribe_common::config::ContentPadding;
-
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
 
 /// Divider line thickness in pixels.
@@ -56,59 +54,6 @@ pub fn collect_dividers(node: &LayoutNode, viewport: Rect) -> Vec<Divider> {
     let mut out = Vec::new();
     collect_dividers_inner(node, viewport, &mut out);
     out
-}
-
-/// Apply viewport padding insets to divider edges that touch the viewport
-/// boundary.
-///
-/// Horizontal dividers (`SplitDirection::Vertical`) have their left/right edges
-/// inset by `padding.left`/`padding.right` when they coincide with the viewport
-/// boundary. Vertical dividers (`SplitDirection::Horizontal`) are clipped below
-/// the tab bar and have their top/bottom edges inset when they coincide with
-/// the viewport boundary.
-pub fn apply_viewport_insets(
-    dividers: &mut [Divider],
-    viewport: Rect,
-    padding: &ContentPadding,
-    tab_bar_height: f32,
-) {
-    for d in dividers.iter_mut() {
-        match d.direction {
-            SplitDirection::Vertical => {
-                // Horizontal line: inset left/right edges at viewport boundary.
-                let vp_right = viewport.x + viewport.width;
-                let d_right = d.rect.x + d.rect.width;
-                if (d.rect.x - viewport.x).abs() < 0.5 {
-                    d.rect.x += padding.left;
-                    d.rect.width -= padding.left;
-                }
-                if (d_right - vp_right).abs() < 0.5 {
-                    d.rect.width -= padding.right;
-                }
-            }
-            SplitDirection::Horizontal => {
-                // Vertical line: clip below tab bar and inset top/bottom edges.
-                let content_top = viewport.y + tab_bar_height;
-                let vp_bottom = viewport.y + viewport.height;
-                let d_bottom = d.rect.y + d.rect.height;
-                // Clip top below tab bar.
-                if d.rect.y < content_top {
-                    let clip = content_top - d.rect.y;
-                    d.rect.y = content_top;
-                    d.rect.height = (d.rect.height - clip).max(0.0);
-                }
-                // Inset top edge if at content boundary.
-                if (d.rect.y - content_top).abs() < 0.5 {
-                    d.rect.y += padding.top;
-                    d.rect.height = (d.rect.height - padding.top).max(0.0);
-                }
-                // Inset bottom edge if at viewport boundary.
-                if (d_bottom - vp_bottom).abs() < 0.5 {
-                    d.rect.height = (d.rect.height - padding.bottom).max(0.0);
-                }
-            }
-        }
-    }
 }
 
 /// Hit-test: return the first divider within [`HIT_TOLERANCE`] of the mouse.
@@ -364,26 +309,5 @@ mod tests {
             parent_origin: 0.0,
         };
         assert!((drag_ratio(&drag, 123.0) - 0.5).abs() < f32::EPSILON);
-    }
-
-    // @lat: [[test#GPUI Pane Dividers#Viewport insets clip vertical dividers below the tab bar]]
-    #[test]
-    fn viewport_insets_clip_vertical_dividers_below_tab_bar() {
-        let (l, _) = leaf();
-        let (r, _) = leaf();
-        let node = LayoutNode::Split {
-            direction: SplitDirection::Horizontal,
-            ratio: 0.5,
-            first: Box::new(l),
-            second: Box::new(r),
-        };
-        let mut dividers = collect_dividers(&node, viewport());
-        let padding = ContentPadding { top: 4.0, bottom: 4.0, left: 6.0, right: 6.0 };
-        apply_viewport_insets(&mut dividers, viewport(), &padding, 30.0);
-        let d = dividers[0];
-        // Clipped below the 30px tab bar, then inset by padding.top (4px).
-        assert!((d.rect.y - 34.0).abs() < f32::EPSILON);
-        // Height shrinks by the 30px clip, 4px top inset, and 4px bottom inset.
-        assert!((d.rect.height - (600.0 - 30.0 - 4.0 - 4.0)).abs() < f32::EPSILON);
     }
 }
