@@ -28,9 +28,9 @@
 #   0. one window with one adopted tab;
 #   1. two more tabs — the report names all three, in strip order;
 #   2. switching tabs moves `active_tab_index` instead of pinning it at 0;
-#   3. the window is moved, and the geometry record follows it;
+#   3. the window is moved and zoomed out, and the geometry record follows both;
 #   4. after a restart the window is back at that position, with the same tab
-#      order and the same active tab.
+#      order, the same active tab, and the same font zoom level.
 #
 # Requires: visual container with SCRIBE_SHARE_TAP=1; xdotool, scrot, python3.
 set -e
@@ -56,6 +56,43 @@ fail() {
 }
 
 count_log() { grep -c "$1" "$CLIENT_LOG" 2>/dev/null || true; }
+
+# The most recent client log line containing $1, with the tracing formatter's
+# ANSI colour codes stripped — they sit between a field name and its value
+# (`level\e[0m=\e[0m-1`), so an unstripped line matches no `field=value` test.
+last_log_line() {
+    grep -F "$1" "$CLIENT_LOG" 2>/dev/null | tail -1 | sed -e 's/\x1b\[[0-9;]*m//g'
+}
+
+# The `zoom = N` line of the newest geometry record on disk, or empty.
+recorded_zoom() {
+    local newest
+    newest=$(ls -t "$GEOMETRY_DIR"/*.toml 2>/dev/null | head -1)
+    [ -n "$newest" ] || return 0
+    grep -h '^zoom = ' "$newest" 2>/dev/null | tr -d ' '
+}
+
+# Wait until the debounced geometry flush has written `zoom = <want>`.
+wait_for_recorded_zoom() {
+    local want="zoom=$1" timeout_secs="$2" started
+    started=$(date +%s)
+    while [ "$(recorded_zoom)" != "$want" ]; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            echo "  (record holds [$(recorded_zoom)], wanted [$want])" >&2
+            return 1
+        fi
+        sleep 0.4
+    done
+    return 0
+}
+
+# Drive one zoom chord and wait for the view to report the level it reached.
+zoom_step() {
+    local chord="$1" baseline
+    baseline=$(count_log "terminal zoom changed")
+    send_keys "$chord"
+    wait_for_log_growth "terminal zoom changed" "$baseline" 15
+}
 
 wait_for_log_growth() {
     local pattern="$1" baseline="$2" timeout_secs="$3" started
@@ -242,6 +279,22 @@ sleep 3.0
 POS_BEFORE=$(window_position)
 echo "PHASE 3 PASS: window moved to $POS_BEFORE"
 
+# ── Phase 3b: zoom out twice; the same record carries the level ───
+# Zoom is per-window state the user set deliberately, so it belongs to the
+# record beside the rect. Two steps, because level -1 is also what a single
+# stray chord would leave behind.
+focus
+zoom_step ctrl+minus || fail "PHASE 3b: the first ctrl+- never reached zoom_out"
+zoom_step ctrl+minus || fail "PHASE 3b: the second ctrl+- never reached zoom_out"
+ZOOM_LINE=$(last_log_line "terminal zoom changed")
+case "$ZOOM_LINE" in
+    *"level=-2"*) ;;
+    *) fail "PHASE 3b: two zoom-out steps did not reach level -2: $ZOOM_LINE" ;;
+esac
+wait_for_recorded_zoom -2 15 \
+    || fail "PHASE 3b: the debounced flush never wrote the zoom level to the record"
+echo "PHASE 3b PASS: the record holds $(recorded_zoom)"
+
 # ── Phase 4: a restart restores position, order, and active tab ───
 pkill -TERM -f 'scribe-client' || true
 wait_for_client_exit 20 || fail "PHASE 4: the client did not exit"
@@ -260,8 +313,23 @@ ACTIVE_AFTER=$(tree_active_index)
 POS_AFTER=$(window_position)
 [ "$POS_AFTER" = "$POS_BEFORE" ] \
     || fail "PHASE 4: window came back at [$POS_AFTER], expected [$POS_BEFORE]"
+
+# The zoom level survived the quit in the record...
+ZOOM_RECORD=$(recorded_zoom)
+[ "$ZOOM_RECORD" = "zoom=-2" ] \
+    || fail "PHASE 4: the restored record holds [$ZOOM_RECORD], expected [zoom=-2]"
+# ...and reached the live view, not just the file: one more step lands on -3,
+# which is only reachable from the restored level. A window that came back
+# unzoomed would report -1 here and would then write that over the record.
+zoom_step ctrl+minus || fail "PHASE 4: ctrl+- never reached zoom_out after the restart"
+ZOOM_AFTER=$(last_log_line "terminal zoom changed")
+case "$ZOOM_AFTER" in
+    *"level=-3"*) ;;
+    *) fail "PHASE 4: the restarted window did not resume at level -2: $ZOOM_AFTER" ;;
+esac
+
 shot /output/01-restored.png
-echo "PHASE 4 PASS: position $POS_AFTER, order [$ORDER_AFTER], active tab $ACTIVE_AFTER"
+echo "PHASE 4 PASS: position $POS_AFTER, order [$ORDER_AFTER], active tab $ACTIVE_AFTER, $ZOOM_RECORD"
 
 # ── Phase 5: a second restart does not walk the window ────────────
 # The saved record is the content origin while a reparenting window manager

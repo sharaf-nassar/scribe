@@ -1,6 +1,6 @@
 //! Persistent window geometry state for the GPUI client.
 //!
-//! Stores window position, size, [`WindowState`], and monitor name in
+//! Stores window position, size, [`WindowState`], font zoom level, and monitor name in
 //! `$XDG_STATE_HOME/scribe/windows/<window_id>.toml` (one file per window to
 //! avoid save races between window processes). Ported from the legacy winit
 //! client's `window_state.rs`; the winit `capture`/`apply` glue is replaced by
@@ -153,6 +153,14 @@ pub struct WindowGeometry {
     /// Absent in legacy files (`serde(default)` → `false`).
     #[serde(default)]
     pub titlebar_normalized: bool,
+    /// Font zoom level the window was last at, as the point *delta* over
+    /// `appearance.font_size` that [`crate::zoom::ZoomState`] holds — never the
+    /// resulting size, so a later config edit rebases the delta instead of
+    /// being overridden by a size captured against the old one. `serde(default)`
+    /// → `0` (unzoomed) for records written before this field existed, and
+    /// [`crate::zoom::ZoomState::at_level`] re-clamps whatever is read back.
+    #[serde(default)]
+    pub zoom: i8,
     /// Legacy `maximized = true|false`, read from pre-[`WindowState`] records
     /// and folded into `state` by [`adopt_legacy_state`]. Never written back.
     #[serde(default, rename = "maximized", skip_serializing)]
@@ -176,6 +184,7 @@ impl Default for WindowGeometry {
             desktop: None,
             // A freshly-created default is already in the new coordinate system.
             titlebar_normalized: true,
+            zoom: 0,
             legacy_maximized: None,
             restore_rect: None,
         }
@@ -209,6 +218,16 @@ impl WindowGeometry {
     #[must_use]
     pub fn on_desktop(self, desktop: Option<u32>) -> Self {
         Self { desktop, ..self }
+    }
+
+    /// The same record with the live font zoom level filled in.
+    ///
+    /// A sibling of [`Self::on_desktop`], for the same two reasons: the zoom is
+    /// not part of the bounds conversion, and the private legacy-`maximized`
+    /// field blocks struct-update syntax from outside this module.
+    #[must_use]
+    pub fn at_zoom(self, zoom: i8) -> Self {
+        Self { zoom, ..self }
     }
 
     /// The origin a restore re-asserts, or `None` when none was captured.
@@ -469,8 +488,9 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
 /// [`crate::monitor::window_origin_is_exposed`]; the `Option` is what keeps the
 /// decision from being quietly dropped here.
 ///
-/// The virtual desktop is left `None` for the caller to fill in with
-/// [`WindowGeometry::on_desktop`]; it is not part of the bounds conversion.
+/// The virtual desktop and the font zoom level are left at their neutral values
+/// for the caller to fill in with [`WindowGeometry::on_desktop`] and
+/// [`WindowGeometry::at_zoom`]; neither is part of the bounds conversion.
 ///
 /// `previous` is the last record this window produced. It is what carries the
 /// pre-maximize/pre-fullscreen rect: once the window is no longer windowed its
@@ -501,6 +521,9 @@ pub fn geometry_from_bounds(
         // Anything captured from a live GPUI window is already in the new
         // coordinate system: the custom titlebar is inside these bounds.
         titlebar_normalized: true,
+        // Filled in by the caller with [`WindowGeometry::at_zoom`]; the zoom is
+        // no more a function of the bounds than the virtual desktop is.
+        zoom: 0,
         legacy_maximized: None,
         restore_rect,
     }
@@ -1022,6 +1045,39 @@ titlebar_normalized = true
 
     fn work_area(name: &str, x: i32, y: i32, width: u32, height: u32) -> MonitorWorkArea {
         MonitorWorkArea { name: name.to_owned(), x, y, width, height }
+    }
+
+    // @lat: [[test#Window geometry compat#The font zoom level round-trips]]
+    #[test]
+    fn zoom_level_round_trips() {
+        let captured = capture(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&WindowGeometry {
+                restore_rect: Some(SavedRect { x: Some(10), y: Some(20), width: 800, height: 600 }),
+                state: WindowState::Maximized,
+                ..WindowGeometry::default()
+            }),
+        );
+        assert_eq!(captured.zoom, 0, "the bounds conversion leaves the level to the caller");
+
+        // A bare key written after `restore_rect`'s table would be read as part
+        // of it, so the round-trip is taken with that table present.
+        let geom = captured.at_zoom(-3);
+        let text = toml::to_string_pretty(&geom).expect("serialize");
+        assert_eq!(toml::from_str::<WindowGeometry>(&text).expect("round-trip"), geom, "{text}");
+
+        // The clamp only touches geometry, so the level survives a monitor
+        // layout change with it.
+        assert_eq!(
+            clamp_geometry_to_layout(&geom, &[work_area("DP-1", 0, 0, 1920, 1080)]).zoom,
+            -3
+        );
+        // And a record written before the field existed restores unzoomed.
+        let legacy: WindowGeometry =
+            toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
+        assert_eq!(legacy.zoom, 0);
     }
 
     // @lat: [[test#Window geometry compat#A window off the layout is clamped back onto it]]

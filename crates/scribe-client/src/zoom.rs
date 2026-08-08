@@ -30,6 +30,16 @@ impl ZoomState {
         Self { level: 0 }
     }
 
+    /// A zoom state at a persisted level, clamped to `[ZOOM_MIN, ZOOM_MAX]`.
+    ///
+    /// The level survives a quit in the window's geometry record, which is a
+    /// plain TOML file a user (or a truncated write) can put any `i8` in, so
+    /// the range is re-imposed on the way back in rather than trusted.
+    #[must_use]
+    pub fn at_level(level: i8) -> Self {
+        Self { level: level.clamp(ZOOM_MIN, ZOOM_MAX) }
+    }
+
     /// Current zoom level in font-size points.
     #[must_use]
     pub fn level(self) -> i8 {
@@ -79,6 +89,20 @@ mod tests {
             z.zoom_out();
         }
         assert_eq!(z.level(), ZOOM_MIN);
+    }
+
+    // @lat: [[test#GPUI Font Zoom#A restored level is clamped, not trusted]]
+    #[test]
+    fn restored_level_is_clamped() {
+        assert_eq!(ZoomState::at_level(0), ZoomState::new());
+        assert_eq!(ZoomState::at_level(-3).level(), -3);
+        // A hand-edited or corrupt record cannot escape the range the live
+        // steps saturate at.
+        assert_eq!(ZoomState::at_level(120).level(), ZOOM_MAX);
+        assert_eq!(ZoomState::at_level(i8::MIN).level(), ZOOM_MIN);
+        // And what it restores is a delta over the configured size, so a
+        // config edit rebases it rather than being overridden by it.
+        assert!((ZoomState::at_level(-2).effective_font_size(20.0) - 18.0).abs() < f32::EPSILON);
     }
 
     // @lat: [[test#GPUI Font Zoom#Reset returns to the configured size]]

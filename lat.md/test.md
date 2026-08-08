@@ -1838,7 +1838,7 @@ Phase 0 hands the client a live pane through the same daemon-stop-and-relaunch t
 
 The wire tap is mandatory, not incidental. The whole tab list exists only as a `ReportWorkspaceTree` frame — a screenshot shows the tab that is on screen and nothing about the ones that are not — so the test reads the newest report and asserts its leaf's `session_ids` and `active_tab_index` directly.
 
-Phase 0 leaves one window with one adopted tab. Phase 1 opens two more and requires the report to name all three: naming only the visible pane is exactly the defect, and it passes every pixel check. Phase 2 selects tabs 1 and 2 and requires `active_tab_index` to follow (2 → 0 → 1) instead of the hardcoded 0. Phase 3 moves the window with `xdotool`. Phase 4 restarts the client and requires the position, the tab order, and the active tab to all come back. Phase 5 restarts a *second* time and requires the position to be unchanged again — a reparenting window manager positions its frame rather than the window, so an uncorrected restore walks the window down and right by one decoration every time, which a single restart hides and two do not.
+Phase 0 leaves one window with one adopted tab. Phase 1 opens two more and requires the report to name all three: naming only the visible pane is exactly the defect, and it passes every pixel check. Phase 2 selects tabs 1 and 2 and requires `active_tab_index` to follow (2 → 0 → 1) instead of the hardcoded 0. Phase 3 moves the window with `xdotool`, and phase 3b zooms the grid out twice and requires the debounced flush to write `zoom = -2` into the same record — two steps, because level -1 is also what a single stray chord would leave behind. Phase 4 restarts the client and requires the position, the tab order, the active tab, and the zoom level to all come back. The zoom half is asserted twice over: the record still reads -2, and one further zoom-out step reports level -3, which is only reachable from a live view that resumed at -2 — a window that came back unzoomed would report -1 and would then write that over the record. Phase 5 restarts a *second* time and requires the position to be unchanged again — a reparenting window manager positions its frame rather than the window, so an uncorrected restore walks the window down and right by one decoration every time, which a single restart hides and two do not.
 
 ### Geometry capture survives a resize
 
@@ -2402,6 +2402,12 @@ The capture used to store the bounds origin unconditionally, so Wayland's `(0, 0
 A record whose `x`/`y` are `None` reopens at the caller's centred fallback origin rather than at `(0, 0)`, while still taking its saved size.
 
 Wayland never exposes a window's origin, so the capture stores `None` instead of a bogus `(0, 0)`; honouring the fallback is what stops a later X11 launch from restoring into the screen corner.
+
+### The font zoom level round-trips
+
+A capture leaves `zoom` at the neutral level for the caller to fill in with [[crates/scribe-client/src/window_state.rs#WindowGeometry#at_zoom]], exactly as it leaves the virtual desktop, and the filled-in record survives a TOML round trip and the layout clamp unchanged.
+
+The round trip is taken with `restore_rect` present on purpose: it serializes as a TOML table, and a bare key emitted after a table would be read back as part of it, so the field's declaration order in the struct is load-bearing. A record written before the field existed carries no key and restores unzoomed through `serde(default)`.
 
 ### A window off the layout is clamped back onto it
 
@@ -3468,6 +3474,12 @@ Covers the runtime font-zoom math in  — the in/out/reset point delta the GPUI 
 ### Zoom steps clamp to the point range
 
 Repeated  and  calls saturate at the `+7` / `-7` point bounds rather than overflowing the level.
+
+### A restored level is clamped, not trusted
+
+[[crates/scribe-client/src/zoom.rs#ZoomState#at_level]] clamps a level read back out of a window's geometry record into the same `-7..=7` range the live steps saturate at.
+
+The record is a TOML file a user can put any `i8` in, so a hand-edited or truncated one must not restore a window to a size the chords could never reach. What it restores is a delta over the configured size, which is what keeps a later `appearance.font_size` edit rebasing the zoom instead of being overridden by it.
 
 ### Reset returns to the configured size
 
