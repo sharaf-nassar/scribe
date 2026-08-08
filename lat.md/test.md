@@ -2403,6 +2403,12 @@ A rect that still touches a work area is returned untouched — position, size, 
 
 This is what keeps clamping from becoming the regression the old gate caused in reverse: a window already on screen never moves, so pre-upgrade nil-UUID records keep their placement and side-by-side windows do not re-open stacked. An empty connected-monitor list (macOS, pure Wayland, no RandR) is unverifiable, so even an absurd rect survives it.
 
+### The virtual desktop round-trips
+
+A capture handed the window manager's `_NET_WM_DESKTOP` stores it, and it survives TOML serialization, deserialization, and the layout clamp unchanged — including EWMH's `0xFFFFFFFF`, so a window pinned to all desktops comes back pinned.
+
+A record written before the field existed, and a window manager that publishes no desktop at all, both deserialize to `None`, which the restore reads as "nothing to re-assert" and leaves the window on the current desktop.
+
 ## X11 focus guard
 
 Unit tests for , the pure reactivation state machine backing the ported X11 focus guard, proving the suppression semantics that the visual E2E exercises against the live `_NET_ACTIVE_WINDOW`.
