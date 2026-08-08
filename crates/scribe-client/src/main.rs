@@ -85,7 +85,8 @@ use scribe_client::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client::remote_handshake::{self, RemoteDialer};
 use scribe_client::remote_picker::{RemotePickerColors, remote_picker_overlay};
 use scribe_client::restore_replay::{
-    self, ReplayLaunch, grid_for_rect, prepare_replay, round_positive_f32_to_u16,
+    self, GridSize, ReplayLaunch, attach_dimensions_for_session, grid_for_rect, prepare_replay,
+    round_positive_f32_to_u16,
 };
 use scribe_client::restore_state::{AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState};
 use scribe_client::scrollbar::{
@@ -524,6 +525,12 @@ struct Shared {
     /// dispatcher's own output thread, drained by the lifecycle tick — raising
     /// the window and selecting a tab are both foreground-only.
     notification_focus: Arc<Mutex<Vec<SessionId>>>,
+    /// Sessions whose cached pane grid [`reattach_visible_sessions`] left
+    /// deliberately unannounced, so [`TerminalView::publish_pane_sizes`] must
+    /// forget what it last sent and publish the real grid again. The reader
+    /// cannot reach `pane_sizes` — it lives on the view — so it parks the ids
+    /// here instead. See [`ReattachPane`] for why a Codex pane takes this route.
+    deferred_grids: Arc<Mutex<Vec<SessionId>>>,
     /// Latest `SearchResults` reply. The IPC reader stores it; the find
     /// overlay adopts it on the next redraw and the paint path highlights the
     /// on-screen spans it names.
@@ -5012,6 +5019,14 @@ impl TerminalView {
         if cell_width <= 0.0 || line_height <= 0.0 {
             return;
         }
+        // A pane the reader reattached without announcing a grid
+        // ([`reattach_visible_sessions`]) has to be re-published even though
+        // nothing about the layout moved, so forget what was last sent for it.
+        if let Ok(mut deferred) = self.shared.deferred_grids.lock() {
+            for session_id in deferred.drain(..) {
+                self.pane_sizes.remove(&session_id);
+            }
+        }
         let placements = self.shell.placements(viewport, cx);
         let split = placements.len() > 1;
         let live: HashSet<SessionId> =
@@ -8402,6 +8417,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         bells: Arc::new(Mutex::new(Vec::new())),
         ai_notices: Arc::new(Mutex::new(Vec::new())),
         notification_focus: Arc::new(Mutex::new(Vec::new())),
+        deferred_grids: Arc::new(Mutex::new(Vec::new())),
         find: Arc::new(Mutex::new(FindResults::default())),
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
@@ -9166,6 +9182,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         lifecycle: Arc::clone(&ctx.shared.lifecycle),
         bells: Arc::clone(&ctx.shared.bells),
         ai_notices: Arc::clone(&ctx.shared.ai_notices),
+        deferred_grids: Arc::clone(&ctx.shared.deferred_grids),
         find: Arc::clone(&ctx.shared.find),
         lan: Arc::clone(&ctx.shared.lan),
         prompt_marks: Arc::clone(&ctx.shared.prompt_marks),
@@ -9660,6 +9677,9 @@ struct ReaderCtx {
     /// AI transitions queued for the foreground's notification gate; see the
     /// `ai_notices` field of `Shared`.
     ai_notices: Arc<Mutex<Vec<AiNotice>>>,
+    /// Panes whose grid the reattach left unannounced; see the `deferred_grids`
+    /// field of `Shared`.
+    deferred_grids: Arc<Mutex<Vec<SessionId>>>,
     /// Latest `SearchResults` reply the find overlay renders and highlights.
     find: Arc<Mutex<FindResults>>,
     /// Feature-014 LAN state the reader parks approval requests in and folds the
@@ -10482,13 +10502,64 @@ fn request_initial_session(
     Ok(())
 }
 
+/// Whether the server's view of a session says a Codex process owns it.
+///
+/// The live state's own provider wins; `ai_provider_hint` is the fallback for a
+/// session whose visible state has already been cleared but whose
+/// provider-aware behaviour must survive the reattach.
+fn is_codex_session(info: &SessionInfo) -> bool {
+    info.ai_state.as_ref().map(|state| state.provider).or(info.ai_provider_hint)
+        == Some(scribe_common::ai_state::AiProvider::CodexCode)
+}
+
+/// One retained pane's reattach: the grid its `AttachSessions` announces, and
+/// whether the reconnect may follow that attach with a `Resize`.
+struct ReattachPane {
+    session_id: SessionId,
+    size: TerminalSize,
+    resize_now: bool,
+}
+
+/// Decide what each retained pane announces when its connection is replaced.
+///
+/// A Codex pane is the exception the retired client encoded and this one lost:
+/// it announces a zero-sized grid and takes no follow-up `Resize`. The server's
+/// `attach_flow::send_attach_replay` runs its pre-replay `resize_term` +
+/// `TIOCSWINSZ` only for a size that has a grid, and Codex renders through Ink,
+/// which repaints on `SIGWINCH` and would paint over the history the replay has
+/// just restored. The real grid is not lost — it is deferred to the ordinary
+/// publish cycle, which is why the caller also parks the pane in
+/// `Shared::deferred_grids`.
+fn reattach_panes(
+    sessions: &[SessionInfo],
+    retained: &[SessionId],
+    grids: &[GridSize],
+    cell_size: (f32, f32),
+) -> Vec<ReattachPane> {
+    let codex: HashSet<SessionId> =
+        sessions.iter().filter(|info| is_codex_session(info)).map(|info| info.session_id).collect();
+    retained
+        .iter()
+        .zip(grids)
+        .map(|(session_id, grid)| {
+            let is_codex = codex.contains(session_id);
+            ReattachPane {
+                session_id: *session_id,
+                size: attach_dimensions_for_session(Some(*grid), cell_size, is_codex),
+                resize_now: !is_codex,
+            }
+        })
+        .collect()
+}
+
 /// Reattach panes retained by the live window to a replacement server stream.
 ///
 /// The local `attached` set describes which sessions the window still shows,
 /// but an `AttachSessions` grant belongs to one IPC connection. A server
 /// handoff therefore needs to replay the set after the replacement connection's
 /// first `SessionList`. Dimensions come from each pane's existing display grid
-/// so split panes keep their geometry across the handoff.
+/// so split panes keep their geometry across the handoff — except for a Codex
+/// pane, which [`reattach_panes`] defers to the next publish.
 fn reattach_visible_sessions(ctx: &ReaderCtx, sessions: &[SessionInfo]) -> Result<(), String> {
     let live: HashSet<_> = sessions.iter().map(|session| session.session_id).collect();
     let retained = ctx.attached.lock().map_or_else(
@@ -10507,40 +10578,54 @@ fn reattach_visible_sessions(ctx: &ReaderCtx, sessions: &[SessionInfo]) -> Resul
     }
 
     let focused = reader_attach_size(ctx);
-    let dimensions = ctx.panes.lock().map_or_else(
-        |_| vec![focused; retained.len()],
+    let fallback = GridSize { cols: focused.cols, rows: focused.rows };
+    let grids: Vec<GridSize> = ctx.panes.lock().map_or_else(
+        |_| vec![fallback; retained.len()],
         |panes| {
             retained
                 .iter()
-                .map(|session_id| {
-                    let Some((cols, rows)) = panes.dimensions(*session_id) else {
-                        return focused;
-                    };
-                    TerminalSize {
-                        cols: u16::try_from(cols).unwrap_or(focused.cols),
-                        rows: u16::try_from(rows).unwrap_or(focused.rows),
-                        cell_width: focused.cell_width,
-                        cell_height: focused.cell_height,
-                    }
-                })
+                .map(|session_id| pane_display_grid(&panes, *session_id).unwrap_or(fallback))
                 .collect()
         },
     );
+    let cell_size = (f32::from(focused.cell_width), f32::from(focused.cell_height));
+    let panes = reattach_panes(sessions, &retained, &grids, cell_size);
 
     tracing::info!(sessions = retained.len(), "reattaching visible sessions");
-    for session_id in &retained {
-        tracing::info!(%session_id, "attaching to session");
+    for pane in &panes {
+        tracing::info!(
+            session_id = %pane.session_id,
+            cols = pane.size.cols,
+            rows = pane.size.rows,
+            resize_now = pane.resize_now,
+            "attaching to session"
+        );
     }
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
             session_ids: retained.clone(),
-            dimensions: dimensions.clone(),
+            dimensions: panes.iter().map(|pane| pane.size).collect(),
         })
         .map_err(|error| error.to_string())?;
-    for (session_id, size) in retained.iter().zip(dimensions) {
-        ctx.sink.resize(*session_id, size).map_err(|error| error.to_string())?;
+    for pane in panes.iter().filter(|pane| pane.resize_now) {
+        ctx.sink.resize(pane.session_id, pane.size).map_err(|error| error.to_string())?;
+    }
+    // The GPUI half of the retired client's `mark_reconnected_grids`: a pane
+    // that announced no grid must not stay at the size the view last published,
+    // or `publish_pane_sizes` would skip it forever and the server would never
+    // hear the real one.
+    if let Ok(mut deferred) = ctx.deferred_grids.lock() {
+        deferred.extend(panes.iter().filter(|pane| !pane.resize_now).map(|pane| pane.session_id));
+    } else {
+        tracing::warn!("deferred-grid queue poisoned; a reattached pane may keep a stale size");
     }
     ctx.sink.subscribe(retained).map_err(|error| error.to_string())
+}
+
+/// A pane's current display grid, when it has one the protocol can carry.
+fn pane_display_grid(panes: &PaneGrids, session_id: SessionId) -> Option<GridSize> {
+    let (cols, rows) = panes.dimensions(session_id)?;
+    Some(GridSize { cols: u16::try_from(cols).ok()?, rows: u16::try_from(rows).ok()? })
 }
 
 /// Store one `SearchResults` reply for the find overlay and the paint path.
@@ -11465,6 +11550,52 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    /// A `SessionInfo` carrying only what the reattach decision reads.
+    fn listed_session(session_id: SessionId, provider: Option<AiProvider>) -> SessionInfo {
+        SessionInfo {
+            session_id,
+            workspace_id: WorkspaceId::new(),
+            shell_name: String::from("bash"),
+            title: None,
+            context: None,
+            task_label: None,
+            codex_task_label: None,
+            cwd: None,
+            git_branch: None,
+            ai_state: None,
+            ai_provider_hint: provider,
+            prompt_state: None,
+        }
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Codex reattach defers its grid]]
+    #[test]
+    fn a_reattaching_codex_pane_announces_no_grid_and_no_resize() {
+        let codex = SessionId::new();
+        let shell = SessionId::new();
+        let sessions =
+            [listed_session(codex, Some(AiProvider::CodexCode)), listed_session(shell, None)];
+        let retained = [codex, shell];
+        let grids = [GridSize { cols: 100, rows: 30 }, GridSize { cols: 90, rows: 20 }];
+
+        let panes = reattach_panes(&sessions, &retained, &grids, (8.0, 16.0));
+
+        // Codex: nothing for the server to pre-size against, and no resize
+        // riding in behind the attach to undo that.
+        assert_eq!(panes[0].session_id, codex);
+        assert_eq!(panes[0].size, TerminalSize::default());
+        assert!(!panes[0].size.has_grid());
+        assert!(!panes[0].resize_now);
+
+        // Every other pane keeps the geometry it reattached with.
+        assert_eq!(panes[1].session_id, shell);
+        assert_eq!(
+            panes[1].size,
+            TerminalSize { cols: 90, rows: 20, cell_width: 8, cell_height: 16 }
+        );
+        assert!(panes[1].resize_now);
+    }
 
     // @lat: [[lat.md/client#Client#GPUI Client Spike#Server Lifecycle Wiring]]
     #[test]

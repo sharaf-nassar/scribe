@@ -1514,6 +1514,14 @@ The entrypoint gates on the client's own `attaching to session` line before runn
 
 The shared-pane rig keeps the test daemon and visible GPUI window on one session. The script records initial topology and attach log counts, upgrades the live server through , then requires both counts to advance while the original `SCRIBE_CLIENT_PID` and `Scribe` window remain alive. Because the harness daemon's own stream ends with the old server, the final oracle types a sentinel through the surviving GPUI window and requires a substantial terminal-body repaint after the replacement connection completes `Hello` / `ListSessions` / `AttachSessions`.
 
+### Codex reattach announces no grid
+
+`tests/e2e/visual/codex-reattach-size.sh` proves the [[client#Client#GPUI Client Spike#Hot Restart Reattach#Codex reattach defers its grid|Codex 0x0 exception]] survives a real reconnect of a live window: the attach announces no grid, no resize rides in behind it, and the pane's real grid follows as an ordinary publish.
+
+It runs on the [[test#Visual E2E Tests#Shared-pane rig|shared-pane rig]] so `$SESSION` is the pane the photographed window renders, fires `scribe-hook-helper --provider=codex_code` events to make the server call that session Codex, and upgrades the server the way the [[test#Visual E2E Tests#Server-upgrade reattach oracle|server-upgrade oracle]] does — the one reconnect in the harness that reaches `reattach_visible_sessions` with a non-empty attached set. The assertions read the client log's own attach and publish lines.
+
+Two things it deliberately does not prove. There is no Codex binary in the image, so the provider is faked through the hook channel exactly as `tests/e2e/func/ai-context-thresholds.sh` fakes it and no Ink process is ever asked to repaint. And the oracle is the log rather than the recording wire tap: the tap moves `server.sock` aside to interpose itself while a handed-off server binds that same fixed path, so the tap and an upgrade cannot coexist.
+
 ### Color emoji renders in color
 
 `tests/e2e/visual/color-emoji.sh` proves color emoji render in color rather than as monochrome/tinted glyphs — the US3 headline parity item promoted to an automated visual check.
