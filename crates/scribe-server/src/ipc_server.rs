@@ -5572,10 +5572,9 @@ fn resolve_window_claim<V>(
                 // Explicit takeover: swap the connected window's writer.
                 // `other_windows` mirrors an adopt of this window — the other
                 // still-unconnected session windows.
-                let other_windows = windows_with_sessions
-                    .iter()
-                    .filter(|wid| **wid != window_id && !connected.contains_key(wid))
-                    .copied()
+                let other_windows = windows_in_stable_order(windows_with_sessions)
+                    .into_iter()
+                    .filter(|wid| *wid != window_id && !connected.contains_key(wid))
                     .collect();
                 return ClaimResolution::Takeover { window_id, other_windows };
             }
@@ -12014,6 +12013,21 @@ fn env_status_to_wire(
     }
 }
 
+/// The known windows in a stable order, so every decision taken over them is
+/// reproducible.
+///
+/// `windows_with_sessions` is a `HashSet`, and walking it directly made both
+/// the adoption pick and the spawn fan-out depend on hash iteration order —
+/// the same class of bug the window session list had. An unnamed `Hello` (a
+/// client that found no claimable snapshot) then adopted an arbitrary window,
+/// differently on every process, so nothing downstream could line up with the
+/// window it landed on.
+fn windows_in_stable_order(windows_with_sessions: &HashSet<WindowId>) -> Vec<WindowId> {
+    let mut ordered: Vec<WindowId> = windows_with_sessions.iter().copied().collect();
+    ordered.sort_unstable_by_key(|wid| wid.to_full_string());
+    ordered
+}
+
 /// Decide which `WindowId` to assign to a connecting client, and which
 /// other unconnected windows should be spawned as separate processes.
 ///
@@ -12021,14 +12035,16 @@ fn env_status_to_wire(
 /// (e.g. it was launched with `--window-id`) and may claim it only if no
 /// current client owns that window. When `None`, this is a fresh launch — if
 /// there are unconnected windows with sessions (restart scenario), the client
-/// adopts one instead of creating a new ID.
+/// adopts one instead of creating a new ID, in
+/// [`windows_in_stable_order`].
 fn resolve_window_assignment<V>(
     hello_window_id: Option<WindowId>,
     windows_with_sessions: &HashSet<WindowId>,
     connected: &HashMap<WindowId, V>,
 ) -> (WindowId, Vec<WindowId>) {
+    let ordered = windows_in_stable_order(windows_with_sessions);
     let next_unconnected = || {
-        windows_with_sessions
+        ordered
             .iter()
             .find(|wid| !connected.contains_key(wid))
             .copied()
@@ -12043,10 +12059,9 @@ fn resolve_window_assignment<V>(
         None => next_unconnected(),
     };
 
-    let other_windows: Vec<WindowId> = windows_with_sessions
-        .iter()
-        .filter(|wid| **wid != assigned && !connected.contains_key(wid))
-        .copied()
+    let other_windows: Vec<WindowId> = ordered
+        .into_iter()
+        .filter(|wid| *wid != assigned && !connected.contains_key(wid))
         .collect();
 
     (assigned, other_windows)
@@ -12486,6 +12501,29 @@ mod tests {
         for o in &others {
             assert!(sessions.contains(o), "other_windows must be known windows");
         }
+    }
+
+    /// An unnamed `Hello` must land on the same window every time, and fan the
+    /// rest out in the same order, however the set was built.
+    // @lat: [[server#Workspaces#Window Assignment#Adoption order is stable]]
+    #[test]
+    fn adoption_order_does_not_depend_on_set_iteration() {
+        let ids: Vec<WindowId> = (0..8).map(|_| WindowId::new()).collect();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
+        let forwards: HashSet<WindowId> = ids.iter().copied().collect();
+        let backwards: HashSet<WindowId> = ids.iter().rev().copied().collect();
+
+        let (assigned, others) = resolve_window_assignment(None, &forwards, &connected);
+        assert_eq!(
+            resolve_window_assignment(None, &backwards, &connected),
+            (assigned, others.clone())
+        );
+
+        // And the order is the id order, not an accident of insertion.
+        let mut expected: Vec<WindowId> = ids;
+        expected.sort_unstable_by_key(|wid| wid.to_full_string());
+        assert_eq!(assigned, expected[0]);
+        assert_eq!(others, expected[1..]);
     }
 
     /// Explicit --window-id always used, even if it doesn't match any session.

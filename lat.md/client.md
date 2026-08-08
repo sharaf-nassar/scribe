@@ -354,6 +354,8 @@ The two persisted files are driven from the running window: `ColdStart` claims a
 
  runs in `main` *before* the backend connects, because the claim must happen once per process rather than once per reconnect, and because the claimed snapshot's window id is both the only key the geometry record can be found under and the window this process claims in its `Hello`. A true cold restart reaches a fresh server that has not named this window yet, and by the time `Welcome` does the window is already on screen. The loaded record goes through  and , then  turns it into the `WindowBounds` handed to `open_window` — so unlike the winit port there is no post-creation move/resize/maximize sequence to race the compositor, and no flash at the default size.  distinguishes "nothing persisted" from the default geometry, because the default is a size *hint*: opening at it would override the grid-derived startup size on every launch that never saved anything.
 
+A launch that finds nothing claimable has no such id: it opens at the default size on the active monitor and sends an unnamed `Hello`, so the window it adopts is only named by `Welcome` — read at [[crates/scribe-client/src/main.rs#TerminalView#poll_restore|poll_restore]], well after the window is on screen. [[crates/scribe-client/src/main.rs#TerminalView#adopt_assigned_geometry|adopt_assigned_geometry]] reads that window's record once at that point and hands it to the same [[crates/scribe-client/src/main.rs#RestoreRuntime#adopt_geometry_record|adopt_geometry_record]] the seeded path uses, so the adopted window's position is re-asserted and its `RestorePlacement` is held open — which is what keeps the opening default from being flushed over the record. Without it the first flush destroyed the bounds of whichever window the server happened to hand over.
+
 Geometry is read back off the live window by  through  — GPUI bounds are already logical pixels, so no scale-factor division is needed. It runs from an `observe_window_bounds` subscription (the GPUI equivalent of winit's `Moved`/`Resized`) and again on every paint, so a window that is opened and never touched still persists the size it came up at. Both files are written on a 500 ms debounce (`RESTORE_DEBOUNCE`), since a drag-resize emits a bounds change per frame and a split re-reports the tree several times while sessions arrive.
 
 The snapshot is marked stale from , the single funnel every layout change already passes through.  serialises the live shell into the ported format: the shell keeps panes in  entities while `snapshot_window_restore` is written against , so a scratch layout is filled from the live trees — one region becomes one tab whose pane tree is the region's whole split, the same shape reported to the server — and panes still awaiting a session are pruned exactly as they are on the wire. A window with nothing replayable in it is *removed* from the store rather than saved blank, so the next cold start cannot claim it and replay an empty window forever.
@@ -401,6 +403,12 @@ Serialising a rebuilt window with `snapshot_window_restore` reproduces the origi
 #### Prompt state survives the snapshot round trip
 
 A saved `LaunchRecord` carrying prompt text, count, and both epoch timestamps replays into `PaneRestore.prompts` as `SystemTime` values and re-serialises back to the same epoch seconds, so a restored prompt bar keeps its rows and its elapsed timer.
+
+#### An adopted window keeps its saved geometry
+
+Verifies a window opened without a geometry record still owes the window the server assigns it a read, and that reading the record arms the same restore a seeded window starts with instead of leaving the opening default to be persisted.
+
+A window opened at its own record named that window in `Hello`, so it has nothing left to adopt and starts out placing itself; one opened without a record starts settled — it should persist the bounds it came up at — and only stops being settled once the assigned window's record is adopted.
 
 #### Replayed prompts reach the live AI chrome
 
