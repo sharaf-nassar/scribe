@@ -2369,6 +2369,12 @@ The capture that first sees a window maximized reads the windowed rect off the p
 
 EWMH 5.7 makes restoring the pre-fullscreen geometry the window manager's job, and a maximized window's own bounds are the work area, so the rect to return to can only come from the reading taken before the transition. It is what `WindowBounds::Maximized`/`Fullscreen` are handed, since GPUI documents those bounds as the restore size.
 
+### A maximized record still has an origin to re-assert
+
+A maximized record answers `restore_origin` with its pre-maximize origin, or its own when a legacy record captured none, so the restore has a placement to assert instead of taking whatever monitor the window manager picked.
+
+The window manager owns a maximized window's size, not its monitor, and the monitor follows the origin. The pre-maximize origin is preferred because it is on the same monitor *and* is where the window returns to when the placement move unmaximizes it. A windowed record keeps answering with its own origin, and a record captured without one (Wayland) answers `None`.
+
 ### Position-less record keeps the fallback origin
 
 A record whose `x`/`y` are `None` reopens at the caller's centred fallback origin rather than at `(0, 0)`, while still taking its saved size.

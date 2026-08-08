@@ -192,6 +192,19 @@ impl WindowGeometry {
         }
     }
 
+    /// The origin a restore re-asserts, or `None` when none was captured.
+    ///
+    /// A maximized or fullscreen window has a placement of its own even though
+    /// the window manager owns its size: the monitor follows the origin. The
+    /// pre-maximize rect is the one to aim at — it is both on that monitor and
+    /// where the window returns to when it is unmaximized around the move — and
+    /// the record's own origin answers for a legacy record that never captured
+    /// one.
+    #[must_use]
+    pub fn restore_origin(&self) -> Option<(i32, i32)> {
+        self.windowed_rect().and_then(|rect| rect.x.zip(rect.y)).or_else(|| self.x.zip(self.y))
+    }
+
     /// The windowed rect to return to, which for a windowed record is its own.
     ///
     /// This is what makes the pre-maximize rect survive: the capture that first
@@ -746,6 +759,28 @@ titlebar_normalized = true
         let geom = legacy_geom(1920, 1080, WindowState::Maximized);
         let fallback = test_bounds(0.0, 0.0, 800.0, 600.0);
         assert!(matches!(window_bounds_for(&geom, fallback), WindowBounds::Maximized(_)));
+    }
+
+    // @lat: [[test#Window geometry compat#A maximized record still has an origin to re-assert]]
+    #[test]
+    fn maximized_record_still_has_an_origin_to_re_assert() {
+        // A legacy maximized record has no pre-maximize rect, and its own
+        // origin is the work area's — still the right monitor to aim at.
+        let mut geom = legacy_geom(1920, 1080, WindowState::Maximized);
+        geom.x = Some(2160);
+        assert_eq!(geom.restore_origin(), Some((2160, 200)));
+        // Once one has been captured it wins: it is on the same monitor and is
+        // where the window returns to when the move unmaximizes it.
+        geom.restore_rect =
+            Some(SavedRect { x: Some(2260), y: Some(120), width: 1200, height: 800 });
+        assert_eq!(geom.restore_origin(), Some((2260, 120)));
+        // A windowed record answers with its own origin, as it always did.
+        assert_eq!(
+            legacy_geom(1200, 800, WindowState::Windowed).restore_origin(),
+            Some((100, 200))
+        );
+        // Nothing captured (Wayland) stays nothing.
+        assert_eq!(WindowGeometry::default().restore_origin(), None);
     }
 
     // @lat: [[test#Window geometry compat#Position-less record keeps the fallback origin]]

@@ -850,9 +850,10 @@ struct RestoreRuntime {
     /// once — and only if — this window's own replay confirms the server is
     /// cold. Zeroed on the way out so a redial cannot spawn them twice.
     siblings: usize,
-    /// The saved position still to be re-applied to the live window, taken by
-    /// the first paint. `None` once applied, or when nothing was persisted.
-    pending_position: Option<(i32, i32)>,
+    /// The saved position still to be re-applied to the live window, with the
+    /// state to re-assert it under, taken by the first paint. `None` once
+    /// applied, or when nothing was persisted.
+    pending_position: Option<((i32, i32), WindowState)>,
     /// Where that move was aiming, and when it was asked for. Kept until the
     /// request has had time to be answered and the placement has been checked.
     position_target: Option<((i32, i32), Instant)>,
@@ -931,12 +932,13 @@ impl RestoreRuntime {
             .as_ref()
             .filter(|geom| geom.state == WindowState::Minimized)
             .map(WindowGeometry::effective_state);
-        // A maximized or fullscreen window has no position of its own to
-        // re-assert; the compositor owns its placement.
+        // A maximized or fullscreen window has a placement too: the window
+        // manager owns its size, but the monitor it fills follows the origin,
+        // and that origin is exactly the hint Mutter ignores. It is re-asserted
+        // with the state lifted around the move (see `apply_saved_position`).
         let restore_position = restore_geometry
             .as_ref()
-            .filter(|geom| geom.effective_state() == WindowState::Windowed)
-            .and_then(|geom| geom.x.zip(geom.y));
+            .and_then(|geom| Some((geom.restore_origin()?, geom.effective_state())));
         // The nil-UUID placeholder legacy records carry is not a connector name
         // and can never match one; verifying against it would warn on every
         // such start.
@@ -1428,13 +1430,20 @@ impl TerminalView {
     /// can be moved — and never repeated, so it can neither fight the user
     /// dragging the window nor loop against a window manager that adjusts it.
     ///
+    /// A maximized or fullscreen window is moved the same way: GPUI maximizes
+    /// it *after* the map (`Window::new` maps, then `zoom()`s), so the window
+    /// manager has already chosen the monitor by the time anything can be
+    /// asked of it. [`monitor::apply_saved_position`] lifts the state for the
+    /// move and puts it back, which re-maximizes the window on the monitor the
+    /// origin names.
+    ///
     /// Runs before [`Self::capture_geometry`] so the same frame records where
     /// the window actually landed rather than where it started.
     fn apply_saved_position(&mut self, window: &Window) {
-        let Some((x, y)) = self.restore.pending_position.take() else { return };
-        if monitor::apply_saved_position(window, x, y) {
+        let Some(((x, y), state)) = self.restore.pending_position.take() else { return };
+        if monitor::apply_saved_position(window, x, y, state) {
             self.restore.position_target = Some(((x, y), Instant::now()));
-            tracing::info!(x, y, "moving the restored window back to its saved position");
+            tracing::info!(x, y, ?state, "moving the restored window back to its saved position");
         } else {
             tracing::debug!(x, y, "no X11 window to reposition; keeping WM placement");
         }
