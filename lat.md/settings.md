@@ -158,6 +158,8 @@ All keybinding actions accept a string or array of strings (combo list, max 5 pe
 
 Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9), clipboard, scrolling, jump to previous prompt, jump to next prompt, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
 
+The settings window writes these keys itself — see [[settings#Settings#GPUI Settings Window#Shortcut capture]] — so a rebind is a keystroke rather than a config-file edit. A captured combo replaces the action's whole list; alternates beyond the first stay a `config.toml` feature.
+
 ### Update Keys
 
 Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer hours, 1–168, stored internally as seconds), and `channel` (stable/beta) to select the release track.
@@ -376,6 +378,45 @@ The apply path stays the single authority on what each key accepts, so no second
 #### Escape cancels the edit
 
 [[crates/scribe-client/src/settings/window.rs#revert_inline_input]] restores the value the edit opened with and clears the rejection ink with it, so an abandoned edit leaves nothing of itself on screen and the config is never touched.
+
+### Shortcut capture
+
+Keybinding rows are recorded from the keyboard rather than typed: activating a
+row puts it in listening state and the next keystroke becomes the binding, so a
+shortcut is entered the way it will later be pressed.
+
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#begin_capture]]
+opens the state on click or Enter/Space and moves focus to the window root,
+because a recording row has to read raw keys through
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#on_key_down]]
+rather than through a text input.
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#capture_keystroke]]
+then claims every keystroke ahead of the window's own Ctrl+K and traversal
+handling — otherwise those chords could never be bound to anything. Modifier
+presses keep the row listening, Escape abandons it, a bare Backspace unbinds
+the action to an empty combo list, and anything else commits through the same
+`{key, value}` apply path every other control uses, under
+`keybindings.<action>`. Keybinding rows are therefore focusable and tab-stop,
+where they previously rendered read-only and were skipped by traversal
+entirely.
+
+#### What a capture is allowed to bind
+
+[[crates/scribe-client/src/settings/window.rs#combo_for_capture]] refuses a keystroke that carries no Ctrl, Alt, or Super, because a plain key bound to a layout action stops reaching the terminal at all — the letter becomes untypeable in every pane.
+
+It then spells the keystroke in the combo grammar and runs it through [[crates/scribe-client/src/keybindings.rs#Keybinding#parse]], the client's own dispatcher parser, so a key the runtime could never match (an F-key, an unknown name) is rejected at the point of entry instead of being written as a shortcut that silently does nothing.
+
+#### Conflicts are named, not silently won
+
+[[crates/scribe-client/src/settings/window.rs#conflicting_action]] refuses a combo another action already owns and names that action on the row, leaving it listening so the next press is the correction.
+
+Both sides of the comparison are folded by [[crates/scribe-client/src/settings/window.rs#canonical_combo]] first, so a hand-written `super+ctrl+w` in `config.toml` and a captured `ctrl+cmd+w` are recognized as the same shortcut. Re-pressing a row's own current combo is not a conflict with itself.
+
+#### Reading the page
+
+Combos render as key caps through [[crates/scribe-client/src/settings/window.rs#key_cap]] — one bordered monospace chip per token, `Page Down` rather than `pagedown` — because a shortcut is a thing to press, not a string to decode.
+
+Rows are labelled by [[crates/scribe-client/src/settings/model.rs#keybinding_label]] in the same sentence case the rest of the pages use (`New Claude resume tab`), where the page previously showed the raw action name with its underscores swapped for spaces. Search also matches a row's combos, so the page answers "what is on Ctrl+Shift?" as well as "what runs the palette?".
 
 ### Environment preflight
 

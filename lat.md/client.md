@@ -300,6 +300,16 @@ The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/
 
 While unsettled the reading is still tracked as the live geometry — the change detection needs a baseline — but it is also recorded as `saved_geometry`, which is what "already on disk" means to both [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_if_due]] and the unconditional quit-time [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_now]]. That keeps both flushes off the record without a second suppression flag, and the user's next move or resize differs from the baseline and arms the flush exactly as before.
 
+#### A restore never saves over the record it aims at
+
+[[crates/scribe-client/src/main.rs#RestorePlacement]] gates geometry persistence on the restore having converged, so a misplaced restore stays a one-restart annoyance instead of corrupting the record permanently.
+
+[[crates/scribe-client/src/main.rs#TerminalView#capture_geometry]] runs on every frame and every bounds change, and it used to arm the debounced flush unconditionally. Wherever the window manager actually dropped a restored window — right monitor or wrong — that placement was written back over the saved record half a second later, so one bad start destroyed the only position the next start had to aim at, and every placement defect became self-reinforcing.
+
+The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/main.rs#RestoreRuntime]]'s `pending_position` or `position_target` still hold work, `Correcting` for one `RESTORE_DEBOUNCE` after the single correction goes out (that move is another asynchronous `ConfigureRequest`, so bounds read beside it still report the placement it is undoing), then `Settled`. A window opened without a saved position starts `Settled`, so nothing about a fresh window's first-frame capture changes.
+
+While unsettled the reading is still tracked as the live geometry — the change detection needs a baseline — but it is also recorded as `saved_geometry`, which is what "already on disk" means to both [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_if_due]] and the unconditional quit-time [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_now]]. That keeps both flushes off the record without a second suppression flag, and the user's next move or resize differs from the baseline and arms the flush exactly as before.
+
 ### Window Identity And Warm Restart
 
 Every connection names the window it wants. The server keeps a window's sessions when its client goes away, so which window a `Hello` claims is what decides whether a restart resumes the user's windows or scatters them.
@@ -885,6 +895,8 @@ Verifies  leaves short titles intact, truncates an overflowing title to exactly 
 Verifies [[crates/scribe-client/src/titlebar.rs#title_columns]] reserves two extra columns while a tab shows the AI dot, on top of the padding/close and context-suffix reservations, clamping to zero on degenerate budgets.
 
 Under-reserving let a full-width tab's title outgrow its slot when the dot appeared and wrap onto a hidden second line, showing as raised text. The title element also wears `truncate` so any residual overflow clips on one line instead of wrapping.
+
+The shell's in-region bars render their own tabs at the same width with the same chrome, and carried a private column budget that skipped the dot and a title element without `truncate` — so the fix held in the titlebar while an alerting AI tab below the top row still rode up. Both bars now call `title_columns` and truncate, so the reservation cannot drift apart again.
 
 ### Context suffix bands and suppression
 

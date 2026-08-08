@@ -437,7 +437,11 @@ pub fn badge_width_px(label: &str) -> f32 {
 /// (4 columns), the context-% suffix, and the AI dot (6px + margin ≈ 2
 /// columns) are reserved. Under-reserving here makes the title overflow its
 /// slot at full tab width, which used to wrap it onto a hidden second line.
-fn title_columns(suffix_len: usize, has_ai_dot: bool) -> usize {
+///
+/// Shared with the shell's lower-region bars: those tabs are the same width
+/// with the same chrome, so they must reserve the dot identically.
+#[must_use]
+pub fn title_columns(suffix_len: usize, has_ai_dot: bool) -> usize {
     let dot_cols = if has_ai_dot { 2 } else { 0 };
     TAB_COLS.saturating_sub(4).saturating_sub(suffix_len).saturating_sub(dot_cols)
 }
