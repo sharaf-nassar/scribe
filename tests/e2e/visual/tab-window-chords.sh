@@ -205,6 +205,19 @@ echo "PHASE 0 PASS: client attached to session $SESSION (grid ink $BASE_INK, 1 w
 # The close dialog used to own this chord. "closing the active tab" is written
 # only by `close_active_tab`, which only `LayoutAction::CloseTab` reaches, so
 # the line appearing means the chord got past the overlay layer.
+# The window has to survive the close. Phase 0 leaves exactly ONE tab, and
+# `on_session_exited` sends CloseWindow the moment the strip empties ("existed
+# && tabs_empty"), so the server acks, the client exits, and phase 2's focus()
+# finds no window at all. Open a second tab first: closing the active one then
+# leaves the strip non-empty and the window alive, which is what phases 2-4
+# need to keep driving. This is the test's own setup gap, not a product bug.
+TABS_BEFORE=$(count_log "opened a new tab")
+focus
+send_keys ctrl+shift+t
+if ! wait_for_log_growth "opened a new tab" "$TABS_BEFORE" 15; then
+    fail "PHASE 1 FAIL: ctrl+shift+t did not open the second tab the close needs"
+fi
+
 CLOSES_BEFORE=$(count_log "closing the active tab")
 SERVER_CLOSES_BEFORE=$(count_server_log "session closed by client")
 focus
