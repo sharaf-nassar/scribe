@@ -288,6 +288,16 @@ GPUI's X11 backend passes the requested origin to `create_window` but sets no `U
 
 The move is a request, and a reparenting window manager answers it by positioning the frame it drew rather than the window inside it — openbox settles the content one border and one titlebar further in. The record is the content origin, so applying it verbatim would push every window down and right by the decoration on *every* restart until it walked off the screen. [[crates/scribe-client/src/main.rs#TerminalView#correct_restored_position]] therefore measures the residual and applies it once. It waits `RESTORE_DEBOUNCE` first: a `ConfigureRequest` is answered asynchronously, so reading back beside it — or on the next bounds change, which can still be an earlier one arriving — reports a position the window has not moved to yet, and a correction computed from that reading doubles the offset instead of cancelling it. Waiting also means the corrected value is the one the geometry record then persists. Exactly one correction is applied; a window manager that still disagrees is enforcing a strut, a snap, or an off-screen clamp, and arguing with it is how a placement loop starts.
 
+#### A restore never saves over the record it aims at
+
+[[crates/scribe-client/src/main.rs#RestorePlacement]] gates geometry persistence on the restore having converged, so a misplaced restore stays a one-restart annoyance instead of corrupting the record permanently.
+
+[[crates/scribe-client/src/main.rs#TerminalView#capture_geometry]] runs on every frame and every bounds change, and it used to arm the debounced flush unconditionally. Wherever the window manager actually dropped a restored window — right monitor or wrong — that placement was written back over the saved record half a second later, so one bad start destroyed the only position the next start had to aim at, and every placement defect became self-reinforcing.
+
+The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/main.rs#RestoreRuntime]]'s `pending_position` or `position_target` still hold work, `Correcting` for one `RESTORE_DEBOUNCE` after the single correction goes out (that move is another asynchronous `ConfigureRequest`, so bounds read beside it still report the placement it is undoing), then `Settled`. A window opened without a saved position starts `Settled`, so nothing about a fresh window's first-frame capture changes.
+
+While unsettled the reading is still tracked as the live geometry — the change detection needs a baseline — but it is also recorded as `saved_geometry`, which is what "already on disk" means to both [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_if_due]] and the unconditional quit-time [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_now]]. That keeps both flushes off the record without a second suppression flag, and the user's next move or resize differs from the baseline and arms the flush exactly as before.
+
 ### Window Identity And Warm Restart
 
 Every connection names the window it wants. The server keeps a window's sessions when its client goes away, so which window a `Hello` claims is what decides whether a restart resumes the user's windows or scatters them.
