@@ -337,6 +337,27 @@ impl AiChrome {
         }
     }
 
+    /// The pane's prompt state, or `None` while its bar is dismissed.
+    ///
+    /// The one gate both the reserved height and the painted strip read, so a
+    /// dismissal hands the rows back to the PTY grid instead of leaving a blank
+    /// band where the strip used to be.
+    fn visible_prompts(&self, session_id: SessionId) -> Option<&PromptBarData> {
+        self.prompts.get(&session_id).filter(|data| !data.dismissed)
+    }
+
+    /// Hide `session_id`'s prompt bar for the rest of this conversation.
+    ///
+    /// The flag rides on the prompt record, so it lifts exactly where the
+    /// record does: [`Self::note_conversation`] retiring the history on a
+    /// conversation switch, or [`Self::forget`] dropping it when the provider
+    /// or the session exits — the same boundary the legacy client used.
+    fn dismiss(&mut self, session_id: SessionId) {
+        if let Some(data) = self.prompts.get_mut(&session_id) {
+            data.dismissed = true;
+        }
+    }
+
     /// Drop every trace of a session, so a closed pane leaves no orphaned
     /// percentage or prompt history behind.
     fn forget(&mut self, session_id: SessionId) {
@@ -929,6 +950,11 @@ struct PointerState {
     /// The cell the last motion report named, for xterm's "reported only if the
     /// pointer has moved to a different character cell" de-duplication.
     report_cell: Option<(u16, u16)>,
+    /// Which prompt-strip target the pointer is over, and the session whose
+    /// pane owns that strip. Keyed by session because a split window paints
+    /// one strip per AI pane, and only the pointed-at one may tint or show its
+    /// dismiss control.
+    prompt_hover: Option<(SessionId, prompt_bar::PromptBarHover)>,
 }
 
 impl ClipboardSurfaces {
@@ -947,6 +973,7 @@ impl Default for PointerState {
             divider_drag: None,
             report_button: None,
             report_cell: None,
+            prompt_hover: None,
         }
     }
 }
@@ -5248,7 +5275,7 @@ impl TerminalView {
         focused: Arc<Content>,
         ime: ImePaint,
         cursor: CursorPaint,
-        cx: &App,
+        cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
@@ -5339,7 +5366,7 @@ impl TerminalView {
                 {
                     element = element.with_ime(ime);
                 }
-                let mut pane = self.compose_pane_content(pane, element.paint(), session_id);
+                let mut pane = self.compose_pane_content(pane, element.paint(), &placement, cx);
                 if let Some(color) = ai_border {
                     pane = pane.children(ai_pane_border(placement.rect, color));
                 }
@@ -5357,13 +5384,18 @@ impl TerminalView {
         &self,
         pane: gpui::Div,
         grid: impl IntoElement,
-        session_id: Option<SessionId>,
+        placement: &pane_shell::PanePlacement,
+        cx: &Context<Self>,
     ) -> gpui::Div {
         let colors = self.prompt_colors.with_opacity(self.opacity);
         let metrics = self.prompt_bar_metrics();
-        let strip = session_id
-            .and_then(|s| self.prompt_model_for(s))
-            .map(|model| prompt_bar::render(&model, &colors, metrics, None).into_any_element());
+        let strip = placement
+            .session_id
+            .and_then(|s| self.prompt_model_for(s).map(|model| (s, model)))
+            .map(|(session_id, model)| {
+                let actions = self.prompt_bar_actions(session_id, placement.rect.width, cx);
+                prompt_bar::render(&model, &colors, metrics, actions).into_any_element()
+            });
         let grid_slot = div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid);
         let pane = pane.flex().flex_col();
         if self.prompt_bar.position == PromptBarPosition::Top {
@@ -7348,7 +7380,7 @@ impl TerminalView {
             return None;
         }
         let ai = self.shared.ai.lock().ok()?;
-        let data = ai.prompts.get(&session_id)?;
+        let data = ai.visible_prompts(session_id)?;
         let indicator = ai.tracker.context_for(session_id).map(|percent| {
             PromptContextIndicator::from_thresholds(
                 percent,
@@ -7372,7 +7404,89 @@ impl TerminalView {
             self.prompt_bar.font_size,
             self.font.size,
             self.font.line_height,
+            self.font.cell_width(),
         )
+    }
+
+    /// Interactive wiring for one pane's strip: the view's hover state on the
+    /// way in, and the listeners that keep it current on the way out.
+    ///
+    /// The handlers hold a weak view handle rather than a listener closure
+    /// because the strip is built from a `&self` render helper, the same shape
+    /// [`Self::render_status_bar`] uses for its CTA and gear.
+    fn prompt_bar_actions(
+        &self,
+        session_id: SessionId,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> prompt_bar::PromptBarActions {
+        let hover_view = cx.entity().downgrade();
+        let dismiss_view = cx.entity().downgrade();
+        prompt_bar::PromptBarActions {
+            id: gpui::ElementId::Name(format!("ai-prompt-status-{session_id}").into()),
+            hover: self
+                .pointer
+                .prompt_hover
+                .filter(|(hovered, _)| *hovered == session_id)
+                .map(|(_, target)| target),
+            width,
+            on_hover: Rc::new(move |target, hovered, _window: &mut Window, app: &mut App| {
+                if let Err(error) = hover_view.update(app, |view, ctx| {
+                    view.set_prompt_hover(session_id, target, hovered, ctx);
+                }) {
+                    tracing::debug!(?error, "prompt-bar hover dropped with its view");
+                }
+            }),
+            on_dismiss: Box::new(move |_window: &mut Window, app: &mut App| {
+                if let Err(error) =
+                    dismiss_view.update(app, |view, ctx| view.dismiss_prompt_bar(session_id, ctx))
+                {
+                    tracing::debug!(?error, "prompt-bar dismissal dropped with its view");
+                }
+            }),
+        }
+    }
+
+    /// Record (or clear) the strip target the pointer is over.
+    ///
+    /// A leave only clears the hover it is actually leaving: GPUI does not
+    /// promise the old row's `false` arrives before the new row's `true`, and
+    /// clearing unconditionally would drop the fresh hover when the pointer
+    /// slides from the first row onto the latest.
+    fn set_prompt_hover(
+        &mut self,
+        session_id: SessionId,
+        target: prompt_bar::PromptBarHover,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = (session_id, target);
+        let next = if hovered {
+            Some(entry)
+        } else if self.pointer.prompt_hover == Some(entry) {
+            None
+        } else {
+            self.pointer.prompt_hover
+        };
+        if self.pointer.prompt_hover != next {
+            self.pointer.prompt_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Hide `session_id`'s prompt bar, giving its rows back to the PTY grid.
+    ///
+    /// No explicit resize call: the render pass republishes every pane's
+    /// geometry from [`Self::pane_prompt_bar_height`], which now reports zero
+    /// for this session, so the redraw this notify schedules resizes the PTY.
+    fn dismiss_prompt_bar(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if let Ok(mut ai) = self.shared.ai.lock() {
+            ai.dismiss(session_id);
+        } else {
+            tracing::warn!("AI chrome mutex poisoned; prompt-bar dismissal dropped");
+        }
+        self.pointer.prompt_hover = None;
+        cx.notify();
     }
 
     /// Height of the prompt strip `session_id`'s pane reserves, or zero when
@@ -7387,8 +7501,7 @@ impl TerminalView {
         }
         let metrics = self.prompt_bar_metrics();
         let Ok(ai) = self.shared.ai.lock() else { return 0.0 };
-        ai.prompts
-            .get(&session_id)
+        ai.visible_prompts(session_id)
             .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompt_count, metrics))
     }
 
@@ -11130,6 +11243,29 @@ mod tests {
         );
         assert!(placement.settled(false));
         assert!(placement.settled(false));
+    }
+
+    // @lat: [[client#GPUI Prompt Bar#Dismissal hides the strip without losing the history]]
+    #[test]
+    fn dismissed_prompt_bar_stays_down_until_the_session_is_forgotten() {
+        let mut chrome = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        chrome.record_prompt(session, "build the thing".to_owned(), std::time::SystemTime::now());
+        assert!(chrome.visible_prompts(session).is_some());
+
+        chrome.dismiss(session);
+        assert!(
+            chrome.visible_prompts(session).is_none(),
+            "a dismissed bar paints nothing and reserves no rows"
+        );
+        assert_eq!(
+            chrome.prompts.get(&session).map(|data| data.prompt_count),
+            Some(1),
+            "the prompt history outlives the dismissal"
+        );
+
+        chrome.forget(session);
+        assert!(!chrome.prompts.contains_key(&session), "session teardown clears the record");
     }
 
     #[test]

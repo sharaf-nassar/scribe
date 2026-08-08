@@ -15,9 +15,10 @@
 //! `#[gpui::test]` without a live window because the reference clock is threaded
 //! in rather than read from `SystemTime::now()` inside the renderer.
 
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use gpui::{Rgba, Role, div, prelude::*, px};
+use gpui::{App, ElementId, Rgba, Role, Window, div, prelude::*, px};
 
 use crate::opacity::scale_slot;
 
@@ -56,6 +57,9 @@ pub struct PromptBarData {
     /// Wall-clock instant the AI finished (or last transitioned). When set, the
     /// elapsed timer freezes here instead of tracking `now`.
     pub latest_prompt_finished_at: Option<SystemTime>,
+    /// Set by the strip's `×` overlay: the pane keeps its prompt history but
+    /// paints no bar and reserves no rows until the record is dropped.
+    pub dismissed: bool,
 }
 
 /// Configurable colours for the prompt bar, derived from the theme with
@@ -123,12 +127,14 @@ impl PromptContextIndicator {
     }
 }
 
-/// Which prompt-bar element the mouse is hovering over, if any.
+/// Which prompt row the mouse is hovering over, if any.
+///
+/// The `×` overlay is not a target of its own: it lies inside the first row's
+/// hitbox, so pointing at it keeps that row hovered and the overlay visible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptBarHover {
     First,
     Latest,
-    DismissButton,
 }
 
 /// One prompt row's icon + text.
@@ -164,6 +170,9 @@ pub struct PromptBarMetrics {
     pub text_size: f32,
     /// Terminal cell height the rows are sized from.
     pub cell_height: f32,
+    /// Per-glyph advance width the strip's monospace text lays out at, which
+    /// is what [`is_prompt_truncated`] measures a row against.
+    pub cell_width: f32,
 }
 
 impl PromptBarMetrics {
@@ -172,13 +181,23 @@ impl PromptBarMetrics {
     ///
     /// Unset, the strip paints at the grid's own size, so an
     /// `appearance.font_size` edit or a zoom step carries the strip along.
-    /// Set, the grid row height is scaled by the same ratio, keeping the row
-    /// padding proportional to the text rather than frozen at the grid's.
+    /// Set, the grid row height and advance width are scaled by the same ratio,
+    /// keeping the row padding and the truncation measure proportional to the
+    /// text rather than frozen at the grid's.
     #[must_use]
-    pub fn resolve(override_size: Option<f32>, grid_size: f32, grid_line_height: f32) -> Self {
+    pub fn resolve(
+        override_size: Option<f32>,
+        grid_size: f32,
+        grid_line_height: f32,
+        grid_cell_width: f32,
+    ) -> Self {
         let text_size = override_size.unwrap_or(grid_size);
         let scale = if grid_size > 0.0 { text_size / grid_size } else { 1.0 };
-        Self { text_size, cell_height: grid_line_height * scale }
+        Self {
+            text_size,
+            cell_height: grid_line_height * scale,
+            cell_width: grid_cell_width * scale,
+        }
     }
 }
 
@@ -286,17 +305,6 @@ pub fn build_model(
     })
 }
 
-/// Full text of the hovered prompt line (for tooltip display), or `None` for
-/// the dismiss button.
-#[must_use]
-pub fn hovered_prompt_text(data: &PromptBarData, hover: PromptBarHover) -> Option<&str> {
-    match hover {
-        PromptBarHover::First => data.first_prompt.as_deref(),
-        PromptBarHover::Latest => data.latest_prompt.as_deref(),
-        PromptBarHover::DismissButton => None,
-    }
-}
-
 /// Whether `text` would be truncated inside a prompt row `bar_width` pixels
 /// wide at `cell_w` pixels per glyph. Drives the hover tooltip that reveals the
 /// full prompt when it is clipped.
@@ -335,6 +343,33 @@ fn row_bg(base: [f32; 4], hover: Option<PromptBarHover>, target: PromptBarHover)
     if hover == Some(target) { lift(base, 0.035) } else { base }
 }
 
+/// Called when the pointer enters (`true`) or leaves (`false`) a hover target.
+/// The target is named on both edges so a leave can be matched against the
+/// hover the view actually holds.
+pub type PromptHoverHandler = Rc<dyn Fn(PromptBarHover, bool, &mut Window, &mut App)>;
+/// Called when the left-edge `×` overlay is clicked.
+pub type PromptDismissHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+/// Interactive wiring for one pane's strip, supplied by the view.
+///
+/// The same split [`crate::status_bar::StatusBarActions`] uses: this module
+/// owns the visual lowering and the view owns the state, so the hovered target
+/// is tracked there (keyed by session, so a split window tints exactly one
+/// strip) and handed back in through `hover`.
+pub struct PromptBarActions {
+    /// Element id for this pane's strip. Every interactive child is scoped
+    /// under it, so two panes' strips never share GPUI's hover or tooltip
+    /// state.
+    pub id: ElementId,
+    /// Which target the pointer is over, per the view.
+    pub hover: Option<PromptBarHover>,
+    /// Painted strip width in pixels, which [`is_prompt_truncated`] needs to
+    /// tell a clipped row (tooltip warranted) from one that already fits.
+    pub width: f32,
+    pub on_hover: PromptHoverHandler,
+    pub on_dismiss: PromptDismissHandler,
+}
+
 /// Styling for one prompt row, bundled to keep [`prompt_row`]'s signature small.
 #[derive(Clone, Copy)]
 struct RowStyle {
@@ -344,18 +379,66 @@ struct RowStyle {
     height: f32,
 }
 
+/// Interaction for one prompt row: its hover target and whether its text is
+/// clipped hard enough to earn the reveal-on-hover tooltip.
+struct RowWiring {
+    id: &'static str,
+    target: PromptBarHover,
+    /// `true` when the row's text does not fit, so hovering should reveal it.
+    truncated: bool,
+    text_size: f32,
+    on_hover: PromptHoverHandler,
+}
+
+/// The hover reveal for a clipped prompt row: the row's full text, wrapped.
+///
+/// Painted opaque over whatever is behind it — the palette handed to
+/// [`render`] already carries `appearance.opacity`, and a see-through popup
+/// over terminal output is unreadable.
+struct PromptTooltip {
+    text: String,
+    style: RowStyle,
+    text_size: f32,
+}
+
+impl gpui::Render for PromptTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(560.0))
+            .bg(rgba(with_alpha(self.style.bg, 1.0)))
+            .border_1()
+            .border_color(rgba(with_alpha(self.style.text_color, 0.28)))
+            .font_family("monospace")
+            .text_size(px(self.text_size))
+            .text_color(rgba(self.style.text_color))
+            .child(self.text.clone())
+    }
+}
+
 fn text_span(text: impl Into<String>, color: [f32; 4]) -> gpui::Div {
     div().text_color(rgba(color)).child(text.into())
 }
 
 /// Build a single prompt row: icon, truncating prompt text, and (optionally) the
 /// right-edge cluster placed after a flexible spacer.
+///
+/// The row is the hover target: entering it reports `wiring.target` to the view
+/// (which tints it back through [`row_bg`] and un-hides the dismiss overlay),
+/// and a clipped row also carries a zero-delay tooltip with its full text.
+/// The delay override is the point of the tooltip here — the reveal has to read
+/// as "the row expanded", not as a hint that shows up half a second later.
 fn prompt_row(
     row: &PromptRowModel,
     style: RowStyle,
+    wiring: &RowWiring,
     right: Option<gpui::AnyElement>,
 ) -> impl IntoElement {
-    div()
+    let target = wiring.target;
+    let on_hover = Rc::clone(&wiring.on_hover);
+    let body = div()
+        .id(wiring.id)
         .flex()
         .flex_row()
         .items_center()
@@ -374,6 +457,41 @@ fn prompt_row(
                 .child(row.text.clone()),
         )
         .children(right)
+        .on_hover(move |hovered: &bool, window, cx| on_hover(target, *hovered, window, cx));
+    if !wiring.truncated {
+        return body;
+    }
+    let text = row.text.clone();
+    let text_size = wiring.text_size;
+    body.tooltip(move |_window, cx| {
+        cx.new(|_| PromptTooltip { text: text.clone(), style, text_size }).into()
+    })
+    .tooltip_show_delay(Duration::ZERO)
+}
+
+/// The `×` overlay that hides the bar, laid into row 1's left padding lane.
+///
+/// Only built while the strip is hovered, mirroring the legacy overlay. It
+/// sits inside row 1's own hitbox, so pointing at it keeps that row hovered
+/// and the overlay therefore stays up long enough to be clicked.
+fn dismiss_overlay(
+    row_height: f32,
+    colors: &PromptBarColors,
+    on_dismiss: PromptDismissHandler,
+) -> impl IntoElement {
+    div()
+        .id("prompt-dismiss")
+        .absolute()
+        .left(px(1.0))
+        .top(px(0.0))
+        .h(px(row_height))
+        .w(px(ROW_SIDE_PAD))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .on_click(move |_, window, cx| on_dismiss(window, cx))
+        .child(text_span(ICON_DISMISS.to_string(), with_alpha(colors.text, 0.94)))
 }
 
 /// Right-edge cluster of the elapsed timer alone (row 1 in the two-prompt state).
@@ -415,17 +533,24 @@ fn count_cluster(
 /// Render the prompt-bar strip for a pane.
 ///
 /// `metrics` sizes both the rows and the text — the same value the pane
-/// reserved space with via [`prompt_bar_height`]; `hover` tints the hovered row
-/// and reveals the dismiss affordance. Interaction (click/hover wiring) is
-/// attached by the view; this function owns only the visual lowering of
-/// [`PromptBarModel`].
+/// reserved space with via [`prompt_bar_height`]; `actions` carries the view's
+/// hover state in (tinting that row and revealing the dismiss affordance) and
+/// the listeners that keep it current back out.
 pub fn render(
     model: &PromptBarModel,
     colors: &PromptBarColors,
     metrics: PromptBarMetrics,
-    hover: Option<PromptBarHover>,
+    actions: PromptBarActions,
 ) -> impl IntoElement {
+    let PromptBarActions { id: strip_id, hover, width, on_hover, on_dismiss } = actions;
     let row_h = prompt_bar_row_height(metrics.cell_height);
+    let wiring = |row_id, target, text: &str| RowWiring {
+        id: row_id,
+        target,
+        truncated: is_prompt_truncated(text, width, metrics.cell_width),
+        text_size: metrics.text_size,
+        on_hover: Rc::clone(&on_hover),
+    };
     // `flex_none` for the same reason the status bar carries it: the strip is a
     // fixed-height band stacked under the flex-grown terminal grid, and a
     // shrinkable band would be squeezed away rather than clipping the grid.
@@ -435,7 +560,7 @@ pub fn render(
         format!("AI prompt status: prompt {} received", model.count_label)
     };
     let mut strip = div()
-        .id("ai-prompt-status")
+        .id(strip_id)
         .role(Role::Status)
         .aria_label(prompt_state)
         .flex()
@@ -453,10 +578,17 @@ pub fn render(
         height: row_h,
     };
 
+    let first_wiring = wiring("prompt-row-first", PromptBarHover::First, &model.first.text);
+
     if let Some(latest) = &model.latest {
         // Two-prompt state: timer on row 1, count + context drop to row 2.
         strip = strip
-            .child(prompt_row(&model.first, first_style, timer_cluster(model, colors)))
+            .child(prompt_row(
+                &model.first,
+                first_style,
+                &first_wiring,
+                timer_cluster(model, colors),
+            ))
             .child(div().w_full().h(px(ROW_SEAM_H)).bg(rgba(with_alpha(colors.text, 0.12))))
             .child(prompt_row(
                 latest,
@@ -466,6 +598,7 @@ pub fn render(
                     text_color: colors.text,
                     height: row_h,
                 },
+                &wiring("prompt-row-latest", PromptBarHover::Latest, &latest.text),
                 Some(count_cluster(model, colors, false).into_any_element()),
             ));
     } else {
@@ -478,22 +611,16 @@ pub fn render(
             .gap(px(6.0))
             .children(timer_cluster(model, colors))
             .child(count_cluster(model, colors, model.elapsed_label.is_some()));
-        strip = strip.child(prompt_row(&model.first, first_style, Some(right.into_any_element())));
+        strip = strip.child(prompt_row(
+            &model.first,
+            first_style,
+            &first_wiring,
+            Some(right.into_any_element()),
+        ));
     }
 
-    // Dismiss affordance: shown in the left padding lane while the bar is
-    // hovered, mirroring the legacy overlay.
     if hover.is_some() {
-        strip = strip.child(
-            div()
-                .absolute()
-                .left(px(1.0))
-                .top(px(0.0))
-                .h(px(row_h))
-                .flex()
-                .items_center()
-                .child(text_span(ICON_DISMISS.to_string(), with_alpha(colors.text, 0.94))),
-        );
+        strip = strip.child(dismiss_overlay(row_h, colors, on_dismiss));
     }
 
     strip
@@ -592,7 +719,7 @@ mod tests {
         // Compare by bit pattern: these are exact f32 arithmetic results, so the
         // strict `clippy::float_cmp` lint stays satisfied without approximation.
         let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
-        let m = |cell_height| PromptBarMetrics { text_size: 14.0, cell_height };
+        let m = |cell_height| PromptBarMetrics { text_size: 14.0, cell_height, cell_width: 8.0 };
         assert!(eq(prompt_bar_height(0, m(16.0)), 0.0));
         assert!(eq(prompt_bar_height(1, m(16.0)), prompt_bar_row_height(16.0)));
         assert!(eq(prompt_bar_height(2, m(16.0)), prompt_bar_row_height(16.0) * 2.0 + ROW_SEAM_H));
@@ -603,17 +730,22 @@ mod tests {
     #[gpui::test]
     fn metrics_follow_grid_font_unless_overridden() {
         let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
-        let (size, line_height) = (20.0, 26.0);
+        let (size, line_height, cell_width) = (20.0, 26.0, 12.0);
 
-        let followed = PromptBarMetrics::resolve(None, size, line_height);
+        let followed = PromptBarMetrics::resolve(None, size, line_height, cell_width);
         assert!(eq(followed.text_size, size), "unset override paints at the grid size");
         assert!(eq(followed.cell_height, line_height), "and reserves the grid's row");
+        assert!(eq(followed.cell_width, cell_width), "and measures with the grid's advance");
 
-        let overridden = PromptBarMetrics::resolve(Some(10.0), size, line_height);
+        let overridden = PromptBarMetrics::resolve(Some(10.0), size, line_height, cell_width);
         assert!(eq(overridden.text_size, 10.0), "an explicit size wins over the grid");
         assert!(
             eq(overridden.cell_height, line_height * 0.5),
             "and scales the row height by the same ratio so padding stays proportional"
+        );
+        assert!(
+            eq(overridden.cell_width, cell_width * 0.5),
+            "and scales the advance width too, so truncation is measured at the painted size"
         );
     }
 
