@@ -157,9 +157,14 @@ impl AiProcessState {
     ///
     /// Fields the new event explicitly carries are kept as-is. If the
     /// previous state belongs to a different provider (e.g. Claude →
-    /// Codex), nothing is merged: switching providers starts fresh.
+    /// Codex) or to a different conversation, nothing is merged: both
+    /// switches start fresh. The conversation guard is what lets the
+    /// context meter actually reset — a new conversation opens an empty
+    /// context window, and merging the retired conversation's `context`
+    /// into its first state-only hook would put the old fill straight back
+    /// after the client cleared it.
     pub fn merge_partial_from_previous(&mut self, prev: &Self) {
-        if prev.provider != self.provider {
+        if prev.provider != self.provider || self.switched_conversation_from(prev) {
             return;
         }
         if self.context.is_none() {
@@ -177,6 +182,20 @@ impl AiProcessState {
         if self.conversation_id.is_none() {
             self.conversation_id.clone_from(&prev.conversation_id);
         }
+    }
+
+    /// Whether this state names a *different* conversation than `prev`.
+    ///
+    /// Only two named ids can disagree: an event that omits the id says
+    /// nothing about which conversation it belongs to, and a first sighting
+    /// is not a switch — the same rule the client's own conversation
+    /// bookkeeping applies before it retires a pane's prompt bar.
+    #[must_use]
+    pub fn switched_conversation_from(&self, prev: &Self) -> bool {
+        matches!(
+            (&self.conversation_id, &prev.conversation_id),
+            (Some(new), Some(old)) if new != old
+        )
     }
 }
 
@@ -201,5 +220,29 @@ context = 42
         assert_eq!(state.tool.as_deref(), Some("Bash"));
         assert_eq!(state.model.as_deref(), Some("claude"));
         assert_eq!(state.context, Some(42));
+    }
+
+    // @lat: [[lat.md/common#Common#AI State#A conversation switch breaks the metadata merge]]
+    #[test]
+    fn conversation_switch_breaks_the_metadata_merge() {
+        let mut prev = AiProcessState::new(AiState::Processing);
+        prev.context = Some(80);
+        prev.model = Some("opus".to_owned());
+        prev.conversation_id = Some("conv-42".to_owned());
+
+        // A state-only hook from the same conversation keeps the live fill.
+        let mut same = AiProcessState::new(AiState::IdlePrompt);
+        same.merge_partial_from_previous(&prev);
+        assert_eq!(same.context, Some(80));
+        assert_eq!(same.conversation_id.as_deref(), Some("conv-42"));
+
+        // The same hook naming a new conversation inherits nothing: the new
+        // window starts empty and the meter must not read 80%.
+        let mut switched = AiProcessState::new(AiState::IdlePrompt);
+        switched.conversation_id = Some("conv-43".to_owned());
+        switched.merge_partial_from_previous(&prev);
+        assert_eq!(switched.context, None);
+        assert_eq!(switched.model, None);
+        assert_eq!(switched.conversation_id.as_deref(), Some("conv-43"));
     }
 }

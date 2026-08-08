@@ -1102,6 +1102,12 @@ Verifies the wiring that produces the frozen value, not just the formatter that 
 
 Driving [[crates/scribe-client/src/main.rs#AiChrome#apply_state_change]] with the edges one real turn emits leaves the label live while `Processing`, frozen at the prompt-to-finish figure once the AI stops, unmoved by the further idle edges an idle provider keeps sending, and ticking again on the return to `Processing`. The assertions read the label off [[crates/scribe-client/src/prompt_bar.rs#build_model]] through [[crates/scribe-client/src/main.rs#AiChrome#visible_prompts]] — the pair the render pass itself uses — so a stamp that never reaches the strip fails the test.
 
+### A new conversation retires the bar and the meter
+
+Verifies that a state edge naming a different conversation drops the pane's prompt rows and the previous conversation's context percentage, while the new conversation's own first reading is kept.
+
+The ordering inside [[crates/scribe-client/src/main.rs#AiChrome#apply_state_change]] is the whole point: the retirement runs before the tracker takes the edge, so a switching edge that already carries the new conversation's fill lands that fill rather than losing it. The server half of the same boundary is [[common#Common#AI State#A conversation switch breaks the metadata merge]] — without it the edge would arrive carrying the retired conversation's `context` and the clear would be undone in the same call.
+
 ### Elapsed clamps a backwards wall clock
 
 Verifies  clamps to `0 sec` when `now` precedes the prompt timestamp (DST/NTP skew) rather than underflowing.

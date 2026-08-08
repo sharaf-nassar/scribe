@@ -11476,10 +11476,7 @@ async fn persist_session_metadata(
         ServerMessage::AiStateChanged { ai_state, .. } => {
             let at = std::time::SystemTime::now();
             update_live_session(session_id, live_sessions, |session| {
-                if let Some(prompts) = session.prompt_state.as_mut() {
-                    prompts.note_prompt_progress(&ai_state.state, at);
-                }
-                session.ai_state = Some(ai_state.clone());
+                retain_ai_state(session, ai_state, at);
             })
             .await;
         }
@@ -11504,6 +11501,28 @@ async fn persist_session_metadata(
         }
         _ => {}
     }
+}
+
+/// Fold one `AiStateChanged` onto the chrome a session retains for the next
+/// client to attach.
+///
+/// A state edge naming a *different* conversation retires the previous one's
+/// prompt history, the same edge the client's `AiChrome::note_conversation`
+/// folds. Without the server half, the next `SessionList` — or a snapshot
+/// written after the switch — repaints the retired conversation's rows and
+/// resumes its count from where the dead conversation left off.
+fn retain_ai_state(
+    session: &mut LiveSession,
+    ai_state: &scribe_common::ai_state::AiProcessState,
+    at: std::time::SystemTime,
+) {
+    if session.ai_state.as_ref().is_some_and(|prev| ai_state.switched_conversation_from(prev)) {
+        session.prompt_state = None;
+    }
+    if let Some(prompts) = session.prompt_state.as_mut() {
+        prompts.note_prompt_progress(&ai_state.state, at);
+    }
+    session.ai_state = Some(ai_state.clone());
 }
 
 async fn update_live_session(
