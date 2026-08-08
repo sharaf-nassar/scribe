@@ -6,13 +6,13 @@
 //! legacy winit client persisted: the `RandR` connector name (`"DP-4"`) of the
 //! monitor under the window. The fallback chain is connector name → GPUI
 //! display UUID where it is real (Wayland derives a stable v5 UUID from the
-//! output name; macOS uses the `CGDisplay` UUID) → `None` (unknown). Restore
-//! gates saved positions on this identity via
-//! [`crate::window_state::gate_position_on_monitor`].
+//! output name; macOS uses the `CGDisplay` UUID) → `None` (unknown). It also
+//! enumerates the live monitor layout ([`connected_monitors`]) that
+//! [`crate::window_state::clamp_geometry_to_layout`] clamps a saved rect into.
 
 use gpui::{App, Window};
 
-use crate::window_state::{ObservedWindowState, WindowState};
+use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
 use crate::x11_focus::xcb_window_id;
 
 /// Read the live window state off the window manager, falling back to GPUI.
@@ -77,15 +77,15 @@ pub fn window_origin_is_exposed(window: &Window) -> bool {
     cfg!(not(target_os = "linux")) || xcb_window_id(window).is_some()
 }
 
-/// Connector names of every currently connected monitor, best effort.
+/// Every currently connected monitor and its work area, best effort.
 ///
 /// Empty when the platform cannot enumerate monitors (pure Wayland, macOS,
-/// `RandR` failure). Callers treat an empty list as "cannot verify" and keep the
-/// saved position, so platforms without `RandR` behave as they did before the
-/// monitor gate existed.
+/// `RandR` failure). Callers treat an empty list as "cannot verify" and leave
+/// the saved geometry alone, so platforms without `RandR` behave as they did
+/// before any monitor check existed.
 #[must_use]
-pub fn connected_monitor_names() -> Vec<String> {
-    x11::connected_monitor_names()
+pub fn connected_monitors() -> Vec<MonitorWorkArea> {
+    x11::connected_monitors()
 }
 
 /// Re-assert a restored window's saved position once it is on screen.
@@ -129,13 +129,13 @@ mod x11 {
 
     use gpui::Window;
     use x11rb::connection::Connection as _;
-    use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::randr::{ConnectionExt as _, MonitorInfo};
     use x11rb::protocol::xproto::{
         Atom, AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask,
     };
     use x11rb::rust_connection::RustConnection;
 
-    use crate::window_state::{ObservedWindowState, WindowState};
+    use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
     use crate::x11_focus::xcb_window_id;
 
     thread_local! {
@@ -226,20 +226,95 @@ mod x11 {
         (atom != 0).then_some(atom)
     }
 
-    /// Connector names of all active `RandR` monitors across every X screen.
-    pub(super) fn connected_monitor_names() -> Vec<String> {
+    /// All active `RandR` monitors across every X screen, work areas included.
+    pub(super) fn connected_monitors() -> Vec<MonitorWorkArea> {
         with_connection(|conn| {
             let roots: Vec<u32> = conn.setup().roots.iter().map(|screen| screen.root).collect();
-            Some(roots.iter().flat_map(|&root| screen_monitor_names(conn, root)).collect())
+            Some(roots.iter().flat_map(|&root| screen_monitors(conn, root)).collect())
         })
         .unwrap_or_default()
     }
 
-    /// Connector names of one screen's active `RandR` monitors, best effort.
-    fn screen_monitor_names(conn: &RustConnection, root: u32) -> Vec<String> {
+    /// One screen's active `RandR` monitors, each already reduced to its work
+    /// area, best effort.
+    fn screen_monitors(conn: &RustConnection, root: u32) -> Vec<MonitorWorkArea> {
         let Ok(cookie) = conn.randr_get_monitors(root, true) else { return Vec::new() };
         let Ok(reply) = cookie.reply() else { return Vec::new() };
-        reply.monitors.iter().filter_map(|monitor| atom_name(conn, monitor.name)).collect()
+        let desktop = net_workarea(conn, root);
+        reply
+            .monitors
+            .iter()
+            .filter_map(|monitor| Some(work_area(atom_name(conn, monitor.name)?, monitor, desktop)))
+            .collect()
+    }
+
+    /// The desktop work area `_NET_WORKAREA` publishes: the screen rect minus
+    /// the struts panels and docks reserve.
+    ///
+    /// EWMH gives one rect per desktop and this reads the first, because a
+    /// panel that differs between desktops is rarer than the extra round trip
+    /// to resolve the current one is cheap.
+    fn net_workarea(conn: &RustConnection, root: u32) -> Option<(i32, i32, u32, u32)> {
+        let property = intern(conn, b"_NET_WORKAREA")?;
+        let reply = conn
+            .get_property(false, root, property, AtomEnum::CARDINAL, 0, 4)
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut values = reply.value32()?;
+        let x = i32::try_from(values.next()?).ok()?;
+        let y = i32::try_from(values.next()?).ok()?;
+        let width = values.next()?;
+        let height = values.next()?;
+        (width > 0 && height > 0).then_some((x, y, width, height))
+    }
+
+    /// A monitor's rect narrowed to the desktop work area.
+    ///
+    /// `_NET_WORKAREA` is screen-wide rather than per-monitor, so a multi-head
+    /// layout gets it intersected with each `RandR` rect: exact when the panel
+    /// spans a screen edge (the usual case) and merely conservative — a
+    /// slightly smaller work area — when it covers only one monitor. The full
+    /// monitor rect answers when there is no usable overlap, which is what a
+    /// window manager that publishes nothing (or a stale 0×0) leaves us with.
+    fn work_area(
+        name: String,
+        monitor: &MonitorInfo,
+        desktop: Option<(i32, i32, u32, u32)>,
+    ) -> MonitorWorkArea {
+        let (x, y) = (i32::from(monitor.x), i32::from(monitor.y));
+        let full = MonitorWorkArea {
+            name,
+            x,
+            y,
+            width: u32::from(monitor.width),
+            height: u32::from(monitor.height),
+        };
+        let Some((desktop_x, desktop_y, desktop_width, desktop_height)) = desktop else {
+            return full;
+        };
+        let left = x.max(desktop_x);
+        let top = y.max(desktop_y);
+        let right =
+            x.saturating_add(edge(full.width)).min(desktop_x.saturating_add(edge(desktop_width)));
+        let bottom =
+            y.saturating_add(edge(full.height)).min(desktop_y.saturating_add(edge(desktop_height)));
+        let (Ok(width), Ok(height)) =
+            (u32::try_from(right.saturating_sub(left)), u32::try_from(bottom.saturating_sub(top)))
+        else {
+            return full;
+        };
+        if width == 0 || height == 0 {
+            return full;
+        }
+        MonitorWorkArea { x: left, y: top, width, height, ..full }
+    }
+
+    /// A pixel extent as a coordinate, saturating rather than wrapping: screen
+    /// geometry never approaches the boundary, and a hostile property must not
+    /// be able to invert a comparison.
+    fn edge(extent: u32) -> i32 {
+        i32::try_from(extent).unwrap_or(i32::MAX)
     }
 
     fn atom_name(conn: &RustConnection, atom: Atom) -> Option<String> {
@@ -383,7 +458,7 @@ mod x11 {
 mod x11 {
     use gpui::Window;
 
-    use crate::window_state::{ObservedWindowState, WindowState};
+    use crate::window_state::{MonitorWorkArea, ObservedWindowState, WindowState};
 
     pub(super) fn observed_window_state(_window: &Window) -> Option<ObservedWindowState> {
         None
@@ -393,7 +468,7 @@ mod x11 {
         None
     }
 
-    pub(super) fn connected_monitor_names() -> Vec<String> {
+    pub(super) fn connected_monitors() -> Vec<MonitorWorkArea> {
         Vec::new()
     }
 

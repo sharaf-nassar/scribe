@@ -2383,7 +2383,7 @@ The window manager owns a maximized window's size, not its monitor, and the moni
 
 A capture handed no origin — the caller's answer on a backend that does not report one — persists `x`/`y` of `None`, keeps the real size, and has no placement to re-assert.
 
-The capture used to store the bounds origin unconditionally, so Wayland's `(0, 0)` was written as if it were a real position. The monitor gate cannot undo that: off X11 the connected-monitor list is empty, which the gate reads as "unverifiable, keep the record". This pins the whole chain — a position-less record survives the gate position-less and reopens at the fallback origin, so a later X11 start places the window by default rather than in the screen corner.
+The capture used to store the bounds origin unconditionally, so Wayland's `(0, 0)` was written as if it were a real position. The layout clamp cannot undo that: off X11 the connected-monitor list is empty, which it reads as "unverifiable, keep the record". This pins the whole chain — a position-less record survives the clamp position-less and reopens at the fallback origin, so a later X11 start places the window by default rather than in the screen corner.
 
 ### Position-less record keeps the fallback origin
 
@@ -2391,11 +2391,17 @@ A record whose `x`/`y` are `None` reopens at the caller's centred fallback origi
 
 Wayland never exposes a window's origin, so the capture stores `None` instead of a bogus `(0, 0)`; honouring the fallback is what stops a later X11 launch from restoring into the screen corner.
 
-### Unknown monitor identity keeps the saved position
+### A window off the layout is clamped back onto it
 
-The monitor gate drops a saved position only when the record names a monitor that is verifiably no longer connected; unknown identities keep the position.
+A record whose monitor is gone — 3840×2160 at `x = 3840`, with only a 1920×1053 work area left — comes back inside that work area at its size, rather than at the window manager's default placement in a size the screen cannot hold.
 
-`None`, the legacy nil-UUID placeholder, and any name when monitor enumeration is unavailable all keep the saved `x`/`y`; only a real connector name absent from a non-empty connected list is gated, and gating strips position while keeping size and window state. Guards the regression where every pre-upgrade window (whose records all carried the nil UUID) lost its position on the first restart and side-by-side windows re-opened stacked at the default placement.
+The clamped record also adopts the name of the monitor it was moved onto, so the post-move landing check reads the deliberate move as success instead of warning that the window manager chose the wrong screen, and a maximized record's pre-maximize `restore_rect` is clamped alongside it, because that is the rect the placement move aims at and the one the window returns to when it is unmaximized.
+
+### A reachable window is left where it is
+
+A rect that still touches a work area is returned untouched — position, size, and monitor name — including one deliberately spanning two monitors, which is clamped against the union of the areas it touches rather than into either monitor alone.
+
+This is what keeps clamping from becoming the regression the old gate caused in reverse: a window already on screen never moves, so pre-upgrade nil-UUID records keep their placement and side-by-side windows do not re-open stacked. An empty connected-monitor list (macOS, pure Wayland, no RandR) is unverifiable, so even an absurd rect survives it.
 
 ## X11 focus guard
 

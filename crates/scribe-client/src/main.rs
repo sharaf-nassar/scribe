@@ -120,7 +120,7 @@ use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client::window_state::{
     NIL_MONITOR_ID, ObservedWindowState, WindowGeometry, WindowRegistry, WindowState,
-    gate_position_on_monitor, geometry_from_bounds, geometry_size_is_sane, logical_px_to_i32,
+    clamp_geometry_to_layout, geometry_from_bounds, geometry_size_is_sane, logical_px_to_i32,
     normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::x11_focus::X11FocusGuard;
@@ -752,12 +752,11 @@ fn saved_geometry_for(window_id: WindowId) -> Option<WindowGeometry> {
         .load_saved(window_id)
         .map(|geom| normalize_legacy_geometry(&geom))
         .filter(geometry_size_is_sane)
-        // Drop the saved position only when the record names a monitor that is
-        // verifiably no longer connected. Unknown identities (the nil-UUID
-        // records legacy captures wrote) keep their position — dropping them
-        // stacked every restored window at the default placement on the first
-        // post-upgrade start.
-        .map(|geom| gate_position_on_monitor(&geom, &monitor::connected_monitor_names()))
+        // Clamped into the layout the window is about to open on rather than
+        // gated against it: a record whose monitor is gone keeps the placement
+        // closest to where the user left it, at a size the remaining screen can
+        // actually hold, instead of falling back to the default placement.
+        .map(|geom| clamp_geometry_to_layout(&geom, &monitor::connected_monitors()))
 }
 
 /// The per-window inputs resolved before GPUI builds the root view.
