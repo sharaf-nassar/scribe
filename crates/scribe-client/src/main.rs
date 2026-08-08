@@ -131,7 +131,9 @@ use scribe_client::{
         flash_blend, px_units, reorder_target_index, tab_display_title,
     },
     tab_session::{TabEntry, TabSessions},
-    titlebar::{TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView},
+    titlebar::{
+        TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView, title_columns,
+    },
 };
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
@@ -244,11 +246,6 @@ fn window_bringup_ms() -> Option<f64> {
 
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
-
-/// Title columns available in a lower region's bar tab before truncation,
-/// matching the titlebar's fixed tab column budget minus its padding/close
-/// reservation.
-const REGION_TAB_TITLE_COLS: usize = 18;
 
 /// Label of the demo smart-selection row in the right-click context menu.
 const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
@@ -5636,7 +5633,7 @@ impl TerminalView {
         };
         let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
         let (display, _truncated) =
-            tab_display_title(&tab.title, REGION_TAB_TITLE_COLS.saturating_sub(suffix_len));
+            tab_display_title(&tab.title, title_columns(suffix_len, tab.ai_indicator.is_some()));
         let ai_dot = tab
             .ai_indicator
             .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_1().into_any_element());
@@ -5684,7 +5681,10 @@ impl TerminalView {
             .when(!tab.is_active, |this| this.hover(move |s| s.bg(hover_bg)))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
             .children(ai_dot)
-            .child(div().flex_1().overflow_hidden().child(display))
+            // `truncate`, as in the titlebar: without it a title that outgrows
+            // the flexed slot once the AI dot appears wraps onto a second line
+            // inside the fixed-height tab and the visible text rides up.
+            .child(div().flex_1().truncate().child(display))
             .children(suffix)
             .children(close)
             .children(underline)

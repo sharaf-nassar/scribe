@@ -12,8 +12,9 @@
 //! keyboard-activate a row to open it, Enter commits through the same apply
 //! path every other control uses, Escape restores the value the edit opened
 //! with. Only colors validate (and carry the live swatch). Keybinding rows
-//! stay read-only, listing every action's current combos so the full shortcut
-//! inventory remains visible.
+//! list every action's combos as key caps and record a replacement from the
+//! keyboard: activating one puts it in listening state, and the next keystroke
+//! is written through the same apply path.
 //!
 //! The content pane carries the terminal's own overlay scrollbar
 //! ([`crate::scrollbar`]) as its page-length affordance: the same thumb
@@ -51,11 +52,12 @@ use std::{ops::Range, time::Duration};
 
 use gpui::{
     AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
-    EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, ResizeEdge, Rgba, Role,
-    ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled, UTF16Selection, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle,
-    WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba, size,
+    EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point,
+    ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled,
+    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowDecorations, WindowHandle, WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba,
+    size,
 };
 use scribe_common::config::{ScribeConfig, load_config};
 use scribe_common::protocol::{
@@ -65,6 +67,7 @@ use scribe_common::protocol::{
 use serde_json::{Value, json};
 
 use crate::app_shortcuts::CloseWindow;
+use crate::keybindings::Keybinding;
 use crate::layout::Rect;
 use crate::scrollbar::{
     SCROLLBAR_WIDTH, ScrollMetrics, ScrollbarLayout, ScrollbarState, ThumbGeometry, compute_thumb,
@@ -74,7 +77,8 @@ use crate::settings::apply::{canonical_color_value, workspace_root_from_value};
 use crate::settings::model::{
     ADD_CURRENT_NETWORK_ACTION, Control, ControlKind, ENV_PERSISTENCE_KEY, ENV_PREFLIGHT_ACTION,
     REFRESH_TRUST_ACTION, REMOVE_TRUSTED_NETWORK_PREFIX, REVOKE_TRUSTED_DEVICE_PREFIX,
-    SettingsPage, page_controls, workspace_badge_color_controls,
+    SettingsPage, keybinding_actions, keybinding_label, page_controls,
+    workspace_badge_color_controls,
 };
 use crate::settings::server_action::{self, EnvPreflightOutcome, LanEnvOutcome, RemoteEnvOutcome};
 use crate::settings::values::{current_value, keybinding_combos};
@@ -275,6 +279,11 @@ pub struct SettingsWindow {
     edit_control: Option<Control>,
     edit_marked_range: Option<Range<usize>>,
     edit_error: Option<String>,
+    /// The keybinding action whose row is listening for a keystroke, and the
+    /// reason the last capture was refused. Single-slot for the same reason the
+    /// inline editor is: one row records at a time.
+    capture_action: Option<String>,
+    capture_error: Option<String>,
     active_input: Option<NativeInputTarget>,
     input_selection: NativeInputSelection,
     /// Keyboard traversal is deliberately window-local: Settings claims only
@@ -428,6 +437,150 @@ fn inline_commit_value(is_color: bool, key: &str, input: &str) -> Result<String,
     }
 }
 
+/// A keystroke that names only a modifier: a recording row waits through it
+/// rather than reading Ctrl-on-its-own as the shortcut.
+fn is_modifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ctrl"
+            | "control"
+            | "shift"
+            | "alt"
+            | "cmd"
+            | "super"
+            | "platform"
+            | "win"
+            | "function"
+            | "fn"
+            | "capslock"
+            | "numlock"
+    )
+}
+
+/// Whether none of the four real modifiers were held.
+const fn is_unmodified(modifiers: Modifiers) -> bool {
+    !(modifiers.control || modifiers.alt || modifiers.shift || modifiers.platform)
+}
+
+/// Spell a captured keystroke in the combo grammar
+/// [`crate::keybindings::Keybinding::parse`] reads back: modifiers in a fixed
+/// order, then the layout base key GPUI reports.
+fn combo_from_keystroke(keystroke: &Keystroke) -> String {
+    let mut combo = String::new();
+    for (held, name) in [
+        (keystroke.modifiers.control, "ctrl"),
+        (keystroke.modifiers.alt, "alt"),
+        (keystroke.modifiers.shift, "shift"),
+        (keystroke.modifiers.platform, "cmd"),
+    ] {
+        if held {
+            combo.push_str(name);
+            combo.push('+');
+        }
+    }
+    combo.push_str(&keystroke.key.to_lowercase());
+    combo
+}
+
+/// The canonical spelling of a combo, or `None` when the client's own parser
+/// cannot bind it.
+///
+/// Both sides of a conflict check go through here, so `super+ctrl+w` written by
+/// hand in `config.toml` and `ctrl+cmd+w` captured from the keyboard compare
+/// equal. The parse call is what keeps the settings window from inventing a
+/// second opinion about which keys bind: an F-key or an unknown name is
+/// rejected here because the runtime dispatcher would drop it anyway.
+fn canonical_combo(combo: &str) -> Option<String> {
+    Keybinding::parse(combo)?;
+    let (mut ctrl, mut alt, mut shift, mut cmd) = (false, false, false, false);
+    let mut key = None;
+    for part in combo.split('+') {
+        match part.trim().to_lowercase().as_str() {
+            "ctrl" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "cmd" | "super" => cmd = true,
+            other => key = Some(other.to_owned()),
+        }
+    }
+    let mut canonical = String::new();
+    for (held, name) in [(ctrl, "ctrl"), (alt, "alt"), (shift, "shift"), (cmd, "cmd")] {
+        if held {
+            canonical.push_str(name);
+            canonical.push('+');
+        }
+    }
+    canonical.push_str(&key?);
+    Some(canonical)
+}
+
+/// The combo a captured keystroke binds to, or the reason it cannot.
+///
+/// A shortcut without Ctrl, Alt, or Super is refused because the terminal would
+/// never see that key again — plain `t` bound to a layout action makes the
+/// letter untypeable in every pane, which is not a mistake the settings window
+/// should be able to commit.
+fn combo_for_capture(keystroke: &Keystroke) -> Result<String, String> {
+    let modifiers = keystroke.modifiers;
+    if !(modifiers.control || modifiers.alt || modifiers.platform) {
+        return Err("Shortcuts need Ctrl, Alt, or Super — anything less stays with the terminal."
+            .to_owned());
+    }
+    let combo = combo_from_keystroke(keystroke);
+    canonical_combo(&combo)
+        .ok_or_else(|| format!("{} cannot be used in a shortcut.", key_cap_label(&keystroke.key)))
+}
+
+/// The keybinding action `combo` is already bound to, ignoring `recording`
+/// itself so re-pressing a row's current shortcut is not a conflict.
+fn conflicting_action(config: &ScribeConfig, combo: &str, recording: &str) -> Option<&'static str> {
+    let canonical = canonical_combo(combo)?;
+    keybinding_actions().into_iter().find(|action| {
+        *action != recording
+            && keybinding_combos(config, action)
+                .iter()
+                .any(|existing| canonical_combo(existing).as_deref() == Some(canonical.as_str()))
+    })
+}
+
+/// The reader-facing name of one combo token: `ctrl` → `Ctrl`, `pageup` →
+/// `Page Up`, `t` → `T`.
+fn key_cap_label(token: &str) -> String {
+    let named = match token.to_lowercase().as_str() {
+        "ctrl" => "Ctrl",
+        "shift" => "Shift",
+        "alt" => "Alt",
+        "cmd" | "super" => {
+            if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Super"
+            }
+        }
+        "escape" | "esc" => "Esc",
+        "enter" | "return" => "Enter",
+        "space" => "Space",
+        "backspace" => "Backspace",
+        "delete" => "Delete",
+        "tab" => "Tab",
+        "pageup" => "Page Up",
+        "pagedown" => "Page Down",
+        "home" => "Home",
+        "end" => "End",
+        "left" => "Left",
+        "right" => "Right",
+        "up" => "Up",
+        "down" => "Down",
+        _ => return token.to_uppercase(),
+    };
+    named.to_owned()
+}
+
+/// A whole combo in reader-facing words, for status lines and screen readers.
+fn key_combo_text(combo: &str) -> String {
+    combo.split('+').map(key_cap_label).collect::<Vec<_>>().join(" ")
+}
+
 /// Cancel an inline edit: the field returns to the value it opened with, and
 /// the rejection ink clears with it, so an abandoned edit leaves nothing of
 /// itself on screen.
@@ -466,6 +619,8 @@ impl SettingsWindow {
             edit_control: None,
             edit_marked_range: None,
             edit_error: None,
+            capture_action: None,
+            capture_error: None,
             active_input: None,
             input_selection: NativeInputSelection::Caret,
             focus_index: 0,
@@ -568,14 +723,19 @@ impl SettingsWindow {
         match key {
             "workspaces.add_root" | "workspaces.remove_root" => "Workspace root".to_owned(),
             "workspaces.reset_badge_colors" => "Badge colors".to_owned(),
-            _ => self
-                .controls_for_page(self.page)
-                .into_iter()
-                .find(|control| control.key == key)
-                .map_or_else(
-                    || humanize_choice_token(key.rsplit('.').next().unwrap_or(key)),
-                    |control| control.label,
-                ),
+            // A keybinding commits under `keybindings.<action>` while its row is
+            // keyed on the bare action, so the prefix comes off before the
+            // lookup or every shortcut would fall back to a generated name.
+            _ => {
+                let control_key = key.strip_prefix("keybindings.").unwrap_or(key);
+                self.controls_for_page(self.page)
+                    .into_iter()
+                    .find(|control| control.key == control_key)
+                    .map_or_else(
+                        || humanize_choice_token(key.rsplit('.').next().unwrap_or(key)),
+                        |control| control.label,
+                    )
+            }
         }
     }
 
@@ -626,8 +786,11 @@ impl SettingsWindow {
         self.page = page;
         self.status = None;
         // A dropdown belongs to one control on one page; leaving the page must
-        // not leave its menu floating over the next one.
+        // not leave its menu floating over the next one, and a row that was
+        // listening for a shortcut is not on screen to say so any more.
         self.open_choice = None;
+        self.capture_action = None;
+        self.capture_error = None;
         // The scroller is one retained element across every page, so without an
         // explicit rewind a short page inherits the previous page's offset and
         // opens blank below its own content.
@@ -698,15 +861,7 @@ impl SettingsWindow {
             if !self.control_matches_search(&control) || !self.control_is_enabled(&control.key) {
                 return None;
             }
-            match control.kind {
-                ControlKind::Toggle
-                | ControlKind::Choice(_)
-                | ControlKind::Stepper { .. }
-                | ControlKind::Action
-                | ControlKind::Color
-                | ControlKind::Text => Some(SettingsFocusTarget::Control(control)),
-                ControlKind::Keybinding => None,
-            }
+            Some(SettingsFocusTarget::Control(control))
         }));
         targets
     }
@@ -739,7 +894,11 @@ impl SettingsWindow {
         let had_visible_focus = self.keyboard_navigation;
         self.keyboard_navigation = false;
         self.focus_index = 0;
-        if had_visible_focus {
+        // A press anywhere ends a recording: the row that was listening is not
+        // where the user is looking any more. The keybinding row's own click
+        // handler runs on release, so it still starts its own recording.
+        let was_recording = self.cancel_capture(cx);
+        if had_visible_focus && !was_recording {
             cx.notify();
         }
     }
@@ -799,6 +958,76 @@ impl SettingsWindow {
         self.input_selection = NativeInputSelection::Caret;
     }
 
+    /// Start listening for the keystroke that replaces a keybinding.
+    ///
+    /// Focus goes to the root so the recording row reads every key through
+    /// [`SettingsWindow::on_key_down`] rather than through a text input: a
+    /// shortcut is pressed, not typed.
+    fn begin_capture(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_inline_edit();
+        self.capture_action = Some(action.to_owned());
+        self.capture_error = None;
+        self.status = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Stop listening, leaving the binding as it was. Returns whether a
+    /// recording was actually running.
+    fn cancel_capture(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_recording = self.capture_action.take().is_some();
+        self.capture_error = None;
+        if was_recording {
+            cx.notify();
+        }
+        was_recording
+    }
+
+    /// Read one keystroke into the recording row.
+    ///
+    /// Modifier presses keep it listening, Escape abandons the recording, and a
+    /// bare Backspace unbinds the action. Anything else is written as the
+    /// action's combo once it parses, keeps a modifier the terminal can live
+    /// without, and is not already spoken for — a refusal keeps the row
+    /// listening with the reason on screen, so the next press is the fix.
+    fn capture_keystroke(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(action) = self.capture_action.clone() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        if is_modifier_key(key) {
+            return;
+        }
+        let bare = is_unmodified(event.keystroke.modifiers);
+        if bare && key == "escape" {
+            self.cancel_capture(cx);
+            return;
+        }
+        if bare && key == "backspace" {
+            self.capture_action = None;
+            self.capture_error = None;
+            self.commit(&format!("keybindings.{action}"), Value::Array(Vec::new()), cx);
+            return;
+        }
+        let combo = match combo_for_capture(&event.keystroke) {
+            Ok(combo) => combo,
+            Err(error) => {
+                self.capture_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(other) = conflicting_action(&self.config, &combo, &action) {
+            self.capture_error =
+                Some(format!("Already bound to {}.", keybinding_label(other).to_lowercase()));
+            cx.notify();
+            return;
+        }
+        self.capture_action = None;
+        self.capture_error = None;
+        self.commit(&format!("keybindings.{action}"), Value::Array(vec![Value::String(combo)]), cx);
+    }
+
     fn clear_inline_edit(&mut self) -> bool {
         let was_active = release_inline_input(&mut self.active_input, &mut self.input_selection);
         self.edit_control = None;
@@ -846,7 +1075,7 @@ impl SettingsWindow {
                     window.focus(&self.edit_handle, cx);
                     cx.notify();
                 }
-                ControlKind::Keybinding => {}
+                ControlKind::Keybinding => self.begin_capture(&control.key, window, cx),
             },
             SettingsFocusTarget::Action(key) => self.run_action(&key, window, cx),
             SettingsFocusTarget::WorkspaceRootInput => {
@@ -915,6 +1144,12 @@ impl SettingsWindow {
             || control.label.to_lowercase().contains(&query)
             || control.key.to_lowercase().contains(&query)
             || control_section(self.page, &control.key).to_lowercase().contains(&query)
+            // A shortcut is looked up by the keys it uses at least as often as
+            // by the action it runs, so "ctrl+shift" finds its own rows.
+            || (matches!(control.kind, ControlKind::Keybinding)
+                && keybinding_combos(&self.config, &control.key)
+                    .iter()
+                    .any(|combo| combo.to_lowercase().contains(&query)))
     }
 
     fn workspace_roots_match_search(&self) -> bool {
@@ -938,6 +1173,8 @@ impl SettingsWindow {
                 settings_nav_pages().into_iter().find(|page| self.page_matches_search(*page))
         {
             self.clear_inline_edit();
+            self.capture_action = None;
+            self.capture_error = None;
             self.page = page;
             self.status = None;
             // Jumping to a different page for a match must rewind the shared
@@ -1139,6 +1376,13 @@ impl SettingsWindow {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A recording row claims every key ahead of the window's own shortcuts,
+        // or Ctrl+K and Tab could never be bound to anything.
+        if self.capture_action.is_some() {
+            self.capture_keystroke(event, cx);
+            cx.stop_propagation();
+            return;
+        }
         if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
             && event.keystroke.key == "k"
         {
@@ -3147,9 +3391,11 @@ impl SettingsWindow {
             .role(Role::Group)
             .aria_label(control.label.clone())
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
+            // A row grows for the second line an open edit's rejection or a
+            // recording row's hint occupies, so neither overlaps its neighbour.
             .h(px(
-                if self.edit_key() == Some(control.key.as_str())
-                    && self.edit_error.is_some()
+                if (self.edit_key() == Some(control.key.as_str()) && self.edit_error.is_some())
+                    || self.capture_action.as_deref() == Some(control.key.as_str())
                 {
                     78.0
                 } else {
@@ -3235,7 +3481,7 @@ impl SettingsWindow {
                 self.render_stepper(control, (*min, *max, *step), *decimals, cx)
             }
             ControlKind::Color | ControlKind::Text => self.render_inline_edit(control, window, cx),
-            ControlKind::Keybinding => self.render_keybinding_value(control),
+            ControlKind::Keybinding => self.render_keybinding_value(control, cx),
             ControlKind::Action => self.render_action_control(control, cx),
         }
     }
@@ -3487,10 +3733,83 @@ impl SettingsWindow {
         was_open
     }
 
-    fn render_keybinding_value(&self, control: &Control) -> gpui::AnyElement {
+    /// A keybinding row's value: its combos as key caps, or the listening state
+    /// while the row records a replacement.
+    ///
+    /// The whole cell is the click target — there is no separate edit button,
+    /// because on this page the value *is* the control.
+    fn render_keybinding_value(
+        &self,
+        control: &Control,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let recording = self.capture_action.as_deref() == Some(control.key.as_str());
+        let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
         let combos = keybinding_combos(&self.config, &control.key);
-        let shown = if combos.is_empty() { "—".to_owned() } else { combos.join(", ") };
-        read_only_value(&control.key, &control.label, &shown, &self.colors)
+        let spoken = if combos.is_empty() {
+            format!("{}: not bound", control.label)
+        } else {
+            format!(
+                "{}: {}",
+                control.label,
+                combos.iter().map(|combo| key_combo_text(combo)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let note = recording.then(|| {
+            self.capture_error.clone().map_or_else(
+                || ("Esc cancels · Backspace unbinds".to_owned(), colors.quiet_text),
+                |error| (error, colors.error),
+            )
+        });
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let capture_key = control.key.clone();
+        let cell = div()
+            .id(("settings-keybinding", key_hash(&control.key)))
+            .role(Role::Button)
+            .aria_label(spoken)
+            .aria_description(if recording {
+                "Listening for a shortcut"
+            } else {
+                "Activate to record a new shortcut"
+            })
+            .focusable()
+            .tab_stop(true)
+            .h(px(30.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(5.0))
+            .overflow_hidden()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(if recording || focused { colors.accent } else { TRANSPARENT })
+            .when(recording, |el| el.bg(colors.input_bg))
+            .cursor_pointer()
+            .when(!recording, |el| el.hover(move |style| style.border_color(colors.border)))
+            .on_click(cx.listener(move |this, _, capture_window, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.begin_capture(&capture_key, capture_window, ctx);
+            }))
+            .children(keybinding_cell_content(recording, &combos, &colors));
+        div()
+            .w(px(VALUE_COLUMN_WIDTH))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_1()
+            .children(note.map(|(text, color)| {
+                div()
+                    .id(("settings-keybinding-note", key_hash(&control.key)))
+                    .role(if self.capture_error.is_some() { Role::Alert } else { Role::Note })
+                    .aria_label(text.clone())
+                    .text_xs()
+                    .text_color(color)
+                    .child(Text::new_inaccessible(text.into()))
+            }))
+            .child(cell)
+            .into_any_element()
     }
 
     fn render_action_control(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -3802,6 +4121,73 @@ const RELEASE_SUMMARY_MAX: usize = 4;
 
 /// Dimming applied to a control whose parent toggle is off.
 const GATED_OPACITY: f32 = 0.42;
+
+/// An outline that reserves its space without drawing: a keybinding cell keeps
+/// the same geometry whether or not it is the focused or recording row.
+const TRANSPARENT: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+
+/// What a keybinding cell holds: the listening prompt, the "not bound" stand-in,
+/// or one key cap per token with a quiet `or` between alternate combos.
+fn keybinding_cell_content(
+    recording: bool,
+    combos: &[String],
+    colors: &SettingsColors,
+) -> Vec<gpui::AnyElement> {
+    if recording {
+        return vec![
+            div()
+                .text_sm()
+                .text_color(colors.accent)
+                .child(Text::new_inaccessible("Press a shortcut…".into()))
+                .into_any_element(),
+        ];
+    }
+    if combos.is_empty() {
+        return vec![
+            div()
+                .text_sm()
+                .text_color(colors.quiet_text)
+                .child(Text::new_inaccessible("Not bound".into()))
+                .into_any_element(),
+        ];
+    }
+    let mut caps = Vec::new();
+    for (index, combo) in combos.iter().enumerate() {
+        if index > 0 {
+            caps.push(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(colors.quiet_text)
+                    .child(Text::new_inaccessible("or".into()))
+                    .into_any_element(),
+            );
+        }
+        caps.extend(combo.split('+').map(|token| key_cap(token, colors)));
+    }
+    caps
+}
+
+/// One key cap — the typeset grammar's mark for a literal key to press, and the
+/// reason a shortcut is legible at a glance where `ctrl+shift+t` was a word to
+/// be decoded.
+fn key_cap(token: &str, colors: &SettingsColors) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .h(px(20.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.control_bg)
+        .font_family("monospace")
+        .text_xs()
+        .text_color(colors.text)
+        .child(Text::new_inaccessible(key_cap_label(token).into()))
+        .into_any_element()
+}
 
 /// The toggle a control depends on, or `None` when it stands alone.
 ///
@@ -4272,7 +4658,7 @@ fn page_summary(page: SettingsPage) -> &'static str {
         SettingsPage::Ai => "Assistant integrations, prompt bar, and state signals",
         SettingsPage::Terminal => "Session behavior, clipboard policy, and status metrics",
         SettingsPage::Environment => "Securely restore environment variables across sessions",
-        SettingsPage::Keybindings => "Current shortcuts for tabs, panes, navigation, and commands",
+        SettingsPage::Keybindings => "Click a shortcut, then press the keys you want to use",
         SettingsPage::Workspaces => "Workspace roots and badge appearance",
         SettingsPage::Updates => "Automatic update cadence and release channel",
         SettingsPage::Releases => "Query available versions from the Scribe server",
@@ -4567,12 +4953,67 @@ fn logical_i32(value: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeInputSelection, NativeInputTarget, SettingsFocusTarget, focus_targets_match,
-        inline_commit_value, inline_placeholder, release_inline_input, revert_inline_input,
-        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
-        workspace_root_controls_match_query, workspace_root_focus_index,
-        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
+        NativeInputSelection, NativeInputTarget, SettingsFocusTarget, canonical_combo,
+        combo_for_capture, conflicting_action, focus_targets_match, inline_commit_value,
+        inline_placeholder, is_modifier_key, key_combo_text, release_inline_input,
+        revert_inline_input, search_display_text, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
+        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
+        workspace_roots_match_query,
     };
+    use gpui::{Keystroke, Modifiers};
+    use scribe_common::config::{KeyComboList, ScribeConfig};
+
+    fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
+        Keystroke { modifiers, key: key.to_owned(), key_char: None }
+    }
+
+    // @lat: [[test#GPUI Settings Window#Shortcut capture]]
+    #[test]
+    fn capture_writes_a_combo_the_dispatcher_can_parse() {
+        let pressed =
+            keystroke(Modifiers { control: true, shift: true, ..Modifiers::default() }, "T");
+
+        assert_eq!(combo_for_capture(&pressed).unwrap(), "ctrl+shift+t");
+        // A modifier press is not a shortcut; the row waits through it.
+        assert!(is_modifier_key("ctrl") && is_modifier_key("shift"));
+        assert!(!is_modifier_key("t"));
+    }
+
+    // @lat: [[test#GPUI Settings Window#Shortcut capture#Unbindable keystrokes are refused]]
+    #[test]
+    fn capture_refuses_keystrokes_that_would_break_the_terminal() {
+        let bare = keystroke(Modifiers::default(), "t");
+        let shift_only = keystroke(Modifiers { shift: true, ..Modifiers::default() }, "t");
+        let f_key = keystroke(Modifiers { control: true, ..Modifiers::default() }, "f5");
+
+        assert!(combo_for_capture(&bare).is_err());
+        assert!(combo_for_capture(&shift_only).is_err());
+        // The client's own parser has no F-key vocabulary, so binding one would
+        // write a shortcut that never fires.
+        assert!(combo_for_capture(&f_key).is_err());
+    }
+
+    // @lat: [[test#GPUI Settings Window#Shortcut capture#Conflicts are named before they are written]]
+    #[test]
+    fn conflicts_compare_combos_by_canonical_spelling() {
+        let mut config = ScribeConfig::default();
+        config.keybindings.new_tab = KeyComboList::single("ctrl+shift+t");
+
+        // Hand-written order and alias fold together before the comparison.
+        assert_eq!(canonical_combo("shift+ctrl+t").as_deref(), Some("ctrl+shift+t"));
+        assert_eq!(canonical_combo("super+ctrl+w").as_deref(), Some("ctrl+cmd+w"));
+        assert!(canonical_combo("ctrl+f5").is_none());
+        assert_eq!(conflicting_action(&config, "shift+ctrl+t", "close_tab"), Some("new_tab"));
+        // Re-pressing a row's own shortcut is not a conflict with itself.
+        assert_eq!(conflicting_action(&config, "ctrl+shift+t", "new_tab"), None);
+    }
+
+    #[test]
+    fn key_caps_read_as_words() {
+        assert_eq!(key_combo_text("ctrl+pagedown"), "Ctrl Page Down");
+        assert_eq!(key_combo_text("alt+1"), "Alt 1");
+    }
 
     #[test]
     fn search_placeholder_hides_only_for_focused_empty_input() {

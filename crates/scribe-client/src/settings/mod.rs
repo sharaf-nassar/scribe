@@ -89,6 +89,31 @@ mod parity_tests {
         }
     }
 
+    // @lat: [[test#GPUI Settings Window#Shortcut capture#Actions read as product language]]
+    /// Every keybinding row is labelled in the same sentence case the rest of
+    /// the settings pages use, with the proper nouns intact, so the page reads
+    /// as a list of things Scribe does rather than a dump of config field
+    /// names.
+    #[test]
+    fn keybinding_labels_are_sentence_case_product_language() {
+        use super::model::keybinding_label;
+
+        assert_eq!(keybinding_label("new_tab"), "New tab");
+        assert_eq!(keybinding_label("new_claude_resume_tab"), "New Claude resume tab");
+        assert_eq!(keybinding_label("new_codex_tab"), "New Codex tab");
+        assert_eq!(keybinding_label("prev_tab"), "Previous tab");
+        assert_eq!(keybinding_label("select_tab_1"), "Select tab 1");
+        assert_eq!(keybinding_label("delete_word_backward_ctrl"), "Delete word backward (Ctrl)");
+        for action in super::model::keybinding_actions() {
+            let label = keybinding_label(action);
+            assert!(!label.contains('_'), "{action} label still reads as a config key: {label}");
+            assert!(
+                label.starts_with(|c: char| c.is_uppercase()),
+                "{action} label must open in sentence case: {label}"
+            );
+        }
+    }
+
     // @lat: [[test#GPUI Settings Window#Keybinding coverage]]
     /// The keybindings page lists every action the apply path routes under
     /// `keybindings.*`, so no shortcut silently disappears from the rebuilt

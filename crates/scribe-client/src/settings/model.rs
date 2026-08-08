@@ -411,8 +411,39 @@ fn environment_controls() -> Vec<Control> {
 fn keybinding_controls() -> Vec<Control> {
     keybinding_actions()
         .into_iter()
-        .map(|a| Control::new(a, &a.replace('_', " "), ControlKind::Keybinding))
+        .map(|a| Control::new(a, &keybinding_label(a), ControlKind::Keybinding))
         .collect()
+}
+
+/// The reader-facing name of a keybinding action: `new_claude_resume_tab` →
+/// `New Claude resume tab`.
+///
+/// Sentence case is what every other page's labels use, so the keybindings page
+/// stops reading as a column of raw config identifiers. Only the proper nouns,
+/// the one abbreviation, and the one action whose trailing word is a modifier
+/// name need a table; the rest generate.
+#[must_use]
+pub fn keybinding_label(action: &str) -> String {
+    if action == "delete_word_backward_ctrl" {
+        return "Delete word backward (Ctrl)".to_owned();
+    }
+    let words = action
+        .split('_')
+        .map(|word| match word {
+            "claude" => "Claude",
+            "codex" => "Codex",
+            "prev" => "previous",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut label = String::with_capacity(words.len());
+    let mut chars = words.chars();
+    if let Some(first) = chars.next() {
+        label.extend(first.to_uppercase());
+        label.push_str(chars.as_str());
+    }
+    label
 }
 
 /// The Workspaces page's generic controls. The config-backed root collection

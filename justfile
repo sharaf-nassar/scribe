@@ -281,6 +281,14 @@ e2e-visual-settings-trust:
 # with the settings chord, the palette row, and the status-bar gear, and
 # asserts the "Scribe Settings" window maps exactly once.
 # SCRIBE_FILE_CHOOSER=1 starts the desktop chooser portal for workspace roots.
+# Run the keybindings-recording E2E: the Keybindings page captures a chord from
+# a real keyboard, refuses a conflicting one, unbinds on Backspace, and the
+# running client re-parses its bindings so the terminal answers the NEW chord.
+# Default visual app (the client): the script opens the settings window itself
+# and fails phase 0 if one is already up.
+e2e-visual-settings-keybindings:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-keybindings.sh
+
 e2e-visual-settings-entry:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_FILE_CHOOSER=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-entry.sh
 
@@ -565,6 +573,7 @@ e2e-all-visual: build-release docker-visual
         'visual/server-upgrade-reattach.sh|e2e-visual-server-upgrade-reattach'
         'visual/session-tooling.sh|e2e-visual-session-tooling'
         'visual/settings-entry.sh|e2e-visual-settings-entry'
+        'visual/settings-keybindings.sh|e2e-visual-settings-keybindings'
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
         'visual/tab-switching.sh|e2e-visual-tab-switching'

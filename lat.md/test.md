@@ -1550,6 +1550,26 @@ The live regression keeps rejected input editable, proves typed roots persist an
 
 The settings regression rejects invalid RGB without changing config, saves canonical `#rrggbb` live, and restores the eight-colour default palette through keyboard Reset.
 
+### Keybindings record from the keyboard
+
+`tests/e2e/visual/settings-keybindings.sh` (`just e2e-visual-settings-keybindings`) is the app-level oracle for shortcut capture: it drives the real settings window through XTEST and asserts on `config.toml` and the client's log.
+
+Unit tests pin the combo grammar and the conflict rule, but they cannot prove that a keystroke pressed at a real X server reaches `capture_keystroke` instead of the settings window's own Ctrl+K and Tab handling, nor that the running client re-parses its bindings afterwards. The script reaches the rows by traversal rather than by pixel coordinates — three Tabs to the Keybindings sidebar row, Enter, then eight more to the page's first control — so a reordered nav or action list fails loudly here instead of silently recording onto the wrong row.
+
+#### A recorded chord is written and applied live
+
+Activating the first row must repaint it into listening state, and Ctrl+Alt+N must land in `keybindings.new_tab`.
+
+The terminal window must then answer that chord with the `opened a new tab` line while ignoring the default it replaced — the only proof the live `ConfigReloaded` path re-parsed `Bindings` rather than only writing a file.
+
+#### A conflicting chord is refused on screen
+
+Recording the same chord on a second action must repaint the row with the conflict, leave both actions' bindings untouched in `config.toml`, and survive Escape without writing anything.
+
+#### Backspace unbinds an action
+
+A bare Backspace on a listening row must write an empty combo list for that action, which is a different config state from the unwritten key the fixture ships with.
+
 ### Tab and window chords reach their actions
 
 `tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
@@ -3462,6 +3482,30 @@ Every page in  exposes controls, and every config-backed control routes cleanly 
 ### Keybinding coverage
 
 The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through  without panicking, so no shortcut silently disappears.
+
+### Shortcut capture
+
+The keybinding rows record a pressed chord rather than typed text, so the unit
+coverage pins the grammar a capture writes, the keystrokes it must refuse, and
+the conflict rule.
+
+A wrong answer to any of the three is either an unusable terminal or a shortcut that silently never fires. A captured Ctrl+Shift+T spells `ctrl+shift+t`, in the same vocabulary the client's own dispatcher parses back, and modifier-only presses are recognized as "still waiting" rather than as the shortcut.
+
+#### Unbindable keystrokes are refused
+
+A keystroke with no Ctrl, Alt, or Super is refused, because binding a plain key to a layout action takes it away from the terminal for good.
+
+A key the client's parser has no vocabulary for (an F-key) is refused too: the runtime would never match the combo it wrote.
+
+#### Conflicts are named before they are written
+
+A combo another action already owns is refused with that action named, and re-pressing a row's own combo is not a conflict with itself.
+
+The comparison folds modifier order and the `super`/`cmd` alias first, so a hand-written `super+ctrl+w` and a captured `ctrl+cmd+w` are recognized as one shortcut.
+
+#### Actions read as product language
+
+Every keybinding row is labelled in the same sentence case the other settings pages use, with `Claude` and `Codex` intact and no underscores left, so the page reads as a list of things Scribe does rather than a dump of config field names.
 
 ### Singleton focus handoff
 
