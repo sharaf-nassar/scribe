@@ -228,7 +228,17 @@ mod x11 {
                 .then_some(WindowState::Fullscreen)
                 .or_else(|| maximized().then_some(WindowState::Maximized))
                 .unwrap_or_default();
-            let hidden = holds(b"_NET_WM_STATE_HIDDEN") || wm_state_is_iconic(conn, xid);
+            // EWMH `_NET_WM_STATE_HIDDEN` alone, never ICCCM `WM_STATE`. 4.1.3.1
+            // makes `IconicState` mean only "not mapped", which a window on
+            // another virtual desktop also is — and `apply_saved_desktop` now
+            // sends restored windows to one routinely. Reading that as
+            // minimization latched: the record persisted `minimized`, the next
+            // restore re-minimized the window, and the capture after it read
+            // `IconicState` again, so a window hidden once never came back.
+            // EWMH 5.7's wording is specific where ICCCM's is not — HIDDEN means
+            // the window "would not be visible... if its desktop were active" —
+            // so it is the only one of the two that answers this question.
+            let hidden = holds(b"_NET_WM_STATE_HIDDEN");
             Some(ObservedWindowState::from_wm_state(hidden, visible))
         })
     }
@@ -262,18 +272,6 @@ mod x11 {
                 .then_some(())
         })
         .is_some()
-    }
-
-    /// ICCCM 4.1.3.1 `WM_STATE`, whose first word is the state and whose type
-    /// atom is the property atom. `IconicState` is the pre-EWMH "minimized".
-    fn wm_state_is_iconic(conn: &RustConnection, xid: u32) -> bool {
-        const ICONIC_STATE: u32 = 3;
-        let Some(property) = intern(conn, b"WM_STATE") else { return false };
-        conn.get_property(false, xid, property, property, 0, 2)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .and_then(|reply| reply.value32()?.next())
-            .is_some_and(|state| state == ICONIC_STATE)
     }
 
     /// An already-interned atom by name, or `None` when nothing has interned it
@@ -394,11 +392,15 @@ mod x11 {
     pub(super) fn move_window(window: &Window, x: i32, y: i32, state: WindowState) -> bool {
         let Some(xid) = xcb_window_id(window) else { return false };
         with_connection(|conn| {
-            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            // The same reply answers both questions the move needs: which root
+            // to send the client message to, and the size to restate in it.
+            let geometry = conn.get_geometry(xid).ok()?.reply().ok()?;
+            let root = geometry.root;
+            let size = (u32::from(geometry.width), u32::from(geometry.height));
             let held = placement_atoms(conn, root, state);
             let lifted = set_wm_state(conn, root, xid, WM_STATE_REMOVE, &held);
-            let moved =
-                move_resize_window(conn, root, xid, x, y) || configure_position(conn, xid, x, y);
+            let moved = move_resize_window(conn, root, xid, (x, y), size)
+                || configure_position(conn, xid, x, y);
             // Put back even when the move failed: a lifted state that is not
             // restored would leave the window unmaximized.
             if lifted {
@@ -487,14 +489,37 @@ mod x11 {
     /// the window manager drew around it, so there is no decoration residual to
     /// measure afterwards. `false` when the window manager does not advertise
     /// the message, which leaves the caller on the `ConfigureRequest` path.
-    fn move_resize_window(conn: &RustConnection, root: u32, xid: u32, x: i32, y: i32) -> bool {
-        // Gravity `StaticGravity` (0xa) in the low byte, bits 8 and 9 marking x
-        // and y as present, bit 12 the "application" source indication.
-        const FLAGS: u32 = 0x0000_130a;
+    fn move_resize_window(
+        conn: &RustConnection,
+        root: u32,
+        xid: u32,
+        origin: (i32, i32),
+        size: (u32, u32),
+    ) -> bool {
         let Some(message) = supported_atom(conn, root, b"_NET_MOVERESIZE_WINDOW") else {
             return false;
         };
-        send_to_wm(conn, root, xid, message, [FLAGS, x.cast_unsigned(), y.cast_unsigned(), 0, 0])
+        send_to_wm(conn, root, xid, message, move_resize_payload(origin, size))
+    }
+
+    /// The `_NET_MOVERESIZE_WINDOW` payload: gravity and presence flags, then
+    /// the four geometry words.
+    ///
+    /// The size is restated rather than left absent even though only the
+    /// position is being changed. EWMH 4.2 marks each of x/y/width/height
+    /// present through its own bit, and a move that clears the size bits leaves
+    /// the window manager to reconstruct the size itself — under `StaticGravity`
+    /// that reconstruction runs through `WM_NORMAL_HINTS`, and GPUI publishes no
+    /// base, minimum, or increment hints, only a maximum. Mutter resolved the
+    /// gap by collapsing the window to 1×1: mapped, listed in the taskbar, and
+    /// invisible, on every restart of a window that had a saved position. Naming
+    /// the current size costs one word each and removes the reconstruction.
+    fn move_resize_payload((x, y): (i32, i32), (width, height): (u32, u32)) -> [u32; 5] {
+        /// `StaticGravity` (0xa) in the low byte, bits 8-11 marking x, y, width
+        /// and height all present, and bits 12-15 holding the source indication
+        /// (1 = a normal application).
+        const FLAGS: u32 = 0x0000_1f0a;
+        [FLAGS, x.cast_unsigned(), y.cast_unsigned(), width, height]
     }
 
     /// The atom for `name`, but only when the window manager lists it in
@@ -508,6 +533,42 @@ mod x11 {
             .reply()
             .ok()?;
         reply.value32()?.any(|atom| atom == wanted).then_some(wanted)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::move_resize_payload;
+
+        // @lat: [[test#Window geometry compat#A placement move restates the window's size]]
+        #[test]
+        fn placement_move_restates_the_windows_size() {
+            let [flags, x, y, width, height] = move_resize_payload((2255, 142), (1152, 1828));
+
+            // EWMH 4.2 splits `data[0]` into gravity, presence bits 8-11, and a
+            // source indication in bits 12-15.
+            assert_eq!(flags & 0xff, 10, "the coordinates must be read as StaticGravity");
+            assert_eq!(
+                (flags & 0xf00) >> 8,
+                0b1111,
+                "x, y, width and height must all be marked present; clearing the \
+                 size bits is what let Mutter collapse the window to 1x1"
+            );
+            assert_eq!((flags & 0xf000) >> 12, 1, "source indication: a normal application");
+
+            assert_eq!((x, y), (2255, 142));
+            assert_eq!((width, height), (1152, 1828), "the current size is restated, not zeroed");
+        }
+
+        // @lat: [[test#Window geometry compat#A negative placement survives the payload]]
+        #[test]
+        fn negative_placement_survives_the_payload() {
+            // A monitor left of the origin gives negative coordinates, which
+            // EWMH carries as the two's-complement bit pattern.
+            let [_, x, y, ..] = move_resize_payload((-1920, -64), (800, 600));
+
+            assert_eq!(x.cast_signed(), -1920);
+            assert_eq!(y.cast_signed(), -64);
+        }
     }
 }
 

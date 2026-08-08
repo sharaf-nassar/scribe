@@ -2421,6 +2421,18 @@ A capture leaves `zoom` at the neutral level for the caller to fill in with [[cr
 
 The round trip is taken with `restore_rect` present on purpose: it serializes as a TOML table, and a bare key emitted after a table would be read back as part of it, so the field's declaration order in the struct is load-bearing. A record written before the field existed carries no key and restores unzoomed through `serde(default)`.
 
+### A placement move restates the window's size
+
+The `_NET_MOVERESIZE_WINDOW` payload marks x, y, width and height all present, carries `StaticGravity`, and repeats the window's current size in its size words instead of zeroing them.
+
+This is the whole of the 1×1 outage: with only the position bits set, Mutter reconstructed the size through `WM_NORMAL_HINTS`, where GPUI publishes a maximum and no base or minimum, and collapsed every restored window with a saved position to 1×1 — mapped, in the taskbar, invisible. The test asserts on the decoded bit fields rather than the literal constant so the flags cannot be silently narrowed back.
+
+### A negative placement survives the payload
+
+A window restored onto a monitor left of the origin keeps its negative coordinates through the payload's unsigned words, read back as the two's-complement pattern EWMH specifies.
+
+Position words are `u32` on the wire while the record holds `i32`, so the conversion is where a monitor at a negative offset would quietly become a window near `u32::MAX`.
+
 ### A window off the layout is clamped back onto it
 
 A record whose monitor is gone — 3840×2160 at `x = 3840`, with only a 1920×1053 work area left — comes back inside that work area at its size, rather than at the window manager's default placement in a size the screen cannot hold.
@@ -2868,23 +2880,41 @@ Locks the selection rules of , the ordered strip the shell's tab shortcuts and t
 
 The suite drives the shortcut side —  appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where  preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
 
+#### Selection never leaves its region
+
+Every way a tab can be chosen — a digit, a click resolved to a session, a next/prev walk off the end of a region — moves only its own region's shown tab and leaves every other region's exactly where it was.
+
+This is the regression that motivated the per-region model: with a flat strip and one cursor, any of these could name a tab of another region, and the pane that then adopted it belonged to whichever region held the window's focus. The test drives all three against a two-region strip and asserts the untouched region's shown tab after each, plus that re-showing an already-shown tab reports no change so no redundant attach is issued.
+
 #### Exit refocus stays inside the workspace
 
-Removing the active tab hands the selection to the nearest surviving tab of the *same* workspace — successor first, then predecessor — never to a strip neighbour from another region.
+Removing the shown tab hands the selection to the nearest surviving tab of the *same* region — successor first, then predecessor — which is now a clamp inside that region's own list rather than a filtered search over the window.
 
-The reconcile pass adopts whatever the refocus selects into the focused pane, so a cross-workspace choice here is what dragged sessions between regions; keeping the choice workspace-scoped removes that path entirely.
+The reconcile pass adopts whatever the refocus selects, so a cross-region choice here is what dragged sessions between regions; a region's tabs being its own removes that path entirely. The test also pins that the neighbouring region's shown tab does not move.
 
-#### Last tab of a workspace falls back across the strip
+#### Emptying a region drops it
 
-Only when the removed tab was its workspace's last does the selection fall back to the strip-global neighbour: the region is collapsing, and the reconcile pass re-points the selection at whichever region inherits focus.
+A region whose last tab is removed is dropped and refocuses nothing, rather than handing its selection to the strip-adjacent tab of another region.
 
-Every surviving tab keeps its own workspace through the fallback, which the test pins with `workspace_of` checks after both removals.
+The flat strip had to fall back across the strip here, which named a session in a different region and pulled it out of its own region when the reconcile pass adopted the answer. The test removes both tabs of one region and requires the survivor region to keep its own shown tab, the dropped region to answer `None`, and every surviving tab to keep its workspace.
 
 #### Digit select is workspace-scoped
 
-`select_in_workspace` counts only the active workspace's tabs, so a `select_tab_N` digit lands on that region's Nth tab — never on the window-global strip position, which would always target the first region.
+[[crates/scribe-client/src/tab_session.rs#TabSessions#select]] takes the region explicitly and indexes only that region's tabs, so a `select_tab_N` digit lands on that region's Nth tab and cannot reach a window-global strip position.
 
-With the selection in the second workspace, digit 2 must pick that workspace's second tab, digit 1 its first, a digit past the workspace's tab count is ignored, and reselecting the active tab reports no change so no redundant attach is issued.
+Aimed at the second region, digit 2 must pick that region's second tab, digit 1 its first, a digit past the region's tab count is ignored, and reselecting the shown tab reports no change. The same digit aimed at the first region picks that region's tab, which is what a window-global index could never do.
+
+#### Reorder and addresses stay region-local
+
+A drag swaps positions inside one region's tab list, and the addresses the bars are clicked through pair one-to-one with the render model so a row position always resolves to the tab that drew there.
+
+Reordering one region must leave the other region's run untouched, the shown tab must travel with its slot rather than with its index, and an out-of-region position is refused rather than clamped into a neighbour. The test also checks that [[crates/scribe-client/src/tab_session.rs#TabSessions#addresses]] and `to_tab_data` agree in length and order, that a strip position carries its region-local index, and that each region underlines its own shown tab — two active tabs in a two-region window, not one for the whole strip.
+
+#### Region runs are structural
+
+Returning to an earlier region and opening a tab there files it in that region's own list, so the strip's region runs are contiguous without a normalizing pass.
+
+A window-global list appended it at the end, producing `left, right, left` — a run the titlebar cannot anchor without overlapping two groups at one region edge — so a regrouping sort had to run before every paint. The test opens a tab in the earlier region and requires the flattened order to be `left, left, right` with the later region's shown tab untouched.
 
 ### GPUI tab task labels
 

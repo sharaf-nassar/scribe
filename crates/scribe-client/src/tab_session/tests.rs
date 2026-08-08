@@ -4,12 +4,17 @@
 //! `select_tab_N` shortcuts drive, plus the server-side `SessionList` /
 //! `SessionCreated` / `SessionExited` mutations, so the shell's tab strip and
 //! its attach target can never disagree.
+//!
+//! Every selection rule here is scoped to one region. That used to be a set of
+//! filters layered over a flat window-global list; it is now the shape of the
+//! data, so most of these tests are asserting that the partition holds rather
+//! than that a filter was remembered.
 
 use scribe_common::ids::{SessionId, WorkspaceId};
 
-use super::{TabEntry, TabSessions};
+use super::{TabEntry, TabSessions, WorkspaceTabs};
 
-/// Build a strip of `count` tabs in one workspace, returning it with the ids.
+/// Build a strip of `count` tabs in one region, returning it with the ids.
 fn strip(count: usize) -> (TabSessions, WorkspaceId, Vec<SessionId>) {
     let workspace_id = WorkspaceId::new();
     let ids: Vec<SessionId> = (0..count).map(|_| SessionId::new()).collect();
@@ -19,22 +24,27 @@ fn strip(count: usize) -> (TabSessions, WorkspaceId, Vec<SessionId>) {
         .enumerate()
         .map(|(i, id)| TabEntry::new(*id, workspace_id, format!("shell{i}")))
         .collect();
-    tabs.reconcile(entries);
+    tabs.reconcile(entries, None);
     (tabs, workspace_id, ids)
+}
+
+/// Every session in strip order, which is region order then tab order.
+fn order(tabs: &TabSessions) -> Vec<SessionId> {
+    tabs.entries().map(|tab| tab.session_id).collect()
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip]]
 #[test]
 fn new_tab_appends_and_focuses() {
     let (mut tabs, workspace_id, ids) = strip(1);
-    assert_eq!(tabs.active_session(), Some(ids[0]));
+    assert_eq!(tabs.active_session_in(workspace_id), Some(ids[0]));
 
     let created = SessionId::new();
     let added = tabs.insert_active(TabEntry::new(created, workspace_id, "shell".to_owned()));
 
     assert!(added);
     assert_eq!(tabs.len(), 2);
-    assert_eq!(tabs.active_session(), Some(created));
+    assert_eq!(tabs.active_session_in(workspace_id), Some(created));
     // The new tab is the one the titlebar renders as active.
     let data = tabs.to_tab_data();
     assert_eq!(data.len(), 2);
@@ -49,129 +59,190 @@ fn new_tab_appends_and_focuses() {
 #[test]
 fn attach_acknowledgement_is_not_a_new_tab() {
     let (mut tabs, workspace_id, ids) = strip(2);
-    tabs.select(0);
+    tabs.select(workspace_id, 0);
 
     let echo = TabEntry::new(ids[1], workspace_id, "shell1".to_owned());
     assert!(!tabs.insert_active(echo), "a re-announced session is not a new tab");
 
     assert_eq!(tabs.len(), 2, "a duplicate SessionCreated must not add a tab");
-    assert_eq!(tabs.active_session(), Some(ids[0]), "the selection must not move");
+    assert_eq!(tabs.active_session_in(workspace_id), Some(ids[0]), "the selection must not move");
 }
 
 #[test]
 fn next_and_prev_wrap_around() {
-    let (mut tabs, _, ids) = strip(3);
-    assert_eq!(tabs.active_session(), Some(ids[0]));
+    let (mut tabs, ws, ids) = strip(3);
+    assert_eq!(tabs.active_session_in(ws), Some(ids[0]));
 
-    assert_eq!(tabs.focus_next(), Some(ids[1]));
-    assert_eq!(tabs.focus_next(), Some(ids[2]));
-    assert_eq!(tabs.focus_next(), Some(ids[0]), "next wraps past the last tab");
-    assert_eq!(tabs.focus_prev(), Some(ids[2]), "prev wraps before the first tab");
+    assert_eq!(tabs.focus_next(ws), Some(ids[1]));
+    assert_eq!(tabs.focus_next(ws), Some(ids[2]));
+    assert_eq!(tabs.focus_next(ws), Some(ids[0]), "next wraps past the last tab");
+    assert_eq!(tabs.focus_prev(ws), Some(ids[2]), "prev wraps before the first tab");
 }
 
 #[test]
 fn single_tab_navigation_reports_no_change() {
-    let (mut tabs, _, _) = strip(1);
-    assert_eq!(tabs.focus_next(), None, "one tab: no attach should be issued");
-    assert_eq!(tabs.focus_prev(), None);
-    assert_eq!(tabs.select(0), None, "reselecting the active tab is a no-op");
-    assert_eq!(tabs.select(7), None, "out-of-range select_tab_N is ignored");
+    let (mut tabs, ws, _) = strip(1);
+    assert_eq!(tabs.focus_next(ws), None, "one tab: no attach should be issued");
+    assert_eq!(tabs.focus_prev(ws), None);
+    assert_eq!(tabs.select(ws, 0), None, "reselecting the active tab is a no-op");
+    assert_eq!(tabs.select(ws, 7), None, "out-of-range select_tab_N is ignored");
+    assert_eq!(tabs.focus_next(WorkspaceId::new()), None, "an unknown region has no tabs");
 }
 
 #[test]
 fn select_jumps_to_index() {
-    let (mut tabs, _, ids) = strip(4);
-    assert_eq!(tabs.select(2), Some(ids[2]));
-    assert_eq!(tabs.select(0), Some(ids[0]));
+    let (mut tabs, ws, ids) = strip(4);
+    assert_eq!(tabs.select(ws, 2), Some(ids[2]));
+    assert_eq!(tabs.select(ws, 0), Some(ids[0]));
 }
 
 #[test]
 fn removing_active_tab_clamps_selection() {
-    let (mut tabs, _, ids) = strip(3);
-    tabs.select(2);
+    let (mut tabs, ws, ids) = strip(3);
+    tabs.select(ws, 2);
 
     // Removing the last (active) tab clamps back onto the new last tab.
     assert_eq!(tabs.remove(ids[2]), Some(ids[1]));
     assert_eq!(tabs.len(), 2);
-    assert_eq!(tabs.active_session(), Some(ids[1]));
+    assert_eq!(tabs.active_session_in(ws), Some(ids[1]));
 
     // Removing an inactive tab ahead of the cursor leaves the selection alone.
     assert_eq!(tabs.remove(ids[0]), None, "inactive removal issues no attach");
-    assert_eq!(tabs.active_session(), Some(ids[1]));
+    assert_eq!(tabs.active_session_in(ws), Some(ids[1]));
 
     // Removing the sole remaining tab empties the strip.
     assert_eq!(tabs.remove(ids[1]), None);
     assert!(tabs.is_empty());
-    assert_eq!(tabs.active_session(), None);
-    assert_eq!(tabs.active_workspace(), None);
+    assert_eq!(tabs.active_session_in(ws), None);
+    assert!(tabs.regions().is_empty(), "an emptied region is dropped, not kept dangling");
 }
 
-/// Two-workspace strip `[a1, a2 | b1, b2]`, selection on `b1` (index 2).
+/// Two-region strip `[a1, a2 | b1, b2]`, with region b showing `b1`.
 fn two_workspace_strip() -> (TabSessions, (WorkspaceId, WorkspaceId), Vec<SessionId>) {
     let ws_a = WorkspaceId::new();
     let ws_b = WorkspaceId::new();
     let ids: Vec<SessionId> = (0..4).map(|_| SessionId::new()).collect();
     let mut tabs = TabSessions::new();
-    tabs.reconcile(vec![
-        TabEntry::new(ids[0], ws_a, "a1".to_owned()),
-        TabEntry::new(ids[1], ws_a, "a2".to_owned()),
-        TabEntry::new(ids[2], ws_b, "b1".to_owned()),
-        TabEntry::new(ids[3], ws_b, "b2".to_owned()),
-    ]);
-    tabs.select(2);
+    tabs.reconcile(
+        vec![
+            TabEntry::new(ids[0], ws_a, "a1".to_owned()),
+            TabEntry::new(ids[1], ws_a, "a2".to_owned()),
+            TabEntry::new(ids[2], ws_b, "b1".to_owned()),
+            TabEntry::new(ids[3], ws_b, "b2".to_owned()),
+        ],
+        None,
+    );
+    tabs.select(ws_b, 0);
     (tabs, (ws_a, ws_b), ids)
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Selection never leaves its region]]
+#[test]
+fn selection_never_leaves_its_region() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+    let before_a = tabs.active_session_in(ws_a);
+
+    // Every way a tab can be chosen — a digit, a click resolved to a session,
+    // and a next/prev walk off the end — targets one region and leaves the
+    // other's shown tab exactly where it was.
+    assert_eq!(tabs.select(ws_b, 1), Some(ids[3]));
+    assert_eq!(tabs.active_session_in(ws_a), before_a);
+
+    assert_eq!(tabs.show(ids[2]), Some(ids[2]), "a click names a session, not a strip position");
+    assert_eq!(tabs.active_session_in(ws_a), before_a);
+
+    assert_eq!(tabs.focus_next(ws_b), Some(ids[3]));
+    assert_eq!(tabs.focus_next(ws_b), Some(ids[2]), "the walk wraps inside region b");
+    assert_eq!(tabs.active_session_in(ws_a), before_a, "region a never moved");
+
+    // Selecting into region a moves only region a.
+    assert_eq!(tabs.show(ids[1]), Some(ids[1]));
+    assert_eq!(tabs.active_session_in(ws_a), Some(ids[1]));
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]));
+    assert_eq!(tabs.show(ids[1]), None, "re-showing the shown tab issues no attach");
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Exit refocus stays inside the workspace]]
 #[test]
 fn exit_refocus_stays_inside_the_workspace() {
-    // Removing b1 must refocus b2 (same workspace), not a2 (strip neighbour).
-    let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
+    // Removing b1 must refocus b2 (same region), not a2 (strip neighbour).
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
     assert_eq!(tabs.remove(ids[2]), Some(ids[3]));
-    assert_eq!(tabs.active_workspace(), Some(ws_b));
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[3]));
+    assert_eq!(tabs.active_session_in(ws_a), Some(ids[0]), "region a is untouched");
 }
 
-/// The predecessor wins when the removed tab was its workspace's last in
-/// strip order.
+/// The predecessor wins when the removed tab was its region's last.
 #[test]
 fn exit_refocus_prefers_the_workspace_predecessor() {
     let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
-    tabs.select(3);
+    tabs.select(ws_b, 1);
     assert_eq!(tabs.remove(ids[3]), Some(ids[2]));
-    assert_eq!(tabs.active_workspace(), Some(ws_b));
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]));
 }
 
-// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Last tab of a workspace falls back across the strip]]
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Emptying a region drops it]]
 #[test]
-fn last_tab_of_a_workspace_falls_back_across_the_strip() {
-    let (mut tabs, (ws_a, _), ids) = two_workspace_strip();
+fn emptying_a_region_drops_it_without_touching_the_neighbour() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
     assert_eq!(tabs.remove(ids[2]), Some(ids[3]));
-    // Removing the workspace's last tab has nowhere same-workspace to go, so
-    // the strip-global clamp applies and the region collapse takes over.
-    assert_eq!(tabs.remove(ids[3]), Some(ids[1]));
-    assert_eq!(tabs.active_workspace(), Some(ws_a));
+    // The region's last tab has nowhere same-region to go, so the region is
+    // dropped and nothing is refocused. With a flat strip this fell back to the
+    // strip-adjacent tab, which named a session in region a and dragged it out
+    // of its own region when the reconcile pass adopted the answer.
+    assert_eq!(tabs.remove(ids[3]), None);
+    assert_eq!(tabs.regions().len(), 1);
+    assert_eq!(tabs.active_session_in(ws_a), Some(ids[0]), "region a keeps its own shown tab");
+    assert_eq!(tabs.active_session_in(ws_b), None);
     assert_eq!(tabs.workspace_of(ids[1]), Some(ws_a), "survivors keep their workspace");
     assert_eq!(tabs.workspace_of(ids[3]), None, "removed sessions are gone");
-    assert_eq!(tabs.workspace_of(ids[0]), Some(ws_a));
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Digit select is workspace-scoped]]
 #[test]
 fn digit_select_is_workspace_scoped() {
-    // Selection sits on b1, so digit 2 must land on b2 — not a2, the strip's
-    // second tab.
-    let (mut tabs, (_, ws_b), ids) = two_workspace_strip();
-    assert_eq!(tabs.select_in_workspace(1), Some(ids[3]));
-    assert_eq!(tabs.active_workspace(), Some(ws_b));
-    assert_eq!(tabs.select_in_workspace(0), Some(ids[2]), "digit 1 targets b1");
-    assert_eq!(tabs.select_in_workspace(2), None, "digits past the workspace are ignored");
-    assert_eq!(tabs.select_in_workspace(0), None, "reselecting the active tab is a no-op");
+    // Digit 2 aimed at region b must land on b2 — not a2, the strip's second
+    // tab, which is what a window-global index would have named.
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+    assert_eq!(tabs.select(ws_b, 1), Some(ids[3]));
+    assert_eq!(tabs.select(ws_b, 0), Some(ids[2]), "digit 1 targets b1");
+    assert_eq!(tabs.select(ws_b, 2), None, "digits past the region are ignored");
+    assert_eq!(tabs.select(ws_b, 0), None, "reselecting the shown tab is a no-op");
+    assert_eq!(tabs.select(ws_a, 1), Some(ids[1]), "the same digit in region a targets a2");
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Reorder and addresses stay region-local]]
+#[test]
+fn reorder_and_addresses_stay_region_local() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+
+    // Region-local positions: swapping b's two tabs must not disturb a's run,
+    // and the shown tab travels with its slot rather than with its index.
+    assert!(tabs.reorder(ws_b, 0, 1));
+    assert_eq!(order(&tabs), [ids[0], ids[1], ids[3], ids[2]]);
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]), "b still shows the tab it showed");
+    assert!(!tabs.reorder(ws_b, 0, 0), "an unchanged move is not a reorder");
+    assert!(!tabs.reorder(ws_b, 0, 5), "an out-of-region position is refused, not clamped");
+    assert!(!tabs.reorder(WorkspaceId::new(), 0, 1), "an unknown region has nothing to move");
+
+    // The addresses the bars are clicked through pair 1:1 with the render
+    // model, so a row position always resolves to the tab that drew there.
+    let data = tabs.to_tab_data();
+    let slots: Vec<_> = tabs.addresses().collect();
+    assert_eq!(data.len(), slots.len());
+    assert_eq!(slots.iter().map(|slot| slot.session_id).collect::<Vec<_>>(), order(&tabs));
+    assert_eq!(slots[0].workspace_id, ws_a);
+    assert_eq!(slots[0].index, 0);
+    assert_eq!(slots[2].workspace_id, ws_b);
+    assert_eq!(slots[2].index, 0, "the third strip tab is region b's first");
+    // Each region underlines its own shown tab, not one tab for the window.
+    assert_eq!(data.iter().filter(|tab| tab.is_active).count(), 2);
 }
 
 #[test]
 fn session_list_rebuild_preserves_order_and_active_session() {
     let (mut tabs, workspace_id, ids) = strip(3);
-    tabs.select(1);
+    tabs.select(workspace_id, 1);
 
     // A reconnect re-lists the same sessions in a different order. The list is
     // authoritative for what exists, never for what order the user put them in,
@@ -182,9 +253,9 @@ fn session_list_rebuild_preserves_order_and_active_session() {
         TabEntry::new(ids[1], workspace_id, "shell1".to_owned()),
         TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
     ];
-    assert_eq!(tabs.reconcile(reordered), Some(ids[1]));
-    assert_eq!(tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(), ids);
-    assert_eq!(tabs.active_session(), Some(ids[1]));
+    assert_eq!(tabs.reconcile(reordered, Some(ids[1])), Some(ids[1]));
+    assert_eq!(order(&tabs), ids);
+    assert_eq!(tabs.active_session_in(workspace_id), Some(ids[1]));
 
     // A session the list no longer names is dropped; a new one is appended.
     let fresh = SessionId::new();
@@ -193,45 +264,95 @@ fn session_list_rebuild_preserves_order_and_active_session() {
         TabEntry::new(ids[1], workspace_id, "shell1".to_owned()),
         TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
     ];
-    assert_eq!(tabs.reconcile(next), Some(ids[1]));
-    assert_eq!(
-        tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(),
-        [ids[0], ids[1], fresh]
-    );
+    assert_eq!(tabs.reconcile(next, Some(ids[1])), Some(ids[1]));
+    assert_eq!(order(&tabs), [ids[0], ids[1], fresh]);
+    assert_eq!(tabs.active_session_in(workspace_id), Some(ids[1]));
 
-    // When the active session is gone the strip falls back to the first tab.
+    // When the attached session is gone the strip falls back to the first
+    // region's shown tab.
     let survivors = vec![TabEntry::new(ids[0], workspace_id, "shell0".to_owned())];
-    assert_eq!(tabs.reconcile(survivors), Some(ids[0]));
+    assert_eq!(tabs.reconcile(survivors, Some(ids[1])), Some(ids[0]));
 }
 
+/// A `SessionList` that re-files a session under another workspace is the
+/// server correcting the strip, so the tab moves to that region rather than
+/// keeping a stale filing that a later `new_tab` would inherit.
 #[test]
-fn new_tab_targets_the_active_workspace() {
-    let (tabs, workspace_id, _) = strip(2);
-    assert_eq!(tabs.active_workspace(), Some(workspace_id));
+fn session_list_refiles_a_moved_session() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+    let moved = vec![
+        TabEntry::new(ids[0], ws_a, "a1".to_owned()),
+        TabEntry::new(ids[1], ws_b, "a2".to_owned()),
+        TabEntry::new(ids[2], ws_b, "b1".to_owned()),
+        TabEntry::new(ids[3], ws_b, "b2".to_owned()),
+    ];
+    tabs.reconcile(moved, Some(ids[2]));
+    assert_eq!(tabs.workspace_of(ids[1]), Some(ws_b));
+    assert_eq!(tabs.region(ws_a).map(WorkspaceTabs::len), Some(1));
+    assert_eq!(tabs.region(ws_b).map(WorkspaceTabs::len), Some(3));
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]), "region b keeps its shown tab");
 }
 
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab session strip#Region runs are structural]]
 #[test]
-fn workspace_tabs_form_one_run_without_losing_the_active_session() {
+fn a_tab_opened_in_an_earlier_region_joins_that_region_run() {
     let left = WorkspaceId::new();
     let right = WorkspaceId::new();
     let left_first = SessionId::new();
     let right_first = SessionId::new();
     let left_new = SessionId::new();
     let mut tabs = TabSessions::new();
-    tabs.reconcile(vec![
-        TabEntry::new(left_first, left, "left-1".to_owned()),
-        TabEntry::new(right_first, right, "right-1".to_owned()),
-        TabEntry::new(left_new, left, "left-2".to_owned()),
-    ]);
-    tabs.select(2);
-
-    tabs.group_by_workspace();
-
-    assert_eq!(
-        tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(),
-        [left_first, left_new, right_first]
+    tabs.reconcile(
+        vec![
+            TabEntry::new(left_first, left, "left-1".to_owned()),
+            TabEntry::new(right_first, right, "right-1".to_owned()),
+        ],
+        None,
     );
-    assert_eq!(tabs.active_session(), Some(left_new));
+
+    // Going back to the left region and opening a tab there used to append to a
+    // window-global list, producing `left, right, left` — a run the titlebar
+    // could not anchor without overlapping two groups at one region edge, so a
+    // regrouping sort had to run before every paint. The tab now joins its own
+    // region's list and the run is contiguous with no sort at all.
+    assert!(tabs.insert_active(TabEntry::new(left_new, left, "left-2".to_owned())));
+
+    assert_eq!(order(&tabs), [left_first, left_new, right_first]);
+    assert_eq!(tabs.active_session_in(left), Some(left_new));
+    assert_eq!(tabs.active_session_in(right), Some(right_first), "the right region is untouched");
+}
+
+/// A reconnect adoption restores both the region order and each region's tab
+/// order from the tree the window last reported.
+#[test]
+fn order_by_restores_regions_and_their_tabs() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+    tabs.order_by(&[ids[3], ids[2], ids[1], ids[0]]);
+
+    assert_eq!(order(&tabs), [ids[3], ids[2], ids[1], ids[0]]);
+    assert_eq!(tabs.regions()[0].workspace_id, ws_b, "region b now sits first");
+    assert_eq!(tabs.regions()[1].workspace_id, ws_a);
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[2]), "each region keeps its shown tab");
+    assert_eq!(tabs.active_session_in(ws_a), Some(ids[0]));
+}
+
+/// The client learns of a cross-region move before the server confirms it: a
+/// pane in a freshly split region adopts a session created through the previous
+/// region's workspace.
+#[test]
+fn set_workspace_moves_a_tab_between_regions() {
+    let (mut tabs, (ws_a, ws_b), ids) = two_workspace_strip();
+    assert!(tabs.set_workspace(ids[0], ws_b));
+    assert_eq!(tabs.workspace_of(ids[0]), Some(ws_b));
+    assert_eq!(tabs.region(ws_b).map(WorkspaceTabs::len), Some(3));
+    assert_eq!(tabs.active_session_in(ws_b), Some(ids[0]), "the adopting region shows it");
+    assert_eq!(tabs.active_session_in(ws_a), Some(ids[1]), "the source region reclamps");
+    assert!(!tabs.set_workspace(ids[0], ws_b), "an unchanged filing is not a move");
+    assert!(!tabs.set_workspace(SessionId::new(), ws_a), "an unknown session cannot move");
+
+    // Moving a region's last tab out drops the region.
+    assert!(tabs.set_workspace(ids[1], ws_b));
+    assert_eq!(tabs.regions().len(), 1);
 }
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab task labels]]

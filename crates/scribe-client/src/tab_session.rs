@@ -1,16 +1,27 @@
-//! Ordered tab/session model backing the GPUI shell's tab bar.
+//! Per-region tab model backing the GPUI shell's tab strip.
 //!
-//! The winit client kept its tab order inside the window-layout tree; the GPUI
-//! rebuild's shell owns a single workspace, so the tab strip needs only an
-//! ordered session list plus a selection cursor. This module is that model,
-//! kept pure (no GPUI, no IPC) so the selection, insertion, and removal rules
-//! are unit-testable headlessly.
+//! A window is a tree of workspace regions, and each region has its own ordered
+//! tabs and its own tab on screen. This module stores exactly that: regions in
+//! strip order, each owning its tabs and the index of the one it is showing.
+//!
+//! It deliberately holds no window-wide "active tab". Which region owns the
+//! window's focus belongs to the shell (`PaneShell::focused_workspace_id`), and
+//! the session the window is attached to is `Shared::active_session` — keeping a
+//! third copy here is what let a selection name a tab in one region and a pane
+//! in another, so every method that needs a region takes it as an argument
+//! instead. The previous shape was one flat `Vec` plus one cursor, written when
+//! the GPUI shell owned a single workspace; everything that had to be layered on
+//! top of it afterwards (strip-wide regrouping, titlebar-position translation,
+//! two selection APIs, a cross-workspace adoption guard) existed to simulate the
+//! partition this now stores directly.
 //!
 //! The IPC reader mutates it from server traffic (`SessionList`,
 //! `SessionCreated`, `SessionExited`) and the key-dispatch path mutates it from
 //! [`crate::keybindings::LayoutAction`] tab commands. Both share it behind a
-//! mutex, so every mutator returns the session that should now be attached (or
-//! `None` when nothing changed) rather than reaching for the IPC sink itself.
+//! mutex — which is why it stays a plain data structure rather than a GPUI
+//! entity, the reader thread having no `App` to hold one in — so every mutator
+//! returns the session that should now be attached (or `None` when nothing
+//! changed) rather than reaching for the IPC sink itself.
 
 use scribe_common::ids::{SessionId, WorkspaceId};
 
@@ -49,14 +60,77 @@ impl TabEntry {
     }
 }
 
-/// Ordered tab strip plus the index of the active tab.
+/// One region's ordered tabs plus the index of the tab it is showing.
 ///
-/// The active index is always a valid position while the strip is non-empty;
-/// removal clamps it so the selection can never dangle past the end.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TabSessions {
+/// The active index is always a valid position while the region is non-empty;
+/// an empty region is dropped rather than kept with a dangling cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTabs {
+    /// The region these tabs belong to.
+    pub workspace_id: WorkspaceId,
     tabs: Vec<TabEntry>,
     active: usize,
+}
+
+impl WorkspaceTabs {
+    /// A region showing its only tab.
+    fn seeded(entry: TabEntry) -> Self {
+        Self { workspace_id: entry.workspace_id, tabs: vec![entry], active: 0 }
+    }
+
+    /// Borrow this region's ordered tabs.
+    #[must_use]
+    pub fn tabs(&self) -> &[TabEntry] {
+        &self.tabs
+    }
+
+    /// The session this region is showing.
+    #[must_use]
+    pub fn active_session(&self) -> Option<SessionId> {
+        self.tabs.get(self.active).map(|tab| tab.session_id)
+    }
+
+    /// Number of tabs in this region.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// `true` while this region holds no tabs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// Re-point `active` at `session_id`, falling back to the first tab.
+    ///
+    /// Every reorder runs through this rather than adjusting the index by hand:
+    /// the tab on screen must not change because its neighbours moved.
+    fn keep_showing(&mut self, session_id: Option<SessionId>) {
+        self.active = session_id
+            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
+            .unwrap_or(0);
+    }
+}
+
+/// Where one rendered tab lives: its region, its position inside that region,
+/// and the session it renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabAddress {
+    /// The region the tab belongs to.
+    pub workspace_id: WorkspaceId,
+    /// The tab's position within that region — the index [`TabSessions::select`]
+    /// and [`TabSessions::reorder`] take, never a window-global one.
+    pub index: usize,
+    /// The session the tab renders.
+    pub session_id: SessionId,
+}
+
+/// The window's tabs, partitioned by region and ordered as the strip draws
+/// them: regions left to right, tabs left to right inside each region.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TabSessions {
+    regions: Vec<WorkspaceTabs>,
 }
 
 impl TabSessions {
@@ -66,43 +140,52 @@ impl TabSessions {
         Self::default()
     }
 
-    /// Borrow the ordered tabs.
+    /// Borrow the regions in strip order.
     #[must_use]
-    pub fn tabs(&self) -> &[TabEntry] {
-        &self.tabs
+    pub fn regions(&self) -> &[WorkspaceTabs] {
+        &self.regions
     }
 
-    /// Number of open tabs.
+    /// Every tab in the window, in strip order.
+    ///
+    /// Region grouping is structural now, so this is simply the concatenation —
+    /// there is no longer a regrouping pass that has to run before the strip can
+    /// be drawn or reported.
+    pub fn entries(&self) -> impl Iterator<Item = &TabEntry> {
+        self.regions.iter().flat_map(|region| region.tabs.iter())
+    }
+
+    /// Total number of open tabs across every region.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tabs.len()
+        self.regions.iter().map(WorkspaceTabs::len).sum()
     }
 
-    /// `true` while no session is open.
+    /// `true` while no session is open in any region.
+    ///
+    /// A region that runs out of tabs is dropped ([`Self::prune_empty`]), so an
+    /// empty strip is an empty region list.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
+        self.regions.is_empty()
     }
 
-    /// The active tab, if any.
+    /// Borrow one region's tabs.
     #[must_use]
-    pub fn active(&self) -> Option<&TabEntry> {
-        self.tabs.get(self.active)
+    pub fn region(&self, workspace_id: WorkspaceId) -> Option<&WorkspaceTabs> {
+        self.regions.iter().find(|region| region.workspace_id == workspace_id)
     }
 
-    /// The active tab's session id, if any.
+    /// The tab `workspace_id`'s region is showing.
     #[must_use]
-    pub fn active_session(&self) -> Option<SessionId> {
-        self.active().map(|tab| tab.session_id)
+    pub fn active_session_in(&self, workspace_id: WorkspaceId) -> Option<SessionId> {
+        self.region(workspace_id).and_then(WorkspaceTabs::active_session)
     }
 
-    /// The workspace new tabs should be spawned into.
-    ///
-    /// Falls back to the first tab's workspace so a `new_tab` issued while the
-    /// selection is momentarily empty still targets the shell's workspace.
+    /// The workspace a session's tab is filed under, if the session is open.
     #[must_use]
-    pub fn active_workspace(&self) -> Option<WorkspaceId> {
-        self.active().or_else(|| self.tabs.first()).map(|tab| tab.workspace_id)
+    pub fn workspace_of(&self, session_id: SessionId) -> Option<WorkspaceId> {
+        self.entries().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
     }
 
     /// Fold an authoritative `SessionList` into the strip, keeping the order the
@@ -110,49 +193,71 @@ impl TabSessions {
     ///
     /// The list says which sessions exist and what they are called; it does not
     /// say what order the user put them in. Overwriting the strip with the
-    /// list's order — which is what this did — threw away every drag-reorder on
-    /// the next list and, because the server's list is grouped by a `HashMap` of
-    /// workspaces, reshuffled a multi-region window's tabs on every reconnect.
-    /// Order is client state now: it is restored from the server's workspace
-    /// tree (see [`Self::order_by`]) and reported back on it.
+    /// list's order threw away every drag-reorder on the next list and, because
+    /// the server's list is grouped by a `HashMap` of workspaces, reshuffled a
+    /// multi-region window's tabs on every reconnect. Order is client state: it
+    /// is restored from the server's workspace tree (see [`Self::order_by`]) and
+    /// reported back on it.
     ///
     /// Surviving tabs keep their position and take the list's fresh metadata,
-    /// sessions the list no longer names are dropped, and genuinely new ones are
-    /// appended in list order. Returns the session that should be attached.
-    pub fn reconcile(&mut self, incoming: Vec<TabEntry>) -> Option<SessionId> {
-        let previous = self.active_session();
-        let mut merged: Vec<TabEntry> = Vec::with_capacity(incoming.len());
-        for existing in &self.tabs {
-            if let Some(fresh) = incoming.iter().find(|tab| tab.session_id == existing.session_id) {
-                merged.push(fresh.clone());
-            }
+    /// sessions the list no longer names are dropped, genuinely new ones are
+    /// appended to their own region in list order, and each region keeps
+    /// showing the tab it was showing. Returns the session the window should be
+    /// attached to: `attached` when it survived the list, else the first
+    /// region's shown tab.
+    pub fn reconcile(
+        &mut self,
+        incoming: Vec<TabEntry>,
+        attached: Option<SessionId>,
+    ) -> Option<SessionId> {
+        let showing: Vec<(WorkspaceId, Option<SessionId>)> = self
+            .regions
+            .iter()
+            .map(|region| (region.workspace_id, region.active_session()))
+            .collect();
+        // Regions keep their strip order and lose only the tabs the list
+        // dropped; a tab that moved workspace is re-filed by the append pass
+        // below, so it is removed here too.
+        // A tab the list still names keeps its slot and takes the list's fresh
+        // metadata. One the list re-files under another workspace is dropped
+        // here and re-appended to its new region by the pass below, so the
+        // server's filing always wins over the strip's.
+        let refreshed = |tab: &TabEntry| {
+            incoming
+                .iter()
+                .find(|fresh| {
+                    fresh.session_id == tab.session_id && fresh.workspace_id == tab.workspace_id
+                })
+                .cloned()
+        };
+        for region in &mut self.regions {
+            region.tabs = region.tabs.iter().filter_map(refreshed).collect();
         }
         for fresh in incoming {
-            if !merged.iter().any(|tab| tab.session_id == fresh.session_id) {
-                merged.push(fresh);
+            if self.entries().any(|tab| tab.session_id == fresh.session_id) {
+                continue;
             }
+            self.push(fresh);
         }
-        self.tabs = merged;
-        self.active = previous
-            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
-            .unwrap_or(0);
-        self.active_session()
+        // Every region is re-pointed, not just the ones that already existed:
+        // the append pass shows each tab it pushes (correct for a user opening
+        // one, wrong for a rebuild), so a region the list introduces has to fall
+        // back to its first tab rather than keep whichever tab landed last.
+        for region in &mut self.regions {
+            let previous = showing
+                .iter()
+                .find(|(workspace_id, _)| *workspace_id == region.workspace_id)
+                .and_then(|(_, session_id)| *session_id);
+            region.keep_showing(previous);
+        }
+        self.prune_empty();
+        attached
+            .filter(|id| self.entries().any(|tab| tab.session_id == *id))
+            .or_else(|| self.regions.first().and_then(WorkspaceTabs::active_session))
     }
 
-    /// Make `session_id` the active tab, if it is open.
-    ///
-    /// Used after a reconnect adoption to restore the tab the region was showing
-    /// when the client last reported its tree.
-    pub fn activate(&mut self, session_id: SessionId) -> bool {
-        let Some(index) = self.tabs.iter().position(|tab| tab.session_id == session_id) else {
-            return false;
-        };
-        self.active = index;
-        true
-    }
-
-    /// Append a session and focus it, matching the legacy client's behaviour of
-    /// switching to a freshly created tab.
+    /// Append a session to its own region and show it there, matching the
+    /// legacy client's behaviour of switching to a freshly created tab.
     ///
     /// Returns `false` — leaving the strip untouched — when the session is
     /// already open. The server re-announces `SessionCreated` as its
@@ -160,169 +265,149 @@ impl TabSessions {
     /// each announcement would loop forever; this makes the insert the only
     /// event that means "a new tab appeared".
     pub fn insert_active(&mut self, entry: TabEntry) -> bool {
-        if self.tabs.iter().any(|tab| tab.session_id == entry.session_id) {
+        if self.entries().any(|tab| tab.session_id == entry.session_id) {
             return false;
         }
-        self.tabs.push(entry);
-        self.active = self.tabs.len() - 1;
+        self.push(entry);
         true
     }
 
-    /// Drop a session (it exited or its tab was closed), clamping the selection.
+    /// Append `entry` to its region, creating the region at the end of the
+    /// strip when this is its first tab, and show it.
+    fn push(&mut self, entry: TabEntry) {
+        match self.regions.iter_mut().find(|region| region.workspace_id == entry.workspace_id) {
+            Some(region) => {
+                region.tabs.push(entry);
+                region.active = region.tabs.len() - 1;
+            }
+            None => self.regions.push(WorkspaceTabs::seeded(entry)),
+        }
+    }
+
+    /// Drop a session (it exited or its tab was closed).
     ///
-    /// Returns the session that should now be attached: `None` when the strip
-    /// is empty or when the removal did not disturb the active tab.
-    ///
-    /// The refocus is workspace-scoped: an exit hands the selection to the
-    /// nearest surviving tab of the *same* workspace, so a strip-adjacent tab
-    /// from another region can never be pulled across a workspace boundary by
-    /// the reconcile pass that adopts the newly active session. Only when the
-    /// exited tab was its workspace's last does the selection fall back to the
-    /// strip-adjacent neighbour — the region is collapsing, and the reconcile
-    /// pass re-points the selection at whichever region inherits focus.
+    /// Returns the tab its region should now show, or `None` when the removed
+    /// tab was not the one on screen or its region emptied out. The refocus
+    /// cannot leave the region: a region's tabs are its own, so the "next tab
+    /// wins, else the previous one" rule is just a clamp inside that region and
+    /// no strip-adjacent tab from another region is reachable.
     pub fn remove(&mut self, session_id: SessionId) -> Option<SessionId> {
-        let index = self.tabs.iter().position(|tab| tab.session_id == session_id)?;
-        let workspace_id = self.tabs.get(index)?.workspace_id;
-        let was_active = index == self.active;
-        self.tabs.remove(index);
-        if self.tabs.is_empty() {
-            self.active = 0;
+        let region = self
+            .regions
+            .iter_mut()
+            .find(|region| region.tabs.iter().any(|tab| tab.session_id == session_id))?;
+        let index = region.tabs.iter().position(|tab| tab.session_id == session_id)?;
+        let was_active = index == region.active;
+        region.tabs.remove(index);
+        if region.tabs.is_empty() {
+            self.prune_empty();
             return None;
         }
-        if index < self.active {
-            self.active -= 1;
+        // The slot at `index` now holds what was its successor, so clamping is
+        // already "next tab wins"; only a removal before the shown tab shifts it.
+        if index < region.active {
+            region.active -= 1;
         }
-        self.active = self.active.min(self.tabs.len() - 1);
-        if !was_active {
+        region.active = region.active.min(region.tabs.len() - 1);
+        was_active.then(|| region.active_session()).flatten()
+    }
+
+    /// Show the next tab of `workspace_id`'s region, wrapping at the end.
+    ///
+    /// Returns the newly shown session, or `None` when the selection did not
+    /// move (fewer than two tabs in the region) so the caller skips a redundant
+    /// attach. The walk stays inside the region — with a window-global strip it
+    /// stepped off the end into a neighbouring region's tabs, which is a switch
+    /// no pane could honour without dragging the session across the boundary.
+    pub fn focus_next(&mut self, workspace_id: WorkspaceId) -> Option<SessionId> {
+        self.step(workspace_id, 1)
+    }
+
+    /// Show the previous tab of `workspace_id`'s region, wrapping at the start.
+    pub fn focus_prev(&mut self, workspace_id: WorkspaceId) -> Option<SessionId> {
+        self.step(workspace_id, -1)
+    }
+
+    /// Show the `index`-th tab (0-based) of `workspace_id`'s region, ignoring
+    /// out-of-range positions the way the legacy `select_tab_N` shortcuts did.
+    ///
+    /// This is the only selection entry point. The window-global variant it
+    /// replaces is what let a `select_tab_N` digit, a titlebar click, or a strip
+    /// fallback name a tab outside the region it was aimed at.
+    pub fn select(&mut self, workspace_id: WorkspaceId, index: usize) -> Option<SessionId> {
+        let region = self.region_mut(workspace_id)?;
+        if index >= region.tabs.len() || index == region.active {
             return None;
         }
-        if let Some(next) = self.nearest_in_workspace(index, workspace_id) {
-            self.active = next;
-        }
-        self.active_session()
+        region.active = index;
+        region.active_session()
     }
 
-    /// The surviving tab of `workspace_id` closest to removal point `index`,
-    /// preferring the tab that slid into the removed slot over the one before
-    /// it — the same "next tab wins" rule the strip-global clamp follows.
-    fn nearest_in_workspace(&self, index: usize, workspace_id: WorkspaceId) -> Option<usize> {
-        let distance = |i: usize| {
-            // The slot at `index` now holds the old `index + 1` tab: the
-            // successor. Rank it closest, then earlier tabs by proximity.
-            if i >= index { (i - index) * 2 } else { (index - i) * 2 - 1 }
-        };
-        self.tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| tab.workspace_id == workspace_id)
-            .min_by_key(|(i, _)| distance(*i))
-            .map(|(i, _)| i)
-    }
-
-    /// Focus the next tab, wrapping at the end.
+    /// Show `session_id` in its own region, whichever region that is.
     ///
-    /// Returns the newly active session, or `None` when the selection did not
-    /// move (fewer than two tabs) so the caller skips a redundant attach.
-    pub fn focus_next(&mut self) -> Option<SessionId> {
-        self.step(1)
-    }
-
-    /// Focus the previous tab, wrapping at the start.
-    pub fn focus_prev(&mut self) -> Option<SessionId> {
-        self.step(-1)
-    }
-
-    /// Focus the tab at `index` (0-based), ignoring out-of-range positions the
-    /// way the legacy `select_tab_N` shortcuts did.
-    pub fn select(&mut self, index: usize) -> Option<SessionId> {
-        if index >= self.tabs.len() || index == self.active {
+    /// Returns the session when this changed what its region shows, and `None`
+    /// when it was already showing (or is not open) so the caller skips a
+    /// redundant attach — the same contract as [`Self::select`], which is what
+    /// lets both feed `switch_tab`. Callers name a session rather than a
+    /// position because a click, a notification, a pane focus, a reconnect
+    /// adoption, and a strip fallback all know *which session*; with a flat
+    /// strip each had to look up a window-global index first, and that lookup
+    /// is what carried the selection out of the region it was aimed at.
+    pub fn show(&mut self, session_id: SessionId) -> Option<SessionId> {
+        let region = self
+            .regions
+            .iter_mut()
+            .find(|region| region.tabs.iter().any(|tab| tab.session_id == session_id))?;
+        let index = region.tabs.iter().position(|tab| tab.session_id == session_id)?;
+        if index == region.active {
             return None;
         }
-        self.active = index;
-        self.active_session()
+        region.active = index;
+        Some(session_id)
     }
 
-    /// Focus the `index`-th tab (0-based) of the active workspace.
+    /// Move a tab inside its own region, keeping the same tab on screen.
     ///
-    /// The strip is window-global, so `select_tab_N` shortcuts must not index
-    /// it directly: with two workspaces the low digits would always land in
-    /// the first region's tabs. This counts only tabs filed under the active
-    /// workspace — the one holding the focused pane, kept current by every
-    /// focus move — and ignores out-of-range digits like [`Self::select`].
-    pub fn select_in_workspace(&mut self, index: usize) -> Option<SessionId> {
-        let workspace_id = self.active_workspace()?;
-        let strip_index = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| tab.workspace_id == workspace_id)
-            .nth(index)
-            .map(|(i, _)| i)?;
-        self.select(strip_index)
+    /// Both positions are region-local, so a drag cannot carry a tab out of its
+    /// region — the strip offset arithmetic that used to translate them is gone
+    /// with the flat model. Returns `false` for an out-of-range or unchanged
+    /// move so callers can skip a redundant redraw.
+    pub fn reorder(&mut self, workspace_id: WorkspaceId, from: usize, to: usize) -> bool {
+        let Some(region) = self.region_mut(workspace_id) else { return false };
+        if from >= region.tabs.len() || to >= region.tabs.len() || from == to {
+            return false;
+        }
+        let showing = region.active_session();
+        let moved = region.tabs.remove(from);
+        region.tabs.insert(to, moved);
+        region.keep_showing(showing);
+        true
     }
 
-    /// Move a tab within the strip while keeping the same session active.
-    ///
-    /// Returns `false` for an out-of-range or unchanged move so callers can
-    /// skip a redundant redraw.
-    /// Reorder the strip so sessions named in `order` come first, in that
-    /// order; everything else keeps its relative order after them.
+    /// Order regions, and the tabs inside each, to match `order`.
     ///
     /// Used after a reconnect adoption: `order` is the adopted layout's
-    /// left-to-right region order, so each workspace's tab group sits in the
-    /// strip where its region sits in the window.
+    /// left-to-right, top-to-bottom session order, so each region lands where
+    /// its own region sits in the window and its tabs come back in the order the
+    /// user left them. Sessions the order does not name keep their relative
+    /// position at the end.
     pub fn order_by(&mut self, order: &[SessionId]) {
-        let active_session = self.active_session();
-        let position = |tab: &TabEntry| {
-            order.iter().position(|id| *id == tab.session_id).unwrap_or(usize::MAX)
+        let rank = |session_id: SessionId| {
+            order.iter().position(|id| *id == session_id).unwrap_or(usize::MAX)
         };
-        self.tabs.sort_by_key(position);
-        self.active = active_session
-            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
-            .unwrap_or(0);
-    }
-
-    /// Keep every workspace's tabs in one contiguous run.
-    ///
-    /// New tabs are appended globally, so returning to an earlier workspace
-    /// and opening one can otherwise produce `left, right, left`. The titlebar
-    /// cannot anchor two separate runs at the same region edge without
-    /// overlapping them, so normalize the strip while preserving both
-    /// workspace order and the order of tabs inside each workspace.
-    pub fn group_by_workspace(&mut self) {
-        let active_session = self.active_session();
-        let mut workspaces = Vec::new();
-        for tab in &self.tabs {
-            if !workspaces.contains(&tab.workspace_id) {
-                workspaces.push(tab.workspace_id);
-            }
+        for region in &mut self.regions {
+            let showing = region.active_session();
+            region.tabs.sort_by_key(|tab| rank(tab.session_id));
+            region.keep_showing(showing);
         }
-        self.tabs.sort_by_key(|tab| {
-            workspaces.iter().position(|id| *id == tab.workspace_id).unwrap_or(usize::MAX)
+        self.regions.sort_by_key(|region| {
+            region.tabs.iter().map(|tab| rank(tab.session_id)).min().unwrap_or(usize::MAX)
         });
-        self.active = active_session
-            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
-            .unwrap_or(0);
-    }
-
-    pub fn reorder(&mut self, from: usize, to: usize) -> bool {
-        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
-            return false;
-        }
-        let active_session = self.active_session();
-        let moved = self.tabs.remove(from);
-        self.tabs.insert(to, moved);
-        self.active = active_session
-            .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
-            .unwrap_or(0);
-        true
     }
 
     /// Retitle a session's tab, returning `true` when the label changed.
     pub fn set_title(&mut self, session_id: SessionId, title: String) -> bool {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {
-            return false;
-        };
+        let Some(tab) = self.entry_mut(session_id) else { return false };
         if tab.title == title {
             return false;
         }
@@ -330,30 +415,37 @@ impl TabSessions {
         true
     }
 
-    /// The workspace a session's tab is filed under, if the session is open.
-    #[must_use]
-    pub fn workspace_of(&self, session_id: SessionId) -> Option<WorkspaceId> {
-        self.tabs.iter().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
-    }
-
-    /// Re-file a session under another workspace, returning `true` when the
-    /// entry moved.
+    /// Re-file a session under another region, returning `true` when it moved.
     ///
     /// A session's workspace is the server's to own, but the client learns of a
     /// move first: a pane in a freshly split region adopts a session that was
     /// created through the previous region's workspace, and the client sends
     /// `ClientMessage::MoveSession` to say so. Recording it here keeps the strip
-    /// (and therefore the workspace a later `new_tab` targets) in step with the
-    /// region the user is actually in, instead of pinning every later session to
-    /// the window's first workspace.
+    /// in step with the region the user is actually in.
+    ///
+    /// The tab is appended to the target region and shown there, because the
+    /// only thing that moves a session between regions is a pane in the target
+    /// adopting it. A source region left empty is dropped.
     pub fn set_workspace(&mut self, session_id: SessionId, workspace_id: WorkspaceId) -> bool {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {
+        let Some(source) = self
+            .regions
+            .iter_mut()
+            .find(|region| region.tabs.iter().any(|tab| tab.session_id == session_id))
+        else {
             return false;
         };
-        if tab.workspace_id == workspace_id {
+        if source.workspace_id == workspace_id {
             return false;
         }
-        tab.workspace_id = workspace_id;
+        let Some(index) = source.tabs.iter().position(|tab| tab.session_id == session_id) else {
+            return false;
+        };
+        let showing = source.active_session();
+        let mut entry = source.tabs.remove(index);
+        source.keep_showing(showing);
+        entry.workspace_id = workspace_id;
+        self.push(entry);
+        self.prune_empty();
         true
     }
 
@@ -364,9 +456,7 @@ impl TabSessions {
     /// rule that a provider must not be able to blank a tab down to nothing.
     pub fn set_task_label(&mut self, session_id: SessionId, label: Option<&str>) -> bool {
         let label = label.map(str::trim).filter(|label| !label.is_empty());
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {
-            return false;
-        };
+        let Some(tab) = self.entry_mut(session_id) else { return false };
         if tab.task_label.as_deref() == label {
             return false;
         }
@@ -374,31 +464,74 @@ impl TabSessions {
         true
     }
 
-    /// Lower the strip into the titlebar's render model.
+    /// Every tab's address, in the same order as [`Self::to_tab_data`].
+    ///
+    /// The titlebar and the in-region bars are flat rows of pixels, so a click
+    /// arrives as a position in a row and has to be resolved back to a tab.
+    /// Pairing the render model with these addresses is what makes that
+    /// resolution total: a row position names a region and a position inside
+    /// it, never a window-global index that a neighbouring region also answers
+    /// to.
+    pub fn addresses(&self) -> impl Iterator<Item = TabAddress> {
+        self.regions.iter().flat_map(|region| {
+            region.tabs.iter().enumerate().map(move |(index, tab)| TabAddress {
+                workspace_id: region.workspace_id,
+                index,
+                session_id: tab.session_id,
+            })
+        })
+    }
+
+    /// Lower the strip into the titlebar's render model, in strip order.
+    ///
+    /// `is_active` marks the tab each region is *showing*, not one tab for the
+    /// whole window: every region paints its own bar and every bar underlines
+    /// its own tab, independent of which region holds the window's focus.
     #[must_use]
     pub fn to_tab_data(&self) -> Vec<TabData> {
-        self.tabs
+        self.regions
             .iter()
-            .enumerate()
-            .map(|(index, tab)| {
-                let mut data = TabData::new(tab.display_title().to_owned());
-                data.accessibility_id = tab.session_id.to_string();
-                data.is_active = index == self.active;
-                data
+            .flat_map(|region| {
+                region.tabs.iter().enumerate().map(move |(index, tab)| {
+                    let mut data = TabData::new(tab.display_title().to_owned());
+                    data.accessibility_id = tab.session_id.to_string();
+                    data.is_active = index == region.active;
+                    data
+                })
             })
             .collect()
     }
 
-    /// Move the selection by `delta` with wraparound.
-    fn step(&mut self, delta: isize) -> Option<SessionId> {
-        let len = self.tabs.len();
+    /// Borrow one region mutably.
+    fn region_mut(&mut self, workspace_id: WorkspaceId) -> Option<&mut WorkspaceTabs> {
+        self.regions.iter_mut().find(|region| region.workspace_id == workspace_id)
+    }
+
+    /// Borrow one session's tab mutably, wherever it is filed.
+    fn entry_mut(&mut self, session_id: SessionId) -> Option<&mut TabEntry> {
+        self.regions
+            .iter_mut()
+            .flat_map(|region| region.tabs.iter_mut())
+            .find(|tab| tab.session_id == session_id)
+    }
+
+    /// Drop regions that have run out of tabs, so an empty region can never be
+    /// carried with a dangling cursor.
+    fn prune_empty(&mut self) {
+        self.regions.retain(|region| !region.tabs.is_empty());
+    }
+
+    /// Move a region's shown tab by `delta` with wraparound.
+    fn step(&mut self, workspace_id: WorkspaceId, delta: isize) -> Option<SessionId> {
+        let region = self.region_mut(workspace_id)?;
+        let len = region.tabs.len();
         if len < 2 {
             return None;
         }
         let len_i = isize::try_from(len).unwrap_or(isize::MAX);
-        let current = isize::try_from(self.active).unwrap_or(0);
-        self.active = usize::try_from((current + delta).rem_euclid(len_i)).unwrap_or(0);
-        self.active_session()
+        let current = isize::try_from(region.active).unwrap_or(0);
+        region.active = usize::try_from((current + delta).rem_euclid(len_i)).unwrap_or(0);
+        region.active_session()
     }
 }
 
