@@ -600,6 +600,9 @@ fn queue_from_launch_record(
             latest_prompt: record.latest_prompt.clone(),
             latest_prompt_at: from_epoch_secs(record.latest_prompt_at),
             latest_prompt_finished_at: from_epoch_secs(record.latest_prompt_finished_at),
+            // A restored pane starts with its bar shown: the dismissal is a
+            // live-session gesture and is not carried in the launch record.
+            dismissed: false,
         },
         last_conversation_id,
         grid: None,

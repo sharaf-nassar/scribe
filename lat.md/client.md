@@ -1026,7 +1026,17 @@ The strip is per-pane chrome, matching the winit client: [[crates/scribe-client/
 
 The meter text itself comes from  so the prompt bar, the tab suffix, and the E2E assertions share one spelling;  colors it by the configured band and falls back to the bar's text color when a band hex fails to parse, degrading the color rather than hiding the percentage.
 
-Both the reserved and the painted height come from one [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics]], resolved per frame by [[crates/scribe-client/src/main.rs#TerminalView#prompt_bar_metrics]] from the live `GridFont` plus the optional `terminal.prompt_bar_font_size` override. Unset, the strip's glyph size *is* the grid's, so an `appearance.font_size` edit and a zoom step both carry the strip along instead of leaving it at a fixed 12px beside larger terminal text; set, the override scales the grid's row height by the same ratio so the row padding stays proportional. Handing the one value to both [[crates/scribe-client/src/prompt_bar.rs#prompt_bar_height]] and [[crates/scribe-client/src/prompt_bar.rs#render]] is what keeps the band the pane reserves identical to the band it paints — a drift there sizes the PTY grid against rows that are not on screen.
+Both the reserved and the painted height come from one [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics]], resolved per frame by [[crates/scribe-client/src/main.rs#TerminalView#prompt_bar_metrics]] from the live `GridFont` plus the optional `terminal.prompt_bar_font_size` override. Unset, the strip's glyph size *is* the grid's, so an `appearance.font_size` edit and a zoom step both carry the strip along instead of leaving it at a fixed 12px beside larger terminal text; set, the override scales the grid's row height and advance width by the same ratio so the row padding and the truncation measure stay proportional. Handing the one value to both [[crates/scribe-client/src/prompt_bar.rs#prompt_bar_height]] and [[crates/scribe-client/src/prompt_bar.rs#render]] is what keeps the band the pane reserves identical to the band it paints — a drift there sizes the PTY grid against rows that are not on screen.
+
+### Hover, reveal, and dismissal
+
+Hovering a prompt row instantly reveals its full text, tints that row, and puts the dismiss control in the strip's left lane; clicking it takes the bar down for that pane.
+
+The renderer owns the visuals and the view owns the state, the split [[crates/scribe-client/src/status_bar.rs#StatusBarActions]] already uses: [[crates/scribe-client/src/main.rs#TerminalView#prompt_bar_actions]] builds a [[crates/scribe-client/src/prompt_bar.rs#PromptBarActions]] carrying the pointed-at target in and the listeners back out. Hover lives in [[crates/scribe-client/src/main.rs#PointerState]] as a `(session, target)` pair, so a split window tints exactly one pane's strip, and a leave only clears the hover it names — GPUI does not order the old row's leave before the new row's enter, and clearing blind would drop the fresh hover as the pointer slides between rows. Each strip takes a session-derived element id so two panes never share GPUI's hover or tooltip state.
+
+The reveal is a GPUI tooltip with [[crates/scribe-client/src/prompt_bar.rs#PromptTooltip]] as its view and its show delay set to zero: the default half-second delay reads as a hint arriving late rather than as the row expanding. Only a clipped row gets one — [[crates/scribe-client/src/prompt_bar.rs#is_prompt_truncated]] measures the row's text against the painted strip width and the strip's own advance width (`PromptBarMetrics::cell_width`, scaled by the same override ratio as the row height), so a prompt that already fits raises no popup.
+
+[[crates/scribe-client/src/prompt_bar.rs#dismiss_overlay]] is built only while the strip is hovered, and it sits inside row 1's own hitbox, so pointing at the `×` keeps that row hovered and the overlay stays up long enough to click. The click routes to [[crates/scribe-client/src/main.rs#TerminalView#dismiss_prompt_bar]], which sets `PromptBarData::dismissed`; [[crates/scribe-client/src/main.rs#AiChrome#visible_prompts]] is the single gate both [[crates/scribe-client/src/main.rs#TerminalView#prompt_model_for]] and [[crates/scribe-client/src/main.rs#TerminalView#pane_prompt_bar_height]] read, so the strip stops painting and stops reserving rows in the same frame and the redraw hands them back to the PTY grid. The flag rides on the prompt record, so it lifts exactly where the record does — [[crates/scribe-client/src/main.rs#AiChrome#note_conversation]] retiring the history on a conversation switch, or [[crates/scribe-client/src/main.rs#AiChrome#forget]] dropping it when the provider or the session exits. That is the legacy boundary: dismissed for the rest of the conversation, back for the next one. A restored pane starts undismissed, because the gesture is not carried in the launch record.
 
 ### Live AI wiring
 
@@ -1064,7 +1074,7 @@ Verifies  is zero for no prompts or a non-positive cell height, one row for one 
 
 ### Strip metrics follow the grid font
 
-Verifies [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics#resolve]] paints at the grid's own glyph size and row height when `terminal.prompt_bar_font_size` is unset, and that an explicit size both wins and scales the row height by the same ratio.
+Verifies [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics#resolve]] paints at the grid's own glyph size, row height, and advance width when `terminal.prompt_bar_font_size` is unset, and that an explicit size both wins and scales the row height and advance width by the same ratio.
 
 ### Model shows one row for one prompt, two for many
 
@@ -1073,6 +1083,10 @@ Verifies  emits only the first row for a single prompt and both rows (with the `
 ### Truncation predicate gates the hover tooltip
 
 Verifies  reports a short prompt as fitting a wide bar and a long prompt as overflowing a narrow one.
+
+### Dismissal hides the strip without losing the history
+
+Verifies [[crates/scribe-client/src/main.rs#AiChrome#dismiss]] takes the pane out of [[crates/scribe-client/src/main.rs#AiChrome#visible_prompts]] — so nothing is painted and no rows are reserved — while the prompt record itself survives until [[crates/scribe-client/src/main.rs#AiChrome#forget]] clears it.
 
 ## GPUI Find Overlay
 
