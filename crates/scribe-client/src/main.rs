@@ -300,6 +300,55 @@ impl AiChrome {
         data.latest_prompt_finished_at = None;
     }
 
+    /// Fold one `AiStateChanged` edge onto the chrome: the conversation
+    /// bookkeeping, the prompt bar's elapsed-timer freeze, and the tracker.
+    ///
+    /// One method rather than a closure inside the IPC reader so everything a
+    /// state edge does to the chrome is exercisable without a live `ReaderCtx`
+    /// — the freeze shipped broken precisely because only the pure formatter
+    /// was under test and nothing asserted that anything ever set its input.
+    fn apply_state_change(
+        &mut self,
+        session_id: SessionId,
+        ai_state: scribe_common::ai_state::AiProcessState,
+        at: std::time::SystemTime,
+    ) {
+        let provider = ai_state.provider;
+        // Before the tracker takes ownership: a state edge is the only frame
+        // that names the provider's conversation, and a switch must take the
+        // previous conversation's prompt bar with it.
+        if let Some(conversation_id) = ai_state.conversation_id.as_deref() {
+            self.note_conversation(session_id, conversation_id);
+        }
+        self.note_prompt_progress(session_id, &ai_state.state, at);
+        self.tracker.update(session_id, ai_state);
+        self.tracker.remember_provider(session_id, provider);
+    }
+
+    /// Freeze or resume the pane's elapsed timer for an AI state edge.
+    ///
+    /// Leaving `Processing` stamps the instant the timer freezes at, so the
+    /// figure reads prompt-to-finish rather than wall-clock-since-prompt; a
+    /// return to `Processing` clears the stamp and the timer ticks again, as
+    /// does the next [`Self::record_prompt`]. The stamp is taken once per run
+    /// rather than on every non-`Processing` edge, because an idle provider
+    /// keeps emitting them and each one would push a frozen value forward.
+    fn note_prompt_progress(
+        &mut self,
+        session_id: SessionId,
+        state: &AiState,
+        at: std::time::SystemTime,
+    ) {
+        let Some(data) = self.prompts.get_mut(&session_id) else {
+            return;
+        };
+        if matches!(state, AiState::Processing) {
+            data.latest_prompt_finished_at = None;
+        } else {
+            data.latest_prompt_finished_at.get_or_insert(at);
+        }
+    }
+
     /// Adopt a replayed pane's persisted prompt history, filed under the
     /// session the restored pane has just been given.
     ///
@@ -9469,17 +9518,8 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
                 ctx,
                 AiNotice::StateChanged { session_id, state: ai_state.state.clone() },
             );
-            update_ai_chrome(ctx, |ai| {
-                let provider = ai_state.provider;
-                // Before the tracker takes ownership: a state edge is the only
-                // frame that names the provider's conversation, and a switch
-                // must take the previous conversation's prompt bar with it.
-                if let Some(conversation_id) = ai_state.conversation_id.as_deref() {
-                    ai.note_conversation(session_id, conversation_id);
-                }
-                ai.tracker.update(session_id, ai_state);
-                ai.tracker.remember_provider(session_id, provider);
-            });
+            let at = std::time::SystemTime::now();
+            update_ai_chrome(ctx, |ai| ai.apply_state_change(session_id, ai_state, at));
         }
         ServerMessage::AiStateCleared { session_id } => {
             queue_ai_notice(ctx, AiNotice::Cleared { session_id });
@@ -11205,6 +11245,38 @@ mod tests {
         // A genuinely new conversation retires the previous one's bar.
         ai.note_conversation(session, "conv-43");
         assert!(!ai.prompts.contains_key(&session));
+    }
+
+    // @lat: [[client#GPUI Prompt Bar#AI state edges freeze and resume the elapsed timer]]
+    #[test]
+    fn ai_state_edges_freeze_and_resume_the_elapsed_timer() {
+        let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| base + std::time::Duration::from_secs(secs);
+        // What the pane's strip would actually render at `now`.
+        let shown = |chrome: &AiChrome, now| {
+            prompt_bar::build_model(chrome.visible_prompts(session)?, now, None)?.elapsed_label
+        };
+        let edge = |state| scribe_common::ai_state::AiProcessState::new(state);
+
+        // The prompt adapter emits state→processing before prompt_received.
+        ai.apply_state_change(session, edge(AiState::Processing), at(100));
+        ai.record_prompt(session, "build the thing".to_owned(), at(100));
+        assert_eq!(shown(&ai, at(130)).as_deref(), Some("30 sec"), "a working AI ticks");
+
+        // The AI stops 45s in: the figure holds there however long the pane sits.
+        ai.apply_state_change(session, edge(AiState::IdlePrompt), at(145));
+        assert_eq!(shown(&ai, at(200)).as_deref(), Some("45 sec"));
+        assert_eq!(shown(&ai, at(100_000)).as_deref(), Some("45 sec"));
+
+        // Repeated idle edges must not push the frozen figure forward.
+        ai.apply_state_change(session, edge(AiState::WaitingForInput), at(400));
+        assert_eq!(shown(&ai, at(100_000)).as_deref(), Some("45 sec"));
+
+        // Back to work: the timer resumes from the original prompt instant.
+        ai.apply_state_change(session, edge(AiState::Processing), at(500));
+        assert_eq!(shown(&ai, at(520)).as_deref(), Some("7m 00s"));
     }
 
     #[test]

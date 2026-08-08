@@ -1056,6 +1056,8 @@ The GPUI client feeds the bar from the IPC reader: `AiStateChanged`, `AiStateCle
 
 `AiStateChanged` updates an  (whose decoupled context store keeps the percentage alive across pulse pruning), `PromptReceived` appends to the pane's , and `AiStateCleared` plus `SessionExited` both route through [[crates/scribe-client/src/main.rs#AiChrome#forget]], dropping the tracker state, the context percentage, and the prompt history in one call — so a Claude Code or Codex exit takes the pane's prompt bar down with it, not just its indicator. Each mutation bumps the redraw generation, so the strip repaints without polling. On render the view builds the model with a context indicator whenever the tracker holds a percentage — the prompt bar is the surface that always shows the Ok band — and separately pushes the warn-and-above tab suffix from  onto the active tab. A poisoned chrome mutex is dropped with a warning rather than propagated, because losing an indicator update must never tear down the reader and with it the pane's terminal output.
 
+A state edge is also what stops the elapsed timer. [[crates/scribe-client/src/main.rs#AiChrome#note_prompt_progress]] stamps `latest_prompt_finished_at` with the edge's arrival instant the moment the state leaves `Processing` — to `IdlePrompt`, `WaitingForInput`, `PermissionPrompt`, or `Error` — and clears it on the way back in, so the strip shows the LLM's response duration instead of wall-clock time since the prompt; [[crates/scribe-client/src/main.rs#AiChrome#record_prompt]] clears it too, and the next turn starts live. The stamp is taken once per run rather than on every non-`Processing` edge, because an idle provider keeps emitting them and each one would push a frozen figure forward. The whole edge — conversation bookkeeping, freeze, tracker update — is one [[crates/scribe-client/src/main.rs#AiChrome#apply_state_change]] rather than a closure inside the reader, so it is exercisable without a live `ReaderCtx`: the freeze shipped broken because only the pure formatter was under test and nothing asserted that anything ever set the field.
+
 ### Elapsed formats span sec, minute, and hour bands
 
 Verifies  renders `"X sec"` under a minute, `"Xm YYs"` under an hour, and `"Xh YYm"` beyond, with zero-padded trailing units.
@@ -1067,6 +1069,12 @@ Verifies  advances with `now` while `latest_prompt_finished_at` is unset.
 ### Elapsed timer freezes when the AI stops
 
 Verifies  holds at the prompt-to-finish duration once `latest_prompt_finished_at` is set, regardless of how far `now` advances.
+
+### AI state edges freeze and resume the elapsed timer
+
+Verifies the wiring that produces the frozen value, not just the formatter that renders it.
+
+Driving [[crates/scribe-client/src/main.rs#AiChrome#apply_state_change]] with the edges one real turn emits leaves the label live while `Processing`, frozen at the prompt-to-finish figure once the AI stops, unmoved by the further idle edges an idle provider keeps sending, and ticking again on the return to `Processing`. The assertions read the label off [[crates/scribe-client/src/prompt_bar.rs#build_model]] through [[crates/scribe-client/src/main.rs#AiChrome#visible_prompts]] — the pair the render pass itself uses — so a stamp that never reaches the strip fails the test.
 
 ### Elapsed clamps a backwards wall clock
 
