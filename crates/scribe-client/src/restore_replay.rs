@@ -14,6 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scribe_common::ai_state::AiProvider;
 use scribe_common::config::ContentPadding;
@@ -23,6 +24,7 @@ use scribe_common::protocol::{
 };
 
 use crate::layout::{LayoutNode, PaneEdges, PaneId, Rect, SplitDirection};
+use crate::prompt_bar::PromptBarData;
 use crate::restore_state::{
     LaunchBinding, LaunchKind, LaunchRecord, PaneSnapshot, TabSnapshot, WindowRestoreState,
     WorkspaceLayoutSnapshot, WorkspaceSnapshot,
@@ -87,9 +89,10 @@ pub struct PaneRestore {
     pub workspace_id: WorkspaceId,
     pub launch_binding: LaunchBinding,
     pub cwd: Option<PathBuf>,
-    pub first_prompt: Option<String>,
-    pub latest_prompt: Option<String>,
-    pub prompt_count: u32,
+    /// Prompt-bar history for this pane, in the same shape the live `AiChrome`
+    /// map keeps it, so the snapshot save path can copy a session's entry
+    /// straight in and replay can hand it straight back.
+    pub prompts: PromptBarData,
     pub last_conversation_id: Option<String>,
     /// Grid dimensions assigned by [`size_replay_pane_grids`]; `None` until the
     /// geometry pass runs.
@@ -591,9 +594,13 @@ fn queue_from_launch_record(
         workspace_id,
         launch_binding: binding.clone(),
         cwd: binding.fallback_cwd.clone(),
-        first_prompt: record.first_prompt.clone(),
-        latest_prompt: record.latest_prompt.clone(),
-        prompt_count: record.prompt_count,
+        prompts: PromptBarData {
+            prompt_count: record.prompt_count,
+            first_prompt: record.first_prompt.clone(),
+            latest_prompt: record.latest_prompt.clone(),
+            latest_prompt_at: from_epoch_secs(record.latest_prompt_at),
+            latest_prompt_finished_at: from_epoch_secs(record.latest_prompt_finished_at),
+        },
         last_conversation_id,
         grid: None,
     };
@@ -711,16 +718,30 @@ fn snapshot_launches<S: BuildHasher>(
                     launch_id: pane.launch_binding.launch_id.clone(),
                     cwd: pane.cwd.clone().or_else(|| pane.launch_binding.fallback_cwd.clone()),
                     kind: pane.launch_binding.kind.clone(),
-                    first_prompt: pane.first_prompt.clone(),
-                    latest_prompt: pane.latest_prompt.clone(),
-                    latest_prompt_at: None,
-                    latest_prompt_finished_at: None,
-                    prompt_count: pane.prompt_count,
+                    first_prompt: pane.prompts.first_prompt.clone(),
+                    latest_prompt: pane.prompts.latest_prompt.clone(),
+                    latest_prompt_at: epoch_secs(pane.prompts.latest_prompt_at),
+                    latest_prompt_finished_at: epoch_secs(pane.prompts.latest_prompt_finished_at),
+                    prompt_count: pane.prompts.prompt_count,
                 })
             }));
         }
     }
     launches
+}
+
+/// Encode a prompt timestamp as the Unix-epoch seconds the snapshot stores.
+///
+/// A clock set before 1970 (or a `None` stamp) persists as no timestamp at all,
+/// which is exactly how a snapshot written by a client that predates the field
+/// reads back.
+fn epoch_secs(at: Option<SystemTime>) -> Option<u64> {
+    at?.duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs())
+}
+
+/// Inverse of [`epoch_secs`], used when a snapshot is replayed.
+fn from_epoch_secs(secs: Option<u64>) -> Option<SystemTime> {
+    Some(UNIX_EPOCH + Duration::from_secs(secs?))
 }
 
 fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
@@ -817,6 +838,40 @@ mod tests {
         assert_eq!(reserialised.launches.len(), 1);
         assert_eq!(reserialised.launches[0].launch_id, "launch-a");
         assert!(reserialised.is_replayable());
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Prompt state survives the snapshot round trip]]
+    #[test]
+    fn prompt_state_survives_snapshot_round_trip() {
+        let window_id = WindowId::new();
+        let workspace_id = WorkspaceId::new();
+        let mut snapshot = single_pane_snapshot(window_id, workspace_id, "launch-a");
+        let saved = &mut snapshot.launches[0];
+        saved.first_prompt = Some("build the thing".to_owned());
+        saved.latest_prompt = Some("now ship it".to_owned());
+        saved.latest_prompt_at = Some(1_700_000_000);
+        saved.latest_prompt_finished_at = Some(1_700_000_042);
+        saved.prompt_count = 7;
+
+        let rebuilt = prepare_replay(&snapshot);
+        let pane = rebuilt.panes.values().next().expect("pane restored");
+        assert_eq!(pane.prompts.prompt_count, 7);
+        assert_eq!(
+            pane.prompts.latest_prompt_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(
+            pane.prompts.latest_prompt_finished_at,
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_042))
+        );
+
+        let reserialised = snapshot_window_restore(window_id, &rebuilt.layout, &rebuilt.panes);
+        let written = &reserialised.launches[0];
+        assert_eq!(written.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(written.latest_prompt.as_deref(), Some("now ship it"));
+        assert_eq!(written.latest_prompt_at, Some(1_700_000_000));
+        assert_eq!(written.latest_prompt_finished_at, Some(1_700_000_042));
+        assert_eq!(written.prompt_count, 7);
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Grid sized before launch]]
