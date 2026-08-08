@@ -127,8 +127,6 @@ LIVE_MOVED=$(live_geometry)
 REC_MOVED=$(record_geometry)
 DELTA_MOVED=$(delta)
 echo "PHASE 0: live [$LIVE_MOVED]  record [$REC_MOVED]  offset ($DELTA_MOVED)"
-LIVE_MX=$(echo "$LIVE_MOVED" | cut -d' ' -f1)
-LIVE_MY=$(echo "$LIVE_MOVED" | cut -d' ' -f2)
 echo "PHASE 0 PASS: after a move the record trails the window by ($DELTA_MOVED)"
 
 # ── Phase 1: a RESIZE must not change that offset ─────────────────

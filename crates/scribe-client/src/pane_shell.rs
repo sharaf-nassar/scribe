@@ -1374,11 +1374,7 @@ mod tests {
                 launch_id: "launch-a".to_owned(),
                 cwd: Some(root.clone()),
                 kind: LaunchKind::Shell,
-                first_prompt: None,
-                latest_prompt: None,
-                latest_prompt_at: None,
-                latest_prompt_finished_at: None,
-                prompt_count: 0,
+                prompts: scribe_common::protocol::SessionPromptState::default(),
             }],
         };
 

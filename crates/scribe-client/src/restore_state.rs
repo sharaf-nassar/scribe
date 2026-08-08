@@ -20,7 +20,7 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::{WindowId, WorkspaceId};
 pub use scribe_common::protocol::AiResumeMode;
-use scribe_common::protocol::LayoutDirection;
+use scribe_common::protocol::{LayoutDirection, SessionPromptState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -111,24 +111,12 @@ pub struct LaunchRecord {
     pub launch_id: String,
     pub cwd: Option<PathBuf>,
     pub kind: LaunchKind,
-    #[serde(default)]
-    pub first_prompt: Option<String>,
-    #[serde(default)]
-    pub latest_prompt: Option<String>,
-    /// Wall-clock time the most recent prompt was received, encoded as
-    /// Unix-epoch seconds. Used by the prompt bar's elapsed-time counter to
-    /// keep counting up across cold restarts. `None` for snapshots written by
-    /// older clients that predate this field.
-    #[serde(default)]
-    pub latest_prompt_at: Option<u64>,
-    /// Wall-clock time the LLM finished responding to the most recent prompt,
-    /// encoded as Unix-epoch seconds. When `Some`, the timer stays frozen at
-    /// this instant across cold restarts. `None` when the LLM was still
-    /// processing (or in older snapshots).
-    #[serde(default)]
-    pub latest_prompt_finished_at: Option<u64>,
-    #[serde(default)]
-    pub prompt_count: u32,
+    /// Prompt-bar history for the pane, the same record the server retains and
+    /// the client renders from. Flattened, so the five prompt fields keep the
+    /// top-level names older snapshots were written with, and each defaults
+    /// individually for snapshots that predate it.
+    #[serde(flatten)]
+    pub prompts: SessionPromptState,
 }
 
 /// Launch type recorded for restore replay.
@@ -556,11 +544,7 @@ mod tests {
                 launch_id: "launch-a".to_owned(),
                 cwd: Some(PathBuf::from("/tmp/proj")),
                 kind: LaunchKind::Shell,
-                first_prompt: None,
-                latest_prompt: None,
-                latest_prompt_at: None,
-                latest_prompt_finished_at: None,
-                prompt_count: 0,
+                prompts: SessionPromptState::default(),
             }],
         }
     }

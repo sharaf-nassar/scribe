@@ -14,7 +14,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scribe_common::ai_state::AiProvider;
 use scribe_common::config::ContentPadding;
@@ -594,16 +593,9 @@ fn queue_from_launch_record(
         workspace_id,
         launch_binding: binding.clone(),
         cwd: binding.fallback_cwd.clone(),
-        prompts: PromptBarData {
-            prompt_count: record.prompt_count,
-            first_prompt: record.first_prompt.clone(),
-            latest_prompt: record.latest_prompt.clone(),
-            latest_prompt_at: from_epoch_secs(record.latest_prompt_at),
-            latest_prompt_finished_at: from_epoch_secs(record.latest_prompt_finished_at),
-            // A restored pane starts with its bar shown: the dismissal is a
-            // live-session gesture and is not carried in the launch record.
-            dismissed: false,
-        },
+        // A restored pane starts with its bar shown: the dismissal is a
+        // live-session gesture and is not carried in the launch record.
+        prompts: PromptBarData::from(record.prompts.clone()),
         last_conversation_id,
         grid: None,
     };
@@ -721,30 +713,12 @@ fn snapshot_launches<S: BuildHasher>(
                     launch_id: pane.launch_binding.launch_id.clone(),
                     cwd: pane.cwd.clone().or_else(|| pane.launch_binding.fallback_cwd.clone()),
                     kind: pane.launch_binding.kind.clone(),
-                    first_prompt: pane.prompts.first_prompt.clone(),
-                    latest_prompt: pane.prompts.latest_prompt.clone(),
-                    latest_prompt_at: epoch_secs(pane.prompts.latest_prompt_at),
-                    latest_prompt_finished_at: epoch_secs(pane.prompts.latest_prompt_finished_at),
-                    prompt_count: pane.prompts.prompt_count,
+                    prompts: pane.prompts.prompts.clone(),
                 })
             }));
         }
     }
     launches
-}
-
-/// Encode a prompt timestamp as the Unix-epoch seconds the snapshot stores.
-///
-/// A clock set before 1970 (or a `None` stamp) persists as no timestamp at all,
-/// which is exactly how a snapshot written by a client that predates the field
-/// reads back.
-fn epoch_secs(at: Option<SystemTime>) -> Option<u64> {
-    at?.duration_since(UNIX_EPOCH).ok().map(|since| since.as_secs())
-}
-
-/// Inverse of [`epoch_secs`], used when a snapshot is replayed.
-fn from_epoch_secs(secs: Option<u64>) -> Option<SystemTime> {
-    Some(UNIX_EPOCH + Duration::from_secs(secs?))
 }
 
 fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
@@ -757,6 +731,8 @@ fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scribe_common::protocol::SessionPromptState;
+
     use crate::restore_state::{LaunchKind, PaneSnapshot, TabSnapshot, WorkspaceSnapshot};
 
     fn shell_record(launch_id: &str, cwd: &str) -> LaunchRecord {
@@ -764,11 +740,7 @@ mod tests {
             launch_id: launch_id.to_owned(),
             cwd: Some(PathBuf::from(cwd)),
             kind: LaunchKind::Shell,
-            first_prompt: None,
-            latest_prompt: None,
-            latest_prompt_at: None,
-            latest_prompt_finished_at: None,
-            prompt_count: 0,
+            prompts: SessionPromptState::default(),
         }
     }
 
@@ -850,31 +822,25 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let mut snapshot = single_pane_snapshot(window_id, workspace_id, "launch-a");
         let saved = &mut snapshot.launches[0];
-        saved.first_prompt = Some("build the thing".to_owned());
-        saved.latest_prompt = Some("now ship it".to_owned());
-        saved.latest_prompt_at = Some(1_700_000_000);
-        saved.latest_prompt_finished_at = Some(1_700_000_042);
-        saved.prompt_count = 7;
+        saved.prompts.first_prompt = Some("build the thing".to_owned());
+        saved.prompts.latest_prompt = Some("now ship it".to_owned());
+        saved.prompts.latest_prompt_at = Some(1_700_000_000);
+        saved.prompts.latest_prompt_finished_at = Some(1_700_000_042);
+        saved.prompts.prompt_count = 7;
 
         let rebuilt = prepare_replay(&snapshot);
         let pane = rebuilt.panes.values().next().expect("pane restored");
-        assert_eq!(pane.prompts.prompt_count, 7);
-        assert_eq!(
-            pane.prompts.latest_prompt_at,
-            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
-        );
-        assert_eq!(
-            pane.prompts.latest_prompt_finished_at,
-            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_042))
-        );
+        assert_eq!(pane.prompts.prompts.prompt_count, 7);
+        assert_eq!(pane.prompts.prompts.latest_prompt_at, Some(1_700_000_000));
+        assert_eq!(pane.prompts.prompts.latest_prompt_finished_at, Some(1_700_000_042));
 
         let reserialised = snapshot_window_restore(window_id, &rebuilt.layout, &rebuilt.panes);
         let written = &reserialised.launches[0];
-        assert_eq!(written.first_prompt.as_deref(), Some("build the thing"));
-        assert_eq!(written.latest_prompt.as_deref(), Some("now ship it"));
-        assert_eq!(written.latest_prompt_at, Some(1_700_000_000));
-        assert_eq!(written.latest_prompt_finished_at, Some(1_700_000_042));
-        assert_eq!(written.prompt_count, 7);
+        assert_eq!(written.prompts.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(written.prompts.latest_prompt.as_deref(), Some("now ship it"));
+        assert_eq!(written.prompts.latest_prompt_at, Some(1_700_000_000));
+        assert_eq!(written.prompts.latest_prompt_finished_at, Some(1_700_000_042));
+        assert_eq!(written.prompts.prompt_count, 7);
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Grid sized before launch]]
@@ -938,11 +904,7 @@ mod tests {
                 resume_mode: AiResumeMode::Resume,
                 conversation_id: Some("conv-42".to_owned()),
             },
-            first_prompt: None,
-            latest_prompt: None,
-            latest_prompt_at: None,
-            latest_prompt_finished_at: None,
-            prompt_count: 3,
+            prompts: SessionPromptState { prompt_count: 3, ..SessionPromptState::default() },
         };
         let command = replay_command_from_record(&record);
         let launch = replay_launch_values(&command);
