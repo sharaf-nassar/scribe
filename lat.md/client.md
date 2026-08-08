@@ -420,6 +420,14 @@ A session seeded with a replayed pane's prompt history keeps its rows when the r
 
 An AI resume launch record replays as structured provider, resume-mode, and conversation-id intent with no client-built command argv.
 
+#### Replayed workspace regains its project root
+
+A region rebuilt from a snapshot starts with no project root — [[crates/scribe-client/src/restore_state.rs#WorkspaceSnapshot|WorkspaceSnapshot]] deliberately omits the one [[crates/scribe-client/src/workspace_layout.rs#WorkspaceSlot|WorkspaceSlot]] field the server owns — and takes it back from the server's answer.
+
+The root is derived, not authored: [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#on_cwd_changed|on_cwd_changed]] sets it whenever a session's CWD falls under a configured `workspaces.roots` entry and clears it on the way out. Persisting it would freeze a value the server recomputes on the next CWD report, so a `workspaces.roots` edit between the snapshot and the restart would replay a root the server immediately contradicts.
+
+Recovery needs no OSC 7. The `Subscribe` [[crates/scribe-client/src/main.rs#adopt_created_session|adopt_created_session]] sends for every replayed pane reaches `handle_subscribe`, which runs `WorkspaceManager::check_cwd_fallback` against the new child's `/proc/<pid>/cwd` and answers with `WorkspaceNamed { project_root }`; the reader parks it as a [[crates/scribe-client/src/pane_shell.rs#WorkspaceInfo|WorkspaceInfo]] and [[crates/scribe-client/src/pane_shell.rs#PaneShell#apply_workspace_info|apply_workspace_info]] writes it onto the replayed slot. Only [[crates/scribe-client/src/main.rs#TerminalView#create_ai_tab|create_ai_tab]] reads the root, and it falls back to the focused pane's CWD, so the window is never wrong in the interval — just less specific.
+
 ### GPUI Layout Entities
 
 The GPUI rebuild ports the two-level split tree into a `lib` target alongside the scaffold binary, so the pure trees and their entity wrappers are library API covered by `#[gpui::test]` headless suites.

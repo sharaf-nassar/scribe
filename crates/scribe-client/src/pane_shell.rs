@@ -1324,6 +1324,14 @@ fn prune_workspace_node(
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use scribe_client::restore_replay::prepare_replay;
+    use scribe_client::restore_state::{
+        LaunchKind, LaunchRecord, PaneSnapshot, TabSnapshot, WorkspaceLayoutSnapshot,
+        WorkspaceSnapshot,
+    };
+
     use super::*;
 
     fn leaf(workspace_id: WorkspaceId, session_id: SessionId) -> WorkspaceTreeNode {
@@ -1333,6 +1341,77 @@ mod tests {
             pane_trees: vec![None],
             active_tab_index: 0,
         }
+    }
+
+    /// A replayed region comes back rootless — [`WorkspaceSnapshot`] persists
+    /// no project root, because the root is derived from a session's CWD and a
+    /// stale one would outrank the server's own answer after a
+    /// `workspaces.roots` edit. The server re-derives it from the replayed
+    /// session's CWD (`WorkspaceManager::on_cwd_changed`, driven by the
+    /// `Subscribe` every created pane sends) and this is the client half:
+    /// the answer lands on the replayed region's slot.
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Replayed workspace regains its project root]]
+    #[gpui::test]
+    fn replayed_workspace_regains_its_project_root(cx: &mut gpui::TestAppContext) {
+        let workspace_id = WorkspaceId::new();
+        let root = PathBuf::from("/home/dev/work/scribe");
+        let snapshot = WindowRestoreState {
+            version: 1,
+            window_id: WindowId::new(),
+            focused_workspace_id: workspace_id,
+            root: WorkspaceLayoutSnapshot::Leaf { workspace_id },
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id,
+                name: Some("scribe".to_owned()),
+                accent_color: [0.4, 0.5, 0.6, 1.0],
+                active_tab_index: 0,
+                tabs: vec![TabSnapshot {
+                    focused_launch_id: "launch-a".to_owned(),
+                    pane_tree: PaneSnapshot::Leaf { launch_id: "launch-a".to_owned() },
+                }],
+            }],
+            launches: vec![LaunchRecord {
+                launch_id: "launch-a".to_owned(),
+                cwd: Some(root.clone()),
+                kind: LaunchKind::Shell,
+                first_prompt: None,
+                latest_prompt: None,
+                latest_prompt_at: None,
+                latest_prompt_finished_at: None,
+                prompt_count: 0,
+            }],
+        };
+
+        cx.update(|cx| {
+            let mut shell = PaneShell::new([0.1, 0.2, 0.3, 1.0], cx);
+            let launches = shell.adopt_restored(prepare_replay(&snapshot), cx);
+
+            assert_eq!(launches.len(), 1, "the saved pane is queued for relaunch");
+            assert_eq!(
+                shell.focused_workspace_project_root(cx),
+                None,
+                "the snapshot carries no project root"
+            );
+
+            // What the server sends once the replayed session's CWD is matched
+            // against the configured roots, parked by the reader's
+            // `WorkspaceNamed` handling.
+            let outcome = shell.apply_workspace_info(
+                &WorkspaceInfo {
+                    workspace_id,
+                    name: Some("scribe".to_owned()),
+                    accent: None,
+                    project_root: Some(root.clone()),
+                },
+                cx,
+            );
+
+            assert_eq!(outcome, WorkspaceInfoOutcome::Updated, "the replayed region claims it");
+            assert_eq!(
+                shell.focused_workspace_project_root(cx).as_deref(),
+                Some(Path::new("/home/dev/work/scribe"))
+            );
+        });
     }
 
     /// A top-row region keeps its full rect — its tabs live in the titlebar —
