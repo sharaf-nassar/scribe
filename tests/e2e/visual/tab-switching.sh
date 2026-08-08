@@ -60,6 +60,19 @@ SEED_COLUMNS=120
 TERM_X=0
 TERM_Y=0
 
+# Every chord this suite presses is the shipped Linux default except the two
+# workspace-focus ones. Their defaults are Ctrl+Alt+Left/Right, which openbox —
+# the window manager the visual container has to run, because the client's X11
+# active-window guard needs a real `_NET_ACTIVE_WINDOW` owner — grabs for
+# "switch to the desktop on the left/right". A grabbed chord never reaches any
+# application, so the rig rebinds those two through SCRIBE_EXTRA_CONFIG (see
+# `tests/e2e/visual/tab-switching-config.toml`). That is a property of the
+# harness's WM, not of the client: the workspace *split* on the same layer still
+# fires from its untouched default. Kept in variables so the rebind and the
+# keypresses can never drift.
+WORKSPACE_FOCUS_LEFT_CHORD="${WORKSPACE_FOCUS_LEFT_CHORD:-ctrl+alt+h}"
+WORKSPACE_FOCUS_RIGHT_CHORD="${WORKSPACE_FOCUS_RIGHT_CHORD:-ctrl+alt+l}"
+
 count_frames() {
     python3 - "$RECORD" "$1" "$2" <<'PY'
 import json
@@ -451,12 +464,13 @@ fi
 shot /output/06-tab-switching-workspace-split.png
 echo "PHASE 6 PASS: workspace split created region session $WS_SESSION"
 
-# ── Phase 7: alt+N indexes the focused region, not the strip ──────
-# The strip is window-global but `select_tab_N` is not: it goes through
-# `TabSessions::select_in_workspace`, which counts only the tabs filed under
-# the active workspace. Indexing the strip directly would make the low digits
-# unreachable for every region but the first, so alt+1 means "this region's
-# first tab" and must not cross a workspace boundary.
+# ── Phase 7: tab keys index the focused region, not the strip ─────
+# Every tab shortcut is region-scoped: `select_tab_N` counts only the focused
+# region's tabs, and `next_tab`/`prev_tab` wrap inside it. Indexing the strip
+# directly would make the low digits unreachable for every region but the
+# first, and a walk that stepped off a region's end would move the keyboard
+# into a different project column — moving between regions is what the
+# `workspace_focus_*` family is for.
 #
 # Focus sits in the new (second) region, whose only tab is the seed session
 # and is already selected. alt+1 there therefore has to be a no-op: nothing
@@ -467,14 +481,19 @@ sleep 3
 if [ "$(count_attach_to "$SESSION")" -gt "$ATTACH_XREGION_KEY_BEFORE" ]; then
     fail "phase 7: alt+1 escaped the focused region and attached $SESSION"
 fi
-# Now put the focus in the first region and repeat. ctrl+Prior walks the
-# window-global strip, so it does cross regions: from the seed tab (last) it
-# lands on the second tab, which is the first region's, and moves the pane
-# focus with it.
-ATTACH_NEW_KEY_BEFORE=$(count_attach_to "$NEW_SESSION")
+# ctrl+Prior is region-scoped too, so it cannot be the way back: the second
+# region holds one tab and the walk has nowhere to go. Prove that, then cross
+# with ctrl+alt+left, the shipped `workspace_focus_left` default.
+ATTACH_XREGION_WALK_BEFORE=$(count_attach_to "$NEW_SESSION")
 send_keys ctrl+Prior
+sleep 3
+if [ "$(count_attach_to "$NEW_SESSION")" -gt "$ATTACH_XREGION_WALK_BEFORE" ]; then
+    fail "phase 7: ctrl+Prior escaped the focused region and attached $NEW_SESSION"
+fi
+ATTACH_NEW_KEY_BEFORE=$(count_attach_to "$NEW_SESSION")
+send_keys "$WORKSPACE_FOCUS_LEFT_CHORD"
 if ! wait_for_attach_to "$NEW_SESSION" "$ATTACH_NEW_KEY_BEFORE" 15; then
-    fail "phase 7: ctrl+Prior never moved the focus back into the first region ($NEW_SESSION)"
+    fail "phase 7: $WORKSPACE_FOCUS_LEFT_CHORD never moved the focus back into the first region ($NEW_SESSION)"
 fi
 ATTACH_FIRST_KEY_BEFORE=$(count_attach_to "$SESSION")
 send_keys alt+1
@@ -485,19 +504,17 @@ shot /output/07-tab-switching-key-in-region.png
 echo "PHASE 7 PASS: alt+1 stayed inside the focused region, then attached $SESSION from it"
 
 # ── Phase 8: click the first tab across workspace regions ─────────
-# Move focus back to the second region first, then click the first tab. The
-# selection is on the first region's tab 0 after phase 7, so ctrl+Prior wraps
-# to the last strip tab — the second region's seed session — which is the one
-# keyboard route to the other region that is not workspace-scoped. (alt+3 no
-# longer does this: three digits into a two-tab region is out of range.)
+# Move focus back to the second region first, then click the first tab. Every
+# tab shortcut is region-scoped, so crossing back is the workspace-focus
+# family's job: ctrl+alt+right is the shipped `workspace_focus_right` default.
 #
 # In multi-workspace mode the badge pill shifts the strip right by its
 # rendered width; 135 px sits inside the first tab for any badge label up to
 # ~19 characters (badge <= ~134 px, tab spans [badge, badge+176]).
 ATTACH_WS_BEFORE=$(count_attach_to "$WS_SESSION")
-send_keys ctrl+Prior
+send_keys "$WORKSPACE_FOCUS_RIGHT_CHORD"
 if ! wait_for_attach_to "$WS_SESSION" "$ATTACH_WS_BEFORE" 15; then
-    fail "phase 8: ctrl+Prior never re-attached the second region's session $WS_SESSION"
+    fail "phase 8: $WORKSPACE_FOCUS_RIGHT_CHORD never re-attached the second region's session $WS_SESSION"
 fi
 BADGED_FIRST_TAB_X=135
 ATTACH_XREGION_CLICK_BEFORE=$(count_attach_to "$SESSION")

@@ -307,7 +307,7 @@ e2e-visual-settings-scrollbar:
 # The client creates its own second tab, then keyboard and titlebar selection
 # changes are asserted on the recorded `AttachSessions` frames.
 e2e-visual-tab-switching:
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/tab-switching.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/tab-switching-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/tab-switching.sh
 
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll

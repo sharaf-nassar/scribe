@@ -132,7 +132,7 @@ use scribe_client::{
         GroupBadge, TabBarColors, TabData, accent_tab_tone, badge_label, context_suffix,
         flash_blend, px_units, reorder_target_index, tab_display_title,
     },
-    tab_session::{TabEntry, TabSessions},
+    tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
         TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView, title_columns,
     },
@@ -1261,7 +1261,7 @@ struct TerminalView {
     /// hosts only top-row regions' tabs — lower regions carry their own bars —
     /// so its Select/Close/Reorder events arrive in titlebar positions and are
     /// translated through this map before touching [`TabSessions`].
-    titlebar_index_map: Vec<usize>,
+    titlebar_slots: Vec<TabAddress>,
     /// Tab-bar contents for each workspace region below the window's top row,
     /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
     /// region's top strip.
@@ -1787,7 +1787,7 @@ impl TerminalView {
             // `SessionList`; `sync_tabs` pushes it into the titlebar on the
             // next redraw so the tab row always mirrors live server state.
             rendered_tabs: TabSessions::new(),
-            titlebar_index_map: Vec::new(),
+            titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
             terminal_colors,
             opacity,
@@ -2012,14 +2012,26 @@ impl TerminalView {
             bar.set_tabs(data, cx);
             bar
         });
-        // Titlebar events carry titlebar positions; with lower regions carrying
-        // their own bars those differ from strip indices, so every index is
-        // translated through the partition map first.
+        // The titlebar is a flat row of pixels holding several regions' tabs, so
+        // every event position is resolved to the tab it actually rendered
+        // before it can mean anything.
         cx.subscribe(&bar, |this, _bar, event: &TitlebarEvent, ctx| match event {
             TitlebarEvent::ReorderTab { from, to } => {
-                let from = this.strip_index(*from);
-                let to = this.strip_index(*to);
-                if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(from, to)) {
+                let (Some(from), Some(to)) = (this.titlebar_slot(*from), this.titlebar_slot(*to))
+                else {
+                    return;
+                };
+                // A drag that left its own region is dropped rather than
+                // clamped: the two ends address different tab lists, so there
+                // is no position in `from`'s region that `to` names.
+                if from.workspace_id != to.workspace_id {
+                    return;
+                }
+                let moved =
+                    this.shared.tabs.lock().is_ok_and(|mut tabs| {
+                        tabs.reorder(from.workspace_id, from.index, to.index)
+                    });
+                if moved {
                     // The strip is the region's tab order, and the reported
                     // tree is the only place it is durable — without this the
                     // drag survives until the next reconnect and no longer.
@@ -2028,27 +2040,31 @@ impl TerminalView {
                 }
             }
             TitlebarEvent::SelectTab { index, source } => {
-                let index = this.strip_index(*index);
+                let Some(slot) = this.titlebar_slot(*index) else { return };
                 let source = *source;
-                this.switch_tab(move |tabs| tabs.select(index), ctx);
+                this.activate_session_tab(slot.session_id, ctx);
                 if source == TabActivationSource::Pointer {
                     this.defer_terminal_focus(ctx);
                 }
             }
-            TitlebarEvent::CloseTab(index) => this.close_tab_at(this.strip_index(*index)),
+            TitlebarEvent::CloseTab(index) => {
+                if let Some(slot) = this.titlebar_slot(*index) {
+                    this.close_session(slot.session_id, "tab close dropped");
+                }
+            }
             TitlebarEvent::Equalize => this.equalize_layout(ctx),
         })
         .detach();
         bar
     }
 
-    /// Translate a titlebar tab position into its strip index.
+    /// Resolve a titlebar tab position to the tab it renders.
     ///
-    /// Identity until the first [`Self::sync_tabs`] partitions the strip; a
-    /// stale position past the map falls back to itself so a racing event
-    /// degrades to the old behaviour instead of hitting the wrong tab.
-    fn strip_index(&self, titlebar_index: usize) -> usize {
-        self.titlebar_index_map.get(titlebar_index).copied().unwrap_or(titlebar_index)
+    /// `None` before the first [`Self::sync_tabs`] fills the slots, and for a
+    /// stale position past their end — a racing event then does nothing rather
+    /// than acting on whichever tab now happens to sit at that position.
+    fn titlebar_slot(&self, titlebar_index: usize) -> Option<TabAddress> {
+        self.titlebar_slots.get(titlebar_index).copied()
     }
 
     /// Drain a pending config-file change and reapply it to the live window.
@@ -2212,31 +2228,29 @@ impl TerminalView {
     /// Mark each multi-workspace titlebar run with its region edge and accent,
     /// plus a badge only when the server provides a real workspace name.
     ///
-    /// `strip_indices` names, for each titlebar position, the strip entry it
-    /// renders — the titlebar hosts only top-row regions' tabs, whose left
-    /// edges are distinct by construction, so the aligned layout always
-    /// engages in a multi-region window.
-    fn apply_group_badges(&self, data: &mut [TabData], strip_indices: &[usize], cx: &App) {
+    /// `slots` names, for each titlebar position, the tab it renders — the
+    /// titlebar hosts only top-row regions' tabs, whose left edges are distinct
+    /// by construction, so the aligned layout always engages in a multi-region
+    /// window.
+    fn apply_group_badges(&self, data: &mut [TabData], slots: &[TabAddress], cx: &App) {
         if self.shell.region_count(cx) <= 1 {
             return;
         }
         let region_x = self.shell.region_left_edges(self.pane_viewport(), cx);
         let mut previous = None;
-        for (tab, strip_index) in data.iter_mut().zip(strip_indices) {
-            let Some(entry) = self.rendered_tabs.tabs().get(*strip_index) else { continue };
-            let accent = self.shell.workspace_accent(entry.workspace_id, cx);
+        for (tab, slot) in data.iter_mut().zip(slots) {
+            let accent = self.shell.workspace_accent(slot.workspace_id, cx);
             tab.group_accent = Some(opaque_slot(accent));
-            if previous != Some(entry.workspace_id) {
-                tab.group_region_x =
-                    Some(region_x.get(&entry.workspace_id).copied().unwrap_or(0.0));
-                let workspace_name = self.workspace_name(entry.workspace_id);
+            if previous != Some(slot.workspace_id) {
+                tab.group_region_x = Some(region_x.get(&slot.workspace_id).copied().unwrap_or(0.0));
+                let workspace_name = self.workspace_name(slot.workspace_id);
                 tab.badge = Self::workspace_group_badge(
                     workspace_name.as_deref(),
                     &self.config.config().config.workspaces.badge_colors,
                     accent,
                 );
             }
-            previous = Some(entry.workspace_id);
+            previous = Some(slot.workspace_id);
         }
     }
 
@@ -2244,11 +2258,18 @@ impl TerminalView {
     /// own bars.
     ///
     /// Tabs of a region below the window's top row go to that region's
-    /// [`RegionBarData`] (stored on `self`), where "active" means the session
-    /// the region is showing. Everything else stays in the titlebar, and the
-    /// returned map records each titlebar position's strip index so titlebar
-    /// events can be translated back.
-    fn partition_tab_strip(&mut self, data: Vec<TabData>, cx: &App) -> (Vec<TabData>, Vec<usize>) {
+    /// [`RegionBarData`] (stored on `self`). Everything else stays in the
+    /// titlebar, and the returned addresses record which tab each titlebar
+    /// position renders so titlebar events can be resolved back.
+    ///
+    /// "Active" is the session the *region* is showing, taken from the shell
+    /// for every bar alike: the shell owns what is painted, so reading it here
+    /// keeps one underline per region and cannot drift from the panes.
+    fn partition_tab_strip(
+        &mut self,
+        data: Vec<TabData>,
+        cx: &App,
+    ) -> (Vec<TabData>, Vec<TabAddress>) {
         let viewport = self.pane_viewport();
         let badge_palette = &self.config.config().config.workspaces.badge_colors;
         let mut bars: Vec<RegionBarData> = self
@@ -2270,19 +2291,18 @@ impl TerminalView {
             })
             .collect();
         let mut titlebar_data = Vec::new();
-        let mut strip_indices = Vec::new();
-        for (index, (mut tab, entry)) in data.into_iter().zip(self.rendered_tabs.tabs()).enumerate()
-        {
-            let Some(bar) = bars.iter_mut().find(|bar| bar.workspace_id == entry.workspace_id)
+        let mut titlebar_slots = Vec::new();
+        for (mut tab, slot) in data.into_iter().zip(self.rendered_tabs.addresses()) {
+            tab.is_active =
+                self.shell.region_shown_session(slot.workspace_id) == Some(slot.session_id);
+            let Some(bar) = bars.iter_mut().find(|bar| bar.workspace_id == slot.workspace_id)
             else {
                 titlebar_data.push(tab);
-                strip_indices.push(index);
+                titlebar_slots.push(slot);
                 continue;
             };
-            tab.is_active =
-                self.shell.region_shown_session(entry.workspace_id) == Some(entry.session_id);
             tab.group_accent = Some(opaque_slot(bar.accent));
-            bar.tabs.push((entry.session_id, tab));
+            bar.tabs.push((slot.session_id, tab));
         }
         // Logged on shape changes only: this is the scripted oracle for the
         // in-region bars, which paint no other externally observable trace.
@@ -2298,33 +2318,29 @@ impl TerminalView {
             tracing::info!(bars = %state, "lower-region tab bars changed");
         }
         self.region_chrome.bars = bars;
-        (titlebar_data, strip_indices)
+        (titlebar_data, titlebar_slots)
     }
 
     fn sync_tabs(&mut self, cx: &mut Context<Self>) {
-        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
-        // A tab created after returning to an earlier workspace is appended to
-        // the window-level strip. Collapse repeated workspace runs before the
-        // titlebar derives group edges so each region has exactly one bar.
-        tabs.group_by_workspace();
+        let Ok(tabs) = self.shared.tabs.lock() else { return };
         self.rendered_tabs = tabs.clone();
         drop(tabs);
         let mut data = self.rendered_tabs.to_tab_data();
         let terminal = &self.config.config().config.terminal;
         let ansi = &self.config.config().theme.ansi_colors;
         if let Ok(ai) = self.shared.ai.lock() {
-            for (tab, entry) in data.iter_mut().zip(self.rendered_tabs.tabs()) {
+            for (tab, slot) in data.iter_mut().zip(self.rendered_tabs.addresses()) {
                 tab.ai_indicator = ai
                     .tracker
-                    .tab_indicator_color(entry.session_id, ansi, terminal)
+                    .tab_indicator_color(slot.session_id, ansi, terminal)
                     .map(opaque_slot);
                 tab.context_suffix =
-                    tab_context_suffix_for(&ai.tracker, entry.session_id, &self.context_thresholds);
+                    tab_context_suffix_for(&ai.tracker, slot.session_id, &self.context_thresholds);
             }
         }
-        let (mut titlebar_data, strip_indices) = self.partition_tab_strip(data, cx);
-        self.apply_group_badges(&mut titlebar_data, &strip_indices, cx);
-        self.titlebar_index_map = strip_indices;
+        let (mut titlebar_data, titlebar_slots) = self.partition_tab_strip(data, cx);
+        self.apply_group_badges(&mut titlebar_data, &titlebar_slots, cx);
+        self.titlebar_slots = titlebar_slots;
         self.titlebar.update(cx, |bar, ctx| {
             if bar.tabs() != titlebar_data {
                 bar.set_tabs(titlebar_data, ctx);
@@ -2386,7 +2402,7 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
             LayoutAction::NewTab => {
                 let cwd = self.focused_session_cwd();
-                self.create_tab(None, None, cwd);
+                self.create_tab(self.creating_workspace(cx), None, None, cwd);
             }
             LayoutAction::NewClaudeTab => {
                 self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New, cx);
@@ -2400,10 +2416,20 @@ impl TerminalView {
             LayoutAction::NewCodexResumeTab => {
                 self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume, cx);
             }
-            LayoutAction::NextTab => self.switch_tab(TabSessions::focus_next, cx),
-            LayoutAction::PrevTab => self.switch_tab(TabSessions::focus_prev, cx),
+            // Every tab shortcut acts on the region the user is in, which the
+            // shell owns; the strip is asked for a tab of that region and can
+            // no longer answer with a neighbouring region's.
+            LayoutAction::NextTab => {
+                let workspace_id = self.shell.focused_workspace_id(cx);
+                self.switch_tab(move |tabs| tabs.focus_next(workspace_id), cx);
+            }
+            LayoutAction::PrevTab => {
+                let workspace_id = self.shell.focused_workspace_id(cx);
+                self.switch_tab(move |tabs| tabs.focus_prev(workspace_id), cx);
+            }
             LayoutAction::SelectTab(index) => {
-                self.switch_tab(move |tabs| tabs.select_in_workspace(index), cx);
+                let workspace_id = self.shell.focused_workspace_id(cx);
+                self.switch_tab(move |tabs| tabs.select(workspace_id, index), cx);
             }
             LayoutAction::CloseTab => self.close_active_tab(),
             LayoutAction::NewWindow => self.open_new_window(cx),
@@ -2856,7 +2882,7 @@ impl TerminalView {
             _ => None,
         };
         if let Some((provider, resume_mode)) = automated_ai {
-            self.create_ai_tab_request(provider, resume_mode, None);
+            self.create_ai_tab_request(self.creating_workspace(cx), provider, resume_mode, None);
             return;
         }
         if let Some(key_action) = key_action_for_automation(&action) {
@@ -2872,7 +2898,9 @@ impl TerminalView {
         }
         match action {
             AutomationAction::SwitchProfile { name } => self.switch_profile(&name, cx),
-            AutomationAction::FocusSession { session_id } => self.focus_session(session_id, cx),
+            AutomationAction::FocusSession { session_id } => {
+                self.activate_session_tab(session_id, cx);
+            }
             AutomationAction::OpenUpdateDialog => self.open_update_dialog(cx),
             // Everything else was lowered onto a `KeyAction` above.
             other => unroutable_action(&format!("{other:?}"), "no automation handler"),
@@ -2914,17 +2942,6 @@ impl TerminalView {
         }
     }
 
-    /// Raise the tab hosting `session_id` and attach it.
-    fn focus_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        self.switch_tab(
-            move |tabs| {
-                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
-                tabs.select(index)
-            },
-            cx,
-        );
-    }
-
     /// Dispatch an action chosen from the right-click context menu.
     ///
     /// Ports the winit `dispatch_context_menu_action` routing for the open/run
@@ -2947,7 +2964,12 @@ impl TerminalView {
             }
             ContextMenuAction::SendText(text) => self.send_key_bytes(text.into_bytes()),
             ContextMenuAction::RunCommandInWindow(command) => {
-                self.create_tab(Some(shell_command_argv(&command)), None, None);
+                self.create_tab(
+                    self.creating_workspace(cx),
+                    Some(shell_command_argv(&command)),
+                    None,
+                    None,
+                );
             }
             ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
             ContextMenuAction::Copy => self.copy_selection(),
@@ -3580,7 +3602,7 @@ impl TerminalView {
         if self.dialog.is_some() {
             return false;
         }
-        let session_count = self.shared.tabs.lock().map_or(0, |tabs| tabs.tabs().len());
+        let session_count = self.shared.tabs.lock().map_or(0, |tabs| tabs.len());
         self.open_dialog(AnyDialog::Close(CloseDialog::new(session_count)), cx);
         false
     }
@@ -3801,9 +3823,8 @@ impl TerminalView {
     /// The label a notification names a pane by: the server's workspace name
     /// when it has one, and the app name otherwise.
     fn notification_workspace_label(&self, session_id: SessionId) -> String {
-        let workspace_id = self.shared.tabs.lock().ok().and_then(|tabs| {
-            tabs.tabs().iter().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
-        });
+        let workspace_id =
+            self.shared.tabs.lock().ok().and_then(|tabs| tabs.workspace_of(session_id));
         workspace_id
             .and_then(|workspace_id| {
                 let metadata = self.shared.chrome_metadata.lock().ok()?;
@@ -3862,15 +3883,7 @@ impl TerminalView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let index = self
-            .shared
-            .tabs
-            .lock()
-            .ok()
-            .and_then(|tabs| tabs.tabs().iter().position(|tab| tab.session_id == session_id));
-        if let Some(index) = index {
-            self.switch_tab(move |tabs| tabs.select(index), cx);
-        }
+        self.activate_session_tab(session_id, cx);
         window.activate_window();
         self.close_notification(session_id);
         tracing::info!(%session_id, "focused a session from a notification click");
@@ -4077,7 +4090,7 @@ impl TerminalView {
     /// everything else (a reattach, a share join) falls back to a plain shell.
     fn sync_launch_bindings(&mut self) {
         let Ok(tabs) = self.shared.tabs.lock() else { return };
-        let live: Vec<SessionId> = tabs.tabs().iter().map(|tab| tab.session_id).collect();
+        let live: Vec<SessionId> = tabs.entries().map(|tab| tab.session_id).collect();
         drop(tabs);
         if !live.is_empty()
             && let Ok(mut pending) = self.shared.initial_session.binding.lock()
@@ -4120,7 +4133,7 @@ impl TerminalView {
         {
             return;
         }
-        let live = self.shared.tabs.lock().map_or(0, |tabs| tabs.tabs().len());
+        let live = self.shared.tabs.lock().map_or(0, |tabs| tabs.len());
         if live > 0 {
             // The claimed snapshot file stays on disk (claim is
             // non-destructive) until this window durably writes a fresh
@@ -4422,14 +4435,19 @@ impl TerminalView {
     ///
     /// The tab appears once the server answers with `SessionCreated`, so the
     /// strip never shows a tab whose PTY failed to spawn.
+    ///
+    /// The region is the caller's to name: the shell owns which region has the
+    /// window's focus, and asking the strip for it — as this did — meant a
+    /// second copy of that fact could disagree and file the new tab in a region
+    /// the user was not looking at.
     fn create_tab(
         &mut self,
+        workspace_id: Option<WorkspaceId>,
         command: Option<Vec<String>>,
         ai_launch: Option<AiLaunchSpec>,
         cwd: Option<PathBuf>,
     ) {
-        let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
-        else {
+        let Some(workspace_id) = workspace_id else {
             tracing::warn!("new tab ignored: no workspace is attached yet");
             return;
         };
@@ -4475,18 +4493,19 @@ impl TerminalView {
     fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode, cx: &App) {
         let cwd =
             self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd());
-        self.create_ai_tab_request(provider, resume_mode, cwd);
+        self.create_ai_tab_request(self.creating_workspace(cx), provider, resume_mode, cwd);
     }
 
     /// Build one immutable structured AI create request.
     fn create_ai_tab_request(
         &mut self,
+        workspace_id: Option<WorkspaceId>,
         provider: AiProvider,
         resume_mode: AiResumeMode,
         cwd: Option<PathBuf>,
     ) {
         let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
-        self.create_tab(launch.command, launch.ai_launch, cwd);
+        self.create_tab(workspace_id, launch.command, launch.ai_launch, cwd);
     }
 
     /// Read the focused session's last server-reported OSC 7 directory.
@@ -4518,8 +4537,9 @@ impl TerminalView {
         self.attach(session_id);
         if let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx) {
             self.shell.focus_pane(workspace_id, pane, cx);
-        } else if let Some(pane) = self.shell.focused_pane(cx) {
+        } else if let Some((workspace_id, pane)) = self.tab_adoption_pane(session_id, cx) {
             self.adopt_session(pane, session_id);
+            self.shell.focus_pane(workspace_id, pane, cx);
             self.publish_pane_sizes(cx);
         }
         // A tab switch moves the focused pane, which the server relays to PTY
@@ -4534,6 +4554,34 @@ impl TerminalView {
         // The report is deduplicated against the last one, so an idle switch
         // back and forth costs one frame's tree build and no traffic.
         self.report_workspace_tree(cx);
+    }
+
+    /// The region and pane an unshown tab should be shown in.
+    ///
+    /// A tab belongs to its own region, so it lands in *that* region's focused
+    /// pane — never the window's, which routinely sits elsewhere and would paint
+    /// the session into a region whose bar never listed it while displacing that
+    /// region's own tab. This is the one adoption rule; the cross-workspace
+    /// guard it replaces existed because a window-global selection could name a
+    /// tab of any region, and "resolved" that by re-pointing the strip at the
+    /// focused pane — overriding the user's own click.
+    ///
+    /// A tab whose workspace has no region in this window (a reattach after
+    /// reconnect, a strip that outlived its region) has nowhere of its own to
+    /// go and falls back to the focused pane.
+    fn tab_adoption_pane(&self, session_id: SessionId, cx: &App) -> Option<(WorkspaceId, PaneId)> {
+        let own_region = self
+            .shared
+            .tabs
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.workspace_of(session_id))
+            .filter(|workspace_id| self.shell.has_region(*workspace_id))
+            .and_then(|workspace_id| {
+                Some((workspace_id, self.shell.region_focused_pane(workspace_id)?))
+            });
+        own_region
+            .or_else(|| Some((self.shell.focused_workspace_id(cx), self.shell.focused_pane(cx)?)))
     }
 
     /// Hand keyboard focus back to the terminal after a pointer tab action.
@@ -4596,25 +4644,17 @@ impl TerminalView {
     }
 
     /// Close the focused tab's session. The strip updates on `SessionExited`.
+    ///
+    /// The focused tab is the session the window is attached to. The strip used
+    /// to answer this from its own window-global cursor, which is a second copy
+    /// of the same fact and could name a tab in a region the window had since
+    /// focused away from.
     fn close_active_tab(&self) {
-        let Some(session_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_session()) else {
-            return;
-        };
-        self.close_session(session_id, "close tab dropped");
-    }
-
-    /// Close the tab at `index`, if it exists.
-    fn close_tab_at(&self, index: usize) {
-        let Some(session_id) = self
-            .shared
-            .tabs
-            .lock()
-            .ok()
-            .and_then(|tabs| tabs.tabs().get(index).map(|tab| tab.session_id))
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
         else {
             return;
         };
-        self.close_session(session_id, "tab close dropped");
+        self.close_session(session_id, "close tab dropped");
     }
 
     /// Close `session_id`, logging the request so UI and shortcut paths share
@@ -4752,7 +4792,7 @@ impl TerminalView {
             return;
         }
         tracing::info!(?direction, panes = self.shell.pane_count(cx), "split the focused pane");
-        self.request_pane_session(cwd);
+        self.request_pane_session(cwd, cx);
         self.after_layout_change(cx);
     }
 
@@ -4863,7 +4903,7 @@ impl TerminalView {
         );
         // A new region is a fresh context, not a continuation of the source
         // pane, so it sends no CWD and the server's home fallback wins.
-        self.request_pane_session(None);
+        self.request_pane_session(None, cx);
         self.after_layout_change(cx);
     }
 
@@ -4888,14 +4928,33 @@ impl TerminalView {
         self.config.config().theme.ansi_colors.get(index).copied().unwrap_or(self.chrome.accent)
     }
 
+    /// The workspace a newly created session should be filed under.
+    ///
+    /// The shell's focused region is the answer whenever the server knows it —
+    /// it is the region the user is looking at. A `workspace_split_*` opens a
+    /// region *before* the server has minted its workspace, though, so the
+    /// session seeding that region has to be created through a workspace the
+    /// server has heard of; [`Self::follow_session_to_region`] re-files it once
+    /// the adopting pane turns out to sit elsewhere.
+    fn creating_workspace(&self, cx: &App) -> Option<WorkspaceId> {
+        let focused = self.shell.focused_workspace_id(cx);
+        if self.shell.is_server_workspace(focused) {
+            return Some(focused);
+        }
+        let attached = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let tabs = self.shared.tabs.lock().ok()?;
+        attached
+            .and_then(|session_id| tabs.workspace_of(session_id))
+            .or_else(|| tabs.regions().first().map(|region| region.workspace_id))
+    }
+
     /// Ask the server for a session to fill the pane that just appeared.
     ///
     /// The pane was queued by the split, so the reconcile pass hands it the
     /// session as soon as `SessionCreated` lands. `cwd` is captured from the
     /// source pane before the split moves focus to this pending pane.
-    fn request_pane_session(&mut self, cwd: Option<PathBuf>) {
-        let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
-        else {
+    fn request_pane_session(&mut self, cwd: Option<PathBuf>, cx: &App) {
+        let Some(workspace_id) = self.creating_workspace(cx) else {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
@@ -4926,10 +4985,7 @@ impl TerminalView {
             return;
         };
         if let Ok(mut tabs) = self.shared.tabs.lock() {
-            let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id);
-            if let Some(index) = index {
-                tabs.select(index);
-            }
+            tabs.show(session_id);
         }
         self.attach(session_id);
         self.report_focus();
@@ -4960,7 +5016,7 @@ impl TerminalView {
     fn report_workspace_tree(&mut self, cx: &mut Context<Self>) {
         // The strip is the region tab lists the report carries, so it is read
         // once here and handed down rather than reached for per region.
-        let tabs = self.shared.tabs.lock().map(|tabs| tabs.tabs().to_vec()).unwrap_or_default();
+        let tabs = self.shared.tabs.lock().map(|tabs| tabs.clone()).unwrap_or_default();
         let tree = self.shell.wire_tree(&tabs, cx);
         if self.reported_trees.back() == Some(&tree) {
             return;
@@ -5204,11 +5260,11 @@ impl TerminalView {
         if let Some(session_id) = self.shell.focused_session(cx)
             && let Ok(mut tabs) = self.shared.tabs.lock()
         {
-            tabs.activate(session_id);
+            tabs.show(session_id);
         }
-        // The pane holding the tab strip's focused session keeps focus, so the
+        // The pane holding the window's attached session keeps focus, so the
         // reader's own reattach and this rebuild agree on the active pane.
-        let active = self.shared.tabs.lock().ok().and_then(|tabs| tabs.active_session());
+        let active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         if let Some(session_id) = active
             && let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx)
         {
@@ -5257,8 +5313,16 @@ impl TerminalView {
         // land before one frame, and applying the latter against the original
         // client-local id would discard its project root as unclaimed.
         let mut changed = false;
-        if let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
-        {
+        // The *server's* id for the first region, not the shell's: the shell is
+        // still on its client-minted id at this point, and this is the frame
+        // that replaces it.
+        let seed = self
+            .shared
+            .tabs
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.regions().first().map(|region| region.workspace_id));
+        if let Some(workspace_id) = seed {
             changed |= self.shell.adopt_server_workspace(workspace_id, cx);
         }
         // Metadata still lands before pane/session adoption. A `WorkspaceInfo`
@@ -5269,10 +5333,10 @@ impl TerminalView {
             |_| (HashSet::new(), HashSet::new()),
             |tabs| {
                 (
-                    tabs.tabs().iter().map(|tab| tab.session_id).collect::<HashSet<SessionId>>(),
-                    tabs.tabs()
+                    tabs.entries().map(|tab| tab.session_id).collect::<HashSet<SessionId>>(),
+                    tabs.regions()
                         .iter()
-                        .map(|tab| tab.workspace_id)
+                        .map(|region| region.workspace_id)
                         .collect::<HashSet<WorkspaceId>>(),
                 )
             },
@@ -5301,8 +5365,10 @@ impl TerminalView {
                 self.adopt_session(pane, session_id);
                 self.follow_session_to_region(pane, session_id, cx);
                 changed = true;
-            } else if let Some(pane) = self.shell.focused_pane(cx) {
-                changed |= self.adopt_into_focused_pane(pane, session_id, cx);
+            } else if let Some((_, pane)) = self.tab_adoption_pane(session_id, cx) {
+                self.adopt_session(pane, session_id);
+                self.follow_session_to_region(pane, session_id, cx);
+                changed = true;
             }
         }
         changed |= self.fill_empty_region_panes(cx);
@@ -5328,7 +5394,7 @@ impl TerminalView {
         }
         let entries: Vec<(WorkspaceId, SessionId)> = self.shared.tabs.lock().map_or_else(
             |_| Vec::new(),
-            |tabs| tabs.tabs().iter().map(|tab| (tab.workspace_id, tab.session_id)).collect(),
+            |tabs| tabs.entries().map(|tab| (tab.workspace_id, tab.session_id)).collect(),
         );
         let mut changed = false;
         for (workspace_id, pane) in empties {
@@ -5368,7 +5434,7 @@ impl TerminalView {
         loop {
             let shown = self.shell.shown_sessions();
             let unshown = self.shared.tabs.lock().ok().and_then(|tabs| {
-                tabs.tabs().iter().map(|tab| tab.session_id).find(|id| !shown.contains(id))
+                tabs.entries().map(|tab| tab.session_id).find(|id| !shown.contains(id))
             });
             let Some(session_id) = unshown else { break };
             let Some(pane) = self.shell.take_pending(cx) else { break };
@@ -5445,61 +5511,6 @@ impl TerminalView {
             return;
         };
         ai.restore_prompts(session_id, restored.prompts, restored.conversation_id);
-    }
-
-    /// Show an unshown active session in the focused pane — unless that would
-    /// drag it across a workspace boundary.
-    ///
-    /// The reader's exit refocus is workspace-scoped, but when a region
-    /// collapses with its last tab the strip's fallback selection can name a
-    /// session filed under another workspace. Adopting it here would displace
-    /// the focused pane's own session and, through
-    /// [`Self::follow_session_to_region`], permanently re-file the adopted
-    /// session on the server. So a cross-workspace selection is resolved the
-    /// other way around: the strip re-points at the session the focused pane
-    /// is already showing, and every session keeps its workspace.
-    ///
-    /// An *empty* focused pane has nothing to protect, so it adopts the
-    /// session regardless — that is the reattach path filling a surviving
-    /// window back in.
-    fn adopt_into_focused_pane(
-        &mut self,
-        pane: PaneId,
-        session_id: SessionId,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let pane_session = self.shell.session_of(pane);
-        let pane_region = self.shell.region_for_pane(pane, cx);
-        let tab_workspace = self.shared.tabs.lock().ok().and_then(|t| t.workspace_of(session_id));
-        // Only a workspace this window shows a region for can be "crossed
-        // into": a tab filed under a region-less workspace (a reattach after
-        // reconnect, or a strip that outlived its region) has nowhere else to
-        // render, so the focused pane takes it exactly as before.
-        let crosses_regions = match (pane_session, pane_region, tab_workspace) {
-            (Some(_), Some(region), Some(workspace)) => {
-                region != workspace && self.shell.has_region(workspace)
-            }
-            _ => false,
-        };
-        if !crosses_regions {
-            self.adopt_session(pane, session_id);
-            self.follow_session_to_region(pane, session_id, cx);
-            return true;
-        }
-        let Some(shown) = pane_session else { return false };
-        tracing::info!(
-            %session_id,
-            %shown,
-            "kept a cross-workspace session out of the focused pane; strip follows the pane"
-        );
-        self.switch_tab(
-            move |tabs| {
-                let index = tabs.tabs().iter().position(|tab| tab.session_id == shown)?;
-                tabs.select(index)
-            },
-            cx,
-        );
-        true
     }
 
     /// Tell the server a session changed workspace regions.
@@ -5793,10 +5804,9 @@ impl TerminalView {
     /// Advance a region bar's tab drag to `cursor_x`, swapping slots as the
     /// dragged tab's centre crosses into a neighbour's.
     ///
-    /// The bar's slots are region-local while the strip is window-global, so the
-    /// swap is applied at the region's offset into the strip. Grouping keeps a
-    /// region's tabs contiguous there, which is what makes a single offset
-    /// enough — and what keeps a drag from ever leaving its own region.
+    /// The bar's slots and the strip's are the same positions now that a region
+    /// owns its own tab list, so the swap applies directly and a drag cannot
+    /// leave its region by construction.
     fn update_region_drag(&mut self, cursor_x: f32, cx: &mut Context<Self>) {
         let Some(mut drag) = self.region_chrome.drag else { return };
         let Some(bar) =
@@ -5819,11 +5829,7 @@ impl TerminalView {
             return;
         }
         let Ok(mut tabs) = self.shared.tabs.lock() else { return };
-        let Some(offset) = tabs.tabs().iter().position(|tab| tab.workspace_id == drag.workspace_id)
-        else {
-            return;
-        };
-        if !tabs.reorder(offset + drag.current, offset + target) {
+        if !tabs.reorder(drag.workspace_id, drag.current, target) {
             return;
         }
         drop(tabs);
@@ -6048,13 +6054,25 @@ impl TerminalView {
     /// attribute the attach to the bar.
     fn select_session_tab(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         tracing::info!(%session_id, "region bar selected a tab");
-        self.switch_tab(
-            move |tabs| {
-                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
-                tabs.select(index)
-            },
-            cx,
-        );
+        self.activate_session_tab(session_id, cx);
+    }
+
+    /// Activate `session_id` from a pointer: show it in its own region and move
+    /// the window's focus there.
+    ///
+    /// A click on an unfocused region's bar means "focus this region, on this
+    /// tab", and that region is usually *already showing* the clicked tab — so
+    /// the strip reports no change and the no-change contract that keeps
+    /// keyboard repeat from re-attaching would swallow exactly that click. The
+    /// window's own focus is the second half of the condition, which is what
+    /// makes a click across regions act while a click on the tab the user is
+    /// already in stays a no-op.
+    fn activate_session_tab(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let moved = self.shared.tabs.lock().is_ok_and(|mut tabs| tabs.show(session_id).is_some());
+        if !moved && self.shell.focused_session(cx) == Some(session_id) {
+            return;
+        }
+        self.switch_tab(move |_| Some(session_id), cx);
     }
 
     /// Translate a window pointer position into the grid band's local space.
@@ -6134,15 +6152,9 @@ impl TerminalView {
             cx.notify();
             return true;
         };
-        // Route through the tab-switch path so the strip's active tab, the
-        // attach, and the focus report all follow the pane focus.
-        self.switch_tab(
-            move |tabs| {
-                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
-                tabs.select(index)
-            },
-            cx,
-        );
+        // Route through the pointer activation path so the strip's shown tab,
+        // the attach, and the focus report all follow the pane focus.
+        self.activate_session_tab(session_id, cx);
         cx.notify();
         true
     }
@@ -7273,7 +7285,7 @@ impl TerminalView {
             .shared
             .tabs
             .lock()
-            .map(|tabs| tabs.tabs().iter().map(|entry| entry.session_id).collect())
+            .map(|tabs| tabs.entries().map(|entry| entry.session_id).collect())
             .unwrap_or_default();
         let focused = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         scribe_common::perf_probe::record_sessions(sessions, focused);
@@ -7607,13 +7619,8 @@ impl TerminalView {
         // the legacy client's pane count: every session open in this window,
         // not just the attached one.
         let (session_count, workspace_id) = self.shared.tabs.lock().map_or((0, None), |tabs| {
-            let workspace_id = active_session.and_then(|session_id| {
-                tabs.tabs()
-                    .iter()
-                    .find(|tab| tab.session_id == session_id)
-                    .map(|entry| entry.workspace_id)
-            });
-            (tabs.tabs().len(), workspace_id)
+            let workspace_id = active_session.and_then(|session_id| tabs.workspace_of(session_id));
+            (tabs.len(), workspace_id)
         });
         // Feature 013/014: the transport label is a `&'static str`, so the
         // tailnet chrome lock is released before `build_model` borrows anything
@@ -10151,7 +10158,7 @@ fn on_session_exited(
     }
     let (refocused, tabs_empty) = ctx.tabs.lock().map_or((None, false), |mut tabs| {
         let refocused = tabs.remove(session_id);
-        (refocused, tabs.tabs().is_empty())
+        (refocused, tabs.is_empty())
     });
     if existed && tabs_empty {
         request_permanent_window_close(&ctx.lifecycle, &ctx.sink);
@@ -11457,7 +11464,7 @@ fn sync_tab_strip(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     let entries = sessions.iter().map(tab_entry_for).collect();
-    let focused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.reconcile(entries));
+    let focused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.reconcile(entries, attached));
     match focused {
         Some(session_id) if Some(session_id) != attached => {
             attach_session(ctx, session_id)?;

@@ -545,7 +545,13 @@ run_user_command() {
 launch_user_binary() {
     local binary="$1"
 
-    run_user_command nohup "$binary" >/dev/null 2>&1 &
+    # Background the client *inside* an `sh -c`, exactly as spawn_upgrade_server
+    # does for the server.  A plain `sudo -u user client &` makes sudo wait on
+    # the long-lived client, so every relaunch left a postinst subshell and two
+    # nested sudo processes alive for as long as the user kept the window open.
+    # Backgrounding within sh lets sh exit, sudo exit, and the client reparent
+    # to init.
+    run_user_command sh -c 'nohup "$1" >/dev/null 2>&1 &' _ "$binary"
 }
 
 probe_client_vulkan() {

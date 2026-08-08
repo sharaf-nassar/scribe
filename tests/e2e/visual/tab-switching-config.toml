@@ -1,0 +1,9 @@
+# Openbox — the window manager the visual container has to run — grabs both
+# Ctrl+Alt+Left and Ctrl+Alt+Right for "switch to the desktop on the
+# left/right", and a grabbed chord never reaches any application. The two
+# workspace-focus actions are therefore rebound for this run only; every other
+# chord the suite presses is the shipped Linux default. See the same note in
+# `pane-workspace-layout.sh`.
+[keybindings]
+workspace_focus_left = "ctrl+alt+h"
+workspace_focus_right = "ctrl+alt+l"

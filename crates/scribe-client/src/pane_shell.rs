@@ -31,7 +31,7 @@ use scribe_client::restore_replay::{
     PaneRestore, RebuiltWindow, ReplayLaunch, new_shell_binding, snapshot_window_restore,
 };
 use scribe_client::restore_state::{LaunchBinding, WindowRestoreState};
-use scribe_client::tab_session::TabEntry;
+use scribe_client::tab_session::TabSessions;
 use scribe_client::workspace_layout::{WindowLayout, WorkspaceSlot, pane_tree_to_layout_node};
 use scribe_client::workspace_tree::WorkspaceTree;
 use scribe_common::{
@@ -351,7 +351,7 @@ impl PaneShell {
     /// Panes that are still waiting for a session are pruned instead of being
     /// serialized under a synthetic id: a reconnect must not restore a pane
     /// pointing at a session that never existed.
-    pub fn wire_tree(&self, tabs: &[TabEntry], cx: &App) -> WorkspaceTreeNode {
+    pub fn wire_tree(&self, tabs: &TabSessions, cx: &App) -> WorkspaceTreeNode {
         let topology = self.workspace.read(cx).to_tree();
         self.fill_regions(topology, tabs, cx)
     }
@@ -360,7 +360,7 @@ impl PaneShell {
     fn fill_regions(
         &self,
         node: WorkspaceTreeNode,
-        tabs: &[TabEntry],
+        tabs: &TabSessions,
         cx: &App,
     ) -> WorkspaceTreeNode {
         match node {
@@ -474,14 +474,16 @@ impl PaneShell {
         self.focused.get(&self.focused_workspace_id(cx)).copied()
     }
 
+    /// The focused pane of `workspace_id`'s region, independent of which region
+    /// owns the window's focus. This is the pane one of that region's tabs
+    /// belongs in.
+    pub fn region_focused_pane(&self, workspace_id: WorkspaceId) -> Option<PaneId> {
+        self.focused.get(&workspace_id).copied()
+    }
+
     /// The session the focused pane is showing.
     pub fn focused_session(&self, cx: &App) -> Option<SessionId> {
         self.focused_pane(cx).and_then(|pane| self.sessions.get(&pane).copied())
-    }
-
-    /// The session `pane` is showing, or `None` while it waits for one.
-    pub fn session_of(&self, pane: PaneId) -> Option<SessionId> {
-        self.sessions.get(&pane).copied()
     }
 
     /// Every session currently shown in a pane.
@@ -1141,15 +1143,14 @@ pub struct RegionTabs {
 /// connect will not restore.
 fn region_tab_payload(
     workspace_id: WorkspaceId,
-    tabs: &[TabEntry],
+    tabs: &TabSessions,
     displayed: Option<PaneTreeNode>,
     active: Option<SessionId>,
 ) -> RegionTabs {
     let mut session_ids: Vec<SessionId> = tabs
-        .iter()
-        .filter(|tab| tab.workspace_id == workspace_id)
-        .map(|tab| tab.session_id)
-        .collect();
+        .region(workspace_id)
+        .map(|region| region.tabs().iter().map(|tab| tab.session_id).collect())
+        .unwrap_or_default();
     if let Some(displayed) = displayed.as_ref() {
         let mut shown = Vec::new();
         collect_pane_sessions(displayed, &mut shown);
@@ -1331,6 +1332,8 @@ mod tests {
         WorkspaceSnapshot,
     };
 
+    use scribe_client::tab_session::TabEntry;
+
     use super::*;
 
     fn leaf(workspace_id: WorkspaceId, session_id: SessionId) -> WorkspaceTreeNode {
@@ -1477,12 +1480,16 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let other = WorkspaceId::new();
         let (first, second, third) = (SessionId::new(), SessionId::new(), SessionId::new());
-        let strip = vec![
-            TabEntry::new(first, workspace_id, "one".to_owned()),
-            TabEntry::new(SessionId::new(), other, "elsewhere".to_owned()),
-            TabEntry::new(second, workspace_id, "two".to_owned()),
-            TabEntry::new(third, workspace_id, "three".to_owned()),
-        ];
+        let mut strip = TabSessions::new();
+        strip.reconcile(
+            vec![
+                TabEntry::new(first, workspace_id, "one".to_owned()),
+                TabEntry::new(SessionId::new(), other, "elsewhere".to_owned()),
+                TabEntry::new(second, workspace_id, "two".to_owned()),
+                TabEntry::new(third, workspace_id, "three".to_owned()),
+            ],
+            None,
+        );
 
         // One pane showing the middle tab: all three tabs are reported, in
         // strip order, and the active index names the one on screen.
