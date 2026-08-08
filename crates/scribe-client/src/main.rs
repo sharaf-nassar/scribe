@@ -11335,6 +11335,35 @@ mod tests {
         assert!(!ai.prompts.contains_key(&session));
     }
 
+    // @lat: [[client#GPUI Prompt Bar#A new conversation retires the bar and the meter]]
+    #[test]
+    fn a_new_conversation_retires_the_bar_and_the_meter() {
+        let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        let edge = |conversation: &str, context| {
+            let mut state = scribe_common::ai_state::AiProcessState::new(AiState::Processing);
+            state.conversation_id = Some(conversation.to_owned());
+            state.context = context;
+            state
+        };
+
+        ai.apply_state_change(session, edge("conv-42", Some(80)), at);
+        ai.record_prompt(session, "build the thing", at);
+        assert!(ai.visible_prompts(session).is_some());
+        assert_eq!(ai.tracker.context_for(session), Some(80));
+
+        // The switching edge carries no fill of its own, because the server's
+        // metadata merge stops at the conversation boundary.
+        ai.apply_state_change(session, edge("conv-43", None), at);
+        assert!(ai.visible_prompts(session).is_none(), "the retired rows go");
+        assert_eq!(ai.tracker.context_for(session), None, "so does the retired percent");
+
+        // The new conversation's own first reading is not collateral damage.
+        ai.apply_state_change(session, edge("conv-43", Some(3)), at);
+        assert_eq!(ai.tracker.context_for(session), Some(3));
+    }
+
     // @lat: [[client#GPUI Prompt Bar#AI state edges freeze and resume the elapsed timer]]
     #[test]
     fn ai_state_edges_freeze_and_resume_the_elapsed_timer() {
