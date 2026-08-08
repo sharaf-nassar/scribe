@@ -113,9 +113,14 @@ render_line_rows() {
 }
 
 # ── Phase 0: the published width, and the PTY that got it ─────────
+# The client log is ANSI-coloured and tracing wraps every FIELD NAME in escapes,
+# so the bytes are `ESC[3mcols ESC[0m ESC[2m= ESC[0m 119` and a literal `cols=`
+# never matches. Message text is uncoloured, which is why the plain-prose greps
+# elsewhere in this suite work; field lookups have to strip the escapes first.
 COLS=""
 for _ in $(seq 1 "$POLL_TICKS"); do
-    COLS=$(grep -o "published a pane's grid size.*cols=[0-9]*" "$CLIENT_LOG" \
+    COLS=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" \
+        | grep -o "published a pane's grid size.*cols=[0-9]*" \
         | tail -1 | grep -o 'cols=[0-9]*' | cut -d= -f2)
     [ -n "$COLS" ] && break
     sleep 0.5
