@@ -289,7 +289,6 @@ fn apply_terminal_key(
         | "terminal.claude_code_integration"
         | "terminal.codex_code_integration"
         | "terminal.preserve_ai_scrollback"
-        | "terminal.ai_tab_cwd"
         | "terminal.natural_scroll"
         | "terminal.keyboard_protocol_enhanced"
         | "terminal.paste_confirmation"
@@ -421,15 +420,6 @@ fn apply_terminal_behavior_key(
         "terminal.env_persistence.enabled" => {
             config.terminal.env_persistence.enabled =
                 value.as_bool().ok_or("env_persistence.enabled must be a boolean")?;
-        }
-        "terminal.ai_tab_cwd" => {
-            let s = value.as_str().ok_or("ai_tab_cwd must be a string")?;
-            config.terminal.ai_tab_cwd = match s {
-                "pane" => scribe_common::config::AiTabCwd::Pane,
-                "project_root" => scribe_common::config::AiTabCwd::ProjectRoot,
-                "home" => scribe_common::config::AiTabCwd::Home,
-                _ => return Err(format!("invalid ai_tab_cwd: {s}")),
-            };
         }
         _ => return Err(format!("unhandled terminal key: {key}")),
     }

@@ -25,15 +25,6 @@ _SCRIBE_INTEGRATION_SOURCED=1
 # ---------------------------------------------------------------------------
 set +o posix 2>/dev/null
 
-# AI tabs source this script from a real login shell immediately before exec.
-# Remember that mode across restore-delta sourcing so an older envelope cannot
-# accidentally re-enable the prompt path by changing SCRIBE_AI_TAB.
-if [[ "${SCRIBE_AI_TAB:-}" == "1" ]]; then
-	__scribe_ai_tab_mode=1
-else
-	__scribe_ai_tab_mode=0
-fi
-
 # ---------------------------------------------------------------------------
 # Source user startup files
 # --rcfile replaces ~/.bashrc, so we must source startup files ourselves.
@@ -45,8 +36,6 @@ fi
 
 # Unset ENV to prevent re-sourcing in child shells
 unset ENV
-
-if ((!__scribe_ai_tab_mode)); then
 
 __scribe_source_login_profile() {
 	[[ -f /etc/profile ]] && source /etc/profile
@@ -70,12 +59,9 @@ else
 	[[ -f ~/.bashrc ]] && source ~/.bashrc
 fi
 
-fi
-
 # ---------------------------------------------------------------------------
 # Colored completions (readline)
 # ---------------------------------------------------------------------------
-if ((!__scribe_ai_tab_mode)); then
 bind "set colored-stats on" 2>/dev/null
 bind "set colored-completion-prefix on" 2>/dev/null
 bind "set visible-stats on" 2>/dev/null
@@ -191,7 +177,6 @@ __scribe_emit_ai_launch() {
 	: "$__scribe_underscore"
 }
 trap '__scribe_emit_ai_launch "$_"' DEBUG
-fi
 
 # ---------------------------------------------------------------------------
 # Env-delta capture (feature 006: persist & restore terminal environment)
@@ -221,14 +206,6 @@ if [[ -n "${SCRIBE_RESTORE_ENV_DELTA_FILE:-}" && -f "${SCRIBE_RESTORE_ENV_DELTA_
 	rm -f "${SCRIBE_RESTORE_ENV_DELTA_FILE}" 2>/dev/null || true
 	unset SCRIBE_RESTORE_ENV_DELTA_FILE
 fi
-
-# AI tabs exec before drawing a prompt. Restore is the only integration work
-# they need, so avoid the baseline/helper fork and every prompt delta hook.
-if ((__scribe_ai_tab_mode)); then
-	unset ENV SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT __scribe_ai_tab_mode
-	return 0
-fi
-unset __scribe_ai_tab_mode
 
 # Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
 # `terminal.env_persistence.enabled` is off, and drops every EnvChanged it

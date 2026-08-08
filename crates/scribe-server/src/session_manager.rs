@@ -465,8 +465,7 @@ impl SessionManager {
         let slot = self.reserve_session_slot()?;
         let session_id = SessionId::new();
 
-        let shell =
-            ResolvedShell::for_request(request.command.as_deref(), request.ai_launch.as_ref());
+        let shell = ResolvedShell::for_request(request.command.as_deref());
 
         // One config read per spawn drives both the restore-apply decision
         // and the shell-side gate var, so a launch cannot see the feature as
@@ -480,24 +479,9 @@ impl SessionManager {
         // defaults instead of being blocked by the keystore.
         let integration_enabled = self.shell_integration_enabled.load(Ordering::Relaxed);
         let restore_env_file = match request.env_envelope_id.as_deref() {
-            Some(envelope_id)
-                if env_persistence
-                    && restore_apply_supported(
-                        shell.kind,
-                        request.ai_launch.as_ref(),
-                        integration_enabled,
-                    ) =>
-            {
+            Some(envelope_id) if env_persistence => {
                 prepare_restore_env_file(request.window_id, session_id, envelope_id, shell.kind)
                     .await
-            }
-            Some(_) if env_persistence && request.ai_launch.is_some() => {
-                tracing::debug!(
-                    shell = %shell.binary,
-                    kind = ?shell.kind,
-                    "AI shell has no restore-delta apply path; skipping staging"
-                );
-                None
             }
             _ => None,
         };
@@ -560,30 +544,20 @@ impl SessionManager {
             .to_owned();
         let integration_enabled = env.integration_enabled;
         let integration_script = session_integration_script(shell.kind, integration_enabled);
-        let integration = match (integration_enabled, request.ai_launch.is_some()) {
-            (false, _) => LaunchIntegration::Disabled,
-            (true, false) => LaunchIntegration::Plain,
-            (true, true) => {
-                LaunchIntegration::Ai { integration_script: integration_script.as_deref() }
-            }
-        };
-        let pty_shell = match request.ai_launch.as_ref() {
-            Some(ai_launch) => Some(build_ai_shell(shell_binary, shell.kind, ai_launch)),
-            None => build_shell(
-                shell_binary,
-                request.command,
-                shell.kind,
-                integration_script.as_deref(),
-            ),
-        };
+        let pty_shell = build_launch_shell(
+            shell_binary,
+            request.command,
+            shell.kind,
+            integration_script.as_deref(),
+            request.ai_launch.as_ref(),
+        )
+        .map(|(program, args)| alacritty_terminal::tty::Shell::new(program, args));
         let pty_options = build_pty_options(PtyOptionsBuild {
             session_id,
             shell: pty_shell,
             cwd: request.cwd,
             shell_kind: shell.kind,
-            integration,
-            restore_env_file: env.restore_file,
-            env_persistence: env.persistence_enabled,
+            env,
             images_enabled: crate::terminal_image_sharing::images_master_enabled(),
         });
 
@@ -808,16 +782,8 @@ struct PtyOptionsBuild<'a> {
     shell: Option<alacritty_terminal::tty::Shell>,
     cwd: Option<std::path::PathBuf>,
     shell_kind: ShellKind,
-    integration: LaunchIntegration<'a>,
-    restore_env_file: Option<&'a std::path::Path>,
-    env_persistence: bool,
+    env: EnvLaunchContext<'a>,
     images_enabled: bool,
-}
-
-enum LaunchIntegration<'a> {
-    Disabled,
-    Plain,
-    Ai { integration_script: Option<&'a str> },
 }
 
 fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
@@ -826,9 +792,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         shell,
         cwd,
         shell_kind,
-        integration,
-        restore_env_file,
-        env_persistence,
+        env: EnvLaunchContext { restore_file, persistence_enabled, integration_enabled },
         images_enabled,
     } = opts;
     let mut env = HashMap::from([
@@ -878,14 +842,13 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     // spawn because no server-to-running-shell channel exists — a live
     // config flip binds newly started shells only, which is the documented
     // "restart or re-init required" semantic in both directions.
-    env.insert("SCRIBE_ENV_PERSIST".to_owned(), if env_persistence { "1" } else { "0" }.to_owned());
+    env.insert(
+        "SCRIBE_ENV_PERSIST".to_owned(),
+        if persistence_enabled { "1" } else { "0" }.to_owned(),
+    );
 
-    match integration {
-        LaunchIntegration::Disabled => {}
-        LaunchIntegration::Plain => inject_shell_integration_env(shell_kind, &mut env),
-        LaunchIntegration::Ai { integration_script } => {
-            inject_ai_shell_integration_env(shell_kind, integration_script, &mut env);
-        }
+    if integration_enabled {
+        inject_shell_integration_env(shell_kind, &mut env);
     }
 
     // Per specs/006-persist-terminal-env/contracts/hook-event-additions.md, when
@@ -893,7 +856,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     // the shell at the per-spawn temp file consumed after login/rc processing.
     // Plain shells and AI bash use integration; AI zsh/fish use the server-built
     // preamble. Shell kinds with no consumer are filtered before staging.
-    if let Some(path) = restore_env_file {
+    if let Some(path) = restore_file {
         env.insert("SCRIBE_RESTORE_ENV_DELTA_FILE".to_owned(), path.to_string_lossy().into_owned());
     }
 
@@ -953,46 +916,13 @@ struct ResolvedShell {
 }
 
 impl ResolvedShell {
-    fn for_request(command: Option<&[String]>, ai_launch: Option<&AiLaunchSpec>) -> Self {
-        let binary = if ai_launch.is_some() {
-            let resolved = scribe_common::shell::ai_login_shell();
-            tracing::debug!(
-                shell = %resolved.program,
-                tier = resolved.source.as_str(),
-                "resolved host login shell for AI launch"
-            );
-            resolved.program
-        } else {
-            shell_binary_str(command)
-        };
+    fn for_request(command: Option<&[String]>) -> Self {
+        let binary = shell_binary_str(command);
         let kind = shell_integration::detect_shell(&binary);
         if kind == ShellKind::Unknown {
             tracing::debug!(shell = %binary, "unknown shell, skipping integration env");
         }
         Self { binary, kind }
-    }
-}
-
-/// Whether this launch has a consumer for a staged restore-delta file.
-fn restore_apply_supported(
-    kind: ShellKind,
-    ai_launch: Option<&AiLaunchSpec>,
-    integration_enabled: bool,
-) -> bool {
-    if ai_launch.is_none() {
-        return true;
-    }
-
-    match kind {
-        // Bash consumes the file from the AI-mode integration script, so a
-        // disabled or unavailable integration path means there is no consumer.
-        ShellKind::Bash => session_integration_script(kind, integration_enabled).is_some(),
-        // Zsh and fish consume the file in the server-owned post-login preamble.
-        ShellKind::Zsh | ShellKind::Fish => true,
-        // Nushell's command path cannot autoload integration; PowerShell AI
-        // launches are intentionally unsupported; unknown shells have no
-        // known source syntax. Staging for any of them would leak a temp file.
-        ShellKind::Nushell | ShellKind::PowerShell | ShellKind::Unknown => false,
     }
 }
 
@@ -1042,103 +972,128 @@ fn build_shell(
     command: Option<Vec<String>>,
     kind: shell_integration::ShellKind,
     integration_script: Option<&str>,
-) -> Option<alacritty_terminal::tty::Shell> {
-    match command {
-        Some(parts) => {
-            let mut iter = parts.into_iter();
-            let program = iter.next()?;
-            let mut args: Vec<String> = iter.collect();
-            match kind {
-                shell_integration::ShellKind::PowerShell => {
-                    if let Some(script) = integration_script.filter(|_| args.is_empty()) {
-                        args.splice(
-                            0..0,
-                            [
-                                String::from("-NoLogo"),
-                                String::from("-NoExit"),
-                                String::from("-File"),
-                                script.to_owned(),
-                            ],
-                        );
-                    }
-                }
-                shell_integration::ShellKind::Bash
-                | shell_integration::ShellKind::Zsh
-                | shell_integration::ShellKind::Fish
-                | shell_integration::ShellKind::Nushell
-                | shell_integration::ShellKind::Unknown => {}
+) -> Option<(String, Vec<String>)> {
+    let Some(parts) = command else {
+        let args = match kind {
+            shell_integration::ShellKind::Bash => integration_script
+                .map_or_else(Vec::new, |script| vec!["--rcfile".to_owned(), script.to_owned()]),
+            shell_integration::ShellKind::PowerShell => {
+                integration_script.map_or_else(Vec::new, |script| {
+                    vec![
+                        String::from("-NoLogo"),
+                        String::from("-NoExit"),
+                        String::from("-File"),
+                        script.to_owned(),
+                    ]
+                })
             }
-            Some(alacritty_terminal::tty::Shell::new(program, args))
-        }
-        None => {
-            match kind {
-                shell_integration::ShellKind::Bash => {
-                    let args = integration_script.map_or_else(Vec::new, |script| {
-                        vec!["--rcfile".to_owned(), script.to_owned()]
-                    });
-                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), args))
-                }
-                shell_integration::ShellKind::PowerShell => {
-                    let args = integration_script.map_or_else(Vec::new, |script| {
-                        vec![
-                            String::from("-NoLogo"),
-                            String::from("-NoExit"),
-                            String::from("-File"),
-                            script.to_owned(),
-                        ]
-                    });
-                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), args))
-                }
-                shell_integration::ShellKind::Zsh
-                | shell_integration::ShellKind::Fish
-                | shell_integration::ShellKind::Nushell
-                | shell_integration::ShellKind::Unknown => {
-                    // These shells rely on environment-based startup hooks, but
-                    // we still spawn the resolved shell binary explicitly.
-                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), Vec::new()))
-                }
+            // These shells rely on environment-based startup hooks, but we
+            // still spawn the resolved shell binary explicitly.
+            shell_integration::ShellKind::Zsh
+            | shell_integration::ShellKind::Fish
+            | shell_integration::ShellKind::Nushell
+            | shell_integration::ShellKind::Unknown => Vec::new(),
+        };
+        return Some((shell_binary.to_owned(), args));
+    };
+
+    let mut iter = parts.into_iter();
+    let program = iter.next()?;
+    let mut args: Vec<String> = iter.collect();
+    match kind {
+        shell_integration::ShellKind::PowerShell => {
+            if let Some(script) = integration_script.filter(|_| args.is_empty()) {
+                args.splice(
+                    0..0,
+                    [
+                        String::from("-NoLogo"),
+                        String::from("-NoExit"),
+                        String::from("-File"),
+                        script.to_owned(),
+                    ],
+                );
             }
         }
+        shell_integration::ShellKind::Bash
+        | shell_integration::ShellKind::Zsh
+        | shell_integration::ShellKind::Fish
+        | shell_integration::ShellKind::Nushell
+        | shell_integration::ShellKind::Unknown => {}
     }
+    Some((program, args))
 }
 
-/// Build a login+interactive shell command for structured AI intent.
-fn build_ai_shell(
+/// The PTY shell for a launch, with or without structured AI intent.
+///
+/// An AI tab is deliberately not its own session class: it is the ordinary
+/// [`build_shell`] invocation — same binary, same integration attachment, same
+/// startup files — with a command appended that runs the provider. The shell
+/// reads the user's rc exactly as every other tab does, so an AI tab can never
+/// resolve a different `PATH` than the tab beside it.
+fn build_launch_shell(
     shell_binary: &str,
+    command: Option<Vec<String>>,
     kind: ShellKind,
-    launch: &AiLaunchSpec,
-) -> alacritty_terminal::tty::Shell {
+    integration_script: Option<&str>,
+    ai_launch: Option<&AiLaunchSpec>,
+) -> Option<(String, Vec<String>)> {
+    let Some(launch) = ai_launch else {
+        return build_shell(shell_binary, command, kind, integration_script);
+    };
+    // PowerShell runs the provider through `-Command`, which is exclusive with
+    // the `-File` integration attachment and has to be the final argument, so
+    // an AI launch drops the script rather than ship an argv where one flag
+    // eats another. Every other shell keeps its attachment.
+    let script = integration_script.filter(|_| kind != ShellKind::PowerShell);
+    let (program, mut args) = build_shell(shell_binary, command, kind, script)?;
+    args.extend(ai_exec_args(kind, launch));
+    Some((program, args))
+}
+
+/// Trailing argv that runs the provider and ends the session with it.
+///
+/// POSIX-family shells `exec` the provider over themselves, so the CLI becomes
+/// the PTY's direct child and quitting it closes the tab instead of dropping
+/// the user at a stray prompt.
+fn ai_exec_args(kind: ShellKind, launch: &AiLaunchSpec) -> Vec<String> {
     let exec = ai_exec_command(kind, launch);
-    let args = match kind {
-        ShellKind::Bash => vec![
-            String::from("-lic"),
-            format!(
-                "[ -n \"${{SCRIBE_INTEGRATION_SCRIPT:-}}\" ] && source \"$SCRIBE_INTEGRATION_SCRIPT\"; unset SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT; {exec}"
-            ),
-        ],
+    match kind {
+        // Nushell rejects the grouped short form and takes no integration
+        // under any `-c` variant (its vendor autoload is REPL-only).
+        ShellKind::Nushell => vec![String::from("-i"), String::from("-c"), exec],
+        // Zsh and fish schedule their restore-delta apply for the first
+        // `precmd` so it lands after the user's rc; an AI tab execs before any
+        // prompt, so that consumer never runs and both the delta and its temp
+        // file would be left behind. The `-c` command is the only point that
+        // is still after user rc and still before `exec`, so it consumes the
+        // file itself. Bash needs no equivalent — `scribe.bash` applies the
+        // delta inline while it is being sourced, which is already post-rc.
         ShellKind::Zsh => vec![
-            String::from("-lic"),
+            String::from("-ic"),
             format!(
-                "[ -n \"${{SCRIBE_RESTORE_ENV_DELTA_FILE:-}}\" ] && [ -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\" ] && . \"$SCRIBE_RESTORE_ENV_DELTA_FILE\" && command rm -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; unset SCRIBE_RESTORE_ENV_DELTA_FILE SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT; {exec}"
+                "[ -n \"${{SCRIBE_RESTORE_ENV_DELTA_FILE:-}}\" ] && [ -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\" ] && . \"$SCRIBE_RESTORE_ENV_DELTA_FILE\" && command rm -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; unset SCRIBE_RESTORE_ENV_DELTA_FILE; {exec}"
             ),
         ],
         ShellKind::Fish => vec![
-            String::from("-lic"),
+            String::from("-ic"),
             format!(
-                "if test -n \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; and test -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; source \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; command rm -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; end; set -e SCRIBE_RESTORE_ENV_DELTA_FILE; if test -n \"$SCRIBE_ORIG_XDG_DATA_DIRS\"; set -gx XDG_DATA_DIRS \"$SCRIBE_ORIG_XDG_DATA_DIRS\"; else; set -e XDG_DATA_DIRS; end; set -e SCRIBE_ORIG_XDG_DATA_DIRS SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT; {exec}"
+                "if test -n \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; and test -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; source \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; command rm -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; end; set -e SCRIBE_RESTORE_ENV_DELTA_FILE; {exec}"
             ),
         ],
-        ShellKind::Nushell => {
-            vec![String::from("-l"), String::from("-i"), String::from("-c"), exec]
-        }
-        ShellKind::PowerShell | ShellKind::Unknown => vec![String::from("-lic"), exec],
-    };
-
-    alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), args)
+        // PowerShell has neither `-i` nor `exec`. `-Command` is the provider's
+        // only job and pwsh exits when it returns, so the tab still ends with
+        // the CLI without an exec to replace the process.
+        ShellKind::PowerShell => vec![String::from("-NoLogo"), String::from("-Command"), exec],
+        // An unknown shell is most likely POSIX-family; `-ic` is the portable
+        // guess and is what `sh` itself accepts.
+        ShellKind::Bash | ShellKind::Unknown => vec![String::from("-ic"), exec],
+    }
 }
 
 fn ai_exec_command(kind: ShellKind, launch: &AiLaunchSpec) -> String {
-    let mut command = format!("exec {}", launch.provider.binary_name());
+    let binary = launch.provider.binary_name();
+    let mut command =
+        if kind == ShellKind::PowerShell { binary.to_owned() } else { format!("exec {binary}") };
     if launch.resume_mode == AiResumeMode::Resume {
         for arg in launch.provider.resume_args() {
             command.push(' ');
@@ -1185,42 +1140,6 @@ fn inject_shell_integration_env(kind: ShellKind, env: &mut HashMap<String, Strin
     let Some(scripts_dir) = shell_integration::find_scripts_dir() else { return };
     let extra = shell_integration::build_env(kind, &scripts_dir);
     env.extend(extra);
-}
-
-/// Inject only the integration transport supported by structured AI launches.
-fn inject_ai_shell_integration_env(
-    kind: ShellKind,
-    integration_script: Option<&str>,
-    env: &mut HashMap<String, String>,
-) {
-    let Some(scripts_dir) = shell_integration::find_scripts_dir() else { return };
-
-    match kind {
-        ShellKind::Bash => {
-            let Some(script) = integration_script else { return };
-            env.insert("SCRIBE_SHELL_INTEGRATION".to_owned(), "1".to_owned());
-            env.insert("SCRIBE_AI_TAB".to_owned(), "1".to_owned());
-            env.insert("SCRIBE_INTEGRATION_SCRIPT".to_owned(), script.to_owned());
-        }
-        ShellKind::Zsh => {
-            let extra = shell_integration::build_env(kind, &scripts_dir);
-            if extra.contains_key("ZDOTDIR") {
-                env.extend(extra);
-                env.insert("SCRIBE_AI_TAB".to_owned(), "1".to_owned());
-            }
-        }
-        ShellKind::Fish => {
-            let original_xdg = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
-            let extra = shell_integration::build_env(kind, &scripts_dir);
-            if extra.contains_key("XDG_DATA_DIRS") {
-                env.extend(extra);
-                env.insert("SCRIBE_AI_TAB".to_owned(), "1".to_owned());
-                env.insert("SCRIBE_ORIG_XDG_DATA_DIRS".to_owned(), original_xdg);
-            }
-        }
-        // These AI launch paths intentionally have no shell integration.
-        ShellKind::Nushell | ShellKind::PowerShell | ShellKind::Unknown => {}
-    }
 }
 
 /// Create a `ScreenSnapshot` from a locked `Term`.
@@ -1536,12 +1455,11 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use alacritty_terminal::tty::Shell;
     use scribe_common::ids::SessionId;
 
     use super::{
-        LaunchIntegration, PtyOptionsBuild, build_pty_options, build_shell,
-        path_with_macos_baseline,
+        AiLaunchSpec, AiProvider, AiResumeMode, EnvLaunchContext, PtyOptionsBuild,
+        build_launch_shell, build_pty_options, build_shell, path_with_macos_baseline,
     };
     use crate::shell_integration::ShellKind;
 
@@ -1594,9 +1512,11 @@ mod tests {
             shell: None,
             cwd: None,
             shell_kind: ShellKind::Bash,
-            integration: LaunchIntegration::Disabled,
-            restore_env_file: None,
-            env_persistence: false,
+            env: EnvLaunchContext {
+                restore_file: None,
+                persistence_enabled: false,
+                integration_enabled: false,
+            },
             images_enabled,
         })
         .env
@@ -1613,7 +1533,73 @@ mod tests {
     fn build_shell_uses_explicit_resolved_shell_for_zsh_defaults() {
         let shell = build_shell("/bin/zsh", None, ShellKind::Zsh, None);
 
-        assert_eq!(shell, Some(Shell::new(String::from("/bin/zsh"), Vec::new())));
+        assert_eq!(shell, Some((String::from("/bin/zsh"), Vec::new())));
+    }
+
+    fn ai_argv(
+        kind: ShellKind,
+        integration_script: Option<&str>,
+        launch: &AiLaunchSpec,
+    ) -> Vec<String> {
+        build_launch_shell("/bin/shell", None, kind, integration_script, Some(launch))
+            .expect("argv")
+            .1
+    }
+
+    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]]
+    #[test]
+    fn ai_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
+        let new = AiLaunchSpec {
+            provider: AiProvider::ClaudeCode,
+            resume_mode: AiResumeMode::New,
+            conversation_id: None,
+        };
+        let resume = AiLaunchSpec { resume_mode: AiResumeMode::Resume, ..new.clone() };
+        let targeted =
+            AiLaunchSpec { conversation_id: Some(String::from("it's mine")), ..resume.clone() };
+
+        // Bash keeps the plain `--rcfile` attachment ahead of the command, so
+        // the AI tab reads exactly the startup files a plain tab reads.
+        assert_eq!(
+            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &new),
+            ["--rcfile", "/s/scribe.bash", "-ic", "exec claude"]
+        );
+        // Env-hook shells carry no startup argv at all, plain or AI, but zsh
+        // and fish prepend the restore-delta consumer their prompt never runs.
+        let zsh = ai_argv(ShellKind::Zsh, None, &resume);
+        assert_eq!(zsh[0], "-ic");
+        assert!(zsh[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", zsh[1]);
+        assert!(zsh[1].ends_with("exec claude --resume"), "{}", zsh[1]);
+        // A conversation id is quoted in the language the shell speaks.
+        let fish = ai_argv(ShellKind::Fish, None, &targeted);
+        assert!(fish[1].ends_with("exec claude --resume 'it\\'s mine'"), "{}", fish[1]);
+        // Nushell rejects the grouped short form.
+        assert_eq!(ai_argv(ShellKind::Nushell, None, &new), ["-i", "-c", "exec claude"]);
+        // PowerShell speaks neither `-i` nor `exec`, and its `-File` attachment
+        // has to be last, so an AI launch drops the script for `-Command`.
+        assert_eq!(
+            ai_argv(ShellKind::PowerShell, Some("/s/scribe.ps1"), &new),
+            ["-NoLogo", "-Command", "claude"]
+        );
+        // Without AI intent the very same call is the untouched plain-tab argv.
+        assert_eq!(
+            build_launch_shell(
+                "/bin/shell",
+                None,
+                ShellKind::PowerShell,
+                Some("/s/scribe.ps1"),
+                None
+            ),
+            Some((
+                String::from("/bin/shell"),
+                vec![
+                    String::from("-NoLogo"),
+                    String::from("-NoExit"),
+                    String::from("-File"),
+                    String::from("/s/scribe.ps1"),
+                ]
+            ))
+        );
     }
 
     #[cfg(target_os = "macos")]

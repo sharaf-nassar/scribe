@@ -21,9 +21,9 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, AsyncApp, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId, Entity, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*,
     px, relative, size,
 };
@@ -120,7 +120,7 @@ use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client::window_state::{
     WindowGeometry, WindowRegistry, gate_position_on_monitor, geometry_from_bounds,
-    geometry_size_is_sane, normalize_legacy_geometry, window_bounds_for,
+    geometry_size_is_sane, logical_px_to_i32, normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::x11_focus::X11FocusGuard;
 use scribe_client::zoom::ZoomState;
@@ -128,7 +128,7 @@ use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{
         GroupBadge, TabBarColors, TabData, accent_tab_tone, badge_label, context_suffix,
-        flash_blend, tab_display_title,
+        flash_blend, px_units, reorder_target_index, tab_display_title,
     },
     tab_session::{TabEntry, TabSessions},
     titlebar::{TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView},
@@ -137,8 +137,8 @@ use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{
-        AiContextThresholds, AiTabCwd, PromptBarPosition, SmartSelectionActionKind,
-        SmartSelectionConfig, StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
+        AiContextThresholds, PromptBarPosition, SmartSelectionActionKind, SmartSelectionConfig,
+        StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
     },
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId},
@@ -634,6 +634,11 @@ struct WindowSeed {
     restored: Option<WindowRestoreState>,
     /// Snapshots left for `--restore-child` siblings; see [`ColdStart::siblings`].
     restore_siblings: usize,
+    /// The absolute position this window's geometry record asked for, re-applied
+    /// once the window is on screen because the creation bounds are only a hint
+    /// the window manager may ignore. See
+    /// [`crate::monitor::apply_saved_position`].
+    restore_position: Option<(i32, i32)>,
 }
 
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
@@ -706,16 +711,26 @@ struct RestoreRuntime {
     /// once — and only if — this window's own replay confirms the server is
     /// cold. Zeroed on the way out so a redial cannot spawn them twice.
     siblings: usize,
+    /// The saved position still to be re-applied to the live window, taken by
+    /// the first paint. `None` once applied, or when nothing was persisted.
+    pending_position: Option<(i32, i32)>,
+    /// Where that move was aiming, and when it was asked for. Kept until the
+    /// request has had time to be answered and one correction has run.
+    position_target: Option<((i32, i32), Instant)>,
 }
 
 impl RestoreRuntime {
-    fn new(pending: Option<WindowRestoreState>, siblings: usize) -> Self {
+    /// Take the three restore inputs the window was opened with.
+    fn from_seed(seed: WindowSeed) -> Self {
+        let WindowSeed { restored: pending, restore_siblings, restore_position, .. } = seed;
         Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
             claimed_window: pending.as_ref().map(|snapshot| snapshot.window_id),
             pending,
-            siblings,
+            siblings: restore_siblings,
+            pending_position: restore_position,
+            position_target: None,
             bindings: HashMap::new(),
             requested: VecDeque::new(),
             window_id: None,
@@ -938,7 +953,7 @@ struct TerminalView {
     /// Tab-bar contents for each workspace region below the window's top row,
     /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
     /// region's top strip.
-    region_bars: Vec<RegionBarData>,
+    region_chrome: RegionChrome,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
     terminal_colors: GridPalette,
@@ -1045,6 +1060,62 @@ impl Focusable for TerminalView {
 /// it needs no drag-reorder or window-move chrome.
 // ponytail: region-bar tabs skip drag-reorder and AccessKit tab stops; route
 // through TitlebarView if either ever matters here.
+/// Marker registering GPUI's native drag for a lower region bar's tab.
+///
+/// Distinct from the titlebar's own marker so a region drag never wakes
+/// [`TitlebarView`]'s `on_drag_move`, and so its presence keeps mouse moves
+/// flowing to the region bar after the cursor leaves the band.
+struct RegionTabDrag;
+
+/// Invisible cursor-following overlay for a region tab drag. The tab itself
+/// slides inside the bar, so the overlay paints nothing.
+struct RegionTabDragGhost;
+
+impl Render for RegionTabDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Which bar a region tab belongs to and where it sits in it.
+#[derive(Clone, Copy)]
+struct RegionTabSlot {
+    workspace_id: WorkspaceId,
+    index: usize,
+}
+
+/// An in-flight drag of a tab inside a lower region's own bar.
+///
+/// The window titlebar keeps its drag inside `TitlebarView`, but a region bar is
+/// rendered inline by the view, so this is where its drag lives. The target slot
+/// comes from pointer travel rather than the titlebar's absolute edge walk: a
+/// region bar's tab run starts after a workspace pill whose width is derived
+/// from the badge text, which a listener has no way to measure. Travel divided
+/// by tab width and rounded puts the boundary at half a tab of overlap, which is
+/// the same rule the titlebar's centre test applies.
+#[derive(Clone, Copy)]
+struct RegionTabDragState {
+    /// The bar being dragged within. A drag never crosses regions.
+    workspace_id: WorkspaceId,
+    /// Slot the drag began at, held fixed so travel stays absolute.
+    origin: usize,
+    /// Slot the tab currently occupies, which is what the next swap moves from.
+    current: usize,
+    press_x: f32,
+    /// Whether any swap committed, so the release can tell a drag from a click.
+    reordered: bool,
+}
+
+/// The lower regions' tab bars and the drag running inside one of them.
+///
+/// Grouped because the drag is only ever meaningful against the bars it indexes
+/// into: a rebuild that drops a bar has to be able to invalidate its drag.
+#[derive(Default)]
+struct RegionChrome {
+    bars: Vec<RegionBarData>,
+    drag: Option<RegionTabDragState>,
+}
+
 struct RegionBarData {
     /// The region this bar belongs to, keyed by its (server) workspace.
     workspace_id: WorkspaceId,
@@ -1104,7 +1175,83 @@ impl TerminalView {
     /// reading each frame, so a window that is opened and never touched still
     /// persists the size it came up at rather than nothing at all.
     fn start_geometry_tracking(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
-        cx.observe_window_bounds(window, |view, window, ctx| view.capture_geometry(window, ctx))
+        cx.observe_window_bounds(window, |view, window, ctx| {
+            // A late bounds change is also a chance to settle the restore move,
+            // for a window that is not repainting for any other reason.
+            view.correct_restored_position(window);
+            view.capture_geometry(window, ctx);
+        })
+    }
+
+    /// Put a restored window back on the monitor it was on, once.
+    ///
+    /// The bounds handed to `open_window` are a hint the window manager is free
+    /// to ignore, and Mutter does: GPUI sets no `USPosition`/`PPosition` size
+    /// hint, so every restored window was placed by the compositor on whatever
+    /// screen was active and the saved position was silently discarded. The
+    /// move is issued from the first frame — the window has to exist before it
+    /// can be moved — and never repeated, so it can neither fight the user
+    /// dragging the window nor loop against a window manager that adjusts it.
+    ///
+    /// Runs before [`Self::capture_geometry`] so the same frame records where
+    /// the window actually landed rather than where it started.
+    fn apply_saved_position(&mut self, window: &Window) {
+        let Some((x, y)) = self.restore.pending_position.take() else { return };
+        if monitor::apply_saved_position(window, x, y) {
+            self.restore.position_target = Some(((x, y), Instant::now()));
+            tracing::info!(x, y, "moving the restored window back to its saved position");
+        } else {
+            tracing::debug!(x, y, "no X11 window to reposition; keeping WM placement");
+        }
+    }
+
+    /// Correct the restored window's position once, from where it actually
+    /// landed.
+    ///
+    /// A reparenting window manager positions the frame it drew, not the window
+    /// inside it, so a window asked for `(320, 180)` settles a border and a
+    /// titlebar further in. The saved record is the *content* origin, so
+    /// restoring it verbatim would push the window down and right by the
+    /// decoration on every restart until it walked off the screen.
+    ///
+    /// The residual is measured from the window's own bounds, and only once the
+    /// request has had [`RESTORE_DEBOUNCE`] to be answered. A `ConfigureRequest`
+    /// is asynchronous: reading back beside it — or on the next bounds change,
+    /// which can still be an earlier one arriving — reports where the window has
+    /// not moved to yet, and a correction computed from that reading doubles the
+    /// offset instead of cancelling it. Waiting also means the corrected value
+    /// is the one the geometry record then persists, so the round trip is
+    /// self-consistent.
+    ///
+    /// Exactly one correction is applied: a window manager that still disagrees
+    /// is enforcing something real (a strut, a snap, an off-screen clamp) and
+    /// arguing with it is how a placement loop starts.
+    fn correct_restored_position(&mut self, window: &Window) {
+        let (want_x, want_y) = match self.restore.position_target {
+            Some((target, asked_at)) if asked_at.elapsed() >= RESTORE_DEBOUNCE => target,
+            _ => return,
+        };
+        self.restore.position_target = None;
+        let origin = window.bounds().origin;
+        // The same rounding the record was written with, so the comparison is
+        // between two values in one space rather than two roundings of one.
+        let (landed_x, landed_y) =
+            (logical_px_to_i32(f32::from(origin.x)), logical_px_to_i32(f32::from(origin.y)));
+        if (landed_x, landed_y) == (want_x, want_y) {
+            tracing::info!(x = want_x, y = want_y, "restored the window to its saved position");
+            return;
+        }
+        let corrected = (want_x - (landed_x - want_x), want_y - (landed_y - want_y));
+        tracing::info!(
+            want_x,
+            want_y,
+            landed_x,
+            landed_y,
+            corrected_x = corrected.0,
+            corrected_y = corrected.1,
+            "correcting the restored window position for the window manager's frame"
+        );
+        monitor::apply_saved_position(window, corrected.0, corrected.1);
     }
 
     /// Capture the live window's geometry into the restore runtime.
@@ -1207,7 +1354,7 @@ impl TerminalView {
             // next redraw so the tab row always mirrors live server state.
             rendered_tabs: TabSessions::new(),
             titlebar_index_map: Vec::new(),
-            region_bars: Vec::new(),
+            region_chrome: RegionChrome::default(),
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -1234,7 +1381,7 @@ impl TerminalView {
             _lifecycle_task: drivers.0,
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
-            restore: RestoreRuntime::new(seed.restored, seed.restore_siblings),
+            restore: RestoreRuntime::from_seed(seed),
             _bounds_observer: bounds_observer,
         }
     }
@@ -1439,6 +1586,10 @@ impl TerminalView {
                 let from = this.strip_index(*from);
                 let to = this.strip_index(*to);
                 if this.shared.tabs.lock().is_ok_and(|mut tabs| tabs.reorder(from, to)) {
+                    // The strip is the region's tab order, and the reported
+                    // tree is the only place it is durable — without this the
+                    // drag survives until the next reconnect and no longer.
+                    this.report_workspace_tree(ctx);
                     ctx.notify();
                 }
             }
@@ -1707,12 +1858,12 @@ impl TerminalView {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let (old, new) = (signature(&self.region_bars), signature(&bars));
+        let (old, new) = (signature(&self.region_chrome.bars), signature(&bars));
         if old != new {
             let state = if new.is_empty() { "none" } else { new.as_str() };
             tracing::info!(bars = %state, "lower-region tab bars changed");
         }
-        self.region_bars = bars;
+        self.region_chrome.bars = bars;
         (titlebar_data, strip_indices)
     }
 
@@ -1799,7 +1950,10 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusRight => self.focus_workspace(FocusDirection::Right, cx),
             LayoutAction::WorkspaceFocusUp => self.focus_workspace(FocusDirection::Up, cx),
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
-            LayoutAction::NewTab => self.create_tab(None, None, None),
+            LayoutAction::NewTab => {
+                let cwd = self.focused_session_cwd();
+                self.create_tab(None, None, cwd);
+            }
             LayoutAction::NewClaudeTab => {
                 self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New, cx);
             }
@@ -3814,8 +3968,25 @@ impl TerminalView {
     }
 
     /// Ask for an AI tab using structured intent.
+    ///
+    /// An AI tab always starts at the focused region's project root when there
+    /// is one. An AI session is scoped to a project rather than to wherever a
+    /// shell happens to have wandered, so a `cd` deep into a subtree should not
+    /// change where the assistant is rooted. The server only reports a project
+    /// root while the region's CWD is under a configured `workspaces.roots`
+    /// entry and clears it on the way out, so "in a workspace" needs no
+    /// separate test — outside one, the tab falls back to the focused pane's
+    /// CWD exactly like a plain new tab.
+    ///
+    /// A missing pane CWD too (no focused session, an automation action without
+    /// visible focus, or a shell that never emitted OSC 7) stays `None` and
+    /// leaves the server's directory validation and `$HOME` fallback as the
+    /// final guard. Cold-restart replay does not come through here; it keeps
+    /// the persisted `LaunchRecord.cwd` passed by
+    /// [`Self::dispatch_replay_launch`].
     fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode, cx: &App) {
-        let cwd = self.resolve_ai_tab_cwd(cx);
+        let cwd =
+            self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd());
         self.create_ai_tab_request(provider, resume_mode, cwd);
     }
 
@@ -3828,23 +3999,6 @@ impl TerminalView {
     ) {
         let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
         self.create_tab(launch.command, launch.ai_launch, cwd);
-    }
-
-    /// Resolve a fresh AI tab's working directory from live client state.
-    ///
-    /// A missing pane CWD (no focused session, an automation action without
-    /// visible focus, or a shell that never emitted OSC 7) stays `None`, which
-    /// leaves the server's directory validation and `$HOME` fallback as the
-    /// final guard. Cold-restart replay does not call this path; it keeps the
-    /// persisted `LaunchRecord.cwd` passed by [`Self::dispatch_replay_launch`].
-    fn resolve_ai_tab_cwd(&self, cx: &App) -> Option<PathBuf> {
-        match self.config.config().config.terminal.ai_tab_cwd {
-            AiTabCwd::Pane => self.focused_session_cwd(),
-            AiTabCwd::ProjectRoot => {
-                self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd())
-            }
-            AiTabCwd::Home => None,
-        }
     }
 
     /// Read the focused session's last server-reported OSC 7 directory.
@@ -3885,6 +4039,13 @@ impl TerminalView {
         // next tick so the switched-to pane learns about it immediately.
         self.report_focus();
         self.sync_tabs(cx);
+        // It also changes which tab the region is showing, and the reported
+        // tree is where that is persisted: a reconnect restores the region to
+        // its `active_tab_index`, so a switch that is never reported comes back
+        // as whichever tab was active the last time something else changed.
+        // The report is deduplicated against the last one, so an idle switch
+        // back and forth costs one frame's tree build and no traffic.
+        self.report_workspace_tree(cx);
     }
 
     /// Hand keyboard focus back to the terminal after a pointer tab action.
@@ -4183,9 +4344,6 @@ impl TerminalView {
     /// because the new one does not exist yet; the `MoveSession` raised when the
     /// pane adopts it is what tells the server the session changed regions.
     fn split_workspace(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
-        // The new region receives focus immediately, so preserve the source
-        // pane's directory before its root pane is queued without a session.
-        let cwd = self.focused_session_cwd();
         let accent = self.next_region_accent(cx);
         let Some(workspace_id) = self.shell.split_workspace(direction, accent, cx) else {
             tracing::warn!(?direction, "workspace split ignored: no focused region");
@@ -4200,7 +4358,9 @@ impl TerminalView {
             regions = self.shell.region_count(cx),
             "split the window into a new workspace region"
         );
-        self.request_pane_session(cwd);
+        // A new region is a fresh context, not a continuation of the source
+        // pane, so it sends no CWD and the server's home fallback wins.
+        self.request_pane_session(None);
         self.after_layout_change(cx);
     }
 
@@ -4295,7 +4455,10 @@ impl TerminalView {
     /// it is exact rather than heuristic because the reported value *is* the
     /// wire payload.
     fn report_workspace_tree(&mut self, cx: &mut Context<Self>) {
-        let tree = self.shell.wire_tree(cx);
+        // The strip is the region tab lists the report carries, so it is read
+        // once here and handed down rather than reached for per region.
+        let tabs = self.shared.tabs.lock().map(|tabs| tabs.tabs().to_vec()).unwrap_or_default();
+        let tree = self.shell.wire_tree(&tabs, cx);
         if self.reported_trees.back() == Some(&tree) {
             return;
         }
@@ -4470,11 +4633,15 @@ impl TerminalView {
             tracing::info!("server workspace tree pruned to nothing; keeping the flat layout");
             return false;
         }
-        // The reader filled the strip in `SessionList` order, which is not the
-        // layout's left-to-right region order; regroup so each workspace's tab
-        // run sits in the strip where its region sits in the window.
+        // The reader filled the strip in `SessionList` order, which is the
+        // server's storage order and not the user's. The tree carries the order
+        // this window last reported — every tab of every region, left to right —
+        // so it, not the list, is what the strip is restored to. Ordering by the
+        // *placed* sessions alone (what this did) left every background tab
+        // wherever the list happened to put it.
+        let order = pane_shell::wire_tree_tab_order(&tree);
         if let Ok(mut tabs) = self.shared.tabs.lock() {
-            tabs.order_by(&visible);
+            tabs.order_by(&order);
         }
         tracing::info!(
             panes = visible.len(),
@@ -4490,6 +4657,15 @@ impl TerminalView {
             if let Some(session_id) = placement.session_id {
                 self.pane_sizes.insert(session_id, self.grid_size_for(placement.rect));
             }
+        }
+        // The adopted layout decides which tab is active, not whichever session
+        // the reader happened to attach first: each region came back showing the
+        // tab its `active_tab_index` named, and the strip has to agree or the
+        // titlebar would highlight a tab that is not the one on screen.
+        if let Some(session_id) = self.shell.focused_session(cx)
+            && let Ok(mut tabs) = self.shared.tabs.lock()
+        {
+            tabs.activate(session_id);
         }
         // The pane holding the tab strip's focused session keeps focus, so the
         // reader's own reattach and this rebuild agree on the active pane.
@@ -5048,6 +5224,57 @@ impl TerminalView {
     /// One lower region's bar: badge pill, then its tabs, over a hairline in
     /// the region's tab tone — the same shape the titlebar draws for a
     /// top-row region's group.
+    /// Advance a region bar's tab drag to `cursor_x`, swapping slots as the
+    /// dragged tab's centre crosses into a neighbour's.
+    ///
+    /// The bar's slots are region-local while the strip is window-global, so the
+    /// swap is applied at the region's offset into the strip. Grouping keeps a
+    /// region's tabs contiguous there, which is what makes a single offset
+    /// enough — and what keeps a drag from ever leaving its own region.
+    fn update_region_drag(&mut self, cursor_x: f32, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.region_chrome.drag else { return };
+        let Some(bar) =
+            self.region_chrome.bars.iter().find(|bar| bar.workspace_id == drag.workspace_id)
+        else {
+            return;
+        };
+        let count = bar.tabs.len();
+        if count == 0 {
+            return;
+        }
+        // Reuse the titlebar's edge walker rather than round pointer travel
+        // here: it clamps and avoids a float-to-index cast. Anchoring its origin
+        // half a tab left of the press makes the walk resolve to
+        // `origin + round(travel / TAB_WIDTH)`, so the swap boundary still sits
+        // at half a tab of overlap wherever inside the tab the grab landed.
+        let anchor = drag.press_x - px_units(drag.origin) * TAB_WIDTH - TAB_WIDTH / 2.0;
+        let target = reorder_target_index(cursor_x, anchor, TAB_WIDTH, count, drag.current);
+        if target == drag.current {
+            return;
+        }
+        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
+        let Some(offset) = tabs.tabs().iter().position(|tab| tab.workspace_id == drag.workspace_id)
+        else {
+            return;
+        };
+        if !tabs.reorder(offset + drag.current, offset + target) {
+            return;
+        }
+        drop(tabs);
+        drag.current = target;
+        drag.reordered = true;
+        self.region_chrome.drag = Some(drag);
+        // Same reason the titlebar reports on every swap: the reported tree is
+        // the only place tab order is durable.
+        self.report_workspace_tree(cx);
+        cx.notify();
+    }
+
+    /// Clear the region drag on release, keeping every swap it committed.
+    fn end_region_drag(&mut self) {
+        self.region_chrome.drag = None;
+    }
+
     fn render_region_bar(
         &self,
         workspace_id: WorkspaceId,
@@ -5055,7 +5282,7 @@ impl TerminalView {
         colors: &TabBarColors,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let bar = self.region_bars.iter().find(|bar| bar.workspace_id == workspace_id);
+        let bar = self.region_chrome.bars.iter().find(|bar| bar.workspace_id == workspace_id);
         let accent =
             bar.map_or_else(|| self.shell.workspace_accent(workspace_id, cx), |bar| bar.accent);
         let tone = accent_tab_tone(opaque_slot(accent), colors.bg);
@@ -5071,7 +5298,24 @@ impl TerminalView {
             .overflow_hidden()
             .bg(colors.bg)
             .border_b_1()
-            .border_color(tone);
+            .border_color(tone)
+            // Every move while a region tab drag is active, so the drag keeps
+            // tracking the cursor after it leaves this bar's band.
+            .on_drag_move(cx.listener(
+                |view, event: &DragMoveEvent<RegionTabDrag>, _win, ctx| {
+                    view.update_region_drag(f32::from(event.event.position.x), ctx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _win, _ctx| view.end_region_drag()),
+            )
+            // A release outside the bar still ends the drag; the swaps already
+            // committed stay, and no stale state can pin the tab off its slot.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _win, _ctx| view.end_region_drag()),
+            );
         let Some(bar) = bar else {
             // A region whose seed session is still in flight: bare bar, so the
             // reserved strip never flashes terminal background.
@@ -5100,19 +5344,64 @@ impl TerminalView {
                 .child(badge.label.clone());
             row = row.child(pill);
         }
-        row =
-            row.children(bar.tabs.iter().map(|(session_id, tab)| {
-                Self::render_region_bar_tab(*session_id, tab, colors, cx)
-            }));
+        row = row.children(bar.tabs.iter().enumerate().map(|(index, (session_id, tab))| {
+            let slot = RegionTabSlot { workspace_id, index };
+            Self::render_region_bar_tab(*session_id, tab, slot, colors, cx)
+        }));
         row.into_any_element()
     }
 
     /// One tab in a lower region's bar: the titlebar tab's look (flash blend,
-    /// AI dot, context suffix, active underline) minus its drag-reorder and
-    /// keyboard chrome.
+    /// Press, drag and click wiring for one region bar tab.
+    ///
+    /// Split out of the render so the element builder stays readable: this is
+    /// the only part of a region tab that is behaviour rather than paint.
+    fn region_tab_interactions(
+        tab: gpui::Stateful<gpui::Div>,
+        session_id: SessionId,
+        slot: RegionTabSlot,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let RegionTabSlot { workspace_id, index } = slot;
+        tab
+            // Arms the drag and stops propagation, so the bar's own press never
+            // reaches the titlebar's window-move arm behind it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, event: &MouseDownEvent, _win, ctx| {
+                    view.region_chrome.drag = Some(RegionTabDragState {
+                        workspace_id,
+                        origin: index,
+                        current: index,
+                        press_x: f32::from(event.position.x),
+                        reordered: false,
+                    });
+                    ctx.stop_propagation();
+                }),
+            )
+            // Registers the drag once the pressed pointer passes GPUI's
+            // threshold; from then on the bar's `on_drag_move` sees every move.
+            .on_drag(RegionTabDrag, |_, _, _, cx| cx.new(|_| RegionTabDragGhost))
+            .on_click(cx.listener(move |view, _, _window, ctx| {
+                // A drag that reordered is not a click: selecting here would
+                // fight the reorder the release just committed.
+                if view.region_chrome.drag.is_some_and(|drag| drag.reordered) {
+                    return;
+                }
+                view.select_session_tab(session_id, ctx);
+            }))
+    }
+
+    /// AI dot, context suffix, active underline) minus its keyboard chrome.
+    ///
+    /// Drag-reorder is not part of that subtraction. A region bar holds every
+    /// tab of every region below the first, so leaving it out made those tabs
+    /// the only ones in the window a user could not reorder — the titlebar's
+    /// drag reached the top region alone.
     fn render_region_bar_tab(
         session_id: SessionId,
         tab: &TabData,
+        slot: RegionTabSlot,
         colors: &TabBarColors,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -5173,10 +5462,7 @@ impl TerminalView {
             .border_color(colors.separator)
             .cursor_pointer()
             .when(!tab.is_active, |this| this.hover(move |s| s.bg(hover_bg)))
-            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-            .on_click(cx.listener(move |view, _, _window, ctx| {
-                view.select_session_tab(session_id, ctx);
-            }))
+            .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
             .children(ai_dot)
             .child(div().flex_1().overflow_hidden().child(display))
             .children(suffix)
@@ -7126,6 +7412,12 @@ impl Render for TerminalView {
         log_first_frame_timing();
         self.report_perf_frame();
         self.ensure_focus(window, cx);
+        self.apply_saved_position(window);
+        // Driven from the frame loop rather than only from the bounds observer:
+        // the observer stops firing once the window settles, and the correction
+        // deliberately waits for that. The focused window's cursor blink keeps
+        // frames coming well inside the wait.
+        self.correct_restored_position(window);
         self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
@@ -7719,6 +8011,13 @@ fn open_window(
     }
     let restored = cold_start.snapshot;
     let restore_siblings = cold_start.siblings;
+    // A maximized window has no position of its own to re-assert; the
+    // compositor owns its placement.
+    let restore_position = cold_start
+        .geometry
+        .as_ref()
+        .filter(|geom| !geom.maximized)
+        .and_then(|geom| geom.x.zip(geom.y));
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -7751,7 +8050,7 @@ fn open_window(
                 TerminalView::new(
                     shared,
                     sink,
-                    WindowSeed { terminal_size, restored, restore_siblings },
+                    WindowSeed { terminal_size, restored, restore_siblings, restore_position },
                     window,
                     cx,
                 )
@@ -10408,7 +10707,7 @@ fn sync_tab_strip(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     let entries = sessions.iter().map(tab_entry_for).collect();
-    let focused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.replace_all(entries));
+    let focused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.reconcile(entries));
     match focused {
         Some(session_id) if Some(session_id) != attached => {
             attach_session(ctx, session_id)?;

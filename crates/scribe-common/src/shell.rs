@@ -3,34 +3,6 @@ use std::path::{Path, PathBuf};
 
 use nix::unistd::{Uid, User};
 
-/// Source selected while resolving the host login shell for an AI launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AiLoginShellSource {
-    /// Current account shell from the passwd database.
-    Passwd,
-    /// `SHELL` inherited by the server daemon.
-    DaemonEnvironment,
-    /// Portable fallback when neither host source names a shell.
-    Fallback,
-}
-
-impl AiLoginShellSource {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Passwd => "passwd",
-            Self::DaemonEnvironment => "daemon_shell",
-            Self::Fallback => "fallback_sh",
-        }
-    }
-}
-
-/// Host login shell and the fallback tier that selected it for an AI launch.
-pub struct AiLoginShell {
-    pub program: String,
-    pub source: AiLoginShellSource,
-}
-
 /// Resolve the shell Scribe should use for new sessions and shell-wrapped
 /// commands.
 #[must_use]
@@ -46,29 +18,6 @@ pub fn default_shell_path() -> Option<PathBuf> {
 #[must_use]
 pub fn default_shell_program() -> String {
     default_shell_path().unwrap_or_else(|| PathBuf::from("sh")).to_string_lossy().into_owned()
-}
-
-/// Resolve an AI launch shell from live host identity before daemon state.
-///
-/// Unlike [`default_shell_program`], this is deliberately passwd-first so a
-/// host-side `chsh` takes effect without waiting for the daemon to restart.
-#[must_use]
-pub fn ai_login_shell() -> AiLoginShell {
-    if let Some(program) = account_shell_path() {
-        return AiLoginShell {
-            program: program.to_string_lossy().into_owned(),
-            source: AiLoginShellSource::Passwd,
-        };
-    }
-
-    if let Some(program) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
-        return AiLoginShell {
-            program: PathBuf::from(program).to_string_lossy().into_owned(),
-            source: AiLoginShellSource::DaemonEnvironment,
-        };
-    }
-
-    AiLoginShell { program: String::from("sh"), source: AiLoginShellSource::Fallback }
 }
 
 #[must_use]

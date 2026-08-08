@@ -341,7 +341,20 @@ impl WorkspaceManager {
         debug!(%session_id, %window_id, "assigned session to window");
     }
 
-    /// Return all session IDs belonging to a window, in workspace-stored order.
+    /// Return all session IDs belonging to a window, in the order the window
+    /// itself last reported.
+    ///
+    /// This is the order a reconnecting client's tab strip is built in when it
+    /// has no tree to adopt, so it has to be stable and it has to mean
+    /// something. Walking `self.workspaces` — a `HashMap` — as the only source
+    /// did neither: a multi-region window's tabs came back grouped in whatever
+    /// order the map happened to iterate, differently on every server process.
+    ///
+    /// The window's own reported tree leads, because its leaves carry the user's
+    /// tab order per region. Sessions created since that report (or belonging to
+    /// a window that never reported one) follow in workspace-stored order, with
+    /// the workspaces themselves in a stable id order so the tail cannot shuffle
+    /// either.
     pub fn sessions_for_window(&self, window_id: WindowId) -> Vec<SessionId> {
         // Collect which sessions belong to this window.
         let window_sids: HashSet<SessionId> = self
@@ -351,14 +364,26 @@ impl WorkspaceManager {
             .map(|(&sid, _)| sid)
             .collect();
 
-        // Walk workspaces and emit sessions in their stored order,
-        // filtered to only those belonging to this window.
-        self.workspaces
-            .values()
-            .flat_map(|ws| &ws.sessions)
-            .copied()
-            .filter(|sid| window_sids.contains(sid))
-            .collect()
+        // The window's own reported tree leads; everything it does not name
+        // follows in workspace-stored order, workspaces in a stable id order.
+        let mut candidates: Vec<SessionId> = Vec::with_capacity(window_sids.len());
+        if let Some(tree) = self.window_trees.get(&window_id) {
+            collect_tree_sessions(tree, &mut candidates);
+        }
+        let mut workspace_ids: Vec<WorkspaceId> = self.workspaces.keys().copied().collect();
+        workspace_ids.sort_by_key(|id| id.to_full_string());
+        for workspace_id in workspace_ids {
+            let Some(workspace) = self.workspaces.get(&workspace_id) else { continue };
+            candidates.extend(workspace.sessions.iter().copied());
+        }
+
+        let mut ordered: Vec<SessionId> = Vec::with_capacity(window_sids.len());
+        for session_id in candidates {
+            if window_sids.contains(&session_id) && !ordered.contains(&session_id) {
+                ordered.push(session_id);
+            }
+        }
+        ordered
     }
 
     /// Distinct display names of the workspaces owning this window's sessions,
@@ -642,6 +667,18 @@ impl WorkspaceManager {
     }
 }
 
+/// Every session a reported workspace tree names, in left-to-right region order
+/// and, within a region, in the client's own tab order.
+fn collect_tree_sessions(node: &WorkspaceTreeNode, out: &mut Vec<SessionId>) {
+    match node {
+        WorkspaceTreeNode::Leaf { session_ids, .. } => out.extend(session_ids.iter().copied()),
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            collect_tree_sessions(first, out);
+            collect_tree_sessions(second, out);
+        }
+    }
+}
+
 // Expose the private helper for unit-testing without making it pub on the
 // main type.
 #[cfg(test)]
@@ -902,6 +939,59 @@ mod tests {
         assert_eq!(restored.window_for_session(orphan_known_ws), Some(win_main));
         assert_eq!(restored.window_for_session(orphan_lost_ws), Some(win_main));
         assert_eq!(restored.sessions_for_window(win_main).len(), 3);
+    }
+
+    // @lat: [[server#Workspaces#Per-Window Trees#Session order follows the reported tree]]
+    #[test]
+    fn session_order_follows_the_reported_tree() {
+        let mut mgr = manager_with_roots(vec![]);
+        let window = WindowId::new();
+        let left = mgr.create_workspace();
+        let right = mgr.create_workspace();
+        let (l1, l2, r1) = (SessionId::new(), SessionId::new(), SessionId::new());
+        for (workspace, session) in [(left, l1), (left, l2), (right, r1)] {
+            mgr.add_session(workspace, session, None);
+            mgr.assign_session_to_window(window, session);
+        }
+
+        // The client reports the user's order: the right-hand region first, and
+        // its own tabs reversed. Walking the workspace map instead would answer
+        // in whatever order it iterates, differently per process.
+        mgr.set_window_tree(
+            window,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: right,
+                    session_ids: vec![r1],
+                    pane_trees: vec![None],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: left,
+                    session_ids: vec![l2, l1],
+                    pane_trees: vec![None, None],
+                    active_tab_index: 0,
+                }),
+            },
+        );
+        assert_eq!(mgr.sessions_for_window(window), vec![r1, l2, l1]);
+
+        // A session created since that report is not lost: it follows the ones
+        // the tree names rather than displacing them.
+        let fresh = SessionId::new();
+        mgr.add_session(left, fresh, None);
+        mgr.assign_session_to_window(window, fresh);
+        assert_eq!(mgr.sessions_for_window(window), vec![r1, l2, l1, fresh]);
+
+        // Another window's sessions never leak in.
+        let other_window = WindowId::new();
+        let theirs = SessionId::new();
+        mgr.add_session(left, theirs, None);
+        mgr.assign_session_to_window(other_window, theirs);
+        assert_eq!(mgr.sessions_for_window(window), vec![r1, l2, l1, fresh]);
+        assert_eq!(mgr.sessions_for_window(other_window), vec![theirs]);
     }
 
     #[test]

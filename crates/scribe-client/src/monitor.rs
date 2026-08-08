@@ -39,6 +39,26 @@ pub fn connected_monitor_names() -> Vec<String> {
     x11::connected_monitor_names()
 }
 
+/// Re-assert a restored window's saved position once it is on screen.
+///
+/// The bounds handed to `open_window` are only a *hint*: GPUI's X11 backend
+/// passes them to `create_window` but sets no `USPosition`/`PPosition` size
+/// hint, and under ICCCM a window without one is placed entirely at the window
+/// manager's discretion. Mutter takes that discretion and puts every new window
+/// on the active monitor, which is why restored windows all came back on one
+/// screen no matter what their geometry record said. GPUI exposes
+/// `Window::resize` but no way to move a window, so the position is applied
+/// through the same X11 connection this module already keeps for `RandR`.
+///
+/// Returns whether a request was actually sent (false off X11). Where the
+/// window ends up is the window manager's answer, not ours: a reparenting frame
+/// offsets it, and struts, snapping, or an off-screen clamp can move it further.
+/// The caller measures the result from the window's next bounds change and
+/// corrects once.
+pub fn apply_saved_position(window: &Window, x: i32, y: i32) -> bool {
+    x11::move_window(window, x, y)
+}
+
 #[cfg(target_os = "linux")]
 mod x11 {
     use std::cell::OnceCell;
@@ -114,6 +134,25 @@ mod x11 {
         let reply = conn.get_atom_name(atom).ok()?.reply().ok()?;
         String::from_utf8(reply.name).ok()
     }
+
+    /// Ask the window manager to put a mapped window at a root-relative
+    /// position.
+    ///
+    /// Only a request. The reply is deliberately NOT read back here: a
+    /// `ConfigureRequest` is answered asynchronously, so a `get_geometry` issued
+    /// in the same breath reports where the window still is, and a correction
+    /// computed from that reading sends the window somewhere arbitrary. Where it
+    /// landed is observed later, from the window's own bounds change — see
+    /// `TerminalView::correct_restored_position`.
+    pub(super) fn move_window(window: &Window, x: i32, y: i32) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            let aux = x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y);
+            conn.configure_window(xid, &aux).ok()?.check().ok()?;
+            Some(())
+        })
+        .is_some()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -126,5 +165,9 @@ mod x11 {
 
     pub(super) fn connected_monitor_names() -> Vec<String> {
         Vec::new()
+    }
+
+    pub(super) fn move_window(_window: &Window, _x: i32, _y: i32) -> bool {
+        false
     }
 }

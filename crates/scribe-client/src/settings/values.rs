@@ -144,7 +144,6 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "terminal.env_persistence.enabled" => Value::Bool(t.env_persistence.enabled),
         "terminal.claude_code_integration" => Value::Bool(t.ai_integration.claude_code.enabled()),
         "terminal.codex_code_integration" => Value::Bool(t.ai_integration.codex_code.enabled()),
-        "terminal.ai_tab_cwd" => enum_str(&t.ai_tab_cwd),
         "terminal.prompt_bar" => Value::Bool(t.prompt_bar.enabled),
         "terminal.prompt_bar_font_size" => json!(t.prompt_bar.font_size),
         "terminal.prompt_bar_position" => enum_str(&t.prompt_bar.position),

@@ -1,5 +1,30 @@
 # Spec: ai-tab-shell-env
 
+**Status:** SUPERSEDED — this spec describes a design that no longer ships.
+It is retained for the history of why AI tabs were briefly a separate session
+class, not as a description of current behavior.
+
+The redesign below made an AI tab a real login+interactive shell with its own
+passwd-first shell resolution, its own pre-exec preambles, and a `SCRIBE_AI_TAB`
+mode in every integration script. That made an AI tab's environment diverge from
+the plain tab beside it. On bash the divergence was fatal: a login shell reads
+only the first of `~/.bash_profile`, `~/.bash_login`, `~/.profile` and therefore
+never reads `~/.bashrc`, which is where most users keep `PATH` — so `exec claude`
+became a command-not-found and the tab died on open, while the same provider
+resolved fine in every plain tab. Clarification Q3e recorded that exact
+consequence as "documented, not mitigated" (spec.md § Clarifications, and
+analysis.md's Principle 2 tension row); it was hit in practice.
+
+AI tabs are now the plain-tab argv plus an interactive `-c` command that execs
+the provider. Current behavior is documented in `lat.md/server.md` §
+[[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]].
+What survived from this spec: server-owned argv construction, the structured
+`CreateSession.ai_launch` field, and the `REMOTE_PROTOCOL_VERSION` 3→4 bump.
+What was deleted: `ai_login_shell` and its passwd-first tier logging, the
+per-shell login preambles, the `SCRIBE_AI_TAB` script mode, and `terminal.ai_tab_cwd`
+— an AI tab now anchors to the focused region's project root, falling back to the
+focused pane's CWD, with no setting to choose between them.
+
 ## Problem Statement
 
 Before feature 018, AI tabs (Claude Code via ctrl+alt+c, Codex via ctrl+alt+x,

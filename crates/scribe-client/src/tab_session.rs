@@ -105,17 +105,50 @@ impl TabSessions {
         self.active().or_else(|| self.tabs.first()).map(|tab| tab.workspace_id)
     }
 
-    /// Replace the whole strip (an authoritative `SessionList`), preserving the
-    /// active session when it survived the rebuild.
+    /// Fold an authoritative `SessionList` into the strip, keeping the order the
+    /// strip already has.
     ///
-    /// Returns the session that should be attached after the rebuild.
-    pub fn replace_all(&mut self, tabs: Vec<TabEntry>) -> Option<SessionId> {
+    /// The list says which sessions exist and what they are called; it does not
+    /// say what order the user put them in. Overwriting the strip with the
+    /// list's order — which is what this did — threw away every drag-reorder on
+    /// the next list and, because the server's list is grouped by a `HashMap` of
+    /// workspaces, reshuffled a multi-region window's tabs on every reconnect.
+    /// Order is client state now: it is restored from the server's workspace
+    /// tree (see [`Self::order_by`]) and reported back on it.
+    ///
+    /// Surviving tabs keep their position and take the list's fresh metadata,
+    /// sessions the list no longer names are dropped, and genuinely new ones are
+    /// appended in list order. Returns the session that should be attached.
+    pub fn reconcile(&mut self, incoming: Vec<TabEntry>) -> Option<SessionId> {
         let previous = self.active_session();
-        self.tabs = tabs;
+        let mut merged: Vec<TabEntry> = Vec::with_capacity(incoming.len());
+        for existing in &self.tabs {
+            if let Some(fresh) = incoming.iter().find(|tab| tab.session_id == existing.session_id) {
+                merged.push(fresh.clone());
+            }
+        }
+        for fresh in incoming {
+            if !merged.iter().any(|tab| tab.session_id == fresh.session_id) {
+                merged.push(fresh);
+            }
+        }
+        self.tabs = merged;
         self.active = previous
             .and_then(|id| self.tabs.iter().position(|tab| tab.session_id == id))
             .unwrap_or(0);
         self.active_session()
+    }
+
+    /// Make `session_id` the active tab, if it is open.
+    ///
+    /// Used after a reconnect adoption to restore the tab the region was showing
+    /// when the client last reported its tree.
+    pub fn activate(&mut self, session_id: SessionId) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.session_id == session_id) else {
+            return false;
+        };
+        self.active = index;
+        true
     }
 
     /// Append a session and focus it, matching the legacy client's behaviour of

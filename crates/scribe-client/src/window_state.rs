@@ -227,7 +227,7 @@ pub fn window_bounds_for(geom: &WindowGeometry, fallback: Bounds<Pixels>) -> Win
 /// Written without a float cast (the workspace denies the pedantic cast lints)
 /// by rounding the magnitude through the shared `u16` helper and re-applying the
 /// sign; coordinates beyond ±65535 logical pixels do not occur on real displays.
-fn logical_px_to_i32(value: f32) -> i32 {
+pub fn logical_px_to_i32(value: f32) -> i32 {
     if !value.is_finite() {
         return 0;
     }

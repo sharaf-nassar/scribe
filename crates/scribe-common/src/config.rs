@@ -1115,24 +1115,6 @@ impl<'de> Deserialize<'de> for ClipboardPolicyConfig {
     }
 }
 
-/// Where a newly opened Claude/Codex AI tab starts its working directory.
-///
-/// `Pane` (default) inherits the focused pane's CWD, like a plain new tab.
-/// `ProjectRoot` anchors the tab to the workspace project root when the pane
-/// is inside a configured workspace root. `Home` starts the tab in the user's
-/// home directory.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AiTabCwd {
-    /// Inherit the focused pane's current working directory.
-    #[default]
-    Pane,
-    /// Anchor to the workspace project root when inside a configured root.
-    ProjectRoot,
-    /// Start in the user's home directory.
-    Home,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalConfig {
     #[serde(default = "default_scrollback_lines")]
@@ -1145,9 +1127,6 @@ pub struct TerminalConfig {
     pub ai_integration: TerminalAiIntegrationConfig,
     #[serde(default, flatten)]
     pub ai_session: TerminalAiSessionConfig,
-    /// Where a newly opened Claude/Codex AI tab starts its working directory.
-    #[serde(default)]
-    pub ai_tab_cwd: AiTabCwd,
     /// Which system stats are shown in the status bar.
     #[serde(default)]
     pub status_bar_stats: StatusBarStatsConfig,
@@ -1190,7 +1169,6 @@ impl Default for TerminalConfig {
             smart_selection: SmartSelectionConfig::default(),
             ai_integration: TerminalAiIntegrationConfig::default(),
             ai_session: TerminalAiSessionConfig::default(),
-            ai_tab_cwd: AiTabCwd::default(),
             status_bar_stats: StatusBarStatsConfig::default(),
             scroll: TerminalScrollConfig::default(),
             env_persistence: TerminalEnvPersistenceConfig::default(),

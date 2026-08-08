@@ -297,6 +297,18 @@ e2e-visual-window-lifecycle:
 e2e-visual-cold-restart:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/cold-restart.sh
 
+# Run the layout-restore E2E: tab order, active tab, and window position across
+# a restart. Needs the wire tap, because the whole tab list only exists as a
+# `ReportWorkspaceTree` frame — a screenshot shows the visible tab and no more.
+e2e-visual-layout-restore:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/layout-restore.sh
+
+# Run the tab drag-reorder E2E: a real pointer drag inside one region. Needs the
+# wire tap, because tab order only exists as a `ReportWorkspaceTree` frame — the
+# tabs themselves are identical shells on screen.
+e2e-visual-tab-drag-reorder:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./test-output:/output scribe-test-visual /tests/visual/tab-drag-reorder.sh
+
 # Run the warm multi-window restore E2E against the real client. No wire tap:
 # it quits and relaunches the client several times, which the tap's renamed
 # socket does not survive. It opens a second window, quits, relaunches, and

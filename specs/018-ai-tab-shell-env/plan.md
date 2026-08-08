@@ -1,5 +1,8 @@
 # Plan: ai-tab-shell-env
 
+**Status:** SUPERSEDED — see `spec.md` for what replaced this design and why. Retained as history; it does not describe current behavior.
+
+
 ## Architecture Approach
 
 Implements the seven binding clarification decisions from
