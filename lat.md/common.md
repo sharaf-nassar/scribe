@@ -74,9 +74,13 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 
-Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` (: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
+Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (`Option<f32>`, 8–32, unset by default), `prompt_bar_position` (: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon. Unset, the strip follows `appearance.font_size` so its text matches the terminal text beside it; a value pins an explicit size and is clamped to 8–32 when written through the settings stepper.
 
  independently toggles CPU, memory, GPU, and network display.  wraps a single `enabled` flag for shell prompt marks.  maps an  to the matching integration toggle.
+
+#### Prompt bar font size follows the terminal
+
+Verifies `prompt_bar_font_size` defaults to `None`, that an unset override survives the flattened `toml::to_string_pretty` round trip [[crates/scribe-common/src/config.rs#save_config]] performs without writing a key, and that an explicit value parses back as `Some`.
 
 ### Keybindings
 

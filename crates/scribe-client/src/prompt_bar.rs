@@ -151,22 +151,53 @@ pub struct PromptBarModel {
     pub context_color: Option<[f32; 4]>,
 }
 
+/// The glyph size and row cell height one pane's strip paints at.
+///
+/// Resolved once per frame by the view and handed to *both* [`prompt_bar_height`]
+/// (the height the pane reserves before the PTY grid is sized) and [`render`]
+/// (the height actually painted). Passing one value to both is what keeps the
+/// reserved strip and the painted strip identical at every font size — a drift
+/// there sizes the PTY grid against a band that is not there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PromptBarMetrics {
+    /// Prompt text glyph size in pixels.
+    pub text_size: f32,
+    /// Terminal cell height the rows are sized from.
+    pub cell_height: f32,
+}
+
+impl PromptBarMetrics {
+    /// Resolve the strip metrics from the live grid font's glyph size and row
+    /// height plus the optional `terminal.prompt_bar_font_size` override.
+    ///
+    /// Unset, the strip paints at the grid's own size, so an
+    /// `appearance.font_size` edit or a zoom step carries the strip along.
+    /// Set, the grid row height is scaled by the same ratio, keeping the row
+    /// padding proportional to the text rather than frozen at the grid's.
+    #[must_use]
+    pub fn resolve(override_size: Option<f32>, grid_size: f32, grid_line_height: f32) -> Self {
+        let text_size = override_size.unwrap_or(grid_size);
+        let scale = if grid_size > 0.0 { text_size / grid_size } else { 1.0 };
+        Self { text_size, cell_height: grid_line_height * scale }
+    }
+}
+
 /// Row height used by the prompt-bar strip layout.
 #[must_use]
 pub fn prompt_bar_row_height(cell_height: f32) -> f32 {
     (cell_height + ROW_VERTICAL_PAD).max(ROW_MIN_HEIGHT)
 }
 
-/// Total prompt-bar height for `prompt_count` prompts at `cell_height`.
+/// Total prompt-bar height for `prompt_count` prompts at `metrics`.
 ///
 /// Zero prompts (or a non-positive cell height) yields a zero-height bar; two
 /// or more prompts add the second row plus its seam.
 #[must_use]
-pub fn prompt_bar_height(prompt_count: u32, cell_height: f32) -> f32 {
-    if prompt_count == 0 || cell_height <= 0.0 {
+pub fn prompt_bar_height(prompt_count: u32, metrics: PromptBarMetrics) -> f32 {
+    if prompt_count == 0 || metrics.cell_height <= 0.0 {
         return 0.0;
     }
-    let row_height = prompt_bar_row_height(cell_height);
+    let row_height = prompt_bar_row_height(metrics.cell_height);
     if prompt_count >= 2 { row_height * 2.0 + ROW_SEAM_H } else { row_height }
 }
 
@@ -383,16 +414,18 @@ fn count_cluster(
 
 /// Render the prompt-bar strip for a pane.
 ///
-/// `cell_height` sizes each row; `hover` tints the hovered row and reveals the
-/// dismiss affordance. Interaction (click/hover wiring) is attached by the view;
-/// this function owns only the visual lowering of [`PromptBarModel`].
+/// `metrics` sizes both the rows and the text — the same value the pane
+/// reserved space with via [`prompt_bar_height`]; `hover` tints the hovered row
+/// and reveals the dismiss affordance. Interaction (click/hover wiring) is
+/// attached by the view; this function owns only the visual lowering of
+/// [`PromptBarModel`].
 pub fn render(
     model: &PromptBarModel,
     colors: &PromptBarColors,
-    cell_height: f32,
+    metrics: PromptBarMetrics,
     hover: Option<PromptBarHover>,
 ) -> impl IntoElement {
-    let row_h = prompt_bar_row_height(cell_height);
+    let row_h = prompt_bar_row_height(metrics.cell_height);
     // `flex_none` for the same reason the status bar carries it: the strip is a
     // fixed-height band stacked under the flex-grown terminal grid, and a
     // shrinkable band would be squeezed away rather than clipping the grid.
@@ -410,7 +443,7 @@ pub fn render(
         .flex_none()
         .w_full()
         .font_family("monospace")
-        .text_xs()
+        .text_size(px(metrics.text_size))
         .relative();
 
     let first_style = RowStyle {
@@ -559,10 +592,29 @@ mod tests {
         // Compare by bit pattern: these are exact f32 arithmetic results, so the
         // strict `clippy::float_cmp` lint stays satisfied without approximation.
         let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
-        assert!(eq(prompt_bar_height(0, 16.0), 0.0));
-        assert!(eq(prompt_bar_height(1, 16.0), prompt_bar_row_height(16.0)));
-        assert!(eq(prompt_bar_height(2, 16.0), prompt_bar_row_height(16.0) * 2.0 + ROW_SEAM_H));
-        assert!(eq(prompt_bar_height(1, 0.0), 0.0), "non-positive cell height yields no bar");
+        let m = |cell_height| PromptBarMetrics { text_size: 14.0, cell_height };
+        assert!(eq(prompt_bar_height(0, m(16.0)), 0.0));
+        assert!(eq(prompt_bar_height(1, m(16.0)), prompt_bar_row_height(16.0)));
+        assert!(eq(prompt_bar_height(2, m(16.0)), prompt_bar_row_height(16.0) * 2.0 + ROW_SEAM_H));
+        assert!(eq(prompt_bar_height(1, m(0.0)), 0.0), "non-positive cell height yields no bar");
+    }
+
+    // @lat: [[client#GPUI Prompt Bar#Strip metrics follow the grid font]]
+    #[gpui::test]
+    fn metrics_follow_grid_font_unless_overridden() {
+        let eq = |a: f32, b: f32| a.to_bits() == b.to_bits();
+        let (size, line_height) = (20.0, 26.0);
+
+        let followed = PromptBarMetrics::resolve(None, size, line_height);
+        assert!(eq(followed.text_size, size), "unset override paints at the grid size");
+        assert!(eq(followed.cell_height, line_height), "and reserves the grid's row");
+
+        let overridden = PromptBarMetrics::resolve(Some(10.0), size, line_height);
+        assert!(eq(overridden.text_size, 10.0), "an explicit size wins over the grid");
+        assert!(
+            eq(overridden.cell_height, line_height * 0.5),
+            "and scales the row height by the same ratio so padding stays proportional"
+        );
     }
 
     // @lat: [[client#GPUI Prompt Bar#Model shows one row for one prompt, two for many]]

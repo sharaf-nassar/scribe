@@ -5243,9 +5243,10 @@ impl TerminalView {
         session_id: Option<SessionId>,
     ) -> gpui::Div {
         let colors = self.prompt_colors.with_opacity(self.opacity);
-        let strip = session_id.and_then(|s| self.prompt_model_for(s)).map(|model| {
-            prompt_bar::render(&model, &colors, f32::from(CELL_HEIGHT), None).into_any_element()
-        });
+        let metrics = self.prompt_bar_metrics();
+        let strip = session_id
+            .and_then(|s| self.prompt_model_for(s))
+            .map(|model| prompt_bar::render(&model, &colors, metrics, None).into_any_element());
         let grid_slot = div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid);
         let pane = pane.flex().flex_col();
         if self.prompt_bar.position == PromptBarPosition::Top {
@@ -7241,6 +7242,22 @@ impl TerminalView {
         prompt_bar::build_model(data, std::time::SystemTime::now(), indicator)
     }
 
+    /// The glyph size and row cell height every prompt strip paints at.
+    ///
+    /// Read from the live grid font, so the strip matches the terminal text
+    /// beside it and follows both an `appearance.font_size` edit and a zoom
+    /// step; `terminal.prompt_bar_font_size` overrides it when set. The single
+    /// source for [`Self::pane_prompt_bar_height`] (what the pane reserves) and
+    /// [`Self::compose_pane_content`] (what is painted), which must agree or the
+    /// PTY grid is sized against a band that is not there.
+    fn prompt_bar_metrics(&self) -> prompt_bar::PromptBarMetrics {
+        prompt_bar::PromptBarMetrics::resolve(
+            self.prompt_bar.font_size,
+            self.font.size,
+            self.font.line_height,
+        )
+    }
+
     /// Height of the prompt strip `session_id`'s pane reserves, or zero when
     /// the feature is off or the session has no prompts.
     ///
@@ -7251,10 +7268,11 @@ impl TerminalView {
         if !self.prompt_bar.enabled {
             return 0.0;
         }
+        let metrics = self.prompt_bar_metrics();
         let Ok(ai) = self.shared.ai.lock() else { return 0.0 };
-        ai.prompts.get(&session_id).map_or(0.0, |data| {
-            prompt_bar::prompt_bar_height(data.prompt_count, f32::from(CELL_HEIGHT))
-        })
+        ai.prompts
+            .get(&session_id)
+            .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompt_count, metrics))
     }
 
     /// The invisible canvas that measures the grid band and republishes the

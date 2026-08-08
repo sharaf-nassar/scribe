@@ -145,7 +145,11 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "terminal.claude_code_integration" => Value::Bool(t.ai_integration.claude_code.enabled()),
         "terminal.codex_code_integration" => Value::Bool(t.ai_integration.codex_code.enabled()),
         "terminal.prompt_bar" => Value::Bool(t.prompt_bar.enabled),
-        "terminal.prompt_bar_font_size" => json!(t.prompt_bar.font_size),
+        // Unset, the strip follows the terminal font, so the stepper opens on
+        // the size the user is actually looking at rather than a stale default.
+        "terminal.prompt_bar_font_size" => {
+            json!(t.prompt_bar.font_size.unwrap_or(config.appearance.font_size))
+        }
         "terminal.prompt_bar_position" => enum_str(&t.prompt_bar.position),
         "terminal.preserve_ai_scrollback" => Value::Bool(t.ai_session.preserve_ai_scrollback),
         "terminal.indicator_height" => json!(t.ai_session.indicator_height),
