@@ -11476,7 +11476,9 @@ async fn persist_session_metadata(
         ServerMessage::AiStateChanged { ai_state, .. } => {
             let at = std::time::SystemTime::now();
             update_live_session(session_id, live_sessions, |session| {
-                note_prompt_progress(&mut session.prompt_state, &ai_state.state, at);
+                if let Some(prompts) = session.prompt_state.as_mut() {
+                    prompts.note_prompt_progress(&ai_state.state, at);
+                }
                 session.ai_state = Some(ai_state.clone());
             })
             .await;
@@ -11493,59 +11495,15 @@ async fn persist_session_metadata(
         }
         ServerMessage::PromptReceived { text, .. } => {
             update_live_session(session_id, live_sessions, |session| {
-                record_prompt(&mut session.prompt_state, text, std::time::SystemTime::now());
+                session
+                    .prompt_state
+                    .get_or_insert_with(Default::default)
+                    .record_prompt(text, std::time::SystemTime::now());
             })
             .await;
         }
         _ => {}
     }
-}
-
-/// Fold one submitted prompt onto a session's retained history.
-///
-/// Mirrors the client's `AiChrome::record_prompt` so a bar painted from a
-/// `SessionList` is the same bar the live `PromptReceived` path would have
-/// built: the first prompt is latched once, the latest one is replaced, and
-/// the elapsed timer restarts.
-fn record_prompt(
-    state: &mut Option<scribe_common::protocol::SessionPromptState>,
-    text: &str,
-    at: std::time::SystemTime,
-) {
-    let prompts = state.get_or_insert_with(Default::default);
-    prompts.prompt_count = prompts.prompt_count.saturating_add(1);
-    if prompts.first_prompt.is_none() {
-        prompts.first_prompt = Some(text.to_owned());
-    }
-    prompts.latest_prompt = Some(text.to_owned());
-    prompts.latest_prompt_at = epoch_secs(at);
-    prompts.latest_prompt_finished_at = None;
-}
-
-/// Freeze or resume a session's elapsed prompt timer for one AI state edge.
-///
-/// Mirrors the client's `AiChrome::note_prompt_progress`, so the frozen figure
-/// a pane is showing is the one a reattaching client reads back rather than a
-/// timer that starts running again from the original prompt instant. The stamp
-/// is taken once per run — an idle provider keeps emitting non-`Processing`
-/// edges and each one would push the frozen figure forward.
-fn note_prompt_progress(
-    state: &mut Option<scribe_common::protocol::SessionPromptState>,
-    ai_state: &AiState,
-    at: std::time::SystemTime,
-) {
-    let Some(prompts) = state.as_mut() else { return };
-    if matches!(ai_state, AiState::Processing) {
-        prompts.latest_prompt_finished_at = None;
-    } else if prompts.latest_prompt_finished_at.is_none() {
-        prompts.latest_prompt_finished_at = epoch_secs(at);
-    }
-}
-
-/// Unix-epoch seconds for a wall-clock instant, the wire form both prompt
-/// timestamps travel in.
-fn epoch_secs(at: std::time::SystemTime) -> Option<u64> {
-    at.duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_secs())
 }
 
 async fn update_live_session(
@@ -12087,28 +12045,28 @@ mod tests {
     fn retained_prompt_history_latches_the_first_and_tracks_the_latest() {
         use std::time::{Duration, UNIX_EPOCH};
 
-        let mut state = None;
+        let mut state: Option<scribe_common::protocol::SessionPromptState> = None;
         let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
-        record_prompt(&mut state, "build the thing", at);
-        record_prompt(&mut state, "now ship it", at + Duration::from_secs(30));
+        state.get_or_insert_with(Default::default).record_prompt("build the thing", at);
+        state
+            .get_or_insert_with(Default::default)
+            .record_prompt("now ship it", at + Duration::from_secs(30));
 
-        let prompts = state.expect("a submitted prompt creates the record");
+        let mut prompts = state.expect("a submitted prompt creates the record");
         assert_eq!(prompts.prompt_count, 2);
         assert_eq!(prompts.first_prompt.as_deref(), Some("build the thing"));
         assert_eq!(prompts.latest_prompt.as_deref(), Some("now ship it"));
         assert_eq!(prompts.latest_prompt_at, Some(1_700_000_030));
 
         // The run ends: the timer freezes once and idle edges do not push it.
-        let mut frozen = Some(prompts);
-        note_prompt_progress(&mut frozen, &AiState::IdlePrompt, at + Duration::from_secs(75));
-        note_prompt_progress(&mut frozen, &AiState::WaitingForInput, at + Duration::from_mins(10));
-        let stamp = frozen.as_ref().and_then(|p| p.latest_prompt_finished_at);
-        assert_eq!(stamp, Some(1_700_000_075));
+        prompts.note_prompt_progress(&AiState::IdlePrompt, at + Duration::from_secs(75));
+        prompts.note_prompt_progress(&AiState::WaitingForInput, at + Duration::from_mins(10));
+        assert_eq!(prompts.latest_prompt_finished_at, Some(1_700_000_075));
 
         // Back to work: the timer runs again.
-        note_prompt_progress(&mut frozen, &AiState::Processing, at + Duration::from_mins(12));
-        assert_eq!(frozen.and_then(|p| p.latest_prompt_finished_at), None);
+        prompts.note_prompt_progress(&AiState::Processing, at + Duration::from_mins(12));
+        assert_eq!(prompts.latest_prompt_finished_at, None);
     }
 
     fn unix_stream_pair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {

@@ -1,8 +1,9 @@
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ai_state::{AiProcessState, AiProvider};
+use crate::ai_state::{AiProcessState, AiProvider, AiState};
 use crate::config::SharingMode;
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
@@ -1161,21 +1162,80 @@ pub struct WorkspaceListEntry {
 /// Mirrors the client's `PromptBarData` minus its purely local `dismissed`
 /// flag. Instants travel as Unix-epoch seconds rather than `SystemTime`,
 /// matching how the restore snapshot already persists them.
+/// Every field carries `#[serde(default)]` so the record can be `#[serde(flatten)]`ed
+/// into the client's persisted launch record, where snapshots written before a
+/// field existed still have to load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPromptState {
     /// Number of prompts submitted in the current conversation.
+    #[serde(default)]
     pub prompt_count: u32,
     /// Text of the first prompt in the conversation.
+    #[serde(default)]
     pub first_prompt: Option<String>,
     /// Text of the most recent prompt.
+    #[serde(default)]
     pub latest_prompt: Option<String>,
     /// When the latest prompt was submitted (the bar's timer origin).
+    #[serde(default)]
     pub latest_prompt_at: Option<u64>,
     /// When the AI last finished, freezing the bar's elapsed timer. Stamped
     /// on the first state edge that leaves `Processing`, so a reattaching
     /// client reads back the frozen figure rather than a timer that starts
     /// running again from the original prompt instant.
+    #[serde(default)]
     pub latest_prompt_finished_at: Option<u64>,
+}
+
+impl SessionPromptState {
+    /// Fold one submitted prompt onto the retained history: the first prompt is
+    /// latched once, the latest one is replaced, and the elapsed timer restarts.
+    ///
+    /// Shared by the server's `PromptReceived` handler and the client's
+    /// `AiChrome`, so a bar painted from a `SessionList` is the same bar the
+    /// live hook path would have built.
+    pub fn record_prompt(&mut self, text: &str, at: SystemTime) {
+        self.prompt_count = self.prompt_count.saturating_add(1);
+        if self.first_prompt.is_none() {
+            self.first_prompt = Some(text.to_owned());
+        }
+        self.latest_prompt = Some(text.to_owned());
+        self.latest_prompt_at = epoch_secs(at);
+        self.latest_prompt_finished_at = None;
+    }
+
+    /// Freeze or resume the elapsed prompt timer for one AI state edge.
+    ///
+    /// Leaving `Processing` stamps the instant the timer freezes at, so the
+    /// figure reads prompt-to-finish rather than wall-clock-since-prompt; a
+    /// return to `Processing` clears the stamp and the timer ticks again. The
+    /// stamp is taken once per run rather than on every non-`Processing` edge,
+    /// because an idle provider keeps emitting them and each one would push a
+    /// frozen value forward.
+    pub fn note_prompt_progress(&mut self, state: &AiState, at: SystemTime) {
+        if matches!(state, AiState::Processing) {
+            self.latest_prompt_finished_at = None;
+        } else if self.latest_prompt_finished_at.is_none() {
+            self.latest_prompt_finished_at = epoch_secs(at);
+        }
+    }
+}
+
+/// Unix-epoch seconds for a wall-clock instant — the wire and on-disk form both
+/// prompt timestamps travel in.
+///
+/// A clock set before 1970 encodes as no timestamp at all, which is exactly how
+/// a record written before the field existed reads back.
+#[must_use]
+pub fn epoch_secs(at: SystemTime) -> Option<u64> {
+    at.duration_since(SystemTime::UNIX_EPOCH).ok().map(|since| since.as_secs())
+}
+
+/// Inverse of [`epoch_secs`], used wherever a stored stamp is compared against
+/// a live `SystemTime`.
+#[must_use]
+pub fn from_epoch_secs(secs: Option<u64>) -> Option<SystemTime> {
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs?))
 }
 
 /// Summary of a live session, sent in `SessionList` responses.

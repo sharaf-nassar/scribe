@@ -290,15 +290,8 @@ impl AiChrome {
 
     /// Record a prompt submission for `session_id`, seeding the first-prompt row
     /// and restarting the elapsed timer on the latest row.
-    fn record_prompt(&mut self, session_id: SessionId, text: String, at: std::time::SystemTime) {
-        let data = self.prompts.entry(session_id).or_default();
-        data.prompt_count = data.prompt_count.saturating_add(1);
-        if data.first_prompt.is_none() {
-            data.first_prompt = Some(text.clone());
-        }
-        data.latest_prompt = Some(text);
-        data.latest_prompt_at = Some(at);
-        data.latest_prompt_finished_at = None;
+    fn record_prompt(&mut self, session_id: SessionId, text: &str, at: std::time::SystemTime) {
+        self.prompts.entry(session_id).or_default().prompts.record_prompt(text, at);
     }
 
     /// Fold one `AiStateChanged` edge onto the chrome: the conversation
@@ -340,13 +333,8 @@ impl AiChrome {
         state: &AiState,
         at: std::time::SystemTime,
     ) {
-        let Some(data) = self.prompts.get_mut(&session_id) else {
-            return;
-        };
-        if matches!(state, AiState::Processing) {
-            data.latest_prompt_finished_at = None;
-        } else {
-            data.latest_prompt_finished_at.get_or_insert(at);
+        if let Some(data) = self.prompts.get_mut(&session_id) {
+            data.prompts.note_prompt_progress(state, at);
         }
     }
 
@@ -775,23 +763,14 @@ struct WindowSeed {
     restored: Option<WindowRestoreState>,
     /// Snapshots left for `--restore-child` siblings; see [`ColdStart::siblings`].
     restore_siblings: usize,
-    /// The absolute position this window's geometry record asked for, re-applied
-    /// once the window is on screen because the creation bounds are only a hint
-    /// the window manager may ignore. See
-    /// [`crate::monitor::apply_saved_position`].
-    restore_position: Option<(i32, i32)>,
-    /// The monitor that position was saved on, checked against where the window
-    /// manager actually put the window by
-    /// [`TerminalView::verify_restored_position`].
-    restore_monitor: Option<String>,
-    /// Set when the record was captured minimized, to the state it would
-    /// unminimize to — the window is opened in that state and iconified again
-    /// once it is mapped. See [`TerminalView::apply_pending_minimize`].
-    restore_minimized: Option<WindowState>,
     /// The whole record the window was restored from, adopted as the baseline
     /// the first live capture compares against. Without it a window restored
     /// maximized would drop its pre-maximize rect on the first capture: that
     /// rect only survives by being carried forward from the previous reading.
+    ///
+    /// The position to re-assert, the monitor to verify it against, and the
+    /// minimize state to re-apply are all derived from this one record by
+    /// [`RestoreRuntime::from_seed`] rather than carried alongside it.
     restore_geometry: Option<WindowGeometry>,
 }
 
@@ -941,17 +920,30 @@ impl RestorePlacement {
 }
 
 impl RestoreRuntime {
-    /// Take the three restore inputs the window was opened with.
+    /// Take the restore inputs the window was opened with, deriving the
+    /// placement bits from the one geometry record that already holds them.
     fn from_seed(seed: WindowSeed) -> Self {
-        let WindowSeed {
-            restored: pending,
-            restore_siblings,
-            restore_position,
-            restore_monitor,
-            restore_minimized,
-            restore_geometry,
-            ..
-        } = seed;
+        let WindowSeed { restored: pending, restore_siblings, restore_geometry, .. } = seed;
+        // A minimized record cannot be opened minimized — GPUI maps the platform
+        // window inside `Window::new` — so the window comes up in the state it
+        // would unminimize to and is re-minimized from the first frame.
+        let restore_minimized = restore_geometry
+            .as_ref()
+            .filter(|geom| geom.state == WindowState::Minimized)
+            .map(WindowGeometry::effective_state);
+        // A maximized or fullscreen window has no position of its own to
+        // re-assert; the compositor owns its placement.
+        let restore_position = restore_geometry
+            .as_ref()
+            .filter(|geom| geom.effective_state() == WindowState::Windowed)
+            .and_then(|geom| geom.x.zip(geom.y));
+        // The nil-UUID placeholder legacy records carry is not a connector name
+        // and can never match one; verifying against it would warn on every
+        // such start.
+        let restore_monitor = restore_position
+            .and(restore_geometry.as_ref())
+            .and_then(|geom| geom.monitor_name.clone())
+            .filter(|name| name != NIL_MONITOR_ID);
         Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
@@ -1547,16 +1539,16 @@ impl TerminalView {
         // its X11 `is_maximized()` goes false the moment the window is hidden;
         // the window manager's own `_NET_WM_STATE` is the only reading that
         // survives minimization. GPUI's answer is the off-X11 fallback.
+        let fallback_state = window
+            .is_fullscreen()
+            .then_some(WindowState::Fullscreen)
+            .or_else(|| window.is_maximized().then_some(WindowState::Maximized))
+            .unwrap_or_default();
+        // GPUI cannot report minimized, so the fallback is never hidden and
+        // never has a restore state of its own.
         let observed = monitor::observed_window_state(
             window,
-            ObservedWindowState::from_wm_state(
-                false,
-                window
-                    .is_fullscreen()
-                    .then_some(WindowState::Fullscreen)
-                    .or_else(|| window.is_maximized().then_some(WindowState::Maximized))
-                    .unwrap_or_default(),
-            ),
+            ObservedWindowState { state: fallback_state, ..ObservedWindowState::default() },
         );
         let geometry = geometry_from_bounds(
             window.bounds(),
@@ -3646,7 +3638,7 @@ impl TerminalView {
             .ok()
             .and_then(|ai| {
                 ai.prompts.get(&session_id).and_then(|data| {
-                    data.latest_prompt.clone().or_else(|| data.first_prompt.clone())
+                    data.prompts.latest_prompt.clone().or_else(|| data.prompts.first_prompt.clone())
                 })
             })
             .unwrap_or_default();
@@ -3997,7 +3989,7 @@ impl TerminalView {
         self.restore.restored_prompts = rebuilt
             .panes
             .iter()
-            .filter(|(_, pane)| pane.prompts.prompt_count > 0)
+            .filter(|(_, pane)| pane.prompts.prompts.prompt_count > 0)
             .map(|(pane_id, pane)| {
                 let restored = RestoredPrompts {
                     prompts: pane.prompts.clone(),
@@ -7636,7 +7628,7 @@ impl TerminalView {
         let metrics = self.prompt_bar_metrics();
         let Ok(ai) = self.shared.ai.lock() else { return 0.0 };
         ai.visible_prompts(session_id)
-            .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompt_count, metrics))
+            .map_or(0.0, |data| prompt_bar::prompt_bar_height(data.prompts.prompt_count, metrics))
     }
 
     /// The invisible canvas that measures the grid band and republishes the
@@ -8465,27 +8457,6 @@ fn open_window(
     }
     let restored = cold_start.snapshot;
     let restore_siblings = cold_start.siblings;
-    // A minimized record cannot be opened minimized — GPUI maps the platform
-    // window inside `Window::new` — so the window comes up in the state it
-    // would unminimize to and is re-minimized from the first frame.
-    let restore_minimized = cold_start
-        .geometry
-        .as_ref()
-        .filter(|geom| geom.state == WindowState::Minimized)
-        .map(WindowGeometry::effective_state);
-    // A maximized or fullscreen window has no position of its own to re-assert;
-    // the compositor owns its placement.
-    let restore_position = cold_start
-        .geometry
-        .as_ref()
-        .filter(|geom| geom.effective_state() == WindowState::Windowed)
-        .and_then(|geom| geom.x.zip(geom.y));
-    // The nil-UUID placeholder legacy records carry is not a connector name and
-    // can never match one; verifying against it would warn on every such start.
-    let restore_monitor = restore_position
-        .and(cold_start.geometry.as_ref())
-        .and_then(|geom| geom.monitor_name.clone())
-        .filter(|name| name != NIL_MONITOR_ID);
     let restore_geometry = cold_start.geometry;
     let shared = shared.clone();
     let sink = sink.clone();
@@ -8519,15 +8490,7 @@ fn open_window(
                 TerminalView::new(
                     shared,
                     sink,
-                    WindowSeed {
-                        terminal_size,
-                        restored,
-                        restore_siblings,
-                        restore_position,
-                        restore_monitor,
-                        restore_minimized,
-                        restore_geometry,
-                    },
+                    WindowSeed { terminal_size, restored, restore_siblings, restore_geometry },
                     window,
                     cx,
                 )
@@ -9628,7 +9591,7 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
         ServerMessage::PromptReceived { session_id, text, .. } => {
             let at = std::time::SystemTime::now();
-            update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, text, at));
+            update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, &text, at));
         }
         other => unhandled_server_message(&other),
     }
@@ -11344,19 +11307,19 @@ mod tests {
     fn restored_prompts_outlive_the_resumed_conversation_edge() {
         let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
         let session = SessionId::new();
-        let restored = PromptBarData {
+        let restored = PromptBarData::from(scribe_common::protocol::SessionPromptState {
             prompt_count: 3,
             first_prompt: Some("build the thing".to_owned()),
             latest_prompt: Some("now ship it".to_owned()),
-            ..PromptBarData::default()
-        };
+            ..Default::default()
+        });
 
         ai.restore_prompts(session, restored, Some("conv-42".to_owned()));
         // The resumed provider re-announces the id it was resumed with.
         ai.note_conversation(session, "conv-42");
         let kept = ai.prompts.get(&session).expect("restored prompts survive the resume edge");
-        assert_eq!(kept.prompt_count, 3);
-        assert_eq!(kept.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(kept.prompts.prompt_count, 3);
+        assert_eq!(kept.prompts.first_prompt.as_deref(), Some("build the thing"));
 
         // A genuinely new conversation retires the previous one's bar.
         ai.note_conversation(session, "conv-43");
@@ -11378,7 +11341,7 @@ mod tests {
 
         // The prompt adapter emits state→processing before prompt_received.
         ai.apply_state_change(session, edge(AiState::Processing), at(100));
-        ai.record_prompt(session, "build the thing".to_owned(), at(100));
+        ai.record_prompt(session, "build the thing", at(100));
         assert_eq!(shown(&ai, at(130)).as_deref(), Some("30 sec"), "a working AI ticks");
 
         // The AI stops 45s in: the figure holds there however long the pane sits.
@@ -11429,12 +11392,9 @@ mod tests {
         ai.seed_from_session_list(std::slice::from_ref(&info));
 
         let bar = ai.visible_prompts(session).expect("a reattached pane paints its prompt bar");
-        assert_eq!(bar.prompt_count, 2);
-        assert_eq!(bar.first_prompt.as_deref(), Some("build the thing"));
-        assert_eq!(
-            bar.latest_prompt_at,
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
-        );
+        assert_eq!(bar.prompts.prompt_count, 2);
+        assert_eq!(bar.prompts.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(bar.prompts.latest_prompt_at, Some(1_700_000_000));
         assert_eq!(
             ai.tracker.provider_for_session(session),
             Some(scribe_common::ai_state::AiProvider::ClaudeCode),
@@ -11453,19 +11413,18 @@ mod tests {
         let session = SessionId::new();
         // The replayed launch answered before the pane adopted the session, so
         // this prompt is newer than anything the snapshot holds.
-        ai.record_prompt(
-            session,
-            "typed after the restart".to_owned(),
-            std::time::SystemTime::now(),
-        );
+        ai.record_prompt(session, "typed after the restart", std::time::SystemTime::now());
 
         ai.restore_prompts(
             session,
-            PromptBarData { prompt_count: 9, ..PromptBarData::default() },
+            PromptBarData::from(scribe_common::protocol::SessionPromptState {
+                prompt_count: 9,
+                ..Default::default()
+            }),
             Some("conv-42".to_owned()),
         );
 
-        assert_eq!(ai.prompts.get(&session).map(|data| data.prompt_count), Some(1));
+        assert_eq!(ai.prompts.get(&session).map(|data| data.prompts.prompt_count), Some(1));
     }
 
     #[test]
@@ -11490,7 +11449,7 @@ mod tests {
     fn dismissed_prompt_bar_stays_down_until_the_session_is_forgotten() {
         let mut chrome = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
         let session = SessionId::new();
-        chrome.record_prompt(session, "build the thing".to_owned(), std::time::SystemTime::now());
+        chrome.record_prompt(session, "build the thing", std::time::SystemTime::now());
         assert!(chrome.visible_prompts(session).is_some());
 
         chrome.dismiss(session);
@@ -11499,7 +11458,7 @@ mod tests {
             "a dismissed bar paints nothing and reserves no rows"
         );
         assert_eq!(
-            chrome.prompts.get(&session).map(|data| data.prompt_count),
+            chrome.prompts.get(&session).map(|data| data.prompts.prompt_count),
             Some(1),
             "the prompt history outlives the dismissal"
         );

@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use gpui::{App, ElementId, Rgba, Role, Window, div, prelude::*, px};
+use scribe_common::protocol::{SessionPromptState, from_epoch_secs};
 
 use crate::opacity::scale_slot;
 
@@ -46,39 +47,23 @@ const SEPARATOR_GLYPH: char = '·';
 /// a live `Pane`) so the pure model and its freeze semantics stay testable.
 #[derive(Clone, Debug, Default)]
 pub struct PromptBarData {
-    /// Number of prompts submitted in this session (drives `#N` and row count).
-    pub prompt_count: u32,
-    /// Text of the first prompt in the session.
-    pub first_prompt: Option<String>,
-    /// Text of the most recent prompt (rendered on the second row when present).
-    pub latest_prompt: Option<String>,
-    /// Wall-clock instant the latest prompt was submitted (timer origin).
-    pub latest_prompt_at: Option<SystemTime>,
-    /// Wall-clock instant the AI finished (or last transitioned). When set, the
-    /// elapsed timer freezes here instead of tracking `now`.
-    pub latest_prompt_finished_at: Option<SystemTime>,
+    /// Prompt history for the session — the same record the server retains and
+    /// the restore snapshot persists, rather than a third declaration of the
+    /// same five fields.
+    pub prompts: SessionPromptState,
     /// Set by the strip's `×` overlay: the pane keeps its prompt history but
     /// paints no bar and reserves no rows until the record is dropped.
     pub dismissed: bool,
 }
 
-impl From<scribe_common::protocol::SessionPromptState> for PromptBarData {
+impl From<SessionPromptState> for PromptBarData {
     /// Adopt the prompt history the server retained for a session.
     ///
     /// `dismissed` has no wire counterpart on purpose: dismissal is a local
     /// gesture against a pane, so a reattaching client starts with the bar
     /// shown, exactly as a fresh window would.
-    fn from(state: scribe_common::protocol::SessionPromptState) -> Self {
-        let from_epoch =
-            |secs: Option<u64>| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs?));
-        Self {
-            prompt_count: state.prompt_count,
-            first_prompt: state.first_prompt,
-            latest_prompt: state.latest_prompt,
-            latest_prompt_at: from_epoch(state.latest_prompt_at),
-            latest_prompt_finished_at: from_epoch(state.latest_prompt_finished_at),
-            dismissed: false,
-        }
+    fn from(prompts: SessionPromptState) -> Self {
+        Self { prompts, dismissed: false }
     }
 }
 
@@ -291,8 +276,8 @@ fn elapsed_since(now: SystemTime, since: SystemTime) -> Duration {
 /// wall-clock time since the prompt. Otherwise it tracks `now`.
 #[must_use]
 pub fn elapsed_text(data: &PromptBarData, now: SystemTime) -> Option<String> {
-    let since = data.latest_prompt_at?;
-    let reference = data.latest_prompt_finished_at.unwrap_or(now);
+    let since = from_epoch_secs(data.prompts.latest_prompt_at)?;
+    let reference = from_epoch_secs(data.prompts.latest_prompt_finished_at).unwrap_or(now);
     Some(format_elapsed(elapsed_since(reference, since)))
 }
 
@@ -304,21 +289,23 @@ pub fn build_model(
     now: SystemTime,
     context_indicator: Option<PromptContextIndicator>,
 ) -> Option<PromptBarModel> {
-    if data.prompt_count == 0 {
+    if data.prompts.prompt_count == 0 {
         return None;
     }
-    let first =
-        PromptRowModel { icon: ICON_FIRST, text: data.first_prompt.clone().unwrap_or_default() };
-    let latest = (data.prompt_count >= 2).then(|| PromptRowModel {
+    let first = PromptRowModel {
+        icon: ICON_FIRST,
+        text: data.prompts.first_prompt.clone().unwrap_or_default(),
+    };
+    let latest = (data.prompts.prompt_count >= 2).then(|| PromptRowModel {
         icon: ICON_LATEST,
-        text: data.latest_prompt.clone().unwrap_or_default(),
+        text: data.prompts.latest_prompt.clone().unwrap_or_default(),
     });
     let (context_label, context_color) = context_indicator
         .map_or((None, None), |ind| (Some(format_context_label(ind.percent)), Some(ind.color)));
     Some(PromptBarModel {
         first,
         latest,
-        count_label: count_label(data.prompt_count),
+        count_label: count_label(data.prompts.prompt_count),
         elapsed_label: elapsed_text(data, now),
         context_label,
         context_color,
@@ -673,13 +660,13 @@ mod tests {
     // @lat: [[client#GPUI Prompt Bar#Elapsed timer tracks now until the AI stops]]
     #[gpui::test]
     fn elapsed_timer_tracks_now_when_running() {
-        let data = PromptBarData {
+        let data = PromptBarData::from(SessionPromptState {
             prompt_count: 1,
             first_prompt: Some("build the thing".into()),
-            latest_prompt_at: Some(at(100)),
+            latest_prompt_at: Some(100),
             latest_prompt_finished_at: None,
-            ..PromptBarData::default()
-        };
+            ..SessionPromptState::default()
+        });
         // now is 130s after submission → live 30s.
         assert_eq!(elapsed_text(&data, at(130)).as_deref(), Some("30 sec"));
         // A later now keeps advancing while unfinished.
@@ -689,14 +676,14 @@ mod tests {
     // @lat: [[client#GPUI Prompt Bar#Elapsed timer freezes when the AI stops]]
     #[gpui::test]
     fn elapsed_timer_freezes_on_finish() {
-        let data = PromptBarData {
+        let data = PromptBarData::from(SessionPromptState {
             prompt_count: 1,
             first_prompt: Some("build the thing".into()),
-            latest_prompt_at: Some(at(100)),
+            latest_prompt_at: Some(100),
             // AI finished 45s after submission.
-            latest_prompt_finished_at: Some(at(145)),
-            ..PromptBarData::default()
-        };
+            latest_prompt_finished_at: Some(145),
+            ..SessionPromptState::default()
+        });
         // Regardless of how far `now` advances, the frozen value holds at 45s.
         assert_eq!(elapsed_text(&data, at(200)).as_deref(), Some("45 sec"));
         assert_eq!(elapsed_text(&data, at(100_000)).as_deref(), Some("45 sec"));
@@ -705,12 +692,12 @@ mod tests {
     // @lat: [[client#GPUI Prompt Bar#Elapsed clamps a backwards wall clock]]
     #[gpui::test]
     fn elapsed_clamps_clock_skew() {
-        let data = PromptBarData {
+        let data = PromptBarData::from(SessionPromptState {
             prompt_count: 1,
-            latest_prompt_at: Some(at(200)),
+            latest_prompt_at: Some(200),
             latest_prompt_finished_at: None,
-            ..PromptBarData::default()
-        };
+            ..SessionPromptState::default()
+        });
         // now is before submission → clamp to zero, not a panic or underflow.
         assert_eq!(elapsed_text(&data, at(100)).as_deref(), Some("0 sec"));
     }
@@ -718,7 +705,10 @@ mod tests {
     // @lat: [[client#GPUI Prompt Bar#No timer without a prompt timestamp]]
     #[gpui::test]
     fn elapsed_none_without_timestamp() {
-        let data = PromptBarData { prompt_count: 1, ..PromptBarData::default() };
+        let data = PromptBarData::from(SessionPromptState {
+            prompt_count: 1,
+            ..SessionPromptState::default()
+        });
         assert_eq!(elapsed_text(&data, at(100)), None);
     }
 
@@ -772,21 +762,21 @@ mod tests {
     // @lat: [[client#GPUI Prompt Bar#Model shows one row for one prompt, two for many]]
     #[gpui::test]
     fn model_row_count_follows_prompt_count() {
-        let one = PromptBarData {
+        let one = PromptBarData::from(SessionPromptState {
             prompt_count: 1,
             first_prompt: Some("first".into()),
-            ..PromptBarData::default()
-        };
+            ..SessionPromptState::default()
+        });
         let model = build_model(&one, at(0), None).expect("one prompt renders");
         assert!(model.latest.is_none(), "a single prompt has no latest row");
         assert_eq!(model.count_label, "#1");
 
-        let two = PromptBarData {
+        let two = PromptBarData::from(SessionPromptState {
             prompt_count: 3,
             first_prompt: Some("first".into()),
             latest_prompt: Some("latest".into()),
-            ..PromptBarData::default()
-        };
+            ..SessionPromptState::default()
+        });
         let multi = build_model(&two, at(0), None).expect("multi prompt renders");
         assert_eq!(multi.latest.as_ref().unwrap().icon, ICON_LATEST);
         assert_eq!(multi.count_label, "#3");
