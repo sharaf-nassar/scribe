@@ -1259,7 +1259,7 @@ impl TerminalView {
     ///
     /// A reparenting window manager positions the frame it drew, not the window
     /// inside it, so a window asked for `(320, 180)` settles a border and a
-    /// titlebar further in. The saved record is the *content* origin, so
+    /// titlebar further in. The saved record is the *frame* origin, so
     /// restoring it verbatim would push the window down and right by the
     /// decoration on every restart until it walked off the screen.
     ///

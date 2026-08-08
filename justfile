@@ -309,6 +309,13 @@ e2e-visual-cold-restart:
 e2e-visual-layout-restore:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/layout-restore.sh
 
+# Run the geometry capture probe: unlike layout-restore's move-only coverage,
+# this resizes the window and asserts the record-to-window offset stays
+# constant, then that a restart still lands exact. Guards against the capture
+# reading a parent-relative ConfigureNotify.
+e2e-visual-geometry-capture-probe:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=120 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/geometry-capture-probe.sh
+
 # Run the tab drag-reorder E2E: a real pointer drag inside one region. Needs the
 # wire tap, because tab order only exists as a `ReportWorkspaceTree` frame — the
 # tabs themselves are identical shells on screen.
