@@ -439,7 +439,9 @@ fn apply_terminal_prompt_key(
         }
         "terminal.prompt_bar_font_size" => {
             let v: f32 = parse_number(value, "prompt_bar_font_size")?;
-            config.terminal.prompt_bar.font_size = v.clamp(8.0, 32.0);
+            // Moving the stepper pins an explicit size; the strip stops
+            // following `appearance.font_size` until the key is deleted.
+            config.terminal.prompt_bar.font_size = Some(v.clamp(8.0, 32.0));
         }
         "terminal.prompt_bar_position" => {
             let s = value.as_str().ok_or("prompt_bar_position must be a string")?;

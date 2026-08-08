@@ -988,9 +988,11 @@ pub struct TerminalPromptBarConfig {
     /// Show first/latest prompt text in AI terminal panes.
     #[serde(default = "default_true", rename = "prompt_bar")]
     pub enabled: bool,
-    /// Font size for prompt bar text (independent of terminal font size).
-    #[serde(default = "default_prompt_bar_font_size", rename = "prompt_bar_font_size")]
-    pub font_size: f32,
+    /// Font size for prompt bar text. `None` — the default — follows
+    /// `appearance.font_size`, so the strip reads at the same size as the
+    /// terminal text beside it; a value here is an explicit override.
+    #[serde(default, rename = "prompt_bar_font_size")]
+    pub font_size: Option<f32>,
     /// Where the prompt bar appears relative to the terminal content.
     #[serde(default, rename = "prompt_bar_position")]
     pub position: PromptBarPosition,
@@ -998,11 +1000,7 @@ pub struct TerminalPromptBarConfig {
 
 impl Default for TerminalPromptBarConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            font_size: default_prompt_bar_font_size(),
-            position: PromptBarPosition::default(),
-        }
+        Self { enabled: true, font_size: None, position: PromptBarPosition::default() }
     }
 }
 
@@ -1237,10 +1235,6 @@ fn default_scrollback_lines() -> u32 {
 
 fn default_indicator_height() -> f32 {
     2.0
-}
-
-fn default_prompt_bar_font_size() -> f32 {
-    14.0
 }
 
 // ---------------------------------------------------------------------------
@@ -2376,6 +2370,27 @@ danger_color = "#ff0000"
         let t = AiContextThresholds::default();
         assert_eq!(t.band(150), ContextBand::Danger);
         assert_eq!(t.band(255), ContextBand::Danger);
+    }
+
+    // @lat: [[common#Configuration#Terminal#Prompt bar font size follows the terminal]]
+    #[test]
+    fn prompt_bar_font_size_defaults_to_following_the_terminal() {
+        let default = super::ScribeConfig::default();
+        assert_eq!(default.terminal.prompt_bar.font_size, None);
+
+        // `prompt_bar` is a flattened table, so an unset override has to survive
+        // the same `toml::to_string_pretty` round trip `save_config` performs
+        // rather than erroring or writing a placeholder.
+        let written = toml::to_string_pretty(&default).expect("default config serializes");
+        assert!(
+            !written.contains("prompt_bar_font_size"),
+            "an unset override writes no key: {written}"
+        );
+
+        let parsed: super::ScribeConfig =
+            toml::from_str("[terminal]\nprompt_bar_font_size = 22.0\n")
+                .expect("explicit override parses");
+        assert_eq!(parsed.terminal.prompt_bar.font_size, Some(22.0));
     }
 }
 

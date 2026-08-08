@@ -1018,6 +1018,8 @@ The strip is per-pane chrome, matching the winit client: [[crates/scribe-client/
 
 The meter text itself comes from  so the prompt bar, the tab suffix, and the E2E assertions share one spelling;  colors it by the configured band and falls back to the bar's text color when a band hex fails to parse, degrading the color rather than hiding the percentage.
 
+Both the reserved and the painted height come from one [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics]], resolved per frame by [[crates/scribe-client/src/main.rs#TerminalView#prompt_bar_metrics]] from the live `GridFont` plus the optional `terminal.prompt_bar_font_size` override. Unset, the strip's glyph size *is* the grid's, so an `appearance.font_size` edit and a zoom step both carry the strip along instead of leaving it at a fixed 12px beside larger terminal text; set, the override scales the grid's row height by the same ratio so the row padding stays proportional. Handing the one value to both [[crates/scribe-client/src/prompt_bar.rs#prompt_bar_height]] and [[crates/scribe-client/src/prompt_bar.rs#render]] is what keeps the band the pane reserves identical to the band it paints — a drift there sizes the PTY grid against rows that are not on screen.
+
 ### Live AI wiring
 
 The GPUI client feeds the bar from the IPC reader: `AiStateChanged`, `AiStateCleared`, and `PromptReceived` land in a shared AI chrome record that the view reads on every frame.
@@ -1051,6 +1053,10 @@ Verifies  fills the three-segment meter proportionally and clamps above 100%.
 ### Strip height tracks the prompt count
 
 Verifies  is zero for no prompts or a non-positive cell height, one row for one prompt, and two rows plus a seam for two or more.
+
+### Strip metrics follow the grid font
+
+Verifies [[crates/scribe-client/src/prompt_bar.rs#PromptBarMetrics#resolve]] paints at the grid's own glyph size and row height when `terminal.prompt_bar_font_size` is unset, and that an explicit size both wins and scales the row height by the same ratio.
 
 ### Model shows one row for one prompt, two for many
 
@@ -1895,7 +1901,7 @@ A per-pane bar that tracks the user's most recent AI prompts as a flat edge-to-e
 
 Prompt state is stored in : `first_prompt`, `latest_prompt`, `latest_prompt_at`, `latest_prompt_finished_at`, `prompt_count`, `last_conversation_id`, and `prompt_bar_dismissed`.  increments `prompt_count`, stores prompt text, and stamps `latest_prompt_at` with `SystemTime::now()` so the elapsed-time counter has a reference point. It then triggers  when the bar height changes; that helper resizes the pane and immediately flushes the PTY resize instead of waiting for the normal resize debounce, so Codex does not repaint old-size synchronized frames into a smaller client grid while the prompt bar is appearing or disappearing.  returns 0.0 when the feature is disabled, dismissed, or no prompts have been received; otherwise it delegates to , which derives a one-row or two-row strip from the scaled prompt-bar cell height and inserts the seam only in the two-row case.  and  both accept a `prompt_bar_height` parameter so the terminal grid is sized and positioned below the bar.
 
-`TerminalConfig` exposes `prompt_bar_font_size` (f32, 8.0–32.0, default 14.0) and `prompt_bar_position` (: Top or Bottom, default Top). The font size is independent of the terminal font: a scale factor `prompt_bar_font_size / appearance.font_size` is applied to the terminal cell dimensions to produce the prompt bar cell size. The scaled cell size is used for bar height, text truncation, hit testing, and glyph rendering (via the per-instance `size` override in `CellInstance`). When position is Bottom, `content_offset` does not include the bar height so terminal content starts directly below the tab bar; the bar rect is placed at the pane bottom edge instead.
+`TerminalConfig` exposes `prompt_bar_font_size` (`Option<f32>`, 8.0–32.0, unset by default) and `prompt_bar_position` (: Top or Bottom, default Top). Unset, the strip paints at the live grid font size so it matches the terminal text beside it; set, it pins an explicit size and a scale factor `prompt_bar_font_size / appearance.font_size` is applied to the terminal cell dimensions to produce the prompt bar cell size. The resulting cell size is used for bar height, text truncation, hit testing, and glyph rendering. When position is Bottom, `content_offset` does not include the bar height so terminal content starts directly below the tab bar; the bar rect is placed at the pane bottom edge instead.
 
 Rendering is handled by , which accepts a  struct controlling the first-row background, second-row background, text, first icon, and latest icon colors and a `glyph_size` override for custom font scaling. Colors are derived from  with optional per-field overrides from `AppearanceConfig` (e.g. `prompt_bar_second_row_bg`, `prompt_bar_text`). The renderer draws a flat strip that fills the pane width with no outer inset or rounded corners, uses the configurable row backgrounds for the two prompt rows, inserts a thin seam/divider between them, and shows a hover-only left-edge `×` overlay for dismissal instead of a permanent bridged capsule. The right edge carries an elapsed-time counter, a typographic `#N` count annotation (no pill), and an optional `▰▰▰ NN%` context-window indicator built by  — a 3-segment level meter (`▰` filled, `▱` empty) whose fill count is `(percent * 3).div_ceil(100)` so any non-zero usage shows at least one filled segment. `#N`, timer, and separator glyphs are layered as text-only glyphs at descending alpha on top of row backgrounds rather than as filled chips; the context bar uses the configured Ok/Warn/Danger threshold color.
 
