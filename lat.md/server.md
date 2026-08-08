@@ -281,6 +281,18 @@ Verifies  answers in the order the window itself reported, so a reconnecting cli
 
 The window's tree leads, region by region and, inside a region, tab by tab. A session created since that report follows the ones the tree names instead of displacing them, and another window's sessions never leak in. Walking `self.workspaces` — a `HashMap` — as the only source made a multi-region window's tabs come back grouped differently on every server process.
 
+### Window Assignment
+
+A connecting client's `Hello` resolves to one window through [[crates/scribe-server/src/ipc_server.rs#resolve_window_assignment]], which also names the still-unconnected session windows the client should fan out as separate processes.
+
+A named `Hello` claims that window when no current client owns it — the ordinary bootstrap, which names the window id of the cold-restart snapshot it claimed, so identity, layout, and geometry all line up. An unnamed one (a launch that found nothing claimable) adopts an existing unconnected window instead of minting a new id, and that pick is taken over [[crates/scribe-server/src/ipc_server.rs#windows_in_stable_order]] rather than straight over the `HashSet` of windows with sessions: hash iteration order made the adopted window arbitrary per process, and the adopting client then wrote its opening default over that window's saved geometry.
+
+#### Adoption order is stable
+
+Verifies an unnamed `Hello` adopts the same window and fans the rest out in the same order however the window set was built, which is what lets the adopting client line up with the window it landed on.
+
+The set is walked in window-id order, so two sets holding the same ids resolve identically, and `other_windows` follows in that same order rather than in a hash order that changed on every server process.
+
 ## Handoff
 
 Zero-downtime server upgrades are implemented in  using Unix file descriptor passing.

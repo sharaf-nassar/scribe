@@ -873,6 +873,9 @@ struct RestoreRuntime {
     /// taken by the first paint. `None` once applied, or when the record was
     /// not captured minimized.
     pending_minimize: Option<WindowState>,
+    /// Whether the record of the window the server assigns is still owed a
+    /// read; see [`TerminalView::adopt_assigned_geometry`].
+    assigned_geometry: AssignedGeometry,
     /// How far the restore's placement has got. Gates geometry persistence so a
     /// restore cannot save over the record it was aiming at.
     placement: RestorePlacement,
@@ -886,6 +889,19 @@ struct RestoredPrompts {
     /// record's `LaunchKind::Ai`. Seeding it is what keeps the resumed
     /// provider's first state edge from reading as a conversation switch.
     conversation_id: Option<String>,
+}
+
+/// Whether this window still has a geometry record to read for the window the
+/// server assigns it.
+///
+/// Only a process that opened without one does: it could not name a window in
+/// `Hello`, so which window it is holding is not known until `Welcome` answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignedGeometry {
+    /// Opened at the default — the assigned window's record is still owed a read.
+    Unread,
+    /// Opened at its own record, or the assigned window's has been read.
+    Adopted,
 }
 
 /// How far a restored window's placement has got, which is what decides whether
@@ -934,53 +950,73 @@ impl RestoreRuntime {
     /// placement bits from the one geometry record that already holds them.
     fn from_seed(seed: WindowSeed) -> Self {
         let WindowSeed { restored: pending, restore_siblings, restore_geometry, .. } = seed;
-        // A minimized record cannot be opened minimized — GPUI maps the platform
-        // window inside `Window::new` — so the window comes up in the state it
-        // would unminimize to and is re-minimized from the first frame.
-        let restore_minimized = restore_geometry
-            .as_ref()
-            .filter(|geom| geom.state == WindowState::Minimized)
-            .map(WindowGeometry::effective_state);
-        // A maximized or fullscreen window has a placement too: the window
-        // manager owns its size, but the monitor it fills follows the origin,
-        // and that origin is exactly the hint Mutter ignores. It is re-asserted
-        // with the state lifted around the move (see `apply_saved_position`).
-        let restore_position = restore_geometry
-            .as_ref()
-            .and_then(|geom| Some((geom.restore_origin()?, geom.effective_state())));
-        // The nil-UUID placeholder legacy records carry is not a connector name
-        // and can never match one; verifying against it would warn on every
-        // such start.
-        let restore_monitor = restore_position
-            .and(restore_geometry.as_ref())
-            .and_then(|geom| geom.monitor_name.clone())
-            .filter(|name| name != NIL_MONITOR_ID);
-        Self {
+        let mut runtime = Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
             claimed_window: pending.as_ref().map(|snapshot| snapshot.window_id),
             pending,
             siblings: restore_siblings,
-            placement: if restore_position.is_some() {
-                RestorePlacement::Restoring
-            } else {
-                RestorePlacement::Settled
-            },
-            pending_position: restore_position,
+            // A window opened without a record has no placement to reach, so it
+            // persists the bounds it came up at from the first capture.
+            placement: RestorePlacement::Settled,
+            pending_position: None,
             position_target: None,
-            monitor: restore_monitor,
-            pending_minimize: restore_minimized,
+            monitor: None,
+            pending_minimize: None,
+            assigned_geometry: if restore_geometry.is_none() {
+                AssignedGeometry::Unread
+            } else {
+                AssignedGeometry::Adopted
+            },
             bindings: HashMap::new(),
             requested: VecDeque::new(),
             window_id: None,
-            geometry: restore_geometry,
+            geometry: None,
             saved_geometry: None,
             layout_dirty_since: None,
             geometry_dirty_since: None,
             cleared: false,
             replaying: false,
             restored_prompts: HashMap::new(),
+        };
+        if let Some(geometry) = restore_geometry {
+            runtime.adopt_geometry_record(geometry);
+            if runtime.pending_position.is_some() {
+                runtime.placement = RestorePlacement::Restoring;
+            }
         }
+        runtime
+    }
+
+    /// Take a persisted record as this window's restore baseline, deriving the
+    /// placement bits from the one record that already holds them.
+    ///
+    /// The caller decides what the [`RestorePlacement`] becomes: a window
+    /// opened at the record's bounds only has a position left to reach, while
+    /// one that adopted a record after the fact is not at those bounds at all.
+    fn adopt_geometry_record(&mut self, geometry: WindowGeometry) {
+        // A minimized record cannot be opened minimized — GPUI maps the platform
+        // window inside `Window::new` — so the window comes up in the state it
+        // would unminimize to and is re-minimized from the first frame.
+        self.pending_minimize = (geometry.state == WindowState::Minimized)
+            .then(|| WindowGeometry::effective_state(&geometry));
+        // A maximized or fullscreen window has a placement too: the window
+        // manager owns its size, but the monitor it fills follows the origin,
+        // and that origin is exactly the hint Mutter ignores. It is re-asserted
+        // with the state lifted around the move (see `apply_saved_position`).
+        self.pending_position = geometry
+            .restore_origin()
+            .map(|origin| (origin, WindowGeometry::effective_state(&geometry)));
+        // The nil-UUID placeholder legacy records carry is not a connector name
+        // and can never match one; verifying against it would warn on every
+        // such start.
+        self.monitor = self
+            .pending_position
+            .is_some()
+            .then(|| geometry.monitor_name.clone())
+            .flatten()
+            .filter(|name| name != NIL_MONITOR_ID);
+        self.geometry = Some(geometry);
     }
 
     /// Note that the persisted snapshot no longer matches the live layout.
@@ -3913,6 +3949,9 @@ impl TerminalView {
         if self.restore.window_id.is_none() {
             self.restore.window_id =
                 self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id());
+            if let Some(window_id) = self.restore.window_id {
+                self.adopt_assigned_geometry(window_id);
+            }
         }
         self.sync_launch_bindings();
         self.replay_cold_restart(cx);
@@ -3920,6 +3959,32 @@ impl TerminalView {
         if self.restore.layout_dirty_since.is_some_and(|at| at.elapsed() >= RESTORE_DEBOUNCE) {
             self.flush_snapshot_now(cx);
         }
+    }
+
+    /// Read the geometry record of the window the server just named, for a
+    /// process that opened without one.
+    ///
+    /// A launch that found no claimable snapshot sends an unnamed `Hello`, so
+    /// it opens at the default size on the active monitor and only learns from
+    /// `Welcome` that it adopted an existing window — by which time it is
+    /// already on screen. Without this, the first flush wrote that default over
+    /// the adopted window's saved record and its real bounds were gone. The
+    /// record is taken as the baseline instead: its position is re-asserted
+    /// like any restore's, and the placement is held open so no capture taken
+    /// on the way there is persisted over the record it is aiming at.
+    fn adopt_assigned_geometry(&mut self, window_id: WindowId) {
+        if self.restore.assigned_geometry == AssignedGeometry::Adopted {
+            return;
+        }
+        self.restore.assigned_geometry = AssignedGeometry::Adopted;
+        let Some(geometry) = saved_geometry_for(window_id) else { return };
+        tracing::info!(%window_id, "adopting the assigned window's saved geometry");
+        self.restore.adopt_geometry_record(geometry);
+        // Unlike a seeded restore this window is NOT at the record's bounds, so
+        // the placement stays open even when there is no position to re-assert:
+        // it is what keeps the opening default off the record.
+        self.restore.placement = RestorePlacement::Restoring;
+        self.restore.geometry_dirty_since = None;
     }
 
     /// Give every live session a launch binding and forget the ones that ended.
@@ -11369,6 +11434,42 @@ mod tests {
 
         assert!(bootstrap.claim(true, 0));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Cold Restart Restore#An adopted window keeps its saved geometry]]
+    #[test]
+    fn a_window_opened_without_a_record_still_owes_the_assigned_one_a_read() {
+        let seed = |restore_geometry| WindowSeed {
+            terminal_size: TerminalSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 },
+            restored: None,
+            restore_siblings: 0,
+            restore_geometry,
+        };
+        let mut record = WindowGeometry::default();
+        record.x = Some(64);
+        record.y = Some(48);
+        record.width = 2000;
+        record.height = 1200;
+        record.monitor_name = Some("DP-1".to_owned());
+
+        // Opened at the default: no placement to reach, so its own bounds are
+        // persisted — but the window the server assigns has yet to be read.
+        let mut runtime = RestoreRuntime::from_seed(seed(None));
+        assert_eq!(runtime.assigned_geometry, AssignedGeometry::Unread);
+        assert_eq!(runtime.placement, RestorePlacement::Settled);
+
+        // Reading it arms the same restore the seeded path uses, so the record
+        // becomes the baseline instead of being written over.
+        runtime.adopt_geometry_record(record.clone());
+        assert_eq!(runtime.pending_position, Some(((64, 48), WindowState::Windowed)));
+        assert_eq!(runtime.monitor.as_deref(), Some("DP-1"));
+        assert_eq!(runtime.geometry.as_ref(), Some(&record));
+
+        // A window opened at its record named that window in `Hello`; there is
+        // nothing left to adopt, and it starts out placing itself.
+        let seeded = RestoreRuntime::from_seed(seed(Some(record)));
+        assert_eq!(seeded.assigned_geometry, AssignedGeometry::Adopted);
+        assert_eq!(seeded.placement, RestorePlacement::Restoring);
     }
 
     // @lat: [[lat.md/client#Client#GPUI Client Spike#Cold Restart Restore#Replayed prompts reach the live AI chrome]]
