@@ -326,6 +326,21 @@ the pure geometry counts in, converted through
 [[crates/scribe-client/src/scrollbar.rs#round_scroll_units]] because the
 workspace denies lossy float-to-int casts.
 
+It is a control, not only a hint: the same pointer grammar the terminal pane
+uses is wired onto the window root, where a gesture keeps being driven after
+the pointer leaves the thin track. Hover in the 3x hit zone widens the thumb
+and pins the overlay open ([[crates/scribe-client/src/settings/window.rs#SettingsWindow#hover_content_scrollbar]]),
+a press on the thumb starts a drag and a press elsewhere on the track jumps
+the page ([[crates/scribe-client/src/settings/window.rs#SettingsWindow#press_content_scrollbar]]),
+and a release re-arms the fade. The press is claimed in the capture phase so
+overlay chrome never also arms the control it covers — and a page that fits
+has no track, so `hit_test_scrollbar` declines and the press stays the
+control's. Every hit test and both gestures resolve through the one
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#content_scrollbar_layout]]
+the paint pass uses, so they cannot disagree about where the track is;
+[[crates/scribe-client/src/settings/window.rs#content_scroll_offset]] is the
+only new math, the inverse mapping back onto the pixel scroller.
+
 At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 
 ### Accessibility semantics

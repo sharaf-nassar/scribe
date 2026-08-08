@@ -3581,6 +3581,12 @@ The comparison folds modifier order and the `super`/`cmd` alias first, so a hand
 
 Every keybinding row is labelled in the same sentence case the other settings pages use, with `Claude` and `Codex` intact and no underscores left, so the page reads as a list of things Scribe does rather than a dump of config field names.
 
+### Scrollbar gestures map back onto the scroller
+
+The content pane counts pixels where the pure geometry counts scrollback rows, so the direction of the mapping back onto the scroller is the one thing the shared module cannot check for it.
+
+A track press at the top resolves to the full display offset and a press at the bottom to zero; [[crates/scribe-client/src/settings/window.rs#content_scroll_offset]] turns those into a rewound scroller and a fully scrolled one respectively, and a downward thumb drag from the top moves the page down rather than up.
+
 ### Singleton focus handoff
 
  makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
