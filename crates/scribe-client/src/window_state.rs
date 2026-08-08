@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{Bounds, Pixels, WindowBounds, point, px, size};
+use gpui::{Bounds, Pixels, Point, Size, WindowBounds, point, px, size};
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::WindowId;
 use serde::{Deserialize, Serialize};
@@ -325,9 +325,14 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
 ///
 /// This is the GPUI half of the legacy winit `capture_window_geometry`. GPUI
 /// bounds are already logical pixels, so no scale-factor division is needed —
-/// unlike winit, which reports physical pixels. A window whose origin is not
-/// exposed (Wayland) yields `x`/`y` of `None` rather than a bogus `(0, 0)`,
-/// which is what keeps a later X11 session from restoring into the corner.
+/// unlike winit, which reports physical pixels.
+///
+/// `origin` is split out of the bounds because a window whose origin is not
+/// exposed (Wayland) must yield `x`/`y` of `None` rather than the bogus
+/// `(0, 0)` GPUI reports there — that fake origin is what a later X11 session
+/// restored into the corner. The caller decides with
+/// [`crate::monitor::window_origin_is_exposed`]; the `Option` is what keeps the
+/// decision from being quietly dropped here.
 ///
 /// `previous` is the last record this window produced. It is what carries the
 /// pre-maximize/pre-fullscreen rect: once the window is no longer windowed its
@@ -335,7 +340,8 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
 /// the reading taken before the transition.
 #[must_use]
 pub fn geometry_from_bounds(
-    bounds: Bounds<Pixels>,
+    origin: Option<Point<Pixels>>,
+    size: Size<Pixels>,
     observed: ObservedWindowState,
     monitor_name: Option<String>,
     previous: Option<&WindowGeometry>,
@@ -346,10 +352,10 @@ pub fn geometry_from_bounds(
         previous.and_then(WindowGeometry::windowed_rect)
     };
     WindowGeometry {
-        x: Some(logical_px_to_i32(f32::from(bounds.origin.x))),
-        y: Some(logical_px_to_i32(f32::from(bounds.origin.y))),
-        width: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.width))),
-        height: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.height))),
+        x: origin.map(|origin| logical_px_to_i32(f32::from(origin.x))),
+        y: origin.map(|origin| logical_px_to_i32(f32::from(origin.y))),
+        width: u32::from(round_positive_f32_to_u16(f32::from(size.width))),
+        height: u32::from(round_positive_f32_to_u16(f32::from(size.height))),
         state: observed.state,
         restore_state: observed.restore_state,
         monitor_name,
@@ -536,6 +542,16 @@ mod tests {
         Bounds { origin: gpui::point(px(x), px(y)), size: gpui::size(px(width), px(height)) }
     }
 
+    /// A capture on a platform that reports the window origin (X11, macOS).
+    fn capture(
+        bounds: Bounds<Pixels>,
+        observed: ObservedWindowState,
+        monitor: Option<String>,
+        previous: Option<&WindowGeometry>,
+    ) -> WindowGeometry {
+        geometry_from_bounds(Some(bounds.origin), bounds.size, observed, monitor, previous)
+    }
+
     // @lat: [[test#Window geometry compat#Legacy geometry gains titlebar inset]]
     #[test]
     fn legacy_geometry_grows_by_titlebar_height() {
@@ -637,7 +653,7 @@ titlebar_normalized = true
         assert_eq!(observed.state, WindowState::Minimized);
         assert_eq!(observed.restore_state, WindowState::Maximized);
 
-        let geom = geometry_from_bounds(
+        let geom = capture(
             test_bounds(0.0, 0.0, 1920.0, 1080.0),
             observed,
             None,
@@ -693,7 +709,7 @@ titlebar_normalized = true
     // @lat: [[test#Window geometry compat#Pre-maximize rect survives the transition]]
     #[test]
     fn pre_maximize_rect_survives_the_transition() {
-        let windowed = geometry_from_bounds(
+        let windowed = capture(
             test_bounds(120.0, 64.0, 1440.0, 900.0),
             ObservedWindowState::default(),
             None,
@@ -701,7 +717,7 @@ titlebar_normalized = true
         );
         assert_eq!(windowed.restore_rect, None, "a windowed record is its own restore rect");
 
-        let maximized = geometry_from_bounds(
+        let maximized = capture(
             test_bounds(0.0, 0.0, 1920.0, 1080.0),
             ObservedWindowState::from_wm_state(false, WindowState::Maximized),
             None,
@@ -714,7 +730,7 @@ titlebar_normalized = true
 
         // A later capture that is still maximized carries the same rect rather
         // than overwriting it with the work area.
-        let still = geometry_from_bounds(
+        let still = capture(
             test_bounds(0.0, 0.0, 1920.0, 1080.0),
             ObservedWindowState::from_wm_state(false, WindowState::Maximized),
             None,
@@ -723,7 +739,7 @@ titlebar_normalized = true
         assert_eq!(still.restore_rect, maximized.restore_rect);
 
         // Unmaximizing drops it again.
-        let back = geometry_from_bounds(
+        let back = capture(
             test_bounds(120.0, 64.0, 1440.0, 900.0),
             ObservedWindowState::default(),
             None,
@@ -736,12 +752,7 @@ titlebar_normalized = true
     #[test]
     fn live_bounds_round_trip_through_a_record() {
         let bounds = test_bounds(120.0, 64.0, 1440.0, 900.0);
-        let geom = geometry_from_bounds(
-            bounds,
-            ObservedWindowState::default(),
-            Some("dp-1".to_owned()),
-            None,
-        );
+        let geom = capture(bounds, ObservedWindowState::default(), Some("dp-1".to_owned()), None);
         assert_eq!((geom.x, geom.y), (Some(120), Some(64)));
         assert_eq!((geom.width, geom.height), (1440, 900));
         assert!(geom.titlebar_normalized, "a live capture is already in the new coordinate system");
@@ -751,6 +762,34 @@ titlebar_normalized = true
             panic!("a non-maximized record must reopen windowed");
         };
         assert_eq!(restored, bounds);
+    }
+
+    // @lat: [[test#Window geometry compat#An unexposed origin is never invented]]
+    #[test]
+    fn unexposed_origin_is_never_invented() {
+        // Wayland reports (0, 0) for every window; the caller withholds it.
+        let bounds = test_bounds(0.0, 0.0, 1440.0, 900.0);
+        let geom = geometry_from_bounds(
+            None,
+            bounds.size,
+            ObservedWindowState::default(),
+            Some("wayland-0".to_owned()),
+            None,
+        );
+        assert_eq!((geom.x, geom.y), (None, None), "an origin that was not observed is not stored");
+        assert_eq!((geom.width, geom.height), (1440, 900), "the size is still real");
+        assert_eq!(geom.restore_origin(), None, "there is no placement to re-assert");
+
+        // The monitor gate cannot resurrect it: off X11 the connected list is
+        // empty, which the gate reads as "unverifiable, keep the record".
+        let gated = gate_position_on_monitor(&geom, &[]);
+        assert_eq!((gated.x, gated.y), (None, None));
+        // So a later X11 start opens at the default placement, not the corner.
+        let fallback = test_bounds(300.0, 200.0, 10.0, 10.0);
+        let WindowBounds::Windowed(restored) = window_bounds_for(&gated, fallback) else {
+            panic!("a windowed record must reopen windowed");
+        };
+        assert_eq!(restored.origin, fallback.origin);
     }
 
     // @lat: [[test#Window geometry compat#Maximized record reopens maximized]]

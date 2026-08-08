@@ -13,6 +13,7 @@
 use gpui::{App, Window};
 
 use crate::window_state::{ObservedWindowState, WindowState};
+use crate::x11_focus::xcb_window_id;
 
 /// Read the live window state off the window manager, falling back to GPUI.
 ///
@@ -61,6 +62,19 @@ pub fn persisted_monitor_name(window: &Window, cx: &App) -> Option<String> {
 #[must_use]
 pub fn window_monitor_name(window: &Window) -> Option<String> {
     x11::window_monitor_name(window)
+}
+
+/// Whether the platform reports this window's real origin.
+///
+/// Wayland deliberately hides window positions and GPUI answers `(0, 0)` for
+/// every window on it, so a capture that trusted the bounds origin persisted a
+/// fake `(0, 0)` — the corner a later X11 session then restored the window
+/// into. X11 is the only Linux backend that exposes an origin, and holding an
+/// X11 window id is the free way to ask (no round trip, unlike the `RandR`
+/// probes above); macOS and Windows always report a real one.
+#[must_use]
+pub fn window_origin_is_exposed(window: &Window) -> bool {
+    cfg!(not(target_os = "linux")) || xcb_window_id(window).is_some()
 }
 
 /// Connector names of every currently connected monitor, best effort.
