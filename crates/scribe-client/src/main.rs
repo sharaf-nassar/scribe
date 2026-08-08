@@ -1568,8 +1568,13 @@ impl TerminalView {
             window,
             ObservedWindowState { state: fallback_state, ..ObservedWindowState::default() },
         );
+        // Wayland answers (0, 0) for every window, and persisting that put a
+        // later X11 start in the screen corner; the record stores no origin at
+        // all instead, and restore falls back to the default placement.
+        let bounds = window.bounds();
         let geometry = geometry_from_bounds(
-            window.bounds(),
+            monitor::window_origin_is_exposed(window).then_some(bounds.origin),
+            bounds.size,
             observed,
             monitor,
             self.restore.geometry.as_ref(),

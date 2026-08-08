@@ -2379,6 +2379,12 @@ A maximized record answers `restore_origin` with its pre-maximize origin, or its
 
 The window manager owns a maximized window's size, not its monitor, and the monitor follows the origin. The pre-maximize origin is preferred because it is on the same monitor *and* is where the window returns to when the placement move unmaximizes it. A windowed record keeps answering with its own origin, and a record captured without one (Wayland) answers `None`.
 
+### An unexposed origin is never invented
+
+A capture handed no origin — the caller's answer on a backend that does not report one — persists `x`/`y` of `None`, keeps the real size, and has no placement to re-assert.
+
+The capture used to store the bounds origin unconditionally, so Wayland's `(0, 0)` was written as if it were a real position. The monitor gate cannot undo that: off X11 the connected-monitor list is empty, which the gate reads as "unverifiable, keep the record". This pins the whole chain — a position-less record survives the gate position-less and reopens at the fallback origin, so a later X11 start places the window by default rather than in the screen corner.
+
 ### Position-less record keeps the fallback origin
 
 A record whose `x`/`y` are `None` reopens at the caller's centred fallback origin rather than at `(0, 0)`, while still taking its saved size.
