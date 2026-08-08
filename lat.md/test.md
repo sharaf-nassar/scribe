@@ -1358,11 +1358,13 @@ Bare interactive passthrough is intentionally not exercised. Profile-writing com
 
 ### AI Shell Environment Matrix
 
-Three functional scripts verify structured AI launch behavior across the supported bash, zsh, and fish login shells without relying on a GPUI client.
+Three functional scripts verify structured AI launch behavior across the supported bash, zsh, and fish shells without relying on a GPUI client.
 
-Every script changes root's passwd shell with `usermod -s` after the disposable container server starts, then requires the server debug log to report the selected binary with `tier = "passwd"`. The deterministic Claude stub records resumed-provider argv and the environment after shell startup.
+Every script exports `SHELL` before restarting the disposable container server, because the session shell is resolved env-first from the daemon's own environment. The deterministic Claude stub records resumed-provider argv and the environment after shell startup.
 
-The matrix covers the server side of `ai_tab_cwd`: an existing `--cwd` is preserved, while a nonexistent path falls back to `$HOME`. Client selection among pane, project-root, and home modes remains covered by the spec-018 GPUI suites documented in `specs/018-ai-tab-shell-env/verification.md`.
+What all three now assert is that an AI tab starts the shell exactly as a plain tab does. Each script places the Claude stub's `PATH` in the file a plain tab reads and nowhere else, so a regression that reintroduces a bespoke AI launch produces a command-not-found `exec` and records no invocation at all.
+
+The matrix covers the server side of AI-tab working directories: an existing `--cwd` is preserved, while a nonexistent path falls back to `$HOME`. Choosing that directory is a client concern — the project root of the focused region, then the focused pane's CWD — and needs no server-side row.
 
 Each script keeps its startup, integration, cleanup, argv, and cwd assertions active without a keyring. With `SCRIBE_KEYRING=1`, the functional entrypoint's integrated Secret Service fixture enables a real plain-shell env delta to pass through the production 100 ms debounce into an encrypted `.envz`; an AI launch using `--env-envelope-id` must expose that delta in the deterministic Claude stub and consume its session-specific file from `$XDG_RUNTIME_DIR/scribe/env-apply/`.
 
@@ -1378,21 +1380,21 @@ The source session stays alive while polling for the `.envz` and through AI cons
 
 #### Bash AI Shell Environment
 
-`tests/e2e/func/ai-shell-env-bash.sh` verifies first-profile-wins bash login startup and the AI integration preamble before provider exec.
+`tests/e2e/func/ai-shell-env-bash.sh` verifies that bash starts non-login for an AI tab and reads `.bashrc`, the same file every other Scribe tab reads.
 
-The stub must see only `.bash_profile`'s marker and PATH, not `.bash_login`, `.profile`, or `.bashrc`. It also requires `SCRIBE_SHELL_INTEGRATION=1` while launch-only `SCRIBE_AI_TAB`, `SCRIBE_INTEGRATION_SCRIPT`, restore-file, and `ENV` variables are absent.
+The stub must see `.bashrc`'s marker and PATH and none of `.bash_profile`, `.bash_login`, or `.profile` — the three login-profile files a non-login bash never touches. It also requires `SCRIBE_SHELL_INTEGRATION=1` while the restore-file and `ENV` variables are absent.
 
 #### Zsh AI Shell Environment
 
-`tests/e2e/func/ai-shell-env-zsh.sh` verifies `.zshenv` → `.zprofile` → `.zshrc` ordering through the redirected integration bootstrap.
+`tests/e2e/func/ai-shell-env-zsh.sh` verifies `.zshenv` → `.zshrc` ordering through the redirected integration bootstrap, with `.zprofile` unread because the shell is not a login shell.
 
-The stub must see the complete order and integration marker, with `ZDOTDIR`, `SCRIBE_ORIG_ZDOTDIR`, launch-only variables, and the restore-file variable removed before exec.
+The integration marker is probed from `.zshrc` rather than `.zshenv`: Scribe's `ZDOTDIR` bootstrap sources the user's `.zshenv` before the integration script, so only files after it can observe the attachment. The stub must see that order and marker, with `ZDOTDIR`, `SCRIBE_ORIG_ZDOTDIR`, and the restore-file variable removed before exec — the last proving the appended `-c` command consumed the delta that zsh's prompt-deferred apply never reaches.
 
 #### Fish AI Shell Environment
 
 `tests/e2e/func/ai-shell-env-fish.sh` verifies Scribe's vendor `conf.d` script runs before the user's `config.fish` and supplies the provider PATH.
 
-The stub must see the vendor/config order and integration marker, with `SCRIBE_ORIG_XDG_DATA_DIRS`, launch-only variables, and the restore-file variable removed and the originally absent `XDG_DATA_DIRS` restored before exec.
+The stub must see the vendor/config order and integration marker, with `SCRIBE_ORIG_XDG_DATA_DIRS` and the restore-file variable removed before exec. `XDG_DATA_DIRS` is asserted to exclude Scribe's `shell-integration` entry rather than to be absent: a plain fish tab hands the variable back as the XDG default when the server's own environment carries none, and matching plain-tab behavior is the point.
 
 ### AI Indicator E2E
 
@@ -1795,6 +1797,24 @@ It exists because neither requirement can be shown headlessly and neither can be
 The wire tap is deliberately not interposed — it renames the socket out from under `scribe-test server stop/start`, which this test has to perform. Assertions instead read both process logs: the client's for what it claimed, replayed and requested, and the server's for the PTYs it actually spawned in answer. Because the client logs with ANSI styling on, every numeric field is read through an escape-stripping filter; a raw `grep` would silently compare against a colour-coded value and pass on garbage.
 
 Phase 0 hands the client a live pane through the same daemon-stop-and-relaunch trick  documents — CLOSING the entrypoint's client rather than killing it, because a killed client leaves its own login shell in a window the server keeps and the relaunch would rightly reopen that window too, leaving two windows and two snapshots for every assertion below to be ambiguous about — then splits it so the snapshot has a real pane tree, waiting for the split pane to actually adopt a session (an un-adopted pane is pruned from the snapshot). Phase 1 asserts exactly one window snapshot on disk carrying two `` plus a geometry record. Phase 2 resizes the window with `xdotool` and asserts the geometry record followed it, within a few pixels of WM frame slop. Phase 3 crashes the client and cold-restarts the server. Phase 4 asserts the relaunched client claimed the snapshot, replayed two panes, sent two restored `CreateSession` frames, and that the *server* answered with two brand-new PTYs. Phase 5 asserts the window reopened at the persisted geometry, that every restored pane adopted a session, and that both panes asked for the same, less-than-full width — which is the pane tree surviving rather than one full-width pane coming back.
+
+### Layout restore drives the real client
+
+`tests/e2e/visual/layout-restore.sh` (`just e2e-visual-layout-restore`) is the app-level oracle for the other half of a restart: the window comes back where it was, with its tabs in order and the right one selected.
+
+The wire tap is mandatory, not incidental. The whole tab list exists only as a `ReportWorkspaceTree` frame — a screenshot shows the tab that is on screen and nothing about the ones that are not — so the test reads the newest report and asserts its leaf's `session_ids` and `active_tab_index` directly.
+
+Phase 0 leaves one window with one adopted tab. Phase 1 opens two more and requires the report to name all three: naming only the visible pane is exactly the defect, and it passes every pixel check. Phase 2 selects tabs 1 and 2 and requires `active_tab_index` to follow (2 → 0 → 1) instead of the hardcoded 0. Phase 3 moves the window with `xdotool`. Phase 4 restarts the client and requires the position, the tab order, and the active tab to all come back. Phase 5 restarts a *second* time and requires the position to be unchanged again — a reparenting window manager positions its frame rather than the window, so an uncorrected restore walks the window down and right by one decoration every time, which a single restart hides and two do not.
+
+### Tab drag reorders in every bar
+
+`tests/e2e/visual/tab-drag-reorder.sh` (`just e2e-visual-tab-drag-reorder`) drives a real pointer drag and is the only coverage that joins the two halves of tab reordering.
+
+Both halves had unit tests and the seam between them had none: the titlebar suite proves a synthetic drag emits `TitlebarEvent::ReorderTab`, [[crates/scribe-client/src/tab_session.rs#TabSessions#reorder]] proves the model moves an entry, and nothing exercised the handler in between — which is where index translation, region scoping, and the wire report live. The oracle is the newest `ReportWorkspaceTree` frame, because tab order exists nowhere else: the tabs are identical shells on screen.
+
+Phase 0 opens three tabs. Phase 1 drags the first onto the third slot and requires the reported order to become `second, third, first` — not merely different. Phase 2 requires the drag to have reached the wire at all, since the reported tree is the only place the order is durable. Phase 3 is the case the other phases cannot reach: it splits the window horizontally, because [[crates/scribe-client/src/pane_shell.rs#PaneShell#is_lower_region]] is `rect.y > 0.5` and only a stacked region renders its own bar, then drags inside that bar. Region-bar tabs shipped with no drag wiring, so every tab below the first region was unreorderable while the titlebar's own drag worked — phases 0 through 2 pass against that build and only phase 3 fails. It also asserts the region above did not move, since the strip is window-global and a swap applied at the wrong offset would reshuffle a neighbour.
+
+Layout chords dispatch from the pane's focus handle, so the script clicks back into the grid before the split: the drag it just performed leaves GPUI focus on a titlebar tab, where a chord never reaches the layout path.
 
 ### Warm multi-window restore drives the real client
 
@@ -2697,6 +2717,18 @@ A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to 
 Unit coverage for the region content-rect rule behind the in-region tab bars: a top-row region keeps its full rect, a stacked region cedes `REGION_TAB_BAR_HEIGHT` at its top, and a region shorter than the bar clamps instead of going negative.
 
 Every pane-geometry consumer (`placements`, `dividers`, directional focus) shares this one rule, so painted panes and hit-tests can never disagree about where a lower region's content starts.
+
+### Region reports every tab and which is active
+
+Verifies one region's wire payload names every tab of that region, in strip order, with the live split at the active tab's index — the report the server persists as the window's layout.
+
+Reporting only the visible pane is what lost tab order and the active tab across a restart, so the assertions are about what is *left out*: another region's tabs are excluded, a lone pane carries no pane tree of its own (the reader rebuilds it from the tab's session id), a split round-trips back through `wire_tab_pane_tree` to the same shape, and a pane whose session the strip has not listed yet is appended rather than dropped.
+
+### Tab order spans every region of the tree
+
+Checks that flattening a reported tree yields every region's tabs, left to right, including the ones that are not on screen.
+
+This is the order a reconnect restores the strip to. Collecting only the sessions currently in panes — which the adoption used to do — left every background tab wherever the server's `SessionList` happened to put it.
 
 ### Pane split-tree logic
 

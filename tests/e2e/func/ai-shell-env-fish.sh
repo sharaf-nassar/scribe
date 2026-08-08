@@ -27,6 +27,13 @@ assert_env() {
     fi
 }
 
+assert_env_excludes() {
+    if grep -E "^$1=" "$RECORD" | grep -Fq "$2"; then
+        echo "FAIL: claude environment leaked '$2' inside $1"
+        exit 1
+    fi
+}
+
 assert_env_absent() {
     if grep -q "^$1=" "$RECORD"; then
         echo "FAIL: claude environment leaked $1"
@@ -49,14 +56,15 @@ assert_invocation() {
 
     assert_env "PWD=$expected_cwd"
     assert_env 'AI_STARTUP_ORDER=vendor,config'
-    assert_env 'AI_CONFIG_SAW_AI_TAB=missing'
     assert_env 'SCRIBE_SHELL_INTEGRATION=1'
     assert_env 'TERM_PROGRAM=Scribe'
-    assert_env_absent SCRIBE_AI_TAB
-    assert_env_absent SCRIBE_INTEGRATION_SCRIPT
     assert_env_absent SCRIBE_RESTORE_ENV_DELTA_FILE
     assert_env_absent SCRIBE_ORIG_XDG_DATA_DIRS
-    assert_env_absent XDG_DATA_DIRS
+    # Plain fish tabs hand XDG_DATA_DIRS back as the XDG default rather than
+    # unsetting it, because the server substitutes that default when its own
+    # environment carries none. The invariant that holds either way is that
+    # Scribe's vendor directory never reaches the provider.
+    assert_env_excludes XDG_DATA_DIRS shell-integration
 }
 
 scribe-test daemon stop
@@ -64,11 +72,10 @@ scribe-test server stop
 rm -f "$SERVER_LOG" "$RECORD" "$EXPECTED" "$ACTUAL"
 export SCRIBE_TEST_SERVER_LOG="$SERVER_LOG"
 export RUST_LOG=scribe_server=debug
+FISH_BIN=$(command -v fish)
+export SHELL="$FISH_BIN"
 scribe-test server start
 scribe-test daemon start
-
-FISH_BIN=$(command -v fish)
-usermod -s "$FISH_BIN" "$(id -un)"
 
 install -d "$REQUESTED_CWD" "$HOME/.config/fish"
 cat > "$HOME/.config/fish/config.fish" <<'FISH_CONFIG'
@@ -76,11 +83,6 @@ if set -q _SCRIBE_INTEGRATION_SOURCED
     set -gx AI_STARTUP_ORDER vendor,config
 else
     set -gx AI_STARTUP_ORDER integration-missing,config
-end
-if set -q SCRIBE_AI_TAB
-    set -gx AI_CONFIG_SAW_AI_TAB $SCRIBE_AI_TAB
-else
-    set -gx AI_CONFIG_SAW_AI_TAB missing
 end
 set -gx PATH /tests/bin $PATH
 FISH_CONFIG
@@ -103,17 +105,9 @@ scribe-test session create \
 wait_for_record
 assert_invocation "$HOME"
 
-if ! grep -F 'resolved host login shell for AI launch' "$SERVER_LOG" \
-    | grep -F "$FISH_BIN" \
-    | grep -Fq '"passwd"'; then
-    echo "FAIL: server log did not prove passwd-tier fish resolution"
-    tail -40 "$SERVER_LOG"
-    exit 1
-fi
-
 if [ "${SCRIBE_KEYRING:-0}" != "1" ]; then
     echo "KEYRING SKIP: encrypted fish restore requires SCRIBE_KEYRING=1"
-    echo "PASS: fish AI launch used passwd shell, startup order, integration env, argv, and cwd guard"
+    echo "PASS: fish AI launch used plain-tab config startup, integration env, argv, and cwd guard"
     exit 0
 fi
 
@@ -168,7 +162,7 @@ assert_env "AI_ENCRYPTED_RESTORE=$RESTORED_VALUE"
 
 # prepare_restore_env_file stages this exact session-specific name beneath
 # $XDG_RUNTIME_DIR/scribe/env-apply. Seeing the delta in the provider proves
-# the file was sourced; its absence proves the AI preamble consumed it.
+# the file was sourced; its absence proves the launch consumed it.
 STAGING_DIR="$XDG_RUNTIME_DIR/scribe/env-apply"
 if [ ! -d "$STAGING_DIR" ]; then
     echo "FAIL: fish restore staging directory was not created"
@@ -183,4 +177,4 @@ fi
 
 scribe-test session close "$WRITER"
 echo "KEYRING PASS: fish AI launch restored encrypted delta and consumed staging file"
-echo "PASS: fish AI launch used passwd shell, startup order, integration env, argv, and cwd guard"
+echo "PASS: fish AI launch used plain-tab config startup, integration env, argv, and cwd guard"

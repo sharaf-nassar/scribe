@@ -3136,8 +3136,7 @@ impl SettingsWindow {
     ) -> gpui::AnyElement {
         let colors = self.colors;
         let enabled = self.control_is_enabled(&control.key);
-        let description = control_description(&self.config, &control.key);
-        let label = row_label_with_description(&control.label, description, &colors);
+        let label = row_label(&control.label, colors.text);
         let value_widget = if enabled {
             self.render_value_widget(control, window, cx)
         } else {
@@ -3147,15 +3146,12 @@ impl SettingsWindow {
             .id(("settings-control", key_hash(&control.key)))
             .role(Role::Group)
             .aria_label(control.label.clone())
-            .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
             .h(px(
                 if self.edit_key() == Some(control.key.as_str())
                     && self.edit_error.is_some()
                 {
                     78.0
-                } else if description.is_some() {
-                    62.0
                 } else {
                     46.0
                 },
@@ -3298,7 +3294,6 @@ impl SettingsWindow {
         let effective = self.choice_options(&control.key, options);
         let value = current_value(&self.config, &control.key);
         let token = value.as_str().unwrap_or("").to_owned();
-        let description = choice_description(&control.key, &token);
         let display = effective
             .iter()
             .find(|(choice, _)| *choice == token)
@@ -3313,7 +3308,6 @@ impl SettingsWindow {
             .tab_stop(true)
             .role(Role::ComboBox)
             .aria_label(control.label.clone())
-            .when(description.is_some(), |el| el.aria_description(description.unwrap_or_default()))
             .aria_value(display.clone())
             .aria_expanded(open)
             .w(px(CHOICE_WIDTH))
@@ -3387,7 +3381,6 @@ impl SettingsWindow {
             .enumerate()
             .map(|(index, (option, label))| {
                 let selected = *option == token;
-                let description = choice_description(&control.key, option);
                 let commit_key = key.to_owned();
                 let commit_value = option.clone();
                 div()
@@ -3396,9 +3389,6 @@ impl SettingsWindow {
                     .tab_stop(true)
                     .role(Role::MenuItem)
                     .aria_label(label.clone())
-                    .when(description.is_some(), |el| {
-                        el.aria_description(description.unwrap_or_default())
-                    })
                     .aria_selected(selected)
                     .aria_position_in_set(index + 1)
                     .aria_size_of_set(options.len())
@@ -3993,51 +3983,6 @@ fn row_label(text: &str, color: Rgba) -> gpui::Stateful<gpui::Div> {
         .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
 }
 
-/// A settings-row label with optional value-specific help text.
-fn row_label_with_description(
-    label: &str,
-    description: Option<&'static str>,
-    colors: &SettingsColors,
-) -> gpui::Stateful<gpui::Div> {
-    description.map_or_else(
-        || row_label(label, colors.text),
-        |description| {
-            div()
-                .id(("settings-label-description", key_hash(label)))
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(row_label(label, colors.text))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors.dim_text)
-                        .child(Text::new_inaccessible(elide(description, NOTE_MAX_CHARS).into())),
-                )
-        },
-    )
-}
-
-fn control_description(config: &ScribeConfig, key: &str) -> Option<&'static str> {
-    let value = current_value(config, key);
-    choice_description(key, value.as_str().unwrap_or(""))
-}
-
-fn choice_description(key: &str, value: &str) -> Option<&'static str> {
-    if key != "terminal.ai_tab_cwd" {
-        return None;
-    }
-    match value {
-        "pane" => Some("Use the focused pane directory; fall back to home when unavailable."),
-        "project_root" => Some("Use the workspace project root, then the focused pane, then home."),
-        "home" => Some("Always start new AI tabs in your home directory."),
-        _ => None,
-    }
-}
-
 /// A read-only current value still needs a semantic node: visual text alone is
 /// otherwise absent from AccessKit's tree.
 ///
@@ -4391,12 +4336,8 @@ fn colors_section(key: &str) -> &'static str {
 fn ai_section(key: &str) -> &'static str {
     if key.starts_with("ai_states.") {
         "Assistant state signals"
-    } else if matches!(
-        key,
-        "terminal.claude_code_integration"
-            | "terminal.codex_code_integration"
-            | "terminal.ai_tab_cwd"
-    ) {
+    } else if matches!(key, "terminal.claude_code_integration" | "terminal.codex_code_integration")
+    {
         "Integrations"
     } else {
         "Assistant surface"

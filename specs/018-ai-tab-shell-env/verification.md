@@ -1,5 +1,8 @@
 # Verification: ai-tab-shell-env
 
+**Status:** SUPERSEDED — see `spec.md` for what replaced this design and why. Retained as history; it does not describe current behavior.
+
+
 Feature 018's final gate and `scribe-0ve.12` repair rerun completed on 2026-08-02 against fresh release artifacts in disposable, networkless containers. Overall status is **PASS** for every in-scope runnable assertion; explicit out-of-scope limitations remain below.
 
 ## Safety boundary and artifact identity

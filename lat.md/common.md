@@ -74,8 +74,6 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 
-`ai_tab_cwd` (: `pane` (default), `project_root`, or `home`) controls where a fresh Claude/Codex AI tab starts. `pane` uses the focused pane's server-reported CWD, `project_root` falls back through pane to home, and `home` sends `cwd: None` for the server's guarded home fallback. The client reads this value from its live-reloaded config for each create; cold-restart replay keeps its persisted cwd.
-
 Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` (: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
 
  independently toggles CPU, memory, GPU, and network display.  wraps a single `enabled` flag for shell prompt marks.  maps an  to the matching integration toggle.

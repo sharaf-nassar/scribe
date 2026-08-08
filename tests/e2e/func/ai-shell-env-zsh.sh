@@ -48,13 +48,11 @@ assert_invocation() {
     fi
 
     assert_env "PWD=$expected_cwd"
-    assert_env 'AI_STARTUP_ORDER=zshenv,zprofile,zshrc'
-    assert_env 'AI_ZSHENV_SAW_AI_TAB=1'
-    assert_env 'AI_ZPROFILE_SAW_INTEGRATION=1'
+    assert_env 'AI_STARTUP_ORDER=zshenv,zshrc'
+    assert_env 'AI_ZSHRC_SAW_INTEGRATION=1'
+    assert_env_absent AI_UNEXPECTED_STARTUP
     assert_env 'SCRIBE_SHELL_INTEGRATION=1'
     assert_env 'TERM_PROGRAM=Scribe'
-    assert_env_absent SCRIBE_AI_TAB
-    assert_env_absent SCRIBE_INTEGRATION_SCRIPT
     assert_env_absent SCRIBE_RESTORE_ENV_DELTA_FILE
     assert_env_absent SCRIBE_ORIG_ZDOTDIR
     assert_env_absent ZDOTDIR
@@ -65,27 +63,27 @@ scribe-test server stop
 rm -f "$SERVER_LOG" "$RECORD" "$EXPECTED" "$ACTUAL"
 export SCRIBE_TEST_SERVER_LOG="$SERVER_LOG"
 export RUST_LOG=scribe_server=debug
+ZSH_BIN=$(command -v zsh)
+export SHELL="$ZSH_BIN"
 scribe-test server start
 scribe-test daemon start
 
-ZSH_BIN=$(command -v zsh)
-usermod -s "$ZSH_BIN" "$(id -un)"
-
 install -d "$REQUESTED_CWD"
-cat > "$HOME/.zshenv" <<'ZSHENV'
-export AI_STARTUP_ORDER=zshenv
-export AI_ZSHENV_SAW_AI_TAB="${SCRIBE_AI_TAB:-missing}"
-ZSHENV
-cat > "$HOME/.zprofile" <<'ZPROFILE'
-export AI_STARTUP_ORDER="$AI_STARTUP_ORDER,zprofile"
-if [[ -n "${_SCRIBE_INTEGRATION_SOURCED:-}" ]]; then
-    export AI_ZPROFILE_SAW_INTEGRATION=1
-else
-    export AI_ZPROFILE_SAW_INTEGRATION=missing
-fi
-ZPROFILE
+# An AI tab is a plain tab plus an interactive `exec`, so zsh starts non-login:
+# `.zshenv` then `.zshrc` through the redirected ZDOTDIR bootstrap, with
+# `.zprofile` deliberately unread. The provider lives on the `.zshrc` PATH.
+# Scribe's ZDOTDIR bootstrap sources the user's `.zshenv` before the
+# integration script, so the "integration is attached" probe belongs in
+# `.zshrc`, which runs after it.
+printf '%s\n' 'export AI_STARTUP_ORDER=zshenv' > "$HOME/.zshenv"
+printf '%s\n' 'export AI_UNEXPECTED_STARTUP=zprofile' > "$HOME/.zprofile"
 cat > "$HOME/.zshrc" <<'ZSHRC'
 export AI_STARTUP_ORDER="$AI_STARTUP_ORDER,zshrc"
+if [[ -n "${_SCRIBE_INTEGRATION_SOURCED:-}" ]]; then
+    export AI_ZSHRC_SAW_INTEGRATION=1
+else
+    export AI_ZSHRC_SAW_INTEGRATION=missing
+fi
 export PATH="/tests/bin:$PATH"
 ZSHRC
 printf '%s\n' '--resume' "$CONVERSATION_ID" > "$EXPECTED"
@@ -107,17 +105,9 @@ scribe-test session create \
 wait_for_record
 assert_invocation "$HOME"
 
-if ! grep -F 'resolved host login shell for AI launch' "$SERVER_LOG" \
-    | grep -F "$ZSH_BIN" \
-    | grep -Fq '"passwd"'; then
-    echo "FAIL: server log did not prove passwd-tier zsh resolution"
-    tail -40 "$SERVER_LOG"
-    exit 1
-fi
-
 if [ "${SCRIBE_KEYRING:-0}" != "1" ]; then
     echo "KEYRING SKIP: encrypted zsh restore requires SCRIBE_KEYRING=1"
-    echo "PASS: zsh AI launch used passwd shell, startup order, integration env, argv, and cwd guard"
+    echo "PASS: zsh AI launch used plain-tab rc startup, integration env, argv, and cwd guard"
     exit 0
 fi
 
@@ -129,7 +119,7 @@ cat >"$HOME/.config/scribe/config.toml" <<'TOML'
 [terminal.env_persistence]
 enabled = true
 TOML
-printf '%s\n' 'export AI_ENCRYPTED_RESTORE=profile' >>"$HOME/.zprofile"
+printf '%s\n' 'export AI_ENCRYPTED_RESTORE=rc' >>"$HOME/.zshrc"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 scribe-test daemon stop
 scribe-test server stop
@@ -171,7 +161,7 @@ assert_env "AI_ENCRYPTED_RESTORE=$RESTORED_VALUE"
 
 # prepare_restore_env_file stages this exact session-specific name beneath
 # $XDG_RUNTIME_DIR/scribe/env-apply. Seeing the delta in the provider proves
-# the file was sourced; its absence proves the AI preamble consumed it.
+# the file was sourced; its absence proves the launch consumed it.
 STAGING_DIR="$XDG_RUNTIME_DIR/scribe/env-apply"
 if [ ! -d "$STAGING_DIR" ]; then
     echo "FAIL: zsh restore staging directory was not created"
@@ -186,4 +176,4 @@ fi
 
 scribe-test session close "$WRITER"
 echo "KEYRING PASS: zsh AI launch restored encrypted delta and consumed staging file"
-echo "PASS: zsh AI launch used passwd shell, startup order, integration env, argv, and cwd guard"
+echo "PASS: zsh AI launch used plain-tab rc startup, integration env, argv, and cwd guard"

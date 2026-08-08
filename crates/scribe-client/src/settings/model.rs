@@ -337,11 +337,6 @@ fn ai_controls() -> Vec<Control> {
         stepper("terminal.indicator_height", "Indicator height", (1.0, 10.0, 1.0, 0)),
         toggle("terminal.claude_code_integration", "Claude Code integration"),
         toggle("terminal.codex_code_integration", "Codex integration"),
-        choice(
-            "terminal.ai_tab_cwd",
-            "AI tab working dir",
-            vec![("pane", "Active pane"), ("project_root", "Project root"), ("home", "Home")],
-        ),
     ];
     // The AI assistant states table: per-state indicator config.
     for (state, label) in ai_states() {

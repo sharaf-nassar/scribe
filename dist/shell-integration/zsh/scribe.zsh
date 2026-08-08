@@ -7,13 +7,6 @@
 [[ -n "${_SCRIBE_INTEGRATION_SOURCED:-}" ]] && return 0
 _SCRIBE_INTEGRATION_SOURCED=1
 
-# AI tabs apply their restore delta from the post-login pre-exec preamble.
-# This pre-rc load only consumes the integration marker and installs nothing.
-if [[ "${SCRIBE_AI_TAB:-}" == "1" ]]; then
-	unset SCRIBE_AI_TAB SCRIBE_INTEGRATION_SCRIPT
-	return 0
-fi
-
 # ── macOS login-profile emulation ────────────────────────────────
 # macOS terminals traditionally start zsh as a login shell, so PATH setup
 # lives in the profile pass: /etc/zprofile runs path_helper and ~/.zprofile

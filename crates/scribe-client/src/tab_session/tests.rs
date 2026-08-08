@@ -19,7 +19,7 @@ fn strip(count: usize) -> (TabSessions, WorkspaceId, Vec<SessionId>) {
         .enumerate()
         .map(|(i, id)| TabEntry::new(*id, workspace_id, format!("shell{i}")))
         .collect();
-    tabs.replace_all(entries);
+    tabs.reconcile(entries);
     (tabs, workspace_id, ids)
 }
 
@@ -112,7 +112,7 @@ fn two_workspace_strip() -> (TabSessions, (WorkspaceId, WorkspaceId), Vec<Sessio
     let ws_b = WorkspaceId::new();
     let ids: Vec<SessionId> = (0..4).map(|_| SessionId::new()).collect();
     let mut tabs = TabSessions::new();
-    tabs.replace_all(vec![
+    tabs.reconcile(vec![
         TabEntry::new(ids[0], ws_a, "a1".to_owned()),
         TabEntry::new(ids[1], ws_a, "a2".to_owned()),
         TabEntry::new(ids[2], ws_b, "b1".to_owned()),
@@ -169,22 +169,39 @@ fn digit_select_is_workspace_scoped() {
 }
 
 #[test]
-fn session_list_rebuild_preserves_active_session() {
+fn session_list_rebuild_preserves_order_and_active_session() {
     let (mut tabs, workspace_id, ids) = strip(3);
     tabs.select(1);
 
-    // A reconnect re-lists the same sessions in a different order.
+    // A reconnect re-lists the same sessions in a different order. The list is
+    // authoritative for what exists, never for what order the user put them in,
+    // so the strip keeps its own — otherwise every drag-reorder would be undone
+    // by the next list, and the server's HashMap-grouped order would win.
     let reordered = vec![
         TabEntry::new(ids[2], workspace_id, "shell2".to_owned()),
         TabEntry::new(ids[1], workspace_id, "shell1".to_owned()),
         TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
     ];
-    assert_eq!(tabs.replace_all(reordered), Some(ids[1]));
+    assert_eq!(tabs.reconcile(reordered), Some(ids[1]));
+    assert_eq!(tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(), ids);
     assert_eq!(tabs.active_session(), Some(ids[1]));
+
+    // A session the list no longer names is dropped; a new one is appended.
+    let fresh = SessionId::new();
+    let next = vec![
+        TabEntry::new(fresh, workspace_id, "fresh".to_owned()),
+        TabEntry::new(ids[1], workspace_id, "shell1".to_owned()),
+        TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
+    ];
+    assert_eq!(tabs.reconcile(next), Some(ids[1]));
+    assert_eq!(
+        tabs.tabs().iter().map(|tab| tab.session_id).collect::<Vec<_>>(),
+        [ids[0], ids[1], fresh]
+    );
 
     // When the active session is gone the strip falls back to the first tab.
     let survivors = vec![TabEntry::new(ids[0], workspace_id, "shell0".to_owned())];
-    assert_eq!(tabs.replace_all(survivors), Some(ids[0]));
+    assert_eq!(tabs.reconcile(survivors), Some(ids[0]));
 }
 
 #[test]
@@ -201,7 +218,7 @@ fn workspace_tabs_form_one_run_without_losing_the_active_session() {
     let right_first = SessionId::new();
     let left_new = SessionId::new();
     let mut tabs = TabSessions::new();
-    tabs.replace_all(vec![
+    tabs.reconcile(vec![
         TabEntry::new(left_first, left, "left-1".to_owned()),
         TabEntry::new(right_first, right, "right-1".to_owned()),
         TabEntry::new(left_new, left, "left-2".to_owned()),

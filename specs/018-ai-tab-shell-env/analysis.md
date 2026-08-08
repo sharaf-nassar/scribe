@@ -1,5 +1,8 @@
 # Analysis: ai-tab-shell-env
 
+**Status:** SUPERSEDED — see `spec.md` for what replaced this design and why. Retained as history; it does not describe current behavior.
+
+
 Cross-artifact analysis of `specs/018-ai-tab-shell-env/spec.md` (clarified,
 Q1-Q7 binding) against `specs/018-ai-tab-shell-env/plan.md` (post-alignment,
 sequencing items 1, 2a, 2b, 3, 4a, 4b, 5, 6, 7a, 7b, 8) and

@@ -38,8 +38,6 @@ pub const EXCLUSION_SET: &[&str] = &[
     "SCRIBE_HOOK_HELPER",
     "SCRIBE_RESTORE_ENV_DELTA_FILE",
     "SCRIBE_ENV_PERSIST",
-    "SCRIBE_AI_TAB",
-    "SCRIBE_INTEGRATION_SCRIPT",
     // Terminal identification (Scribe injects fresh values)
     "TERM",
     "COLORTERM",
@@ -274,8 +272,6 @@ mod tests {
         // Spot-check a representative entry from each category.
         for name in [
             "SCRIBE_HOOK_SOCK",
-            "SCRIBE_AI_TAB",
-            "SCRIBE_INTEGRATION_SCRIPT",
             "TERM",
             "DISPLAY",
             "SSH_AUTH_SOCK",
