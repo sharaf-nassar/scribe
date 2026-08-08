@@ -1878,7 +1878,7 @@ An overlay scrollbar in  that fades in on scroll and fades out after 1.5s of ina
 
 Width animates on hover via lerp expansion. The hit zone is 3x the visible width for easy targeting. Drag-to-scroll computes offset from mouse delta relative to track height. Fade-out duration is 0.3 seconds.
 
-The pure module has a second consumer: the settings window's content pane reuses the same fade state and thumb geometry as its page-length affordance, in display-only form, counting whole pixels as its scroll unit. See [[lat.md/settings#Settings#GPUI Settings Window#Typeset Ink presentation]].
+The pure module has a second consumer: the settings window's content pane reuses the same fade state, thumb geometry, and pointer gestures — hover widen, click-to-jump, and thumb drag — as its page-length affordance, counting whole pixels as its scroll unit. Its render pass goes through `build_scrollbar_render` with no command marks, because that is where the module drives the hover width target. See [[lat.md/settings#Settings#GPUI Settings Window#Typeset Ink presentation]].
 
 ### Prompt Mark Indicators
 

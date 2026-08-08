@@ -19,7 +19,9 @@
 //! The content pane carries the terminal's own overlay scrollbar
 //! ([`crate::scrollbar`]) as its page-length affordance: the same thumb
 //! geometry and the same fade-in-on-scroll, fade-out-after-idle state, driven
-//! from [`SettingsWindow::tick_content_scrollbar`] on the render pass.
+//! from [`SettingsWindow::tick_content_scrollbar`] on the render pass, and the
+//! same pointer gestures — hover widens the thumb and pins the overlay, a press
+//! on the thumb drags it, and a press elsewhere on the track jumps the page.
 //!
 //! Two pages additionally talk to the local server through
 //! [`crate::settings::server_action`]: `Environment` gates its env-persistence
@@ -53,9 +55,9 @@ use std::{ops::Range, time::Duration};
 use gpui::{
     AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
     EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point,
-    ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions, Toggled,
-    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions,
+    Toggled, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowHandle, WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba,
     size,
 };
@@ -70,8 +72,9 @@ use crate::app_shortcuts::CloseWindow;
 use crate::keybindings::Keybinding;
 use crate::layout::Rect;
 use crate::scrollbar::{
-    SCROLLBAR_WIDTH, ScrollMetrics, ScrollbarLayout, ScrollbarState, ThumbGeometry, compute_thumb,
-    round_scroll_units,
+    CommandMarkColors, SCROLLBAR_WIDTH, ScrollMetrics, ScrollbarDrag, ScrollbarLayout,
+    ScrollbarQuad, ScrollbarState, ScrollbarStyle, build_scrollbar_render, hit_test_scrollbar,
+    hit_test_thumb, offset_from_drag, offset_from_track_click, round_scroll_units,
 };
 use crate::settings::apply::{canonical_color_value, workspace_root_from_value};
 use crate::settings::model::{
@@ -645,53 +648,156 @@ impl SettingsWindow {
         self.content_scrollbar.on_scroll_action();
     }
 
-    /// Advance the content pane's overlay-scrollbar fade and return the thumb
-    /// geometry, in coordinates relative to the scroller, or `None` while it is
-    /// invisible or the page fits.
+    /// The content pane's scrollbar placement, in coordinates relative to the
+    /// scroller. Paint and every pointer hit test resolve through this, so they
+    /// can never disagree about where the track is.
     ///
     /// The pure geometry counts scroll units from the live bottom; a pixel
-    /// scroller is that same shape with one pixel as the unit. The fade is
-    /// wall-clock, so a visible thumb asks for the next animation frame — the
-    /// scroller itself only repaints when the offset changes.
-    fn tick_content_scrollbar(&mut self, window: &Window, cx: &App) -> Option<ThumbGeometry> {
+    /// scroller is that same shape with one pixel as the unit.
+    fn content_scrollbar_layout(&self) -> ScrollbarLayout {
         let viewport = self.scroll_handle.bounds().size;
         let overflow = round_scroll_units(f32::from(self.scroll_handle.max_offset().y), UNIT_CAP);
         let scrolled = round_scroll_units(f32::from(-self.scroll_handle.offset().y), overflow);
-        if scrolled != self.content_scrolled {
-            self.content_scrolled = scrolled;
-            self.pulse_content_scrollbar();
-        }
-        let metrics = ScrollMetrics {
-            history_size: overflow,
-            screen_lines: round_scroll_units(f32::from(viewport.height), UNIT_CAP),
-            display_offset: overflow.saturating_sub(scrolled),
-        };
-        if cx.reduce_motion() {
-            // Reduced motion keeps the affordance rather than the animation:
-            // the thumb simply stays on an overflowing page, so nothing moves
-            // and no animation frames are requested.
-            self.content_scrollbar.opacity = 1.0;
-        } else if self.content_scrollbar.tick_fade(metrics.display_offset) {
-            window.request_animation_frame();
-        }
-        if self.content_scrollbar.opacity <= 0.0 {
-            return None;
-        }
-        // ponytail: display-only thumb — no hover widen, click-to-jump, or
-        // drag. The pure module already has `hit_test_scrollbar` and
-        // `ScrollbarDrag`; wire them through a mouse handler on the overlay if
-        // grabbing the settings thumb is ever wanted.
-        let layout = ScrollbarLayout {
+        ScrollbarLayout {
             pane_rect: Rect {
                 x: 0.0,
                 y: 0.0,
                 width: f32::from(viewport.width),
                 height: f32::from(viewport.height),
             },
-            metrics,
+            metrics: ScrollMetrics {
+                history_size: overflow,
+                screen_lines: round_scroll_units(f32::from(viewport.height), UNIT_CAP),
+                display_offset: overflow.saturating_sub(scrolled),
+            },
             tab_bar_height: 0.0,
+        }
+    }
+
+    /// Advance the content pane's overlay-scrollbar animations and return the
+    /// thumb quad, in coordinates relative to the scroller, or `None` while it
+    /// is invisible or the page fits.
+    ///
+    /// Routed through [`build_scrollbar_render`] rather than `compute_thumb`
+    /// because that is where the shared module drives the hover width target;
+    /// the settings pane has no command marks, so the tick list comes back
+    /// empty and only the thumb is painted. The fade is wall-clock, so a
+    /// visible thumb asks for the next animation frame — the scroller itself
+    /// only repaints when the offset changes.
+    fn tick_content_scrollbar(&mut self, window: &Window, cx: &App) -> Option<ScrollbarQuad> {
+        let layout = self.content_scrollbar_layout();
+        let scrolled = layout.metrics.history_size.saturating_sub(layout.metrics.display_offset);
+        if scrolled != self.content_scrolled {
+            self.content_scrolled = scrolled;
+            self.pulse_content_scrollbar();
+        }
+        if cx.reduce_motion() {
+            // Reduced motion keeps the affordance rather than the animation:
+            // the thumb simply stays on an overflowing page, so nothing moves
+            // and no animation frames are requested.
+            self.content_scrollbar.opacity = 1.0;
+        } else if self.content_scrollbar.tick_fade(layout.metrics.display_offset) {
+            window.request_animation_frame();
+        }
+        let style = ScrollbarStyle {
+            width: SCROLLBAR_WIDTH,
+            color: [
+                self.colors.scrollbar.r,
+                self.colors.scrollbar.g,
+                self.colors.scrollbar.b,
+                self.colors.scrollbar.a,
+            ],
+            // Never read: the settings pane passes no command marks.
+            command_mark_colors: CommandMarkColors { success: [0.0; 4], failure: [0.0; 4] },
         };
-        compute_thumb(&layout, SCROLLBAR_WIDTH)
+        build_scrollbar_render(&layout, &[], &mut self.content_scrollbar, &style)
+            .map(|render| render.thumb)
+    }
+
+    /// A window pointer position in the content scroller's own coordinates —
+    /// the space the scrollbar geometry is computed in.
+    fn content_scrollbar_local(&self, position: Point<Pixels>) -> (f32, f32) {
+        let origin = self.scroll_handle.bounds().origin;
+        (f32::from(position.x - origin.x), f32::from(position.y - origin.y))
+    }
+
+    /// Track the pointer over the content pane's scrollbar hit zone.
+    ///
+    /// Hover pins the overlay open and widens the thumb, which is what makes it
+    /// grabbable: the resting 6 px thumb is a hint, and the 3x hit zone plus
+    /// the widen are what turn it into a control.
+    fn hover_content_scrollbar(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let layout = self.content_scrollbar_layout();
+        let (x, y) = self.content_scrollbar_local(position);
+        let width = self.content_scrollbar.current_width(SCROLLBAR_WIDTH);
+        let inside = hit_test_scrollbar(&layout, x, y, width.max(SCROLLBAR_WIDTH));
+        if inside == self.content_scrollbar.hover {
+            return;
+        }
+        if inside {
+            self.content_scrollbar.on_hover_enter();
+        } else {
+            self.content_scrollbar.on_hover_leave();
+        }
+        cx.notify();
+    }
+
+    /// Claim a left press that landed on the content pane's scrollbar.
+    ///
+    /// A press on the thumb starts a drag; a press anywhere else in the hit
+    /// zone jumps the page to that point on the track. Returns `true` when the
+    /// press was consumed, so the caller stops it reaching the control it was
+    /// painted over. A page that fits has no track to press: `hit_test_scrollbar`
+    /// declines on an empty history, and the press stays the control's.
+    fn press_content_scrollbar(&mut self, position: Point<Pixels>) -> bool {
+        let layout = self.content_scrollbar_layout();
+        let (x, y) = self.content_scrollbar_local(position);
+        let width = self.content_scrollbar.current_width(SCROLLBAR_WIDTH);
+        if !hit_test_scrollbar(&layout, x, y, width) {
+            return false;
+        }
+        if hit_test_thumb(&layout, x, y, width) {
+            self.content_scrollbar.drag = Some(ScrollbarDrag {
+                start_mouse_y: y,
+                start_display_offset: layout.metrics.display_offset,
+            });
+            // A drag holds the overlay open by itself; clearing the timer keeps
+            // it from fading out from under the pointer mid-drag.
+            self.content_scrollbar.opacity = 1.0;
+            self.content_scrollbar.fade_start = None;
+            return true;
+        }
+        self.scroll_content_to_offset(&layout, offset_from_track_click(&layout, y, width));
+        true
+    }
+
+    /// Continue an in-flight thumb drag. Returns `true` while a drag owns the
+    /// pointer, so the move never doubles as a hover update.
+    fn drag_content_scrollbar(&mut self, position: Point<Pixels>) -> bool {
+        let Some(drag) = self.content_scrollbar.drag else { return false };
+        let layout = self.content_scrollbar_layout();
+        let (_, y) = self.content_scrollbar_local(position);
+        let width = self.content_scrollbar.current_width(SCROLLBAR_WIDTH);
+        self.scroll_content_to_offset(&layout, offset_from_drag(&layout, &drag, y, width));
+        true
+    }
+
+    /// Finish a thumb drag, re-arming the fade unless the pointer is still
+    /// hovering. Returns `true` when a drag was actually in flight.
+    fn release_content_scrollbar(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.content_scrollbar.drag.is_none() {
+            return false;
+        }
+        self.content_scrollbar.on_drag_end();
+        cx.notify();
+        true
+    }
+
+    /// Move the scroller to an absolute `display_offset` a scrollbar gesture
+    /// resolved to.
+    fn scroll_content_to_offset(&mut self, layout: &ScrollbarLayout, target: usize) {
+        let offset = content_scroll_offset(layout.metrics.history_size, target);
+        self.scroll_handle.set_offset(point(self.scroll_handle.offset().x, offset));
     }
 
     /// Reload the config from disk after an edit so the UI reflects the saved
@@ -2058,6 +2164,35 @@ impl Render for SettingsWindow {
                     this.clear_keyboard_navigation(ctx);
                 }),
             )
+            // The scrollbar gestures ride the root rather than the scroll track
+            // they are painted over: the pointer has to keep driving a drag —
+            // and has to be able to leave the hover zone — after it has moved
+            // off that element, exactly as the terminal's own handlers do on
+            // the pane container. The press is claimed in the capture phase so
+            // a hit on the overlay never also arms the control underneath; the
+            // scrollbar is chrome painted over the page, and a click on it was
+            // never meant for what it covers.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _key_window, ctx| {
+                if event.button == MouseButton::Left
+                    && this.press_content_scrollbar(event.position)
+                {
+                    ctx.notify();
+                    ctx.stop_propagation();
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _key_window, ctx| {
+                if this.drag_content_scrollbar(event.position) {
+                    ctx.notify();
+                    return;
+                }
+                this.hover_content_scrollbar(event.position, ctx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _key_window, ctx| {
+                    this.release_content_scrollbar(ctx);
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -2556,13 +2691,11 @@ impl SettingsWindow {
 
     fn render_content(
         &self,
-        thumb: Option<ThumbGeometry>,
+        thumb: Option<ScrollbarQuad>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = self.colors;
-        let mut thumb_color = colors.scrollbar;
-        thumb_color.a *= self.content_scrollbar.opacity;
         let mut children = vec![self.render_page_heading()];
         // The Remote page leads with the runtime "Local network" trust surface so
         // its lists and their Remove/Revoke buttons sit above the fold; the static
@@ -2632,14 +2765,18 @@ impl SettingsWindow {
                     // Painted after the scroller so the overlay reads as an
                     // overlay; it is out of flow, so it reserves no column.
                     .children(thumb.map(|thumb| {
+                        // The shared renderer already folded the fade opacity
+                        // into the alpha and sized the corner radius to the
+                        // hover-animated width.
+                        let [red, green, blue, alpha] = thumb.color;
                         div()
                             .absolute()
-                            .left(px(thumb.x))
-                            .top(px(thumb.y))
-                            .w(px(thumb.width))
-                            .h(px(thumb.height))
-                            .rounded(px(thumb.width / 2.0))
-                            .bg(thumb_color)
+                            .left(px(thumb.rect.x))
+                            .top(px(thumb.rect.y))
+                            .w(px(thumb.rect.width))
+                            .h(px(thumb.rect.height))
+                            .rounded(px(thumb.corner_radius))
+                            .bg(Rgba { r: red, g: green, b: blue, a: alpha })
                     })),
             )
             // Pinned below the scroller, not appended to it. As the last row of a
@@ -4946,6 +5083,18 @@ fn saved_settings_geometry_fits(
         && height <= f32::from(available.height)
 }
 
+/// The scroller offset that puts the content pane at an absolute
+/// `display_offset` — the inverse of the count-from-the-bottom mapping
+/// [`SettingsWindow::content_scrollbar_layout`] builds, so a gesture the pure
+/// geometry resolved lands on the pixel scroller it was measured from.
+///
+/// The `u16` conversion is the [`UNIT_CAP`] ceiling in code: a scroll unit is
+/// one pixel, so the cap keeps the whole round trip cast-free.
+fn content_scroll_offset(history_size: usize, target: usize) -> Pixels {
+    let scrolled = u16::try_from(history_size.saturating_sub(target)).unwrap_or(u16::MAX);
+    px(-f32::from(scrolled))
+}
+
 fn logical_i32(value: i32) -> f32 {
     f32::from(i16::try_from(value.clamp(i32::from(i16::MIN), i32::from(i16::MAX))).unwrap_or(0))
 }
@@ -4953,19 +5102,48 @@ fn logical_i32(value: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeInputSelection, NativeInputTarget, SettingsFocusTarget, canonical_combo,
-        combo_for_capture, conflicting_action, focus_targets_match, inline_commit_value,
-        inline_placeholder, is_modifier_key, key_combo_text, release_inline_input,
-        revert_inline_input, search_display_text, utf16_range_to_utf8,
-        workspace_badge_color_controls, workspace_root_controls_match_query,
-        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
-        workspace_roots_match_query,
+        NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH, ScrollMetrics,
+        ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, canonical_combo, combo_for_capture,
+        conflicting_action, content_scroll_offset, focus_targets_match, inline_commit_value,
+        inline_placeholder, is_modifier_key, key_combo_text, offset_from_drag,
+        offset_from_track_click, px, release_inline_input, revert_inline_input,
+        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
+        workspace_root_controls_match_query, workspace_root_focus_index,
+        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
     };
     use gpui::{Keystroke, Modifiers};
     use scribe_common::config::{KeyComboList, ScribeConfig};
 
     fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
         Keystroke { modifiers, key: key.to_owned(), key_char: None }
+    }
+
+    // @lat: [[test#GPUI Settings Window#Scrollbar gestures map back onto the scroller]]
+    #[test]
+    fn scrollbar_gestures_map_back_onto_the_scroller() {
+        // A 400px viewport over a 1200px page: 800px of overflow, opened at the
+        // top, which the pure geometry reads as a full display offset.
+        let layout = ScrollbarLayout {
+            pane_rect: Rect { x: 0.0, y: 0.0, width: 600.0, height: 400.0 },
+            metrics: ScrollMetrics { history_size: 800, screen_lines: 400, display_offset: 800 },
+            tab_bar_height: 0.0,
+        };
+
+        let top = offset_from_track_click(&layout, 0.0, SCROLLBAR_WIDTH);
+        let bottom = offset_from_track_click(&layout, 400.0, SCROLLBAR_WIDTH);
+        assert_eq!(top, 800);
+        assert_eq!(bottom, 0);
+        // The offset counts up from the live bottom and the scroller counts
+        // down from the top of the page: pressing the track top rewinds to
+        // zero, and the bottom scrolls the whole overflow.
+        assert_eq!(content_scroll_offset(800, top), px(0.0));
+        assert_eq!(content_scroll_offset(800, bottom), px(-800.0));
+
+        // Dragging the thumb down scrolls the page down, not up.
+        let drag = ScrollbarDrag { start_mouse_y: 0.0, start_display_offset: top };
+        let dragged = offset_from_drag(&layout, &drag, 100.0, SCROLLBAR_WIDTH);
+        assert!(dragged < top);
+        assert!(content_scroll_offset(800, dragged) < px(0.0));
     }
 
     // @lat: [[test#GPUI Settings Window#Shortcut capture]]
