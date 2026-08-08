@@ -481,6 +481,12 @@ e2e-visual-server-lifecycle:
 e2e-visual-server-upgrade-reattach:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/server-upgrade-reattach.sh
 
+# Run the Codex reattach oracle: the same live handoff, over a pane the hook
+# channel has told the server is a codex_code session, asserting the attach
+# announces no grid and the real one follows as an ordinary resize.
+e2e-visual-codex-reattach:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/codex-reattach-size.sh
+
 # Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
 # and exports XMODIFIERS before the client launches, so a real input method
 # owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the
@@ -551,6 +557,7 @@ e2e-all-visual: build-release docker-visual
         'visual/ai-task-label.sh|e2e-visual-ai-task-label'
         'visual/bell.sh|e2e-visual-bell'
         'visual/clipboard-osc52.sh|e2e-visual-clipboard'
+        'visual/codex-reattach-size.sh|e2e-visual-codex-reattach'
         'visual/cold-restart.sh|e2e-visual-cold-restart'
         'visual/color-emoji.sh|e2e-visual-shared'
         'visual/config-reload.sh|e2e-visual'

@@ -336,9 +336,21 @@ The conversation id the seeded prompts are filed under comes from the retained `
 
 This path is independent of the cold-restart snapshot below and never touches it. A surviving server means the snapshot is not replayed at all, and burning a claim to read prompt text out of it would cost a later cold restart the layout it needs.
 
+The same list drives the reattach itself, and a Codex pane is the exception there. [[crates/scribe-client/src/main.rs#reattach_visible_sessions|reattach_visible_sessions]] replays the window's attached set onto the replacement connection with each pane's live display grid — except for a session the list calls `CodexCode`, which [[crates/scribe-client/src/main.rs#reattach_panes|reattach_panes]] gives a zero-sized `TerminalSize` through [[crates/scribe-client/src/restore_replay.rs#attach_dimensions_for_session|attach_dimensions_for_session]]. The server's `attach_flow::send_attach_replay` runs its pre-replay `resize_term` + `TIOCSWINSZ` only for a size with a grid, so a zero leaves the PTY alone while the replay restores the pane's history; Codex renders through Ink, which repaints on `SIGWINCH` and would paint over that history the moment it arrived.
+
+Announcing nothing is only two thirds of the port. The retired client also skipped the follow-up `Resize` (the GPUI client sends one per reattached pane, and a resize landing right behind the attach would size the PTY anyway) and cleared the pane's last-sent grid so the real size arrived later through the ordinary publish. The GPUI equivalent of that clear is `Shared::deferred_grids`: the reader parks the Codex session ids there because `pane_sizes` lives on the view, and [[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes|publish_pane_sizes]] drops each parked entry so its next pass re-sends the real grid instead of skipping a pane whose cached size still matches.
+
+Only the reconnect path takes the exception. [[crates/scribe-client/src/main.rs#attach_session|attach_session]] and [[crates/scribe-client/src/main.rs#TerminalView#stream_session|stream_session]] are the tab-switch and pane-adopt attaches, where the pane is already correctly sized and a zero would leave it unsized until the next publish — worse than announcing the grid. Ink's actual repaint behaviour is unverified: there is no Codex binary in the harness, so [[test#Visual E2E Tests#Codex reattach announces no grid]] pins the announced wire shape and nothing beyond it.
+
 #### Session list seeds the AI chrome
 
 A `SessionInfo` carrying retained prompt history, an AI state, and a provider hint paints its prompt bar and restores the tracker's provider on seeding, and the seeded bar survives the resumed provider re-announcing its own conversation id.
+
+#### Codex reattach defers its grid
+
+A reconnect gives a `CodexCode` session zero attach dimensions and no follow-up resize, while every other retained pane announces its display grid and takes the resize.
+
+That leaves the Ink-rendered PTY unsized until the replay has restored its history, and the real grid arrives afterwards through the ordinary publish.
 
 ### Cold Restart Restore
 
@@ -346,7 +358,7 @@ The GPUI client ports cold-restart recovery: after a server crash the bootstrap 
 
  persists one TOML snapshot per window under `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared `index.toml`, all hardened to `0700`/`0600` because launch bindings can carry prompt text and provider conversation IDs. A bootstrap lock serialises multi-process index mutations and stale locks (>30 s) are reclaimed.  atomically claims the first replayable  entry, skips non-replayable and unreadable entries, and reports how many windows remain. Those are fanned out as `--restore-child` processes via  only once the server's first `SessionList` proves it lost its sessions, because a server that kept them restores its own windows through `Welcome`'s `other_windows` and fanning out both would open every window twice; each child claims exactly one more entry and, gated by , never fans out again. A claim is non-destructive: the snapshot file stays on disk as the window's last good layout, its id parked in the index's `claimed` list so it can never be claimed twice, and it is retired only when the claiming window durably writes a fresh snapshot of its own, or the user explicitly closes the window. A claim the window never consumed — the server kept its sessions, so nothing was replayed — is released rather than retired, because a claim the server refused names another live window's layout and deleting it is how a layout gets lost.
 
- rebuilds a  — the , a  map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered  queue that re-creates each session. Before the launches dispatch, the replay sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized, through the same [[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] the live republish uses.  preserves the Codex 0x0 exception: reattaching a Codex session sends a zero-sized `TerminalSize` so the server does not pre-size its Ink-rendered PTY.  serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
+ rebuilds a  — the , a  map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered  queue that re-creates each session. Before the launches dispatch, the replay sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized, through the same [[crates/scribe-client/src/restore_replay.rs#grid_for_rect|grid_for_rect]] the live republish uses. It also owns the Codex 0x0 exception the reconnect path applies — see [[client#Client#GPUI Client Spike#Hot Restart Reattach|Hot Restart Reattach]] — so reattaching a Codex session sends a zero-sized `TerminalSize` and the server does not pre-size its Ink-rendered PTY.  serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
 
 #### Live wiring in the GPUI shell
 
@@ -422,7 +434,7 @@ A session seeded with a replayed pane's prompt history keeps its rows when the r
 
 `attach_dimensions_for_session` returns the sized grid for a normal session but a zero-sized `TerminalSize` for a Codex session, encoding the exception that leaves Codex PTY sizing to its own SIGWINCH.
 
-The helper is not on a live path: the two attach sites in the client send the pane grid unconditionally, so the exception the retired client applied is currently lost and Codex panes reattach pre-sized. Tracked as `scribe-gnh`.
+Its one caller is the reconnect path described under [[client#Client#GPUI Client Spike#Hot Restart Reattach|Hot Restart Reattach]], which pairs the zero with a deferred republish so the pane's real grid still reaches the server — after the replay, as an ordinary resize.
 
 #### Restore child never fans out
 

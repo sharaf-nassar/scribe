@@ -284,12 +284,11 @@ pub fn terminal_size_for_grid(grid: GridSize, cell_size: (f32, f32)) -> Terminal
 /// session, sending a zero-sized [`TerminalSize`] for Codex so the server does
 /// not pre-size its Ink-rendered PTY (Codex reflows from its own SIGWINCH).
 ///
-/// NOT WIRED UP (scribe-gnh). The server half is live —
+/// The server half is what makes the zero meaningful:
 /// `attach_flow::send_attach_replay` skips its pre-snapshot resize unless
-/// `has_grid()` — but neither `attach_session` nor `reattach_visible_sessions`
-/// routes through here yet, so every pane including Codex attaches pre-sized.
-/// Kept rather than deleted because that is a behaviour regression against the
-/// retired client, not dead scaffolding.
+/// `has_grid()`. The one caller is the client's reconnect path, which pairs the
+/// zero with a deferred republish so the real grid still arrives — after the
+/// replay, as an ordinary resize.
 #[must_use]
 pub fn attach_dimensions_for_session(
     grid: Option<GridSize>,
