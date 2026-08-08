@@ -119,8 +119,9 @@ use scribe_client::vi_mode::ViMotion;
 use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client::window_state::{
-    NIL_MONITOR_ID, WindowGeometry, WindowRegistry, gate_position_on_monitor, geometry_from_bounds,
-    geometry_size_is_sane, logical_px_to_i32, normalize_legacy_geometry, window_bounds_for,
+    NIL_MONITOR_ID, ObservedWindowState, WindowGeometry, WindowRegistry, WindowState,
+    gate_position_on_monitor, geometry_from_bounds, geometry_size_is_sane, logical_px_to_i32,
+    normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::x11_focus::X11FocusGuard;
 use scribe_client::zoom::ZoomState;
@@ -755,6 +756,15 @@ struct WindowSeed {
     /// manager actually put the window by
     /// [`TerminalView::verify_restored_position`].
     restore_monitor: Option<String>,
+    /// Set when the record was captured minimized, to the state it would
+    /// unminimize to — the window is opened in that state and iconified again
+    /// once it is mapped. See [`TerminalView::apply_pending_minimize`].
+    restore_minimized: Option<WindowState>,
+    /// The whole record the window was restored from, adopted as the baseline
+    /// the first live capture compares against. Without it a window restored
+    /// maximized would drop its pre-maximize rect on the first capture: that
+    /// rect only survives by being carried forward from the previous reading.
+    restore_geometry: Option<WindowGeometry>,
 }
 
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
@@ -842,6 +852,10 @@ struct RestoreRuntime {
     /// The monitor the saved position was captured on, for that check. `None`
     /// when the record names no monitor, which makes the check unanswerable.
     monitor: Option<String>,
+    /// The state the restored window still has to be re-minimized out of,
+    /// taken by the first paint. `None` once applied, or when the record was
+    /// not captured minimized.
+    pending_minimize: Option<WindowState>,
     /// How far the restore's placement has got. Gates geometry persistence so a
     /// restore cannot save over the record it was aiming at.
     placement: RestorePlacement,
@@ -906,6 +920,8 @@ impl RestoreRuntime {
             restore_siblings,
             restore_position,
             restore_monitor,
+            restore_minimized,
+            restore_geometry,
             ..
         } = seed;
         Self {
@@ -922,10 +938,11 @@ impl RestoreRuntime {
             pending_position: restore_position,
             position_target: None,
             monitor: restore_monitor,
+            pending_minimize: restore_minimized,
             bindings: HashMap::new(),
             requested: VecDeque::new(),
             window_id: None,
-            geometry: None,
+            geometry: restore_geometry,
             saved_geometry: None,
             layout_dirty_since: None,
             geometry_dirty_since: None,
@@ -1403,6 +1420,26 @@ impl TerminalView {
         }
     }
 
+    /// Put a restored window back into its minimized state, once.
+    ///
+    /// ICCCM 4.1.2.4's "map me iconified" is `WM_HINTS.initial_state`, set
+    /// *before* the window is mapped — and GPUI maps inside `Window::new`, so
+    /// the only reachable request is the post-map one: `minimize_window`, which
+    /// on X11 is the ICCCM `WM_CHANGE_STATE` client message. The window
+    /// therefore flashes visible for a frame on the way down; removing that
+    /// needs the pre-map hint, which only GPUI can set.
+    ///
+    /// Issued after [`Self::apply_saved_position`] so the window manager has
+    /// somewhere to put the window when the user brings it back. A hidden
+    /// window stops painting, so the placement check the restore is waiting on
+    /// only runs once the user unminimizes it — which is also the first moment
+    /// the geometry is worth re-persisting.
+    fn apply_pending_minimize(&mut self, window: &Window) {
+        let Some(restore_state) = self.restore.pending_minimize.take() else { return };
+        tracing::info!(?restore_state, "re-minimizing the restored window");
+        window.minimize_window();
+    }
+
     /// Check where the restored window actually landed, once.
     ///
     /// The question that matters is not the pixel residual — `StaticGravity`
@@ -1478,7 +1515,27 @@ impl TerminalView {
         // RandR connector name where available; GPUI's X11 display uuid is a
         // nil placeholder and must never be persisted (see `monitor`).
         let monitor = monitor::persisted_monitor_name(window, cx);
-        let geometry = geometry_from_bounds(window.bounds(), window.is_maximized(), monitor);
+        // GPUI answers maximized and fullscreen but has no minimized query, and
+        // its X11 `is_maximized()` goes false the moment the window is hidden;
+        // the window manager's own `_NET_WM_STATE` is the only reading that
+        // survives minimization. GPUI's answer is the off-X11 fallback.
+        let observed = monitor::observed_window_state(
+            window,
+            ObservedWindowState::from_wm_state(
+                false,
+                window
+                    .is_fullscreen()
+                    .then_some(WindowState::Fullscreen)
+                    .or_else(|| window.is_maximized().then_some(WindowState::Maximized))
+                    .unwrap_or_default(),
+            ),
+        );
+        let geometry = geometry_from_bounds(
+            window.bounds(),
+            observed,
+            monitor,
+            self.restore.geometry.as_ref(),
+        );
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -7780,6 +7837,7 @@ impl Render for TerminalView {
         self.report_perf_frame();
         self.ensure_focus(window, cx);
         self.apply_saved_position(window);
+        self.apply_pending_minimize(window);
         // Driven from the frame loop rather than only from the bounds observer:
         // the observer stops firing once the window settles, and the check
         // deliberately waits for that. The focused window's cursor blink keeps
@@ -8372,18 +8430,27 @@ fn open_window(
         tracing::info!(
             width = geom.width,
             height = geom.height,
-            maximized = geom.maximized,
+            state = ?geom.state,
+            restore_state = ?geom.restore_state,
             "restoring persisted window geometry"
         );
     }
     let restored = cold_start.snapshot;
     let restore_siblings = cold_start.siblings;
-    // A maximized window has no position of its own to re-assert; the
-    // compositor owns its placement.
+    // A minimized record cannot be opened minimized — GPUI maps the platform
+    // window inside `Window::new` — so the window comes up in the state it
+    // would unminimize to and is re-minimized from the first frame.
+    let restore_minimized = cold_start
+        .geometry
+        .as_ref()
+        .filter(|geom| geom.state == WindowState::Minimized)
+        .map(WindowGeometry::effective_state);
+    // A maximized or fullscreen window has no position of its own to re-assert;
+    // the compositor owns its placement.
     let restore_position = cold_start
         .geometry
         .as_ref()
-        .filter(|geom| !geom.maximized)
+        .filter(|geom| geom.effective_state() == WindowState::Windowed)
         .and_then(|geom| geom.x.zip(geom.y));
     // The nil-UUID placeholder legacy records carry is not a connector name and
     // can never match one; verifying against it would warn on every such start.
@@ -8391,6 +8458,7 @@ fn open_window(
         .and(cold_start.geometry.as_ref())
         .and_then(|geom| geom.monitor_name.clone())
         .filter(|name| name != NIL_MONITOR_ID);
+    let restore_geometry = cold_start.geometry;
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -8429,6 +8497,8 @@ fn open_window(
                         restore_siblings,
                         restore_position,
                         restore_monitor,
+                        restore_minimized,
+                        restore_geometry,
                     },
                     window,
                     cx,

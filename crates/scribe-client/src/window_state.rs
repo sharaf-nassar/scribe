@@ -1,6 +1,6 @@
 //! Persistent window geometry state for the GPUI client.
 //!
-//! Stores window position, size, maximized state, and monitor name in
+//! Stores window position, size, [`WindowState`], and monitor name in
 //! `$XDG_STATE_HOME/scribe/windows/<window_id>.toml` (one file per window to
 //! avoid save races between window processes). Ported from the legacy winit
 //! client's `window_state.rs`; the winit `capture`/`apply` glue is replaced by
@@ -52,6 +52,75 @@ pub enum StateError {
     Serialize(#[from] toml::ser::Error),
 }
 
+/// How a window was last displayed.
+///
+/// Replaces the old `maximized: bool`, which could represent neither a
+/// minimized nor a fullscreen window. Records written before this existed carry
+/// `maximized = true|false` instead; [`WindowRegistry::load_saved`] folds that
+/// into [`Self::Maximized`]/[`Self::Windowed`] on the way in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowState {
+    /// A normal window with a position and a size of its own.
+    #[default]
+    Windowed,
+    /// Filling the work area, with the window manager owning its geometry.
+    Maximized,
+    /// Iconified. Whatever it was before is kept in
+    /// [`WindowGeometry::restore_state`].
+    Minimized,
+    /// Filling the whole monitor, decorations and struts included.
+    Fullscreen,
+}
+
+/// A live window's state, as the platform reports it right now.
+///
+/// Split in two because minimization is orthogonal to the rest: the window
+/// manager keeps a minimized window's maximized and fullscreen bits set, and
+/// losing them is what made "minimize a maximized window, then quit" come back
+/// windowed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObservedWindowState {
+    /// What the window is now.
+    pub state: WindowState,
+    /// What unminimizing it would return to. Only meaningful when `state` is
+    /// [`WindowState::Minimized`].
+    pub restore_state: WindowState,
+}
+
+impl ObservedWindowState {
+    /// Combine the window manager's hidden bit with the state underneath it.
+    ///
+    /// Hidden wins, because it is the state the window is actually in; what it
+    /// hides becomes the restore state rather than being thrown away, which is
+    /// the whole point of keeping the two apart. `visible` is the caller's read
+    /// of the remaining EWMH bits, taken fullscreen-before-maximized: a window
+    /// manager leaves the maximized bits set underneath a fullscreen window, so
+    /// reading those first would lose the fullscreen.
+    #[must_use]
+    pub fn from_wm_state(hidden: bool, visible: WindowState) -> Self {
+        if hidden {
+            Self { state: WindowState::Minimized, restore_state: visible }
+        } else {
+            Self { state: visible, restore_state: WindowState::Windowed }
+        }
+    }
+}
+
+/// The windowed rect a maximized, fullscreen, or minimized window returns to.
+///
+/// Kept separately from the record's own rect because that one tracks the
+/// window as it is: for a maximized window it is the work area, and EWMH 5.7
+/// makes restoring the pre-fullscreen geometry the window manager's job, which
+/// it can only do if it was handed the rect to restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRect {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Persisted window geometry and display state.
 ///
 /// Position fields are `Option` because Wayland does not expose window
@@ -65,12 +134,27 @@ pub struct WindowGeometry {
     pub y: Option<i32>,
     pub width: u32,
     pub height: u32,
-    pub maximized: bool,
+    /// How the window was displayed. Absent in pre-[`WindowState`] records,
+    /// which carry `maximized` instead.
+    #[serde(default)]
+    pub state: WindowState,
+    /// What unminimizing the window would return to; only read when `state` is
+    /// [`WindowState::Minimized`].
+    #[serde(default)]
+    pub restore_state: WindowState,
     pub monitor_name: Option<String>,
     /// Whether the geometry-compat titlebar inset has already been applied.
     /// Absent in legacy files (`serde(default)` → `false`).
     #[serde(default)]
     pub titlebar_normalized: bool,
+    /// Legacy `maximized = true|false`, read from pre-[`WindowState`] records
+    /// and folded into `state` by [`adopt_legacy_state`]. Never written back.
+    #[serde(default, rename = "maximized", skip_serializing)]
+    legacy_maximized: Option<bool>,
+    /// Declared last: it serializes as a TOML table, and TOML cannot carry a
+    /// bare key after one.
+    #[serde(default)]
+    pub restore_rect: Option<SavedRect>,
 }
 
 impl Default for WindowGeometry {
@@ -80,12 +164,61 @@ impl Default for WindowGeometry {
             y: None,
             width: 1200,
             height: 800,
-            maximized: false,
+            state: WindowState::Windowed,
+            restore_state: WindowState::Windowed,
             monitor_name: None,
             // A freshly-created default is already in the new coordinate system.
             titlebar_normalized: true,
+            legacy_maximized: None,
+            restore_rect: None,
         }
     }
+}
+
+impl WindowGeometry {
+    /// The state the window is opened in, with minimization resolved away.
+    ///
+    /// A window cannot be *created* minimized through GPUI — the platform
+    /// window is mapped inside `Window::new` — so restore opens it in the state
+    /// it would unminimize to and issues the minimize request afterwards.
+    #[must_use]
+    pub fn effective_state(&self) -> WindowState {
+        match (self.state, self.restore_state) {
+            // A record claiming to unminimize into minimization is nonsense
+            // from a hand-edited or truncated file; windowed is the safe read.
+            (WindowState::Minimized, WindowState::Minimized) => WindowState::Windowed,
+            (WindowState::Minimized, restore) => restore,
+            (state, _) => state,
+        }
+    }
+
+    /// The windowed rect to return to, which for a windowed record is its own.
+    ///
+    /// This is what makes the pre-maximize rect survive: the capture that first
+    /// sees the window maximized reads it off the previous (windowed) record,
+    /// and every later capture carries it forward unchanged.
+    #[must_use]
+    fn windowed_rect(&self) -> Option<SavedRect> {
+        if self.state == WindowState::Windowed {
+            Some(SavedRect { x: self.x, y: self.y, width: self.width, height: self.height })
+        } else {
+            self.restore_rect
+        }
+    }
+}
+
+/// Fold a pre-[`WindowState`] record's `maximized` bool into `state`.
+///
+/// Runs on every load rather than inside [`normalize_legacy_geometry`], which
+/// short-circuits on `titlebar_normalized`: records written by the intervening
+/// client are already normalized *and* still carry the bool.
+#[must_use]
+fn adopt_legacy_state(geom: WindowGeometry) -> WindowGeometry {
+    let state = match geom.legacy_maximized {
+        Some(true) if geom.state == WindowState::Windowed => WindowState::Maximized,
+        _ => geom.state,
+    };
+    WindowGeometry { state, legacy_maximized: None, ..geom }
 }
 
 /// The nil UUID string GPUI's X11 backend reports as its display "uuid".
@@ -115,7 +248,7 @@ pub fn saved_monitor_allows_position(saved: Option<&str>, connected: &[String]) 
 }
 
 /// Drop the saved position when [`saved_monitor_allows_position`] rejects the
-/// record's monitor, keeping size and maximized state. The restore path then
+/// record's monitor, keeping size and window state. The restore path then
 /// opens the window at its default placement — the legacy client's "saved
 /// monitor not found, letting OS place window" behavior.
 #[must_use]
@@ -152,7 +285,7 @@ pub fn geometry_size_is_sane(geom: &WindowGeometry) -> bool {
 /// 1. Size is clamped into `[MIN_WINDOW_EDGE, MAX_WINDOW_EDGE]`.
 /// 2. The window height grows by `CUSTOM_TITLEBAR_HEIGHT` so the terminal area
 ///    below the new titlebar matches the old client area (skipped for maximized
-///    windows, whose size the compositor overrides on restore).
+///    and fullscreen windows, whose size the compositor overrides on restore).
 /// 3. `titlebar_normalized` is set so a re-save + reload is idempotent.
 ///
 /// Already-normalized geometry is returned unchanged.
@@ -166,10 +299,10 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
     // Grow the height so the terminal area under the in-window titlebar keeps
     // its old size, then clamp to the accepted range. Maximized windows are
     // resized by the compositor on restore, so leave their stored size alone.
-    let height = if geom.maximized {
-        geom.height.clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
-    } else {
+    let height = if geom.effective_state() == WindowState::Windowed {
         geom.height.saturating_add(CUSTOM_TITLEBAR_HEIGHT).clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
+    } else {
+        geom.height.clamp(MIN_WINDOW_EDGE, MAX_WINDOW_EDGE)
     };
 
     WindowGeometry { width, height, titlebar_normalized: true, ..geom.clone() }
@@ -182,22 +315,36 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
 /// unlike winit, which reports physical pixels. A window whose origin is not
 /// exposed (Wayland) yields `x`/`y` of `None` rather than a bogus `(0, 0)`,
 /// which is what keeps a later X11 session from restoring into the corner.
+///
+/// `previous` is the last record this window produced. It is what carries the
+/// pre-maximize/pre-fullscreen rect: once the window is no longer windowed its
+/// own bounds are the work area, so the rect to return to can only come from
+/// the reading taken before the transition.
 #[must_use]
 pub fn geometry_from_bounds(
     bounds: Bounds<Pixels>,
-    maximized: bool,
+    observed: ObservedWindowState,
     monitor_name: Option<String>,
+    previous: Option<&WindowGeometry>,
 ) -> WindowGeometry {
+    let restore_rect = if observed.state == WindowState::Windowed {
+        None
+    } else {
+        previous.and_then(WindowGeometry::windowed_rect)
+    };
     WindowGeometry {
         x: Some(logical_px_to_i32(f32::from(bounds.origin.x))),
         y: Some(logical_px_to_i32(f32::from(bounds.origin.y))),
         width: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.width))),
         height: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.height))),
-        maximized,
+        state: observed.state,
+        restore_state: observed.restore_state,
         monitor_name,
         // Anything captured from a live GPUI window is already in the new
         // coordinate system: the custom titlebar is inside these bounds.
         titlebar_normalized: true,
+        legacy_maximized: None,
+        restore_rect,
     }
 }
 
@@ -210,16 +357,41 @@ pub fn geometry_from_bounds(
 /// from `fallback`-independent bounds are the ones the window actually gets.
 ///
 /// `fallback` supplies the origin when the saved record has none (Wayland).
+///
+/// A minimized record opens in the state it would unminimize to — GPUI maps the
+/// window inside `Window::new`, so there is no "map me iconified" to ask for
+/// here — and the caller issues `Window::minimize_window` once it is up. For a
+/// maximized or fullscreen record the bounds GPUI wants are the *restore* size,
+/// which is `restore_rect` when the transition was observed.
 #[must_use]
 pub fn window_bounds_for(geom: &WindowGeometry, fallback: Bounds<Pixels>) -> WindowBounds {
-    let bounds = Bounds {
-        origin: match (geom.x, geom.y) {
+    let bounds = logical_bounds(geom.x, geom.y, geom.width, geom.height, fallback);
+    let restore = geom
+        .restore_rect
+        .map_or(bounds, |rect| logical_bounds(rect.x, rect.y, rect.width, rect.height, fallback));
+    match geom.effective_state() {
+        // `effective_state` never answers Minimized; folding it in here keeps
+        // the match exhaustive without an unreachable arm.
+        WindowState::Windowed | WindowState::Minimized => WindowBounds::Windowed(bounds),
+        WindowState::Maximized => WindowBounds::Maximized(restore),
+        WindowState::Fullscreen => WindowBounds::Fullscreen(restore),
+    }
+}
+
+fn logical_bounds(
+    x: Option<i32>,
+    y: Option<i32>,
+    width: u32,
+    height: u32,
+    fallback: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    Bounds {
+        origin: match (x, y) {
             (Some(x), Some(y)) => point(px(i32_to_logical_px(x)), px(i32_to_logical_px(y))),
             _ => fallback.origin,
         },
-        size: size(px(u32_to_logical_px(geom.width)), px(u32_to_logical_px(geom.height))),
-    };
-    if geom.maximized { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) }
+        size: size(px(u32_to_logical_px(width)), px(u32_to_logical_px(height))),
+    }
 }
 
 /// Round a logical-pixel coordinate to the signed integer the record stores.
@@ -285,7 +457,7 @@ impl WindowRegistry {
         let path = self.window_path(window_id)?;
         match std::fs::read_to_string(&path) {
             Ok(content) => match toml::from_str(&content) {
-                Ok(geom) => Some(geom),
+                Ok(geom) => Some(adopt_legacy_state(geom)),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "window state parse error");
                     None
@@ -334,22 +506,27 @@ impl WindowRegistry {
 mod tests {
     use super::*;
 
-    fn legacy_geom(width: u32, height: u32, maximized: bool) -> WindowGeometry {
+    fn legacy_geom(width: u32, height: u32, state: WindowState) -> WindowGeometry {
         WindowGeometry {
             x: Some(100),
             y: Some(200),
             width,
             height,
-            maximized,
+            state,
             monitor_name: Some("DP-1".to_owned()),
             titlebar_normalized: false,
+            ..WindowGeometry::default()
         }
+    }
+
+    fn test_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds { origin: gpui::point(px(x), px(y)), size: gpui::size(px(width), px(height)) }
     }
 
     // @lat: [[test#Window geometry compat#Legacy geometry gains titlebar inset]]
     #[test]
     fn legacy_geometry_grows_by_titlebar_height() {
-        let normalized = normalize_legacy_geometry(&legacy_geom(1200, 800, false));
+        let normalized = normalize_legacy_geometry(&legacy_geom(1200, 800, WindowState::Windowed));
         assert_eq!(normalized.width, 1200);
         assert_eq!(normalized.height, 800 + CUSTOM_TITLEBAR_HEIGHT);
         assert!(normalized.titlebar_normalized);
@@ -362,7 +539,7 @@ mod tests {
     // @lat: [[test#Window geometry compat#Normalization is idempotent]]
     #[test]
     fn normalization_is_idempotent() {
-        let once = normalize_legacy_geometry(&legacy_geom(1200, 800, false));
+        let once = normalize_legacy_geometry(&legacy_geom(1200, 800, WindowState::Windowed));
         let twice = normalize_legacy_geometry(&once);
         assert_eq!(once, twice);
     }
@@ -370,7 +547,8 @@ mod tests {
     // @lat: [[test#Window geometry compat#Maximized geometry keeps its size]]
     #[test]
     fn maximized_geometry_keeps_size() {
-        let normalized = normalize_legacy_geometry(&legacy_geom(1920, 1080, true));
+        let normalized =
+            normalize_legacy_geometry(&legacy_geom(1920, 1080, WindowState::Maximized));
         assert_eq!(normalized.height, 1080);
         assert!(normalized.titlebar_normalized);
     }
@@ -378,7 +556,7 @@ mod tests {
     // @lat: [[test#Window geometry compat#Out-of-range legacy size is clamped]]
     #[test]
     fn out_of_range_size_is_clamped() {
-        let huge = normalize_legacy_geometry(&legacy_geom(999_999, 30, false));
+        let huge = normalize_legacy_geometry(&legacy_geom(999_999, 30, WindowState::Windowed));
         assert_eq!(huge.width, MAX_WINDOW_EDGE);
         // 30 + 36 = 66, already >= MIN_WINDOW_EDGE, so no clamp needed there.
         assert_eq!(huge.height, 30 + CUSTOM_TITLEBAR_HEIGHT);
@@ -404,26 +582,158 @@ width = 1000
 height = 700
 maximized = false
 ";
-        let geom: WindowGeometry = toml::from_str(toml).expect("parse legacy toml");
+        let geom = adopt_legacy_state(toml::from_str(toml).expect("parse legacy toml"));
         assert!(!geom.titlebar_normalized);
         let normalized = normalize_legacy_geometry(&geom);
         assert_eq!(normalized.height, 700 + CUSTOM_TITLEBAR_HEIGHT);
     }
 
+    // @lat: [[test#Window geometry compat#Legacy maximized bool folds into the state]]
+    #[test]
+    fn legacy_maximized_bool_folds_into_the_state() {
+        let toml = "\
+x = 10
+y = 20
+width = 1920
+height = 1080
+maximized = true
+titlebar_normalized = true
+";
+        let geom = adopt_legacy_state(toml::from_str(toml).expect("parse legacy toml"));
+        assert_eq!(geom.state, WindowState::Maximized);
+        // The fold survives normalization's `titlebar_normalized` short-circuit,
+        // which is why it does not live inside it.
+        assert_eq!(normalize_legacy_geometry(&geom).state, WindowState::Maximized);
+        // And it is never written back out as a bool.
+        let round_tripped = toml::to_string_pretty(&geom).expect("serialize");
+        assert!(!round_tripped.contains("maximized ="), "{round_tripped}");
+        assert!(round_tripped.contains("state = \"maximized\""), "{round_tripped}");
+
+        let windowed = adopt_legacy_state(
+            toml::from_str("width = 800\nheight = 600\nmaximized = false\n").expect("parse"),
+        );
+        assert_eq!(windowed.state, WindowState::Windowed);
+    }
+
+    // @lat: [[test#Window geometry compat#Minimizing a maximized window keeps it maximized]]
+    #[test]
+    fn minimizing_a_maximized_window_keeps_it_maximized() {
+        // The three window-manager flags are independent: a minimized window
+        // keeps its maximized bits, which GPUI's `is_maximized()` hides.
+        let observed = ObservedWindowState::from_wm_state(true, WindowState::Maximized);
+        assert_eq!(observed.state, WindowState::Minimized);
+        assert_eq!(observed.restore_state, WindowState::Maximized);
+
+        let geom = geometry_from_bounds(
+            test_bounds(0.0, 0.0, 1920.0, 1080.0),
+            observed,
+            None,
+            Some(&WindowGeometry {
+                state: WindowState::Maximized,
+                restore_rect: Some(SavedRect {
+                    x: Some(100),
+                    y: Some(200),
+                    width: 1200,
+                    height: 800,
+                }),
+                ..WindowGeometry::default()
+            }),
+        );
+        assert_eq!(geom.effective_state(), WindowState::Maximized);
+        let WindowBounds::Maximized(restore) =
+            window_bounds_for(&geom, test_bounds(0.0, 0.0, 10.0, 10.0))
+        else {
+            panic!("a minimized-from-maximized record must reopen maximized");
+        };
+        // GPUI takes the restore size here, which is the pre-maximize rect.
+        assert_eq!(restore, test_bounds(100.0, 200.0, 1200.0, 800.0));
+
+        // Minimized from plain windowed reopens windowed at its own rect.
+        let plain = ObservedWindowState::from_wm_state(true, WindowState::Windowed);
+        assert_eq!(plain.restore_state, WindowState::Windowed);
+        // Minimizing out of fullscreen keeps the fullscreen the same way.
+        let from_fullscreen = ObservedWindowState::from_wm_state(true, WindowState::Fullscreen);
+        assert_eq!(from_fullscreen.restore_state, WindowState::Fullscreen);
+    }
+
+    // @lat: [[test#Window geometry compat#Fullscreen record reopens fullscreen]]
+    #[test]
+    fn fullscreen_record_reopens_fullscreen() {
+        let geom = WindowGeometry {
+            state: WindowState::Fullscreen,
+            ..legacy_geom(2560, 1440, WindowState::Fullscreen)
+        };
+        assert!(matches!(
+            window_bounds_for(&geom, test_bounds(0.0, 0.0, 800.0, 600.0)),
+            WindowBounds::Fullscreen(_)
+        ));
+        // A hand-broken record that unminimizes into minimization is read as
+        // windowed rather than looping.
+        let broken = WindowGeometry {
+            state: WindowState::Minimized,
+            restore_state: WindowState::Minimized,
+            ..WindowGeometry::default()
+        };
+        assert_eq!(broken.effective_state(), WindowState::Windowed);
+    }
+
+    // @lat: [[test#Window geometry compat#Pre-maximize rect survives the transition]]
+    #[test]
+    fn pre_maximize_rect_survives_the_transition() {
+        let windowed = geometry_from_bounds(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::default(),
+            None,
+            None,
+        );
+        assert_eq!(windowed.restore_rect, None, "a windowed record is its own restore rect");
+
+        let maximized = geometry_from_bounds(
+            test_bounds(0.0, 0.0, 1920.0, 1080.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&windowed),
+        );
+        assert_eq!(
+            maximized.restore_rect,
+            Some(SavedRect { x: Some(120), y: Some(64), width: 1440, height: 900 })
+        );
+
+        // A later capture that is still maximized carries the same rect rather
+        // than overwriting it with the work area.
+        let still = geometry_from_bounds(
+            test_bounds(0.0, 0.0, 1920.0, 1080.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&maximized),
+        );
+        assert_eq!(still.restore_rect, maximized.restore_rect);
+
+        // Unmaximizing drops it again.
+        let back = geometry_from_bounds(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::default(),
+            None,
+            Some(&still),
+        );
+        assert_eq!(back.restore_rect, None);
+    }
+
     // @lat: [[test#Window geometry compat#Live bounds round-trip through a record]]
     #[test]
     fn live_bounds_round_trip_through_a_record() {
-        let bounds = Bounds {
-            origin: gpui::point(px(120.0), px(64.0)),
-            size: gpui::size(px(1440.0), px(900.0)),
-        };
-        let geom = geometry_from_bounds(bounds, false, Some("dp-1".to_owned()));
+        let bounds = test_bounds(120.0, 64.0, 1440.0, 900.0);
+        let geom = geometry_from_bounds(
+            bounds,
+            ObservedWindowState::default(),
+            Some("dp-1".to_owned()),
+            None,
+        );
         assert_eq!((geom.x, geom.y), (Some(120), Some(64)));
         assert_eq!((geom.width, geom.height), (1440, 900));
         assert!(geom.titlebar_normalized, "a live capture is already in the new coordinate system");
 
-        let fallback =
-            Bounds { origin: gpui::point(px(0.0), px(0.0)), size: gpui::size(px(1.0), px(1.0)) };
+        let fallback = test_bounds(0.0, 0.0, 1.0, 1.0);
         let WindowBounds::Windowed(restored) = window_bounds_for(&geom, fallback) else {
             panic!("a non-maximized record must reopen windowed");
         };
@@ -433,11 +743,8 @@ maximized = false
     // @lat: [[test#Window geometry compat#Maximized record reopens maximized]]
     #[test]
     fn maximized_record_reopens_maximized() {
-        let geom = WindowGeometry { maximized: true, ..legacy_geom(1920, 1080, true) };
-        let fallback = Bounds {
-            origin: gpui::point(px(0.0), px(0.0)),
-            size: gpui::size(px(800.0), px(600.0)),
-        };
+        let geom = legacy_geom(1920, 1080, WindowState::Maximized);
+        let fallback = test_bounds(0.0, 0.0, 800.0, 600.0);
         assert!(matches!(window_bounds_for(&geom, fallback), WindowBounds::Maximized(_)));
     }
 
@@ -445,10 +752,7 @@ maximized = false
     #[test]
     fn position_less_record_keeps_the_fallback_origin() {
         let geom = WindowGeometry { x: None, y: None, ..WindowGeometry::default() };
-        let fallback = Bounds {
-            origin: gpui::point(px(300.0), px(200.0)),
-            size: gpui::size(px(10.0), px(10.0)),
-        };
+        let fallback = test_bounds(300.0, 200.0, 10.0, 10.0);
         let WindowBounds::Windowed(bounds) = window_bounds_for(&geom, fallback) else {
             panic!("a non-maximized record must reopen windowed");
         };
@@ -459,11 +763,12 @@ maximized = false
     // @lat: [[test#Window geometry compat#Sanity range rejects extremes]]
     #[test]
     fn sanity_range_rejects_extremes() {
-        assert!(!geometry_size_is_sane(&legacy_geom(0, 0, false)));
-        assert!(!geometry_size_is_sane(&legacy_geom(39, 800, false)));
-        assert!(!geometry_size_is_sane(&legacy_geom(1200, 16385, false)));
-        assert!(geometry_size_is_sane(&legacy_geom(40, 40, false)));
-        assert!(geometry_size_is_sane(&legacy_geom(16384, 16384, false)));
+        let windowed = WindowState::Windowed;
+        assert!(!geometry_size_is_sane(&legacy_geom(0, 0, windowed)));
+        assert!(!geometry_size_is_sane(&legacy_geom(39, 800, windowed)));
+        assert!(!geometry_size_is_sane(&legacy_geom(1200, 16385, windowed)));
+        assert!(geometry_size_is_sane(&legacy_geom(40, 40, windowed)));
+        assert!(geometry_size_is_sane(&legacy_geom(16384, 16384, windowed)));
     }
 
     // @lat: [[test#Window geometry compat#Unknown monitor identity keeps the saved position]]
@@ -480,12 +785,13 @@ maximized = false
         assert!(saved_monitor_allows_position(Some("DP-7"), &[]));
 
         // The gate strips only x/y, and only for a verifiably gone monitor.
-        let mut geom = legacy_geom(1200, 800, true);
+        let mut geom = legacy_geom(1200, 800, WindowState::Maximized);
         geom.monitor_name = Some(NIL_MONITOR_ID.to_owned());
         assert_eq!(gate_position_on_monitor(&geom, &connected), geom);
         geom.monitor_name = Some("DP-7".to_owned());
         let gated = gate_position_on_monitor(&geom, &connected);
         assert_eq!((gated.x, gated.y), (None, None));
-        assert_eq!((gated.width, gated.height, gated.maximized), (1200, 800, true));
+        assert_eq!((gated.width, gated.height), (1200, 800));
+        assert_eq!(gated.state, WindowState::Maximized);
     }
 }
