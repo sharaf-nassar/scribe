@@ -119,7 +119,7 @@ use scribe_client::vi_mode::ViMotion;
 use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client::window_state::{
-    WindowGeometry, WindowRegistry, gate_position_on_monitor, geometry_from_bounds,
+    NIL_MONITOR_ID, WindowGeometry, WindowRegistry, gate_position_on_monitor, geometry_from_bounds,
     geometry_size_is_sane, logical_px_to_i32, normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::x11_focus::X11FocusGuard;
@@ -684,6 +684,10 @@ struct WindowSeed {
     /// the window manager may ignore. See
     /// [`crate::monitor::apply_saved_position`].
     restore_position: Option<(i32, i32)>,
+    /// The monitor that position was saved on, checked against where the window
+    /// manager actually put the window by
+    /// [`TerminalView::verify_restored_position`].
+    restore_monitor: Option<String>,
 }
 
 /// Classify what a `CreateSession` is launching so a cold restart relaunches
@@ -766,8 +770,11 @@ struct RestoreRuntime {
     /// the first paint. `None` once applied, or when nothing was persisted.
     pending_position: Option<(i32, i32)>,
     /// Where that move was aiming, and when it was asked for. Kept until the
-    /// request has had time to be answered and one correction has run.
+    /// request has had time to be answered and the placement has been checked.
     position_target: Option<((i32, i32), Instant)>,
+    /// The monitor the saved position was captured on, for that check. `None`
+    /// when the record names no monitor, which makes the check unanswerable.
+    monitor: Option<String>,
     /// How far the restore's placement has got. Gates geometry persistence so a
     /// restore cannot save over the record it was aiming at.
     placement: RestorePlacement,
@@ -786,20 +793,20 @@ struct RestoredPrompts {
 /// How far a restored window's placement has got, which is what decides whether
 /// the window's current bounds are the user's layout or the restore's.
 ///
-/// A restored window is moved twice — once to the saved position, once to
-/// correct for the frame the window manager drew around it — and both moves are
-/// asynchronous `ConfigureRequest`s. Every reading taken before the last one has
-/// been answered is the placement the restore is trying to undo, and persisting
-/// it overwrites the only record the next start has to aim at. That is what
-/// turned a single misplaced restore into a permanent one.
+/// A restored window's move is an asynchronous request the window manager
+/// answers when it likes. Every reading taken before it has been answered is
+/// the placement the restore is trying to undo, and persisting it overwrites
+/// the only record the next start has to aim at. That is what turned a single
+/// misplaced restore into a permanent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestorePlacement {
-    /// A saved position is still to be applied, or its correction still to be
-    /// computed.
+    /// A saved position is still to be applied, or its landing still to be
+    /// checked.
     Restoring,
-    /// The corrective move went out at this instant and has [`RESTORE_DEBOUNCE`]
-    /// to be answered, the same wait the correction itself was computed after.
-    Correcting(Instant),
+    /// The landing was checked at this instant and gets one more
+    /// [`RESTORE_DEBOUNCE`] of grace, so a window manager still nudging the
+    /// window (a strut, a snap) cannot have that reading adopted as the user's.
+    Verifying(Instant),
     /// The restore is over; bounds changes from here are the user's.
     Settled,
 }
@@ -809,15 +816,15 @@ impl RestorePlacement {
     ///
     /// `position_pending` is true while [`RestoreRuntime::pending_position`] or
     /// [`RestoreRuntime::position_target`] still hold work.
-    /// [`TerminalView::correct_restored_position`] runs immediately before every
-    /// geometry capture, so both being empty means the one correction has just
-    /// gone out — or that there was never a position to restore, which is why a
+    /// [`TerminalView::verify_restored_position`] runs immediately before every
+    /// geometry capture, so both being empty means the landing has just been
+    /// checked — or that there was never a position to restore, which is why a
     /// window opened without one starts [`Self::Settled`].
     fn settled(&mut self, position_pending: bool) -> bool {
         *self = match *self {
             Self::Restoring if position_pending => Self::Restoring,
-            Self::Restoring => Self::Correcting(Instant::now()),
-            Self::Correcting(at) if at.elapsed() < RESTORE_DEBOUNCE => Self::Correcting(at),
+            Self::Restoring => Self::Verifying(Instant::now()),
+            Self::Verifying(at) if at.elapsed() < RESTORE_DEBOUNCE => Self::Verifying(at),
             _ => Self::Settled,
         };
         *self == Self::Settled
@@ -827,7 +834,13 @@ impl RestorePlacement {
 impl RestoreRuntime {
     /// Take the three restore inputs the window was opened with.
     fn from_seed(seed: WindowSeed) -> Self {
-        let WindowSeed { restored: pending, restore_siblings, restore_position, .. } = seed;
+        let WindowSeed {
+            restored: pending,
+            restore_siblings,
+            restore_position,
+            restore_monitor,
+            ..
+        } = seed;
         Self {
             store: RestoreStore::new(),
             registry: WindowRegistry::new(),
@@ -841,6 +854,7 @@ impl RestoreRuntime {
             },
             pending_position: restore_position,
             position_target: None,
+            monitor: restore_monitor,
             bindings: HashMap::new(),
             requested: VecDeque::new(),
             window_id: None,
@@ -1289,7 +1303,7 @@ impl TerminalView {
         cx.observe_window_bounds(window, |view, window, ctx| {
             // A late bounds change is also a chance to settle the restore move,
             // for a window that is not repainting for any other reason.
-            view.correct_restored_position(window);
+            view.verify_restored_position(window);
             view.capture_geometry(window, ctx);
         })
     }
@@ -1316,28 +1330,23 @@ impl TerminalView {
         }
     }
 
-    /// Correct the restored window's position once, from where it actually
-    /// landed.
+    /// Check where the restored window actually landed, once.
     ///
-    /// A reparenting window manager positions the frame it drew, not the window
-    /// inside it, so a window asked for `(320, 180)` settles a border and a
-    /// titlebar further in. The saved record is the *frame* origin, so
-    /// restoring it verbatim would push the window down and right by the
-    /// decoration on every restart until it walked off the screen.
+    /// The question that matters is not the pixel residual — `StaticGravity`
+    /// removes the frame ambiguity that used to produce one — but whether the
+    /// window is on the monitor its record names. A window manager is free to
+    /// answer the move with a strut, a snap, an off-screen clamp, or the active
+    /// monitor, and silently accepting the wrong screen is what made a bad
+    /// restore look like a good one.
     ///
-    /// The residual is measured from the window's own bounds, and only once the
-    /// request has had [`RESTORE_DEBOUNCE`] to be answered. A `ConfigureRequest`
-    /// is asynchronous: reading back beside it — or on the next bounds change,
-    /// which can still be an earlier one arriving — reports where the window has
-    /// not moved to yet, and a correction computed from that reading doubles the
-    /// offset instead of cancelling it. Waiting also means the corrected value
-    /// is the one the geometry record then persists, so the round trip is
-    /// self-consistent.
-    ///
-    /// Exactly one correction is applied: a window manager that still disagrees
-    /// is enforcing something real (a strut, a snap, an off-screen clamp) and
-    /// arguing with it is how a placement loop starts.
-    fn correct_restored_position(&mut self, window: &Window) {
+    /// The reading is taken only once the request has had [`RESTORE_DEBOUNCE`]
+    /// to be answered: the move is asynchronous, so reading back beside it — or
+    /// on the next bounds change, which can still be an earlier one arriving —
+    /// reports a placement the window has not reached yet. Nothing is
+    /// re-asserted; a window manager that has put the window elsewhere is
+    /// enforcing something real, and arguing with it is how a placement loop
+    /// starts. It is logged instead, so the give-up is explicit.
+    fn verify_restored_position(&mut self, window: &Window) {
         let (want_x, want_y) = match self.restore.position_target {
             Some((target, asked_at)) if asked_at.elapsed() >= RESTORE_DEBOUNCE => target,
             _ => return,
@@ -1348,21 +1357,34 @@ impl TerminalView {
         // between two values in one space rather than two roundings of one.
         let (landed_x, landed_y) =
             (logical_px_to_i32(f32::from(origin.x)), logical_px_to_i32(f32::from(origin.y)));
-        if (landed_x, landed_y) == (want_x, want_y) {
-            tracing::info!(x = want_x, y = want_y, "restored the window to its saved position");
+        // No saved monitor, or no RandR to resolve the live one (Wayland,
+        // macOS, headless): the position is all there is to report.
+        let (Some(want_monitor), Some(landed_monitor)) =
+            (self.restore.monitor.as_deref(), monitor::window_monitor_name(window))
+        else {
+            tracing::info!(want_x, want_y, landed_x, landed_y, "restored the window's position");
+            return;
+        };
+        if landed_monitor == want_monitor {
+            tracing::info!(
+                want_x,
+                want_y,
+                landed_x,
+                landed_y,
+                monitor = want_monitor,
+                "restored the window to its saved monitor"
+            );
             return;
         }
-        let corrected = (want_x - (landed_x - want_x), want_y - (landed_y - want_y));
-        tracing::info!(
+        tracing::warn!(
             want_x,
             want_y,
             landed_x,
             landed_y,
-            corrected_x = corrected.0,
-            corrected_y = corrected.1,
-            "correcting the restored window position for the window manager's frame"
+            want_monitor,
+            landed_monitor,
+            "the window manager placed the restored window on a different monitor; giving up"
         );
-        monitor::apply_saved_position(window, corrected.0, corrected.1);
     }
 
     /// Capture the live window's geometry into the restore runtime.
@@ -7597,10 +7619,10 @@ impl Render for TerminalView {
         self.ensure_focus(window, cx);
         self.apply_saved_position(window);
         // Driven from the frame loop rather than only from the bounds observer:
-        // the observer stops firing once the window settles, and the correction
+        // the observer stops firing once the window settles, and the check
         // deliberately waits for that. The focused window's cursor blink keeps
         // frames coming well inside the wait.
-        self.correct_restored_position(window);
+        self.verify_restored_position(window);
         self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
@@ -8201,6 +8223,12 @@ fn open_window(
         .as_ref()
         .filter(|geom| !geom.maximized)
         .and_then(|geom| geom.x.zip(geom.y));
+    // The nil-UUID placeholder legacy records carry is not a connector name and
+    // can never match one; verifying against it would warn on every such start.
+    let restore_monitor = restore_position
+        .and(cold_start.geometry.as_ref())
+        .and_then(|geom| geom.monitor_name.clone())
+        .filter(|name| name != NIL_MONITOR_ID);
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -8233,7 +8261,13 @@ fn open_window(
                 TerminalView::new(
                     shared,
                     sink,
-                    WindowSeed { terminal_size, restored, restore_siblings, restore_position },
+                    WindowSeed {
+                        terminal_size,
+                        restored,
+                        restore_siblings,
+                        restore_position,
+                        restore_monitor,
+                    },
                     window,
                     cx,
                 )
@@ -11082,16 +11116,16 @@ mod tests {
     }
 
     #[test]
-    fn restore_placement_suppresses_capture_until_the_correction_settles() {
+    fn restore_placement_suppresses_capture_until_the_landing_settles() {
         let mut placement = RestorePlacement::Restoring;
 
-        // The move and its correction are both still outstanding.
+        // The move is still outstanding, and so is the landing check.
         assert!(!placement.settled(true));
-        // The correction has just gone out and needs the same debounce.
+        // The landing has just been checked and gets one more debounce.
         assert!(!placement.settled(false));
-        assert!(matches!(placement, RestorePlacement::Correcting(_)));
+        assert!(matches!(placement, RestorePlacement::Verifying(_)));
         // Rewind past the debounce rather than sleeping through it.
-        placement = RestorePlacement::Correcting(
+        placement = RestorePlacement::Verifying(
             Instant::now().checked_sub(RESTORE_DEBOUNCE).expect("monotonic clock past the wait"),
         );
         assert!(placement.settled(false));

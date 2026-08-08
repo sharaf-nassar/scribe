@@ -103,9 +103,9 @@ launch_client() {
 sleep 1.0
 focus
 
-# The record is the frame origin while xdotool reports the content origin, so
-# the two differ by one decoration. That offset is a CONSTANT the restore path
-# already compensates for; what matters is whether it stays constant.
+# Whatever the offset between the record and xdotool's root-relative reading
+# is, it must be a CONSTANT: a parent-relative capture is what would make it
+# jump. What matters here is that it stays constant, not that it is zero.
 delta() {
     local live rec
     live=$(live_geometry) || return 1
