@@ -292,6 +292,17 @@ e2e-visual-settings-keybindings:
 e2e-visual-settings-entry:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_FILE_CHOOSER=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-entry.sh
 
+# Run the settings-scrollbar E2E: the content pane's overlay scrollbar answers
+# the pointer — hover widens it and pins it open, the thumb drags the page, a
+# track click jumps it, and a page that fits paints no overlay and keeps the
+# press. Runs the settings window as the app (`--settings`); no wire tap, since
+# every assertion is a pixel in the running window.
+# SCRIBE_DISABLE_ANIMATIONS=0 deliberately unpins the image default: that switch
+# flips GPUI reduce-motion, which pins the thumb opaque and stops the width
+# lerp, and the fade and the widen are the behaviour under test.
+e2e-visual-settings-scrollbar:
+    docker run --rm --network none {{gpu_flags}} -e SCRIBE_VISUAL_APP=settings -e SCRIBE_DISABLE_ANIMATIONS=0 -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-scrollbar.sh
+
 # Run the live tab-switching E2E through the shared-pane rig and the wire tap.
 # The client creates its own second tab, then keyboard and titlebar selection
 # changes are asserted on the recorded `AttachSessions` frames.
@@ -581,6 +592,7 @@ e2e-all-visual: build-release docker-visual
         'visual/session-tooling.sh|e2e-visual-session-tooling'
         'visual/settings-entry.sh|e2e-visual-settings-entry'
         'visual/settings-keybindings.sh|e2e-visual-settings-keybindings'
+        'visual/settings-scrollbar.sh|e2e-visual-settings-scrollbar'
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
         'visual/tab-switching.sh|e2e-visual-tab-switching'

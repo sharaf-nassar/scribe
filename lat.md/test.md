@@ -1578,6 +1578,18 @@ Recording the same chord on a second action must repaint the row with the confli
 
 A bare Backspace on a listening row must write an empty combo list for that action, which is a different config state from the unwritten key the fixture ships with.
 
+### The settings scrollbar is a control
+
+`tests/e2e/visual/settings-scrollbar.sh` (`just e2e-visual-settings-scrollbar`) is the app-level oracle for the settings content pane's overlay scrollbar: it drives the real window through XTEST and reads the thumb straight out of the pixels.
+
+[[client#Client#Scrollbar]]'s own `#[gpui::test]` suite already proves the geometry — `hit_test_scrollbar`, `hit_test_thumb`, `offset_from_track_click` and `offset_from_drag` all have unit tests, and they were green the whole time the settings pane painted a thumb that answered nothing. The gap is reachability in both directions: that a real pointer press lands on the settings window's handler rather than on the control it is painted over, and that the invisible overlay does *not* eat presses on a page with nothing to scroll.
+
+Every measurement comes from a 32px strip cropped off the content pane's right edge, the only region the overlay writes into — the rows are laid out inside the scroller's 44px padding, so no glyph ever reaches it. A helper reports the bright-pixel box in that strip as count, painted width, top edge and centre column, and each gesture is aimed at the thumb the previous capture actually found, so the script carries no constant for where the scrollbar sits. Keybindings is the overflowing page (60 action rows) and Releases the page that fits (two rows under one heading); both are reached by Down-key traversal from the inert sidebar footer, never by a pixel offset.
+
+The recipe passes `SCRIBE_DISABLE_ANIMATIONS=0`, deliberately unpinning the image default. That switch flips GPUI's global reduce-motion flag, and `tick_content_scrollbar` honours it by pinning the thumb fully opaque and requesting no animation frames — so under the image default there is no idle fade to stop and no hover width lerp to observe. Nothing this script asserts is a byte-identical frame comparison, so motion stays on for this one suite.
+
+Six phases run in order. An overflowing page must paint a thumb and then fade it out on its own. Parking the pointer in the hit zone must bring it back at least two pixels wider and hold it there past the idle delay. Pressing the thumb and dragging down must move the thumb down with the pointer to within whole-pixel rounding *and* repaint the page — the thumb alone would prove the overlay and not the scroll. Holding that drag across the fade delay must leave the thumb painted. Releasing and clicking the track below the thumb must jump both the thumb and the viewport. Finally, on the page that fits, the strip must hold no thumb at all and a press where the hit zone would be must clear the keyboard focus ring — the ring is cleared by the window root on any left press and the scrollbar stops propagation whenever it consumes one, so a ring that survives is a press the invisible overlay ate.
+
 ### Tab and window chords reach their actions
 
 `tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
