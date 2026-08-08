@@ -20,9 +20,11 @@
 # terminal session live.
 #
 # Phases 6-10 extend the oracle to multi-workspace windows: a live
-# ctrl+alt+backslash workspace split, then keyboard (alt+1) and pointer tab
-# selection across workspace regions, then a client relaunch that rebuilds
-# the two regions from the server's persisted workspace tree
+# ctrl+alt+backslash workspace split, then the two selection paths that a
+# second region tells apart — alt+N, which indexes the FOCUSED region's tabs
+# (TabSessions::select_in_workspace), and a pointer tab click, which indexes
+# the window-global strip and so does cross regions — then a client relaunch
+# that rebuilds the two regions from the server's persisted workspace tree
 # (adopt_server_topology) and the same cross-region click on that adopted
 # layout. Sessions the client created itself are asserted through the wire's
 # KeyInput frames rather than `scribe-test wait-output`, which can only
@@ -449,27 +451,53 @@ fi
 shot /output/06-tab-switching-workspace-split.png
 echo "PHASE 6 PASS: workspace split created region session $WS_SESSION"
 
-# ── Phase 7: keyboard-select tab 1 across workspace regions ───────
-# Focus sits in the new (second) region; alt+1 targets the strip's first tab,
-# whose session lives in the FIRST region. The switch must cross regions and
-# attach the original session.
+# ── Phase 7: alt+N indexes the focused region, not the strip ──────
+# The strip is window-global but `select_tab_N` is not: it goes through
+# `TabSessions::select_in_workspace`, which counts only the tabs filed under
+# the active workspace. Indexing the strip directly would make the low digits
+# unreachable for every region but the first, so alt+1 means "this region's
+# first tab" and must not cross a workspace boundary.
+#
+# Focus sits in the new (second) region, whose only tab is the seed session
+# and is already selected. alt+1 there therefore has to be a no-op: nothing
+# on the wire, and in particular no attach of the FIRST region's tab 0.
 ATTACH_XREGION_KEY_BEFORE=$(count_attach_to "$SESSION")
 send_keys alt+1
-if ! wait_for_attach_to "$SESSION" "$ATTACH_XREGION_KEY_BEFORE" 15; then
-    fail "phase 7: alt+1 never attached the first region's session $SESSION"
+sleep 3
+if [ "$(count_attach_to "$SESSION")" -gt "$ATTACH_XREGION_KEY_BEFORE" ]; then
+    fail "phase 7: alt+1 escaped the focused region and attached $SESSION"
 fi
-shot /output/07-tab-switching-key-cross-region.png
-echo "PHASE 7 PASS: alt+1 attached $SESSION across workspace regions"
+# Now put the focus in the first region and repeat. ctrl+Prior walks the
+# window-global strip, so it does cross regions: from the seed tab (last) it
+# lands on the second tab, which is the first region's, and moves the pane
+# focus with it.
+ATTACH_NEW_KEY_BEFORE=$(count_attach_to "$NEW_SESSION")
+send_keys ctrl+Prior
+if ! wait_for_attach_to "$NEW_SESSION" "$ATTACH_NEW_KEY_BEFORE" 15; then
+    fail "phase 7: ctrl+Prior never moved the focus back into the first region ($NEW_SESSION)"
+fi
+ATTACH_FIRST_KEY_BEFORE=$(count_attach_to "$SESSION")
+send_keys alt+1
+if ! wait_for_attach_to "$SESSION" "$ATTACH_FIRST_KEY_BEFORE" 15; then
+    fail "phase 7: alt+1 never attached the focused region's first tab $SESSION"
+fi
+shot /output/07-tab-switching-key-in-region.png
+echo "PHASE 7 PASS: alt+1 stayed inside the focused region, then attached $SESSION from it"
 
 # ── Phase 8: click the first tab across workspace regions ─────────
-# Move focus back to the second region's session first (alt+3), then click the
-# first tab. In multi-workspace mode the badge pill shifts the strip right by
-# its rendered width; 135 px sits inside the first tab for any badge label up
-# to ~19 characters (badge <= ~134 px, tab spans [badge, badge+176]).
+# Move focus back to the second region first, then click the first tab. The
+# selection is on the first region's tab 0 after phase 7, so ctrl+Prior wraps
+# to the last strip tab — the second region's seed session — which is the one
+# keyboard route to the other region that is not workspace-scoped. (alt+3 no
+# longer does this: three digits into a two-tab region is out of range.)
+#
+# In multi-workspace mode the badge pill shifts the strip right by its
+# rendered width; 135 px sits inside the first tab for any badge label up to
+# ~19 characters (badge <= ~134 px, tab spans [badge, badge+176]).
 ATTACH_WS_BEFORE=$(count_attach_to "$WS_SESSION")
-send_keys alt+3
+send_keys ctrl+Prior
 if ! wait_for_attach_to "$WS_SESSION" "$ATTACH_WS_BEFORE" 15; then
-    fail "phase 8: alt+3 never re-attached the second region's session $WS_SESSION"
+    fail "phase 8: ctrl+Prior never re-attached the second region's session $WS_SESSION"
 fi
 BADGED_FIRST_TAB_X=135
 ATTACH_XREGION_CLICK_BEFORE=$(count_attach_to "$SESSION")
@@ -509,10 +537,11 @@ echo "PHASE 9 PASS: relaunched client rebuilt two regions from the server tree"
 
 # ── Phase 10: cross-region tab click on the adopted layout ────────
 # The adopted strip's order follows the server's SessionList, which is not
-# guaranteed to be creation order, so this phase is order-independent: alt+3
-# moves the selection off the first tab (a fresh SessionList always activates
-# tab 0), the click on tab 0 must then attach a DIFFERENT session, and every
-# typed key must be routed to that clicked session.
+# guaranteed to be creation order, so this phase is order-independent:
+# ctrl+Prior moves the selection off the first tab and into the second region
+# (adoption restores tab 0, so the wrap lands on the last tab), the click on
+# tab 0 must then attach a DIFFERENT session, and every typed key must be
+# routed to that clicked session.
 latest_attach_session() {
     python3 - "$RECORD" <<'PY'
 import json
@@ -536,19 +565,19 @@ print(found)
 PY
 }
 ATTACH_ANY_BEFORE=$(count_client AttachSessions)
-send_keys alt+3
+send_keys ctrl+Prior
 if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
-    fail "phase 10: alt+3 never switched tabs on the adopted layout"
+    fail "phase 10: ctrl+Prior never switched tabs on the adopted layout"
 fi
-ALT3_SESSION=$(latest_attach_session) || fail "phase 10: no attach recorded after alt+3"
+PARKED_SESSION=$(latest_attach_session) || fail "phase 10: no attach recorded after ctrl+Prior"
 ATTACH_ANY_BEFORE=$(count_client AttachSessions)
 click_terminal_at "$BADGED_FIRST_TAB_X" "$TITLEBAR_Y"
 if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
     fail "phase 10: clicking the first titlebar tab attached nothing on the adopted layout"
 fi
 CLICKED_SESSION=$(latest_attach_session) || fail "phase 10: no attach recorded after the click"
-if [ "$CLICKED_SESSION" = "$ALT3_SESSION" ]; then
-    fail "phase 10: the tab click re-attached $ALT3_SESSION instead of switching tabs"
+if [ "$CLICKED_SESSION" = "$PARKED_SESSION" ]; then
+    fail "phase 10: the tab click re-attached $PARKED_SESSION instead of switching tabs"
 fi
 KEYS_CLICKED_BEFORE=$(count_keys_to "$CLICKED_SESSION")
 type_text "echo TAB_CLICK_ADOPTED_FOCUS"
@@ -566,12 +595,12 @@ echo "PHASE 10 PASS: cross-region tab click stays live on the adopted layout (cl
 # clicks stayed green). An engaged drag that never reordered must select the
 # pressed tab on release.
 ATTACH_ANY_BEFORE=$(count_client AttachSessions)
-send_keys alt+3
+send_keys ctrl+Prior
 if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
-    fail "phase 11: alt+3 never moved the selection off the first tab"
+    fail "phase 11: ctrl+Prior never moved the selection off the first tab"
 fi
 JITTER_BASE_SESSION=$(latest_attach_session) \
-    || fail "phase 11: no attach recorded after alt+3"
+    || fail "phase 11: no attach recorded after ctrl+Prior"
 ATTACH_ANY_BEFORE=$(count_client AttachSessions)
 jitter_click_terminal_at "$BADGED_FIRST_TAB_X" "$TITLEBAR_Y"
 if ! wait_for_count_growth "count_client AttachSessions" "$ATTACH_ANY_BEFORE" 15; then
