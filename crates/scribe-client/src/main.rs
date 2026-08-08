@@ -368,6 +368,34 @@ impl AiChrome {
         self.prompts.entry(session_id).or_insert(prompts);
     }
 
+    /// Adopt the server's view of every listed session's AI chrome.
+    ///
+    /// This is what makes a client restart against a surviving server
+    /// non-destructive: the prompt bar, the indicator state, and the provider
+    /// all come back from the `SessionList` reply instead of waiting for the
+    /// provider's next hook event, which an idle conversation never sends.
+    /// Prompt history goes through [`Self::restore_prompts`], so a
+    /// `PromptReceived` that beat the list still wins.
+    fn seed_from_session_list(&mut self, sessions: &[SessionInfo]) {
+        for info in sessions {
+            let session_id = info.session_id;
+            if let Some(prompts) = info.prompt_state.clone() {
+                let conversation_id =
+                    info.ai_state.as_ref().and_then(|state| state.conversation_id.clone());
+                self.restore_prompts(session_id, prompts.into(), conversation_id);
+            }
+            if let Some(ai_state) = info.ai_state.clone() {
+                self.tracker.update(session_id, ai_state);
+            }
+            // After `update`, which files the live state's own provider: the
+            // hint is the fallback for a session whose visible state is gone
+            // but whose provider-aware behaviour must survive the reattach.
+            if let Some(provider) = info.ai_provider_hint {
+                self.tracker.remember_provider(session_id, provider);
+            }
+        }
+    }
+
     /// Note the conversation an AI state edge belongs to, retiring the session's
     /// prompt history when it names a *different* conversation than the last
     /// one seen.
@@ -10251,11 +10279,29 @@ fn on_session_list(
         metadata.seed_from_session_list(sessions, workspaces);
     });
     if first_on_connection {
+        seed_ai_chrome_from_session_list(ctx, sessions);
         reattach_visible_sessions(ctx, sessions)?;
     }
     let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
     sync_tab_strip(ctx, sessions, attached)?;
     request_initial_session(ctx, sessions.len(), first_on_connection)
+}
+
+/// Seed [`AiChrome`] from the server's view of every listed session.
+///
+/// The counterpart to [`ChromeMetadata::seed_from_session_list`] for the AI
+/// half of the chrome. A client that reconnects to a surviving server gets its
+/// prompt bars and AI indicators back from this list instead of staying blank
+/// until the provider happens to emit the next hook event — which, for an idle
+/// conversation, may be never.
+///
+/// Only the first list of a connection seeds: a later list is a topology
+/// refresh, and re-applying `ai_state` there would resurrect an attention
+/// state the user has already dismissed with a keystroke
+/// ([`AiStateTracker::clear_attention_states`]), which the server never hears
+/// about.
+fn seed_ai_chrome_from_session_list(ctx: &ReaderCtx, sessions: &[SessionInfo]) {
+    update_ai_chrome(ctx, |ai| ai.seed_from_session_list(sessions));
 }
 
 /// Create the login shell that makes a genuinely fresh window useful.
@@ -11347,6 +11393,58 @@ mod tests {
         // Back to work: the timer resumes from the original prompt instant.
         ai.apply_state_change(session, edge(AiState::Processing), at(500));
         assert_eq!(shown(&ai, at(520)).as_deref(), Some("7m 00s"));
+    }
+
+    // @lat: [[client#GPUI Client Spike#Hot Restart Reattach#Session list seeds the AI chrome]]
+    #[test]
+    fn session_list_seeds_the_prompt_bar_and_the_indicator() {
+        let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
+        let session = SessionId::new();
+        let mut ai_state = scribe_common::ai_state::AiProcessState::new_with_provider(
+            scribe_common::ai_state::AiProvider::ClaudeCode,
+            scribe_common::ai_state::AiState::Processing,
+        );
+        ai_state.conversation_id = Some("conv-42".to_owned());
+        let info = SessionInfo {
+            session_id: session,
+            workspace_id: WorkspaceId::new(),
+            shell_name: String::from("bash"),
+            title: None,
+            context: None,
+            task_label: None,
+            codex_task_label: None,
+            cwd: None,
+            git_branch: None,
+            ai_state: Some(ai_state),
+            ai_provider_hint: Some(scribe_common::ai_state::AiProvider::ClaudeCode),
+            prompt_state: Some(scribe_common::protocol::SessionPromptState {
+                prompt_count: 2,
+                first_prompt: Some("build the thing".to_owned()),
+                latest_prompt: Some("now ship it".to_owned()),
+                latest_prompt_at: Some(1_700_000_000),
+                latest_prompt_finished_at: None,
+            }),
+        };
+
+        ai.seed_from_session_list(std::slice::from_ref(&info));
+
+        let bar = ai.visible_prompts(session).expect("a reattached pane paints its prompt bar");
+        assert_eq!(bar.prompt_count, 2);
+        assert_eq!(bar.first_prompt.as_deref(), Some("build the thing"));
+        assert_eq!(
+            bar.latest_prompt_at,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(
+            ai.tracker.provider_for_session(session),
+            Some(scribe_common::ai_state::AiProvider::ClaudeCode),
+            "the indicator comes back without waiting for a hook event"
+        );
+
+        // The resumed provider re-announcing its own id is not a switch, so the
+        // seeded bar survives the first live state edge.
+        ai.note_conversation(session, "conv-42");
+        assert!(ai.visible_prompts(session).is_some());
     }
 
     #[test]

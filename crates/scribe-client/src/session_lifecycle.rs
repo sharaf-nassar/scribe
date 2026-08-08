@@ -496,6 +496,7 @@ mod tests {
             git_branch: None,
             ai_state: None,
             ai_provider_hint: None,
+            prompt_state: None,
         }
     }
 
