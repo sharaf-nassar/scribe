@@ -309,11 +309,23 @@ e2e-visual-settings-scrollbar:
 e2e-visual-tab-switching:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/tab-switching-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/tab-switching.sh
 
+# Run the maximized-restore E2E. It stops the client with SIGTERM the way the
+# package upgrade does and relaunches it, so it needs room for two client
+# starts.
+e2e-visual-maximized-restore:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/maximized-restore.sh
+
+# Run the Ctrl+click link E2E. It installs a stand-in `xdg-open` inside the
+# container to observe what the client asked the OS to open, and drives a real
+# shell for the CWD phase, so it needs more than the default budget.
+e2e-visual-terminal-links:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-links-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/terminal-links.sh
+
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll
 # on, and the run relaunches the client twice so it needs a longer budget.
 e2e-visual-window-lifecycle:
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/window-lifecycle.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/window-lifecycle.sh
 
 # Run the cold-restart restore E2E against the real client. No wire tap: the run
 # restarts the real server, and the tap renames the socket `scribe-test server`
@@ -580,6 +592,7 @@ e2e-all-visual: build-release docker-visual
         'visual/lan-approval.sh|e2e-visual-lan-approval'
         'visual/layout-restore.sh|e2e-visual-layout-restore'
         'visual/mouse-reporting.sh|e2e-visual-mouse-reporting'
+        'visual/maximized-restore.sh|e2e-visual-maximized-restore'
         'visual/multi-window-restore.sh|e2e-visual-multi-window-restore'
         'visual/notifications.sh|e2e-visual-notifications'
         'visual/overlay-actions.sh|e2e-visual-shared'
@@ -607,6 +620,7 @@ e2e-all-visual: build-release docker-visual
         'visual/terminal-image-renderer.sh|e2e-visual'
         'visual/terminal-images-frame-stability.sh|e2e-visual'
         'visual/terminal-images-visual.sh|e2e-visual'
+        'visual/terminal-links.sh|e2e-visual-terminal-links'
         'visual/terminal-viewport.sh|e2e-visual-terminal-viewport'
         'visual/terminal-zoom.sh|e2e-visual-terminal-zoom'
         'visual/titlebar.sh|e2e-visual'

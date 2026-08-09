@@ -328,6 +328,9 @@ pub struct TerminalElement {
     /// Mouse-selection runs for this frame, already projected onto the visible
     /// viewport. Empty whenever the pane holds no selection.
     selection: Vec<SelectionSpan>,
+    /// Rows of the Ctrl-hovered link for this frame. Empty on every frame with
+    /// no link under the pointer, which is almost all of them.
+    link_underline: Vec<SelectionSpan>,
     /// IME plumbing for this frame. `None` on every unfocused pane: only one
     /// pane composes, and registering two handlers would race for the platform
     /// slot.
@@ -371,6 +374,7 @@ impl TerminalElement {
             highlights: Vec::new(),
             highlight_colors,
             selection: Vec::new(),
+            link_underline: Vec::new(),
             ime: None,
             cursor: None,
             scrollbar: None,
@@ -390,29 +394,34 @@ impl TerminalElement {
     ///
     /// Every pane showing a session passes one: the thumb is per-pane state
     /// (each pane scrolls its own scrollback), unlike the IME registration
-    /// which is a window-wide singleton.
+    /// which is a window-wide singleton. `None` before a session is attached.
+    ///
+    /// This and the two below take the `Option` the field already holds, so a
+    /// pane that gets nothing says so in the builder chain instead of guarding
+    /// the call — which is what turned four of these into `if` statements
+    /// around a single assignment at the one call site.
     #[must_use]
-    pub fn with_scrollbar(mut self, scrollbar: ScrollbarPaint) -> Self {
-        self.scrollbar = Some(scrollbar);
+    pub fn with_scrollbar(mut self, scrollbar: Option<ScrollbarPaint>) -> Self {
+        self.scrollbar = scrollbar;
         self
     }
 
     /// Serve the OS input method from this pane's paint pass.
     ///
-    /// Only the focused pane calls this: the platform holds one input handler
+    /// Only the focused pane passes one: the platform holds one input handler
     /// per window, and the composition belongs to the pane the keystrokes are
     /// going to.
     #[must_use]
-    pub fn with_ime(mut self, ime: ImePaint) -> Self {
-        self.ime = Some(ime);
+    pub fn with_ime(mut self, ime: Option<ImePaint>) -> Self {
+        self.ime = ime;
         self
     }
 
     /// Paint the focused pane's shell cursor with this frame's focus/blink
-    /// state.
+    /// state. `None` on every unfocused pane.
     #[must_use]
-    pub fn with_cursor(mut self, cursor: CursorPaint) -> Self {
-        self.cursor = Some(cursor);
+    pub fn with_cursor(mut self, cursor: Option<CursorPaint>) -> Self {
+        self.cursor = cursor;
         self
     }
 
@@ -432,6 +441,16 @@ impl TerminalElement {
     #[must_use]
     pub fn with_selection(mut self, selection: Vec<SelectionSpan>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Rule the cells of the link the pointer is over while Ctrl is held.
+    ///
+    /// One span per viewport row, because a wrapped or hard-break-joined link
+    /// is not a rectangle: its continuation rows start at their own indent.
+    #[must_use]
+    pub fn with_link_underline(mut self, rows: Vec<SelectionSpan>) -> Self {
+        self.link_underline = rows;
         self
     }
 
@@ -529,16 +548,13 @@ impl TerminalElement {
             )),
             cursor: opaque_slot(linear_to_srgb_rgba(self.colors.cells.cursor_color())),
         };
-        self.paint_selection_overlay(
-            overlay,
-            &SelectionOverlayPaint {
-                resolved_rows: &resolved_rows,
-                variants: &variants,
-                thickness,
-            },
-            window,
-            cx,
-        );
+        // The two overlays that repaint resolved cells share their inputs, so
+        // they share one bundle: neither can be handed a different view of the
+        // cells the phases above already painted.
+        let cells =
+            SelectionOverlayPaint { resolved_rows: &resolved_rows, variants: &variants, thickness };
+        self.paint_selection_overlay(overlay, &cells, window, cx);
+        self.paint_link_underline(overlay, &cells, window);
         paint_block_cursor(
             cursor,
             overlay,
@@ -700,6 +716,52 @@ impl TerminalElement {
                     "terminal image placement paint failed"
                 );
                 note_renderer_failure(&images.cache, &error, session_id, window);
+            }
+        }
+    }
+
+    /// Rule the Ctrl-hovered link, one quad per row segment.
+    ///
+    /// Drawn after the selection overlay so a link inside a selection still
+    /// shows its rule, and in each cell's own resolved foreground so the rule
+    /// reads as an underline of that text rather than as separate chrome —
+    /// which is also why it is a quad rather than a `TextRun` underline: the
+    /// cells were already shaped and painted by phase 4, and the hover must not
+    /// reshape them.
+    fn paint_link_underline(
+        &self,
+        overlay: OverlayGeometry,
+        cells: &SelectionOverlayPaint<'_>,
+        window: &mut Window,
+    ) {
+        let thickness = cells.thickness;
+        for span in &self.link_underline {
+            let Some(resolved) = cells.resolved_rows.get(span.row) else { continue };
+            let end = span.end_col.min(resolved.len().saturating_sub(1));
+            if span.start_col > end {
+                continue;
+            }
+            // The baseline sits above the cell's bottom edge, so the rule is
+            // inset by its own thickness rather than flush with the row below.
+            let top = overlay.bounds.top()
+                + overlay.line_height * grid_f32(span.row)
+                + overlay.line_height
+                - thickness * 2.;
+            for (offset, cell) in resolved
+                .get(span.start_col..=end)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            {
+                let left = overlay.bounds.left()
+                    + px(overlay.cell_width * grid_f32(span.start_col.saturating_add(offset)));
+                // A double-width glyph's spacer cell is filtered out above, so
+                // the rule under the glyph has to span both of its columns.
+                let columns = 1 + u8::from(cell.flags.contains(Flags::WIDE_CHAR));
+                let width = px(overlay.cell_width * f32::from(columns));
+                let rule = Bounds::new(point(left, top), size(width, thickness));
+                window.paint_quad(fill(rule, cell.fg));
             }
         }
     }

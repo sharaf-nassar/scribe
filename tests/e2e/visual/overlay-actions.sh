@@ -45,10 +45,12 @@ MENU_CLICK_Y=300
 
 # Offset of the last context-menu row ("Send Text: …") from the click point.
 # The box is anchored at the cursor with a 4px pad; above the last row sit the
-# three copy-head rows, one divider, "Open URL", and "Copy hyperlink address".
-# Calibrated against 02-context-menu-open.png — a menu layout change turns into
+# three copy-head rows (31px each) and one divider (9px). The open rows are NOT
+# among them: this phase right-clicks blank grid, and "Open URL" / "Open File" /
+# "Copy hyperlink address" only appear over a cell that actually carries a link.
+# Calibrated against 01-context-menu-open.png — a menu layout change turns into
 # a failing phase here rather than a silent miss.
-MENU_ROW_SEND_DY=184
+MENU_ROW_SEND_DY=122
 MENU_ROW_DX=60
 
 # Extra lit pixels the echoed command must add to the grid. The row types

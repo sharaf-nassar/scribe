@@ -56,6 +56,7 @@ use scribe_client::terminal_image_scene::{
     CommittedImageScene, LiveImageScene, LiveSceneApply, LiveSceneError,
     filter_terminal_image_placeholders,
 };
+use scribe_client::url_detect::{PaneUrlCache, SpanKind};
 use scribe_client::vi_mode::{self, ViMotion};
 use vte::ansi::{Color, CursorShape as TerminalCursorShape, Handler as _};
 
@@ -226,6 +227,24 @@ impl alacritty_terminal_gpui::grid::Dimensions for TerminalDimensions {
 }
 
 /// Alacritty terminal with Zed's display-only ownership model.
+/// A link the pointer is over: what activating it opens, and where to draw it.
+///
+/// One value serves both consumers so the underline can never cover a
+/// different span than the one a click would follow.
+pub struct HoveredLink {
+    /// Whether this is an explicit OSC 8 hyperlink, a heuristic URL, or a path.
+    /// Each opens through a different route: OSC 8 through the scheme-allowlist
+    /// gate, a URL through the allowlist directly, a path through the OS
+    /// handler with the pane's CWD.
+    pub kind: SpanKind,
+    /// The URI or path text, verbatim.
+    pub target: String,
+    /// The viewport rows the span covers, one span per row. A wrapped or
+    /// hard-break-joined link covers several, and a continuation row starts at
+    /// its indent rather than column 0.
+    pub rows: Vec<SelectionSpan>,
+}
+
 pub struct DisplayOnlyTerminal {
     term: Term<VoidListener>,
     output_processor: vte::ansi::Processor,
@@ -248,6 +267,10 @@ pub struct DisplayOnlyTerminal {
     /// Atomically published CPU-only terminal-image state. GPU resources stay
     /// outside this model and land with the renderer bead.
     image_scene: LiveImageScene,
+    /// Detected URL / path / OSC 8 spans over the visible grid, rescanned
+    /// lazily. Invalidated by [`Self::make_content`], which is the one place
+    /// every path that can move a visible cell already funnels through.
+    urls: PaneUrlCache,
     /// Scrollback capacity this grid was built with, restored after a
     /// [`Self::trim_history`] shrinks the ring to drop rows.
     scrollback_lines: usize,
@@ -269,6 +292,7 @@ impl DisplayOnlyTerminal {
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
             image_scene: LiveImageScene::default(),
+            urls: PaneUrlCache::new(),
         };
         terminal.make_content();
         terminal
@@ -741,6 +765,42 @@ impl DisplayOnlyTerminal {
         rules.action_candidates_at(&self.term, self.selection_point(at))
     }
 
+    /// The URL, path, or OSC 8 hyperlink under a viewport cell, with the
+    /// viewport rows its underline covers.
+    ///
+    /// Takes `&mut self` because the scan is lazy: the cache rescans here on
+    /// the first lookup after the grid moved, so an idle pane pays nothing and
+    /// a pointer resting on one cell pays once.
+    ///
+    /// The row mapping is the plain `row - display_offset` the scanner itself
+    /// uses, not [`Self::selection_point`]'s split-scroll-aware one, so the
+    /// underline lands on exactly the cells the scan matched. Inside a
+    /// split-scroll pin the two disagree and links under the pinned rows are
+    /// not offered — the scanner has no notion of the pin either, so hit-testing
+    /// them against it would only underline the wrong cells.
+    #[must_use]
+    pub fn link_at(&mut self, at: ViewportPoint) -> Option<HoveredLink> {
+        if self.content.pin_rows > 0 {
+            return None;
+        }
+        self.urls.refresh(&self.term);
+        let display_offset = grid_i32(self.display_offset());
+        let span = self.urls.url_at(grid_i32(at.row) - display_offset, at.col)?;
+        let rows = span
+            .segments
+            .iter()
+            .filter_map(|segment| {
+                let row = usize::try_from(segment.row.saturating_add(display_offset)).ok()?;
+                (row < self.content.rows.len()).then_some(SelectionSpan {
+                    row,
+                    start_col: segment.col_start,
+                    end_col: segment.col_end,
+                })
+            })
+            .collect();
+        Some(HoveredLink { kind: span.kind, target: span.url.clone(), rows })
+    }
+
     /// The grid line a viewport row reads from.
     ///
     /// Outside the split-scroll pin this is just the row shifted by the display
@@ -787,6 +847,10 @@ impl DisplayOnlyTerminal {
     /// active the trailing [`Content::pin_rows`] rows are read from the live
     /// screen instead, anchored on the shell cursor.
     fn make_content(&mut self) {
+        // Every path that can move a visible cell — a parse, a scroll, a
+        // resize, a history trim, a vi motion — rebuilds the snapshot here, so
+        // this is the one place the link scan has to be invalidated from.
+        self.urls.mark_dirty();
         let lines = self.term.screen_lines();
         let columns = self.term.columns();
         let display_offset = grid_i32(self.display_offset());
@@ -1179,6 +1243,40 @@ mod tests {
 
     fn pinned() -> SplitScrollEligibility {
         SplitScrollEligibility { scroll_pin_enabled: true, ai_provider_enabled: true }
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Link lookup follows the scrolled viewport]]
+    #[gpui::test]
+    fn link_lookup_follows_the_scrolled_viewport() {
+        let mut terminal = DisplayOnlyTerminal::new(40, 3);
+        terminal.feed_output(b"see https://example.com/a\r\nrun ./build.sh\r\nplain");
+
+        // Row 0 is the URL line: every cell of the URL resolves to one span
+        // carrying the whole thing, and the words around it resolve to nothing.
+        let link = terminal.link_at(ViewportPoint { row: 0, col: 6 }).expect("URL under the cell");
+        assert!(matches!(link.kind, SpanKind::Url));
+        assert_eq!(link.target, "https://example.com/a");
+        assert_eq!(link.rows, vec![SelectionSpan { row: 0, start_col: 4, end_col: 24 }]);
+        assert!(terminal.link_at(ViewportPoint { row: 0, col: 1 }).is_none());
+
+        // A relative path is a Path, not a URL: the two open through different
+        // routes, and only one of them is resolved against the pane's CWD.
+        let path = terminal.link_at(ViewportPoint { row: 1, col: 6 }).expect("path under the cell");
+        assert!(matches!(path.kind, SpanKind::Path));
+        assert_eq!(path.target, "./build.sh");
+        assert_eq!(path.rows, vec![SelectionSpan { row: 1, start_col: 4, end_col: 13 }]);
+
+        // Push both lines into scrollback, then scroll one row back up. The same
+        // viewport row now paints different content, so the lookup has to answer
+        // for what is there now — a cache that outlived the scroll would still
+        // hand back the URL that used to be on row 0.
+        terminal.feed_output(b"\r\nmore\r\nlines");
+        assert!(terminal.link_at(ViewportPoint { row: 0, col: 6 }).is_none());
+        assert!(terminal.scroll(Scroll::Delta(1)));
+        let scrolled =
+            terminal.link_at(ViewportPoint { row: 0, col: 6 }).expect("path after the scroll");
+        assert_eq!(scrolled.target, "./build.sh");
+        assert_eq!(scrolled.rows, vec![SelectionSpan { row: 0, start_col: 4, end_col: 13 }]);
     }
 
     // @lat: [[test#GPUI Terminal Viewport#Scrolling paints scrollback and returns to the live bottom]]

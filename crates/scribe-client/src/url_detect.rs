@@ -1073,27 +1073,7 @@ pub fn open_path(raw: &str, cwd: Option<&std::path::Path>) {
 
     // Parse optional :N line-number suffix.
     let (path_str, line_num) = parse_path_line_suffix(raw);
-
-    // Expand ~/
-    let expanded: String = path_str.strip_prefix("~/").map_or_else(
-        || path_str.to_owned(),
-        |rel| {
-            std::env::var("HOME").ok().map_or_else(
-                || path_str.to_owned(),
-                |home| format!("{}/{rel}", home.trim_end_matches('/')),
-            )
-        },
-    );
-
-    // Resolve relative paths against cwd.
-    let resolved = if expanded.starts_with('/') {
-        expanded
-    } else {
-        match cwd {
-            Some(base) => base.join(&expanded).to_string_lossy().into_owned(),
-            None => expanded,
-        }
-    };
+    let resolved = resolve_path(path_str, cwd);
 
     #[cfg(target_os = "linux")]
     let open_cmd = "xdg-open";
@@ -1120,6 +1100,48 @@ pub fn open_path(raw: &str, cwd: Option<&std::path::Path>) {
         Ok(_child) => {}
         Err(e) => tracing::warn!("open_path: failed to spawn {open_cmd}: {e}"),
     }
+}
+
+/// Resolve a detected path into what the OS handler should be given: `~/`
+/// expanded, a relative path joined onto the pane's working directory, and the
+/// `./` the detector matched on dropped.
+///
+/// `cwd` is the directory of the shell the path was printed by, not this
+/// process's — a relative path in a terminal means "relative to that pane", and
+/// the client's own directory has nothing to do with it. Without one the path
+/// is handed over as-is rather than resolved against a guess: the OS handler
+/// failing on a relative path is a visible, correct failure, where opening the
+/// wrong file silently is not.
+///
+/// `..` segments deliberately survive. Collapsing them lexically names a
+/// different file whenever a symlink sits on the path, and the OS resolves them
+/// correctly anyway; `.` carries no such risk, so it goes.
+fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> String {
+    let expanded: String = path.strip_prefix("~/").map_or_else(
+        || path.to_owned(),
+        |rel| {
+            std::env::var("HOME").ok().map_or_else(
+                || path.to_owned(),
+                |home| format!("{}/{rel}", home.trim_end_matches('/')),
+            )
+        },
+    );
+    if expanded.starts_with('/') {
+        return tidy_absolute(std::path::Path::new(&expanded));
+    }
+    // Only ever called with an absolute path: `std::path::absolute` would
+    // otherwise resolve against *this* process's directory, which is the one
+    // answer this function exists to avoid.
+    match cwd {
+        Some(base) if base.is_absolute() => tidy_absolute(&base.join(&expanded)),
+        Some(base) => base.join(&expanded).to_string_lossy().into_owned(),
+        None => expanded,
+    }
+}
+
+/// Drop the `.` components from an already-absolute path.
+fn tidy_absolute(path: &std::path::Path) -> String {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
 /// Split a raw path string into `(path, optional_line_number)`.
@@ -1207,7 +1229,7 @@ mod tests {
 
     use super::{
         HardBreakContext, LogicalCell, Osc8CellRange, PaneUrlCache, RowSegment, SpanKind,
-        hard_break_continuation_start, segments_from_cells,
+        hard_break_continuation_start, resolve_path, segments_from_cells,
     };
 
     #[derive(Clone, Copy)]
@@ -1409,5 +1431,35 @@ mod tests {
 
         assert_eq!(spans.len(), 2);
         assert!(spans.iter().all(|span| span.0 == "https://example.com/target"));
+    }
+
+    // @lat: [[test#GPUI URL Detection#A relative path resolves against the pane's CWD]]
+    #[test]
+    fn a_relative_path_resolves_against_the_panes_cwd() {
+        let cwd = std::path::Path::new("/srv/project");
+
+        // The detector matches `./name`, so the `./` has to come back off
+        // before the path reaches the OS handler.
+        assert_eq!(resolve_path("./build.sh", Some(cwd)), "/srv/project/build.sh");
+        assert_eq!(resolve_path("docs/index.md", Some(cwd)), "/srv/project/docs/index.md");
+
+        // `..` survives: collapsing it here would name a different file
+        // whenever a symlink sits on the path.
+        assert_eq!(resolve_path("../sibling/x", Some(cwd)), "/srv/project/../sibling/x");
+
+        // An absolute path ignores the CWD entirely but still loses its `.`.
+        assert_eq!(resolve_path("/etc/./hosts", Some(cwd)), "/etc/hosts");
+
+        // With no CWD the path is handed over unresolved rather than resolved
+        // against this process's directory, which is not the shell's.
+        assert_eq!(resolve_path("./build.sh", None), "./build.sh");
+
+        // `~/` expands from `$HOME` and ignores the pane's CWD, so the result
+        // is whatever this environment's home is — asserted as a prefix rather
+        // than a literal so the test does not mutate process-global state.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(resolve_path("~/notes.md", Some(cwd)), format!("{home}/notes.md"));
+        }
     }
 }

@@ -41,6 +41,7 @@ RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 SESSION="${SESSION:?the entrypoint must export a created SESSION}"
+HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 
 # Titlebar geometry from crates/scribe-client/src/titlebar.rs: the client band
 # is 34 px tall and each tab is a fixed 176 px wide. This shared-pane rig runs
@@ -101,6 +102,35 @@ PY
 
 count_client() { count_frames client "$1"; }
 count_server() { count_frames server "$1"; }
+
+count_server_to() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json
+import sys
+
+path, wanted, session_id = sys.argv[1:]
+total = 0
+try:
+    handle = open(path)
+except OSError:
+    print(0)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if (
+            row.get("dir") == "server"
+            and message.get("type") == wanted
+            and message.get("session_id") == session_id
+        ):
+            total += 1
+print(total)
+PY
+}
 
 # Count client KeyInput frames addressed to one session. This is the focus
 # oracle for sessions the client itself created: `scribe-test wait-output`
@@ -201,6 +231,66 @@ print(cols)
 PY
 }
 
+attach_rows_for() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+rows = ""
+try:
+    handle = open(path)
+except OSError:
+    print(rows)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != "client":
+            continue
+        message = row.get("message", {})
+        if message.get("type") != "AttachSessions":
+            continue
+        ids = message.get("session_ids", [])
+        dimensions = message.get("dimensions", [])
+        if session_id in ids:
+            index = ids.index(session_id)
+            if index < len(dimensions):
+                rows = dimensions[index].get("rows", "")
+print(rows)
+PY
+}
+
+replay_rows_for() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json
+import sys
+
+path, session_id = sys.argv[1:]
+rows = ""
+try:
+    handle = open(path)
+except OSError:
+    print(rows)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != "server":
+            continue
+        message = row.get("message", {})
+        if message.get("type") == "SessionReplay" and message.get("session_id") == session_id:
+            rows = message.get("replay", {}).get("rows", "")
+print(rows)
+PY
+}
+
 # Columns the client's own layout pass last published for a pane. This is the
 # measured truth the announced size is checked against: `publish_pane_sizes`
 # logs it after dividing the painted pane rect by the live cell box.
@@ -215,6 +305,14 @@ published_cols() {
         | grep -a "published a pane's grid size" \
         | tail -1) || true
     printf '%s' "$line" | sed -n 's/.*cols=\([0-9][0-9]*\).*/\1/p'
+}
+
+published_rows() {
+    local line
+    line=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" 2>/dev/null \
+        | grep -a "published a pane's grid size" \
+        | tail -1) || true
+    printf '%s' "$line" | sed -n 's/.*rows=\([0-9][0-9]*\).*/\1/p'
 }
 
 wait_for_count_growth() {
@@ -235,6 +333,11 @@ wait_for_count_growth() {
 wait_for_attach_to() {
     local session_id="$1" baseline="$2" timeout_secs="${3:-15}"
     wait_for_count_growth "count_attach_to '$session_id'" "$baseline" "$timeout_secs"
+}
+
+wait_for_server_to() {
+    local message="$1" session_id="$2" baseline="$3" timeout_secs="${4:-15}"
+    wait_for_count_growth "count_server_to '$message' '$session_id'" "$baseline" "$timeout_secs"
 }
 
 latest_created_session_after() {
@@ -368,25 +471,70 @@ NEW_SESSION=$(latest_created_session_after "$CREATED_BEFORE") \
 shot /output/01-tab-switching-new-tab.png
 echo "PHASE 1 PASS: ctrl+shift+t created tab session $NEW_SESSION"
 
+# Give the hidden original tab one Scribe prompt row. The selected new tab has
+# none, so the two sessions now require different PTY row counts in the same
+# pane. This is the discriminating state for both switch directions below.
+PLAIN_ROWS=$(published_rows)
+[ -n "$PLAIN_ROWS" ] || fail "phase 1: no published plain-tab row count"
+PROMPTS_BEFORE=$(count_server_to PromptReceived "$SESSION")
+SCRIBE_HOOK_SOCK="$HOOK_SOCK" SCRIBE_SESSION_ID="$SESSION" scribe-hook-helper \
+    --provider=claude_code --event=prompt_received --text="tab switch geometry"
+if ! wait_for_server_to PromptReceived "$SESSION" "$PROMPTS_BEFORE" 15; then
+    fail "phase 1: the server never sent the prompt state for $SESSION"
+fi
+echo "PHASE 1 PASS: hidden tab $SESSION now owns prompt chrome"
+
 # ── Phase 2: keyboard switch back to the original tab ─────────────
+# @lat: [[test#Visual E2E Tests#Tab switching is live#First replay uses selected tab prompt geometry]]
 ATTACH_ORIGINAL_BEFORE=$(count_attach_to "$SESSION")
+REPLAY_ORIGINAL_BEFORE=$(count_server_to SessionReplay "$SESSION")
 send_keys ctrl+Prior
 if ! wait_for_attach_to "$SESSION" "$ATTACH_ORIGINAL_BEFORE" 15; then
     fail "phase 2: ctrl+Prior never switched back to $SESSION"
 fi
+if ! wait_for_server_to SessionReplay "$SESSION" "$REPLAY_ORIGINAL_BEFORE" 15; then
+    fail "phase 2: the switched-to prompt tab never received its attach replay"
+fi
+AI_ATTACH_ROWS=$(attach_rows_for "$SESSION")
+AI_REPLAY_ROWS=$(replay_rows_for "$SESSION")
+if [ -z "$AI_ATTACH_ROWS" ] || [ -z "$AI_REPLAY_ROWS" ]; then
+    fail "phase 2: missing prompt-tab geometry (attach=${AI_ATTACH_ROWS:-none}, replay=${AI_REPLAY_ROWS:-none})"
+fi
+if [ "$AI_ATTACH_ROWS" != "$AI_REPLAY_ROWS" ]; then
+    fail "phase 2: prompt-tab attach announced $AI_ATTACH_ROWS rows but its first replay used $AI_REPLAY_ROWS"
+fi
+if [ "$AI_ATTACH_ROWS" -ge "$PLAIN_ROWS" ]; then
+    fail "phase 2: prompt-tab first replay kept $AI_ATTACH_ROWS rows; plain tab had $PLAIN_ROWS, so prompt chrome was not reserved before paint"
+fi
 shot /output/02-tab-switching-key-prev.png
-echo "PHASE 2 PASS: ctrl+Prior attached $SESSION"
+echo "PHASE 2 PASS: ctrl+Prior attached $SESSION and first replay reserved prompt rows ($PLAIN_ROWS -> $AI_ATTACH_ROWS)"
 
 # ── Phase 3: keyboard switch forward to the new tab ───────────────
 ATTACH_NEW_BEFORE=$(count_attach_to "$NEW_SESSION")
+REPLAY_NEW_BEFORE=$(count_server_to SessionReplay "$NEW_SESSION")
 send_keys ctrl+Next
 if ! wait_for_attach_to "$NEW_SESSION" "$ATTACH_NEW_BEFORE" 15; then
     fail "phase 3: ctrl+Next never switched forward to $NEW_SESSION"
 fi
+if ! wait_for_server_to SessionReplay "$NEW_SESSION" "$REPLAY_NEW_BEFORE" 15; then
+    fail "phase 3: the switched-to plain tab never received its attach replay"
+fi
+PLAIN_ATTACH_ROWS=$(attach_rows_for "$NEW_SESSION")
+PLAIN_REPLAY_ROWS=$(replay_rows_for "$NEW_SESSION")
+if [ -z "$PLAIN_ATTACH_ROWS" ] || [ -z "$PLAIN_REPLAY_ROWS" ]; then
+    fail "phase 3: missing plain-tab geometry (attach=${PLAIN_ATTACH_ROWS:-none}, replay=${PLAIN_REPLAY_ROWS:-none})"
+fi
+if [ "$PLAIN_ATTACH_ROWS" != "$PLAIN_REPLAY_ROWS" ]; then
+    fail "phase 3: plain-tab attach announced $PLAIN_ATTACH_ROWS rows but its first replay used $PLAIN_REPLAY_ROWS"
+fi
+if [ "$PLAIN_ATTACH_ROWS" != "$PLAIN_ROWS" ] || [ "$PLAIN_ATTACH_ROWS" -le "$AI_ATTACH_ROWS" ]; then
+    fail "phase 3: plain-tab first replay used $PLAIN_ATTACH_ROWS rows; expected restored $PLAIN_ROWS above prompt tab's $AI_ATTACH_ROWS"
+fi
 shot /output/03-tab-switching-key-next.png
 # Both tabs share this rig's single pane, so each switch must announce that
-# pane's own grid. An unshown tab has no placement, so `publish_pane_sizes`
-# has already dropped its `pane_sizes` entry; falling back to the window's
+# pane's own grid. Before attach used the selected tab's placement, the old
+# path attached an unshown tab before adopting it into the pane; its
+# `pane_sizes` entry had already been dropped, so falling back to the window's
 # fixed `WindowSeed` default resized the PTY to COLUMNS (120) and the
 # switched-to tab painted its replay wrapped at 120 before the layout's own
 # publish corrected it one round trip later — a visible reflow on every
@@ -407,6 +555,7 @@ if [ "$NEW_COLS" != "$PANE_COLS" ]; then
     fail "phase 3: the switch announced $NEW_COLS columns for $NEW_SESSION but the layout published $PANE_COLS for its pane"
 fi
 echo "PHASE 3 PASS: ctrl+Next attached $NEW_SESSION at the pane's own $NEW_COLS columns"
+echo "PHASE 3 PASS: plain-tab first replay reclaimed prompt rows ($AI_ATTACH_ROWS -> $PLAIN_ATTACH_ROWS)"
 
 # ── Phase 4: clicking the first titlebar tab switches back ────────
 ATTACH_ORIGINAL_CLICK_BEFORE=$(count_attach_to "$SESSION")

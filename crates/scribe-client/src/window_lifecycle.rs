@@ -83,6 +83,7 @@ pub struct WindowLifecycle {
     window_active: bool,
     focus: Option<SessionId>,
     siblings: Vec<WindowId>,
+    closed: bool,
 }
 
 impl Default for WindowLifecycle {
@@ -98,6 +99,7 @@ impl Default for WindowLifecycle {
             window_active: true,
             focus: None,
             siblings: Vec::new(),
+            closed: false,
         }
     }
 }
@@ -200,13 +202,26 @@ impl WindowLifecycle {
         }
         self.pending = None;
         self.exit = Some(ExitReason::WindowClosed);
+        self.closed = true;
         true
     }
 
     /// Take the acknowledged exit, if one is due. The foreground drains this on
-    /// its lifecycle tick and quits the app.
+    /// its lifecycle tick and tears the window down.
     pub fn take_exit(&mut self) -> Option<ExitReason> {
         self.exit.take()
+    }
+
+    /// Whether this window's own close was acknowledged, latched.
+    ///
+    /// [`Self::take_exit`] consumes the exit on the GPUI thread, so it cannot
+    /// answer this for the IPC thread, which needs a durable answer: the window
+    /// is gone but the server keeps the socket open, so the reader and its
+    /// supervisor stop on this rather than draining and redialling for a window
+    /// that no longer exists.
+    #[must_use]
+    pub const fn window_closed(&self) -> bool {
+        self.closed
     }
 
     /// Fold a `WindowList` reply into the remote-controller summary the status
@@ -305,17 +320,24 @@ mod tests {
         assert!(!lifecycle.begin_quit_all());
         // Requesting is not exiting: only the server's ack ends the window.
         assert_eq!(lifecycle.take_exit(), None);
+        assert!(!lifecycle.window_closed());
 
         assert!(lifecycle.on_window_closed(window_id));
         assert_eq!(lifecycle.pending(), None);
         assert_eq!(lifecycle.take_exit(), Some(ExitReason::WindowClosed));
         assert_eq!(lifecycle.take_exit(), None);
+        // The exit is one-shot but the closed latch is not: the IPC thread
+        // reads it after the GPUI thread has already drained the exit.
+        assert!(lifecycle.window_closed());
 
         let mut quitting = WindowLifecycle::new();
         assert!(quitting.begin_quit_all());
         assert_eq!(quitting.pending(), Some(PendingShutdown::QuitAll));
         quitting.on_quit_requested();
         assert_eq!(quitting.take_exit(), Some(ExitReason::QuitRequested));
+        // A quit-all ends the process, not this window's server-side identity:
+        // its sessions live on, so its backend must still be able to redial.
+        assert!(!quitting.window_closed());
 
         // A quit broadcast caused by another window still exits this one.
         let mut bystander = WindowLifecycle::new();
@@ -332,11 +354,14 @@ mod tests {
         // No close is pending at all.
         assert!(!lifecycle.on_window_closed(WindowId::new()));
         assert_eq!(lifecycle.take_exit(), None);
+        assert!(!lifecycle.window_closed());
 
         let mine = lifecycle.begin_close_window().unwrap();
-        // An ack naming somebody else's window leaves ours pending.
+        // An ack naming somebody else's window leaves ours pending, and must
+        // not tear this window's backend down either.
         assert!(!lifecycle.on_window_closed(WindowId::new()));
         assert_eq!(lifecycle.take_exit(), None);
+        assert!(!lifecycle.window_closed());
         assert_eq!(lifecycle.pending(), Some(PendingShutdown::CloseWindow { window_id: mine }));
         assert!(lifecycle.on_window_closed(mine));
         assert_eq!(lifecycle.take_exit(), Some(ExitReason::WindowClosed));

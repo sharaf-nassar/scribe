@@ -867,6 +867,17 @@ pub fn hit_test_workspace_divider(
     dividers.iter().find(|d| is_within_workspace_divider(d, mouse_x, mouse_y))
 }
 
+/// Return the full pointer target around a workspace divider line.
+pub fn workspace_divider_hit_rect(divider: &WorkspaceDivider) -> Rect {
+    let r = &divider.rect;
+    Rect {
+        x: r.x - WORKSPACE_HIT_TOLERANCE,
+        y: r.y - WORKSPACE_HIT_TOLERANCE,
+        width: r.width + WORKSPACE_HIT_TOLERANCE * 2.0,
+        height: r.height + WORKSPACE_HIT_TOLERANCE * 2.0,
+    }
+}
+
 /// Create a `WorkspaceDividerDrag` from a workspace divider.
 pub fn start_workspace_drag(divider: &WorkspaceDivider) -> WorkspaceDividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {
@@ -978,13 +989,7 @@ fn workspace_divider_rect_between(r1: &Rect, direction: SplitDirection) -> Rect 
 
 /// Check if a mouse position is within hit-test tolerance of a workspace divider.
 fn is_within_workspace_divider(divider: &WorkspaceDivider, mouse_x: f32, mouse_y: f32) -> bool {
-    let r = &divider.rect;
-    let expanded = Rect {
-        x: r.x - WORKSPACE_HIT_TOLERANCE,
-        y: r.y - WORKSPACE_HIT_TOLERANCE,
-        width: r.width + WORKSPACE_HIT_TOLERANCE * 2.0,
-        height: r.height + WORKSPACE_HIT_TOLERANCE * 2.0,
-    };
+    let expanded = workspace_divider_hit_rect(divider);
     mouse_x >= expanded.x
         && mouse_x <= expanded.x + expanded.width
         && mouse_y >= expanded.y

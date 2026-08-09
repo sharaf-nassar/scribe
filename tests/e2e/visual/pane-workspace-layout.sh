@@ -21,8 +21,9 @@
 #   * Ctrl+Tab cycles pane focus (the `cycle_pane` row);
 #   * Ctrl+Shift+W closes the focused pane and the server sees its session end;
 #   * Ctrl+Alt+\ splits the WINDOW into a second workspace region and
-#     Ctrl+Alt+Left moves focus back to the first — the outer layer of the tree,
-#     which is a different action family from the pane splits above.
+#     dragging that region divider resizes both panes and reports the new tree;
+#     Ctrl+Alt+Left then moves focus back to the first — the outer layer of the
+#     tree, which is a different action family from the pane splits above.
 #
 # Phase 0 is the same session-adoption dance `tab-window-chords.sh` documents:
 # the entrypoint creates $SESSION after the client launched, so the running
@@ -407,6 +408,34 @@ if ! plain_client_log | grep -qE 'split the window into a new workspace region.*
 fi
 echo "PHASE 7 PASS: ctrl+alt+backslash split the window into two regions (+$WS_DIFF px)"
 
+# @lat: [[test#GPUI Workspace Dividers#Live drag resizes regions]]
+# ── Phase 7a: drag the workspace divider and persist its ratio ────
+WS_RESIZES_BEFORE=$(plain_client_log | grep -cF "published a pane's grid size" || true)
+WS_REPORTS_BEFORE=$(count_log "reported the workspace tree to the server")
+GRID_H=$(( WIN_H - TITLEBAR_H - BOTTOM_BANDS_H ))
+WS_DIVIDER_X=$(( WIN_X + WIN_W / 2 ))
+WS_DIVIDER_Y=$(( WIN_Y + TITLEBAR_H + GRID_H / 2 ))
+WS_DRAG_X=$(( WS_DIVIDER_X + WIN_W / 6 ))
+xdotool mousemove --sync "$WS_DIVIDER_X" "$WS_DIVIDER_Y"
+xdotool mousedown 1
+xdotool mousemove --sync "$WS_DRAG_X" "$WS_DIVIDER_Y"
+xdotool mouseup 1
+sleep 1.5
+focus
+shot /output/07a-after-workspace-divider-drag.png
+WS_RESIZES_AFTER=$(plain_client_log | grep -cF "published a pane's grid size" || true)
+if [ "$WS_RESIZES_AFTER" -lt $(( WS_RESIZES_BEFORE + 2 )) ]; then
+    fail "PHASE 7a FAIL: workspace drag did not republish both grids ($WS_RESIZES_BEFORE -> $WS_RESIZES_AFTER)"
+fi
+if ! wait_for_log_growth "reported the workspace tree to the server" "$WS_REPORTS_BEFORE" 15; then
+    fail "PHASE 7a FAIL: workspace drag did not report its ratio"
+fi
+WS_DIVIDER_DIFF=$(window_diff /output/07-after-workspace-split.png /output/07a-after-workspace-divider-drag.png)
+if [ "${WS_DIVIDER_DIFF:-0}" -lt "$DIVIDER_DIFF_MIN" ]; then
+    fail "PHASE 7a FAIL: workspace drag changed $WS_DIVIDER_DIFF px (min $DIVIDER_DIFF_MIN)"
+fi
+echo "PHASE 7a PASS: dragged workspace divider (+$WS_DIVIDER_DIFF px; both grids re-laid and tree reported)"
+
 # ── Phase 8: Ctrl+Alt+Left moves focus between regions ───────────
 WS_FOCUS_BEFORE=$(count_log "focused workspace moved")
 focus
@@ -447,5 +476,6 @@ echo "    06-after-divider-drag.png      — both grids after drag-resize"
 echo "    05-after-close.png             — back to one pane after close_pane"
 echo "    06-before-workspace-split.png  — the window before the workspace split"
 echo "    07-after-workspace-split.png   — two workspace regions"
+echo "    07a-after-workspace-divider-drag.png — resized workspace regions"
 echo "    08-workspace-focus-left.png    — focus back in the first workspace region"
 echo "    09-unnamed-tab-groups-aligned.png — left tabs grouped before right region"

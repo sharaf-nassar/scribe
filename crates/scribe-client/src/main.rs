@@ -22,10 +22,10 @@ use std::{
 
 use gpui::{
     App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId, Entity, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollWheelEvent, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*,
-    px, relative, size,
+    Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription, Task,
+    TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -115,7 +115,7 @@ use scribe_client::terminal_image_scene::{
 };
 use scribe_client::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client::update::UpdateState;
-use scribe_client::url_detect;
+use scribe_client::url_detect::{self, SpanKind};
 use scribe_client::vi_mode::ViMotion;
 use scribe_client::window_chrome;
 use scribe_client::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
@@ -124,6 +124,7 @@ use scribe_client::window_state::{
     clamp_geometry_to_layout, geometry_from_bounds, geometry_size_is_sane, logical_px_to_i32,
     normalize_legacy_geometry, window_bounds_for,
 };
+use scribe_client::workspace_layout::{self, WorkspaceDividerDrag};
 use scribe_client::x11_focus::X11FocusGuard;
 use scribe_client::zoom::ZoomState;
 use scribe_client::{
@@ -172,7 +173,10 @@ use crate::{
     pane_shell::{ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{present_next_burst, present_rebuild},
-    terminal::{Content, DisplayOnlyTerminal, PaneFrame, PaneGrid, PaneGrids, PaneStream, Scroll},
+    terminal::{
+        Content, DisplayOnlyTerminal, HoveredLink, PaneFrame, PaneGrid, PaneGrids, PaneStream,
+        Scroll,
+    },
     terminal_element::{
         CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
         TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
@@ -691,6 +695,25 @@ enum GridDrag {
     Idle,
     /// The left button is down; pointer motion extends the selection.
     Selecting,
+    /// A Ctrl+click opened a link. The gesture is already complete, and the
+    /// state exists only so the matching release is swallowed rather than
+    /// reported to a mouse-tracking application that never saw the press.
+    Link,
+}
+
+/// Everything the *focused* pane alone gets for one frame.
+///
+/// The four travel together because they share one reason: each is driven by
+/// something the window resolves against exactly one pane — the split-scroll
+/// pin, the platform's single input-method slot, the shell cursor, and the
+/// pointer. Every other pane paints its own untouched grid.
+struct FocusedPanePaint {
+    /// The snapshot [`TerminalView::sync_split_scroll`] already pinned.
+    content: Arc<Content>,
+    ime: ImePaint,
+    cursor: CursorPaint,
+    /// The link under a Ctrl-held pointer, if any.
+    link: Option<HoveredLink>,
 }
 
 /// What this process claimed out of the restore store before opening a window.
@@ -893,6 +916,10 @@ struct RestoreRuntime {
     /// taken by the first paint. `None` once applied, or when the record was
     /// not captured minimized.
     pending_minimize: Option<WindowState>,
+    /// The maximized or fullscreen state the restored window still has to be
+    /// asserted into, taken by the first paint. `None` once applied, or for a
+    /// record whose state owns no `_NET_WM_STATE` atoms.
+    pending_state: Option<WindowState>,
     /// The virtual desktop the restored window still has to be sent back to,
     /// taken by the first paint. `None` once applied, or when the record names
     /// no desktop.
@@ -987,6 +1014,7 @@ impl RestoreRuntime {
             position_target: None,
             monitor: None,
             pending_minimize: None,
+            pending_state: None,
             pending_desktop: None,
             assigned_geometry: if restore_geometry.is_none() {
                 AssignedGeometry::Unread
@@ -1030,6 +1058,17 @@ impl RestoreRuntime {
         // `Window::new` map likewise puts out of reach, so it is re-asserted
         // from the first frame too.
         self.pending_desktop = geometry.desktop;
+        // The state itself is asserted rather than left to the bounds the window
+        // was opened with: GPUI reaches its X11 backend as a *toggle*, so a
+        // window manager that maps the window already maximized turns "open
+        // maximized" into "unmaximize". See [`monitor::assert_window_state`].
+        // Minimized is not here — `pending_minimize` owns it, and the state a
+        // minimized window unminimizes into is asserted the same way.
+        self.pending_state = matches!(
+            WindowGeometry::effective_state(&geometry),
+            WindowState::Maximized | WindowState::Fullscreen
+        )
+        .then(|| WindowGeometry::effective_state(&geometry));
         // A maximized or fullscreen window has a placement too: the window
         // manager owns its size, but the monitor it fills follows the origin,
         // and that origin is exactly the hint Mutter ignores. It is re-asserted
@@ -1103,6 +1142,8 @@ struct PointerState {
     drag: GridDrag,
     /// Divider drag captured from the grid overlay.
     divider_drag: Option<DividerDrag>,
+    /// Workspace-region divider drag captured from the grid overlay.
+    workspace_divider_drag: Option<WorkspaceDividerDrag>,
     /// The button currently forwarded to the application, or `None` when no
     /// forwarded press is outstanding. Mode 1002 gates drag motion on it, and
     /// the reported Cb carries this exact button rather than a hardcoded Left.
@@ -1131,6 +1172,7 @@ impl Default for PointerState {
             clicks: MouseClickState::new(),
             drag: GridDrag::Idle,
             divider_drag: None,
+            workspace_divider_drag: None,
             report_button: None,
             report_cell: None,
             prompt_hover: None,
@@ -1207,9 +1249,15 @@ struct TerminalView {
     /// Pixel height of the split-scroll pin as of the last frame, so a click
     /// can be hit-tested against the jump chip the paint pass drew.
     split_scroll: SplitScrollState,
-    /// Where the terminal grid was painted last frame, filled in by the grid
-    /// canvas so a pointer position can be lowered onto a cell.
-    grid_bounds: GridBounds,
+    /// Where each pane painted its grid last frame, filled in by that pane's
+    /// own grid canvas so a pointer position can be lowered onto a cell.
+    ///
+    /// Keyed by session because the pointer gestures that need a rect do not
+    /// all belong to the focused pane: the wheel and the overlay scrollbar act
+    /// on whichever pane is under the pointer, and a split window paints their
+    /// rects side by side. One sink per pane is the only thing that keeps a hit
+    /// test agreeing with what paint actually drew.
+    pane_bounds: HashMap<SessionId, GridBounds>,
     /// Overlay-scrollbar fade/hover state and the in-flight thumb drag.
     scrollbars: ScrollbarSurfaces,
     /// Pixel rect of the whole grid *area* — every pane plus the dividers
@@ -1524,6 +1572,26 @@ impl TerminalView {
         }
     }
 
+    /// Put a restored window back into the maximized or fullscreen state its
+    /// record names, once.
+    ///
+    /// Issued after [`Self::apply_saved_position`], which lifts that same state
+    /// around the move and puts it back: this is the backstop for every case
+    /// that move does not cover — a record with no saved origin to move to, a
+    /// window manager that refused the move, and above all the fact that GPUI's
+    /// own "open maximized" is a toggle rather than an assertion, so a window
+    /// mapped already-maximized arrives here windowed. `_NET_WM_STATE_ADD` is
+    /// idempotent, so doing it after a move that already restored the state
+    /// costs one ignored client message.
+    fn apply_saved_window_state(&mut self, window: &Window) {
+        let Some(state) = self.restore.pending_state.take() else { return };
+        if monitor::assert_window_state(window, state) {
+            tracing::info!(?state, "asserting the restored window's saved state");
+        } else {
+            tracing::debug!(?state, "no X11 window state to assert; keeping what the WM chose");
+        }
+    }
+
     /// Put a restored window back on its saved virtual desktop, once.
     ///
     /// EWMH 5.5 says the window manager "should honor `_NET_WM_DESKTOP`
@@ -1768,7 +1836,7 @@ impl TerminalView {
             zoom,
             smart_selection,
             split_scroll: SplitScrollState::new(),
-            grid_bounds: GridBounds::default(),
+            pane_bounds: HashMap::new(),
             scrollbars: ScrollbarSurfaces::new(scrollbar_style),
             grid_area: GridBounds::default(),
             published_grid_area: None,
@@ -2490,7 +2558,19 @@ impl TerminalView {
     /// eligible AI pane grows its pinned live region on the very first page-up
     /// rather than a frame later.
     fn scroll_terminal(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
-        let Some((moved, offset, pin_rows)) = self.with_focused_grid(|terminal| {
+        let Some(session_id) = self.focused_session() else { return };
+        self.scroll_session(session_id, scroll, cx);
+    }
+
+    /// Move a named pane's viewport and repaint.
+    ///
+    /// Split out of [`Self::scroll_terminal`] because the wheel scrolls the
+    /// pane under the pointer, focused or not — the scroll chords still act on
+    /// the focused pane, and both land here so the split-scroll gate and the
+    /// scrollbar pulse cannot drift apart between them.
+    fn scroll_session(&mut self, session_id: SessionId, scroll: Scroll, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_for(session_id) else { return };
+        let Some((moved, offset, pin_rows)) = pane.with_terminal(|terminal| {
             if matches!(scroll, Scroll::Bottom) {
                 // Landing at the bottom dissolves the split by definition;
                 // clearing the gate first keeps the pin from surviving one
@@ -2502,10 +2582,17 @@ impl TerminalView {
         }) else {
             return;
         };
-        tracing::info!(?scroll, moved, offset, pin_rows, "terminal scrollback moved");
+        tracing::info!(
+            session = %session_id,
+            ?scroll,
+            moved,
+            offset,
+            pin_rows,
+            "terminal scrollback moved"
+        );
         // Pulse even when the viewport did not move: a page-up that hit the top
         // of scrollback is exactly when the user wants to see where they are.
-        self.pulse_focused_scrollbar();
+        self.pulse_scrollbar(session_id);
         cx.notify();
     }
 
@@ -2956,7 +3043,9 @@ impl TerminalView {
         match action {
             ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
             ContextMenuAction::OpenOsc8Url(uri) => self.route_osc8_activation(uri, cx),
-            ContextMenuAction::OpenFile(path) => url_detect::open_path(&path, None),
+            ContextMenuAction::OpenFile(path) => {
+                url_detect::open_path(&path, self.focused_cwd().as_deref());
+            }
             // An explicit user-initiated run, not a clipboard paste: it bypasses
             // the paste-confirmation gate exactly as the legacy client does.
             ContextMenuAction::RunCommand(command) => {
@@ -3315,7 +3404,7 @@ impl TerminalView {
     /// triple or quadruple click selects whole logical lines.
     fn begin_selection(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
         let kind = self.pointer.clicks.record_press(f32::from(position.x), f32::from(position.y));
-        let Some(bounds) = self.grid_bounds.get() else {
+        let Some(bounds) = self.focused_grid_bounds() else {
             return;
         };
         let Some(cell) = cell_at(bounds, &self.font, position) else {
@@ -3334,10 +3423,13 @@ impl TerminalView {
     /// Extend the in-progress selection to the pointer. A no-op unless the left
     /// button is still down, so ordinary hovering costs one boolean test.
     fn extend_selection(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        if self.pointer.drag == GridDrag::Idle {
+        // Only a press that actually began a selection may extend one: a
+        // Ctrl+click that opened a link holds the button down over the grid too,
+        // and dragging afterwards must not paint a selection nothing started.
+        if self.pointer.drag != GridDrag::Selecting {
             return;
         }
-        let Some(bounds) = self.grid_bounds.get() else {
+        let Some(bounds) = self.focused_grid_bounds() else {
             return;
         };
         let Some(cell) = cell_at(bounds, &self.font, position) else {
@@ -3347,9 +3439,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Settle a selection drag: copy-on-select publishes the result to the X11
-    /// primary selection so a middle click in any app pastes it, matching the
-    /// winit client's `set_primary_selection`.
+    /// Settle a selection drag: copy-on-select publishes the result to the
+    /// system clipboard and, on Linux, the primary selection.
     fn finish_selection(&mut self, cx: &mut Context<Self>) {
         if self.pointer.drag == GridDrag::Idle {
             return;
@@ -3363,6 +3454,9 @@ impl TerminalView {
             return;
         };
         let options = self.copy_text_options();
+        let text = clipboard_cleanup::prepare_copy_text(&raw, options);
+        self.write_clipboard(text);
+        #[cfg(target_os = "linux")]
         clipboard::set_primary(&mut self.clipboard.handle, &raw, options);
         cx.notify();
     }
@@ -3390,10 +3484,60 @@ impl TerminalView {
         self.with_focused_grid(|terminal| terminal.mouse_modes()).unwrap_or_default()
     }
 
+    /// The same modes for a named pane, which the wheel needs because it acts
+    /// on the pane under the pointer rather than on the focused one.
+    fn session_mouse_modes(&self, session_id: SessionId) -> MouseModes {
+        self.pane_for(session_id)
+            .and_then(|pane| pane.with_terminal(|terminal| terminal.mouse_modes()))
+            .unwrap_or_default()
+    }
+
     /// The grid cell under `position` in the `(col, row)` viewport coordinates
     /// a mouse report carries, or `None` when the pointer is off the grid.
     fn report_cell(&self, position: Point<gpui::Pixels>) -> Option<(u16, u16)> {
-        let bounds = self.grid_bounds.get()?;
+        self.report_cell_in(self.focused_grid_bounds()?, position)
+    }
+
+    /// Where one pane painted its grid last frame.
+    fn pane_grid_bounds(&self, session_id: SessionId) -> Option<Bounds<Pixels>> {
+        self.pane_bounds.get(&session_id)?.get()
+    }
+
+    /// The sink a pane's grid canvas writes its rect into each frame. A pane
+    /// with no session yet gets a throwaway cell nothing ever reads.
+    fn pane_bounds_sink(&self, session_id: Option<SessionId>) -> GridBounds {
+        session_id
+            .and_then(|session| self.pane_bounds.get(&session))
+            .map_or_else(GridBounds::default, Rc::clone)
+    }
+
+    /// The same for the focused pane, which is what every gesture a *click*
+    /// precedes resolves against — selection, links, smart selection and the
+    /// split-scroll chip all run after [`Self::press_focuses_pane`] has made
+    /// the pane under the pointer the focused one.
+    fn focused_grid_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.pane_grid_bounds(self.focused_session()?)
+    }
+
+    /// The session whose painted grid contains `position`.
+    ///
+    /// The wheel and the overlay scrollbar are pointer gestures with no click
+    /// in front of them, so they resolve their pane here rather than reading
+    /// the focus. Panes never overlap, so the first rect that contains the
+    /// point is the only one that can.
+    fn pane_at(&self, position: Point<Pixels>) -> Option<SessionId> {
+        self.pane_bounds
+            .iter()
+            .find(|(_, sink)| sink.get().is_some_and(|rect| rect.contains(&position)))
+            .map(|(session_id, _)| *session_id)
+    }
+
+    /// The same, against an arbitrary pane's painted grid rect.
+    fn report_cell_in(
+        &self,
+        bounds: Bounds<Pixels>,
+        position: Point<gpui::Pixels>,
+    ) -> Option<(u16, u16)> {
         let cell = cell_at(bounds, &self.font, position)?;
         Some((report_axis(cell.col), report_axis(cell.row)))
     }
@@ -3406,16 +3550,19 @@ impl TerminalView {
     /// nothing at all — the server drops its input anyway, and unlike a
     /// keystroke there is no take-control affordance to raise for a mouse move.
     fn send_pty_bytes(&self, kind: &'static str, bytes: Vec<u8>) {
+        let Some(session_id) = self.focused_session() else { return };
+        self.send_pty_bytes_to(session_id, kind, bytes);
+    }
+
+    /// The same, addressed to a named pane: the wheel reports against whichever
+    /// pane the pointer is over, which is not necessarily the focused one.
+    fn send_pty_bytes_to(&self, session_id: SessionId, kind: &'static str, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
         if self.shared.share.lock().is_ok_and(|share| share.is_viewer()) {
             return;
         }
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
-            return;
-        };
         // The escaped payload is the scripted E2E's oracle: it is the only way
         // to tell a wired encoder from an unwired one without reading the wire.
         tracing::info!(kind, bytes = %escape_report_bytes(&bytes), "mouse input forwarded");
@@ -3523,18 +3670,32 @@ impl TerminalView {
     /// A mouse-tracking application gets a button 64 / 65 report, an alternate
     /// screen that asked for alternate scroll (1007) gets cursor keys, and
     /// anything else moves this client's own scrollback viewport.
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    ///
+    /// `session_id` is the pane the pointer is over rather than the focused
+    /// one, because the wheel is a pointer gesture: hovering a pane is enough
+    /// to scroll it, the way every other tiling application behaves, and doing
+    /// so must not steal focus from the pane the keyboard is in. The button
+    /// 64 / 65 coordinates are resolved against that same pane's painted rect.
+    fn scroll_pane(
+        &mut self,
+        session_id: SessionId,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
         let natural = self.config.config().config.terminal.scroll.natural_scroll;
         let rows = mouse_reporting::wheel_lines(event.delta, self.font.line_height, natural);
         if rows == 0 {
             return;
         }
-        let modes = self.focused_mouse_modes();
+        let modes = self.session_mouse_modes(session_id);
         let action = mouse_reporting::wheel_action(modes);
         tracing::info!(rows, ?action, "mouse wheel");
         match action {
             WheelAction::Report => {
-                let Some((col, row)) = self.report_cell(event.position) else {
+                let Some((col, row)) = self
+                    .pane_grid_bounds(session_id)
+                    .and_then(|bounds| self.report_cell_in(bounds, event.position))
+                else {
                     return;
                 };
                 let bytes = mouse_reporting::encode_mouse_scroll(
@@ -3544,13 +3705,13 @@ impl TerminalView {
                     event.modifiers,
                     modes.encoding,
                 );
-                self.send_pty_bytes("scroll", bytes);
+                self.send_pty_bytes_to(session_id, "scroll", bytes);
             }
             WheelAction::CursorKeys => {
                 let bytes = mouse_reporting::alternate_scroll_keys(rows);
-                self.send_pty_bytes("alternate-scroll", bytes);
+                self.send_pty_bytes_to(session_id, "alternate-scroll", bytes);
             }
-            WheelAction::Scrollback => self.scroll_terminal(Scroll::Delta(rows), cx),
+            WheelAction::Scrollback => self.scroll_session(session_id, Scroll::Delta(rows), cx),
         }
     }
 
@@ -3915,7 +4076,7 @@ impl TerminalView {
     /// here because arboard and the confirmation modal both belong to this
     /// thread, and the automation actions a `RunAction` queued are executed here
     /// because the entities they drive are owned by this thread too.
-    fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
+    fn poll_window_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(mut ai) = self.shared.ai.lock()
             && ai.tracker.clear_stale_processing()
         {
@@ -3926,6 +4087,10 @@ impl TerminalView {
         self.poll_notification_clicks(cx);
         let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
         if let Some(reason) = exit {
+            // Toasts outlive the process that raised them, and a fresh client
+            // cannot manage ids it never allocated — so the dispatcher closes
+            // every live one before the window goes away.
+            self.shutdown_notifications();
             match reason {
                 ExitReason::QuitRequested => {
                     tracing::info!("quit requested by server — exiting");
@@ -3938,17 +4103,23 @@ impl TerminalView {
                     // had, able to reclaim only the one the server volunteered.
                     self.flush_geometry_now();
                     self.flush_snapshot_now(cx);
+                    // A quit-all is the only exit that ends the process: the
+                    // server told EVERY window to go, and this one may be
+                    // hosting several of them.
+                    cx.quit();
                 }
                 ExitReason::WindowClosed => {
-                    tracing::info!("window close acknowledged by server — exiting");
+                    tracing::info!("window close acknowledged by server — closing this window");
                     self.clear_restore_state(true);
+                    // Only THIS window was killed. One process hosts every
+                    // window the user opened (see `open_restored_window`), so
+                    // quitting the app here took its siblings down with it —
+                    // and merely closed them, since their sessions were never
+                    // asked to die. GPUI quits on its own once the last window
+                    // is gone.
+                    window.remove_window();
                 }
             }
-            // Toasts outlive the process that raised them, and a fresh client
-            // cannot manage ids it never allocated — so the dispatcher closes
-            // every live one before the app goes away.
-            self.shutdown_notifications();
-            cx.quit();
             return;
         }
         self.report_focus();
@@ -4529,17 +4700,21 @@ impl TerminalView {
         let Ok(mut tabs) = self.shared.tabs.lock() else { return };
         let Some(session_id) = move_selection(&mut tabs) else { return };
         drop(tabs);
-        // Attach before any adoption: the adopt branch's publish enqueues
-        // `Resize` + `RequestSnapshot` for the adopted pane on the same
-        // ordered channel, and the server denies both for a session whose
-        // `AttachSessions` has not landed yet ("RequestSnapshot denied for
-        // unattached session" in the window status bar).
-        self.attach(session_id);
+        let mut adopted = false;
         if let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx) {
             self.shell.focus_pane(workspace_id, pane, cx);
         } else if let Some((workspace_id, pane)) = self.tab_adoption_pane(session_id, cx) {
             self.adopt_session(pane, session_id);
             self.shell.focus_pane(workspace_id, pane, cx);
+            adopted = true;
+        }
+        // Resolve the incoming session's grid only after it occupies its pane:
+        // prompt chrome is per tab, so the outgoing pane size is not a valid
+        // attach fallback. Attach still precedes the publish below, so any
+        // remaining Resize + RequestSnapshot stays authorised on the ordered
+        // channel.
+        self.attach(session_id, cx);
+        if adopted {
             self.publish_pane_sizes(cx);
         }
         // A tab switch moves the focused pane, which the server relays to PTY
@@ -4607,32 +4782,33 @@ impl TerminalView {
     /// `SessionReplay` that repaints the tab; the subscription is what makes the
     /// server re-check the pane's working directory, so the status bar follows
     /// the switch instead of keeping the previous tab's chrome.
-    fn attach(&self, session_id: SessionId) {
+    fn attach(&mut self, session_id: SessionId, cx: &App) {
         if let Ok(mut guard) = self.shared.active_session.lock() {
             *guard = Some(session_id);
         }
-        self.stream_session(session_id);
+        self.stream_session(session_id, cx);
     }
 
     /// Attach and subscribe `session_id` without making it the active session,
     /// so a pane in an unfocused region can stream a freshly adopted tab while
     /// the user keeps typing wherever they are.
-    fn stream_session(&self, session_id: SessionId) {
+    fn stream_session(&mut self, session_id: SessionId, cx: &App) {
         if let Ok(mut attached) = self.shared.attached.lock() {
             attached.insert(session_id);
         }
-        // A pane owns only its slice of the window, so the size announced here
-        // is the one the layout published for this session, not the window's.
-        //
-        // An unshown tab has no placement, so `publish_pane_sizes` has already
-        // dropped its entry — that is the common case on every tab switch, not
-        // a rare one. The fallback therefore has to be the live size of the
-        // pane the tab is about to be adopted into, never `terminal_size`:
-        // that is the `WindowSeed` startup default (`COLUMNS`x`ROWS`), fixed
-        // for the window's whole life, so announcing it resized the PTY to 120
-        // columns and the switched-to tab painted its replay wrapped at 120
-        // before the layout's own publish corrected it one round trip later.
-        let size = self.pane_sizes.get(&session_id).copied().unwrap_or(self.focused_pane_size);
+        // The attach replay is the first frame the switched-to tab paints, so
+        // size it from that session's current placement rather than the
+        // outgoing focused pane. Prompt chrome is per tab and can change the
+        // row count even when both sessions share one pane.
+        let size = self
+            .placed_pane_size(session_id, cx)
+            .or_else(|| self.pane_sizes.get(&session_id).copied())
+            .unwrap_or(self.focused_pane_size);
+        self.pane_sizes.insert(session_id, size);
+        self.resize_pane_grid(session_id, size);
+        if self.shell.focused_session(cx) == Some(session_id) {
+            self.adopt_focused_pane_size(size);
+        }
         let result = self
             .sink
             .attach_sessions(vec![session_id], vec![size])
@@ -4987,7 +5163,7 @@ impl TerminalView {
         if let Ok(mut tabs) = self.shared.tabs.lock() {
             tabs.show(session_id);
         }
-        self.attach(session_id);
+        self.attach(session_id, cx);
         self.report_focus();
         self.sync_tabs(cx);
         cx.notify();
@@ -5091,6 +5267,22 @@ impl TerminalView {
             rect.height = (rect.height - self.pane_prompt_bar_height(session_id)).max(0.0);
         }
         rect
+    }
+
+    /// The measured grid currently painted for a shown session.
+    ///
+    /// Attach and publish both lower the same placement through
+    /// [`Self::painted_pane_rect`] and [`Self::grid_size_for`], so the first
+    /// replay cannot be sized from the tab that happened to occupy the pane
+    /// before it.
+    fn placed_pane_size(&self, session_id: SessionId, cx: &App) -> Option<TerminalSize> {
+        let viewport = self.measured_pane_viewport()?;
+        let placements = self.shell.placements(viewport, cx);
+        let split = placements.len() > 1;
+        placements
+            .iter()
+            .find(|placement| placement.session_id == Some(session_id))
+            .map(|placement| self.grid_size_for(self.painted_pane_rect(placement, split)))
     }
 
     /// Tell the server (and each local grid) how big every pane now is.
@@ -5240,19 +5432,6 @@ impl TerminalView {
             regions = self.shell.region_count(cx),
             "rebuilt workspace splits from the server's tree"
         );
-        // Size each pane from the measured layout before attaching, so every
-        // attach announces the grid its pane will actually render at instead
-        // of the window-wide fallback. Resize frames themselves wait for
-        // `publish_pane_sizes` below, after the attaches that authorise them.
-        let viewport = self.pane_viewport();
-        let placements = self.shell.placements(viewport, cx);
-        let split = placements.len() > 1;
-        for placement in placements {
-            if let Some(session_id) = placement.session_id {
-                let rect = self.painted_pane_rect(&placement, split);
-                self.pane_sizes.insert(session_id, self.grid_size_for(rect));
-            }
-        }
         // The adopted layout decides which tab is active, not whichever session
         // the reader happened to attach first: each region came back showing the
         // tab its `active_tab_index` named, and the strip has to agree or the
@@ -5274,14 +5453,14 @@ impl TerminalView {
         // it ends up as the active (typed-into) session.
         let focused = self.shell.focused_session(cx);
         for session_id in visible.iter().filter(|id| Some(**id) != focused) {
-            self.attach(*session_id);
+            self.attach(*session_id, cx);
         }
         if let Some(session_id) = focused {
-            self.attach(session_id);
+            self.attach(session_id, cx);
         }
-        // Now that every pane session is attached, the publish's resize and
-        // snapshot frames are authorised; sizes already cached above are
-        // skipped, so this mostly settles the shared focused-pane size.
+        // Now that every pane session is attached, any publish resize and
+        // snapshot are authorised. `stream_session` already cached each exact
+        // placement, so unchanged panes are skipped.
         self.publish_pane_sizes(cx);
         self.sync_tabs(cx);
         // Report the (possibly pruned) adopted layout back so the server's
@@ -5405,7 +5584,7 @@ impl TerminalView {
                 .map(|(_, session)| *session);
             let Some(session_id) = refill else { continue };
             self.adopt_session(pane, session_id);
-            self.stream_session(session_id);
+            self.stream_session(session_id, cx);
             tracing::info!(%session_id, %workspace_id, "refilled an emptied pane from its workspace's tabs");
             changed = true;
         }
@@ -5603,6 +5782,12 @@ impl TerminalView {
         }
     }
 
+    /// Mint the per-pane state the render closure below only borrows.
+    ///
+    /// Both maps outlive the elements that read them — the scrollbar fade is a
+    /// wall-clock animation across frames, and a bounds sink is written during
+    /// paint and read by the *next* frame's pointer events — so they live here
+    /// and are minted before the closure takes `self` immutably.
     fn prepare_pane_surfaces(
         &mut self,
         placements: &[pane_shell::PanePlacement],
@@ -5610,6 +5795,7 @@ impl TerminalView {
         let sessions = placements.iter().filter_map(|placement| placement.session_id);
         for session_id in sessions.clone() {
             self.scrollbars.panes.entry(session_id).or_default();
+            self.pane_bounds.entry(session_id).or_default();
         }
         Rc::new(sessions.collect())
     }
@@ -5621,19 +5807,19 @@ impl TerminalView {
     /// device pixels. The focus ring is only drawn once a window actually has
     /// more than one pane, so an unsplit window paints exactly as before.
     ///
-    /// Find matches, the split-scroll pin and the recorded grid bounds all
-    /// belong to the focused pane: the overlay searched the pane the query was
-    /// typed against, the pin follows that pane's viewport, and the bounds are
-    /// what the mouse path hit-tests against. `focused` is therefore the
-    /// snapshot [`Self::sync_split_scroll`] already pinned, and every other
-    /// pane paints its own untouched grid.
+    /// Find matches and the split-scroll pin belong to the focused pane: the
+    /// overlay searched the pane the query was typed against, and the pin
+    /// follows that pane's viewport. `focused` is therefore the snapshot
+    /// [`Self::sync_split_scroll`] already pinned, and every other pane paints
+    /// its own untouched grid. The recorded grid bounds are *not* in that set —
+    /// every pane records its own, because the pointer gestures that read them
+    /// pick their pane by position rather than by focus.
     fn render_panes(
         &mut self,
-        focused: Arc<Content>,
-        ime: ImePaint,
-        cursor: CursorPaint,
+        focused: FocusedPanePaint,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let FocusedPanePaint { content: focused, ime, cursor, link } = focused;
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
@@ -5648,8 +5834,15 @@ impl TerminalView {
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
         let mut ime = Some(ime);
+        let mut link_rows = link.map(|link| link.rows);
         let opacity = self.opacity;
-        let background = surface(self.terminal_colors.background, opacity);
+        // Identical for every pane, so it is built once and cloned in: the
+        // clone is an `Rgba`, an `Arc` bump, and an `f32`.
+        let colors = GridColors {
+            background: surface(self.terminal_colors.background, opacity),
+            cells: Arc::clone(&self.terminal_colors.cells),
+            opacity,
+        };
         let idle_border = surface(self.chrome.divider, opacity);
         let chrome_bg = scribe_client::tab_bar::srgba(self.chrome.tab_bar_bg);
         let mut focused = Some(focused);
@@ -5664,11 +5857,6 @@ impl TerminalView {
                 } else {
                     placement.session_id.and_then(|s| self.pane_content(s)).unwrap_or_default()
                 };
-                let colors = GridColors {
-                    background,
-                    cells: Arc::clone(&self.terminal_colors.cells),
-                    opacity,
-                };
                 let mut pane = div()
                     .absolute()
                     .left(relative(placement.rect.x / viewport.width))
@@ -5681,55 +5869,67 @@ impl TerminalView {
                     pane = pane.border_1().border_color(border);
                 }
                 let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
-                // Only the focused pane publishes its painted bounds: they are
-                // what `cell_at` resolves a pointer against, and the mouse
-                // path acts on the focused pane.
-                let (highlights, bounds) = if placement.focused {
-                    (self.find_highlights(&content, cx), Rc::clone(&self.grid_bounds))
+                // These three belong to the focused pane alone, for one reason:
+                // each is driven by something this window resolves against
+                // exactly one pane — the overlay's matches, the mouse
+                // selection, and the Ctrl-hovered link rule. Taken rather than
+                // cloned, the way the snapshot above is.
+                let (highlights, selection, underline) = if placement.focused {
+                    (
+                        self.find_highlights(&content, cx),
+                        selection_spans.clone(),
+                        link_rows.take().unwrap_or_default(),
+                    )
                 } else {
-                    (Vec::new(), GridBounds::default())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
-                // Selection lives on the focused pane only, for the same reason
-                // the bounds do: it is driven by a pointer this window resolves
-                // against that one pane.
-                let selection =
-                    if placement.focused { selection_spans.clone() } else { Vec::new() };
-                let mut element = TerminalElement::new(
+                let bounds = self.pane_bounds_sink(session_id);
+                if !underline.is_empty() {
+                    pane = pane.cursor_pointer();
+                }
+                // The IME handler is a window-level singleton, so `take` gives
+                // it to the focused pane and to nothing else even if the layout
+                // ever reported two focused placements. The scrollbar is the
+                // opposite: per-pane, so every pane showing a session gets one.
+                let element = TerminalElement::new(
                     content,
                     self.font.clone(),
-                    colors,
+                    colors.clone(),
                     self.highlight_colors,
                     bounds,
                 )
                 .with_highlights(highlights)
                 .with_selection(selection)
-                .with_terminal_images(image_paint);
-                if placement.focused {
-                    element = element.with_cursor(cursor);
-                }
-                // Every pane showing a session gets its own scrollbar: each
-                // pane scrolls its own scrollback, so unlike the IME handler
-                // this is not a window-wide singleton.
-                if let Some(scrollbar) =
-                    placement.session_id.and_then(|session| self.scrollbar_paint(session))
-                {
-                    element = element.with_scrollbar(scrollbar);
-                }
-                // The input handler is a window-level singleton, so it is
-                // registered by the focused pane alone — `take` guarantees that
-                // even if the layout ever reported two focused placements.
-                if placement.focused
-                    && let Some(ime) = ime.take()
-                {
-                    element = element.with_ime(ime);
-                }
-                let mut pane = self.compose_pane_content(pane, element.paint(), &placement, cx);
+                .with_link_underline(underline)
+                .with_terminal_images(image_paint)
+                .with_cursor(placement.focused.then_some(cursor))
+                .with_scrollbar(placement.session_id.and_then(|s| self.scrollbar_paint(s)))
+                .with_ime(placement.focused.then(|| ime.take()).flatten());
+                let pane = self.compose_pane_content(pane, element.paint(), &placement, cx);
+                let mut pane = Self::attach_wheel(pane, &placement, cx);
                 if let Some(color) = ai_border {
                     pane = pane.children(ai_pane_border(placement.rect, color));
                 }
                 pane.into_any_element()
             })
             .collect()
+    }
+
+    /// Hang the wheel off one pane, so GPUI's own hit test decides which
+    /// terminal a scroll belongs to.
+    ///
+    /// Hovering a pane scrolls it whether or not it holds focus, and whether or
+    /// not this window is the active one: the wheel is a pointer gesture, so it
+    /// must act on what the pointer is over without taking the keyboard's pane
+    /// away from it. The grid rect travels with the listener because a mouse
+    /// report carries a cell, which the handler reads out of that pane's own
+    /// bounds sink. A pane still waiting on `SessionCreated` gets no listener
+    /// at all — there is nothing to scroll yet.
+    fn attach_wheel(pane: gpui::Div, placement: &PanePlacement, cx: &Context<Self>) -> gpui::Div {
+        let Some(session) = placement.session_id else { return pane };
+        pane.on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _window, ctx| {
+            view.scroll_pane(session, event, ctx);
+        }))
     }
 
     /// Stack a pane's grid and its optional prompt strip inside the pane div.
@@ -5762,22 +5962,48 @@ impl TerminalView {
         }
     }
 
-    /// Paint each live pane divider above the grids it separates.
+    /// Paint each live workspace and pane divider above the grids it separates.
     fn render_dividers(&self, cx: &App) -> Vec<gpui::AnyElement> {
-        self.shell
-            .dividers(self.pane_viewport(), cx)
-            .into_iter()
+        let viewport = self.pane_viewport();
+        let workspace_dividers = self.shell.workspace_dividers(viewport, cx);
+        let cursor_bands = workspace_dividers
+            .iter()
             .map(|divider| {
+                let rect = workspace_layout::workspace_divider_hit_rect(divider);
                 div()
                     .absolute()
-                    .left(px(divider.rect.x))
-                    .top(px(divider.rect.y))
-                    .w(px(divider.rect.width))
-                    .h(px(divider.rect.height))
+                    .left(px(rect.x))
+                    .top(px(rect.y))
+                    .w(px(rect.width))
+                    .h(px(rect.height))
+                    .cursor(Self::workspace_divider_cursor(divider.direction))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        workspace_dividers
+            .into_iter()
+            .map(|divider| divider.rect)
+            .chain(self.shell.dividers(viewport, cx).into_iter().map(|divider| divider.rect))
+            .map(|rect| {
+                div()
+                    .absolute()
+                    .left(px(rect.x))
+                    .top(px(rect.y))
+                    .w(px(rect.width))
+                    .h(px(rect.height))
                     .bg(surface(self.chrome.divider, self.opacity))
                     .into_any_element()
             })
+            .chain(cursor_bands)
             .collect()
+    }
+
+    /// Use the native pointer that matches a workspace split's resize axis.
+    const fn workspace_divider_cursor(direction: SplitDirection) -> gpui::CursorStyle {
+        match direction {
+            SplitDirection::Horizontal => gpui::CursorStyle::ResizeLeftRight,
+            SplitDirection::Vertical => gpui::CursorStyle::ResizeUpDown,
+        }
     }
 
     /// Paint each lower region's tab bar over the strip it reserved.
@@ -6088,6 +6314,14 @@ impl TerminalView {
     fn press_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         let Some((x, y)) = self.grid_local_position(position) else { return false };
         let viewport = self.pane_viewport();
+        let workspace_dividers = self.shell.workspace_dividers(viewport, cx);
+        if let Some(divider) =
+            workspace_layout::hit_test_workspace_divider(&workspace_dividers, x, y)
+        {
+            self.pointer.workspace_divider_drag =
+                Some(workspace_layout::start_workspace_drag(divider));
+            return true;
+        }
         let dividers = self.shell.dividers(viewport, cx);
         let Some(divider) = divider::hit_test_divider(&dividers, x, y) else {
             return false;
@@ -6098,6 +6332,22 @@ impl TerminalView {
 
     /// Apply an in-flight divider drag and republish both panes' geometry.
     fn drag_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if let Some(drag) = self.pointer.workspace_divider_drag {
+            let Some((x, y)) = self.grid_local_position(position) else { return true };
+            let mouse_pos = match drag.direction {
+                SplitDirection::Horizontal => x,
+                SplitDirection::Vertical => y,
+            };
+            if self.shell.set_workspace_ratio(
+                drag.first_workspace,
+                drag.second_workspace,
+                workspace_layout::workspace_drag_ratio(&drag, mouse_pos),
+                cx,
+            ) {
+                self.after_layout_change(cx);
+            }
+            return true;
+        }
         let Some(drag) = self.pointer.divider_drag else { return false };
         let Some((x, y)) = self.grid_local_position(position) else { return true };
         let mouse_pos = match drag.direction {
@@ -6112,15 +6362,20 @@ impl TerminalView {
 
     /// Resolve a left press over the grid band.
     ///
-    /// Three consumers in priority order. The overlay scrollbar goes first
-    /// because it is chrome painted over the cells: a click on the thumb was
-    /// never meant for the application below it, which is the order the winit
-    /// client resolved its chrome in too. A mouse-tracking application comes
-    /// next, and only when it declines does the press mean selection.
+    /// Consumers in priority order. A divider press is a resize and owns the
+    /// boundary outright. The overlay scrollbar comes next because it is chrome
+    /// painted over the cells: a click on the thumb was never meant for the
+    /// application below it, which is the order the winit client resolved its
+    /// chrome in too — and because it is a scroll gesture, it precedes the
+    /// focusing click rather than waiting behind one. Focusing an unfocused
+    /// pane follows, then the Ctrl-click link, then a mouse-tracking
+    /// application; only when all of them decline does the press mean
+    /// selection.
     fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if self.press_divider(event.position, cx)
-            || self.press_focuses_pane(event.position, cx)
             || self.press_scrollbar(event.position, cx)
+            || self.press_focuses_pane(event.position, cx)
+            || self.press_opens_link(event, cx)
             || self.forward_mouse_press(event)
         {
             return;
@@ -6147,6 +6402,10 @@ impl TerminalView {
         if placement.focused {
             return false;
         }
+        // Logged under the same message the focus chords use: a focus move is
+        // a focus move whichever gesture asked for it, and one grep has to find
+        // them all.
+        tracing::info!(pane = placement.pane_id.raw(), "focused pane moved");
         let Some(session_id) = placement.session_id else {
             self.shell.focus_pane(placement.workspace_id, placement.pane_id, cx);
             cx.notify();
@@ -6171,6 +6430,13 @@ impl TerminalView {
             return;
         }
         self.update_scrollbar_hover(event.position, cx);
+        // The link rule follows the pointer, and it is read off the window at
+        // paint time rather than tracked here — so the move only has to ask for
+        // the repaint that will re-read it. Gated on Ctrl so an ordinary mouse
+        // move over the grid still costs nothing.
+        if event.modifiers.control {
+            cx.notify();
+        }
         if self.forward_mouse_motion(event) {
             return;
         }
@@ -6180,7 +6446,15 @@ impl TerminalView {
     /// Resolve a left release over the grid band, ending whichever gesture the
     /// matching press started.
     fn release_over_grid(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.pointer.divider_drag.take().is_some()
+        // The press already opened a link, so this release belongs to a gesture
+        // that is over. Forwarding it would hand a mouse-tracking application a
+        // release with no press.
+        if self.pointer.drag == GridDrag::Link {
+            self.pointer.drag = GridDrag::Idle;
+            return;
+        }
+        if self.pointer.workspace_divider_drag.take().is_some()
+            || self.pointer.divider_drag.take().is_some()
             || self.release_scrollbar(cx)
             || self.forward_mouse_release(event)
         {
@@ -6215,13 +6489,6 @@ impl TerminalView {
     /// the whole reason it fades in rather than being always on.
     fn pulse_scrollbar(&mut self, session_id: SessionId) {
         self.scrollbars.panes.entry(session_id).or_default().borrow_mut().on_scroll_action();
-    }
-
-    /// Reveal the focused pane's scrollbar, if a session is attached.
-    fn pulse_focused_scrollbar(&mut self) {
-        if let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard) {
-            self.pulse_scrollbar(session_id);
-        }
     }
 
     /// Advance every pane's fade animation, reporting whether any scrollbar is
@@ -6268,12 +6535,15 @@ impl TerminalView {
         }
     }
 
-    /// Drop scrollbar state for sessions that are no longer on screen.
+    /// Drop the per-pane paint state for sessions that are no longer on screen.
     ///
     /// Keyed by session, so this is the same retirement the pane grids get: a
-    /// closed tab must not leave its fade timer (or a stale drag) behind.
+    /// closed tab must not leave its fade timer (or a stale drag) behind, and a
+    /// retired pane's last painted rect must not keep answering hit tests for a
+    /// region some other pane now occupies.
     fn retire_scrollbars(&mut self, live: &HashSet<SessionId>) {
         self.scrollbars.panes.retain(|session_id, _| live.contains(session_id));
+        self.pane_bounds.retain(|session_id, _| live.contains(session_id));
         if self.scrollbars.drag.is_some_and(|session| !live.contains(&session)) {
             self.scrollbars.drag = None;
         }
@@ -6284,7 +6554,7 @@ impl TerminalView {
     /// grid. Pointer hit-testing and drag math both resolve through this so
     /// they can never disagree with what paint drew.
     fn scrollbar_layout(&self, session_id: SessionId) -> Option<ScrollbarLayout> {
-        let bounds = self.grid_bounds.get()?;
+        let bounds = self.pane_grid_bounds(session_id)?;
         let metrics = self.shared.panes.lock().ok()?.scroll_metrics(session_id)?;
         Some(ScrollbarLayout {
             pane_rect: Rect {
@@ -6300,48 +6570,58 @@ impl TerminalView {
         })
     }
 
-    /// Track the pointer over the focused pane's scrollbar hit zone.
+    /// Track the pointer over every pane's scrollbar hit zone.
     ///
     /// Hover pins the overlay open and widens the thumb, which is what makes it
     /// grabbable: the resting 6 px thumb is a hint, and the 3x hit zone plus
-    /// the widen are what turn it into a control.
+    /// the widen are what turn it into a control. The pass covers all panes
+    /// rather than the focused one because the wheel already scrolls whatever
+    /// the pointer is over — a bar that fades in on an unfocused pane and then
+    /// refuses to widen under the pointer is a control that lies. Sweeping all
+    /// of them is also what clears the hover the pointer just left.
     fn update_scrollbar_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
-            return;
-        };
-        let Some(layout) = self.scrollbar_layout(session_id) else { return };
-        let Some(state) = self.scrollbars.panes.get(&session_id) else { return };
-        let width = state.borrow().current_width(self.scrollbars.style.width);
-        let inside = hit_test_scrollbar(
-            &layout,
-            f32::from(position.x),
-            f32::from(position.y),
-            width.max(self.scrollbars.style.width),
-        );
-        let mut state = state.borrow_mut();
-        if inside == state.hover {
-            return;
+        let hovered = self.pane_at(position);
+        let mut changed = false;
+        for (session_id, state) in &self.scrollbars.panes {
+            let width = state.borrow().current_width(self.scrollbars.style.width);
+            let inside = hovered == Some(*session_id)
+                && self.scrollbar_layout(*session_id).is_some_and(|layout| {
+                    hit_test_scrollbar(
+                        &layout,
+                        f32::from(position.x),
+                        f32::from(position.y),
+                        width.max(self.scrollbars.style.width),
+                    )
+                });
+            let mut state = state.borrow_mut();
+            if inside == state.hover {
+                continue;
+            }
+            if inside {
+                state.on_hover_enter();
+            } else {
+                state.on_hover_leave();
+            }
+            changed = true;
         }
-        if inside {
-            state.on_hover_enter();
-        } else {
-            state.on_hover_leave();
+        if changed {
+            cx.notify();
         }
-        drop(state);
-        cx.notify();
     }
 
-    /// Claim a left press that landed on the focused pane's scrollbar.
+    /// Claim a left press that landed on any pane's scrollbar.
     ///
     /// A press on the thumb starts a drag; a press anywhere else in the hit
     /// zone jumps the viewport to that point on the track. Returns `true` when
     /// the press was consumed, so the caller leaves selection alone — the
     /// scrollbar is chrome painted over the grid, and a click on it was never
     /// meant for the cells underneath.
+    ///
+    /// Resolved by pointer, and ordered ahead of [`Self::press_focuses_pane`]
+    /// for the same reason the wheel is: dragging a thumb is scrolling, and
+    /// scrolling a pane you can see must not cost a focus-stealing click first.
     fn press_scrollbar(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
+        let Some(session_id) = self.pane_at(position) else {
             return false;
         };
         let Some(layout) = self.scrollbar_layout(session_id) else { return false };
@@ -6607,13 +6887,28 @@ impl TerminalView {
             enabled: true,
         }];
         smart_actions.extend(self.smart_selection_rows(position));
+        // The open rows come from the same detector Ctrl+click uses, so the menu
+        // can never offer to open something the pointer is not actually on — it
+        // used to carry a hardcoded demo URI on every cell. No modifier is
+        // required here: raising the menu is already an explicit request to act
+        // on this cell. Exactly one of the three is ever set, since a cell
+        // carries one span.
+        let (url, file_path, osc8_uri) = match self.link_at(position) {
+            Some(link) => match link.kind {
+                SpanKind::Url => (Some(link.target), None, None),
+                SpanKind::Path => (None, Some(link.target), None),
+                SpanKind::Osc8Hyperlink => (None, None, Some(link.target)),
+            },
+            None => (None, None, None),
+        };
         let request = ContextMenuRequest {
             has_selection: self
                 .with_focused_grid(|terminal| terminal.has_selection())
                 .unwrap_or(false),
-            osc8_uri: Some("https://example.com/spec".into()),
+            osc8_uri,
+            url,
+            file_path,
             smart_actions,
-            ..Default::default()
         };
         let menu = cx.new(|cx| ContextMenuView::new(colors, request, position, cx));
         cx.subscribe(&menu, |this, _menu, event: &ContextMenuEvent, ctx| {
@@ -6694,7 +6989,7 @@ impl TerminalView {
         if self.split_scroll.pin_height <= 0.0 {
             return false;
         }
-        let Some(bounds) = self.grid_bounds.get() else {
+        let Some(bounds) = self.focused_grid_bounds() else {
             return false;
         };
         let (rows, pin_rows) = self
@@ -6703,13 +6998,68 @@ impl TerminalView {
         hits_jump_chip(bounds, &self.font, rows, pin_rows, position)
     }
 
+    /// The link under a window-space pointer position, if any.
+    ///
+    /// Resolved against the focused pane's recorded bounds, like every other
+    /// pointer gesture on the grid: a press into an unfocused pane focuses it
+    /// first, so by the time a link can be clicked its pane is the focused one.
+    fn link_at(&self, position: Point<gpui::Pixels>) -> Option<HoveredLink> {
+        let bounds = self.focused_grid_bounds()?;
+        let cell = cell_at(bounds, &self.font, position)?;
+        self.with_focused_grid(|terminal| terminal.link_at(cell))?
+    }
+
+    /// Open the link under a Ctrl+click, reporting whether there was one.
+    ///
+    /// Ordered ahead of mouse reporting in [`Self::press_grid`] for the same
+    /// reason the scrollbar is: a modifier chord on a detected link is a
+    /// gesture aimed at the terminal, not at the program running in it. The
+    /// gate is narrow on purpose — with no link under the pointer the press
+    /// falls straight through to the application, so Ctrl+click keeps working
+    /// for programs that use it.
+    ///
+    /// The three kinds are deliberately not collapsed: an OSC 8 URI is
+    /// program-supplied and goes through the scheme-allowlist gate that can
+    /// raise the confirmation dialog, a heuristic URL keeps the silent
+    /// non-allowlisted drop, and a path is not a URI at all — it is resolved
+    /// against the pane's CWD and handed to the OS file handler.
+    fn press_opens_link(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
+        if !event.modifiers.control {
+            return false;
+        }
+        let Some(link) = self.link_at(event.position) else { return false };
+        self.pointer.drag = GridDrag::Link;
+        tracing::info!(target = %link.target, "opening a Ctrl+clicked link");
+        match link.kind {
+            SpanKind::Osc8Hyperlink => self.route_osc8_activation(link.target, cx),
+            SpanKind::Url => url_detect::open_url(&link.target),
+            SpanKind::Path => url_detect::open_path(&link.target, self.focused_cwd().as_deref()),
+        }
+        true
+    }
+
+    /// The focused pane's OSC 7 working directory, which is what a relative
+    /// path in that pane is relative *to*.
+    ///
+    /// `None` before the shell has reported one (no OSC 7 integration, or the
+    /// first prompt has not been drawn yet), which leaves
+    /// [`url_detect::open_path`] to hand the path over unresolved rather than
+    /// guessing at the client process's own directory — that is Scribe's cwd,
+    /// not the shell's, and opening something from it would be wrong more often
+    /// than right.
+    fn focused_cwd(&self) -> Option<PathBuf> {
+        let session_id = self.focused_session()?;
+        let metadata = self.shared.chrome_metadata.lock().ok()?;
+        metadata.session(session_id)?.cwd.clone()
+    }
+
     /// The live smart-selection rows for the grid cell under `position`.
     ///
     /// Empty whenever the pointer is off the grid, no rule matched, or the
     /// matched rules carry no actions — which is the ordinary case over blank
     /// space, so an ordinary right-click still gets the plain menu.
     fn smart_selection_rows(&self, position: Point<gpui::Pixels>) -> Vec<MenuItem> {
-        let Some(bounds) = self.grid_bounds.get() else {
+        let Some(bounds) = self.focused_grid_bounds() else {
             return Vec::new();
         };
         let Some(cell) = cell_at(bounds, &self.font, position) else {
@@ -7543,11 +7893,12 @@ async fn drive_x11_focus_polls(view: WeakEntity<TerminalView>, app: &mut AsyncAp
 /// The IPC reader learns that the server acknowledged a close or a quit, and
 /// moves the focused pane on a reattach, but it owns neither the app nor the
 /// sink's UI-side callers. This task is where those cross-thread facts become
-/// actions: quitting the app, reporting focus, and re-polling the window list.
+/// actions: closing this window (or quitting the app on a quit-all), reporting
+/// focus, and re-polling the window list.
 async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncApp) {
     loop {
         app.background_executor().timer(WINDOW_LIFECYCLE_TICK).await;
-        if view.update(app, TerminalView::poll_window_lifecycle).is_err() {
+        if view.update_in(app, TerminalView::poll_window_lifecycle).is_err() {
             return;
         }
     }
@@ -7905,15 +8256,20 @@ impl TerminalView {
     /// split ratios need no device-pixel measurement, and the band itself
     /// carries the right-click that opens the context menu at the cursor
     /// without disturbing the display-only elements inside it.
-    fn render_grid(&mut self, ime: ImePaint, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let focused = self.sync_split_scroll();
+    fn render_grid(
+        &mut self,
+        ime: ImePaint,
+        link: Option<HoveredLink>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let content = self.sync_split_scroll();
         let appearance = &self.config.config().config.appearance;
         let cursor = CursorPaint {
             visible: self.focus.cursor_blink.window_active
                 && (!appearance.cursor_blink || self.focus.cursor_blink.visible),
             shape: appearance.cursor_shape,
         };
-        let panes = self.render_panes(focused, ime, cursor, cx);
+        let panes = self.render_panes(FocusedPanePaint { content, ime, cursor, link }, cx);
         let dividers = self.render_dividers(cx);
         let region_bars = self.render_region_tab_bars(cx);
         div()
@@ -7922,14 +8278,8 @@ impl TerminalView {
             .bg(surface(self.terminal_colors.background, self.opacity))
             .child(self.grid_area_probe(cx))
             .children(panes)
-            .children(dividers)
             .children(region_bars)
-            // The wheel is claimed by the application when it tracks the mouse,
-            // by the alternate screen's 1007 fallback, or — the ordinary case —
-            // by this client's own scrollback viewport.
-            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, ctx| {
-                view.scroll_wheel(event, ctx);
-            }))
+            .children(dividers)
             // Every button gesture below asks the mouse reporter first: an
             // application that enabled tracking owns the pointer, and only when
             // it declines (or Shift takes the pointer back) does the click mean
@@ -8087,6 +8437,7 @@ impl Render for TerminalView {
         self.report_perf_frame();
         self.ensure_focus(window, cx);
         self.apply_saved_position(window);
+        self.apply_saved_window_state(window);
         self.apply_saved_desktop(window);
         self.apply_pending_minimize(window);
         // Driven from the frame loop rather than only from the bounds observer:
@@ -8107,7 +8458,13 @@ impl Render for TerminalView {
         // Per-session no-change checks inside make this idempotent.
         self.publish_pane_sizes(cx);
         let ime = self.sync_ime(cx);
-        let grid = self.render_grid(ime, cx);
+        // The hovered link is read straight off the window rather than tracked
+        // across events: the pointer position and the modifier state are both
+        // already live there, so a hover that survives a repaint needs no state
+        // of its own to survive with it.
+        let link =
+            window.modifiers().control.then(|| self.link_at(window.mouse_position())).flatten();
+        let grid = self.render_grid(ime, link, cx);
         let status_bar = self.render_status_bar(cx);
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
@@ -8120,6 +8477,18 @@ impl Render for TerminalView {
         // than the configured value.
         div()
             .track_focus(&self.focus.root)
+            // Ctrl going down or up changes what the grid shows with no pointer
+            // motion behind it, and an idle pane bumps no generation, so the
+            // redraw pump would never come round to notice. This is the only
+            // thing that rules a link under a stationary pointer.
+            //
+            // It sits on the focus root rather than on the grid band because
+            // gpui dispatches modifier changes down the *focus* path, like key
+            // events — a listener on the hovered-but-unfocusable band is never
+            // reached at all.
+            .on_modifiers_changed(cx.listener(|_view, _: &ModifiersChangedEvent, _win, ctx| {
+                ctx.notify();
+            }))
             .on_action(cx.listener(
                 |view, _: &CloseWindow, _window, ctx| {
                     view.request_window_close(ctx);
@@ -8670,14 +9039,25 @@ fn open_window(
     cold_start: ColdStart,
 ) -> Option<WindowHandle<TerminalView>> {
     let bounds = Bounds::centered(None, startup_window_size(cx), cx);
-    // Restored geometry wins over the grid-derived startup size, and it is
-    // applied at creation rather than after: GPUI takes the bounds (and the
-    // maximized state) as window options, so a restored window never flashes at
-    // the default size the way the winit client's async resize did.
+    // Restored geometry wins over the grid-derived startup size. Non-X11
+    // platforms receive its bounds and state in GPUI's creation options; X11
+    // keeps the saved restore rect but strips GPUI's state toggle below, then
+    // Scribe asserts that state after the map and before any application frame.
     let window_bounds = cold_start
         .geometry
         .as_ref()
         .map_or(WindowBounds::Windowed(bounds), |geom| window_bounds_for(geom, bounds));
+    // GPUI's X11 `WindowBounds::Maximized`/`Fullscreen` path sends a toggle on
+    // its own X connection. Our idempotent ADD uses another connection after
+    // the map, so the two requests have no ordering and a late toggle can undo
+    // the restore. Open at the saved restore rect on X11 and let Scribe's ADD be
+    // the sole state transition. Wayland keeps GPUI's native pre-map request.
+    #[cfg(target_os = "linux")]
+    let window_bounds = if gpui::guess_compositor() == "X11" {
+        x11_creation_bounds(window_bounds)
+    } else {
+        window_bounds
+    };
     if let Some(geom) = cold_start.geometry.as_ref() {
         tracing::info!(
             width = geom.width,
@@ -8691,6 +9071,10 @@ fn open_window(
     let restored = cold_start.snapshot;
     let restore_siblings = cold_start.siblings;
     let restore_geometry = cold_start.geometry;
+    let startup_state = restore_geometry
+        .as_ref()
+        .map(WindowGeometry::effective_state)
+        .filter(|state| matches!(state, WindowState::Maximized | WindowState::Fullscreen));
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -8719,6 +9103,13 @@ fn open_window(
         |window, cx| {
             let bringup_ms = bringup_start.elapsed().as_secs_f64() * 1000.0;
             WINDOW_BRINGUP_MS_BITS.store(bringup_ms.to_bits(), Ordering::Release);
+            // Earliest Scribe-owned point: GPUI has mapped the platform window,
+            // but no root view exists and no application frame can paint yet.
+            // The render-path assertion remains for records adopted from
+            // `Welcome`, which were unknowable when their window was created.
+            if let Some(state) = startup_state {
+                monitor::assert_window_state(window, state);
+            }
             cx.new(|cx| {
                 TerminalView::new(
                     shared,
@@ -8735,6 +9126,17 @@ fn open_window(
             tracing::error!(%error, "failed to open GPUI window");
             None
         }
+    }
+}
+
+/// Strip GPUI's stateful X11 toggle from restored creation bounds.
+#[cfg(target_os = "linux")]
+fn x11_creation_bounds(bounds: WindowBounds) -> WindowBounds {
+    match bounds {
+        WindowBounds::Maximized(bounds) | WindowBounds::Fullscreen(bounds) => {
+            WindowBounds::Windowed(bounds)
+        }
+        WindowBounds::Windowed(bounds) => WindowBounds::Windowed(bounds),
     }
 }
 
@@ -8832,6 +9234,15 @@ async fn supervise_connection(mut ctx: IpcThread) {
 
     loop {
         let result = run_connection(&mut ctx).await;
+        // A killed window's backend is done: its sessions are destroyed and its
+        // window is gone from the workspace manager, so a redial would claim
+        // (see [`IpcThread::window_claim`]) a window id the server no longer
+        // has, resurrecting it as a ghost. The process outlives this thread
+        // because it may still be hosting other windows.
+        if ctx.shared.lifecycle.lock().is_ok_and(|lifecycle| lifecycle.window_closed()) {
+            tracing::info!("window closed — its IPC backend is shutting down");
+            return;
+        }
         // Reader and writer failures also end connections that were fully live,
         // so the Result alone cannot distinguish them from failed dial attempts.
         // Consume the shared connection marker before choosing the next delay:
@@ -10259,6 +10670,14 @@ where
         if is_session_list {
             first_session_list = false;
         }
+        // This window's own close was just acknowledged. The server does not
+        // hang up — it answered and moved on — so nothing else ever ends this
+        // reader, and the window it serves is already being torn down on the
+        // GPUI thread. Stop here rather than draining frames for sessions the
+        // server destroyed.
+        if ctx.lifecycle.lock().is_ok_and(|lifecycle| lifecycle.window_closed()) {
+            return Ok(());
+        }
     }
 }
 
@@ -11591,9 +12010,36 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
 
 #[cfg(test)]
 mod tests {
+    use gpui::point;
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[test#GPUI Workspace Dividers#Hover cursor follows split axis across hit band]]
+    #[test]
+    fn workspace_divider_cursor_follows_axis_across_hit_band() {
+        assert_eq!(
+            TerminalView::workspace_divider_cursor(SplitDirection::Horizontal),
+            gpui::CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(
+            TerminalView::workspace_divider_cursor(SplitDirection::Vertical),
+            gpui::CursorStyle::ResizeUpDown
+        );
+
+        let divider = workspace_layout::WorkspaceDivider {
+            rect: Rect { x: 10.0, y: 20.0, width: 1.0, height: 100.0 },
+            direction: SplitDirection::Horizontal,
+            first_workspace: WorkspaceId::new(),
+            second_workspace: WorkspaceId::new(),
+            parent_rect: Rect { x: 0.0, y: 0.0, width: 200.0, height: 100.0 },
+        };
+        let hit_rect = workspace_layout::workspace_divider_hit_rect(&divider);
+        assert!((hit_rect.x - 6.0).abs() < f32::EPSILON);
+        assert!((hit_rect.y - 16.0).abs() < f32::EPSILON);
+        assert!((hit_rect.width - 9.0).abs() < f32::EPSILON);
+        assert!((hit_rect.height - 108.0).abs() < f32::EPSILON);
+    }
 
     /// A `SessionInfo` carrying only what the reattach decision reads.
     fn listed_session(session_id: SessionId, provider: Option<AiProvider>) -> SessionInfo {
@@ -11681,11 +12127,80 @@ mod tests {
         assert_eq!(runtime.pending_desktop, Some(3));
         assert_eq!(runtime.geometry.as_ref(), Some(&record));
 
+        // A windowed record has no `_NET_WM_STATE` atoms to assert, so nothing
+        // is queued for the window state.
+        assert_eq!(runtime.pending_state, None);
+
         // A window opened at its record named that window in `Hello`; there is
         // nothing left to adopt, and it starts out placing itself.
         let seeded = RestoreRuntime::from_seed(seed(Some(record)));
         assert_eq!(seeded.assigned_geometry, AssignedGeometry::Adopted);
         assert_eq!(seeded.placement, RestorePlacement::Restoring);
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Cold Restart Restore#A maximized record is asserted, not toggled]]
+    #[test]
+    fn a_maximized_record_queues_the_state_for_assertion() {
+        let seed = |restore_geometry| WindowSeed {
+            terminal_size: TerminalSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 },
+            restored: None,
+            restore_siblings: 0,
+            restore_geometry,
+        };
+        // Assigned field by field rather than with struct-update syntax: the
+        // private legacy-`maximized` field blocks `..Default::default()`.
+        let mut maximized = WindowGeometry::default();
+        maximized.state = WindowState::Maximized;
+        maximized.width = 3840;
+        maximized.height = 2125;
+
+        // Both halves of the restore queue it: the window opened at the record,
+        // and the window that only learned which record it has afterwards. The
+        // second is the one that has nothing else to fall back on — it was
+        // never opened with `WindowBounds::Maximized` at all.
+        let seeded = RestoreRuntime::from_seed(seed(Some(maximized.clone())));
+        assert_eq!(seeded.pending_state, Some(WindowState::Maximized));
+        let mut adopted = RestoreRuntime::from_seed(seed(None));
+        adopted.adopt_geometry_record(maximized);
+        assert_eq!(adopted.pending_state, Some(WindowState::Maximized));
+
+        // Fullscreen owns an atom of its own and is queued the same way.
+        let mut fullscreen = WindowGeometry::default();
+        fullscreen.state = WindowState::Fullscreen;
+        assert_eq!(
+            RestoreRuntime::from_seed(seed(Some(fullscreen))).pending_state,
+            Some(WindowState::Fullscreen)
+        );
+
+        // A minimized record is asserted into the state it unminimizes *into*,
+        // not into minimization — `pending_minimize` owns that half, and a
+        // window that comes back maximized-but-iconified has to carry both.
+        let mut minimized = WindowGeometry::default();
+        minimized.state = WindowState::Minimized;
+        minimized.restore_state = WindowState::Maximized;
+        let runtime = RestoreRuntime::from_seed(seed(Some(minimized)));
+        assert_eq!(runtime.pending_minimize, Some(WindowState::Maximized));
+        assert_eq!(runtime.pending_state, Some(WindowState::Maximized));
+    }
+
+    // @lat: [[test#Window geometry compat#X11 restore has one state transition]]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_creation_bounds_leave_window_state_to_the_assertion() {
+        let bounds = Bounds::new(point(px(20.0), px(30.0)), size(px(800.0), px(600.0)));
+
+        assert!(matches!(
+            x11_creation_bounds(WindowBounds::Maximized(bounds)),
+            WindowBounds::Windowed(_)
+        ));
+        assert!(matches!(
+            x11_creation_bounds(WindowBounds::Fullscreen(bounds)),
+            WindowBounds::Windowed(_)
+        ));
+        assert!(matches!(
+            x11_creation_bounds(WindowBounds::Windowed(bounds)),
+            WindowBounds::Windowed(_)
+        ));
     }
 
     // @lat: [[lat.md/client#Client#GPUI Client Spike#Cold Restart Restore#Replayed prompts reach the live AI chrome]]

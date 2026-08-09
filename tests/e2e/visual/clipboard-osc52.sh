@@ -353,9 +353,10 @@ fi
 shot /output/04-read-answered.png
 echo "PHASE 2 PASS: the host clipboard crossed the wire as ClipboardBridgeReadReply"
 
-# ── Phase 3: a mouse selection copies with the copy chord ─────────
+# ── Phase 3: a mouse selection copies on release and by chord ───
+# @lat: [[test#Test Harness#Visual E2E Tests#Clipboard and OSC 52 bridge]]
 # The needle is echoed on its own line, so a drag across that line selects a
-# known string and the copy chord must produce exactly it.
+# known string and both copy paths must produce it.
 set_clipboard "clipboard-before-copy"
 # The server writes the OSC 52 read reply back into the PTY, so the shell has
 # an escape sequence sitting on its input line. Ctrl+C drops it, and `clear`
@@ -375,6 +376,7 @@ shot /output/05-before-selection.png
 # strip, so the drag runs down the first rows of the viewport.
 DRAG_TOP=$(( WIN_Y + 80 ))
 DRAG_BOTTOM=$(( WIN_Y + 220 ))
+COPIES_BEFORE=$(count_log "copied to the host clipboard")
 xdotool mousemove $(( WIN_X + 12 )) "$DRAG_TOP"
 xdotool mousedown 1
 sleep 0.3
@@ -383,11 +385,16 @@ sleep 0.2
 xdotool mousemove $(( WIN_X + 600 )) "$DRAG_BOTTOM"
 sleep 0.3
 xdotool mouseup 1
-sleep 0.6
+wait_for_log_growth "copied to the host clipboard" "$COPIES_BEFORE" 15 \
+    || fail "PHASE 3: releasing the selection did not copy it"
 shot /output/06-selection-highlight.png
-if [ "$(read_clipboard)" = "$COPY_NEEDLE" ]; then
-    fail "PHASE 3: the clipboard held the needle before the copy chord ran"
-fi
+AUTO_COPIED=$(read_clipboard)
+case "$AUTO_COPIED" in
+    *"$COPY_NEEDLE"*) ;;
+    *) fail "PHASE 3: copy-on-select left '$AUTO_COPIED' on the clipboard" ;;
+esac
+
+set_clipboard "clipboard-before-copy-chord"
 COPIES_BEFORE=$(count_log "copied to the host clipboard")
 send_keys ctrl+shift+c
 wait_for_log_growth "copied to the host clipboard" "$COPIES_BEFORE" 15 \
@@ -401,7 +408,7 @@ case "$COPIED" in
     *) fail "PHASE 3: the clipboard holds '$COPIED', not the selected needle" ;;
 esac
 shot /output/07-after-copy.png
-echo "PHASE 3 PASS: the dragged selection reached the host clipboard as '$COPIED'"
+echo "PHASE 3 PASS: release and the copy chord reached the host clipboard"
 
 # ── Phase 4: the paste chord types the clipboard into the pane ────
 set_clipboard "$PASTE_PAYLOAD"
