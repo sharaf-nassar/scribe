@@ -23,8 +23,10 @@
 #      last sends `CloseWindow` and exits after `WindowClosed`;
 #   4. the WM's close button raises the close dialog, "Quit Scribe" puts
 #      `QuitAll` on the wire, and the server's `QuitRequested` exits the client;
-#   5. a relaunched client's "Kill Window" puts `CloseWindow` on the wire and
-#      the server's `WindowClosed` exits it.
+#   5. with two windows open in the one client process, "Kill Window" puts
+#      `CloseWindow` on the wire for the focused window only, and the server's
+#      `WindowClosed` takes that window down while its sibling stays up;
+#   6. killing the last remaining window ends the process.
 #
 # Phase 0 reads the client's own `FocusChanged` frame rather than the separate
 # session the entrypoint creates for `scribe-test`. Fresh-window bootstrap gives
@@ -194,6 +196,42 @@ find_window() {
     [ -z "$wid" ] && wid=$(xdotool search --name '[Ss]cribe' 2>/dev/null | tail -1)
     printf '%s' "$wid"
 }
+
+# Every mapped Scribe window, one X11 id per line and sorted, so two captures
+# can be compared as sets. One client process hosts them all, which is exactly
+# what the kill-one-window phase has to prove.
+scribe_windows() {
+    { xdotool search --onlyvisible --class '[Ss]cribe' 2>/dev/null || true
+      xdotool search --onlyvisible --name '[Ss]cribe' 2>/dev/null || true
+    } | sort -u
+}
+
+focus_window() {
+    xdotool windowactivate --sync "$1" 2>/dev/null \
+        || xdotool windowfocus --sync "$1" 2>/dev/null || true
+    # Past the X11 focus guard's 300 ms reactivation debounce, as in `focus`.
+    sleep 0.8
+}
+
+# Wait until `$2...` succeeds against the current Scribe window set, or give up
+# after `$1` seconds. The set is the only thing either window phase waits on, so
+# both the "a second one opened" and the "that one is gone" waits are this loop
+# with a different test.
+wait_for_windows() {
+    local timeout_secs="$1" started
+    shift
+    started=$(date +%s)
+    until "$@"; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+    return 0
+}
+
+window_count_is() { [ "$(scribe_windows | wc -l)" -eq "$1" ]; }
+window_is_gone() { ! scribe_windows | grep -qx "$1"; }
 
 focus() {
     local wid
@@ -388,15 +426,35 @@ wait_for_frames server "$ACK_BEFORE" 15 QuitRequested \
 wait_for_client_exit 20 || fail "PHASE 4: the client ignored QuitRequested and stayed up"
 echo "PHASE 4 PASS: WM close raised the dialog, Quit Scribe sent QuitAll, the ack exited the app"
 
-# ── Phase 5: Kill Window closes this window only ──────────────────
+# ── Phase 5: Kill Window kills THIS window and no other ───────────
 # Sessions survived the quit-all, but this phase needs no pane: `CloseWindow`
 # names the window the fresh `Welcome` assigns and destroys whatever it owns.
+#
+# The second window is the whole point. One client process hosts every window
+# the user opens, so a "Kill Window" that ends the PROCESS takes its siblings
+# down with it — and merely closes them, since nobody asked the server to
+# destroy their sessions. That is invisible with one window open, which is how
+# it shipped, so the assertion here is on the sibling: still mapped, still
+# served by a live process, and never named in a `CloseWindow`.
 launch_client
 WIN=$(last_welcome_window) || fail "PHASE 5: the relaunched client never got a Welcome"
 echo "relaunched client window id: $WIN"
 focus
-CLOSE_BEFORE=$(count_client CloseWindow "window_id=$WIN")
-CLOSED_BEFORE=$(count_server WindowClosed "window_id=$WIN")
+BEFORE_WINDOWS=$(scribe_windows)
+send_keys ctrl+shift+n
+wait_for_windows 15 window_count_is 2 \
+    || fail "PHASE 5: ctrl+shift+n never opened a second window"
+VICTIM_WID=$(comm -13 <(printf '%s\n' "$BEFORE_WINDOWS") <(scribe_windows))
+[ -n "$VICTIM_WID" ] || fail "PHASE 5: could not identify the new window"
+SIBLING_WID=$BEFORE_WINDOWS
+VICTIM=$(last_welcome_window) || fail "PHASE 5: the new window never got a Welcome"
+[ "$VICTIM" != "$WIN" ] || fail "PHASE 5: the new window adopted the existing window's id"
+echo "second window id: $VICTIM (X11 $VICTIM_WID), sibling X11 $SIBLING_WID"
+focus_window "$VICTIM_WID"
+shot /output/05a-two-windows.png
+
+CLOSE_BEFORE=$(count_client CloseWindow "window_id=$VICTIM")
+CLOSED_BEFORE=$(count_server WindowClosed "window_id=$VICTIM")
 send_keys ctrl+shift+d
 shot /output/05-close-dialog-again.png
 # Cancel -> Quit Scribe -> Kill Window.
@@ -404,12 +462,36 @@ send_keys Tab
 send_keys Tab
 shot /output/06-kill-window-focused.png
 send_keys Return
-wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$WIN" \
-    || fail "PHASE 5: Kill Window put no CloseWindow for $WIN on the wire"
-wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$WIN" \
+wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$VICTIM" \
+    || fail "PHASE 5: Kill Window put no CloseWindow for $VICTIM on the wire"
+wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$VICTIM" \
     || fail "PHASE 5: the server never acknowledged with WindowClosed"
-wait_for_client_exit 20 || fail "PHASE 5: the client ignored WindowClosed and stayed up"
-echo "PHASE 5 PASS: Kill Window sent CloseWindow and its ack exited the app"
+wait_for_windows 20 window_is_gone "$VICTIM_WID" \
+    || fail "PHASE 5: the killed window's frame never went away"
+sleep 1.0
+pgrep -f 'scribe-client' >/dev/null 2>&1 \
+    || fail "PHASE 5: killing one window ended the process hosting the other one"
+[ "$(scribe_windows)" = "$SIBLING_WID" ] \
+    || fail "PHASE 5: killing one window closed its sibling instead of leaving it up"
+[ "$(count_client CloseWindow "window_id=$WIN")" -eq 0 ] \
+    || fail "PHASE 5: the sibling window was closed too"
+shot /output/05b-sibling-survived.png
+echo "PHASE 5 PASS: Kill Window destroyed only its own window; the sibling stayed up"
+
+# ── Phase 6: killing the last window ends the process ─────────────
+focus_window "$SIBLING_WID"
+CLOSE_BEFORE=$(count_client CloseWindow "window_id=$WIN")
+CLOSED_BEFORE=$(count_server WindowClosed "window_id=$WIN")
+send_keys ctrl+shift+d
+send_keys Tab
+send_keys Tab
+send_keys Return
+wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$WIN" \
+    || fail "PHASE 6: Kill Window put no CloseWindow for $WIN on the wire"
+wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$WIN" \
+    || fail "PHASE 6: the server never acknowledged the last window's close"
+wait_for_client_exit 20 || fail "PHASE 6: the last window's close left the client running"
+echo "PHASE 6 PASS: killing the last window ended the process"
 
 echo ""
 echo "PASS: visual window-lifecycle test"
@@ -421,6 +503,8 @@ echo "    03-one-terminal-left.png   — one terminal exit kept the window open"
 echo "    03a-before-close.png       — the window just before the close request"
 echo "    03-close-dialog.png        — WM close raised the in-app dialog"
 echo "    04-quit-focused.png        — Tab moved focus onto Quit Scribe"
+echo "    05a-two-windows.png        — a second window open in the same process"
 echo "    05-close-dialog-again.png  — the close chord raised it on a fresh window"
 echo "    06-kill-window-focused.png — Tab twice landed on Kill Window"
+echo "    05b-sibling-survived.png   — the sibling window after the kill"
 echo "  Wire record: test-output/share-wire.jsonl"

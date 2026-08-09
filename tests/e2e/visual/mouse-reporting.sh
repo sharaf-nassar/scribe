@@ -489,6 +489,130 @@ echo "PHASE 9 PASS: DECRST 1000 gave the wheel back to the scrollback — $LINE"
 
 reset_pane
 
+# ── Phase 10: the wheel follows the pointer, not the focus ────────
+# Split the window in two. The split leaves the NEW pane focused, so the
+# original pane — the one carrying phase 1's 200 rows of scrollback — is now
+# unfocused, and it keeps the top-left corner of the grid whichever axis the
+# split used. A wheel parked over that corner must scroll the pane the pointer
+# is on rather than the pane the keyboard is in, and must not quietly move the
+# focus to make that true.
+focus
+BASE_SPLIT=$(count_log "split the focused pane")
+xdotool key --clearmodifiers ctrl+shift+backslash
+if ! wait_for_log_growth "split the focused pane" "$BASE_SPLIT"; then
+    fail "PHASE 10 FAIL: ctrl+shift+backslash did not split the pane"
+fi
+sleep 1.5
+# Baselined after the split, which moves the focus itself. The client logs a
+# session by its short `session-xxxxxxxx` form, not by the full UUID.
+BASE_FOCUS=$(count_log "focused pane moved")
+SHORT="session-${SESSION%%-*}"
+
+# Wheel one corner, and report which session the client says it scrolled.
+wheel_corner() {
+    local base line
+    base=$(count_log "terminal scrollback moved")
+    point_at "$1" "$2"
+    click 4
+    if ! wait_for_log_growth "terminal scrollback moved" "$base"; then
+        return 1
+    fi
+    line=$(last_log_line "terminal scrollback moved")
+    printf '%s' "${line#*session=}" | cut -d' ' -f1
+}
+
+# The original pane holds the top-left corner whichever axis the split used,
+# and the new pane holds the bottom-right.
+FIRST=$(wheel_corner $(( WIN_W / 6 )) $(( WIN_H * 2 / 5 ))) \
+    || fail "PHASE 10 FAIL: the wheel over the unfocused pane moved no viewport at all"
+SECOND=$(wheel_corner $(( WIN_W * 5 / 6 )) $(( WIN_H * 3 / 5 ))) \
+    || fail "PHASE 10 FAIL: the wheel over the second pane moved no viewport at all"
+if [ "$FIRST" != "$SHORT" ]; then
+    fail "PHASE 10 FAIL: the top-left pane is $SHORT but the wheel scrolled $FIRST"
+fi
+if [ "$SECOND" = "$FIRST" ]; then
+    fail "PHASE 10 FAIL: both corners scrolled $FIRST — the wheel follows focus, not the pointer"
+fi
+AFTER_FOCUS=$(count_log "focused pane moved")
+if [ "$AFTER_FOCUS" -ne "$BASE_FOCUS" ]; then
+    fail "PHASE 10 FAIL: scrolling an unfocused pane stole the focus"
+fi
+capture /output/mouse-10-unfocused-pane.png
+echo "PHASE 10 PASS: the wheel picked the pane under it — $FIRST then $SECOND, focus unmoved"
+
+# ── Phase 11: the wheel works while Scribe is not the active window
+# Every other application scrolls whatever the pointer is over even when it is
+# in the background, and a terminal is no exception. A second X client takes the
+# activation away (openbox is click-to-focus, so merely parking the pointer over
+# Scribe cannot hand it back), and the wheel over the top-left pane must still
+# move that pane's viewport without raising the window.
+command -v xmessage >/dev/null || fail "PHASE 11 FAIL: xmessage is missing from the image"
+SCRIBE_WID=$(find_window)
+# Bottom-right, out of the corner the wheel is aimed at.
+xmessage -geometry 140x60-0-0 'background' &
+XMSG_PID=$!
+sleep 1.5
+XMSG_WID=$(xdotool search --name '[Xx]message' 2>/dev/null | tail -1)
+[ -n "$XMSG_WID" ] || fail "PHASE 11 FAIL: the background window never mapped"
+xdotool windowactivate --sync "$XMSG_WID" 2>/dev/null || true
+sleep 0.5
+if [ "$(xdotool getactivewindow)" = "$SCRIBE_WID" ]; then
+    fail "PHASE 11 FAIL: Scribe kept the activation, so the phase would prove nothing"
+fi
+BASE_SCROLL=$(count_log "terminal scrollback moved")
+# No `focus` call anywhere below: it would activate the very window this phase
+# needs left in the background. WIN_* are still phase 10's geometry.
+point_at $(( WIN_W / 6 )) $(( WIN_H * 2 / 5 ))
+click 4
+if ! wait_for_log_growth "terminal scrollback moved" "$BASE_SCROLL"; then
+    kill "$XMSG_PID" 2>/dev/null || true
+    fail "PHASE 11 FAIL: the wheel did nothing while Scribe was in the background"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+ACTIVE_AFTER=$(xdotool getactivewindow)
+kill "$XMSG_PID" 2>/dev/null || true
+sleep 0.5
+case "$LINE" in
+    *"session=$SHORT"*) ;;
+    *) fail "PHASE 11 FAIL: the background wheel scrolled the wrong pane: $LINE" ;;
+esac
+if [ "$ACTIVE_AFTER" = "$SCRIBE_WID" ]; then
+    fail "PHASE 11 FAIL: scrolling raised Scribe to the foreground"
+fi
+capture /output/mouse-11-background-window.png
+echo "PHASE 11 PASS: the wheel scrolled an unfocused Scribe window — $LINE"
+
+# ── Phase 12: the scrollbar is a scroll gesture, not a focus one ──
+# Dragging a thumb is scrolling, so it resolves its pane by pointer and runs
+# ahead of the click that focuses a pane — otherwise every gesture the wheel
+# just learned to do without focus would still cost a focusing click when the
+# user reaches for the bar instead of the wheel.
+#
+# `ctrl+shift+\` splits side by side (`direction=Horizontal`), so the unfocused
+# original is the left half and its overlay scrollbar hugs the inside of the
+# divider: the hit zone is three thumb-widths wide, and nine pixels left of the
+# window's centre line clears the divider's own 4 px band while staying in it.
+#
+# The contrast is the assertion. The same press in the middle of that same
+# unfocused pane is an ordinary click and must still focus it — a run where
+# neither press focuses would mean pane focusing broke, not that the scrollbar
+# claimed the gesture.
+BASE_FOCUS=$(count_log "focused pane moved")
+point_at $(( WIN_W / 2 - 9 )) $(( WIN_H * 2 / 5 ))
+click 1
+sleep 0.8
+if [ "$(count_log "focused pane moved")" -ne "$BASE_FOCUS" ]; then
+    fail "PHASE 12 FAIL: pressing the unfocused pane's scrollbar moved the focus"
+fi
+point_at $(( WIN_W / 4 )) $(( WIN_H * 2 / 5 ))
+click 1
+sleep 0.8
+if [ "$(count_log "focused pane moved")" -le "$BASE_FOCUS" ]; then
+    fail "PHASE 12 FAIL: an ordinary press on the same pane did not focus it"
+fi
+capture /output/mouse-12-scrollbar-press.png
+echo "PHASE 12 PASS: the scrollbar claimed the press, the grid beside it focused"
+
 echo ""
 echo "ALL PHASES PASS — the wheel scrolls and mouse reporting is on the wire."
 echo "  Captures:    test-output/mouse-0*.png"

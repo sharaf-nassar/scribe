@@ -32,7 +32,9 @@ use scribe_client::restore_replay::{
 };
 use scribe_client::restore_state::{LaunchBinding, WindowRestoreState};
 use scribe_client::tab_session::TabSessions;
-use scribe_client::workspace_layout::{WindowLayout, WorkspaceSlot, pane_tree_to_layout_node};
+use scribe_client::workspace_layout::{
+    WindowLayout, WorkspaceDivider, WorkspaceSlot, pane_tree_to_layout_node,
+};
 use scribe_client::workspace_tree::WorkspaceTree;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
@@ -787,6 +789,24 @@ impl PaneShell {
                 })
             })
             .collect()
+    }
+
+    /// Resolve every workspace-region divider against the grid viewport.
+    pub fn workspace_dividers(&self, viewport: Rect, cx: &App) -> Vec<WorkspaceDivider> {
+        self.workspace.read(cx).layout().collect_workspace_dividers(viewport)
+    }
+
+    /// Set the ratio of the split between two workspace regions.
+    pub fn set_workspace_ratio(
+        &mut self,
+        first_workspace: WorkspaceId,
+        second_workspace: WorkspaceId,
+        ratio: f32,
+        cx: &mut App,
+    ) -> bool {
+        self.workspace.update(cx, |tree, ctx| {
+            tree.set_workspace_ratio(first_workspace, second_workspace, ratio, ctx)
+        })
     }
 
     /// Set the split ratio containing `pane_id` and report whether it changed.

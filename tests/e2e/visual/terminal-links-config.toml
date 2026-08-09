@@ -1,0 +1,5 @@
+# The Ctrl-hover phase compares two captures of the same grid, so nothing may
+# repaint on a clock of its own between them. A blinking shell cursor is the one
+# such thing on an otherwise idle window.
+[appearance]
+cursor_blink = false

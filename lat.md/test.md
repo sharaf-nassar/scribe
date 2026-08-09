@@ -1606,6 +1606,12 @@ Phase 3 also pins the announced grid. `AttachSessions` carries per-session `dime
 
 The phase guards its own oracle first. The defect announced exactly `COLUMNS`, so a rig whose pane happens to measure that same width cannot distinguish a fixed client from a broken one — the assertion would pass vacuously. Phase 3 therefore fails loudly when the published width equals the seed, demanding the container geometry change rather than the check be deleted. This container measures 119, one column off the seed, which is precisely why the guard is worth stating.
 
+#### First replay uses selected tab prompt geometry
+
+Switching between a tab with Scribe prompt chrome and a plain tab must paint each first `SessionReplay` at that selected tab's row count, without a corrective second geometry pass.
+
+The script sends a real `PromptReceived` for the hidden original tab, leaving the selected second tab plain. On plain-to-prompt switch, the wire-recorded `AttachSessions` and first `SessionReplay` must agree on a row count below the plain pane's published count. On prompt-to-plain switch, both must agree on the original larger count. Checking attach and replay ordering distinguishes the first painted state from eventual convergence: the broken path attached with the outgoing tab's rows, then corrected itself through `Resize` and `RequestSnapshot` one round trip later.
+
 Phases 6–10 extend the oracle to multi-workspace windows, and they are where the two selection paths stop agreeing. A live `ctrl+alt+backslash` splits the window into a second workspace region (settled on the `MoveSession` frame that re-files the seed session under the new region). Phase 7 then pins [[lat.md/test#Test Harness#GPUI Client Headless Suites#GPUI tab session strip#Digit select is workspace-scoped]] on the running client: with focus in the second region, whose only tab is already selected, `alt+1` must put nothing on the wire — an attach of the first region's tab 0 there would be the window-global indexing `TabSessions::select_in_workspace` exists to prevent. Moving the focus back into the first region with `ctrl+Prior`, which walks the strip globally and so does cross regions, `alt+1` must then attach that region's first tab. Phase 8 keeps the cross-region assertion for the path that still owns it: a pointer click on the first tab — offset past the workspace badge pill — attaches it from focus in the second region.
 
 The client is then killed and relaunched so the fresh window rebuilds both regions from the server's persisted workspace tree (`adopt_server_topology` → `PaneShell::adopt_server_tree`), and the same cross-region click must still switch tabs on that adoption-built layout. The adopted strip's order follows the server's `SessionList`, which is not creation order, so the adopted-layout phase asserts order-independently: adoption restores tab 0, `ctrl+Prior` wraps the selection onto the last tab (the second region's), and the click on tab 0 must attach a different session than that, with every typed key routed to the clicked session. Focus assertions for sessions the client created itself run against the wire's per-session `KeyInput` frames rather than `scribe-test wait-output`, which can only observe daemon-owned sessions — a limitation that produced deterministic false failures before the oracle was switched.
@@ -1694,13 +1700,13 @@ Each provider runs a set/clear cycle asserted twice over: the client's own `tab 
 
 ### Clipboard and OSC 52 bridge
 
-`tests/e2e/visual/clipboard-osc52.sh` is the app-level oracle for : the two-hop OSC 52 bridge, the confirmation modal, and the copy / paste chords, none of which a headless test can show.
+`tests/e2e/visual/clipboard-osc52.sh` is the app-level oracle for : the two-hop OSC 52 bridge, copy-on-select, the confirmation modal, and the copy / paste chords, none of which a headless test can show.
 
 It runs through the recording wire tap ( with `SCRIBE_SHARE_TAP=1`, described under ) with `terminal.clipboard.{read,write}_mode = "prompt"` and a 1 ms burst window seeded through `SCRIBE_EXTRA_CONFIG`, so each phase raises its own modal instead of inheriting the previous decision. Phase 0 relaunches the client after stopping the test daemon, which both hands it the harness session and makes it the window's only participant — the server routes an OSC 52 prompt to the window's *controller*, so a client sharing the window with the daemon might never see one.
 
 The OSC 52 phases drive the escape from inside the real pane (`printf '\033]52;c;<base64>\a'` typed through XTEST), because only a PTY-side emission reaches the server's policy engine. Each asserts three things: the client raised a modal, the answer left as a `ClipboardPromptResponse` frame on the wire, and the effect landed — the allowed write shows up in `xclip -o -selection clipboard`, and the allowed read comes back as a `ClipboardBridgeReadReply` whose `Ok` payload carries what was on the host clipboard.
 
-The copy phase drags a real mouse selection across the pane and presses the `copy` chord, then requires the X11 clipboard to hold the selected needle — a chord that reached only the drop counter leaves the clipboard at its seeded value. The paste phase seeds the clipboard, presses the `paste` chord, and asserts the pasted bytes appear inside a `KeyInput` frame on the wire and that the shell's echo repaints the grid.
+The copy phase drags a real mouse selection across the pane and first requires release to place the selected needle on the X11 clipboard. It then reseeds the clipboard, presses the `copy` chord, and requires the needle again, distinguishing copy-on-select from chord wiring. The paste phase seeds the clipboard, presses the `paste` chord, and asserts the pasted bytes appear inside a `KeyInput` frame on the wire and that the shell's echo repaints the grid.
 
 ### Terminal viewport navigation
 
@@ -1721,6 +1727,12 @@ Split-scroll needs both halves of its gate, so the phase posts a real `state_cha
 Both halves were invisible to every headless test. The crate contained no scroll-wheel handling at all, and `mouse_reporting.rs` was an unwired module with a green golden-byte suite — a suite that cannot tell a wired encoder from an unwired one, which is exactly how the pair survived to the launch gate. The run therefore uses the  plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and asserts against three independent oracles: the client's own log lines, the recorded `KeyInput` bytes, and the pane's own screen.
 
 The third oracle is what makes the run end-to-end. Each tracking phase starts a real `cat -v` in the pane behind the DEC modes under test and a non-canonical, non-echoing line discipline, so every byte the client forwards is printed straight back onto the pane as visible text (`^ plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and every phase needs a screenshot diff *and* a recorded `Resize` before it passes.
+
+Two closing phases assert that the wheel is a *pointer* gesture rather than a focus-relative one, which is how it was wrong: every wheel event resolved against the focused pane, so a split window could only be scrolled where the keyboard already was. Phase 10 splits the window, then wheels the top-left corner and the bottom-right one and requires the two `terminal scrollback moved` lines to name **different** sessions — a single reported session is exactly what a focus-relative wheel produces, so the pair is the assertion and neither half alone would fail. The top-left corner must name the rig's own `SESSION`, and `focused pane moved` must not appear at all between the two: scrolling a pane may not quietly take the keyboard away from its neighbour.
+
+Phase 12 covers the other scroll gesture. The split leaves the original pane on the left, so a press nine pixels inside the window's centre line lands in that unfocused pane's overlay scrollbar — clear of the divider's own 4 px band — and must *not* move the focus. The contrast is what makes it an assertion rather than a coincidence: the same press in the middle of that same pane is an ordinary click and must focus it. A miss on the hit zone focuses the pane and fails the first check, so the phase cannot pass by aiming at nothing.
+
+Phase 11 covers the background case. A second X client (`xmessage`, parked in the corner the wheel is not aimed at) takes the activation, and the phase refuses to run unless `xdotool getactivewindow` confirms Scribe actually lost it — openbox is click-to-focus, so parking the pointer over Scribe cannot hand it back, and a phase that silently kept the activation would prove nothing. The wheel must then still move the pane under the pointer, and Scribe must still be in the background afterwards.
 
 `ctrl+-` must log `level=-1`, repaint the grid, and publish a smaller cell box with *more* columns; two `ctrl+=` presses must reach `level=1` with a bigger cell box and fewer columns than both the zoomed-out grid and the baseline. The column assertions are the point: a client that rescales glyphs inside a frozen `cols`x`rows` box also repaints and also emits a `Resize`, so pixels and frame counts alone cannot tell a real zoom from a cosmetic one. `ctrl+0` must return `level=0`, republish the pre-zoom geometry field for field, and leave a frame within a few hundred pixels of the pre-zoom capture — the seeded rows are short enough that no zoom level wraps them, so a restored grid is a restored image.
 
@@ -1822,13 +1834,37 @@ Every control is reached through a semantic target rather than a coordinate: the
 The single pointer gesture is that seed: a click in the middle of the sidebar's 36px version footer. It exists because nothing holds the GPUI focus handle when the window opens, so the first keystroke would otherwise dispatch to the window root and be dropped; the click hands the root its handle and resets `focus_index` to 0 through `clear_keyboard_navigation`, which is why every phase can count Down presses from a known origin. Phase 0 asserts it sends no frame, so a future sidebar that puts a control there fails loudly instead of silently mutating config.
 
 The footer is the one part of the sidebar that cannot become a control by accident: a `flex_none` `Role::Note` pinned below the nav list, which is its own scroll region, so adding pages scrolls them rather than pushing anything into the seed point. Aiming at the empty background below the last nav item is what the grouped-nav redesign broke — the list grew under the old point and the seed click started selecting Remote, putting four frames on a wire phase 0 requires to stay silent. The point is window-relative (`xdotool mousemove --window`) because under a reparenting WM `getwindowgeometry`'s absolute Y carries the frame offset and absolute arithmetic aims low.
+### A maximized window survives an update
+
+`tests/e2e/visual/maximized-restore.sh` (`just e2e-visual-maximized-restore`) drives the restore path an *update* takes, which is not the one a quit takes.
+
+A package upgrade first hot-handoffs the server while the old client reconnects, then stops that client with SIGTERM (`stop_client_processes` in `dist/debian/postinst`) and launches its replacement. The test opens two UI windows, maximizes the newly opened sibling, uses `scribe-test server upgrade` for the real fd handoff, terminates the client, and relaunches against the handed-off sessions.
+
+The oracle is the complete visible-XID set plus `_NET_WM_STATE`, because screen-sized is not the same state and newest/lowest XID does not identify a logical window across processes. Both replacements must appear and report their restored app frames, exactly one must then hold both maximize atoms, and the screenshot plus a second set-wide read prove neither a late GPUI toggle nor a delayed fan-out changed that invariant. The harness daemon's unrelated session is closed before handoff so only the two UI windows participate.
+
+The script maximizes through an EWMH ADD client message because the image's xdotool predates `windowstate` and `wmctrl` is absent. [[client#Client#GPUI Client Spike#Restored Window Placement]] explains why X11 creation suppresses GPUI's independent toggle and leaves Scribe's ADD as the sole state transition.
+
+### Ctrl+click links open for real
+
+`tests/e2e/visual/terminal-links.sh` (`just e2e-visual-terminal-links`) is the app-level oracle for [[client#Client#URL Detection#Ctrl+Click in the GPUI Client]]. Detection is unit-tested against a grid; this asserts the rest.
+
+Nothing else can. "The pointer was over a link, Ctrl was down, and the OS handler was asked to open the right thing" spans the pointer path, the focused pane's live grid, the pane's CWD as the server reports it, and a spawned process. The oracle is a stand-in `xdg-open` installed on PATH ahead of the client's spawn, which appends its argument to a log — so the assertions are on the exact string [[crates/scribe-client/src/url_detect.rs#open_url]] / [[crates/scribe-client/src/url_detect.rs#open_path]] handed the OS, not on a screenshot of a highlight. It is installed rather than injected because the point is to observe the real `Command::new("xdg-open")` spawn, and the PATH lookup happens per spawn, so the already-running client picks it up with no relaunch.
+
+Every row of the grid is filled with the same link, which is what lets the click land without cell-accurate pixel arithmetic: any point in the middle of the window is over one. What is under test is the routing, and a test that also had to solve for glyph metrics would fail for reasons that have nothing to do with it.
+
+Phase 1 clicks a link with no modifier and requires that nothing opened — the modifier is the entire gate, and a build that opened on a bare click would launch a browser on every drag-select over a URL. Phase 2 parks the pointer, captures the grid, holds Ctrl, and requires the capture to change, then requires it to change back when Ctrl comes up: the rule is the whole discoverability half of the feature, and a build that draws nothing is aiming a click at a link the user was never shown. The capture is cropped above the status bar, whose sparklines resample on their own clock, and the seeded `terminal-links-config.toml` turns the cursor blink off — between two frames of an idle window those are the only things that would otherwise repaint themselves.
+
+Phase 3 Ctrl+clicks the URL. Phase 4 is the one that needs a real shell: it `cd`s into a directory, announces it with OSC 7, fills the grid with `./linkme.txt`, and requires the *absolute* path to come out of the opener. A relative link opened without a CWD would reach the OS as `./linkme.txt` and resolve against whatever directory the client process happens to be in, which is exactly the bug the phase exists to catch.
+
 ### Window lifecycle over the wire
 
 `tests/e2e/visual/window-lifecycle.sh` is the app-level oracle for the seven window-lifecycle parity rows: it drives the real client against the real server and reads every frame off the recorded wire (see ).
 
 Nothing is stubbed and nothing is injected. The wire tap (, `SCRIBE_SHARE_TAP=1`) is interposed purely as a recorder, so every server frame the script asserts on is one the real `scribe-server` chose to send in answer to something the real client sent. `tests/e2e/visual/window-lifecycle-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn `remote.enabled` on, because the window-list poll is gated on it exactly as the winit client gates it; the entrypoint writes that file after the server has already started, so only the client's poll is affected and no remote listener is bound.
 
-The six phases each assert a different half of the conversation. Phase 0 reads the client's own nonempty `FocusChanged.gained` to identify the shell fresh-window bootstrap placed in the visible pane; the separate session the entrypoint creates for `scribe-test` is deliberately ignored. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 exits that tab and proves the process stays alive without sending `CloseWindow`, then exits the remaining terminal and requires `CloseWindow`, `WindowClosed`, and process death in order. Phase 4 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 5 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
+The seven phases each assert a different half of the conversation. Phase 0 reads the client's own nonempty `FocusChanged.gained` to identify the shell fresh-window bootstrap placed in the visible pane; the separate session the entrypoint creates for `scribe-test` is deliberately ignored. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 exits that tab and proves the process stays alive without sending `CloseWindow`, then exits the remaining terminal and requires `CloseWindow`, `WindowClosed`, and process death in order. Phase 4 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 5 relaunches, opens a *second* window with Ctrl+Shift+N, and asserts "Kill Window" on the focused one sent `CloseWindow` naming that window's id, that the server answered `WindowClosed`, and that only that window's frame went away. Phase 6 kills the survivor and requires the process to exit on the ack.
+
+The second window in phase 5 is the phase. One client process hosts every window, so a kill that ends the *process* is invisible with one window open and takes every sibling down with it as soon as there are two — and merely closes them, since nobody asked the server to destroy their sessions. The assertions are therefore all on the sibling: its X11 frame is still mapped, a `scribe-client` process is still alive, and no `CloseWindow` ever named its id. The frames are compared as sets of X11 window ids captured before and after the new window opened, so the phase names the victim and the survivor explicitly rather than trusting the newest-window heuristic `find_window` uses. Splitting the last window's kill into phase 6 keeps "the process exits when the last window goes" an assertion of its own, rather than a side effect nothing checks.
 
 The one-Tab Quit Scribe path and two-Tab Kill Window path are focus-trap checks as well as action checks: traversal must remain inside the close modal until Enter emits the exact lifecycle frame, while the real server acknowledgement remains the only exit oracle.
 
@@ -2171,6 +2207,12 @@ Unit tests for the GPUI client's ported  scanner —  over Zed's Alacritty fork 
 
  collapses a multi-row OSC 8 run into exact per-row s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
 
+### A relative path resolves against the pane's CWD
+
+[[crates/scribe-client/src/url_detect.rs#resolve_path]] turns a detected path into what the OS handler is actually given, which is the half of opening a file link that can be tested without spawning anything.
+
+A relative path joins onto the pane's working directory and loses the `./` the detector matched on; a `..` segment survives, because collapsing it lexically names a different file whenever a symlink sits on the path. An absolute path ignores the CWD but still loses its `.` components. With no CWD the path is handed over unresolved rather than resolved against this process's directory — which is Scribe's, not the shell's, and would open the wrong file silently.
+
 ## GPUI Terminal Selection
 
 Unit tests for the ported  state —  and its vi-mode wrapper — proving cell/word/line granularity, `WRAPLINE`-aware extraction, and copy-on-select over Zed's Alacritty fork.
@@ -2372,6 +2414,12 @@ The record is also already marked normalized: a capture off a GPUI window is in 
 ### Maximized record reopens maximized
 
 A record whose state is `maximized` yields `WindowBounds::Maximized`, so the window is maximized from its first frame instead of being resized a frame later the way the winit client's async `set_maximized` was.
+
+### X11 restore has one state transition
+
+X11 creation strips maximized and fullscreen bounds to their saved windowed rect, leaving Scribe's idempotent EWMH ADD as the only state transition while windowed bounds stay unchanged.
+
+This removes the cross-connection race between GPUI's toggle and Scribe's assertion without changing Wayland's native creation request.
 
 ### Legacy maximized bool folds into the state
 
@@ -3157,6 +3205,8 @@ Confirms both shutdown requests are one-shot and that neither of them, on its ow
 
 "Kill Window" is inert until a `Welcome` names this connection's window, because the server refuses a `CloseWindow` that names any other one. Once claimed,  and  both refuse a second request, so a repeated Enter on the dialog cannot put a second frame on the wire.  stays empty until the matching acknowledgement arrives and yields the exit exactly once, and a `QuitRequested` caused by a *different* window still exits this one.
 
+The exit and the closed latch are asserted apart, because they answer different threads. [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#window_closed]] must survive the drain the GPUI thread has already performed, since the IPC backend reads it afterwards to stop redialling, and it must stay clear after a `QuitRequested`: a quit-all leaves this window's sessions and its server-side identity alive, so its backend still has a window to reconnect to.
+
 #### An unrelated close ack is ignored
 
 Verifies  only obeys an acknowledgement naming the window this client asked to close.
@@ -3329,6 +3379,18 @@ A tree with an outer split whose second child is itself a split emits exactly on
 
 A drag whose captured parent extent is zero returns a neutral 0.5 ratio instead of dividing by zero, keeping the layout stable during a zero-area transient.
 
+## GPUI Workspace Dividers
+
+Covers live workspace-region divider rendering, pointer routing, grid resize, and persisted ratio reporting in the GPUI client.
+
+### Hover cursor follows split axis across hit band
+
+Side-by-side regions use GPUI's left-right resize cursor and stacked regions use its up-down cursor across the same 4px-tolerance target as drag hit-testing.
+
+### Live drag resizes regions
+
+Dragging the outer divider between workspace regions republishes both pane grids and reports the changed ratio so the layout persists.
+
 ## GPUI Focus Borders
 
 Covers the focus-border edge geometry in  — the four accent strips the GPUI paint path fills for a focused pane or workspace, kept pure so the corner-overlap math is verifiable without a window.
@@ -3388,6 +3450,12 @@ These are the reachability tests for : the pure modules already had unit tests, 
  really removes the display grid's oldest rows and reports the drop, and  applies it to the marks.
 
 The surviving top row is the one after the cut rather than a renumbered original, anchors below the cut shift down, anchors inside it are retired, and a trim that keeps everything the grid already holds is a no-op.
+
+### Link lookup follows the scrolled viewport
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#link_at]] resolves a viewport cell onto the URL, path, or OSC 8 span painted there, and keeps answering for what is painted there *now* after the grid moves.
+
+A URL and a relative path on adjacent rows come back as different [[crates/scribe-client/src/url_detect.rs#SpanKind]]s carrying their exact row segments, because the two open through different routes and only one of them is resolved against the pane's CWD; the words beside them resolve to nothing. Both lines are then pushed into scrollback and the viewport scrolled back one row, so the same viewport row paints different content: a cache that outlived the scroll would hand back the link that used to be there, which is the failure the [[client#Client#URL Detection#Ctrl+Click in the GPUI Client|make_content invalidation]] exists to prevent.
 
 ### Split-scroll pins the live rows under the scrollback
 

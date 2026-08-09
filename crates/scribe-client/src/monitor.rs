@@ -149,6 +149,25 @@ pub fn apply_saved_position(window: &Window, x: i32, y: i32, state: WindowState)
     x11::move_window(window, x, y, state)
 }
 
+/// Put a restored window into the maximized or fullscreen state its record
+/// names, by asserting the `_NET_WM_STATE` atoms that own it.
+///
+/// GPUI cannot be relied on for this. `WindowBounds::Maximized` reaches its X11
+/// backend as `zoom()`, which sends `_NET_WM_STATE_TOGGLE` — the enum has no
+/// Add — so "open this window maximized" is really "flip whatever the window
+/// manager decided". A window the WM maps already maximized (a size request
+/// that meets the work area, a session restore, a per-application rule) comes
+/// back *un*maximized from exactly the same code that restores every other one
+/// correctly. `_NET_WM_STATE_ADD` is idempotent by EWMH 4.1.3.1, so asserting
+/// it is right whichever way the toggle went.
+///
+/// Returns whether a request was sent: false for a state that owns no atoms
+/// (windowed, and minimized which [`Window::minimize_window`] owns), off X11,
+/// and on a window manager that does not advertise the atoms.
+pub fn assert_window_state(window: &Window, state: WindowState) -> bool {
+    x11::add_placement_state(window, state)
+}
+
 #[cfg(target_os = "linux")]
 mod x11 {
     use std::cell::OnceCell;
@@ -411,6 +430,18 @@ mod x11 {
         .is_some()
     }
 
+    /// Add the `_NET_WM_STATE` atoms `state` owns, leaving every other bit of
+    /// the window's state alone.
+    pub(super) fn add_placement_state(window: &Window, state: WindowState) -> bool {
+        let Some(xid) = xcb_window_id(window) else { return false };
+        with_connection(|conn| {
+            let root = conn.get_geometry(xid).ok()?.reply().ok()?.root;
+            let held = placement_atoms(conn, root, state);
+            set_wm_state(conn, root, xid, WM_STATE_ADD, &held).then_some(())
+        })
+        .is_some()
+    }
+
     /// The ICCCM `ConfigureRequest` fallback, for a window manager that does
     /// not advertise `_NET_MOVERESIZE_WINDOW`.
     fn configure_position(conn: &RustConnection, xid: u32, x: i32, y: i32) -> bool {
@@ -588,6 +619,10 @@ mod x11 {
 
     pub(super) fn connected_monitors() -> Vec<MonitorWorkArea> {
         Vec::new()
+    }
+
+    pub(super) fn add_placement_state(_window: &Window, _state: WindowState) -> bool {
+        false
     }
 
     pub(super) fn move_window(_window: &Window, _x: i32, _y: i32, _state: WindowState) -> bool {

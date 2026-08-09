@@ -7,3 +7,7 @@
 [keybindings]
 workspace_focus_left = "ctrl+alt+h"
 workspace_focus_right = "ctrl+alt+l"
+
+# Exercise the reported layout: prompt chrome at the pane's bottom edge.
+[terminal]
+prompt_bar_position = "bottom"

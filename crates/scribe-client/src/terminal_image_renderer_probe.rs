@@ -327,7 +327,7 @@ impl Render for RendererProbe {
             MatchHighlightColors::from_chrome(&theme.chrome),
             Rc::clone(&self.grid_bounds),
         )
-        .with_cursor(CursorPaint { visible: true, shape: CursorShape::Block })
+        .with_cursor(Some(CursorPaint { visible: true, shape: CursorShape::Block }))
         .with_selection(vec![SelectionSpan { row: 9, start_col: 31, end_col: 32 }])
         .with_highlights(vec![MatchHighlight { row: 9, start_col: 32, end_col: 32, current: true }])
         .with_terminal_images(TerminalImagesPaint {
