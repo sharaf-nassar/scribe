@@ -1291,7 +1291,11 @@ Failed nightly runs upload `test-output/` for 14 days, including `test-output/e2
 
 Hosted validation remains external and pending after push: this unpushed implementation has no GitHub pull-request, manual, scheduled, or full hosted-nightly run to cite. Post-push acceptance must record a real warm PR duration and manual-nightly artifact/summary result before treating hosted CI timing and execution as measured.
 
-No workflow runs `cargo clippy` or `cargo test`; both live only in the local `just ready` gate. Combined with Ubuntu-only runners, that leaves `#[cfg(target_os = "macos")]` code checked by nothing but a developer running `just ready` on a Mac — the gap that let a never-executable `hdiutil` mount-point parse and a batch of denied lints in `macos_proc`, `x11_focus`, and `config` accumulate unnoticed. Treat a green PR as saying nothing about macOS-gated code.
+`quality.yml` runs `just clippy` and `just test` on both platforms — `rust-linux` on `ubuntu-22.04` and `rust-macos` on `macos-14` — always through the justfile so CI and the local `just ready` gate cannot drift apart. Before those jobs existed neither command ran anywhere in CI, and over a thousand unit tests executed nowhere.
+
+The macOS job exists because a Linux runner cannot compile `#[cfg(target_os = "macos")]` code at all. Until it was added, the only thing that ever type-checked that code was `release.yml`'s macOS build leg, which fires on a version tag — too late to stop drift, and it runs no tests. That gap is why a `hdiutil` mount-point parse that could never succeed shipped, alongside denied lints in `macos_proc`, `x11_focus`, and `config`. The job needs no system dependencies: the apt list is Linux-only in both workflows.
+
+It runs lint and unit tests only and never invokes the Scribe runtime, so it is distinct from the sanctioned native-macOS runtime validation in [[terminal-images#Terminal Images#Native macOS Metal Validation]]. The residue still outside automated coverage is the install path's restart tail — `launchctl kickstart`, `pkill`, and the handoff wait — which no CI job may execute.
 
 ## AI-Launch Harness Plumbing
 
