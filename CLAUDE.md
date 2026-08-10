@@ -65,6 +65,13 @@
   `.github/workflows/native-macos-metal.yml` on GitHub's hosted
   `macos-14` ARM64 runner. This narrow exception does not authorize
   invoking Scribe on a developer workstation or another macOS host.
+- Compiling and unit-testing on a macOS runner is not runtime
+  validation and is not covered by this restriction. The `rust-macos`
+  job in `.github/workflows/quality.yml` runs `just clippy` and
+  `just test` on `macos-14` for every pull request; it never starts
+  `scribe-server`, `scribe-client`, or `scribe-test`. The install
+  path's restart tail (`launchctl kickstart`, `pkill`, the handoff
+  wait) must stay unreachable from any test on any host.
 - A repository maintainer with GitHub write access owns dispatch, failure
   triage, evidence review, and the release decision. Dispatch only after the
   workflow is present on the default branch and the target ref contains the

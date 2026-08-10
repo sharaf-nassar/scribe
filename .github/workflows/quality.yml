@@ -51,3 +51,90 @@ jobs:
         run: |
           tools/check-parity-inventory.sh \
             --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+
+  # Until this job existed no workflow ran clippy or the unit tests at all:
+  # the suppression guards above are repo hygiene, and e2e.yml only builds
+  # binaries for the Docker suites. The workspace denies clippy::pedantic
+  # plus cherry-picked restriction lints in [workspace.lints], and 1000+
+  # unit tests were executing nowhere in CI.
+  #
+  rust-linux:
+    name: Clippy and unit tests (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: 'false'
+
+      # Mirrors the e2e smoke job's dependency list so the two stay buildable
+      # from the same tree. mesa-vulkan-drivers supplies a Vulkan ICD for any
+      # test that reaches GPUI's renderer.
+      - name: Install build dependencies and just
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libdbus-1-dev \
+            libfontconfig-dev \
+            libssl-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            mesa-vulkan-drivers
+          cargo install just --locked --version 1.57.0
+
+      # Both go through just so CI and `just ready` cannot drift apart.
+      - name: Clippy
+        run: just clippy
+
+      - name: Unit tests
+        run: just test
+
+  # The Linux job above cannot compile `#[cfg(target_os = "macos")]` code at
+  # all, so until this job existed the only thing that ever type-checked it was
+  # release.yml's macOS build leg — and that runs on a version tag, far too
+  # late to stop drift. That gap is why a `hdiutil` mount-point parse that
+  # could never succeed shipped, alongside denied lints in `macos_proc`,
+  # `x11_focus`, and `config`.
+  #
+  # This runs lint and unit tests only. It does not invoke the Scribe runtime,
+  # so it is outside the native-macOS runtime restriction in CLAUDE.md.
+  #
+  # macOS needs no system dependency installation — the apt list in the Linux
+  # job and in release.yml is guarded `if: matrix.os == 'linux'`.
+  rust-macos:
+    name: Clippy and unit tests (macOS)
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: 'false'
+
+      - name: Install just
+        run: cargo install just --locked --version 1.57.0
+
+      - name: Clippy
+        run: just clippy
+
+      - name: Unit tests
+        run: just test
