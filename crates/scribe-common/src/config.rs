@@ -1773,10 +1773,12 @@ fn migrate_keybinding(
 
 #[cfg(target_os = "macos")]
 fn keybinding_matches_any(binding: &KeyComboList, candidates: &[&str]) -> bool {
-    if binding.as_slice().len() != 1 {
+    // Slice pattern instead of a length check plus an index: a single-binding
+    // list is the only shape this migration applies to, and destructuring says
+    // so without a panicking index.
+    let [current] = binding.as_slice() else {
         return false;
-    }
-    let current = &binding.as_slice()[0];
+    };
     candidates.iter().any(|candidate| current.eq_ignore_ascii_case(candidate))
 }
 

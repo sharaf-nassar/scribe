@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// How a session's child process terminated.
 ///
@@ -119,6 +119,9 @@ fn peek_child_exit(pidfd: &AsyncFd<OwnedFd>, child_pid: u32) -> ChildExit {
     use std::os::fd::AsFd as _;
 
     use rustix::process::{WaitId, WaitIdOptions, waitid};
+    // Scoped to this Linux-only body: the macOS variant below never logs at
+    // debug, so a module-level import would be unused off Linux.
+    use tracing::debug;
 
     match waitid(
         WaitId::PidFd(pidfd.get_ref().as_fd()),

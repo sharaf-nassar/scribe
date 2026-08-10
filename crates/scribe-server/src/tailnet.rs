@@ -627,9 +627,7 @@ fn read_appstore_proof() -> Option<(u16, String)> {
         let Some(rest) = line.get(index + needle.len()..) else {
             continue;
         };
-        let mut parts = rest.splitn(2, '-');
-        let port_str = parts.next()?;
-        let token = parts.next()?;
+        let (port_str, token) = rest.split_once('-')?;
         if let Ok(port) = port_str.parse::<u16>() {
             return Some((port, token.to_string()));
         }

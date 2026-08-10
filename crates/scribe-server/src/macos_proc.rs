@@ -112,14 +112,15 @@ mod imp {
         const MAX_PROCARGS2_BYTES: usize = 1024 * 1024;
 
         let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mib_len = libc::c_uint::try_from(mib.len()).ok()?;
         let mut len: libc::size_t = 0;
 
         let size_result = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
-                mib.len() as libc::c_uint,
+                mib_len,
                 std::ptr::null_mut(),
-                &mut len,
+                std::ptr::from_mut(&mut len),
                 std::ptr::null_mut(),
                 0,
             )
@@ -133,9 +134,9 @@ mod imp {
         let args_result = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
-                mib.len() as libc::c_uint,
+                mib_len,
                 buf.as_mut_ptr().cast::<libc::c_void>(),
-                &mut actual_len,
+                std::ptr::from_mut(&mut actual_len),
                 std::ptr::null_mut(),
                 0,
             )
@@ -151,39 +152,46 @@ mod imp {
 
     fn parse_procargs2_argv(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
         let argc_size = std::mem::size_of::<libc::c_int>();
-        if argc_size != 4 || buf.len() < argc_size {
+        if argc_size != 4 {
             return None;
         }
 
-        let argc = i32::from_ne_bytes(buf[..argc_size].try_into().ok()?);
+        // `get` rather than an index: a short buffer is a "cannot parse"
+        // answer, not a panic, and it subsumes the old length check.
+        let argc = i32::from_ne_bytes(buf.get(..argc_size)?.try_into().ok()?);
         if argc < 0 {
             return None;
         }
 
-        let mut data = &buf[argc_size..];
+        // Skip the executable path and the NUL padding that follows it.
+        let mut data = buf.get(argc_size..)?;
         let exe_end = data.iter().position(|byte| *byte == 0)?;
-        data = &data[exe_end + 1..];
-        while data.first() == Some(&0) {
-            data = &data[1..];
-        }
+        data = skip_leading_nuls(data.get(exe_end + 1..)?);
 
-        let mut args = Vec::new();
+        let mut parsed = Vec::new();
         for _ in 0..argc {
             if data.is_empty() {
                 break;
             }
             let arg_end = data.iter().position(|byte| *byte == 0).unwrap_or(data.len());
-            let arg = &data[..arg_end];
+            let arg = data.get(..arg_end)?;
             if !arg.is_empty() {
-                args.push(arg.to_vec());
+                parsed.push(arg.to_vec());
             }
-            data = if arg_end < data.len() { &data[arg_end + 1..] } else { &[] };
-            while data.first() == Some(&0) {
-                data = &data[1..];
-            }
+            // Past the final argument there is no separator to step over, so an
+            // out-of-range tail is the empty slice rather than a failure.
+            data = skip_leading_nuls(data.get(arg_end + 1..).unwrap_or(&[]));
         }
 
-        Some(args)
+        Some(parsed)
+    }
+
+    /// Advances past the NUL padding `KERN_PROCARGS2` writes between entries.
+    fn skip_leading_nuls(mut data: &[u8]) -> &[u8] {
+        while data.first() == Some(&0) {
+            data = data.get(1..).unwrap_or(&[]);
+        }
+        data
     }
 }
 

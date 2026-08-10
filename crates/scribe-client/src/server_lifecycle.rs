@@ -759,12 +759,12 @@ fn terminate_pid(pid: u32, label: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let status = std::process::Command::new("kill")
+    let force_status = std::process::Command::new("kill")
         .args(["-9", &pid_text])
         .status()
         .map_err(|error| format!("failed to force-kill {label} pid {pid}: {error}"))?;
-    if !status.success() {
-        return Err(format!("kill -9 {pid} for {label} exited with {status}"));
+    if !force_status.success() {
+        return Err(format!("kill -9 {pid} for {label} exited with {force_status}"));
     }
     if wait_for_process_exit(pid, Duration::from_secs(1)) {
         Ok(())

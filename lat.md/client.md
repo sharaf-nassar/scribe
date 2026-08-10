@@ -1514,6 +1514,8 @@ Keyboard events are only processed when the window has focus (`window_focused ==
 
 Compositor overlays (e.g. GNOME Shell screenshot) clear or change this EWMH property without sending `FocusOut`. The guard polls in `about_to_wait` and on each key press. A `was_inactive` flag tracks whether the window has been obscured; when `should_suppress_key` or `poll` first sees the window become active again, a `reactivated_at` timestamp is set and keys are suppressed for 300ms from that transition. The debounce is cleared on `Focused(true)` so it only applies to compositor overlay dismissals — not normal focus transitions — preventing the first keystroke from being swallowed when the user alt-tabs or clicks to Scribe.
 
+Off Linux the guard carries an uninhabited field, so [[crates/scribe-client/src/x11_focus.rs#X11FocusGuard]] cannot be constructed at all rather than merely being empty — `from_window_handle` already returns `None` there. That makes the platform-neutral `poll`, `clear_reactivation_debounce`, and `should_suppress_key` discharge `self` by matching a value that cannot exist, instead of silently ignoring it.
+
 #### GPUI X11 Handle
 
 Pinned GPUI exposes the X11 XID as `RawWindowHandle::Xcb`, so the rebuild keeps

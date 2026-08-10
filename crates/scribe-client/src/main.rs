@@ -12010,7 +12010,6 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
 
 #[cfg(test)]
 mod tests {
-    use gpui::point;
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;

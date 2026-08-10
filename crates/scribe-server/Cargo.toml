@@ -282,6 +282,10 @@ pulldown-cmark = { version = "0.13", default-features = false, features = [
 ] }
 semver.workspace = true
 serde_json.workspace = true
+# `hdiutil info -plist` is the documented machine-readable interface for
+# discovering which devices an update DMG still has attached. Not macOS-gated:
+# keeping the parser cross-platform is what lets Linux CI test it.
+plist = "1"
 minisign-verify.workspace = true
 sha2 = "0.10"
 keyring = { workspace = true }

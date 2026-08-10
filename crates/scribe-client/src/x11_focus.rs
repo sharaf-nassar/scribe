@@ -131,6 +131,13 @@ pub struct X11FocusGuard {
     our_window: u32,
     #[cfg(target_os = "linux")]
     debounce: ReactivationDebounce,
+    /// Off Linux there is no constructor — [`X11FocusGuard::from_window_handle`]
+    /// always yields `None` — so the guard is uninhabited rather than merely
+    /// empty. Stating that in the type keeps the platform-neutral methods below
+    /// honest: they discharge `self` by matching a value that cannot exist,
+    /// instead of quietly ignoring it.
+    #[cfg(not(target_os = "linux"))]
+    never: std::convert::Infallible,
 }
 
 impl X11FocusGuard {
@@ -183,12 +190,16 @@ impl X11FocusGuard {
         } else {
             self.debounce.note_inactive();
         }
+        #[cfg(not(target_os = "linux"))]
+        match self.never {}
     }
 
     /// Clear the reactivation debounce on a genuine focus event.
     pub fn clear_reactivation_debounce(&mut self) {
         #[cfg(target_os = "linux")]
         self.debounce.clear();
+        #[cfg(not(target_os = "linux"))]
+        match self.never {}
     }
 
     /// Returns `true` when keyboard input should be suppressed: either our
@@ -196,7 +207,7 @@ impl X11FocusGuard {
     /// again within [`REACTIVATION_DEBOUNCE`].
     pub fn should_suppress_key(&mut self) -> bool {
         #[cfg(not(target_os = "linux"))]
-        return false;
+        match self.never {}
 
         #[cfg(target_os = "linux")]
         {

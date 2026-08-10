@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -13,6 +15,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgressState};
 
 use crate::ipc_server::WindowShares;
+
+pub mod macos_install;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -722,184 +726,38 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
 
 #[cfg(target_os = "macos")]
 fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
-    use scribe_common::socket::handoff_socket_path;
-    use std::collections::HashMap;
-    use std::process::Stdio;
+    use macos_install::{SwapPaths, SystemHost, swap_bundle_from_dmg};
 
     let app_bundle_path = current_app_bundle_path()?;
     let prev_path = app_bundle_path.with_extension("app.prev");
-    let path_str = asset.path.to_string_lossy();
-
-    // Attach the DMG.
-    let attach = std::process::Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-quiet", &path_str])
-        .output()
-        .map_err(|e| ScribeError::UpdateInstallFailed {
-            reason: format!("hdiutil attach failed: {e}"),
-        })?;
-
-    if !attach.status.success() {
-        return Err(ScribeError::UpdateInstallFailed {
-            reason: format!(
-                "hdiutil attach exited with {}: {}",
-                attach.status,
-                String::from_utf8_lossy(&attach.stderr)
-            ),
-        });
-    }
-
-    // The mount point is the last whitespace-separated token on the last line.
-    let stdout = String::from_utf8_lossy(&attach.stdout);
-    let mount_point = stdout
-        .lines()
-        .last()
-        .and_then(|l| l.split_whitespace().last())
-        .ok_or_else(|| ScribeError::UpdateInstallFailed {
-            reason: "could not parse hdiutil mount point".into(),
-        })?
-        .to_owned();
+    let mount_point = update_mount_point(&asset.path)?;
 
     // Capture which client processes are running before the update.
-    let is_running = |name: &str| -> bool {
-        std::process::Command::new("pgrep")
-            .args(["-x", name])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    let client_was_running = is_running("scribe-client");
+    let client_was_running = process_is_running("scribe-client");
 
-    // Remove any stale .app.prev left by a previous failed update so the
-    // upcoming rename doesn't collide with it.
-    if prev_path.exists() {
-        let _ = std::fs::remove_dir_all(&prev_path);
-    }
+    // Mount, replace the bundle, roll back on failure, and always detach.
+    let backup_existed = swap_bundle_from_dmg(
+        &mut SystemHost,
+        &SwapPaths {
+            dmg: &asset.path,
+            mount_point: &mount_point,
+            bundle_name: current_identity().app_bundle_name(),
+            app_bundle: &app_bundle_path,
+            prev_bundle: &prev_path,
+        },
+    )
+    .map_err(|reason| ScribeError::UpdateInstallFailed { reason })?
+    .backup_existed;
 
-    // Rename existing app to .app.prev for rollback (O(rename), same filesystem).
-    // If it doesn't exist (fresh install), continue without backup.
-    let backup_existed = std::fs::rename(&app_bundle_path, &prev_path).is_ok();
-
-    let app_src = Path::new(&mount_point).join(current_identity().app_bundle_name());
-    let ditto_result = std::process::Command::new("ditto")
-        .arg(&app_src)
-        .arg(&app_bundle_path)
-        .status()
-        .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("ditto failed: {e}") });
-
-    // Always attempt to detach, even if ditto failed.
-    let detach =
-        std::process::Command::new("hdiutil").args(["detach", "-quiet", &mount_point]).status();
-    if let Err(ref e) = detach {
-        warn!("hdiutil detach failed: {e}");
-    }
-
-    let ditto_status = match ditto_result {
-        Err(e) => {
-            // ditto could not be launched — restore backup if we have one.
-            if backup_existed {
-                if let Err(re) = std::fs::rename(&prev_path, &app_bundle_path) {
-                    warn!("rollback rename failed: {re}");
-                }
-            }
-            return Err(e);
-        }
-        Ok(s) => s,
-    };
-
-    if !ditto_status.success() {
-        // ditto ran but failed — restore backup if we have one.
-        if backup_existed {
-            if let Err(re) = std::fs::rename(&prev_path, &app_bundle_path) {
-                warn!("rollback rename failed: {re}");
-            }
-        }
-        return Err(ScribeError::UpdateInstallFailed {
-            reason: format!("ditto exited with {ditto_status}"),
-        });
-    }
-
-    // Compare old and new binaries to determine which components need restart.
-    // If no backup existed (fresh install), treat all as changed.
-    let binaries = ["scribe-server", "scribe-client"];
-    let mut changed: HashMap<&str, bool> = HashMap::new();
-    for name in &binaries {
-        let differs = if backup_existed {
-            let old_path = prev_path.join("Contents/MacOS").join(name);
-            let new_path = app_bundle_path.join("Contents/MacOS").join(name);
-            file_hash_differs(&old_path, &new_path)
-        } else {
-            true
-        };
-        changed.insert(name, differs);
-    }
+    let changed = changed_binaries(backup_existed, &prev_path, &app_bundle_path);
 
     // Remove the backup now that hash comparison is complete (best-effort).
-    if backup_existed {
-        if let Err(e) = std::fs::remove_dir_all(&prev_path) {
-            warn!("failed to remove .app.prev backup: {e}");
-        }
+    if backup_existed && let Err(e) = std::fs::remove_dir_all(&prev_path) {
+        warn!("failed to remove .app.prev backup: {e}");
     }
 
-    // Restart the server: try launchctl kickstart first, fall back to direct spawn.
-    let handoff_path = handoff_socket_path();
-
-    let wait_for_handoff = || -> bool {
-        let deadline = std::time::Instant::now() + HOT_RELOAD_HANDOFF_TIMEOUT;
-        let mut handed_off = false;
-        while std::time::Instant::now() < deadline {
-            if !handoff_path.exists() {
-                handed_off = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        if !handed_off {
-            warn!(
-                timeout_secs = HOT_RELOAD_HANDOFF_TIMEOUT.as_secs(),
-                "hot-reload handoff timed out"
-            );
-        }
-        handed_off
-    };
-
-    let server_changed = *changed.get("scribe-server").unwrap_or(&true);
-    let hot_reload_succeeded = if server_changed {
-        let uid = scribe_common::socket::current_uid();
-        let service_target = format!("user/{uid}/com.scribe.server");
-
-        let launchctl_ok = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &service_target])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if launchctl_ok {
-            info!("launchctl kickstart succeeded — waiting for handoff");
-            wait_for_handoff()
-        } else {
-            info!("launchctl kickstart unavailable — falling back to direct --upgrade spawn");
-            match std::env::current_exe() {
-                Err(e) => {
-                    warn!("could not determine current exe path for --upgrade spawn: {e}");
-                    false
-                }
-                Ok(exe) => {
-                    match std::process::Command::new(&exe)
-                        .arg("--upgrade")
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                    {
-                        Err(e) => {
-                            warn!("failed to spawn new server with --upgrade: {e}");
-                            false
-                        }
-                        Ok(_child) => wait_for_handoff(),
-                    }
-                }
-            }
-        }
+    let hot_reload_succeeded = if *changed.get("scribe-server").unwrap_or(&true) {
+        restart_server_in_place()
     } else {
         info!("server binary unchanged — skipping server restart");
         true
@@ -910,33 +768,128 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
         return Ok(false);
     }
 
-    // Restart client binaries that changed and were running before the update.
+    relaunch_clients(&app_bundle_path, &changed, client_was_running);
+
+    Ok(hot_reload_succeeded)
+}
+
+/// Whether a process with exactly this name is currently running.
+#[cfg(target_os = "macos")]
+fn process_is_running(name: &str) -> bool {
+    std::process::Command::new("pgrep").args(["-x", name]).status().is_ok_and(|s| s.success())
+}
+
+/// Which shipped binaries differ from the pre-update backup.
+///
+/// A fresh install has no backup to compare against, so every binary counts as
+/// changed and nothing is skipped.
+#[cfg(target_os = "macos")]
+fn changed_binaries(
+    backup_existed: bool,
+    prev_path: &Path,
+    app_bundle_path: &Path,
+) -> HashMap<&'static str, bool> {
+    let mut changed = HashMap::new();
+    for name in ["scribe-server", "scribe-client"] {
+        let differs = if backup_existed {
+            file_hash_differs(
+                &prev_path.join("Contents/MacOS").join(name),
+                &app_bundle_path.join("Contents/MacOS").join(name),
+            )
+        } else {
+            true
+        };
+        changed.insert(name, differs);
+    }
+    changed
+}
+
+/// Waits for the outgoing server to release its handoff socket.
+#[cfg(target_os = "macos")]
+fn wait_for_handoff() -> bool {
+    let handoff_path = scribe_common::socket::handoff_socket_path();
+    let deadline = std::time::Instant::now() + HOT_RELOAD_HANDOFF_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !handoff_path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    warn!(timeout_secs = HOT_RELOAD_HANDOFF_TIMEOUT.as_secs(), "hot-reload handoff timed out");
+    false
+}
+
+/// Restarts the server in place, preferring launchd, and reports whether the
+/// zero-downtime handoff completed.
+#[cfg(target_os = "macos")]
+fn restart_server_in_place() -> bool {
+    let uid = scribe_common::socket::current_uid();
+    let service_target = format!("user/{uid}/com.scribe.server");
+
+    let launchctl_ok = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &service_target])
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if launchctl_ok {
+        info!("launchctl kickstart succeeded — waiting for handoff");
+        return wait_for_handoff();
+    }
+
+    info!("launchctl kickstart unavailable — falling back to direct --upgrade spawn");
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            warn!("could not determine current exe path for --upgrade spawn: {e}");
+            return false;
+        }
+    };
+    match spawn_detached(&exe, &["--upgrade"]) {
+        Ok(()) => wait_for_handoff(),
+        Err(e) => {
+            warn!("failed to spawn new server with --upgrade: {e}");
+            false
+        }
+    }
+}
+
+/// Restarts client binaries that changed and were running before the update.
+#[cfg(target_os = "macos")]
+fn relaunch_clients(
+    app_bundle_path: &Path,
+    changed: &HashMap<&'static str, bool>,
+    client_was_running: bool,
+) {
     let macos_dir = app_bundle_path.join("Contents/MacOS");
-    for &name in &["scribe-client"] {
+    for name in ["scribe-client"] {
         if !changed.get(name).unwrap_or(&true) {
             info!("{name} binary unchanged — skipping restart");
             continue;
         }
-        let was_running = client_was_running;
-        if !was_running {
+        if !client_was_running {
             continue;
         }
         // Kill the old process (best-effort, it may not be running).
-        let _ = std::process::Command::new("pkill").args(["-x", name]).status();
-        // Relaunch.
-        let bin_path = macos_dir.join(name);
-        match std::process::Command::new(&bin_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => info!("relaunched {name}"),
+        drop(std::process::Command::new("pkill").args(["-x", name]).status());
+        match spawn_detached(&macos_dir.join(name), &[]) {
+            Ok(()) => info!("relaunched {name}"),
             Err(e) => warn!("failed to relaunch {name}: {e}"),
         }
     }
+}
 
-    Ok(hot_reload_succeeded)
+/// Spawns a detached process with no inherited stdio.
+#[cfg(target_os = "macos")]
+fn spawn_detached(program: &Path, args: &[&str]) -> std::io::Result<()> {
+    use std::process::Stdio;
+
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(drop)
 }
 
 /// Returns `true` if the two files have different content (or if either cannot be read).
@@ -965,6 +918,22 @@ fn current_app_bundle_path() -> Result<PathBuf, ScribeError> {
         .ok_or_else(|| ScribeError::UpdateInstallFailed {
             reason: format!("current executable is not inside an app bundle: {}", exe.display()),
         })
+}
+
+/// Creates the directory the update DMG mounts on.
+///
+/// It lives inside the private staging directory that already holds the
+/// verified asset, so the volume never enters the shared `/Volumes` namespace
+/// (where a second mount of the same volume name would land at
+/// `/Volumes/<name> 1`) and the mount point is removed with the stage.
+#[cfg(target_os = "macos")]
+fn update_mount_point(asset_path: &Path) -> Result<PathBuf, ScribeError> {
+    let stage_dir = asset_path.parent().ok_or_else(|| ScribeError::UpdateInstallFailed {
+        reason: format!("verified asset has no staging directory: {}", asset_path.display()),
+    })?;
+    let mount_point = stage_dir.join("mnt");
+    std::fs::create_dir_all(&mount_point).map_err(|e| ScribeError::Io { source: e })?;
+    Ok(mount_point)
 }
 
 fn parse_version(tag: &str) -> Result<semver::Version, ScribeError> {
