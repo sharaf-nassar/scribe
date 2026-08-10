@@ -1700,9 +1700,9 @@ The script walks the surface in five phases, screenshotting each: a `ShareRoster
 
 Keystroke *suppression* is asserted from both the client log and an absent `KeyInput`. A fresh GPUI window now bootstraps a real first PTY, so the wire assertion is meaningful rather than vacuously true; `run_share_key` logs every swallowed key as the independent client-side oracle.
 
-### AI task labels rename the tab
+### Application titles own AI task-label fallbacks
 
-`tests/e2e/visual/ai-task-label.sh` is the app-level oracle for the four provider task-label rows (`TaskLabelChanged`, `TaskLabelCleared`, `CodexTaskLabelChanged`, `CodexTaskLabelCleared`), which the client dropped until  routed them.
+`tests/e2e/visual/ai-task-label.sh` proves native OSC 0 titles own the tab while AI task labels remain a fallback source.
 
 ### AI indicator paints provider state
 
@@ -1714,7 +1714,7 @@ Nothing is stubbed. The image ships `scribe-hook-helper`, so the script posts a 
 
 Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the entrypoint's `$SESSION` belongs to the test daemon's window and is therefore hidden from the client's `ListSessions`, so the daemon is stopped and the client relaunched, after which it adopts the session through the normal attach path. `scribe-hook-helper` needs no daemon — it addresses the socket directly with the session id in its environment — so the hook channel outlives that teardown.
 
-Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the 54 px chrome-only band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten). The band includes openbox's 20 px decoration and the client's 34 px titlebar, then stops before the terminal grid so its blinking cursor cannot contaminate the clear oracle.
+Each provider first runs a set/clear cycle: the client's `tab task label updated` line proves the notice reached the reader, the 54 px chrome-only band changes by at least 40 pixels, and clear restores the shell-identical baseline. A final phase sets a task label, emits OSC 0 from the real pane, and requires the native-title pixels to remain unchanged when the hidden task label clears; blank OSC 0 must then restore the shell-identical baseline. The band includes openbox's 20 px decoration and the client's 34 px titlebar, then stops before the terminal grid so its blinking cursor cannot contaminate the oracle.
 
 ### Clipboard and OSC 52 bridge
 
@@ -3048,9 +3048,9 @@ A window-global list appended it at the end, producing `left, right, left` — a
 
 ### GPUI tab task labels
 
-Locks the precedence rule behind , the mutator the four provider task-label notices land in, so an AI tab shows its task and falls back to its shell title once the task ends.
+Locks source ownership behind , so native application titles outrank AI task-label fallbacks and blank resets reveal the next valid source.
 
-A set label outranks the title through  and leaves sibling tabs untouched; a title arriving mid-task is stored but stays behind the label until it clears; a blank label is treated as a clear, so a provider cannot blank a tab down to nothing; and an identical set, a repeated clear, and an unknown session all report "no change" so the reader does not repaint for nothing.
+A task label appears while no native title exists and leaves sibling tabs untouched; a native title arriving mid-task immediately owns the tab; blank native title reveals the retained task label; blank task label reveals the shell; and identical updates, repeated clears, and unknown sessions report no change.
 
 ### GPUI terminal chrome metadata
 

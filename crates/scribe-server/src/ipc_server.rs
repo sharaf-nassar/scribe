@@ -1452,7 +1452,7 @@ pub struct LiveSession {
     workspace_id: WorkspaceId,
     shell_name: String,
     /// Last-known terminal title (OSC 0/2), persisted for reconnect.
-    title: String,
+    title: Option<String>,
     /// Last-known provider task label, persisted separately from OSC 0/2 titles.
     task_label: Option<String>,
     /// Last-known working directory (OSC 7), persisted for reconnect.
@@ -6821,7 +6821,7 @@ async fn start_session(
         attachment: Arc::clone(&shared.attachment),
         workspace_id,
         shell_name,
-        title: title.unwrap_or_else(|| String::from("shell")),
+        title,
         task_label,
         cwd,
         last_cwd_report: None,
@@ -8221,7 +8221,7 @@ async fn handle_list_sessions(
         session_id: sid,
         workspace_id: s.workspace_id,
         shell_name: s.shell_name.clone(),
-        title: Some(s.title.clone()),
+        title: s.title.clone(),
         context: s.context.clone(),
         task_label: s.task_label.clone(),
         codex_task_label: s.task_label.clone(),
@@ -11428,9 +11428,9 @@ async fn persist_session_metadata(
     live_sessions: &LiveSessionRegistry,
 ) {
     match server_msg {
-        ServerMessage::TitleChanged { title, .. } if !title.trim().is_empty() => {
+        ServerMessage::TitleChanged { title, .. } => {
             update_live_session(session_id, live_sessions, |session| {
-                title.clone_into(&mut session.title);
+                session.title = (!title.trim().is_empty()).then(|| title.clone());
             })
             .await;
         }
@@ -11483,6 +11483,7 @@ async fn persist_session_metadata(
             update_live_session(session_id, live_sessions, |session| {
                 session.ai_state = None;
                 session.ai_provider_hint = None;
+                session.task_label = None;
                 // Same boundary the client's `AiChrome::forget` uses: the
                 // provider exiting must take the prompt bar with it, or the
                 // next client to attach paints a bar for a dead conversation.
@@ -11776,7 +11777,7 @@ pub async fn serialize_live_for_handoff(
             cell_height: live.cell_height,
             snapshot: None,
             session_replay,
-            title: Some(live.title.clone()),
+            title: live.title.clone(),
             shell_name: live.shell_name.clone(),
             task_label: live.task_label.clone(),
             codex_task_label: live.task_label.clone(),
@@ -12305,6 +12306,16 @@ mod tests {
         let writer = test_shared_writer(server_write);
         let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
 
+        persist_session_metadata(
+            &ServerMessage::TaskLabelChanged {
+                session_id,
+                provider: AiProvider::CodexCode,
+                task_label: String::from("finish the release"),
+            },
+            session_id,
+            &live_sessions,
+        )
+        .await;
         let ai_state =
             AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::WaitingForInput);
         persist_session_metadata(
@@ -12340,6 +12351,34 @@ mod tests {
         assert!(retained.ai_state.is_none());
         assert!(retained.ai_provider_hint.is_none());
         assert!(retained.prompt_state.is_none());
+        assert!(retained.task_label.is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_terminal_title_resets_persisted_source() {
+        let (server, _client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let writer = test_shared_writer(server_write);
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
+
+        persist_session_metadata(
+            &ServerMessage::TitleChanged { session_id, title: String::from("editor") },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        assert_eq!(
+            live_sessions.read().await.get(&session_id).unwrap().title.as_deref(),
+            Some("editor")
+        );
+
+        persist_session_metadata(
+            &ServerMessage::TitleChanged { session_id, title: String::new() },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        assert!(live_sessions.read().await.get(&session_id).unwrap().title.is_none());
     }
 
     /// The grid a frame repaints the pane at, or `None` for any other frame.

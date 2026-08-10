@@ -10235,10 +10235,15 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
         ServerMessage::AiStateCleared { session_id } => {
             queue_ai_notice(ctx, AiNotice::Cleared { session_id });
+            let label_changed =
+                ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_task_label(session_id, None));
             // `forget`, not just the tracker halves: the provider exiting must
             // also take the prompt bar down with it, or the pane keeps a stale
             // prompt history the next conversation never clears.
             update_ai_chrome(ctx, |ai| ai.forget(session_id));
+            if label_changed {
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
         }
         ServerMessage::PromptReceived { session_id, text, .. } => {
             let at = std::time::SystemTime::now();
@@ -11184,11 +11189,7 @@ fn on_workspace_info(ctx: &ReaderCtx, message: ServerMessage) {
 fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::TitleChanged { session_id, title } => {
-            // OSC 0/2 is the pane's own label; an empty title is the shell
-            // clearing it, which must not blank the tab down to nothing.
-            if !title.trim().is_empty()
-                && ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_title(session_id, title))
-            {
+            if ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_title(session_id, Some(title))) {
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
@@ -11903,17 +11904,11 @@ fn sync_tab_strip(
 
 /// Lower a server [`SessionInfo`] into a tab strip entry.
 ///
-/// The label prefers the session's live terminal title (OSC 0/2) and falls back
-/// to the shell basename, matching what the legacy tab bar rendered. A session
-/// that is mid-task when the list arrives also replays its provider task label,
-/// so a reattach restores the AI tab's name instead of waiting for the provider
-/// to emit the next one.
+/// Native OSC 0/2 title owns the label. A provider task label is retained as a
+/// fallback while no native title exists, then the shell basename wins.
 fn tab_entry_for(info: &SessionInfo) -> TabEntry {
-    let mut entry = TabEntry::new(
-        info.session_id,
-        info.workspace_id,
-        info.title.clone().unwrap_or_else(|| info.shell_name.clone()),
-    );
+    let mut entry = TabEntry::new(info.session_id, info.workspace_id, info.shell_name.clone());
+    entry.terminal_title = info.title.clone().filter(|title| !title.trim().is_empty());
     let label = info.task_label.as_deref().or(info.codex_task_label.as_deref());
     entry.task_label =
         label.map(str::trim).filter(|label| !label.is_empty()).map(ToOwned::to_owned);

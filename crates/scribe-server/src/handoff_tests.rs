@@ -258,6 +258,7 @@ async fn serialize_live_returns_activated_sessions() {
     assert!(sessions[0].session_replay.is_some(), "v5 sender must populate session_replay");
     assert!(sessions[0].snapshot.is_none(), "v5 sender must leave legacy snapshot None");
     assert_eq!(sessions[0].shell_name, "zsh");
+    assert_eq!(sessions[0].title, None, "missing terminal title must survive handoff as missing");
     assert_eq!(
         sessions[0].context.as_ref().and_then(|context| context.host.as_deref()),
         Some("builder")

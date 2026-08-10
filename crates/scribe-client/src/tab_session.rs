@@ -34,29 +34,27 @@ pub struct TabEntry {
     pub session_id: SessionId,
     /// The workspace the session belongs to, used when spawning sibling tabs.
     pub workspace_id: WorkspaceId,
-    /// Tab label (shell basename, or the session title once one arrives).
-    pub title: String,
+    /// Basename of the shell or command entrypoint.
+    pub shell_name: String,
+    /// Native application title from OSC 0/2, when one is active.
+    pub terminal_title: Option<String>,
     /// Provider task label, set while an AI tool is working on a named task.
-    /// It outranks `title` in the rendered strip and is dropped again when the
-    /// provider clears it.
+    /// It is a fallback when the application has not set its own title and is
+    /// dropped again when the provider clears it.
     pub task_label: Option<String>,
 }
 
 impl TabEntry {
     /// A tab with no provider task label yet.
     #[must_use]
-    pub fn new(session_id: SessionId, workspace_id: WorkspaceId, title: String) -> Self {
-        Self { session_id, workspace_id, title, task_label: None }
+    pub fn new(session_id: SessionId, workspace_id: WorkspaceId, shell_name: String) -> Self {
+        Self { session_id, workspace_id, shell_name, terminal_title: None, task_label: None }
     }
 
-    /// The label the strip renders: the provider task label while one is
-    /// active, otherwise the session title.
-    ///
-    /// Mirrors the winit client's `Pane::preferred_tab_title` so a pane's label
-    /// does not change meaning across the cutover.
+    /// The label the strip renders: native title, AI fallback, then shell.
     #[must_use]
     pub fn display_title(&self) -> &str {
-        self.task_label.as_deref().unwrap_or(&self.title)
+        self.terminal_title.as_deref().or(self.task_label.as_deref()).unwrap_or(&self.shell_name)
     }
 }
 
@@ -405,13 +403,14 @@ impl TabSessions {
         });
     }
 
-    /// Retitle a session's tab, returning `true` when the label changed.
-    pub fn set_title(&mut self, session_id: SessionId, title: String) -> bool {
+    /// Set or reset a session's native title, returning `true` on change.
+    pub fn set_title(&mut self, session_id: SessionId, title: Option<String>) -> bool {
+        let title = title.filter(|title| !title.trim().is_empty());
         let Some(tab) = self.entry_mut(session_id) else { return false };
-        if tab.title == title {
+        if tab.terminal_title == title {
             return false;
         }
-        tab.title = title;
+        tab.terminal_title = title;
         true
     }
 

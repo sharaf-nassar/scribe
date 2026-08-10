@@ -112,6 +112,8 @@ Normal session PTY output now forwards those raw sync markers to the attached cl
 
 Metadata events trigger title, provider task label, CWD, AI state, prompt text, and bell updates. CWD changes also trigger workspace auto-naming and git branch detection.
 
+Live sessions retain shell basename, optional OSC 0/2 title, and provider task label independently. Blank title events clear only the native title, and provider exit clears stale task labels with the rest of its AI chrome.
+
 A shell prompt returning (OSC 133 `A`) while mouse-reporting or focus-event modes are still active means the foreground program died without cleanup — e.g. a force-closed SSH session whose remote TUI never sent DECRST, which otherwise turns every mouse move into `\x1b[<…M` garbage echoed at the prompt until the user runs `reset`.  injects DECRST for the active modes (1000/1002/1003 protocols, 1005/1006 encodings, 1004 focus) into both the server Term and the client-bound `PtyOutput` stream, so attached clients stop forwarding mouse events and replay snapshots no longer restore the stale modes. Bracketed paste and application cursor/keypad are deliberately untouched (shells manage those across prompts), a lingering encoding bit alone does not fire, and a `CommandStart` (133 `C`) later in the same chunk suppresses the reset so a type-ahead-launched TUI that just re-enabled mouse reporting is not clobbered ().
 
 #### Focus State On Reporting Enable
@@ -203,7 +205,7 @@ Two prompts folded onto an empty record latch the first, track the latest, and c
 
 #### SessionEnd clears reattach chrome
 
-After attention dismissal leaves only a provider hint and prompt history, `AiStateCleared` removes both so a later session list cannot restore AI chrome for the exited provider.
+After attention dismissal leaves only a provider hint, prompt history, or task label, `AiStateCleared` removes all three so a later session list cannot restore AI chrome for the exited provider.
 
 ### Git Branch Detection
 
@@ -313,7 +315,7 @@ An ACK confirms receipt. If the ACK is not received (version mismatch, peer cras
 
 The HandoffState contains per-session metadata, per-session replay payload, and workspace layout state for restart handoff.
 
-Per-session payloads include title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a  carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
+Per-session payloads include optional native title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a  carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. Missing native titles remain `None` across takeover instead of becoming a literal fallback title. File descriptors are transferred one-for-one with the serialized session list.
 
 Each session also carries an additive `#[serde(default)]` prompt-history payload, so a server upgrade leaves every AI pane's prompt bar standing; see [[server#Server#Sessions#Retained Prompt History]]. A sender that predates the field just means the first prompt after the upgrade rebuilds the history.
 

@@ -357,26 +357,27 @@ fn set_workspace_moves_a_tab_between_regions() {
 
 // @lat: [[test#GPUI Client Headless Suites#GPUI tab task labels]]
 #[test]
-fn task_label_outranks_the_title_until_cleared() {
+fn native_title_outranks_task_label_and_reset_reveals_fallbacks() {
     let (mut tabs, _, ids) = strip(2);
-    assert!(tabs.set_title(ids[0], "zsh".to_owned()));
 
     assert!(tabs.set_task_label(ids[0], Some("Ship the tab labels")));
     assert_eq!(tabs.to_tab_data()[0].title, "Ship the tab labels");
     assert_eq!(tabs.to_tab_data()[1].title, "shell1", "siblings are untouched");
     assert!(!tabs.set_task_label(ids[0], Some("Ship the tab labels")), "identical is no change");
 
-    // A title arriving mid-task is stored but stays behind the label.
-    assert!(tabs.set_title(ids[0], "bash".to_owned()));
+    assert!(tabs.set_title(ids[0], Some("editor".to_owned())));
+    assert_eq!(tabs.to_tab_data()[0].title, "editor");
+
+    assert!(tabs.set_title(ids[0], Some("   ".to_owned())));
     assert_eq!(tabs.to_tab_data()[0].title, "Ship the tab labels");
 
     // A blank label is the provider clearing it, never a blank tab.
     assert!(tabs.set_task_label(ids[0], Some("   ")));
-    assert_eq!(tabs.to_tab_data()[0].title, "bash");
+    assert_eq!(tabs.to_tab_data()[0].title, "shell0");
 
     assert!(tabs.set_task_label(ids[0], Some("Second task")));
     assert!(tabs.set_task_label(ids[0], None));
-    assert_eq!(tabs.to_tab_data()[0].title, "bash");
+    assert_eq!(tabs.to_tab_data()[0].title, "shell0");
     assert!(!tabs.set_task_label(ids[0], None), "already cleared is no change");
     assert!(!tabs.set_task_label(SessionId::new(), Some("ghost")));
 }
@@ -384,8 +385,8 @@ fn task_label_outranks_the_title_until_cleared() {
 #[test]
 fn retitle_updates_only_on_change() {
     let (mut tabs, _, ids) = strip(2);
-    assert!(tabs.set_title(ids[0], "claude".to_owned()));
-    assert!(!tabs.set_title(ids[0], "claude".to_owned()), "identical title is not a change");
-    assert!(!tabs.set_title(SessionId::new(), "ghost".to_owned()));
+    assert!(tabs.set_title(ids[0], Some("claude".to_owned())));
+    assert!(!tabs.set_title(ids[0], Some("claude".to_owned())), "identical title is not a change");
+    assert!(!tabs.set_title(SessionId::new(), Some("ghost".to_owned())));
     assert_eq!(tabs.to_tab_data()[0].title, "claude");
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 [ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
-# Visual E2E: an AI provider's task label becomes the tab label, and clearing
-# it puts the shell title back.
+# Visual E2E: an AI provider's task label is the fallback tab label, while a
+# native OSC 0 title owns the tab until the application resets it.
 #
 # The four task-label notices (`TaskLabelChanged`, `TaskLabelCleared`,
 # `CodexTaskLabelChanged`, `CodexTaskLabelCleared`) used to fall into the live
@@ -36,6 +36,7 @@ HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 
 CLAUDE_LABEL="Ship the tab labels"
 CODEX_LABEL="Rewrite the parser"
+NATIVE_TITLE="Native application title"
 
 # Minimum differing pixels in the tab band for a label to count as rendered.
 # Replacing a four-character shell name with a multi-word label repaints far
@@ -192,6 +193,65 @@ run_label_cycle() {
     echo "PASS ($provider): clearing the task label restored the shell title"
 }
 
+# Prove an application title supersedes an already-visible AI fallback. Clear
+# the hidden task label first, then reset OSC 0, so the final source is the
+# shell basename and every transition has an unambiguous pixel oracle.
+run_native_title_precedence() {
+    local baseline delta
+
+    shot /output/03-title-00-shell.png
+    crop_tab_band /output/03-title-00-shell.png /output/03-title-band-shell.png
+
+    baseline=$(count_log "tab task label updated")
+    hook --provider=claude_code --event=task_label_changed --label="$CLAUDE_LABEL"
+    if ! wait_for_log_growth "tab task label updated" "$baseline"; then
+        fail "FAIL (title): the client never took the fallback task label"
+    fi
+    shot /output/03-title-01-task.png
+    crop_tab_band /output/03-title-01-task.png /output/03-title-band-task.png
+
+    focus
+    xdotool type --clearmodifiers --delay 20 \
+        "printf '\\033]0;${NATIVE_TITLE}\\a'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/03-title-02-native.png
+    crop_tab_band /output/03-title-02-native.png /output/03-title-band-native.png
+    delta=$(band_delta /output/03-title-band-task.png /output/03-title-band-native.png)
+    echo "  tab band delta after OSC 0 title: $delta"
+    if [ "${delta:-0}" -lt "$LABEL_DELTA_MIN" ]; then
+        fail "FAIL (title): OSC 0 did not replace the AI fallback label"
+    fi
+    echo "PASS (title): native OSC 0 title owns the tab"
+
+    baseline=$(count_log "tab task label updated")
+    hook --provider=claude_code --event=task_label_cleared
+    if ! wait_for_log_growth "tab task label updated" "$baseline"; then
+        fail "FAIL (title): the client never cleared the hidden task label"
+    fi
+    shot /output/03-title-03-task-cleared.png
+    crop_tab_band /output/03-title-03-task-cleared.png \
+        /output/03-title-band-task-cleared.png
+    delta=$(band_delta /output/03-title-band-native.png \
+        /output/03-title-band-task-cleared.png)
+    if [ "${delta:-0}" -gt "$CLEARED_DELTA_MAX" ]; then
+        fail "FAIL (title): clearing hidden AI metadata changed the native title"
+    fi
+    echo "PASS (title): clearing hidden task metadata leaves OSC 0 visible"
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 "printf '\\033]0;\\a'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/03-title-04-reset.png
+    crop_tab_band /output/03-title-04-reset.png /output/03-title-band-reset.png
+    delta=$(band_delta /output/03-title-band-shell.png /output/03-title-band-reset.png)
+    if [ "${delta:-0}" -gt "$CLEARED_DELTA_MAX" ]; then
+        fail "FAIL (title): blank OSC 0 did not restore the shell fallback"
+    fi
+    xdotool key --clearmodifiers ctrl+c
+    echo "PASS (title): blank OSC 0 restores the shell fallback"
+}
+
 # ── Phase 0: hand the client a live pane so it has a tab at all ────
 sleep 1.0
 kill "$SCRIBE_CLIENT_PID" 2>/dev/null || true
@@ -232,11 +292,17 @@ echo "PHASE 1 PASS: TaskLabelChanged / TaskLabelCleared drive the tab label"
 run_label_cycle codex_code "$CODEX_LABEL" 02-codex
 echo "PHASE 2 PASS: CodexTaskLabelChanged / CodexTaskLabelCleared drive it too"
 
+# ── Phase 3: application titles own the primary automatic label ───
+run_native_title_precedence
+echo "PHASE 3 PASS: OSC 0 owns the tab and blank OSC 0 restores the shell"
+
 echo ""
-echo "PASS: AI task labels rename the tab and clear back to the shell title"
+echo "PASS: native titles own AI fallback labels and reset to the shell"
 echo "  Inspect screenshots in test-output/:"
 echo "    01-claude-00-before.png    — tab strip before the Claude label"
 echo "    01-claude-01-labelled.png  — tab renamed to \"$CLAUDE_LABEL\""
 echo "    01-claude-02-cleared.png   — tab back to its shell title"
 echo "    02-codex-01-labelled.png   — tab renamed to \"$CODEX_LABEL\""
 echo "    02-codex-02-cleared.png    — tab back to its shell title"
+echo "    03-title-02-native.png     — OSC 0 title overrides an active AI label"
+echo "    03-title-04-reset.png      — blank OSC 0 restores the shell title"
