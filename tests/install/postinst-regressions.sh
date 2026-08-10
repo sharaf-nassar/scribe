@@ -180,6 +180,108 @@ fi
 kill "$UPGRADE_PID" 2>/dev/null
 rm -rf "$upgrade_fixture"
 
+# ── AI SessionEnd hooks install and clear without payload parsing ────────
+if command -v python3 >/dev/null 2>&1; then
+    hook_fixture=$(mktemp -d)
+    hook_home="$hook_fixture/home"
+    hook_capture="$hook_fixture/helper-argv"
+    python_capture="$hook_fixture/python-called"
+    mkdir -p "$hook_home/.claude" "$hook_home/.codex" "$hook_fixture/bin"
+
+    if ! HOME="$hook_home" SCRIBE_INSTALL_PREFIX="$repo_root/dist" \
+        bash "$repo_root/dist/setup-claude-hooks.sh" >/dev/null 2>&1; then
+        echo "FAIL: Claude SessionEnd hook setup failed"
+        failures=$((failures + 1))
+    elif ! HOME="$hook_home" \
+        bash "$repo_root/dist/setup-codex-hooks.sh" \
+            --hook-source "$repo_root/dist" >/dev/null 2>&1; then
+        echo "FAIL: Codex SessionEnd hook setup failed"
+        failures=$((failures + 1))
+    elif ! python3 - "$repo_root" "$hook_home" <<'PY'
+import json
+import os
+import re
+import sys
+
+root, home = sys.argv[1:]
+dist = os.path.join(root, "dist")
+
+with open(os.path.join(home, ".claude", "settings.json")) as handle:
+    claude = json.load(handle)
+claude_entry = claude["hooks"]["SessionEnd"]
+assert claude_entry == [{
+    "hooks": [{
+        "type": "command",
+        "command": os.path.join(dist, "ai-hook-claude.sh") + " session_end",
+    }],
+}]
+
+hooks_path = os.path.join(home, ".codex", "hooks.json")
+with open(hooks_path) as handle:
+    codex = json.load(handle)
+codex_entry = codex["hooks"]["SessionEnd"]
+assert codex_entry == [{
+    "hooks": [{
+        "type": "command",
+        "command": '"' + os.path.join(dist, "ai-hook-codex.sh") + '" session_end',
+        "timeout": 3,
+    }],
+}]
+
+with open(os.path.join(home, ".codex", "config.toml")) as handle:
+    config = handle.read()
+trust_key = hooks_path + ":session_end:0:0"
+header = "[hooks.state." + json.dumps(trust_key) + "]"
+block = config.split(header, 1)[1].split("\n[", 1)[0]
+assert re.search(r"^enabled = true$", block, re.MULTILINE)
+assert re.search(r'^trusted_hash = "sha256:[0-9a-f]{64}"$', block, re.MULTILINE)
+PY
+    then
+        echo "FAIL: SessionEnd hook registrations or Codex trust state are wrong"
+        failures=$((failures + 1))
+    else
+        echo "PASS: Claude and Codex install unmatched trusted SessionEnd hooks"
+    fi
+
+    cat > "$hook_fixture/bin/python3" <<'EOF'
+#!/bin/sh
+: >"$SCRIBE_PYTHON_CAPTURE"
+exit 1
+EOF
+    cat > "$hook_fixture/helper" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SCRIBE_HOOK_CAPTURE"
+cat >/dev/null
+EOF
+    chmod +x "$hook_fixture/bin/python3" "$hook_fixture/helper"
+
+    printf '{not-json' | PATH="$hook_fixture/bin:/usr/bin:/bin" \
+        SCRIBE_HOOK_HELPER="$hook_fixture/helper" \
+        SCRIBE_HOOK_CAPTURE="$hook_capture" \
+        SCRIBE_PYTHON_CAPTURE="$python_capture" \
+        sh "$repo_root/dist/ai-hook-claude.sh" session_end
+    printf '{not-json' | PATH="$hook_fixture/bin:/usr/bin:/bin" \
+        SCRIBE_HOOK_HELPER="$hook_fixture/helper" \
+        SCRIBE_HOOK_CAPTURE="$hook_capture" \
+        SCRIBE_PYTHON_CAPTURE="$python_capture" \
+        sh "$repo_root/dist/ai-hook-codex.sh" session_end
+
+    if [ -e "$python_capture" ]; then
+        echo "FAIL: SessionEnd adapter started a JSON interpreter"
+        failures=$((failures + 1))
+    elif [ "$(wc -l < "$hook_capture")" -ne 2 ] || \
+         ! grep -Fxq -- '--provider=claude_code --event=state_cleared' "$hook_capture" || \
+         ! grep -Fxq -- '--provider=codex_code --event=state_cleared' "$hook_capture"; then
+        echo "FAIL: SessionEnd adapters did not emit provider state_cleared events"
+        failures=$((failures + 1))
+    else
+        echo "PASS: SessionEnd adapters clear both providers without parsing payloads"
+    fi
+    rm -rf "$hook_fixture"
+else
+    echo "SKIP: AI SessionEnd hook regressions require python3"
+fi
+
 if [ "$failures" -gt 0 ]; then
     echo "${failures} postinst regression test(s) failed."
     exit 1

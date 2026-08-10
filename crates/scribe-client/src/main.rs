@@ -12186,7 +12186,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn x11_creation_bounds_leave_window_state_to_the_assertion() {
-        let bounds = Bounds::new(point(px(20.0), px(30.0)), size(px(800.0), px(600.0)));
+        let bounds = Bounds::new(gpui::point(px(20.0), px(30.0)), size(px(800.0), px(600.0)));
 
         assert!(matches!(
             x11_creation_bounds(WindowBounds::Maximized(bounds)),
@@ -12378,6 +12378,11 @@ mod tests {
     fn dismissed_prompt_bar_stays_down_until_the_session_is_forgotten() {
         let mut chrome = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
         let session = SessionId::new();
+        chrome.apply_state_change(
+            session,
+            scribe_common::ai_state::AiProcessState::new(AiState::WaitingForInput),
+            std::time::SystemTime::now(),
+        );
         chrome.record_prompt(session, "build the thing", std::time::SystemTime::now());
         assert!(chrome.visible_prompts(session).is_some());
 
@@ -12394,6 +12399,11 @@ mod tests {
 
         chrome.forget(session);
         assert!(!chrome.prompts.contains_key(&session), "session teardown clears the record");
+        assert_eq!(
+            chrome.tracker.provider_for_session(session),
+            None,
+            "the exited provider cannot keep split-scroll active"
+        );
     }
 
     #[test]

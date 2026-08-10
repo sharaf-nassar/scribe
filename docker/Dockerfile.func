@@ -43,10 +43,12 @@ COPY ${BIN_DIR}/scribe-hook-helper /usr/local/bin/scribe-hook-helper
 # this copy the `shell-integration.sh` e2e test times out at Phase 1 waiting
 # for `SCRIBE_SHELL_INTEGRATION=1`.
 COPY dist/shell-integration /usr/local/share/scribe/shell-integration
+COPY dist/ai-hook-codex.sh /usr/local/share/scribe/ai-hook-codex.sh
 COPY docker/entrypoint-func.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/scribe-server /usr/local/bin/scribe-test \
-    /usr/local/bin/scribe /usr/local/bin/scribe-cli /usr/local/bin/scribe-hook-helper
+    /usr/local/bin/scribe /usr/local/bin/scribe-cli /usr/local/bin/scribe-hook-helper \
+    /usr/local/share/scribe/ai-hook-codex.sh
 
 RUN mkdir -p /output
 

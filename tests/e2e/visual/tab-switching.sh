@@ -449,6 +449,12 @@ fail() {
     exit 1
 }
 
+# Bounding box of pixels near one configured color: x y width height.
+color_bounds() {
+    convert "$1" -alpha off -fuzz 1% -fill black +opaque "$2" \
+        -fill white -opaque "$2" -trim -format '%X %Y %w %h' info:
+}
+
 # ── Phase 0: shared-pane attach is live ───────────────────────────
 if ! wait_for_attach_to "$SESSION" 0 20; then
     fail "phase 0: the client never attached to the shared-pane session $SESSION"
@@ -478,7 +484,8 @@ PLAIN_ROWS=$(published_rows)
 [ -n "$PLAIN_ROWS" ] || fail "phase 1: no published plain-tab row count"
 PROMPTS_BEFORE=$(count_server_to PromptReceived "$SESSION")
 SCRIBE_HOOK_SOCK="$HOOK_SOCK" SCRIBE_SESSION_ID="$SESSION" scribe-hook-helper \
-    --provider=claude_code --event=prompt_received --text="tab switch geometry"
+    --provider=claude_code --event=prompt_received \
+    --text="You are writing customer-facing GitHub release notes for this repo."
 if ! wait_for_server_to PromptReceived "$SESSION" "$PROMPTS_BEFORE" 15; then
     fail "phase 1: the server never sent the prompt state for $SESSION"
 fi
@@ -507,7 +514,25 @@ if [ "$AI_ATTACH_ROWS" -ge "$PLAIN_ROWS" ]; then
     fail "phase 2: prompt-tab first replay kept $AI_ATTACH_ROWS rows; plain tab had $PLAIN_ROWS, so prompt chrome was not reserved before paint"
 fi
 shot /output/02-tab-switching-key-prev.png
+read -r BAR_X BAR_Y BAR_W BAR_H <<<"$(color_bounds \
+    /output/02-tab-switching-key-prev.png 'rgb(9,9,11)')"
+if [ "${BAR_W:-0}" -lt 100 ] || [ "${BAR_H:-0}" -lt 20 ]; then
+    fail "phase 2: prompt-row background probe missed (${BAR_W:-0}x${BAR_H:-0})"
+fi
+ABOVE_INK=$(convert /output/02-tab-switching-key-prev.png \
+    -crop "$((BAR_W - 28))x${BAR_H}+$((BAR_X + 14))+$((BAR_Y - BAR_H))" \
+    +repage -colorspace Gray -threshold 12% -format '%[fx:mean*w*h]' info:)
+BAR_INK=$(convert /output/02-tab-switching-key-prev.png \
+    -crop "${BAR_W}x${BAR_H}+${BAR_X}+${BAR_Y}" +repage \
+    -colorspace Gray -threshold 12% -format '%[fx:mean*w*h]' info:)
+if [ "${ABOVE_INK%.*}" -gt 50 ]; then
+    fail "phase 2: ${ABOVE_INK%.*} prompt-colored pixels escaped above the visible bar"
+fi
+if [ "${BAR_INK%.*}" -lt 2000 ]; then
+    fail "phase 2: prompt text missed the visible bar (${BAR_INK%.*} lit pixels)"
+fi
 echo "PHASE 2 PASS: ctrl+Prior attached $SESSION and first replay reserved prompt rows ($PLAIN_ROWS -> $AI_ATTACH_ROWS)"
+echo "PHASE 2 PASS: large prompt text stays inside its visible bottom bar"
 
 # ── Phase 3: keyboard switch forward to the new tab ───────────────
 ATTACH_NEW_BEFORE=$(count_attach_to "$NEW_SESSION")

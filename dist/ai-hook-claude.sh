@@ -15,7 +15,8 @@
 #   ai-hook-claude.sh <event-name>
 #
 # Recognized event-name values: permission_prompt, error,
-# pre_ask_user_question, post_ask_user_question, user_prompt_submit, stop.
+# pre_ask_user_question, post_ask_user_question, user_prompt_submit, stop,
+# session_end.
 
 set +e
 EVENT_NAME="${1:-}"
@@ -30,6 +31,15 @@ HELPER="${SCRIBE_HOOK_HELPER:-$(dirname "$0")/scribe-hook-helper}"
 # every failure mode silently, but this short-circuit avoids the
 # python-extraction cost when nothing can be delivered.
 [ -x "$HELPER" ] || { cat >/dev/null 2>&1; exit 0; }
+
+# SessionEnd carries no state Scribe needs to inspect. Drain its stdin so the
+# provider can finish writing the hook payload, then clear the retained chrome
+# without starting an interpreter.
+if [ "$EVENT_NAME" = "session_end" ]; then
+    cat >/dev/null 2>&1
+    exec "$HELPER" --provider=claude_code --event=state_cleared \
+        </dev/null >/dev/null 2>&1
+fi
 
 # Read the full payload once. python3 is already a Scribe install dep used
 # elsewhere in dist/. Any read failure → silent exit 0.

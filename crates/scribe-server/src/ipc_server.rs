@@ -11482,6 +11482,7 @@ async fn persist_session_metadata(
         ServerMessage::AiStateCleared { .. } => {
             update_live_session(session_id, live_sessions, |session| {
                 session.ai_state = None;
+                session.ai_provider_hint = None;
                 // Same boundary the client's `AiChrome::forget` uses: the
                 // provider exiting must take the prompt bar with it, or the
                 // next client to attach paints a bar for a dead conversation.
@@ -11593,10 +11594,14 @@ pub async fn send_metadata_event(
     // ServerMessage the client keeps its prompt bar, notification tracker,
     // and cold-restart launch binding pointing at a dead AI tool. Capture
     // the transition before persistence so the follow-up emission below
-    // brings the client view in line with the server's interpretation.
+    // brings the client view in line with the server's interpretation. Prompt
+    // history and the provider hint count too: a keystroke may have dismissed
+    // the visible attention state just before the shell prompt returns.
     let synthesize_ai_cleared =
         matches!(&event, MetadataEvent::PromptMark { kind: PromptMarkKind::PromptStart, .. })
-            && live_sessions.read().await.get(&session_id).is_some_and(|s| s.ai_state.is_some());
+            && live_sessions.read().await.get(&session_id).is_some_and(|s| {
+                s.ai_state.is_some() || s.ai_provider_hint.is_some() || s.prompt_state.is_some()
+            });
 
     let Some((mut server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id)
     else {
@@ -12290,6 +12295,51 @@ mod tests {
             lock_sinks(&session.client_writer).set_sole(Arc::clone(writer), queue);
         }
         (session_id, live_sessions, vec![pty.slave])
+    }
+
+    // @lat: [[lat.md/server#Server#Sessions#Retained Prompt History#SessionEnd clears reattach chrome]]
+    #[tokio::test]
+    async fn state_cleared_drops_all_reattach_chrome_after_attention_dismissal() {
+        let (server, _client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let writer = test_shared_writer(server_write);
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
+
+        let ai_state =
+            AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::WaitingForInput);
+        persist_session_metadata(
+            &ServerMessage::AiStateChanged { session_id, ai_state },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        persist_session_metadata(
+            &ServerMessage::PromptReceived {
+                session_id,
+                provider: AiProvider::CodexCode,
+                text: String::from("finish the release"),
+            },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+
+        {
+            let mut sessions = live_sessions.write().await;
+            dismiss_persisted_attention_state(sessions.get_mut(&session_id).unwrap());
+        }
+        persist_session_metadata(
+            &ServerMessage::AiStateCleared { session_id },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+
+        let sessions = live_sessions.read().await;
+        let retained = sessions.get(&session_id).unwrap();
+        assert!(retained.ai_state.is_none());
+        assert!(retained.ai_provider_hint.is_none());
+        assert!(retained.prompt_state.is_none());
     }
 
     /// The grid a frame repaints the pane at, or `None` for any other frame.
