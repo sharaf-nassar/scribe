@@ -116,6 +116,9 @@ where
             Ok(ServerMessage::TitleChanged { session_id, title }) => {
                 info!(%session_id, %title, "title changed");
             }
+            Ok(ServerMessage::IconTitleChanged { session_id, title }) => {
+                info!(%session_id, %title, "icon title changed");
+            }
             Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
                 info!(%session_id, ?ai_state, "AI state changed");
             }

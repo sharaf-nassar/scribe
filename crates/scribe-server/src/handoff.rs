@@ -210,6 +210,9 @@ pub struct HandoffSession {
     /// old servers that did not include this field.
     #[serde(default)]
     pub title: Option<String>,
+    /// Last-known OSC 0/1 icon/tab title.
+    #[serde(default)]
+    pub icon_title: Option<String>,
     /// Last-known session shell name. `#[serde(default)]` for backward compat.
     #[serde(default = "default_shell_name")]
     pub shell_name: String,

@@ -21,6 +21,7 @@ fn info(session_id: SessionId, workspace_id: WorkspaceId) -> SessionInfo {
         workspace_id,
         shell_name: "zsh".to_owned(),
         title: None,
+        icon_title: None,
         context: None,
         task_label: None,
         codex_task_label: None,

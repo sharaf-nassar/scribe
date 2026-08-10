@@ -184,6 +184,8 @@ pub struct ManagedSession {
     pub handoff_snapshot: Option<ScreenSnapshot>,
     /// Title from handoff, used to restore tab name. `None` for fresh sessions.
     pub title: Option<String>,
+    /// Icon/tab title from handoff. `None` for fresh sessions.
+    pub icon_title: Option<String>,
     /// Provider task label from handoff. `None` when unset for the session.
     pub task_label: Option<String>,
     /// CWD from handoff, used to restore working directory. `None` for fresh sessions.
@@ -265,6 +267,7 @@ fn restored_managed_session(
         pty: None,
         handoff_snapshot: parts.handoff_snapshot,
         title: handoff_session.title.clone(),
+        icon_title: handoff_session.icon_title.clone(),
         task_label: handoff_session
             .task_label
             .clone()
@@ -395,6 +398,7 @@ impl PreparedSessionLaunch {
             pty: Some(PtyGuard::new(pty)),
             handoff_snapshot: None,
             title: None,
+            icon_title: None,
             task_label: None,
             cwd: None,
             context: None,
@@ -1348,6 +1352,7 @@ mod tests_session_cap {
                 snapshot: None,
                 session_replay: None,
                 title: None,
+                icon_title: None,
                 shell_name: String::from("zsh"),
                 task_label: None,
                 codex_task_label: None,

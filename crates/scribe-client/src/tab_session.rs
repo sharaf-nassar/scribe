@@ -38,6 +38,8 @@ pub struct TabEntry {
     pub shell_name: String,
     /// Native application title from OSC 0/2, when one is active.
     pub terminal_title: Option<String>,
+    /// Native icon/tab title from OSC 0/1, when one is active.
+    pub icon_title: Option<String>,
     /// Provider task label, set while an AI tool is working on a named task.
     /// It is a fallback when the application has not set its own title and is
     /// dropped again when the provider clears it.
@@ -48,13 +50,24 @@ impl TabEntry {
     /// A tab with no provider task label yet.
     #[must_use]
     pub fn new(session_id: SessionId, workspace_id: WorkspaceId, shell_name: String) -> Self {
-        Self { session_id, workspace_id, shell_name, terminal_title: None, task_label: None }
+        Self {
+            session_id,
+            workspace_id,
+            shell_name,
+            terminal_title: None,
+            icon_title: None,
+            task_label: None,
+        }
     }
 
-    /// The label the strip renders: native title, AI fallback, then shell.
+    /// The label the strip renders: icon title, window title, AI, then shell.
     #[must_use]
     pub fn display_title(&self) -> &str {
-        self.terminal_title.as_deref().or(self.task_label.as_deref()).unwrap_or(&self.shell_name)
+        self.icon_title
+            .as_deref()
+            .or(self.terminal_title.as_deref())
+            .or(self.task_label.as_deref())
+            .unwrap_or(&self.shell_name)
     }
 }
 
@@ -411,6 +424,17 @@ impl TabSessions {
             return false;
         }
         tab.terminal_title = title;
+        true
+    }
+
+    /// Set or reset a session's OSC 0/1 icon title.
+    pub fn set_icon_title(&mut self, session_id: SessionId, title: Option<String>) -> bool {
+        let title = title.filter(|title| !title.trim().is_empty());
+        let Some(tab) = self.entry_mut(session_id) else { return false };
+        if tab.icon_title == title {
+            return false;
+        }
+        tab.icon_title = title;
         true
     }
 

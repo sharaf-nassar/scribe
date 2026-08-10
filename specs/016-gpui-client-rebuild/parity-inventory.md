@@ -149,7 +149,7 @@ are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (60 variants, 1 sequenced gap)
+## Server messages (61 variants, 1 sequenced gap)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
@@ -157,8 +157,8 @@ be handled without loss, including additive sharing and LAN variants.
 The original planning note named 57 variants. Terminal-images v1 adds three
 typed contract variants before their sequenced server/client implementation.
 
-The live reader's dispatcher `main.rs::dispatch_server_message` handles 52 of
-60 variants and routes the rest to `main.rs::unhandled_server_message`, which
+The live reader's dispatcher `main.rs::dispatch_server_message` handles 56 of
+61 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
@@ -183,7 +183,8 @@ replay and atomic client staging.
 | `AiStateCleared` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
 | `CwdChanged` | tab metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_cwd` → `StatusBarData.cwd` | required |
 | `SessionContextChanged` | session metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_context` → `SessionChrome::host_label` / `SessionChrome::tmux_label` | required |
-| `TitleChanged` | tab title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_title` | required |
+| `TitleChanged` | window title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_title` → `TabEntry::display_title` | required |
+| `IconTitleChanged` | icon/tab title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_icon_title` → `TabEntry::display_title` | required |
 | `CodexTaskLabelChanged` | Codex tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `CodexTaskLabelCleared` | Codex tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `TaskLabelChanged` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
@@ -237,7 +238,7 @@ replay and atomic client staging.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 60 of 60 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 61 of 61 rows name a live-path symbol; 0 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -459,18 +460,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
 | Client messages | 45 | 45 | 0 | 0 |
-| Server messages | 60 | 60 | 0 | 0 |
+| Server messages | 61 | 61 | 0 | 0 |
 | Input and keybinding actions | 55 | 55 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **203** | **0** | **0** |
+| **Total** | **204** | **204** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 194 are
-reachable (100%)** and 0 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **195 rows, of which 195 are
+reachable (100%)** and 0 are not. **1 of those 195** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **193 of 194**.
+the in-client figure is **194 of 195**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

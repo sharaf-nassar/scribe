@@ -1453,6 +1453,8 @@ pub struct LiveSession {
     shell_name: String,
     /// Last-known terminal title (OSC 0/2), persisted for reconnect.
     title: Option<String>,
+    /// Last-known icon/tab title (OSC 0/1), persisted for reconnect.
+    icon_title: Option<String>,
     /// Last-known provider task label, persisted separately from OSC 0/2 titles.
     task_label: Option<String>,
     /// Last-known working directory (OSC 7), persisted for reconnect.
@@ -6798,11 +6800,10 @@ async fn start_session(
     #[rustfmt::skip]
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
-        osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd, context,
-        ai_state, ai_provider_hint, prompt_state, cell_width, cell_height, env_envelope_id,
-        image_state, ..
+        osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, icon_title, cwd,
+        context, ai_state, ai_provider_hint, prompt_state, cell_width, cell_height,
+        env_envelope_id, image_state, ..
     } = session;
-    let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
     let shared = SharedSessionHandles::new(pty_fd, initial_attachment).await;
     let (terminal_images, terminal_grid_observer) =
         new_session_image_seam(session_id, cell_width, cell_height, image_state.as_deref());
@@ -6822,6 +6823,7 @@ async fn start_session(
         workspace_id,
         shell_name,
         title,
+        icon_title,
         task_label,
         cwd,
         last_cwd_report: None,
@@ -6842,10 +6844,10 @@ async fn start_session(
         env_envelope_id,
         clipboard_command_tx: shared.clipboard_command_tx,
         exit_gate: Arc::clone(&shared.exit_gate),
-        // Moved, never cloned: the entry owns the cap slot, freed on drop.
+        // Moved, never cloned; the entry owns the cap slot and frees it on drop.
         _slot: slot,
     };
-    register_live_session(&runtime, session_id, child_pidfd, child_pid, live).await;
+    let ai_provider = register_session(&runtime, session_id, child_pidfd, child_pid, live).await;
 
     spawn_pty_reader(
         PtyReaderInputs {
@@ -6878,19 +6880,22 @@ async fn start_session(
 
 /// Insert the registry entry and arm the child-exit watcher.
 ///
-/// The exit handles are cloned before the insert because the watcher
+/// Returns the effective AI provider for the reader. The exit handles are
+/// cloned before the insert because the watcher
 /// outlives the registry entry and has to finalize the session after it is
 /// gone.
-async fn register_live_session(
+async fn register_session(
     runtime: &SessionRuntimeContext<'_>,
     session_id: SessionId,
     child_pidfd: Option<OwnedFd>,
     child_pid: u32,
     live: LiveSession,
-) {
+) -> Option<AiProvider> {
+    let ai_provider = live.ai_state.as_ref().map(|state| state.provider).or(live.ai_provider_hint);
     let exit_handles = live.exit_handles();
     runtime.live_sessions.write().await.insert(session_id, live);
     spawn_child_exit_watcher(child_pidfd, child_pid, session_id, exit_handles, runtime);
+    ai_provider
 }
 
 /// The `ManagedSession`-derived inputs a PTY reader task needs. Bundled so
@@ -8222,6 +8227,7 @@ async fn handle_list_sessions(
         workspace_id: s.workspace_id,
         shell_name: s.shell_name.clone(),
         title: s.title.clone(),
+        icon_title: s.icon_title.clone(),
         context: s.context.clone(),
         task_label: s.task_label.clone(),
         codex_task_label: s.task_label.clone(),
@@ -11146,7 +11152,7 @@ fn classify_event(
     last_cwd: &mut Option<std::path::PathBuf>,
 ) {
     match event {
-        MetadataEvent::TitleChanged(_) => *saw_title = true,
+        MetadataEvent::TitleChanged(_) | MetadataEvent::IconTitleChanged(_) => *saw_title = true,
         MetadataEvent::CwdChanged(cwd) => {
             *saw_cwd = true;
             *last_cwd = Some(cwd.clone());
@@ -11434,6 +11440,12 @@ async fn persist_session_metadata(
             })
             .await;
         }
+        ServerMessage::IconTitleChanged { title, .. } => {
+            update_live_session(session_id, live_sessions, |session| {
+                session.icon_title = (!title.trim().is_empty()).then(|| title.clone());
+            })
+            .await;
+        }
         ServerMessage::CodexTaskLabelChanged { task_label, .. }
             if !task_label.trim().is_empty() =>
         {
@@ -11671,6 +11683,9 @@ fn convert_metadata_event(
         MetadataEvent::TitleChanged(title) => {
             Some((ServerMessage::TitleChanged { session_id, title }, None))
         }
+        MetadataEvent::IconTitleChanged(title) => {
+            Some((ServerMessage::IconTitleChanged { session_id, title }, None))
+        }
         MetadataEvent::TaskLabelChanged { provider: AiProvider::CodexCode, label }
         | MetadataEvent::CodexTaskLabelChanged(label) => {
             Some((ServerMessage::CodexTaskLabelChanged { session_id, task_label: label }, None))
@@ -11778,6 +11793,7 @@ pub async fn serialize_live_for_handoff(
             snapshot: None,
             session_replay,
             title: live.title.clone(),
+            icon_title: live.icon_title.clone(),
             shell_name: live.shell_name.clone(),
             task_label: live.task_label.clone(),
             codex_task_label: live.task_label.clone(),
@@ -12261,6 +12277,7 @@ mod tests {
                 snapshot: None,
                 session_replay: None,
                 title: None,
+                icon_title: None,
                 shell_name: String::from("bash"),
                 task_label: None,
                 codex_task_label: None,
@@ -12355,7 +12372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_terminal_title_resets_persisted_source() {
+    async fn terminal_title_sources_persist_and_reset_independently() {
         let (server, _client) = unix_stream_pair();
         let (_server_read, server_write) = tokio::io::split(server);
         let writer = test_shared_writer(server_write);
@@ -12371,6 +12388,33 @@ mod tests {
             live_sessions.read().await.get(&session_id).unwrap().title.as_deref(),
             Some("editor")
         );
+
+        persist_session_metadata(
+            &ServerMessage::IconTitleChanged { session_id, title: String::from("icon") },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        persist_session_metadata(
+            &ServerMessage::TitleChanged { session_id, title: String::from("newer window") },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        {
+            let sessions = live_sessions.read().await;
+            let retained = sessions.get(&session_id).unwrap();
+            assert_eq!(retained.title.as_deref(), Some("newer window"));
+            assert_eq!(retained.icon_title.as_deref(), Some("icon"));
+        }
+
+        persist_session_metadata(
+            &ServerMessage::IconTitleChanged { session_id, title: String::new() },
+            session_id,
+            &live_sessions,
+        )
+        .await;
+        assert!(live_sessions.read().await.get(&session_id).unwrap().icon_title.is_none());
 
         persist_session_metadata(
             &ServerMessage::TitleChanged { session_id, title: String::new() },

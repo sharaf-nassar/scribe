@@ -711,6 +711,7 @@ fn session_stub(image_state: Option<SessionImageHandoff>) -> HandoffSession {
         snapshot: None,
         session_replay: None,
         title: None,
+        icon_title: None,
         shell_name: "shell".to_owned(),
         task_label: None,
         codex_task_label: None,

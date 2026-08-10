@@ -30,7 +30,9 @@ This parallel execution is necessary because alacritty_terminal ignores custom O
 
 ### Intercepted Sequences
 
-OSC 7 (current working directory), OSC 133 (shell-integration prompt marks), OSC 1337 (`ScribeContext` shell-integration payload and `ScribeAiLaunch` AI pre-arm sentinel only — AI tool state arrives via the hook channel; see ).
+Scribe intercepts title, directory, prompt, and shell-context metadata that upstream cannot distinguish or does not expose.
+
+OSC 0/1 carries icon/tab title, OSC 7 current directory, OSC 133 shell prompt marks, and OSC 1337 only `ScribeContext` plus the `ScribeAiLaunch` pre-arm sentinel. AI tool state arrives through the hook channel; see .
 
 ### Passed Through
 
@@ -40,7 +42,7 @@ OSC 52 (clipboard read/write) is **out of scope** for this interceptor — it is
 
 BEL (0x07) is out of scope for the same reason: `alacritty_terminal` executes the byte itself and surfaces it as `Event::Bell`. Both parsers see the same stream, so recognising BEL here as well produced two `MetadataEvent::Bell`s — and therefore two `Bell` frames and two client attention requests — for every bell.
 
-OSC 0/2 (window title) is out of scope on the same grounds: `alacritty_terminal` parses it natively and reports it as `Event::Title` / `Event::ResetTitle`. Recognising it here as well produced two `TitleChanged` frames and two live-registry write-locks per title sequence, and for a `;`-containing title the two payloads even disagreed — the interceptor kept only the first OSC param, so `\e]2;alpha;beta\e\\` emitted `alpha` before `alpha;beta`.
+OSC 0/2 **window-title** handling stays out of scope: `alacritty_terminal` parses it natively and reports `Event::Title` / `Event::ResetTitle`. The interceptor handles only OSC 0's icon-title half and OSC 1, which upstream ignores; it rejoins every parameter after the selector so semicolons remain title text.
 
 ## Metadata Parser
 
@@ -48,7 +50,7 @@ The  is a stateful parser that classifies OSC sequences into typed events.
 
 ### Metadata Events
 
-Metadata events cover CWD, provider task label, AI state, prompt text, and prompt marks extracted from OSC sequences. `Bell` and `TitleChanged` are the two variants this parser never produces: both come from the Event Listener.
+Metadata events cover icon title, CWD, provider task label, AI state, prompt text, and prompt marks extracted from OSC sequences. `Bell` and window `TitleChanged` come only from the Event Listener.
 
 ### OSC 7 — Working Directory
 
@@ -136,11 +138,13 @@ Metadata events still carry title, CWD, AI-state, prompt-mark, and bell signals,
 
 ### OSC 0/2 — Window Title
 
-`Event::Title` and `Event::ResetTitle` are the single source of `MetadataEvent::TitleChanged`: one event, one `TitleChanged` frame and one live-registry write-lock per title sequence.
+`Event::Title` and `Event::ResetTitle` are the sole source of window `MetadataEvent::TitleChanged` for OSC 0/2; the interceptor separately emits icon/tab title events for OSC 0/1.
 
-The listener truncates the title to 4096 characters before emitting it, the bound the OSC interceptor used to apply, because `alacritty_terminal` stores the OSC payload unbounded. It does not reject empty titles: a reset (`Event::ResetTitle`, or an OSC 0/2 with a blank payload) is a legitimate event, and both the server's registry write and the client's tab rename already ignore an empty string rather than blanking the name.
+OSC 0 follows both paths: the Event Listener updates the window title and the parallel interceptor updates the icon title. OSC 1 follows only the interceptor path. BEL and ST terminate both paths identically.
 
-Titles arrive joined rather than split: `alacritty_terminal`'s parser rejoins the semicolon-separated OSC params, so `\e]2;alpha;beta\e\\` yields the whole `alpha;beta`, whereas the interceptor's parser stopped at the first `;`.
+Both paths truncate titles to 4096 characters. Empty native title events clear the window-title source, while empty interceptor events clear the icon-title source; either reset reveals the next configured title fallback instead of being ignored.
+
+Both paths rejoin semicolon-separated OSC parameters, so `\e]2;alpha;beta\e\\` and `\e]1;alpha;beta\e\\` preserve the full `alpha;beta` payload.
 
 ### Terminal Query Replies
 

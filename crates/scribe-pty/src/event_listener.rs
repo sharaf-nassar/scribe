@@ -58,10 +58,10 @@ impl ScribeEventListener {
 impl EventListener for ScribeEventListener {
     fn send_event(&self, event: Event) {
         match event {
-            // Sole source of `MetadataEvent::TitleChanged`: the OSC interceptor
-            // runs a second parser over the same bytes and deliberately ignores
-            // OSC 0/2. `Term`'s parser joins the semicolon-separated OSC params
-            // back into one title, so `\e]2;alpha;beta\e\\` arrives here whole.
+            // Sole source of window `MetadataEvent::TitleChanged` for OSC 0/2.
+            // The parallel interceptor additionally emits `IconTitleChanged`
+            // for OSC 0's icon half and OSC 1. Both paths preserve semicolons;
+            // empty events clear their source downstream to reveal a fallback.
             Event::Title(title) => {
                 let title = truncate_chars(&title, MAX_TITLE_LEN);
                 self.emit(SessionEvent::Metadata(MetadataEvent::TitleChanged(title)));

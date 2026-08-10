@@ -10492,6 +10492,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::CwdChanged { .. } => "CwdChanged",
         ServerMessage::SessionContextChanged { .. } => "SessionContextChanged",
         ServerMessage::TitleChanged { .. } => "TitleChanged",
+        ServerMessage::IconTitleChanged { .. } => "IconTitleChanged",
         ServerMessage::CodexTaskLabelChanged { .. } => "CodexTaskLabelChanged",
         ServerMessage::CodexTaskLabelCleared { .. } => "CodexTaskLabelCleared",
         ServerMessage::TaskLabelChanged { .. } => "TaskLabelChanged",
@@ -10749,6 +10750,7 @@ async fn dispatch_server_message(
         // strip's labels and the shared metadata), so it is named here and
         // routed as one to [`on_chrome_message`].
         chrome @ (ServerMessage::TitleChanged { .. }
+        | ServerMessage::IconTitleChanged { .. }
         | ServerMessage::CwdChanged { .. }
         | ServerMessage::GitBranch { .. }
         | ServerMessage::SessionContextChanged { .. }
@@ -11190,6 +11192,11 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::TitleChanged { session_id, title } => {
             if ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_title(session_id, Some(title))) {
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+        }
+        ServerMessage::IconTitleChanged { session_id, title } => {
+            if ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_icon_title(session_id, Some(title))) {
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
@@ -11909,6 +11916,7 @@ fn sync_tab_strip(
 fn tab_entry_for(info: &SessionInfo) -> TabEntry {
     let mut entry = TabEntry::new(info.session_id, info.workspace_id, info.shell_name.clone());
     entry.terminal_title = info.title.clone().filter(|title| !title.trim().is_empty());
+    entry.icon_title = info.icon_title.clone().filter(|title| !title.trim().is_empty());
     let label = info.task_label.as_deref().or(info.codex_task_label.as_deref());
     entry.task_label =
         label.map(str::trim).filter(|label| !label.is_empty()).map(ToOwned::to_owned);
@@ -12045,6 +12053,7 @@ mod tests {
             workspace_id: WorkspaceId::new(),
             shell_name: String::from("bash"),
             title: None,
+            icon_title: None,
             context: None,
             task_label: None,
             codex_task_label: None,
@@ -12054,6 +12063,22 @@ mod tests {
             ai_provider_hint: provider,
             prompt_state: None,
         }
+    }
+
+    #[test]
+    fn session_list_restores_independent_title_sources() {
+        let session = SessionId::new();
+        let mut info = listed_session(session, None);
+        info.title = Some(String::from("window"));
+        info.icon_title = Some(String::from("icon"));
+
+        let entry = tab_entry_for(&info);
+        assert_eq!(entry.display_title(), "icon");
+        assert_eq!(entry.terminal_title.as_deref(), Some("window"));
+        assert_eq!(entry.icon_title.as_deref(), Some("icon"));
+
+        info.icon_title = Some(String::new());
+        assert_eq!(tab_entry_for(&info).display_title(), "window");
     }
 
     // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Codex reattach defers its grid]]
@@ -12300,6 +12325,7 @@ mod tests {
             workspace_id: WorkspaceId::new(),
             shell_name: String::from("bash"),
             title: None,
+            icon_title: None,
             context: None,
             task_label: None,
             codex_task_label: None,

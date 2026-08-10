@@ -75,6 +75,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         snapshot: None,
         session_replay: Some(replay),
         title: None,
+        icon_title: None,
         shell_name: String::from("zsh"),
         task_label: None,
         codex_task_label: None,
@@ -147,6 +148,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             snapshot: Some(dummy_snapshot(80, 24)),
             session_replay: None,
             title: None,
+            icon_title: None,
             shell_name: String::from("zsh"),
             task_label: None,
             codex_task_label: None,
@@ -193,7 +195,9 @@ async fn wait_registry_count(registry: &LiveSessionRegistry, expected: usize) {
 
 #[tokio::test]
 async fn restore_from_handoff_populates_session_manager() {
-    let (state, masters, _slaves) = make_handoff_state(1);
+    let (mut state, masters, _slaves) = make_handoff_state(1);
+    state.sessions[0].title = Some(String::from("window"));
+    state.sessions[0].icon_title = Some(String::from("icon"));
     let expected_id = state.sessions[0].session_id;
 
     let sm = SessionManager::restore_from_handoff(&state, masters, 100).unwrap();
@@ -204,6 +208,8 @@ async fn restore_from_handoff_populates_session_manager() {
 
     let restored = sm.take_session(expected_id).await.unwrap();
     assert_eq!(restored.shell_name, "zsh");
+    assert_eq!(restored.title.as_deref(), Some("window"));
+    assert_eq!(restored.icon_title.as_deref(), Some("icon"));
     assert_eq!(
         restored.context.as_ref().and_then(|context| context.host.as_deref()),
         Some("builder")
@@ -239,7 +245,9 @@ async fn activate_moves_sessions_to_live_registry() {
 
 #[tokio::test]
 async fn serialize_live_returns_activated_sessions() {
-    let (state, masters, _slaves) = make_handoff_state(1);
+    let (mut state, masters, _slaves) = make_handoff_state(1);
+    state.sessions[0].title = Some(String::from("window"));
+    state.sessions[0].icon_title = Some(String::from("icon"));
     let expected_id = state.sessions[0].session_id;
 
     let sm = Arc::new(SessionManager::restore_from_handoff(&state, masters, 100).unwrap());
@@ -258,7 +266,8 @@ async fn serialize_live_returns_activated_sessions() {
     assert!(sessions[0].session_replay.is_some(), "v5 sender must populate session_replay");
     assert!(sessions[0].snapshot.is_none(), "v5 sender must leave legacy snapshot None");
     assert_eq!(sessions[0].shell_name, "zsh");
-    assert_eq!(sessions[0].title, None, "missing terminal title must survive handoff as missing");
+    assert_eq!(sessions[0].title.as_deref(), Some("window"));
+    assert_eq!(sessions[0].icon_title.as_deref(), Some("icon"));
     assert_eq!(
         sessions[0].context.as_ref().and_then(|context| context.host.as_deref()),
         Some("builder")
@@ -529,6 +538,7 @@ fn prior_version_payload_decodes_with_absent_child_identity() {
     assert_eq!(session.child_identity, None, "absent field must default to None");
     assert_eq!(session.child_pid, 4242);
     assert_eq!(session.title.as_deref(), Some("editor"));
+    assert_eq!(session.icon_title, None, "absent field must default to None");
     assert_eq!(session.shell_name, "zsh");
     assert_eq!(session.cell_width, 8);
     assert_eq!(session.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
@@ -542,11 +552,13 @@ fn current_version_payload_round_trips_child_identity() {
     state.version = 6;
     let recorded = crate::child_identity::read_child_identity(std::process::id());
     state.sessions.first_mut().expect("one session").child_identity = recorded;
+    state.sessions.first_mut().expect("one session").icon_title = Some(String::from("icon"));
 
     let bytes = rmp_serde::to_vec_named(&state).unwrap();
     let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
 
     assert_eq!(decoded.sessions.first().expect("one session").child_identity, recorded);
+    assert_eq!(decoded.sessions.first().expect("one session").icon_title.as_deref(), Some("icon"));
 }
 
 /// The reverse direction of the same upgrade rehearsal: an N-1 receiver must

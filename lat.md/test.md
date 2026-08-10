@@ -1702,7 +1702,7 @@ Keystroke *suppression* is asserted from both the client log and an absent `KeyI
 
 ### Application titles own AI task-label fallbacks
 
-`tests/e2e/visual/ai-task-label.sh` proves native OSC 0 titles own the tab while AI task labels remain a fallback source.
+`tests/e2e/visual/ai-task-label.sh` proves standard OSC 0/1/2 tab-title ownership while AI task labels remain a fallback source.
 
 ### AI indicator paints provider state
 
@@ -1714,7 +1714,7 @@ Nothing is stubbed. The image ships `scribe-hook-helper`, so the script posts a 
 
 Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the entrypoint's `$SESSION` belongs to the test daemon's window and is therefore hidden from the client's `ListSessions`, so the daemon is stopped and the client relaunched, after which it adopts the session through the normal attach path. `scribe-hook-helper` needs no daemon — it addresses the socket directly with the session id in its environment — so the hook channel outlives that teardown.
 
-Each provider first runs a set/clear cycle: the client's `tab task label updated` line proves the notice reached the reader, the 54 px chrome-only band changes by at least 40 pixels, and clear restores the shell-identical baseline. A final phase sets a task label, emits OSC 0 from the real pane, and requires the native-title pixels to remain unchanged when the hidden task label clears; blank OSC 0 must then restore the shell-identical baseline. The band includes openbox's 20 px decoration and the client's 34 px titlebar, then stops before the terminal grid so its blinking cursor cannot contaminate the oracle.
+Each provider first runs a set/clear cycle, then OSC 0 proves native ownership over AI metadata. The title-source phase drives OSC 2 → OSC 1 → newer hidden OSC 2 → empty OSC 1, followed by OSC 0 and independent clears. BEL and ST both terminate real pane output, and a semicolon-bearing title protects payload joining. The 54 px chrome-only band stops before the blinking terminal cursor.
 
 ### Clipboard and OSC 52 bridge
 
@@ -3050,7 +3050,7 @@ A window-global list appended it at the end, producing `left, right, left` — a
 
 Locks source ownership behind , so native application titles outrank AI task-label fallbacks and blank resets reveal the next valid source.
 
-A task label appears while no native title exists and leaves sibling tabs untouched; a native title arriving mid-task immediately owns the tab; blank native title reveals the retained task label; blank task label reveals the shell; and identical updates, repeated clears, and unknown sessions report no change.
+A task label appears while no native title exists and leaves sibling tabs untouched; window title owns AI metadata; icon title owns later window updates until reset; blank native sources reveal the next retained fallback; and identical updates, repeated clears, and unknown sessions report no change.
 
 ### GPUI terminal chrome metadata
 

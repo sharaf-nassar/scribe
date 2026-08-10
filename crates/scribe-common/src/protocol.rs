@@ -611,6 +611,10 @@ pub enum ServerMessage {
         session_id: SessionId,
         title: String,
     },
+    IconTitleChanged {
+        session_id: SessionId,
+        title: String,
+    },
     CodexTaskLabelChanged {
         session_id: SessionId,
         task_label: String,
@@ -1247,6 +1251,9 @@ pub struct SessionInfo {
     pub shell_name: String,
     /// Last-known terminal title (from OSC 0/2). `None` before first title event.
     pub title: Option<String>,
+    /// Last-known icon/tab title (from OSC 0/1). `None` before first title event.
+    #[serde(default)]
+    pub icon_title: Option<String>,
     /// Last-known shell/session context (remote host, tmux session).
     #[serde(default)]
     pub context: Option<SessionContext>,

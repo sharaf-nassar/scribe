@@ -37,6 +37,10 @@ HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 CLAUDE_LABEL="Ship the tab labels"
 CODEX_LABEL="Rewrite the parser"
 NATIVE_TITLE="Native application title"
+WINDOW_TITLE="Window title via BEL"
+ICON_TITLE="Icon title via ST"
+LATEST_WINDOW_TITLE="Latest window title via BEL"
+UNIFIED_TITLE="Unified;title via OSC 0"
 
 # Minimum differing pixels in the tab band for a label to count as rendered.
 # Replacing a four-character shell name with a multi-word label repaints far
@@ -252,6 +256,103 @@ run_native_title_precedence() {
     echo "PASS (title): blank OSC 0 restores the shell fallback"
 }
 
+# Prove the standard xterm title-source precedence through both OSC
+# terminators. OSC 1 owns the visible tab while set; clearing it reveals the
+# independently retained OSC 2 title. OSC 0 then updates both sources, so
+# clearing only OSC 1 leaves the same label visible before blank OSC 0 resets
+# both to the shell fallback.
+run_osc_title_sources() {
+    local delta
+
+    shot /output/04-title-00-shell.png
+    crop_tab_band /output/04-title-00-shell.png /output/04-title-band-shell.png
+
+    focus
+    xdotool type --clearmodifiers --delay 20 \
+        "printf '\\033]2;${WINDOW_TITLE}\\a'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-01-window-bel.png
+    crop_tab_band /output/04-title-01-window-bel.png /output/04-title-band-window.png
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 \
+        "printf '\\033]1;${ICON_TITLE}\\033\\\\'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-02-icon-st.png
+    crop_tab_band /output/04-title-02-icon-st.png /output/04-title-band-icon.png
+    delta=$(band_delta /output/04-title-band-window.png /output/04-title-band-icon.png)
+    if [ "${delta:-0}" -lt "$LABEL_DELTA_MIN" ]; then
+        fail "FAIL (OSC 1 ST): icon title did not override the OSC 2 tab title"
+    fi
+    echo "PASS (OSC 1 ST): icon title owns the visible tab"
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 \
+        "printf '\\033]2;${LATEST_WINDOW_TITLE}\\a'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-03-window-hidden-bel.png
+    crop_tab_band /output/04-title-03-window-hidden-bel.png \
+        /output/04-title-band-window-hidden.png
+    delta=$(band_delta /output/04-title-band-icon.png \
+        /output/04-title-band-window-hidden.png)
+    if [ "${delta:-0}" -gt "$CLEARED_DELTA_MAX" ]; then
+        fail "FAIL (OSC 2 BEL): newer window title displaced active OSC 1"
+    fi
+    echo "PASS (OSC 2 BEL): newer window title remains hidden behind OSC 1"
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 "printf '\\033]1;\\033\\\\'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-04-icon-reset-st.png
+    crop_tab_band /output/04-title-04-icon-reset-st.png \
+        /output/04-title-band-icon-reset.png
+    delta=$(band_delta /output/04-title-band-icon.png /output/04-title-band-icon-reset.png)
+    if [ "${delta:-0}" -lt "$LABEL_DELTA_MIN" ]; then
+        fail "FAIL (OSC 1 ST): blank icon title did not reveal latest OSC 2"
+    fi
+    echo "PASS (OSC 1 ST): blank icon title reveals the latest OSC 2 title"
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 \
+        "printf '\\033]0;${UNIFIED_TITLE}\\a'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-05-unified-bel.png
+    crop_tab_band /output/04-title-05-unified-bel.png /output/04-title-band-unified.png
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 "printf '\\033]1;\\033\\\\'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-06-unified-icon-reset-st.png
+    crop_tab_band /output/04-title-06-unified-icon-reset-st.png \
+        /output/04-title-band-unified-icon-reset.png
+    delta=$(band_delta /output/04-title-band-unified.png \
+        /output/04-title-band-unified-icon-reset.png)
+    if [ "${delta:-0}" -gt "$CLEARED_DELTA_MAX" ]; then
+        fail "FAIL (OSC 0 BEL): OSC 0 did not update both title sources"
+    fi
+    echo "PASS (OSC 0 BEL): OSC 0 updates icon and window title sources"
+
+    xdotool key --clearmodifiers ctrl+c
+    focus
+    xdotool type --clearmodifiers --delay 20 "printf '\\033]0;\\033\\\\'; read"
+    xdotool key --clearmodifiers Return
+    shot /output/04-title-07-unified-reset-st.png
+    crop_tab_band /output/04-title-07-unified-reset-st.png \
+        /output/04-title-band-unified-reset.png
+    delta=$(band_delta /output/04-title-band-shell.png \
+        /output/04-title-band-unified-reset.png)
+    if [ "${delta:-0}" -gt "$CLEARED_DELTA_MAX" ]; then
+        fail "FAIL (OSC 0 ST): blank OSC 0 did not clear both title sources"
+    fi
+    xdotool key --clearmodifiers ctrl+c
+    echo "PASS (OSC 0 ST): blank OSC 0 restores the shell fallback"
+}
+
 # ── Phase 0: hand the client a live pane so it has a tab at all ────
 sleep 1.0
 kill "$SCRIBE_CLIENT_PID" 2>/dev/null || true
@@ -296,6 +397,10 @@ echo "PHASE 2 PASS: CodexTaskLabelChanged / CodexTaskLabelCleared drive it too"
 run_native_title_precedence
 echo "PHASE 3 PASS: OSC 0 owns the tab and blank OSC 0 restores the shell"
 
+# ── Phase 4: OSC 0/1/2 keep independent standard title sources ───
+run_osc_title_sources
+echo "PHASE 4 PASS: OSC 0/1/2 title precedence survives BEL and ST"
+
 echo ""
 echo "PASS: native titles own AI fallback labels and reset to the shell"
 echo "  Inspect screenshots in test-output/:"
@@ -306,3 +411,6 @@ echo "    02-codex-01-labelled.png   — tab renamed to \"$CODEX_LABEL\""
 echo "    02-codex-02-cleared.png    — tab back to its shell title"
 echo "    03-title-02-native.png     — OSC 0 title overrides an active AI label"
 echo "    03-title-04-reset.png      — blank OSC 0 restores the shell title"
+echo "    04-title-02-icon-st.png    — OSC 1 overrides OSC 2"
+echo "    04-title-04-icon-reset-st.png — blank OSC 1 reveals latest OSC 2"
+echo "    04-title-07-unified-reset-st.png — blank OSC 0 clears both sources"

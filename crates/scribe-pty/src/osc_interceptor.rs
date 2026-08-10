@@ -9,14 +9,13 @@ use crate::metadata::{MetadataEvent, MetadataParser};
 /// By feeding the same bytes through an `OscInterceptor` we can extract:
 ///
 /// - OSC 7 — current working directory
+/// - OSC 0 / 1 — icon/tab title
 /// - OSC 133 — shell-integration prompt marks
 /// - OSC 1337 `ScribeContext` / `ScribeAiLaunch` — shell context, AI pre-arm
 ///
-/// OSC 0 / 2 (window title) is deliberately absent: `alacritty_terminal`
-/// parses it natively and surfaces it as `Event::Title` / `Event::ResetTitle`,
-/// joining the semicolon-separated params back into one title in the process.
-/// Recognising it here too emitted a second, differently-truncated
-/// `MetadataEvent::TitleChanged` for every title sequence.
+/// OSC 0 / 2 window-title handling remains native to `alacritty_terminal`,
+/// which surfaces `Event::Title` / `Event::ResetTitle`. The interceptor only
+/// takes OSC 0's icon-title half and OSC 1, which upstream ignores.
 ///
 /// Create one per read-loop iteration, advance it with `vte::Parser::advance`,
 /// then inspect the `events` vec passed in at construction time.
@@ -72,4 +71,28 @@ impl Perform for OscInterceptor<'_> {
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OscInterceptor;
+    use crate::metadata::MetadataEvent;
+
+    #[test]
+    fn accepts_bel_and_st_icon_titles() {
+        let mut parser = vte::Parser::new();
+        let mut events = Vec::new();
+        let mut interceptor = OscInterceptor::new(&mut events);
+
+        parser.advance(&mut interceptor, b"\x1b]1;bel title\x07");
+        parser.advance(&mut interceptor, b"\x1b]1;st;title\x1b\\");
+
+        assert_eq!(
+            events,
+            [
+                MetadataEvent::IconTitleChanged(String::from("bel title")),
+                MetadataEvent::IconTitleChanged(String::from("st;title")),
+            ]
+        );
+    }
 }

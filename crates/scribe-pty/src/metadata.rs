@@ -19,6 +19,9 @@ pub enum MetadataEvent {
     /// both is one title frame and one registry write-lock per sequence too
     /// many.
     TitleChanged(String),
+    /// An OSC 0/1 icon title reached the terminal through Scribe's parallel
+    /// interceptor. OSC 0 also produces `TitleChanged` through the `Term`.
+    IconTitleChanged(String),
     SessionContextChanged(SessionContext),
     TaskLabelChanged {
         provider: AiProvider,
@@ -77,11 +80,24 @@ impl MetadataParser {
         let osc_number = params.first()?;
 
         match *osc_number {
+            b"0" | b"1" => Self::parse_icon_title(params),
             b"7" => Self::parse_cwd(params),
             b"133" => Self::parse_prompt_mark(params),
             b"1337" => Self::parse_iterm2(params),
             _ => None,
         }
+    }
+
+    fn parse_icon_title(params: &[&[u8]]) -> Option<MetadataEvent> {
+        let payload = params.get(1..)?;
+        let mut title = String::new();
+        for (index, part) in payload.iter().enumerate() {
+            if index > 0 {
+                title.push(';');
+            }
+            title.push_str(&String::from_utf8_lossy(part));
+        }
+        Some(MetadataEvent::IconTitleChanged(truncate_chars(&title, MAX_TITLE_LEN)))
     }
 
     fn parse_cwd(params: &[&[u8]]) -> Option<MetadataEvent> {
@@ -370,5 +386,17 @@ mod tests {
         assert!(parse_iterm2(&[b"1337", b"CodexPrompt=Add OAuth support"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"ClaudeContext=42"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"AiState=state=processing"]).is_none());
+    }
+
+    #[test]
+    fn parses_icon_titles_without_losing_semicolons() {
+        assert_eq!(
+            MetadataParser::process_osc(&[b"1", b"alpha", b"beta"]),
+            Some(MetadataEvent::IconTitleChanged(String::from("alpha;beta")))
+        );
+        assert_eq!(
+            MetadataParser::process_osc(&[b"0", b""]),
+            Some(MetadataEvent::IconTitleChanged(String::new()))
+        );
     }
 }

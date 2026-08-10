@@ -77,6 +77,7 @@ struct SessionState {
     last_output_at: Option<tokio::time::Instant>,
     cwd: Option<PathBuf>,
     title: Option<String>,
+    icon_title: Option<String>,
     status: SessionStatus,
     /// Latest AI context-window fill percentage, from `AiStateChanged`.
     ///
@@ -115,6 +116,7 @@ impl SessionState {
             last_output_at: None,
             cwd: None,
             title: None,
+            icon_title: None,
             status: SessionStatus::Running,
             ai_context: None,
             ai_pulsing: false,
@@ -406,6 +408,7 @@ async fn dispatch_server_message(
         | ServerMessage::SessionReplay { .. }
         | ServerMessage::CwdChanged { .. }
         | ServerMessage::TitleChanged { .. }
+        | ServerMessage::IconTitleChanged { .. }
         | ServerMessage::SessionCreated { .. }
         | ServerMessage::SessionExited { .. }
         | ServerMessage::SessionContextChanged { .. }
@@ -495,6 +498,9 @@ async fn dispatch_session_message(
         }
         ServerMessage::TitleChanged { session_id, title } => {
             handle_title_changed(session_id, title, state).await;
+        }
+        ServerMessage::IconTitleChanged { session_id, title } => {
+            handle_icon_title_changed(session_id, title, state).await;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             handle_session_created(session_id, workspace_id, &shell_name, state, notifiers).await;
@@ -788,6 +794,13 @@ async fn handle_title_changed(session_id: SessionId, title: String, state: &Shar
     let mut guard = state.lock().await;
     if let Some(session) = guard.sessions.get_mut(&session_id) {
         session.title = Some(title);
+    }
+}
+
+async fn handle_icon_title_changed(session_id: SessionId, title: String, state: &SharedState) {
+    let mut guard = state.lock().await;
+    if let Some(session) = guard.sessions.get_mut(&session_id) {
+        session.icon_title = Some(title);
     }
 }
 

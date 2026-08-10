@@ -368,6 +368,13 @@ fn native_title_outranks_task_label_and_reset_reveals_fallbacks() {
     assert!(tabs.set_title(ids[0], Some("editor".to_owned())));
     assert_eq!(tabs.to_tab_data()[0].title, "editor");
 
+    assert!(tabs.set_icon_title(ids[0], Some("vim icon".to_owned())));
+    assert_eq!(tabs.to_tab_data()[0].title, "vim icon");
+    assert!(tabs.set_title(ids[0], Some("newer window".to_owned())));
+    assert_eq!(tabs.to_tab_data()[0].title, "vim icon");
+    assert!(tabs.set_icon_title(ids[0], Some(String::new())));
+    assert_eq!(tabs.to_tab_data()[0].title, "newer window");
+
     assert!(tabs.set_title(ids[0], Some("   ".to_owned())));
     assert_eq!(tabs.to_tab_data()[0].title, "Ship the tab labels");
 
@@ -389,4 +396,9 @@ fn retitle_updates_only_on_change() {
     assert!(!tabs.set_title(ids[0], Some("claude".to_owned())), "identical title is not a change");
     assert!(!tabs.set_title(SessionId::new(), Some("ghost".to_owned())));
     assert_eq!(tabs.to_tab_data()[0].title, "claude");
+
+    assert!(tabs.set_icon_title(ids[0], Some("icon".to_owned())));
+    assert!(!tabs.set_icon_title(ids[0], Some("icon".to_owned())));
+    assert!(!tabs.set_icon_title(SessionId::new(), Some("ghost".to_owned())));
+    assert_eq!(tabs.to_tab_data()[0].title, "icon");
 }
