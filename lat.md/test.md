@@ -789,6 +789,10 @@ The rig replaces the entrypoint's client with a freshly launched one against a
 clean log, because only a capable viewer latches a session and an unlatched
 session answers no discovery probe at all.
 
+When that process restores several windows, the corpus maps its first attached
+session to the X11 window logged by the same backend and drives that exact
+capable pane.
+
 No image-specific environment is set: terminal images are on by default, so a
 plain `scribe-client` is already capable.
 

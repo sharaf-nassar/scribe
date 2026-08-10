@@ -755,19 +755,18 @@ never spoofed.
 
 ## Kitty Environment Marker
 
-Spawned PTYs carry `KITTY_WINDOW_ID=1` while the image master switch is on, so applications that sniff the environment instead of probing can discover graphics support.
+Structured Codex PTYs carry `KITTY_WINDOW_ID=1` while the image master switch is on, so Codex can discover graphics support without misidentifying ordinary Scribe terminals as Kitty.
 
 [[crates/scribe-server/src/session_manager.rs#build_pty_options]] sets the
-variable only when
+variable only for a structured Codex launch when
 [[crates/scribe-server/src/terminal_image_sharing.rs#images_master_enabled]]
-reads on at spawn, so a disabled Scribe never claims image capability — the
-same honesty [[terminal-images#Terminal Images#Sixel DA1 Advertisement]] keeps
-on the probe side. Codex-style tools check `KITTY_WINDOW_ID` first and never
-send an escape-sequence probe, so without the marker they cannot see Scribe's
-image support at all.
+reads on at spawn. Ordinary shells stay unmarked, so applications such as Yazi
+use Scribe's truthful Kitty query and Sixel DA1 responses instead of treating
+the marker as terminal identity. Codex checks `KITTY_WINDOW_ID` first and never
+sends an escape-sequence probe, so its dedicated launch still needs the hint.
 
 The marker is a static spawn-time hint, not a capability guarantee. A later
-config reload binds newly spawned sessions only — inherent to environment
+config reload binds newly spawned Codex sessions only — inherent to environment
 variables — and whether images actually render still requires an image-capable
 viewer to latch the session, which the environment cannot know at spawn.
 `$TERM` and `TERM_PROGRAM` are still never spoofed.

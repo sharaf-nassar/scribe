@@ -9,6 +9,7 @@ SERVER_LOG=/output/server.log
 CLIENT_LOG=/output/client-images.log
 STEPS=/tmp/image-apps
 EVIDENCE="$OUT/steps.tsv"
+ACTIVE_WID=
 mkdir -p "$OUT" "$STEPS"
 : >"$EVIDENCE"
 
@@ -41,11 +42,43 @@ wait_client_log() {
 
 focus() {
     local wid
-    wid=$(xdotool search --name '^Scribe$' 2>/dev/null | tail -1)
+    wid="${ACTIVE_WID:-}"
+    [ -n "$wid" ] || wid=$(xdotool search --name '^Scribe$' 2>/dev/null | tail -1)
     [ -n "$wid" ] || fail "no Scribe client window"
     xdotool windowactivate --sync "$wid" 2>/dev/null \
         || xdotool windowfocus --sync "$wid" 2>/dev/null || true
     printf '%s' "$wid"
+}
+
+# Match a live session to the GPUI window that published its grid. This works
+# for both restored sessions (`attach` precedes X11) and freshly created ones
+# (`pane adopted` follows X11).
+window_for_session() {
+    sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" | awk -v wanted="$1" '
+        /X11 active-window guard enabled window=/ {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^window=/) window = substr($i, 8)
+        }
+        /published a pane.s grid size session_id=/ {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^session_id=/ && substr($i, 12) == wanted) {
+                    print window
+                    exit
+                }
+        }
+    '
+}
+
+wait_session_window() {
+    local session="$1" timeout_secs="$2" started wid
+    started=$(date +%s)
+    while :; do
+        wid=$(window_for_session "$session")
+        [ -n "$wid" ] && { printf '%s' "$wid"; return 0; }
+        [ $(( "$(date +%s)" - started )) -lt "$timeout_secs" ] || return 1
+        kill -0 "$CLIENT_PID" 2>/dev/null || return 1
+        sleep 0.2
+    done
 }
 
 # Highest value a named evidence field reached inside one step's log window.
@@ -128,8 +161,13 @@ LIBGL_ALWAYS_SOFTWARE=1 \
 CLIENT_PID=$!
 trap 'kill "$CLIENT_PID" 2>/dev/null || true' EXIT
 
-wait_client_log "pane adopted a session" 30 || fail "image-capable client never adopted a session"
-sleep 1.5
+wait_client_log "published a pane's grid size" 30 \
+    || fail "image-capable client never published a pane"
+IMAGE_SESSION=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" \
+    | sed -n "s/.*published a pane's grid size session_id=\([^ ]*\).*/\1/p" | head -1)
+ACTIVE_WID=$(wait_session_window "$IMAGE_SESSION" 30) \
+    || fail "the client never opened a window for session $IMAGE_SESSION"
+sleep 0.5
 focus >/dev/null
 
 # Prove the pane is live and typed input lands before any protocol assertion,

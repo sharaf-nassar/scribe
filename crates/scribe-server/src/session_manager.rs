@@ -562,13 +562,17 @@ impl SessionManager {
             request.ai_launch.as_ref(),
         )
         .map(|(program, args)| alacritty_terminal::tty::Shell::new(program, args));
+        let kitty_window_id = codex_kitty_window_id(
+            request.ai_launch.as_ref(),
+            crate::terminal_image_sharing::images_master_enabled(),
+        );
         let pty_options = build_pty_options(PtyOptionsBuild {
             session_id,
             shell: pty_shell,
             cwd: request.cwd,
             shell_kind: shell.kind,
             env,
-            images_enabled: crate::terminal_image_sharing::images_master_enabled(),
+            kitty_window_id,
         });
 
         PreparedSessionLaunch {
@@ -793,7 +797,7 @@ struct PtyOptionsBuild<'a> {
     cwd: Option<std::path::PathBuf>,
     shell_kind: ShellKind,
     env: EnvLaunchContext<'a>,
-    images_enabled: bool,
+    kitty_window_id: bool,
 }
 
 fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
@@ -803,7 +807,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         cwd,
         shell_kind,
         env: EnvLaunchContext { restore_file, persistence_enabled, integration_enabled },
-        images_enabled,
+        kitty_window_id,
     } = opts;
     let mut env = HashMap::from([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
@@ -833,15 +837,10 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         env.insert("SCRIBE_HOOK_HELPER".to_owned(), helper.to_string_lossy().into_owned());
     }
 
-    // Kitty graphics env marker for applications that sniff environment
-    // variables instead of probing (Codex CLI checks `KITTY_WINDOW_ID`
-    // first and never sends an escape-sequence probe). Gated on the image
-    // master switch at spawn so a disabled Scribe never claims image
-    // capability; it is a spawn-time snapshot — a later config flip binds
-    // new sessions only, like every other env var here. It is a protocol
-    // hint, not a capability guarantee: whether images actually render
-    // still depends on an image-capable viewer latching the session.
-    if images_enabled {
+    // Codex checks `KITTY_WINDOW_ID` instead of probing. Keep that
+    // compatibility marker out of ordinary PTYs, where applications such as
+    // Yazi correctly treat it as terminal identity and skip capability probes.
+    if kitty_window_id {
         env.insert("KITTY_WINDOW_ID".to_owned(), "1".to_owned());
     }
 
@@ -876,6 +875,10 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
         ..PtyOptions::default()
     }
+}
+
+fn codex_kitty_window_id(ai_launch: Option<&AiLaunchSpec>, images_enabled: bool) -> bool {
+    images_enabled && ai_launch.is_some_and(|launch| launch.provider == AiProvider::CodexCode)
 }
 
 /// Return a PATH guaranteed to contain the macOS baseline directories.
@@ -1471,7 +1474,8 @@ mod tests {
 
     use super::{
         AiLaunchSpec, AiProvider, AiResumeMode, EnvLaunchContext, PtyOptionsBuild,
-        build_launch_shell, build_pty_options, build_shell, path_with_macos_baseline,
+        build_launch_shell, build_pty_options, build_shell, codex_kitty_window_id,
+        path_with_macos_baseline,
     };
     use crate::shell_integration::ShellKind;
 
@@ -1518,7 +1522,7 @@ mod tests {
         assert_eq!(path_with_macos_baseline(Some(MACOS_BASELINE_PATH)), MACOS_BASELINE_PATH);
     }
 
-    fn pty_env(images_enabled: bool) -> std::collections::HashMap<String, String> {
+    fn pty_env(kitty_window_id: bool) -> std::collections::HashMap<String, String> {
         build_pty_options(PtyOptionsBuild {
             session_id: SessionId::new(),
             shell: None,
@@ -1529,14 +1533,25 @@ mod tests {
                 persistence_enabled: false,
                 integration_enabled: false,
             },
-            images_enabled,
+            kitty_window_id,
         })
         .env
     }
 
     // @lat: [[terminal-images#Terminal Images#Kitty Environment Marker]]
     #[test]
-    fn kitty_window_id_env_follows_images_master_switch() {
+    fn kitty_window_id_env_is_limited_to_image_enabled_codex_tabs() {
+        let codex = AiLaunchSpec {
+            provider: AiProvider::CodexCode,
+            resume_mode: AiResumeMode::New,
+            conversation_id: None,
+        };
+        let claude = AiLaunchSpec { provider: AiProvider::ClaudeCode, ..codex.clone() };
+
+        assert!(codex_kitty_window_id(Some(&codex), true));
+        assert!(!codex_kitty_window_id(Some(&codex), false));
+        assert!(!codex_kitty_window_id(Some(&claude), true));
+        assert!(!codex_kitty_window_id(None, true));
         assert_eq!(pty_env(true).get("KITTY_WINDOW_ID").map(String::as_str), Some("1"));
         assert_eq!(pty_env(false).get("KITTY_WINDOW_ID"), None);
     }
