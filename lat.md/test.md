@@ -1706,7 +1706,9 @@ Keystroke *suppression* is asserted from both the client log and an absent `KeyI
 
 ### AI indicator paints provider state
 
-`tests/e2e/visual/ai-indicator.sh` posts a real provider state hook and asserts pixels in both the titlebar tab and pane-border strip. It proves the live hook-to-paint path documented in .
+`tests/e2e/visual/ai-indicator.sh` checks tab and pane-border pixels from a real provider hook, then verifies a hot-reloaded processing color repaints both surfaces without another hook edge.
+
+This proves the live hook-to-paint and config-to-paint paths documented in .
 
 Nothing is stubbed. The image ships `scribe-hook-helper`, so the script posts a real hook event to the real `scribe-server` (the hook channel's endpoint *is* the server socket, exported as `SCRIBE_RUNTIME_DIR` by the entrypoint), the server translates and broadcasts the notice through , and the running client's tab strip repaints. `--provider=claude_code` drives the provider-tagged pair and `--provider=codex_code` the legacy Codex pair, because the server splits Codex back out for backward compatibility — so all four wire variants are exercised against one window.
 

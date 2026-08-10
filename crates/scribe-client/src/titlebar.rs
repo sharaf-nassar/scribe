@@ -554,7 +554,7 @@ impl TitlebarView {
         let (display, _truncated) = tab_display_title(&tab.title, available);
         let ai_dot = tab
             .ai_indicator
-            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_1().into_any_element());
+            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });

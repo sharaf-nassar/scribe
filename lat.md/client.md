@@ -1085,11 +1085,15 @@ The GPUI rebuild ports the winit client's per-session AI state machine so pulsin
 
 The context-window percent is stored independently of the visible state () so it survives every state-pruning path; the pulse-suppression predicate () is the `pulsing` argument for the tab suffix banding that now lives in . The pulsing border geometry is , which excludes the tab bar and reuses the shared  strip math; the GPUI paint path fills those rects with the aggregated colour. `AiStateChanged`/`AiStateCleared` are verified by the visual-E2E harness.
 
- supplies each tab's indicator and context suffix, while  aggregates and paints each workspace border. The redraw and lifecycle ticks advance pulses and clear stale processing; PTY output re-arms liveness and encoded keystrokes clear attention states.
+ supplies each tab's indicator and context suffix, while  aggregates and paints each workspace border. Config reloads reconfigure the shared tracker, so active tab dots and pane borders immediately use the latest per-state signal colors. The redraw and lifecycle ticks advance pulses and clear stale processing; PTY output re-arms liveness and encoded keystrokes clear attention states.
 
 ### Provider toggle gates the indicator
 
 Verifies  returns `None` for a provider disabled in `TerminalConfig`, so a toggled-off tool shows no indicator.
+
+### Config reload updates active indicator colors
+
+Verifies a live config reload updates both `tab_indicator_color` and `workspace_border_color` for an already-active state, so saved signal-color changes repaint both surfaces without a restart or new hook edge.
 
 ### Provider memory survives clears
 

@@ -554,7 +554,7 @@ mod tests {
     use super::{AiStateTracker, STALE_PROCESSING_CLEAR, pane_border_edges};
     use crate::layout::Rect;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-    use scribe_common::config::TerminalConfig;
+    use scribe_common::config::{AiColor, AiStateStylesConfig, TerminalConfig};
     use scribe_common::ids::SessionId;
     use std::time::{Duration, Instant};
 
@@ -583,6 +583,29 @@ mod tests {
             AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
         );
         assert_eq!(tracker.tab_indicator_color(session_id, &ANSI_COLORS, &terminal), None);
+    }
+
+    // @lat: [[client#GPUI AI Indicator#Config reload updates active indicator colors]]
+    #[gpui::test]
+    fn reconfigured_color_reaches_active_tab_and_border() {
+        let mut tracker = AiStateTracker::default();
+        let session_id = SessionId::new();
+        let terminal = TerminalConfig::default();
+        tracker.update(session_id, AiProcessState::new(AiState::Processing));
+
+        let configured = [1.0, 0.0, 1.0, 1.0];
+        let mut styles = AiStateStylesConfig::default();
+        styles.processing.color = AiColor::Hex(configured);
+        tracker.reconfigure(styles);
+
+        assert_eq!(
+            tracker.tab_indicator_color(session_id, &ANSI_COLORS, &terminal),
+            Some(configured)
+        );
+        let border = tracker
+            .workspace_border_color(&[session_id], &ANSI_COLORS, &terminal)
+            .expect("processing state paints a border");
+        assert_eq!(border[0..3], configured[0..3]);
     }
 
     // @lat: [[client#GPUI AI Indicator#Provider memory survives clears]]

@@ -2187,6 +2187,9 @@ impl TerminalView {
         self.context_thresholds = terminal.ai_session.context_thresholds.clone();
         self.prompt_bar = terminal.prompt_bar.clone();
         self.smart_selection = compile_smart_selection(&terminal.smart_selection);
+        if let Ok(mut ai) = self.shared.ai.lock() {
+            ai.tracker.reconfigure(terminal.ai_session.ai_states.clone());
+        }
         let paste_confirmation = terminal.paste_confirmation;
         self.clipboard.gate.update(cx, |gate, _| gate.set_confirmation_enabled(paste_confirmation));
         // The notification gate reads `enabled`, `condition`, and the two
@@ -6217,7 +6220,7 @@ impl TerminalView {
             tab_display_title(&tab.title, title_columns(suffix_len, tab.ai_indicator.is_some()));
         let ai_dot = tab
             .ai_indicator
-            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_1().into_any_element());
+            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
