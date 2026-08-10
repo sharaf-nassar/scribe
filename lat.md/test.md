@@ -1236,7 +1236,11 @@ server that keeps writing after its bind-ready line, then runs
 `cleanup_upgrade_state` and asserts the successor's stdout still resolves to
 the state-dir `upgrade.log` — `readlink` reports ` (deleted)` if the log was
 unlinked underneath it. `just test-install-vulkan-guard` runs the harness in a
-disposable Debian container.
+disposable Debian container. The same offline fixture runs both AI-hook
+installers, requires unmatched Claude and Codex `SessionEnd` registrations and
+Codex's trusted-hash state, then drives malformed payloads through both
+adapters with a failing `python3` shim to prove each emits `state_cleared`
+without parsing the payload.
 
 ## E2E Recipe Contract
 
@@ -1406,7 +1410,7 @@ The stub must see the vendor/config order and integration marker, with `SCRIBE_O
 
 ### AI Indicator E2E
 
-Two scripts covering the AI state indicator and its context-window percentage, both driving the  rather than OSC 1337 and reading the result back through .
+Three scripts cover the AI state indicator, context-window percentage, and Codex root/subagent hook isolation through the structured hook channel.
 
 Transport and readback are the two things these scripts get right that a naive version cannot. AI state, prompt text, and context % travel over the hook channel — OSC 1337 parsing for them was removed by spec 003 FR-022 — so the scripts run `scribe-hook-helper` inside the session shell, where the server exports `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID`. Readback cannot use a screen snapshot:  returns the server's PTY grid, and the prompt bar and tab label are client chrome that never appears in it. `scribe-test ai-chrome` renders the session's live AI state through  instead, emitting one `prompt-bar:` line whenever a percentage exists and one `tab:` line only from the warn band up.
 
@@ -1420,9 +1424,15 @@ Claude phases set `processing` plus a prompt and a context refresh of 50/72/91. 
 
 #### AI State Indicator E2E
 
-Seven-phase test in `tests/e2e/func/ai-state-indicator.sh` covering the state machine end of the same channel.
+Nine-phase test in `tests/e2e/func/ai-state-indicator.sh` covering the state machine end of the same channel.
 
-It cycles all five `AiState` variants without corrupting the grid, asserts a context refresh of 42 reaches the AI chrome, confirms a legacy OSC 1337 payload is still consumed silently with the text on either side of it preserved, drives rapid transitions without deadlock, asserts `state_cleared` empties the chrome, and closes a session while an AI state is active.
+It cycles all five `AiState` variants without corrupting the grid, asserts a context refresh of 42 reaches the AI chrome, and verifies a shell prompt clears retained prompt/provider chrome after a keystroke dismisses the visible attention state. It also confirms a legacy OSC 1337 payload stays invisible, drives rapid transitions without deadlock, checks explicit clear, and closes a session with live AI state. Its final phase restarts only the disposable Docker server with `terminal.ai_session.shell_integration.enabled = false`, keeps the provider foregrounded through SessionEnd, and proves explicit `state_cleared` removes the hook chrome without an OSC 133 fallback.
+
+#### Codex Subagent Hook Isolation E2E
+
+`tests/e2e/func/codex-subagent-hooks.sh` proves child hook payloads cannot replace foreground root AI state.
+
+The fixture sends a root `PostToolUse` backed by a 43% transcript, then a child `PostToolUse` backed by a 93% transcript under the same ambient session. It requires only the root processing/context events, then repeats the isolation check for root and child `PreToolUse`.
 
 ### Env Persistence Create-Path E2E
 
@@ -2577,7 +2587,7 @@ Permission denied gets its own sentence, and any other `io::Error` is passed thr
 
 Unit tests for [[crates/scribe-server/src/updater/macos_install.rs#swap_bundle_from_dmg]], the mount-and-replace step of the macOS install, driven through a fake host so the mount lifecycle and rollback ordering are proven without a DMG.
 
-The module is deliberately not `cfg`-gated, so these run on Linux CI even though the install path they describe only executes on macOS — the platform gap that let the original mount-point defect ship unnoticed.
+The module is compiled on macOS and in test builds, so these run on Linux CI even though the install path they describe only executes on macOS — the platform gap that let the original mount-point defect ship unnoticed.
 
 ### Attach pins the mount point
 
@@ -3772,6 +3782,26 @@ A track press at the top resolves to the full display offset and a press at the 
  makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
 
 The primary then accepts the handoff connection, verifies the peer UID, and reads back that exact focus command — proving the second launch focuses the running window instead of opening a duplicate.
+
+## Beads Board Reader Spike
+
+These tests cover only queue partitioning, schema cursor comparison, and cooperative gate contention; they do not prove OS-level read-only storage or Scribe integration.
+
+### Queue partition is exclusive and bounded
+
+Every standard source issue lands in exactly one queue under Done, Blocked, In
+Progress, Ready, then Backlog precedence. Stored blocked status is sufficient,
+each queue retains its exact count, and returned items respect the limit.
+
+[[tools/scribe-beads-board/main_test.go#TestPartitionIsExclusiveAndBounded]]
+also serializes the result and pins Scribe's `format_version` and
+`in_progress` field names.
+[[tools/scribe-beads-board/main_test.go#TestPartitionTreatsStoredBlockedStatusAsBlocked]]
+covers the stored-status regression.
+[[tools/scribe-beads-board/main_test.go#TestSchemaVersionsIncludeIgnoredCursor]]
+compares both pinned schema cursors, while
+[[tools/scribe-beads-board/main_test.go#TestReadGatesExcludeMaintenance]]
+verifies that a held cooperative shared gate rejects an exclusive gate.
 
 ## Terminal Image Release Gate
 

@@ -164,6 +164,9 @@ SCRIBE_HOOKS = [
     ("Stop", None, [
         {"type": "command", "command": f"{adapter} stop"},
     ]),
+    ("SessionEnd", None, [
+        {"type": "command", "command": f"{adapter} session_end"},
+    ]),
 ]
 
 

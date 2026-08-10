@@ -225,6 +225,7 @@ HOOK_EVENTS = (
     "PreCompact",
     "PostCompact",
     "SessionStart",
+    "SessionEnd",
     "UserPromptSubmit",
     "Stop",
 )
@@ -235,6 +236,7 @@ HOOK_EVENT_LABELS = {
     "PreCompact": "pre_compact",
     "PostCompact": "post_compact",
     "SessionStart": "session_start",
+    "SessionEnd": "session_end",
     "UserPromptSubmit": "user_prompt_submit",
     "Stop": "stop",
 }
@@ -282,6 +284,9 @@ SCRIBE_HOOKS = [
     ]),
     ("Stop", None, [
         {"type": "command", "command": f'"{adapter}" stop', "timeout": 30},
+    ]),
+    ("SessionEnd", None, [
+        {"type": "command", "command": f'"{adapter}" session_end', "timeout": 3},
     ]),
 ]
 

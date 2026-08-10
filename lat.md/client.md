@@ -886,6 +886,45 @@ The outbound half exists for one concrete case: a feature-015 **viewer**. Its ke
 
 The whole surface is verified against the running app, not headlessly: see .
 
+## Beads Board Reader Spike
+
+This bounded prototype measures a direct embedded-Dolt snapshot and defines the optional one-shot reader boundary; it is not shipped product code.
+
+[[tools/scribe-beads-board/main.go#readSnapshot]] resolves one embedded Beads
+workspace, takes its shared workspace and physical-root maintenance gates, and
+uses one Dolt connector and one read transaction. Beads' own list, Ready, and
+Blocked functions produce a coherent source set; Scribe partitions it as Done,
+Blocked, In Progress, Ready, then Backlog and bounds only the returned items.
+
+The reader requires exact main and ignored/wisp schema cursor matches and
+rejects missing storage, server/proxied modes, and gate contention. It has no
+mutation calls and requests a read-only transaction, but raw `OpenSQL` remains
+write-capable and embedded Dolt excludes every other `bd` process while open.
+
+Redirect/source database identity is unsupported, standard status filters omit
+custom or hooked statuses, and failures have no versioned JSON error contract.
+This means the successful snapshot shape is versioned, but the prototype does
+not provide a complete or mechanically read-only integration boundary.
+
+Ten-process evidence in `tools/scribe-beads-board/README.md` compares the current
+three-command installed-`bd` fallback and records an 89.73% median latency
+reduction. A 116.5 MB stripped helper, 23.1 MB compressed artifact, reproduced
+read/write lock collision, and unavailable local ARM64/macOS toolchains rule out
+bundling the prototype unchanged.
+
+The selected direction is a separately signed optional component behind a
+server-owned memory/disk stale-while-revalidate cache. Cached state renders
+immediately; missing, busy, timed-out, or schema-skewed helpers fall back to
+installed `bd`. Each helper refresh is serialized per physical database,
+bounded to 500–750 ms, and exits after one snapshot.
+
+A disposable-fixture driver patch enabled Dolt's engine-wide `IsReadOnly` mode
+and removed telemetry. Snapshot reads remained 0.15 s while INSERT, DDL, and
+`DOLT_COMMIT` were rejected; logical database state and existing file hashes
+did not change. Gate creation, NBS timestamp touches, and the roughly 150 ms
+exclusive lock remain. Production still requires canonical redirect identity,
+custom statuses, versioned errors, native packaging, and license inventory.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.
@@ -1120,7 +1159,7 @@ Verifies  offsets the border below the tab bar and produces corner-safe top/bott
 
 The GPUI rebuild ports the winit prompt bar's display-independent logic — elapsed-timer formatting with freeze-on-AI-stop, the segmented context meter, the `#N` count, strip height, and truncation — and lowers the visuals onto a GPUI flex strip.
 
- turns a  snapshot into a pure  (first/latest rows, count, elapsed, optional meter);  lowers it onto div rows (timer on row 1 with count/context on row 2 in the two-prompt state, everything on row 1 otherwise, plus the hover dismiss overlay). The elapsed timer is computed by , which freezes at `latest_prompt_finished_at` when the AI stops and clamps a backwards wall clock; the reference clock is threaded in so the freeze is `#[gpui::test]`-verifiable without a live window.  gates the hover tooltip and  sizes the strip. The rendered strip is a visual-E2E surface.
+ turns a  snapshot into a pure  (first/latest rows, count, elapsed, optional meter);  lowers it onto div rows (timer on row 1 with count/context on row 2 in the two-prompt state, everything on row 1 otherwise, plus the hover dismiss overlay). Its prompt-text child fills and centers inside the fixed row before truncation, so a large `terminal.prompt_bar_font_size` cannot paint the text above a bottom-positioned strip while the icon and timer stay inside it. The elapsed timer is computed by , which freezes at `latest_prompt_finished_at` when the AI stops and clamps a backwards wall clock; the reference clock is threaded in so the freeze is `#[gpui::test]`-verifiable without a live window.  gates the hover tooltip and  sizes the strip. The rendered strip is a visual-E2E surface.
 
 The strip is per-pane chrome, matching the winit client: [[crates/scribe-client/src/main.rs#TerminalView#compose_pane_content]] stacks it inside the pane that runs the AI session — above or below that pane's grid per `terminal.prompt_bar_position` (default Top) — so it never spans neighbouring panes or regions. It is also per-tab: the model is keyed by the pane placement's *shown* session, so switching tabs inside a region swaps the bar with the tab, and a hidden AI tab keeps its prompt history for when it is shown again. [[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes]] subtracts [[crates/scribe-client/src/main.rs#TerminalView#pane_prompt_bar_height]] from that pane's rect before deriving the PTY grid, and the render pass republishes pane sizes every frame (idempotent per session) because a prompt arriving or clearing changes one pane's strip height without moving the grid band the probe watches. A tab switch adopts the incoming session before [[crates/scribe-client/src/main.rs#TerminalView#stream_session]] resolves [[crates/scribe-client/src/main.rs#TerminalView#placed_pane_size]], so its first attach replay already reserves that tab's strip rather than briefly using the outgoing tab's row count.
 
@@ -1142,7 +1181,7 @@ The reveal is a GPUI tooltip with [[crates/scribe-client/src/prompt_bar.rs#Promp
 
 The GPUI client feeds the bar from the IPC reader: `AiStateChanged`, `AiStateCleared`, and `PromptReceived` land in a shared AI chrome record that the view reads on every frame.
 
-`AiStateChanged` updates an  (whose decoupled context store keeps the percentage alive across pulse pruning), `PromptReceived` appends to the pane's , and `AiStateCleared` plus `SessionExited` both route through [[crates/scribe-client/src/main.rs#AiChrome#forget]], dropping the tracker state, the context percentage, and the prompt history in one call — so a Claude Code or Codex exit takes the pane's prompt bar down with it, not just its indicator. Each mutation bumps the redraw generation, so the strip repaints without polling. On render the view builds the model with a context indicator whenever the tracker holds a percentage — the prompt bar is the surface that always shows the Ok band — and separately pushes the warn-and-above tab suffix from  onto the active tab. A poisoned chrome mutex is dropped with a warning rather than propagated, because losing an indicator update must never tear down the reader and with it the pane's terminal output.
+`AiStateChanged` updates an  (whose decoupled context store keeps the percentage alive across pulse pruning), `PromptReceived` appends to the pane's , and `AiStateCleared` plus `SessionExited` both route through [[crates/scribe-client/src/main.rs#AiChrome#forget]], dropping the tracker state, remembered provider, context percentage, and prompt history in one call. A Claude Code or Codex exit therefore takes down both the pane's prompt bar and the provider gate that permits split-scroll; neither survives as AI chrome in a plain shell tab. Each mutation bumps the redraw generation, so the strip repaints without polling. On render the view builds the model with a context indicator whenever the tracker holds a percentage — the prompt bar is the surface that always shows the Ok band — and separately pushes the warn-and-above tab suffix from  onto the active tab. A poisoned chrome mutex is dropped with a warning rather than propagated, because losing an indicator update must never tear down the reader and with it the pane's terminal output.
 
 A state edge is also what stops the elapsed timer. [[crates/scribe-client/src/main.rs#AiChrome#note_prompt_progress]] stamps `latest_prompt_finished_at` with the edge's arrival instant the moment the state leaves `Processing` — to `IdlePrompt`, `WaitingForInput`, `PermissionPrompt`, or `Error` — and clears it on the way back in, so the strip shows the LLM's response duration instead of wall-clock time since the prompt; [[crates/scribe-client/src/main.rs#AiChrome#record_prompt]] clears it too, and the next turn starts live. The stamp is taken once per run rather than on every non-`Processing` edge, because an idle provider keeps emitting them and each one would push a frozen figure forward. The whole edge — conversation bookkeeping, freeze, tracker update — is one [[crates/scribe-client/src/main.rs#AiChrome#apply_state_change]] rather than a closure inside the reader, so it is exercisable without a live `ReaderCtx`: the freeze shipped broken because only the pure formatter was under test and nothing asserted that anything ever set the field.
 

@@ -146,7 +146,7 @@ fn needs_claude_setup(contents: &str, expected_hook: &str, expected_statusline: 
     let Ok(settings) = serde_json::from_str::<Value>(contents) else {
         return true;
     };
-    if !contents.contains(expected_hook) {
+    if !has_session_end_hook(contents, expected_hook) {
         return true;
     }
 
@@ -162,8 +162,13 @@ fn needs_codex_setup(
     hooks_contents: Option<&str>,
     expected_hook: &str,
 ) -> bool {
-    !config_contents.is_some_and(|contents| contents.contains(expected_hook))
-        && !hooks_contents.is_some_and(|contents| contents.contains(expected_hook))
+    !config_contents.is_some_and(|contents| has_session_end_hook(contents, expected_hook))
+        && !hooks_contents.is_some_and(|contents| has_session_end_hook(contents, expected_hook))
+}
+
+#[cfg(target_os = "macos")]
+fn has_session_end_hook(contents: &str, expected_hook: &str) -> bool {
+    contents.lines().any(|line| line.contains(expected_hook) && line.contains("session_end"))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -181,9 +186,22 @@ mod tests {
     }
 
     #[test]
-    fn claude_custom_statusline_does_not_force_repair() {
+    fn claude_stop_only_hook_needs_session_end_repair() {
         let settings = r#"{
             "hooks":{"Stop":[{"hooks":[{"command":"/Applications/Scribe.app/Contents/Resources/ai-hook-claude.sh stop"}]}]},
+            "statusLine":{"type":"command","command":"node /tmp/custom.js"}
+        }"#;
+        assert!(needs_claude_setup(
+            settings,
+            "/Applications/Scribe.app/Contents/Resources/ai-hook-claude.sh",
+            "/Applications/Scribe.app/Contents/Resources/ai-hook-statusline.sh",
+        ));
+    }
+
+    #[test]
+    fn claude_session_end_hook_with_custom_statusline_is_fresh() {
+        let settings = r#"{
+            "hooks":{"SessionEnd":[{"hooks":[{"command":"/Applications/Scribe.app/Contents/Resources/ai-hook-claude.sh session_end"}]}]},
             "statusLine":{"type":"command","command":"node /tmp/custom.js"}
         }"#;
         assert!(!needs_claude_setup(
@@ -219,10 +237,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_current_hook_in_config_is_fresh() {
+    fn codex_stop_only_hook_needs_session_end_repair() {
         let config = r#"[[hooks.Stop]]
 [[hooks.Stop.hooks]]
 command = "\"/Applications/Scribe.app/Contents/Resources/ai-hook-codex.sh\" stop"
+"#;
+        assert!(needs_codex_setup(
+            Some(config),
+            None,
+            "/Applications/Scribe.app/Contents/Resources/ai-hook-codex.sh",
+        ));
+    }
+
+    #[test]
+    fn codex_session_end_hook_in_config_is_fresh() {
+        let config = r#"[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+command = "\"/Applications/Scribe.app/Contents/Resources/ai-hook-codex.sh\" session_end"
 "#;
         assert!(!needs_codex_setup(
             Some(config),

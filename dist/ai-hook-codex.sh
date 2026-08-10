@@ -15,7 +15,7 @@
 #   ai-hook-codex.sh <event-name>
 #
 # Recognized event-name values: session_start, user_prompt_submit,
-# permission_request, pre_tool_use, post_tool_use, stop.
+# permission_request, pre_tool_use, post_tool_use, stop, session_end.
 #
 # One Codex event costs at most one interpreter start: a single python3 run
 # reads the hook JSON once and prints the whole emit plan — one
@@ -46,16 +46,15 @@ HELPER="${SCRIBE_HOOK_HELPER:-$SELF_DIR/scribe-hook-helper}"
 [ -x "$HELPER" ] || { cat >/dev/null 2>&1; exit 0; }
 
 case "$EVENT_NAME" in
-    pre_tool_use | tool_processing)
-        # A fixed state transition that reads no field of the payload, so
-        # this path starts no interpreter at all. stdin is still drained:
-        # Codex is blocked writing the hook JSON into our pipe and must not
-        # see it close early.
+    session_end)
+        # SessionEnd carries no state Scribe needs to inspect. Drain stdin so
+        # Codex can finish writing the hook payload, then clear without
+        # starting an interpreter.
         cat >/dev/null 2>&1
-        exec "$HELPER" --provider=codex_code --event=state_changed \
-            --state=processing </dev/null >/dev/null 2>&1
+        exec "$HELPER" --provider=codex_code --event=state_cleared \
+            </dev/null >/dev/null 2>&1
         ;;
-    session_start | user_prompt_submit | permission_request | post_tool_use | stop | context) ;;
+    session_start | user_prompt_submit | permission_request | pre_tool_use | post_tool_use | stop | context | tool_processing) ;;
     *)
         cat >/dev/null 2>&1
         exit 0
@@ -87,6 +86,12 @@ except ValueError:
     PAYLOAD = {}
 if not isinstance(PAYLOAD, dict):
     PAYLOAD = {}
+
+# Thread-spawn agents inherit the root terminal SCRIBE_SESSION_ID, but
+# their transcript and lifecycle belong to the child. Letting either through
+# makes child context/state overwrite the foreground root session.
+if PAYLOAD.get("subagent") is not None:
+    sys.exit(0)
 
 
 def text_field(name):
@@ -294,6 +299,8 @@ def build(plan):
         # Codex is about to ask for approval. Surface the attention state
         # in Scribe without deciding the request for Codex.
         add(plan, "state_changed", with_session({"state": "permission_prompt"}))
+    elif EVENT in ("pre_tool_use", "tool_processing"):
+        add(plan, "state_changed", {"state": "processing"})
     elif EVENT == "post_tool_use":
         add(plan, "state_changed", {"state": "processing"})
         add_context(plan)
