@@ -1291,6 +1291,8 @@ Failed nightly runs upload `test-output/` for 14 days, including `test-output/e2
 
 Hosted validation remains external and pending after push: this unpushed implementation has no GitHub pull-request, manual, scheduled, or full hosted-nightly run to cite. Post-push acceptance must record a real warm PR duration and manual-nightly artifact/summary result before treating hosted CI timing and execution as measured.
 
+No workflow runs `cargo clippy` or `cargo test`; both live only in the local `just ready` gate. Combined with Ubuntu-only runners, that leaves `#[cfg(target_os = "macos")]` code checked by nothing but a developer running `just ready` on a Mac — the gap that let a never-executable `hdiutil` mount-point parse and a batch of denied lints in `macos_proc`, `x11_focus`, and `config` accumulate unnoticed. Treat a green PR as saying nothing about macOS-gated code.
+
 ## AI-Launch Harness Plumbing
 
 The functional harness can launch structured AI sessions and inspect the provider process without requiring a GPUI client.
@@ -2566,6 +2568,70 @@ A socket file that exists but refuses connections is reported as a stale socket 
 ### Other connect failures keep the OS error
 
 Permission denied gets its own sentence, and any other `io::Error` is passed through verbatim so an unanticipated failure is not mislabelled as one of the two known shapes.
+
+## macOS updater bundle swap
+
+Unit tests for [[crates/scribe-server/src/updater/macos_install.rs#swap_bundle_from_dmg]], the mount-and-replace step of the macOS install, driven through a fake host so the mount lifecycle and rollback ordering are proven without a DMG.
+
+The module is deliberately not `cfg`-gated, so these run on Linux CI even though the install path they describe only executes on macOS — the platform gap that let the original mount-point defect ship unnoticed.
+
+### Attach pins the mount point
+
+The attach argv passes `-mountpoint` with the caller's directory, proving the mount location is chosen rather than recovered by parsing `hdiutil` output.
+
+### Detach targets the pinned mount point
+
+The detach argv releases the same caller-owned path the attach pinned, so cleanup cannot target the wrong volume.
+
+### Successful swap releases the mount
+
+A swap that completes still detaches, and detach is the final effect, so the happy path leaves no mounted volume behind.
+
+### Copy failure releases the mount
+
+A failing `ditto` still detaches. This is the regression that matters: the original code detached only after a successful copy, so every earlier error path leaked a mounted volume.
+
+### Copy failure restores the backup
+
+When the copy fails after the installed bundle was moved aside, the `.app.prev` backup is renamed back so the machine keeps a working install.
+
+### Attach failure leaves the install untouched
+
+When the volume never mounts, the installed bundle is not touched: no move-aside, no copy, no rollback rename.
+
+### Attach failure releases a partially attached image
+
+`hdiutil attach` can attach an image's devices and then fail at the mount step, so a failed attach still runs the image teardown rather than assuming it was a no-op.
+
+Observed live during this work: one failed attach left `/dev/disk6` and `/dev/disk7` attached with no mount point.
+
+### Failed detach falls back to releasing the image
+
+When detaching by mount point fails, the whole-image teardown runs as a fallback, so a busy or unmountable volume cannot leave the attachment outliving the install.
+
+### Teardown targets only the requested image
+
+`attached_devices_for` returns the whole-disk node for the image whose `image-path` matches, and ignores every other attached image.
+
+### Teardown skips an image with no devices
+
+An image entry carrying no `system-entities` yields nothing to detach instead of erroring.
+
+### Unreadable hdiutil output yields no devices
+
+Output that will not parse degrades to an empty device list, because a cleanup failure must never mask the install failure that triggered it.
+
+### Stale backup is discarded before the swap
+
+An `.app.prev` left by an earlier failed update is removed before the move-aside, so the rename cannot collide with it.
+
+### Fresh install reports no backup
+
+When there is no installed bundle to move aside, the outcome reports no backup, which tells the caller to treat every binary as changed.
+
+### Fresh install failure skips rollback
+
+A copy failure with no backup on disk attempts no restore, so a fresh install cannot rename a bundle that was never moved.
 
 ## GPUI OSC 52 Clipboard Bridge
 

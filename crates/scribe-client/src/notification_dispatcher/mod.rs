@@ -189,7 +189,10 @@ pub fn spawn_dispatcher(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = out;
+        // Consume the sender rather than borrowing it: the Linux dispatcher
+        // takes ownership, so the signature must stay by-value on every
+        // platform, and closing it here is the honest no-op.
+        drop(out);
         let (tx, _rx) = mpsc::unbounded_channel();
         tx
     }

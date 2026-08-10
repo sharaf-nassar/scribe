@@ -417,11 +417,17 @@ Downloads are staged in a private per-update runtime directory with owner-only f
 
 On Linux, installation uses `pkexec dpkg -i`; the Debian maintainer scripts recover the invoking desktop UID from `SUDO_UID` or `PKEXEC_UID` so user services, runtime directories, and hook setup still target the logged-in user. Updater-triggered installs also create a runtime `update-defer-cold-restart` marker first, so `postinst` can report a handoff failure back to the UI with `update-restart-required` instead of immediately killing live sessions. On macOS, it uses `hdiutil attach` + `ditto` and replaces the currently running `.app` bundle derived from `current_exe()` instead of assuming `/Applications/Scribe.app`. Progress is broadcast to all connected clients.
 
+The mount-and-replace step lives in [[crates/scribe-server/src/updater/macos_install.rs#swap_bundle_from_dmg]], separated from the surrounding process orchestration so its ordering can be unit-tested on any platform (see [[test#Test Harness#macOS updater bundle swap]]). The DMG is attached read-only at a mount point the caller pins with `-mountpoint`, inside the same private staging directory that holds the verified asset. The mount point is never recovered by parsing `hdiutil` output: `-quiet` suppresses that output entirely, and even without it a second mount of the same volume name lands at `/Volumes/<name> 1`, which a whitespace-split misreads. Mounting outside `/Volumes` also keeps the volume out of the shared namespace, so a leaked mount from an earlier attempt cannot misdirect the copy.
+
 ### Rollback
 
 Restores the previous installation if an update fails mid-install.
 
-On macOS, the existing `.app` bundle is renamed to an adjacent `.app.prev` backup before `ditto` copies the new version. If `ditto` fails, that adjacent backup is renamed back to restore the previous version. On Linux, rollback relies on dpkg's own transactional behavior.
+On macOS, the existing `.app` bundle is renamed to an adjacent `.app.prev` backup before `ditto` copies the new version. If `ditto` fails, that adjacent backup is renamed back to restore the previous version. A stale `.app.prev` from an earlier failed update is cleared first so the rename cannot collide with it. On Linux, rollback relies on dpkg's own transactional behavior.
+
+The mount is released on every path out of the swap once the attach has succeeded, not only on the success path. An early return between attach and copy was what left a mounted volume behind when the mount-point parse failed, and the detach is now paired with the attach by construction.
+
+A failed attach is cleaned up too. `hdiutil attach` can attach an image's devices and then fail at the mount step, leaving them with no mount point for a detach to target, so the failure path runs [[crates/scribe-server/src/updater/macos_install.rs#attached_devices_for]] over `hdiutil info -plist` and detaches the whole-disk node for that image. The same teardown is the fallback when detaching by mount point fails. Both are best-effort: unparsable output yields no devices, because a cleanup failure must never mask the install failure that triggered it.
 
 ### macOS Hot-Reload
 
