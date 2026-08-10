@@ -840,12 +840,13 @@ leaves the pane usable; and after `terminal.images.enabled = false` a client
 attaching next paints nothing while the pane keeps running commands.
 
 Two mechanics keep the relaunching phases honest. The container leaves more
-than one window with nobody viewing it and the server hands a starting client
-one of them, so a relaunch that comes up on the wrong session is simply
-repeated until it adopts the session the image went into. Each relaunch then
-issues a cursor save/restore, since the server drains a new sink's replay debt
-on the session's next PTY read — six bytes that carry no image information, so
-what they reveal came from canonical state. Evidence lands in
+than one window with nobody viewing it, and one client process reopens all of
+them. The corpus maps each restored session to the X11 window logged by its
+backend and focuses the image session directly, rather than depending on which
+window the server assigns first. Each relaunch then issues a cursor save/restore,
+since the server drains a new sink's replay debt on the session's next PTY read —
+six bytes that carry no image information, so what they reveal came from
+canonical state. Evidence lands in
 `test-output/terminal-images/linux/client/`.
 
 ## Terminal Image Safety and Continuity

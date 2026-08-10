@@ -53,6 +53,7 @@ WIN_X=0
 WIN_Y=0
 WIN_W=0
 WIN_H=0
+ACTIVE_WID=
 
 fail() {
     echo "FAIL: $1" >&2
@@ -85,7 +86,8 @@ wait_client_log() {
 
 focus() {
     local wid
-    wid=$(xdotool search --name '^Scribe$' 2>/dev/null | tail -1)
+    wid="${ACTIVE_WID:-}"
+    [ -n "$wid" ] || wid=$(xdotool search --name '^Scribe$' 2>/dev/null | tail -1)
     [ -n "$wid" ] || fail "no Scribe client window"
     xdotool windowactivate --sync "$wid" 2>/dev/null \
         || xdotool windowfocus --sync "$wid" 2>/dev/null || true
@@ -96,6 +98,33 @@ focus() {
     WIN_W="$WIDTH"
     WIN_H="$HEIGHT"
     printf '%s' "$wid"
+}
+
+# Match a restored session to the GPUI window created for it. Each backend logs
+# its attach before the X11 id for that same window.
+window_for_session() {
+    sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" | awk -v wanted="$1" '
+        /attaching to session session_id=/ {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^session_id=/) session = substr($i, 12)
+        }
+        /X11 active-window guard enabled window=/ && session == wanted {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^window=/) { print substr($i, 8); exit }
+        }
+    '
+}
+
+wait_session_window() {
+    local session="$1" timeout_secs="$2" started wid
+    started=$(date +%s)
+    while :; do
+        wid=$(window_for_session "$session")
+        [ -n "$wid" ] && { printf '%s' "$wid"; return 0; }
+        [ $(( "$(date +%s)" - started )) -lt "$timeout_secs" ] || return 1
+        kill -0 "$CLIENT_PID" 2>/dev/null || return 1
+        sleep 0.2
+    done
 }
 
 # Capture the client window alone; a full-screen scrot also catches openbox
@@ -295,38 +324,31 @@ scribe-test daemon stop >/dev/null 2>&1 || true
 sleep 1.0
 
 launch_client() {
+    local wanted="${1:-}"
     : >"$CLIENT_LOG"
+    ACTIVE_WID=
     LIBGL_ALWAYS_SOFTWARE=1 \
         scribe-client >"$CLIENT_LOG" 2>&1 &
     CLIENT_PID=$!
-    wait_client_log "pane adopted a session" 45 \
-        || fail "the image-capable client never adopted a session"
-    ADOPTED_SESSION=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" \
-        | sed -n 's/.*pane adopted a session session_id=\([^ ]*\).*/\1/p' | head -1)
-    sleep 2.0
+    wait_client_log "attaching to session" 45 \
+        || fail "the image-capable client never attached to a session"
+    if [ -n "$wanted" ]; then
+        ADOPTED_SESSION="$wanted"
+    else
+        ADOPTED_SESSION=$(sed 's/\x1b\[[0-9;]*m//g' "$CLIENT_LOG" \
+            | sed -n 's/.*attaching to session session_id=\([^ ]*\).*/\1/p' | head -1)
+    fi
+    ACTIVE_WID=$(wait_session_window "$ADOPTED_SESSION" 45) \
+        || fail "the client never opened a window for session $ADOPTED_SESSION"
+    sleep 0.5
     focus >/dev/null
 }
 
-# Start a client and, when a particular session is wanted, keep starting one
-# until that is the session it adopted.
-#
-# The container leaves more than one window with nobody viewing it — the
-# entrypoint's and the daemon's — and the server hands a starting client one of
-# them. Which one is not this corpus's to decide, but every phase after the
-# first needs the window an image was put in, so a client that came up on
-# another one is simply relaunched.
+# Start one client process. It reopens every server-retained window, so a
+# requested session is selected by its logged X11 id rather than by relaunching
+# until the server happens to assign that window first.
 start_client() {
-    local wanted="${1:-}" attempt
-    for attempt in $(seq 1 12); do
-        launch_client
-        [ -z "$wanted" ] && return 0
-        [ "$ADOPTED_SESSION" = "$wanted" ] && return 0
-        echo "  (attempt $attempt adopted $ADOPTED_SESSION, wanted $wanted; relaunching)"
-        kill "$CLIENT_PID" 2>/dev/null || true
-        wait "$CLIENT_PID" 2>/dev/null || true
-        sleep 1.0
-    done
-    fail "the client never came back up on the image session $wanted"
+    launch_client "${1:-}"
 }
 
 start_client
