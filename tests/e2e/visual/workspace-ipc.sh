@@ -123,6 +123,18 @@ shot() {
     echo "captured $1"
 }
 
+# Capture only the focused window's left status-bar band. A full-desktop trim
+# can select another restored Scribe window when their frames overlap.
+status_bar_shot() {
+    local wid w
+    wid=$(find_window)
+    [ -n "$wid" ] || fail "no Scribe window found for status-bar capture"
+    w=$(( WIN_W * LEFT_FRACTION_NUM / LEFT_FRACTION_DEN ))
+    import -window "$wid" +repage miff:- \
+        | convert - -gravity SouthWest -crop "${w}x${STATUS_BAND_H}+0+0" +repage "$1"
+    echo "captured $1"
+}
+
 # Lit pixels inside the client window. Rendered text is near-white on a
 # near-black background, so a luminance threshold separates ink from the pane.
 window_ink() {
@@ -142,29 +154,10 @@ window_diff() {
     printf '%s' "${value%%.*}"
 }
 
-# Count differing pixels between two captures, cropped to the status bar's left
-# group — the band the workspace name renders into.
-#
-# The band is derived from the capture's OWN content bounding box rather than
-# from `xdotool getwindowgeometry`: under openbox the reported rectangle does
-# not line up with the client area the client actually paints, and a band
-# computed from it lands below the window on a black desktop, where every
-# capture is identical. Trimming the frame finds the painted window directly.
+# Count differing pixels between two focused-window status-bar crops.
 status_left_diff() {
-    local bbox w h x y
-    bbox=$(convert "$1" -format "%@" info:)
-    w=$(( ${bbox%%x*} * LEFT_FRACTION_NUM / LEFT_FRACTION_DEN ))
-    h=${bbox#*x}
-    h=${h%%+*}
-    x=${bbox#*+}
-    x=${x%%+*}
-    y=${bbox##*+}
-    y=$(( y + h - STATUS_BAND_H ))
     local value
-    value=$(compare -metric AE \
-        \( "$1" -crop "${w}x${STATUS_BAND_H}+${x}+${y}" +repage \) \
-        \( "$2" -crop "${w}x${STATUS_BAND_H}+${x}+${y}" +repage \) \
-        null: 2>&1 || true)
+    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
     printf '%s' "${value%%.*}"
 }
 
@@ -436,13 +429,13 @@ TARGET_WS=$(frame_field client MoveSession target_workspace) || TARGET_WS="$NEW_
 WS_ACCENT=$(frame_field server WorkspaceInfo accent_color) || WS_ACCENT="#a78bfa"
 INFOS_BEFORE=$(count_log "workspace info received")
 focus
-shot /output/03-before-workspace-name.png
+status_bar_shot /output/03-before-workspace-name.png
 inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$TARGET_WS\",\"name\":\"$WS_NAME\",\"accent_color\":\"$WS_ACCENT\",\"split_direction\":null,\"project_root\":null}"
 if ! wait_for_log_growth "workspace info received" "$INFOS_BEFORE" 15; then
     fail "PHASE 4 FAIL: the injected WorkspaceInfo never reached the reader"
 fi
 focus
-shot /output/04-workspace-named.png
+status_bar_shot /output/04-workspace-named.png
 NAME_DIFF=$(status_left_diff /output/03-before-workspace-name.png /output/04-workspace-named.png)
 if [ "${NAME_DIFF:-0}" -lt "$NAME_DIFF_MIN" ]; then
     fail "PHASE 4 FAIL: the named workspace changed $NAME_DIFF px in the status bar (min $NAME_DIFF_MIN)"
@@ -455,7 +448,7 @@ if ! wait_for_log_growth "workspace info received" "$INFOS_BEFORE" 15; then
     fail "PHASE 4 FAIL: the second injected WorkspaceInfo never reached the reader"
 fi
 focus
-shot /output/05-workspace-name-cleared.png
+status_bar_shot /output/05-workspace-name-cleared.png
 CLEAR_DIFF=$(status_left_diff /output/04-workspace-named.png /output/05-workspace-name-cleared.png)
 BACK_DIFF=$(status_left_diff /output/03-before-workspace-name.png /output/05-workspace-name-cleared.png)
 if [ "${CLEAR_DIFF:-0}" -lt "$NAME_DIFF_MIN" ]; then
