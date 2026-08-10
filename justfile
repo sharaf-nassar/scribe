@@ -538,6 +538,7 @@ e2e: build-release docker-func
         func/ai-state-indicator.sh
         func/attach-lossless.sh
         func/cli-smoke.sh
+        func/codex-subagent-hooks.sh
         func/cold-restart.sh
         func/env-persistence.sh
         func/failure-server-down.sh
