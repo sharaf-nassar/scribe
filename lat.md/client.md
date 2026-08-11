@@ -789,7 +789,8 @@ The terminal window learns about an available update from the server, renders it
 
 The CTA is a real control, not a label:  takes an optional  and attaches it only when `center_clickable` is set, so an actionable CTA gets a pointer cursor and an accent hover tint while "Downloading..." / "Update failed" stay inert. Clicking it runs , which asks  for the modal to raise — the restart-required flow outranks a pending version, exactly as the winit `open_update_dialog` match does.
 
- resolves the modal's choice. Confirming an install sends  and clears the pending version so the CTA stops offering it, with the server's own `UpdateProgress` taking over the label; declining (the "Later" button, Esc, or a backdrop click, all of which resolve to the safe  action) sends  and clears the whole state, because the server then suppresses re-notification for that version. The restart-required flow's "Continue" would spawn a platform cold-restart helper, which the GPUI shell does not host yet, so it is logged rather than silently swallowed.
+ resolves the modal's choice. Confirming an install sends  and clears the pending version so the CTA stops offering it, with the server's own `UpdateProgress` taking over the label; declining (the "Later" button, Esc, or a backdrop click, all of which resolve to the safe  action) sends  and clears the whole state, because the server then suppresses re-notification for that version. The restart-required flow's "Continue" spawns [[crates/scribe-client/src/server_lifecycle.rs#spawn_update_restart_helper]], then sends `QuitAll` so every client window flushes its restore snapshot and exits before the helper cold-restarts the server and launches one replacement client.
+
 ## GPUI Window Lifecycle
 
 The window's own lifecycle is live: the WM's close button raises the in-app close dialog, whose answer asks the server to kill this window or quit them all, and only the server's ack exits. The client also reports focus and polls the window list.
@@ -2182,7 +2183,7 @@ When a PTY exit removes the last remaining pane in a window, the client reuses t
 Shows update-install and restart-required confirmations in a shared overlay, opened from the command palette or the centered status-bar CTA.
 
 The update notification appears in the compositor window title rather than in the tab bar. Stable windows use `Scribe`, while `scribe-dev` windows use `devScribe`, yielding titles such as `devScribe - v{version} available - click below to update` when the centered bottom status-bar CTA is clickable and `devScribe - v{version} available` otherwise. If installation finishes with `CompletedRestartRequired`, the same overlay switches to a `Continue` / `Cancel` cold-restart prompt and the centered status-bar label stays clickable as `Updated! Restart required` so canceling does not strand the user.
-Approving that deferred restart spawns a detached helper mode of the client binary. The helper performs the platform-specific cold restart, waits for the old client windows to disconnect and flush restore snapshots, then launches one fresh client so normal cold-restore fan-out recreates the remaining windows.
+Approving that deferred restart spawns a detached helper mode of the client binary, then sends `QuitAll` so all client windows flush their restore snapshots and exit. The helper waits for those processes, performs the platform cold restart, and launches one fresh client so normal cold-restore fan-out recreates the remaining windows.
 
 ### Context Menu
 

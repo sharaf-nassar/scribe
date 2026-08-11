@@ -25,6 +25,8 @@ use scribe_common::socket::{handoff_socket_path, server_socket_path};
 
 /// Maximum time to wait for a freshly started server to accept connections.
 pub const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Detached client mode that completes an approved destructive update fallback.
+pub const FINISH_UPDATE_RESTART_ARG: &str = "--finish-update-restart";
 /// Maximum time to wait for a hot-reloaded macOS server to take over.
 #[cfg(target_os = "macos")]
 const SERVER_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -703,7 +705,7 @@ async fn wait_for_refreshed_server(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn listed_process_pids(process_name: &str) -> Result<Vec<u32>, String> {
     let output = std::process::Command::new("pgrep")
         .args(["-x", process_name])
@@ -725,15 +727,39 @@ fn listed_process_pids(process_name: &str) -> Result<Vec<u32>, String> {
         .collect())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+    let signalable = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    signalable && !process_is_zombie(pid)
+}
+
+fn process_state_is_zombie(state: &str) -> bool {
+    state.trim_start().starts_with('Z')
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status.lines().find_map(|line| line.strip_prefix("State:")).is_some_and(process_state_is_zombie)
 }
 
 #[cfg(target_os = "macos")]
+fn process_is_zombie(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|state| process_state_is_zombie(&state))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -743,6 +769,107 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(SERVER_RETRY_INTERVAL);
     }
     !process_is_alive(pid)
+}
+
+/// Return whether this invocation is the detached deferred-restart helper.
+#[must_use]
+pub fn is_finish_update_restart<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|arg| arg.as_ref() == FINISH_UPDATE_RESTART_ARG)
+}
+
+/// Spawn the installed client in detached deferred-restart mode.
+///
+/// # Errors
+/// Returns an error when this executable cannot be resolved or the helper
+/// process cannot be started.
+pub fn spawn_update_restart_helper() -> Result<(), String> {
+    use std::process::Stdio;
+
+    let client_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve client executable: {error}"))?;
+    let child = std::process::Command::new(&client_exe)
+        .arg(FINISH_UPDATE_RESTART_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!("failed to spawn deferred update helper {}: {error}", client_exe.display())
+        })?;
+
+    tracing::info!(pid = child.id(), exe = %client_exe.display(), "spawned deferred update helper");
+    Ok(())
+}
+
+fn other_process_pids(current_pid: u32, pids: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    pids.into_iter().filter(|pid| *pid != current_pid).collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_tracked_clients_to_exit(client_pids: &[u32]) -> Result<(), String> {
+    for pid in client_pids {
+        if !wait_for_process_exit(*pid, Duration::from_secs(10)) {
+            return Err(format!(
+                "client pid {pid} did not exit after the deferred restart was approved"
+            ));
+        }
+    }
+
+    // Let the old server consume every connection EOF before it is stopped.
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_replacement_client(client_exe: &Path) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let child = std::process::Command::new(client_exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to relaunch client {}: {error}", client_exe.display()))?;
+    tracing::info!(pid = child.id(), exe = %client_exe.display(), "relaunched client after update restart");
+    Ok(())
+}
+
+/// Complete an update whose warm server handoff failed.
+///
+/// The UI starts this helper before asking every client window to save and
+/// exit. The helper waits for those clients, cold-restarts the server, then
+/// launches one fresh client so the normal restore fan-out recreates the rest.
+///
+/// # Errors
+/// Returns an error if clients do not exit, the server restart fails, or the
+/// replacement client cannot be launched.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn finish_update_restart() -> Result<(), String> {
+    let identity = current_identity();
+    let client_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve client executable: {error}"))?;
+    let clients = listed_process_pids(identity.client_binary_name())?;
+    let client_pids = other_process_pids(std::process::id(), clients);
+
+    wait_for_tracked_clients_to_exit(&client_pids)?;
+
+    #[cfg(target_os = "linux")]
+    perform_linux_cold_restart(&client_exe)?;
+
+    #[cfg(target_os = "macos")]
+    perform_macos_cold_restart()?;
+
+    spawn_replacement_client(&client_exe)
+}
+
+/// Reject deferred update mode on unsupported platforms.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn finish_update_restart() -> Result<(), String> {
+    Err(String::from("deferred update restart is only supported on macOS and Linux"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1022,5 +1149,26 @@ mod tests {
         let other = std::io::Error::other("boom");
         let other_reason = socket_failure_reason(Path::new("/tmp/s.sock"), &other);
         assert!(other_reason.contains("boom"));
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Deferred restart mode bypasses the UI]]
+    #[test]
+    fn deferred_restart_mode_bypasses_the_ui() {
+        assert!(is_finish_update_restart(["scribe-client", FINISH_UPDATE_RESTART_ARG]));
+        assert!(!is_finish_update_restart(["scribe-client", "--restore-child"]));
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Deferred restart helper excludes itself]]
+    #[test]
+    fn deferred_restart_helper_excludes_itself() {
+        assert_eq!(other_process_pids(42, [11, 42, 73]), vec![11, 73]);
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Zombie clients do not block relaunch]]
+    #[test]
+    fn zombie_clients_do_not_block_relaunch() {
+        assert!(process_state_is_zombie(" Z (zombie)"));
+        assert!(process_state_is_zombie("Z+"));
+        assert!(!process_state_is_zombie("S (sleeping)"));
     }
 }

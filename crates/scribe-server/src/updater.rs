@@ -17,9 +17,9 @@ use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgr
 use crate::ipc_server::WindowShares;
 
 #[cfg(any(target_os = "macos", test))]
-pub mod launchd;
-#[cfg(any(target_os = "macos", test))]
 pub mod macos_install;
+#[cfg(any(target_os = "macos", test))]
+pub mod macos_restart;
 pub mod post_upgrade;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
@@ -761,7 +761,11 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
     }
 
     let hot_reload_succeeded = if *changed.get("scribe-server").unwrap_or(&true) {
-        restart_server_in_place()
+        let server_exe = macos_restart::server_executable(
+            &app_bundle_path,
+            current_identity().server_binary_name(),
+        );
+        restart_server_in_place(&server_exe)
     } else {
         info!("server binary unchanged — skipping server restart");
         true
@@ -823,40 +827,15 @@ fn wait_for_handoff() -> bool {
     false
 }
 
-/// Restarts the server in place, preferring launchd, and reports whether the
+/// Starts the replacement server in upgrade mode and reports whether its
 /// zero-downtime handoff completed.
 #[cfg(target_os = "macos")]
-fn restart_server_in_place() -> bool {
-    let uid = scribe_common::socket::current_uid();
-    let label = current_identity().launchd_label();
-
-    // Try both launchd domains. A desktop LaunchAgent lives in `gui/<uid>`;
-    // the shipped code only ever tried `user/<uid>`, so this "unavailable"
-    // branch was taken on every install and the fallback did all the work.
-    for target in launchd::service_targets(uid, label) {
-        let ok = std::process::Command::new("/bin/launchctl")
-            .args(launchd::kickstart_args(&target))
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            info!(%target, "launchctl kickstart succeeded — waiting for handoff");
-            return wait_for_handoff();
-        }
-        info!(%target, "launchctl kickstart did not resolve this target");
-    }
-
-    info!("no launchd target resolved — falling back to direct --upgrade spawn");
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            warn!("could not determine current exe path for --upgrade spawn: {e}");
-            return false;
-        }
-    };
-    match spawn_detached(&exe, &["--upgrade"]) {
+fn restart_server_in_place(server_exe: &Path) -> bool {
+    info!(exe = %server_exe.display(), "starting replacement server in upgrade mode");
+    match spawn_detached(server_exe, macos_restart::upgrade_args()) {
         Ok(()) => wait_for_handoff(),
         Err(e) => {
-            warn!("failed to spawn new server with --upgrade: {e}");
+            warn!(exe = %server_exe.display(), "failed to spawn replacement server with --upgrade: {e}");
             false
         }
     }

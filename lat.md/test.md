@@ -2606,6 +2606,18 @@ A socket file that exists but refuses connections is reported as a stale socket 
 
 Permission denied gets its own sentence, and any other `io::Error` is passed through verbatim so an unanticipated failure is not mislabelled as one of the two known shapes.
 
+### Deferred restart mode bypasses the UI
+
+The `--finish-update-restart` argument selects the detached helper before GPUI or IPC startup, while ordinary and restore-child launches remain on the interactive path.
+
+### Deferred restart helper excludes itself
+
+The helper removes its own PID from the client process set it waits on, so it cannot deadlock waiting for itself to exit before restarting the server.
+
+### Zombie clients do not block relaunch
+
+Zombie process states count as exited because their tasks are already gone and cannot respond to signals, preventing an unreaped desktop child from blocking the replacement client.
+
 ## Server handoff
 
 Unit coverage for the socket takeover an upgrade receiver performs against the still-serving old server, proving the mechanism over a real bound socket without a live handoff peer.
@@ -2684,23 +2696,17 @@ When there is no installed bundle to move aside, the outcome reports no backup, 
 
 A copy failure with no backup on disk attempts no restore, so a fresh install cannot rename a bundle that was never moved.
 
-## launchd service targets
+## macOS updater handoff command
 
-Unit tests for [[crates/scribe-server/src/updater/launchd.rs#service_targets]], which names the launchd services the in-place restart may kickstart.
+Unit tests for the executable and arguments used after the updater swaps the app bundle, proving the warm path starts a real handoff receiver.
 
-The shipped updater built one target, `user/<uid>/com.scribe.server`, and read its failure as "launchd unavailable". It was not: a `LaunchAgent` loaded into a desktop session lives in the `gui/<uid>` domain, so the kickstart silently failed on every install and every macOS upgrade took the direct spawn fallback.
+### Uses the replacement bundle server
 
-### GUI domain is tried before the user domain
+The successor path resolves inside the newly copied app rather than through the predecessor process's `current_exe()`, which may name the moved-aside bundle.
 
-`gui/<uid>` is offered first because that is where a desktop `LaunchAgent` is loaded; `user/<uid>` follows for agents loaded outside a GUI session.
+### Starts the successor in upgrade mode
 
-### Label selects the flavour service
-
-The label is a parameter, so the Dev flavour targets its own service and a test can point at one of its own rather than restarting a developer's live server.
-
-### Kickstart forces a restart
-
-`-k` is present, which kills the running instance first; without it launchd leaves the old binary up and the upgrade appears to succeed while nothing changed.
+The successor receives `--upgrade`; a normal launch or launchd kickstart cannot request the live PTY transfer and therefore is not a warm restart.
 
 ## macOS bundle swap contract
 

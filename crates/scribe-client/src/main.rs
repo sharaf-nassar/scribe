@@ -7325,9 +7325,9 @@ impl TerminalView {
     /// Confirming an available install sends `TriggerUpdate` and clears the
     /// pending version so the CTA stops offering it; declining sends
     /// `DismissUpdate` so the server stops re-notifying about this version.
-    /// The restart-required flow only closes: its "Continue" spawns the
-    /// platform cold-restart helper, which the GPUI shell does not host yet, so
-    /// it is logged rather than silently swallowed.
+    /// The restart-required flow starts a detached cold-restart helper, then
+    /// asks every client window to flush its restore snapshot and exit. The
+    /// helper waits for those exits before replacing the server and relaunching.
     fn route_update_action(&mut self, action: UpdateAction) {
         let kind = self.update_dialog_kind;
         match (kind, action) {
@@ -7344,7 +7344,15 @@ impl TerminalView {
                 }
             }
             (Some(UpdateDialogKind::RestartRequired), UpdateAction::Primary) => {
-                tracing::warn!("deferred cold restart helper is not wired in the GPUI shell");
+                match server_lifecycle::spawn_update_restart_helper() {
+                    Ok(()) => {
+                        tracing::info!("user approved deferred cold restart");
+                        self.request_quit_all();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to spawn deferred update helper");
+                    }
+                }
             }
             (Some(UpdateDialogKind::RestartRequired), UpdateAction::Secondary) => {
                 tracing::info!("user postponed the deferred cold restart");
@@ -9041,6 +9049,15 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
 fn main() -> std::process::ExitCode {
     PROCESS_START.get_or_init(Instant::now);
     init_tracing();
+    if server_lifecycle::is_finish_update_restart(std::env::args()) {
+        return match server_lifecycle::finish_update_restart() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                tracing::error!(%error, "deferred update restart failed");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::args().skip(1).any(|arg| arg == "--vulkan-probe") {
         if let Err(error) = probe_vulkan() {
             tracing::error!(%error, "Scribe Vulkan probe failed");
