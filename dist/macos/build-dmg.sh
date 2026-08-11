@@ -16,11 +16,16 @@ STAGING_DIR="${REPO_ROOT}/target/macos-staging"
 
 # Parse arguments
 SKIP_BUILD=false
+SKIP_DMG=false
 VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build)
             SKIP_BUILD=true
+            shift
+            ;;
+        --skip-dmg)
+            SKIP_DMG=true
             shift
             ;;
         --version)
@@ -136,6 +141,10 @@ cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
 
 echo "==> ${BUNDLE_NAME} assembled at ${APP_DIR}"
+
+if [[ "$SKIP_DMG" == "true" ]]; then
+    exit 0
+fi
 
 # --- Step 4: Create DMG ---
 echo "==> Creating DMG..."

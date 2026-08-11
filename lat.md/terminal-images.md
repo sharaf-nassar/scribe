@@ -1068,9 +1068,10 @@ So [[crates/scribe-server/src/handoff.rs#handoff_state_version]] declares v7
 exactly when the payload carries image state, and
 [[crates/scribe-server/src/handoff.rs#handoff_version_accepted]] refuses N+1 —
 an older server cold-restarts instead of dropping images. An image-free payload
-declares v6 and omits the key entirely, so its bytes are the bytes a pre-image
-server produced. Turning the master image switch off is therefore the rollback
-path: the next upgrade payload is v6 again and an older server accepts it.
+declares v6 and omits the image key entirely, so a pre-image named-map receiver
+accepts it and ignores unrelated additive keys. Turning the master image switch
+off is therefore the rollback path: the next payload is v6 again and an older
+server accepts it.
 
 ## Typed Failures
 

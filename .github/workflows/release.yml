@@ -81,11 +81,11 @@ jobs:
           cp target/${{ matrix.target }}/release/scribe-server target/release/
           cp target/${{ matrix.target }}/release/scribe-hook-helper target/release/
 
-      - name: Build DMG
+      - name: Assemble app bundle
         if: matrix.os == 'macos'
         env:
           TAG: ${{ github.ref_name }}
-        run: bash dist/macos/build-dmg.sh --skip-build --version "${TAG#v}"
+        run: bash dist/macos/build-dmg.sh --skip-build --skip-dmg --version "${TAG#v}"
 
       - name: Sign and notarize DMG
         if: matrix.os == 'macos'

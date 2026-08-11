@@ -307,8 +307,9 @@ corner note (omitted on the server-driven Releases page) over a 14px summary.
 Section heads are quiet uppercase caps with more air above than below, and
 rows run 46px (62px with a description) against a stable 300px value column:
 choices are 240×30 with an anchored 30px-row menu, steppers 152×30 with 36px
-actions, switches 38×22 fully rounded with an amber on-fill, text inputs and
-color editors 30px tall on the engraved inset, and actions 30px neutral
+actions, switches 38×22 fully rounded with an amber on-fill, text inputs are
+30px tall on the engraved inset, and color selectors are 240×30 swatch/value
+triggers with anchored preset and custom palettes. Actions are 30px neutral
 outline buttons. Keybinding and gated values render as plain right-aligned
 dim monospace — the missing control outline is the read-only mark, and
 AccessKit still says `Read-only value` explicitly.
@@ -359,28 +360,45 @@ The eleven settings pages are described in : each owns an ordered control list k
 
 The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
- renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Shared colour controls and general free-text controls both edit inline through the one editor below, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
+ renders that model generically — toggles flip, choices cycle, and numeric steppers increment through , committing immediately like the old live-apply webview. Current values are read back by . Shared colour controls open the selector below, general free-text controls edit inline, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
 
-The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, or action; Left/Right adjust toggles, choices, and steppers. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
+The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, color selector, or action; Left/Right adjust toggles, choices, steppers, and color presets. An open color selector sends Tab into its exact-value field. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
 The root takes focus when the window opens, so Ctrl+K and traversal work before any click. Escape clears transient menus or an active search from every focus stop; titlebar window controls claim Enter/Space only, letting settings-wide keys continue to the root.
 
 Action controls route through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#run_action]], which is the single live entry point into [[crates/scribe-client/src/settings/server_action.rs]] — the update check, the release list, the keystore preflight, and the whole LAN trust surface below.
 
+### Color selection
+
+Every color control uses one anchored selector with named presets, a hue strip, a continuous saturation/brightness palette, and an exact-value field for hex or AI `ansi:N` input.
+
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_color_selector]]
+keeps the saved canonical value and its swatch visible on the compact trigger.
+Enter or Space opens the anchored palette, Left and Right apply presets, and
+Tab enters the exact-value field. Preset and custom-palette choices commit
+immediately through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#select_color]],
+which reuses the existing validator and config writer rather than adding a
+second persistence path. The custom canvas maps pointer position to continuous
+saturation and brightness for the chosen hue. Preset, hue, and canvas nodes are
+pointer-only images rather than false tab stops: the outer selector owns
+keyboard preset stepping, and the exact field owns arbitrary keyboard input.
+
 ### Inline editing
 
-Colour rows and general free-text rows share one inline editor, so there is a
-single field, a single native-input target, and a single commit path rather
+The color selector's exact-value field and general free-text rows share one
+inline editor, so there is a single native-input target and commit path rather
 than one editor per control kind.
 
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#begin_inline_edit]]
-opens it on the focused control — click or Enter/Space from keyboard traversal
-— seeding the field from the saved value and retaining the whole
+opens it from a free-text row or the color palette's exact-value action,
+seeding the field from the saved value and retaining the whole
 [[crates/scribe-client/src/settings/model.rs#Control]], because the commit
 needs its kind. Enter commits through
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#save_inline_edit]],
 which routes the typed text into the same `{key, value}` apply path every
 other control uses; there is no parallel persistence route. Escape cancels.
+For a color exact-value edit, Escape also closes the picker and restores focus
+to its selector; Tab or Shift-Tab closes it before continuing traversal.
 Free-text rows are therefore focusable and tab-stop, where they previously
 rendered read-only.
 
@@ -392,7 +410,9 @@ The apply path stays the single authority on what each key accepts, so no second
 
 #### Escape cancels the edit
 
-[[crates/scribe-client/src/settings/window.rs#revert_inline_input]] restores the value the edit opened with and clears the rejection ink with it, so an abandoned edit leaves nothing of itself on screen and the config is never touched.
+[[crates/scribe-client/src/settings/window.rs#revert_inline_input]] restores the opening value and clears rejection ink, so abandoning an edit never touches config.
+
+Color edits also close their picker, preventing focus from remaining in hidden exact-entry chrome.
 
 ### Shortcut capture
 

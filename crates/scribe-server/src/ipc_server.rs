@@ -1506,11 +1506,11 @@ pub struct LiveSession {
     /// Shared with the reader task, which delivers the state to the PTY when
     /// the application enables focus reporting (DECSET 1004).
     has_focus: Arc<AtomicBool>,
-    /// The window that requested this session at create time. Stashed on
-    /// the session itself (rather than re-derived from the workspace
-    /// manager) so the clean-close path in [`handle_close_session`] can
-    /// route the env-envelope delete after the session→window mapping has
-    /// been torn down. Stable for the session's lifetime.
+    /// The window that requested this session at create time, or the same
+    /// stable owner carried through handoff. Stashed on the session itself
+    /// (rather than re-derived from the workspace manager) so the clean-close
+    /// path can route the env-envelope delete after the session→window mapping
+    /// has been torn down. Stable for the session's lifetime.
     ///
     /// `pub(crate)` so [`crate::hook_ingress`] can read it when routing an
     /// `EnvChanged` event into [`crate::env_store::EnvStoreState::schedule_persist`].
@@ -1518,11 +1518,10 @@ pub struct LiveSession {
     /// Launch-record id (== env-envelope id) naming this session's
     /// `<state_dir>/restore/env/<window_id>/<launch_id>.envz` file plus
     /// its keystore DEK. Carried by `CreateSession.env_envelope_id`: every
-    /// create path mints one, so this is `Some` from creation for anything
-    /// a client asked for. `None` at creation only for handoff-restored
-    /// sessions and for pre-minting clients, and in that case
-    /// [`crate::hook_ingress`] fills it in on the session's first
-    /// persistable delta.
+    /// create path mints one, so this is `Some` from creation for anything a
+    /// client asked for, and handoff carries it into the successor. `None`
+    /// remains possible for legacy handoffs and pre-minting clients; hook
+    /// ingress fills the latter on the session's first persistable delta.
     ///
     /// `pub(crate)` so [`crate::hook_ingress`] can read and bootstrap it when
     /// routing an `EnvChanged` event into
@@ -4408,19 +4407,32 @@ fn audit_reason(refusal: RemoteRefusal) -> &'static str {
     }
 }
 
+/// The advisory singleton lock, held for the server's whole life. `None` for an
+/// upgrade receiver: the old server holds the lock until it exits, and the
+/// atomic socket takeover in `bind_over` is what keeps the two from racing.
+pub type ServerLock = Option<nix::fcntl::Flock<std::fs::File>>;
+
 /// Acquire the server socket with singleton enforcement.
 ///
 /// In normal mode, uses an advisory flock on `server.lock` to serialise
 /// the bind-or-connect sequence.  If another server already holds the
 /// socket, returns `IpcError` ("already running").  In upgrade mode the
 /// lock and liveness check are skipped — the handoff protocol coordinates
-/// the two servers, and the old server still holds the lock.
+/// the two servers, and the old server still holds the lock and serves on
+/// the path this call takes over.
 ///
 /// Returns the lock file guard (must be kept alive) and the bound listener.
+/// Both callers bind before serving: the normal path from `run_normal_server`,
+/// the upgrade path from inside `receive_handoff`, ahead of its ACK.
+///
+/// # Errors
+/// Returns an error when the singleton lock is held, another server answers on
+/// the socket, or the bind itself fails. In upgrade mode an error here aborts
+/// the handoff before the ACK, leaving the old server serving.
 pub fn acquire_server_socket(
     socket_path: &Path,
     upgrade_mode: bool,
-) -> Result<(Option<nix::fcntl::Flock<std::fs::File>>, UnixListener), ScribeError> {
+) -> Result<(ServerLock, UnixListener), ScribeError> {
     // Ensure the parent directory exists with 0700 permissions.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ScribeError::Io { source: e })?;
@@ -4429,10 +4441,16 @@ pub fn acquire_server_socket(
     }
 
     if upgrade_mode {
-        // Upgrade mode: unconditionally replace the socket.  The handoff
-        // protocol has already coordinated with the old server.
-        drop(std::fs::remove_file(socket_path));
-        return Ok((None, try_bind(socket_path)?));
+        // Upgrade mode: replace the socket atomically. The handoff protocol has
+        // already coordinated with the old server, which is still listening on
+        // the inode this rename displaces — see `bind_over`.
+        //
+        // No singleton lock is taken here: the old server holds it until it
+        // exits. That is safe precisely because the path is never unowned, so a
+        // concurrently launched normal-mode server always finds a live server
+        // on the far end and refuses to start rather than racing for the path.
+        let listener = bind_over(socket_path)?;
+        return Ok((None, listener));
     }
 
     // Normal mode: acquire flock then bind-or-connect.
@@ -4451,10 +4469,10 @@ pub fn acquire_server_socket(
 
     // Try to bind the socket.  If it fails with EADDRINUSE the path
     // already exists; any other error is a real failure.
-    match UnixListener::bind(socket_path) {
+    let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => {
             set_socket_permissions(socket_path);
-            Ok((Some(lock_file), listener))
+            listener
         }
         Err(bind_err) if bind_err.kind() == std::io::ErrorKind::AddrInUse => {
             // Socket file exists — check if another server is alive.
@@ -4466,10 +4484,46 @@ pub fn acquire_server_socket(
             // Stale socket from a crashed server — remove and retry.
             info!("removing stale server socket");
             drop(std::fs::remove_file(socket_path));
-            Ok((Some(lock_file), try_bind(socket_path)?))
+            try_bind(socket_path)?
         }
-        Err(bind_err) => Err(ScribeError::Io { source: bind_err }),
+        Err(bind_err) => return Err(ScribeError::Io { source: bind_err }),
+    };
+
+    Ok((Some(lock_file), listener))
+}
+
+/// Bind `socket_path` by binding a sibling staging path and renaming over it.
+///
+/// `remove_file` followed by `bind` leaves a window in which the path does not
+/// exist, and an upgrade receiver takes this path while the old server is still
+/// serving on it. The client treats a single failed `connect` as "no server is
+/// running" and cold-starts a stateless server through systemd
+/// ([[crates/scribe-client/src/server_lifecycle.rs#connect_or_start_server]]),
+/// so any window at all is long enough to lose every session the successor is
+/// carrying. `rename` is atomic: a concurrent `connect` reaches either the old
+/// server or this one, never nothing.
+fn bind_over(socket_path: &Path) -> Result<UnixListener, ScribeError> {
+    let staging = staging_socket_path(socket_path);
+    // A staging file survives only a successor that died between bind and
+    // rename; its inode is unreachable either way, so clear it unconditionally.
+    drop(std::fs::remove_file(&staging));
+
+    let listener = try_bind(&staging)?;
+    if let Err(e) = std::fs::rename(&staging, socket_path) {
+        drop(std::fs::remove_file(&staging));
+        return Err(ScribeError::Io { source: e });
     }
+    Ok(listener)
+}
+
+/// Fixed sibling path used to bind before renaming over the live socket. The
+/// old server processes one handoff peer through ACK at a time, so only that
+/// receiver can reach this path; a fixed name also lets it clear a staging
+/// socket left by a receiver that died before rename.
+fn staging_socket_path(socket_path: &Path) -> std::path::PathBuf {
+    let mut name = socket_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".upgrade");
+    socket_path.with_file_name(name)
 }
 
 /// Bind the Unix socket and set file permissions to 0o600 (defense-in-depth).
@@ -5852,7 +5906,8 @@ async fn connection_may_attach(
 fn requires_window_control(msg: &ClientMessage) -> bool {
     matches!(
         msg,
-        ClientMessage::KeyInput { .. }
+        ClientMessage::CreateSession { .. }
+            | ClientMessage::KeyInput { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::CloseSession { .. }
             | ClientMessage::CloseWindow { .. }
@@ -6520,6 +6575,7 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
                 &context.server.workspace_manager,
                 context.writer,
                 context.window_id,
+                context.is_remote,
             )
             .await;
         }
@@ -6802,7 +6858,7 @@ async fn start_session(
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, icon_title, cwd,
         context, ai_state, ai_provider_hint, prompt_state, cell_width, cell_height,
-        env_envelope_id, image_state, ..
+        env_window_id, env_envelope_id, image_state, ..
     } = session;
     let shared = SharedSessionHandles::new(pty_fd, initial_attachment).await;
     let (terminal_images, terminal_grid_observer) =
@@ -6840,7 +6896,7 @@ async fn start_session(
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
         scrollback_lines: Arc::clone(&shared.scrollback_lines),
         has_focus: Arc::clone(&shared.has_focus),
-        env_window_id: window_id,
+        env_window_id: env_window_id.unwrap_or(window_id),
         env_envelope_id,
         clipboard_command_tx: shared.clipboard_command_tx,
         exit_gate: Arc::clone(&shared.exit_gate),
@@ -8203,11 +8259,21 @@ async fn handle_create_workspace(
 }
 
 /// Handle `ListSessions` — reply with all live sessions and their workspace info.
+fn list_session_launch_id(
+    is_remote: bool,
+    requested_window: WindowId,
+    envelope_window: WindowId,
+    launch_id: Option<&str>,
+) -> Option<String> {
+    launch_id.filter(|_| !is_remote && requested_window == envelope_window).map(str::to_owned)
+}
+
 async fn handle_list_sessions(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
     window_id: WindowId,
+    is_remote: bool,
 ) {
     let sessions = live_sessions.read().await;
     let wm = workspace_manager.read().await;
@@ -8225,6 +8291,12 @@ async fn handle_list_sessions(
     let mut build_info = |sid: SessionId, s: &LiveSession| SessionInfo {
         session_id: sid,
         workspace_id: s.workspace_id,
+        launch_id: list_session_launch_id(
+            is_remote,
+            window_id,
+            s.env_window_id,
+            s.env_envelope_id.as_deref(),
+        ),
         shell_name: s.shell_name.clone(),
         title: s.title.clone(),
         icon_title: s.icon_title.clone(),
@@ -11806,6 +11878,8 @@ pub async fn serialize_live_for_handoff(
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
             prompt_state: live.prompt_state.clone(),
+            env_window_id: Some(live.env_window_id),
+            env_envelope_id: live.env_envelope_id.clone(),
             image_state,
         });
 
@@ -11854,11 +11928,10 @@ pub async fn activate_pending_sessions(
 
     for (session_id, workspace_id) in pending {
         if let Some(session) = session_manager.take_session(session_id).await {
-            // Look up the handoff-restored window owner. Falls back to a
-            // fresh window id if the workspace manager somehow lost the
-            // mapping — handoff-restored sessions carry
-            // `env_envelope_id = None`, so close-time envelope delete is a
-            // no-op in that case anyway.
+            // Look up the handoff-restored membership owner. A preserved
+            // `env_window_id` on the session remains authoritative for env
+            // cleanup; this value is the backward-compatible fallback for
+            // payloads that predate those handoff fields.
             let window_id = workspace_manager
                 .read()
                 .await
@@ -12096,6 +12169,110 @@ mod tests {
     use scribe_common::framing::read_message;
     use std::os::unix::net::UnixStream as StdUnixStream;
 
+    // @lat: [[protocol#Server Messages#Launch identity is local-only]]
+    #[test]
+    fn session_list_exposes_launch_identity_only_to_local_clients() {
+        let local = WindowId::new();
+        let other = WindowId::new();
+
+        assert_eq!(
+            list_session_launch_id(false, local, local, Some("launch-42")),
+            Some("launch-42".to_owned())
+        );
+        assert_eq!(list_session_launch_id(true, local, local, Some("launch-42")), None);
+        assert_eq!(list_session_launch_id(false, local, other, Some("launch-42")), None);
+        assert_eq!(list_session_launch_id(false, local, local, None), None);
+
+        assert!(requires_window_control(&ClientMessage::CreateSession {
+            workspace_id: WorkspaceId::new(),
+            split_direction: None,
+            cwd: None,
+            size: None,
+            command: None,
+            ai_launch: None,
+            env_envelope_id: Some("launch-42".to_owned()),
+        }));
+    }
+
+    // @lat: [[protocol#Server Messages#Launch identity is local-only]]
+    #[tokio::test]
+    async fn create_session_requires_the_current_window_owner() {
+        let local = test_writer();
+        let remote = test_writer();
+        let lost_control = test_writer();
+        let window_id = WindowId::new();
+        let mut share = WindowShare::new(
+            Participant::local(&local, false),
+            scribe_config::SharingMode::FreeForAll,
+            scribe_config::ControlAcquisition::FreeClaim,
+            None,
+        );
+        share.add_participant(Participant::new(
+            &remote,
+            ControllerIdentity::Remote {
+                device_name: "peer".to_owned(),
+                login_name: "viewer".to_owned(),
+            },
+            ParticipantTransport::Remote,
+            false,
+        ));
+        let shares = new_window_shares();
+        shares.write().await.insert(window_id, share);
+        let create = ClientMessage::CreateSession {
+            workspace_id: WorkspaceId::new(),
+            split_direction: None,
+            cwd: None,
+            size: None,
+            command: None,
+            ai_launch: None,
+            env_envelope_id: Some("launch-42".to_owned()),
+        };
+
+        assert!(connection_may_type(&shares, window_id, &local, &create).await);
+        assert!(!connection_may_type(&shares, window_id, &remote, &create).await);
+        assert!(!connection_may_type(&shares, window_id, &lost_control, &create).await);
+    }
+
+    // @lat: [[lat.md/test#Test Harness#Server handoff#Upgrade takeover replaces a live socket]]
+    #[tokio::test]
+    async fn upgrade_takeover_replaces_a_live_socket_in_place() {
+        let dir = std::env::temp_dir().join(format!("scribe-takeover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("server.sock");
+        drop(std::fs::remove_file(&path));
+        let staging = staging_socket_path(&path);
+        drop(std::fs::remove_file(&staging));
+
+        // Stand in for the old server: bound and listening, exactly as it still
+        // is when the receiver takes the path over ahead of the handoff ACK.
+        let old = std::os::unix::net::UnixListener::bind(&path).expect("old server binds");
+        // Stand in for a receiver killed after staging its socket but before
+        // rename. The next receiver must clear this orphan before binding.
+        let stale = std::os::unix::net::UnixListener::bind(&staging).expect("stale staging binds");
+
+        let (lock, successor) =
+            acquire_server_socket(&path, true).expect("takeover over a live socket");
+
+        assert!(lock.is_none(), "an upgrade receiver must not take the singleton lock");
+        assert!(!staging_socket_path(&path).exists(), "staging socket left behind");
+        assert!(path.exists(), "the socket path must survive the takeover");
+
+        // The path now routes to the successor. Proving the old listener is
+        // bypassed is the point: its inode is orphaned by the rename, so a
+        // client that connects after the takeover can only reach the new server.
+        let _client =
+            std::os::unix::net::UnixStream::connect(&path).expect("connect after takeover");
+        successor.accept().await.expect("successor accepts the connection");
+        old.set_nonblocking(true).expect("nonblocking");
+        assert!(old.accept().is_err(), "the orphaned listener must receive nothing");
+        stale.set_nonblocking(true).expect("nonblocking");
+        assert!(stale.accept().is_err(), "the stale staging listener must receive nothing");
+
+        drop(old);
+        drop(stale);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     // @lat: [[lat.md/server#Server#Sessions#Retained Prompt History#Retained prompt history]]
     #[test]
     fn retained_prompt_history_latches_the_first_and_tracks_the_latest() {
@@ -12286,6 +12463,8 @@ mod tests {
                 ai_state: None,
                 ai_provider_hint: None,
                 prompt_state: None,
+                env_window_id: None,
+                env_envelope_id: None,
                 image_state: None,
             }],
             workspaces: vec![],

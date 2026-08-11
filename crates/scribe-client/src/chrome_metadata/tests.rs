@@ -19,6 +19,7 @@ fn info(session_id: SessionId, workspace_id: WorkspaceId) -> SessionInfo {
     SessionInfo {
         session_id,
         workspace_id,
+        launch_id: None,
         shell_name: "zsh".to_owned(),
         title: None,
         icon_title: None,
@@ -120,6 +121,7 @@ fn session_list_seeds_and_prunes() {
     chrome.set_git_branch(live, Some("feature".to_owned()));
 
     let mut listed = info(live, workspace_id);
+    listed.launch_id = Some("launch-42".to_owned());
     listed.cwd = Some(PathBuf::from("/srv/app"));
     listed.context =
         Some(SessionContext { remote: true, host: Some("laptop".to_owned()), tmux_session: None });
@@ -127,6 +129,7 @@ fn session_list_seeds_and_prunes() {
 
     let entry = chrome.session(live).expect("listed session seeded");
     assert_eq!(entry.cwd.as_deref(), Some(Path::new("/srv/app")));
+    assert_eq!(entry.launch_id.as_deref(), Some("launch-42"));
     // The list omits the branch, so the live value survives the reseed.
     assert_eq!(entry.git_branch.as_deref(), Some("feature"));
     assert_eq!(entry.host_label(), Some("laptop"));
@@ -150,4 +153,5 @@ fn session_list_seeds_and_prunes() {
     let retained = chrome.session(live).expect("session metadata retained");
     assert_eq!(retained.cwd.as_deref(), Some(Path::new("/srv/app")));
     assert_eq!(retained.git_branch.as_deref(), Some("feature"));
+    assert_eq!(retained.launch_id.as_deref(), Some("launch-42"));
 }

@@ -340,7 +340,11 @@ When only the client restarts and the server survives, the whole window is rebui
 
 Only the *first* list of a connection seeds. A later list is a topology refresh, and re-applying `ai_state` there would resurrect an attention state the user has already dismissed with a keystroke through [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_attention_states|clear_attention_states]] — a purely local clear the server never hears about.
 
-The conversation id the seeded prompts are filed under comes from the retained `ai_state`, so the running provider's first live `AiStateChanged` re-announces an id the chrome already knows and does not read as a switch. `dismissed` has no wire counterpart on purpose: dismissal is a local gesture against a pane, so a reattaching client starts with the bar shown, exactly as a fresh window would.
+The conversation id comes from retained `ai_state` even when the pane has no prompt rows, so [[crates/scribe-client/src/main.rs#TerminalView#sync_launch_bindings|sync_launch_bindings]] can rebuild a structured AI resume binding from the shared tracker, conversation map, and retained CWD. The running provider's first live `AiStateChanged` re-announces an id the chrome already knows and does not read as a switch. `dismissed` has no wire counterpart on purpose: dismissal is a local gesture against a pane, so a reattaching client starts with the bar shown, exactly as a fresh window would.
+
+The same reconciliation runs for existing bindings on every restore poll. A live AI state edge promotes a shell fallback or updates its provider and conversation id; explicit `AiStateCleared` demotes it to a shell; a CWD edge updates its fallback directory. Each change dirties the snapshot without replacing its launch id. A local `SessionInfo` also returns the launch id when its environment envelope belongs to this window, so a new client process retains that identity. Older servers and the first handoff from a version that did not transfer envelope coordinates return none and mint once; remote/shared clients never receive the selector.
+
+Provider absence in `SessionList` is not treated as a clear because it is also the valid pre-hook state of a fresh AI process. A clear emitted only while this client is disconnected therefore waits for the next explicit AI edge instead of risking a false shell demotion.
 
 This path is independent of the cold-restart snapshot below and never touches it. A surviving server means the snapshot is not replayed at all, and burning a claim to read prompt text out of it would cost a later cold restart the layout it needs.
 
@@ -353,6 +357,14 @@ Only the reconnect path takes the exception. [[crates/scribe-client/src/main.rs#
 #### Session list seeds the AI chrome
 
 A `SessionInfo` carrying retained prompt history, an AI state, and a provider hint paints its prompt bar and restores the tracker's provider on seeding, and the seeded bar survives the resumed provider re-announcing its own conversation id.
+
+#### Retained AI bindings stay structured
+
+A retained provider, conversation id, and CWD build an AI resume binding, so the next cold restart sends structured targeted resume intent instead of launching the pane as a shell.
+
+#### Live AI metadata updates restore
+
+A live AI state edge promotes or updates the persisted binding without replacing its launch id, a partial edge that omits the conversation id preserves the last targeted resume id, and only an explicit provider-clear edge demotes it to a shell.
 
 #### Codex reattach defers its grid
 

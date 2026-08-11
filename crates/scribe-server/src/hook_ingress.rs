@@ -179,9 +179,10 @@ async fn handle_env_changed_dispatch(
 /// Gated on the session already having a baseline: without one the fold is
 /// dropped anyway, and a session that never emits a baseline (a handoff-
 /// restored PTY, whose shell already ran its rc under the previous server)
-/// must keep the documented "no envelope across handoff" behavior. The mint
-/// happens under the live-sessions write lock and re-checks the field, so
-/// concurrent deltas on one session agree on a single id.
+/// must not mint a new envelope. Handoff carries any existing envelope id for
+/// cleanup but does not transfer the baseline or scheduler. The mint happens
+/// under the live-sessions write lock and re-checks the field, so concurrent
+/// deltas on one session agree on a single id.
 async fn bootstrap_envelope_id(server: &IpcServerState, session_id: SessionId) -> Option<String> {
     if !server.env_store.has_baseline(session_id).await {
         return None;

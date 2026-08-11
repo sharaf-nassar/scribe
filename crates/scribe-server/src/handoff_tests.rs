@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use vte::ansi::Processor as AnsiProcessor;
 
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
 use scribe_common::screen::{
     CellFlags, CursorStyle, DecPrivateMode, ScreenCell, ScreenColor, ScreenSnapshot,
@@ -84,6 +84,8 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         ai_state: None,
         ai_provider_hint: None,
         prompt_state: None,
+        env_window_id: None,
+        env_envelope_id: None,
         image_state: None,
     };
 
@@ -161,6 +163,8 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             ai_state: None,
             ai_provider_hint: None,
             prompt_state: None,
+            env_window_id: None,
+            env_envelope_id: None,
             image_state: None,
         });
         masters.push(pty.master);
@@ -272,6 +276,30 @@ async fn serialize_live_returns_activated_sessions() {
         sessions[0].context.as_ref().and_then(|context| context.host.as_deref()),
         Some("builder")
     );
+}
+
+// @lat: [[lat.md/test#Test Harness#Server handoff#Environment identity survives handoff]]
+#[tokio::test]
+async fn environment_identity_survives_handoff_restore_and_reexport() {
+    let (mut state, masters, _slaves) = make_handoff_state(1);
+    let expected_window = WindowId::new();
+    let expected_envelope = String::from("launch-env-identity");
+    state.sessions[0].env_window_id = Some(expected_window);
+    state.sessions[0].env_envelope_id = Some(expected_envelope.clone());
+
+    let bytes = rmp_serde::to_vec_named(&state).unwrap();
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+    let sm = Arc::new(SessionManager::restore_from_handoff(&decoded, masters, 100).unwrap());
+    let wm = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
+    let registry = ipc_server::new_live_session_registry();
+    let shares = ipc_server::new_window_shares();
+
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
+    wait_registry_count(&registry, 1).await;
+
+    let (sessions, _) = ipc_server::serialize_live_for_handoff(&registry).await;
+    assert_eq!(sessions[0].env_window_id, Some(expected_window));
+    assert_eq!(sessions[0].env_envelope_id.as_deref(), Some(expected_envelope.as_str()));
 }
 
 #[tokio::test]
@@ -536,6 +564,8 @@ fn prior_version_payload_decodes_with_absent_child_identity() {
     assert_eq!(decoded.version, 5);
     let session = decoded.sessions.first().expect("one session");
     assert_eq!(session.child_identity, None, "absent field must default to None");
+    assert_eq!(session.env_window_id, None, "absent field must default to None");
+    assert_eq!(session.env_envelope_id, None, "absent field must default to None");
     assert_eq!(session.child_pid, 4242);
     assert_eq!(session.title.as_deref(), Some("editor"));
     assert_eq!(session.icon_title, None, "absent field must default to None");

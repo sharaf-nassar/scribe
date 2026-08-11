@@ -11,7 +11,7 @@ mod terminal_image_renderer_probe;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
@@ -88,7 +88,9 @@ use scribe_client::restore_replay::{
     self, GridSize, ReplayLaunch, attach_dimensions_for_session, grid_for_rect, prepare_replay,
     round_positive_f32_to_u16,
 };
-use scribe_client::restore_state::{AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState};
+use scribe_client::restore_state::{
+    AiResumeMode, LaunchBinding, LaunchKind, RestoreStore, WindowRestoreState,
+};
 use scribe_client::scrollbar::{
     ScrollbarDrag, ScrollbarHandle, ScrollbarLayout, ScrollbarStyle, hit_test_scrollbar,
     hit_test_thumb, offset_from_drag, offset_from_track_click,
@@ -146,7 +148,7 @@ use scribe_common::{
         StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
     },
     framing::{read_message, write_message},
-    ids::{SessionId, WindowId, WorkspaceId},
+    ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
         AiLaunchSpec, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
         ServerMessage, SessionInfo, TerminalSize, WindowInfo, WorkspaceTreeNode,
@@ -289,6 +291,10 @@ struct AiChrome {
     /// snapshot's launch record, because the resumed provider re-announces the
     /// id it was resumed with and that must not read as a switch.
     conversations: HashMap<SessionId, String>,
+    /// Sessions whose provider explicitly exited. This is separate from
+    /// provider absence: a fresh AI session has no state briefly and must not
+    /// be demoted before its first hook event.
+    binding_cleared: HashSet<SessionId>,
 }
 
 impl AiChrome {
@@ -299,6 +305,7 @@ impl AiChrome {
             tracker: AiStateTracker::new(styles),
             prompts: HashMap::new(),
             conversations: HashMap::new(),
+            binding_cleared: HashSet::new(),
         }
     }
 
@@ -321,6 +328,7 @@ impl AiChrome {
         ai_state: scribe_common::ai_state::AiProcessState,
         at: std::time::SystemTime,
     ) {
+        self.binding_cleared.remove(&session_id);
         let provider = ai_state.provider;
         // Before the tracker takes ownership: a state edge is the only frame
         // that names the provider's conversation, and a switch must take the
@@ -381,9 +389,15 @@ impl AiChrome {
     fn seed_from_session_list(&mut self, sessions: &[SessionInfo]) {
         for info in sessions {
             let session_id = info.session_id;
+            if info.ai_state.is_some() || info.ai_provider_hint.is_some() {
+                self.binding_cleared.remove(&session_id);
+            }
+            let conversation_id =
+                info.ai_state.as_ref().and_then(|state| state.conversation_id.clone());
+            if let Some(conversation_id) = conversation_id.as_deref() {
+                self.note_conversation(session_id, conversation_id);
+            }
             if let Some(prompts) = info.prompt_state.clone() {
-                let conversation_id =
-                    info.ai_state.as_ref().and_then(|state| state.conversation_id.clone());
                 self.restore_prompts(session_id, prompts.into(), conversation_id);
             }
             if let Some(ai_state) = info.ai_state.clone() {
@@ -442,6 +456,15 @@ impl AiChrome {
         self.tracker.clear_context(session_id);
         self.prompts.remove(&session_id);
         self.conversations.remove(&session_id);
+        self.binding_cleared.remove(&session_id);
+    }
+
+    /// Forget visible AI state and remember that the provider explicitly
+    /// exited, so restore demotes this binding rather than treating the gap as
+    /// a fresh AI process that has not emitted its first hook yet.
+    fn clear(&mut self, session_id: SessionId) {
+        self.forget(session_id);
+        self.binding_cleared.insert(session_id);
     }
 }
 
@@ -850,6 +873,107 @@ fn launch_binding_for(
     restore_replay::new_custom_binding(argv.clone(), cwd)
 }
 
+type RetainedSessionMetadata =
+    (Option<(AiProvider, Option<String>)>, Option<PathBuf>, Option<String>, bool);
+
+fn update_binding_cwd(binding: &mut LaunchBinding, cwd: Option<&Path>) -> bool {
+    let Some(cwd) = cwd else { return false };
+    if binding.fallback_cwd.as_deref() == Some(cwd) {
+        return false;
+    }
+    binding.fallback_cwd = Some(cwd.to_path_buf());
+    true
+}
+
+/// Reconcile server-retained metadata onto a session's restore binding.
+///
+/// The launch id is deliberately never replaced: a live session keeps the
+/// environment-envelope identity it was created with. AI state edges promote
+/// shell fallbacks to structured resume bindings, while partial edges preserve
+/// the last conversation id exactly as the retired client did.
+fn update_retained_binding(
+    binding: &mut LaunchBinding,
+    ai: Option<(AiProvider, Option<&str>)>,
+    cwd: Option<&Path>,
+) -> bool {
+    let changed = update_binding_cwd(binding, cwd);
+    let Some((provider, retained_conversation_id)) = ai else { return changed };
+    let effective_conversation_id = retained_conversation_id.map(str::to_owned).or_else(|| {
+        if let LaunchKind::Ai { conversation_id: existing_conversation_id, .. } = &binding.kind {
+            existing_conversation_id.clone()
+        } else {
+            None
+        }
+    });
+    if matches!(
+        &binding.kind,
+        LaunchKind::Ai {
+            provider: existing_provider,
+            conversation_id: existing_conversation,
+            ..
+        } if *existing_provider == provider && *existing_conversation == effective_conversation_id
+    ) {
+        return changed;
+    }
+    binding.kind = LaunchKind::Ai {
+        provider,
+        resume_mode: AiResumeMode::Resume,
+        conversation_id: effective_conversation_id,
+    };
+    true
+}
+
+/// Demote a binding only after an explicit provider-exit edge.
+fn clear_retained_binding(binding: &mut LaunchBinding, cwd: Option<&Path>) -> bool {
+    let changed = update_binding_cwd(binding, cwd);
+    if matches!(binding.kind, LaunchKind::Shell) {
+        return changed;
+    }
+    binding.kind = LaunchKind::Shell;
+    true
+}
+
+/// Build the best restore binding available for a server-retained session.
+///
+/// A local `SessionInfo` carries the original launch id when its envelope
+/// belongs to this window. Legacy payloads and redacted remote listings omit
+/// it and mint once; provider, conversation and CWD still keep replay targeted.
+fn retained_session_binding(
+    ai: Option<(AiProvider, Option<&str>)>,
+    cwd: Option<PathBuf>,
+    launch_id: Option<String>,
+) -> LaunchBinding {
+    let kind = if let Some((provider, conversation_id)) = ai {
+        LaunchKind::Ai {
+            provider,
+            resume_mode: AiResumeMode::Resume,
+            conversation_id: conversation_id.map(str::to_owned),
+        }
+    } else {
+        LaunchKind::Shell
+    };
+    LaunchBinding { launch_id: launch_id.unwrap_or_else(new_launch_id), kind, fallback_cwd: cwd }
+}
+
+fn retained_ai_ref(
+    ai: Option<&(AiProvider, Option<String>)>,
+) -> Option<(AiProvider, Option<&str>)> {
+    ai.map(|(provider, conversation)| (*provider, conversation.as_deref()))
+}
+
+fn reconcile_retained_binding(
+    binding: &mut LaunchBinding,
+    ai: Option<&(AiProvider, Option<String>)>,
+    cwd: Option<&Path>,
+    cleared: bool,
+) -> bool {
+    if cleared {
+        clear_retained_binding(binding, cwd)
+    } else {
+        update_retained_binding(binding, retained_ai_ref(ai), cwd)
+    }
+}
+
 /// Everything the window needs to persist its state and replay a cold restart.
 ///
 /// The two halves are deliberately kept together: a restore is only useful with
@@ -866,8 +990,9 @@ struct RestoreRuntime {
     /// has durably written a fresh snapshot of its own.
     claimed_window: Option<WindowId>,
     /// Per-session launch bindings — what a snapshot's `LaunchRecord`s are built
-    /// from. A session this window did not create itself (a reattach, a share
-    /// join) gets a plain shell binding, which is what a cold restart relaunches.
+    /// from. Reattached sessions recover structured AI metadata from the
+    /// server's retained state; only sessions with no AI identity fall back to
+    /// a shell binding.
     bindings: HashMap<SessionId, LaunchBinding>,
     /// Bindings for sessions this window has asked for but not yet been given,
     /// oldest first. `CreateSession` carries no id, so the answering
@@ -4255,17 +4380,66 @@ impl TerminalView {
         self.restore.geometry_dirty_since = None;
     }
 
+    /// Reconcile one live session with its retained launch metadata.
+    fn sync_launch_binding(&mut self, session_id: SessionId, retained: RetainedSessionMetadata) {
+        let (ai, cwd, launch_id, cleared) = retained;
+        if let Some(binding) = self.restore.bindings.get_mut(&session_id) {
+            if reconcile_retained_binding(binding, ai.as_ref(), cwd.as_deref(), cleared) {
+                self.restore.mark_layout_dirty();
+            }
+            return;
+        }
+
+        let mut binding = self.restore.requested.pop_front().unwrap_or_else(|| {
+            retained_session_binding(retained_ai_ref(ai.as_ref()), cwd.clone(), launch_id)
+        });
+        reconcile_retained_binding(&mut binding, ai.as_ref(), cwd.as_deref(), cleared);
+        self.restore.bindings.insert(session_id, binding);
+        self.restore.mark_layout_dirty();
+    }
+
     /// Give every live session a launch binding and forget the ones that ended.
     ///
     /// A binding is what a snapshot's `LaunchRecord` is built from, so this is
     /// the thing that decides what a cold restart relaunches. Sessions this
     /// window asked for take the binding queued by the request that asked for
-    /// them, in the FIFO order the one ordered writer channel guarantees;
-    /// everything else (a reattach, a share join) falls back to a plain shell.
+    /// them, in the FIFO order the one ordered writer channel guarantees.
+    /// Everything else (a reattach, a share join) is hydrated from the
+    /// server-retained AI and CWD metadata already folded into shared chrome.
+    /// Existing bindings are reconciled too, so each live `AiStateChanged` or
+    /// `CwdChanged` edge makes the next snapshot current without changing its
+    /// launch identity.
     fn sync_launch_bindings(&mut self) {
         let Ok(tabs) = self.shared.tabs.lock() else { return };
         let live: Vec<SessionId> = tabs.entries().map(|tab| tab.session_id).collect();
         drop(tabs);
+        let retained: HashMap<SessionId, RetainedSessionMetadata> = {
+            let ai = self.shared.ai.lock().ok();
+            let chrome = self.shared.chrome_metadata.lock().ok();
+            live.iter()
+                .map(|session_id| {
+                    let provider =
+                        ai.as_ref().and_then(|ai| ai.tracker.provider_for_session(*session_id));
+                    let conversation_id =
+                        ai.as_ref().and_then(|ai| ai.conversations.get(session_id).cloned());
+                    let metadata =
+                        chrome.as_ref().and_then(|metadata| metadata.session(*session_id));
+                    let cwd = metadata.and_then(|session| session.cwd.clone());
+                    let launch_id = metadata.and_then(|session| session.launch_id.clone());
+                    let cleared =
+                        ai.as_ref().is_some_and(|ai| ai.binding_cleared.contains(session_id));
+                    (
+                        *session_id,
+                        (
+                            provider.map(|provider| (provider, conversation_id)),
+                            cwd,
+                            launch_id,
+                            cleared,
+                        ),
+                    )
+                })
+                .collect()
+        };
         if !live.is_empty()
             && let Ok(mut pending) = self.shared.initial_session.binding.lock()
             && let Some(binding) = pending.take()
@@ -4273,16 +4447,8 @@ impl TerminalView {
             self.restore.requested.push_front(binding);
         }
         for session_id in &live {
-            if self.restore.bindings.contains_key(session_id) {
-                continue;
-            }
-            let binding = self
-                .restore
-                .requested
-                .pop_front()
-                .unwrap_or_else(|| restore_replay::new_shell_binding(None));
-            self.restore.bindings.insert(*session_id, binding);
-            self.restore.mark_layout_dirty();
+            let metadata = retained.get(session_id).cloned().unwrap_or_default();
+            self.sync_launch_binding(*session_id, metadata);
         }
         let before = self.restore.bindings.len();
         self.restore.bindings.retain(|session_id, _| live.contains(session_id));
@@ -10240,7 +10406,7 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
             // `forget`, not just the tracker halves: the provider exiting must
             // also take the prompt bar down with it, or the pane keeps a stale
             // prompt history the next conversation never clears.
-            update_ai_chrome(ctx, |ai| ai.forget(session_id));
+            update_ai_chrome(ctx, |ai| ai.clear(session_id));
             if label_changed {
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
@@ -12051,6 +12217,7 @@ mod tests {
         SessionInfo {
             session_id,
             workspace_id: WorkspaceId::new(),
+            launch_id: None,
             shell_name: String::from("bash"),
             title: None,
             icon_title: None,
@@ -12315,6 +12482,7 @@ mod tests {
     fn session_list_seeds_the_prompt_bar_and_the_indicator() {
         let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
         let session = SessionId::new();
+        ai.clear(session);
         let mut ai_state = scribe_common::ai_state::AiProcessState::new_with_provider(
             scribe_common::ai_state::AiProvider::ClaudeCode,
             scribe_common::ai_state::AiState::Processing,
@@ -12323,6 +12491,7 @@ mod tests {
         let info = SessionInfo {
             session_id: session,
             workspace_id: WorkspaceId::new(),
+            launch_id: None,
             shell_name: String::from("bash"),
             title: None,
             icon_title: None,
@@ -12353,11 +12522,69 @@ mod tests {
             Some(scribe_common::ai_state::AiProvider::ClaudeCode),
             "the indicator comes back without waiting for a hook event"
         );
+        assert!(!ai.binding_cleared.contains(&session));
 
         // The resumed provider re-announcing its own id is not a switch, so the
         // seeded bar survives the first live state edge.
         ai.note_conversation(session, "conv-42");
         assert!(ai.visible_prompts(session).is_some());
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained AI bindings stay structured]]
+    #[test]
+    fn retained_ai_metadata_builds_a_targeted_resume_binding() {
+        let cwd = PathBuf::from("/tmp/paperclip");
+        let binding = retained_session_binding(
+            Some((AiProvider::CodexCode, Some("conv-42"))),
+            Some(cwd.clone()),
+            Some("launch-42".to_owned()),
+        );
+
+        assert_eq!(binding.launch_id, "launch-42");
+        assert_eq!(binding.fallback_cwd, Some(cwd));
+        assert!(matches!(
+            binding.kind,
+            LaunchKind::Ai {
+                provider: AiProvider::CodexCode,
+                resume_mode: AiResumeMode::Resume,
+                conversation_id: Some(ref conversation_id),
+            } if conversation_id == "conv-42"
+        ));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Live AI metadata updates restore]]
+    #[test]
+    fn live_ai_metadata_updates_restore_without_replacing_launch_identity() {
+        let mut binding = restore_replay::new_shell_binding(None);
+        let launch_id = binding.launch_id.clone();
+
+        assert!(update_retained_binding(
+            &mut binding,
+            Some((AiProvider::CodexCode, Some("conv-42"))),
+            Some(Path::new("/tmp/cue")),
+        ));
+        assert_eq!(binding.launch_id, launch_id);
+        assert_eq!(binding.fallback_cwd.as_deref(), Some(Path::new("/tmp/cue")));
+        assert!(matches!(
+            binding.kind,
+            LaunchKind::Ai {
+                provider: AiProvider::CodexCode,
+                resume_mode: AiResumeMode::Resume,
+                conversation_id: Some(ref conversation_id),
+            } if conversation_id == "conv-42"
+        ));
+
+        // Partial provider hooks do not erase the targeted resume id.
+        assert!(!update_retained_binding(
+            &mut binding,
+            Some((AiProvider::CodexCode, None)),
+            Some(Path::new("/tmp/cue")),
+        ));
+
+        // Only an explicit provider-exit edge demotes the binding.
+        assert!(clear_retained_binding(&mut binding, Some(Path::new("/tmp/cue"))));
+        assert_eq!(binding.launch_id, launch_id);
+        assert!(matches!(binding.kind, LaunchKind::Shell));
     }
 
     #[test]

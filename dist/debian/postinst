@@ -858,8 +858,15 @@ case "$1" in
 
                     # The old server exits on its own after handoff (clean exit
                     # code 0). With Restart=on-failure in the service file,
-                    # systemd will not auto-restart it.  The singleton flock
-                    # in acquire_server_socket prevents duplicate servers.
+                    # systemd will not auto-restart it.
+                    #
+                    # What keeps a duplicate server out is NOT the singleton
+                    # flock: an upgrade receiver holds no lock, so after the
+                    # first hot reload the lock is unheld and a cold start would
+                    # take it uncontested. The receiver instead claims the
+                    # socket path atomically before it acknowledges the handoff,
+                    # so the path always names a live server and any cold start
+                    # racing this window finds one and refuses.
                     #
                     # We intentionally do NOT `systemctl stop` or kill server
                     # processes here:

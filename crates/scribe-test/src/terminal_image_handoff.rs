@@ -720,6 +720,8 @@ fn session_stub(image_state: Option<SessionImageHandoff>) -> HandoffSession {
         ai_state: None,
         ai_provider_hint: None,
         prompt_state: None,
+        env_window_id: None,
+        env_envelope_id: None,
         image_state,
     }
 }

@@ -8,13 +8,12 @@
 //! immediately, mirroring the old webview's live-apply behaviour; the file
 //! watcher in the running client picks the change up as a `ConfigReloaded`.
 //!
-//! Color and general free-text controls share one inline editor: click or
-//! keyboard-activate a row to open it, Enter commits through the same apply
-//! path every other control uses, Escape restores the value the edit opened
-//! with. Only colors validate (and carry the live swatch). Keybinding rows
-//! list every action's combos as key caps and record a replacement from the
-//! keyboard: activating one puts it in listening state, and the next keystroke
-//! is written through the same apply path.
+//! Colors open one anchored preset/custom palette; its exact-value field and
+//! general free-text controls share one inline editor. Enter commits through
+//! the same apply path every other control uses and Escape restores the value
+//! the edit opened with. Keybinding rows list every action's combos as key caps
+//! and record a replacement from the keyboard: activating one puts it in
+//! listening state, and the next keystroke is written through the same path.
 //!
 //! The content pane carries the terminal's own overlay scrollbar
 //! ([`crate::scrollbar`]) as its page-length affordance: the same thumb
@@ -50,7 +49,7 @@
 //! FINISH: unreviewed and undocumented is unfinished; this build ends with
 //! the finish review, the verdict, and DESIGN.md.
 
-use std::{ops::Range, time::Duration};
+use std::{cell::Cell, ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
     AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
@@ -58,8 +57,8 @@ use gpui::{
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
     Pixels, Point, ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions,
     Toggled, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowHandle, WindowOptions, canvas, div, point, prelude::*, px, rgb, rgba,
-    size,
+    WindowDecorations, WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb,
+    rgba, size,
 };
 use scribe_common::config::{ScribeConfig, load_config};
 use scribe_common::protocol::{
@@ -312,6 +311,10 @@ pub struct SettingsWindow {
     /// and rewound on open so the live value is on screen even in the ~190-entry
     /// theme preset list.
     choice_scroll: ScrollHandle,
+    /// Config key of the color selector whose anchored palette is open.
+    open_color: Option<String>,
+    /// Hue shown by the custom saturation/brightness palette.
+    color_hue: f32,
     /// The content pane's page-length affordance: the terminal's own overlay
     /// scrollbar state, so the thumb fades in on scroll and out after idle
     /// exactly as it does in a pane.
@@ -633,6 +636,8 @@ impl SettingsWindow {
             scroll_handle: ScrollHandle::new(),
             open_choice: None,
             choice_scroll: ScrollHandle::new(),
+            open_color: None,
+            color_hue: 0.0,
             content_scrollbar: ScrollbarState::new(),
             content_scrolled: 0,
         };
@@ -895,6 +900,7 @@ impl SettingsWindow {
         // not leave its menu floating over the next one, and a row that was
         // listening for a shortcut is not on screen to say so any more.
         self.open_choice = None;
+        self.open_color = None;
         self.capture_action = None;
         self.capture_error = None;
         // The scroller is one retained element across every page, so without an
@@ -1031,7 +1037,7 @@ impl SettingsWindow {
                 window.focus(&self.workspace_root_handle, cx);
             }
             Some(SettingsFocusTarget::Control(control))
-                if matches!(control.kind, ControlKind::Color | ControlKind::Text) =>
+                if matches!(control.kind, ControlKind::Text) =>
             {
                 self.begin_inline_edit(&control);
                 window.focus(&self.edit_handle, cx);
@@ -1052,6 +1058,14 @@ impl SettingsWindow {
     /// Open the shared inline editor on a color or free-text control, seeding it
     /// with the saved value that Escape later restores.
     fn begin_inline_edit(&mut self, control: &Control) {
+        let target = SettingsFocusTarget::Control(control.clone());
+        if let Some(index) = self
+            .focus_targets()
+            .iter()
+            .position(|candidate| focus_targets_match(candidate, &target))
+        {
+            self.focus_index = index;
+        }
         if self.edit_key() != Some(control.key.as_str()) {
             let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
             self.edit_input.clone_from(&value);
@@ -1176,7 +1190,8 @@ impl SettingsWindow {
                     self.step(&control.key, (min, max), step, cx);
                 }
                 ControlKind::Action => self.run_action(&control.key, window, cx),
-                ControlKind::Color | ControlKind::Text => {
+                ControlKind::Color => self.toggle_color_picker(&control, cx),
+                ControlKind::Text => {
                     self.begin_inline_edit(&control);
                     window.focus(&self.edit_handle, cx);
                     cx.notify();
@@ -1221,6 +1236,13 @@ impl SettingsWindow {
             }
             ControlKind::Toggle if direction != 0.0 => {
                 self.toggle(&control.key, cx);
+                true
+            }
+            ControlKind::Color => {
+                let value = current_value(&self.config, &control.key);
+                let current = value.as_str().unwrap_or("");
+                let preset = adjacent_color_preset(current, direction);
+                self.select_color(&control.key, preset, cx);
                 true
             }
             _ => false,
@@ -1281,6 +1303,8 @@ impl SettingsWindow {
             self.clear_inline_edit();
             self.capture_action = None;
             self.capture_error = None;
+            self.open_color = None;
+            self.open_choice = None;
             self.page = page;
             self.status = None;
             // Jumping to a different page for a match must rewind the shared
@@ -1394,6 +1418,35 @@ impl SettingsWindow {
         self.clear_active_input_error();
     }
 
+    fn cancel_native_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_input != Some(NativeInputTarget::Inline) {
+            self.dismiss_transient_state(cx);
+            window.focus(&self.focus_handle, cx);
+            self.keyboard_navigation = true;
+            cx.notify();
+            return;
+        }
+
+        let closes_color_picker = self
+            .edit_control
+            .as_ref()
+            .is_some_and(|control| matches!(control.kind, ControlKind::Color));
+        revert_inline_input(
+            &mut self.edit_input,
+            &self.edit_original,
+            &mut self.edit_marked_range,
+            &mut self.edit_error,
+        );
+        self.input_selection = NativeInputSelection::Caret;
+        if closes_color_picker {
+            self.open_color = None;
+            self.clear_inline_edit();
+            window.focus(&self.focus_handle, cx);
+            self.keyboard_navigation = true;
+        }
+        cx.notify();
+    }
+
     fn handle_native_input_key(
         &mut self,
         event: &KeyDownEvent,
@@ -1424,20 +1477,7 @@ impl SettingsWindow {
         }
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.active_input == Some(NativeInputTarget::Inline) {
-                    revert_inline_input(
-                        &mut self.edit_input,
-                        &self.edit_original,
-                        &mut self.edit_marked_range,
-                        &mut self.edit_error,
-                    );
-                    self.input_selection = NativeInputSelection::Caret;
-                } else {
-                    self.dismiss_transient_state(cx);
-                    window.focus(&self.focus_handle, cx);
-                    self.keyboard_navigation = true;
-                }
-                cx.notify();
+                self.cancel_native_input(window, cx);
                 true
             }
             "backspace" => {
@@ -1462,11 +1502,19 @@ impl SettingsWindow {
                 }
                 true
             }
-            "tab" if event.keystroke.modifiers.shift => {
-                self.move_focus(-1, window, cx);
+            "tab" => {
+                if self
+                    .edit_control
+                    .as_ref()
+                    .is_some_and(|control| matches!(control.kind, ControlKind::Color))
+                {
+                    self.open_color = None;
+                    self.clear_inline_edit();
+                }
+                self.move_focus(if event.keystroke.modifiers.shift { -1 } else { 1 }, window, cx);
                 true
             }
-            "tab" | "down" => {
+            "down" => {
                 self.move_focus(1, window, cx);
                 true
             }
@@ -1516,6 +1564,26 @@ impl SettingsWindow {
             // a user who filters and then clicks a control is never stranded in a
             // filtered UI with no visible way out.
             "escape" => self.dismiss_transient_state(cx),
+            "tab" if self.open_color.is_some() => {
+                let control = match self.focused_target() {
+                    Some(SettingsFocusTarget::Control(control))
+                        if matches!(control.kind, ControlKind::Color)
+                            && self.open_color.as_deref() == Some(control.key.as_str()) =>
+                    {
+                        Some(control)
+                    }
+                    _ => None,
+                };
+                if let Some(control) = control {
+                    self.begin_inline_edit(&control);
+                    window.focus(&self.edit_handle, cx);
+                    cx.notify();
+                    true
+                } else {
+                    self.move_focus(1, window, cx);
+                    true
+                }
+            }
             "tab" | "down" => {
                 self.move_focus(1, window, cx);
                 true
@@ -1542,6 +1610,9 @@ impl SettingsWindow {
     /// anything was actually dismissed so the caller only claims the keystroke
     /// when it did something.
     fn dismiss_transient_state(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.close_color_picker(cx) {
+            return true;
+        }
         if self.close_choice_menu(cx) {
             return true;
         }
@@ -3617,7 +3688,8 @@ impl SettingsWindow {
             ControlKind::Stepper { min, max, step, decimals } => {
                 self.render_stepper(control, (*min, *max, *step), *decimals, cx)
             }
-            ControlKind::Color | ControlKind::Text => self.render_inline_edit(control, window, cx),
+            ControlKind::Color => self.render_color_selector(control, window, cx),
+            ControlKind::Text => self.render_inline_edit(control, window, cx),
             ControlKind::Keybinding => self.render_keybinding_value(control, cx),
             ControlKind::Action => self.render_action_control(control, cx),
         }
@@ -3842,6 +3914,7 @@ impl SettingsWindow {
         if self.open_choice.as_deref() == Some(key) {
             self.open_choice = None;
         } else {
+            self.open_color = None;
             self.open_choice = Some(key.to_owned());
             self.align_choice_scroll(key, options);
         }
@@ -3868,6 +3941,61 @@ impl SettingsWindow {
             cx.notify();
         }
         was_open
+    }
+
+    /// Open one shared color palette, initialized from the live value's hue.
+    fn toggle_color_picker(&mut self, control: &Control, cx: &mut Context<Self>) {
+        if self.open_color.as_deref() == Some(control.key.as_str()) {
+            self.open_color = None;
+        } else {
+            let value = current_value(&self.config, &control.key);
+            self.color_hue = value
+                .as_str()
+                .and_then(|value| color_swatch(&self.config, &control.key, value))
+                .map(srgba)
+                .map(gpui::Hsla::from)
+                .map_or(self.color_hue, |color| color.h);
+            self.open_choice = None;
+            self.open_color = Some(control.key.clone());
+        }
+        cx.notify();
+    }
+
+    /// Commit a generated palette color through the same validator and writer
+    /// as typed colors, retaining the canonical value for the exact-value field.
+    fn select_color(&mut self, key: &str, value: &str, cx: &mut Context<Self>) -> bool {
+        let stored = match inline_commit_value(true, key, value) {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.edit_error = Some(error);
+                cx.notify();
+                return false;
+            }
+        };
+        if !self.commit(key, Value::String(stored.clone()), cx) {
+            return false;
+        }
+        if self.edit_key() == Some(key) {
+            self.edit_input.clone_from(&stored);
+            self.edit_original = stored;
+            self.edit_marked_range = None;
+            self.edit_error = None;
+        }
+        true
+    }
+
+    fn close_color_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_open = self.open_color.take().is_some();
+        if was_open {
+            cx.notify();
+        }
+        was_open
+    }
+
+    fn close_color_picker_for(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.open_color.as_deref() == Some(key) {
+            self.close_color_picker(cx);
+        }
     }
 
     /// A keybinding row's value: its combos as key caps, or the listening state
@@ -4087,9 +4215,310 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// Render the shared inline editor: the color fields on theme, AI,
-    /// appearance, and workspace badge rows, and the general free-text fields.
-    /// Only a color carries the live swatch; everything else is the field alone.
+    /// Render one color as a compact swatch/value trigger with an anchored
+    /// preset and custom palette. The exact-value editor stays inside the
+    /// palette for hex entry and the AI color family's `ansi:N` values.
+    fn render_color_selector(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let open = self.open_color.as_deref() == Some(control.key.as_str());
+        let close_key = control.key.clone();
+        div()
+            .id(("color-selector-shell", key_hash(&control.key)))
+            .relative()
+            .w(px(CHOICE_WIDTH))
+            .h(px(30.0))
+            .flex_none()
+            .when(open, |el| {
+                el.on_mouse_down_out(cx.listener(move |this, _, _window, ctx| {
+                    this.close_color_picker_for(&close_key, ctx);
+                }))
+                .child(self.render_color_menu(control, window, cx))
+            })
+            .child(self.render_color_trigger(control, open, cx))
+            .into_any_element()
+    }
+
+    fn render_color_trigger(
+        &self,
+        control: &Control,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
+        let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let display = if value.is_empty() {
+            inline_placeholder(&control.key, true).to_owned()
+        } else {
+            value.clone()
+        };
+        let swatch =
+            color_swatch(&self.config, &control.key, &value).map_or(colors.input_bg, srgba);
+        let picker_control = control.clone();
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        div()
+            .id(("color-selector", key_hash(&control.key)))
+            .role(Role::ComboBox)
+            .aria_label(format!("{} color", control.label))
+            .aria_description("Press Enter or Space for presets and a custom palette; Left and Right choose presets; Tab edits the exact value")
+            .aria_value(value)
+            .aria_expanded(open)
+            .focusable()
+            .tab_stop(true)
+            .w(px(CHOICE_WIDTH))
+            .h(px(30.0))
+            .px(px(7.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(if focused || open { colors.accent } else { colors.border })
+            .bg(colors.control_bg)
+            .cursor_pointer()
+            .hover(move |style| {
+                style.bg(colors.control_hover_bg).border_color(colors.strong_border)
+            })
+            .active(move |style| style.bg(colors.control_pressed_bg))
+            .on_click(cx.listener(move |this, _, _window, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.toggle_color_picker(&picker_control, ctx);
+            }))
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(colors.strong_border)
+                    .bg(swatch),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .font_family("monospace")
+                    .text_sm()
+                    .text_color(if display.starts_with('#') || display.starts_with("ansi:") {
+                        colors.text
+                    } else {
+                        colors.quiet_text
+                    })
+                    .child(Text::new_inaccessible(display.into())),
+            )
+            .child(
+                div()
+                    .font_family("Symbols Nerd Font Mono")
+                    .text_sm()
+                    .text_color(colors.quiet_text)
+                    .child(if open { "\u{f106}" } else { "\u{f107}" }),
+            )
+            .into_any_element()
+    }
+
+    fn render_color_menu(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let current = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let presets = self.render_color_presets(control, &current, cx);
+        let hue_steps = self.render_color_hue_steps(control, cx);
+        let palette = self.render_custom_color_palette(control, &current, cx);
+
+        let error = (self.edit_key() == Some(control.key.as_str()))
+            .then(|| self.edit_error.clone())
+            .flatten()
+            .map(|error| {
+                div()
+                    .id(("color-menu-error", key_hash(&control.key)))
+                    .role(Role::Alert)
+                    .aria_label(error.clone())
+                    .text_xs()
+                    .text_color(colors.error)
+                    .child(Text::new_inaccessible(error.into()))
+            });
+        let exact = self.render_inline_field(control, window, cx);
+
+        gpui::deferred(
+            gpui::anchored().snap_to_window_with_margin(px(12.0)).child(
+                div()
+                    .id(("color-menu", key_hash(&control.key)))
+                    .role(Role::Group)
+                    .aria_label(format!("{} colors", control.label))
+                    .w(px(COLOR_PICKER_WIDTH))
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(colors.strong_border)
+                    .bg(colors.menu_bg)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.quiet_text)
+                            .child("PRESETS"),
+                    )
+                    .child(div().flex().flex_wrap().gap_2().children(presets))
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.quiet_text)
+                            .child("CUSTOM"),
+                    )
+                    .child(div().flex().items_center().justify_between().children(hue_steps))
+                    .child(palette)
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_xs()
+                            .text_color(colors.quiet_text)
+                            .child("EXACT VALUE"),
+                    )
+                    .children(error)
+                    .child(exact),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    fn render_color_presets(
+        &self,
+        control: &Control,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let colors = self.colors;
+        COLOR_PRESETS
+            .into_iter()
+            .map(|(name, value)| {
+                let selected = current == value;
+                let key = control.key.clone();
+                let pointer_target = SettingsFocusTarget::Control(control.clone());
+                div()
+                    .id(("color-preset", key_hash(&format!("{}:{value}", control.key))))
+                    .role(Role::Image)
+                    .aria_label(format!("{name} preset swatch, {value}"))
+                    .size(px(32.0))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if selected { colors.accent } else { colors.strong_border })
+                    .bg(rgb(u32::from_str_radix(&value[1..], 16).unwrap_or_default()))
+                    .cursor_pointer()
+                    .hover(move |style| style.border_color(colors.text))
+                    .on_click(cx.listener(move |this, _, _window, ctx| {
+                        this.begin_pointer_interaction(&pointer_target);
+                        this.select_color(&key, value, ctx);
+                    }))
+                    .when(selected, |el| {
+                        el.child(
+                            div()
+                                .font_family("Symbols Nerd Font Mono")
+                                .text_xs()
+                                .text_color(colors.accent)
+                                .child("\u{f00c}"),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_color_hue_steps(
+        &self,
+        control: &Control,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let colors = self.colors;
+        (0..COLOR_HUE_STEPS)
+            .map(|index| {
+                let hue = f32::from(index) / f32::from(COLOR_HUE_STEPS);
+                let selected = (self.color_hue - hue).abs() < 0.04;
+                let pointer_target = SettingsFocusTarget::Control(control.clone());
+                div()
+                    .id(("color-hue", usize::from(index)))
+                    .role(Role::Image)
+                    .aria_label(format!("Hue {} degree swatch", index * 30))
+                    .w(px(17.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if selected { colors.accent } else { colors.strong_border })
+                    .bg(hsv_color(hue, 0.85, 0.9))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _window, ctx| {
+                        this.begin_pointer_interaction(&pointer_target);
+                        this.color_hue = hue;
+                        ctx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_custom_color_palette(
+        &self,
+        control: &Control,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let palette_bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let paint_bounds = Rc::clone(&palette_bounds);
+        let click_bounds = palette_bounds;
+        let hue = self.color_hue;
+        let key = control.key.clone();
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        div()
+            .id(("custom-color-palette", key_hash(&control.key)))
+            .role(Role::Image)
+            .aria_label(format!("{} custom color palette", control.label))
+            .aria_description("Pointer position chooses saturation and brightness; use the exact value field for keyboard entry")
+            .aria_value(current.to_owned())
+            .w_full()
+            .h(px(COLOR_PALETTE_HEIGHT))
+            .overflow_hidden()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(colors.strong_border)
+            .cursor_crosshair()
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                if let Some(bounds) = click_bounds.get()
+                    && let Some(value) = palette_color_at(event.position(), bounds, hue)
+                {
+                    this.select_color(&key, &value, ctx);
+                }
+            }))
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| paint_bounds.set(Some(bounds)),
+                    move |bounds, (), window, _cx| paint_color_palette(bounds, window, hue),
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// Render the shared inline editor for general free-text fields. Color
+    /// exact-value editing reuses this field inside its anchored palette.
     fn render_inline_edit(
         &self,
         control: &Control,
@@ -4249,6 +4678,29 @@ const CHOICE_MENU_LEAD: f32 = 90.0;
 /// has close to 190 entries.
 const CHOICE_MENU_MAX_HEIGHT: f32 = 360.0;
 
+/// Fixed, useful starting colors. The custom palette below covers arbitrary
+/// choices; these are the one-click path for common terminal roles.
+const COLOR_PRESETS: [(&str, &str); 12] = [
+    ("Black", "#000000"),
+    ("White", "#ffffff"),
+    ("Red", "#ef4444"),
+    ("Orange", "#f97316"),
+    ("Yellow", "#eab308"),
+    ("Green", "#22c55e"),
+    ("Teal", "#14b8a6"),
+    ("Cyan", "#06b6d4"),
+    ("Blue", "#3b82f6"),
+    ("Indigo", "#6366f1"),
+    ("Violet", "#a855f7"),
+    ("Pink", "#ec4899"),
+];
+
+const COLOR_PICKER_WIDTH: f32 = 280.0;
+const COLOR_PALETTE_HEIGHT: f32 = 120.0;
+const COLOR_PALETTE_COLUMNS: u16 = 32;
+const COLOR_PALETTE_ROWS: u16 = 16;
+const COLOR_HUE_STEPS: u16 = 12;
+
 /// Shared pending line for both keystore probes (the manual action and the
 /// toggle's gated ON transition), so the two surfaces say the same thing.
 const KEYSTORE_PENDING: &str = "Probing the OS keystore…";
@@ -4377,6 +4829,73 @@ fn color_swatch(config: &ScribeConfig, key: &str, value: &str) -> Option<[f32; 4
         return Some(color.resolve(&scribe_common::config::resolve_theme(config).ansi_colors));
     }
     scribe_common::theme::hex_to_rgba(value).ok()
+}
+
+fn adjacent_color_preset(current: &str, direction: f64) -> &'static str {
+    let index = COLOR_PRESETS.iter().position(|(_, value)| *value == current);
+    let next = if direction.is_sign_negative() {
+        index.map_or(COLOR_PRESETS.len() - 1, |index| {
+            (index + COLOR_PRESETS.len() - 1) % COLOR_PRESETS.len()
+        })
+    } else {
+        index.map_or(0, |index| (index + 1) % COLOR_PRESETS.len())
+    };
+    COLOR_PRESETS.get(next).or_else(|| COLOR_PRESETS.first()).map_or("", |preset| preset.1)
+}
+
+fn hsv_color(hue: f32, saturation: f32, value: f32) -> Rgba {
+    let hue = hue.rem_euclid(1.0);
+    let saturation = saturation.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let chroma = value * saturation;
+    let sector = hue * 6.0;
+    let secondary = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match sector.floor() {
+        sector if sector < 1.0 => (chroma, secondary, 0.0),
+        sector if sector < 2.0 => (secondary, chroma, 0.0),
+        sector if sector < 3.0 => (0.0, chroma, secondary),
+        sector if sector < 4.0 => (0.0, secondary, chroma),
+        sector if sector < 5.0 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let offset = value - chroma;
+    Rgba { r: red + offset, g: green + offset, b: blue + offset, a: 1.0 }
+}
+
+fn color_hex(color: Rgba) -> String {
+    scribe_common::theme::rgba_to_hex([color.r, color.g, color.b, color.a])
+}
+
+fn paint_color_palette(bounds: Bounds<Pixels>, window: &mut Window, hue: f32) {
+    let columns = f32::from(COLOR_PALETTE_COLUMNS);
+    let rows = f32::from(COLOR_PALETTE_ROWS);
+    let cell_width = f32::from(bounds.size.width) / columns;
+    let cell_height = f32::from(bounds.size.height) / rows;
+    for row in 0..COLOR_PALETTE_ROWS {
+        for column in 0..COLOR_PALETTE_COLUMNS {
+            let saturation = (f32::from(column) + 0.5) / columns;
+            let value = 1.0 - (f32::from(row) + 0.5) / rows;
+            let cell = Bounds {
+                origin: point(
+                    bounds.origin.x + px(f32::from(column) * cell_width),
+                    bounds.origin.y + px(f32::from(row) * cell_height),
+                ),
+                size: size(px(cell_width + 0.5), px(cell_height + 0.5)),
+            };
+            window.paint_quad(fill(cell, hsv_color(hue, saturation, value)));
+        }
+    }
+}
+
+fn palette_color_at(position: Point<Pixels>, bounds: Bounds<Pixels>, hue: f32) -> Option<String> {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let saturation = (f32::from(position.x - bounds.origin.x) / width).clamp(0.0, 1.0);
+    let value = (1.0 - f32::from(position.y - bounds.origin.y) / height).clamp(0.0, 1.0);
+    Some(color_hex(hsv_color(hue, saturation, value)))
 }
 
 fn workspace_root_controls_match_query(query: &str) -> bool {
@@ -5103,15 +5622,16 @@ fn logical_i32(value: i32) -> f32 {
 mod tests {
     use super::{
         NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH, ScrollMetrics,
-        ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, canonical_combo, combo_for_capture,
-        conflicting_action, content_scroll_offset, focus_targets_match, inline_commit_value,
-        inline_placeholder, is_modifier_key, key_combo_text, offset_from_drag,
-        offset_from_track_click, px, release_inline_input, revert_inline_input,
-        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
-        workspace_root_controls_match_query, workspace_root_focus_index,
-        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
+        ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
+        canonical_combo, combo_for_capture, conflicting_action, content_scroll_offset,
+        focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
+        key_combo_text, offset_from_drag, offset_from_track_click, palette_color_at, px,
+        release_inline_input, revert_inline_input, search_display_text, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
+        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
+        workspace_roots_match_query,
     };
-    use gpui::{Keystroke, Modifiers};
+    use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig};
 
     fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
@@ -5333,6 +5853,27 @@ mod tests {
         );
         assert_eq!(inline_placeholder("appearance.font_family", false), "Not set");
         assert_eq!(inline_placeholder("theme.background", true), "#rrggbb");
+    }
+
+    // @lat: [[test#GPUI Settings Window#Color selector palette]]
+    #[test]
+    fn custom_palette_maps_clickable_interior_points_to_canonical_colors() {
+        let bounds = Bounds { origin: point(px(10.0), px(20.0)), size: size(px(200.0), px(100.0)) };
+
+        assert_eq!(
+            palette_color_at(point(px(110.0), px(70.0)), bounds, 0.0).as_deref(),
+            Some("#804040")
+        );
+        assert_eq!(
+            palette_color_at(point(px(209.0), px(21.0)), bounds, 0.0).as_deref(),
+            Some("#fc0101")
+        );
+        assert_eq!(
+            palette_color_at(point(px(209.0), px(21.0)), bounds, 1.0 / 3.0).as_deref(),
+            Some("#01fc01")
+        );
+        assert_eq!(adjacent_color_preset("#000000", 1.0), "#ffffff");
+        assert_eq!(adjacent_color_preset("#000000", -1.0), "#ec4899");
     }
 
     // @lat: [[settings#GPUI Settings Window#Inline editing#Escape cancels the edit]]

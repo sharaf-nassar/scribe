@@ -20,8 +20,9 @@
 #     the corrected root, removes it again, and reloads the server after both
 #     valid mutations; the native chooser maps and cancellation leaves config
 #     unchanged;
-#   * Badge color 1 rejects invalid RGB text without changing config, saves a
-#     canonical RGB value live, and Reset restores the default palette;
+#   * Badge color 1 opens the native preset/custom palette, applies a preset,
+#     rejects invalid exact text, saves canonical RGB live, and Reset restores
+#     the default palette;
 #   * pressing it again from the terminal window raises the SAME window: the
 #     count stays at one and the client logs "focused the open settings window",
 #     the line only the retained `WindowHandle` path writes;
@@ -78,6 +79,12 @@ SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}
 # 14px inter-group gap: 38+42+14+28+32+14+28+16 = 212.
 FILTERED_WORKSPACES_X=140
 FILTERED_WORKSPACES_Y=212
+# Fixed 1040×720 composition: the tall color picker snaps inside the right and
+# bottom edges. These points land on its green hue swatch and custom palette.
+COLOR_PICKER_HUE_X=865
+COLOR_PICKER_HUE_Y=513
+COLOR_PICKER_PALETTE_X=930
+COLOR_PICKER_PALETTE_Y=575
 
 TERM_X=0
 TERM_Y=0
@@ -241,6 +248,19 @@ click_filtered_workspaces() {
     sleep 0.6
 }
 
+click_settings_at() {
+    local relative_x="$1" relative_y="$2" wid info x y
+    wid=$(list_settings_windows | tail -1)
+    [ -z "$wid" ] && fail "PHASE 2 FAIL: no settings window for picker click"
+    info=$(xwininfo -id "$wid")
+    x=$(printf '%s\n' "$info" | awk '/Absolute upper-left X/ { print $4 }')
+    y=$(printf '%s\n' "$info" | awk '/Absolute upper-left Y/ { print $4 }')
+    xdotool mousemove "$(( x + relative_x ))" "$(( y + relative_y ))"
+    sleep 0.3
+    xdotool click 1
+    sleep 0.6
+}
+
 assert_workspace_roots() {
     python3 - "$CONFIG_FILE" "$@" <<'PY'
 import sys
@@ -367,7 +387,6 @@ if ! assert_workspace_roots; then
 fi
 DEFAULT_BADGE_COLORS=$(workspace_badge_colors default)
 ORIGINAL_BADGE_COLORS=$(workspace_badge_colors read)
-ORIGINAL_BADGE_COLOR_1=$(workspace_badge_colors first)
 if [ "$ORIGINAL_BADGE_COLORS" != "$DEFAULT_BADGE_COLORS" ]; then
     fail "PHASE 0 FAIL: settings-entry fixture did not start with the default badge palette"
 fi
@@ -492,14 +511,53 @@ send_keys Down
 send_keys Down
 send_keys Down
 
+send_keys Return
+shot /output/02-badge-color-picker.png
+RELOADS_BEFORE=$(count_server_reloads)
+send_keys Right
+if ! workspace_badge_colors assert-first "#000000"; then
+    fail "PHASE 2 FAIL: Badge color 1 preset did not apply live"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: Badge color 1 preset triggered no server live reload"
+fi
+shot /output/02-badge-color-preset.png
+
+RELOADS_BEFORE=$(count_server_reloads)
+click_settings_at "$COLOR_PICKER_HUE_X" "$COLOR_PICKER_HUE_Y"
+click_settings_at "$COLOR_PICKER_PALETTE_X" "$COLOR_PICKER_PALETTE_Y"
+CUSTOM_BADGE_COLOR=$(workspace_badge_colors first)
+if [ "$CUSTOM_BADGE_COLOR" = "#000000" ] \
+    || ! printf '%s\n' "$CUSTOM_BADGE_COLOR" | grep -Eq '^#[0-9a-f]{6}$'; then
+    fail "PHASE 2 FAIL: custom palette produced invalid color $CUSTOM_BADGE_COLOR"
+fi
+if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
+    fail "PHASE 2 FAIL: custom palette selection triggered no server live reload"
+fi
+shot /output/02-badge-color-custom.png
+
+# Tab enters the palette's exact-value field without adding another semantic
+# row stop. Validation remains available for hand-authored hex and ansi:N.
+send_keys Tab
 send_keys ctrl+a
 type_text "not-a-color"
 send_keys Return
-if ! workspace_badge_colors assert "$ORIGINAL_BADGE_COLORS"; then
+if ! workspace_badge_colors assert-first "$CUSTOM_BADGE_COLOR"; then
     fail "PHASE 2 FAIL: invalid badge color changed the configured palette"
 fi
 shot /output/02-badge-color-invalid.png
 
+# Escape abandons exact entry and closes the picker; reopen it before entering
+# the corrected value so keyboard focus cannot remain trapped in hidden chrome.
+send_keys Escape
+shot /output/02-badge-color-escape.png
+click_filtered_workspaces
+send_keys Down
+send_keys Down
+send_keys Down
+send_keys Down
+send_keys Return
+send_keys Tab
 send_keys ctrl+a
 type_text "112233"
 RELOADS_BEFORE=$(count_server_reloads)
@@ -511,6 +569,8 @@ if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
     fail "PHASE 2 FAIL: saving Badge color 1 triggered no server live reload"
 fi
 shot /output/02-badge-color-saved.png
+send_keys Tab
+shot /output/02-badge-color-tab-closed.png
 
 # Exactly 12 Down stops: root input + Browse + Add + 8 colors + Reset.
 click_filtered_workspaces
@@ -526,7 +586,7 @@ if ! wait_for_server_reload_growth "$RELOADS_BEFORE" 15; then
     fail "PHASE 2 FAIL: resetting badge colors triggered no server live reload"
 fi
 shot /output/02-badge-colors-reset.png
-echo "PHASE 2 PASS: Badge color 1 changed from $ORIGINAL_BADGE_COLOR_1 to #112233, then Reset restored defaults"
+echo "PHASE 2 PASS: Badge color 1 applied preset and custom colors, canonicalized #112233, then Reset restored defaults"
 
 # ── Phase 3: the chord again raises it, never duplicates it ───────
 # The retained `WindowHandle` is the deduplication. A second open would leave
@@ -595,8 +655,13 @@ echo "    02-workspace-added.png        — corrected root rendered from config"
 echo "    02-workspace-removed.png      — root removed through keyboard traversal"
 echo "    02-workspace-chooser.png      — native portal directory chooser"
 echo "    02-workspace-chooser-cancelled.png — cancellation left roots unchanged"
+echo "    02-badge-color-picker.png     — preset and custom palette opened"
+echo "    02-badge-color-preset.png     — keyboard preset applied live"
+echo "    02-badge-color-custom.png     — pointer hue and palette applied live"
 echo "    02-badge-color-invalid.png    — invalid RGB retained with inline error"
+echo "    02-badge-color-escape.png     — Escape closed exact entry and picker"
 echo "    02-badge-color-saved.png      — canonical #112233 editor and swatch"
+echo "    02-badge-color-tab-closed.png — Tab left exact entry and closed picker"
 echo "    02-badge-colors-reset.png     — eight default badge colors restored"
 echo "    03-settings-refocused.png     — the same window raised, not duplicated"
 echo "    04-palette-open-settings.png  — palette filtered to 'Open Settings'"

@@ -91,9 +91,10 @@ The shared `release.sh` wrapper keeps release-note generation noninteractive so 
 
 The release matrix builds the GPUI client on Apple Silicon and Intel macOS
 runners. Each macOS job stages the GPUI executable with its server and
-helpers, produces a DMG, signs it, submits it for notarization, staples the
-accepted ticket, then minisigns the release artifact. Linux `.deb` releases
-continue through the same artifact and publish path.
+helpers, signs the app bundle, creates its DMG once, submits it for
+notarization, staples the accepted ticket, then minisigns the release
+artifact. Linux `.deb` releases continue through the same artifact and
+publish path.
 
 Release CI disables `Swatinem/rust-cache` caching for `~/.cargo/bin` and uses a cache prefix that excludes older bin-cached archives. This prevents restored caches from replacing the runner's `cargo` shim with unrelated binaries before the release build starts.
 

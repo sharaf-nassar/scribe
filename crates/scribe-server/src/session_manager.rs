@@ -203,11 +203,13 @@ pub struct ManagedSession {
     /// Latest known terminal cell size in pixels for PTY winsize replies.
     pub cell_width: u16,
     pub cell_height: u16,
+    /// Stable env-envelope owner carried by handoff. `None` for fresh sessions
+    /// and older handoffs; `start_session` then uses its existing window id.
+    pub env_window_id: Option<WindowId>,
     /// Launch-record id (== env-envelope id) used to name this session's
     /// encrypted env envelope on disk. `Some` for cold-restart replays that
-    /// re-issued a `LaunchRecord` via `CreateSession.env_envelope_id`; `None`
-    /// for fresh first-time creations and for handoff-restored sessions
-    /// (handoff keeps env on the existing PTY, no envelope handoff).
+    /// re-issued a `LaunchRecord` via `CreateSession.env_envelope_id`, and for
+    /// handoff-restored sessions whose predecessor already had an envelope.
     ///
     /// Captured so the clean-close path in `ipc_server::handle_close_session`
     /// can find and delete the matching `<state_dir>/restore/env/<window_id>/
@@ -279,9 +281,8 @@ fn restored_managed_session(
         prompt_state: handoff_session.prompt_state.clone(),
         cell_width: handoff_session.cell_width.max(1),
         cell_height: handoff_session.cell_height.max(1),
-        // Handoff keeps env on the existing PTY; no envelope is written for
-        // handoff-restored sessions, so close-time delete has nothing to do.
-        env_envelope_id: None,
+        env_window_id: handoff_session.env_window_id,
+        env_envelope_id: handoff_session.env_envelope_id.clone(),
         image_state: handoff_session.image_state.clone().map(Box::new),
     }
 }
@@ -407,6 +408,7 @@ impl PreparedSessionLaunch {
             prompt_state: None,
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
+            env_window_id: None,
             env_envelope_id: self.env_envelope_id,
             image_state: None,
         })
@@ -1364,6 +1366,8 @@ mod tests_session_cap {
                 ai_state: None,
                 ai_provider_hint: None,
                 prompt_state: None,
+                env_window_id: None,
+                env_envelope_id: None,
                 image_state: None,
             });
             masters.push(pty.master);

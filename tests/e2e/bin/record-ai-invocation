@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+record=${SCRIBE_AI_STUB_RECORD:?SCRIBE_AI_STUB_RECORD is required}
+{
+    printf '%s\n' BEGIN
+    printf 'SESSION=%s\n' "${SCRIBE_SESSION_ID:-}"
+    for argument do
+        printf 'ARG=%s\n' "$argument"
+    done
+    printf '%s\n' END
+} >> "$record"
+
+trap 'exit 0' HUP INT TERM
+while :; do
+    sleep 1
+done

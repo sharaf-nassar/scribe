@@ -510,6 +510,11 @@ e2e-visual-server-upgrade-reattach:
 e2e-visual-codex-reattach:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/codex-reattach-size.sh
 
+# Run the targeted Codex resume oracle through server upgrade, warm client
+# reattach, and cold replay. A blocking stub records exact provider argv.
+e2e-visual-codex-targeted-resume:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -e SCRIBE_AI_STUB_RECORD=/output/codex-targeted-resume.invocations -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/codex-targeted-resume.sh
+
 # Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
 # and exports XMODIFIERS before the client launches, so a real input method
 # owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the
@@ -582,6 +587,7 @@ e2e-all-visual: build-release docker-visual
         'visual/bell.sh|e2e-visual-bell'
         'visual/clipboard-osc52.sh|e2e-visual-clipboard'
         'visual/codex-reattach-size.sh|e2e-visual-codex-reattach'
+        'visual/codex-targeted-resume.sh|e2e-visual-codex-targeted-resume'
         'visual/cold-restart.sh|e2e-visual-cold-restart'
         'visual/color-emoji.sh|e2e-visual-shared'
         'visual/config-reload.sh|e2e-visual'

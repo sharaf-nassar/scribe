@@ -1247,6 +1247,10 @@ pub fn from_epoch_secs(secs: Option<u64>) -> Option<SystemTime> {
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
+    /// Stable launch/environment-envelope identity for local client restore.
+    /// Omitted for remote clients and payloads from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     /// Basename of the session shell or command entrypoint.
     pub shell_name: String,
     /// Last-known terminal title (from OSC 0/2). `None` before first title event.
@@ -1535,6 +1539,34 @@ mod tests {
             command: Option<Vec<String>>,
             env_envelope_id: Option<String>,
         },
+    }
+
+    #[derive(Serialize)]
+    struct SessionInfoWithoutLaunchIdentity {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        shell_name: String,
+        title: Option<String>,
+        cwd: Option<PathBuf>,
+    }
+
+    // @lat: [[protocol#Server Messages#Launch identity is local-only]]
+    #[test]
+    fn session_info_launch_identity_is_additive_and_omitted_when_absent() {
+        let legacy = SessionInfoWithoutLaunchIdentity {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            shell_name: "bash".to_owned(),
+            title: None,
+            cwd: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).expect("serialize legacy SessionInfo");
+        let decoded: SessionInfo =
+            rmp_serde::from_slice(&bytes).expect("decode legacy SessionInfo");
+        assert!(decoded.launch_id.is_none());
+
+        let redacted = rmp_serde::to_vec_named(&decoded).expect("serialize redacted SessionInfo");
+        assert!(!redacted.windows(b"launch_id".len()).any(|key| key == b"launch_id"));
     }
 
     fn sample_release() -> Release {

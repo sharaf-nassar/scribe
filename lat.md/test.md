@@ -1543,6 +1543,12 @@ It runs on the [[test#Visual E2E Tests#Shared-pane rig|shared-pane rig]] so `$SE
 
 Two things it deliberately does not prove. There is no Codex binary in the image, so the provider is faked through the hook channel exactly as `tests/e2e/func/ai-context-thresholds.sh` fakes it and no Ink process is ever asked to repaint. And the oracle is the log rather than the recording wire tap: the tap moves `server.sock` aside to interpose itself while a handed-off server binds that same fixed path, so the tap and an upgrade cannot coexist.
 
+### Codex metadata survives update and cold replay
+
+`tests/e2e/visual/codex-targeted-resume.sh` (`just e2e-visual-codex-targeted-resume`) proves a real client retains exact Codex launch metadata across update, warm reattach, and cold replay.
+
+The client first opens generic Codex resume through Ctrl+Alt+E, then a real hook event supplies the conversation id. After production server handoff, a fresh client reattaches to the retained PTY and must rewrite the snapshot with the same launch id, provider, resume mode, and conversation id. A cold server restart leaves the snapshot as the only launch intent; the opt-in recording stub must receive exactly `codex resume <conversation-id>`, not a shell or generic picker.
+
 ### Color emoji renders in color
 
 `tests/e2e/visual/color-emoji.sh` proves color emoji render in color rather than as monochrome/tinted glyphs — the US3 headline parity item promoted to an automated visual check.
@@ -1577,7 +1583,7 @@ The live regression keeps rejected input editable, proves typed roots persist an
 
 #### Workspace badge colors edit and reset live
 
-The settings regression rejects invalid RGB without changing config, saves canonical `#rrggbb` live, and restores the eight-colour default palette through keyboard Reset.
+The settings regression opens the selector, applies a keyboard preset and a pointer hue/custom-palette color, rejects invalid exact RGB, proves Escape and Tab close exact entry, saves canonical `#rrggbb` live, and restores defaults.
 
 ### Keybindings record from the keyboard
 
@@ -2589,6 +2595,20 @@ A socket file that exists but refuses connections is reported as a stale socket 
 ### Other connect failures keep the OS error
 
 Permission denied gets its own sentence, and any other `io::Error` is passed through verbatim so an unanticipated failure is not mislabelled as one of the two known shapes.
+
+## Server handoff
+
+Unit coverage for the socket takeover an upgrade receiver performs against the still-serving old server, proving the mechanism over a real bound socket without a live handoff peer.
+
+### Upgrade takeover replaces a live socket
+
+Upgrade mode clears stale staging, replaces a live socket without a singleton lock, leaves no staging file, and routes new connections only to the successor via [[crates/scribe-server/src/ipc_server.rs#acquire_server_socket]].
+
+The test proves the takeover mechanism, not the absence of a gap: the rename is atomic by construction, so no observer inside one process can catch the path missing. What it locks in is that the receiver never has to unbind the old server first, which is what made the old `remove_file` + `bind` pair look acceptable.
+
+### Environment identity survives handoff
+
+Named serialization, restore, activation, and re-export preserve each session's environment window and envelope ids so the successor can delete the original envelope on clean close.
 
 ## macOS updater bundle swap
 
@@ -3749,6 +3769,10 @@ Unit tests for the GPUI settings window that replaces the deleted `scribe-settin
 ### Per-page parity checklist
 
 Every page in  exposes controls, and every config-backed control routes cleanly through the ported  with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
+
+### Color selector palette
+
+The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.
 
 ### Keybinding coverage
 

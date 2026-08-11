@@ -26,6 +26,8 @@ use scribe_common::{
 /// a session context, and a branch only exists inside a git worktree.
 #[derive(Debug, Clone, Default)]
 pub struct SessionChrome {
+    /// Stable local launch/environment-envelope identity from `SessionList`.
+    pub launch_id: Option<String>,
     /// Working directory from OSC 7 (`CwdChanged`).
     pub cwd: Option<PathBuf>,
     /// Git branch the server detected for `cwd` (`GitBranch`). `None` outside a
@@ -161,6 +163,9 @@ impl ChromeMetadata {
         self.sessions.retain(|id, _| sessions.iter().any(|info| info.session_id == *id));
         for info in sessions {
             let entry = self.sessions.entry(info.session_id).or_default();
+            if let Some(launch_id) = info.launch_id.clone() {
+                entry.launch_id = Some(launch_id);
+            }
             // The list carries a snapshot, not a transition: only overwrite a
             // field the server actually knows a value for, so a live update
             // that raced ahead of the list is not rolled back to `None`.

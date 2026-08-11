@@ -487,6 +487,7 @@ mod tests {
         SessionInfo {
             session_id: SessionId::new(),
             workspace_id,
+            launch_id: None,
             shell_name: "zsh".to_owned(),
             title: None,
             icon_title: None,

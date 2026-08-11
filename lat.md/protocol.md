@@ -168,6 +168,12 @@ All three variants honour the attach-time `clipboard_gating` negotiation: the se
 
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries independent window and icon titles, active AI state, AI provider hint, provider task label, shell basename, session context, CWD, and detected git branch — enough to restore tab ownership and status chrome without post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 
+### Launch identity is local-only
+
+`SessionInfo.launch_id` is a local-only restore selector and is absent from remote/shared session lists.
+
+The server returns it only when the requesting window owns the environment envelope, and remote session creation remains controller-gated, so a viewer cannot read or replay another window's environment. Older payloads default the additive field to none.
+
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
 
 ### Automation

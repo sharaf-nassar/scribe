@@ -101,7 +101,7 @@ sign_code "${APP_BUNDLE}"
 echo "==> Verifying .app signature..."
 codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
 
-echo "==> Re-creating DMG from signed .app..."
+echo "==> Creating DMG from signed .app..."
 DMG_STAGING="${STAGING_DIR}/dmg-contents"
 rm -rf "${DMG_STAGING}"
 mkdir -p "${DMG_STAGING}"

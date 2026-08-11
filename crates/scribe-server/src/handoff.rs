@@ -52,11 +52,11 @@ use unix_ancillary::{AncillaryData, SocketAncillary};
 use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::app::current_identity;
 use scribe_common::error::ScribeError;
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
-use scribe_common::socket::{current_uid, handoff_socket_path};
+use scribe_common::socket::{current_uid, handoff_socket_path, server_socket_path};
 
 pub use crate::workspace_manager::HandoffWindowState;
 
@@ -240,6 +240,13 @@ pub struct HandoffSession {
     /// first prompt after the upgrade rebuilds the history.
     #[serde(default)]
     pub prompt_state: Option<scribe_common::protocol::SessionPromptState>,
+    /// Stable owner and envelope coordinates used by env persistence cleanup.
+    /// Older senders omit both, so restore falls back to workspace membership
+    /// for the window and keeps the previous no-envelope behavior.
+    #[serde(default)]
+    pub env_window_id: Option<WindowId>,
+    #[serde(default)]
+    pub env_envelope_id: Option<String>,
     /// Committed image scene, paused framing, and any in-flight chunked
     /// transfer (spec 020). `#[serde(default)]` so a pre-image sender restores
     /// as a session with an empty scene rather than failing to decode.
@@ -248,8 +255,8 @@ pub struct HandoffSession {
     /// lifts the payload to v7 and blocks a rollback that would drop it.
     ///
     /// `skip_serializing_if` matters as much as `default`: an image-free
-    /// payload must be byte-identical to one a pre-image server produced, or
-    /// "images off" would still ship a key an old receiver never expected.
+    /// payload must omit this key, or an old receiver would silently discard
+    /// image state while accepting the payload as compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_state: Option<crate::terminal_image_handoff::SessionImageHandoff>,
 }
@@ -719,9 +726,12 @@ fn read_ack(fd: RawFd) -> Result<(), ScribeError> {
 
 /// Connect to the old server's handoff socket and receive state + fds.
 ///
-/// Returns the deserialised state and the received PTY master fds (in the
-/// same order as `state.sessions`).
-pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
+/// Returns the deserialised state, the received PTY master fds (in the same
+/// order as `state.sessions`), and the IPC listener this receiver took over
+/// from the old server — see the ACK ordering note below for why the socket is
+/// claimed here rather than after the caller has rebuilt its sessions.
+pub fn receive_handoff()
+-> Result<(HandoffState, Vec<OwnedFd>, tokio::net::UnixListener), ScribeError> {
     let path = handoff_socket_path();
 
     let sock_fd = socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None)
@@ -782,10 +792,32 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
 
     info!(count = fds.len(), "received PTY fds via SCM_RIGHTS");
 
+    // Take over the IPC socket BEFORE acknowledging, because the ACK is what
+    // tells the old server to exit. Claiming it afterwards — once the caller
+    // has rebuilt every session — leaves the path pointing at a dead server for
+    // as long as restoration takes, which is proportional to session count. The
+    // client polls its lost connection every `SERVER_RETRY_INTERVAL` (100 ms)
+    // and cold-starts a stateless server on the first refusal, so a large
+    // enough session set made that race a guaranteed loss of the whole handoff.
+    //
+    // Failing here aborts with the ACK unsent: `wait_for_successful_handoff`
+    // loops back and the old server keeps serving every session, instead of
+    // exiting into a takeover that never completed.
+    //
+    // ponytail: bind and ACK cannot be made one atomic step, so a receiver
+    // killed between them leaves the old server alive and serving its existing
+    // connections on a path that now names this dead inode. Reaching it needs
+    // abrupt receiver death inside a two-syscall window; the alternative
+    // ordering (ACK, then rename) needs only ordinary preemption to strand the
+    // path, which is the far likelier failure. Closing it outright means
+    // teaching the old server to rebind and swap the listener inside
+    // `run_server_loop`'s select — worth doing only if this is ever observed.
+    let (_lock, listener) = crate::ipc_server::acquire_server_socket(&server_socket_path(), true)?;
+
     // Send ACK.
     send_ack(fd)?;
 
-    Ok((state, fds))
+    Ok((state, fds, listener))
 }
 
 /// Send the upgrade request magic bytes.

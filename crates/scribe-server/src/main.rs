@@ -201,7 +201,12 @@ async fn run_normal_server() -> Result<(), ScribeError> {
     };
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::new(cfg.workspace_roots)));
-    run_server_loop(session_manager, workspace_manager, false, cfg.update).await
+
+    // Acquire the server socket with singleton enforcement. The lock guard must
+    // live until the server shuts down to hold the advisory flock.
+    let (lock_guard, listener) = ipc_server::acquire_server_socket(&server_socket_path(), false)?;
+
+    run_server_loop(session_manager, workspace_manager, lock_guard, listener, cfg.update).await
 }
 
 /// Upgrade receiver mode: connect to old server, receive handoff, then serve.
@@ -219,8 +224,11 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     // just read, before restoring any handed-off session state.
     terminal_image_sharing::set_images_master_enabled(cfg.images_enabled);
 
-    // Receive handoff from the old server (blocking until complete).
-    let (state, fds) = handoff::receive_handoff()?;
+    // Receive handoff from the old server (blocking until complete). The IPC
+    // socket comes back already claimed: `receive_handoff` takes it before it
+    // acknowledges, so the path never points at a server that has exited while
+    // the sessions below are still being rebuilt.
+    let (state, fds, listener) = handoff::receive_handoff()?;
 
     info!(
         sessions = state.sessions.len(),
@@ -247,37 +255,33 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
             &live_sessions,
         )));
 
-    info!("session restoration complete — starting IPC server");
+    info!("session restoration complete — accepting connections");
 
-    run_server_loop(session_manager, workspace_manager, true, cfg.update).await
+    run_server_loop(session_manager, workspace_manager, None, listener, cfg.update).await
 }
 
 /// Run the IPC server, handoff listener, and signal handler concurrently.
 ///
 /// Shared between normal and upgrade startup paths. Cleans up the IPC socket
-/// on exit. `upgrade_mode` is forwarded to the socket acquisition logic so
-/// that upgrade receivers skip the singleton lock (the old server holds it).
+/// on exit. Both the singleton lock guard and the listener are acquired by the
+/// caller: the normal path binds before this call, and the upgrade path binds
+/// inside the handoff, before it acknowledges. `_lock_guard` must live until
+/// the server shuts down to hold the advisory flock; it is `None` for an
+/// upgrade receiver, where the old server owns the lock until it exits.
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
-    upgrade_mode: bool,
+    _lock_guard: ipc_server::ServerLock,
+    listener: tokio::net::UnixListener,
     update_config: UpdateConfig,
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
 
-    // Acquire the server socket with singleton enforcement. The lock guard
-    // must live until the server shuts down to hold the advisory flock.
-    let (_lock_guard, listener) = ipc_server::acquire_server_socket(&path, upgrade_mode)?;
-
-    // Emit the bind-ready signal as soon as the socket is acquired. The
-    // Debian postinst watchdog greps the upgrade log for this exact string
-    // and counts it as "new server is reachable". Logging it here, before
-    // session activation, guarantees the watchdog never times out on the
-    // per-session restore work that follows. Queued client connections sit
-    // in the kernel backlog until `start_ipc_server` begins accepting.
-    info!("IPC server listening");
+    // The socket is already bound; queued client connections sit in the kernel
+    // backlog until `start_ipc_server` begins accepting below, so nothing here
+    // can present a connectable-but-dead socket to a client.
 
     // Activate sessions restored from a hot-reload handoff. Moves them from
     // SessionManager into the live registry and starts their PTY reader tasks
@@ -346,6 +350,12 @@ async fn run_server_loop(
     // listener live on every `ConfigReloaded`. Spawned, not awaited, so a wedged
     // tailscaled cannot delay local serving; the server is never restarted.
     tokio::spawn(ipc_server::remote_supervisor(Arc::clone(&remote_control), server_state.clone()));
+
+    // Debian postinst treats this exact line as successful hot-reload. Emit it
+    // only after handoff restoration and session activation have succeeded,
+    // immediately before the already-bound listener starts accepting. Normal
+    // startup reaches the same readiness point through this shared path.
+    info!("IPC server listening");
 
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(listener, server_state) => {
