@@ -29,6 +29,19 @@ use x11rb::rust_connection::RustConnection;
 /// Debounce window after the compositor overlay dismisses.
 pub const REACTIVATION_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Whether a confirmed X11 active-window observation should repair a missed
+/// platform activation callback.
+///
+/// Inactive and failed observations never blur the window: compositor overlays
+/// intentionally use the guard only to suppress input.
+#[must_use]
+pub const fn should_reconcile_window_activation(
+    window_active: bool,
+    x11_active: Option<bool>,
+) -> bool {
+    !window_active && matches!(x11_active, Some(true))
+}
+
 /// Extract the X11 window id from a GPUI window (or any `HasWindowHandle`).
 ///
 /// Returns `None` on Wayland, macOS, or any backend that does not expose an
@@ -182,13 +195,19 @@ impl X11FocusGuard {
     /// Refresh cached state by querying `_NET_ACTIVE_WINDOW`.
     ///
     /// Call from a periodic callback so the guard has an up-to-date picture of
-    /// whether a compositor overlay is active. Does not itself suppress input.
-    pub fn poll(&mut self) {
+    /// whether a compositor overlay is active. Returns the confirmed state so
+    /// the client can repair a missed activation callback; X11 errors stay
+    /// unknown and must not synthesize a focus transition.
+    pub fn poll(&mut self) -> Option<bool> {
         #[cfg(target_os = "linux")]
-        if self.query_is_active() {
-            self.debounce.note_active(Instant::now());
-        } else {
-            self.debounce.note_inactive();
+        {
+            let is_active = self.query_is_active()?;
+            if is_active {
+                self.debounce.note_active(Instant::now());
+            } else {
+                self.debounce.note_inactive();
+            }
+            Some(is_active)
         }
         #[cfg(not(target_os = "linux"))]
         match self.never {}
@@ -211,38 +230,38 @@ impl X11FocusGuard {
 
         #[cfg(target_os = "linux")]
         {
-            let is_active = self.query_is_active();
+            // A transient X11 error must not wedge input.
+            let is_active = self.query_is_active().unwrap_or(true);
             self.debounce.observe(is_active, Instant::now())
         }
     }
 
     /// Query `_NET_ACTIVE_WINDOW` and return whether it matches our window.
-    /// Assumes active on any X11 error so a transient failure never wedges
-    /// input.
     #[cfg(target_os = "linux")]
-    fn query_is_active(&self) -> bool {
-        let Ok(cookie) = self.conn.get_property(
-            false,
-            self.root,
-            self.net_active_window,
-            AtomEnum::WINDOW,
-            0,
-            1,
-        ) else {
-            return true;
-        };
+    fn query_is_active(&self) -> Option<bool> {
+        let reply = self
+            .conn
+            .get_property(false, self.root, self.net_active_window, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
 
-        let Ok(reply) = cookie.reply() else {
-            return true;
-        };
-
-        reply.value32().and_then(|mut iter| iter.next()) == Some(self.our_window)
+        Some(reply.value32().and_then(|mut iter| iter.next()) == Some(self.our_window))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // @lat: [[test#X11 focus guard#Only confirmed activation repairs lifecycle]]
+    #[test]
+    fn only_confirmed_activation_repairs_lifecycle() {
+        assert!(should_reconcile_window_activation(false, Some(true)));
+        assert!(!should_reconcile_window_activation(true, Some(true)));
+        assert!(!should_reconcile_window_activation(false, Some(false)));
+        assert!(!should_reconcile_window_activation(false, None));
+    }
 
     // @lat: [[test#X11 focus guard#Inactive window suppresses input]]
     #[test]

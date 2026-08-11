@@ -49,12 +49,19 @@ set -e
 
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+FOCUS_PROBE=/tmp/window-lifecycle-focus-probe.py
+FOCUS_PROBE_PREFIX=/tmp/window-lifecycle-focus-probe
+FOCUS_PROBE_LOG=/output/window-lifecycle-focus-probe.log
 SESSION=""
 
 fail() {
     echo "FAIL: $1" >&2
     echo "--- client log tail ---" >&2
     tail -40 "$CLIENT_LOG" >&2 || true
+    if [ -f "$FOCUS_PROBE_LOG" ]; then
+        echo "--- focus probe log ---" >&2
+        cat "$FOCUS_PROBE_LOG" >&2 || true
+    fi
     exit 1
 }
 
@@ -213,11 +220,8 @@ focus_window() {
     sleep 0.8
 }
 
-# Wait until `$2...` succeeds against the current Scribe window set, or give up
-# after `$1` seconds. The set is the only thing either window phase waits on, so
-# both the "a second one opened" and the "that one is gone" waits are this loop
-# with a different test.
-wait_for_windows() {
+# Wait until `$2...` succeeds, or give up after `$1` seconds.
+wait_until() {
     local timeout_secs="$1" started
     shift
     started=$(date +%s)
@@ -232,6 +236,36 @@ wait_for_windows() {
 
 window_count_is() { [ "$(scribe_windows | wc -l)" -eq "$1" ]; }
 window_is_gone() { ! scribe_windows | grep -qx "$1"; }
+window_is_active() { [ "$(xdotool getactivewindow 2>/dev/null)" = "$1" ]; }
+
+# Whether the server has relayed a byte sequence from this session. Joining
+# adjacent PtyOutput chunks keeps the check stable when one PTY write is split.
+server_output_contains() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+
+path, session, wanted = sys.argv[1], sys.argv[2], bytes.fromhex(sys.argv[3])
+output = bytearray()
+try:
+    handle = open(path)
+except OSError:
+    sys.exit(1)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if (
+            row.get("dir") == "server"
+            and message.get("type") == "PtyOutput"
+            and str(message.get("session_id")) == session
+        ):
+            output.extend(message.get("data") or [])
+sys.exit(wanted not in output)
+PY
+}
 
 focus() {
     local wid
@@ -301,6 +335,98 @@ launch_client() {
     scribe-client >>"$CLIENT_LOG" 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2
+}
+
+# Write the bounded raw-PTY stand-in used for Claude Code 2.1.228's focus-mode
+# suspend/restore sequence. State files synchronize the X11 driver without
+# reading the PTY while focus reporting is suspended.
+write_focus_probe() {
+    cat >"$FOCUS_PROBE" <<'PY'
+import os
+import select
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+PREFIX = Path("/tmp/window-lifecycle-focus-probe")
+TRACE = Path("/output/window-lifecycle-focus-probe.log")
+INITIAL = b"\x1b[?1049h\x1b[?25l\x1b[?1004h"
+SUSPEND = (
+    b"\x1b[<u\x1b[>4m\x1b[?1049h\x1b[?1004l\x1b[?2004l"
+    b"\x1b[?2031l\x1b[0m\x1b[?25h\x1b[2J\x1b[H"
+)
+RESTORE = (
+    b"\x1b[?1049l\x1b[?25l\x1b[<u\x1b[>4m\x1b[?1004h"
+    b"\x1b[?2004h\x1b[?2031h"
+)
+RESET = b"\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?25h\x1b[0m"
+
+
+def marker(name):
+    return Path(f"{PREFIX}.{name}")
+
+
+def record(label, data=b""):
+    with TRACE.open("a") as handle:
+        handle.write(f"{label} {data.hex()}\n")
+
+
+def read_through(needle, label, buffered=b"", timeout=15):
+    deadline = time.monotonic() + timeout
+    while needle not in buffered:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([sys.stdin], [], [], remaining)[0]:
+            raise TimeoutError(f"timed out waiting for {label}")
+        chunk = os.read(sys.stdin.fileno(), 1024)
+        if not chunk:
+            raise EOFError(f"PTY closed while waiting for {label}")
+        buffered += chunk
+    end = buffered.index(needle) + len(needle)
+    record(label, buffered[:end])
+    marker(label).touch()
+    return buffered[end:]
+
+
+for name in ("initial-I", "blur-O", "suspended", "restore", "second-I", "done", "failed"):
+    marker(name).unlink(missing_ok=True)
+TRACE.write_text("")
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+ok = False
+try:
+    tty.setraw(fd)
+    os.write(sys.stdout.fileno(), INITIAL)
+    pending = read_through(b"\x1b[I", "initial-I")
+    pending = read_through(b"\x1b[O", "blur-O", pending)
+    os.write(sys.stdout.fileno(), SUSPEND)
+    record("suspend-output", SUSPEND)
+    marker("suspended").touch()
+
+    deadline = time.monotonic() + 15
+    while not marker("restore").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for restore signal")
+        time.sleep(0.01)
+
+    os.write(sys.stdout.fileno(), RESTORE)
+    record("restore-output", RESTORE)
+    read_through(b"\x1b[I", "second-I", pending)
+    ok = True
+except Exception as error:
+    record("error", str(error).encode())
+    marker("failed").touch()
+    raise
+finally:
+    os.write(sys.stdout.fileno(), RESET)
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+if ok:
+    marker("done").touch()
+    print("\r\nFOCUS_PROBE_DONE", flush=True)
+PY
 }
 
 # ── Phase 0: identify the client's live pane ──────────────────────
@@ -426,7 +552,7 @@ wait_for_frames server "$ACK_BEFORE" 15 QuitRequested \
 wait_for_client_exit 20 || fail "PHASE 4: the client ignored QuitRequested and stayed up"
 echo "PHASE 4 PASS: WM close raised the dialog, Quit Scribe sent QuitAll, the ack exited the app"
 
-# ── Phase 5: Kill Window kills THIS window and no other ───────────
+# ── Phase 5: refocus repair, then Kill Window kills only this window ──
 # Sessions survived the quit-all, but this phase needs no pane: `CloseWindow`
 # names the window the fresh `Welcome` assigns and destroys whatever it owns.
 #
@@ -440,9 +566,17 @@ launch_client
 WIN=$(last_welcome_window) || fail "PHASE 5: the relaunched client never got a Welcome"
 echo "relaunched client window id: $WIN"
 focus
+PROBE_SESSION=$(last_focused_session) \
+    || fail "PHASE 5a: the relaunched client never focused a live session"
+write_focus_probe
+type_text "python3 $FOCUS_PROBE"
+send_keys Return
+wait_until 15 test -f "$FOCUS_PROBE_PREFIX.initial-I" \
+    || fail "PHASE 5a: enabling focus reporting produced no initial ESC[I"
+
 BEFORE_WINDOWS=$(scribe_windows)
 send_keys ctrl+shift+n
-wait_for_windows 15 window_count_is 2 \
+wait_until 15 window_count_is 2 \
     || fail "PHASE 5: ctrl+shift+n never opened a second window"
 VICTIM_WID=$(comm -13 <(printf '%s\n' "$BEFORE_WINDOWS") <(scribe_windows))
 [ -n "$VICTIM_WID" ] || fail "PHASE 5: could not identify the new window"
@@ -450,6 +584,35 @@ SIBLING_WID=$BEFORE_WINDOWS
 VICTIM=$(last_welcome_window) || fail "PHASE 5: the new window never got a Welcome"
 [ "$VICTIM" != "$WIN" ] || fail "PHASE 5: the new window adopted the existing window's id"
 echo "second window id: $VICTIM (X11 $VICTIM_WID), sibling X11 $SIBLING_WID"
+
+# @lat: [[test#Test Harness#Visual E2E Tests#Window lifecycle over the wire#Claude focus-mode restore repairs activation]]
+# Claude Code 2.1.228 disables focus reporting while blurred, stops reading,
+# then restores it immediately after asking X11 to reactivate the original
+# window. GPUI can miss that activation callback during the fullscreen repaint;
+# the 100 ms EWMH poll must repair the lifecycle and put both the gained frame
+# and the second focus-in on their real paths.
+wait_until 15 test -f "$FOCUS_PROBE_PREFIX.blur-O" \
+    || fail "PHASE 5a: blurring the original window produced no ESC[O"
+wait_until 15 test -f "$FOCUS_PROBE_PREFIX.suspended" \
+    || fail "PHASE 5a: the fake Claude process never suspended focus reporting"
+SUSPEND_HEX=1b5b3c751b5b3e346d1b5b3f31303439681b5b3f313030346c1b5b3f323030346c1b5b3f323033316c1b5b306d1b5b3f3235681b5b324a1b5b48
+wait_until 15 server_output_contains "$PROBE_SESSION" "$SUSPEND_HEX" \
+    || fail "PHASE 5a: the Claude suspend sequence never crossed the server wire"
+GAIN_BEFORE=$(count_client FocusChanged "gained=$PROBE_SESSION" "lost=null")
+xdotool windowactivate "$SIBLING_WID" 2>/dev/null \
+    || xdotool windowfocus "$SIBLING_WID" 2>/dev/null || true
+: >"$FOCUS_PROBE_PREFIX.restore"
+wait_until 15 window_is_active "$SIBLING_WID" \
+    || fail "PHASE 5a: EWMH never reactivated the original Scribe XID"
+wait_for_frames client "$GAIN_BEFORE" 15 FocusChanged \
+    "gained=$PROBE_SESSION" "lost=null" \
+    || fail "PHASE 5a: EWMH reactivation put no gained FocusChanged on the wire"
+wait_until 15 test -f "$FOCUS_PROBE_PREFIX.second-I" \
+    || fail "PHASE 5a: restored focus reporting received no second ESC[I"
+wait_until 15 test -f "$FOCUS_PROBE_PREFIX.done" \
+    || fail "PHASE 5a: the fake Claude process did not exit cleanly"
+echo "PHASE 5a PASS: EWMH repaired activation and restored focus reporting received ESC[I"
+
 focus_window "$VICTIM_WID"
 shot /output/05a-two-windows.png
 
@@ -466,7 +629,7 @@ wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$VICTIM" \
     || fail "PHASE 5: Kill Window put no CloseWindow for $VICTIM on the wire"
 wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$VICTIM" \
     || fail "PHASE 5: the server never acknowledged with WindowClosed"
-wait_for_windows 20 window_is_gone "$VICTIM_WID" \
+wait_until 20 window_is_gone "$VICTIM_WID" \
     || fail "PHASE 5: the killed window's frame never went away"
 sleep 1.0
 pgrep -f 'scribe-client' >/dev/null 2>&1 \

@@ -18,6 +18,7 @@ use crate::ipc_server::WindowShares;
 
 #[cfg(any(target_os = "macos", test))]
 pub mod launchd;
+#[cfg(any(target_os = "macos", test))]
 pub mod macos_install;
 pub mod post_upgrade;
 

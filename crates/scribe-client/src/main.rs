@@ -127,7 +127,7 @@ use scribe_client::window_state::{
     normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::workspace_layout::{self, WorkspaceDividerDrag};
-use scribe_client::x11_focus::X11FocusGuard;
+use scribe_client::x11_focus::{X11FocusGuard, should_reconcile_window_activation};
 use scribe_client::zoom::ZoomState;
 use scribe_client::{
     smart_selection::CompiledSmartSelection,
@@ -7591,6 +7591,24 @@ impl TerminalView {
     /// debounce rather than eating the keystroke that follows a real refocus.
     fn on_activation(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = window.is_window_active();
+        self.update_window_activation(active, cx);
+        if !active {
+            return;
+        }
+        // Focus-on-activate fallback: a notification service that activates the
+        // app without reporting which toast was clicked leaves this as the only
+        // link between the click and the pane that asked for attention. The
+        // click-reporting path consumes the same token, so a dispatcher that
+        // does report the click never double-switches.
+        if let Some(session_id) =
+            self.notifications.center.update(cx, |center, _| center.take_pending_focus())
+        {
+            self.focus_notified_session(session_id, window, cx);
+        }
+    }
+
+    /// Apply one window-activation state across every focus consumer.
+    fn update_window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
         self.focus.cursor_blink.set_window_active(active);
         cx.notify();
         if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
@@ -7611,25 +7629,20 @@ impl TerminalView {
         if let Some(guard) = self.x11_focus.as_mut() {
             guard.clear_reactivation_debounce();
         }
-        // Focus-on-activate fallback: a notification service that activates the
-        // app without reporting which toast was clicked leaves this as the only
-        // link between the click and the pane that asked for attention. The
-        // click-reporting path consumes the same token, so a dispatcher that
-        // does report the click never double-switches.
-        if let Some(session_id) =
-            self.notifications.center.update(cx, |center, _| center.take_pending_focus())
-        {
-            self.focus_notified_session(session_id, window, cx);
-        }
     }
 
     /// Refresh the X11 active-window guard's cached state (no-op off X11).
     ///
     /// Driven by [`drive_x11_focus_polls`] so an overlay that opens and closes
     /// between keystrokes still arms the reactivation debounce.
-    fn poll_x11_focus(&mut self, _cx: &mut Context<Self>) {
-        if let Some(guard) = self.x11_focus.as_mut() {
-            guard.poll();
+    fn poll_x11_focus(&mut self, cx: &mut Context<Self>) {
+        let x11_active = self.x11_focus.as_mut().and_then(X11FocusGuard::poll);
+        let window_active =
+            self.shared.lifecycle.lock().is_ok_and(|lifecycle| lifecycle.window_active());
+        if should_reconcile_window_activation(window_active, x11_active) {
+            // Only repair a stale blur from confirmed EWMH truth. Inactive
+            // observations still belong exclusively to the overlay input gate.
+            self.update_window_activation(true, cx);
         }
     }
 

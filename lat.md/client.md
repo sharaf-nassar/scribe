@@ -679,6 +679,8 @@ The module remains available on non-Linux targets with an inert guard API, so th
 
  starts the guard from the live window-open path:  hands it the real `Window`, which is the first point an Xcb window id exists. Three call sites keep it honest —  refreshes it every  so an overlay opening while the user is idle is noticed before their next keystroke (the GPUI client has no winit-style event-loop tick to piggyback on),  clears the reactivation debounce on a genuine activation because compositor overlays never send one, and  is the first gate on the key path — ahead of the overlay router, the bindings, and the PTY encoder — so a key aimed at the overlay lands nowhere in the client. Every dropped keystroke is logged, since silently vanishing input is precisely this guard's failure mode.
 
+The poll has one active-only lifecycle repair: when `_NET_ACTIVE_WINDOW` positively names this XID while `WindowLifecycle` still says blurred, it sends `true` through the same activation update and deduplicated `FocusChanged` path as GPUI's callback. Inactive or failed EWMH reads never synthesize blur; they remain input-suppression signals, preserving compositor-overlay behavior while repairing callbacks GPUI misses during immediate alternate-screen restore.
+
  quotes a dropped file path for the focused pane's shell via  (POSIX, fish, PowerShell, or nushell) and appends a trailing space; per FR-013 it bypasses the paste-confirmation gate because the path is already quoted.
 
 ### Server Lifecycle Wiring

@@ -1891,13 +1891,19 @@ Phase 3 Ctrl+clicks the URL. Phase 4 is the one that needs a real shell: it `cd`
 
 Nothing is stubbed and nothing is injected. The wire tap (, `SCRIBE_SHARE_TAP=1`) is interposed purely as a recorder, so every server frame the script asserts on is one the real `scribe-server` chose to send in answer to something the real client sent. `tests/e2e/visual/window-lifecycle-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn `remote.enabled` on, because the window-list poll is gated on it exactly as the winit client gates it; the entrypoint writes that file after the server has already started, so only the client's poll is affected and no remote listener is bound.
 
-The seven phases each assert a different half of the conversation. Phase 0 reads the client's own nonempty `FocusChanged.gained` to identify the shell fresh-window bootstrap placed in the visible pane; the separate session the entrypoint creates for `scribe-test` is deliberately ignored. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 exits that tab and proves the process stays alive without sending `CloseWindow`, then exits the remaining terminal and requires `CloseWindow`, `WindowClosed`, and process death in order. Phase 4 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 5 relaunches, opens a *second* window with Ctrl+Shift+N, and asserts "Kill Window" on the focused one sent `CloseWindow` naming that window's id, that the server answered `WindowClosed`, and that only that window's frame went away. Phase 6 kills the survivor and requires the process to exit on the ack.
+The seven phases each assert a different half of the conversation. Phase 0 reads the client's own nonempty `FocusChanged.gained` to identify the shell fresh-window bootstrap placed in the visible pane; the separate session the entrypoint creates for `scribe-test` is deliberately ignored. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 exits that tab and proves the process stays alive without sending `CloseWindow`, then exits the remaining terminal and requires `CloseWindow`, `WindowClosed`, and process death in order. Phase 4 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 5 relaunches, opens a *second* window with Ctrl+Shift+N, proves the original repairs a missed activation during Claude's focus-mode restore, then asserts "Kill Window" on the focused sibling sent `CloseWindow` naming that window's id, that the server answered `WindowClosed`, and that only that window's frame went away. Phase 6 kills the survivor and requires the process to exit on the ack.
 
 The second window in phase 5 is the phase. One client process hosts every window, so a kill that ends the *process* is invisible with one window open and takes every sibling down with it as soon as there are two — and merely closes them, since nobody asked the server to destroy their sessions. The assertions are therefore all on the sibling: its X11 frame is still mapped, a `scribe-client` process is still alive, and no `CloseWindow` ever named its id. The frames are compared as sets of X11 window ids captured before and after the new window opened, so the phase names the victim and the survivor explicitly rather than trusting the newest-window heuristic `find_window` uses. Splitting the last window's kill into phase 6 keeps "the process exits when the last window goes" an assertion of its own, rather than a side effect nothing checks.
 
 The one-Tab Quit Scribe path and two-Tab Kill Window path are focus-trap checks as well as action checks: traversal must remain inside the close modal until Enter emits the exact lifecycle frame, while the real server acknowledgement remains the only exit oracle.
 
 Exiting is asserted as process death rather than as a screenshot, because the whole point of the acknowledgement is that the app goes away; a pixel check could not tell a torn-down window from a hung one.
+
+#### Claude focus-mode restore repairs activation
+
+The Docker visual probe requires EWMH reactivation to emit `FocusChanged.gained` and a second CSI focus-in after Claude Code 2.1.228 restores DECSET 1004.
+
+The bounded raw-PTY stand-in reproduces Claude's exact alternate-screen suspend and restore order. It stops reading while blurred, requests the original XID, and restores immediately; the wire tap proves the client repaired its focus state, while the probe proves the server delivered the resulting `ESC[I` to the application.
 
 ### Cold-restart restore drives the real client
 
@@ -2547,6 +2553,10 @@ A window that has been continuously active is never suppressed by `observe`.
 ### Genuine focus event clears debounce
 
  drops the debounce on a real focus event (which overlays never send), so input flows immediately after a genuine refocus.
+
+### Only confirmed activation repairs lifecycle
+
+The repair predicate accepts only a positive EWMH observation while lifecycle remains inactive; inactive, unknown, and already-active states stay unchanged.
 
 ### Poll transition arms debounce
 
