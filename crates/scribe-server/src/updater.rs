@@ -17,7 +17,9 @@ use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgr
 use crate::ipc_server::WindowShares;
 
 #[cfg(any(target_os = "macos", test))]
+pub mod launchd;
 pub mod macos_install;
+pub mod post_upgrade;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -825,19 +827,24 @@ fn wait_for_handoff() -> bool {
 #[cfg(target_os = "macos")]
 fn restart_server_in_place() -> bool {
     let uid = scribe_common::socket::current_uid();
-    let service_target = format!("user/{uid}/com.scribe.server");
+    let label = current_identity().launchd_label();
 
-    let launchctl_ok = std::process::Command::new("launchctl")
-        .args(["kickstart", "-k", &service_target])
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if launchctl_ok {
-        info!("launchctl kickstart succeeded — waiting for handoff");
-        return wait_for_handoff();
+    // Try both launchd domains. A desktop LaunchAgent lives in `gui/<uid>`;
+    // the shipped code only ever tried `user/<uid>`, so this "unavailable"
+    // branch was taken on every install and the fallback did all the work.
+    for target in launchd::service_targets(uid, label) {
+        let ok = std::process::Command::new("/bin/launchctl")
+            .args(launchd::kickstart_args(&target))
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            info!(%target, "launchctl kickstart succeeded — waiting for handoff");
+            return wait_for_handoff();
+        }
+        info!(%target, "launchctl kickstart did not resolve this target");
     }
 
-    info!("launchctl kickstart unavailable — falling back to direct --upgrade spawn");
+    info!("no launchd target resolved — falling back to direct --upgrade spawn");
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -949,6 +956,39 @@ fn current_version() -> Result<semver::Version, ScribeError> {
             reason: format!("invalid CARGO_PKG_VERSION '{}': {error}", env!("CARGO_PKG_VERSION")),
         }
     })
+}
+
+/// Tell reconnecting clients that the upgrade finished.
+///
+/// The predecessor could not: on a successful hot reload it exits inside
+/// `install_update` while the handoff completes, so its terminal
+/// `UpdateProgress` broadcast is never sent and the client sits on a stale
+/// progress label. Ownership of the report belongs to the survivor — the same
+/// rule nginx follows when the new master takes over, and Sparkle when the
+/// relaunched app reports for the installer that replaced it.
+///
+/// A no-op on a normal (non-upgrade) startup.
+pub async fn announce_upgrade_completion(window_shares: WindowShares) {
+    let Some(version) = post_upgrade::pending_version() else {
+        return;
+    };
+
+    // Clients reconnect a moment after the handoff, so wait for one rather
+    // than announcing into an empty room. Bounded: a client that never comes
+    // back must not hold this task open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && crate::ipc_server::connected_window_writers(&window_shares).await.is_empty()
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    info!(%version, "announcing completed upgrade to reconnected clients");
+    broadcast(
+        &ServerMessage::UpdateProgress { state: UpdateProgressState::Completed { version } },
+        &window_shares,
+    )
+    .await;
 }
 
 // ── Broadcast helper ──────────────────────────────────────────────

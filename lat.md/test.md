@@ -2674,6 +2674,62 @@ When there is no installed bundle to move aside, the outcome reports no backup, 
 
 A copy failure with no backup on disk attempts no restore, so a fresh install cannot rename a bundle that was never moved.
 
+## launchd service targets
+
+Unit tests for [[crates/scribe-server/src/updater/launchd.rs#service_targets]], which names the launchd services the in-place restart may kickstart.
+
+The shipped updater built one target, `user/<uid>/com.scribe.server`, and read its failure as "launchd unavailable". It was not: a `LaunchAgent` loaded into a desktop session lives in the `gui/<uid>` domain, so the kickstart silently failed on every install and every macOS upgrade took the direct spawn fallback.
+
+### GUI domain is tried before the user domain
+
+`gui/<uid>` is offered first because that is where a desktop `LaunchAgent` is loaded; `user/<uid>` follows for agents loaded outside a GUI session.
+
+### Label selects the flavour service
+
+The label is a parameter, so the Dev flavour targets its own service and a test can point at one of its own rather than restarting a developer's live server.
+
+### Kickstart forces a restart
+
+`-k` is present, which kills the running instance first; without it launchd leaves the old binary up and the upgrade appears to succeed while nothing changed.
+
+## macOS bundle swap contract
+
+Integration tests in `crates/scribe-server/tests/macos_dmg_contract.rs` that drive the production `SystemHost` through real `hdiutil` and `ditto` against a real disk image.
+
+Every defect this feature has shipped was a runtime one — a flag contradicting a parse, a `/Volumes` name collision, a leaked attachment — and none were reachable by a lint or a unit test over pure functions. Hermetic: the tests build their own image, install into a temp directory, and never touch `/Applications` or a live server. They deliberately avoid `install_update`, whose restart tail would `pkill` a developer's client.
+
+### Swap installs the bundle with /Volumes occupied
+
+A decoy image with the same volume name is mounted first, so `/Volumes/Scribe` is taken — the state that made the shipped parser read back `1`.
+
+The swap must still install the right bundle at the pinned mount point and leave nothing attached. Removing `-mountpoint` from the attach argv fails this test.
+
+### Copy failure restores the bundle and detaches
+
+Pointing the swap at a bundle name absent from the image makes the real `ditto` fail, proving against real tools that the moved-aside bundle is restored and the image is still released.
+
+## Post-upgrade announcement
+
+Unit tests for [[crates/scribe-server/src/updater/post_upgrade.rs#UpgradeAnnouncement]] and [[crates/scribe-server/src/updater/post_upgrade.rs#orphaned_stage_dirs]], the two duties a surviving server inherits from the predecessor it replaced.
+
+A macOS hot reload exits the old server inside `install_update`, so it can neither broadcast a terminal `UpdateProgress` nor drop its staging directory. Every established updater assigns both to the survivor.
+
+### Announces to a client reconnecting after the handoff
+
+A client that reconnects moments after the handoff is told the update completed, because the process that would otherwise have said so no longer exists.
+
+### Stops announcing once the window closes
+
+The announcement expires, so a window opened long afterwards is never told about an upgrade it did not witness.
+
+### Orphaned staging dirs are identified by prefix
+
+Only `update-*` directories are reaped. Any that exist at startup are orphaned by definition, since an update is driven by a live server and this process has not started one.
+
+### Sockets are never reaped
+
+The reaper leaves `server.sock`, `handoff.sock`, and lock files alone — deleting a live socket would strand every connected client.
+
 ## GPUI OSC 52 Clipboard Bridge
 
 Unit coverage for the ported host clipboard bridge (): OSC 52 routing, the FR-019 focus gate, primary-selection read/write with AI cleanup, and reply-message construction.

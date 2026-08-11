@@ -218,6 +218,14 @@ async fn run_normal_server() -> Result<(), ScribeError> {
 async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     info!("scribe-server starting (upgrade mode)");
 
+    // The predecessor is being replaced and cannot do either of these for
+    // itself: it exits inside `install_update` before it can report the
+    // outcome or drop its staging directory.
+    updater::post_upgrade::record_upgrade(env!("CARGO_PKG_VERSION"));
+    if let Some(runtime_dir) = server_socket_path().parent() {
+        updater::post_upgrade::reap_orphaned_stages(runtime_dir);
+    }
+
     let cfg = config::load_config()?;
 
     // Spec 020: the successor decides its own image policy from the file it
@@ -298,6 +306,9 @@ async fn run_server_loop(
     // so that TriggerUpdate / DismissUpdate messages can reach it.
     let updater_handle =
         Arc::new(updater::spawn_updater(Arc::clone(&window_shares), update_config));
+
+    // No-op unless this process came up from an upgrade.
+    tokio::spawn(updater::announce_upgrade_completion(Arc::clone(&window_shares)));
 
     // Build the release catalog + GitHub fetcher used by the Releases settings
     // panel. The catalog is empty until the first `ListReleases` request; the

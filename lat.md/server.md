@@ -455,9 +455,17 @@ The mount is released on every path out of the swap once the attach has succeede
 
 A failed attach is cleaned up too. `hdiutil attach` can attach an image's devices and then fail at the mount step, leaving them with no mount point for a detach to target, so the failure path runs [[crates/scribe-server/src/updater/macos_install.rs#attached_devices_for]] over `hdiutil info -plist` and detaches the whole-disk node for that image. The same teardown is the fallback when detaching by mount point fails. Both are best-effort: unparsable output yields no devices, because a cleanup failure must never mask the install failure that triggered it.
 
+### Completion Reporting
+
+The server that performs a macOS update cannot report its own outcome, so the survivor does it — see [[test#Test Harness#Post-upgrade announcement]].
+
+On a successful hot reload the old server exits inside `install_update` while the handoff completes, before `run_install` can broadcast `Completed`. A client is left on a stale progress label, and the staging directory is never dropped because `UpdateDownloadStage::drop` never runs. The `--upgrade` successor therefore calls [[crates/scribe-server/src/updater/post_upgrade.rs#record_upgrade]] at startup, reaps any orphaned `update-*` directories, and broadcasts `Completed` once a client reconnects. This is the rule every established updater follows: nginx lets the new master report while the old drains, and Sparkle and Squirrel let the relaunched app report for the installer that replaced it.
+
 ### macOS Hot-Reload
 
 After a successful `ditto`, the updater attempts a zero-downtime handoff by running `launchctl kickstart -k` to restart the launchd service in-place.
+
+The target is resolved through [[crates/scribe-server/src/updater/launchd.rs#service_targets]], which tries `gui/<uid>` before `user/<uid>` and takes the label from the running flavour. Only `user/<uid>` was tried before, and a desktop `LaunchAgent` does not live there, so the kickstart never resolved and every macOS upgrade silently used the spawn fallback instead.
 
 If `kickstart` is unavailable or fails, it falls back to spawning the new binary with `--upgrade` and waits up to 30 seconds for the handoff to complete. The longer timeout avoids false restart-required fallbacks when large handoff snapshots take longer to transfer and restore. If the handoff still times out, the updater broadcasts `CompletedRestartRequired` to all connected clients and intentionally skips client/settings relaunches so the old processes stay alive until the user approves a cold restart from the UI.
 
