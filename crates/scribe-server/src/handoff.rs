@@ -81,7 +81,7 @@ use crate::workspace_manager::WorkspaceManager;
 /// match the current one. When deserialization fails the error is propagated
 /// verbatim (no more "version mismatch" masking) and the scribe-client
 /// `wait_for_refreshed_server` path on macOS detects the stuck old server and
-/// performs a forced cold restart instead of looping until launch times out.
+/// asks the user to approve a cold restart instead of terminating it.
 ///
 /// Features 013 (tailnet) and 014 (LAN) remote window control added no fields
 /// to the handoff shape — the remote/LAN listener state, the per-install device
@@ -724,14 +724,17 @@ fn read_ack(fd: RawFd) -> Result<(), ScribeError> {
 
 // ── Receiver (new server with --upgrade) ────────────────────────────
 
+/// State and resources transferred from the old server during a handoff.
+pub type ReceivedHandoff =
+    (HandoffState, Vec<OwnedFd>, crate::ipc_server::ServerLock, tokio::net::UnixListener);
+
 /// Connect to the old server's handoff socket and receive state + fds.
 ///
 /// Returns the deserialised state, the received PTY master fds (in the same
 /// order as `state.sessions`), and the IPC listener this receiver took over
 /// from the old server — see the ACK ordering note below for why the socket is
 /// claimed here rather than after the caller has rebuilt its sessions.
-pub fn receive_handoff()
--> Result<(HandoffState, Vec<OwnedFd>, tokio::net::UnixListener), ScribeError> {
+pub fn receive_handoff() -> Result<ReceivedHandoff, ScribeError> {
     let path = handoff_socket_path();
 
     let sock_fd = socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None)
@@ -817,7 +820,13 @@ pub fn receive_handoff()
     // Send ACK.
     send_ack(fd)?;
 
-    Ok((state, fds, listener))
+    // The old process releases its advisory lock only after observing the ACK
+    // and defusing the handed-off PTYs. Keep the replacement out of its accept
+    // loop until it owns that lock itself, so every post-upgrade server remains
+    // protected by the same singleton contract as a cold start.
+    let lock = Some(crate::ipc_server::acquire_server_lock()?);
+
+    Ok((state, fds, lock, listener))
 }
 
 /// Send the upgrade request magic bytes.

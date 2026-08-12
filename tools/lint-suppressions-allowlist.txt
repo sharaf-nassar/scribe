@@ -1,3 +1,4 @@
 crates/scribe-client/src/notification_dispatcher/linux.rs|#[allow(clippy::too_many_arguments)]
 crates/scribe-common/src/config.rs|#[allow(clippy::struct_excessive_bools)]
+crates/scribe-common/src/macos_launchd.rs|#[allow(unsafe_code)]
 crates/scribe-server/src/macos_proc.rs|#[allow(unsafe_code)]

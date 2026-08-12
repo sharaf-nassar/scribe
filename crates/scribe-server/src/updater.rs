@@ -736,8 +736,10 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
     let prev_path = app_bundle_path.with_extension("app.prev");
     let mount_point = update_mount_point(&asset.path)?;
 
-    // Capture which client processes are running before the update.
-    let client_was_running = process_is_running("scribe-client");
+    // Capture exact pre-install client PIDs. A new-bundle relay receives this
+    // set before the server handoff and never targets helpers started later.
+    let clients = tracked_client_processes(current_identity().client_binary_name())
+        .map_err(|reason| ScribeError::UpdateInstallFailed { reason })?;
 
     // Mount, replace the bundle, roll back on failure, and always detach.
     let backup_existed = swap_bundle_from_dmg(
@@ -754,20 +756,38 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
     .backup_existed;
 
     let changed = changed_binaries(backup_existed, &prev_path, &app_bundle_path);
+    let launch_agents_changed = !backup_existed
+        || macos_restart::launch_agent_paths(&prev_path, current_identity())
+            .into_iter()
+            .zip(macos_restart::launch_agent_paths(&app_bundle_path, current_identity()))
+            .any(|(old, new)| file_hash_differs(&old, &new));
 
     // Remove the backup now that hash comparison is complete (best-effort).
     if backup_existed && let Err(e) = std::fs::remove_dir_all(&prev_path) {
         warn!("failed to remove .app.prev backup: {e}");
     }
 
-    let hot_reload_succeeded = if *changed.get("scribe-server").unwrap_or(&true) {
-        let server_exe = macos_restart::server_executable(
+    let server_launch_changed =
+        *changed.get("scribe-server").unwrap_or(&true) || launch_agents_changed;
+    if *changed.get("scribe-client").unwrap_or(&true) && !clients.is_empty() {
+        let relay_exe = macos_restart::client_executable(
             &app_bundle_path,
-            current_identity().server_binary_name(),
+            current_identity().client_binary_name(),
         );
-        restart_server_in_place(&server_exe)
+        spawn_client_relaunch_relay(
+            &relay_exe,
+            server_launch_changed.then_some(std::process::id()),
+            &clients,
+        )?;
+    }
+    let hot_reload_succeeded = if server_launch_changed {
+        let registration_exe = macos_restart::client_executable(
+            &app_bundle_path,
+            current_identity().client_binary_name(),
+        );
+        restart_server_in_place(&registration_exe)?
     } else {
-        info!("server binary unchanged — skipping server restart");
+        info!("server binary and LaunchAgent definitions unchanged — skipping server restart");
         true
     };
 
@@ -776,15 +796,56 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
         return Ok(false);
     }
 
-    relaunch_clients(&app_bundle_path, &changed, client_was_running);
-
     Ok(hot_reload_succeeded)
 }
 
-/// Whether a process with exactly this name is currently running.
+/// PIDs owned by this user whose process name exactly matches `name`.
 #[cfg(target_os = "macos")]
-fn process_is_running(name: &str) -> bool {
-    std::process::Command::new("pgrep").args(["-x", name]).status().is_ok_and(|s| s.success())
+fn named_process_pids(name: &str) -> Result<Vec<u32>, String> {
+    let uid = scribe_common::socket::current_uid().to_string();
+    let output = std::process::Command::new("pgrep")
+        .args(["-U", uid.as_str(), "-x", name])
+        .output()
+        .map_err(|error| format!("failed to list {name} processes: {error}"))?;
+    if !output.status.success() {
+        return if output.status.code() == Some(1) {
+            Ok(Vec::new())
+        } else {
+            Err(format!("pgrep for {name} exited with {}", output.status))
+        };
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok()?.trim().parse::<u32>().ok())
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn tracked_client_processes(
+    name: &str,
+) -> Result<Vec<scribe_common::macos_launchd::TrackedClient>, String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let pids = named_process_pids(name)?;
+    let sys_pids = pids.iter().map(|pid| Pid::from_u32(*pid)).collect::<Vec<_>>();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&sys_pids),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| {
+            system.process(Pid::from_u32(pid)).map(|process| {
+                scribe_common::macos_launchd::TrackedClient {
+                    pid,
+                    start_time_secs: process.start_time(),
+                }
+            })
+        })
+        .collect())
 }
 
 /// Which shipped binaries differ from the pre-update backup.
@@ -812,13 +873,19 @@ fn changed_binaries(
     changed
 }
 
-/// Waits for the outgoing server to release its handoff socket.
+/// Wait until ACK completed and the replacement reached serving readiness.
 #[cfg(target_os = "macos")]
-fn wait_for_handoff() -> bool {
+fn wait_for_handoff(
+    replacement: scribe_common::macos_launchd::LaunchdSlot,
+    previous_replacement_owner: Option<u32>,
+) -> bool {
     let handoff_path = scribe_common::socket::handoff_socket_path();
     let deadline = std::time::Instant::now() + HOT_RELOAD_HANDOFF_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if !handoff_path.exists() {
+        let replacement_ready =
+            scribe_common::macos_launchd::active_slot_owner(current_identity(), replacement)
+                .is_some_and(|pid| Some(pid) != previous_replacement_owner);
+        if !handoff_path.exists() && replacement_ready {
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -830,54 +897,65 @@ fn wait_for_handoff() -> bool {
 /// Starts the replacement server in upgrade mode and reports whether its
 /// zero-downtime handoff completed.
 #[cfg(target_os = "macos")]
-fn restart_server_in_place(server_exe: &Path) -> bool {
-    info!(exe = %server_exe.display(), "starting replacement server in upgrade mode");
-    match spawn_detached(server_exe, macos_restart::upgrade_args()) {
-        Ok(()) => wait_for_handoff(),
-        Err(e) => {
-            warn!(exe = %server_exe.display(), "failed to spawn replacement server with --upgrade: {e}");
-            false
-        }
+fn restart_server_in_place(registration_exe: &Path) -> Result<bool, ScribeError> {
+    let current = macos_restart::current_slot(std::env::args());
+    let replacement = macos_restart::replacement_slot(current);
+    let previous_replacement_owner =
+        scribe_common::macos_launchd::active_slot_owner(current_identity(), replacement);
+    info!(
+        exe = %registration_exe.display(),
+        current_slot = current.name(),
+        replacement_slot = replacement.name(),
+        "activating replacement launchd slot"
+    );
+    let registration_arg = macos_restart::registration_argument(current);
+    let output = std::process::Command::new(registration_exe)
+        .arg(&registration_arg)
+        .output()
+        .map_err(|error| ScribeError::UpdateInstallFailed {
+            reason: format!(
+                "could not start replacement launchd registration helper {}: {error}",
+                registration_exe.display()
+            ),
+        })?;
+    if output.status.success() {
+        return Ok(wait_for_handoff(replacement, previous_replacement_owner));
     }
+
+    Err(ScribeError::UpdateInstallFailed {
+        reason: format!(
+            "replacement launchd registration helper {} exited with {}; stdout: {}; stderr: {}",
+            registration_exe.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
 }
 
-/// Restarts client binaries that changed and were running before the update.
+/// Start a new-bundle relay that survives the old server's handoff exit.
 #[cfg(target_os = "macos")]
-fn relaunch_clients(
-    app_bundle_path: &Path,
-    changed: &HashMap<&'static str, bool>,
-    client_was_running: bool,
-) {
-    let macos_dir = app_bundle_path.join("Contents/MacOS");
-    for name in ["scribe-client"] {
-        if !changed.get(name).unwrap_or(&true) {
-            info!("{name} binary unchanged — skipping restart");
-            continue;
-        }
-        if !client_was_running {
-            continue;
-        }
-        // Kill the old process (best-effort, it may not be running).
-        drop(std::process::Command::new("pkill").args(["-x", name]).status());
-        match spawn_detached(&macos_dir.join(name), &[]) {
-            Ok(()) => info!("relaunched {name}"),
-            Err(e) => warn!("failed to relaunch {name}: {e}"),
-        }
-    }
-}
-
-/// Spawns a detached process with no inherited stdio.
-#[cfg(target_os = "macos")]
-fn spawn_detached(program: &Path, args: &[&str]) -> std::io::Result<()> {
+fn spawn_client_relaunch_relay(
+    relay_exe: &Path,
+    old_server_pid: Option<u32>,
+    clients: &[scribe_common::macos_launchd::TrackedClient],
+) -> Result<(), ScribeError> {
     use std::process::Stdio;
 
-    std::process::Command::new(program)
-        .args(args)
+    let argument = macos_restart::client_relaunch_argument(old_server_pid, clients);
+    std::process::Command::new(relay_exe)
+        .arg(&argument)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(drop)
+        .map_err(|error| ScribeError::UpdateInstallFailed {
+            reason: format!(
+                "could not start client relaunch relay {}: {error}",
+                relay_exe.display()
+            ),
+        })
 }
 
 /// Returns `true` if the two files have different content (or if either cannot be read).

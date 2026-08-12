@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use scribe_common::config::UpdateConfig;
 use scribe_common::error::ScribeError;
+use scribe_common::macos_launchd::{self, LaunchdSlot};
 use scribe_common::socket::server_socket_path;
 
 mod attach_flow;
@@ -89,13 +90,22 @@ fn main() -> Result<(), ScribeError> {
     // Set TERM/COLORTERM before any threads are spawned.
     alacritty_terminal::tty::setup_env();
 
-    let upgrade_mode = std::env::args().nth(1).is_some_and(|a| a == "--upgrade");
+    let args = std::env::args().collect::<Vec<_>>();
+    let upgrade_mode = args.iter().any(|argument| argument == "--upgrade");
+    let launchd_slot = LaunchdSlot::from_args(args.iter().map(String::as_str));
+    #[cfg(target_os = "macos")]
+    let _launchd_slot_guard = launchd_slot
+        .map(|slot| {
+            macos_launchd::acquire_slot_guard(scribe_common::app::current_identity(), slot)
+                .map_err(|reason| ScribeError::IpcError { reason })
+        })
+        .transpose()?;
 
     let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
-    // An updater-spawned `--upgrade` server has no durable stdio of its own:
-    // the Debian postinst redirects it to a state-dir `upgrade.log` that the
-    // next upgrade truncates, and the macOS fallback spawn uses Stdio::null().
+    // An upgrade server has no durable stdio of its own: Debian postinst
+    // redirects it to a state-dir `upgrade.log`, while the macOS LaunchAgents
+    // send stdout and stderr to `/dev/null`.
     // Mirror tracing into a file under the state dir so the successor's logs
     // survive; stdout stays active because the postinst watchdog greps it for
     // "IPC server listening".
@@ -120,10 +130,13 @@ fn main() -> Result<(), ScribeError> {
         .map_err(|e| ScribeError::Io { source: e })?;
 
     let result = runtime.block_on(async {
-        if upgrade_mode {
-            Box::pin(run_upgrade_receiver()).await
+        if let Some(slot) = launchd_slot {
+            Box::pin(run_launchd_managed(slot)).await
+        } else if upgrade_mode {
+            let mut handoff_committed = false;
+            Box::pin(run_upgrade_receiver(None, &mut handoff_committed)).await
         } else {
-            Box::pin(run_normal_server()).await
+            Box::pin(run_normal_server(None)).await
         }
     });
 
@@ -173,7 +186,7 @@ fn rotate_if_oversized(path: &Path, max_bytes: u64) {
 }
 
 /// Normal server mode: start IPC server + handoff listener, run until shutdown.
-async fn run_normal_server() -> Result<(), ScribeError> {
+async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), ScribeError> {
     info!("scribe-server starting (normal mode)");
 
     let cfg = config::load_config()?;
@@ -206,7 +219,59 @@ async fn run_normal_server() -> Result<(), ScribeError> {
     // live until the server shuts down to hold the advisory flock.
     let (lock_guard, listener) = ipc_server::acquire_server_socket(&server_socket_path(), false)?;
 
-    run_server_loop(session_manager, workspace_manager, lock_guard, listener, cfg.update).await
+    run_server_loop(
+        session_manager,
+        workspace_manager,
+        (lock_guard, listener),
+        cfg.update,
+        launchd_slot,
+    )
+    .await
+}
+
+/// Start a launchd slot as either a crash-recovery owner or a warm successor.
+async fn run_launchd_managed(slot: LaunchdSlot) -> Result<(), ScribeError> {
+    if std::os::unix::net::UnixStream::connect(server_socket_path()).is_err() {
+        match run_normal_server(Some(slot)).await {
+            Ok(()) => return Ok(()),
+            Err(error) if std::os::unix::net::UnixStream::connect(server_socket_path()).is_ok() => {
+                // Both registered slots may bootstrap together at login. The
+                // lock loser observes the winner's socket and becomes its warm
+                // successor instead of exiting non-zero into launchd throttle.
+                warn!(%error, slot = slot.name(), "another launchd slot won normal startup; switching to handoff");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut handoff_committed = false;
+    match run_upgrade_receiver(Some(slot), &mut handoff_committed).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if !handoff_committed
+                && std::os::unix::net::UnixStream::connect(server_socket_path()).is_ok() =>
+        {
+            // The predecessor is still serving, most commonly because the
+            // handoff versions are incompatible. A successful exit keeps this
+            // inactive slot from crash-looping under `KeepAlive` while the UI
+            // asks for explicit cold-restart approval.
+            warn!(%error, slot = slot.name(), "warm handoff refused; predecessor remains active");
+            #[cfg(target_os = "macos")]
+            if let Err(cleanup_error) = spawn_inactive_slot_cleanup(slot.other()) {
+                warn!(%cleanup_error, slot = slot.name(), "failed to unregister refused launchd slot");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                slot = slot.name(),
+                handoff_committed,
+                "managed successor cannot continue; taking normal ownership"
+            );
+            run_normal_server(Some(slot)).await
+        }
+    }
 }
 
 /// Upgrade receiver mode: connect to old server, receive handoff, then serve.
@@ -215,16 +280,11 @@ async fn run_normal_server() -> Result<(), ScribeError> {
 /// PTY fds and session state, then starts serving on the IPC socket. The
 /// old server exits after handoff. The `postinst` script runs this in the
 /// background so it doesn't block the package install.
-async fn run_upgrade_receiver() -> Result<(), ScribeError> {
+async fn run_upgrade_receiver(
+    launchd_slot: Option<LaunchdSlot>,
+    handoff_committed: &mut bool,
+) -> Result<(), ScribeError> {
     info!("scribe-server starting (upgrade mode)");
-
-    // The predecessor is being replaced and cannot do either of these for
-    // itself: it exits inside `install_update` before it can report the
-    // outcome or drop its staging directory.
-    updater::post_upgrade::record_upgrade(env!("CARGO_PKG_VERSION"));
-    if let Some(runtime_dir) = server_socket_path().parent() {
-        updater::post_upgrade::reap_orphaned_stages(runtime_dir);
-    }
 
     let cfg = config::load_config()?;
 
@@ -236,7 +296,8 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     // socket comes back already claimed: `receive_handoff` takes it before it
     // acknowledges, so the path never points at a server that has exited while
     // the sessions below are still being rebuilt.
-    let (state, fds, listener) = handoff::receive_handoff()?;
+    let (state, fds, lock_guard, listener) = handoff::receive_handoff()?;
+    *handoff_committed = true;
 
     info!(
         sessions = state.sessions.len(),
@@ -263,9 +324,23 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
             &live_sessions,
         )));
 
+    // Record completion only after restoration succeeds. A receiver that ACKed
+    // but could not rebuild the handed-off state must not announce success.
+    updater::post_upgrade::record_upgrade(env!("CARGO_PKG_VERSION"));
+    if let Some(runtime_dir) = server_socket_path().parent() {
+        updater::post_upgrade::reap_orphaned_stages(runtime_dir);
+    }
+
     info!("session restoration complete — accepting connections");
 
-    run_server_loop(session_manager, workspace_manager, None, listener, cfg.update).await
+    run_server_loop(
+        session_manager,
+        workspace_manager,
+        (lock_guard, listener),
+        cfg.update,
+        launchd_slot,
+    )
+    .await
 }
 
 /// Run the IPC server, handoff listener, and signal handler concurrently.
@@ -273,17 +348,16 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 /// Shared between normal and upgrade startup paths. Cleans up the IPC socket
 /// on exit. Both the singleton lock guard and the listener are acquired by the
 /// caller: the normal path binds before this call, and the upgrade path binds
-/// inside the handoff, before it acknowledges. `_lock_guard` must live until
-/// the server shuts down to hold the advisory flock; it is `None` for an
-/// upgrade receiver, where the old server owns the lock until it exits.
+/// inside the handoff, then acquires the lock after the predecessor exits.
+/// `_lock_guard` must live until the server shuts down to hold the advisory
+/// flock.
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
-    _lock_guard: ipc_server::ServerLock,
-    listener: tokio::net::UnixListener,
+    (_lock_guard, listener): (ipc_server::ServerLock, tokio::net::UnixListener),
     update_config: UpdateConfig,
+    launchd_slot: Option<LaunchdSlot>,
 ) -> Result<(), ScribeError> {
-    let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
 
@@ -366,6 +440,18 @@ async fn run_server_loop(
     // only after handoff restoration and session activation have succeeded,
     // immediately before the already-bound listener starts accepting. Normal
     // startup reaches the same readiness point through this shared path.
+    if let Some(slot) = launchd_slot
+        && let Err(error) =
+            macos_launchd::record_active_slot(scribe_common::app::current_identity(), slot)
+    {
+        warn!(%error, slot = slot.name(), "failed to record active launchd slot");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(slot) = launchd_slot
+        && let Err(error) = spawn_inactive_slot_cleanup(slot)
+    {
+        warn!(%error, slot = slot.name(), "failed to start inactive launchd cleanup");
+    }
     info!("IPC server listening");
 
     let handoff_triggered = tokio::select! {
@@ -410,11 +496,32 @@ async fn run_server_loop(
         // Only clean up the IPC socket if we're NOT handing off. During a
         // handoff the new server has already bound to the same socket path —
         // removing it would make the new server unreachable.
-        cleanup_socket(&path);
+        cleanup_socket(&server_socket_path());
     }
 
     info!("scribe-server stopped");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_inactive_slot_cleanup(active: LaunchdSlot) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let identity = scribe_common::app::current_identity();
+    let client = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve server executable: {error}"))?
+        .with_file_name(identity.client_binary_name());
+    if !client.is_file() {
+        return Err(format!("client binary not found at {}", client.display()));
+    }
+    std::process::Command::new(&client)
+        .arg(active.inactive_unregistration_argument())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("failed to spawn inactive-slot cleanup: {error}"))
 }
 
 /// Remove the IPC socket file, ignoring "not found" errors.

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.scribe.server</string>
+	<string>com.scribe.server.alternate</string>
 
 	<key>BundleProgram</key>
 	<string>Contents/MacOS/scribe-server</string>
@@ -12,7 +12,7 @@
 	<array>
 		<string>scribe-server</string>
 		<string>--upgrade</string>
-		<string>--launchd-slot=primary</string>
+		<string>--launchd-slot=alternate</string>
 	</array>
 
 	<key>EnvironmentVariables</key>

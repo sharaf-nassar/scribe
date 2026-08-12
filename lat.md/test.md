@@ -1304,7 +1304,7 @@ Hosted validation remains external and pending after push: this unpushed impleme
 
 The macOS job exists because a Linux runner cannot compile `#[cfg(target_os = "macos")]` code at all. Until it was added, the only thing that ever type-checked that code was `release.yml`'s macOS build leg, which fires on a version tag — too late to stop drift, and it runs no tests. That gap is why a `hdiutil` mount-point parse that could never succeed shipped, alongside denied lints in `macos_proc`, `x11_focus`, and `config`. The job needs no system dependencies: the apt list is Linux-only in both workflows.
 
-It runs lint and unit tests only and never invokes the Scribe runtime, so it is distinct from the sanctioned native-macOS runtime validation in [[terminal-images#Terminal Images#Native macOS Metal Validation]]. The residue still outside automated coverage is the install path's restart tail — `launchctl kickstart`, `pkill`, and the handoff wait — which no CI job may execute.
+It runs lint and unit tests only and never invokes the Scribe runtime, so it is distinct from the sanctioned native-macOS runtime validation in [[terminal-images#Terminal Images#Native macOS Metal Validation]]. The residue still outside automated coverage is the install path's restart tail — `SMAppService` registration, client relaunch, and the handoff wait — which no CI job may execute.
 
 ## AI-Launch Harness Plumbing
 
@@ -2574,6 +2574,14 @@ A running server whose executable path differs from the installed binary is repo
 
 A running server that started before the installed binary's modification time is reported stale (an in-place rebuild landed).
 
+### Manual DMG inode change marks server stale
+
+The installed-file timestamp probe takes the later modification and inode-change time, so a Finder replacement is detectable even when the copied release binary preserves an older modification time.
+
+### Launchd marker detects bundle replacement
+
+A serving marker whose recorded device/inode differs from the installed server is stale even when both paths and timestamps compare equal; missing legacy identity remains on the timestamp fallback.
+
 ### Matching fresh server is not stale
 
 A running server at the same path that started after the installed binary's modification time is not stale.
@@ -2582,13 +2590,29 @@ A running server at the same path that started after the installed binary's modi
 
 When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
 
+### Unknown launchd slot fails closed
+
+A command-line slot wins over the PID marker, a PID marker fills missing command metadata, and only an observed legacy no-slot command maps to primary; completely unreadable metadata cannot select a service to unregister.
+
+### Cold restart requirement is typed
+
+The local connection error carries a boolean cold-restart requirement separately from its display text, allowing the UI to raise approval without parsing an error string or misclassifying ordinary startup failures.
+
+### Deferred restart signals only surviving clients
+
+After the cooperative `QuitAll` grace window, the approved helper targets only tracked client PIDs that are still alive, avoiding needless signals to clients that already flushed and exited.
+
+### Graceful shutdown waits for every hosted window
+
+The process-wide shutdown coordinator counts terminal views, treats the first flushed view as incomplete when another remains, and exits only after the final view has independently persisted its recovery state.
+
 ### Launchd plist pins a baseline PATH
 
 The generated LaunchAgent plist carries an `EnvironmentVariables` PATH that leads with both Homebrew prefixes, so a launchd-started server hands PTY sessions more than the bare system PATH.
 
 ### Dist plist matches the generated plist
 
-The static `dist/macos/com.scribe.server.plist` shipped for packaging must stay byte-identical to the client's generated LaunchAgent plist, so the installed baseline PATH never drifts from the runtime generator.
+Both static primary/alternate plists shipped for packaging stay byte-identical to the shared generator, so their labels, `BundleProgram`, managed arguments, and baseline PATH cannot drift.
 
 ### macOS peer PID drives stale refresh
 
@@ -2610,13 +2634,29 @@ Permission denied gets its own sentence, and any other `io::Error` is passed thr
 
 The `--finish-update-restart` argument selects the detached helper before GPUI or IPC startup, while ordinary and restore-child launches remain on the interactive path.
 
+### Client relaunch relay payload is typed
+
+The one-shot relay parses an optional old-server PID plus start-time-qualified client identities and rejects malformed fields before it can wait, signal, or launch anything.
+
+### Updater quit is a transient local action
+
+The replacement-bundle relay's `QuitAll` frame uses the bounded local transient pool and never registers a fake window, while remote transports still reject non-`Hello` first frames.
+
+### Deferred restart uses the installed bundle
+
+A helper launched by a process still owned by `Scribe.app.prev` resolves the executable in `Scribe.app`, preventing an approved fallback from registering the removed predecessor bundle's agents.
+
 ### Deferred restart helper excludes itself
 
-The helper removes its own PID from the client process set it waits on, so it cannot deadlock waiting for itself to exit before restarting the server.
+The helper takes a per-install advisory lock and removes its own PID from the client process set it waits on, so duplicate approvals collapse to one restart owner and the owner cannot deadlock waiting for itself to exit.
 
 ### Zombie clients do not block relaunch
 
 Zombie process states count as exited because their tasks are already gone and cannot respond to signals, preventing an unreaped desktop child from blocking the replacement client.
+
+### Restart failure still relaunches the client
+
+The recovery wrapper invokes the replacement client even when the destructive server restart returns an error, so approval cannot leave every UI process closed with no recovery surface.
 
 ## Server handoff
 
@@ -2698,21 +2738,37 @@ A copy failure with no backup on disk attempts no restore, so a fresh install ca
 
 ## macOS updater handoff command
 
-Unit tests for the executable and arguments used after the updater swaps the app bundle, proving the warm path starts a real handoff receiver.
+Unit tests for the executable and slot selection used after the updater swaps the app bundle, proving registration comes from the replacement app and never targets the active job.
 
-### Uses the replacement bundle server
+### Uses the replacement bundle registrar
 
-The successor path resolves inside the newly copied app rather than through the predecessor process's `current_exe()`, which may name the moved-aside bundle.
+The one-shot client registrar resolves inside the newly copied app rather than through the predecessor's `current_exe()`, which may name the moved-aside bundle and cannot register its replacement's agents.
 
-### Starts the successor in upgrade mode
+### Alternates launchd slots
 
-The successor receives `--upgrade`; a normal launch or launchd kickstart cannot request the live PTY transfer and therefore is not a warm restart.
+Legacy servers map to primary, managed servers keep their slot, and the registrar derives the opposite job from the active slot. Both plist paths and the typed client-relay argument belong to this contract.
+
+## macOS launchd lifecycle
+
+Pure contract tests keep warm replacements under launchd while preventing destructive activation.
+
+### Warm replacements alternate services
+
+Primary and alternate have distinct service labels and each selects the other as its warm successor, allowing both launchd-owned processes to overlap.
+
+### Bundled agents request managed handoff
+
+Generated agents use `BundleProgram` and fixed `--upgrade --launchd-slot` arguments. The registration command names the active slot, ensuring the Service Management layer can only unregister and re-register its opposite.
+
+### Readiness marker preserves binary identity
+
+The active-slot parser accepts new PID/slot/device/inode records and legacy PID/slot records, while rejecting partial identities so bundle replacement checks never trust ambiguous metadata.
 
 ## macOS bundle swap contract
 
 Integration tests in `crates/scribe-server/tests/macos_dmg_contract.rs` that drive the production `SystemHost` through real `hdiutil` and `ditto` against a real disk image.
 
-Every defect this feature has shipped was a runtime one — a flag contradicting a parse, a `/Volumes` name collision, a leaked attachment — and none were reachable by a lint or a unit test over pure functions. Hermetic: the tests build their own image, install into a temp directory, and never touch `/Applications` or a live server. They deliberately avoid `install_update`, whose restart tail would `pkill` a developer's client.
+Every defect this feature has shipped was a runtime one — a flag contradicting a parse, a `/Volumes` name collision, a leaked attachment — and none were reachable by a lint or a unit test over pure functions. Hermetic: the tests build their own image, install into a temp directory, and never touch `/Applications` or a live server. They deliberately avoid `install_update`, whose restart tail manages launchd and live client processes.
 
 ### Swap installs the bundle with /Volumes occupied
 

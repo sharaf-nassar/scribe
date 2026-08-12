@@ -103,8 +103,9 @@ APP_DIR="${STAGING_DIR}/${BUNDLE_NAME}"
 CONTENTS="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS}/MacOS"
 RESOURCES_DIR="${CONTENTS}/Resources"
+LAUNCH_AGENTS_DIR="${CONTENTS}/Library/LaunchAgents"
 
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${LAUNCH_AGENTS_DIR}"
 
 # Copy Info.plist
 cp "${SCRIPT_DIR}/Info.plist" "${CONTENTS}/Info.plist"
@@ -138,7 +139,8 @@ chmod 755 \
     "${RESOURCES_DIR}/ai-hook-codex.sh" \
     "${RESOURCES_DIR}/setup-codex-hooks.sh"
 cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/macos/com.scribe.server.plist" "${LAUNCH_AGENTS_DIR}/"
+cp "${DIST_DIR}/macos/com.scribe.server.alternate.plist" "${LAUNCH_AGENTS_DIR}/"
 
 echo "==> ${BUNDLE_NAME} assembled at ${APP_DIR}"
 

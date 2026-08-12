@@ -4407,10 +4407,39 @@ fn audit_reason(refusal: RemoteRefusal) -> &'static str {
     }
 }
 
-/// The advisory singleton lock, held for the server's whole life. `None` for an
-/// upgrade receiver: the old server holds the lock until it exits, and the
-/// atomic socket takeover in `bind_over` is what keeps the two from racing.
+/// The advisory singleton lock, held for the server's whole life.
+///
+/// An upgrade receiver acquires a new lock after the predecessor acknowledges
+/// and exits, closing the former gap where successors ran permanently unlocked.
 pub type ServerLock = Option<nix::fcntl::Flock<std::fs::File>>;
+
+fn acquire_server_lock_with(
+    argument: nix::fcntl::FlockArg,
+) -> Result<nix::fcntl::Flock<std::fs::File>, ScribeError> {
+    let lock_path = scribe_common::socket::server_lock_path();
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| ScribeError::Io { source: e })?;
+
+    let lock_file =
+        nix::fcntl::Flock::lock(lock_file, argument).map_err(|(_, _)| ScribeError::IpcError {
+            reason: "another scribe-server is already running (lock held)".into(),
+        })?;
+    Ok(lock_file)
+}
+
+/// Acquire the process-wide server lock after an acknowledged handoff.
+pub fn acquire_server_lock() -> Result<nix::fcntl::Flock<std::fs::File>, ScribeError> {
+    acquire_server_lock_with(nix::fcntl::FlockArg::LockExclusive)
+}
+
+/// Try to acquire the process-wide server lock without blocking.
+pub fn try_acquire_server_lock() -> Result<nix::fcntl::Flock<std::fs::File>, ScribeError> {
+    acquire_server_lock_with(nix::fcntl::FlockArg::LockExclusiveNonblock)
+}
 
 /// Acquire the server socket with singleton enforcement.
 ///
@@ -4454,18 +4483,7 @@ pub fn acquire_server_socket(
     }
 
     // Normal mode: acquire flock then bind-or-connect.
-    let lock_path = scribe_common::socket::server_lock_path();
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| ScribeError::Io { source: e })?;
-
-    let lock_file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, _)| ScribeError::IpcError {
-            reason: "another scribe-server is already running (lock held)".into(),
-        })?;
+    let lock_file = try_acquire_server_lock()?;
 
     // Try to bind the socket.  If it fails with EADDRINUSE the path
     // already exists; any other error is a real failure.
@@ -4885,6 +4903,7 @@ fn is_transient_first_frame(msg: &ClientMessage) -> bool {
     matches!(
         msg,
         ClientMessage::ListWindows
+            | ClientMessage::QuitAll
             | ClientMessage::DispatchAction { .. }
             | ClientMessage::CheckForUpdates
             | ClientMessage::ListReleases
@@ -4935,6 +4954,13 @@ async fn establish_local_first_frame(
     attached_ids: &AttachedSessionIds,
 ) -> Option<WindowId> {
     match msg {
+        ClientMessage::QuitAll => {
+            let quit = ServerMessage::QuitRequested;
+            for window_writer in connected_local_window_writers(&server.window_shares).await {
+                send_message(&window_writer, &quit).await;
+            }
+            None
+        }
         ClientMessage::ListWindows => {
             handle_list_windows(&server.window_shares, &server.workspace_manager, writer).await;
             None
@@ -8379,6 +8405,18 @@ pub async fn connected_window_writers(window_shares: &WindowShares) -> Vec<Share
         .await
         .values()
         .filter_map(|share| share.controller_writer().cloned())
+        .collect()
+}
+
+/// Snapshot each owning-machine participant for a local-only lifecycle action.
+async fn connected_local_window_writers(window_shares: &WindowShares) -> Vec<SharedWriter> {
+    window_shares
+        .read()
+        .await
+        .values()
+        .filter_map(|share| {
+            share.local_participant().map(|participant| Arc::clone(&participant.writer))
+        })
         .collect()
 }
 
@@ -12168,6 +12206,12 @@ mod tests {
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
     use scribe_common::framing::read_message;
     use std::os::unix::net::UnixStream as StdUnixStream;
+
+    // @lat: [[test#Test Harness#Server lifecycle#Updater quit is a transient local action]]
+    #[test]
+    fn updater_quit_is_a_transient_local_action() {
+        assert!(is_transient_first_frame(&ClientMessage::QuitAll));
+    }
 
     // @lat: [[protocol#Server Messages#Launch identity is local-only]]
     #[test]

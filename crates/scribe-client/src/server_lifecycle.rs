@@ -21,15 +21,22 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use scribe_common::app::current_identity;
+#[cfg(any(target_os = "macos", test))]
+use scribe_common::macos_launchd;
+use scribe_common::macos_launchd::LaunchdSlot;
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
 
 /// Maximum time to wait for a freshly started server to accept connections.
 pub const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Detached client mode that completes an approved destructive update fallback.
 pub const FINISH_UPDATE_RESTART_ARG: &str = "--finish-update-restart";
+/// One-shot relay mode used by the macOS updater after swapping the app bundle.
+pub const RELAUNCH_CLIENTS_ARG_PREFIX: &str =
+    scribe_common::macos_launchd::RELAUNCH_CLIENTS_ARG_PREFIX;
+use scribe_common::macos_launchd::TrackedClient;
 /// Maximum time to wait for a hot-reloaded macOS server to take over.
 #[cfg(target_os = "macos")]
-const SERVER_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVER_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval while waiting for the server socket to become connectable.
 pub const SERVER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -42,7 +49,32 @@ pub struct ConnectedServerInfo {
     pub exe_path: Option<PathBuf>,
     /// Process start time in seconds since the Unix epoch, if known.
     pub start_time_secs: Option<u64>,
+    /// launchd slot named by the process command line, when present.
+    pub launchd_slot: Option<LaunchdSlot>,
+    /// Whether the process command line was available for slot inspection.
+    pub command_line_observed: bool,
 }
+
+/// A live local connection plus any deferred destructive action it requires.
+pub struct ServerConnection {
+    pub stream: tokio::net::UnixStream,
+    pub cold_restart_required: bool,
+}
+
+/// Failure to establish a local server connection.
+#[derive(Debug)]
+pub struct ServerConnectError {
+    pub reason: String,
+    pub cold_restart_required: bool,
+}
+
+impl std::fmt::Display for ServerConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ServerConnectError {}
 
 /// Canonicalize both paths (falling back to the literal path) and compare.
 fn same_file_path(left: &Path, right: &Path) -> bool {
@@ -51,11 +83,39 @@ fn same_file_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-/// File modification time in whole seconds since the Unix epoch.
+/// Installed-file freshness time in whole seconds since the Unix epoch.
+///
+/// macOS installer copies can preserve a release artifact's modification time.
+/// Its inode change time still advances on replacement, so macOS takes the
+/// later value; other platforms retain the existing modification-time rule.
 #[must_use]
-pub fn file_modified_epoch_secs(path: &Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    modified.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+pub fn file_change_epoch_secs(path: &Path) -> Option<u64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(target_os = "macos")]
+    let changed = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        u64::try_from(metadata.ctime()).ok().map(|seconds| {
+            let nanoseconds = u32::try_from(metadata.ctime_nsec()).unwrap_or(0);
+            UNIX_EPOCH + Duration::new(seconds, nanoseconds)
+        })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let changed = None;
+    latest_file_change_epoch_secs(metadata.modified().ok(), changed)
+}
+
+fn latest_file_change_epoch_secs(
+    modified: Option<std::time::SystemTime>,
+    changed: Option<std::time::SystemTime>,
+) -> Option<u64> {
+    [modified, changed]
+        .into_iter()
+        .flatten()
+        .max()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// Decide whether a connected server is stale relative to the installed binary.
@@ -127,12 +187,16 @@ pub fn socket_failure_reason(socket_path: &Path, error: &std::io::Error) -> Stri
 /// connectable before the timeout.
 pub async fn connect_or_start_server(
     socket_path: &Path,
-) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerConnection, ServerConnectError> {
     let refusal = match tokio::net::UnixStream::connect(socket_path).await {
         Ok(stream) => {
             #[cfg(target_os = "macos")]
             match refresh_stale_connected_server(&stream) {
                 Ok(Some(refresh)) => {
+                    if !refresh.started {
+                        tracing::warn!(reason = %refresh.reason, "warm refresh could not start");
+                        return Ok(ServerConnection { stream, cold_restart_required: false });
+                    }
                     drop(stream);
                     tracing::info!(
                         old_pid = refresh.old_pid,
@@ -154,21 +218,23 @@ pub async fn connect_or_start_server(
                     );
                 }
             }
-            return Ok(stream);
+            return Ok(ServerConnection { stream, cold_restart_required: false });
         }
         Err(error) => socket_failure_reason(socket_path, &error),
     };
 
     tracing::info!(%refusal, "server not running, starting scribe-server");
-    platform_start_server().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("{refusal}; autostart failed: {e}").into()
+    platform_start_server().map_err(|error| ServerConnectError {
+        cold_restart_required: error.cold_restart_required,
+        reason: format!("{refusal}; autostart failed: {}", error.reason),
     })?;
 
-    wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("{refusal}; after autostart: {e}").into()
-        },
-    )
+    wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await.map_err(|error| {
+        ServerConnectError {
+            cold_restart_required: error.cold_restart_required,
+            reason: format!("{refusal}; after autostart: {}", error.reason),
+        }
+    })
 }
 
 /// Snapshot the server process on the far end of a connected socket.
@@ -198,13 +264,18 @@ pub fn connected_server_info(
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[sys_pid]),
         true,
-        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cmd(UpdateKind::Always),
     );
     let process = system.process(sys_pid);
+    let command_line_observed = process.is_some_and(|process| !process.cmd().is_empty());
     Ok(ConnectedServerInfo {
         pid,
         exe_path: process.and_then(|proc| proc.exe()).map(Path::to_path_buf),
         start_time_secs: process.map(sysinfo::Process::start_time),
+        launchd_slot: process.and_then(|process| {
+            LaunchdSlot::from_args(process.cmd().iter().map(|arg| arg.to_string_lossy()))
+        }),
+        command_line_observed,
     })
 }
 
@@ -219,7 +290,27 @@ pub fn connected_server_info(
 pub fn installed_server_exe() -> Result<PathBuf, String> {
     let client_exe =
         std::env::current_exe().map_err(|e| format!("cannot resolve client exe: {e}"))?;
-    Ok(client_exe.with_file_name(current_identity().server_binary_name()))
+    Ok(installed_bundle_executable(&client_exe, current_identity().server_binary_name()))
+}
+
+/// Resolve a shipped executable from the installed app rather than a renamed
+/// `.app.prev` bundle that may still own the running process image.
+fn installed_bundle_executable(current_exe: &Path, binary_name: &str) -> PathBuf {
+    if let Some(previous_bundle) = current_exe.ancestors().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".app.prev"))
+    }) {
+        return previous_bundle.with_extension("").join("Contents/MacOS").join(binary_name);
+    }
+
+    current_exe.with_file_name(binary_name)
+}
+
+fn installed_client_exe() -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve client executable: {error}"))?;
+    Ok(installed_bundle_executable(&current_exe, current_identity().client_binary_name()))
 }
 
 /// Diagnose the server on the far end of a live connection.
@@ -236,7 +327,7 @@ pub fn connected_server_staleness(stream: &tokio::net::UnixStream) -> Option<Str
     let running = connected_server_info(stream)
         .inspect_err(|error| tracing::debug!(%error, "cannot inspect the connected server"))
         .ok()?;
-    let installed_modified = file_modified_epoch_secs(&installed);
+    let installed_modified = file_change_epoch_secs(&installed);
     let reason = stale_server_reason(&running, &installed, installed_modified)?;
     tracing::warn!(pid = running.pid, %reason, "connected scribe-server is stale");
     Some(reason)
@@ -249,7 +340,7 @@ pub fn connected_server_staleness(stream: &tokio::net::UnixStream) -> Option<Str
 pub async fn wait_for_server_connection(
     socket_path: &Path,
     timeout: Duration,
-) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerConnection, ServerConnectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(SERVER_RETRY_INTERVAL).await;
@@ -258,6 +349,10 @@ pub async fn wait_for_server_connection(
             #[cfg(target_os = "macos")]
             match refresh_stale_connected_server(&stream) {
                 Ok(Some(refresh)) => {
+                    if !refresh.started {
+                        tracing::warn!(reason = %refresh.reason, "warm refresh could not start");
+                        return Ok(ServerConnection { stream, cold_restart_required: false });
+                    }
                     tracing::info!(
                         old_pid = refresh.old_pid,
                         reason = %refresh.reason,
@@ -280,19 +375,14 @@ pub async fn wait_for_server_connection(
                 }
             }
             tracing::info!("connected to scribe-server");
-            return Ok(stream);
+            return Ok(ServerConnection { stream, cold_restart_required: false });
         }
 
         if tokio::time::Instant::now() >= deadline {
-            #[cfg(target_os = "macos")]
-            if let Some(stream) = try_cold_restart_recovery(socket_path).await? {
-                return Ok(stream);
-            }
-            return Err(format!(
-                "scribe-server did not become ready within {}s",
-                timeout.as_secs()
-            )
-            .into());
+            return Err(ServerConnectError {
+                reason: format!("scribe-server did not become ready within {}s", timeout.as_secs()),
+                cold_restart_required: false,
+            });
         }
     }
 }
@@ -323,7 +413,7 @@ pub fn wait_for_server_ready(timeout: Duration) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns an error when the service cannot be started.
-pub fn platform_start_server() -> Result<(), String> {
+pub fn platform_start_server() -> Result<(), ServerConnectError> {
     #[cfg(target_os = "linux")]
     {
         linux_start_server()
@@ -334,7 +424,10 @@ pub fn platform_start_server() -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Err(String::from("server auto-start is not supported on this platform"))
+        Err(ServerConnectError {
+            reason: String::from("server auto-start is not supported on this platform"),
+            cold_restart_required: false,
+        })
     }
 }
 
@@ -396,230 +489,81 @@ pub fn sync_linux_service_environment() {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_start_server() -> Result<(), String> {
+fn linux_start_server() -> Result<(), ServerConnectError> {
     sync_linux_service_environment();
     let identity = current_identity();
     let status = std::process::Command::new("systemctl")
         .args(["--user", "start", identity.systemd_service_name()])
         .status()
-        .map_err(|e| format!("failed to run systemctl: {e}"))?;
+        .map_err(|error| ServerConnectError {
+            reason: format!("failed to run systemctl: {error}"),
+            cold_restart_required: false,
+        })?;
     if status.success() {
         tracing::info!(service = identity.systemd_service_name(), "server service started");
         Ok(())
     } else {
-        Err(format!("systemctl start exited with {status}"))
+        Err(ServerConnectError {
+            reason: format!("systemctl start exited with {status}"),
+            cold_restart_required: false,
+        })
     }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_start_server() -> Result<(), String> {
-    match start_server_via_launchctl(false) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            tracing::warn!(%error, "launchctl start failed; falling back to direct spawn");
-            start_server_directly(false)
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn restart_server() -> Result<(), String> {
-    // A direct upgrade can hand the live PTYs to the replacement. A launchd
-    // kickstart only kills the old process when launchd still owns it, which
-    // is often false after an app-bundle replacement.
-    match start_server_directly(true) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            tracing::warn!(%error, "--upgrade spawn failed; falling back to launchctl kickstart");
-            start_server_via_launchctl(true)
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn start_server_via_launchctl(force_restart: bool) -> Result<(), String> {
+fn macos_start_server() -> Result<(), ServerConnectError> {
     let identity = current_identity();
-    let uid = scribe_common::socket::current_uid();
-    let domain = format!("user/{uid}");
-    let service = format!("user/{uid}/{}", identity.launchd_label());
+    let stale = listed_process_pids(identity.server_binary_name())
+        .map_err(|reason| ServerConnectError { reason, cold_restart_required: false })?;
+    if !stale.is_empty() {
+        return Err(ServerConnectError {
+            reason: format!(
+                "scribe-server processes {stale:?} are alive without a reachable socket; cold restart required"
+            ),
+            cold_restart_required: true,
+        });
+    }
+    let server_exe = installed_server_exe()
+        .map_err(|reason| ServerConnectError { reason, cold_restart_required: false })?;
+    if !server_exe.is_file() {
+        return Err(ServerConnectError {
+            reason: format!("server binary not found at {}", server_exe.display()),
+            cold_restart_required: false,
+        });
+    }
+    macos_launchd::activate_initial_slot(identity, LaunchdSlot::Primary)
+        .map_err(|reason| ServerConnectError { reason, cold_restart_required: false })
+}
 
-    let home = std::env::var("HOME").map_err(|error| format!("HOME not set: {error}"))?;
-    let agents_dir = PathBuf::from(home).join("Library/LaunchAgents");
-    let installed_plist = agents_dir.join(identity.launchd_plist_name());
-    std::fs::create_dir_all(&agents_dir)
-        .map_err(|error| format!("failed to create LaunchAgents dir: {error}"))?;
-
+#[cfg(target_os = "macos")]
+fn restart_server(active_slot: LaunchdSlot) -> Result<(), String> {
+    let identity = current_identity();
     let server_exe = installed_server_exe()?;
     if !server_exe.is_file() {
         return Err(format!("server binary not found at {}", server_exe.display()));
     }
-    let plist = launchd_plist_contents(identity.launchd_label(), &server_exe);
-    let refreshed = sync_launchd_plist(&installed_plist, &plist)?;
-
-    if refreshed {
-        tracing::info!(
-            plist = %installed_plist.display(),
-            server = %server_exe.display(),
-            "updated launchd agent plist"
-        );
-        rebootstrap_launchd_agent(&domain, &service, &installed_plist)?;
-    }
-
-    match kickstart_launchd_agent(&service, force_restart) {
-        Ok(()) => Ok(()),
-        Err(error) if !refreshed => {
-            tracing::warn!(%error, "launchctl kickstart failed; re-bootstrapping agent");
-            rebootstrap_launchd_agent(&domain, &service, &installed_plist)?;
-            kickstart_launchd_agent(&service, force_restart)
-        }
-        Err(error) => Err(error),
-    }
+    macos_launchd::activate_replacement(identity, active_slot)
 }
 
-#[cfg(target_os = "macos")]
-fn start_server_directly(upgrade: bool) -> Result<(), String> {
-    use std::process::Stdio;
-
-    let server_exe = installed_server_exe()?;
-    if !server_exe.is_file() {
-        return Err(format!("server binary not found at {}", server_exe.display()));
-    }
-
-    let mut command = std::process::Command::new(&server_exe);
-    if upgrade {
-        command.arg("--upgrade");
-    }
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to spawn scribe-server: {error}"))?;
-
-    tracing::info!(pid = child.id(), exe = %server_exe.display(), upgrade, "spawned scribe-server");
-    Ok(())
-}
-
-// Compiled under `test` on every platform so the plist snapshot assertions
-// run on Linux CI as well.
+/// Resolve the active slot without treating unreadable process metadata as a
+/// legacy primary server.
 #[cfg(any(target_os = "macos", test))]
-fn launchd_plist_contents(label: &str, server_exe: &Path) -> String {
-    let label = escape_launchd_plist_value(label);
-    let server_exe = escape_launchd_plist_value(&server_exe.display().to_string());
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>{label}</string>
-
-	<key>ProgramArguments</key>
-	<array>
-		<string>{server_exe}</string>
-	</array>
-
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-	</dict>
-
-	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
-
-	<key>ProcessType</key>
-	<string>Background</string>
-
-	<key>ThrottleInterval</key>
-	<integer>1</integer>
-
-	<key>StandardOutPath</key>
-	<string>/dev/null</string>
-
-	<key>StandardErrorPath</key>
-	<string>/dev/null</string>
-</dict>
-</plist>
-"#
-    )
+fn refresh_active_slot(
+    command_line_slot: Option<LaunchdSlot>,
+    marker_slot: Option<LaunchdSlot>,
+    command_line_observed: bool,
+) -> Option<LaunchdSlot> {
+    command_line_slot
+        .or(marker_slot)
+        .or_else(|| command_line_observed.then_some(LaunchdSlot::Primary))
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn escape_launchd_plist_value(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-#[cfg(target_os = "macos")]
-fn sync_launchd_plist(path: &Path, expected: &str) -> Result<bool, String> {
-    let current = match std::fs::read_to_string(path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!("failed to read launchd plist {}: {error}", path.display()));
-        }
-    };
-
-    if current.as_deref() == Some(expected) {
-        return Ok(false);
-    }
-
-    std::fs::write(path, expected)
-        .map_err(|error| format!("failed to write launchd plist {}: {error}", path.display()))?;
-    Ok(true)
-}
-
-#[cfg(target_os = "macos")]
-fn rebootstrap_launchd_agent(domain: &str, service: &str, plist: &Path) -> Result<(), String> {
-    match std::process::Command::new("launchctl").args(["bootout", service]).status() {
-        Ok(status) if status.success() => {
-            tracing::info!(%service, "booted out existing launchd agent");
-        }
-        Ok(status) => {
-            tracing::debug!(%service, %status, "launchd agent bootout skipped");
-        }
-        Err(error) => {
-            tracing::debug!(%service, %error, "launchctl bootout unavailable");
-        }
-    }
-
-    let status = std::process::Command::new("launchctl")
-        .arg("bootstrap")
-        .arg(domain)
-        .arg(plist)
-        .status()
-        .map_err(|error| format!("failed to run launchctl bootstrap: {error}"))?;
-    if !status.success() {
-        return Err(format!("launchctl bootstrap exited with {status}"));
-    }
-    tracing::info!(%service, plist = %plist.display(), "bootstrapped launchd agent");
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn kickstart_launchd_agent(service: &str, force_restart: bool) -> Result<(), String> {
-    let mut command = std::process::Command::new("launchctl");
-    command.arg("kickstart");
-    if force_restart {
-        command.arg("-k");
-    }
-    let status = command
-        .arg(service)
-        .status()
-        .map_err(|error| format!("failed to run launchctl kickstart: {error}"))?;
-    if !status.success() {
-        return Err(format!("launchctl kickstart exited with {status}"));
-    }
-    tracing::info!(%service, force_restart, "kickstarted launchd agent");
-    Ok(())
+fn marker_binary_drift(
+    marker_binary: Option<macos_launchd::BinaryIdentity>,
+    installed_binary: Option<macos_launchd::BinaryIdentity>,
+) -> bool {
+    matches!((marker_binary, installed_binary), (Some(running), Some(installed)) if running != installed)
 }
 
 #[cfg(target_os = "macos")]
@@ -630,11 +574,169 @@ fn peer_pid_of(stream: &tokio::net::UnixStream) -> Result<i32, String> {
         .map_err(|error| format!("failed to query server peer pid: {error}"))
 }
 
+/// Parse the updater relay's old-server and exact client PID payload.
+#[must_use]
+pub fn client_relaunch_request<I, S>(args: I) -> Option<(Option<u32>, Vec<TrackedClient>)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let payload = args.into_iter().find_map(|argument| {
+        argument.as_ref().strip_prefix(RELAUNCH_CLIENTS_ARG_PREFIX).map(str::to_owned)
+    })?;
+    let (server, clients) = payload.split_once(':')?;
+    let old_server = if server == "unchanged" { None } else { Some(server.parse().ok()?) };
+    let clients = if clients.is_empty() {
+        Vec::new()
+    } else {
+        clients
+            .split(',')
+            .map(|client| {
+                let (pid, start_time) = client.split_once('@')?;
+                Some(TrackedClient {
+                    pid: pid.parse().ok()?,
+                    start_time_secs: start_time.parse().ok()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some((old_server, clients))
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid() -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt};
+
+    let stream = std::os::unix::net::UnixStream::connect(server_socket_path()).ok()?;
+    u32::try_from(getsockopt(&stream, sockopt::LocalPeerPid).ok()?).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_replacement_server(
+    old_server_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let ready = socket_peer_pid().is_some_and(|pid| {
+            old_server_pid != Some(pid)
+                && (old_server_pid.is_none()
+                    || macos_launchd::active_slot_for_pid(current_identity(), pid).is_some())
+        });
+        if ready {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(String::from(
+                "replacement server did not become ready for client relaunch",
+            ));
+        }
+        std::thread::sleep(SERVER_RETRY_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_graceful_client_shutdown() -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut stream = std::os::unix::net::UnixStream::connect(server_socket_path())
+        .map_err(|error| format!("cannot connect for graceful client shutdown: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("cannot bound graceful client shutdown write: {error}"))?;
+    let payload = rmp_serde::to_vec_named(&scribe_common::protocol::ClientMessage::QuitAll)
+        .map_err(|error| format!("cannot encode graceful client shutdown: {error}"))?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| String::from("graceful client shutdown frame is too large"))?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .and_then(|()| stream.write_all(&payload))
+        .map_err(|error| format!("cannot send graceful client shutdown: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn request_settings_shutdown() -> Result<(), String> {
+    use std::io::Write as _;
+
+    let path = scribe_common::socket::settings_socket_path();
+    let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot connect to settings shutdown socket: {error}")),
+    };
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("cannot bound settings shutdown write: {error}"))?;
+    stream
+        .write_all(b"{\"cmd\":\"quit\"}\n")
+        .map_err(|error| format!("cannot request settings shutdown: {error}"))
+}
+
+/// Relaunch changed clients only after the replacement server is accepting.
+#[cfg(target_os = "macos")]
+pub fn finish_client_relaunch(
+    old_server_pid: Option<u32>,
+    tracked_clients: &[TrackedClient],
+) -> Result<(), String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    if tracked_clients.is_empty() {
+        return Ok(());
+    }
+    wait_for_replacement_server(old_server_pid, SERVER_REFRESH_TIMEOUT)?;
+
+    let name = current_identity().client_binary_name();
+    let currently_named = listed_process_pids(name)?;
+    let sys_pids =
+        tracked_clients.iter().map(|client| Pid::from_u32(client.pid)).collect::<Vec<_>>();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&sys_pids),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let targets = tracked_clients
+        .iter()
+        .copied()
+        .filter(|client| {
+            currently_named.contains(&client.pid)
+                && system
+                    .process(Pid::from_u32(client.pid))
+                    .is_some_and(|process| process.start_time() == client.start_time_secs)
+        })
+        .collect::<Vec<_>>();
+    request_settings_shutdown()?;
+    request_graceful_client_shutdown()?;
+    let graceful_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut survivors = targets;
+    while !survivors.is_empty() && std::time::Instant::now() < graceful_deadline {
+        std::thread::sleep(SERVER_RETRY_INTERVAL);
+        survivors.retain(|client| process_is_alive(client.pid));
+    }
+
+    if !survivors.is_empty() {
+        let pids = survivors.iter().map(|client| client.pid).collect::<Vec<_>>();
+        return Err(format!(
+            "pre-update clients {pids:?} did not exit after graceful shutdown; refusing destructive termination and duplicate relaunch"
+        ));
+    }
+
+    spawn_replacement_client(&installed_client_exe()?)
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct StaleRefresh {
     old_pid: i32,
     reason: String,
+    started: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -643,8 +745,18 @@ fn refresh_stale_connected_server(
 ) -> Result<Option<StaleRefresh>, String> {
     let installed = installed_server_exe()?;
     let running = connected_server_info(stream)?;
-    let installed_modified = file_modified_epoch_secs(&installed);
-    let Some(reason) = stale_server_reason(&running, &installed, installed_modified) else {
+    let installed_modified = file_change_epoch_secs(&installed);
+    let marker_record = u32::try_from(running.pid)
+        .ok()
+        .and_then(|pid| macos_launchd::active_slot_record_for_pid(current_identity(), pid));
+    let reason = stale_server_reason(&running, &installed, installed_modified).or_else(|| {
+        marker_binary_drift(
+            marker_record.and_then(|(_, binary)| binary),
+            macos_launchd::binary_identity(&installed),
+        )
+        .then(|| String::from("running server executable identity differs from installed bundle"))
+    });
+    let Some(reason) = reason else {
         return Ok(None);
     };
 
@@ -653,8 +765,26 @@ fn refresh_stale_connected_server(
         %reason,
         "connected scribe-server is stale; requesting refresh"
     );
-    restart_server()?;
-    Ok(Some(StaleRefresh { old_pid: running.pid, reason }))
+    let marker_slot = marker_record.map(|(slot, _)| slot);
+    let Some(active_slot) =
+        refresh_active_slot(running.launchd_slot, marker_slot, running.command_line_observed)
+    else {
+        return Ok(Some(StaleRefresh {
+            old_pid: running.pid,
+            reason: format!(
+                "{reason}; warm refresh refused because the active launchd slot could not be proven"
+            ),
+            started: false,
+        }));
+    };
+    match restart_server(active_slot) {
+        Ok(()) => Ok(Some(StaleRefresh { old_pid: running.pid, reason, started: true })),
+        Err(error) => Ok(Some(StaleRefresh {
+            old_pid: running.pid,
+            reason: format!("{reason}; warm launchd activation failed: {error}"),
+            started: false,
+        })),
+    }
 }
 
 /// Wait until a hot-upgrade replaces `old_pid`, then return its connection.
@@ -663,7 +793,7 @@ async fn wait_for_refreshed_server(
     socket_path: &Path,
     old_pid: i32,
     timeout: Duration,
-) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerConnection, ServerConnectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(SERVER_RETRY_INTERVAL).await;
@@ -672,7 +802,7 @@ async fn wait_for_refreshed_server(
             match peer_pid_of(&stream) {
                 Ok(pid) if pid != old_pid => {
                     tracing::info!(new_pid = pid, "connected to refreshed scribe-server");
-                    return Ok(stream);
+                    return Ok(ServerConnection { stream, cold_restart_required: false });
                 }
                 Ok(_) => drop(stream),
                 Err(error) => {
@@ -680,7 +810,7 @@ async fn wait_for_refreshed_server(
                         %error,
                         "could not query peer pid after refresh; accepting connection"
                     );
-                    return Ok(stream);
+                    return Ok(ServerConnection { stream, cold_restart_required: false });
                 }
             }
         }
@@ -688,27 +818,30 @@ async fn wait_for_refreshed_server(
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 old_pid,
-                "handoff did not take over within {}s; falling back to cold restart",
-                timeout.as_secs()
+                "handoff did not take over; user-approved cold restart required"
             );
-            perform_macos_cold_restart().map_err(
-                |error| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("cold-restart fallback after handoff timeout failed: {error}").into()
-                },
-            )?;
-            return tokio::net::UnixStream::connect(socket_path).await.map_err(
-                |error| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("connect after handoff cold-restart failed: {error}").into()
-                },
-            );
+            let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(|error| {
+                ServerConnectError {
+                    reason: format!("handoff failed and the old server is unreachable: {error}"),
+                    cold_restart_required: true,
+                }
+            })?;
+            return Ok(ServerConnection { stream, cold_restart_required: true });
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn listed_process_pids(process_name: &str) -> Result<Vec<u32>, String> {
-    let output = std::process::Command::new("pgrep")
-        .args(["-x", process_name])
+    let mut command = std::process::Command::new("pgrep");
+    #[cfg(target_os = "linux")]
+    command.args(["-x", process_name]);
+    #[cfg(target_os = "macos")]
+    {
+        let uid = scribe_common::socket::current_uid().to_string();
+        command.args(["-U", uid.as_str(), "-x", process_name]);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("failed to run pgrep for {process_name}: {error}"))?;
 
@@ -716,7 +849,7 @@ fn listed_process_pids(process_name: &str) -> Result<Vec<u32>, String> {
         return if output.status.code() == Some(1) {
             Ok(Vec::new())
         } else {
-            Err(format!("pgrep -x {process_name} exited with {}", output.status))
+            Err(format!("pgrep for {process_name} exited with {}", output.status))
         };
     }
 
@@ -771,6 +904,11 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     !process_is_alive(pid)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn surviving_process_pids(pids: &[u32], mut is_alive: impl FnMut(u32) -> bool) -> Vec<u32> {
+    pids.iter().copied().filter(|pid| is_alive(*pid)).collect()
+}
+
 /// Return whether this invocation is the detached deferred-restart helper.
 #[must_use]
 pub fn is_finish_update_restart<I, S>(args: I) -> bool
@@ -789,8 +927,7 @@ where
 pub fn spawn_update_restart_helper() -> Result<(), String> {
     use std::process::Stdio;
 
-    let client_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve client executable: {error}"))?;
+    let client_exe = installed_client_exe()?;
     let child = std::process::Command::new(&client_exe)
         .arg(FINISH_UPDATE_RESTART_ARG)
         .stdin(Stdio::null())
@@ -810,9 +947,60 @@ fn other_process_pids(current_pid: u32, pids: impl IntoIterator<Item = u32>) -> 
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn wait_for_tracked_clients_to_exit(client_pids: &[u32]) -> Result<(), String> {
-    for pid in client_pids {
-        if !wait_for_process_exit(*pid, Duration::from_secs(10)) {
+fn acquire_restart_helper_guard(
+    identity: scribe_common::app::AppIdentity,
+) -> Result<Option<nix::fcntl::Flock<std::fs::File>>, String> {
+    let directory =
+        identity.state_dir().ok_or_else(|| String::from("state directory unavailable"))?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create restart-helper lock directory: {error}"))?;
+    let path = directory.join("update-restart-helper.lock");
+    let file =
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).map_err(
+            |error| format!("failed to open restart-helper lock {}: {error}", path.display()),
+        )?;
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(guard) => Ok(Some(guard)),
+        Err((_, error)) if error == nix::errno::Errno::EWOULDBLOCK => Ok(None),
+        Err((_, error)) => {
+            Err(format!("failed to acquire restart-helper lock {}: {error}", path.display()))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_tracked_clients_to_exit(
+    process_name: &str,
+    client_pids: &[u32],
+    cooperative_timeout: Duration,
+) -> Result<(), String> {
+    let cooperative_deadline = std::time::Instant::now() + cooperative_timeout;
+    let mut survivors = surviving_process_pids(client_pids, process_is_alive);
+    while !survivors.is_empty() && std::time::Instant::now() < cooperative_deadline {
+        std::thread::sleep(SERVER_RETRY_INTERVAL);
+        survivors = surviving_process_pids(&survivors, process_is_alive);
+    }
+
+    let still_named = listed_process_pids(process_name)?;
+    survivors.retain(|pid| still_named.contains(pid));
+
+    // The ordinary path exits through the server's QuitRequested broadcast.
+    // If the server is unreachable, that broadcast cannot arrive; SIGTERM is
+    // the client's explicit graceful-shutdown signal and flushes every hosted
+    // window before exiting. Settings-only processes retain SIGTERM's default
+    // action because they have no terminal restore state to flush.
+    for pid in &survivors {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .map_err(|error| format!("failed to signal client pid {pid}: {error}"))?;
+        if !status.success() && process_is_alive(*pid) {
+            return Err(format!("kill -TERM {pid} exited with {status}"));
+        }
+    }
+
+    for pid in survivors {
+        if !wait_for_process_exit(pid, Duration::from_secs(10)) {
             return Err(format!(
                 "client pid {pid} did not exit after the deferred restart was approved"
             ));
@@ -838,6 +1026,24 @@ fn spawn_replacement_client(client_exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn restart_then_relaunch(
+    restart: impl FnOnce() -> Result<(), String>,
+    relaunch: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let restart_result = restart();
+    let relaunch_result = relaunch();
+    match (restart_result, relaunch_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(restart_error), Ok(())) => Err(format!(
+            "server restart failed, but the client was relaunched for recovery: {restart_error}"
+        )),
+        (Ok(()), Err(relaunch_error)) => Err(relaunch_error),
+        (Err(restart_error), Err(relaunch_error)) => Err(format!(
+            "server restart failed: {restart_error}; client relaunch also failed: {relaunch_error}"
+        )),
+    }
+}
+
 /// Complete an update whose warm server handoff failed.
 ///
 /// The UI starts this helper before asking every client window to save and
@@ -850,20 +1056,33 @@ fn spawn_replacement_client(client_exe: &Path) -> Result<(), String> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn finish_update_restart() -> Result<(), String> {
     let identity = current_identity();
-    let client_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve client executable: {error}"))?;
+    let Some(_restart_guard) = acquire_restart_helper_guard(identity)? else {
+        tracing::info!("another deferred update helper already owns the restart");
+        return Ok(());
+    };
+    let client_exe = installed_client_exe()?;
     let clients = listed_process_pids(identity.client_binary_name())?;
     let client_pids = other_process_pids(std::process::id(), clients);
+    let cooperative_timeout =
+        if std::os::unix::net::UnixStream::connect(server_socket_path()).is_ok() {
+            Duration::from_secs(10)
+        } else {
+            Duration::ZERO
+        };
 
-    wait_for_tracked_clients_to_exit(&client_pids)?;
+    wait_for_tracked_clients_to_exit(
+        identity.client_binary_name(),
+        &client_pids,
+        cooperative_timeout,
+    )?;
 
     #[cfg(target_os = "linux")]
-    perform_linux_cold_restart(&client_exe)?;
+    let restart = || perform_linux_cold_restart(&client_exe);
 
     #[cfg(target_os = "macos")]
-    perform_macos_cold_restart()?;
+    let restart = perform_macos_cold_restart;
 
-    spawn_replacement_client(&client_exe)
+    restart_then_relaunch(restart, || spawn_replacement_client(&client_exe))
 }
 
 /// Reject deferred update mode on unsupported platforms.
@@ -879,6 +1098,9 @@ fn terminate_pid(pid: u32, label: &str) -> Result<(), String> {
         .arg(&pid_text)
         .status()
         .map_err(|error| format!("failed to signal {label} pid {pid}: {error}"))?;
+    if !status.success() && !process_is_alive(pid) {
+        return Ok(());
+    }
     if !status.success() {
         return Err(format!("kill {pid} for {label} exited with {status}"));
     }
@@ -900,10 +1122,20 @@ fn terminate_pid(pid: u32, label: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn remove_file_if_present(path: &Path, description: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove {description} {}: {error}", path.display())),
+    }
+}
+
 /// Last-resort macOS recovery after a handoff or accept-loop failure.
 #[cfg(target_os = "macos")]
 fn perform_macos_cold_restart() -> Result<(), String> {
     let identity = current_identity();
+    macos_launchd::unregister_all_slots(identity)?;
     let current_pid = std::process::id();
     let server_pids = listed_process_pids(identity.server_binary_name())?
         .into_iter()
@@ -911,53 +1143,31 @@ fn perform_macos_cold_restart() -> Result<(), String> {
         .collect::<Vec<_>>();
 
     for pid in server_pids {
-        if let Err(error) = terminate_pid(pid, "scribe-server") {
-            tracing::warn!(pid, %error, "failed to terminate stale scribe-server");
-        }
+        terminate_pid(pid, "scribe-server")?;
     }
 
-    drop(std::fs::remove_file(server_socket_path()));
-    drop(std::fs::remove_file(handoff_socket_path()));
-
-    // Force launchd to replace any KeepAlive respawn that raced the explicit
-    // termination. A normal kickstart could leave that process running after
-    // its socket was removed.
-    start_server_via_launchctl(true).or_else(|error| {
-        tracing::warn!(%error, "launchctl cold restart failed; falling back to direct spawn");
-        start_server_directly(false)
-    })?;
-    wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
-}
-
-#[cfg(target_os = "macos")]
-async fn try_cold_restart_recovery(
-    socket_path: &Path,
-) -> Result<Option<tokio::net::UnixStream>, Box<dyn std::error::Error + Send + Sync>> {
-    let identity = current_identity();
-    let current_pid = std::process::id();
-    let stale = listed_process_pids(identity.server_binary_name())
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?
+    let survivors = listed_process_pids(identity.server_binary_name())?
         .into_iter()
         .filter(|pid| *pid != current_pid)
         .collect::<Vec<_>>();
-
-    if stale.is_empty() {
-        return Ok(None);
+    if !survivors.is_empty() {
+        return Err(format!(
+            "refusing to clear server sockets while scribe-server processes {survivors:?} remain alive"
+        ));
     }
 
-    tracing::warn!(
-        ?stale,
-        "server connect timed out with stale processes alive; forcing cold restart"
-    );
-    perform_macos_cold_restart().map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("cold-restart recovery after connect timeout failed: {error}").into()
-    })?;
-    let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(
-        |error| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("connect after cold-restart recovery failed: {error}").into()
-        },
-    )?;
-    Ok(Some(stream))
+    remove_file_if_present(&server_socket_path(), "server socket")?;
+    remove_file_if_present(&handoff_socket_path(), "handoff socket")?;
+    if let Some(path) = macos_launchd::active_slot_path(identity) {
+        remove_file_if_present(&path, "active-slot marker")?;
+    }
+
+    let server_exe = installed_server_exe()?;
+    if !server_exe.is_file() {
+        return Err(format!("server binary not found at {}", server_exe.display()));
+    }
+    macos_launchd::activate_initial_slot(identity, LaunchdSlot::Primary)?;
+    wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
 }
 
 /// Whether any server process owned by `uid` matching `server_exe` is alive.
@@ -1027,7 +1237,7 @@ pub fn perform_linux_cold_restart(client_exe: &Path) -> Result<(), String> {
             .status(),
     );
 
-    platform_start_server()?;
+    platform_start_server().map_err(|error| error.reason)?;
     wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
 }
 
@@ -1036,15 +1246,60 @@ mod tests {
     use super::*;
 
     fn running(exe: &str, start: Option<u64>) -> ConnectedServerInfo {
-        ConnectedServerInfo { pid: 42, exe_path: Some(PathBuf::from(exe)), start_time_secs: start }
+        ConnectedServerInfo {
+            pid: 42,
+            exe_path: Some(PathBuf::from(exe)),
+            start_time_secs: start,
+            launchd_slot: None,
+            command_line_observed: true,
+        }
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Unknown launchd slot fails closed]]
+    #[test]
+    fn unknown_launchd_slot_fails_closed() {
+        assert_eq!(
+            refresh_active_slot(Some(LaunchdSlot::Alternate), None, true),
+            Some(LaunchdSlot::Alternate)
+        );
+        assert_eq!(
+            refresh_active_slot(None, Some(LaunchdSlot::Alternate), false),
+            Some(LaunchdSlot::Alternate)
+        );
+        assert_eq!(refresh_active_slot(None, None, true), Some(LaunchdSlot::Primary));
+        assert_eq!(refresh_active_slot(None, None, false), None);
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Cold restart requirement is typed]]
+    #[test]
+    fn cold_restart_requirement_is_typed() {
+        let error = ServerConnectError {
+            reason: String::from("server is wedged"),
+            cold_restart_required: true,
+        };
+
+        assert!(error.cold_restart_required);
+        assert_eq!(error.to_string(), "server is wedged");
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Deferred restart uses the installed bundle]]
+    #[test]
+    fn deferred_restart_uses_the_installed_bundle() {
+        let running = Path::new("/Applications/Scribe.app.prev/Contents/MacOS/scribe-client");
+        let installed = installed_bundle_executable(running, "scribe-client");
+
+        assert_eq!(
+            installed,
+            PathBuf::from("/Applications/Scribe.app/Contents/MacOS/scribe-client")
+        );
     }
 
     // @lat: [[test#Server lifecycle#Launchd plist pins a baseline PATH]]
     #[test]
     fn launchd_plist_sets_baseline_path_environment() {
-        let plist = launchd_plist_contents(
-            "com.scribe.server",
-            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+        let plist = macos_launchd::plist_contents(
+            scribe_common::app::AppIdentity::stable(),
+            LaunchdSlot::Primary,
         );
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains(
@@ -1055,11 +1310,20 @@ mod tests {
     // @lat: [[test#Server lifecycle#Dist plist matches the generated plist]]
     #[test]
     fn dist_plist_matches_generated_launchd_plist() {
-        let generated = launchd_plist_contents(
-            "com.scribe.server",
-            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+        let generated = macos_launchd::plist_contents(
+            scribe_common::app::AppIdentity::stable(),
+            LaunchdSlot::Primary,
         );
         assert_eq!(generated, include_str!("../../../dist/macos/com.scribe.server.plist"));
+
+        let alternate = macos_launchd::plist_contents(
+            scribe_common::app::AppIdentity::stable(),
+            LaunchdSlot::Alternate,
+        );
+        assert_eq!(
+            alternate,
+            include_str!("../../../dist/macos/com.scribe.server.alternate.plist")
+        );
     }
 
     // @lat: [[test#Server lifecycle#Path drift marks server stale]]
@@ -1076,6 +1340,26 @@ mod tests {
         let info = running("/usr/bin/scribe-server", Some(100));
         let reason = stale_server_reason(&info, Path::new("/usr/bin/scribe-server"), Some(101));
         assert!(reason.is_some());
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Manual DMG inode change marks server stale]]
+    #[test]
+    fn later_inode_change_time_wins_over_preserved_mtime() {
+        let modified = UNIX_EPOCH + Duration::from_secs(50);
+        let changed = UNIX_EPOCH + Duration::from_mins(2);
+
+        assert_eq!(latest_file_change_epoch_secs(Some(modified), Some(changed)), Some(120));
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Launchd marker detects bundle replacement]]
+    #[test]
+    fn launchd_marker_detects_bundle_replacement() {
+        let running = macos_launchd::BinaryIdentity { device: 1, inode: 20 };
+        let installed = macos_launchd::BinaryIdentity { device: 1, inode: 21 };
+
+        assert!(marker_binary_drift(Some(running), Some(installed)));
+        assert!(!marker_binary_drift(Some(running), Some(running)));
+        assert!(!marker_binary_drift(None, Some(installed)));
     }
 
     // @lat: [[test#Server lifecycle#Matching fresh server is not stale]]
@@ -1158,10 +1442,39 @@ mod tests {
         assert!(!is_finish_update_restart(["scribe-client", "--restore-child"]));
     }
 
+    // @lat: [[test#Test Harness#Server lifecycle#Client relaunch relay payload is typed]]
+    #[test]
+    fn client_relaunch_relay_payload_is_typed() {
+        assert_eq!(
+            client_relaunch_request([
+                "scribe-client",
+                "--relaunch-clients-after-server=41:7@70,9@90",
+            ]),
+            Some((
+                Some(41),
+                vec![
+                    TrackedClient { pid: 7, start_time_secs: 70 },
+                    TrackedClient { pid: 9, start_time_secs: 90 },
+                ],
+            ))
+        );
+        assert_eq!(
+            client_relaunch_request(["--relaunch-clients-after-server=unchanged:7@70"]),
+            Some((None, vec![TrackedClient { pid: 7, start_time_secs: 70 }]))
+        );
+        assert_eq!(client_relaunch_request(["--relaunch-clients-after-server=bad:7@70"]), None);
+    }
+
     // @lat: [[test#Test Harness#Server lifecycle#Deferred restart helper excludes itself]]
     #[test]
     fn deferred_restart_helper_excludes_itself() {
         assert_eq!(other_process_pids(42, [11, 42, 73]), vec![11, 73]);
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Deferred restart signals only surviving clients]]
+    #[test]
+    fn deferred_restart_signals_only_surviving_clients() {
+        assert_eq!(surviving_process_pids(&[11, 42, 73], |pid| pid != 42), vec![11, 73]);
     }
 
     // @lat: [[test#Test Harness#Server lifecycle#Zombie clients do not block relaunch]]
@@ -1170,5 +1483,21 @@ mod tests {
         assert!(process_state_is_zombie(" Z (zombie)"));
         assert!(process_state_is_zombie("Z+"));
         assert!(!process_state_is_zombie("S (sleeping)"));
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Restart failure still relaunches the client]]
+    #[test]
+    fn restart_failure_still_relaunches_the_client() {
+        let relaunched = std::cell::Cell::new(false);
+        let result = restart_then_relaunch(
+            || Err(String::from("restart failed")),
+            || {
+                relaunched.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(relaunched.get());
+        assert!(result.is_err_and(|error| error.contains("relaunched for recovery")));
     }
 }

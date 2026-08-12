@@ -65,6 +65,7 @@ tracing-subscriber = { version = "0.3", features = [
   "json",
   "registry",
 ] }
+signal-hook = "0.4"
 bytes = "1"
 
 # OS keystore + crypto (feature 006)
@@ -90,6 +91,18 @@ socket2 = "0.6"
 rustix = { version = "1.1", features = ["net", "process"] }
 libc = "0.2"
 unix-ancillary = "0.1"
+block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "NSString",
+] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "SMAppService",
+  "block2",
+  "objc2",
+  "objc2-foundation",
+] }
 # `randr` names the monitor under a window for geometry persistence
 # (`scribe-client/src/monitor.rs`); GPUI's X11 display uuid is a nil
 # placeholder, so the connector name has to come from RandR directly.

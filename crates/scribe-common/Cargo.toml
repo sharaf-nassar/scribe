@@ -24,3 +24,9 @@ base64.workspace = true
 flate2.workspace = true
 scribe-image-decode.workspace = true
 scribe-png-decoder.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-service-management.workspace = true

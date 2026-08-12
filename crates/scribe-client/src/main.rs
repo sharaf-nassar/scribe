@@ -15,7 +15,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -151,7 +151,8 @@ use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
         AiLaunchSpec, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
-        ServerMessage, SessionInfo, TerminalSize, WindowInfo, WorkspaceTreeNode,
+        ServerMessage, SessionInfo, TerminalSize, UpdateProgressState, WindowInfo,
+        WorkspaceTreeNode,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -188,6 +189,7 @@ use crate::{
 /// Wall-clock origin captured at the very top of `main`, used to time
 /// startup-to-first-frame for the perf A/B rig (`tools/perf-ab-rig`).
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+static PROCESS_SHUTDOWN: OnceLock<Arc<ProcessShutdown>> = OnceLock::new();
 
 /// Latches once the first frame has emitted its startup-timing marker so the
 /// per-frame `render` hook only measures the initial paint.
@@ -473,6 +475,48 @@ impl AiChrome {
 /// [`Shared`].
 type ServerTopologySlot = Arc<Mutex<Option<(WorkspaceTreeNode, HashSet<SessionId>)>>>;
 
+/// Coordinates one graceful process exit across every hosted terminal view.
+///
+/// The deferred restart helper uses SIGTERM only when `QuitAll` cannot reach
+/// the server. Signal handling sets `requested`; each foreground view then
+/// flushes its own restore state and the final view quits the application.
+struct ProcessShutdown {
+    requested: Arc<AtomicBool>,
+    views: AtomicUsize,
+}
+
+impl ProcessShutdown {
+    fn install() -> Result<Arc<Self>, String> {
+        let requested = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&requested))
+            .map_err(|error| format!("failed to install graceful SIGTERM handler: {error}"))?;
+        Ok(Arc::new(Self { requested, views: AtomicUsize::new(0) }))
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Arc<Self> {
+        Arc::new(Self { requested: Arc::new(AtomicBool::new(false)), views: AtomicUsize::new(0) })
+    }
+
+    fn register_view(&self) {
+        self.views.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// Retire one active view and report whether it was the process's last one.
+    fn finish_view(&self) -> bool {
+        self.views.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+}
+
 /// Shared handles threaded from the app entry into the background IPC thread and
 /// the foreground GPUI view.
 #[derive(Clone)]
@@ -536,6 +580,9 @@ struct Shared {
     /// the server's `WindowClosed` / `QuitRequested` / `WindowList` answer back
     /// into it; the view's lifecycle tick drains the acknowledged exit.
     lifecycle: Arc<Mutex<WindowLifecycle>>,
+    /// Process-wide graceful shutdown shared by every terminal window hosted
+    /// in this client process.
+    process_shutdown: Arc<ProcessShutdown>,
     /// Terminal bells the IPC reader has taken off the wire and the foreground
     /// has not yet run through the [`BellController`] gate. The reader cannot
     /// touch the gate itself: it is a GPUI entity whose signal is a window-level
@@ -1526,6 +1573,8 @@ struct TerminalView {
     /// Cold-restart snapshot persistence, geometry persistence, and the replay
     /// of whatever this process claimed at launch.
     restore: RestoreRuntime,
+    /// This view has retired from the process-wide active-view count.
+    process_shutdown_finished: bool,
     /// Held to keep the window-bounds observer alive, which is what notices a
     /// move or resize worth persisting.
     _bounds_observer: Subscription,
@@ -1925,9 +1974,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let bounds_observer = Self::start_geometry_tracking(window, cx);
-        let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
-        // The focus observer is unconditional; activation drives more than the X11 guard.
+        shared.process_shutdown.register_view();
+        let (bounds_observer, (x11_focus, x11_focus_task)) =
+            (Self::start_geometry_tracking(window, cx), Self::start_x11_focus_guard(window, cx));
         let activation_observer = cx
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
@@ -1937,8 +1986,7 @@ impl TerminalView {
         let notifications = Self::start_notifications(&shared, &config, window, cx);
         let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
-        let chrome = config.config().chrome;
-        let opacity = clamp_opacity(config.opacity());
+        let (chrome, opacity) = (config.config().chrome, clamp_opacity(config.opacity()));
         let (zoom, font) = Self::opening_font(&config, &seed);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
@@ -1947,8 +1995,6 @@ impl TerminalView {
         let prompt_bar = terminal.prompt_bar.clone();
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, cx);
-        // One initial pane: the shape the window has before every later split.
-        let shell = PaneShell::new(chrome.accent, cx);
         Self {
             shared,
             sink,
@@ -1968,7 +2014,7 @@ impl TerminalView {
             prompt_colors: PromptBarColors::from(&chrome),
             context_thresholds,
             prompt_bar,
-            shell,
+            shell: PaneShell::new(chrome.accent, cx),
             pane_sizes: HashMap::new(),
             image_cache: Rc::new(RefCell::new(GpuiImageCache::new())),
             focused_pane_size: seed.terminal_size,
@@ -2009,6 +2055,7 @@ impl TerminalView {
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
             restore: RestoreRuntime::from_seed(seed),
+            process_shutdown_finished: false,
             _bounds_observer: bounds_observer,
         }
     }
@@ -4213,41 +4260,16 @@ impl TerminalView {
         self.poll_bells(cx);
         self.poll_notifications(cx);
         self.poll_notification_clicks(cx);
-        let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
+        let process_shutdown = self.shared.process_shutdown.requested();
+        let exit = process_shutdown
+            .then_some(ExitReason::QuitRequested)
+            .or_else(|| self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit()));
         if let Some(reason) = exit {
             // Toasts outlive the process that raised them, and a fresh client
             // cannot manage ids it never allocated — so the dispatcher closes
             // every live one before the window goes away.
             self.shutdown_notifications();
-            match reason {
-                ExitReason::QuitRequested => {
-                    tracing::info!("quit requested by server — exiting");
-                    // A quit ends the CLIENT, not the sessions: every pane in
-                    // this window is still running on the server and comes back
-                    // on the next launch. So the snapshot is flushed, not
-                    // dropped — it is this window's layout, its geometry, and
-                    // the id the next launch claims the window back by. Dropping
-                    // it is what left a restart with no record of the windows it
-                    // had, able to reclaim only the one the server volunteered.
-                    self.flush_geometry_now();
-                    self.flush_snapshot_now(cx);
-                    // A quit-all is the only exit that ends the process: the
-                    // server told EVERY window to go, and this one may be
-                    // hosting several of them.
-                    cx.quit();
-                }
-                ExitReason::WindowClosed => {
-                    tracing::info!("window close acknowledged by server — closing this window");
-                    self.clear_restore_state(true);
-                    // Only THIS window was killed. One process hosts every
-                    // window the user opened (see `open_restored_window`), so
-                    // quitting the app here took its siblings down with it —
-                    // and merely closed them, since their sessions were never
-                    // asked to die. GPUI quits on its own once the last window
-                    // is gone.
-                    window.remove_window();
-                }
-            }
+            self.finish_exit(reason, window, cx);
             return;
         }
         self.report_focus();
@@ -4257,6 +4279,37 @@ impl TerminalView {
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
         self.poll_restore(cx);
+    }
+
+    fn finish_exit(&mut self, reason: ExitReason, window: &mut Window, cx: &mut Context<Self>) {
+        match reason {
+            ExitReason::QuitRequested => {
+                if self.process_shutdown_finished {
+                    return;
+                }
+                self.process_shutdown_finished = true;
+                tracing::info!("graceful process shutdown requested — flushing window");
+                // A quit ends the client, not its server-owned sessions. Flush
+                // the window layout and geometry so the next launch restores it.
+                self.flush_geometry_now();
+                self.flush_snapshot_now(cx);
+                if self.shared.process_shutdown.finish_view() {
+                    cx.quit();
+                } else {
+                    window.remove_window();
+                }
+            }
+            ExitReason::WindowClosed => {
+                tracing::info!("window close acknowledged by server — closing this window");
+                if !self.process_shutdown_finished {
+                    self.process_shutdown_finished = true;
+                    self.shared.process_shutdown.finish_view();
+                }
+                self.clear_restore_state(true);
+                // GPUI quits on its own once the last hosted window is gone.
+                window.remove_window();
+            }
+        }
     }
 
     /// Reopen the windows `Welcome` reported the server still holds sessions
@@ -7832,6 +7885,15 @@ impl TerminalView {
     }
 }
 
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        if !self.process_shutdown_finished {
+            self.process_shutdown_finished = true;
+            self.shared.process_shutdown.finish_view();
+        }
+    }
+}
+
 /// Owned backing store for an [`ActionExpansionContext`], which borrows every
 /// field it interpolates.
 struct ActionExpansionValues {
@@ -8998,6 +9060,10 @@ struct WindowBackend {
 /// this process opens afterwards, so the paths cannot drift.
 fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
     let WindowBackend { claim, initial_session, fan_out } = window;
+    let Some(process_shutdown) = PROCESS_SHUTDOWN.get().map(Arc::clone) else {
+        tracing::error!("terminal backend opened before shutdown handler installation");
+        std::process::abort();
+    };
     let shared = Shared {
         panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
         attached: Arc::new(Mutex::new(HashSet::new())),
@@ -9016,6 +9082,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
+        process_shutdown,
         bells: Arc::new(Mutex::new(Vec::new())),
         ai_notices: Arc::new(Mutex::new(Vec::new())),
         notification_focus: Arc::new(Mutex::new(Vec::new())),
@@ -9046,17 +9113,91 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
     (shared, sink)
 }
 
-fn main() -> std::process::ExitCode {
-    PROCESS_START.get_or_init(Instant::now);
-    init_tracing();
+fn launchd_command_exit() -> Option<std::process::ExitCode> {
+    if let Some(_active_slot) =
+        scribe_common::macos_launchd::LaunchdSlot::registration_from_args(std::env::args())
+    {
+        #[cfg(target_os = "macos")]
+        return Some(
+            match scribe_common::macos_launchd::activate_replacement(
+                scribe_common::app::current_identity(),
+                _active_slot,
+            ) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        active_slot = _active_slot.name(),
+                        "launchd replacement registration failed"
+                    );
+                    std::process::ExitCode::FAILURE
+                }
+            },
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        return Some(std::process::ExitCode::FAILURE);
+    }
+    if let Some(_active_slot) =
+        scribe_common::macos_launchd::LaunchdSlot::inactive_unregistration_from_args(
+            std::env::args(),
+        )
+    {
+        #[cfg(target_os = "macos")]
+        return Some(
+            match scribe_common::macos_launchd::unregister_inactive_slot(
+                scribe_common::app::current_identity(),
+                _active_slot,
+            ) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        active_slot = _active_slot.name(),
+                        "inactive launchd unregister failed"
+                    );
+                    std::process::ExitCode::FAILURE
+                }
+            },
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        return Some(std::process::ExitCode::FAILURE);
+    }
     if server_lifecycle::is_finish_update_restart(std::env::args()) {
-        return match server_lifecycle::finish_update_restart() {
+        return Some(match server_lifecycle::finish_update_restart() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(error) => {
                 tracing::error!(%error, "deferred update restart failed");
                 std::process::ExitCode::FAILURE
             }
-        };
+        });
+    }
+    if let Some((_old_server_pid, _client_pids)) =
+        server_lifecycle::client_relaunch_request(std::env::args())
+    {
+        #[cfg(target_os = "macos")]
+        return Some(
+            match server_lifecycle::finish_client_relaunch(_old_server_pid, &_client_pids) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(%error, "post-update client relaunch failed");
+                    std::process::ExitCode::FAILURE
+                }
+            },
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        return Some(std::process::ExitCode::FAILURE);
+    }
+    None
+}
+
+fn main() -> std::process::ExitCode {
+    PROCESS_START.get_or_init(Instant::now);
+    init_tracing();
+    if let Some(exit) = launchd_command_exit() {
+        return exit;
     }
     if std::env::args().skip(1).any(|arg| arg == "--vulkan-probe") {
         if let Err(error) = probe_vulkan() {
@@ -9086,6 +9227,18 @@ fn main() -> std::process::ExitCode {
     if std::env::args().skip(1).any(|arg| arg == "--settings") {
         run_settings();
         return std::process::ExitCode::SUCCESS;
+    }
+
+    let process_shutdown = match ProcessShutdown::install() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            tracing::error!(%error, "cannot install terminal shutdown handler");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if PROCESS_SHUTDOWN.set(process_shutdown).is_err() {
+        tracing::error!("terminal shutdown handler was installed twice");
+        return std::process::ExitCode::FAILURE;
     }
 
     // Claimed before the backend connects: the claimed snapshot's geometry is
@@ -9535,9 +9688,27 @@ async fn run_local_connection(ctx: &mut IpcThread) -> Result<(), String> {
     // refusal is diagnosed on the way through, which is what turns a leftover
     // socket file from "connection refused" into a named stale socket.
     let socket_path = server_socket_path();
-    let stream = server_lifecycle::connect_or_start_server(&socket_path)
-        .await
-        .map_err(|error| error.to_string())?;
+    let connection = match server_lifecycle::connect_or_start_server(&socket_path).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            if error.cold_restart_required
+                && let Ok(mut update) = ctx.shared.update.lock()
+            {
+                update.on_progress(UpdateProgressState::CompletedRestartRequired {
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                });
+            }
+            return Err(error.to_string());
+        }
+    };
+    let stream = connection.stream;
+    if connection.cold_restart_required
+        && let Ok(mut update) = ctx.shared.update.lock()
+    {
+        update.on_progress(UpdateProgressState::CompletedRestartRequired {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        });
+    }
     // Connected — but possibly to a server older than the installed binary
     // (a package upgrade or a local rebuild landed under a live process). Say so
     // on the status bar instead of leaving the mismatch to surface as a protocol
@@ -12215,6 +12386,19 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[test#Test Harness#Server lifecycle#Graceful shutdown waits for every hosted window]]
+    #[test]
+    fn graceful_shutdown_waits_for_every_hosted_window() {
+        let shutdown = ProcessShutdown::for_test();
+        shutdown.register_view();
+        shutdown.register_view();
+        shutdown.request();
+
+        assert!(shutdown.requested());
+        assert!(!shutdown.finish_view());
+        assert!(shutdown.finish_view());
+    }
 
     // @lat: [[test#GPUI Workspace Dividers#Hover cursor follows split axis across hit band]]
     #[test]
