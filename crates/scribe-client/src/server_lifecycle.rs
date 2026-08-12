@@ -348,11 +348,11 @@ pub async fn wait_for_server_connection(
         if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
             #[cfg(target_os = "macos")]
             match refresh_stale_connected_server(&stream) {
+                Ok(Some(refresh)) if !refresh.started => {
+                    tracing::warn!(reason = %refresh.reason, "warm refresh could not start");
+                    return Ok(ServerConnection { stream, cold_restart_required: false });
+                }
                 Ok(Some(refresh)) => {
-                    if !refresh.started {
-                        tracing::warn!(reason = %refresh.reason, "warm refresh could not start");
-                        return Ok(ServerConnection { stream, cold_restart_required: false });
-                    }
                     tracing::info!(
                         old_pid = refresh.old_pid,
                         reason = %refresh.reason,

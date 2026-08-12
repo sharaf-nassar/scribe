@@ -1247,6 +1247,18 @@ Codex's trusted-hash state, then drives malformed payloads through both
 adapters with a failing `python3` shim to prove each emits `state_cleared`
 without parsing the payload.
 
+## AI Hook Helper
+
+Focused transport tests pin the short-lived helper's delivery contract without requiring an AI provider process.
+
+### Sender lifetime protects macOS peer credentials
+
+The helper writes one complete hook frame but remains connected until the server closes, preventing macOS `getpeereid` from racing an already-exited sender while retaining the bounded no-reply protocol.
+
+### Packaged helper waits for server close
+
+The Docker functional harness drives the staged release helper against a stub Unix peer and proves the real process stays alive after its complete frame is read, exiting only after the peer closes.
+
 ## E2E Recipe Contract
 
 Docker E2E recipes default to portable software rendering and keep test sources immutable, while explicit image and environment parameters support focused diagnostics.
@@ -3941,26 +3953,6 @@ A track press at the top resolves to the full display offset and a press at the 
  makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
 
 The primary then accepts the handoff connection, verifies the peer UID, and reads back that exact focus command — proving the second launch focuses the running window instead of opening a duplicate.
-
-## Beads Board Reader Spike
-
-These tests cover only queue partitioning, schema cursor comparison, and cooperative gate contention; they do not prove OS-level read-only storage or Scribe integration.
-
-### Queue partition is exclusive and bounded
-
-Every standard source issue lands in exactly one queue under Done, Blocked, In
-Progress, Ready, then Backlog precedence. Stored blocked status is sufficient,
-each queue retains its exact count, and returned items respect the limit.
-
-[[tools/scribe-beads-board/main_test.go#TestPartitionIsExclusiveAndBounded]]
-also serializes the result and pins Scribe's `format_version` and
-`in_progress` field names.
-[[tools/scribe-beads-board/main_test.go#TestPartitionTreatsStoredBlockedStatusAsBlocked]]
-covers the stored-status regression.
-[[tools/scribe-beads-board/main_test.go#TestSchemaVersionsIncludeIgnoredCursor]]
-compares both pinned schema cursors, while
-[[tools/scribe-beads-board/main_test.go#TestReadGatesExcludeMaintenance]]
-verifies that a held cooperative shared gate rejects an exclusive gate.
 
 ## Terminal Image Release Gate
 

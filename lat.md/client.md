@@ -901,44 +901,21 @@ The outbound half exists for one concrete case: a feature-015 **viewer**. Its ke
 
 The whole surface is verified against the running app, not headlessly: see .
 
-## Beads Board Reader Spike
+## Beads Board CLI Data Source
 
-This bounded prototype measures a direct embedded-Dolt snapshot and defines the optional one-shot reader boundary; it is not shipped product code.
+Workspace Beads boards use installed `bd` JSON commands behind a server-owned stale-while-revalidate cache; Scribe does not bundle a reader or access Dolt directly.
 
-[[tools/scribe-beads-board/main.go#readSnapshot]] resolves one embedded Beads
-workspace, takes its shared workspace and physical-root maintenance gates, and
-uses one Dolt connector and one read transaction. Beads' own list, Ready, and
-Blocked functions produce a coherent source set; Scribe partitions it as Done,
-Blocked, In Progress, Ready, then Backlog and bounds only the returned items.
+Workspace detection eagerly refreshes a memory and disk cache through
+`bd --readonly --json`. A refresh composes `list`, `ready`, and `blocked` into
+exact Backlog, Ready, In Progress, Blocked, and Done queues. Classification
+precedence is Done, Blocked, In Progress, Ready, then Backlog, so an issue
+appears in only one queue.
 
-The reader requires exact main and ignored/wisp schema cursor matches and
-rejects missing storage, server/proxied modes, and gate contention. It has no
-mutation calls and requests a read-only transaction, but raw `OpenSQL` remains
-write-capable and embedded Dolt excludes every other `bd` process while open.
-
-Redirect/source database identity is unsupported, standard status filters omit
-custom or hooked statuses, and failures have no versioned JSON error contract.
-This means the successful snapshot shape is versioned, but the prototype does
-not provide a complete or mechanically read-only integration boundary.
-
-Ten-process evidence in `tools/scribe-beads-board/README.md` compares the current
-three-command installed-`bd` fallback and records an 89.73% median latency
-reduction. A 116.5 MB stripped helper, 23.1 MB compressed artifact, reproduced
-read/write lock collision, and unavailable local ARM64/macOS toolchains rule out
-bundling the prototype unchanged.
-
-The selected direction is a separately signed optional component behind a
-server-owned memory/disk stale-while-revalidate cache. Cached state renders
-immediately; missing, busy, timed-out, or schema-skewed helpers fall back to
-installed `bd`. Each helper refresh is serialized per physical database,
-bounded to 500–750 ms, and exits after one snapshot.
-
-A disposable-fixture driver patch enabled Dolt's engine-wide `IsReadOnly` mode
-and removed telemetry. Snapshot reads remained 0.15 s while INSERT, DDL, and
-`DOLT_COMMIT` were rejected; logical database state and existing file hashes
-did not change. Gate creation, NBS timestamp touches, and the roughly 150 ms
-exclusive lock remain. Production still requires canonical redirect identity,
-custom statuses, versioned errors, native packaging, and license inventory.
+Hover paints cached state immediately and refreshes off-thread when it is over
+30 seconds old. A pinned board in a focused workspace refreshes every 60
+seconds. Only one refresh may run per Beads identity; failures preserve the
+last good snapshot. Future Scribe-issued writes invalidate the cache and start
+an immediate refresh.
 
 ## GPUI Titlebar
 

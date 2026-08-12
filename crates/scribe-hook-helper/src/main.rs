@@ -33,10 +33,11 @@ use scribe_common::framing::write_message;
 use scribe_common::hook::{HookEvent, HookEventKind};
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::ClientMessage;
+use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-/// Total wall-clock budget covering connect + write + close. Spec FR-012.
+/// Total wall-clock budget covering connect + write + server close. Spec FR-012.
 /// Comfortably above warm-cache loopback Unix-socket round-trip (sub-ms) and
 /// well below the SC-002 200 ms p95 end-to-end UI budget.
 const EMIT_BUDGET: Duration = Duration::from_millis(100);
@@ -195,7 +196,22 @@ fn run() -> Result<(), ()> {
 async fn try_send(sock_path: &str, msg: &ClientMessage) -> Result<(), ()> {
     let mut stream = UnixStream::connect(sock_path).await.map_err(|_| ())?;
     write_message(&mut stream, msg).await.map_err(|_| ())?;
-    Ok(())
+
+    // Keep the connection established until the server consumes the transient
+    // frame and closes its side. On macOS, `getpeereid` fails with ENOTCONN if
+    // this process exits between the server's `accept` and `peer_cred` calls;
+    // the complete frame remains buffered, but the server correctly rejects it
+    // because it can no longer verify the sender. Linux's SO_PEERCRED does not
+    // expose that race, which made every provider hook look healthy there.
+    //
+    // HookEvent has no reply by contract, so EOF is the acknowledgement. A
+    // server that never closes cannot hold up the AI tool: the caller wraps
+    // connect + write + this read in the fixed EMIT_BUDGET timeout.
+    let mut unexpected_reply = [0_u8; 1];
+    match stream.read(&mut unexpected_reply).await {
+        Ok(0) => Ok(()),
+        Ok(_) | Err(_) => Err(()),
+    }
 }
 
 /// Read and parse the `--payload-stdin` document, or return an empty payload
@@ -317,6 +333,8 @@ fn parse_ai_state(s: &str) -> Result<AiState, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scribe_common::framing::read_message;
+    use tokio::net::UnixListener;
 
     #[test]
     fn parse_ai_state_recognizes_canonical_values() {
@@ -332,6 +350,49 @@ mod tests {
         assert_eq!(parse_ai_state("inactive"), Err(()));
         assert_eq!(parse_ai_state("IdlePrompt"), Err(()));
         assert_eq!(parse_ai_state(""), Err(()));
+    }
+
+    // @lat: [[test#Test Harness#AI Hook Helper#Sender lifetime protects macOS peer credentials]]
+    #[tokio::test]
+    async fn sender_waits_for_server_close_after_writing_frame() {
+        let session_id = SessionId::new();
+        let socket_path = std::env::temp_dir().join(format!(
+            "sh-{}-{}.sock",
+            std::process::id(),
+            &session_id.to_full_string()[..8]
+        ));
+        let listener = UnixListener::bind(&socket_path).expect("test listener should bind");
+        let message = ClientMessage::HookEvent(HookEvent {
+            session_id,
+            provider: AiProvider::ClaudeCode,
+            kind: HookEventKind::StateChanged { state: AiState::Processing, conversation_id: None },
+        });
+
+        let sender_path = socket_path.to_string_lossy().into_owned();
+        let sender = tokio::spawn(async move { try_send(&sender_path, &message).await });
+        let (mut server_stream, _) = listener.accept().await.expect("sender should connect");
+
+        let received: ClientMessage =
+            read_message(&mut server_stream).await.expect("sender should write one complete frame");
+        assert!(matches!(received, ClientMessage::HookEvent(_)));
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "sender must remain connected while the server verifies and consumes the frame"
+        );
+        server_stream
+            .peer_cred()
+            .expect("peer credentials must remain queryable after the complete frame arrives");
+
+        drop(server_stream);
+        let result = tokio::time::timeout(Duration::from_secs(1), sender)
+            .await
+            .expect("sender should observe server close")
+            .expect("sender task should not panic");
+        assert_eq!(result, Ok(()));
+
+        drop(listener);
+        std::fs::remove_file(&socket_path).expect("test socket should be removable");
     }
 
     fn make_cli(event: EventKind) -> Cli {

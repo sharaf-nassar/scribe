@@ -9114,20 +9114,21 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
 }
 
 fn launchd_command_exit() -> Option<std::process::ExitCode> {
-    if let Some(_active_slot) =
+    if let Some(active_slot) =
         scribe_common::macos_launchd::LaunchdSlot::registration_from_args(std::env::args())
     {
+        let _ = active_slot;
         #[cfg(target_os = "macos")]
         return Some(
             match scribe_common::macos_launchd::activate_replacement(
                 scribe_common::app::current_identity(),
-                _active_slot,
+                active_slot,
             ) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => {
                     tracing::error!(
                         %error,
-                        active_slot = _active_slot.name(),
+                        active_slot = active_slot.name(),
                         "launchd replacement registration failed"
                     );
                     std::process::ExitCode::FAILURE
@@ -9138,22 +9139,23 @@ fn launchd_command_exit() -> Option<std::process::ExitCode> {
         #[cfg(not(target_os = "macos"))]
         return Some(std::process::ExitCode::FAILURE);
     }
-    if let Some(_active_slot) =
+    if let Some(active_slot) =
         scribe_common::macos_launchd::LaunchdSlot::inactive_unregistration_from_args(
             std::env::args(),
         )
     {
+        let _ = active_slot;
         #[cfg(target_os = "macos")]
         return Some(
             match scribe_common::macos_launchd::unregister_inactive_slot(
                 scribe_common::app::current_identity(),
-                _active_slot,
+                active_slot,
             ) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => {
                     tracing::error!(
                         %error,
-                        active_slot = _active_slot.name(),
+                        active_slot = active_slot.name(),
                         "inactive launchd unregister failed"
                     );
                     std::process::ExitCode::FAILURE
@@ -9173,12 +9175,13 @@ fn launchd_command_exit() -> Option<std::process::ExitCode> {
             }
         });
     }
-    if let Some((_old_server_pid, _client_pids)) =
+    if let Some((old_server_pid, client_pids)) =
         server_lifecycle::client_relaunch_request(std::env::args())
     {
+        let _ = (&old_server_pid, &client_pids);
         #[cfg(target_os = "macos")]
         return Some(
-            match server_lifecycle::finish_client_relaunch(_old_server_pid, &_client_pids) {
+            match server_lifecycle::finish_client_relaunch(old_server_pid, &client_pids) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => {
                     tracing::error!(%error, "post-update client relaunch failed");

@@ -7,7 +7,7 @@
 - **Socket**: The existing `scribe-server` Unix domain socket (`server.sock`). No new socket.
 - **Path discovery**: Helper reads it from `SCRIBE_HOOK_SOCK` env var (see [env-vars.md](./env-vars.md)).
 - **Framing**: Length-prefixed msgpack via `scribe_common::framing` (`crates/scribe-common/src/framing.rs:1-73`). Unchanged from existing IPC: 4-byte big-endian `u32` length + msgpack-named payload, 64 MiB cap.
-- **Connection model**: Transient. Helper opens a fresh connection per event, writes one `ClientMessage::HookEvent`, then closes. No `Hello` handshake. No `Welcome` reply. No window registration. Identical to the existing `ClientMessage::CheckForUpdates` / `ClientMessage::ListReleases` transient pattern (`ipc_server.rs:519-533`).
+- **Connection model**: Transient. Helper opens a fresh connection per event, writes one `ClientMessage::HookEvent`, then waits for the server to close. No `Hello` handshake. No `Welcome` reply. No window registration. Waiting for EOF keeps the sender connected through macOS's post-accept `getpeereid` check; an immediate helper exit can make that check fail with `ENOTCONN` even though the complete frame remains buffered. The wait shares the existing 100 ms total I/O budget.
 
 ## Request shape
 
@@ -41,8 +41,8 @@ See [data-model.md](../data-model.md) for field semantics and caps.
 
 ## Server response policy
 
-- **Default**: server reads, dispatches, writes no reply. Helper closes the connection after its single write.
-- **Validation failures**: server-side validation errors (unknown `session_id`, unknown `provider`, payload over cap) are handled silently — truncate-or-drop on the server side, never propagated back as an error message. The helper has no reply to consume and has already exited.
+- **Default**: server reads, dispatches, writes no reply, and closes. The helper treats EOF as the acknowledgement that it may exit; no response frame is added.
+- **Validation failures**: server-side validation errors (unknown `session_id`, unknown `provider`, payload over cap) are handled silently — truncate-or-drop on the server side, never propagated back as an error message. The server still closes the transient connection, releasing the helper's bounded EOF wait.
 - **Server unreachable** (connect failed, server crashed, socket file removed): helper's contract is exit 0 with no I/O. The event is lost; the next event lands fine.
 
 ## Server-side dispatch

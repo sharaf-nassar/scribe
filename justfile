@@ -550,6 +550,7 @@ e2e: build-release docker-func
         func/failure-socket-loss.sh
         func/fresh-create-geometry.sh
         func/handoff-truecolor.sh
+        func/hook-helper-lifetime.sh
         func/hot-reload.sh
         func/keybindings-validation.sh
         func/multi-window.sh

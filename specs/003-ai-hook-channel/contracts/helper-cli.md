@@ -126,7 +126,7 @@ Before doing any work:
 1. Read `SCRIBE_HOOK_SOCK` env var → if unset/empty, **exit 0 silently**.
 2. Read `SCRIBE_SESSION_ID` env var → if unset/empty or not a valid UUID-v4, **exit 0 silently**.
 3. Parse CLI args → if invalid, **exit 0 silently**.
-4. Build `HookEvent` → connect to socket → frame and write → close → **exit 0**.
+4. Build `HookEvent` → connect to socket → frame and write → wait for server EOF → **exit 0**.
 
 ## I/O policy (HARD CONSTRAINTS — FR-007 through FR-011)
 
@@ -138,9 +138,11 @@ Before doing any work:
 
 ## Timeout (FR-012)
 
-- **Total budget**: 100 ms wall-clock, covering connect + write + close.
+- **Total budget**: 100 ms wall-clock, covering connect + write + the server-close wait.
 - **Enforcement**: the binary sets a `tokio::time::timeout` around the full I/O sequence. Expiry → drop in-progress operations, exit 0.
 - **Rationale**: see [research.md](../research.md) Decision 8.
+
+The EOF wait is intentionally reply-free. It keeps the Unix connection established while macOS performs the server's post-accept `getpeereid` check; exiting immediately after the write can otherwise produce `ENOTCONN` and make the server reject a fully buffered event. Existing servers already close transient hook connections after dispatch, so this adds no wire variant.
 
 ## Retries
 

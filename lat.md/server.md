@@ -523,9 +523,9 @@ The injection site is : `SCRIBE_HOOK_SOCK` (absolute path to the existing server
 
 ### Emitter
 
-The shared  binary sends one `HookEvent` per invocation, then exits 0.
+The shared  binary sends one `HookEvent` per invocation, waits for server EOF, then exits 0.
 
-CLI parsing via `clap`; both env vars read; payload built; `ClientMessage::HookEvent` length-prefix-msgpack-framed to the socket via the existing `framing::write_message`. A 100 ms `tokio::time::timeout` bounds connect + write + close (FR-012). Provider-specific adapters in `dist/ai-hook-{claude,codex,statusline}.sh` translate the AI tool's hook stdin JSON into the helper's argv.
+CLI parsing via `clap`; both env vars read; payload built; `ClientMessage::HookEvent` length-prefix-msgpack-framed to the socket via the existing `framing::write_message`. After the write, the helper holds the connection open until the server consumes the transient frame and closes it. That EOF is a reply-free acknowledgement and prevents macOS `getpeereid` from returning `ENOTCONN` when an immediately exiting helper wins the race against the server's post-accept credential check. A 100 ms `tokio::time::timeout` bounds connect + write + server close (FR-012). Provider-specific adapters in `dist/ai-hook-{claude,codex,statusline}.sh` translate the AI tool's hook stdin JSON into the helper's argv.
 
 Claude Code and Codex `UserPromptSubmit` adapters both emit `StateChanged { Processing }` followed by `PromptReceived` when the hook payload contains prompt text, so the prompt bar is driven by the same structured hook event for both providers. Codex additionally derives a `TaskLabelChanged` event from the first non-empty non-slash prompt line and maps `PermissionRequest` to `PermissionPrompt`.
 
@@ -563,7 +563,7 @@ Concretely: (1) add a variant to `AiProvider` in `crates/scribe-common/src/ai_st
 
 Hook subprocesses must never break the AI tool — even outside Scribe.
 
-The helper exits 0 in every code path (FR-007), writes nothing to stdout (FR-008) or stderr (FR-009), does not open `/dev/tty` (FR-010), and bounds its connect+write+close to 100 ms (FR-012). Absence of `SCRIBE_HOOK_SOCK` or `SCRIBE_SESSION_ID` is the canonical "not under Scribe" signal — the helper exits 0 silently (FR-003). The same holds for unreachable sockets, dead Scribe servers, malformed args, or any other failure. This contract is what makes the AI tool's view of "is Scribe installed?" identical to "is the channel reachable right now?", so Scribe-installed hooks run safely in cloud sessions, subagents, SSH, and CI (FR-025).
+The helper exits 0 in every code path (FR-007), writes nothing to stdout (FR-008) or stderr (FR-009), does not open `/dev/tty` (FR-010), and bounds its connect+write+server-close wait to 100 ms (FR-012). Absence of `SCRIBE_HOOK_SOCK` or `SCRIBE_SESSION_ID` is the canonical "not under Scribe" signal — the helper exits 0 silently (FR-003). The same holds for unreachable sockets, dead Scribe servers, malformed args, or any other failure. This contract is what makes the AI tool's view of "is Scribe installed?" identical to "is the channel reachable right now?", so Scribe-installed hooks run safely in cloud sessions, subagents, SSH, and CI (FR-025).
 
 ## Shell Integration
 
