@@ -195,11 +195,11 @@ All three variants honour the attach-time `clipboard_gating` negotiation: the se
 
 `CiRunState { repo_root, delta }` carries a bounded full replacement or head-identified clear for one repository's active pushed head.
 
-The replacement contains trusted `owner/name`, head SHA, branch, per-workflow run id/name/status/conclusion/timestamps, queued-to-terminal rollup, and stale overlay. Job and step detail remain outside this message.
+The replacement contains trusted `owner/name`, head SHA, branch, at most 100 per-workflow run id/name/status/conclusion/timestamp entries, queued-to-terminal rollup, and stale overlay. Elapsed text and dismissal are derived state, not wire fields.
 
 `CiRunDetails { repo_root, details }` carries a head-qualified, bounded job
-snapshot only to a participant with matching open demand. Each job names its
-workflow, execution interval, conclusion, and steps; clients discard details
+snapshot only to a participant with matching open demand. Each workflow keeps
+at most 100 jobs, each job keeps at most 100 steps, and clients discard details
 for a head other than the visible replacement.
 
 #### State message round trip

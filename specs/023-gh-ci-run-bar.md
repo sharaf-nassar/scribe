@@ -9,18 +9,17 @@ and branch. It should surface an in-progress GitHub Actions run as a bar at
 the top of the workspace so the user can see and track the run in realtime
 without leaving the terminal, and get notified when a run starts.
 
-This run's immediate deliverables are (a) research into the optimal UX and
-notification/transport mechanism and (b) a visual mockup, both to be consumed
-by a later implementation pass. Implementation tasks are specced but expected
-to be sequenced after research + mockup are approved.
+The approved research and mockup now ship as a server-owned tracker, additive
+IPC, and collapsed plus expanded GPUI trace. This spec records the as-built v1
+contract and separates offline automation from the required real-GitHub gate.
 
 ## Goals
 
 - A workspace whose repo is hosted on github.com shows a CI bar at the top
-  of the workspace while GitHub Actions runs for the user's last locally
-  pushed head commit are in progress — all triggered workflows aggregated
-  into a worst-status rollup; the bar disappears (or collapses to a
-  terminal state) when no tracked run is active.
+  of the workspace for the user's last locally pushed head commit. All
+  observed workflows contribute to a worst-status rollup. Terminal state
+  remains visible until the owner dismisses it or a later observed head
+  replaces it.
 - The bar tracks the run in near-realtime: overall status, per-job progress,
   elapsed time, and completion result (success/failure/cancelled).
 - The user is notified when their own push triggers a CI run without Scribe
@@ -135,7 +134,7 @@ the binding visual reference for implementation; implement exactly that
 research live in `specs/023-gh-ci-run-bar/research.md`. The transport
 recommendation's approval is tracked at the scribe-gygu.5 gate.
 
-### Story 4 — Implementation: CI bar in the workspace (sequenced later)
+### Story 4 — CI bar in the workspace
 
 As a Scribe user, I want an in-workspace bar tracking my repo's active CI
 run, so I don't need a browser tab to know whether my push is green.
@@ -165,8 +164,8 @@ Acceptance criteria:
   research (zero idle requests, 5 s in-window cadence, 120 s discovery
   window, ETag caching). Webhooks are out of scope entirely — see
   Non-Goals.
-- Research first: Stories 1–3 are the immediate deliverables; Story 4 is
-  specced but sequenced behind mockup approval.
+- The implementation follows the approved research and trace mockup. The
+  completed approval record remains in the research artifact and Story 3.
 - Local-first (constitution #6): all network access is optional and gated;
   the feature must never transmit terminal contents; offline Scribe works
   unchanged.
@@ -239,14 +238,13 @@ A: No — github.com only. The host seam stays generic; GHES is a declared
 non-goal. Reflected in Non-Goals.
 
 **Q7: Tracking UI depth?**
-A: The mockup designs both the collapsed one-line bar (status, workflow
-names, elapsed) and an expandable per-job/step detail panel;
-implementation may phase bar-first. Reflected in Story 3.
+A: v1 ships both the collapsed one-line bar (status, workflow names,
+elapsed) and the expandable per-job/step detail panel. Job requests exist
+only while at least one matching panel is open.
 
 ## Architecture Approach
 
-Server-owned CI tracker (research-validated before lock): a new
-server-side module detects the user's local push by watching workspace
+The server-owned CI tracker detects the user's local push by watching workspace
 repos' ref state, opens a bounded polling window against the GitHub
 Actions API using the user's `gh` credentials, aggregates all workflow
 runs for the pushed head commit, and broadcasts CI state to attached
@@ -254,15 +252,14 @@ clients over new IPC messages. The GPUI client renders the state as a
 dynamic chrome band at the top of the workspace, following the per-pane
 prompt bar precedent (bands appear/disappear with grid re-measure).
 
-This is a research-first plan: Phase A (research + mockup) precedes and
-may amend the implementation phases; the analyze gate and the approval
-gate both sit before implementation starts.
+The completed research and approved mockup remain the rationale and visual
+reference. The implementation inventory below records the resulting modules
+and exact bounds.
 
-Token handling: the tracker obtains the token via `gh auth token` at
-need; it never crosses the client/server IPC or the LAN/remote
-transports, and is only ever sent to the API host `gh` authenticated —
-never to a host derived from an untrusted remote URL (constitution
-#5/#6, Clarification Q5).
+Token handling: the tracker obtains the token via `gh auth token` at need. It
+never crosses client/server IPC or LAN/remote transports. `HttpGithubApi`
+sends it only to fixed `https://api.github.com` or an explicit loopback test
+override, never to a host from an untrusted remote URL.
 
 Performance: all tracking runs server-side, entirely off the client
 render path; bar updates arrive as bounded IPC deltas so terminal
@@ -272,8 +269,8 @@ Alternatives rejected:
 - Client-owned polling — duplicates traffic per attached client and
   breaks under remote attach, where the repo lives on the server machine
   (constitution #1/#2).
-- Webhook transport as default — requires webhook-creation permission and
-  mutates repo config; allowed only as explicit opt-in (Clarification Q4).
+- Webhook transport — requires webhook-creation permission or hosted
+  infrastructure and was removed from v1 at the approval gate.
 - Continuous background polling — violates the zero steady-state traffic
   constraint (Clarification Q2, constitution #6).
 - PTY command-text push detection — untrusted input must never initiate
@@ -281,17 +278,17 @@ Alternatives rejected:
 
 ## Affected Components
 
-- `crates/scribe-server` — new CI tracker module: ref-state push
+- `crates/scribe-server` — CI tracker module: ref-state push
   detection (building on the existing per-session `.git/HEAD` walk seam
   for repo discovery), push-gated polling windows, run aggregation.
   Reuses the updater's reqwest seam and its API-base-URL override
   pattern (`updater.rs`, `SCRIBE_UPDATE_API_URL` precedent). One tracker
   per (host, repo) shared across workspaces/windows/clients. Every
   silent-disable path logs a diagnosable reason.
-- `crates/scribe-common` — `protocol.rs`: new server→client CI state
+- `crates/scribe-common` — `protocol.rs`: server→client CI state
   message and a client dismiss message; config schema: global off-by-
   default toggle.
-- `crates/scribe-client` (GPUI) — new workspace-top chrome band (collapsed
+- `crates/scribe-client` (GPUI) — workspace-top chrome band (collapsed
   bar + expandable detail panel), themed, with non-color status
   signifiers; renders read-only for shared viewers. Hosts the
   "open in browser" affordance (run URL derived from repo + run id),
@@ -302,20 +299,23 @@ Alternatives rejected:
   config keys.
 - `tests/e2e/` + docker harness — fake GitHub Actions API on 127.0.0.1
   inside the `--network none` container; func + visual suites.
-- `lat.md/` — new sections for tracker, protocol messages, bar UI, tests.
+- `lat.md/` — tracker, protocol, bar UI, and test contracts.
 
 ## Data Model
 
 In-memory server state only; no persistence, no migrations; state is
 cheaply re-derivable after hot upgrade (constitution #2/#7).
 
-- `CiRepo`: host (github.com only in v1), owner, name — resolved from the
-  push-target remote.
-- `CiRunState`: head SHA, per-workflow entries (run id, name, status,
-  conclusion, timestamps), aggregated worst-status rollup, elapsed,
-  stale flag, dismissed flag (syncs across clients).
-- Per-job/step detail (expanded panel): fetched only while a window is
-  active and the panel is open, if phased in.
+- `GithubRepository`: validated owner and name resolved from the push-target
+  github.com remote.
+- `CiRunState`: trusted `owner/name`, head SHA, branch, at most 100 workflow
+  entries (run id, name, status, conclusion, observation timestamps),
+  worst-status rollup, and stale flag. Elapsed text is derived client-side.
+- `CiRunDetails`: head-qualified jobs and steps, fetched only while a matching
+  panel is open. Each workflow response is bounded to 100 jobs and each job
+  to 100 steps; provider strings are truncated to 256 UTF-8 bytes.
+- Dismissal is server state keyed by repository root and head. It is not part
+  of `CiRunState` and no credential or token enters either message.
 - Config: `github_ci.enabled`, default false.
 
 The server tracker records each workflow's first and latest local observation
@@ -332,61 +332,86 @@ those checks begin only after a later qualifying local-push gate.
 
 ## API / Interface Changes
 
-- New server→client IPC message carrying `CiRunState` deltas, broadcast
-  to clients attached to windows rooted in the affected repo. Additive
-  protocol change; version/compat handling must follow the framing
-  policy (a MessagePack decode failure discards only that frame) and the
-  existing N/N-1 protocol compatibility conventions — the research phase
-  verifies whether gating on protocol version is required before an old
-  client receives the new variant.
-- New client→server dismiss message (dismissal syncs across clients).
-- New env override for the GitHub API base URL (test seam, mirrors
-  `SCRIBE_UPDATE_API_URL`).
-- No CLI surface changes. No breaking changes.
+- `Hello.ci_run_bar` defaults false for older local clients and gates both
+  `CiRunState` and `CiRunDetails` server frames. Remote protocol version 6
+  carries the CI messages under the existing exact-version handshake.
+- `CiRunState { repo_root, delta }` sends a full replacement or
+  head-qualified clear. `CiRunDetails { repo_root, details }` goes only to
+  interested capable writers.
+- `DismissCiRun` synchronizes owner dismissal. `SetCiRunDetailsInterest`
+  carries root, head, and open state; capable read-only viewers may request
+  details but cannot invoke host actions.
+- `SCRIBE_GITHUB_API_URL` is a loopback-only test seam that mirrors
+  `SCRIBE_UPDATE_API_URL`.
+- No CLI surface changes.
 
-## Testing Strategy
+## Automated verification
 
-- Unit (server): rollup/aggregation logic, repo-resolution rule
-  (push-target remote, fork triangles), ref-state change detection across
-  backends (loose, packed-refs, reftable, worktree `.git`-file
-  indirection), window open/close/timeout semantics, protocol serde.
-- Unit (client): bar segment/state model without a live window, following
-  the existing status-bar model test precedent.
-- Unit/E2E degrade checks: enabled-but-unauthenticated and disabled
-  paths produce zero traffic and a logged reason naming the cause.
-- E2E func (`--network none`): local bare repo fixture + scripted push +
-  fake GitHub API on 127.0.0.1 driving the full flow — bar appears,
-  updates, completes, degrades to stale on API failure, generates zero
-  requests when idle or disabled; includes a shared-viewer case proving
-  read-only rendering.
-- E2E visual: screenshots of collapsed/running/success/failure/stale and
-  expanded states against the mockup; frame-stability spot check that an
-  active bar does not perturb terminal rendering.
-- Manual verification protocol (constitution #3): a documented
-  maintainer-run check against a real github.com repo, since the harness
-  can never reach the network.
-- Research/mockup stories are verified by user approval (their ACs).
+Automated coverage is deliberately offline. Every runtime check uses the
+Docker E2E images with `--network none`; none can validate github.com itself.
 
-## Risks
+- Server, protocol, and client unit tests cover configuration, logical ref
+  changes, URL trust, request bounds, aggregation, handoff, IPC authorization,
+  state models, region geometry, accessibility, and owner-only actions.
+- `tests/e2e/github-actions-api.sh` checks the loopback fake API in both Docker
+  images, including head filtering, run and job progression, ETags, `304`,
+  rejected routes, and the JSONL request log.
+- `tests/e2e/func/ci-run-bar.sh` uses a real local push and the fake API to
+  assert zero requests while disabled and idle, first state within 10 seconds,
+  5-second refreshes, queued/running/success progression, ETag reuse, stale
+  fallback, and identical read-only viewer state.
+- `tests/e2e/func/ci-run-details.sh` proves job requests are absent while the
+  panel is closed, start after open interest, and stop after close interest.
+- `tests/e2e/visual/ci-run-bar.sh` checks the 40px collapsed reflow, terminal
+  frame stability, theme pixels, and non-color cues for running, passed,
+  failed, cancelled, and stale states.
+- `tests/e2e/visual/ci-run-details.sh` checks pointer and keyboard toggles,
+  both interest messages, terminal input isolation, and the expanded trace.
 
-- ETag/304 rate-limit semantics may have changed — verify against live
-  docs in research; fallback is a conservative in-window poll interval.
-- Ref-backend matrix (reftable lands in git ≥ 2.45) is the likeliest
-  effort doubler — research includes a small ref-watch prototype and
-  checks existing crate deps before adding any watcher/git dependency
-  (constitution #1).
-- Protocol compat: an old client receiving the new message variant must
-  not degrade its connection — verify frame-discard behavior and follow
-  N/N-1 conventions; mitigation is capability/version gating.
-- `gh webhook forward` support status unknown — opt-in only, so a dead
-  end there cannot block v1.
-- Hot-upgrade continuity — state is re-derivable by design; low risk.
-- Rollback: the feature is a leaf behind a default-off toggle; disabling
-  it restores current behavior exactly.
+These checks do not prove installed `gh` authentication, current github.com
+REST behavior, GitHub-side run creation latency, or the browser destination.
 
-## Sequencing
+## Maintainer manual verification
 
-Phase A — research (can start immediately, parallel):
+This is a release gate. A Scribe maintainer with write access must run it on an
+installed release-candidate build against a real github.com repository. A
+loopback fixture, fork without write access, or Docker run does not satisfy it.
+
+Use a repository with a harmless disposable branch and at least one Actions
+workflow triggered by `push`. Do not record or print the authentication token.
+
+| Step | Action | Expected result |
+| --- | --- | --- |
+| 1. Authenticate | Run `gh auth status --hostname github.com`. | The command exits successfully and names the active github.com account that can read Actions for the repository. |
+| 2. Enable | In Scribe Settings, enable Updates > GitHub CI run status. Open a local session whose current directory is inside the repository. | No restart occurs. No CI bar appears before a new local push. This visual check does not prove zero idle HTTP traffic; Docker request logs cover that contract. |
+| 3. Push | Make a normal harmless commit on the disposable branch, then run `git push origin HEAD` in that Scribe session. Record push completion, GitHub run visibility, and bar appearance times. | GitHub creates run entries for the pushed head. The collapsed bar appears within 10 seconds after those runs become visible and shows the branch plus the first seven head-SHA characters. |
+| 4. Compare | Compare the collapsed glyph, state word, workflow names, completed count, and elapsed time with the repository Actions page. | Scribe matches GitHub's queued/running state. The band occupies only the matching workspace region and keeps a 40px collapsed height. |
+| 5. Expand | Click the band, then close and reopen it with Enter or Space while its toggle has focus. | A loading row gives way to the real jobs and current steps on a shared minute axis. Closing returns the terminal rows and does not type Enter or Space into the terminal. |
+| 6. Finish and open | Let the run reach any terminal conclusion, then use Open CI run. | Passed, failed, or cancelled matches GitHub and stops repeating motion. The browser opens `https://github.com/{owner}/{repo}/actions/runs/{run_id}` for the preferred visible workflow. |
+| 7. Dismiss | Use Dismiss CI run, then restore the repository and setting to their prior state through normal maintainer cleanup. | The matching head disappears from every local capable view. No credential appears in Scribe logs or captured evidence. |
+
+Retain the release-candidate commit, repository and head SHA, run URL, the three
+timestamps from step 3, and collapsed, expanded, and terminal screenshots.
+Record a failure if any expected result differs; do not replace real-GitHub
+evidence with an offline rerun.
+
+## Known limits
+
+- A synthetic fixture checks the reftable watch path because the audited host
+  Git cannot create a real reftable repository. Loose refs, packed refs, and
+  linked worktrees use real repositories.
+- Only a qualifying local remote-tracking ref change opens a window. Remote
+  SSH pushes, scheduled runs, teammate pushes, and later manual re-runs remain
+  invisible.
+- Terminal snapshots stop polling but stay visible in the client until owner
+  dismissal or replacement by an observed later head.
+
+## Historical implementation sequence
+
+All phases below are complete. This record explains dependency order; it is
+not a list of remaining work.
+
+Phase A: research
 - Ownership conclusion (Story 1 milestone, early): validate the
   server-owned lean against remote-attach topology and hot-upgrade
   continuity. Split out as its own deliverable so UX research unblocks
@@ -408,7 +433,7 @@ Phase A — research (can start immediately, parallel):
   run-triggered moment. Depends on the ownership conclusion. Findings
   land in the same research artifact. Blocks: mockup, approval gate.
 
-Phase B — mockup and approval:
+Phase B: mockup and approval
 - Mockup (Story 3): static themed HTML/SVG under
   `specs/023-gh-ci-run-bar/mockup/`, all states including
   stale/degraded, non-color signifiers, collapsed + expanded views.
@@ -416,8 +441,7 @@ Phase B — mockup and approval:
 - Approval gate: user approves research recommendation + mockup
   direction. Blocks every implementation task.
 
-Phase C — implementation (all blocked by the approval gate; details may
-be amended by approved research):
+Phase C: implementation:
 - Config toggle + settings UI surface.
 - Server: ref-state push detection.
 - Server: GitHub client, push-gated polling window, aggregation, logged
@@ -443,7 +467,7 @@ be amended by approved research):
   implementation bead still updates its own lat.md sections per repo
   rules; this item is the consolidation, not the only doc work.
 
-## Backlog Refinement
+## Historical backlog refinement
 
 None — this feature has no backlog inputs; no P4 sources exist to
 disposition.
@@ -480,7 +504,7 @@ disposition.
   server component; off-render-path perf note added to Architecture
   Approach with a frame-stability check in testing (should-fix, A).
 
-## Spec Review
+## Historical spec review
 
 Six parallel review passes (requirements, gaps, ambiguity, feasibility,
 scope, stakeholders) were synthesized into the lists below. Cross-dimension

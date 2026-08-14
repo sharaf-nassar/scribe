@@ -1503,7 +1503,8 @@ their colors; queued bars are dashed. A running bar's edge uses the same 1.2s
 breathing cadence as the collapsed live mark, and stale or globally disabled
 animation freezes it.
 
-The trace height follows its bounded job count. [[crates/scribe-client/src/pane_shell.rs#PaneShell#set_ci_strips]]
+The loading panel is 54px high. Loaded detail reserves 38px plus 26px per job
+and uses a minimum four-minute axis. [[crates/scribe-client/src/pane_shell.rs#PaneShell#set_ci_strips]]
 reserves the collapsed row plus panel inside only the owning region, preserving
 neighbor geometry and returning the rows immediately on close.
 

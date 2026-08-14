@@ -9,7 +9,7 @@ Server unit fixtures verify the local push gate before any GitHub polling or cli
 
 ### Git ref-state detection
 
-Tests exercise logical Git snapshots and native watcher delivery across every required ref layout.
+Tests exercise real loose, packed, and linked-worktree layouts plus native delivery and a synthetic reftable watch path.
 
 #### Disabled construction creates no watcher
 
@@ -690,6 +690,10 @@ One script proves the same binary and API-base env seam in both `--network none`
 ## GitHub CI Functional E2E
 
 Docker coverage drives the real push watcher, tracker, capable IPC, and client state model against the loopback Actions fixture.
+
+The container cannot prove installed `gh` auth or current github.com behavior.
+The [maintainer manual verification](../specs/023-gh-ci-run-bar.md#maintainer-manual-verification)
+owns those release checks against a real repository.
 
 [[crates/scribe-test/src/daemon.rs#handle_ci_run_state]] exposes the owner's state, while [[crates/scribe-test/src/daemon.rs#observe_shared_ci_messages]] requires a real two-participant share before projecting fanout. Both reuse [[crates/scribe-client/src/ci_bar.rs#CiRunBars#apply]] and [[crates/scribe-client/src/ci_bar.rs#CiBarModel#build]].
 
@@ -1693,7 +1697,7 @@ Visual end-to-end tests run the real `scribe-client` window headlessly (`docker/
 
 ### Collapsed CI run bar visual contract
 
-`just e2e-visual-ci-run-bar` checks the approved collapsed trace against a live client in a `--network none` container; expanded job detail remains outside this test.
+`just e2e-visual-ci-run-bar` checks the approved collapsed trace against a live client in a `--network none` container; `just e2e-visual-ci-details` separately checks expansion and interaction.
 
 #### Public push state progression
 
@@ -4097,7 +4101,7 @@ The record is a TOML file a user can put any `i8` in, so a hand-edited or trunca
 
 ## GPUI CI Run Bar
 
-Pure model, state, palette, geometry, and sink tests cover the collapsed workspace CI trace without constructing a live window.
+Pure model, state, palette, geometry, and sink tests cover the collapsed band and expanded job trace without constructing a live window.
 
 ### Every aggregate state has a non-color signifier
 

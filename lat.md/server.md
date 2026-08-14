@@ -249,9 +249,9 @@ Push-target HTTPS, SSH, and scp URLs must resolve to `github.com/{owner}/{repo}`
 
 [[crates/scribe-server/src/github_ci.rs#HttpGithubApi]] validates the fixed production host or an explicit loopback-only `SCRIBE_GITHUB_API_URL` before invoking `gh auth token --hostname github.com`. The token stays inside the server and only enters an Authorization header for that validated URL.
 
-The run-list request uses `head_sha`, `event=push`, and `per_page=100`, retains an ETag for the exact URL, and handles `304` without replacing state. The server-wide scheduler permits one attempt every 5 seconds and at most 720 attempts per rolling hour. A no-run window expires after 120 seconds, before a 25th request.
+The run-list request uses `head_sha`, `event=push`, and `per_page=100`, retains an ETag for the exact URL, and handles `304` without replacing state. The server-wide scheduler permits one attempt every 5 seconds and at most 720 attempts per rolling hour. A no-run window expires after 120 seconds, before a 25th request. Transient failures back off through 5, 10, 20, then 30 seconds.
 
-All returned workflow runs contribute to a bounded worst-status rollup. Queued or running remains non-terminal until every workflow completes; terminal precedence is failure, cancelled, then success. Each run records its first server observation and latest observation without a date-parsing dependency.
+Up to 100 returned workflow runs contribute to the worst-status rollup. Queued or running remains non-terminal until every workflow completes; terminal precedence is failure, cancelled, then success. Each run records its first server observation and latest observation without a date-parsing dependency.
 
 Authentication or permission failure before observation logs once and hides the window without HTTP after failed `gh` auth. Offline failures retry with bounded backoff. Failures after observation publish the last state as stale; terminal state stops polling. Tracker updates route through [[crates/scribe-server/src/ipc_server.rs#publish_ci_run_delta]], which retains capability, repository, and dismissal gates.
 
@@ -260,7 +260,9 @@ scheduler. [[crates/scribe-server/src/github_ci.rs#GithubCiTracker#set_detail_in
 creates demand only for an observed matching root and head, and removes it when
 the last interested writer closes or disconnects. The loop alternates ready
 run and detail work on the shared cadence; [[crates/scribe-server/src/github_ci.rs#HttpGithubApi#prepare_jobs]]
-requests the trusted per-run jobs endpoint only while demand exists.
+requests the trusted per-run jobs endpoint only while demand exists. Each
+response keeps at most 100 jobs, each job keeps at most 100 steps, and provider
+strings stop at a valid UTF-8 boundary no later than 256 bytes.
 
 [[crates/scribe-server/src/ipc_server.rs#set_ci_detail_interest]] accepts capable
 owning and read-only viewers for roots visible in their window. Only
