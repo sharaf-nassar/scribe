@@ -1624,6 +1624,26 @@ The live regression keeps rejected input editable, proves typed roots persist an
 
 The settings regression opens the selector, applies a keyboard preset and a pointer hue/custom-palette color, rejects invalid exact RGB, proves Escape and Tab close exact entry, saves canonical `#rrggbb` live, and restores defaults.
 
+### Settings theme picker
+
+`tests/e2e/visual/settings-theme-picker.sh` drives the Colors page against the running client and checks pixels, TOML state, and the live config watcher.
+
+#### Preset preview and filter
+
+Typing Dracula narrows the open preset menu to a row whose ten painted chips match the built-in background, foreground, and ANSI 0-7 colors.
+
+#### Keyboard apply persists once
+
+Enter opens Preset, Down highlights the filtered Dracula row, and Enter applies it without pointer selection, writes `appearance.theme`, paints selected chrome, and emits one client hot-reload line.
+
+#### Derived swatch keeps its trigger visible
+
+An unset First Row override paints the Dracula-derived `#232531` swatch, and opening its color menu leaves that trigger swatch unobscured.
+
+#### Reset omits the override key
+
+Activating Reset after a preset write removes `appearance.prompt_bar_first_row_bg` from TOML instead of serializing an empty value.
+
 ### Keybindings record from the keyboard
 
 `tests/e2e/visual/settings-keybindings.sh` (`just e2e-visual-settings-keybindings`) is the app-level oracle for shortcut capture: it drives the real settings window through XTEST and asserts on `config.toml` and the client's log.

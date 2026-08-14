@@ -292,6 +292,11 @@ e2e-visual-settings-keybindings:
 e2e-visual-settings-entry:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_FILE_CHOOSER=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-entry.sh
 
+# Run the Colors theme-picker E2E through the live client so one preset apply
+# can be matched to one config-watcher hot reload.
+e2e-visual-settings-theme-picker:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/settings-theme-picker.sh
+
 # Run the settings-scrollbar E2E: the content pane's overlay scrollbar answers
 # the pointer — hover widens it and pins it open, the thumb drags the page, a
 # track click jumps it, and a page that fits paints no overlay and keeps the
@@ -634,6 +639,7 @@ e2e-all-visual: build-release docker-visual
         'visual/settings-entry.sh|e2e-visual-settings-entry'
         'visual/settings-keybindings.sh|e2e-visual-settings-keybindings'
         'visual/settings-scrollbar.sh|e2e-visual-settings-scrollbar'
+        'visual/settings-theme-picker.sh|e2e-visual-settings-theme-picker'
         'visual/settings-trust.sh|e2e-visual-settings-trust'
         'visual/share-control.sh|e2e-visual-share'
         'visual/tab-drag-reorder.sh|e2e-visual-tab-drag-reorder'
