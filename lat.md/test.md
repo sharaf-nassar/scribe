@@ -1724,7 +1724,7 @@ Asserting on the log rather than on pixels alone is deliberate: the status bar's
 
 `tests/e2e/visual/x11-focus-guard.sh` is the scripted oracle for the X11 focus guard parity row: it proves the guard is started by  on the real window and actually gates keystrokes, which no unit test over  can show.
 
-The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so the guard's verdict is a pure pixel change inside the window and nothing can reach a PTY. The script asserts the startup line naming the guarded window id, then walks three phases: with the client active the toggle changes the tooltip crop; with a second client window holding `_NET_ACTIVE_WINDOW` the same `xdotool key --window` keystroke leaves the crop pixel-identical and adds a `suppressed keystroke` line (proving the key was delivered and dropped, not merely lost); and after re-activation the toggle lands again and the crop returns to its pre-toggle state.
+The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so the guard's verdict is a pure pixel change inside the window and nothing can reach a PTY. The script asserts the startup line naming the guarded window id, then walks three phases: with the client active the toggle changes the tooltip crop; with an `xmessage` window holding `_NET_ACTIVE_WINDOW` the same `xdotool key --window` keystroke leaves the crop pixel-identical and adds a `suppressed keystroke` line (proving the key was delivered and dropped, not merely lost); and after re-activation the toggle lands again and the crop returns to its pre-toggle state.
 
 The crop excludes the status bar deliberately — its sparklines resample every two seconds, so a whole-window comparison could never assert pixel identity.
 
@@ -1943,6 +1943,18 @@ Exiting is asserted as process death rather than as a screenshot, because the wh
 The Docker visual probe requires EWMH reactivation to emit `FocusChanged.gained` and a second CSI focus-in after Claude Code 2.1.228 restores DECSET 1004.
 
 The bounded raw-PTY stand-in reproduces Claude's exact alternate-screen suspend and restore order. It stops reading while blurred, requests the original XID, and restores immediately; the wire tap proves the client repaired its focus state, while the probe proves the server delivered the resulting `ESC[I` to the application.
+
+### Client relaunch handling
+
+`tests/e2e/visual/relaunch-focus.sh` and `tests/e2e/visual/refused-claim.sh` cover singleton focus handoff and stale-restore refusal against real GPUI windows and the Docker server.
+
+#### Plain relaunch focuses the live owner
+
+A second plain client exits successfully before GPUI or server bootstrap, leaves server window and session counts unchanged, and activates the owner's most-recent terminal window.
+
+#### Refused stale claim stays fresh and non-destructive
+
+A harness-bypassed singleton lets a plain bootstrap claim a live owner's persisted window. Server refusal yields one empty window without replay, duplicate sessions, child fan-out, or loss of the owner's restore index and snapshot files.
 
 ### Cold-restart restore drives the real client
 

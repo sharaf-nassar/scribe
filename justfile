@@ -360,6 +360,15 @@ e2e-visual-tab-drag-reorder:
 e2e-visual-multi-window-restore:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/multi-window-restore.sh
 
+# Run the plain relaunch focus-handoff E2E through the window-list wire tap.
+e2e-visual-relaunch-focus:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=120 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/relaunch-focus.sh
+
+# Run the refused stale-claim E2E. The script removes only the disposable
+# container's client singleton socket so one plain bootstrap reaches the server.
+e2e-visual-refused-claim:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/refused-claim.sh
+
 # Run the find-overlay E2E. It needs the shared pane (so the harness can put
 # the searched text on the real PTY the client renders) AND the wire tap (so
 # SearchRequest leaving the client and SearchResults coming back can both be
@@ -615,6 +624,8 @@ e2e-all-visual: build-release docker-visual
         'visual/paste-confirmation.sh|e2e-visual-paste-confirmation'
         'visual/prompt-marks.sh|e2e-visual-prompt-marks'
         'visual/reconnect.sh|e2e-visual'
+        'visual/refused-claim.sh|e2e-visual-refused-claim'
+        'visual/relaunch-focus.sh|e2e-visual-relaunch-focus'
         'visual/remote-control.sh|e2e-visual-remote-control'
         'visual/scrollbar.sh|e2e-visual-scrollbar'
         'visual/server-lifecycle.sh|e2e-visual-server-lifecycle'

@@ -88,14 +88,16 @@ shot "$W1" 01-tooltip-on.png
 echo "PHASE 1 PASS: active window — keystroke reached the overlay router"
 
 # ── Phase 2: another window owns _NET_ACTIVE_WINDOW, so the key is dropped ───
-# A second client instance is the stand-in for the compositor overlay: it takes
-# _NET_ACTIVE_WINDOW, and the keystroke is still delivered straight to the first
-# window with XSendEvent, so only the guard can stop it.
-scribe-client >"$OUT/client-overlay.log" 2>&1 &
+# xmessage is the stand-in for the compositor overlay: it takes
+# _NET_ACTIVE_WINDOW, and the keystroke is still delivered straight to the
+# client with XSendEvent, so only the guard can stop it. A plain second Scribe
+# launch now hands focus back through the terminal singleton instead.
+command -v xmessage >/dev/null || fail "phase 2: xmessage is missing from the image"
+xmessage -geometry 140x60-0-0 'focus guard overlay' >"$OUT/xmessage-overlay.log" 2>&1 &
 OVERLAY_PID=$!
 trap 'kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do
-    W2=$(xdotool search --name '[Ss]cribe' | grep -v "^$W1$" | head -1)
+    W2=$(xdotool search --name '[Xx]message' 2>/dev/null | tail -1)
     [ -n "$W2" ] && break
     sleep 0.25
 done
