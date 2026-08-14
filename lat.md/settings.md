@@ -248,7 +248,7 @@ The GPUI window renders `Scribe v<version>` directly in [[crates/scribe-client/s
 
 ## Singleton
 
-The settings app uses the same singleton structure as the server: a lock file plus a Unix socket for focus handoff. It takes `settings.lock`, listens on `settings.sock`, and sends a `focus` command to an existing instance when one is already running.
+The settings app uses the same singleton structure as the terminal client: a lock file plus a Unix socket for focus handoff. `settings.lock` serializes bind-or-connect, while the bound `settings.sock` owns the singleton lifetime.
 
 Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process. Focus commands may carry the launcher terminal rectangle; new settings processes receive the same anchor via `SCRIBE_SETTINGS_ANCHOR`.
 

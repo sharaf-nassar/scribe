@@ -1182,6 +1182,30 @@ Three CLI surfaces read it back:
 
 Raw replay into blank or dirty primary and alternate terminals reproduces exactly zero or N history rows without receiver trimming, resets stale margins and modes, and leaves omitted malformed cells blank.
 
+## Terminal Client Singleton
+
+Unit checks cover terminal-client launch gating, focus handoff, stale-owner recovery, and flavor-scoped paths without starting a Scribe runtime process.
+
+### Plain local launch owns the singleton
+
+Only a plain local launch acquires the terminal singleton; restore children, explicit joins, and remote or LAN dial launches bypass it.
+
+### Duplicate launch sends focus without waiting
+
+A second acquisition returns while the primary is alive and writes one focus command instead of waiting for the primary's advisory lock.
+
+### Dead owner socket is reclaimed
+
+A socket inode left by a dead owner is removed and rebound so the updater's one replacement client can open normally.
+
+### Focus command reaches the owner
+
+The primary's same-UID listener forwards a focus command to the GPUI receiver that raises the owner's most-recent terminal window.
+
+### Client paths stay flavor scoped
+
+The terminal lock and focus socket share the server socket's flavor runtime directory and use distinct `client.lock` and `client.sock` names.
+
 ## Server Lifecycle
 
 Start, stop, and hot-reload the scribe-server process from tests using PID-file tracking and socket polling.

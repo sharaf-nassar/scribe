@@ -1,4 +1,4 @@
-//! Settings process singleton enforcement.
+//! Client-process singleton enforcement.
 //!
 //! Uses a Unix domain socket for singleton detection and a `flock` advisory
 //! lock to prevent TOCTOU races during the bind-or-connect sequence.
@@ -9,19 +9,16 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use scribe_common::settings_window::{SettingsWindowAnchor, SettingsWindowCommand};
-use scribe_common::socket::{settings_lock_path, settings_socket_path};
+use scribe_common::socket::{
+    client_lock_path, client_socket_path, settings_lock_path, settings_socket_path,
+};
 
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
 
-/// Result of attempting to become the singleton settings process.
+/// Result of attempting to become a singleton client process.
 pub enum SingletonResult {
     /// We are the singleton. The listener is ready to accept focus commands.
-    /// The caller must keep the `lock_file` guard alive to hold the flock.
-    Primary {
-        listener: UnixListener,
-        socket_path: PathBuf,
-        lock_file: nix::fcntl::Flock<std::fs::File>,
-    },
+    Primary { listener: UnixListener, socket_path: PathBuf },
     /// Another instance is already running and was told to focus.
     AlreadyRunning,
 }
@@ -33,6 +30,11 @@ pub enum SingletonResult {
 /// `AlreadyRunning`.
 pub fn acquire(anchor: Option<SettingsWindowAnchor>) -> Result<SingletonResult, String> {
     acquire_at(&settings_lock_path(), settings_socket_path(), anchor)
+}
+
+/// Attempt to become the singleton terminal-client process.
+pub fn acquire_terminal() -> Result<SingletonResult, String> {
+    acquire_at(&client_lock_path(), client_socket_path(), None)
 }
 
 /// Core singleton acquisition against explicit lock/socket paths.
@@ -66,9 +68,11 @@ pub fn acquire_at(
     let lock_file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
         .map_err(|(_, e)| format!("flock failed: {e}"))?;
 
-    // Try to bind the socket.
-    match try_bind(&socket_path) {
-        Ok(listener) => Ok(SingletonResult::Primary { listener, socket_path, lock_file }),
+    // The socket owns the singleton lifetime. The flock only serialises this
+    // bind-or-connect decision; retaining it would block later launchers before
+    // they could send the focus command.
+    let result = match try_bind(&socket_path) {
+        Ok(listener) => Ok(SingletonResult::Primary { listener, socket_path }),
         Err(_bind_err) => {
             // Socket exists — try to connect and send focus.
             if send_focus_to_existing(&socket_path, anchor) {
@@ -78,10 +82,12 @@ pub fn acquire_at(
                 drop(std::fs::remove_file(&socket_path));
                 let listener = try_bind(&socket_path)
                     .map_err(|e| format!("failed to bind after stale removal: {e}"))?;
-                Ok(SingletonResult::Primary { listener, socket_path, lock_file })
+                Ok(SingletonResult::Primary { listener, socket_path })
             }
         }
-    }
+    };
+    drop(lock_file);
+    result
 }
 
 /// Try to bind the Unix socket. Sets permissions to 0o600.
@@ -117,7 +123,7 @@ pub fn write_command(
     stream.write_all(b"\n")
 }
 
-/// Check if an incoming connection is from the same UID.
+/// Check if an incoming singleton connection is from the same UID.
 ///
 /// Linux: `SO_PEERCRED` via nix. macOS: `getpeereid()` via nix.
 /// Returns `false` if credentials cannot be retrieved or the UID does not match.
@@ -131,7 +137,7 @@ pub fn verify_peer_uid(stream: &UnixStream) -> bool {
     };
     let expected = scribe_common::socket::current_uid();
     if peer_uid != expected {
-        tracing::warn!(peer_uid, expected, "rejected settings connection from different UID");
+        tracing::warn!(peer_uid, expected, "rejected singleton connection from different UID");
         return false;
     }
     true
@@ -166,7 +172,7 @@ pub fn read_command(stream: &UnixStream) -> Option<SettingsWindowCommand> {
         return None;
     }
     if line.len() > MAX_COMMAND_LINE_BYTES {
-        tracing::warn!("settings singleton command exceeded size limit");
+        tracing::warn!("singleton command exceeded size limit");
         return None;
     }
 
@@ -178,7 +184,7 @@ pub fn cleanup_socket(socket_path: &std::path::Path) {
     if let Err(e) = std::fs::remove_file(socket_path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::warn!(path = %socket_path.display(), "failed to remove settings socket: {e}");
+        tracing::warn!(path = %socket_path.display(), "failed to remove singleton socket: {e}");
     }
 }
 
@@ -193,6 +199,7 @@ mod tests {
     /// connection, verifies the peer UID, and reads back exactly that focus
     /// command — proving the second launch hands focus to the running window
     /// instead of opening a duplicate.
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Duplicate launch sends focus without waiting]]
     #[test]
     fn focus_handoff_routes_second_launch_to_primary() {
         let dir = std::env::temp_dir()
@@ -207,21 +214,21 @@ mod tests {
         let primary = acquire_at(&lock_path, socket_path.clone(), None)
             .expect("first acquire should become primary");
         let listener = match primary {
-            SingletonResult::Primary { listener, lock_file, .. } => {
-                // The exclusive flock only serialises the bind-or-connect race;
-                // the bound socket is the real singleton guard. Release it here
-                // so the second in-process acquire does not block on the
-                // exclusive lock the primary would otherwise hold for its
-                // lifetime (two separate open descriptions cannot both hold
-                // LOCK_EX). The listener keeps the socket bound.
-                drop(lock_file);
-                listener
-            }
+            SingletonResult::Primary { listener, .. } => listener,
             SingletonResult::AlreadyRunning => panic!("first acquire must be primary"),
         };
 
         // A second launch must detect the live socket and hand off focus.
-        let second = acquire_at(&lock_path, socket_path.clone(), Some(anchor))
+        let second_lock = lock_path.clone();
+        let second_socket = socket_path.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let second_thread = std::thread::spawn(move || {
+            let result = acquire_at(&second_lock, second_socket, Some(anchor));
+            drop(result_tx.send(result));
+        });
+        let second = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second acquire must not wait for the primary to exit")
             .expect("second acquire should succeed");
         assert!(
             matches!(second, SingletonResult::AlreadyRunning),
@@ -253,6 +260,26 @@ mod tests {
         assert_eq!(received.y, anchor.y);
         assert_eq!(received.width, anchor.width);
         assert_eq!(received.height, anchor.height);
+
+        cleanup_socket(&socket_path);
+        second_thread.join().expect("second acquire thread should exit");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Dead owner socket is reclaimed]]
+    #[test]
+    fn stale_owner_socket_is_reclaimed() {
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-client-singleton-stale-{}", std::process::id()));
+        drop(std::fs::create_dir_all(&dir));
+        let lock_path = dir.join("client.lock");
+        let socket_path = dir.join("client.sock");
+        drop(std::fs::remove_file(&socket_path));
+        drop(UnixListener::bind(&socket_path).expect("stale owner should bind once"));
+
+        let result = acquire_at(&lock_path, socket_path.clone(), None)
+            .expect("a dead owner's socket should be reclaimed");
+        assert!(matches!(result, SingletonResult::Primary { .. }));
 
         cleanup_socket(&socket_path);
         drop(std::fs::remove_dir_all(&dir));

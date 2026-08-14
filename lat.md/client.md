@@ -811,6 +811,16 @@ The window-list poll rounds it out:  sends  on the same tick, throttled to  and 
 
 The whole surface is verified against the running app, not headlessly: see .
 
+### Terminal client singleton
+
+A plain local launch focuses the running terminal client and exits before GPUI startup, restore-index claims, server attachment, or session creation.
+
+[[crates/scribe-client/src/main.rs#terminal_singleton_required]] exempts `--restore-child`, `SCRIBE_JOIN_WINDOW`, `SCRIBE_REMOTE_DIAL`, and `SCRIBE_LAN_DIAL`. Special command modes return earlier. A primary binds `client.sock` through [[crates/scribe-client/src/settings/singleton.rs#acquire_terminal]] in the flavor runtime directory documented by [[common#Common#Socket Paths]].
+
+The advisory lock covers only bind-or-connect, preventing launch races without blocking later focus senders. A dead owner's stale socket is removed and rebound. The updater's bare replacement therefore becomes primary after every old client exits.
+
+The owner accepts same-UID `focus` commands and activates its own most-recently-focused terminal window. Recency stays process-local; restore children and explicit join clients remain independent processes.
+
 ## GPUI Window Chrome Layout
 
 The terminal window is a flex column of chrome bands around one flex-grown grid, and its startup size is derived from that stack rather than hardcoded — so the whole grid and every band land on screen at once.

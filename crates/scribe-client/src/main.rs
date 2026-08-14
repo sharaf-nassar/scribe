@@ -193,6 +193,13 @@ use crate::{
 /// startup-to-first-frame for the perf A/B rig (`tools/perf-ab-rig`).
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 static PROCESS_SHUTDOWN: OnceLock<Arc<ProcessShutdown>> = OnceLock::new();
+thread_local! {
+    /// Owner-local recency target for a duplicate launch's focus handoff.
+    // ponytail: persist recency only if restore-child windows must win handoffs.
+    static RECENT_TERMINAL_WINDOW: RefCell<Option<WindowHandle<TerminalView>>> = const {
+        RefCell::new(None)
+    };
+}
 
 /// Latches once the first frame has emitted its startup-timing marker so the
 /// per-frame `render` hook only measures the initial paint.
@@ -7940,6 +7947,9 @@ impl TerminalView {
         if !active {
             return;
         }
+        if let Some(handle) = window.window_handle().downcast::<TerminalView>() {
+            RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(Some(handle)));
+        }
         // Focus-on-activate fallback: a notification service that activates the
         // app without reporting which toast was clicked leaves this as the only
         // link between the click and the pane that asked for attention. The
@@ -9567,6 +9577,108 @@ fn launchd_command_exit() -> Option<std::process::ExitCode> {
     None
 }
 
+// @lat: [[client#Client#GPUI Window Lifecycle#Terminal client singleton]]
+const fn terminal_singleton_required(exemptions: [bool; 4]) -> bool {
+    !exemptions[0] && !exemptions[1] && !exemptions[2] && !exemptions[3]
+}
+
+fn start_terminal_focus_listener(
+    listener: std::os::unix::net::UnixListener,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<()>, String> {
+    use scribe_client::settings::singleton;
+
+    listener
+        .set_nonblocking(false)
+        .map_err(|error| format!("failed to configure terminal singleton listener: {error}"))?;
+    let (focus_tx, focus_rx) = unbounded_channel();
+    std::thread::Builder::new()
+        .name("scribe-client-singleton".to_owned())
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        tracing::warn!(%error, "terminal singleton listener stopped");
+                        return;
+                    }
+                };
+                if singleton::verify_peer_uid(&stream)
+                    && singleton::read_command(&stream)
+                        .is_some_and(|command| command.cmd == "focus")
+                    && focus_tx.send(()).is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("failed to start terminal singleton listener: {error}"))?;
+    Ok(focus_rx)
+}
+
+async fn drive_terminal_focus(
+    mut focus_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    app: &mut AsyncApp,
+) {
+    while focus_rx.recv().await.is_some() {
+        let target = RECENT_TERMINAL_WINDOW.with(|recent| *recent.borrow());
+        let Some(window_handle) = target else {
+            continue;
+        };
+        if window_handle.update(app, |_, window, _| window.activate_window()).is_err() {
+            RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(None));
+        }
+    }
+}
+
+enum TerminalSingletonStartup {
+    Exempt,
+    AlreadyRunning,
+    Primary { socket_path: PathBuf, focus_rx: tokio::sync::mpsc::UnboundedReceiver<()> },
+}
+
+fn prepare_terminal_singleton(required: bool) -> Result<TerminalSingletonStartup, String> {
+    use scribe_client::settings::singleton::{self, SingletonResult};
+
+    if !required {
+        return Ok(TerminalSingletonStartup::Exempt);
+    }
+    match singleton::acquire_terminal()? {
+        SingletonResult::AlreadyRunning => Ok(TerminalSingletonStartup::AlreadyRunning),
+        SingletonResult::Primary { listener, socket_path } => {
+            let focus_rx = start_terminal_focus_listener(listener).inspect_err(|_| {
+                singleton::cleanup_socket(&socket_path);
+            })?;
+            Ok(TerminalSingletonStartup::Primary { socket_path, focus_rx })
+        }
+    }
+}
+
+fn run_terminal_app(
+    shared: Shared,
+    sink: IpcSink,
+    terminal_size: TerminalSize,
+    cold_start: ColdStart,
+    focus_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+) {
+    application().run(move |cx: &mut App| {
+        gpui_tokio::init(cx);
+        scribe_client::fonts::register_embedded_fonts(cx);
+        let animations = load_config().map_or(true, |config| config.appearance.animations);
+        AnimationSettings::resolve(animations).apply_to_app(cx);
+        app_shortcuts::register(cx);
+        if let Some(terminal_window) = open_window(cx, &shared, &sink, terminal_size, cold_start) {
+            RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(Some(terminal_window)));
+            cx.on_action(move |_: &Quit, cx| {
+                defer_terminal_window_close(terminal_window, cx);
+            });
+        }
+        if let Some(focus_rx) = focus_rx {
+            cx.spawn(async move |app| drive_terminal_focus(focus_rx, app).await).detach();
+        }
+        cx.activate(true);
+    });
+}
+
 fn main() -> std::process::ExitCode {
     PROCESS_START.get_or_init(Instant::now);
     init_tracing();
@@ -9615,6 +9727,29 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    let restore_child = restore_replay::is_restore_child(std::env::args());
+    let join_window = scribe_client::share_join::join_window_from_env();
+    let singleton_required = terminal_singleton_required([
+        restore_child,
+        std::env::var_os(scribe_client::share_join::JOIN_WINDOW_ENV).is_some(),
+        std::env::var_os(remote_handshake::REMOTE_DIAL_ENV).is_some(),
+        std::env::var_os(remote_handshake::LAN_DIAL_ENV).is_some(),
+    ]);
+    let (terminal_socket_path, focus_rx) = match prepare_terminal_singleton(singleton_required) {
+        Ok(TerminalSingletonStartup::Exempt) => (None, None),
+        Ok(TerminalSingletonStartup::AlreadyRunning) => {
+            tracing::info!("terminal client already running; sent focus and exiting");
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(TerminalSingletonStartup::Primary { socket_path, focus_rx }) => {
+            (Some(socket_path), Some(focus_rx))
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to acquire terminal singleton");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     // Claimed before the backend connects: the claimed snapshot's geometry is
     // what the window is opened at, and it is only findable under that
     // snapshot's own (pre-crash) window id.
@@ -9625,7 +9760,6 @@ fn main() -> std::process::ExitCode {
     // claim as an additive share join under any non-`single_controller` sharing
     // mode, so this client renders and types into the SAME panes instead of
     // opening an empty window of its own — and must not create a shell there.
-    let join_window = scribe_client::share_join::join_window_from_env();
     let bootstrap_initial_session = cold_start.snapshot.is_none() && join_window.is_none();
     // The claimed snapshot names the window this process is resuming. Claiming
     // it back is what makes the resume line up: a server that kept the window
@@ -9642,35 +9776,14 @@ fn main() -> std::process::ExitCode {
             // The bootstrap reopens the server's other windows; a
             // `--restore-child` is already the other half of the client-side
             // cold-restart fan-out.
-            fan_out: !restore_replay::is_restore_child(std::env::args()),
+            fan_out: !restore_child,
         },
     );
 
-    application().run(move |cx: &mut App| {
-        // Picker probes use Tokio networking while all view mutations return
-        // through GPUI tasks, so both runtimes remain on their owning threads.
-        gpui_tokio::init(cx);
-        // Register the embedded Symbols Nerd Font before anything shapes a
-        // line: `load_family` caches per-family lookups, so a later add could
-        // never displace a cached miss for the fallback chain's first entry.
-        scribe_client::fonts::register_embedded_fonts(cx);
-        // Resolve the motion policy from `appearance.animations` (default true)
-        // and the SCRIBE_DISABLE_ANIMATIONS override, then mirror it onto GPUI's
-        // global reduce-motion flag so any UI transitions stay off — and
-        // screenshots stay byte-identical — under the E2E determinism path.
-        let animations = load_config().map_or(true, |config| config.appearance.animations);
-        AnimationSettings::resolve(animations).apply_to_app(cx);
-        app_shortcuts::register(cx);
-        if let Some(terminal_window) = open_window(cx, &shared, &sink, terminal_size, cold_start) {
-            // A settings window can be active in this process, so Quit is an
-            // app-level action rather than a listener on the terminal root.
-            // It still lands on the terminal's server-owned close workflow.
-            cx.on_action(move |_: &Quit, cx| {
-                defer_terminal_window_close(terminal_window, cx);
-            });
-        }
-        cx.activate(true);
-    });
+    run_terminal_app(shared, sink, terminal_size, cold_start, focus_rx);
+    if let Some(socket_path) = terminal_socket_path {
+        scribe_client::settings::singleton::cleanup_socket(&socket_path);
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -9724,10 +9837,8 @@ fn probe_vulkan() -> Result<(), String> {
 fn run_settings() {
     use scribe_client::settings::singleton::{self, SingletonResult};
 
-    let (listener, socket_path, lock_file) = match singleton::acquire(None) {
-        Ok(SingletonResult::Primary { listener, socket_path, lock_file }) => {
-            (listener, socket_path, lock_file)
-        }
+    let (listener, socket_path) = match singleton::acquire(None) {
+        Ok(SingletonResult::Primary { listener, socket_path }) => (listener, socket_path),
         Ok(SingletonResult::AlreadyRunning) => {
             tracing::info!("settings window already running; sent focus and exiting");
             return;
@@ -9754,7 +9865,6 @@ fn run_settings() {
     // Hold the singleton guards for the window's lifetime, then clean up.
     singleton::cleanup_socket(&socket_path);
     drop(listener);
-    drop(lock_file);
 }
 
 fn open_window(
@@ -12817,6 +12927,47 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]
+    #[test]
+    fn terminal_singleton_only_applies_to_plain_local_launches() {
+        assert!(terminal_singleton_required([false, false, false, false]));
+        assert!(!terminal_singleton_required([true, false, false, false]));
+        assert!(!terminal_singleton_required([false, true, false, false]));
+        assert!(!terminal_singleton_required([false, false, true, false]));
+        assert!(!terminal_singleton_required([false, false, false, true]));
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Focus command reaches the owner]]
+    #[test]
+    fn terminal_singleton_listener_forwards_focus_commands() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        use scribe_client::settings::singleton;
+        use scribe_common::settings_window::SettingsWindowCommand;
+
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-client-focus-listener-{}", std::process::id()));
+        drop(std::fs::create_dir_all(&dir));
+        let socket_path = dir.join("client.sock");
+        drop(std::fs::remove_file(&socket_path));
+        let listener = UnixListener::bind(&socket_path).expect("test listener should bind");
+        let mut focus_rx =
+            start_terminal_focus_listener(listener).expect("focus listener should start");
+
+        let mut stream = UnixStream::connect(&socket_path).expect("focus sender should connect");
+        singleton::write_command(&mut stream, &SettingsWindowCommand::focus(None))
+            .expect("focus command should send");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while focus_rx.try_recv().is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(Instant::now() < deadline, "focus command should reach the GPUI receiver");
+
+        singleton::cleanup_socket(&socket_path);
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     // @lat: [[test#Test Harness#Server lifecycle#Graceful shutdown waits for every hosted window]]
     #[test]

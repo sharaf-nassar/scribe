@@ -162,7 +162,7 @@ Platform-specific socket and lock file paths for all Scribe singleton processes,
 | macOS | `~/Library/Application Support/Scribe/run/` for stable installs, `~/Library/Application Support/Scribe Dev/run/` for `scribe-dev` |
 | Other Unix | `$TMPDIR/scribe-{uid}/` for stable installs, `$TMPDIR/scribe-dev-{uid}/` for `scribe-dev` |
 
-Named sockets in the base directory: `server.sock`, `settings.sock`, and `handoff.sock`, with lock files for the long-lived singleton processes. macOS uses a stable Application Support path so Finder-launched clients and `launchctl`-started background services resolve the same socket location. Public API: , , , , , and .
+Named sockets in the base directory are `server.sock`, `client.sock`, `settings.sock`, and `handoff.sock`. `client.lock` and `settings.lock` serialize singleton acquisition; the bound sockets own process lifetime. Flavor-specific base directories prevent stable and dev clients from handing focus to each other.
 
 ## Theme System
 

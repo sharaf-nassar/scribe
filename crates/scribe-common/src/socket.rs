@@ -69,6 +69,18 @@ pub fn settings_socket_path() -> PathBuf {
     runtime_dir().join("settings.sock")
 }
 
+/// Returns the socket path for the terminal-client singleton.
+#[must_use]
+pub fn client_socket_path() -> PathBuf {
+    runtime_dir().join("client.sock")
+}
+
+/// Returns the lock file path for terminal-client singleton acquisition.
+#[must_use]
+pub fn client_lock_path() -> PathBuf {
+    runtime_dir().join("client.lock")
+}
+
 /// Returns the lock file path for the settings singleton.
 ///
 /// - Linux: `/run/user/{uid}/scribe/settings.lock`
@@ -112,5 +124,22 @@ mod tests {
     fn macos_runtime_dir_uses_application_support_for_dev() {
         let dir = macos_runtime_dir_for_home(AppIdentity::dev(), Path::new("/Users/tester"));
         assert_eq!(dir, PathBuf::from("/Users/tester/Library/Application Support/Scribe Dev/run"));
+    }
+}
+
+#[cfg(test)]
+mod shared_runtime_tests {
+    use super::{client_lock_path, client_socket_path, server_socket_path};
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Client paths stay flavor scoped]]
+    #[test]
+    fn terminal_client_paths_share_the_flavor_runtime_directory() {
+        let server_socket = server_socket_path();
+        let runtime_dir = server_socket.parent().expect("server socket has a parent");
+
+        assert_eq!(client_socket_path().parent(), Some(runtime_dir));
+        assert_eq!(client_lock_path().parent(), Some(runtime_dir));
+        assert_eq!(client_socket_path().file_name().unwrap(), "client.sock");
+        assert_eq!(client_lock_path().file_name().unwrap(), "client.lock");
     }
 }
