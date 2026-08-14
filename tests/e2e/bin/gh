@@ -1,8 +1,11 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -eq 4 ] && [ "$1" = auth ] && [ "$2" = token ] \
-    && [ "$3" = --hostname ] && [ "$4" = github.com ]; then
+if [ "$#" -eq 4 ] \
+    && [ "$1" = auth ] \
+    && [ "$2" = token ] \
+    && [ "$3" = --hostname ] \
+    && [ "$4" = github.com ]; then
     printf '%s\n' scribe-e2e-token
     exit 0
 fi

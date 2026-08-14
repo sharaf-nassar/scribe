@@ -268,6 +268,10 @@ e2e-visual-shared script:
 e2e-visual-share:
     docker run --rm --network none {{gpu_flags}} -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/share-control.sh
 
+# Run the CI job-detail trace against the protocol wire tap.
+e2e-visual-ci-details:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/ci-run-details.sh
+
 # Run the Subscribe / RequestSnapshot session-tooling E2E through the wire tap
 e2e-visual-session-tooling:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/session-tooling.sh
@@ -575,6 +579,7 @@ e2e: build-release docker-func
         func/ai-state-indicator.sh
         func/attach-lossless.sh
         func/beads-board.sh
+        func/ci-run-details.sh
         func/cli-smoke.sh
         func/codex-subagent-hooks.sh
         func/cold-restart.sh
@@ -621,6 +626,7 @@ e2e-all-visual: build-release docker-visual
         'visual/beads-board.sh|e2e-visual-beads-board'
         'visual/bell.sh|e2e-visual-bell'
         'visual/ci-run-bar.sh|e2e-visual-ci-run-bar'
+        'visual/ci-run-details.sh|e2e-visual-ci-details'
         'visual/clipboard-osc52.sh|e2e-visual-clipboard'
         'visual/codex-reattach-size.sh|e2e-visual-codex-reattach'
         'visual/codex-targeted-resume.sh|e2e-visual-codex-targeted-resume'

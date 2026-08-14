@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,7 +13,8 @@ use gpui::{
 };
 use scribe_common::{
     protocol::{
-        CiRunConclusion, CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun, CiWorkflowStatus,
+        CiJob, CiRunConclusion, CiRunDelta, CiRunDetails, CiRunState, CiRunStatus, CiWorkflowRun,
+        CiWorkflowStatus,
     },
     theme::Theme,
 };
@@ -21,11 +23,17 @@ use crate::{animation::AnimationSettings, layout::Rect, opacity::scale_slot};
 
 /// Fixed height of the collapsed workspace-region band.
 pub const CI_BAR_HEIGHT: f32 = 40.0;
+/// Fixed panel chrome plus one 26px row per returned job.
+pub const CI_TRACE_BASE_HEIGHT: f32 = 38.0;
+pub const CI_TRACE_ROW_HEIGHT: f32 = 26.0;
+/// Loading state shown immediately after expansion and before the first reply.
+pub const CI_TRACE_LOADING_HEIGHT: f32 = 54.0;
 
 /// Server-owned CI snapshots keyed by their trusted repository root.
 #[derive(Debug, Default)]
 pub struct CiRunBars {
     states: HashMap<PathBuf, CiRunState>,
+    details: HashMap<PathBuf, CiRunDetails>,
 }
 
 impl CiRunBars {
@@ -33,11 +41,19 @@ impl CiRunBars {
     pub fn apply(&mut self, repo_root: PathBuf, delta: CiRunDelta) {
         match delta {
             CiRunDelta::Set(state) => {
+                if self
+                    .details
+                    .get(&repo_root)
+                    .is_some_and(|details| details.head_sha != state.head_sha)
+                {
+                    self.details.remove(&repo_root);
+                }
                 self.states.insert(repo_root, state);
             }
             CiRunDelta::Cleared { head_sha } => {
                 if self.states.get(&repo_root).is_some_and(|state| state.head_sha == head_sha) {
                     self.states.remove(&repo_root);
+                    self.details.remove(&repo_root);
                 }
             }
         }
@@ -47,6 +63,19 @@ impl CiRunBars {
     #[must_use]
     pub fn get(&self, repo_root: &Path) -> Option<&CiRunState> {
         self.states.get(repo_root)
+    }
+
+    /// Store detail only when it belongs to the repository's visible head.
+    pub fn apply_details(&mut self, repo_root: PathBuf, details: CiRunDetails) {
+        if self.states.get(&repo_root).is_some_and(|state| state.head_sha == details.head_sha) {
+            self.details.insert(repo_root, details);
+        }
+    }
+
+    /// Detail for exactly `head_sha`; old cached heads never enter a new panel.
+    #[must_use]
+    pub fn details(&self, repo_root: &Path, head_sha: &str) -> Option<&CiRunDetails> {
+        self.details.get(repo_root).filter(|details| details.head_sha == head_sha)
     }
 }
 
@@ -191,6 +220,143 @@ impl CiBarModel {
     }
 }
 
+/// One time-positioned row in the expanded trace panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiTraceRowModel {
+    pub job_id: u64,
+    pub name: String,
+    pub workflow_name: String,
+    pub kind: TraceCellKind,
+    pub glyph: &'static str,
+    pub state_word: &'static str,
+    pub current_step: String,
+    pub elapsed: String,
+    /// Start and width on the shared axis, in basis points.
+    pub left: u16,
+    pub width: u16,
+    pub accessibility_label: String,
+}
+
+/// Display-independent expanded job trace on one shared minute axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiTraceModel {
+    pub axis_labels: Vec<String>,
+    pub rows: Vec<CiTraceRowModel>,
+    pub motion: bool,
+    pub accessibility_label: String,
+}
+
+impl CiTraceModel {
+    /// Build the approved time-positioned trace without a GPUI window.
+    #[must_use]
+    // @lat: [[client#GPUI CI Run Bar#Expanded job trace]]
+    pub fn build(details: &CiRunDetails, now: u64, stale: bool) -> Self {
+        let origin =
+            details.jobs.iter().filter_map(|job| job.started_at_epoch_secs).min().unwrap_or(now);
+        let live = details.jobs.iter().any(|job| job.status != CiWorkflowStatus::Completed);
+        let end = if live {
+            now
+        } else {
+            details
+                .jobs
+                .iter()
+                .filter_map(|job| job.completed_at_epoch_secs)
+                .max()
+                .unwrap_or(origin)
+        };
+        let axis_minutes = end.saturating_sub(origin).div_ceil(60).max(4);
+        let axis_seconds = axis_minutes.saturating_mul(60);
+        let rows = details
+            .jobs
+            .iter()
+            .map(|job| trace_row(job, origin, axis_seconds, now))
+            .collect::<Vec<_>>();
+        Self {
+            axis_labels: (0..=axis_minutes).map(|minute| format!("{minute}m")).collect(),
+            motion: !stale
+                && details.jobs.iter().any(|job| job.status == CiWorkflowStatus::InProgress),
+            accessibility_label: format!("CI job trace, {} jobs", rows.len()),
+            rows,
+        }
+    }
+
+    #[must_use]
+    pub fn height(&self) -> f32 {
+        let rows = u16::try_from(self.rows.len()).unwrap_or(u16::MAX);
+        CI_TRACE_BASE_HEIGHT + f32::from(rows) * CI_TRACE_ROW_HEIGHT
+    }
+}
+
+fn trace_row(job: &CiJob, origin: u64, axis_seconds: u64, now: u64) -> CiTraceRowModel {
+    let (kind, state_word) = job_state(job);
+    let start = job.started_at_epoch_secs.unwrap_or(now).max(origin);
+    let end = job.completed_at_epoch_secs.unwrap_or(now).max(start);
+    let left = axis_basis_points(start.saturating_sub(origin), axis_seconds);
+    let width = if kind == TraceCellKind::Queued {
+        axis_basis_points(60, axis_seconds).min(10_000_u16.saturating_sub(left))
+    } else {
+        axis_basis_points(end.saturating_sub(start), axis_seconds)
+            .max(1)
+            .min(10_000_u16.saturating_sub(left))
+    };
+    let current_step = job
+        .steps
+        .iter()
+        .find(|step| step.status == CiWorkflowStatus::InProgress)
+        .or_else(|| job.steps.iter().rev().find(|step| step.status == CiWorkflowStatus::Completed))
+        .map_or_else(|| state_word.to_owned(), |step| step.name.clone());
+    let elapsed = job
+        .started_at_epoch_secs
+        .map_or_else(|| "—".to_owned(), |started| duration_label(end.saturating_sub(started)));
+    let glyph = kind.glyph();
+    let accessibility_label = format!(
+        "{} job {}, workflow {}, {state_word}, step {current_step}, elapsed {elapsed}",
+        glyph, job.name, job.workflow_name
+    );
+    CiTraceRowModel {
+        job_id: job.job_id,
+        name: job.name.clone(),
+        workflow_name: job.workflow_name.clone(),
+        kind,
+        glyph,
+        state_word,
+        current_step,
+        elapsed,
+        left,
+        width,
+        accessibility_label,
+    }
+}
+
+fn job_state(job: &CiJob) -> (TraceCellKind, &'static str) {
+    match (job.status, job.conclusion) {
+        (CiWorkflowStatus::Queued, _) => (TraceCellKind::Queued, "queued"),
+        (CiWorkflowStatus::InProgress, _) => (TraceCellKind::Active, "running"),
+        (CiWorkflowStatus::Completed, Some(CiRunConclusion::Success)) => {
+            (TraceCellKind::Success, "passed")
+        }
+        (CiWorkflowStatus::Completed, Some(CiRunConclusion::Failure)) => {
+            (TraceCellKind::Failure, "failed")
+        }
+        (CiWorkflowStatus::Completed, Some(CiRunConclusion::Cancelled) | None) => {
+            (TraceCellKind::Cancelled, "cancelled")
+        }
+    }
+}
+
+fn axis_basis_points(seconds: u64, axis_seconds: u64) -> u16 {
+    seconds.saturating_mul(10_000).checked_div(axis_seconds.max(1)).unwrap_or_default().min(10_000)
+        as u16
+}
+
+fn duration_label(seconds: u64) -> String {
+    if seconds < 3_600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
 fn state_label(state: &CiRunState) -> (&'static str, &'static str, CiTone) {
     if state.stale {
         return ("!", "stale", CiTone::Stale);
@@ -242,6 +408,7 @@ fn elapsed_label(state: &CiRunState, now: u64, terminal: bool) -> String {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CiBarColors {
     pub background: [f32; 4],
+    pub panel_background: [f32; 4],
     pub text: [f32; 4],
     pub muted: [f32; 4],
     pub divider: [f32; 4],
@@ -258,6 +425,7 @@ impl CiBarColors {
         let background = lift(theme.background, 0.01);
         Self {
             background: scale_slot(background, opacity),
+            panel_background: scale_slot(theme.background, opacity),
             text: theme.foreground,
             muted: with_alpha(theme.foreground, 0.55),
             divider: with_alpha(theme.foreground, 0.12),
@@ -288,44 +456,54 @@ fn rgba(color: [f32; 4]) -> Rgba {
 }
 
 /// User action carried out by the host view.
-pub type CiActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
+pub type CiActionHandler = Arc<dyn Fn(&mut Window, &mut App)>;
 
 /// Geometry, ownership color, motion policy, and callbacks for one region band.
 pub struct CiBarRender {
     pub id: ElementId,
+    pub trace_id: ElementId,
     pub open_id: ElementId,
     pub dismiss_id: ElementId,
     pub rect: Rect,
     pub accent: [f32; 4],
     pub animations: AnimationSettings,
+    pub expanded: bool,
+    pub trace: Option<CiTraceModel>,
+    pub toggle_focus: FocusHandle,
     pub open_focus: Option<FocusHandle>,
     pub dismiss_focus: Option<FocusHandle>,
+    pub on_toggle: CiActionHandler,
     pub on_open: Option<CiActionHandler>,
     pub on_dismiss: Option<CiActionHandler>,
 }
 
 /// Lower a pure collapsed model onto the approved 40px trace direction.
 pub fn render(model: &CiBarModel, colors: &CiBarColors, render: CiBarRender) -> gpui::AnyElement {
-    let CiBarRender {
-        id,
-        open_id,
-        dismiss_id,
-        rect,
-        accent,
-        animations,
-        open_focus,
-        dismiss_focus,
-        on_open,
-        on_dismiss,
-    } = render;
-    let underline = underline_color(model.tone, colors, accent);
-    let state = state_summary(model, tone_color(model.tone, colors));
+    let band = collapsed_band(model, colors, &render);
+    let panel = render
+        .expanded
+        .then(|| trace_panel(render.trace_id, render.trace.as_ref(), colors, render.animations));
+    div()
+        .absolute()
+        .left(px(render.rect.x))
+        .top(px(render.rect.y))
+        .w(px(render.rect.width))
+        .h(px(render.rect.height))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(band)
+        .children(panel)
+        .into_any_element()
+}
+
+fn collapsed_cells(model: &CiBarModel, colors: &CiBarColors) -> gpui::AnyElement {
     let trace_cells = model
         .cells
         .iter()
         .enumerate()
         .map(|(index, cell)| trace_cell(cell, model.motion, index, colors));
-    let cells = div()
+    div()
         .flex()
         .flex_1()
         .min_w(px(220.0))
@@ -338,8 +516,16 @@ pub fn render(model: &CiBarModel, colors: &CiBarColors, render: CiBarRender) -> 
                 .text_size(px(10.5))
                 .text_color(rgba(colors.muted))
                 .child(format!("+{}", model.hidden_cells))
-        }));
-    let metadata = div()
+        }))
+        .into_any_element()
+}
+
+fn collapsed_metadata(
+    model: &CiBarModel,
+    colors: &CiBarColors,
+    render: &CiBarRender,
+) -> gpui::AnyElement {
+    div()
         .flex()
         .flex_none()
         .items_center()
@@ -356,36 +542,254 @@ pub fn render(model: &CiBarModel, colors: &CiBarColors, render: CiBarRender) -> 
         .child(action_cluster(
             model.action_mode,
             colors,
-            (open_id, dismiss_id),
-            open_focus.zip(on_open),
-            dismiss_focus.zip(on_dismiss),
-        ));
-    let sweep = appear_sweep(&model.head_sha, colors, animations);
+            (render.open_id.clone(), render.dismiss_id.clone()),
+            render.open_focus.clone().zip(render.on_open.clone()),
+            render.dismiss_focus.clone().zip(render.on_dismiss.clone()),
+        ))
+        .into_any_element()
+}
+
+fn collapsed_toggle(
+    model: &CiBarModel,
+    colors: &CiBarColors,
+    render: &CiBarRender,
+) -> gpui::AnyElement {
+    let toggle_click = Arc::clone(&render.on_toggle);
+    let toggle_key = Arc::clone(&render.on_toggle);
+    let toggle_focus = render.toggle_focus.clone();
+    let toggle_label = format!(
+        "{}. CI job trace is {}",
+        model.accessibility_label,
+        if render.expanded { "expanded" } else { "collapsed" }
+    );
     div()
-        .id(id)
-        .role(Role::Status)
-        .aria_label(model.accessibility_label.clone())
-        .absolute()
-        .left(px(rect.x))
-        .top(px(rect.y))
-        .w(px(rect.width))
-        .h(px(rect.height))
-        .overflow_hidden()
+        .id(render.id.clone())
+        .role(Role::Button)
+        .aria_label(toggle_label)
+        .aria_description("Press Enter or Space to toggle job details")
+        .aria_expanded(render.expanded)
+        .track_focus(&render.toggle_focus)
+        .flex()
+        .flex_1()
+        .min_w(px(0.0))
+        .items_center()
+        .gap(px(18.0))
+        .focus_visible(|style| style.bg(rgba(with_alpha(colors.text, 0.08))))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                cx.stop_propagation();
+                toggle_key(window, cx);
+            }
+        })
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            window.focus(&toggle_focus, cx);
+            toggle_click(window, cx);
+        })
+        .child(state_summary(model, tone_color(model.tone, colors)))
+        .child(collapsed_cells(model, colors))
+        .into_any_element()
+}
+
+fn collapsed_band(
+    model: &CiBarModel,
+    colors: &CiBarColors,
+    render: &CiBarRender,
+) -> gpui::AnyElement {
+    div()
+        .relative()
+        .h(px(CI_BAR_HEIGHT))
         .flex()
         .items_center()
         .gap(px(18.0))
         .px(px(14.0))
         .bg(rgba(colors.background))
         .border_b_1()
-        .border_color(rgba(underline))
+        .border_color(rgba(underline_color(model.tone, colors, render.accent)))
         .font_family("monospace")
         .text_size(px(12.5))
         .text_color(rgba(colors.text))
-        .child(state)
-        .child(cells)
-        .child(metadata)
-        .child(sweep)
+        .child(collapsed_toggle(model, colors, render))
+        .child(collapsed_metadata(model, colors, render))
+        .child(appear_sweep(&model.head_sha, colors, render.animations))
         .into_any_element()
+}
+
+fn trace_panel(
+    id: ElementId,
+    model: Option<&CiTraceModel>,
+    colors: &CiBarColors,
+    animations: AnimationSettings,
+) -> gpui::AnyElement {
+    let panel = div()
+        .id(id)
+        .role(Role::List)
+        .aria_label(
+            model.map_or("CI job trace loading", |trace| trace.accessibility_label.as_str()),
+        )
+        .w_full()
+        .flex()
+        .flex_col()
+        .px(px(14.0))
+        .pt(px(12.0))
+        .pb(px(14.0))
+        .bg(rgba(colors.panel_background))
+        .border_b_1()
+        .border_color(rgba(colors.divider));
+    let Some(model) = model else {
+        return panel
+            .h(px(CI_TRACE_LOADING_HEIGHT))
+            .text_size(px(11.0))
+            .text_color(rgba(colors.muted))
+            .child("loading job trace…")
+            .into_any_element();
+    };
+    panel
+        .h(px(model.height()))
+        .child(trace_axis(model, colors))
+        .children(
+            model
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| trace_row_element(row, index, model, colors, animations)),
+        )
+        .into_any_element()
+}
+
+fn trace_axis(model: &CiTraceModel, colors: &CiBarColors) -> gpui::AnyElement {
+    div()
+        .h(px(12.0))
+        .ml(px(168.0))
+        .mr(px(68.0))
+        .mb(px(6.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_size(px(9.5))
+        .text_color(rgba(with_alpha(colors.text, 0.35)))
+        .children(model.axis_labels.iter().cloned())
+        .into_any_element()
+}
+
+fn trace_row_element(
+    row: &CiTraceRowModel,
+    index: usize,
+    model: &CiTraceModel,
+    colors: &CiBarColors,
+    animations: AnimationSettings,
+) -> gpui::AnyElement {
+    let name = div()
+        .w(px(156.0))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .text_size(px(12.0))
+        .line_height(px(16.0))
+        .child(div().truncate().child(format!("{} {}", row.glyph, row.name)))
+        .child(
+            div()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(rgba(colors.muted))
+                .child(row.workflow_name.clone()),
+        );
+    let grid_steps = u16::try_from(model.axis_labels.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let grid = (1..grid_steps).map(|line| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(relative(f32::from(line) / f32::from(grid_steps)))
+            .border_l_1()
+            .border_color(rgba(with_alpha(colors.text, 0.05)))
+    });
+    let track = div().relative().flex_1().h(px(18.0)).children(grid).child(trace_job_bar(
+        row,
+        index,
+        model.motion,
+        colors,
+        animations,
+    ));
+    div()
+        .id(("ci-job-row", row.job_id))
+        .role(Role::ListItem)
+        .aria_label(row.accessibility_label.clone())
+        .h(px(CI_TRACE_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .text_color(rgba(colors.text))
+        .child(name)
+        .child(track)
+        .child(
+            div()
+                .w(px(56.0))
+                .flex_none()
+                .text_align(gpui::TextAlign::Right)
+                .text_size(px(11.0))
+                .text_color(rgba(colors.muted))
+                .child(row.elapsed.clone()),
+        )
+        .into_any_element()
+}
+
+fn trace_job_bar(
+    row: &CiTraceRowModel,
+    index: usize,
+    motion: bool,
+    colors: &CiBarColors,
+    animations: AnimationSettings,
+) -> gpui::AnyElement {
+    let tone = match row.kind {
+        TraceCellKind::Queued => with_alpha(colors.text, 0.25),
+        TraceCellKind::Active => colors.running,
+        TraceCellKind::Success => colors.success,
+        TraceCellKind::Failure => colors.failure,
+        TraceCellKind::Cancelled => colors.cancelled,
+    };
+    let mut bar = div()
+        .absolute()
+        .top(px(2.0))
+        .bottom(px(2.0))
+        .left(relative(f32::from(row.left) / 10_000.0))
+        .w(relative(f32::from(row.width) / 10_000.0))
+        .min_w(px(8.0))
+        .overflow_hidden()
+        .rounded(px(3.0))
+        .px(px(8.0))
+        .flex()
+        .items_center()
+        .truncate()
+        .text_size(px(10.0))
+        .text_color(rgba(with_alpha(colors.text, 0.85)))
+        .child(format!("{} {}", row.glyph, row.current_step));
+    if row.kind == TraceCellKind::Queued {
+        return bar
+            .border_1()
+            .border_dashed()
+            .border_color(rgba(tone))
+            .text_color(rgba(colors.muted))
+            .into_any_element();
+    }
+    bar = bar.bg(rgba(with_alpha(tone, 0.72)));
+    if row.kind == TraceCellKind::Active {
+        let edge = div().absolute().right_0().top_0().bottom_0().w(px(2.0)).bg(rgba(colors.text));
+        bar = bar.child(if motion && animations.enabled() {
+            edge.with_animation(
+                ElementId::Name(format!("ci-trace-frontier-{index}").into()),
+                Animation::new(Duration::from_millis(1_200)).repeat(),
+                |edge, delta| edge.opacity(0.3 + 0.7 * (1.0 - (delta * 2.0 - 1.0).abs())),
+            )
+            .into_any_element()
+        } else {
+            edge.into_any_element()
+        });
+    }
+    bar.into_any_element()
 }
 
 fn state_summary(model: &CiBarModel, tone: [f32; 4]) -> gpui::AnyElement {
@@ -577,6 +981,7 @@ fn action_button(
             }
         })
         .on_click(move |_, window, cx| {
+            cx.stop_propagation();
             window.focus(&click_focus, cx);
             action(window, cx);
         })
@@ -614,10 +1019,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use scribe_common::protocol::{
-        CiRunConclusion, CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun, CiWorkflowStatus,
+        CiJob, CiJobStep, CiRunConclusion, CiRunDelta, CiRunDetails, CiRunState, CiRunStatus,
+        CiWorkflowRun, CiWorkflowStatus,
     };
 
-    use super::{CiActionMode, CiBarColors, CiBarModel, CiRunBars, TraceCellKind};
+    use super::{CiActionMode, CiBarColors, CiBarModel, CiRunBars, CiTraceModel, TraceCellKind};
 
     fn workflow(
         run_id: u64,
@@ -652,6 +1058,28 @@ mod tests {
             workflows: vec![workflow(42, "quality", status, conclusion)],
             rollup,
             stale,
+        }
+    }
+
+    fn job(
+        job_id: u64,
+        workflow_name: &str,
+        name: &str,
+        state: (CiWorkflowStatus, Option<CiRunConclusion>),
+        execution: (Option<u64>, Option<u64>, &str),
+    ) -> CiJob {
+        let (status, conclusion) = state;
+        let (started_at_epoch_secs, completed_at_epoch_secs, step) = execution;
+        CiJob {
+            job_id,
+            workflow_run_id: 42,
+            workflow_name: workflow_name.to_owned(),
+            name: name.to_owned(),
+            status,
+            conclusion,
+            started_at_epoch_secs,
+            completed_at_epoch_secs,
+            steps: vec![CiJobStep { name: step.to_owned(), status, conclusion }],
         }
     }
 
@@ -753,5 +1181,87 @@ mod tests {
         assert_eq!(colors.stale.map(f32::to_bits), theme.ansi_colors[3].map(f32::to_bits));
         assert_eq!(colors.cancelled.map(f32::to_bits), theme.ansi_colors[8].map(f32::to_bits));
         assert_eq!(colors.background[3].to_bits(), 0.75_f32.to_bits());
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Shared minute grid and non-color job cues]]
+    #[test]
+    fn trace_panel_uses_one_minute_axis_and_non_color_job_cues() {
+        let details = CiRunDetails {
+            head_sha: "head-a".to_owned(),
+            jobs: vec![
+                job(
+                    1,
+                    "quality",
+                    "rust-linux",
+                    (CiWorkflowStatus::Completed, Some(CiRunConclusion::Success)),
+                    (Some(100), Some(160), "just test"),
+                ),
+                job(
+                    2,
+                    "quality",
+                    "rust-macos",
+                    (CiWorkflowStatus::InProgress, None),
+                    (Some(115), None, "cargo clippy --workspace"),
+                ),
+                job(
+                    3,
+                    "docs",
+                    "lat-check",
+                    (CiWorkflowStatus::Queued, None),
+                    (None, None, "queued"),
+                ),
+            ],
+        };
+
+        let model = CiTraceModel::build(&details, 220, false);
+
+        assert_eq!(model.axis_labels, ["0m", "1m", "2m", "3m", "4m"]);
+        assert_eq!((model.rows[0].left, model.rows[0].width), (0, 2_500));
+        assert_eq!((model.rows[1].left, model.rows[1].width), (625, 4_375));
+        assert_eq!((model.rows[2].left, model.rows[2].width), (5_000, 2_500));
+        assert_eq!(
+            model
+                .rows
+                .iter()
+                .map(|row| (
+                    row.glyph,
+                    row.state_word,
+                    row.current_step.as_str(),
+                    row.elapsed.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("✓", "passed", "just test", "1m 00s"),
+                ("◐", "running", "cargo clippy --workspace", "1m 45s"),
+                ("◌", "queued", "queued", "—"),
+            ]
+        );
+        assert!(model.rows.iter().all(|row| row.accessibility_label.contains(row.state_word)));
+        assert!(model.motion);
+
+        let stale = CiTraceModel::build(&details, 220, true);
+        assert!(!stale.motion);
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Detail snapshots follow current head]]
+    #[test]
+    fn detail_snapshots_are_head_qualified() {
+        let root = PathBuf::from("/work/scribe");
+        let mut bars = CiRunBars::default();
+        let current = state(CiRunStatus::Running, false);
+        let head = current.head_sha.clone();
+        bars.apply(root.clone(), CiRunDelta::Set(current));
+
+        bars.apply_details(
+            root.clone(),
+            CiRunDetails { head_sha: "older-head".to_owned(), jobs: Vec::new() },
+        );
+        assert!(bars.details(&root, &head).is_none());
+
+        bars.apply_details(root.clone(), CiRunDetails { head_sha: head.clone(), jobs: Vec::new() });
+        assert!(bars.details(&root, &head).is_some());
+
+        bars.apply(root.clone(), CiRunDelta::Cleared { head_sha: head.clone() });
+        assert!(bars.details(&root, &head).is_none());
     }
 }

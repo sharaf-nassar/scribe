@@ -102,6 +102,12 @@ CI run messages carry server-owned state while keeping dismissal local to an aut
 
 `Hello.ci_run_bar` advertises support for the additive CI server message. `DismissCiRun { repo_root, head_sha }` asks the server to hide only that tracked head; the server rejects remote viewers, incapable senders, and roots absent from the sender's window.
 
+`SetCiRunDetailsInterest { repo_root, head_sha, interested }` opens or closes
+job-detail demand for one visible head. It carries no token or credential, and
+the server accepts it from capable owning and read-only participants whose
+window contains the root; a close remains valid after the root moves so stale
+demand can always be stopped.
+
 #### Backward-compatible negotiation
 
 A named-MessagePack `Hello` without `ci_run_bar` decodes it as `false`, preventing a new server from sending an unknown top-level variant to an old local client.
@@ -109,6 +115,11 @@ A named-MessagePack `Hello` without `ci_run_bar` decodes it as `false`, preventi
 #### Dismiss message round trip
 
 Named MessagePack preserves the repository root and head SHA carried by `DismissCiRun`.
+
+#### Detail-interest message round trip
+
+Named MessagePack preserves the repository root, head SHA, and open/closed
+state carried by `SetCiRunDetailsInterest`.
 
 ### Configuration
 
@@ -186,9 +197,19 @@ All three variants honour the attach-time `clipboard_gating` negotiation: the se
 
 The replacement contains trusted `owner/name`, head SHA, branch, per-workflow run id/name/status/conclusion/timestamps, queued-to-terminal rollup, and stale overlay. Job and step detail remain outside this message.
 
+`CiRunDetails { repo_root, details }` carries a head-qualified, bounded job
+snapshot only to a participant with matching open demand. Each job names its
+workflow, execution interval, conclusion, and steps; clients discard details
+for a head other than the visible replacement.
+
 #### State message round trip
 
 Named MessagePack preserves the full state and its repository routing key.
+
+#### Job-detail message round trip
+
+Named MessagePack preserves job, workflow, timing, conclusion, and step fields
+together with the repository routing key and head qualifier.
 
 #### Capability and repository scoping
 
@@ -246,7 +267,7 @@ Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is 
 
 Terminal-images v1 bumps the constant to `5` because capabilities, live output boundaries, and generation-tagged replay are remote-visible. A typed mismatch names both versions and whether client or server must update; local capability fields remain default-false for old/new Unix-socket decoding. See [[terminal-images#Terminal Images#Typed IPC Contract]].
 
-CI run state bumps the constant to `6` because state and dismissal cross tailnet and LAN connections. Local mixed-generation safety still comes from the default-false `Hello.ci_run_bar` gate.
+CI run state bumps the constant to `6` because state and dismissal cross tailnet and LAN connections. Job-detail demand and snapshots extend unreleased v6 under the same `ci_run_bar` capability rather than advancing it again. Local mixed-generation safety still comes from the default-false gate.
 
 ### Remote Transport
 

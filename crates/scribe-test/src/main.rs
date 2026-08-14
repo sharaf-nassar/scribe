@@ -468,6 +468,15 @@ enum DaemonAction {
     LastAction,
     /// Reset the recorded automation action to empty.
     ClearAction,
+    /// Open or close CI job-detail interest on the daemon connection.
+    CiDetails {
+        #[arg(long)]
+        repo_root: PathBuf,
+        #[arg(long)]
+        head_sha: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        interested: bool,
+    },
     /// Internal: run the daemon in the foreground (not user-facing).
     Run,
 }
@@ -784,6 +793,11 @@ fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
             drop(rt);
             daemon::clear_last_action().map_err(|e| TestError::InfraError(e.to_string()))
         }
+        DaemonAction::CiDetails { repo_root, head_sha, interested } => {
+            drop(rt);
+            daemon::set_ci_run_details_interest(repo_root.clone(), head_sha.clone(), *interested)
+                .map_err(|e| TestError::InfraError(e.to_string()))
+        }
         DaemonAction::Run => {
             rt.block_on(daemon::run()).map_err(|e| TestError::InfraError(e.to_string()))
         }
@@ -954,4 +968,36 @@ fn extract_char(s: &str) -> Result<char, TestError> {
         return Err(TestError::InfraError(format!("expected a single character but got \"{s}\"")));
     }
     Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Cli, Command, DaemonAction};
+
+    // @lat: [[test#GPUI CI Run Bar#Detail harness parses both interest values]]
+    #[test]
+    fn ci_details_interest_requires_an_explicit_boolean_value() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let cli = Cli::try_parse_from([
+                "scribe-test",
+                "daemon",
+                "ci-details",
+                "--repo-root",
+                "/work/scribe",
+                "--head-sha",
+                "abc123",
+                "--interested",
+                value,
+            ])
+            .expect("explicit CI interest value should parse");
+            assert!(matches!(
+                cli.command,
+                Command::Daemon {
+                    action: DaemonAction::CiDetails { interested, .. }
+                } if interested == expected
+            ));
+        }
+    }
 }

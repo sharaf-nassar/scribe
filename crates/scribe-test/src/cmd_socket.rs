@@ -123,6 +123,12 @@ pub enum DaemonRequest {
     },
     /// Refresh the current workspace's Beads board through the real server.
     RequestBeadsBoard,
+    /// Open or close job-detail interest on the daemon's capable connection.
+    SetCiRunDetailsInterest {
+        repo_root: PathBuf,
+        head_sha: String,
+        interested: bool,
+    },
     /// Ask what `SessionReplay` frames the daemon has applied for a session.
     ///
     /// `min_frames` blocks until that many frames have been applied — the

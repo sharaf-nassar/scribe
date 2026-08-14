@@ -195,8 +195,8 @@ pub struct PaneShell {
     server_workspaces: HashSet<WorkspaceId>,
     /// Regions giving up a top strip to a pinned Beads board, and how much.
     pinned_boards: HashMap<WorkspaceId, f32>,
-    /// Regions giving up the fixed collapsed CI strip below their tab chrome.
-    ci_regions: HashSet<WorkspaceId>,
+    /// Regions giving up a collapsed or expanded CI strip below their tab chrome.
+    ci_strips: HashMap<WorkspaceId, f32>,
 }
 
 impl PaneShell {
@@ -220,7 +220,7 @@ impl PaneShell {
             pending_workspaces: VecDeque::new(),
             server_workspaces: HashSet::new(),
             pinned_boards: HashMap::new(),
-            ci_regions: HashSet::new(),
+            ci_strips: HashMap::new(),
         }
     }
 
@@ -464,23 +464,19 @@ impl PaneShell {
     }
 
     /// The collapsed CI strip inside one raw region rect, directly below tabs.
-    fn ci_rect(rect: Rect) -> Option<Rect> {
+    fn ci_rect(rect: Rect, strip: f32) -> Option<Rect> {
         let tab = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
-        let height = scribe_client::ci_bar::CI_BAR_HEIGHT.min((rect.height - tab).max(0.0));
+        let height = strip.min((rect.height - tab).max(0.0));
         (height > 0.0).then_some(Rect { x: rect.x, y: rect.y + tab, width: rect.width, height })
     }
 
     fn ci_strip(&self, workspace_id: WorkspaceId) -> f32 {
-        if self.ci_regions.contains(&workspace_id) {
-            scribe_client::ci_bar::CI_BAR_HEIGHT
-        } else {
-            0.0
-        }
+        self.ci_strips.get(&workspace_id).copied().unwrap_or_default()
     }
 
-    /// Publish the regions whose current repository has a visible CI snapshot.
-    pub fn set_ci_regions(&mut self, regions: HashSet<WorkspaceId>) {
-        self.ci_regions = regions;
+    /// Publish each visible CI region's collapsed or expanded reservation.
+    pub fn set_ci_strips(&mut self, strips: HashMap<WorkspaceId, f32>) {
+        self.ci_strips = strips;
     }
 
     /// Resolve one visible collapsed CI band against the region layout.
@@ -491,7 +487,7 @@ impl PaneShell {
             .compute_workspace_rects(viewport)
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
-            .and_then(|(_, rect)| Self::ci_rect(rect))
+            .and_then(|(_, rect)| Self::ci_rect(rect, self.ci_strip(workspace_id)))
     }
 
     /// The strip a pinned board reserves inside `workspace_id`'s region, which
@@ -1570,7 +1566,8 @@ mod tests {
     #[test]
     fn ci_band_reflows_only_its_workspace_region() {
         let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
-        let band = PaneShell::ci_rect(top).expect("region has room for CI band");
+        let band = PaneShell::ci_rect(top, scribe_client::ci_bar::CI_BAR_HEIGHT)
+            .expect("region has room for CI band");
         assert!((band.x - top.x).abs() < f32::EPSILON);
         assert!((band.y - top.y).abs() < f32::EPSILON);
         assert!((band.width - top.width).abs() < f32::EPSILON);
@@ -1584,6 +1581,15 @@ mod tests {
             (content.height - (top.height - scribe_client::ci_bar::CI_BAR_HEIGHT)).abs()
                 < f32::EPSILON
         );
+
+        let expanded = scribe_client::ci_bar::CI_BAR_HEIGHT
+            + scribe_client::ci_bar::CI_TRACE_BASE_HEIGHT
+            + 3.0 * scribe_client::ci_bar::CI_TRACE_ROW_HEIGHT;
+        let trace = PaneShell::ci_rect(top, expanded).expect("region has room for trace panel");
+        assert!((trace.height - expanded).abs() < f32::EPSILON);
+        let traced_content = PaneShell::content_rect(top, expanded, 0.0);
+        assert!((traced_content.y - expanded).abs() < f32::EPSILON);
+        assert!((traced_content.height - (top.height - expanded)).abs() < f32::EPSILON);
     }
 
     /// A pinned board takes its strip out of its own region's content, stacking

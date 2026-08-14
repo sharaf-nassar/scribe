@@ -8,15 +8,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use scribe_common::protocol::{
-    CiRunConclusion, CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun, CiWorkflowStatus,
+    CiJob, CiJobStep, CiRunConclusion, CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun,
+    CiWorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::git_ref_watcher::PushDetected;
 use crate::git_ref_watcher::{GitRefWatcherControl, PushEventReceiver};
-use crate::ipc_server::{CiDismissals, WindowShares, publish_ci_run_delta};
+use crate::ipc_server::{
+    CiDismissals, SharedWriter, WindowShares, publish_ci_run_delta, send_message,
+};
 use crate::workspace_manager::WorkspaceManager;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -158,7 +161,12 @@ impl SecretToken {
 
 pub struct ApiRequest {
     url: reqwest::Url,
-    head_sha: String,
+    kind: ApiRequestKind,
+}
+
+enum ApiRequestKind {
+    Runs { head_sha: String },
+    Jobs { run_id: u64 },
 }
 
 impl ApiRequest {
@@ -169,13 +177,14 @@ impl ApiRequest {
             repository.full_name()
         ))
         .expect("test URL");
-        Self { url, head_sha: head_sha.to_owned() }
+        Self { url, kind: ApiRequestKind::Runs { head_sha: head_sha.to_owned() } }
     }
 }
 
 pub enum ApiResponse {
     NotModified,
     Runs { etag: Option<String>, branch: String, workflows: Vec<CiWorkflowRun> },
+    Jobs { etag: Option<String>, run_id: u64, jobs: Vec<CiJob> },
 }
 
 struct RunsObservation {
@@ -202,6 +211,14 @@ pub trait GithubApi: Send + Sync {
         repository: &GithubRepository,
         head_sha: &str,
     ) -> Result<ApiRequest, ApiError>;
+
+    fn prepare_jobs(
+        &self,
+        _repository: &GithubRepository,
+        _run_id: u64,
+    ) -> Result<ApiRequest, ApiError> {
+        Err(ApiError::InvalidPush)
+    }
 
     fn authenticate(&self) -> BoxFuture<'_, Result<SecretToken, ApiError>>;
 
@@ -271,6 +288,21 @@ impl HttpGithubApi {
             .append_pair("per_page", "100");
         Ok(url)
     }
+
+    fn jobs_url(
+        &self,
+        repository: &GithubRepository,
+        run_id: u64,
+    ) -> Result<reqwest::Url, ApiError> {
+        let mut url = self.request_url(repository, "0")?;
+        url.set_path(&format!(
+            "/repos/{}/{}/actions/runs/{run_id}/jobs",
+            repository.owner, repository.name
+        ));
+        url.set_query(None);
+        url.query_pairs_mut().append_pair("filter", "latest").append_pair("per_page", "100");
+        Ok(url)
+    }
 }
 
 impl GithubApi for HttpGithubApi {
@@ -281,7 +313,18 @@ impl GithubApi for HttpGithubApi {
     ) -> Result<ApiRequest, ApiError> {
         Ok(ApiRequest {
             url: self.request_url(repository, head_sha)?,
-            head_sha: head_sha.to_owned(),
+            kind: ApiRequestKind::Runs { head_sha: head_sha.to_owned() },
+        })
+    }
+
+    fn prepare_jobs(
+        &self,
+        repository: &GithubRepository,
+        run_id: u64,
+    ) -> Result<ApiRequest, ApiError> {
+        Ok(ApiRequest {
+            url: self.jobs_url(repository, run_id)?,
+            kind: ApiRequestKind::Jobs { run_id },
         })
     }
 
@@ -352,9 +395,22 @@ impl GithubApi for HttpGithubApi {
                 .and_then(|value| value.to_str().ok())
                 .filter(|value| value.len() <= 1_024)
                 .map(str::to_owned);
-            let body: GithubRunsResponse =
-                response.json().await.map_err(|_| ApiError::Transient)?;
-            Ok(body.into_response(&request.head_sha, response_etag))
+            match &request.kind {
+                ApiRequestKind::Runs { head_sha } => {
+                    let body: GithubRunsResponse =
+                        response.json().await.map_err(|_| ApiError::Transient)?;
+                    Ok(body.into_response(head_sha, response_etag))
+                }
+                ApiRequestKind::Jobs { run_id } => {
+                    let body: GithubJobsResponse =
+                        response.json().await.map_err(|_| ApiError::Transient)?;
+                    Ok(ApiResponse::Jobs {
+                        etag: response_etag,
+                        run_id: *run_id,
+                        jobs: body.into_jobs(*run_id, ""),
+                    })
+                }
+            }
         })
     }
 }
@@ -375,6 +431,30 @@ struct GithubWorkflowRun {
     conclusion: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct GithubJobsResponse {
+    jobs: Vec<GithubJob>,
+}
+
+#[derive(Deserialize)]
+struct GithubJob {
+    id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    #[serde(default)]
+    steps: Vec<GithubJobStep>,
+}
+
+#[derive(Deserialize)]
+struct GithubJobStep {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+}
+
 impl GithubRunsResponse {
     fn into_response(self, head_sha: &str, etag: Option<String>) -> ApiResponse {
         let mut branch = String::new();
@@ -390,22 +470,101 @@ impl GithubRunsResponse {
                 CiWorkflowRun {
                     run_id: run.id,
                     name: truncate_text(&run.name, 256),
-                    status: match run.status.as_str() {
-                        "completed" => CiWorkflowStatus::Completed,
-                        "in_progress" => CiWorkflowStatus::InProgress,
-                        _ => CiWorkflowStatus::Queued,
-                    },
-                    conclusion: run.conclusion.as_deref().map(|conclusion| match conclusion {
-                        "success" | "neutral" | "skipped" => CiRunConclusion::Success,
-                        "cancelled" => CiRunConclusion::Cancelled,
-                        _ => CiRunConclusion::Failure,
-                    }),
+                    status: github_status(&run.status),
+                    conclusion: github_conclusion(run.conclusion.as_deref()),
                     started_at_epoch_secs: None,
                     updated_at_epoch_secs: None,
                 }
             })
             .collect();
         ApiResponse::Runs { etag, branch, workflows }
+    }
+}
+
+impl GithubJobsResponse {
+    fn into_jobs(self, run_id: u64, workflow_name: &str) -> Vec<CiJob> {
+        self.jobs
+            .into_iter()
+            .take(100)
+            .map(|job| CiJob {
+                job_id: job.id,
+                workflow_run_id: run_id,
+                workflow_name: truncate_text(workflow_name, 256),
+                name: truncate_text(&job.name, 256),
+                status: github_status(&job.status),
+                conclusion: github_conclusion(job.conclusion.as_deref()),
+                started_at_epoch_secs: job.started_at.as_deref().and_then(parse_github_time),
+                completed_at_epoch_secs: job.completed_at.as_deref().and_then(parse_github_time),
+                steps: job
+                    .steps
+                    .into_iter()
+                    .take(100)
+                    .map(|step| CiJobStep {
+                        name: truncate_text(&step.name, 256),
+                        status: github_status(&step.status),
+                        conclusion: github_conclusion(step.conclusion.as_deref()),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+fn github_status(status: &str) -> CiWorkflowStatus {
+    match status {
+        "completed" => CiWorkflowStatus::Completed,
+        "in_progress" => CiWorkflowStatus::InProgress,
+        _ => CiWorkflowStatus::Queued,
+    }
+}
+
+fn github_conclusion(conclusion: Option<&str>) -> Option<CiRunConclusion> {
+    conclusion.map(|conclusion| match conclusion {
+        "success" | "neutral" | "skipped" => CiRunConclusion::Success,
+        "cancelled" => CiRunConclusion::Cancelled,
+        _ => CiRunConclusion::Failure,
+    })
+}
+
+fn parse_github_time(value: &str) -> Option<u64> {
+    let (date, time) = value.strip_suffix('Z')?.split_once('T')?;
+    let mut date = date.split('-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    if date.next().is_some() {
+        return None;
+    }
+    let mut time = time.split(':').map(str::parse::<i64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    if time.next().is_some()
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let shifted_year = year - i64::from(month <= 2);
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days.checked_mul(86_400)?.checked_add(hour * 3_600 + minute * 60 + second)?).ok()
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year.rem_euclid(4) == 0
+            && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0) =>
+        {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
     }
 }
 
@@ -481,6 +640,7 @@ pub struct HandoffCiWindow {
 #[derive(Clone, Default)]
 pub struct GithubCiTrackerHandle {
     active: std::sync::Arc<std::sync::Mutex<Vec<HandoffCiWindow>>>,
+    detail_tx: Option<mpsc::UnboundedSender<DetailCommand>>,
 }
 
 impl GithubCiTrackerHandle {
@@ -492,6 +652,40 @@ impl GithubCiTrackerHandle {
     fn replace(&self, windows: Vec<HandoffCiWindow>) {
         *self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = windows;
     }
+
+    pub fn set_detail_interest(&self, interest: DetailInterest) {
+        if let Some(tx) = &self.detail_tx {
+            tx.send(DetailCommand::Set(interest)).ok();
+        }
+    }
+
+    pub fn drop_detail_writer(&self, writer: SharedWriter) {
+        if let Some(tx) = &self.detail_tx {
+            tx.send(DetailCommand::DropWriter(writer)).ok();
+        }
+    }
+}
+
+pub struct DetailInterest {
+    pub repo_root: PathBuf,
+    pub head_sha: String,
+    pub writer: SharedWriter,
+    pub interested: bool,
+}
+
+enum DetailCommand {
+    Set(DetailInterest),
+    DropWriter(SharedWriter),
+}
+
+struct DetailTrace {
+    repository: GithubRepository,
+    workflows: Vec<(u64, String)>,
+    subscribers: Vec<SharedWriter>,
+    jobs: HashMap<u64, Vec<CiJob>>,
+    etags: HashMap<u64, String>,
+    next_workflow: usize,
+    next_attempt: Instant,
 }
 
 struct PushResult {
@@ -503,14 +697,17 @@ struct PushResult {
 enum PollStep {
     Config(Result<(), tokio::sync::watch::error::RecvError>),
     Push(Option<Result<PushDetected, tokio::sync::broadcast::error::RecvError>>),
+    Detail(Option<DetailCommand>),
     Complete(Vec<(PathBuf, CiRunDelta)>),
 }
 
 #[derive(Default)]
 pub struct GithubCiTracker {
     windows: HashMap<GithubRepository, PollWindow>,
+    details: HashMap<(PathBuf, String), DetailTrace>,
     scheduler: PollScheduler,
     token: Option<SecretToken>,
+    prefer_details: bool,
 }
 
 impl GithubCiTracker {
@@ -537,6 +734,7 @@ impl GithubCiTracker {
             });
         }
         let mut roots = BTreeSet::from([push.repository_root.clone()]);
+        self.details.retain(|_, trace| trace.repository != repository);
         let publications = self.windows.remove(&repository).map_or_else(Vec::new, |previous| {
             roots.extend(previous.roots.iter().take(MAX_REPOSITORY_ROOTS).cloned());
             previous.observed.map_or_else(Vec::new, |state| {
@@ -557,6 +755,59 @@ impl GithubCiTracker {
         })
     }
 
+    // @lat: [[server#Sessions#GitHub Actions Tracking]]
+    fn set_detail_interest(&mut self, interest: DetailInterest, now: Instant) {
+        let key = (interest.repo_root.clone(), interest.head_sha.clone());
+        if !interest.interested {
+            let empty = self.details.get_mut(&key).is_some_and(|trace| {
+                trace
+                    .subscribers
+                    .retain(|writer| !std::sync::Arc::ptr_eq(writer, &interest.writer));
+                trace.subscribers.is_empty()
+            });
+            if empty {
+                self.details.remove(&key);
+            }
+            return;
+        }
+        let Some(window) = self.windows.values().find(|window| {
+            window.head_sha == interest.head_sha && window.roots.contains(&interest.repo_root)
+        }) else {
+            return;
+        };
+        let Some(state) = window.observed.as_ref() else { return };
+        let repository = window.repository.clone();
+        let workflows = state
+            .workflows
+            .iter()
+            .map(|workflow| (workflow.run_id, workflow.name.clone()))
+            .collect::<Vec<_>>();
+        if workflows.is_empty() {
+            return;
+        }
+        let trace = self.details.entry(key).or_insert_with(|| DetailTrace {
+            repository,
+            workflows,
+            subscribers: Vec::new(),
+            jobs: HashMap::new(),
+            etags: HashMap::new(),
+            next_workflow: 0,
+            next_attempt: now,
+        });
+        if !trace.subscribers.iter().any(|writer| std::sync::Arc::ptr_eq(writer, &interest.writer))
+        {
+            trace.subscribers.push(interest.writer);
+        }
+        self.prefer_details = true;
+    }
+
+    fn drop_detail_writer(&mut self, writer: &SharedWriter) {
+        self.details.retain(|_, trace| {
+            trace.subscribers.retain(|subscriber| !std::sync::Arc::ptr_eq(subscriber, writer));
+            !trace.subscribers.is_empty()
+        });
+    }
+
     async fn poll_one(
         &mut self,
         now: Instant,
@@ -567,16 +818,37 @@ impl GithubCiTracker {
         if !self.scheduler.ready(now) {
             return Vec::new();
         }
-        let Some(key) = self
+        let detail_ready = self
+            .details
+            .iter()
+            .filter(|(_, trace)| trace.next_attempt <= now)
+            .min_by_key(|(_, trace)| trace.next_attempt)
+            .map(|(key, _)| key.clone());
+        let run_ready = self
             .windows
             .iter()
             .filter(|(_, window)| window.next_attempt <= now)
             .min_by_key(|(_, window)| window.next_attempt)
-            .map(|(key, _)| key.clone())
-        else {
+            .map(|(key, _)| key.clone());
+        if let Some(detail_key) = detail_ready.clone()
+            && (self.prefer_details || run_ready.is_none())
+        {
+            self.prefer_details = false;
+            self.poll_detail(detail_key, now, api).await;
             return Vec::new();
-        };
+        }
+        self.prefer_details = detail_ready.is_some();
+        let Some(key) = run_ready else { return Vec::new() };
+        self.poll_run(key, now, observed_epoch_secs, api).await
+    }
 
+    async fn poll_run(
+        &mut self,
+        key: GithubRepository,
+        now: Instant,
+        observed_epoch_secs: u64,
+        api: &dyn GithubApi,
+    ) -> Vec<(PathBuf, CiRunDelta)> {
         let request = {
             let Some(window) = self.windows.get(&key) else {
                 return Vec::new();
@@ -623,6 +895,7 @@ impl GithubCiTracker {
                     workflows,
                 },
             ),
+            Ok(ApiResponse::Jobs { .. }) => Vec::new(),
             Err(ApiError::Authentication) => {
                 warn!(repository = %key.full_name(), "GitHub CI polling lost authentication; stopping window");
                 self.token = None;
@@ -641,6 +914,92 @@ impl GithubCiTracker {
                 self.windows.remove(&key);
                 Vec::new()
             }
+        }
+    }
+
+    async fn poll_detail(&mut self, key: (PathBuf, String), now: Instant, api: &dyn GithubApi) {
+        let Some((repository, run_id, workflow_name)) = self.details.get(&key).and_then(|trace| {
+            trace
+                .workflows
+                .get(trace.next_workflow)
+                .map(|(run_id, name)| (trace.repository.clone(), *run_id, name.clone()))
+        }) else {
+            self.details.remove(&key);
+            return;
+        };
+        let Ok(request) = api.prepare_jobs(&repository, run_id) else {
+            self.details.remove(&key);
+            return;
+        };
+        if self.token.is_none() {
+            let Ok(token) = api.authenticate().await else {
+                self.details.remove(&key);
+                return;
+            };
+            self.token = Some(token);
+        }
+        self.scheduler.record(now);
+        let Some(token) = self.token.as_ref() else { return };
+        let etag =
+            self.details.get(&key).and_then(|trace| trace.etags.get(&run_id)).map(String::as_str);
+        match api.fetch(&request, token, etag).await {
+            Ok(ApiResponse::Jobs { etag, run_id: response_run_id, mut jobs }) => {
+                for job in &mut jobs {
+                    job.workflow_name.clone_from(&workflow_name);
+                }
+                if let Some(trace) = self.details.get_mut(&key) {
+                    trace.etags.extend(etag.map(|etag| (response_run_id, etag)));
+                    trace.jobs.insert(response_run_id, jobs);
+                }
+                self.publish_detail(&key).await;
+                self.advance_detail(&key, now);
+            }
+            Ok(ApiResponse::NotModified | ApiResponse::Runs { .. }) => {
+                self.advance_detail(&key, now);
+            }
+            Err(ApiError::Authentication) => {
+                self.token = None;
+                self.details.remove(&key);
+            }
+            Err(ApiError::Permission | ApiError::InvalidPush | ApiError::UntrustedEndpoint) => {
+                self.details.remove(&key);
+            }
+            Err(ApiError::RateLimited(delay)) => {
+                self.scheduler.blocked_until = now.checked_add(delay);
+                self.defer_detail(&key, now, delay);
+            }
+            Err(ApiError::Transient) => self.defer_detail(&key, now, POLL_INTERVAL),
+        }
+    }
+
+    fn advance_detail(&mut self, key: &(PathBuf, String), now: Instant) {
+        if let Some(trace) = self.details.get_mut(key) {
+            trace.next_workflow = (trace.next_workflow + 1) % trace.workflows.len();
+            trace.next_attempt = now + POLL_INTERVAL;
+        }
+    }
+
+    fn defer_detail(&mut self, key: &(PathBuf, String), now: Instant, delay: Duration) {
+        if let Some(trace) = self.details.get_mut(key) {
+            trace.next_attempt = now + delay.max(POLL_INTERVAL);
+        }
+    }
+
+    async fn publish_detail(&self, key: &(PathBuf, String)) {
+        let Some(trace) = self.details.get(key) else { return };
+        let jobs = trace
+            .workflows
+            .iter()
+            .filter_map(|(run_id, _)| trace.jobs.get(run_id))
+            .flatten()
+            .cloned()
+            .collect();
+        let message = scribe_common::protocol::ServerMessage::CiRunDetails {
+            repo_root: key.0.clone(),
+            details: scribe_common::protocol::CiRunDetails { head_sha: key.1.clone(), jobs },
+        };
+        for writer in &trace.subscribers {
+            send_message(writer, &message).await;
         }
     }
 
@@ -737,6 +1096,7 @@ impl GithubCiTracker {
 
     fn clear(&mut self) -> Vec<(PathBuf, CiRunDelta)> {
         self.token = None;
+        self.details.clear();
         self.windows
             .drain()
             .flat_map(|(_, window)| {
@@ -755,7 +1115,13 @@ impl GithubCiTracker {
             .min()
             .map(|due| self.scheduler.ready_at().map_or(due, |ready| due.max(ready)));
         let expiry = self.windows.values().filter_map(|window| window.discovery_deadline).min();
-        [next_poll, expiry].into_iter().flatten().min().map(|wake| wake.max(now))
+        let detail = self
+            .details
+            .values()
+            .map(|trace| trace.next_attempt)
+            .min()
+            .map(|due| self.scheduler.ready_at().map_or(due, |ready| due.max(ready)));
+        [next_poll, detail, expiry].into_iter().flatten().min().map(|wake| wake.max(now))
     }
 
     fn handoff_windows(&self, now: Instant) -> Vec<HandoffCiWindow> {
@@ -849,7 +1215,9 @@ pub fn spawn_tracker(
     dismissals: CiDismissals,
     restored: Vec<HandoffCiWindow>,
 ) -> GithubCiTrackerHandle {
-    let handle = GithubCiTrackerHandle::default();
+    let (detail_tx, detail_rx) = mpsc::unbounded_channel();
+    let handle =
+        GithubCiTrackerHandle { detail_tx: Some(detail_tx), ..GithubCiTrackerHandle::default() };
     let task_handle = handle.clone();
     tokio::spawn(async move {
         run_tracker(
@@ -859,6 +1227,7 @@ pub fn spawn_tracker(
                 window_shares,
                 dismissals,
                 handle: task_handle,
+                detail_rx,
             },
             restored,
             HttpGithubApi::new(),
@@ -874,11 +1243,45 @@ struct TrackerRuntime {
     window_shares: WindowShares,
     dismissals: CiDismissals,
     handle: GithubCiTrackerHandle,
+    detail_rx: mpsc::UnboundedReceiver<DetailCommand>,
+}
+
+struct TrackerPublisher<'a> {
+    handle: &'a GithubCiTrackerHandle,
+    workspace_manager: &'a std::sync::Arc<RwLock<WorkspaceManager>>,
+    window_shares: &'a WindowShares,
+    dismissals: &'a CiDismissals,
+}
+
+impl TrackerPublisher<'_> {
+    async fn accept_push(&self, tracker: &mut GithubCiTracker, push: PushDetected) {
+        let Some(result) = tracker.accept_push(push, Instant::now()) else { return };
+        self.handle.replace(tracker.handoff_windows(Instant::now()));
+        publish_all(
+            self.workspace_manager,
+            self.window_shares,
+            self.dismissals,
+            result.publications,
+        )
+        .await;
+    }
 }
 
 async fn run_tracker(runtime: TrackerRuntime, restored: Vec<HandoffCiWindow>, api: impl GithubApi) {
-    let TrackerRuntime { git_ref_watcher, workspace_manager, window_shares, dismissals, handle } =
-        runtime;
+    let TrackerRuntime {
+        git_ref_watcher,
+        workspace_manager,
+        window_shares,
+        dismissals,
+        handle,
+        mut detail_rx,
+    } = runtime;
+    let publisher = TrackerPublisher {
+        handle: &handle,
+        workspace_manager: &workspace_manager,
+        window_shares: &window_shares,
+        dismissals: &dismissals,
+    };
     let mut tracker = GithubCiTracker::restore(restored, Instant::now());
     let mut config_rx = git_ref_watcher.subscribe_changes();
     let mut pushes = None;
@@ -893,22 +1296,15 @@ async fn run_tracker(runtime: TrackerRuntime, restored: Vec<HandoffCiWindow>, ap
         }
         handle.replace(tracker.handoff_windows(Instant::now()));
 
-        let wake = tracker.next_wake(Instant::now());
         tokio::select! {
             biased;
-            transition = config_rx.changed() => {
-                if transition.is_err() {
-                    return;
-                }
+            transition = config_rx.changed() => if transition.is_err() { return },
+            command = detail_rx.recv() => {
+                apply_detail_command(&mut tracker, command, Instant::now());
             }
             event = receive_push(&mut pushes) => {
                 match event {
-                    Some(Ok(push)) => {
-                        if let Some(result) = tracker.accept_push(push, Instant::now()) {
-                            handle.replace(tracker.handoff_windows(Instant::now()));
-                            publish_all(&workspace_manager, &window_shares, &dismissals, result.publications).await;
-                        }
-                    }
+                    Some(Ok(push)) => publisher.accept_push(&mut tracker, push).await,
                     Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                         warn!(skipped, "GitHub CI push receiver lagged");
                     }
@@ -916,7 +1312,7 @@ async fn run_tracker(runtime: TrackerRuntime, restored: Vec<HandoffCiWindow>, ap
                     None => {}
                 }
             }
-            () = sleep_until(wake) => {
+            () = sleep_until(tracker.next_wake(Instant::now())) => {
                 let step = {
                     let polling = tracker.poll_one(Instant::now(), epoch_secs(), &api);
                     tokio::pin!(polling);
@@ -924,18 +1320,17 @@ async fn run_tracker(runtime: TrackerRuntime, restored: Vec<HandoffCiWindow>, ap
                         biased;
                         transition = config_rx.changed() => PollStep::Config(transition),
                         event = receive_push(&mut pushes) => PollStep::Push(event),
+                        command = detail_rx.recv() => PollStep::Detail(command),
                         publications = &mut polling => PollStep::Complete(publications),
                     }
                 };
                 match step {
                     PollStep::Config(Err(_)) => return,
                     PollStep::Config(Ok(())) | PollStep::Push(None) => {}
-                    PollStep::Push(Some(Ok(push))) => {
-                        if let Some(result) = tracker.accept_push(push, Instant::now()) {
-                            handle.replace(tracker.handoff_windows(Instant::now()));
-                            publish_all(&workspace_manager, &window_shares, &dismissals, result.publications).await;
-                        }
+                    PollStep::Detail(command) => {
+                        apply_detail_command(&mut tracker, command, Instant::now());
                     }
+                    PollStep::Push(Some(Ok(push))) => publisher.accept_push(&mut tracker, push).await,
                     PollStep::Push(Some(Err(tokio::sync::broadcast::error::RecvError::Closed))) => {
                         pushes = None;
                     }
@@ -949,6 +1344,18 @@ async fn run_tracker(runtime: TrackerRuntime, restored: Vec<HandoffCiWindow>, ap
                 }
             }
         }
+    }
+}
+
+fn apply_detail_command(
+    tracker: &mut GithubCiTracker,
+    command: Option<DetailCommand>,
+    now: Instant,
+) {
+    match command {
+        Some(DetailCommand::Set(interest)) => tracker.set_detail_interest(interest, now),
+        Some(DetailCommand::DropWriter(writer)) => tracker.drop_detail_writer(&writer),
+        None => tracker.details.clear(),
     }
 }
 
@@ -991,12 +1398,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use scribe_common::protocol::{
-        CiRunConclusion, CiRunDelta, CiRunStatus, CiWorkflowRun, CiWorkflowStatus,
+        CiJob, CiRunConclusion, CiRunDelta, CiRunStatus, CiWorkflowRun, CiWorkflowStatus,
     };
 
     use super::{
-        ApiError, ApiRequest, ApiResponse, BoxFuture, GithubApi, GithubCiTracker, GithubRepository,
-        HttpGithubApi, PollScheduler, github_ci_enabled, set_github_ci_enabled,
+        ApiError, ApiRequest, ApiRequestKind, ApiResponse, BoxFuture, DetailInterest, GithubApi,
+        GithubCiTracker, GithubJobsResponse, GithubRepository, HttpGithubApi, PollScheduler,
+        github_ci_enabled, set_github_ci_enabled,
     };
     use crate::git_ref_watcher::{PushDetected, RemoteRepository};
 
@@ -1213,6 +1621,153 @@ mod tests {
             attacker.prepare(&repository, "abc123"),
             Err(ApiError::UntrustedEndpoint)
         ));
+    }
+
+    #[test]
+    fn jobs_request_uses_the_trusted_repository_and_run_id() {
+        let api = HttpGithubApi::with_override(None);
+        let repository = GithubRepository::new("acme", "scribe").unwrap();
+
+        let request = api.prepare_jobs(&repository, 42).unwrap();
+
+        assert_eq!(
+            request.url.as_str(),
+            "https://api.github.com/repos/acme/scribe/actions/runs/42/jobs?filter=latest&per_page=100"
+        );
+    }
+
+    #[test]
+    fn jobs_response_preserves_timing_steps_and_non_color_status() {
+        let response: GithubJobsResponse = serde_json::from_str(
+            r#"{
+                "jobs": [{
+                    "id": 7,
+                    "name": "rust-linux",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "started_at": "1970-01-01T00:01:40Z",
+                    "completed_at": "1970-01-01T00:02:40Z",
+                    "steps": [{
+                        "name": "just test",
+                        "status": "completed",
+                        "conclusion": "success"
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let jobs = response.into_jobs(42, "quality");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].workflow_run_id, 42);
+        assert_eq!(jobs[0].workflow_name, "quality");
+        assert_eq!(jobs[0].started_at_epoch_secs, Some(100));
+        assert_eq!(jobs[0].completed_at_epoch_secs, Some(160));
+        assert_eq!(jobs[0].steps[0].name, "just test");
+        assert_eq!(jobs[0].conclusion, Some(CiRunConclusion::Success));
+    }
+
+    struct DetailApi {
+        job_calls: AtomicUsize,
+    }
+
+    impl DetailApi {
+        fn jobs_response(&self, run_id: u64) -> ApiResponse {
+            self.job_calls.fetch_add(1, Ordering::Relaxed);
+            ApiResponse::Jobs {
+                etag: None,
+                run_id,
+                jobs: vec![CiJob {
+                    job_id: 7,
+                    workflow_run_id: run_id,
+                    workflow_name: String::new(),
+                    name: "rust-linux".into(),
+                    status: CiWorkflowStatus::InProgress,
+                    conclusion: None,
+                    started_at_epoch_secs: Some(100),
+                    completed_at_epoch_secs: None,
+                    steps: Vec::new(),
+                }],
+            }
+        }
+    }
+
+    impl GithubApi for DetailApi {
+        fn prepare(
+            &self,
+            repository: &GithubRepository,
+            head_sha: &str,
+        ) -> Result<ApiRequest, ApiError> {
+            Ok(ApiRequest::for_test(repository, head_sha))
+        }
+
+        fn prepare_jobs(
+            &self,
+            repository: &GithubRepository,
+            run_id: u64,
+        ) -> Result<ApiRequest, ApiError> {
+            HttpGithubApi::with_override(None).prepare_jobs(repository, run_id)
+        }
+
+        fn authenticate(&self) -> BoxFuture<'_, Result<super::SecretToken, ApiError>> {
+            Box::pin(async { Ok(super::SecretToken::new("secret")) })
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            request: &'a ApiRequest,
+            _token: &'a super::SecretToken,
+            _etag: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<ApiResponse, ApiError>> {
+            Box::pin(async move {
+                match request.kind {
+                    ApiRequestKind::Runs { .. } => Ok(ApiResponse::Runs {
+                        etag: None,
+                        branch: "main".into(),
+                        workflows: vec![run(42, CiWorkflowStatus::InProgress, None)],
+                    }),
+                    ApiRequestKind::Jobs { run_id } => Ok(self.jobs_response(run_id)),
+                }
+            })
+        }
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Detail scheduler follows subscribers]]
+    #[tokio::test]
+    async fn job_requests_exist_only_while_a_panel_is_interested() {
+        let api = DetailApi { job_calls: AtomicUsize::new(0) };
+        let start = Instant::now();
+        let mut tracker = GithubCiTracker::default();
+        tracker
+            .accept_push(push("git@github.com:acme/scribe.git", "/work/scribe", "abc123"), start);
+        tracker.poll_one(start, 100, &api).await;
+        assert_eq!(api.job_calls.load(Ordering::Relaxed), 0);
+
+        let writer = crate::ipc_server::test_shared_writer(tokio::io::sink());
+        tracker.set_detail_interest(
+            DetailInterest {
+                repo_root: "/work/scribe".into(),
+                head_sha: "abc123".into(),
+                writer: std::sync::Arc::clone(&writer),
+                interested: true,
+            },
+            start,
+        );
+        tracker.poll_one(start + Duration::from_secs(5), 105, &api).await;
+        assert_eq!(api.job_calls.load(Ordering::Relaxed), 1);
+
+        tracker.set_detail_interest(
+            DetailInterest {
+                repo_root: "/work/scribe".into(),
+                head_sha: "abc123".into(),
+                writer,
+                interested: false,
+            },
+            start,
+        );
+        tracker.poll_one(start + Duration::from_secs(10), 110, &api).await;
+        assert_eq!(api.job_calls.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Default)]

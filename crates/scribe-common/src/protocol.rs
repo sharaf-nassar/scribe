@@ -350,6 +350,35 @@ pub enum CiRunDelta {
     Cleared { head_sha: String },
 }
 
+/// One named step inside a workflow job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiJobStep {
+    pub name: String,
+    pub status: CiWorkflowStatus,
+    pub conclusion: Option<CiRunConclusion>,
+}
+
+/// One job in the expanded CI trace panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiJob {
+    pub job_id: u64,
+    pub workflow_run_id: u64,
+    pub workflow_name: String,
+    pub name: String,
+    pub status: CiWorkflowStatus,
+    pub conclusion: Option<CiRunConclusion>,
+    pub started_at_epoch_secs: Option<u64>,
+    pub completed_at_epoch_secs: Option<u64>,
+    pub steps: Vec<CiJobStep>,
+}
+
+/// Head-qualified job detail sent only to clients with an open trace panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiRunDetails {
+    pub head_sha: String,
+    pub jobs: Vec<CiJob>,
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +542,12 @@ pub enum ClientMessage {
     DismissCiRun {
         repo_root: PathBuf,
         head_sha: String,
+    },
+    /// Start or stop fetching job detail for one visible CI head.
+    SetCiRunDetailsInterest {
+        repo_root: PathBuf,
+        head_sha: String,
+        interested: bool,
     },
     /// User explicitly requested an update check (e.g. "Check now" button in
     /// settings). The server replies with a single `UpdateCheckResult` on the
@@ -787,6 +822,11 @@ pub enum ServerMessage {
     CiRunState {
         repo_root: PathBuf,
         delta: CiRunDelta,
+    },
+    /// Expanded job detail for an interested client and visible head.
+    CiRunDetails {
+        repo_root: PathBuf,
+        details: CiRunDetails,
     },
     SessionCreated {
         session_id: SessionId,
@@ -1797,6 +1837,63 @@ mod tests {
             ClientMessage::DismissCiRun { repo_root, head_sha }
                 if repo_root == std::path::Path::new("/work/scribe")
                     && head_sha == "0123456789abcdef"
+        ));
+    }
+
+    // @lat: [[protocol#Client Messages#CI Run State#Detail-interest message round trip]]
+    #[test]
+    fn ci_run_details_interest_round_trips_through_msgpack_named() {
+        let message = ClientMessage::SetCiRunDetailsInterest {
+            repo_root: PathBuf::from("/work/scribe"),
+            head_sha: "0123456789abcdef".into(),
+            interested: true,
+        };
+
+        let bytes = rmp_serde::to_vec_named(&message).expect("serialize CI detail interest");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize CI detail interest");
+
+        assert!(matches!(
+            decoded,
+            ClientMessage::SetCiRunDetailsInterest { repo_root, head_sha, interested: true }
+                if repo_root == std::path::Path::new("/work/scribe")
+                    && head_sha == "0123456789abcdef"
+        ));
+    }
+
+    // @lat: [[protocol#Server Messages#CI Run State#Job-detail message round trip]]
+    #[test]
+    fn ci_run_details_round_trip_through_msgpack_named() {
+        let details = CiRunDetails {
+            head_sha: "0123456789abcdef".into(),
+            jobs: vec![CiJob {
+                job_id: 7,
+                workflow_run_id: 42,
+                workflow_name: "quality".into(),
+                name: "rust-linux".into(),
+                status: CiWorkflowStatus::InProgress,
+                conclusion: None,
+                started_at_epoch_secs: Some(1_723_600_000),
+                completed_at_epoch_secs: None,
+                steps: vec![CiJobStep {
+                    name: "cargo test".into(),
+                    status: CiWorkflowStatus::InProgress,
+                    conclusion: None,
+                }],
+            }],
+        };
+        let message = ServerMessage::CiRunDetails {
+            repo_root: PathBuf::from("/work/scribe"),
+            details: details.clone(),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&message).expect("serialize CI details");
+        let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("deserialize CI details");
+
+        assert!(matches!(
+            decoded,
+            ServerMessage::CiRunDetails { repo_root, details: decoded }
+                if repo_root == std::path::Path::new("/work/scribe") && decoded == details
         ));
     }
 

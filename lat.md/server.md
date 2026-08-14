@@ -255,6 +255,19 @@ All returned workflow runs contribute to a bounded worst-status rollup. Queued o
 
 Authentication or permission failure before observation logs once and hides the window without HTTP after failed `gh` auth. Offline failures retry with bounded backoff. Failures after observation publish the last state as stale; terminal state stops polling. Tracker updates route through [[crates/scribe-server/src/ipc_server.rs#publish_ci_run_delta]], which retains capability, repository, and dismissal gates.
 
+Job detail reuses that tracker, token, HTTP implementation, and server-wide
+scheduler. [[crates/scribe-server/src/github_ci.rs#GithubCiTracker#set_detail_interest]]
+creates demand only for an observed matching root and head, and removes it when
+the last interested writer closes or disconnects. The loop alternates ready
+run and detail work on the shared cadence; [[crates/scribe-server/src/github_ci.rs#HttpGithubApi#prepare_jobs]]
+requests the trusted per-run jobs endpoint only while demand exists.
+
+[[crates/scribe-server/src/ipc_server.rs#set_ci_detail_interest]] accepts capable
+owning and read-only viewers for roots visible in their window. Only
+repository/head/open state crosses IPC; `gh` authentication and its token stay
+inside the server. Detail snapshots return directly to interested writers and
+are not stored in hot-handoff state.
+
 [[crates/scribe-server/src/handoff.rs#HandoffState]] carries active descriptors, roots, discovery time, and last bounded state without credentials. The successor re-polls each descriptor once, then resumes normal cadence; older named-map handoffs default to no active CI windows.
 
 ### Clipboard Gating

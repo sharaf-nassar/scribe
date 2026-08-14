@@ -448,6 +448,7 @@ async fn run_server_loop(
         live_sessions: Arc::clone(&live_sessions),
         window_shares: Arc::clone(&window_shares),
         ci_dismissals,
+        github_ci_tracker: github_ci_tracker.clone(),
         updater_handle: Arc::clone(&updater_handle),
         release_catalog: Arc::clone(&release_catalog),
         release_fetcher: Arc::clone(&release_fetcher),

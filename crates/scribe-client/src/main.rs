@@ -154,9 +154,9 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
-        AiLaunchSpec, AutomationAction, CiRunState, ClientMessage, ClipboardSelection,
-        PromptMarkKind, ServerMessage, SessionInfo, TerminalSize, UpdateProgressState, WindowInfo,
-        WorkspaceTreeNode,
+        AiLaunchSpec, AutomationAction, CiRunDetails, CiRunState, ClientMessage,
+        ClipboardSelection, PromptMarkKind, ServerMessage, SessionInfo, TerminalSize,
+        UpdateProgressState, WindowInfo, WorkspaceTreeNode,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -1420,6 +1420,10 @@ struct TerminalFocus {
     cursor_blink: CursorBlink,
 }
 
+fn focus_is_unclaimed(claims: [bool; 4]) -> bool {
+    !claims.into_iter().any(std::convert::identity)
+}
+
 impl TerminalFocus {
     fn new(window_active: bool, cx: &mut Context<TerminalView>) -> Self {
         Self {
@@ -1455,6 +1459,8 @@ impl CursorBlink {
         self.show_now();
     }
 }
+
+type VisibleCiRun = (WorkspaceId, PathBuf, CiRunState, Option<CiRunDetails>);
 
 struct TerminalView {
     shared: Shared,
@@ -1601,9 +1607,11 @@ struct TerminalView {
     /// Workspace board painted this frame and whether it is pinned.
     visible_beads_boards: Vec<(WorkspaceId, bool)>,
     /// CI snapshots matched to the regions that currently own their repository.
-    visible_ci_runs: Vec<(WorkspaceId, PathBuf, CiRunState)>,
-    /// Stable tab stops for each owning region's open and dismiss controls.
-    ci_action_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
+    visible_ci_runs: Vec<VisibleCiRun>,
+    /// Client-local open panel identity; the server sees only interest changes.
+    ci_expanded: HashMap<WorkspaceId, (PathBuf, String)>,
+    /// Stable tab stops for each region's toggle plus owner-only actions.
+    ci_action_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle, FocusHandle)>,
     /// X11 active-window guard, present only when this window has an Xcb/Xlib
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
@@ -2132,6 +2140,7 @@ impl TerminalView {
             tooltip_demo: false,
             visible_beads_boards: Vec::new(),
             visible_ci_runs: Vec::new(),
+            ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
             x11_focus,
             ime: Self::start_ime(cx),
@@ -8525,6 +8534,22 @@ fn ci_action_ids(workspace_id: WorkspaceId) -> (ElementId, ElementId) {
     )
 }
 
+fn visible_ci_run(
+    runs: &CiRunBars,
+    workspace_id: WorkspaceId,
+    root: PathBuf,
+) -> Option<VisibleCiRun> {
+    let state = runs.get(&root).cloned()?;
+    let details = runs.details(&root, &state.head_sha).cloned();
+    Some((workspace_id, root, state, details))
+}
+
+fn ci_panel_height(details: Option<&CiRunDetails>, stale: bool) -> f32 {
+    details.map_or(ci_bar::CI_TRACE_LOADING_HEIGHT, |details| {
+        ci_bar::CiTraceModel::build(details, 0, stale).height()
+    })
+}
+
 impl TerminalView {
     /// Build the status-bar segment model from the live connection / stats
     /// state and the server-reported chrome metadata for the attached pane.
@@ -8964,26 +8989,49 @@ impl TerminalView {
             |runs| {
                 roots
                     .into_iter()
-                    .filter_map(|(workspace_id, root)| {
-                        runs.get(&root).cloned().map(|state| (workspace_id, root, state))
-                    })
+                    .filter_map(|(workspace_id, root)| visible_ci_run(&runs, workspace_id, root))
                     .collect()
             },
-        );
-        self.shell.set_ci_regions(
-            self.visible_ci_runs.iter().map(|(workspace_id, ..)| *workspace_id).collect(),
         );
         let visible = self
             .visible_ci_runs
             .iter()
-            .map(|(workspace_id, ..)| *workspace_id)
+            .map(|(workspace_id, repo_root, state, _)| {
+                (*workspace_id, repo_root.clone(), state.head_sha.clone())
+            })
             .collect::<HashSet<_>>();
-        self.ci_action_focus.retain(|workspace_id, _| visible.contains(workspace_id));
-        if self.shared.ci_owner_controls {
-            for workspace_id in visible {
-                self.ensure_ci_action_focus(workspace_id, cx);
-            }
+        let closed = self
+            .ci_expanded
+            .iter()
+            .filter(|(workspace_id, (repo_root, head_sha))| {
+                !visible.contains(&(**workspace_id, repo_root.clone(), head_sha.clone()))
+            })
+            .map(|(workspace_id, request)| (*workspace_id, request.clone()))
+            .collect::<Vec<_>>();
+        for (workspace_id, (repo_root, head_sha)) in closed {
+            self.ci_expanded.remove(&workspace_id);
+            self.set_ci_detail_interest(repo_root, head_sha, false);
         }
+        let visible_ids =
+            visible.iter().map(|(workspace_id, ..)| *workspace_id).collect::<HashSet<_>>();
+        self.ci_action_focus.retain(|workspace_id, _| visible_ids.contains(workspace_id));
+        for workspace_id in &visible_ids {
+            self.ensure_ci_action_focus(*workspace_id, cx);
+        }
+        self.shell.set_ci_strips(
+            self.visible_ci_runs
+                .iter()
+                .map(|(workspace_id, repo_root, state, details)| {
+                    let expanded = self
+                        .ci_expanded
+                        .get(workspace_id)
+                        .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
+                    let panel =
+                        if expanded { ci_panel_height(details.as_ref(), state.stale) } else { 0.0 };
+                    (*workspace_id, ci_bar::CI_BAR_HEIGHT + panel)
+                })
+                .collect(),
+        );
     }
 
     fn ensure_ci_action_focus(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
@@ -8995,25 +9043,73 @@ impl TerminalView {
             (
                 cx.focus_handle().tab_index(0).tab_stop(true),
                 cx.focus_handle().tab_index(0).tab_stop(true),
+                cx.focus_handle().tab_index(0).tab_stop(true),
             ),
         );
     }
 
     fn ci_open_handler(url: String) -> ci_bar::CiActionHandler {
-        Box::new(move |_: &mut Window, _: &mut App| url_detect::open_url(&url))
+        Arc::new(move |_: &mut Window, _: &mut App| url_detect::open_url(&url))
     }
 
     fn ci_dismiss_handler(&self, repo_root: PathBuf, head_sha: String) -> ci_bar::CiActionHandler {
         let sink = self.sink.clone();
-        Box::new(move |_: &mut Window, _: &mut App| {
+        Arc::new(move |_: &mut Window, _: &mut App| {
             if let Err(error) = sink.dismiss_ci_run(repo_root.clone(), head_sha.clone()) {
                 tracing::warn!(%error, "CI run dismissal dropped: IPC writer closed");
             }
         })
     }
 
+    fn set_ci_detail_interest(&self, repo_root: PathBuf, head_sha: String, interested: bool) {
+        if let Err(error) = self.sink.set_ci_run_details_interest(repo_root, head_sha, interested) {
+            tracing::warn!(%error, "CI detail interest dropped: IPC writer closed");
+        }
+    }
+
+    // @lat: [[client#GPUI CI Run Bar#Demand-driven job data]]
+    fn toggle_ci_trace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        repo_root: PathBuf,
+        head_sha: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .ci_expanded
+            .get(&workspace_id)
+            .is_some_and(|open| open.0 == repo_root && open.1 == head_sha)
+        {
+            self.ci_expanded.remove(&workspace_id);
+            self.set_ci_detail_interest(repo_root, head_sha, false);
+        } else {
+            if let Some((old_root, old_head)) =
+                self.ci_expanded.insert(workspace_id, (repo_root.clone(), head_sha.clone()))
+            {
+                self.set_ci_detail_interest(old_root, old_head, false);
+            }
+            self.set_ci_detail_interest(repo_root, head_sha, true);
+        }
+        cx.notify();
+    }
+
+    fn ci_toggle_handler(
+        workspace_id: WorkspaceId,
+        repo_root: PathBuf,
+        head_sha: String,
+        cx: &Context<Self>,
+    ) -> ci_bar::CiActionHandler {
+        let view = cx.weak_entity();
+        Arc::new(move |_: &mut Window, app: &mut App| {
+            view.update(app, |view, view_cx| {
+                view.toggle_ci_trace(workspace_id, repo_root.clone(), head_sha.clone(), view_cx);
+            })
+            .ok();
+        })
+    }
+
     /// Paint one collapsed trace band in each region whose repository has CI state.
-    fn render_ci_run_bars(&self, cx: &App) -> Vec<gpui::AnyElement> {
+    fn render_ci_run_bars(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -9023,32 +9119,61 @@ impl TerminalView {
         let viewport = self.pane_viewport();
         self.visible_ci_runs
             .iter()
-            .filter_map(|(workspace_id, repo_root, state)| {
+            .filter_map(|(workspace_id, repo_root, state, details)| {
                 let rect = self.shell.ci_bar_rect(*workspace_id, viewport, cx)?;
                 let model = CiBarModel::build(state, now, self.shared.ci_owner_controls);
                 let (open_id, dismiss_id) = ci_action_ids(*workspace_id);
-                let (open_focus, dismiss_focus) = self
+                let (toggle_focus, open_focus, dismiss_focus) = self
                     .ci_action_focus
                     .get(workspace_id)
                     .cloned()
-                    .map_or((None, None), |(open, dismiss)| (Some(open), Some(dismiss)));
+                    .map(|(toggle, open, dismiss)| (toggle, Some(open), Some(dismiss)))?;
+                let expanded = self
+                    .ci_expanded
+                    .get(workspace_id)
+                    .is_some_and(|open| open.0 == *repo_root && open.1 == state.head_sha);
+                let trace_now = if state.stale {
+                    state
+                        .workflows
+                        .iter()
+                        .filter_map(|workflow| workflow.updated_at_epoch_secs)
+                        .max()
+                        .unwrap_or(now)
+                } else {
+                    now
+                };
+                let trace = expanded
+                    .then_some(details.as_ref())
+                    .flatten()
+                    .map(|details| ci_bar::CiTraceModel::build(details, trace_now, state.stale));
                 let on_open = model.open_url.clone().map(Self::ci_open_handler);
                 let on_dismiss = self
                     .shared
                     .ci_owner_controls
                     .then(|| self.ci_dismiss_handler(repo_root.clone(), model.head_sha.clone()));
+                let on_toggle = Self::ci_toggle_handler(
+                    *workspace_id,
+                    repo_root.clone(),
+                    model.head_sha.clone(),
+                    cx,
+                );
                 Some(ci_bar::render(
                     &model,
                     &colors,
                     ci_bar::CiBarRender {
                         id: gpui::ElementId::Name(format!("ci-run-{workspace_id}").into()),
+                        trace_id: gpui::ElementId::Name(format!("ci-trace-{workspace_id}").into()),
                         open_id,
                         dismiss_id,
                         rect,
                         accent: self.shell.workspace_accent(*workspace_id, cx),
                         animations,
+                        expanded,
+                        trace,
+                        toggle_focus,
                         open_focus,
                         dismiss_focus,
+                        on_toggle,
                         on_open,
                         on_dismiss,
                     },
@@ -9153,10 +9278,15 @@ impl TerminalView {
             }
             return;
         }
-        if !self.focus.root.is_focused(window)
-            && !self.titlebar.read(cx).has_keyboard_focus(window)
-            && !self.focus.update.is_focused(window)
-        {
+        let focus_is_unclaimed = focus_is_unclaimed([
+            self.focus.root.is_focused(window),
+            self.titlebar.read(cx).has_keyboard_focus(window),
+            self.focus.update.is_focused(window),
+            self.ci_action_focus.values().any(|(toggle, open, dismiss)| {
+                toggle.is_focused(window) || open.is_focused(window) || dismiss.is_focused(window)
+            }),
+        ]);
+        if focus_is_unclaimed {
             window.focus(&self.focus.root, cx);
         }
     }
@@ -11524,6 +11654,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::PromptReceived { .. } => "PromptReceived",
         ServerMessage::WorkspaceNamed { .. } => "WorkspaceNamed",
         ServerMessage::CiRunState { .. } => "CiRunState",
+        ServerMessage::CiRunDetails { .. } => "CiRunDetails",
         ServerMessage::SessionCreated { .. } => "SessionCreated",
         ServerMessage::SessionExited { .. } => "SessionExited",
         ServerMessage::Bell { .. } => "Bell",
@@ -11821,7 +11952,9 @@ async fn dispatch_server_message(
         update @ (ServerMessage::UpdateAvailable { .. } | ServerMessage::UpdateProgress { .. }) => {
             on_update_message(ctx, update);
         }
-        ci @ ServerMessage::CiRunState { .. } => on_ci_run_message(ctx, ci),
+        ci @ (ServerMessage::CiRunState { .. } | ServerMessage::CiRunDetails { .. }) => {
+            on_ci_run_message(ctx, ci);
+        }
         ServerMessage::Bell { session_id } => on_bell_message(ctx, session_id),
         ServerMessage::SearchResults { session_id, query, matches } => {
             on_search_results(ctx, session_id, query, matches, attached);
@@ -12485,15 +12618,21 @@ fn on_update_message(ctx: &ReaderCtx, message: ServerMessage) {
 
 /// Fold one repository-scoped CI replacement or clear onto workspace chrome.
 fn on_ci_run_message(ctx: &ReaderCtx, message: ServerMessage) {
-    let ServerMessage::CiRunState { repo_root, delta } = message else {
-        unhandled_server_message(&message);
-        return;
-    };
     let Ok(mut runs) = ctx.ci_runs.lock() else {
         tracing::warn!("CI run state mutex poisoned; dropping update");
         return;
     };
-    runs.apply(repo_root, delta);
+    match message {
+        ServerMessage::CiRunState { repo_root, delta } => runs.apply(repo_root, delta),
+        ServerMessage::CiRunDetails { repo_root, details } => {
+            runs.apply_details(repo_root, details);
+        }
+        other => {
+            drop(runs);
+            unhandled_server_message(&other);
+            return;
+        }
+    }
     drop(runs);
     ctx.generation.fetch_add(1, Ordering::Release);
 }
@@ -13117,6 +13256,13 @@ mod tests {
 
         assert_ne!(first_open, second_open);
         assert_ne!(first_dismiss, second_dismiss);
+    }
+
+    // @lat: [[test#Test Harness#GPUI CI Run Bar#CI controls retain keyboard focus]]
+    #[test]
+    fn ci_control_claim_prevents_terminal_focus_restore() {
+        assert!(!focus_is_unclaimed([false, false, false, true]));
+        assert!(focus_is_unclaimed([false; 4]));
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]

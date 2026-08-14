@@ -91,6 +91,17 @@ An empty discovery window expires at 120 seconds after exactly 24 permitted atte
 
 Handoff state preserves an active run without its token, and the successor re-polls it while retaining stale-state fallback.
 
+### Detail scheduler follows subscribers
+
+The server makes no job request without a detail subscriber, begins on open,
+and makes no further job request after the last subscriber closes.
+
+### Detail interest authorization
+
+A `ci_run_bar` participant may request jobs for a root visible in its window
+whether it owns or only views the window. Incapable clients and foreign roots
+are rejected, while close remains accepted after the root moves.
+
 ## Architecture
 
 CLI binary (`scribe-test`) dispatches subcommands to a long-lived daemon that holds an open IPC connection to scribe-server and buffers per-session state.
@@ -4105,6 +4116,42 @@ The 40px reservation keeps the owning region's x and width, moves its content do
 ### Dismissal carries repository and head
 
 The ordered IPC sink emits `DismissCiRun` with both the repository root and visible head so the server can validate and synchronize the gesture.
+
+### Shared minute grid and non-color job cues
+
+Expanded jobs share minute positions and expose workflow, current step,
+elapsed time, glyph, and state word. Running motion freezes for stale state.
+
+### Detail snapshots follow current head
+
+The client ignores details for an older head, retains matching details, and
+clears them with the matching run state.
+
+### Detail interest carries open state
+
+The ordered IPC sink emits root, head, and the exact open/closed boolean.
+
+### Detail harness parses both interest values
+
+The Docker driver accepts explicit true and false interest values instead of
+treating the option as a presence-only flag.
+
+### Job requests follow open panels
+
+Docker drives a real push through the production watcher and offline GitHub
+fixture. Its request log stays free of jobs while closed, gains jobs only after
+open, and stops gaining them after close.
+
+### Expanded trace visual and keyboard toggle
+
+Visual Docker opens the collapsed band with a pointer, injects three timed job
+states, captures the expanded trace, then closes it with Space while asserting
+both interest edges on the wire.
+
+### CI controls retain keyboard focus
+
+Terminal repaint recognizes focused CI toggle, open, and dismiss controls as
+valid focus owners so it does not route their next keystroke into the PTY.
 
 ## GPUI Status Bar
 

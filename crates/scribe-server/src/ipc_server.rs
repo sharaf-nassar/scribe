@@ -46,6 +46,7 @@ use crate::beads_board::BeadsBoardCache;
 use crate::child_identity::{IdentityCheck, check_child_identity};
 use crate::child_watch::{ChildExit, ChildExitWatcher};
 use crate::git_ref_watcher::GitRefWatcherControl;
+use crate::github_ci::{DetailInterest, GithubCiTrackerHandle};
 use crate::handoff::HandoffSession;
 use crate::hook_ingress;
 use crate::lan::discovery::{AdvertiseConfig, LanDiscovery, LanPeerHandle, local_hostname};
@@ -1122,6 +1123,8 @@ pub struct IpcServerState {
     pub window_shares: WindowShares,
     /// Current dismissed CI head per repo, shared across every attached window.
     pub ci_dismissals: CiDismissals,
+    /// Existing tracker loop; detail interest reuses its auth and scheduler.
+    pub github_ci_tracker: GithubCiTrackerHandle,
     pub updater_handle: Arc<UpdaterHandle>,
     /// In-memory cache of GitHub releases populated lazily on the first
     /// `ListReleases` request and refreshed in the background past its TTL.
@@ -6217,6 +6220,7 @@ async fn detach_client_window(
     writer: &SharedWriter,
     severed: bool,
 ) {
+    server.github_ci_tracker.drop_detail_writer(Arc::clone(writer));
     let attached_ids = attached_snapshot(attached_ids).await;
     // Detach only the sessions still routed to THIS connection. A feature-013
     // takeover may already have re-pointed them at the new controller, whose
@@ -6377,14 +6381,9 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
     // scrollback (SearchRequest). Bar those unless this connection is STILL the
     // window's registered controller; local clients always are. `AttachSessions` is guarded in
     // `filter_attachable_sessions`.
+    let shares = &context.server.window_shares;
     if requires_window_control(&msg)
-        && !connection_may_type(
-            &context.server.window_shares,
-            context.window_id,
-            context.writer,
-            &msg,
-        )
-        .await
+        && !connection_may_type(shares, context.window_id, context.writer, &msg).await
     {
         debug!(
             window_id = %context.window_id,
@@ -6419,6 +6418,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::TriggerUpdate
         | ClientMessage::DismissUpdate
         | ClientMessage::DismissCiRun { .. }
+        | ClientMessage::SetCiRunDetailsInterest { .. }
         | ClientMessage::CheckForUpdates
         | ClientMessage::ListReleases
         | ClientMessage::ListWindows
@@ -6764,6 +6764,9 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
         }
         ClientMessage::DismissCiRun { repo_root, head_sha } => {
             dismiss_ci_run(context, repo_root, head_sha).await;
+        }
+        ClientMessage::SetCiRunDetailsInterest { repo_root, head_sha, interested } => {
+            set_ci_detail_interest(context, repo_root, head_sha, interested).await;
         }
         ClientMessage::CheckForUpdates => {
             handle_check_for_updates(context).await;
@@ -8622,6 +8625,61 @@ async fn dismiss_ci_run(context: &ClientDispatchContext<'_>, repo_root: PathBuf,
         },
     )
     .await;
+}
+
+async fn set_ci_detail_interest(
+    context: &ClientDispatchContext<'_>,
+    repo_root: PathBuf,
+    head_sha: String,
+    interested: bool,
+) {
+    if !ci_detail_interest_allowed(
+        &context.server.workspace_manager,
+        &context.server.window_shares,
+        CiDetailInterestRequest {
+            window_id: context.window_id,
+            writer: context.writer,
+            repo_root: &repo_root,
+            interested,
+        },
+    )
+    .await
+    {
+        debug!(window_id = %context.window_id, ?repo_root, "ignoring unauthorized CI detail interest");
+        return;
+    }
+    context.server.github_ci_tracker.set_detail_interest(DetailInterest {
+        repo_root,
+        head_sha,
+        writer: Arc::clone(context.writer),
+        interested,
+    });
+}
+
+struct CiDetailInterestRequest<'a> {
+    window_id: WindowId,
+    writer: &'a SharedWriter,
+    repo_root: &'a Path,
+    interested: bool,
+}
+
+async fn ci_detail_interest_allowed(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    request: CiDetailInterestRequest<'_>,
+) -> bool {
+    let capable = window_shares
+        .read()
+        .await
+        .get(&request.window_id)
+        .and_then(|share| share.participant_for_writer(request.writer))
+        .is_some_and(|participant| participant.ci_run_bar);
+    capable
+        && (!request.interested
+            || workspace_manager
+                .read()
+                .await
+                .window_contains_project_root(request.window_id, request.repo_root))
 }
 
 /// Accept an owning capable client's dismissal and synchronize it across views.
@@ -12731,6 +12789,60 @@ mod tests {
             .await
             .is_err(),
             "a window rooted in another repo received the update"
+        );
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Detail interest authorization]]
+    #[tokio::test]
+    async fn ci_detail_interest_allows_capable_viewers_only_for_visible_roots() {
+        let base = Path::new("/work");
+        let repo = base.join("scribe");
+        let window_id = WindowId::new();
+        let mut manager = WorkspaceManager::new(vec![base.to_path_buf()]);
+        add_ci_workspace(&mut manager, window_id, &repo.join("src"));
+        let manager = Arc::new(RwLock::new(manager));
+        let (writer, _client) = ci_test_writer();
+        let shares = new_window_shares();
+        shares.write().await.insert(window_id, ci_share(&writer, true));
+
+        assert!(
+            ci_detail_interest_allowed(
+                &manager,
+                &shares,
+                CiDetailInterestRequest {
+                    window_id,
+                    writer: &writer,
+                    repo_root: &repo,
+                    interested: true,
+                },
+            )
+            .await
+        );
+        assert!(
+            !ci_detail_interest_allowed(
+                &manager,
+                &shares,
+                CiDetailInterestRequest {
+                    window_id,
+                    writer: &writer,
+                    repo_root: &base.join("other"),
+                    interested: true,
+                },
+            )
+            .await
+        );
+        assert!(
+            ci_detail_interest_allowed(
+                &manager,
+                &shares,
+                CiDetailInterestRequest {
+                    window_id,
+                    writer: &writer,
+                    repo_root: &base.join("old-root"),
+                    interested: false,
+                },
+            )
+            .await
         );
     }
 

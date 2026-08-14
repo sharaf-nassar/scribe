@@ -293,6 +293,22 @@ pub fn clear_last_action() -> Result<(), ScribeError> {
     }
 }
 
+/// Tell the test daemon whether this window currently owns an open CI detail panel.
+pub fn set_ci_run_details_interest(
+    repo_root: PathBuf,
+    head_sha: String,
+    interested: bool,
+) -> Result<(), ScribeError> {
+    match send_request(&DaemonRequest::SetCiRunDetailsInterest { repo_root, head_sha, interested })?
+    {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error { message } => Err(ScribeError::IpcError { reason: message }),
+        other => Err(ScribeError::ProtocolError {
+            reason: format!("unexpected daemon response: {other:?}"),
+        }),
+    }
+}
+
 /// Run the daemon event loop (foreground). This is the `daemon run` entry.
 pub async fn run() -> Result<(), ScribeError> {
     let state: SharedState = Arc::new(Mutex::new(DaemonState::new()));
@@ -321,7 +337,7 @@ pub async fn run() -> Result<(), ScribeError> {
             // — exactly the rollback a user would perform.
             // @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
-            ci_run_bar: false,
+            ci_run_bar: true,
         },
     )
     .await?;
@@ -480,6 +496,7 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::CiRunState { .. }
+        | ServerMessage::CiRunDetails { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
@@ -998,11 +1015,10 @@ async fn process_request(
         DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
             handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
         }
-        DaemonRequest::RequestAiChrome { session_id } => {
-            handle_request_ai_chrome(session_id, state).await
-        }
-        DaemonRequest::RequestBeadsBoard => {
-            handle_request_beads_board(state, notifiers, server_writer).await
+        request @ (DaemonRequest::RequestAiChrome { .. }
+        | DaemonRequest::RequestBeadsBoard
+        | DaemonRequest::SetCiRunDetailsInterest { .. }) => {
+            handle_chrome_request(request, state, notifiers, server_writer).await
         }
         DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
             handle_replay_status(session_id, min_frames, timeout_ms, state, notifiers).await
@@ -1022,6 +1038,41 @@ async fn process_request(
             DaemonResponse::Ok
         }
         DaemonRequest::Shutdown => handle_shutdown(shutdown),
+    }
+}
+
+async fn handle_chrome_request(
+    request: DaemonRequest,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    match request {
+        DaemonRequest::RequestAiChrome { session_id } => {
+            handle_request_ai_chrome(session_id, state).await
+        }
+        DaemonRequest::RequestBeadsBoard => {
+            handle_request_beads_board(state, notifiers, server_writer).await
+        }
+        DaemonRequest::SetCiRunDetailsInterest { repo_root, head_sha, interested } => {
+            handle_ci_detail_interest(repo_root, head_sha, interested, server_writer).await
+        }
+        _ => DaemonResponse::Error { message: "invalid chrome request".to_owned() },
+    }
+}
+
+async fn handle_ci_detail_interest(
+    repo_root: PathBuf,
+    head_sha: String,
+    interested: bool,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    let message = ClientMessage::SetCiRunDetailsInterest { repo_root, head_sha, interested };
+    match send_to_server(server_writer, &message).await {
+        Ok(()) => DaemonResponse::Ok,
+        Err(error) => {
+            DaemonResponse::Error { message: format!("failed to set CI detail interest: {error}") }
+        }
     }
 }
 

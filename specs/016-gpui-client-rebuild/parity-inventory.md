@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (47 variants, fully reachable)
+## Client messages (48 variants, fully reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -119,6 +119,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `TriggerUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::trigger_update`, from the status-bar CTA's confirmation | required |
 | `DismissUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::dismiss_update`, from the status-bar CTA's confirmation | required |
 | `DismissCiRun` | workspace CI run bar | visual-E2E | `main.rs::TerminalView::render_ci_run_bars` → `ipc_bridge::IpcSink::dismiss_ci_run`, from owning local clients only | required |
+| `SetCiRunDetailsInterest` | expanded workspace CI trace | visual-E2E | `main.rs::TerminalView::toggle_ci_trace` → `ipc_bridge::IpcSink::set_ci_run_details_interest`, from owning and read-only capable windows — `tests/e2e/visual/ci-run-details.sh` | required |
 | `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListWindows` | window management | scripted-E2E | `main.rs::TerminalView::poll_window_list` → `ipc_bridge::IpcSink::list_windows`, on the lifecycle tick while `remote.enabled` | required |
@@ -146,18 +147,18 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `RequestBeadsBoard` | workspace Beads board open, hover refresh and pinned poll | visual-E2E | `main.rs::park_workspace_info`, `main.rs::TerminalView::poll_beads_board`, titlebar/region bead hover and click → `ipc_bridge.rs::IpcSink::request_beads_board` — `tests/e2e/visual/beads-board.sh` | required |
 
-**Reachability:** 47 of 47 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 48 of 48 rows name a live-path symbol; 0 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (63 variants, fully reachable)
+## Server messages (64 variants, fully reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
-The live reader's dispatcher `main.rs::dispatch_server_message` handles 57 of
-63 variants and routes the rest to `main.rs::unhandled_server_message`, which
+The live reader's dispatcher `main.rs::dispatch_server_message` handles 59 of
+64 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
@@ -190,6 +191,7 @@ erase a replacement.
 | `PromptReceived` | prompt history | scripted-E2E | `main.rs::on_ai_message` → `AiChrome::record_prompt` | required |
 | `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
 | `CiRunState` | workspace CI run bar | visual-E2E (`just e2e-visual-ci-run-bar`) | `main.rs::on_ci_run_message` → `ci_bar::CiRunBars::apply` → `TerminalView::render_ci_run_bars` | required |
+| `CiRunDetails` | expanded workspace CI trace | visual-E2E | `main.rs::on_ci_run_message` → `ci_bar::CiRunBars::apply_details` → `TerminalView::render_ci_run_bars` — `tests/e2e/visual/ci-run-details.sh` | required |
 | `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `session_lifecycle::SessionRegistry::on_session_created` + `main.rs::open_created_tab` | required |
 | `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_session_exited` → tab removal + `AiChrome::forget` | required |
 | `Bell` | terminal bell | scripted-E2E | `main.rs::on_bell_message` queue → `main.rs::TerminalView::poll_bells` → `BellController::on_bell` → `Window::request_attention` | required |
@@ -238,7 +240,7 @@ erase a replacement.
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 | `BeadsBoard` | workspace Beads board snapshot, loading, unavailable and not-detected states | visual-E2E | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::update` → `beads_board.rs::render` — `tests/e2e/visual/beads-board.sh` | required |
 
-**Reachability:** 63 of 63 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 64 of 64 rows name a live-path symbol; 0 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -459,19 +461,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 47 | 47 | 0 | 0 |
-| Server messages | 63 | 63 | 0 | 0 |
+| Client messages | 48 | 48 | 0 | 0 |
+| Server messages | 64 | 64 | 0 | 0 |
 | Input and keybinding actions | 55 | 55 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **208** | **208** | **0** | **0** |
+| **Total** | **210** | **210** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **199 rows, of which 199 are
-reachable (100%)** and 0 are not. **1 of those 199** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **201 rows, of which 201 are
+reachable (100%)** and 0 are not. **1 of those 201** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **198 of 199**.
+the in-client figure is **200 of 201**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

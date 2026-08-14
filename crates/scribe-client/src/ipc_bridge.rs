@@ -1410,6 +1410,16 @@ impl IpcSink {
         self.enqueue(ClientMessage::DismissCiRun { repo_root, head_sha })
     }
 
+    /// Start or stop server-owned job-detail fetching for one open trace panel.
+    pub fn set_ci_run_details_interest(
+        &self,
+        repo_root: PathBuf,
+        head_sha: String,
+        interested: bool,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::SetCiRunDetailsInterest { repo_root, head_sha, interested })
+    }
+
     /// Asks the server to destroy `window_id` and every session it owns, which
     /// is the close dialog's "Kill Window". The server answers `WindowClosed`
     /// and the shell exits on that acknowledgement, never on this send.
@@ -2056,6 +2066,25 @@ mod tests {
             out_rx.recv().await.unwrap(),
             ClientMessage::DismissCiRun { repo_root, head_sha }
                 if repo_root == Path::new("/work/scribe") && head_sha == "head-a"
+        ));
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Detail interest carries open state]]
+    #[tokio::test]
+    async fn ci_detail_interest_carries_repository_head_and_open_state() {
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        sink.set_ci_run_details_interest(PathBuf::from("/work/scribe"), "head-a".to_owned(), true)
+            .unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await.unwrap(),
+            ClientMessage::SetCiRunDetailsInterest {
+                repo_root,
+                head_sha,
+                interested: true,
+            } if repo_root == Path::new("/work/scribe") && head_sha == "head-a"
         ));
     }
 

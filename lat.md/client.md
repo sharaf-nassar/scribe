@@ -1487,6 +1487,42 @@ Each band spans only its repository-owning region, below that region's title or 
 
 The band sits above a pinned Beads board when both are visible. Its bottom hairline uses the owning workspace accent, except failure and stale replace it with their semantic theme colors.
 
+### Expanded job trace
+
+Pointer, Enter, or Space toggles an accessible trace panel below the fixed
+collapsed row.
+
+The button exposes its expanded state and label through GPUI accessibility,
+while owner open/dismiss buttons stop propagation and keep their original
+behavior.
+
+[[crates/scribe-client/src/ci_bar.rs#CiTraceModel#build]] positions every job
+against one minute-labeled axis, with a job/workflow column at left and elapsed
+time at right. Passed, running, and queued rows pair glyphs and words with
+their colors; queued bars are dashed. A running bar's edge uses the same 1.2s
+breathing cadence as the collapsed live mark, and stale or globally disabled
+animation freezes it.
+
+The trace height follows its bounded job count. [[crates/scribe-client/src/pane_shell.rs#PaneShell#set_ci_strips]]
+reserves the collapsed row plus panel inside only the owning region, preserving
+neighbor geometry and returning the rows immediately on close.
+
+### Demand-driven job data
+
+Job and step demand exists only while a capable visible window keeps its panel
+open.
+
+[[crates/scribe-client/src/main.rs#TerminalView#toggle_ci_trace]] sends
+[[crates/scribe-client/src/ipc_bridge.rs#IpcSink#set_ci_run_details_interest]]
+only on open/close edges. A root/head replacement or disappearing region sends
+the close edge before dropping local state. Owning and read-only windows render
+and request the same panel; only the owner's browser and dismissal controls
+remain local-only.
+
+Incoming detail is cached only when its head matches the visible run. A closed
+panel paints no trace, retains collapsed rendering unchanged, and owns no
+server demand.
+
 ### Local owner actions
 
 Only an owning client connected to its local server receives open and dismiss controls; local share joins, LAN clients, and remote clients render a read-only viewer chip.
