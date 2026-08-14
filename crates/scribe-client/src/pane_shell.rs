@@ -195,6 +195,8 @@ pub struct PaneShell {
     server_workspaces: HashSet<WorkspaceId>,
     /// Regions giving up a top strip to a pinned Beads board, and how much.
     pinned_boards: HashMap<WorkspaceId, f32>,
+    /// Regions giving up the fixed collapsed CI strip below their tab chrome.
+    ci_regions: HashSet<WorkspaceId>,
 }
 
 impl PaneShell {
@@ -218,6 +220,7 @@ impl PaneShell {
             pending_workspaces: VecDeque::new(),
             server_workspaces: HashSet::new(),
             pinned_boards: HashMap::new(),
+            ci_regions: HashSet::new(),
         }
     }
 
@@ -414,6 +417,22 @@ impl PaneShell {
             .and_then(|slot| slot.project_root.clone())
     }
 
+    /// Every visible region whose server-derived project root is known.
+    pub fn region_project_roots(&self, cx: &App) -> Vec<(WorkspaceId, std::path::PathBuf)> {
+        let workspace = self.workspace.read(cx);
+        workspace
+            .layout()
+            .compute_workspace_rects(Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 })
+            .into_iter()
+            .filter_map(|(workspace_id, _)| {
+                workspace
+                    .find_workspace(workspace_id)
+                    .and_then(|slot| slot.project_root.clone())
+                    .map(|root| (workspace_id, root))
+            })
+            .collect()
+    }
+
     /// Each region's left edge keyed by workspace, for aligning the strip's
     /// workspace tab groups over their regions.
     pub fn region_left_edges(&self, viewport: Rect, cx: &App) -> HashMap<WorkspaceId, f32> {
@@ -432,17 +451,47 @@ impl PaneShell {
         rect.y > 0.5
     }
 
-    /// `rect` minus everything a region reserves at its top: the in-region tab
-    /// bar a lower region carries (a top-row region's tabs live in the
-    /// titlebar), then `board` for a pinned Beads board.
+    /// `rect` minus everything a region reserves at its top: lower-region tabs,
+    /// the collapsed CI band, then a pinned Beads board.
     ///
     /// Both reservations land here rather than at the call sites so pane math,
     /// painted panes, dividers, and the rows published to the PTY cannot
     /// disagree about where a region's content starts.
-    fn content_rect(rect: Rect, board: f32) -> Rect {
+    fn content_rect(rect: Rect, ci: f32, board: f32) -> Rect {
         let bar = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
-        let reserved = (bar + board).min(rect.height);
+        let reserved = (bar + ci + board).min(rect.height);
         Rect { x: rect.x, y: rect.y + reserved, width: rect.width, height: rect.height - reserved }
+    }
+
+    /// The collapsed CI strip inside one raw region rect, directly below tabs.
+    fn ci_rect(rect: Rect) -> Option<Rect> {
+        let tab = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
+        let height = scribe_client::ci_bar::CI_BAR_HEIGHT.min((rect.height - tab).max(0.0));
+        (height > 0.0).then_some(Rect { x: rect.x, y: rect.y + tab, width: rect.width, height })
+    }
+
+    fn ci_strip(&self, workspace_id: WorkspaceId) -> f32 {
+        if self.ci_regions.contains(&workspace_id) {
+            scribe_client::ci_bar::CI_BAR_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// Publish the regions whose current repository has a visible CI snapshot.
+    pub fn set_ci_regions(&mut self, regions: HashSet<WorkspaceId>) {
+        self.ci_regions = regions;
+    }
+
+    /// Resolve one visible collapsed CI band against the region layout.
+    pub fn ci_bar_rect(&self, workspace_id: WorkspaceId, viewport: Rect, cx: &App) -> Option<Rect> {
+        self.workspace
+            .read(cx)
+            .layout()
+            .compute_workspace_rects(viewport)
+            .into_iter()
+            .find(|(id, _)| *id == workspace_id)
+            .and_then(|(_, rect)| Self::ci_rect(rect))
     }
 
     /// The strip a pinned board reserves inside `workspace_id`'s region, which
@@ -472,7 +521,7 @@ impl PaneShell {
             .compute_workspace_rects(viewport)
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
-            .map(|(_, rect)| Self::content_rect(rect, 0.0))
+            .map(|(_, rect)| Self::content_rect(rect, self.ci_strip(workspace_id), 0.0))
             .map(|content| Rect { height: height.min(content.height), ..content })
     }
 
@@ -787,7 +836,11 @@ impl PaneShell {
         let focused_workspace = workspace.focused_workspace_id();
         let mut out = Vec::new();
         for (workspace_id, region) in workspace.layout().compute_workspace_rects(viewport) {
-            let region = Self::content_rect(region, self.board_strip(workspace_id));
+            let region = Self::content_rect(
+                region,
+                self.ci_strip(workspace_id),
+                self.board_strip(workspace_id),
+            );
             let Some(tree) = self.trees.get(&workspace_id) else { continue };
             let accent = workspace
                 .find_workspace(workspace_id)
@@ -819,7 +872,11 @@ impl PaneShell {
             .compute_workspace_rects(viewport)
             .into_iter()
             .flat_map(|(workspace_id, region)| {
-                let region = Self::content_rect(region, self.board_strip(workspace_id));
+                let region = Self::content_rect(
+                    region,
+                    self.ci_strip(workspace_id),
+                    self.board_strip(workspace_id),
+                );
                 self.trees.get(&workspace_id).into_iter().flat_map(move |tree| {
                     divider::collect_dividers(tree.read(cx).tree().root(), region)
                 })
@@ -1130,7 +1187,11 @@ impl PaneShell {
     fn region_rect(&self, workspace_id: WorkspaceId, viewport: Rect, cx: &App) -> Option<Rect> {
         let layout: &WindowLayout = self.workspace.read(cx).layout();
         layout.compute_workspace_rects(viewport).into_iter().find_map(|(id, rect)| {
-            (id == workspace_id).then_some(Self::content_rect(rect, self.board_strip(workspace_id)))
+            (id == workspace_id).then_some(Self::content_rect(
+                rect,
+                self.ci_strip(workspace_id),
+                self.board_strip(workspace_id),
+            ))
         })
     }
 }
@@ -1486,7 +1547,7 @@ mod tests {
     #[test]
     fn lower_regions_reserve_their_tab_bar() {
         let top = Rect { x: 0.0, y: 0.0, width: 800.0, height: 300.0 };
-        let kept = PaneShell::content_rect(top, 0.0);
+        let kept = PaneShell::content_rect(top, 0.0, 0.0);
         assert!(
             (kept.y - top.y).abs() < f32::EPSILON
                 && (kept.height - top.height).abs() < f32::EPSILON,
@@ -1494,15 +1555,35 @@ mod tests {
         );
 
         let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 300.0 };
-        let content = PaneShell::content_rect(lower, 0.0);
+        let content = PaneShell::content_rect(lower, 0.0, 0.0);
         assert!((content.y - (300.0 + REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
         assert!((content.height - (300.0 - REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
         assert!((content.x - lower.x).abs() < f32::EPSILON);
         assert!((content.width - lower.width).abs() < f32::EPSILON);
 
         let sliver = Rect { x: 0.0, y: 300.0, width: 800.0, height: 10.0 };
-        let clamped = PaneShell::content_rect(sliver, 0.0);
+        let clamped = PaneShell::content_rect(sliver, 0.0, 0.0);
         assert!(clamped.height >= 0.0, "a sliver region clamps instead of going negative");
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Band reflows only its workspace region]]
+    #[test]
+    fn ci_band_reflows_only_its_workspace_region() {
+        let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
+        let band = PaneShell::ci_rect(top).expect("region has room for CI band");
+        assert!((band.x - top.x).abs() < f32::EPSILON);
+        assert!((band.y - top.y).abs() < f32::EPSILON);
+        assert!((band.width - top.width).abs() < f32::EPSILON);
+        assert!((band.height - scribe_client::ci_bar::CI_BAR_HEIGHT).abs() < f32::EPSILON);
+
+        let content = PaneShell::content_rect(top, scribe_client::ci_bar::CI_BAR_HEIGHT, 0.0);
+        assert!((content.x - top.x).abs() < f32::EPSILON);
+        assert!((content.width - top.width).abs() < f32::EPSILON);
+        assert!((content.y - scribe_client::ci_bar::CI_BAR_HEIGHT).abs() < f32::EPSILON);
+        assert!(
+            (content.height - (top.height - scribe_client::ci_bar::CI_BAR_HEIGHT)).abs()
+                < f32::EPSILON
+        );
     }
 
     /// A pinned board takes its strip out of its own region's content, stacking
@@ -1513,7 +1594,7 @@ mod tests {
     fn a_pinned_board_reserves_only_its_own_region() {
         let board = 246.0;
         let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
-        let with_board = PaneShell::content_rect(top, board);
+        let with_board = PaneShell::content_rect(top, 0.0, board);
         assert!((with_board.y - board).abs() < f32::EPSILON);
         assert!((with_board.height - (600.0 - board)).abs() < f32::EPSILON);
         assert!(
@@ -1523,10 +1604,10 @@ mod tests {
         );
 
         let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 600.0 };
-        let stacked = PaneShell::content_rect(lower, board);
+        let stacked = PaneShell::content_rect(lower, 0.0, board);
         assert!((stacked.y - (300.0 + REGION_TAB_BAR_HEIGHT + board)).abs() < f32::EPSILON);
 
-        let shallow = PaneShell::content_rect(Rect { height: 100.0, ..top }, board);
+        let shallow = PaneShell::content_rect(Rect { height: 100.0, ..top }, 0.0, board);
         assert!(shallow.height >= 0.0, "a region shorter than the board clamps to zero");
     }
 

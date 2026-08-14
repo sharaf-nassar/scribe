@@ -62,6 +62,7 @@ pub mod beads_board;
 pub mod bell;
 pub mod box_drawing;
 pub mod chrome_metadata;
+pub mod ci_bar;
 pub mod clipboard;
 pub mod clipboard_cleanup;
 pub mod color;

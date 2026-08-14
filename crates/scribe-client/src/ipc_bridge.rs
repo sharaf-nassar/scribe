@@ -1405,6 +1405,11 @@ impl IpcSink {
         self.enqueue(ClientMessage::DismissUpdate)
     }
 
+    /// Hide one repository's currently rendered CI head across its attached views.
+    pub fn dismiss_ci_run(&self, repo_root: PathBuf, head_sha: String) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::DismissCiRun { repo_root, head_sha })
+    }
+
     /// Asks the server to destroy `window_id` and every session it owns, which
     /// is the close dialog's "Kill Window". The server answers `WindowClosed`
     /// and the shell exits on that acknowledgement, never on this send.
@@ -1559,6 +1564,7 @@ impl IpcSink {
 #[cfg(test)]
 mod tests {
     use std::{
+        path::Path,
         sync::{Arc, Mutex},
         time::Instant,
     };
@@ -2036,6 +2042,21 @@ mod tests {
 
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::ConfigReloaded));
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
+    }
+
+    // @lat: [[test#GPUI CI Run Bar#Dismissal carries repository and head]]
+    #[tokio::test]
+    async fn ci_dismissal_carries_repository_and_head() {
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        sink.dismiss_ci_run(PathBuf::from("/work/scribe"), "head-a".to_owned()).unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await.unwrap(),
+            ClientMessage::DismissCiRun { repo_root, head_sha }
+                if repo_root == Path::new("/work/scribe") && head_sha == "head-a"
+        ));
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#The overlay's query reaches the wire]]

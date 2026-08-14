@@ -3267,6 +3267,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | OSC 52 clipboard bridge |  | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
 | Notification dispatcher |  | Notification `replaces_id` coalescing + click-to-focus |
 | Terminal chrome metadata |  | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
+| CI run bar | [[test#GPUI CI Run Bar]] | `CiRunState`, `DismissCiRun`, workspace-region chrome |
 
 ### Refused restore claim decision
 
@@ -4010,6 +4011,42 @@ The record is a TOML file a user can put any `i8` in, so a hand-edited or trunca
 ### Effective size applies the delta and honors the floor
 
 `effective_font_size` adds the zoom delta to the base size and floors the result at the 6pt minimum so extreme zoom-out still renders legible cells.
+
+## GPUI CI Run Bar
+
+Pure model, state, palette, geometry, and sink tests cover the collapsed workspace CI trace without constructing a live window.
+
+### Every aggregate state has a non-color signifier
+
+Queued, running, passed, failed, cancelled, and stale models pair a distinct glyph with a word, expose the same word to accessibility, and leave repeating motion only on a fresh running state.
+
+### Head-qualified clears preserve newer runs
+
+A clear removes its repository snapshot only when the named head matches, so a delayed clear for an older run cannot erase its replacement.
+
+### Owner actions stay local
+
+The owning model carries its trusted GitHub run URL, while a shared viewer has no host URL and resolves to read-only chrome.
+
+### Owner action identities are region-scoped
+
+Open and dismiss controls derive distinct GPUI element identities from each region's full workspace UUID so simultaneous bands cannot collide.
+
+### Long traces keep actionable cells
+
+A trace beyond six workflows retains failed and active cells and reports the hidden count, keeping the useful part of a crowded run visible.
+
+### Theme drives every band color
+
+The palette derives its background, text, semantic status colors, and opacity from the active terminal theme instead of fixed mockup colors.
+
+### Band reflows only its workspace region
+
+The 40px reservation keeps the owning region's x and width, moves its content down by exactly one band, and leaves neighboring regions outside the calculation.
+
+### Dismissal carries repository and head
+
+The ordered IPC sink emits `DismissCiRun` with both the repository root and visible head so the server can validate and synchronize the gesture.
 
 ## GPUI Status Bar
 

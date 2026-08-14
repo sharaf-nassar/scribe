@@ -36,6 +36,7 @@ use scribe_client::beads_board::{
 };
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
+use scribe_client::ci_bar::{self, CiBarColors, CiBarModel, CiRunBars};
 use scribe_client::clipboard::{
     self, ArboardClipboard, BridgeJob, ClipboardBackend as _, ClipboardBridge, ClipboardPrompt,
     FocusGate,
@@ -153,8 +154,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
-        AiLaunchSpec, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
-        ServerMessage, SessionInfo, TerminalSize, UpdateProgressState, WindowInfo,
+        AiLaunchSpec, AutomationAction, CiRunState, ClientMessage, ClipboardSelection,
+        PromptMarkKind, ServerMessage, SessionInfo, TerminalSize, UpdateProgressState, WindowInfo,
         WorkspaceTreeNode,
     },
     screen::ScreenSnapshot,
@@ -585,6 +586,10 @@ struct Shared {
     /// writes it; the view renders the centred status-bar CTA from it and opens
     /// the confirmation modal a click on that CTA resolves to.
     update: Arc<Mutex<UpdateState>>,
+    /// Server-owned CI snapshots keyed by repository root.
+    ci_runs: Arc<Mutex<CiRunBars>>,
+    /// Host actions exist only on this machine's owning local connection.
+    ci_owner_controls: bool,
     /// Window close / quit / focus-report state. The view raises a close, a
     /// quit, or a focus change here from a real UI event and the reader folds
     /// the server's `WindowClosed` / `QuitRequested` / `WindowList` answer back
@@ -1595,6 +1600,10 @@ struct TerminalView {
     tooltip_demo: bool,
     /// Workspace board painted this frame and whether it is pinned.
     visible_beads_boards: Vec<(WorkspaceId, bool)>,
+    /// CI snapshots matched to the regions that currently own their repository.
+    visible_ci_runs: Vec<(WorkspaceId, PathBuf, CiRunState)>,
+    /// Stable tab stops for each owning region's open and dismiss controls.
+    ci_action_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
     /// X11 active-window guard, present only when this window has an Xcb/Xlib
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
@@ -2122,6 +2131,8 @@ impl TerminalView {
             pointer: PointerState::default(),
             tooltip_demo: false,
             visible_beads_boards: Vec::new(),
+            visible_ci_runs: Vec::new(),
+            ci_action_focus: HashMap::new(),
             x11_focus,
             ime: Self::start_ime(cx),
             bell,
@@ -8507,6 +8518,13 @@ async fn drive_redraws(
     }
 }
 
+fn ci_action_ids(workspace_id: WorkspaceId) -> (ElementId, ElementId) {
+    (
+        ElementId::from(format!("ci-open-{}", workspace_id.to_full_string())),
+        ElementId::from(format!("ci-dismiss-{}", workspace_id.to_full_string())),
+    )
+}
+
 impl TerminalView {
     /// Build the status-bar segment model from the live connection / stats
     /// state and the server-reported chrome metadata for the attached pane.
@@ -8828,6 +8846,7 @@ impl TerminalView {
         let panes = self.render_panes(FocusedPanePaint { content, ime, cursor, link }, cx);
         let dividers = self.render_dividers(cx);
         let region_bars = self.render_region_tab_bars(cx);
+        let ci_bars = self.render_ci_run_bars(cx);
         // The board is placed against the same region rects the panes are, so
         // it belongs in the grid band with them rather than in a window-wide
         // band that would span every region.
@@ -8839,6 +8858,7 @@ impl TerminalView {
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(region_bars)
+            .children(ci_bars)
             .children(beads_boards)
             // Dividers paint last, over panes, region bars, and boards alike:
             // a region divider runs the full height of the split, so two
@@ -8931,6 +8951,110 @@ impl TerminalView {
             self.write_clipboard(text);
         }
         self.shell.set_pinned_boards(strips);
+    }
+
+    /// Match repository-keyed CI snapshots to the regions that own them.
+    fn sync_ci_run_strips(&mut self, cx: &mut Context<Self>) {
+        let roots = self.shell.region_project_roots(cx);
+        self.visible_ci_runs = self.shared.ci_runs.lock().map_or_else(
+            |_| {
+                tracing::warn!("CI run state mutex poisoned; hiding bands");
+                Vec::new()
+            },
+            |runs| {
+                roots
+                    .into_iter()
+                    .filter_map(|(workspace_id, root)| {
+                        runs.get(&root).cloned().map(|state| (workspace_id, root, state))
+                    })
+                    .collect()
+            },
+        );
+        self.shell.set_ci_regions(
+            self.visible_ci_runs.iter().map(|(workspace_id, ..)| *workspace_id).collect(),
+        );
+        let visible = self
+            .visible_ci_runs
+            .iter()
+            .map(|(workspace_id, ..)| *workspace_id)
+            .collect::<HashSet<_>>();
+        self.ci_action_focus.retain(|workspace_id, _| visible.contains(workspace_id));
+        if self.shared.ci_owner_controls {
+            for workspace_id in visible {
+                self.ensure_ci_action_focus(workspace_id, cx);
+            }
+        }
+    }
+
+    fn ensure_ci_action_focus(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
+        if self.ci_action_focus.contains_key(&workspace_id) {
+            return;
+        }
+        self.ci_action_focus.insert(
+            workspace_id,
+            (
+                cx.focus_handle().tab_index(0).tab_stop(true),
+                cx.focus_handle().tab_index(0).tab_stop(true),
+            ),
+        );
+    }
+
+    fn ci_open_handler(url: String) -> ci_bar::CiActionHandler {
+        Box::new(move |_: &mut Window, _: &mut App| url_detect::open_url(&url))
+    }
+
+    fn ci_dismiss_handler(&self, repo_root: PathBuf, head_sha: String) -> ci_bar::CiActionHandler {
+        let sink = self.sink.clone();
+        Box::new(move |_: &mut Window, _: &mut App| {
+            if let Err(error) = sink.dismiss_ci_run(repo_root.clone(), head_sha.clone()) {
+                tracing::warn!(%error, "CI run dismissal dropped: IPC writer closed");
+            }
+        })
+    }
+
+    /// Paint one collapsed trace band in each region whose repository has CI state.
+    fn render_ci_run_bars(&self, cx: &App) -> Vec<gpui::AnyElement> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let colors = CiBarColors::from_theme(&self.config.config().theme, self.opacity);
+        let animations = AnimationSettings::from_config(&self.config.config().config);
+        let viewport = self.pane_viewport();
+        self.visible_ci_runs
+            .iter()
+            .filter_map(|(workspace_id, repo_root, state)| {
+                let rect = self.shell.ci_bar_rect(*workspace_id, viewport, cx)?;
+                let model = CiBarModel::build(state, now, self.shared.ci_owner_controls);
+                let (open_id, dismiss_id) = ci_action_ids(*workspace_id);
+                let (open_focus, dismiss_focus) = self
+                    .ci_action_focus
+                    .get(workspace_id)
+                    .cloned()
+                    .map_or((None, None), |(open, dismiss)| (Some(open), Some(dismiss)));
+                let on_open = model.open_url.clone().map(Self::ci_open_handler);
+                let on_dismiss = self
+                    .shared
+                    .ci_owner_controls
+                    .then(|| self.ci_dismiss_handler(repo_root.clone(), model.head_sha.clone()));
+                Some(ci_bar::render(
+                    &model,
+                    &colors,
+                    ci_bar::CiBarRender {
+                        id: gpui::ElementId::Name(format!("ci-run-{workspace_id}").into()),
+                        open_id,
+                        dismiss_id,
+                        rect,
+                        accent: self.shell.workspace_accent(*workspace_id, cx),
+                        animations,
+                        open_focus,
+                        dismiss_focus,
+                        on_open,
+                        on_dismiss,
+                    },
+                ))
+            })
+            .collect()
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]
@@ -9092,11 +9216,12 @@ impl Render for TerminalView {
         self.sync_remote_connect();
         self.reconcile_panes(cx);
         self.sync_equalize_visibility(cx);
+        self.sync_ci_run_strips(cx);
         self.sync_beads_board_strips(cx);
         self.sync_grid_geometry(cx);
-        // A prompt arriving or clearing changes one pane's strip height without
-        // moving the grid band, so the band probe never notices; republishing
-        // here keeps that pane's PTY exactly the rows the strip leaves visible.
+        // A prompt or CI state edge changes an internal strip without moving the
+        // grid band, so the band probe never notices; republishing here keeps the
+        // affected PTYs exactly the rows their strips leave visible.
         // Per-session no-change checks inside make this idempotent.
         self.publish_pane_sizes(cx);
         let ime = self.sync_ime(cx);
@@ -9458,6 +9583,9 @@ enum LocalJoinIntent {
 /// this process opens afterwards, so the paths cannot drift.
 fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
     let WindowBackend { claim, join_intent, initial_session, fan_out } = window;
+    let ci_owner_controls = matches!(join_intent, LocalJoinIntent::Plain)
+        && lan_dial::target_from_env().is_none()
+        && remote_handshake::target_from_env().is_none();
     let Some(process_shutdown) = PROCESS_SHUTDOWN.get().map(Arc::clone) else {
         tracing::error!("terminal backend opened before shutdown handler installation");
         std::process::abort();
@@ -9479,6 +9607,8 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
+        ci_runs: Arc::new(Mutex::new(CiRunBars::default())),
+        ci_owner_controls,
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
         process_shutdown,
         bells: Arc::new(Mutex::new(Vec::new())),
@@ -10525,6 +10655,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
         update: Arc::clone(&ctx.shared.update),
+        ci_runs: Arc::clone(&ctx.shared.ci_runs),
         lifecycle: Arc::clone(&ctx.shared.lifecycle),
         bells: Arc::clone(&ctx.shared.bells),
         ai_notices: Arc::clone(&ctx.shared.ai_notices),
@@ -11015,6 +11146,8 @@ struct ReaderCtx {
     share: Arc<Mutex<ShareChrome>>,
     /// Update availability / progress the centred status-bar CTA renders from.
     update: Arc<Mutex<UpdateState>>,
+    /// Repository-keyed CI snapshots the workspace-region bands render from.
+    ci_runs: Arc<Mutex<CiRunBars>>,
     /// Window-lifecycle state the reader adopts a window id into and folds the
     /// server's close / quit / window-list answers onto.
     lifecycle: Arc<Mutex<WindowLifecycle>>,
@@ -11688,6 +11821,7 @@ async fn dispatch_server_message(
         update @ (ServerMessage::UpdateAvailable { .. } | ServerMessage::UpdateProgress { .. }) => {
             on_update_message(ctx, update);
         }
+        ci @ ServerMessage::CiRunState { .. } => on_ci_run_message(ctx, ci),
         ServerMessage::Bell { session_id } => on_bell_message(ctx, session_id),
         ServerMessage::SearchResults { session_id, query, matches } => {
             on_search_results(ctx, session_id, query, matches, attached);
@@ -12349,6 +12483,21 @@ fn on_update_message(ctx: &ReaderCtx, message: ServerMessage) {
     }
 }
 
+/// Fold one repository-scoped CI replacement or clear onto workspace chrome.
+fn on_ci_run_message(ctx: &ReaderCtx, message: ServerMessage) {
+    let ServerMessage::CiRunState { repo_root, delta } = message else {
+        unhandled_server_message(&message);
+        return;
+    };
+    let Ok(mut runs) = ctx.ci_runs.lock() else {
+        tracing::warn!("CI run state mutex poisoned; dropping update");
+        return;
+    };
+    runs.apply(repo_root, delta);
+    drop(runs);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
 /// Queue a terminal bell for the foreground's [`BellController`] gate.
 ///
 /// The suppression gate itself cannot run here. It is a GPUI entity, and the
@@ -12957,6 +13106,18 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
+    #[test]
+    fn ci_action_ids_are_scoped_to_workspace() {
+        let first = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let second = "10000000-0000-0000-0000-000000000001".parse().unwrap();
+        let (first_open, first_dismiss) = ci_action_ids(first);
+        let (second_open, second_dismiss) = ci_action_ids(second);
+
+        assert_ne!(first_open, second_open);
+        assert_ne!(first_dismiss, second_dismiss);
+    }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]
     #[test]

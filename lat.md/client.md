@@ -1471,6 +1471,30 @@ Verifies  clears the stored context percent for a closed session.
 
 Verifies  offsets the border below the tab bar and produces corner-safe top/bottom/left/right strips.
 
+## GPUI CI Run Bar
+
+The GPUI client renders server-owned GitHub Actions state as a 40px collapsed trace band inside each matching workspace region.
+
+[[crates/scribe-client/src/ci_bar.rs#CiRunBars#apply]] stores full replacements by trusted repository root and ignores a `Cleared` delta unless its head matches the current snapshot. [[crates/scribe-client/src/ci_bar.rs#CiBarModel#build]] turns each workflow entry into one collapsed trace cell without fetching job detail.
+
+Every aggregate state pairs a glyph with a word. Running cells also use a square live mark, full-strength text, and an indeterminate shimmer; queued cells use a dashed track. Terminal and stale models disable repeating motion, and GPUI's shared animation policy freezes all motion when configured off.
+
+### Region placement and reflow
+
+Each band spans only its repository-owning region, below that region's title or tab chrome and above its panes.
+
+[[crates/scribe-client/src/main.rs#TerminalView#sync_ci_run_strips]] matches stored repository roots to live workspace regions. [[crates/scribe-client/src/pane_shell.rs#PaneShell#ci_bar_rect]] and the shared content-rect rule reserve the same 40px that [[crates/scribe-client/src/ci_bar.rs#render]] paints, so a state edge republishes affected PTY sizes without shrinking neighboring regions.
+
+The band sits above a pinned Beads board when both are visible. Its bottom hairline uses the owning workspace accent, except failure and stale replace it with their semantic theme colors.
+
+### Local owner actions
+
+Only an owning client connected to its local server receives open and dismiss controls; local share joins, LAN clients, and remote clients render a read-only viewer chip.
+
+Both owner controls are stable keyboard tab stops with visible focus and Enter/Space activation. Their GPUI element identities include the full workspace UUID so separate visible bands cannot alias interaction state.
+
+Open builds `https://github.com/{repository}/actions/runs/{run_id}` from the server-trusted repository and preferred workflow run, then uses the existing host browser helper. Dismiss sends the visible repository root and head through [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#dismiss_ci_run]]; the band remains until the server synchronizes a matching clear.
+
 ## GPUI Prompt Bar
 
 The GPUI rebuild ports the winit prompt bar's display-independent logic — elapsed-timer formatting with freeze-on-AI-stop, the segmented context meter, the `#N` count, strip height, and truncation — and lowers the visuals onto a GPUI flex strip.
