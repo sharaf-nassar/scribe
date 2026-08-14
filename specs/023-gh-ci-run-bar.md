@@ -55,6 +55,10 @@ to be sequenced after research + mockup are approved.
 - Historical run browsing / a runs list UI. Only the current (most recent
   relevant) run is surfaced.
 - Hosting any Scribe-side web service or webhook receiver infrastructure.
+- Webhooks in any form — repo/org webhook creation and `gh webhook
+  forward` alike. Removed entirely at the approval gate (2026-08-14):
+  GitHub documents forwarding as dev/test-only, and webhook transports
+  need privileges and infrastructure v1 refuses.
 - Desktop OS notifications; "notified" means the bar appearing (and any
   existing in-app notification surface), not system toasts, unless research
   finds Scribe already has a fitting surface.
@@ -157,9 +161,10 @@ Acceptance criteria:
 
 - Avoid constant polling: steady-state (no active run) GitHub traffic must
   be zero; polling is bounded to push-gated active-run windows.
-- Webhook creation on the user's repo is never the default transport, but
-  is allowed as an explicit opt-in enhancement (e.g. `gh webhook forward`);
-  research evaluates it as an eligible opt-in path.
+- Transport is push-gated conditional REST polling per the approved
+  research (zero idle requests, 5 s in-window cadence, 120 s discovery
+  window, ETag caching). Webhooks are out of scope entirely — see
+  Non-Goals.
 - Research first: Stories 1–3 are the immediate deliverables; Story 4 is
   specced but sequenced behind mockup approval.
 - Local-first (constitution #6): all network access is optional and gated;
@@ -180,22 +185,22 @@ Acceptance criteria:
 
 ## Open Questions
 
-- Trigger detection: is watching `.git` ref state reliable enough as the
-  "CI probably started" signal across ref backends (loose, packed-refs,
-  reftable) and worktree layouts? (Research Story 1.)
-- Does `gh webhook forward` still exist/work as a supported gh capability,
-  and what permissions does it need? (Policy decided: opt-in only; research
-  verifies mechanics and support status.)
-- Do GitHub conditional requests (ETag → 304) still not count against the
-  REST rate limit? This materially changes the polling budget.
-- What does "top of a workspace" mean precisely in Scribe's GPUI layout —
-  a bar under the titlebar spanning the window, or per-workspace within a
-  split layout? How does it interact with the per-pane prompt bar?
-- Server-owned or client-owned? Lean is server-owned (see Spec Review
-  technical decisions); Story 1 validates against remote-attach topology
-  and hot-upgrade continuity before lock.
-- Is there an existing in-app notification surface the "run triggered"
-  moment should also use, or is the bar's appearance sufficient?
+All resolved by the completed research (`specs/023-gh-ci-run-bar/research.md`)
+and the approval gate:
+
+- Trigger detection — validated by a watcher prototype across loose refs,
+  packed-refs, worktree indirection, with a documented reftable rule
+  ("Ref-state prototype").
+- `gh webhook forward` — verified dev/test-only; webhooks removed entirely
+  at the gate (Clarifications Q4, revised).
+- ETag/304 semantics — verified: authenticated conditional 304s don't
+  count against the primary limit but remain HTTP traffic; the 720/hour
+  ceiling counts attempts ("Numeric contract").
+- Bar placement — workspace-region chrome band ("Placement rules").
+- Ownership — server-owned, validated against remote attach and hot
+  upgrade ("Ownership conclusion").
+- Notification surface — the bar's appearance is the v1 notification
+  ("Notification surface decision").
 
 ## Clarifications
 
@@ -218,6 +223,10 @@ non-goal. Reflected in Goals, Non-Goals, and Stories 2 and 4.
 A: Not by default — but allowed as an explicit opt-in enhancement. Research
 must treat webhook forwarding as an eligible opt-in transport and document
 its permissions and support status. Reflected in Constraints.
+REVISED at the approval gate (2026-08-14): after research showed
+`gh webhook forward` is a dev/test-only extension and webhook transports
+need admin privileges or hosted infrastructure, the user removed webhooks
+entirely — no opt-in path remains. Reflected in Non-Goals and Constraints.
 
 **Q5: Do shared-session viewers see the bar?**
 A: Yes, read-only. The bar renders in shared surfaces (LAN share, remote
