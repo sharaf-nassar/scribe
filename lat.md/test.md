@@ -2257,6 +2257,16 @@ Unit tests for the GPUI client's ported  scanner —  over Zed's Alacritty fork 
 
  collapses a multi-row OSC 8 run into exact per-row s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
 
+### Delimited absolute paths retain their root
+
+The path scanner keeps the leading slash when an absolute path follows a quote, backtick, parenthesis, or equals sign, without reclassifying the interior slash in a bare relative path.
+
+Single-quoted, double-quoted, backtick-quoted, parenthesized, and equals-prefixed paths produce the exact rooted path. `PATH=/usr/bin:/opt/bin` remains one span, while explicit and bare relative forms keep their prefixes.
+
+### Backticks terminate detected URLs
+
+The URL scanner excludes a closing backtick from a URL embedded in inline code so the OS handler receives the exact URL.
+
 ### A relative path resolves against the pane's CWD
 
 [[crates/scribe-client/src/url_detect.rs#resolve_path]] turns a detected path into what the OS handler is actually given, which is the half of opening a file link that can be tested without spawning anything.

@@ -173,7 +173,7 @@ const PREFIXES: &[&str] =
     &["https://", "http://", "ftp://", "file://", "mailto:", "ssh:", "telnet:"];
 
 /// Characters that terminate a URL when encountered (in addition to whitespace).
-const URL_TERMINATORS: &[char] = &['<', '>', '"', '\'', '|'];
+const URL_TERMINATORS: &[char] = &['<', '>', '"', '\'', '`', '|'];
 
 /// Punctuation that is stripped from the end of a URL when the corresponding
 /// opening bracket is absent from the URL body.
@@ -913,6 +913,10 @@ fn strip_trailing_punct(mut url: String) -> String {
 /// Maximum lookahead for bare relative path detection (e.g. `src/main.rs`).
 const BARE_PATH_LOOKAHEAD: usize = 30;
 
+fn is_path_token_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '.' | '~' | '_' | '-')
+}
+
 /// Scan a logical line for file-system paths and push found spans into `out`.
 ///
 /// `url_ranges` contains `(col_start, col_end)` pairs for URL spans already
@@ -1029,12 +1033,13 @@ fn detect_path_prefix(chars: &[char], pos: usize) -> Option<(usize, bool)> {
         return Some((2, false));
     }
 
-    // `/something` — absolute path: must be preceded by whitespace or BOL
-    // and the character after `/` must not be another `/` or whitespace.
+    // `/something` — absolute path: must not continue a path token and the
+    // character after `/` must not be another `/` or whitespace.
     if chars.get(pos) == Some(&'/') {
-        let preceded_by_ws = pos == 0 || chars.get(pos - 1).is_some_and(|c| c.is_whitespace());
+        let at_path_boundary =
+            pos == 0 || chars.get(pos - 1).is_some_and(|c| !is_path_token_char(*c));
         let followed_ok = chars.get(pos + 1).is_some_and(|c| !c.is_whitespace() && *c != '/');
-        if preceded_by_ws && followed_ok {
+        if at_path_boundary && followed_ok {
             return Some((1, false));
         }
         return None;
@@ -1045,13 +1050,13 @@ fn detect_path_prefix(chars: &[char], pos: usize) -> Option<(usize, bool)> {
     if chars.get(pos).is_some_and(char::is_ascii_alphanumeric) {
         let look_end = (pos + BARE_PATH_LOOKAHEAD).min(chars.len());
         let window = chars.get(pos..look_end).unwrap_or(&[]);
-        // Ensure there is a `/` in the window and no space before it.
+        // Ensure there is a `/` in the window and only path-token characters
+        // before it, so delimiters advance the scanner to the slash.
         let slash_pos = window.iter().position(|c| *c == '/');
         if let Some(rel_slash) = slash_pos {
-            // No whitespace before the slash.
-            let no_space =
-                window.get(..rel_slash).unwrap_or(&[]).iter().all(|c| !c.is_whitespace());
-            if no_space {
+            let path_token =
+                window.get(..rel_slash).unwrap_or(&[]).iter().all(|c| is_path_token_char(*c));
+            if path_token {
                 return Some((0, true));
             }
         }
@@ -1257,6 +1262,56 @@ mod tests {
         let mut processor: Processor = Processor::new();
         processor.advance(&mut term, output);
         term
+    }
+
+    fn detected_paths(text: &str) -> Vec<String> {
+        let term = term_with_output(text.chars().count().saturating_add(1), 1, text.as_bytes());
+        let mut cache = PaneUrlCache::new();
+        cache.refresh(&term);
+        cache
+            .visible_spans()
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Path))
+            .map(|span| span.url.clone())
+            .collect()
+    }
+
+    fn detected_urls(text: &str) -> Vec<String> {
+        let term = term_with_output(text.chars().count().saturating_add(1), 1, text.as_bytes());
+        let mut cache = PaneUrlCache::new();
+        cache.refresh(&term);
+        cache
+            .visible_spans()
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Url))
+            .map(|span| span.url.clone())
+            .collect()
+    }
+
+    // @lat: [[test#GPUI URL Detection#Delimited absolute paths retain their root]]
+    #[test]
+    fn delimited_absolute_paths_retain_their_root() {
+        for input in [
+            "'/tmp/example'",
+            "\"/tmp/example\"",
+            "`/tmp/example`",
+            "(/tmp/example)",
+            "path=/tmp/example",
+        ] {
+            assert_eq!(detected_paths(input), ["/tmp/example"], "input: {input}");
+        }
+
+        assert_eq!(detected_paths("PATH=/usr/bin:/opt/bin"), ["/usr/bin:/opt/bin"]);
+        assert_eq!(
+            detected_paths("src/main.rs ./build.sh ../parent ~/notes foo/bar"),
+            ["src/main.rs", "./build.sh", "../parent", "~/notes", "foo/bar"]
+        );
+    }
+
+    // @lat: [[test#GPUI URL Detection#Backticks terminate detected URLs]]
+    #[test]
+    fn backticks_terminate_detected_urls() {
+        assert_eq!(detected_urls("`https://example.com/path`"), ["https://example.com/path"]);
     }
 
     #[test]
