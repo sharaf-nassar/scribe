@@ -63,6 +63,10 @@ pub enum TitlebarEvent {
     ReorderTab { from: usize, to: usize },
     /// The equalize icon was clicked (equalize the active tab's panes).
     Equalize,
+    /// Pointer entered or left a detected workspace's Beads icon.
+    BeadsHover { index: usize, hovered: bool },
+    /// A detected workspace's Beads icon was clicked.
+    ToggleBeadsBoard { index: usize },
 }
 
 /// Marker value handed to GPUI's native drag system when a tab press turns
@@ -147,6 +151,7 @@ pub struct TitlebarView {
     tab_focus_handles: Vec<FocusHandle>,
     tab_close_focus_handles: Vec<FocusHandle>,
     equalize_focus_handle: FocusHandle,
+    beads_focus_handles: Vec<FocusHandle>,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -165,6 +170,7 @@ impl TitlebarView {
             tab_focus_handles: Vec::new(),
             tab_close_focus_handles: Vec::new(),
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
+            beads_focus_handles: Vec::new(),
         }
     }
 
@@ -185,9 +191,11 @@ impl TitlebarView {
         while self.tab_focus_handles.len() < self.tabs.len() {
             self.tab_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
             self.tab_close_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
+            self.beads_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
         }
         self.tab_focus_handles.truncate(self.tabs.len());
         self.tab_close_focus_handles.truncate(self.tabs.len());
+        self.beads_focus_handles.truncate(self.tabs.len());
         cx.notify();
     }
 
@@ -226,6 +234,7 @@ impl TitlebarView {
         self.tabs.remove(index);
         self.tab_focus_handles.remove(index);
         self.tab_close_focus_handles.remove(index);
+        self.beads_focus_handles.remove(index);
         if was_active && !self.tabs.is_empty() {
             let new_active = index.min(self.tabs.len() - 1);
             for (i, tab) in self.tabs.iter_mut().enumerate() {
@@ -330,6 +339,8 @@ impl TitlebarView {
         self.tab_focus_handles.insert(to, focus);
         let close_focus = self.tab_close_focus_handles.remove(from);
         self.tab_close_focus_handles.insert(to, close_focus);
+        let beads_focus = self.beads_focus_handles.remove(from);
+        self.beads_focus_handles.insert(to, beads_focus);
     }
 
     /// Left edge of the first tab: region edge plus an optional badge pill.
@@ -338,8 +349,7 @@ impl TitlebarView {
     // matters.
     fn tabs_origin_x(&self) -> f32 {
         self.tabs.first().map_or(0.0, |tab| {
-            tab.group_region_x.unwrap_or(0.0)
-                + tab.badge.as_ref().map_or(0.0, |badge| badge_width_px(&badge.label))
+            tab.group_region_x.unwrap_or(0.0) + tab.badge.as_ref().map_or(0.0, badge_width_px)
         })
     }
 
@@ -349,6 +359,7 @@ impl TitlebarView {
         self.tab_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.tab_close_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.equalize_focus_handle.is_focused(window)
+            || self.beads_focus_handles.iter().any(|handle| handle.is_focused(window))
     }
 
     fn focus_next_or_previous(
@@ -427,10 +438,24 @@ impl TitlebarView {
     }
 }
 
-/// Pixel width of the badge pill for `label` (leading + trailing pad + gap).
+/// Pixel width of the badge, including the optional Beads icon target.
 #[must_use]
-pub fn badge_width_px(label: &str) -> f32 {
-    px_units(label.chars().count() + 2) * CHAR_WIDTH + 16.0
+pub fn badge_width_px(badge: &GroupBadge) -> f32 {
+    px_units(badge.label.chars().count() + 2) * CHAR_WIDTH + if badge.beads { 42.0 } else { 16.0 }
+}
+
+fn beads_graph_icon(color: Rgba) -> AnyElement {
+    div()
+        .relative()
+        .size(px(16.0))
+        .child(div().absolute().left(px(3.0)).top(px(4.0)).w(px(9.0)).h(px(1.0)).bg(color))
+        .child(div().absolute().left(px(5.0)).top(px(8.0)).w(px(7.0)).h(px(1.0)).bg(color))
+        .child(div().absolute().left(px(3.0)).top(px(2.0)).size(px(4.0)).rounded_full().bg(color))
+        .child(div().absolute().right(px(1.0)).top(px(5.0)).size(px(4.0)).rounded_full().bg(color))
+        .child(
+            div().absolute().left(px(2.0)).bottom(px(1.0)).size(px(4.0)).rounded_full().bg(color),
+        )
+        .into_any_element()
 }
 
 /// Label columns left for a tab title once padding and the close button
@@ -799,14 +824,12 @@ impl TitlebarView {
         // darker tab-tone of the region accent — the same colour the group
         // hairline and the region border wear, so all three read as one shape.
         let tag_bg = accent_tab_tone(badge.accent, self.colors.bg);
-        div()
+        let label = div()
             .id(ElementId::from(format!("workspace-badge-{index}")))
             .flex()
-            .flex_none()
             .items_center()
             .px_2()
             .h_full()
-            .bg(tag_bg)
             .text_color(self.colors.active_text)
             .text_xs()
             .cursor_pointer()
@@ -814,7 +837,47 @@ impl TitlebarView {
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
-            .child(badge.label.clone())
+            .child(badge.label.clone());
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h_full()
+            .bg(tag_bg)
+            .child(label)
+            .when(badge.beads, |row| {
+                let focus = self
+                    .beads_focus_handles
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.focus_handle.clone());
+                row.child(
+                    div()
+                        .id(ElementId::from(format!("workspace-beads-{index}")))
+                        .role(Role::Button)
+                        .aria_label(format!("Open {} Beads board", badge.label))
+                        .track_focus(&focus)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(26.0))
+                        .h_full()
+                        .text_color(self.colors.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(self.colors.gradient_top))
+                        .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
+                            ctx.emit(TitlebarEvent::BeadsHover { index, hovered: *hovered });
+                        }))
+                        .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
+                            ctx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |_this, _, window, ctx| {
+                            window.focus(&focus, ctx);
+                            ctx.emit(TitlebarEvent::ToggleBeadsBoard { index });
+                        }))
+                        .child(beads_graph_icon(self.colors.accent)),
+                )
+            })
             .into_any_element()
     }
 
@@ -1019,9 +1082,13 @@ mod tests {
             bar.tabs[0].group_region_x = Some(24.0);
             assert!((bar.tabs_origin_x() - 24.0).abs() < f32::EPSILON);
 
-            bar.tabs[0].badge =
-                Some(GroupBadge { label: "scribe".to_owned(), accent: bar.colors.accent });
-            assert!((bar.tabs_origin_x() - 24.0 - badge_width_px("scribe")).abs() < f32::EPSILON);
+            bar.tabs[0].badge = Some(GroupBadge {
+                label: "scribe".to_owned(),
+                accent: bar.colors.accent,
+                beads: true,
+            });
+            let badge = bar.tabs[0].badge.as_ref().expect("badge");
+            assert!((bar.tabs_origin_x() - 24.0 - badge_width_px(badge)).abs() < f32::EPSILON);
         });
     }
 

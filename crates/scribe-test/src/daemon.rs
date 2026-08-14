@@ -471,6 +471,7 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageLive { .. }
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
+        | ServerMessage::BeadsBoard { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }

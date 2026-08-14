@@ -31,6 +31,9 @@ use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client::animation::AnimationSettings;
 use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
+use scribe_client::beads_board::{
+    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
+};
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client::clipboard::{
@@ -643,6 +646,8 @@ struct Shared {
     /// banner from it, suppresses input while that banner is up, and drains the
     /// automation queue on its lifecycle tick.
     remote: Arc<Mutex<RemoteChrome>>,
+    /// Server-owned Beads snapshots plus this window's hover/pin intent.
+    beads_boards: Arc<Mutex<BeadsBoards>>,
 }
 
 /// State shared across the IPC reader and GPUI view for a fresh window's first
@@ -702,6 +707,11 @@ const RESTORE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// client's throttle: the reply only feeds the status bar's remote-control
 /// summary, so it is refreshed on a human timescale rather than per frame.
 const WINDOW_LIST_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A visible pinned board's refresh cadence. Hidden boards never poll.
+const BEADS_PINNED_POLL_INTERVAL: Duration = Duration::from_mins(1);
+const BEADS_HOVER_REFRESH_AGE: Duration = Duration::from_secs(30);
+const BEADS_UNAVAILABLE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The terminal grid's window-level background, kept in sRGB `[f32; 4]` theme
 /// space until the render pass folds `appearance.opacity` into its alpha,
@@ -1407,6 +1417,9 @@ struct TerminalView {
     stats: SystemStatsCollector,
     /// Theme-derived status-bar palette, rebuilt on every theme reload.
     status_colors: StatusBarColors,
+    /// The Beads board's palette, derived from the theme like every other
+    /// per-surface palette here.
+    beads_colors: BeadsBoardColors,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
     /// Font metrics the terminal grid paints with, rebuilt on a font reload
@@ -1535,6 +1548,8 @@ struct TerminalView {
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
+    /// Workspace board painted this frame and whether it is pinned.
+    visible_beads_boards: Vec<(WorkspaceId, bool)>,
     /// X11 active-window guard, present only when this window has an Xcb/Xlib
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
@@ -1553,6 +1568,8 @@ struct TerminalView {
     /// When the window list was last polled, throttling the `ListWindows` send
     /// to [`WINDOW_LIST_POLL_INTERVAL`].
     last_window_list_poll: Instant,
+    /// Last request sent while a pinned Beads board was visible and focused.
+    last_beads_poll: Instant,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
     /// Held to keep the config-reload poll alive; dropping the view cancels it.
@@ -1920,7 +1937,11 @@ impl TerminalView {
         // step itself: this runs on every frame, so a step's `cx.notify()`
         // brings the new level through the same equality check that arms the
         // debounce for a move or a resize, and there is no second write path.
-        .at_zoom(self.zoom.level());
+        .at_zoom(self.zoom.level())
+        // Pinned boards ride the same capture as the zoom level: a pin is
+        // per-window state the user chose, and the record is the only place it
+        // survives a quit.
+        .with_pinned_boards(self.pinned_board_ids());
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -1936,6 +1957,11 @@ impl TerminalView {
         if self.restore.geometry_dirty_since.is_none() {
             self.restore.geometry_dirty_since = Some(Instant::now());
         }
+    }
+
+    /// Workspaces whose boards are pinned open, in the order the record keeps.
+    fn pinned_board_ids(&self) -> Vec<WorkspaceId> {
+        self.shared.beads_boards.lock().map(|boards| boards.pinned()).unwrap_or_default()
     }
 
     /// The zoom level a window opens at, and the grid font that level yields.
@@ -1967,6 +1993,7 @@ impl TerminalView {
         )
     }
 
+    #[allow(clippy::too_many_lines, reason = "view construction lists its owned surfaces once")]
     fn new(
         shared: Shared,
         sink: IpcSink,
@@ -1987,6 +2014,11 @@ impl TerminalView {
         let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
         let (chrome, opacity) = (config.config().chrome, clamp_opacity(config.opacity()));
+        let beads_colors = BeadsBoardColors::from_theme(
+            &config.config().theme.chrome,
+            &config.config().theme.ansi_colors,
+            opacity,
+        );
         let (zoom, font) = Self::opening_font(&config, &seed);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
@@ -2002,6 +2034,7 @@ impl TerminalView {
             config,
             stats: SystemStatsCollector::new(),
             status_colors,
+            beads_colors,
             stats_config,
             font,
             zoom,
@@ -2043,11 +2076,13 @@ impl TerminalView {
             clipboard: ClipboardSurfaces::new(gate),
             pointer: PointerState::default(),
             tooltip_demo: false,
+            visible_beads_boards: Vec::new(),
             x11_focus,
             ime: Self::start_ime(cx),
             bell,
             notifications,
             last_window_list_poll: Instant::now(),
+            last_beads_poll: Instant::now(),
             _refresh_task: drivers.1,
             _config_task: drivers.2,
             _x11_focus_task: x11_focus_task,
@@ -2293,6 +2328,34 @@ impl TerminalView {
                 }
             }
             TitlebarEvent::Equalize => this.equalize_layout(ctx),
+            TitlebarEvent::BeadsHover { index, hovered } => {
+                let Some(workspace_id) = this.titlebar_slot(*index).map(|slot| slot.workspace_id)
+                else {
+                    return;
+                };
+                let refresh = this.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                    boards.hover(workspace_id, HoverSource::Bead, *hovered);
+                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                });
+                if *hovered && refresh {
+                    request_beads_board_or_log(&this.sink, workspace_id, "hover refresh");
+                }
+                ctx.notify();
+            }
+            TitlebarEvent::ToggleBeadsBoard { index } => {
+                let Some(workspace_id) = this.titlebar_slot(*index).map(|slot| slot.workspace_id)
+                else {
+                    return;
+                };
+                let refresh = this.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                    boards.toggle_pin(workspace_id);
+                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                });
+                if refresh {
+                    request_beads_board_or_log(&this.sink, workspace_id, "pin refresh");
+                }
+                ctx.notify();
+            }
         })
         .detach();
         bar
@@ -2334,6 +2397,7 @@ impl TerminalView {
             self.chrome = theme.chrome;
             self.prompt_colors = PromptBarColors::from(&self.chrome);
             self.highlight_colors = MatchHighlightColors::from_chrome(&self.chrome);
+            self.rebuild_beads_colors();
             self.push_tab_bar_colors(cx);
             // Open overlays captured the old palette when they were built; drop
             // them so a live theme edit never leaves stale colours on screen.
@@ -2421,7 +2485,21 @@ impl TerminalView {
     fn apply_opacity_change(&mut self, cx: &mut Context<Self>) {
         self.opacity = clamp_opacity(self.config.opacity());
         self.push_tab_bar_colors(cx);
+        self.rebuild_beads_colors();
         tracing::info!(opacity = self.opacity, "config reload: opacity applied");
+    }
+
+    /// Rebuild the board's palette from the live theme and opacity.
+    ///
+    /// Both inputs move on their own — a theme edit and an opacity edit are
+    /// separate reload plans — so this runs from each rather than from one.
+    fn rebuild_beads_colors(&mut self) {
+        let config = self.config.config();
+        self.beads_colors = BeadsBoardColors::from_theme(
+            &config.theme.chrome,
+            &config.theme.ansi_colors,
+            self.opacity,
+        );
     }
 
     /// Rebuild the titlebar's cached palette from the live chrome and opacity.
@@ -2454,10 +2532,11 @@ impl TerminalView {
         workspace_name: Option<&str>,
         palette: &[String],
         fallback: [f32; 4],
+        beads: bool,
     ) -> Option<GroupBadge> {
         let label = badge_label(workspace_name, true)?;
         let accent = Self::workspace_badge_accent(label, palette, fallback);
-        Some(GroupBadge { label: label.to_owned(), accent })
+        Some(GroupBadge { label: label.to_owned(), accent, beads })
     }
 
     fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String> {
@@ -2476,21 +2555,24 @@ impl TerminalView {
     /// by construction, so the aligned layout always engages in a multi-region
     /// window.
     fn apply_group_badges(&self, data: &mut [TabData], slots: &[TabAddress], cx: &App) {
-        if self.shell.region_count(cx) <= 1 {
-            return;
-        }
+        let single_region = self.shell.region_count(cx) <= 1;
         let region_x = self.shell.region_left_edges(self.pane_viewport(), cx);
         let mut previous = None;
         for (tab, slot) in data.iter_mut().zip(slots) {
             let accent = self.shell.workspace_accent(slot.workspace_id, cx);
             tab.group_accent = Some(opaque_slot(accent));
             if previous != Some(slot.workspace_id) {
-                tab.group_region_x = Some(region_x.get(&slot.workspace_id).copied().unwrap_or(0.0));
+                tab.group_region_x = (!single_region)
+                    .then(|| region_x.get(&slot.workspace_id).copied().unwrap_or(0.0));
                 let workspace_name = self.workspace_name(slot.workspace_id);
                 tab.badge = Self::workspace_group_badge(
                     workspace_name.as_deref(),
                     &self.config.config().config.workspaces.badge_colors,
                     accent,
+                    self.shared
+                        .beads_boards
+                        .lock()
+                        .is_ok_and(|boards| boards.detected(slot.workspace_id)),
                 );
             }
             previous = Some(slot.workspace_id);
@@ -2528,6 +2610,10 @@ impl TerminalView {
                         self.workspace_name(workspace_id).as_deref(),
                         badge_palette,
                         accent,
+                        self.shared
+                            .beads_boards
+                            .lock()
+                            .is_ok_and(|boards| boards.detected(workspace_id)),
                     ),
                     tabs: Vec::new(),
                 }
@@ -4257,6 +4343,9 @@ impl TerminalView {
         {
             cx.notify();
         }
+        if self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.expire_hover()) {
+            cx.notify();
+        }
         self.poll_bells(cx);
         self.poll_notifications(cx);
         self.poll_notification_clicks(cx);
@@ -4275,6 +4364,7 @@ impl TerminalView {
         self.report_focus();
         self.poll_sibling_windows(cx);
         self.poll_window_list();
+        self.poll_beads_board(window);
         self.poll_lan_approval(cx);
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
@@ -4418,6 +4508,9 @@ impl TerminalView {
         let Some(geometry) = saved_geometry_for(window_id) else { return };
         tracing::info!(%window_id, "adopting the assigned window's saved geometry");
         let level = geometry.zoom;
+        if let Ok(mut boards) = self.shared.beads_boards.lock() {
+            boards.restore_pins(geometry.beads_pinned.iter().copied());
+        }
         self.restore.adopt_geometry_record(geometry);
         // This process built its font before it knew which window it was
         // holding, so the record's zoom level is applied here rather than at
@@ -4821,6 +4914,34 @@ impl TerminalView {
         self.last_window_list_poll = Instant::now();
         if let Err(error) = self.sink.list_windows() {
             tracing::warn!(%error, "window list poll dropped: IPC writer closed");
+        }
+    }
+
+    fn poll_beads_board(&mut self, window: &Window) {
+        if let Some(workspace_id) = self
+            .shared
+            .beads_boards
+            .lock()
+            .ok()
+            .and_then(|mut boards| boards.due_retry(BEADS_UNAVAILABLE_RETRY_INTERVAL))
+        {
+            request_beads_board_or_log(&self.sink, workspace_id, "unavailable retry");
+        }
+        if !window.is_window_active() || self.last_beads_poll.elapsed() < BEADS_PINNED_POLL_INTERVAL
+        {
+            return;
+        }
+        // Every pinned board is open on screen, so every one of them polls.
+        let pinned =
+            self.shared.beads_boards.lock().map(|boards| boards.pinned()).unwrap_or_default();
+        if pinned.is_empty() {
+            return;
+        }
+        self.last_beads_poll = Instant::now();
+        for workspace_id in pinned {
+            if let Err(error) = self.sink.request_beads_board(workspace_id) {
+                tracing::warn!(%error, "pinned Beads board poll dropped: IPC writer closed");
+            }
         }
     }
 
@@ -6295,6 +6416,11 @@ impl TerminalView {
         self.region_chrome.drag = None;
     }
 
+    #[allow(clippy::too_many_lines, reason = "one region bar owns its complete interaction tree")]
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "GPUI declarative element listeners nest by design"
+    )]
     fn render_region_bar(
         &self,
         workspace_id: WorkspaceId,
@@ -6346,14 +6472,12 @@ impl TerminalView {
         // nothing to select, so it waits for the seed session.
         let first_session = bar.tabs.first().map(|(session_id, _)| *session_id);
         if let Some((badge, first)) = bar.badge.as_ref().zip(first_session) {
-            let pill = div()
+            let label = div()
                 .id(ElementId::from(format!("region-badge-{workspace_id}")))
                 .flex()
-                .flex_none()
                 .items_center()
                 .px_2()
                 .h_full()
-                .bg(tone)
                 .text_color(colors.active_text)
                 .text_xs()
                 .cursor_pointer()
@@ -6362,6 +6486,59 @@ impl TerminalView {
                     view.select_session_tab(first, ctx);
                 }))
                 .child(badge.label.clone());
+            let pill = div().flex().flex_none().items_center().h_full().bg(tone).child(label).when(
+                badge.beads,
+                |pill| {
+                    pill.child(
+                        div()
+                            .id(ElementId::from(format!("region-beads-{workspace_id}")))
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("Open {} Beads board", badge.label))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(26.0))
+                            .h_full()
+                            .text_color(colors.accent)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.gradient_top))
+                            .on_hover(cx.listener(move |view, hovered: &bool, _window, ctx| {
+                                let refresh =
+                                    view.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                                        boards.hover(workspace_id, HoverSource::Bead, *hovered);
+                                        boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                                    });
+                                if *hovered && refresh {
+                                    request_beads_board_or_log(
+                                        &view.sink,
+                                        workspace_id,
+                                        "region hover refresh",
+                                    );
+                                }
+                                ctx.notify();
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
+                                ctx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |view, _, _window, ctx| {
+                                let refresh =
+                                    view.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                                        boards.toggle_pin(workspace_id);
+                                        boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                                    });
+                                if refresh {
+                                    request_beads_board_or_log(
+                                        &view.sink,
+                                        workspace_id,
+                                        "region pin refresh",
+                                    );
+                                }
+                                ctx.notify();
+                            }))
+                            .child("⌘"),
+                    )
+                },
+            );
             row = row.child(pill);
         }
         row = row.children(bar.tabs.iter().enumerate().map(|(index, (session_id, tab))| {
@@ -6532,6 +6709,57 @@ impl TerminalView {
         ))
     }
 
+    /// Start a resize when the pointer lands on an open board's bottom bar.
+    ///
+    /// Resolved here rather than by a listener inside the board so the press is
+    /// consumed the way a divider's is: the pane under an unpinned board never
+    /// sees it, and a mouse-reporting application below is not handed the press
+    /// that started a chrome gesture.
+    fn press_board_edge(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if self.visible_beads_boards.is_empty() {
+            return false;
+        }
+        let Some((x, y)) = self.grid_local_position(position) else { return false };
+        let viewport = self.pane_viewport();
+        let Ok(mut boards) = self.shared.beads_boards.lock() else { return false };
+        let grabbed = self.visible_beads_boards.iter().find(|(workspace_id, _)| {
+            self.shell
+                .board_rect(*workspace_id, boards.height(*workspace_id), viewport, cx)
+                .is_some_and(|rect| {
+                    x >= rect.x
+                        && x < rect.x + rect.width
+                        && (y - (rect.y + rect.height)).abs() <= BEADS_BOARD_GRIP
+                })
+        });
+        let Some((workspace_id, _)) = grabbed else { return false };
+        boards.start_resize(*workspace_id, y);
+        true
+    }
+
+    /// Apply an in-flight board resize.
+    ///
+    /// The new height is published by the ordinary paint that follows: the
+    /// strip a pinned board reserves is re-read from this state every frame,
+    /// and the pane sizes are republished from the rects that leaves.
+    fn drag_board(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Ok(mut boards) = self.shared.beads_boards.lock() else { return false };
+        let Some(workspace_id) = boards.resizing() else { return false };
+        let Some((_, y)) = self.grid_local_position(position) else { return true };
+        // A board may take its region up to the last few lines of terminal.
+        // Growing past that is what the user asked for right up until the
+        // terminal disappears, and there is no gesture to get it back.
+        let viewport = self.pane_viewport();
+        let max = self
+            .shell
+            .board_rect(workspace_id, f32::MAX, viewport, cx)
+            .map_or(0.0, |content| content.height - self.font.line_height * 3.0);
+        if boards.resize_to(y, max) {
+            drop(boards);
+            cx.notify();
+        }
+        true
+    }
+
     /// Start a drag when the pointer lands in a divider's hit band.
     fn press_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         let Some((x, y)) = self.grid_local_position(position) else { return false };
@@ -6594,7 +6822,8 @@ impl TerminalView {
     /// application; only when all of them decline does the press mean
     /// selection.
     fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if self.press_divider(event.position, cx)
+        if self.press_board_edge(event.position, cx)
+            || self.press_divider(event.position, cx)
             || self.press_scrollbar(event.position, cx)
             || self.press_focuses_pane(event.position, cx)
             || self.press_opens_link(event, cx)
@@ -6648,7 +6877,10 @@ impl TerminalView {
     /// claimed by the scrollbar anyway — before the motion falls through to
     /// mouse reporting and then to extending a selection.
     fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.drag_divider(event.position, cx) || self.drag_scrollbar(event.position, cx) {
+        if self.drag_board(event.position, cx)
+            || self.drag_divider(event.position, cx)
+            || self.drag_scrollbar(event.position, cx)
+        {
             return;
         }
         self.update_scrollbar_hover(event.position, cx);
@@ -6675,7 +6907,8 @@ impl TerminalView {
             self.pointer.drag = GridDrag::Idle;
             return;
         }
-        if self.pointer.workspace_divider_drag.take().is_some()
+        if self.release_board(cx)
+            || self.pointer.workspace_divider_drag.take().is_some()
             || self.pointer.divider_drag.take().is_some()
             || self.release_scrollbar(cx)
             || self.forward_mouse_release(event)
@@ -6683,6 +6916,18 @@ impl TerminalView {
             return;
         }
         self.finish_selection(cx);
+    }
+
+    /// Let go of a board's bottom bar, reporting whether one was held.
+    ///
+    /// The board is left at whatever height the drag reached; a hovered one
+    /// then closes on the grace period the drag was holding open.
+    fn release_board(&mut self, cx: &mut Context<Self>) -> bool {
+        let released = self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.end_resize());
+        if released {
+            cx.notify();
+        }
+        released
     }
 
     /// Collect everything `session_id`'s overlay scrollbar needs for one frame.
@@ -8524,6 +8769,10 @@ impl TerminalView {
         let panes = self.render_panes(FocusedPanePaint { content, ime, cursor, link }, cx);
         let dividers = self.render_dividers(cx);
         let region_bars = self.render_region_tab_bars(cx);
+        // The board is placed against the same region rects the panes are, so
+        // it belongs in the grid band with them rather than in a window-wide
+        // band that would span every region.
+        let beads_boards = self.render_beads_boards(cx);
         div()
             .flex_1()
             .relative()
@@ -8531,6 +8780,10 @@ impl TerminalView {
             .child(self.grid_area_probe(cx))
             .children(panes)
             .children(region_bars)
+            .children(beads_boards)
+            // Dividers paint last, over panes, region bars, and boards alike:
+            // a region divider runs the full height of the split, so two
+            // regions with boards open must still read as two regions.
             .children(dividers)
             // Every button gesture below asks the mouse reporter first: an
             // application that enabled tracking owns the pointer, and only when
@@ -8589,6 +8842,83 @@ impl TerminalView {
                 }),
             )
             .into_any_element()
+    }
+
+    /// Publish the strip each pinned board takes out of its own region, before
+    /// the geometry passes that turn region rects into published PTY sizes.
+    fn sync_beads_board_strips(&mut self, cx: &App) {
+        let live = self.shell.region_workspaces(cx);
+        let mut copied = None;
+        let mut strips = HashMap::new();
+        self.visible_beads_boards = self
+            .shared
+            .beads_boards
+            .lock()
+            .map(|mut boards| {
+                boards.retain_regions(&live);
+                copied = boards.take_copy();
+                let visible = boards.visible();
+                strips = visible
+                    .iter()
+                    .filter(|(_, pinned)| *pinned)
+                    .map(|(workspace_id, _)| (*workspace_id, boards.height(*workspace_id)))
+                    .collect();
+                visible
+            })
+            .unwrap_or_default();
+        // A card asked for an id or an epic name; the board itself cannot
+        // reach the window's clipboard handle, so the copy lands here.
+        if let Some(text) = copied {
+            self.write_clipboard(text);
+        }
+        self.shell.set_pinned_boards(strips);
+    }
+
+    // @lat: [[client#Client#Beads Board CLI Data Source]]
+    fn render_beads_boards(&mut self, cx: &App) -> Vec<gpui::AnyElement> {
+        let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
+        let scale = boards.text_scale();
+        let colors = self.beads_colors;
+        let viewport = self.pane_viewport();
+        self.visible_beads_boards
+            .iter()
+            .filter_map(|(workspace_id, pinned)| {
+                let rect = self.shell.board_rect(
+                    *workspace_id,
+                    boards.height(*workspace_id),
+                    viewport,
+                    cx,
+                )?;
+                let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
+                Some((
+                    scribe_client::beads_board::render(
+                        &name,
+                        boards.state(*workspace_id),
+                        BeadsBoardRender {
+                            rect,
+                            overlay: !pinned,
+                            hover_state: Arc::clone(&self.shared.beads_boards),
+                            workspace_id: *workspace_id,
+                            scale,
+                            colors,
+                        },
+                    ),
+                    // The bar's grab band, carrying nothing but the pointer a
+                    // divider's does — the press itself is resolved against the
+                    // same rect over in `press_board_edge`, so the two cannot
+                    // disagree about where the bar is.
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y + rect.height - BEADS_BOARD_GRIP))
+                        .w(px(rect.width))
+                        .h(px(BEADS_BOARD_GRIP * 2.0))
+                        .cursor(gpui::CursorStyle::ResizeUpDown)
+                        .into_any_element(),
+                ))
+            })
+            .flat_map(|(board, grip)| [board, grip])
+            .collect()
     }
 
     /// Lower the live share state onto the overlay layer: the presence roster,
@@ -8703,6 +9033,7 @@ impl Render for TerminalView {
         self.sync_remote_connect();
         self.reconcile_panes(cx);
         self.sync_equalize_visibility(cx);
+        self.sync_beads_board_strips(cx);
         self.sync_grid_geometry(cx);
         // A prompt arriving or clearing changes one pane's strip height without
         // moving the grid band, so the band probe never notices; republishing
@@ -9094,6 +9425,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         server_topology: Arc::new(Mutex::new(None)),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
+        beads_boards: Arc::new(Mutex::new(BeadsBoards::default())),
     };
     let (out_tx, out_rx) = outbound_channel();
     let (in_tx, in_rx) = inbound_channel();
@@ -9394,6 +9726,14 @@ fn open_window(
     cold_start: ColdStart,
 ) -> Option<WindowHandle<TerminalView>> {
     let bounds = Bounds::centered(None, startup_window_size(cx), cx);
+    // A cold-restart window knows its record before it opens, so its pinned
+    // boards are seeded here; a window the server assigns an id to instead
+    // picks them up in `adopt_assigned_geometry`.
+    if let Some(geometry) = cold_start.geometry.as_ref()
+        && let Ok(mut boards) = shared.beads_boards.lock()
+    {
+        boards.restore_pins(geometry.beads_pinned.iter().copied());
+    }
     // Restored geometry wins over the grid-derived startup size. Non-X11
     // platforms receive its bounds and state in GPUI's creation options; X11
     // keeps the saved restore rect but strips GPUI's state toggle below, then
@@ -10018,6 +10358,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         server_topology: Arc::clone(&ctx.shared.server_topology),
         clipboard: Arc::clone(&ctx.shared.clipboard),
         remote: Arc::clone(&ctx.shared.remote),
+        beads_boards: Arc::clone(&ctx.shared.beads_boards),
         out_tx: ctx.out_tx.clone(),
         in_tx: ctx.in_tx.clone(),
         sink: ctx.sink.clone(),
@@ -10528,6 +10869,8 @@ struct ReaderCtx {
     /// Feature-013 tailnet state the reader folds every remote answer onto and
     /// queues inbound automation actions in.
     remote: Arc<Mutex<RemoteChrome>>,
+    /// Beads-board states written by the reader and painted by the window.
+    beads_boards: Arc<Mutex<BeadsBoards>>,
     out_tx: OutboundSender,
     in_tx: InboundSender,
     sink: IpcSink,
@@ -10876,6 +11219,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::GitBranch { .. } => "GitBranch",
         ServerMessage::SessionList { .. } => "SessionList",
         ServerMessage::WorkspaceInfo { .. } => "WorkspaceInfo",
+        ServerMessage::BeadsBoard { .. } => "BeadsBoard",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::TerminalImageLive { .. } => "TerminalImageLive",
@@ -10915,6 +11259,12 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::ControlRequested { .. } => "ControlRequested",
         ServerMessage::ControlDenied { .. } => "ControlDenied",
         ServerMessage::ShareEnded { .. } => "ShareEnded",
+    }
+}
+
+fn request_beads_board_or_log(sink: &IpcSink, workspace_id: WorkspaceId, reason: &'static str) {
+    if let Err(error) = sink.request_beads_board(workspace_id) {
+        tracing::debug!(%error, reason, "Beads board request dropped");
     }
 }
 
@@ -11070,6 +11420,10 @@ where
 /// for a background pane stays a deliberate no-op instead of being reported as
 /// an unhandled message. The terminal-chrome family is named here but handled
 /// in [`on_chrome_message`], so this stays a table of routing decisions.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive protocol routing stays auditable in one table"
+)]
 async fn dispatch_server_message(
     message: ServerMessage,
     ctx: &ReaderCtx,
@@ -11127,6 +11481,20 @@ async fn dispatch_server_message(
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
         info @ ServerMessage::WorkspaceInfo { .. } => on_workspace_info(ctx, info),
+        ServerMessage::BeadsBoard { workspace_id, state, .. } => {
+            let loading = matches!(state, scribe_common::protocol::BeadsBoardState::Loading { .. });
+            if let Ok(mut boards) = ctx.beads_boards.lock() {
+                boards.update(workspace_id, state);
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+            if loading {
+                let sink = ctx.sink.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    request_beads_board_or_log(&sink, workspace_id, "loading retry");
+                });
+            }
+        }
         // The four provider task-label notices all land in the tab strip's
         // label column, so they are named here and routed as one to
         // [`on_task_label_message`]. Naming them is what keeps an AI tab's
@@ -11254,8 +11622,9 @@ fn on_session_list(
     // client restores project roots instead of waiting for a later CWD change.
     // Message dispatch is ordered, so a following live `WorkspaceNamed` update
     // is appended after this snapshot and wins when the foreground drains it.
-    if let Ok(mut parked) = ctx.workspaces.lock() {
-        parked.extend(workspaces.iter().map(|workspace| {
+    park_workspace_info(
+        ctx,
+        workspaces.iter().map(|workspace| {
             let accent = scribe_common::theme::hex_to_rgba(&workspace.accent_color).ok();
             if accent.is_none() {
                 tracing::warn!(
@@ -11270,10 +11639,8 @@ fn on_session_list(
                 accent,
                 project_root: workspace.project_root.clone(),
             }
-        }));
-    } else {
-        tracing::warn!("workspace info mutex poisoned; dropping SessionList metadata");
-    }
+        }),
+    );
     update_chrome_metadata(ctx, |metadata| {
         metadata.seed_from_session_list(sessions, workspaces);
     });
@@ -11536,14 +11903,38 @@ fn on_workspace_info(ctx: &ReaderCtx, message: ServerMessage) {
     update_chrome_metadata(ctx, |store| {
         store.name_workspace(workspace_id, name.clone().unwrap_or_default());
     });
+    tracing::info!(%workspace_id, ?name, accent_color, "workspace info received");
+    park_workspace_info(ctx, [WorkspaceInfo { workspace_id, name, accent, project_root }]);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Park server-owned workspace metadata for the GPUI thread, asking for the
+/// Beads board of every entry that arrives carrying a project root.
+///
+/// Parking and asking are one step on purpose. A rooted workspace parked
+/// without a request paints no board until something unrelated asks, and the
+/// three channels that carry a root — the session list, `WorkspaceInfo`, and
+/// the `WorkspaceNamed` a CWD change produces — each looked like the whole
+/// story on their own. Routing them through here is what keeps a fourth from
+/// silently reintroducing that gap.
+fn park_workspace_info(ctx: &ReaderCtx, infos: impl IntoIterator<Item = WorkspaceInfo>) {
     let Ok(mut parked) = ctx.workspaces.lock() else {
-        tracing::warn!("workspace info mutex poisoned; dropping WorkspaceInfo");
+        tracing::warn!("workspace info mutex poisoned; dropping workspace metadata");
         return;
     };
-    tracing::info!(%workspace_id, ?name, accent_color, "workspace info received");
-    parked.push(WorkspaceInfo { workspace_id, name, accent, project_root });
+    let first_new = parked.len();
+    parked.extend(infos);
+    let rooted: Vec<WorkspaceId> = parked
+        .get(first_new..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|info| info.project_root.is_some())
+        .map(|info| info.workspace_id)
+        .collect();
     drop(parked);
-    ctx.generation.fetch_add(1, Ordering::Release);
+    for workspace_id in rooted {
+        request_beads_board_or_log(&ctx.sink, workspace_id, "rooted workspace parked");
+    }
 }
 
 /// Fold one terminal-chrome message onto the state the status bar and the tab
@@ -11586,20 +11977,18 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
             // Auto-naming is also the live project-root update. Park it for
             // the GPUI thread before bumping the redraw generation so the
             // focused workspace slot and status-bar metadata advance together.
-            let Ok(mut parked) = ctx.workspaces.lock() else {
-                tracing::warn!(
-                    "workspace info mutex poisoned; dropping WorkspaceNamed project root"
-                );
-                update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
-                return;
-            };
-            parked.push(WorkspaceInfo {
-                workspace_id,
-                name: (!name.is_empty()).then(|| name.clone()),
-                accent: None,
-                project_root,
-            });
-            drop(parked);
+            // Auto-naming is where most workspaces first gain a root: a fresh
+            // server cannot name one until a shell reports a CWD, which is
+            // after the session list that seeds the eager requests.
+            park_workspace_info(
+                ctx,
+                [WorkspaceInfo {
+                    workspace_id,
+                    name: (!name.is_empty()).then(|| name.clone()),
+                    accent: None,
+                    project_root,
+                }],
+            );
             update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
         }
         // Unreachable: the caller only routes the chrome family here.
@@ -12927,12 +13316,12 @@ mod tests {
     #[test]
     fn workspace_group_badge_requires_a_real_name() {
         let fallback = [0.25, 0.5, 0.75, 1.0];
-        let badge = TerminalView::workspace_group_badge(Some(" scribe "), &[], fallback)
+        let badge = TerminalView::workspace_group_badge(Some(" scribe "), &[], fallback, false)
             .expect("named workspace has a badge");
 
         assert_eq!(badge.label, "scribe");
-        assert!(TerminalView::workspace_group_badge(None, &[], fallback).is_none());
-        assert!(TerminalView::workspace_group_badge(Some("  "), &[], fallback).is_none());
+        assert!(TerminalView::workspace_group_badge(None, &[], fallback, false).is_none());
+        assert!(TerminalView::workspace_group_badge(Some("  "), &[], fallback, false).is_none());
     }
 
     /// Build a plain key-down event for `key` with `modifiers` held.

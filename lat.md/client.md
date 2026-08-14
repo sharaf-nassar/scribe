@@ -905,17 +905,317 @@ The whole surface is verified against the running app, not headlessly: see .
 
 Workspace Beads boards use installed `bd` JSON commands behind a server-owned stale-while-revalidate cache; Scribe does not bundle a reader or access Dolt directly.
 
-Workspace detection eagerly refreshes a memory and disk cache through
-`bd --readonly --json`. A refresh composes `list`, `ready`, and `blocked` into
-exact Backlog, Ready, In Progress, Blocked, and Done queues. Classification
-precedence is Done, Blocked, In Progress, Ready, then Backlog, so an issue
-appears in only one queue.
+Three channels carry a project root to the client — the session list,
+`WorkspaceInfo`, and the `WorkspaceNamed` a CWD change produces — and each one
+looked like the whole story on its own. They all park through
+[[crates/scribe-client/src/main.rs#park_workspace_info]], which asks for the
+board of every rooted entry it parks, so the request cannot be forgotten by a
+fourth channel. Naming matters most: a fresh server cannot name a workspace
+until one of its shells reports a CWD, which is after the session list. The
+server first runs store-free `bd context`, then composes bounded `list`,
+`ready`, and `blocked` JSON into exact Backlog, Ready, In Progress, Blocked,
+and Done queues. Classification precedence is Done, Blocked, In Progress,
+Ready, then Backlog, so an issue appears in only one queue. Priorities stay as
+Beads P0-P4 values; blocker IDs and parent-epic names travel with each item.
 
-Hover paints cached state immediately and refreshes off-thread when it is over
-30 seconds old. A pinned board in a focused workspace refreshes every 60
-seconds. Only one refresh may run per Beads identity; failures preserve the
-last good snapshot. Future Scribe-issued writes invalidate the cache and start
-an immediate refresh.
+One in-memory snapshot is cached per canonical project root for 30 seconds.
+The first request returns Loading immediately and refreshes off-thread; later
+requests paint last-good state immediately. Only one refresh may run per root,
+and failures preserve last-good state. Commands use direct argv, read-only
+mode, bounded output, a five-second deadline, and process-group cleanup.
+
+Every command also runs *in* the project root, not only with `-C` pointing at
+it: `bd context` resolves the repository through git in its own working
+directory, and a packaged server's is `/`, so `-C` alone makes the first call
+of each refresh fail. A failing `--json` command reports its reason as
+`{"error": …}` on stdout and leaves stderr empty, so the reason — including the
+`no beads project found` sentinel that hides the board — is read from whichever
+stream carried it.
+
+Each refresh resolves `bd` through [[crates/scribe-server/src/beads_board.rs#resolve_bd_executable]] to an absolute executable path instead of relying on
+the packaged service's minimal PATH. It checks inherited absolute PATH entries,
+then common user installs (`~/.local/bin`, mise, Go, and Cargo), Linuxbrew, both
+macOS Homebrew prefixes, and system binary directories. A candidate qualifies
+only when it is a regular file this user may execute, tested with `access`
+rather than the exec bits, so a `bd` owned by someone else cannot shadow a
+usable one later in the list. The winning entry is spawned exactly as it was
+found and never resolved through its symlinks, because a mise shim is a link to
+the mise binary that dispatches on `argv[0]`; canonicalizing it would run mise
+with bd's arguments. That same search list, minus the relative PATH entries,
+becomes the child's own PATH, so anything `bd` shells out to is looked up the
+way `bd` itself was. Resolution is not
+cached, and unavailable workspaces retry every 30 seconds, so installing or
+upgrading Beads after Scribe takes effect without a Scribe reinstall or restart.
+Debian package configuration reports a missing CLI as an advisory because
+Beads remains optional; its root-run `-x` test is deliberately looser than the
+server's, which re-checks executability for the real user at every refresh.
+macOS drag-install has no postinstall hook, so runtime resolution is the
+authoritative check there.
+
+Detected workspaces add a separate connected-bead target without changing the
+workspace label's existing click behavior. Hover opens the board over the
+terminal; clicking pins the same fixed-height board above the terminal across
+that workspace's tabs. A focused pinned board refreshes every 60 seconds;
+hidden boards do not poll.
+
+The board takes its structure, sizes, and weights from
+`.impeccable/mocks/beads-compact-live-overview.html` while
+[[crates/scribe-client/src/beads_board.rs#BeadsBoardColors#from_theme]] reads
+its colours off the live theme, so a board wears whatever palette the terminal
+is wearing. Text and hairlines come from the chrome slots the tab bar already
+uses, and the queue states take the ANSI colours their meaning implies — ready
+cyan, in progress blue, blocked red, done green — which every theme defines.
+The palette is rebuilt from both a theme edit and an opacity edit, since those
+arrive as separate reload plans.
+
+Where the mock lays its issues on the bare strip, an issue here is a **raised
+card**: a gradient fill lit from the top under a hairline border, rounded at
+4px. The pointer brightens the fill and the border and lifts the card on a
+small shadow. Elevation is light in every theme — the card is the ground
+carried toward white, which on a pale theme lands on the white a paper card
+would be and leaves the border and the shadow to carry the lift. Each queue's
+total is written in its own colour with nothing behind it — lifted again for
+the floor a word has to clear, since the same colour is only a mark on the rail
+— and a wash of the queue's own colour zones each column.
+
+An issue's **priority is a filled badge** at the head of its title, and
+nothing else on the card carries it. Earlier passes spread the colour along the
+line — a tinted chip, a wash bled down it, a rule under the title, a bar across
+the card's head — and each either competed with the title for the line a reader
+actually scans or coloured more of the card than one field is worth. A badge is
+the one shape that stays where its own field is.
+
+A badge is read the other way round from everything else on the card: the
+colour is the ground rather than the ink, so the digits take whichever end of
+the range that ground is not, then clear the floor against it like every other
+word. The fill is the wash's own solved tint tripled, which lands the hottest
+rank on the colour itself and leaves the coolest a fill its digits can still be
+read on.
+
+The mock's tint on the top edge of the blocked lane's first row is gone with
+the accents. Priority is the badge's alone now, and a red edge anywhere else on
+a card would be a second thing saying it.
+
+Priorities run a **heat scale**: red at P0, amber at P1, yellow at P2, then two
+neutral steps for the ranks that carry no heat. Every step is a different hue
+rather than one red at three strengths, because a badge this small is not much
+to tell apart and near-neighbours in the same family read as the same mark. No
+terminal palette carries an amber, so P1 is mixed from the theme's own red and
+yellow. Each of the three takes the more saturated of the two slots its hue
+gets — a washed-out pink says less than a deep red however light it is, and the
+ranking cannot be left to which slot a theme happened to fill.
+
+The rank a badge carries is then a solved tint, not a fixed one. What a reader
+sees is how much colour it lays over the card, which is the tint times the
+distance between that colour and the card: at one fixed tint a hue that sits
+far from the card carries more than a nearer one a rank above it, and the ramp
+says the opposite of what it means. So each rank names the amount of colour it
+is allowed and the tint is divided out of it, which ranks P0 through P4 in any
+theme's hues. The wash is one band per
+queue, running the full depth of the strip — past the padding the lanes hold at
+the bottom, so it stops on the board's own bottom bar — and running edge to
+edge so the five meet with no ground between them: the board reads as five
+columns of colour rather than as five headings over one shared ground. Each
+band is flat across its middle third and travels to meet its neighbours over
+the outer two, so a boundary is a crossing rather than a step. Both sides
+compute the same midpoint of the same two queues, which is what lets the two
+gradients meet without a seam of their own — nothing coordinates them at paint
+time, so the arithmetic has to agree by construction. The wash is laid
+translucent rather than mixed into a solid, because the rail is painted before
+the lanes and a solid wash would erase the length of it crossing that column.
+The strip keeps its own left and right margin unpainted, which frames the five
+and leaves the board's ground readable where a colour never lands. The rail is painted before the lanes, so a solid wash
+would erase the length of it running through that column, and the queue line
+that breaks the rail is filled in the wash's own colour rather than in bare
+ground, which would read as a hole in it. Every queue's node carries a halo;
+the lane the eye should land on carries more. The halo is painted after that
+patch and not before it: it reaches past the node, the patch begins at the
+node's edge, and whichever of the two goes down first comes up with a bite out
+of it. Painting last washes it over the node as well as around it, which a glow
+of the node's own colour is welcome to do — the dot keeps its colour and its
+rim picks the hue up.
+
+The mock's hairline between two lanes is gone with the cards that replaced its
+rows. It ran down the left of a lane, a hand's width from the card border and
+the priority rule beside it, and three parallel vertical lines said once what a
+column edge already said: where one queue's colour ends and the next begins is
+the boundary now.
+
+A queue holding nothing says so in the slot its first card would have taken —
+a dashed ghost of a card in the queue's colour, over a word written for that
+queue: nothing waiting, none ready, none picked up, nothing held back, nothing
+finished yet. An empty column under a floating heading reads as content that
+failed to arrive, and the outline is what says the queue itself is the empty
+thing.
+
+Every colour carrying words is then lifted away from the ground it is read on
+until it clears WCAG AA, and every dot, chevron, and mark until it clears the
+lower ratio a non-text element needs. Reproducing the mock's tones is not the
+same as reproducing its legibility: those tones are relative to the mock's own
+ground, and a theme whose muted slot or ANSI red sits close to its background
+renders blockers and IDs unreadable at the same ratios. There are three grounds
+to clear, not one. The strip's and the card's pull opposite ways — the card is
+lighter, which is the worse case for a dark theme's pale ink and the better one
+for a pale theme's dark ink — so every word is measured on both, one pass each,
+the second lifting further only where the first left it short. A chip is the
+third: its tint is the ink's own hue laid under those same words, so a colour
+that cleared the floor on the board can fail on a chip of itself, and each chip
+carries ink lifted against the fill it actually lands on. A colour already
+clearing its floor is returned untouched, so a theme with good contrast keeps
+its own tones exactly, and the mock's brightness steps are taken between the
+floor and the ground rather than below it.
+
+Five lanes sit under that rail, each headed by a coloured node, the queue's
+name, and its total — name and total sharing one 20px line box and centred on
+it, since baseline alignment left the smaller total sitting low. The head's own
+patch of ground breaks the rail behind those words, and it starts at the node
+rather than at the words: the gap between the two is the patch's padding, not a
+margin, or the rail shows through it and reads as a line joining a dot to a
+word. The rail stops a clear gap short of the text-size controls at the other
+end for the same reason — a line that runs under a button looks like it means
+something.
+Lanes scroll, showing three of their 50px issue rows at a time with a
+chevron marking the rest. A card gives its whole first line to P0-P4 and the
+title, since the title is the only line a reader scans; beneath it sit the
+issue's ID at the left and its parent epic at the right, pushed there by a
+grown spacer between them rather than by justify-content: a grown container
+fills its row and then has nothing left to justify, which reads as left
+aligned. A margin on the epic keeps a minimum gap the slack alone cannot
+guarantee once a long name has eaten it, since the two read as one string when
+they meet.
+The ID drops the project prefix that every card on one board repeats, keeping
+the tail after the last `-` — or the whole ID when there is no tail to keep,
+half an ID being worse than a long one. The epic name is cut to 24 characters at a
+word boundary — space, hyphen, underscore, or slash, so a slug-style name
+breaks as readably as a sentence one — and only when that boundary leaves at
+least half the budget, one near the start throwing away more than it saves. The
+cap was measured against every epic in the Beads projects on one machine: a
+median name is one word and 21 characters, so half are untouched while the cap
+trims a tail that runs to 72. The epic wears the one ANSI hue no queue or
+priority has claimed — which the heat scale moved, since taking yellow for P2
+left the epic and a priority wearing the same colour on one card — pulled most
+of the way to muted so it stays quiet beside the ID. It is plain text there:
+the mock's diamond, a tinted tag, and a rule beneath it were each tried in
+front of the name, and none of them said anything the hue was not already
+saying.
+
+Both are click-to-copy, and both copy in full — the ID with its prefix and the
+epic with everything past its cut — even though the card shows each shortened: what
+lands on the clipboard is what another tool would be given, and a shortened ID
+is not one anything else accepts. A
+board is built by a free function with no reach into the window's clipboard
+handle, so the click parks the text on the same shared state that already
+carries hover and pin intent, and the view lifts it on the next frame through
+the copy surface every other copy in the client goes through. Blockers are not listed: the lane the card sits in
+already says the issue is blocked, and the line cost more than it carried. The
+board has no
+header of its own, so a stale or failed refresh no longer shows a status line
+and is visible only in the server log.
+
+A pin outlives the window. The workspaces whose boards are open ride the
+window's own geometry record, captured on the same frame as the zoom level and
+written on the same debounce, and are read back when the window reopens. A
+restored pin names a workspace the layout has not adopted yet, so it waits in a
+pending set rather than being pruned by the reconcile that runs before its
+region appears, and is handed over once so unpinning it is not undone on the
+next frame.
+
+Two small buttons in the strip's top right step the board's text size, plus on
+the left and minus on its right, in tenths between 0.8 and 1.6 of the designed
+size. The setting is one per window
+rather than per board, and lives only as long as the window. The strip's outer
+height never moves with it — a pinned board reserved exactly that much from its
+region — so larger text takes its space from the lane bodies and the terminal
+below is untouched.
+
+The one thing that does move that outer height is a drag of the board's bottom
+bar, which is a resize grip with a divider's four-pixel tolerance either side.
+Height is per workspace, not per window like the text size, because the strip a
+pinned board holds comes out of that region's terminal and no other's. The
+gesture is resolved by the grid's own press chain
+([[crates/scribe-client/src/main.rs#TerminalView#press_board_edge]]) rather than
+by a listener inside the board, so a press on the bar is consumed the way a
+divider press is: the pane under an unpinned board never sees it, and a
+mouse-reporting application below is not handed the press that started a chrome
+gesture. The drag is carried as a delta from where the bar was grabbed, so a
+pointer that outruns a frame still resolves to the height the gesture asked for.
+It stops at a strip that still shows one issue row under a lane head, and at a
+region with three lines of terminal left — growing past that is what the user
+asked for right up until the terminal disappears, and there is no gesture that
+would bring it back. Nothing else has to be told: the strip a pinned board
+reserves is read off this state every frame, so the next paint republishes that
+region's PTY rows. Dragging the bar of a board only hovered open holds it open
+for the gesture, which otherwise ends when the pointer leaves the board it is
+resizing. Heights live as long as the window, and a region that leaves takes its
+own with it, so the next workspace to hold that region opens at the designed
+size.
+
+Hover is tracked per source — the bead, the board, and a control inside it —
+because they overlap and report out of order: a button takes the hover away
+from the board, which then reports a leave it never had. The board starts
+closing only once every source is gone, and a grace period covers the gap the
+pointer crosses on its way from the bead.
+
+Both modes paint inside their own workspace's region, at the strip
+[[crates/scribe-client/src/pane_shell.rs#PaneShell#board_rect]] cuts from the
+top of that region's content — never as a window-wide band, which in a window
+showing two regions side by side would cover the terminal it does not describe.
+A pinned board's strip is a second region reservation stacked on the in-region
+tab bar's, so only that region's panes and published PTY rows give up the
+space.
+
+Boards are per region in state as well as in geometry: hover, pin, and snapshot
+are all keyed by workspace, so every region opens, pins, and closes its own
+board without touching another's. A window can show several boards at once —
+two pinned and a third hovered beside them — and each pinned one polls and
+reserves for itself. Focus is not an input to any of it, so a pinned board
+stays open while the user works in another region. State for a workspace the
+window no longer shows a region for is dropped by reconciling against the live
+layout, not by hooking every path that can close a region.
+
+Queries tolerate all three shapes `bd --json` answers with: `list`'s object,
+the bare arrays `ready` and `blocked` return, and the `{"data": …}` envelope bd
+announces as v2.0's default, so a Beads upgrade cannot silently turn every
+board into a parse error.
+
+A refresh that fails is logged server-side, because a workspace that never
+paints a board is otherwise indistinguishable from one that has no Beads
+project. Only a change in the reason is logged: a broken workspace retries
+every thirty seconds and would otherwise bury the log in repeats.
+
+The Docker visual contract injects a deterministic snapshot through the real
+MessagePack reader and captures both interaction modes in
+`tests/e2e/visual/beads-board.sh`. It requires the board's ground — sampled in the strip's own
+padding, since a lane is covered by its cards and its wash — to sample identical
+to the tab bar's, which is the same chrome slot, so a colour hardcoded back
+into the board fails. It reads the fill inside a card against that ground and
+requires it to sit above it, so a card flattened back onto the strip fails. It
+puts the pointer on a card's ID and requires the board
+to survive it, then clicks and requires the full ID on the X11 clipboard. It
+measures the epic on every card line that carries one against that card's
+own content edge, reading the card's fill from between the name and the border
+so the border cannot stand in for the name it is checking. It presses both text-size buttons, requiring the first to
+repaint the board and the second to undo it. It finds the pinned board's bottom
+bar by scanning a column the lanes leave clear, drags it sixty pixels down, and
+requires both that the board paints that much taller and that its region's
+published rows drop — then drags it back and requires the rows to return
+exactly. It then splits the window
+and pins a board in each region, requiring that each region gives up its own
+rows, that neither board disturbs the other's, and that the region divider
+still separates the two open boards. It reads the badge of three priorities down one lane — P0, P1 and P2, three
+different hues — and requires each to carry measurably less colour than the
+rank above it. The three are compared as a ratio rather than a margin: the ranks are
+about a fifth apart by design, so a fixed number of levels would either pass a
+flat ramp or fail a fine one. It reads a row of bare wash along the strip's bottom padding and requires the
+largest jump between two neighbouring pixels to stay inside rounding, so a
+queue colour that meets the next as a step rather than a crossing fails. It
+then injects a board whose every queue has run dry and requires the first
+card's slot not to be one flat colour, sampled across the middle third of the
+lane where the wash is flat — the outer thirds are travelling toward the
+neighbouring queues, and a band including them would be many-coloured whether
+the ghost was drawn or not. It finally names a rooted workspace and requires the matching
+`RequestBeadsBoard` on the wire tap, so the trigger the injected snapshot
+bypasses stays covered.
 
 ## GPUI Titlebar
 

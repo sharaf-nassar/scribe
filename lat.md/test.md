@@ -1245,7 +1245,10 @@ disposable Debian container. The same offline fixture runs both AI-hook
 installers, requires unmatched Claude and Codex `SessionEnd` registrations and
 Codex's trusted-hash state, then drives malformed payloads through both
 adapters with a failing `python3` shim to prove each emits `state_cleared`
-without parsing the payload.
+without parsing the payload. Beads diagnostics run with a sanitized PATH,
+proving lookup finds the target user's executable `~/.local/bin/bd` without
+running it; a forced miss must remain nonfatal and explain that boards stay
+hidden until `bd` is installed.
 
 ## AI Hook Helper
 
@@ -2516,6 +2519,12 @@ A capture leaves `zoom` at the neutral level for the caller to fill in with [[cr
 
 The round trip is taken with `restore_rect` present on purpose: it serializes as a TOML table, and a bare key emitted after a table would be read back as part of it, so the field's declaration order in the struct is load-bearing. A record written before the field existed carries no key and restores unzoomed through `serde(default)`.
 
+### Pinned boards round-trip
+
+A capture pins nothing itself, leaving the workspaces to the caller's [[crates/scribe-client/src/window_state.rs#WindowGeometry#with_pinned_boards]] exactly as it leaves the zoom level, and the filled-in record survives a TOML round trip.
+
+The round trip is taken with `restore_rect` present for the same reason the zoom's is: the pinned list is an array, which TOML writes as a bare key, and one emitted after a table would be read back as part of it. A record written before the field existed restores with no board pinned.
+
 ### A placement move restates the window's size
 
 The `_NET_MOVERESIZE_WINDOW` payload marks x, y, width and height all present, carries `StaticGravity`, and repeats the window's current size in its size words instead of zeroing them.
@@ -3140,6 +3149,14 @@ A side-by-side (`Horizontal`) two-region wire tree with live sessions prunes to 
 Unit coverage for the region content-rect rule behind the in-region tab bars: a top-row region keeps its full rect, a stacked region cedes `REGION_TAB_BAR_HEIGHT` at its top, and a region shorter than the bar clamps instead of going negative.
 
 Every pane-geometry consumer (`placements`, `dividers`, directional focus) shares this one rule, so painted panes and hit-tests can never disagree about where a lower region's content starts.
+
+### A pinned board reserves only its own region
+
+Unit coverage for the second reservation the region content rect carries: a pinned Beads board takes its strip from the top of its own region, stacking below a lower region's tab bar.
+
+The strip keeps its region's x and width, and clamps rather than going negative in a region shorter than the board.
+
+Pinning it here is what keeps the board a region citizen. The band it replaced spanned the window, so pinning a board in one region pushed every other region's panes down and shrank PTYs that had nothing to do with it.
 
 ### Region reports every tab and which is active
 

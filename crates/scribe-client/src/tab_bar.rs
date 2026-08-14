@@ -202,6 +202,8 @@ pub struct GroupBadge {
     pub label: String,
     /// The workspace's region accent, tinting the pill.
     pub accent: Rgba,
+    /// Whether this workspace has a detected Beads project.
+    pub beads: bool,
 }
 
 impl TabData {

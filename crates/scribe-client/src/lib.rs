@@ -58,6 +58,7 @@
 pub mod ai_indicator;
 pub mod animation;
 pub mod app_shortcuts;
+pub mod beads_board;
 pub mod bell;
 pub mod box_drawing;
 pub mod chrome_metadata;

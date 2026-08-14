@@ -63,6 +63,7 @@ use scribe_server::terminal_image_handoff;
 // `crate::child_watch`. Re-exported for the same reason — the non-Linux build
 // never reaches the watcher itself, so an in-binary copy would report its
 // `pub` items dead there.
+use scribe_server::beads_board;
 use scribe_server::child_watch;
 mod updater;
 mod workspace_manager;
@@ -351,6 +352,7 @@ async fn run_upgrade_receiver(
 /// inside the handoff, then acquires the lock after the predecessor exits.
 /// `_lock_guard` must live until the server shuts down to hold the advisory
 /// flock.
+#[allow(clippy::too_many_lines, reason = "server setup remains one ordered startup transaction")]
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
@@ -421,6 +423,7 @@ async fn run_server_loop(
     let server_state = ipc_server::IpcServerState {
         session_manager: Arc::clone(&session_manager),
         workspace_manager: Arc::clone(&workspace_manager),
+        beads_boards: beads_board::BeadsBoardCache::default(),
         live_sessions: Arc::clone(&live_sessions),
         window_shares: Arc::clone(&window_shares),
         updater_handle: Arc::clone(&updater_handle),

@@ -230,6 +230,64 @@ pub struct AiLaunchSpec {
     pub conversation_id: Option<String>,
 }
 
+/// Version of the local workspace Beads-board protocol.
+pub const BEADS_BOARD_PROTOCOL_VERSION: u32 = 1;
+
+/// One issue rendered by the workspace Beads board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsBoardItem {
+    pub id: String,
+    pub title: String,
+    /// Native Beads priority (`0` is highest, `4` is lowest).
+    pub priority: u8,
+    #[serde(default)]
+    pub blocker_ids: Vec<String>,
+    #[serde(default)]
+    pub parent_epic_name: Option<String>,
+}
+
+/// A complete, mutually-exclusive five-queue board snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsBoardSnapshot {
+    pub refreshed_at_epoch_ms: u64,
+    #[serde(default)]
+    pub backlog_total: u32,
+    #[serde(default)]
+    pub ready_total: u32,
+    #[serde(default)]
+    pub in_progress_total: u32,
+    #[serde(default)]
+    pub blocked_total: u32,
+    #[serde(default)]
+    pub done_total: u32,
+    pub backlog: Vec<BeadsBoardItem>,
+    pub ready: Vec<BeadsBoardItem>,
+    pub in_progress: Vec<BeadsBoardItem>,
+    pub blocked: Vec<BeadsBoardItem>,
+    pub done: Vec<BeadsBoardItem>,
+}
+
+/// Server-owned loading state for one workspace's Beads board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeadsBoardState {
+    /// `bd context` found no Beads project for this workspace.
+    NotDetected,
+    /// A refresh is running. A previous memory snapshot may already be paintable.
+    Loading {
+        #[serde(default)]
+        cached: Option<BeadsBoardSnapshot>,
+    },
+    /// Last-good snapshot. `stale` means a refresh is due or failed.
+    Ready {
+        snapshot: BeadsBoardSnapshot,
+        stale: bool,
+        #[serde(default)]
+        refresh_error: Option<String>,
+    },
+    /// `bd` could not be invoked and no last-good snapshot exists.
+    Unavailable { message: String },
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +345,11 @@ pub enum ClientMessage {
     /// already-empty workspace.
     CloseWorkspace {
         workspace_id: WorkspaceId,
+    },
+    /// Request the cached Beads board for one authoritative server workspace.
+    RequestBeadsBoard {
+        workspace_id: WorkspaceId,
+        protocol_version: u32,
     },
     /// Move a session to a different workspace. The workspace-split flow seeds
     /// its session through the old workspace (the new one does not exist yet)
@@ -701,6 +764,12 @@ pub enum ServerMessage {
         /// Absolute path to the project directory (root + first CWD component).
         #[serde(default)]
         project_root: Option<PathBuf>,
+    },
+    /// Cached Beads-board state for `RequestBeadsBoard`.
+    BeadsBoard {
+        workspace_id: WorkspaceId,
+        protocol_version: u32,
+        state: BeadsBoardState,
     },
     /// Search results for a `SearchRequest`.
     SearchResults {
@@ -1527,6 +1596,62 @@ pub struct TrustedNetworkInfo {
 mod tests {
     use super::*;
     use serde::de::IgnoredAny;
+
+    // @lat: [[client#Client#Beads Board CLI Data Source]]
+    #[test]
+    fn beads_board_messages_round_trip_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let request = ClientMessage::RequestBeadsBoard {
+            workspace_id,
+            protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+        };
+        let bytes = rmp_serde::to_vec_named(&request).expect("serialize board request");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize board request");
+        assert!(matches!(
+            decoded,
+            ClientMessage::RequestBeadsBoard {
+                workspace_id: decoded_id,
+                protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+            } if decoded_id == workspace_id
+        ));
+
+        let item = BeadsBoardItem {
+            id: "scribe-1bf.2".into(),
+            title: "Add board cache".into(),
+            priority: 2,
+            blocker_ids: vec!["scribe-blocker".into()],
+            parent_epic_name: Some("Workspace board".into()),
+        };
+        let response = ServerMessage::BeadsBoard {
+            workspace_id,
+            protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+            state: BeadsBoardState::Ready {
+                snapshot: BeadsBoardSnapshot {
+                    refreshed_at_epoch_ms: 42,
+                    blocked: vec![item.clone()],
+                    ..BeadsBoardSnapshot::default()
+                },
+                stale: true,
+                refresh_error: Some("refresh timed out".into()),
+            },
+        };
+        let response_bytes = rmp_serde::to_vec_named(&response).expect("serialize board response");
+        let decoded_response: ServerMessage =
+            rmp_serde::from_slice(&response_bytes).expect("deserialize board response");
+        assert!(matches!(
+            decoded_response,
+            ServerMessage::BeadsBoard {
+                workspace_id: decoded_id,
+                protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+                state: BeadsBoardState::Ready {
+                    snapshot: BeadsBoardSnapshot { blocked, .. },
+                    stale: true,
+                    refresh_error: Some(_),
+                },
+            } if decoded_id == workspace_id && blocked == vec![item]
+        ));
+    }
 
     #[derive(Serialize)]
     #[serde(tag = "type")]

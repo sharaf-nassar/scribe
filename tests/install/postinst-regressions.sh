@@ -282,6 +282,62 @@ else
     echo "SKIP: AI SessionEnd hook regressions require python3"
 fi
 
+# ── Beads diagnostic resolves the target user's home, not root HOME ──
+beads_fixture=$(mktemp -d)
+beads_target_home="$beads_fixture/target-home"
+mkdir -p "$beads_target_home/.local/bin"
+printf '#!/bin/sh\n: > %q\n' \
+    "$beads_fixture/bd-executed" > "$beads_target_home/.local/bin/bd"
+chmod +x "$beads_target_home/.local/bin/bd"
+
+getent() {
+    [ "$1" = "passwd" ] && [ "$2" = "$TARGET_UID" ] || return 2
+    printf 'target:x:%s:%s::%s:/bin/sh\n' \
+        "$TARGET_UID" "$TARGET_UID" "$beads_target_home"
+}
+
+user_manager_env() {
+    [ "$1" = "PATH" ] || return 1
+    printf '/usr/bin:/bin\n'
+}
+
+TARGET_UID=4242
+saved_path="$PATH"
+PATH="/usr/bin:/bin"
+beads_output="$(diagnose_beads_cli 2>&1)"
+beads_status=$?
+PATH="$saved_path"
+
+if [ "$beads_status" -ne 0 ]; then
+    echo "FAIL: Beads diagnostic failed package configuration"
+    failures=$((failures + 1))
+elif ! grep -Fq "$beads_target_home/.local/bin/bd" <<< "$beads_output"; then
+    echo "FAIL: Beads diagnostic missed the target user's ~/.local/bin/bd"
+    failures=$((failures + 1))
+elif [ -e "$beads_fixture/bd-executed" ]; then
+    echo "FAIL: Beads diagnostic executed bd instead of inspecting it"
+    failures=$((failures + 1))
+else
+    echo "PASS: Beads diagnostic uses the target home with a sanitized PATH"
+fi
+
+# Missing bd is advisory because Beads integration is optional.
+find_beads_cli() {
+    return 1
+}
+beads_output="$(diagnose_beads_cli 2>&1)"
+beads_status=$?
+if [ "$beads_status" -ne 0 ]; then
+    echo "FAIL: Missing bd made the diagnostic fatal"
+    failures=$((failures + 1))
+elif ! grep -Fq "The Beads board stays hidden until bd is installed." <<< "$beads_output"; then
+    echo "FAIL: Missing bd warning did not explain the hidden board"
+    failures=$((failures + 1))
+else
+    echo "PASS: Missing bd emits a nonfatal Beads board warning"
+fi
+rm -rf "$beads_fixture"
+
 if [ "$failures" -gt 0 ]; then
     echo "${failures} postinst regression test(s) failed."
     exit 1

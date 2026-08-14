@@ -1253,6 +1253,14 @@ impl IpcSink {
         self.enqueue(ClientMessage::RequestSnapshot { session_id })
     }
 
+    /// Ask for the server-owned Beads snapshot for one workspace.
+    pub fn request_beads_board(&self, workspace_id: WorkspaceId) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::RequestBeadsBoard {
+            workspace_id,
+            protocol_version: scribe_common::protocol::BEADS_BOARD_PROTOCOL_VERSION,
+        })
+    }
+
     /// Asks the server to terminate `session_id`, backing the `close_tab`
     /// shortcut. The tab leaves the strip once `SessionExited` arrives.
     ///

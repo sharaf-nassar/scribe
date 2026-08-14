@@ -386,6 +386,18 @@ impl WorkspaceManager {
         ordered
     }
 
+    /// Whether `workspace_id` owns a session visible in `window_id`.
+    #[must_use]
+    pub fn window_contains_workspace(
+        &self,
+        window_id: WindowId,
+        workspace_id: WorkspaceId,
+    ) -> bool {
+        self.sessions_for_window(window_id)
+            .iter()
+            .any(|session_id| self.session_to_workspace.get(session_id) == Some(&workspace_id))
+    }
+
     /// Distinct display names of the workspaces owning this window's sessions,
     /// in the window's stored session order. Unnamed workspaces are skipped and
     /// duplicates removed. Feeds the feature-013 remote connect picker's window
@@ -827,6 +839,22 @@ mod tests {
         // Unknown target: dropped, membership unchanged.
         assert!(!mgr.move_session(sess, WorkspaceId::new()));
         assert_eq!(mgr.workspace_for_session(sess), Some(ws_new));
+    }
+
+    #[test]
+    fn window_contains_only_its_own_workspaces() {
+        let mut mgr = manager_with_roots(vec![]);
+        let ours = mgr.create_workspace();
+        let theirs = mgr.create_workspace();
+        let our_session = SessionId::new();
+        let their_session = SessionId::new();
+        let window = WindowId::new();
+        mgr.add_session(ours, our_session, None);
+        mgr.add_session(theirs, their_session, None);
+        mgr.assign_session_to_window(window, our_session);
+
+        assert!(mgr.window_contains_workspace(window, ours));
+        assert!(!mgr.window_contains_workspace(window, theirs));
     }
 
     // @lat: [[server#Workspaces#Destructive close refusal]]

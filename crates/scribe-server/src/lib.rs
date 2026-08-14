@@ -6,6 +6,7 @@
 //! through the binary.
 
 pub mod attach_flow;
+pub mod beads_board;
 pub mod child_identity;
 pub mod child_watch;
 pub mod clipboard_state;

@@ -199,6 +199,63 @@ user_manager_env() {
     run_user_systemctl show-environment | sed -n "s/^${key}=//p" | head -n 1
 }
 
+find_beads_cli() {
+    local manager_path="" target_home="" dir="" candidate=""
+    local -a manager_dirs=() search_dirs=()
+
+    manager_path="$(user_manager_env PATH 2>/dev/null || true)"
+    IFS=: read -r -a manager_dirs <<< "$manager_path"
+    for dir in "${manager_dirs[@]}"; do
+        case "$dir" in
+            /*) search_dirs+=("$dir") ;;
+        esac
+    done
+
+    target_home="$(getent passwd "$TARGET_UID" 2>/dev/null | cut -d: -f6 | head -n 1 || true)"
+    case "$target_home" in
+        /*)
+            search_dirs+=(
+                "$target_home/.local/bin"
+                "$target_home/.local/share/mise/shims"
+                "$target_home/go/bin"
+                "$target_home/.cargo/bin"
+                "$target_home/.linuxbrew/bin"
+            )
+            ;;
+    esac
+    search_dirs+=(
+        /home/linuxbrew/.linuxbrew/bin
+        /home/linuxbrew/.linuxbrew/opt/beads/bin
+        /usr/local/bin
+        /usr/local/opt/beads/bin
+        /usr/bin
+        /bin
+    )
+
+    # Advisory only: this runs as root, whose -x accepts any exec bit. The
+    # server re-tests executability as the real user on every board refresh.
+    for dir in "${search_dirs[@]}"; do
+        candidate="${dir}/bd"
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+diagnose_beads_cli() {
+    local beads_cli=""
+
+    if beads_cli="$(find_beads_cli)"; then
+        echo "  ✓ Beads CLI detected at ${beads_cli}."
+    else
+        echo "  ⚠ Beads CLI 'bd' was not found for the target user."
+        echo "    The Beads board stays hidden until bd is installed."
+    fi
+    return 0
+}
+
 refresh_service_enablement() {
     # Previous packages enabled the user service under default.target, which
     # can start before a display manager publishes DISPLAY/XAUTHORITY. Disable
@@ -769,6 +826,7 @@ case "$1" in
             WORKSPACE_NOTES_CLEANUP_TARGET_KNOWN=0
         fi
 
+        diagnose_beads_cli
         ensure_state_dir
         probe_client_vulkan || true
         CONFIG_HOME="$(user_config_home || true)"

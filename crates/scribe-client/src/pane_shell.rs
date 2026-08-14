@@ -193,6 +193,8 @@ pub struct PaneShell {
     /// `CloseWorkspace` or a `MoveSession`: the server has never heard of a
     /// client-minted id and would reject or misapply one.
     server_workspaces: HashSet<WorkspaceId>,
+    /// Regions giving up a top strip to a pinned Beads board, and how much.
+    pinned_boards: HashMap<WorkspaceId, f32>,
 }
 
 impl PaneShell {
@@ -215,6 +217,7 @@ impl PaneShell {
             adopted_server_workspace: false,
             pending_workspaces: VecDeque::new(),
             server_workspaces: HashSet::new(),
+            pinned_boards: HashMap::new(),
         }
     }
 
@@ -429,15 +432,48 @@ impl PaneShell {
         rect.y > 0.5
     }
 
-    /// `rect` minus the in-region tab bar a lower region reserves at its top.
-    /// Top-row regions pass through untouched — their tabs live in the
-    /// titlebar.
-    fn content_rect(rect: Rect) -> Rect {
-        if !Self::is_lower_region(rect) {
-            return rect;
-        }
-        let bar = REGION_TAB_BAR_HEIGHT.min(rect.height);
-        Rect { x: rect.x, y: rect.y + bar, width: rect.width, height: rect.height - bar }
+    /// `rect` minus everything a region reserves at its top: the in-region tab
+    /// bar a lower region carries (a top-row region's tabs live in the
+    /// titlebar), then `board` for a pinned Beads board.
+    ///
+    /// Both reservations land here rather than at the call sites so pane math,
+    /// painted panes, dividers, and the rows published to the PTY cannot
+    /// disagree about where a region's content starts.
+    fn content_rect(rect: Rect, board: f32) -> Rect {
+        let bar = if Self::is_lower_region(rect) { REGION_TAB_BAR_HEIGHT } else { 0.0 };
+        let reserved = (bar + board).min(rect.height);
+        Rect { x: rect.x, y: rect.y + reserved, width: rect.width, height: rect.height - reserved }
+    }
+
+    /// The strip a pinned board reserves inside `workspace_id`'s region, which
+    /// is zero for every region whose board is not pinned.
+    fn board_strip(&self, workspace_id: WorkspaceId) -> f32 {
+        self.pinned_boards.get(&workspace_id).copied().unwrap_or(0.0)
+    }
+
+    /// Record which regions give up a strip to a pinned Beads board. Every
+    /// region pins independently, so this is a map and not one entry.
+    pub fn set_pinned_boards(&mut self, pinned: HashMap<WorkspaceId, f32>) {
+        self.pinned_boards = pinned;
+    }
+
+    /// The strip a board of `height` paints in at the top of `workspace_id`'s
+    /// region: the region's own content area, never the window's.
+    pub fn board_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        height: f32,
+        viewport: Rect,
+        cx: &App,
+    ) -> Option<Rect> {
+        self.workspace
+            .read(cx)
+            .layout()
+            .compute_workspace_rects(viewport)
+            .into_iter()
+            .find(|(id, _)| *id == workspace_id)
+            .map(|(_, rect)| Self::content_rect(rect, 0.0))
+            .map(|content| Rect { height: height.min(content.height), ..content })
     }
 
     /// The tab-bar strip each lower region reserves at its top, in region
@@ -751,7 +787,7 @@ impl PaneShell {
         let focused_workspace = workspace.focused_workspace_id();
         let mut out = Vec::new();
         for (workspace_id, region) in workspace.layout().compute_workspace_rects(viewport) {
-            let region = Self::content_rect(region);
+            let region = Self::content_rect(region, self.board_strip(workspace_id));
             let Some(tree) = self.trees.get(&workspace_id) else { continue };
             let accent = workspace
                 .find_workspace(workspace_id)
@@ -783,7 +819,7 @@ impl PaneShell {
             .compute_workspace_rects(viewport)
             .into_iter()
             .flat_map(|(workspace_id, region)| {
-                let region = Self::content_rect(region);
+                let region = Self::content_rect(region, self.board_strip(workspace_id));
                 self.trees.get(&workspace_id).into_iter().flat_map(move |tree| {
                     divider::collect_dividers(tree.read(cx).tree().root(), region)
                 })
@@ -841,6 +877,17 @@ impl PaneShell {
     /// Number of workspace regions the window is split into.
     pub fn region_count(&self, cx: &App) -> usize {
         self.workspace.read(cx).layout().workspace_count()
+    }
+
+    /// Every workspace this window currently shows a region for.
+    pub fn region_workspaces(&self, cx: &App) -> HashSet<WorkspaceId> {
+        self.workspace
+            .read(cx)
+            .layout()
+            .compute_workspace_rects(Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 })
+            .into_iter()
+            .map(|(workspace_id, _)| workspace_id)
+            .collect()
     }
 
     // -- Cold-restart restore -------------------------------------------------
@@ -1082,10 +1129,9 @@ impl PaneShell {
     /// lower region's tab bar, so pane math and painted panes agree.
     fn region_rect(&self, workspace_id: WorkspaceId, viewport: Rect, cx: &App) -> Option<Rect> {
         let layout: &WindowLayout = self.workspace.read(cx).layout();
-        layout
-            .compute_workspace_rects(viewport)
-            .into_iter()
-            .find_map(|(id, rect)| (id == workspace_id).then_some(Self::content_rect(rect)))
+        layout.compute_workspace_rects(viewport).into_iter().find_map(|(id, rect)| {
+            (id == workspace_id).then_some(Self::content_rect(rect, self.board_strip(workspace_id)))
+        })
     }
 }
 
@@ -1440,7 +1486,7 @@ mod tests {
     #[test]
     fn lower_regions_reserve_their_tab_bar() {
         let top = Rect { x: 0.0, y: 0.0, width: 800.0, height: 300.0 };
-        let kept = PaneShell::content_rect(top);
+        let kept = PaneShell::content_rect(top, 0.0);
         assert!(
             (kept.y - top.y).abs() < f32::EPSILON
                 && (kept.height - top.height).abs() < f32::EPSILON,
@@ -1448,15 +1494,40 @@ mod tests {
         );
 
         let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 300.0 };
-        let content = PaneShell::content_rect(lower);
+        let content = PaneShell::content_rect(lower, 0.0);
         assert!((content.y - (300.0 + REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
         assert!((content.height - (300.0 - REGION_TAB_BAR_HEIGHT)).abs() < f32::EPSILON);
         assert!((content.x - lower.x).abs() < f32::EPSILON);
         assert!((content.width - lower.width).abs() < f32::EPSILON);
 
         let sliver = Rect { x: 0.0, y: 300.0, width: 800.0, height: 10.0 };
-        let clamped = PaneShell::content_rect(sliver);
+        let clamped = PaneShell::content_rect(sliver, 0.0);
         assert!(clamped.height >= 0.0, "a sliver region clamps instead of going negative");
+    }
+
+    /// A pinned board takes its strip out of its own region's content, stacking
+    /// with a lower region's tab bar and never widening past that region — the
+    /// window-wide band it replaced pushed every region's panes down.
+    // @lat: [[test#GPUI Client Headless Suites#A pinned board reserves only its own region]]
+    #[test]
+    fn a_pinned_board_reserves_only_its_own_region() {
+        let board = 246.0;
+        let top = Rect { x: 400.0, y: 0.0, width: 400.0, height: 600.0 };
+        let with_board = PaneShell::content_rect(top, board);
+        assert!((with_board.y - board).abs() < f32::EPSILON);
+        assert!((with_board.height - (600.0 - board)).abs() < f32::EPSILON);
+        assert!(
+            (with_board.x - top.x).abs() < f32::EPSILON
+                && (with_board.width - top.width).abs() < f32::EPSILON,
+            "the strip stays inside its own region's columns"
+        );
+
+        let lower = Rect { x: 0.0, y: 300.0, width: 800.0, height: 600.0 };
+        let stacked = PaneShell::content_rect(lower, board);
+        assert!((stacked.y - (300.0 + REGION_TAB_BAR_HEIGHT + board)).abs() < f32::EPSILON);
+
+        let shallow = PaneShell::content_rect(Rect { height: 100.0, ..top }, board);
+        assert!(shallow.height >= 0.0, "a region shorter than the board clamps to zero");
     }
 
     /// The hot-reconnect adoption lowering preserves split orientation: a

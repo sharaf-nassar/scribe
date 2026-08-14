@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use gpui::{Bounds, Pixels, Point, Size, WindowBounds, point, px, size};
 use scribe_common::app::current_state_dir;
-use scribe_common::ids::WindowId;
+use scribe_common::ids::{WindowId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::restore_replay::round_positive_f32_to_u16;
@@ -161,6 +161,13 @@ pub struct WindowGeometry {
     /// [`crate::zoom::ZoomState::at_level`] re-clamps whatever is read back.
     #[serde(default)]
     pub zoom: i8,
+    /// Workspaces whose Beads board was pinned open, so a restart brings the
+    /// boards back with the window. Per-window like the zoom level, and
+    /// declared before `restore_rect` because TOML cannot carry a bare key
+    /// after a table. `serde(default)` → none, for records written before this
+    /// field existed.
+    #[serde(default)]
+    pub beads_pinned: Vec<WorkspaceId>,
     /// Legacy `maximized = true|false`, read from pre-[`WindowState`] records
     /// and folded into `state` by [`adopt_legacy_state`]. Never written back.
     #[serde(default, rename = "maximized", skip_serializing)]
@@ -185,6 +192,7 @@ impl Default for WindowGeometry {
             // A freshly-created default is already in the new coordinate system.
             titlebar_normalized: true,
             zoom: 0,
+            beads_pinned: Vec::new(),
             legacy_maximized: None,
             restore_rect: None,
         }
@@ -228,6 +236,16 @@ impl WindowGeometry {
     #[must_use]
     pub fn at_zoom(self, zoom: i8) -> Self {
         Self { zoom, ..self }
+    }
+
+    /// The same record with the workspaces whose boards are pinned open.
+    ///
+    /// A sibling of [`Self::at_zoom`], captured the same way and for the same
+    /// reason: it rides the frame's equality check, so a pin arms the debounce
+    /// exactly as a move or a resize does and there is no second write path.
+    #[must_use]
+    pub fn with_pinned_boards(self, beads_pinned: Vec<WorkspaceId>) -> Self {
+        Self { beads_pinned, ..self }
     }
 
     /// The origin a restore re-asserts, or `None` when none was captured.
@@ -524,6 +542,9 @@ pub fn geometry_from_bounds(
         // Filled in by the caller with [`WindowGeometry::at_zoom`]; the zoom is
         // no more a function of the bounds than the virtual desktop is.
         zoom: 0,
+        // Likewise filled in by the caller, with
+        // [`WindowGeometry::with_pinned_boards`].
+        beads_pinned: Vec::new(),
         legacy_maximized: None,
         restore_rect,
     }
@@ -1078,6 +1099,36 @@ titlebar_normalized = true
         let legacy: WindowGeometry =
             toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
         assert_eq!(legacy.zoom, 0);
+    }
+
+    // @lat: [[test#Window geometry compat#Pinned boards round-trip]]
+    #[test]
+    fn pinned_boards_round_trip() {
+        let captured = capture(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&WindowGeometry {
+                restore_rect: Some(SavedRect { x: Some(10), y: Some(20), width: 800, height: 600 }),
+                state: WindowState::Maximized,
+                ..WindowGeometry::default()
+            }),
+        );
+        assert!(captured.beads_pinned.is_empty(), "the bounds conversion pins nothing itself");
+
+        // Taken with `restore_rect` present: an array is a bare key, and one
+        // written after a table would be read back as part of it.
+        let pinned = vec![WorkspaceId::new(), WorkspaceId::new()];
+        let geom = captured.with_pinned_boards(pinned.clone());
+        assert!(geom.restore_rect.is_some(), "the round trip needs the table present");
+        let text = toml::to_string_pretty(&geom).expect("serialize");
+        assert_eq!(toml::from_str::<WindowGeometry>(&text).expect("round-trip"), geom, "{text}");
+        assert_eq!(geom.beads_pinned, pinned);
+
+        // A record written before the field existed restores with none pinned.
+        let legacy: WindowGeometry =
+            toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
+        assert!(legacy.beads_pinned.is_empty());
     }
 
     // @lat: [[test#Window geometry compat#A window off the layout is clamped back onto it]]

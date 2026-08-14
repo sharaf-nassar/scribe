@@ -29,10 +29,11 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AiLaunchSpec, AutomationAction, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal,
-    ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal,
-    SearchMatch, ServerMessage, SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo,
-    WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
+    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, ClientMessage,
+    ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind,
+    REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage,
+    SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
+    WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -41,6 +42,7 @@ use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
+use crate::beads_board::BeadsBoardCache;
 use crate::child_identity::{IdentityCheck, check_child_identity};
 use crate::child_watch::{ChildExit, ChildExitWatcher};
 use crate::handoff::HandoffSession;
@@ -1089,6 +1091,8 @@ impl WindowShare {
 pub struct IpcServerState {
     pub session_manager: Arc<SessionManager>,
     pub workspace_manager: Arc<RwLock<WorkspaceManager>>,
+    /// Last-good Beads snapshots, shared by every window on this server.
+    pub beads_boards: BeadsBoardCache,
     pub live_sessions: LiveSessionRegistry,
     /// Feature 015 (T006, D1): the single per-window share registry that replaces
     /// the three retired per-window maps (`connected_clients`,
@@ -6352,6 +6356,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::CloseWorkspace { .. }
         | ClientMessage::MoveSession { .. }
         | ClientMessage::ListSessions
+        | ClientMessage::RequestBeadsBoard { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
         }
@@ -6605,6 +6610,9 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
             )
             .await;
         }
+        ClientMessage::RequestBeadsBoard { workspace_id, protocol_version } => {
+            handle_request_beads_board(workspace_id, protocol_version, context).await;
+        }
         ClientMessage::ReportWorkspaceTree { tree } => {
             debug!(window_id = %context.window_id, "received workspace tree from client");
             let mut wm = context.server.workspace_manager.write().await;
@@ -6613,6 +6621,69 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
             wm.set_window_tree(context.window_id, tree);
         }
         other => debug!(?other, "ignored non-workspace client message in workspace dispatcher"),
+    }
+}
+
+// @lat: [[client#Client#Beads Board CLI Data Source]]
+async fn handle_request_beads_board(
+    workspace_id: WorkspaceId,
+    protocol_version: u32,
+    context: &ClientDispatchContext<'_>,
+) {
+    if protocol_version != BEADS_BOARD_PROTOCOL_VERSION {
+        send_message(
+            context.writer,
+            &ServerMessage::BeadsBoard {
+                workspace_id,
+                protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+                state: BeadsBoardState::Unavailable {
+                    message: "Scribe Beads-board protocol version mismatch".into(),
+                },
+            },
+        )
+        .await;
+        return;
+    }
+
+    let project_root = {
+        let workspaces = context.server.workspace_manager.read().await;
+        workspaces
+            .window_contains_workspace(context.window_id, workspace_id)
+            .then(|| workspaces.workspace_info(workspace_id))
+            .flatten()
+            .and_then(|(_, _, _, root)| root)
+    };
+    let Some(project_root) = project_root else {
+        send_message(
+            context.writer,
+            &ServerMessage::BeadsBoard {
+                workspace_id,
+                protocol_version,
+                state: BeadsBoardState::NotDetected,
+            },
+        )
+        .await;
+        return;
+    };
+
+    let lookup = context.server.beads_boards.lookup(&project_root).await;
+    send_message(
+        context.writer,
+        &ServerMessage::BeadsBoard { workspace_id, protocol_version, state: lookup.state },
+    )
+    .await;
+
+    if lookup.refresh {
+        let cache = context.server.beads_boards.clone();
+        let writer = Arc::clone(context.writer);
+        tokio::spawn(async move {
+            let state = Box::pin(cache.refresh(lookup.key)).await;
+            send_message(
+                &writer,
+                &ServerMessage::BeadsBoard { workspace_id, protocol_version, state },
+            )
+            .await;
+        });
     }
 }
 

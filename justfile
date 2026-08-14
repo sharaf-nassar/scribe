@@ -465,6 +465,10 @@ e2e-visual-ai-task-label:
 # client to adopt the harness session first.
 e2e-visual-workspace-ipc:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/workspace-ipc.sh
+
+# Run the workspace Beads board visual contract.
+e2e-visual-beads-board:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-board.sh
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
 # response and the bridge read reply leaving the client, and the seeded config
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run
@@ -585,6 +589,7 @@ e2e-all-visual: build-release docker-visual
     mappings=(
         'visual/ai-indicator.sh|e2e-visual-shared'
         'visual/ai-task-label.sh|e2e-visual-ai-task-label'
+        'visual/beads-board.sh|e2e-visual-beads-board'
         'visual/bell.sh|e2e-visual-bell'
         'visual/clipboard-osc52.sh|e2e-visual-clipboard'
         'visual/codex-reattach-size.sh|e2e-visual-codex-reattach'
