@@ -934,6 +934,10 @@ of each refresh fail. A failing `--json` command reports its reason as
 `no beads project found` sentinel that hides the board — is read from whichever
 stream carried it.
 
+Successful calls force bd's opt-in versioned JSON envelope. Scribe accepts
+only schema 1 and rejects any other schema before parsing its payload, so a
+CLI format change cannot silently turn a board into an empty snapshot.
+
 Each refresh resolves `bd` through [[crates/scribe-server/src/beads_board.rs#resolve_bd_executable]] to an absolute executable path instead of relying on
 the packaged service's minimal PATH. It checks inherited absolute PATH entries,
 then common user installs (`~/.local/bin`, mise, Go, and Cargo), Linuxbrew, both

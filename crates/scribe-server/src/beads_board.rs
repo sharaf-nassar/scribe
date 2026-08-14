@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -26,6 +26,7 @@ const MAX_ITEMS_PER_QUEUE: usize = 200;
 const MAX_BLOCKERS_PER_ITEM: usize = 16;
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 512;
+const BD_JSON_SCHEMA_VERSION: u64 = 1;
 const SYSTEM_BD_DIRS: [&str; 9] = [
     "/opt/homebrew/bin",
     "/opt/homebrew/opt/beads/bin",
@@ -140,8 +141,7 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
     let bd = resolve_bd_executable()?;
     match Box::pin(run_bd(&bd, project_root, &["context"])).await {
         Ok(bytes) => {
-            let context: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("invalid bd context JSON: {error}"))?;
+            let context: serde_json::Value = parse_envelope(&bytes, "context")?;
             if !context.is_object() {
                 return Err("invalid bd context JSON: expected an object".into());
             }
@@ -237,6 +237,7 @@ async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<V
         // `-C` does not cover everything: `bd context` resolves the repository
         // through git in the process's own directory, and the server's is `/`.
         .current_dir(project_root)
+        .env("BD_JSON_ENVELOPE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -340,26 +341,25 @@ fn kill_process_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: Option<u32>) {}
 
-/// The three shapes `bd --json` answers a query with: `list`'s object today,
-/// the bare array `ready` and `blocked` return today, and the
-/// `{"data": …, "schema_version": …}` envelope bd 1.x announces on every run
-/// as v2.0's default and already serves under `BD_JSON_ENVELOPE=1`. Accepting
-/// the envelope now costs one variant and keeps a bd upgrade from silently
-/// turning every board into a parse error.
+#[derive(Debug, Deserialize)]
+struct JsonEnvelope {
+    data: serde_json::Value,
+    schema_version: u64,
+}
+
+/// The two collection payloads bd 1.1 returns under `BD_JSON_ENVELOPE=1`:
+/// `list` nests its issues, while `ready` and `blocked` return arrays.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum IssueCollection {
-    Envelope { issues: Vec<IssueJson> },
-    Versioned { data: Vec<IssueJson> },
+    List { issues: Vec<IssueJson> },
     Array(Vec<IssueJson>),
 }
 
 impl IssueCollection {
     fn into_issues(self) -> Vec<IssueJson> {
         match self {
-            Self::Envelope { issues } | Self::Versioned { data: issues } | Self::Array(issues) => {
-                issues
-            }
+            Self::List { issues } | Self::Array(issues) => issues,
         }
     }
 }
@@ -460,8 +460,19 @@ fn classify_snapshot(
 }
 
 fn parse_collection(bytes: &[u8], command: &str) -> Result<Vec<IssueJson>, String> {
-    serde_json::from_slice::<IssueCollection>(bytes)
-        .map(IssueCollection::into_issues)
+    parse_envelope::<IssueCollection>(bytes, command).map(IssueCollection::into_issues)
+}
+
+fn parse_envelope<T: DeserializeOwned>(bytes: &[u8], command: &str) -> Result<T, String> {
+    let envelope = serde_json::from_slice::<JsonEnvelope>(bytes)
+        .map_err(|error| format!("invalid bd {command} JSON: {error}"))?;
+    if envelope.schema_version != BD_JSON_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported bd {command} JSON schema version {} (expected {BD_JSON_SCHEMA_VERSION})",
+            envelope.schema_version
+        ));
+    }
+    serde_json::from_value(envelope.data)
         .map_err(|error| format!("invalid bd {command} JSON: {error}"))
 }
 
@@ -535,14 +546,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_bd_in_the_project_root_and_surfaces_its_stdout_error() {
+    async fn runs_bd_in_the_project_root_with_versioned_json_and_surfaces_its_stdout_error() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
         let scratch = std::env::temp_dir().join(format!("scribe-bd-run-{nonce}"));
         let root = scratch.join("project");
         fs::create_dir_all(&root).expect("create project dir");
         let fake = scratch.join("bd");
         // Stands in for a `--json` failure: the reason goes to stdout, not stderr.
-        fs::write(&fake, "#!/bin/sh\nprintf '{\"error\":\"ran in %s\"}' \"$(pwd)\"\nexit 1\n")
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '{\"error\":\"envelope %s, ran in %s\"}' \"${BD_JSON_ENVELOPE:-unset}\" \"$(pwd)\"\nexit 1\n",
+        )
             .expect("write fake bd");
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
         let bd = Bd { exe: fake, search_path: None };
@@ -550,23 +564,46 @@ mod tests {
         let error = run_bd(&bd, &root, &["context"]).await.expect_err("fake bd exits 1");
 
         let expected = root.canonicalize().expect("canonical project root");
-        assert_eq!(error.message(), format!("bd failed: ran in {}", expected.display()));
+        assert_eq!(
+            error.message(),
+            format!("bd failed: envelope 1, ran in {}", expected.display())
+        );
+        fs::remove_dir_all(scratch).expect("remove scratch dir");
+    }
+
+    #[tokio::test]
+    async fn recognizes_the_current_no_project_error() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let scratch = std::env::temp_dir().join(format!("scribe-bd-no-project-{nonce}"));
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let fake = scratch.join("bd");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'Error: cannot use -C directory \"/tmp\": no beads project found' >&2\nexit 1\n",
+        )
+        .expect("write fake bd");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let bd = Bd { exe: fake, search_path: None };
+
+        let error = run_bd(&bd, &scratch, &["context"]).await.expect_err("fake bd exits 1");
+
+        assert!(matches!(error, RunError::NoProject));
         fs::remove_dir_all(scratch).expect("remove scratch dir");
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]
     #[test]
     fn classifies_each_issue_once_with_board_precedence_and_metadata() {
-        let list = br#"{"issues":[
+        let list = br#"{"data":{"issues":[
           {"id":"epic","title":"Board epic","status":"open","priority":2,"issue_type":"epic"},
           {"id":"backlog","title":"Backlog","status":"deferred","priority":4},
           {"id":"ready","title":"Ready","status":"open","priority":1,"parent":"epic"},
           {"id":"doing","title":"Doing","status":"in_progress","priority":0},
           {"id":"blocked","title":"Blocked","status":"in_progress","priority":2},
           {"id":"done","title":"Done","status":"closed","priority":3}
-        ]}"#;
-        let ready = br#"[{"id":"ready","title":"Ready","status":"open","priority":1},{"id":"doing","title":"Doing","status":"in_progress","priority":0}]"#;
-        let blocked = br#"[{"id":"blocked","title":"Blocked","status":"in_progress","priority":2,"blocked_by":["gate-1"]},{"id":"done","title":"Done","status":"closed","priority":3,"blocked_by":["old"]}]"#;
+        ]},"schema_version":1}"#;
+        let ready = br#"{"data":[{"id":"ready","title":"Ready","status":"open","priority":1},{"id":"doing","title":"Doing","status":"in_progress","priority":0}],"schema_version":1}"#;
+        let blocked = br#"{"data":[{"id":"blocked","title":"Blocked","status":"in_progress","priority":2,"blocked_by":["gate-1"]},{"id":"done","title":"Done","status":"closed","priority":3,"blocked_by":["old"]}],"schema_version":1}"#;
 
         let board = classify_snapshot(list, ready, blocked).expect("classify board");
 
@@ -593,22 +630,30 @@ mod tests {
     }
 
     #[test]
-    fn reads_issues_from_the_versioned_envelope_bd_v2_will_default_to() {
-        let list =
-            br#"{"data":[{"id":"a","title":"A","status":"open","priority":2}],"schema_version":1}"#;
-        let board = classify_snapshot(list, b"[]", b"[]").expect("classify enveloped list");
+    fn reads_both_collection_shapes_from_the_versioned_envelope() {
+        let list = br#"{"data":{"issues":[{"id":"a","title":"A","status":"open","priority":2}]},"schema_version":1}"#;
+        let empty = br#"{"data":[],"schema_version":1}"#;
+        let board = classify_snapshot(list, empty, empty).expect("classify enveloped list");
 
         assert_eq!(board.backlog.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["a"]);
     }
 
     #[test]
-    fn rejects_malformed_json_and_non_native_priority() {
-        assert!(classify_snapshot(b"{}", b"[]", b"[]").is_err());
+    fn rejects_unknown_schema_malformed_json_and_non_native_priority() {
+        let empty = br#"{"data":[],"schema_version":1}"#;
+        let error = classify_snapshot(
+            br#"{"data":{"renamed_in_future":[]},"schema_version":2}"#,
+            empty,
+            empty,
+        )
+        .expect_err("future schema must fail explicitly");
+        assert_eq!(error, "unsupported bd list JSON schema version 2 (expected 1)");
+        assert!(classify_snapshot(b"{}", empty, empty).is_err());
         assert!(
             classify_snapshot(
-                br#"[{"id":"bad","title":"Bad","status":"open","priority":5}]"#,
-                b"[]",
-                b"[]",
+                br#"{"data":{"issues":[{"id":"bad","title":"Bad","status":"open","priority":5}]},"schema_version":1}"#,
+                empty,
+                empty,
             )
             .is_err()
         );
