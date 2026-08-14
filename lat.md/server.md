@@ -225,6 +225,20 @@ Probing the memo is a path compare and a clone, so it stays under the guards; a 
 
 Misses are keyed on the directory rather than the session for the second half of the same problem. Panes are independent sessions with independent memos, so a split window sitting in one repository misses once per pane; keying the walk on the directory collapses those into one `.git/HEAD` walk that every pane in that directory shares. Each pending session is then handed the answer and stores it in its own memo, so per-session invalidation semantics are unchanged.
 
+### Git Push Detection
+
+The server detects local pushes from Git's ref state and never treats PTY text as evidence of network activity.
+
+[[crates/scribe-server/src/git_ref_watcher.rs#GitRefWatcherControl|GitRefWatcherControl]] is owned by `IpcServerState`. Fresh and handoff-restored sessions submit their initial CWD, and later `CwdChanged` metadata uses the same path. Registration runs on the blocking pool, never a PTY reader's Tokio worker.
+
+Git resolves the worktree root, private git dir, and shared common dir, so a linked worktree's `.git` file is followed instead of parsed as a directory. Repositories sharing a common dir share one logical snapshot and watcher while retaining each worktree's private git-dir watch.
+
+Each repository watches its git dirs and common dir non-recursively, `refs` recursively, and `reftable` non-recursively. Native `notify` events debounce for 250 ms. A watch error or rescan request replaces that repository's native watcher with a 2 s `PollWatcher`; the fallback reads only local ref paths.
+
+After a burst, Git plumbing reads local branch tips and every configured remote's tracking namespace. A changed remote-tracking OID qualifies only when it equals a local branch tip. Repacking refs therefore emits nothing, while a qualifying change emits [[crates/scribe-server/src/git_ref_watcher.rs#PushDetected|PushDetected]] with the canonical repository root, head SHA, remote name, and push URL.
+
+[[crates/scribe-server/src/git_ref_watcher.rs#GitRefWatcher#start|GitRefWatcher::start]] returns `None` before allocating channels, a worker thread, or filesystem watchers when the feature is disabled. Live disable drops and joins the worker; live enable starts it and submits every retained session CWD. Enabled operation still makes no network request; the event only gates later CI polling.
+
 ### Clipboard Gating
 
 OSC 52 clipboard reads and writes from PTY-side programs flow through a per-session policy engine before reaching the host clipboard (spec 010). The in-memory `ServerClipboard` buffer is gone; the host clipboard is now the single source of truth.

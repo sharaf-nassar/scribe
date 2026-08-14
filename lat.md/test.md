@@ -3,6 +3,50 @@
 Scribe tests combine server-focused functional checks with GPUI headless and
 visual end-to-end coverage for the rebuilt client.
 
+## GitHub CI Tracking
+
+Server unit fixtures verify the local push gate before any GitHub polling or client protocol is involved.
+
+### Git ref-state detection
+
+Tests exercise logical Git snapshots and native watcher delivery across every required ref layout.
+
+#### Disabled construction creates no watcher
+
+Starting with the feature off returns no detector, receiver, worker thread, or filesystem watcher.
+
+#### Non-repository CWD is ignored
+
+An enabled detector given a normal directory returns without adding a watcher or treating repository absence as a server error.
+
+#### Live disable stops ref watching
+
+Disabling the server-owned control drops its worker and filesystem watchers, closes the internal event stream, and emits nothing for a later push.
+
+#### Loose refs emit pushed head
+
+A real push that advances a loose remote-tracking ref emits the canonical repository root, matching local branch-tip SHA, and configured remote's push URL.
+
+#### Packed refs use logical state
+
+A remote-tracking ref packed before the next push remains visible because the detector asks Git for refs instead of reading loose files.
+
+#### Packed ref rewrites do not mimic pushes
+
+Running `git pack-refs --all` without changing an OID produces no push event even though the watched storage files change.
+
+#### Linked worktrees resolve indirection
+
+A real linked-worktree push resolves its private git dir and shared common dir through Git, then emits that worktree's canonical root and pushed branch-tip SHA.
+
+#### Reftable path fixture
+
+Host Git 2.43 cannot create reftable repositories, so a synthetic resolved-path fixture verifies the documented `reftable` watch alongside `refs`, common dir, and private git dir paths.
+
+#### Watcher debounces push events
+
+A real native watcher receives one push's ref burst and emits exactly one internal event with its canonical repository root after the 250 ms debounce.
+
 ## Architecture
 
 CLI binary (`scribe-test`) dispatches subcommands to a long-lived daemon that holds an open IPC connection to scribe-server and buffers per-session state.

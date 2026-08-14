@@ -6116,6 +6116,7 @@ dependencies = [
  "minisign-verify",
  "netdev",
  "nix 0.31.2",
+ "notify",
  "plist",
  "pulldown-cmark",
  "rcgen",

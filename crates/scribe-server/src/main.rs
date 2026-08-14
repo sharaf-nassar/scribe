@@ -45,6 +45,9 @@ use scribe_server::lan;
 // the LIBRARY crate for the same reason as `tailnet`/`lan` — a second in-binary
 // copy would recompile its `pub` items into dead-code warnings.
 use scribe_server::session_exit;
+// CI ref watching is implemented once in the library; binary startup and CWD
+// wiring reach that copy through `crate::git_ref_watcher`.
+pub use scribe_server::git_ref_watcher;
 // The PTY reader owns the library's single terminal-image seam implementation;
 // re-export it here so the binary's `ipc_server` module uses that production
 // type instead of compiling a second copy.
@@ -365,6 +368,8 @@ async fn run_server_loop(
 ) -> Result<(), ScribeError> {
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
+    let git_ref_watcher =
+        Arc::new(git_ref_watcher::GitRefWatcherControl::new(github_ci::github_ci_enabled()));
 
     // The socket is already bound; queued client connections sit in the kernel
     // backlog until `start_ipc_server` begins accepting below, so nothing here
@@ -378,6 +383,7 @@ async fn run_server_loop(
         &workspace_manager,
         &live_sessions,
         &window_shares,
+        &git_ref_watcher,
     )
     .await;
 
@@ -435,6 +441,7 @@ async fn run_server_loop(
         release_fetcher: Arc::clone(&release_fetcher),
         env_store: Arc::clone(&env_store),
         remote_control: Arc::clone(&remote_control),
+        git_ref_watcher,
     };
 
     // Start the remote-control supervisor: it applies the current `[remote]`

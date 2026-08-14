@@ -22,6 +22,7 @@ use scribe_common::screen::{
 use scribe_common::screen_replay::build_session_replay;
 use scribe_pty::event_listener::ScribeEventListener;
 
+use crate::git_ref_watcher::GitRefWatcherControl;
 use crate::handoff::{HandoffSession, HandoffState};
 use crate::ipc_server::{self, LiveSessionRegistry};
 use crate::session_manager::{SessionManager, build_term_config, snapshot_term};
@@ -230,7 +231,8 @@ async fn activate_moves_sessions_to_live_registry() {
     let registry = ipc_server::new_live_session_registry();
 
     let shares = ipc_server::new_window_shares();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
+    let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares, &git_ref_watcher).await;
 
     // SessionManager should now be empty.
     assert!(
@@ -259,7 +261,8 @@ async fn serialize_live_returns_activated_sessions() {
     let registry = ipc_server::new_live_session_registry();
 
     let shares = ipc_server::new_window_shares();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
+    let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares, &git_ref_watcher).await;
     wait_registry_count(&registry, 1).await;
 
     let (sessions, fds) = ipc_server::serialize_live_for_handoff(&registry).await;
@@ -293,8 +296,9 @@ async fn environment_identity_survives_handoff_restore_and_reexport() {
     let wm = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
     let registry = ipc_server::new_live_session_registry();
     let shares = ipc_server::new_window_shares();
+    let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
 
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares, &git_ref_watcher).await;
     wait_registry_count(&registry, 1).await;
 
     let (sessions, _) = ipc_server::serialize_live_for_handoff(&registry).await;
@@ -315,7 +319,8 @@ async fn v4_legacy_handoff_snapshot_is_restored_durably() {
     let registry = ipc_server::new_live_session_registry();
 
     let shares = ipc_server::new_window_shares();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
+    let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares, &git_ref_watcher).await;
     wait_registry_count(&registry, 1).await;
 
     // The legacy handoff snapshot had alt_screen=true and cursor_visible=false.

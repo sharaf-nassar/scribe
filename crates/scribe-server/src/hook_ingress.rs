@@ -23,7 +23,7 @@ use scribe_common::ids::{SessionId, WindowId};
 use scribe_pty::metadata::MetadataEvent;
 
 use crate::env_store::{EnvChangeEvent, EnvStoreState, StartupBaseline};
-use crate::ipc_server::{ClientWriter, IpcServerState, send_metadata_event};
+use crate::ipc_server::{ClientWriter, IpcServerState, MetadataRuntime, send_metadata_event};
 use crate::stop_classifier;
 
 /// Handle one inbound `HookEvent` from a hook subprocess.
@@ -76,8 +76,11 @@ pub async fn handle(server: &IpcServerState, event: HookEvent) {
         metadata_event,
         session_id,
         &client_writer,
-        &server.workspace_manager,
-        &server.live_sessions,
+        MetadataRuntime {
+            workspace_manager: &server.workspace_manager,
+            live_sessions: &server.live_sessions,
+            git_ref_watcher: &server.git_ref_watcher,
+        },
     )
     .await;
 }

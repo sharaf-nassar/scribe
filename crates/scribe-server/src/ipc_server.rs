@@ -45,6 +45,7 @@ use scribe_pty::osc_interceptor::OscInterceptor;
 use crate::beads_board::BeadsBoardCache;
 use crate::child_identity::{IdentityCheck, check_child_identity};
 use crate::child_watch::{ChildExit, ChildExitWatcher};
+use crate::git_ref_watcher::GitRefWatcherControl;
 use crate::handoff::HandoffSession;
 use crate::hook_ingress;
 use crate::lan::discovery::{AdvertiseConfig, LanDiscovery, LanPeerHandle, local_hostname};
@@ -1142,6 +1143,8 @@ pub struct IpcServerState {
     /// accept path consults the matching per-transport state for the disable-race
     /// refusal and the connection cap.
     pub remote_control: Arc<RemoteControl>,
+    /// Server-wide local-push detector, absent internally while its setting is off.
+    pub git_ref_watcher: Arc<GitRefWatcherControl>,
 }
 
 struct ClientDispatchContext<'a> {
@@ -1180,9 +1183,17 @@ struct CreateSessionRequest {
 struct SessionRuntimeContext<'a> {
     workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
     live_sessions: &'a LiveSessionRegistry,
+    git_ref_watcher: &'a Arc<GitRefWatcherControl>,
     /// Feature 015 (T006): the per-window share registry, consulted by the PTY
     /// reader for the controller's spec-010 clipboard-gating bit.
     window_shares: &'a WindowShares,
+}
+
+#[derive(Clone, Copy)]
+pub struct MetadataRuntime<'a> {
+    pub workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+    pub live_sessions: &'a LiveSessionRegistry,
+    pub git_ref_watcher: &'a Arc<GitRefWatcherControl>,
 }
 
 #[derive(Clone, Copy)]
@@ -1242,6 +1253,7 @@ struct PtyReaderState {
     attachment: SessionAttachment,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
+    git_ref_watcher: Arc<GitRefWatcherControl>,
     /// Feature 015 (T006): the per-window share registry, read for the window
     /// controller's spec-010 clipboard-gating capability bit.
     window_shares: WindowShares,
@@ -6886,6 +6898,7 @@ async fn handle_create_session(
         SessionRuntimeContext {
             workspace_manager: &context.server.workspace_manager,
             live_sessions: &context.server.live_sessions,
+            git_ref_watcher: &context.server.git_ref_watcher,
             window_shares: &context.server.window_shares,
         },
     ))
@@ -7091,6 +7104,9 @@ async fn register_session(
 ) -> Option<AiProvider> {
     let ai_provider = live.ai_state.as_ref().map(|state| state.provider).or(live.ai_provider_hint);
     let exit_handles = live.exit_handles();
+    if let Some(cwd) = live.cwd.as_deref() {
+        observe_git_repository(runtime.git_ref_watcher, cwd);
+    }
     runtime.live_sessions.write().await.insert(session_id, live);
     spawn_child_exit_watcher(child_pidfd, child_pid, session_id, exit_handles, runtime);
     ai_provider
@@ -7208,6 +7224,7 @@ fn spawn_pty_reader(
         attachment: inputs.attachment,
         workspace_manager: Arc::clone(runtime.workspace_manager),
         live_sessions: Arc::clone(runtime.live_sessions),
+        git_ref_watcher: Arc::clone(runtime.git_ref_watcher),
         window_shares: Arc::clone(runtime.window_shares),
         clipboard_burst: ClipboardBurstState::new(load_clipboard_policy_snapshot()),
         pending_clipboard_reads: HashMap::new(),
@@ -9176,9 +9193,19 @@ async fn handle_config_reloaded(server: &IpcServerState) {
     }
     apply_image_master_switch(cfg.images_enabled, &sessions);
     crate::github_ci::set_github_ci_enabled(cfg.github_ci.enabled);
+    let github_ci_changed = server.git_ref_watcher.set_enabled(cfg.github_ci.enabled);
+    let github_ci_cwds: Vec<_> = if github_ci_changed && cfg.github_ci.enabled {
+        sessions.values().filter_map(|session| session.cwd.clone()).collect()
+    } else {
+        Vec::new()
+    };
     apply_reload_to_sessions(&sessions, &term_config, new_scrollback, &cfg).await;
     let sessions_len = sessions.len();
     drop(sessions);
+
+    for cwd in github_ci_cwds {
+        observe_git_repository(&server.git_ref_watcher, &cwd);
+    }
 
     for (client_writer, msg) in workspace_messages {
         send_to_client(&client_writer, None, &msg);
@@ -10732,8 +10759,11 @@ async fn handle_session_event(
                 event,
                 state.session_id,
                 &state.client_writer,
-                &state.workspace_manager,
-                &state.live_sessions,
+                MetadataRuntime {
+                    workspace_manager: &state.workspace_manager,
+                    live_sessions: &state.live_sessions,
+                    git_ref_watcher: &state.git_ref_watcher,
+                },
             )
             .await;
         }
@@ -11511,8 +11541,11 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
         event,
         state.session_id,
         &state.client_writer,
-        &state.workspace_manager,
-        &state.live_sessions,
+        MetadataRuntime {
+            workspace_manager: &state.workspace_manager,
+            live_sessions: &state.live_sessions,
+            git_ref_watcher: &state.git_ref_watcher,
+        },
     )
     .await;
 }
@@ -11534,8 +11567,11 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
         event,
         state.session_id,
         &state.client_writer,
-        &state.workspace_manager,
-        &state.live_sessions,
+        MetadataRuntime {
+            workspace_manager: &state.workspace_manager,
+            live_sessions: &state.live_sessions,
+            git_ref_watcher: &state.git_ref_watcher,
+        },
     )
     .await;
 }
@@ -11906,6 +11942,20 @@ async fn record_cwd_report(
     true
 }
 
+/// Hand an observed session CWD to Git without blocking a Tokio worker.
+fn observe_git_repository(git_ref_watcher: &Arc<GitRefWatcherControl>, cwd: &Path) {
+    if !git_ref_watcher.is_running() {
+        return;
+    }
+    let git_ref_watcher = Arc::clone(git_ref_watcher);
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = git_ref_watcher.watch_cwd(&cwd) {
+            debug!(%error, cwd = %cwd.display(), "Git repository watch skipped");
+        }
+    });
+}
+
 /// Convert a `MetadataEvent` to a `ServerMessage` and send it.
 /// For `CwdChanged`, also notifies the workspace manager and sends git branch.
 /// Workspace naming always runs (even when detached) so names are ready on
@@ -11919,9 +11969,9 @@ pub async fn send_metadata_event(
     event: MetadataEvent,
     session_id: SessionId,
     client_writer: &ClientWriter,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    live_sessions: &LiveSessionRegistry,
+    runtime: MetadataRuntime<'_>,
 ) {
+    let MetadataRuntime { workspace_manager, live_sessions, git_ref_watcher } = runtime;
     // Context-only refreshes patch the existing live state instead of
     // creating a new `AiStateChanged`. They never carry a state value, so
     // they cannot synthesize one — when no live state has been established
@@ -11973,6 +12023,7 @@ pub async fn send_metadata_event(
     }
 
     if let Some(cwd) = cwd_for_workspace {
+        observe_git_repository(git_ref_watcher, &cwd);
         // Send git branch information for the new CWD. A detached session has
         // no sink to render the branch, so the walk is pure waste — the
         // `SessionList` reply that precedes the next attach resolves it.
@@ -12182,6 +12233,7 @@ pub async fn activate_pending_sessions(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
     window_shares: &WindowShares,
+    git_ref_watcher: &Arc<GitRefWatcherControl>,
 ) {
     let pending = session_manager.pending_session_ids().await;
 
@@ -12200,7 +12252,12 @@ pub async fn activate_pending_sessions(
                 StartSessionIds { session: session_id, workspace: workspace_id, window: window_id },
                 session,
                 InitialAttachment { writer: None, attached_ids: None },
-                SessionRuntimeContext { workspace_manager, live_sessions, window_shares },
+                SessionRuntimeContext {
+                    workspace_manager,
+                    live_sessions,
+                    git_ref_watcher,
+                    window_shares,
+                },
             )
             .await;
             info!(%session_id, "activated restored session (detached)");
@@ -12924,7 +12981,9 @@ mod tests {
         let workspaces = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
         let live_sessions = new_live_session_registry();
         let shares = new_window_shares();
-        activate_pending_sessions(&manager, &workspaces, &live_sessions, &shares).await;
+        let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
+        activate_pending_sessions(&manager, &workspaces, &live_sessions, &shares, &git_ref_watcher)
+            .await;
 
         for _ in 0..100 {
             if live_sessions.read().await.contains_key(&session_id) {
