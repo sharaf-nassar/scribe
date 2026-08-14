@@ -4,9 +4,9 @@
 //! nav plus a scrollable content pane whose controls read their current value
 //! from the loaded [`ScribeConfig`] via [`crate::settings::values`] and write
 //! edits back through the ported [`crate::settings::apply::apply_settings_change`]
-//! path. Interactive controls (toggle, choice-cycle, numeric stepper) commit
-//! immediately, mirroring the old webview's live-apply behaviour; the file
-//! watcher in the running client picks the change up as a `ConfigReloaded`.
+//! path. Interactive controls commit immediately except closed theme-preset
+//! cycling, which updates its label at once and coalesces repeated arrow steps;
+//! the file watcher in the running client picks writes up as `ConfigReloaded`.
 //!
 //! Colors open one anchored preset/custom palette; its exact-value field and
 //! general free-text controls share one inline editor. Enter commits through
@@ -95,6 +95,9 @@ const SERVER_ACTION_TIMEOUT: Duration = Duration::from_secs(3);
 /// server action — two frames at 60 Hz, enough for the pending status line to
 /// be drawn and presented.
 const PENDING_PAINT_DELAY: Duration = Duration::from_millis(34);
+
+/// Idle window that folds repeated closed theme-preset steps into one write.
+const THEME_PRESET_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Width of the client-side-decoration resize gutter painted around the window.
 ///
@@ -315,6 +318,12 @@ pub struct SettingsWindow {
     /// Token of the open menu row moved by Up/Down. This stays separate from
     /// the applied value so keyboard browsing never previews or commits early.
     choice_highlight: Option<String>,
+    /// Closed `theme.preset` cycling paints this value before it reaches disk.
+    pending_theme_preset: Option<String>,
+    /// Bumped by every step, flush, or discard so a stale timer cannot apply.
+    theme_preset_generation: u64,
+    /// Dropping a superseded task cancels its timer, matching the find overlay.
+    theme_preset_task: Option<gpui::Task<()>>,
     /// Scroll position of that dropdown. Shared because only one is ever open,
     /// and rewound on open so the live value is on screen even in the ~190-entry
     /// theme preset list.
@@ -426,6 +435,28 @@ enum ChoiceMenuKey {
     Apply,
     Dismiss,
     Swallow,
+}
+
+fn replace_pending_theme_preset(
+    pending: &mut Option<String>,
+    generation: &mut u64,
+    value: String,
+) -> u64 {
+    *pending = Some(value);
+    *generation = generation.wrapping_add(1);
+    *generation
+}
+
+fn take_pending_theme_preset(
+    pending: &mut Option<String>,
+    generation: &mut u64,
+    expected_generation: Option<u64>,
+) -> Option<String> {
+    if expected_generation.is_some_and(|expected| expected != *generation) {
+        return None;
+    }
+    *generation = generation.wrapping_add(1);
+    pending.take()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -722,6 +753,9 @@ impl SettingsWindow {
             scroll_handle: ScrollHandle::new(),
             open_choice: None,
             choice_highlight: None,
+            pending_theme_preset: None,
+            theme_preset_generation: 0,
+            theme_preset_task: None,
             choice_scroll: ScrollHandle::new(),
             open_color: None,
             color_hue: 0.0,
@@ -975,6 +1009,7 @@ impl SettingsWindow {
     }
 
     fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_theme_preset(cx);
         if page != self.page {
             let edit_was_focused = self.edit_handle.is_focused(window);
             let edit_was_active = self.clear_inline_edit();
@@ -1091,6 +1126,7 @@ impl SettingsWindow {
     /// stale keyboard seam. Registered click handlers replace this index with
     /// their precise target before applying an action.
     fn clear_keyboard_navigation(&mut self, cx: &mut Context<Self>) {
+        self.flush_theme_preset(cx);
         let had_visible_focus = self.keyboard_navigation;
         self.keyboard_navigation = false;
         self.focus_index = 0;
@@ -1104,6 +1140,7 @@ impl SettingsWindow {
     }
 
     fn move_focus(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_theme_preset(cx);
         let count = self.focus_targets().len();
         if count > 0 {
             self.focus_index = if direction.is_negative() {
@@ -1650,6 +1687,7 @@ impl SettingsWindow {
         if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
             && event.keystroke.key == "k"
         {
+            self.flush_theme_preset(cx);
             window.focus(&self.search_handle, cx);
             self.keyboard_navigation = false;
             cx.notify();
@@ -1732,6 +1770,9 @@ impl SettingsWindow {
     /// Back out of whatever transient state Escape should unwind, innermost
     /// first: an open palette, choice filter, choice menu, then page search.
     fn dismiss_transient_state(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.discard_theme_preset(cx) {
+            return true;
+        }
         if self.close_color_picker(cx) {
             return true;
         }
@@ -1991,9 +2032,18 @@ impl SettingsWindow {
         key: &str,
         options: &[(&'static str, &'static str)],
     ) -> Vec<(String, String)> {
+        let token = self.choice_token(key);
+        choice_options_from_cache(key, &token, options, &self.theme_presets)
+    }
+
+    fn choice_token(&self, key: &str) -> String {
         let value = current_value(&self.config, key);
-        let token = value.as_str().unwrap_or("");
-        choice_options_from_cache(key, token, options, &self.theme_presets)
+        let saved = value.as_str().unwrap_or("");
+        if key == "theme.preset" {
+            self.pending_theme_preset.as_deref().unwrap_or(saved).to_owned()
+        } else {
+            saved.to_owned()
+        }
     }
 
     /// Step a choice control by one position through [`Self::choice_options`],
@@ -2010,15 +2060,72 @@ impl SettingsWindow {
         if count == 0 {
             return;
         }
-        let value = current_value(&self.config, key);
-        let token = value.as_str().unwrap_or("");
-        let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
+        let token = self.choice_token(key);
+        let index = options.iter().position(|(candidate, _)| candidate == &token).unwrap_or(0);
         let next =
             if direction.is_negative() { (index + count - 1) % count } else { (index + 1) % count };
         let Some((chosen, _)) = options.get(next) else {
             return;
         };
-        self.commit(key, Value::String(chosen.clone()), cx);
+        if key == "theme.preset" {
+            self.defer_theme_preset(chosen.clone(), cx);
+        } else {
+            self.commit(key, Value::String(chosen.clone()), cx);
+        }
+    }
+
+    fn defer_theme_preset(&mut self, value: String, cx: &mut Context<Self>) {
+        let generation = replace_pending_theme_preset(
+            &mut self.pending_theme_preset,
+            &mut self.theme_preset_generation,
+            value,
+        );
+        self.theme_preset_task = Some(cx.spawn(async move |settings, app| {
+            app.background_executor().timer(THEME_PRESET_DEBOUNCE).await;
+            settings
+                .update(app, |settings, ctx| settings.settle_theme_preset(generation, ctx))
+                .ok();
+        }));
+        cx.notify();
+    }
+
+    fn settle_theme_preset(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let Some(value) = take_pending_theme_preset(
+            &mut self.pending_theme_preset,
+            &mut self.theme_preset_generation,
+            Some(generation),
+        ) else {
+            return;
+        };
+        self.theme_preset_task = None;
+        self.commit("theme.preset", Value::String(value), cx);
+    }
+
+    fn flush_theme_preset(&mut self, cx: &mut Context<Self>) -> bool {
+        self.theme_preset_task = None;
+        let Some(value) = take_pending_theme_preset(
+            &mut self.pending_theme_preset,
+            &mut self.theme_preset_generation,
+            None,
+        ) else {
+            return false;
+        };
+        self.commit("theme.preset", Value::String(value), cx);
+        true
+    }
+
+    fn discard_theme_preset(&mut self, cx: &mut Context<Self>) -> bool {
+        self.theme_preset_task = None;
+        let discarded = take_pending_theme_preset(
+            &mut self.pending_theme_preset,
+            &mut self.theme_preset_generation,
+            None,
+        )
+        .is_some();
+        if discarded {
+            cx.notify();
+        }
+        discarded
     }
 
     fn cycle(
@@ -2369,7 +2476,8 @@ impl Render for SettingsWindow {
             .role(Role::Application)
             .aria_label("Scribe settings")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &CloseWindow, action_window, _| {
+            .on_action(cx.listener(|this, _: &CloseWindow, action_window, ctx| {
+                this.flush_theme_preset(ctx);
                 action_window.remove_window();
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, key_window, ctx| {
@@ -3902,8 +4010,7 @@ impl SettingsWindow {
         let colors = self.colors;
         let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
         let effective = self.choice_options(&control.key, options);
-        let value = current_value(&self.config, &control.key);
-        let token = value.as_str().unwrap_or("").to_owned();
+        let token = self.choice_token(&control.key);
         let display = effective
             .iter()
             .find(|(choice, _)| *choice == token)
@@ -4192,6 +4299,7 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.flush_theme_preset(cx);
         if self.open_choice.as_deref() == Some(key) {
             self.clear_choice_menu_state();
             window.focus(&self.focus_handle, cx);
@@ -5693,7 +5801,13 @@ fn settings_window_control(
         .hover(move |style| style.bg(hover).text_color(colors.text))
         // Keep the press off the titlebar's drag arming so a click with a pixel
         // of jitter can never turn into a window move that eats the click.
-        .on_mouse_down(MouseButton::Left, |_, _, ctx| ctx.stop_propagation())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, ctx| {
+                this.flush_theme_preset(ctx);
+                ctx.stop_propagation();
+            }),
+        )
         .on_click(cx.listener(move |_, _, window, _| match kind {
             SettingsWindowControl::Minimize => window.minimize_window(),
             SettingsWindowControl::Maximize => window.zoom_window(),
@@ -6117,10 +6231,11 @@ mod tests {
         content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
         focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
         key_combo_text, move_choice_highlight, offset_from_drag, offset_from_track_click,
-        palette_color_at, px, release_inline_input, revert_inline_input, search_display_text,
-        theme_preset_preview, utf16_range_to_utf8, workspace_badge_color_controls,
-        workspace_root_controls_match_query, workspace_root_focus_index,
-        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
+        palette_color_at, px, release_inline_input, replace_pending_theme_preset,
+        revert_inline_input, search_display_text, take_pending_theme_preset, theme_preset_preview,
+        utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
+        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
+        workspace_roots_match_query,
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig, ThemeConfig};
@@ -6306,6 +6421,55 @@ mod tests {
             choice_menu_key_action("tab", Modifiers { shift: true, ..Modifiers::default() }),
             Some(ChoiceMenuKey::Swallow)
         );
+    }
+
+    // @lat: [[test#Test Harness#GPUI Settings Window#Closed theme preset debounce]]
+    #[test]
+    fn theme_preset_steps_settle_once_and_escape_discards() {
+        let mut pending = None;
+        let mut generation = 0;
+        let stale =
+            replace_pending_theme_preset(&mut pending, &mut generation, String::from("dracula"));
+        replace_pending_theme_preset(&mut pending, &mut generation, String::from("gruvbox-dark"));
+        let current = replace_pending_theme_preset(
+            &mut pending,
+            &mut generation,
+            String::from("solarized-dark"),
+        );
+        let mut applied = Vec::new();
+
+        if let Some(value) = take_pending_theme_preset(&mut pending, &mut generation, Some(stale)) {
+            applied.push(value);
+        }
+        if let Some(value) = take_pending_theme_preset(&mut pending, &mut generation, Some(current))
+        {
+            applied.push(value);
+        }
+
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied, ["solarized-dark"]);
+        assert_eq!(pending.as_deref().unwrap_or("minimal-dark"), "minimal-dark");
+
+        let mut cancelled = None;
+        let mut cancelled_generation = 0;
+        let cancelled_timer = replace_pending_theme_preset(
+            &mut cancelled,
+            &mut cancelled_generation,
+            String::from("dracula"),
+        );
+        assert_eq!(cancelled.as_deref().unwrap_or("minimal-dark"), "dracula");
+        let discarded = take_pending_theme_preset(&mut cancelled, &mut cancelled_generation, None);
+        assert_eq!(discarded.as_deref(), Some("dracula"));
+        assert_eq!(cancelled.as_deref().unwrap_or("minimal-dark"), "minimal-dark");
+        let escaped_applies = usize::from(
+            take_pending_theme_preset(
+                &mut cancelled,
+                &mut cancelled_generation,
+                Some(cancelled_timer),
+            )
+            .is_some(),
+        );
+        assert_eq!(escaped_applies, 0);
     }
 
     // @lat: [[test#GPUI Settings Window#Theme preset filtering#Filtered highlight]]

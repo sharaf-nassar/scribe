@@ -4005,6 +4005,10 @@ An open menu consumes both Tab and Shift+Tab so reverse traversal cannot move pa
 
 Highlight movement wraps at both ends using the filtered row count and yields no row for an empty result.
 
+### Closed theme preset debounce
+
+Repeated Left/Right steps update the closed preset label immediately but settle through one apply; Escape restores the saved label without applying.
+
 ### Color selector palette
 
 The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.
