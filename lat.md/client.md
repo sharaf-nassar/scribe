@@ -944,6 +944,10 @@ of each refresh fail. A failing `--json` command reports its reason as
 `no beads project found` sentinel that hides the board — is read from whichever
 stream carried it.
 
+Server tests execute checked-in, read-only fake `bd` scripts instead of writing
+executables at runtime. Resolver permission and layout fixtures use scratch
+paths namespaced by process ID and a process-local atomic sequence.
+
 Successful calls force bd's opt-in versioned JSON envelope. Scribe accepts
 only schema 1 and rejects any other schema before parsing its payload, so a
 CLI format change cannot silently turn a board into an empty snapshot.

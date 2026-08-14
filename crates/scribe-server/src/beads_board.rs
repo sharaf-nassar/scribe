@@ -483,9 +483,21 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn beads_test_scratch_path(label: &str) -> PathBuf {
+        let id = NEXT_SCRATCH_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("scribe-bd-{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn bd_test_scratch_paths_are_unique_within_a_process() {
+        assert_ne!(beads_test_scratch_path("unique"), beads_test_scratch_path("unique"));
+    }
 
     #[test]
     fn bd_search_covers_linux_macos_and_user_installs() {
@@ -510,8 +522,7 @@ mod tests {
 
     #[test]
     fn resolves_a_runnable_shim_without_following_it_to_its_target() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let scratch = std::env::temp_dir().join(format!("scribe-bd-resolver-{nonce}"));
+        let scratch = beads_test_scratch_path("resolver");
         let unreadable = scratch.join("not-executable");
         let foreign = scratch.join("foreign");
         let shims = scratch.join("shims");
@@ -547,21 +558,12 @@ mod tests {
 
     #[tokio::test]
     async fn runs_bd_in_the_project_root_with_versioned_json_and_surfaces_its_stdout_error() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let scratch = std::env::temp_dir().join(format!("scribe-bd-run-{nonce}"));
-        let root = scratch.join("project");
-        fs::create_dir_all(&root).expect("create project dir");
-        let fake = scratch.join("bd");
         // Stands in for a `--json` failure: the reason goes to stdout, not stderr.
-        fs::write(
-            &fake,
-            "#!/bin/sh\nprintf '{\"error\":\"envelope %s, ran in %s, args %s\"}' \"${BD_JSON_ENVELOPE:-unset}\" \"$(pwd)\" \"$*\"\nexit 1\n",
-        )
-            .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fake = root.join("tests/fixtures/bd-stdout-error.sh");
         let bd = Bd { exe: fake, search_path: None };
 
-        let error = run_bd(&bd, &root, &["context"]).await.expect_err("fake bd exits 1");
+        let error = run_bd(&bd, root, &["context"]).await.expect_err("fake bd exits 1");
 
         let expected = root.canonicalize().expect("canonical project root");
         assert_eq!(
@@ -572,24 +574,17 @@ mod tests {
                 root.display()
             )
         );
-        fs::remove_dir_all(scratch).expect("remove scratch dir");
     }
 
     #[tokio::test]
     async fn recognizes_the_current_no_project_error() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let scratch = std::env::temp_dir().join(format!("scribe-bd-no-project-{nonce}"));
-        fs::create_dir_all(&scratch).expect("create scratch dir");
-        let fake = scratch.join("bd");
-        fs::write(&fake, "#!/bin/sh\nprintf 'Error: no beads project found' >&2\nexit 1\n")
-            .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fake = root.join("tests/fixtures/bd-no-project.sh");
         let bd = Bd { exe: fake, search_path: None };
 
-        let error = run_bd(&bd, &scratch, &["context"]).await.expect_err("fake bd exits 1");
+        let error = run_bd(&bd, root, &["context"]).await.expect_err("fake bd exits 1");
 
         assert!(matches!(error, RunError::NoProject));
-        fs::remove_dir_all(scratch).expect("remove scratch dir");
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]
