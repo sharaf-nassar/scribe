@@ -88,10 +88,10 @@ with `stale` as an overlay of `running`.
   ~10 s; failure and cancelled persist until dismissed — failure is the
   state the user must not miss.
 - **stale** — API failure (auth expired, rate-limited, offline) during an
-  active tracked run: keep the last-known content, add `⚠ stale · retry
-  in Ns`, stop advancing elapsed. Recovery resumes running; window
-  deadline expiry goes to hidden. Outside an active run, failures never
-  surface a bar.
+  active tracked run: keep the last-known content, lead with the state
+  word `stale · retry in Ns`, stop advancing elapsed. Recovery resumes
+  running; window deadline expiry goes to hidden. Outside an active run,
+  failures never surface a bar.
 - **dismiss** — `✕` hides the bar for the current tracked head and syncs
   across all attached clients; a new push (new head) resurrects the bar.
   Terminal states also auto-clear when the window closes.
@@ -140,24 +140,28 @@ status (accessibility rule from the spec review).
 ### Visual direction
 
 The mockup's primary direction is **trace**: the band is a timeline, not a
-status row. Collapsed, a segmented pipeline strip carries one named
-segment per job (micro-label above each segment; workflow boundaries as a
-wider gap), with a conic ring filling as jobs complete. The active job is
-marked three ways at once: its segment shimmers, its name brightens to
-full foreground, and a breathing ▸ precedes it; done jobs dim to solid,
-queued jobs dash, a failed job's name goes red. Beyond ~6 jobs the strip
-elides to failed + active jobs plus a "+n" counter segment. Expanded,
-jobs render as time-positioned bars on a shared minute-grid axis so
-parallelism reads at a glance. A hairline under the band takes the
-workspace badge color — ownership encoded structurally, which is what
-disambiguates the band in multi-workspace windows. Failure/stale re-key
-that hairline semantically; stale freezes all motion while keeping the
-active job named. Motion (appear sweep, shimmer, breathing caret, success
-exit) routes through the existing GPUI animation system and its off
-switch; terminal states are static. An alternate **edge** direction
-trades the band for a 2px luminous progress line under the titlebar plus
-a fading micro cluster naming the active job — zero chrome height; both
-directions share the trace panel.
+status row. The 40px collapsed band is one aligned system — state
+cluster, job cells, metadata. A conic ring fills as jobs complete and
+collapses to a solid square mark on terminal states. Each job is a cell
+(name over a live track); workflow boundaries are drawn as one-pixel
+rules. The active job is marked three ways at once: its track shimmers,
+its name holds full foreground, and a breathing square dot (the
+workspace-pill dot, smaller) precedes it; done jobs settle solid, queued
+jobs dash, a failed job's name goes red. Beyond ~6 jobs the strip elides
+to failed + active jobs plus a "+n" counter cell. Metadata groups as
+`branch @ sha · elapsed` with a one-pixel rule before the actions.
+Expanded, jobs render as time-positioned bars on a shared minute-grid
+axis so parallelism reads at a glance. A hairline under the band takes
+the workspace badge color — ownership encoded structurally, which is
+what disambiguates the band in multi-workspace windows. Failure/stale
+re-key that hairline semantically; stale leads with its own state word
+("stale · retry in Ns") and freezes elapsed and all motion while keeping
+the active job named. Motion (appear sweep, shimmer, one shared 1.2 s
+breathing rhythm, success exit) routes through the existing GPUI
+animation system and its off switch; terminal states are static. An
+alternate **edge** direction trades the band for a 2px luminous progress
+line under the titlebar plus a fading micro cluster naming the active
+job — zero chrome height; both directions share the trace panel.
 
 ### Notification surface decision
 

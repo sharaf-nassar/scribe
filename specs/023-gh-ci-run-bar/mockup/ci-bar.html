@@ -18,8 +18,8 @@
     --brblack: #52525b;
     /* Derived chrome */
     --tab-bar-bg: #1a1a1d;
-    --band-bg: #0b0b0d;               /* recessed below the titlebar */
-    --panel-bg: #0a0a0c;
+    --band-bg: #101013;               /* recessed below the titlebar */
+    --panel-bg: #0c0c0e;
     --chrome-text: rgba(228, 228, 231, 0.5);
     --divider: rgba(228, 228, 231, 0.12);
     --badge: #a78bfa;                 /* workspace accent slot 1 */
@@ -27,7 +27,7 @@
     /* Documentation frame */
     --page-bg: #08080a;
     --page-fg: #d4d4d8;
-    --page-muted: #7f7f8a;
+    --page-muted: #83838d;
     --page-rule: #1f1f24;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   }
@@ -38,30 +38,34 @@
     font-family: var(--mono);
     font-size: 14px;
     line-height: 1.6;
-    padding: 56px 24px 96px;
+    padding: 64px 24px 112px;
   }
   .wrap { max-width: 940px; margin: 0 auto; }
 
-  header { margin-bottom: 64px; }
+  header { margin-bottom: 72px; }
   header h1 {
-    font-size: 24px; font-weight: 600; letter-spacing: -0.01em;
+    font-size: 26px; font-weight: 600; letter-spacing: -0.015em;
     color: #fafafa; text-wrap: balance;
   }
-  header .sub { color: var(--page-muted); margin-top: 10px; max-width: 68ch; }
+  header .sub {
+    color: var(--page-muted); margin-top: 12px; max-width: 64ch;
+    font-size: 13.5px;
+  }
   header .meta {
-    margin-top: 18px; font-size: 12px; color: var(--page-muted);
-    display: flex; gap: 20px; flex-wrap: wrap;
+    margin-top: 22px; font-size: 12px; color: var(--page-muted);
+    display: flex; gap: 24px; flex-wrap: wrap;
+    padding-top: 14px; border-top: 1px solid var(--page-rule);
   }
   header .meta b { color: var(--page-fg); font-weight: 500; }
 
-  .vignette { margin: 56px 0; }
-  .vignette > .label {
-    text-transform: uppercase; letter-spacing: 0.16em;
-    font-size: 11px; color: var(--blue); margin-bottom: 4px;
+  .vignette { margin: 64px 0; }
+  .vignette > h2, .specs > h2 {
+    font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+    color: #fafafa;
   }
   .vignette > .caption {
-    color: var(--page-muted); font-size: 13px; max-width: 74ch;
-    margin-bottom: 16px;
+    color: var(--page-muted); font-size: 13px; max-width: 66ch;
+    margin: 6px 0 18px;
   }
   .frame-scroll { overflow-x: auto; }
 
@@ -100,14 +104,14 @@
 
   /* =========================================================
      CI band — "trace" direction.
-     A recessed timeline surface: status ring, pipeline strip,
-     badge-keyed underline. Not a status row — a live timeline.
+     One aligned system: state cluster · job cells · metadata.
+     Flat surface, one-pixel rules, badge-keyed underline.
      ========================================================= */
   .ci-band {
     position: relative;
-    display: flex; align-items: center; gap: 14px;
-    height: 34px; padding: 0 12px 0 14px;
-    background: linear-gradient(rgba(255,255,255,0.015), rgba(0,0,0,0.25)), var(--band-bg);
+    display: flex; align-items: center; gap: 18px;
+    height: 40px; padding: 0 14px;
+    background: var(--band-bg);
     color: var(--term-fg);
     white-space: nowrap;
     overflow: hidden;
@@ -117,6 +121,8 @@
     content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px;
     background: color-mix(in srgb, var(--badge) 55%, transparent);
   }
+  .ci-band.failed::before { background: color-mix(in srgb, var(--red) 60%, transparent); }
+  .ci-band.stale-band::before { background: color-mix(in srgb, var(--yellow) 50%, transparent); }
   /* one-shot light sweep on appear (echoes the titlebar attention flash) */
   .ci-band.appearing::after {
     content: ""; position: absolute; top: 0; bottom: 0; width: 160px;
@@ -127,83 +133,82 @@
   }
   @keyframes sweep { from { left: -180px; } to { left: 110%; } }
 
-  /* status ring: conic fill = completed jobs / total jobs */
+  /* state cluster: ring (while running) or mark (terminal), plus word */
+  .ci-state { display: flex; align-items: center; gap: 8px; flex: none; }
   .ring {
-    width: 14px; height: 14px; border-radius: 50%;
+    width: 16px; height: 16px; border-radius: 50%; flex: none;
     background: conic-gradient(var(--ring-c, var(--blue)) var(--ring-p, 40%),
-                rgba(228,228,231,0.14) 0);
-    -webkit-mask: radial-gradient(farthest-side, transparent 55%, #000 57%);
-            mask: radial-gradient(farthest-side, transparent 55%, #000 57%);
-    flex: none;
+                rgba(228, 228, 231, 0.15) 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent 60%, #000 63%);
+            mask: radial-gradient(farthest-side, transparent 60%, #000 63%);
   }
-  .ring.done { -webkit-mask: none; mask: none; transform: scale(0.62); border-radius: 3px; }
-  .ci-word { font-weight: 600; letter-spacing: 0.02em; }
+  .mark { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .ci-word { font-weight: 600; letter-spacing: 0.01em; font-size: 12.5px; }
   .w-running   { color: var(--blue); }
   .w-success   { color: var(--green); }
   .w-failure   { color: var(--red); }
   .w-cancelled { color: var(--brblack); }
   .w-stale     { color: var(--yellow); }
 
-  /* pipeline strip: one labeled segment per job, grouped by workflow */
-  .strip {
-    flex: 1; display: flex; gap: 5px; align-items: center; min-width: 180px;
+  /* job cells: name over track, one cell per job.
+     A 1px rule between cells marks a workflow boundary. */
+  .jobs { flex: 1; display: flex; align-items: center; gap: 18px; min-width: 220px; }
+  .job { flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 72px; }
+  .job.grp { border-left: 1px solid var(--divider); padding-left: 18px; }
+  .job .name {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 10.5px; letter-spacing: 0.02em;
+    color: rgba(228, 228, 231, 0.55);
+    line-height: 1;
   }
-  .seg {
-    height: 4px; border-radius: 2px; flex: 1; position: relative;
-    background: rgba(228, 228, 231, 0.10);
+  .job.active .name { color: var(--term-fg); }
+  .job.fail   .name { color: var(--red); }
+  .live-dot {
+    width: 5px; height: 5px; border-radius: 1.5px; flex: none;
+    background: var(--blue);
+    animation: breathe 1.2s ease-in-out infinite;
   }
-  .seg .fill {
-    position: absolute; inset: 0 auto 0 0; border-radius: 2px;
-    background: var(--seg-c, var(--blue));
+  @keyframes breathe { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+  .job .track {
+    height: 3px; border-radius: 1.5px; position: relative;
+    background: rgba(228, 228, 231, 0.09);
   }
-  .seg.active .fill {
+  .job .track .fill {
+    position: absolute; inset: 0 auto 0 0; border-radius: 1.5px;
+    background: var(--fill-c, var(--blue));
+  }
+  .job.active .track .fill {
     background:
       linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent) 0 0/40% 100% no-repeat,
-      var(--seg-c, var(--blue));
+      var(--fill-c, var(--blue));
     animation: shimmer 1.6s linear infinite;
   }
   @keyframes shimmer { from { background-position: -40% 0, 0 0; } to { background-position: 140% 0, 0 0; } }
-  .seg.queued { background: repeating-linear-gradient(90deg,
-      rgba(228,228,231,0.14) 0 4px, transparent 4px 9px); }
-  .seg.ok    .fill { background: var(--green); box-shadow: 0 0 6px rgba(34, 197, 94, 0.35); }
-  .seg.fail  .fill { background: var(--red);   box-shadow: 0 0 8px rgba(239, 68, 68, 0.45); }
-  .seg .seg-label {
-    position: absolute; top: -15px; left: 1px;
-    font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
-    color: rgba(228, 228, 231, 0.35);
-    white-space: nowrap;
-  }
-  .seg.active .seg-label { color: var(--term-fg); }
-  .seg.active .seg-label::before {
-    content: "▸ "; color: var(--blue);
-    animation: caret 1.2s ease-in-out infinite;
-  }
-  .seg.fail .seg-label { color: var(--red); }
-  .seg.grp { margin-left: 10px; }   /* wider gap = workflow boundary */
-  .strip.labeled { padding-top: 12px; }
-
-  .ci-ref { color: var(--chrome-text); font-size: 11.5px; }
-  .ci-ref b { color: var(--term-fg); font-weight: 500; }
-  .ci-elapsed { color: var(--chrome-text); font-variant-numeric: tabular-nums; }
-  .ci-note { color: var(--chrome-text); font-size: 11px; font-style: italic; }
-  .ci-actions { display: flex; align-items: center; gap: 2px; }
-  .ci-actions .act {
-    padding: 3px 9px; border-radius: 4px; color: var(--chrome-text); cursor: default;
-  }
-  .ci-actions .act:hover { background: rgba(228,228,231,0.08); color: var(--term-fg); }
-  .viewer-chip {
-    display: flex; align-items: center; gap: 7px;
-    color: var(--chrome-text); font-size: 11px;
-    border: 1px solid var(--divider); border-radius: 4px; padding: 2px 9px;
-  }
-
-  /* failure emphasis: the band underline turns semantic */
-  .ci-band.failed::before { background: color-mix(in srgb, var(--red) 60%, transparent); }
-  .ci-band.failed { box-shadow: inset 0 -8px 18px -14px rgba(239, 68, 68, 0.55); }
-  .ci-band.stale-band::before { background: color-mix(in srgb, var(--yellow) 45%, transparent); }
+  .job.queued .track { background: repeating-linear-gradient(90deg,
+      rgba(228, 228, 231, 0.16) 0 3px, transparent 3px 7px); }
+  .job.ok     .track .fill { background: var(--green); }
+  .job.fail   .track .fill { background: var(--red); }
+  .job.halted .track .fill { background: var(--brblack); }
   /* stale: the active job stays named, but all motion freezes */
-  .ci-band.stale-band .seg.active .fill,
-  .ci-band.stale-band .seg.active .seg-label::before { animation: none; }
+  .ci-band.stale-band .job.active .track .fill,
+  .ci-band.stale-band .live-dot { animation: none; }
+
+  /* metadata cluster: ref · elapsed, a 1px rule, then actions */
+  .ci-meta {
+    display: flex; align-items: center; gap: 12px; flex: none;
+    color: var(--chrome-text); font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ci-meta b { color: var(--term-fg); font-weight: 500; }
+  .ci-meta .vr { width: 1px; height: 14px; background: var(--divider); }
+  .ci-meta .act {
+    padding: 4px 9px; border-radius: 4px; color: var(--chrome-text); cursor: default;
+  }
+  .ci-meta .act:hover { background: rgba(228, 228, 231, 0.08); color: var(--term-fg); }
+  .viewer-chip {
+    color: var(--chrome-text); font-size: 11px;
+    border: 1px solid var(--divider); border-radius: 4px; padding: 3px 10px;
+  }
 
   /* =========================================================
      Trace panel — expanded view. Jobs as time-positioned
@@ -211,45 +216,43 @@
      ========================================================= */
   .trace {
     background: var(--panel-bg);
+    border-top: 1px solid rgba(228, 228, 231, 0.06);
     border-bottom: 1px solid var(--divider);
-    padding: 10px 12px 12px;
+    padding: 12px 14px 14px;
   }
   .trace .axis {
     display: flex; justify-content: space-between;
-    color: rgba(228,228,231,0.3); font-size: 9.5px;
-    padding: 0 0 4px 168px; letter-spacing: 0.06em;
+    color: rgba(228, 228, 231, 0.35); font-size: 9.5px;
+    padding: 0 0 6px 168px; letter-spacing: 0.06em;
   }
   .t-row {
     display: flex; align-items: center; gap: 12px;
-    padding: 3px 0; font-size: 12px;
+    padding: 4px 0; font-size: 12px;
   }
-  .t-row .t-name { width: 156px; flex: none; color: var(--term-fg); }
+  .t-row .t-name { width: 156px; flex: none; color: var(--term-fg); line-height: 1.35; }
   .t-row .t-name small { color: var(--chrome-text); display: block; font-size: 10px; }
   .t-track {
-    flex: 1; height: 16px; position: relative; border-radius: 3px;
+    flex: 1; height: 18px; position: relative; border-radius: 3px;
     background: repeating-linear-gradient(90deg,
-      rgba(228,228,231,0.05) 0 1px, transparent 1px 25%);
+      rgba(228, 228, 231, 0.05) 0 1px, transparent 1px 25%);
   }
   .t-bar {
     position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
     display: flex; align-items: center; padding: 0 8px;
-    font-size: 10px; color: rgba(255,255,255,0.85); overflow: hidden;
+    font-size: 10px; color: rgba(255, 255, 255, 0.85); overflow: hidden;
   }
   .t-bar.run {
     background: linear-gradient(90deg,
       color-mix(in srgb, var(--blue) 55%, transparent), var(--blue));
-    box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
   }
   .t-bar.run::after {
     content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 2px;
-    background: #fff; opacity: 0.7; animation: caret 1.2s ease-in-out infinite;
+    background: #fff; animation: breathe 1.2s ease-in-out infinite;
   }
-  @keyframes caret { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.85; } }
-  .t-bar.ok   { background: color-mix(in srgb, var(--green) 75%, #0a0a0c); }
-  .t-bar.fail { background: color-mix(in srgb, var(--red) 78%, #0a0a0c);
-                box-shadow: 0 0 10px rgba(239, 68, 68, 0.35); }
+  .t-bar.ok   { background: color-mix(in srgb, var(--green) 72%, #0c0c0e); }
+  .t-bar.fail { background: color-mix(in srgb, var(--red) 75%, #0c0c0e); }
   .t-bar.queued {
-    background: transparent; border: 1px dashed rgba(228,228,231,0.25);
+    background: transparent; border: 1px dashed rgba(228, 228, 231, 0.25);
     color: var(--chrome-text);
   }
   .t-row .t-time {
@@ -280,50 +283,51 @@
   .region-split { border-top: 1px solid var(--divider); }
 
   /* ------- band-only specimens ------- */
-  .specimen { margin: 10px 0; }
-  .specimen .window { min-width: 740px; border-radius: 5px; }
+  .specimen { margin: 12px 0; }
+  .specimen .window { border-radius: 5px; }
 
   /* =========================================================
      Alternate direction — "edge": collapsed presence is a 2px
      luminous progress line + micro cluster. Zero band height.
      ========================================================= */
-  .edge-line {
-    position: relative; height: 2px; background: rgba(228,228,231,0.08);
-  }
+  .edge-line { position: relative; height: 2px; background: rgba(228, 228, 231, 0.08); }
   .edge-line .edge-fill {
     position: absolute; inset: 0 auto 0 0; width: 58%;
     background: linear-gradient(90deg, var(--badge), var(--blue));
-    box-shadow: 0 0 8px 1px rgba(59, 130, 246, 0.5);
   }
   .edge-line .edge-fill::after {
     content: ""; position: absolute; right: -1px; top: -2px; bottom: -2px; width: 3px;
-    background: #fff; border-radius: 2px; opacity: 0.8;
-    animation: caret 1.2s ease-in-out infinite;
+    background: #fff; border-radius: 2px;
+    animation: breathe 1.2s ease-in-out infinite;
   }
   .micro {
     position: absolute; top: 8px; right: 10px; z-index: 2;
     display: flex; align-items: center; gap: 8px;
-    padding: 3px 10px;
-    background: rgba(14, 14, 16, 0.82);
+    padding: 4px 11px;
+    background: rgba(14, 14, 16, 0.85);
     border: 1px solid var(--divider); border-radius: 4px;
     color: var(--chrome-text); font-size: 11px;
+    font-variant-numeric: tabular-nums;
     backdrop-filter: blur(4px);
   }
-  .micro b { color: var(--blue); font-weight: 600; }
   .edge-host { position: relative; }
 
   /* ------- legend / spec strip ------- */
-  .specs { margin-top: 80px; border-top: 1px solid var(--page-rule); padding-top: 32px; }
-  .specs h2 {
-    text-transform: uppercase; letter-spacing: 0.16em;
-    font-size: 11px; font-weight: 600; color: var(--blue); margin-bottom: 16px;
-  }
+  .specs { margin-top: 88px; border-top: 1px solid var(--page-rule); padding-top: 40px; }
+  .specs h2 { margin-bottom: 14px; }
+  .specs h2 + * { margin-bottom: 40px; }
   .specs table { border-collapse: collapse; font-size: 13px; }
-  .specs td { padding: 5px 28px 5px 0; vertical-align: top; }
-  .specs td:first-child { white-space: nowrap; }
-  .specs ul { list-style: none; margin-top: 10px; }
-  .specs li { padding: 4px 0; color: var(--page-muted); max-width: 80ch; }
-  .specs li::before { content: "—"; color: var(--page-rule); margin-right: 10px; }
+  .specs td { padding: 6px 28px 6px 0; vertical-align: top; color: var(--page-muted); }
+  .specs td:first-child { white-space: nowrap; color: var(--page-fg); }
+  .specs ul { list-style: none; }
+  .specs li {
+    padding: 4px 0 4px 26px; color: var(--page-muted); max-width: 78ch;
+    position: relative;
+  }
+  .specs li::before {
+    content: "—"; color: var(--page-rule);
+    position: absolute; left: 0;
+  }
   .specs li b { color: var(--page-fg); font-weight: 500; }
 
   @media (prefers-reduced-motion: reduce) {
@@ -336,11 +340,11 @@
 
 <header>
   <h1>Scribe CI Bar</h1>
-  <p class="sub">The bar is a timeline, not a status row. Collapsed, the run's
-  shape lives in a segmented pipeline strip; expanded, jobs become
-  time-positioned tracks. A badge-keyed underline ties the band to the
-  workspace that owns it. Motion follows the existing GPUI animation policy
-  (attention-flash lineage, honors the global off switch).</p>
+  <p class="sub">The bar is a timeline, not a status row. Collapsed, every job
+  is a named cell with a live track; expanded, jobs become time-positioned
+  bars. A badge-keyed underline ties the band to the workspace that owns it.
+  Motion follows the existing GPUI animation policy (attention-flash lineage,
+  honors the global off switch).</p>
   <p class="meta">
     <span>spec <b>specs/023-gh-ci-run-bar.md</b></span>
     <span>rules <b>specs/023-gh-ci-run-bar/research.md</b></span>
@@ -351,15 +355,14 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">01 · appear — running, collapsed</div>
+  <h2>Running, collapsed</h2>
   <p class="caption">First run observation: the band slides in under the
-  titlebar with a single light sweep (the titlebar attention-flash, made
-  horizontal). Left: a conic ring filling as jobs complete. Center: the
-  pipeline strip — one named segment per job, workflow boundaries marked by
-  a wider gap. The active job announces itself three ways at once: its
-  segment shimmers, its name brightens to full foreground, and a breathing
-  ▸ precedes it; done jobs dim to solid, queued jobs dash. The violet
-  hairline is the workspace badge color: this bar belongs to
+  titlebar with a single light sweep. Left, a conic ring fills as jobs
+  complete. Center, one cell per job — name over live track — with workflow
+  boundaries drawn as one-pixel rules. The active job's name holds full
+  foreground behind a breathing dot (the workspace-pill dot, smaller) while
+  its track shimmers; done jobs settle, queued jobs dash. The violet
+  underline is the workspace badge color: this bar belongs to
   <em>scribe</em>.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
@@ -369,16 +372,30 @@
       <div class="spacer"></div>
     </div>
     <div class="ci-band appearing">
-      <span class="ring" style="--ring-p:33%"></span>
-      <span class="ci-word w-running">running</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
+      <div class="ci-state">
+        <span class="ring" style="--ring-p:33%"></span>
+        <span class="ci-word w-running">running</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">1m 42s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job ok">
+          <span class="name">rust-linux</span>
+          <div class="track"><div class="fill" style="width:100%"></div></div>
+        </div>
+        <div class="job active">
+          <span class="name"><span class="live-dot"></span>rust-macos</span>
+          <div class="track"><div class="fill" style="width:62%"></div></div>
+        </div>
+        <div class="job queued grp">
+          <span class="name">lat-check</span>
+          <div class="track"></div>
+        </div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 1m 42s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
     <div class="term">
       <div><span class="p">➜</span> <span class="c">git push origin main</span></div>
@@ -396,12 +413,12 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">02 · expanded — trace panel</div>
+  <h2>The trace panel</h2>
   <p class="caption">Click or keybinding drops the trace: each job is a bar
   positioned on a shared time axis against a faint minute grid, so
-  parallelism, stragglers, and queue gaps read instantly. The live job
-  carries a breathing caret at its right edge. Per-job data is fetched only
-  while the trace is open.</p>
+  parallelism, stragglers, and queue gaps read instantly. The live job's
+  right edge breathes in the same rhythm as the collapsed dot. Per-job data
+  is fetched only while the trace is open.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -410,16 +427,30 @@
       <div class="spacer"></div>
     </div>
     <div class="ci-band">
-      <span class="ring" style="--ring-p:33%"></span>
-      <span class="ci-word w-running">running</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:70%"></span></div>
-        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
+      <div class="ci-state">
+        <span class="ring" style="--ring-p:33%"></span>
+        <span class="ci-word w-running">running</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">2m 08s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job ok">
+          <span class="name">rust-linux</span>
+          <div class="track"><div class="fill" style="width:100%"></div></div>
+        </div>
+        <div class="job active">
+          <span class="name"><span class="live-dot"></span>rust-macos</span>
+          <div class="track"><div class="fill" style="width:70%"></div></div>
+        </div>
+        <div class="job queued grp">
+          <span class="name">lat-check</span>
+          <div class="track"></div>
+        </div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 2m 08s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
     <div class="trace">
       <div class="axis"><span>0m</span><span>1m</span><span>2m</span><span>3m</span><span>4m</span></div>
@@ -452,82 +483,100 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">03 · terminal states — band specimens</div>
-  <p class="caption">Success flashes the strip green and auto-clears after
-  ~10 s. Failure keeps its segment glowing, turns the failing job's name
-  red, and re-keys the ownership hairline semantic red — it persists until
-  dismissed. Cancelled goes quiet. Stale freezes elapsed and all motion
-  (the active job stays named, its ▸ stops breathing) and amber-keys the
-  hairline while retrying. Glyph + word always accompany color.</p>
+  <h2>Terminal states</h2>
+  <p class="caption">Success settles every track green and auto-clears after
+  ~10 s. Failure names the broken job in red and re-keys the ownership
+  underline semantic red — it persists until dismissed. Cancelled goes
+  quiet. Stale amber-keys the underline, freezes elapsed and all motion,
+  and names the retry. A square mark replaces the ring once the run is
+  over; glyph + word always accompany color.</p>
 
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band">
-      <span class="ring done" style="background:var(--green)"></span>
-      <span class="ci-word w-success">✓ passed</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok"><span class="seg-label">rust-macos</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok grp"><span class="seg-label">lat-check</span><span class="fill" style="width:100%"></span></div>
+      <div class="ci-state">
+        <span class="mark" style="background:var(--green)"></span>
+        <span class="ci-word w-success">passed</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">4m 51s</span>
-      <span class="ci-note">clears in 10s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job ok"><span class="name">rust-linux</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job ok"><span class="name">rust-macos</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job ok grp"><span class="name">lat-check</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 4m 51s · clears in 10s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
   </div></div></div>
 
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band failed">
-      <span class="ring done" style="background:var(--red)"></span>
-      <span class="ci-word w-failure">✕ failed</span>
-      <div class="strip labeled">
-        <div class="seg fail"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok"><span class="seg-label">rust-macos</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok grp"><span class="seg-label">lat-check</span><span class="fill" style="width:100%"></span></div>
+      <div class="ci-state">
+        <span class="mark" style="background:var(--red)"></span>
+        <span class="ci-word w-failure">failed</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">3m 27s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job fail"><span class="name">rust-linux</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job ok"><span class="name">rust-macos</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job ok grp"><span class="name">lat-check</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 3m 27s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
   </div></div></div>
 
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band">
-      <span class="ring done" style="background:var(--brblack)"></span>
-      <span class="ci-word w-cancelled">⊘ cancelled</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg"><span class="seg-label">rust-macos</span><span class="fill" style="width:34%; background:var(--brblack)"></span></div>
-        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
+      <div class="ci-state">
+        <span class="mark" style="background:var(--brblack)"></span>
+        <span class="ci-word w-cancelled">cancelled</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">1m 03s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job ok"><span class="name">rust-linux</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job halted"><span class="name">rust-macos</span><div class="track"><div class="fill" style="width:34%"></div></div></div>
+        <div class="job queued grp"><span class="name">lat-check</span><div class="track"></div></div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 1m 03s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
   </div></div></div>
 
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band stale-band">
-      <span class="ring" style="--ring-p:33%; --ring-c:var(--yellow)"></span>
-      <span class="ci-word w-running">running</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
+      <div class="ci-state">
+        <span class="ring" style="--ring-p:33%; --ring-c:var(--yellow)"></span>
+        <span class="ci-word w-stale">stale · retry in 30s</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">2m 40s</span>
-      <span class="ci-word w-stale">⚠ stale · retry in 30s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job ok"><span class="name">rust-linux</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job active"><span class="name"><span class="live-dot"></span>rust-macos</span><div class="track"><div class="fill" style="width:62%"></div></div></div>
+        <div class="job queued grp"><span class="name">lat-check</span><div class="track"></div></div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 2m 40s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
   </div></div></div>
 </section>
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">04 · multi-workspace — badge-keyed ownership</div>
+  <h2>Multi-workspace ownership</h2>
   <p class="caption">In a stacked window the band renders under the owning
-  region's tab bar, and its violet hairline matches the scribe badge — the
+  region's tab bar, and its violet underline matches the scribe badge — the
   cyan firecrawl region above shows no CI chrome. Ownership is structural,
   not decorative.</p>
   <div class="frame-scroll"><div class="window">
@@ -548,15 +597,26 @@
       <div class="spacer"></div>
     </div>
     <div class="ci-band">
-      <span class="ring" style="--ring-p:20%"></span>
-      <span class="ci-word w-running">running</span>
-      <div class="strip labeled">
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-linux</span><span class="fill" style="width:38%"></span></div>
-        <div class="seg queued"><span class="seg-label">rust-macos</span></div>
+      <div class="ci-state">
+        <span class="ring" style="--ring-p:20%"></span>
+        <span class="ci-word w-running">running</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">0m 58s</span>
-      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
+      <div class="jobs">
+        <div class="job active">
+          <span class="name"><span class="live-dot"></span>rust-linux</span>
+          <div class="track"><div class="fill" style="width:38%"></div></div>
+        </div>
+        <div class="job queued">
+          <span class="name">rust-macos</span>
+          <div class="track"></div>
+        </div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 0m 58s</span>
+        <span class="vr"></span>
+        <span class="act">open ↗</span>
+        <span class="act">✕</span>
+      </div>
     </div>
     <div class="term">
       <div><span class="p">➜</span> <span class="cur"></span></div>
@@ -571,34 +631,37 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">05 · shared viewer — read-only</div>
+  <h2>Shared viewers</h2>
   <p class="caption">LAN-share and remote-control viewers get the same
   timeline with the action cluster swapped for a viewing chip: no open ↗,
   no dismiss. State travels; credentials never do.</p>
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band">
-      <span class="ring" style="--ring-p:33%"></span>
-      <span class="ci-word w-running">running</span>
-      <div class="strip labeled">
-        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
+      <div class="ci-state">
+        <span class="ring" style="--ring-p:33%"></span>
+        <span class="ci-word w-running">running</span>
       </div>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">1m 42s</span>
-      <div class="viewer-chip">viewing · read-only</div>
+      <div class="jobs">
+        <div class="job ok"><span class="name">rust-linux</span><div class="track"><div class="fill" style="width:100%"></div></div></div>
+        <div class="job active"><span class="name"><span class="live-dot"></span>rust-macos</span><div class="track"><div class="fill" style="width:62%"></div></div></div>
+        <div class="job queued grp"><span class="name">lat-check</span><div class="track"></div></div>
+      </div>
+      <div class="ci-meta">
+        <span><b>main</b> @ 4f2a91c · 1m 42s</span>
+        <span class="viewer-chip">viewing · read-only</span>
+      </div>
     </div>
   </div></div></div>
 </section>
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">06 · alternate direction — edge</div>
+  <h2>Alternate: edge</h2>
   <p class="caption">For zero chrome cost: collapsed presence is a 2px
-  luminous progress line under the titlebar (badge→accent gradient, bright
-  caret at the frontier) plus a translucent micro cluster naming the active
-  job, fading after a few seconds. Click either to drop the same trace
-  panel. Costs two pixels; the workspace keeps its full height.</p>
+  luminous progress line under the titlebar (badge→accent gradient, a
+  breathing caret at the frontier) plus a translucent micro cluster naming
+  the active job, fading after a few seconds. Click either to drop the same
+  trace panel. Costs two pixels; the workspace keeps its full height.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -608,7 +671,7 @@
     </div>
     <div class="edge-line"><div class="edge-fill"></div></div>
     <div class="edge-host">
-      <div class="micro"><b>◐</b> rust-macos · 1m 42s</div>
+      <div class="micro"><span class="live-dot"></span>rust-macos · 1m 42s</div>
       <div class="term">
         <div><span class="p">➜</span> <span class="c">git push origin main</span></div>
         <div class="o">To github.com:mamba/scribe.git</div>
@@ -628,26 +691,30 @@
 <section class="specs">
   <h2>Reading the timeline</h2>
   <table>
-    <tr><td style="color:var(--blue)">ring</td>
-        <td>conic fill = jobs completed / total; collapses to a solid square on terminal states</td></tr>
-    <tr><td style="color:var(--blue)">segment</td>
-        <td>one named segment per job, workflow boundaries as a wider gap;
-            shimmer + bright ▸ name = active, dim solid = done, dashes =
-            queued, red name = failed. Beyond ~6 jobs the strip elides to
-            failed + active jobs plus a “+n” counter segment</td></tr>
-    <tr><td style="color:var(--badge)">hairline</td>
-        <td>workspace badge color = ownership; turns red/amber on failure/stale</td></tr>
-    <tr><td style="color:var(--blue)">trace bar</td>
-        <td>job positioned on the shared time axis; breathing caret = live frontier</td></tr>
+    <tr><td>ring</td>
+        <td>conic fill = jobs completed / total; a solid square mark
+            replaces it on terminal states</td></tr>
+    <tr><td>job cell</td>
+        <td>name over live track, one per job; workflow boundaries drawn as
+            one-pixel rules. Breathing dot + full-foreground name = active,
+            settled fill = done, dashes = queued, red name = failed. Beyond
+            ~6 jobs the strip elides to failed + active jobs plus a “+n”
+            counter cell</td></tr>
+    <tr><td>underline</td>
+        <td>workspace badge color = ownership; re-keyed red on failure,
+            amber on stale</td></tr>
+    <tr><td>trace bar</td>
+        <td>job positioned on the shared time axis; the breathing right
+            edge is the live frontier</td></tr>
   </table>
-  <h2 style="margin-top:32px">Motion rules</h2>
+  <h2>Motion rules</h2>
   <ul>
     <li><b>Appear</b> — 200 ms slide-down + one-shot light sweep; runs once per run, never loops.</li>
-    <li><b>Shimmer / caret</b> — only while a job is live; terminal states are fully static.</li>
-    <li><b>Success exit</b> — strip flashes green, band slides up after ~10 s.</li>
+    <li><b>Breathe / shimmer</b> — one shared 1.2 s rhythm for the live dot, trace frontier, and edge caret; only while a job is live. Terminal states are fully static.</li>
+    <li><b>Success exit</b> — tracks settle green, band slides up after ~10 s.</li>
     <li><b>Policy</b> — all motion routes through the GPUI animation system and its off switch; reduced-motion renders static fills.</li>
   </ul>
-  <h2 style="margin-top:32px">Interaction rules</h2>
+  <h2>Interaction rules</h2>
   <ul>
     <li><b>Appear</b> — first run observation for your pushed head; a push that triggers no workflows never shows a bar.</li>
     <li><b>Click / keybinding</b> — toggles the trace; per-job data fetched only while open.</li>
