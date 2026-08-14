@@ -96,6 +96,20 @@ Two additive variants drive the OSC 52 gating reply path (spec 010 C3 / [[server
 
 `ClipboardBridgeReadReply { request_id, payload }` carries the host clipboard content for an allowed OSC 52 read. `payload` is a `Result<String, BridgeError>`; `Err(_)` collapses onto an empty OSC 52 reply per UX-002 so PTY-side programs never observe a distinct error state.
 
+### CI Run State
+
+CI run messages carry server-owned state while keeping dismissal local to an authorized owning client.
+
+`Hello.ci_run_bar` advertises support for the additive CI server message. `DismissCiRun { repo_root, head_sha }` asks the server to hide only that tracked head; the server rejects remote viewers, incapable senders, and roots absent from the sender's window.
+
+#### Backward-compatible negotiation
+
+A named-MessagePack `Hello` without `ci_run_bar` decodes it as `false`, preventing a new server from sending an unknown top-level variant to an old local client.
+
+#### Dismiss message round trip
+
+Named MessagePack preserves the repository root and head SHA carried by `DismissCiRun`.
+
 ### Configuration
 
 `ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit, shell integration, and workspace-root updates across live sessions.
@@ -166,6 +180,26 @@ Three additive variants drive the OSC 52 gating + host clipboard bridge (spec 01
 
 All three variants honour the attach-time `clipboard_gating` negotiation: the server never emits them when the client failed to advertise support, and the client silently no-ops on receipt when its own cached `Welcome.clipboard_gating` is `false`.
 
+### CI Run State
+
+`CiRunState { repo_root, delta }` carries a bounded full replacement or head-identified clear for one repository's active pushed head.
+
+The replacement contains trusted `owner/name`, head SHA, branch, per-workflow run id/name/status/conclusion/timestamps, queued-to-terminal rollup, and stale overlay. Job and step detail remain outside this message.
+
+#### State message round trip
+
+Named MessagePack preserves the full state and its repository routing key.
+
+#### Capability and repository scoping
+
+The server sends CI frames only to `ci_run_bar` participants attached to windows containing a workspace with the same project root.
+
+#### Synchronized dismissal
+
+The server stores the dismissed `(repo_root, head_sha)`, broadcasts `Cleared { head_sha }` to every capable matching participant, and suppresses that head.
+
+A different head removes the dismissal. Clear identity lets clients ignore a delayed clear for an older head instead of erasing its replacement.
+
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries independent window and icon titles, active AI state, AI provider hint, provider task label, shell basename, session context, CWD, and detected git branch — enough to restore tab ownership and status chrome without post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 
 ### Launch identity is local-only
@@ -212,6 +246,8 @@ Feature 018 bumps the same constant to `4` because `CreateSession.ai_launch` is 
 
 Terminal-images v1 bumps the constant to `5` because capabilities, live output boundaries, and generation-tagged replay are remote-visible. A typed mismatch names both versions and whether client or server must update; local capability fields remain default-false for old/new Unix-socket decoding. See [[terminal-images#Terminal Images#Typed IPC Contract]].
 
+CI run state bumps the constant to `6` because state and dismissal cross tailnet and LAN connections. Local mixed-generation safety still comes from the default-false `Hello.ci_run_bar` gate.
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -226,6 +262,7 @@ Deleting four message variants and six supporting types left
 [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] at `3`.
 Feature 018 later advanced it to `4` for structured AI launch, and
 terminal-images v1 advances it to `5`.
+CI run state later advances it to `6`.
 
 Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
 
@@ -306,7 +343,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, and `5` for terminal-images v1 — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, and `6` for CI run state — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 

@@ -10477,6 +10477,7 @@ where
             // application running in them.
             // @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
+            ci_run_bar: true,
         },
     )
     .await
@@ -11389,6 +11390,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::TaskLabelCleared { .. } => "TaskLabelCleared",
         ServerMessage::PromptReceived { .. } => "PromptReceived",
         ServerMessage::WorkspaceNamed { .. } => "WorkspaceNamed",
+        ServerMessage::CiRunState { .. } => "CiRunState",
         ServerMessage::SessionCreated { .. } => "SessionCreated",
         ServerMessage::SessionExited { .. } => "SessionExited",
         ServerMessage::Bell { .. } => "Bell",

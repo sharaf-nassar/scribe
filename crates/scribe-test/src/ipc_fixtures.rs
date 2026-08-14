@@ -1,12 +1,12 @@
 //! Stable `MessagePack` fixtures for the bounded terminal-image IPC contract.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::protocol::{
-    ClientMessage, REMOTE_PROTOCOL_VERSION, RemoteRefusal, ServerMessage,
+    CiRunDelta, ClientMessage, REMOTE_PROTOCOL_VERSION, RemoteRefusal, ServerMessage,
 };
 use scribe_common::terminal_images::{
     BoundedImageBytes, CellExtent, ImageBoundError, ImageLimits, PixelRect, PlaceholderMetadata,
@@ -212,6 +212,15 @@ fn insert_local_fixtures(
             takeover: false,
             join_window: false,
             terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: false,
+        },
+    )?;
+    insert_named(
+        values,
+        "ci_run_cleared",
+        &ServerMessage::CiRunState {
+            repo_root: PathBuf::from("/work/scribe"),
+            delta: CiRunDelta::Cleared { head_sha: "head-a".into() },
         },
     )?;
     insert_named(
@@ -351,9 +360,11 @@ fn insert_replay_fixtures(
 }
 
 fn insert_remote_fixtures(values: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
-    for (name, client_version, server_version) in
-        [("remote_client_older", 4, 5), ("remote_server_older", 5, 4)]
-    {
+    let previous = REMOTE_PROTOCOL_VERSION.saturating_sub(1);
+    for (name, client_version, server_version) in [
+        ("remote_client_older", previous, REMOTE_PROTOCOL_VERSION),
+        ("remote_server_older", REMOTE_PROTOCOL_VERSION, previous),
+    ] {
         insert_named(
             values,
             name,
@@ -393,7 +404,7 @@ fn decode_fixtures(fixtures: &BTreeMap<String, String>) -> Result<(), String> {
 fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     let message: ClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
-    let ClientMessage::Hello { join_window, terminal_images, .. } = message else {
+    let ClientMessage::Hello { join_window, terminal_images, ci_run_bar, .. } = message else {
         return Err(format!("{name} decoded as wrong client message"));
     };
     if name.ends_with("old") && terminal_images != TerminalImageCapabilities::default() {
@@ -401,6 +412,9 @@ fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     }
     if name.ends_with("old") && join_window {
         return Err("old Hello did not default join intent".to_owned());
+    }
+    if name.ends_with("old") && ci_run_bar {
+        return Err("old Hello did not default CI capability".to_owned());
     }
     let _: LegacyClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("legacy decode {name}: {error}"))?;
@@ -412,6 +426,16 @@ fn decode_server_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
         rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
     if name == "local_welcome_old" {
         verify_old_welcome(&message)?;
+    } else if name == "ci_run_cleared"
+        && !matches!(
+            &message,
+            ServerMessage::CiRunState {
+                repo_root,
+                delta: CiRunDelta::Cleared { head_sha }
+            } if repo_root == Path::new("/work/scribe") && head_sha == "head-a"
+        )
+    {
+        return Err("CI clear fixture lost its head identity".to_owned());
     } else if let ServerMessage::TerminalImageReplay { message, .. } = &message {
         message.validate().map_err(|error| format!("validate {name}: {error}"))?;
     }
@@ -564,9 +588,10 @@ fn verify_malformed_placements(model: &FixtureModel) -> Result<usize, String> {
 }
 
 fn verify_remote_directions() -> Result<(bool, bool), String> {
-    let old_client = RemoteProtocolMismatch::between(4, REMOTE_PROTOCOL_VERSION)
+    let previous = REMOTE_PROTOCOL_VERSION.saturating_sub(1);
+    let old_client = RemoteProtocolMismatch::between(previous, REMOTE_PROTOCOL_VERSION)
         .ok_or_else(|| "old client mismatch missing".to_owned())?;
-    let old_server = RemoteProtocolMismatch::between(REMOTE_PROTOCOL_VERSION, 4)
+    let old_server = RemoteProtocolMismatch::between(REMOTE_PROTOCOL_VERSION, previous)
         .ok_or_else(|| "old server mismatch missing".to_owned())?;
     Ok((
         old_client.update == RemoteProtocolUpdateTarget::Client,

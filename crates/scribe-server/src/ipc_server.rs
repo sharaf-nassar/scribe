@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -29,8 +29,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, ClientMessage,
-    ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind,
+    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, CiRunDelta,
+    ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind,
     REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage,
     SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
     WorkspaceListEntry, WorkspaceTreeNode,
@@ -594,6 +594,9 @@ pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
 /// feature 013.
 pub type WindowShares = Arc<RwLock<HashMap<WindowId, WindowShare>>>;
 
+/// Dismissed CI head per repository. A different published head clears the entry.
+pub type CiDismissals = Arc<RwLock<HashMap<PathBuf, String>>>;
+
 /// Feature 013: identity of the client currently controlling a window under the
 /// single-writer ownership model. `Local` is a Unix-socket client on this
 /// machine; `Remote` is an authenticated tailnet peer. Tracked per window in
@@ -716,6 +719,8 @@ pub struct Participant {
     /// Per-participant OSC 52 clipboard-gating capability (spec 010 C7), moved off
     /// the retired per-window `window_clipboard_gating` map (D7).
     pub clipboard_gating: bool,
+    /// Whether this participant can decode CI run-state server frames.
+    pub ci_run_bar: bool,
 }
 
 impl Participant {
@@ -733,6 +738,7 @@ impl Participant {
             transport,
             viewport: TerminalSize::default(),
             clipboard_gating,
+            ci_run_bar: false,
         }
     }
 
@@ -748,7 +754,10 @@ impl Participant {
             ControllerIdentity::Local => ParticipantTransport::Local,
             ControllerIdentity::Remote { .. } => ParticipantTransport::Remote,
         };
-        Self::new(writer, claim.controller.clone(), transport, claim.clipboard_gating)
+        let mut participant =
+            Self::new(writer, claim.controller.clone(), transport, claim.clipboard_gating);
+        participant.ci_run_bar = claim.ci_run_bar;
+        participant
     }
 }
 
@@ -943,6 +952,15 @@ impl WindowShare {
         self.participants.values().map(|p| Arc::clone(&p.writer)).collect()
     }
 
+    /// Writers that advertised support for CI run-state frames in `Hello`.
+    fn ci_run_writers(&self) -> Vec<SharedWriter> {
+        self.participants
+            .values()
+            .filter(|participant| participant.ci_run_bar)
+            .map(|participant| Arc::clone(&participant.writer))
+            .collect()
+    }
+
     /// The smallest-wins grid across attached participants that have reported a
     /// viewport (D3, FR-012): `min(rows) × min(cols)`. `None` until at least one
     /// participant has reported.
@@ -1101,6 +1119,8 @@ pub struct IpcServerState {
     /// every connected window; in `SingleController` mode each share carries one
     /// participant, so all derived state is byte-identical to feature 013.
     pub window_shares: WindowShares,
+    /// Current dismissed CI head per repo, shared across every attached window.
+    pub ci_dismissals: CiDismissals,
     pub updater_handle: Arc<UpdaterHandle>,
     /// In-memory cache of GitHub releases populated lazily on the first
     /// `ListReleases` request and refreshed in the background past its TTL.
@@ -4756,6 +4776,7 @@ async fn claim_hello_window(
         takeover,
         join_window,
         terminal_images,
+        ci_run_bar,
         ..
     } = hello
     else {
@@ -4779,6 +4800,7 @@ async fn claim_hello_window(
         },
         controller,
         terminal_images: record_image_capabilities(conn.writer, terminal_images).await,
+        ci_run_bar,
     };
     Some(handle_client_hello(claim, conn.server, conn.writer).await)
 }
@@ -5409,6 +5431,8 @@ struct HelloClaim<'a> {
     /// Spec 020: the image subset this connection may actually render, already
     /// intersected with Scribe's v1 support and the master switch.
     terminal_images: TerminalImageCapabilities,
+    /// CI run-bar protocol support advertised by this connection.
+    ci_run_bar: bool,
     /// This connection's controller identity (local vs remote peer).
     controller: &'a ControllerIdentity,
 }
@@ -5878,6 +5902,7 @@ async fn claim_window(
         intent: ClaimIntent::Plain,
         controller: &local,
         terminal_images: TerminalImageCapabilities::default(),
+        ci_run_bar: false,
     };
     match resolve_and_register_claim(
         window_shares,
@@ -6338,8 +6363,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
     // `attached_contains` gate alone would still let it mutate the window it lost
     // (KeyInput/Resize/CloseSession/CloseWindow/FocusChanged) or read its
     // scrollback (SearchRequest). Bar those unless this connection is STILL the
-    // window's registered controller. Local Unix-socket clients always are, so
-    // this never affects the local path; `AttachSessions` is guarded separately in
+    // window's registered controller; local clients always are. `AttachSessions` is guarded in
     // `filter_attachable_sessions`.
     if requires_window_control(&msg)
         && !connection_may_type(
@@ -6382,6 +6406,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::QuitAll
         | ClientMessage::TriggerUpdate
         | ClientMessage::DismissUpdate
+        | ClientMessage::DismissCiRun { .. }
         | ClientMessage::CheckForUpdates
         | ClientMessage::ListReleases
         | ClientMessage::ListWindows
@@ -6389,7 +6414,6 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::EnvPreflight) => {
             dispatch_window_message(msg, context).await;
         }
-        ClientMessage::Hello { .. } => debug!("unexpected Hello after handshake, ignoring"),
         ClientMessage::ClipboardPromptResponse { request_id, decision } => {
             forward_clipboard_command_to_window(
                 context,
@@ -6725,6 +6749,9 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
         ClientMessage::DismissUpdate => {
             info!(window_id = %context.window_id, "client dismissed update notification");
             context.server.updater_handle.dismiss();
+        }
+        ClientMessage::DismissCiRun { repo_root, head_sha } => {
+            dismiss_ci_run(context, repo_root, head_sha).await;
         }
         ClientMessage::CheckForUpdates => {
             handle_check_for_updates(context).await;
@@ -8507,6 +8534,110 @@ async fn connected_local_window_writers(window_shares: &WindowShares) -> Vec<Sha
             share.local_participant().map(|participant| Arc::clone(&participant.writer))
         })
         .collect()
+}
+
+/// Publish one tracker delta to capable participants whose window contains the repo.
+/// A dismissed head stays hidden; publishing a different head clears its dismissal.
+pub async fn publish_ci_run_delta(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    dismissals: &CiDismissals,
+    repo_root: &Path,
+    delta: CiRunDelta,
+) {
+    {
+        let mut dismissed = dismissals.write().await;
+        match &delta {
+            CiRunDelta::Set(state)
+                if dismissed.get(repo_root).is_some_and(|head| head == &state.head_sha) =>
+            {
+                return;
+            }
+            CiRunDelta::Set(_) => {
+                dismissed.remove(repo_root);
+            }
+            CiRunDelta::Cleared { .. } => {}
+        }
+    }
+    send_ci_run_delta(workspace_manager, window_shares, repo_root, delta).await;
+}
+
+async fn send_ci_run_delta(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    repo_root: &Path,
+    delta: CiRunDelta,
+) {
+    let windows = workspace_manager.read().await.windows_for_project_root(repo_root);
+    let writers = {
+        let shares = window_shares.read().await;
+        windows
+            .iter()
+            .filter_map(|window_id| shares.get(window_id))
+            .flat_map(WindowShare::ci_run_writers)
+            .collect::<Vec<_>>()
+    };
+    let message = ServerMessage::CiRunState { repo_root: repo_root.to_path_buf(), delta };
+    for writer in &writers {
+        send_message(writer, &message).await;
+    }
+}
+
+struct CiDismissRequest<'a> {
+    window_id: WindowId,
+    writer: &'a SharedWriter,
+    is_remote: bool,
+    repo_root: PathBuf,
+    head_sha: String,
+}
+
+async fn dismiss_ci_run(context: &ClientDispatchContext<'_>, repo_root: PathBuf, head_sha: String) {
+    apply_ci_dismissal(
+        &context.server.workspace_manager,
+        &context.server.window_shares,
+        &context.server.ci_dismissals,
+        CiDismissRequest {
+            window_id: context.window_id,
+            writer: context.writer,
+            is_remote: context.is_remote,
+            repo_root,
+            head_sha,
+        },
+    )
+    .await;
+}
+
+/// Accept an owning capable client's dismissal and synchronize it across views.
+async fn apply_ci_dismissal(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    dismissals: &CiDismissals,
+    request: CiDismissRequest<'_>,
+) {
+    if request.is_remote {
+        debug!(window_id = %request.window_id, "ignoring CI dismissal from a remote viewer");
+        return;
+    }
+    let capable = window_shares
+        .read()
+        .await
+        .get(&request.window_id)
+        .and_then(|share| share.participant_for_writer(request.writer))
+        .is_some_and(|participant| participant.ci_run_bar);
+    if !capable
+        || !workspace_manager
+            .read()
+            .await
+            .window_contains_project_root(request.window_id, &request.repo_root)
+    {
+        debug!(window_id = %request.window_id, repo_root = ?request.repo_root, "ignoring unauthorized CI dismissal");
+        return;
+    }
+
+    let delta = CiRunDelta::Cleared { head_sha: request.head_sha.clone() };
+    dismissals.write().await.insert(request.repo_root.clone(), request.head_sha);
+    publish_ci_run_delta(workspace_manager, window_shares, dismissals, &request.repo_root, delta)
+        .await;
 }
 
 /// Feature 015 (T022, D8): broadcast the full-state `ShareRoster` to every
@@ -12295,6 +12426,7 @@ mod tests {
     use super::*;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
     use scribe_common::framing::read_message;
+    use scribe_common::protocol::{CiRunState, CiRunStatus};
     use std::os::unix::net::UnixStream as StdUnixStream;
 
     // @lat: [[test#Test Harness#Server lifecycle#Updater quit is a transient local action]]
@@ -12444,6 +12576,188 @@ mod tests {
             tokio::net::UnixStream::from_std(left).unwrap(),
             tokio::net::UnixStream::from_std(right).unwrap(),
         )
+    }
+
+    fn ci_test_writer() -> (SharedWriter, tokio::net::UnixStream) {
+        let (server, client) = unix_stream_pair();
+        let (_read, write) = tokio::io::split(server);
+        (test_shared_writer(write), client)
+    }
+
+    fn ci_share(writer: &SharedWriter, capable: bool) -> WindowShare {
+        let controller = ControllerIdentity::Local;
+        let claim = HelloClaim {
+            requested_window_id: None,
+            clipboard_gating: false,
+            intent: ClaimIntent::Plain,
+            terminal_images: TerminalImageCapabilities::default(),
+            ci_run_bar: capable,
+            controller: &controller,
+        };
+        WindowShare::new_single_controller(Participant::from_claim(&claim, writer))
+    }
+
+    fn add_ci_workspace(manager: &mut WorkspaceManager, window_id: WindowId, cwd: &Path) {
+        let workspace_id = manager.create_workspace();
+        let session_id = SessionId::new();
+        manager.add_session(workspace_id, session_id, None);
+        manager.assign_session_to_window(window_id, session_id);
+        manager.on_cwd_changed(session_id, cwd);
+    }
+
+    fn ci_state(head_sha: &str) -> CiRunState {
+        CiRunState {
+            repository: "acme/scribe".into(),
+            head_sha: head_sha.into(),
+            branch: "main".into(),
+            workflows: Vec::new(),
+            rollup: CiRunStatus::Queued,
+            stale: false,
+        }
+    }
+
+    // @lat: [[protocol#Server Messages#CI Run State#Capability and repository scoping]]
+    #[tokio::test]
+    async fn ci_updates_reach_only_capable_clients_rooted_in_the_repo() {
+        let base = Path::new("/work");
+        let repo = base.join("scribe");
+        let other_repo = base.join("other");
+        let capable_window = WindowId::new();
+        let incapable_window = WindowId::new();
+        let other_window = WindowId::new();
+        let mut manager = WorkspaceManager::new(vec![base.to_path_buf()]);
+        add_ci_workspace(&mut manager, capable_window, &repo.join("src"));
+        add_ci_workspace(&mut manager, incapable_window, &repo.join("tests"));
+        add_ci_workspace(&mut manager, other_window, &other_repo.join("src"));
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (capable_writer, mut capable_client) = ci_test_writer();
+        let (incapable_writer, mut incapable_client) = ci_test_writer();
+        let (other_writer, mut other_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(capable_window, ci_share(&capable_writer, true));
+            shares.insert(incapable_window, ci_share(&incapable_writer, false));
+            shares.insert(other_window, ci_share(&other_writer, true));
+        }
+
+        publish_ci_run_delta(
+            &manager,
+            &shares,
+            &CiDismissals::default(),
+            &repo,
+            CiRunDelta::Set(ci_state("head-a")),
+        )
+        .await;
+
+        let message: ServerMessage = read_message(&mut capable_client).await.unwrap();
+        assert!(matches!(
+            message,
+            ServerMessage::CiRunState { repo_root, delta: CiRunDelta::Set(state) }
+                if repo_root == repo && state.head_sha == "head-a"
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err(),
+            "an incapable client received an unknown CI frame"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut other_client),
+            )
+            .await
+            .is_err(),
+            "a window rooted in another repo received the update"
+        );
+    }
+
+    // @lat: [[protocol#Server Messages#CI Run State#Synchronized dismissal]]
+    #[tokio::test]
+    async fn dismissing_a_head_clears_all_capable_views_until_a_new_head() {
+        let base = Path::new("/work");
+        let repo = base.join("scribe");
+        let sender_window = WindowId::new();
+        let peer_window = WindowId::new();
+        let mut manager = WorkspaceManager::new(vec![base.to_path_buf()]);
+        add_ci_workspace(&mut manager, sender_window, &repo.join("src"));
+        add_ci_workspace(&mut manager, peer_window, &repo.join("tests"));
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (sender_writer, mut sender_client) = ci_test_writer();
+        let (peer_writer, mut peer_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(sender_window, ci_share(&sender_writer, true));
+            shares.insert(peer_window, ci_share(&peer_writer, true));
+        }
+        let dismissals = CiDismissals::default();
+
+        apply_ci_dismissal(
+            &manager,
+            &shares,
+            &dismissals,
+            CiDismissRequest {
+                window_id: sender_window,
+                writer: &sender_writer,
+                is_remote: false,
+                repo_root: repo.clone(),
+                head_sha: "head-a".into(),
+            },
+        )
+        .await;
+
+        for client in [&mut sender_client, &mut peer_client] {
+            let message: ServerMessage = read_message(client).await.unwrap();
+            assert!(matches!(
+                message,
+                ServerMessage::CiRunState {
+                    ref repo_root,
+                    delta: CiRunDelta::Cleared { ref head_sha }
+                } if repo_root == &repo && head_sha == "head-a"
+            ));
+        }
+        assert_eq!(dismissals.read().await.get(&repo).map(String::as_str), Some("head-a"));
+
+        publish_ci_run_delta(
+            &manager,
+            &shares,
+            &dismissals,
+            &repo,
+            CiRunDelta::Set(ci_state("head-a")),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut peer_client),
+            )
+            .await
+            .is_err(),
+            "the dismissed head reappeared"
+        );
+
+        publish_ci_run_delta(
+            &manager,
+            &shares,
+            &dismissals,
+            &repo,
+            CiRunDelta::Set(ci_state("head-b")),
+        )
+        .await;
+        let message: ServerMessage = read_message(&mut peer_client).await.unwrap();
+        assert!(matches!(
+            message,
+            ServerMessage::CiRunState { delta: CiRunDelta::Set(state), .. }
+                if state.head_sha == "head-b"
+        ));
+        assert!(!dismissals.read().await.contains_key(&repo));
     }
 
     /// Drive one buffering sink and read back what actually reached its socket.

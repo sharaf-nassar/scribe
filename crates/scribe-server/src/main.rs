@@ -429,6 +429,7 @@ async fn run_server_loop(
         beads_boards: beads_board::BeadsBoardCache::default(),
         live_sessions: Arc::clone(&live_sessions),
         window_shares: Arc::clone(&window_shares),
+        ci_dismissals: Arc::default(),
         updater_handle: Arc::clone(&updater_handle),
         release_catalog: Arc::clone(&release_catalog),
         release_fetcher: Arc::clone(&release_fetcher),

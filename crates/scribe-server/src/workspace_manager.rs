@@ -398,6 +398,25 @@ impl WorkspaceManager {
             .any(|session_id| self.session_to_workspace.get(session_id) == Some(&workspace_id))
     }
 
+    /// Connected-window identities containing a workspace rooted at `project_root`.
+    #[must_use]
+    pub fn windows_for_project_root(&self, project_root: &Path) -> HashSet<WindowId> {
+        self.session_to_window
+            .iter()
+            .filter_map(|(session_id, window_id)| {
+                let workspace_id = self.session_to_workspace.get(session_id)?;
+                let workspace = self.workspaces.get(workspace_id)?;
+                (workspace.project_root.as_deref() == Some(project_root)).then_some(*window_id)
+            })
+            .collect()
+    }
+
+    /// Whether one window contains a workspace rooted at `project_root`.
+    #[must_use]
+    pub fn window_contains_project_root(&self, window_id: WindowId, project_root: &Path) -> bool {
+        self.windows_for_project_root(project_root).contains(&window_id)
+    }
+
     /// Distinct display names of the workspaces owning this window's sessions,
     /// in the window's stored session order. Unnamed workspaces are skipped and
     /// duplicates removed. Feeds the feature-013 remote connect picker's window

@@ -26,11 +26,13 @@
 
 counts modules-total 72
 counts modules-wired 72
-counts server-messages-total 62
+counts server-messages-total 63
 counts server-messages-handled 57
 counts layout-actions-total 37
 counts layout-actions-handled 37
 
+## Intentional seam: scribe-gygu.10 owns CI client state and rendering.
+unhandled-server-message CiRunState
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message TrustedDeviceList

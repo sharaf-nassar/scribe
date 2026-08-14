@@ -35,7 +35,9 @@ use crate::terminal_images::{
 ///
 /// Bumped to `5` for terminal-images v1: remote peers must share the typed
 /// image capability, live-update, and replay contract exactly.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 5;
+///
+/// Bumped to `6` for the remote-visible CI run state and dismissal messages.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 6;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +290,66 @@ pub enum BeadsBoardState {
     Unavailable { message: String },
 }
 
+/// Aggregate state rendered by the CI run bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiRunStatus {
+    Queued,
+    Running,
+    Success,
+    Failure,
+    Cancelled,
+}
+
+/// GitHub workflow execution phase before its terminal conclusion is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiWorkflowStatus {
+    Queued,
+    InProgress,
+    Completed,
+}
+
+/// Terminal workflow result used by the aggregate worst-status rollup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiRunConclusion {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+/// One workflow run contributing to a pushed head's aggregate CI state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiWorkflowRun {
+    pub run_id: u64,
+    pub name: String,
+    pub status: CiWorkflowStatus,
+    pub conclusion: Option<CiRunConclusion>,
+    pub started_at_epoch_secs: Option<u64>,
+    pub updated_at_epoch_secs: Option<u64>,
+}
+
+/// Full bounded snapshot for one repository's currently tracked pushed head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiRunState {
+    /// Trusted GitHub `owner/name`, enough for the owning client to open a run.
+    pub repository: String,
+    pub head_sha: String,
+    pub branch: String,
+    pub workflows: Vec<CiWorkflowRun>,
+    pub rollup: CiRunStatus,
+    /// The tracker could not refresh an active run; last-known data remains valid.
+    pub stale: bool,
+}
+
+/// Replacement-sized CI updates. A clear names the head it retires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CiRunDelta {
+    Set(CiRunState),
+    Cleared { head_sha: String },
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +492,10 @@ pub enum ClientMessage {
         /// old/new handshakes remain safely decodable.
         #[serde(default)]
         terminal_images: TerminalImageCapabilities,
+        /// CI run-bar protocol support. Missing means incapable so a new server
+        /// never sends an unknown top-level variant to an older local client.
+        #[serde(default)]
+        ci_run_bar: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -442,6 +508,12 @@ pub enum ClientMessage {
     TriggerUpdate,
     /// User dismissed the update notification.
     DismissUpdate,
+    /// Hide CI for this tracked head. The server validates the repo against the
+    /// sender's window and synchronizes the clear across capable attached clients.
+    DismissCiRun {
+        repo_root: PathBuf,
+        head_sha: String,
+    },
     /// User explicitly requested an update check (e.g. "Check now" button in
     /// settings). The server replies with a single `UpdateCheckResult` on the
     /// same connection. May be sent as the first message on a transient
@@ -710,6 +782,11 @@ pub enum ServerMessage {
         /// Absolute path to the project directory (root + first CWD component).
         #[serde(default)]
         project_root: Option<PathBuf>,
+    },
+    /// One bounded CI state replacement or clear for workspaces rooted in `repo_root`.
+    CiRunState {
+        repo_root: PathBuf,
+        delta: CiRunDelta,
     },
     SessionCreated {
         session_id: SessionId,
@@ -1612,6 +1689,18 @@ mod tests {
         },
     }
 
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum HelloWithoutCiRunBar {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            join_window: bool,
+            terminal_images: TerminalImageCapabilities,
+        },
+    }
+
     #[test]
     fn hello_without_join_intent_defaults_to_false() {
         let bytes = rmp_serde::to_vec_named(&HelloWithoutJoinIntent::Hello {
@@ -1624,6 +1713,91 @@ mod tests {
 
         let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("deserialize old Hello");
         assert!(matches!(decoded, ClientMessage::Hello { join_window: false, .. }));
+    }
+
+    // @lat: [[protocol#Client Messages#CI Run State#Backward-compatible negotiation]]
+    #[test]
+    fn hello_without_ci_run_bar_capability_defaults_to_false() {
+        let bytes = rmp_serde::to_vec_named(&HelloWithoutCiRunBar::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+        })
+        .expect("serialize old Hello");
+
+        let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded, ClientMessage::Hello { ci_run_bar: false, .. }));
+    }
+
+    // @lat: [[protocol#Server Messages#CI Run State#State message round trip]]
+    #[test]
+    fn ci_run_state_round_trips_through_msgpack_named() {
+        let state = CiRunState {
+            repository: "acme/scribe".into(),
+            head_sha: "0123456789abcdef".into(),
+            branch: "main".into(),
+            workflows: vec![CiWorkflowRun {
+                run_id: 42,
+                name: "quality".into(),
+                status: CiWorkflowStatus::Completed,
+                conclusion: Some(CiRunConclusion::Failure),
+                started_at_epoch_secs: Some(1_723_600_000),
+                updated_at_epoch_secs: Some(1_723_600_030),
+            }],
+            rollup: CiRunStatus::Failure,
+            stale: true,
+        };
+        let message = ServerMessage::CiRunState {
+            repo_root: PathBuf::from("/work/scribe"),
+            delta: CiRunDelta::Set(state.clone()),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&message).expect("serialize CI state");
+        let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("deserialize CI state");
+
+        assert!(matches!(
+            decoded,
+            ServerMessage::CiRunState { repo_root, delta: CiRunDelta::Set(decoded) }
+                if repo_root == std::path::Path::new("/work/scribe") && decoded == state
+        ));
+
+        let clear_message = ServerMessage::CiRunState {
+            repo_root: PathBuf::from("/work/scribe"),
+            delta: CiRunDelta::Cleared { head_sha: "head-a".into() },
+        };
+        let clear_bytes = rmp_serde::to_vec_named(&clear_message).expect("serialize CI clear");
+        let decoded_clear: ServerMessage =
+            rmp_serde::from_slice(&clear_bytes).expect("deserialize CI clear");
+
+        assert!(matches!(
+            decoded_clear,
+            ServerMessage::CiRunState {
+                repo_root,
+                delta: CiRunDelta::Cleared { head_sha }
+            } if repo_root == std::path::Path::new("/work/scribe") && head_sha == "head-a"
+        ));
+    }
+
+    // @lat: [[protocol#Client Messages#CI Run State#Dismiss message round trip]]
+    #[test]
+    fn dismiss_ci_run_round_trips_through_msgpack_named() {
+        let message = ClientMessage::DismissCiRun {
+            repo_root: PathBuf::from("/work/scribe"),
+            head_sha: "0123456789abcdef".into(),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&message).expect("serialize CI dismissal");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize CI dismissal");
+
+        assert!(matches!(
+            decoded,
+            ClientMessage::DismissCiRun { repo_root, head_sha }
+                if repo_root == std::path::Path::new("/work/scribe")
+                    && head_sha == "0123456789abcdef"
+        ));
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]

@@ -321,6 +321,7 @@ pub async fn run() -> Result<(), ScribeError> {
             // — exactly the rollback a user would perform.
             // @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
+            ci_run_bar: false,
         },
     )
     .await?;
@@ -478,6 +479,7 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageLive { .. }
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
+        | ServerMessage::CiRunState { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
