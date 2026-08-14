@@ -137,6 +137,22 @@ status (accessibility rule from the spec review).
 - **Multiple workflows**: all runs for the pushed head aggregate into the
   worst-status rollup; each workflow is an individual chip.
 
+### Visual direction
+
+The mockup's primary direction is **trace**: the band is a timeline, not a
+status row. Collapsed, a segmented pipeline strip (one segment per
+workflow, live shimmer, queued dashes) shows the run's shape inline, with
+a conic ring filling as jobs complete; expanded, jobs render as
+time-positioned bars on a shared minute-grid axis so parallelism reads at
+a glance. A hairline under the band takes the workspace badge color —
+ownership encoded structurally, which is what disambiguates the band in
+multi-workspace windows. Failure/stale re-key that hairline semantically.
+Motion (appear sweep, shimmer, breathing caret, success exit) routes
+through the existing GPUI animation system and its off switch; terminal
+states are static. An alternate **edge** direction trades the band for a
+2px luminous progress line under the titlebar plus a fading micro
+cluster — zero chrome height; both directions share the trace panel.
+
 ### Notification surface decision
 
 The bar's appearance is the v1 notification. The client's existing

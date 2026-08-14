@@ -11,24 +11,24 @@
     /* Scribe minimal-dark terminal palette (crates/scribe-common/src/theme.rs) */
     --term-bg: #0e0e10;
     --term-fg: #e4e4e7;
-    --ansi-red: #ef4444;
-    --ansi-green: #22c55e;
-    --ansi-yellow: #eab308;
-    --ansi-blue: #3b82f6;     /* derived chrome accent */
-    --ansi-brblack: #52525b;
-    /* Derived chrome (theme.rs ChromeColors derivation) */
-    --tab-bar-bg: #1a1a1d;            /* bg lightened ~6% */
-    --band-bg: #141416;               /* bg lightened ~3% */
-    --panel-bg: #121214;              /* bg lightened ~2% */
+    --red: #ef4444;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --blue: #3b82f6;                  /* derived chrome accent */
+    --brblack: #52525b;
+    /* Derived chrome */
+    --tab-bar-bg: #1a1a1d;
+    --band-bg: #0b0b0d;               /* recessed below the titlebar */
+    --panel-bg: #0a0a0c;
     --chrome-text: rgba(228, 228, 231, 0.5);
-    --divider: rgba(228, 228, 231, 0.14);
+    --divider: rgba(228, 228, 231, 0.12);
     --badge: #a78bfa;                 /* workspace accent slot 1 */
     --badge2: #38bdf8;                /* workspace accent slot 2 */
     /* Documentation frame */
-    --page-bg: #09090b;
+    --page-bg: #08080a;
     --page-fg: #d4d4d8;
-    --page-muted: #85858f;
-    --page-rule: #232327;
+    --page-muted: #7f7f8a;
+    --page-rule: #1f1f24;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -40,212 +40,284 @@
     line-height: 1.6;
     padding: 56px 24px 96px;
   }
-  .wrap { max-width: 920px; margin: 0 auto; }
+  .wrap { max-width: 940px; margin: 0 auto; }
 
-  header { margin-bottom: 56px; }
+  header { margin-bottom: 64px; }
   header h1 {
-    font-size: 22px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    color: #fafafa;
-    text-wrap: balance;
+    font-size: 24px; font-weight: 600; letter-spacing: -0.01em;
+    color: #fafafa; text-wrap: balance;
   }
-  header .sub { color: var(--page-muted); margin-top: 8px; max-width: 66ch; }
+  header .sub { color: var(--page-muted); margin-top: 10px; max-width: 68ch; }
   header .meta {
-    margin-top: 16px;
-    font-size: 12px;
-    color: var(--page-muted);
+    margin-top: 18px; font-size: 12px; color: var(--page-muted);
     display: flex; gap: 20px; flex-wrap: wrap;
   }
-  header .meta span b { color: var(--page-fg); font-weight: 500; }
+  header .meta b { color: var(--page-fg); font-weight: 500; }
 
-  .vignette { margin: 48px 0; }
+  .vignette { margin: 56px 0; }
   .vignette > .label {
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    font-size: 11px;
-    color: var(--ansi-blue);
-    margin-bottom: 4px;
+    text-transform: uppercase; letter-spacing: 0.16em;
+    font-size: 11px; color: var(--blue); margin-bottom: 4px;
   }
   .vignette > .caption {
-    color: var(--page-muted);
-    font-size: 13px;
-    max-width: 72ch;
-    margin-bottom: 14px;
+    color: var(--page-muted); font-size: 13px; max-width: 74ch;
+    margin-bottom: 16px;
   }
   .frame-scroll { overflow-x: auto; }
 
   /* ------- Scribe window frame ------- */
   .window {
-    min-width: 720px;
+    min-width: 740px;
     background: var(--term-bg);
-    border: 1px solid #2b2b30;
+    border: 1px solid #26262b;
     border-radius: 6px;
     overflow: hidden;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
     font-size: 12.5px;
   }
   .titlebar {
-    display: flex; align-items: stretch;
-    height: 34px;
+    display: flex; align-items: stretch; height: 34px;
     background: linear-gradient(#1d1d20, var(--tab-bar-bg));
     border-bottom: 1px solid var(--divider);
   }
   .ws-pill {
-    display: flex; align-items: center; gap: 6px;
-    padding: 0 12px;
-    color: var(--badge);
-    font-weight: 600;
+    display: flex; align-items: center; gap: 6px; padding: 0 12px;
+    color: var(--badge); font-weight: 600;
   }
   .ws-pill.alt { color: var(--badge2); }
   .ws-pill .dot { width: 7px; height: 7px; border-radius: 2px; background: currentColor; }
   .tab {
-    display: flex; align-items: center;
-    padding: 0 16px;
-    color: var(--chrome-text);
-    border-right: 1px solid var(--divider);
+    display: flex; align-items: center; padding: 0 16px;
+    color: var(--chrome-text); border-right: 1px solid var(--divider);
     position: relative;
   }
-  .tab.active {
-    color: var(--term-fg);
-    background: #232327;
-  }
+  .tab.active { color: var(--term-fg); background: #232327; }
   .tab.active::after {
     content: ""; position: absolute; left: 0; right: 0; bottom: 0;
     height: 2px; background: var(--badge);
   }
   .titlebar .spacer { flex: 1; }
 
-  /* ------- CI bar band ------- */
-  .ci-bar {
+  /* =========================================================
+     CI band — "trace" direction.
+     A recessed timeline surface: status ring, pipeline strip,
+     badge-keyed underline. Not a status row — a live timeline.
+     ========================================================= */
+  .ci-band {
+    position: relative;
     display: flex; align-items: center; gap: 14px;
-    height: 30px;
-    padding: 0 12px;
-    background: var(--band-bg);
-    border-bottom: 1px solid var(--divider);
+    height: 34px; padding: 0 12px 0 14px;
+    background: linear-gradient(rgba(255,255,255,0.015), rgba(0,0,0,0.25)), var(--band-bg);
     color: var(--term-fg);
     white-space: nowrap;
+    overflow: hidden;
   }
-  .ci-status { display: flex; align-items: center; gap: 7px; font-weight: 600; }
-  .ci-status .glyph { font-weight: 400; }
-  .st-running   { color: var(--ansi-blue); }
-  .st-success   { color: var(--ansi-green); }
-  .st-failure   { color: var(--ansi-red); }
-  .st-cancelled { color: var(--ansi-brblack); }
-  .st-stale     { color: var(--ansi-yellow); }
-  .ci-chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 2px 8px;
-    border: 1px solid var(--divider);
-    border-radius: 3px;
+  /* badge-keyed ownership underline: the band belongs to its workspace */
+  .ci-band::before {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px;
+    background: color-mix(in srgb, var(--badge) 55%, transparent);
+  }
+  /* one-shot light sweep on appear (echoes the titlebar attention flash) */
+  .ci-band.appearing::after {
+    content: ""; position: absolute; top: 0; bottom: 0; width: 160px;
+    background: linear-gradient(100deg, transparent,
+                rgba(228, 228, 231, 0.07) 45%, transparent 90%);
+    animation: sweep 900ms cubic-bezier(0.22, 0.6, 0.3, 1) 1 both;
+    pointer-events: none;
+  }
+  @keyframes sweep { from { left: -180px; } to { left: 110%; } }
+
+  /* status ring: conic fill = completed jobs / total jobs */
+  .ring {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: conic-gradient(var(--ring-c, var(--blue)) var(--ring-p, 40%),
+                rgba(228,228,231,0.14) 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent 55%, #000 57%);
+            mask: radial-gradient(farthest-side, transparent 55%, #000 57%);
+    flex: none;
+  }
+  .ring.done { -webkit-mask: none; mask: none; transform: scale(0.62); border-radius: 3px; }
+  .ci-word { font-weight: 600; letter-spacing: 0.02em; }
+  .w-running   { color: var(--blue); }
+  .w-success   { color: var(--green); }
+  .w-failure   { color: var(--red); }
+  .w-cancelled { color: var(--brblack); }
+  .w-stale     { color: var(--yellow); }
+
+  /* pipeline strip: one segment per workflow, live fill */
+  .strip {
+    flex: 1; display: flex; gap: 5px; align-items: center; min-width: 180px;
+  }
+  .seg {
+    height: 4px; border-radius: 2px; flex: 1; position: relative;
+    background: rgba(228, 228, 231, 0.10); overflow: hidden;
+  }
+  .seg .fill {
+    position: absolute; inset: 0 auto 0 0; border-radius: 2px;
+    background: var(--seg-c, var(--blue));
+  }
+  .seg.active .fill {
+    background:
+      linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent) 0 0/40% 100% no-repeat,
+      var(--seg-c, var(--blue));
+    animation: shimmer 1.6s linear infinite;
+  }
+  @keyframes shimmer { from { background-position: -40% 0, 0 0; } to { background-position: 140% 0, 0 0; } }
+  .seg.queued { background: repeating-linear-gradient(90deg,
+      rgba(228,228,231,0.14) 0 4px, transparent 4px 9px); }
+  .seg.ok    .fill { background: var(--green); box-shadow: 0 0 6px rgba(34, 197, 94, 0.35); }
+  .seg.fail  .fill { background: var(--red);   box-shadow: 0 0 8px rgba(239, 68, 68, 0.45); }
+  .seg .seg-label {
+    position: absolute; top: -15px; left: 1px;
+    font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
     color: var(--chrome-text);
-    font-size: 11.5px;
   }
-  .ci-chip .g-run    { color: var(--ansi-blue); }
-  .ci-chip .g-ok     { color: var(--ansi-green); }
-  .ci-chip .g-fail   { color: var(--ansi-red); }
-  .ci-chip .g-queue  { color: var(--ansi-brblack); }
-  .ci-chip .g-cancel { color: var(--ansi-brblack); }
+  .strip.labeled { padding-top: 12px; }
+
   .ci-ref { color: var(--chrome-text); font-size: 11.5px; }
   .ci-ref b { color: var(--term-fg); font-weight: 500; }
   .ci-elapsed { color: var(--chrome-text); font-variant-numeric: tabular-nums; }
-  .ci-note { color: var(--chrome-text); font-size: 11.5px; font-style: italic; }
-  .ci-actions {
-    margin-left: auto;
-    display: flex; align-items: center; gap: 4px;
-  }
+  .ci-note { color: var(--chrome-text); font-size: 11px; font-style: italic; }
+  .ci-actions { display: flex; align-items: center; gap: 2px; }
   .ci-actions .act {
-    padding: 3px 9px;
-    border-radius: 3px;
-    color: var(--chrome-text);
-    cursor: default;
+    padding: 3px 9px; border-radius: 4px; color: var(--chrome-text); cursor: default;
   }
-  .ci-actions .act:hover { background: #232327; color: var(--term-fg); }
+  .ci-actions .act:hover { background: rgba(228,228,231,0.08); color: var(--term-fg); }
+  .viewer-chip {
+    display: flex; align-items: center; gap: 7px;
+    color: var(--chrome-text); font-size: 11px;
+    border: 1px solid var(--divider); border-radius: 4px; padding: 2px 9px;
+  }
 
-  /* ------- expanded panel ------- */
-  .ci-panel {
+  /* failure emphasis: the band underline turns semantic */
+  .ci-band.failed::before { background: color-mix(in srgb, var(--red) 60%, transparent); }
+  .ci-band.failed { box-shadow: inset 0 -8px 18px -14px rgba(239, 68, 68, 0.55); }
+  .ci-band.stale-band::before { background: color-mix(in srgb, var(--yellow) 45%, transparent); }
+
+  /* =========================================================
+     Trace panel — expanded view. Jobs as time-positioned
+     tracks against a minute grid: parallelism at a glance.
+     ========================================================= */
+  .trace {
     background: var(--panel-bg);
     border-bottom: 1px solid var(--divider);
-    padding: 8px 12px 10px;
+    padding: 10px 12px 12px;
   }
-  .ci-wf { margin: 4px 0 8px; }
-  .ci-wf .wf-name {
-    color: var(--term-fg);
-    font-weight: 600;
-    font-size: 12px;
-    margin-bottom: 3px;
+  .trace .axis {
+    display: flex; justify-content: space-between;
+    color: rgba(228,228,231,0.3); font-size: 9.5px;
+    padding: 0 0 4px 168px; letter-spacing: 0.06em;
   }
-  .ci-job {
-    display: flex; align-items: baseline; gap: 10px;
-    padding: 2px 0 2px 18px;
+  .t-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 3px 0; font-size: 12px;
+  }
+  .t-row .t-name { width: 156px; flex: none; color: var(--term-fg); }
+  .t-row .t-name small { color: var(--chrome-text); display: block; font-size: 10px; }
+  .t-track {
+    flex: 1; height: 16px; position: relative; border-radius: 3px;
+    background: repeating-linear-gradient(90deg,
+      rgba(228,228,231,0.05) 0 1px, transparent 1px 25%);
+  }
+  .t-bar {
+    position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
+    display: flex; align-items: center; padding: 0 8px;
+    font-size: 10px; color: rgba(255,255,255,0.85); overflow: hidden;
+  }
+  .t-bar.run {
+    background: linear-gradient(90deg,
+      color-mix(in srgb, var(--blue) 55%, transparent), var(--blue));
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
+  }
+  .t-bar.run::after {
+    content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 2px;
+    background: #fff; opacity: 0.7; animation: caret 1.2s ease-in-out infinite;
+  }
+  @keyframes caret { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.85; } }
+  .t-bar.ok   { background: color-mix(in srgb, var(--green) 75%, #0a0a0c); }
+  .t-bar.fail { background: color-mix(in srgb, var(--red) 78%, #0a0a0c);
+                box-shadow: 0 0 10px rgba(239, 68, 68, 0.35); }
+  .t-bar.queued {
+    background: transparent; border: 1px dashed rgba(228,228,231,0.25);
     color: var(--chrome-text);
-    font-size: 12px;
   }
-  .ci-job .j-name { color: var(--term-fg); min-width: 150px; }
-  .ci-job .j-step { flex: 1; }
-  .ci-job .j-time { font-variant-numeric: tabular-nums; }
+  .t-row .t-time {
+    width: 56px; flex: none; text-align: right;
+    color: var(--chrome-text); font-variant-numeric: tabular-nums; font-size: 11px;
+  }
 
   /* ------- terminal content + status bar ------- */
-  .term {
-    padding: 12px 14px 16px;
-    color: var(--term-fg);
-    font-size: 12.5px;
-    line-height: 1.75;
-  }
-  .term .p  { color: var(--ansi-green); }
-  .term .c  { color: var(--term-fg); }
-  .term .o  { color: var(--chrome-text); }
-  .term .cur {
-    display: inline-block; width: 7px; height: 14px;
-    background: var(--term-fg); vertical-align: text-bottom;
-  }
+  .term { padding: 12px 14px 14px; color: var(--term-fg); font-size: 12.5px; line-height: 1.75; }
+  .term .p { color: var(--green); }
+  .term .c { color: var(--term-fg); }
+  .term .o { color: var(--chrome-text); }
+  .term .cur { display: inline-block; width: 7px; height: 14px; background: var(--term-fg); vertical-align: text-bottom; }
   .statusbar {
-    display: flex; align-items: center; gap: 16px;
-    height: 24px;
-    padding: 0 12px;
-    background: var(--tab-bar-bg);
-    border-top: 1px solid var(--divider);
-    color: var(--chrome-text);
-    font-size: 11.5px;
+    display: flex; align-items: center; gap: 16px; height: 24px; padding: 0 12px;
+    background: var(--tab-bar-bg); border-top: 1px solid var(--divider);
+    color: var(--chrome-text); font-size: 11.5px;
   }
-  .statusbar .ok { color: var(--ansi-green); }
+  .statusbar .ok { color: var(--green); }
   .statusbar .spacer { flex: 1; }
 
   /* ------- multi-workspace region chrome ------- */
   .region-bar {
-    display: flex; align-items: stretch;
-    height: 30px;
+    display: flex; align-items: stretch; height: 30px;
     background: var(--tab-bar-bg);
-    border-top: 1px solid var(--divider);
-    border-bottom: 1px solid var(--divider);
+    border-top: 1px solid var(--divider); border-bottom: 1px solid var(--divider);
   }
-  .region-bar .tab { font-size: 12px; }
   .region-split { border-top: 1px solid var(--divider); }
 
-  /* ------- shared viewer chrome ------- */
-  .viewer-note {
-    display: flex; align-items: center; gap: 7px;
-    color: var(--chrome-text);
-    font-size: 11.5px;
-    margin-left: auto;
+  /* ------- band-only specimens ------- */
+  .specimen { margin: 10px 0; }
+  .specimen .window { min-width: 740px; border-radius: 5px; }
+
+  /* =========================================================
+     Alternate direction — "edge": collapsed presence is a 2px
+     luminous progress line + micro cluster. Zero band height.
+     ========================================================= */
+  .edge-line {
+    position: relative; height: 2px; background: rgba(228,228,231,0.08);
   }
+  .edge-line .edge-fill {
+    position: absolute; inset: 0 auto 0 0; width: 58%;
+    background: linear-gradient(90deg, var(--badge), var(--blue));
+    box-shadow: 0 0 8px 1px rgba(59, 130, 246, 0.5);
+  }
+  .edge-line .edge-fill::after {
+    content: ""; position: absolute; right: -1px; top: -2px; bottom: -2px; width: 3px;
+    background: #fff; border-radius: 2px; opacity: 0.8;
+    animation: caret 1.2s ease-in-out infinite;
+  }
+  .micro {
+    position: absolute; top: 8px; right: 10px; z-index: 2;
+    display: flex; align-items: center; gap: 8px;
+    padding: 3px 10px;
+    background: rgba(14, 14, 16, 0.82);
+    border: 1px solid var(--divider); border-radius: 4px;
+    color: var(--chrome-text); font-size: 11px;
+    backdrop-filter: blur(4px);
+  }
+  .micro b { color: var(--blue); font-weight: 600; }
+  .edge-host { position: relative; }
 
   /* ------- legend / spec strip ------- */
-  .specs { margin-top: 72px; border-top: 1px solid var(--page-rule); padding-top: 32px; }
+  .specs { margin-top: 80px; border-top: 1px solid var(--page-rule); padding-top: 32px; }
   .specs h2 {
-    text-transform: uppercase; letter-spacing: 0.14em;
-    font-size: 11px; font-weight: 600;
-    color: var(--ansi-blue);
-    margin-bottom: 16px;
+    text-transform: uppercase; letter-spacing: 0.16em;
+    font-size: 11px; font-weight: 600; color: var(--blue); margin-bottom: 16px;
   }
   .specs table { border-collapse: collapse; font-size: 13px; }
   .specs td { padding: 5px 28px 5px 0; vertical-align: top; }
   .specs td:first-child { white-space: nowrap; }
-  .specs .g { font-size: 14px; }
   .specs ul { list-style: none; margin-top: 10px; }
-  .specs li { padding: 4px 0; color: var(--page-muted); max-width: 78ch; }
+  .specs li { padding: 4px 0; color: var(--page-muted); max-width: 80ch; }
   .specs li::before { content: "—"; color: var(--page-rule); margin-right: 10px; }
   .specs li b { color: var(--page-fg); font-weight: 500; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; }
+  }
 </style>
 </head>
 <body>
@@ -253,22 +325,28 @@
 
 <header>
   <h1>Scribe CI Bar</h1>
-  <p class="sub">Workspace-top chrome band tracking the GitHub Actions runs
-  triggered by your own push. Every state below is a full-window vignette in
-  Scribe's minimal-dark theme with its derived chrome colors.</p>
+  <p class="sub">The bar is a timeline, not a status row. Collapsed, the run's
+  shape lives in a segmented pipeline strip; expanded, jobs become
+  time-positioned tracks. A badge-keyed underline ties the band to the
+  workspace that owns it. Motion follows the existing GPUI animation policy
+  (attention-flash lineage, honors the global off switch).</p>
   <p class="meta">
     <span>spec <b>specs/023-gh-ci-run-bar.md</b></span>
     <span>rules <b>specs/023-gh-ci-run-bar/research.md</b></span>
     <span>theme <b>minimal-dark</b></span>
+    <span>direction <b>trace</b> (alt: edge)</span>
   </p>
 </header>
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">01 · running — collapsed</div>
-  <p class="caption">First observation of a run for the pushed head is the
-  notification: the band appears under the titlebar, panes re-measure. Rollup
-  glyph + word, one chip per workflow, tracked head, elapsed.</p>
+  <div class="label">01 · appear — running, collapsed</div>
+  <p class="caption">First run observation: the band slides in under the
+  titlebar with a single light sweep (the titlebar attention-flash, made
+  horizontal). Left: a conic ring filling as jobs complete. Center: the
+  pipeline strip — one labeled segment per workflow, live shimmer on the
+  active one, dashes for queued. The violet hairline under the band is the
+  workspace badge color: this bar belongs to <em>scribe</em>.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -276,21 +354,19 @@
       <div class="tab">cargo watch</div>
       <div class="spacer"></div>
     </div>
-    <div class="ci-bar">
-      <span class="ci-status st-running"><span class="glyph">◐</span>running</span>
-      <span class="ci-chip">quality <span class="g-run">◐</span></span>
-      <span class="ci-chip">docs <span class="g-queue">◌</span></span>
+    <div class="ci-band appearing">
+      <span class="ring" style="--ring-p:33%"></span>
+      <span class="ci-word w-running">running</span>
+      <div class="strip labeled">
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">quality</span><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued"><span class="seg-label">docs</span></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">1m 42s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
     <div class="term">
       <div><span class="p">➜</span> <span class="c">git push origin main</span></div>
-      <div class="o">Enumerating objects: 11, done.</div>
-      <div class="o">Writing objects: 100% (6/6), 1.24 KiB | 1.24 MiB/s, done.</div>
       <div class="o">To github.com:mamba/scribe.git</div>
       <div class="o">&nbsp;&nbsp; d01dce6..4f2a91c&nbsp; main -> main</div>
       <div><span class="p">➜</span> <span class="cur"></span></div>
@@ -305,11 +381,12 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">02 · running — expanded</div>
-  <p class="caption">Clicking the band (or the keybinding) opens the per-job
-  panel inside the same band, pushing pane content down. Job rows show status
-  glyph, name, current step, elapsed. Per-job data is fetched only while the
-  panel is open.</p>
+  <div class="label">02 · expanded — trace panel</div>
+  <p class="caption">Click or keybinding drops the trace: each job is a bar
+  positioned on a shared time axis against a faint minute grid, so
+  parallelism, stragglers, and queue gaps read instantly. The live job
+  carries a breathing caret at its right edge. Per-job data is fetched only
+  while the trace is open.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -317,35 +394,33 @@
       <div class="tab">cargo watch</div>
       <div class="spacer"></div>
     </div>
-    <div class="ci-bar">
-      <span class="ci-status st-running"><span class="glyph">◐</span>running</span>
-      <span class="ci-chip">quality <span class="g-run">◐</span></span>
-      <span class="ci-chip">docs <span class="g-queue">◌</span></span>
+    <div class="ci-band">
+      <span class="ring" style="--ring-p:33%"></span>
+      <span class="ci-word w-running">running</span>
+      <div class="strip">
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:70%"></span></div>
+        <div class="seg queued"></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">2m 08s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
-    <div class="ci-panel">
-      <div class="ci-wf">
-        <div class="wf-name">quality</div>
-        <div class="ci-job"><span class="g-ok" style="color:var(--ansi-green)">✓</span>
-          <span class="j-name">rust-linux</span>
-          <span class="j-step">just clippy · just test</span>
-          <span class="j-time">1m 51s</span></div>
-        <div class="ci-job"><span style="color:var(--ansi-blue)">◐</span>
-          <span class="j-name">rust-macos</span>
-          <span class="j-step">cargo clippy --workspace</span>
-          <span class="j-time">1m 12s</span></div>
+    <div class="trace">
+      <div class="axis"><span>0m</span><span>1m</span><span>2m</span><span>3m</span><span>4m</span></div>
+      <div class="t-row">
+        <div class="t-name">rust-linux <small>quality</small></div>
+        <div class="t-track"><div class="t-bar ok" style="left:2%; width:44%">just clippy · just test</div></div>
+        <div class="t-time">1m 51s</div>
       </div>
-      <div class="ci-wf">
-        <div class="wf-name">docs</div>
-        <div class="ci-job"><span style="color:var(--ansi-brblack)">◌</span>
-          <span class="j-name">lat-check</span>
-          <span class="j-step">queued</span>
-          <span class="j-time">—</span></div>
+      <div class="t-row">
+        <div class="t-name">rust-macos <small>quality</small></div>
+        <div class="t-track"><div class="t-bar run" style="left:6%; width:46%">cargo clippy --workspace</div></div>
+        <div class="t-time">1m 58s</div>
+      </div>
+      <div class="t-row">
+        <div class="t-name">lat-check <small>docs</small></div>
+        <div class="t-track"><div class="t-bar queued" style="left:52%; width:18%">queued</div></div>
+        <div class="t-time">—</div>
       </div>
     </div>
     <div class="term">
@@ -361,153 +436,79 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">03 · success</div>
-  <p class="caption">Worst-status rollup resolves green only when every
-  workflow passed. Success lingers ~10 s, then the band auto-dismisses and
-  panes reclaim the row.</p>
-  <div class="frame-scroll"><div class="window">
-    <div class="titlebar">
-      <div class="ws-pill"><span class="dot"></span>scribe</div>
-      <div class="tab active">zsh</div>
-      <div class="tab">cargo watch</div>
-      <div class="spacer"></div>
-    </div>
-    <div class="ci-bar">
-      <span class="ci-status st-success"><span class="glyph">✓</span>passed</span>
-      <span class="ci-chip">quality <span class="g-ok">✓</span></span>
-      <span class="ci-chip">docs <span class="g-ok">✓</span></span>
+  <div class="label">03 · terminal states — band specimens</div>
+  <p class="caption">Success flashes the strip green and auto-clears after
+  ~10 s. Failure keeps its segment glowing and turns the ownership hairline
+  semantic red — it persists until dismissed. Cancelled goes quiet.
+  Stale freezes elapsed and amber-keys the hairline while retrying.
+  Glyph + word always accompany color.</p>
+
+  <div class="specimen"><div class="frame-scroll"><div class="window">
+    <div class="ci-band">
+      <span class="ring done" style="background:var(--green)"></span>
+      <span class="ci-word w-success">✓ passed</span>
+      <div class="strip">
+        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">4m 51s</span>
       <span class="ci-note">clears in 10s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
-    <div class="term">
-      <div><span class="p">➜</span> <span class="cur"></span></div>
-    </div>
-    <div class="statusbar">
-      <span class="ok">●</span><span>connected</span>
-      <span class="spacer"></span>
-      <span>⎇ main</span><span>2 sessions</span><span>14:36</span>
-    </div>
-  </div></div>
-</section>
+  </div></div></div>
 
-<!-- ============================================================ -->
-<section class="vignette">
-  <div class="label">04 · failure</div>
-  <p class="caption">Failure persists until dismissed — it is the state the
-  user must not miss. The failing workflow's chip carries the cross; open ↗
-  jumps to the run on GitHub.</p>
-  <div class="frame-scroll"><div class="window">
-    <div class="titlebar">
-      <div class="ws-pill"><span class="dot"></span>scribe</div>
-      <div class="tab active">zsh</div>
-      <div class="tab">cargo watch</div>
-      <div class="spacer"></div>
-    </div>
-    <div class="ci-bar">
-      <span class="ci-status st-failure"><span class="glyph">✕</span>failed</span>
-      <span class="ci-chip">quality <span class="g-fail">✕</span></span>
-      <span class="ci-chip">docs <span class="g-ok">✓</span></span>
+  <div class="specimen"><div class="frame-scroll"><div class="window">
+    <div class="ci-band failed">
+      <span class="ring done" style="background:var(--red)"></span>
+      <span class="ci-word w-failure">✕ failed</span>
+      <div class="strip">
+        <div class="seg fail"><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">3m 27s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
-    <div class="term">
-      <div><span class="p">➜</span> <span class="cur"></span></div>
-    </div>
-    <div class="statusbar">
-      <span class="ok">●</span><span>connected</span>
-      <span class="spacer"></span>
-      <span>⎇ main</span><span>2 sessions</span><span>14:35</span>
-    </div>
-  </div></div>
-</section>
+  </div></div></div>
 
-<!-- ============================================================ -->
-<section class="vignette">
-  <div class="label">05 · cancelled</div>
-  <p class="caption">Cancellation outranks success but not failure in the
-  rollup. Persists until dismissed, styled in the muted bright-black rather
-  than a semantic color.</p>
-  <div class="frame-scroll"><div class="window">
-    <div class="titlebar">
-      <div class="ws-pill"><span class="dot"></span>scribe</div>
-      <div class="tab active">zsh</div>
-      <div class="tab">cargo watch</div>
-      <div class="spacer"></div>
-    </div>
-    <div class="ci-bar">
-      <span class="ci-status st-cancelled"><span class="glyph">⊘</span>cancelled</span>
-      <span class="ci-chip">quality <span class="g-cancel">⊘</span></span>
-      <span class="ci-chip">docs <span class="g-ok">✓</span></span>
+  <div class="specimen"><div class="frame-scroll"><div class="window">
+    <div class="ci-band">
+      <span class="ring done" style="background:var(--brblack)"></span>
+      <span class="ci-word w-cancelled">⊘ cancelled</span>
+      <div class="strip">
+        <div class="seg"><span class="fill" style="width:34%; background:var(--brblack)"></span></div>
+        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">1m 03s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
-    <div class="term">
-      <div><span class="p">➜</span> <span class="cur"></span></div>
-    </div>
-    <div class="statusbar">
-      <span class="ok">●</span><span>connected</span>
-      <span class="spacer"></span>
-      <span>⎇ main</span><span>2 sessions</span><span>14:34</span>
-    </div>
-  </div></div>
-</section>
+  </div></div></div>
 
-<!-- ============================================================ -->
-<section class="vignette">
-  <div class="label">06 · stale</div>
-  <p class="caption">API failure during an active run: last-known content is
-  kept, elapsed freezes, and a yellow ⚠ names the degradation and the retry.
-  Recovery resumes running; window expiry hides the band. Outside an active
-  run, failures never surface a bar.</p>
-  <div class="frame-scroll"><div class="window">
-    <div class="titlebar">
-      <div class="ws-pill"><span class="dot"></span>scribe</div>
-      <div class="tab active">zsh</div>
-      <div class="tab">cargo watch</div>
-      <div class="spacer"></div>
-    </div>
-    <div class="ci-bar">
-      <span class="ci-status st-running"><span class="glyph">◐</span>running</span>
-      <span class="ci-chip">quality <span class="g-run">◐</span></span>
-      <span class="ci-chip">docs <span class="g-queue">◌</span></span>
+  <div class="specimen"><div class="frame-scroll"><div class="window">
+    <div class="ci-band stale-band">
+      <span class="ring" style="--ring-p:33%; --ring-c:var(--yellow)"></span>
+      <span class="ci-word w-running">running</span>
+      <div class="strip">
+        <div class="seg" style="--seg-c:var(--blue)"><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued"></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">2m 40s</span>
-      <span class="ci-status st-stale"><span class="glyph">⚠</span>stale · retry in 30s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <span class="ci-word w-stale">⚠ stale · retry in 30s</span>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
-    <div class="term">
-      <div><span class="p">➜</span> <span class="cur"></span></div>
-    </div>
-    <div class="statusbar">
-      <span class="ok">●</span><span>connected</span>
-      <span class="spacer"></span>
-      <span>⎇ main</span><span>2 sessions</span><span>14:34</span>
-    </div>
-  </div></div>
+  </div></div></div>
 </section>
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">07 · multi-workspace placement</div>
-  <p class="caption">The band belongs to the workspace region whose repo owns
-  the run. In a stacked layout it renders directly under that region's tab
-  bar — the top region (other workspace) is untouched.</p>
+  <div class="label">04 · multi-workspace — badge-keyed ownership</div>
+  <p class="caption">In a stacked window the band renders under the owning
+  region's tab bar, and its violet hairline matches the scribe badge — the
+  cyan firecrawl region above shows no CI chrome. Ownership is structural,
+  not decorative.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill alt"><span class="dot"></span>firecrawl</div>
@@ -525,15 +526,15 @@
       <div class="tab">cargo watch</div>
       <div class="spacer"></div>
     </div>
-    <div class="ci-bar">
-      <span class="ci-status st-running"><span class="glyph">◐</span>running</span>
-      <span class="ci-chip">quality <span class="g-run">◐</span></span>
+    <div class="ci-band">
+      <span class="ring" style="--ring-p:20%"></span>
+      <span class="ci-word w-running">running</span>
+      <div class="strip">
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:38%"></span></div>
+      </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">0m 58s</span>
-      <div class="ci-actions">
-        <span class="act">open ↗</span>
-        <span class="act">✕</span>
-      </div>
+      <div class="ci-actions"><span class="act">open ↗</span><span class="act">✕</span></div>
     </div>
     <div class="term">
       <div><span class="p">➜</span> <span class="cur"></span></div>
@@ -548,10 +549,33 @@
 
 <!-- ============================================================ -->
 <section class="vignette">
-  <div class="label">08 · shared viewer — read-only</div>
-  <p class="caption">LAN-share and remote-control viewers see the same band
-  with the action cluster omitted: no open ↗, no dismiss. Rendering involves
-  no token — viewers receive state, never credentials.</p>
+  <div class="label">05 · shared viewer — read-only</div>
+  <p class="caption">LAN-share and remote-control viewers get the same
+  timeline with the action cluster swapped for a viewing chip: no open ↗,
+  no dismiss. State travels; credentials never do.</p>
+  <div class="specimen"><div class="frame-scroll"><div class="window">
+    <div class="ci-band">
+      <span class="ring" style="--ring-p:33%"></span>
+      <span class="ci-word w-running">running</span>
+      <div class="strip">
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued"></div>
+      </div>
+      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
+      <span class="ci-elapsed">1m 42s</span>
+      <div class="viewer-chip">viewing · read-only</div>
+    </div>
+  </div></div></div>
+</section>
+
+<!-- ============================================================ -->
+<section class="vignette">
+  <div class="label">06 · alternate direction — edge</div>
+  <p class="caption">For zero chrome cost: collapsed presence is a 2px
+  luminous progress line under the titlebar (badge→accent gradient, bright
+  caret at the frontier) plus a translucent micro cluster that fades after a
+  few seconds. Click either to drop the same trace panel. Costs two pixels;
+  the workspace keeps its full height.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -559,16 +583,15 @@
       <div class="tab">cargo watch</div>
       <div class="spacer"></div>
     </div>
-    <div class="ci-bar">
-      <span class="ci-status st-running"><span class="glyph">◐</span>running</span>
-      <span class="ci-chip">quality <span class="g-run">◐</span></span>
-      <span class="ci-chip">docs <span class="g-queue">◌</span></span>
-      <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
-      <span class="ci-elapsed">1m 42s</span>
-      <div class="viewer-note">viewing · read-only</div>
-    </div>
-    <div class="term">
-      <div><span class="p">➜</span> <span class="cur"></span></div>
+    <div class="edge-line"><div class="edge-fill"></div></div>
+    <div class="edge-host">
+      <div class="micro"><b>◐</b> ci 1m 42s</div>
+      <div class="term">
+        <div><span class="p">➜</span> <span class="c">git push origin main</span></div>
+        <div class="o">To github.com:mamba/scribe.git</div>
+        <div class="o">&nbsp;&nbsp; d01dce6..4f2a91c&nbsp; main -> main</div>
+        <div><span class="p">➜</span> <span class="cur"></span></div>
+      </div>
     </div>
     <div class="statusbar">
       <span class="ok">●</span><span>connected</span>
@@ -580,33 +603,31 @@
 
 <!-- ============================================================ -->
 <section class="specs">
-  <h2>Glyph vocabulary — never color alone</h2>
+  <h2>Reading the timeline</h2>
   <table>
-    <tr><td class="g" style="color:var(--ansi-blue)">◐ running</td>
-        <td>active run; elapsed advances</td></tr>
-    <tr><td class="g" style="color:var(--ansi-brblack)">◌ queued</td>
-        <td>run/job accepted, not started</td></tr>
-    <tr><td class="g" style="color:var(--ansi-green)">✓ passed</td>
-        <td>terminal success; auto-clears after ~10 s</td></tr>
-    <tr><td class="g" style="color:var(--ansi-red)">✕ failed</td>
-        <td>terminal failure; persists until dismissed</td></tr>
-    <tr><td class="g" style="color:var(--ansi-brblack)">⊘ cancelled</td>
-        <td>terminal cancellation; persists until dismissed</td></tr>
-    <tr><td class="g" style="color:var(--ansi-yellow)">⚠ stale</td>
-        <td>API degraded mid-run; elapsed frozen, retry named</td></tr>
+    <tr><td style="color:var(--blue)">ring</td>
+        <td>conic fill = jobs completed / total; collapses to a solid square on terminal states</td></tr>
+    <tr><td style="color:var(--blue)">segment</td>
+        <td>one per workflow; shimmer = live, dashes = queued, glow = terminal emphasis</td></tr>
+    <tr><td style="color:var(--badge)">hairline</td>
+        <td>workspace badge color = ownership; turns red/amber on failure/stale</td></tr>
+    <tr><td style="color:var(--blue)">trace bar</td>
+        <td>job positioned on the shared time axis; breathing caret = live frontier</td></tr>
   </table>
+  <h2 style="margin-top:32px">Motion rules</h2>
+  <ul>
+    <li><b>Appear</b> — 200 ms slide-down + one-shot light sweep; runs once per run, never loops.</li>
+    <li><b>Shimmer / caret</b> — only while a job is live; terminal states are fully static.</li>
+    <li><b>Success exit</b> — strip flashes green, band slides up after ~10 s.</li>
+    <li><b>Policy</b> — all motion routes through the GPUI animation system and its off switch; reduced-motion renders static fills.</li>
+  </ul>
   <h2 style="margin-top:32px">Interaction rules</h2>
   <ul>
-    <li><b>Appear</b> — first run observation for your pushed head; a push
-      that triggers no workflows never shows a bar.</li>
-    <li><b>Click / keybinding</b> — toggles the per-job panel; per-job data
-      is fetched only while open.</li>
-    <li><b>open ↗</b> — opens the run on GitHub; owning client only, omitted
-      for shared viewers.</li>
-    <li><b>✕ dismiss</b> — hides the bar for this head on every attached
-      client; a new push resurrects it.</li>
-    <li><b>Colors</b> — all from the live theme's ANSI palette and derived
-      chrome; the band re-themes with the terminal.</li>
+    <li><b>Appear</b> — first run observation for your pushed head; a push that triggers no workflows never shows a bar.</li>
+    <li><b>Click / keybinding</b> — toggles the trace; per-job data fetched only while open.</li>
+    <li><b>open ↗</b> — owning client only; omitted for shared viewers.</li>
+    <li><b>✕ dismiss</b> — hides this head's bar on every attached client; a new push resurrects it.</li>
+    <li><b>Colors</b> — semantic states from the live theme's ANSI palette; ownership from the workspace badge palette; the band re-themes with the terminal.</li>
   </ul>
 </section>
 
