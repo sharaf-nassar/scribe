@@ -124,6 +124,11 @@ Acceptance criteria:
   mock, SVG, or annotated screenshot) and referenced from the spec.
 - User has seen and approved the mockup direction.
 
+Delivered: `specs/023-gh-ci-run-bar/mockup/ci-bar.html` (eight full-window
+vignettes in minimal-dark), with the design rules and ownership conclusion
+in `specs/023-gh-ci-run-bar/research.md`. Approval pending at the
+scribe-gygu.5 gate.
+
 ### Story 4 — Implementation: CI bar in the workspace (sequenced later)
 
 As a Scribe user, I want an in-workspace bar tracking my repo's active CI
