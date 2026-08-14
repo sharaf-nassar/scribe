@@ -276,28 +276,11 @@ fn appearance_controls() -> Vec<Control> {
     ]
 }
 
-/// The `theme.preset` option set: every preset
-/// [`scribe_common::theme::resolve_preset`] can actually resolve, alphabetically,
-/// plus the inline `custom` escape hatch.
-///
-/// Generated rather than hand-listed. The previous three-entry list neither
-/// covered the ~190 installable presets — so a config naming one of them was
-/// dropped on the first activation with no way back — nor was it even accurate:
-/// `minimal-light` resolves to nothing and silently fell back to `minimal-dark`.
-///
-/// Options carry their raw name as the label; the window title-cases any option
-/// whose label matches its value.
-fn theme_preset_choices() -> Vec<(&'static str, &'static str)> {
-    let mut names = scribe_common::theme::all_preset_names();
-    names.sort_unstable();
-    let mut choices = names.into_iter().map(|name| (name, name)).collect::<Vec<_>>();
-    choices.push(("custom", "Custom"));
-    choices
-}
-
 fn colors_controls() -> Vec<Control> {
     let mut controls = vec![
-        choice("theme.preset", "Preset", theme_preset_choices()),
+        // Resolved presets live in the settings window's cache. Keeping only
+        // this escape hatch here makes cloned focus targets constant-sized.
+        choice("theme.preset", "Preset", vec![("custom", "Custom")]),
         color("theme.foreground", "Foreground"),
         color("theme.background", "Background"),
         color("theme.cursor", "Cursor"),

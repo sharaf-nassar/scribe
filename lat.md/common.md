@@ -182,7 +182,7 @@ These are defined in `theme.rs` as `pub(crate)` builder functions returning `The
 
 187 color schemes imported from the Tabby terminal emulator, accessible via case-insensitive kebab-case names.
 
-The presets are defined in `theme_community_presets.rs` as a static slice of `ThemeSpec` structs containing hex color strings. They are looked up at runtime and never eagerly constructed. The full name list is exposed via .
+The presets are defined in `theme_community_presets.rs` as a static slice of `ThemeSpec` structs containing hex color strings. Runtime resolution stays lazy except for the settings window, which resolves each preset once when its window-local cache is built or reloaded. The full name list is exposed via .
 
 ### Chrome Color Derivation
 

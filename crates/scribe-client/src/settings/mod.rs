@@ -52,6 +52,19 @@ mod parity_tests {
         }
     }
 
+    #[test]
+    fn theme_preset_control_carries_only_the_custom_token() {
+        let preset = page_controls(SettingsPage::Colors)
+            .into_iter()
+            .find(|control| control.key == "theme.preset")
+            .expect("Colors page must expose the theme preset control");
+        let ControlKind::Choice(options) = preset.kind else {
+            panic!("theme.preset must remain a choice control");
+        };
+
+        assert_eq!(options, vec![("custom", "Custom")]);
+    }
+
     /// Assert one control routes through the apply path with the window's value.
     fn check_control_applies(base: &ScribeConfig, control: &super::model::Control) {
         let Some((key, value)) = apply_input_for(base, control) else {

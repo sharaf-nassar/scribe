@@ -3937,6 +3937,10 @@ Unit tests for the GPUI settings window that replaces the deleted `scribe-settin
 
 Every page in  exposes controls, and every config-backed control routes cleanly through the ported  with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
 
+### Theme preset cache
+
+The settings window resolves every named preset into its cache once, exposes them alphabetically through the shared choice path, and keeps `Custom` last without embedding the full list in cloned focus targets.
+
 ### Color selector palette
 
 The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.

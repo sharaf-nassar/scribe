@@ -65,6 +65,7 @@ use scribe_common::protocol::{
     PreflightError, Release, ReleaseListResultState, TrustedDeviceInfo, TrustedNetworkInfo,
     UpdateCheckResultState,
 };
+use scribe_common::theme::{Theme, all_preset_names, resolve_preset};
 use serde_json::{Value, json};
 
 use crate::app_shortcuts::CloseWindow;
@@ -255,6 +256,7 @@ impl SettingsColors {
 /// The settings window view: a page selector plus the live-editing content pane.
 pub struct SettingsWindow {
     config: ScribeConfig,
+    theme_presets: Vec<PresetEntry>,
     colors: SettingsColors,
     page: SettingsPage,
     /// Last action/error line shown under the content (server-action results,
@@ -323,6 +325,27 @@ pub struct SettingsWindow {
     /// A change is what pulses the thumb — the scroller applies the wheel
     /// itself, so there is no scroll event to hang the pulse off.
     content_scrolled: usize,
+}
+
+struct PresetEntry {
+    token: &'static str,
+    label: String,
+    theme: Theme,
+}
+
+fn build_theme_preset_cache() -> Vec<PresetEntry> {
+    let mut presets = all_preset_names()
+        .into_iter()
+        .filter_map(|token| {
+            resolve_preset(token).map(|theme| PresetEntry {
+                token,
+                label: choice_label(token, token),
+                theme,
+            })
+        })
+        .collect::<Vec<_>>();
+    presets.sort_unstable_by(|left, right| left.theme.name.as_ref().cmp(right.theme.name.as_ref()));
+    presets
 }
 
 /// One focus stop in the settings window's stable keyboard traversal order.
@@ -605,9 +628,11 @@ impl SettingsWindow {
     /// Build the view, loading the current config (or defaults on failure).
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config = load_config().unwrap_or_default();
+        let theme_presets = build_theme_preset_cache();
         let colors = SettingsColors::resolve(&config);
         let mut settings = Self {
             config,
+            theme_presets,
             colors,
             page: SettingsPage::Appearance,
             status: None,
@@ -811,6 +836,7 @@ impl SettingsWindow {
         if let Ok(config) = load_config() {
             self.colors = SettingsColors::resolve(&config);
             self.config = config;
+            self.theme_presets = build_theme_preset_cache();
         }
     }
 
@@ -1840,14 +1866,7 @@ impl SettingsWindow {
     ) -> Vec<(String, String)> {
         let value = current_value(&self.config, key);
         let token = value.as_str().unwrap_or("");
-        let mut out = options
-            .iter()
-            .map(|(option, label)| ((*option).to_owned(), choice_label(option, label)))
-            .collect::<Vec<_>>();
-        if !token.is_empty() && !out.iter().any(|(candidate, _)| candidate == token) {
-            out.insert(0, (token.to_owned(), humanize_choice_token(token)));
-        }
-        out
+        choice_options_from_cache(key, token, options, &self.theme_presets)
     }
 
     /// Step a choice control by one position through [`Self::choice_options`],
@@ -4961,6 +4980,29 @@ fn choice_label(value: &str, label: &str) -> String {
     if value == label { humanize_choice_token(value) } else { label.to_owned() }
 }
 
+fn choice_options_from_cache(
+    key: &str,
+    current: &str,
+    declared: &[(&'static str, &'static str)],
+    theme_presets: &[PresetEntry],
+) -> Vec<(String, String)> {
+    let mut options = Vec::with_capacity(
+        declared.len() + if key == "theme.preset" { theme_presets.len() } else { 0 },
+    );
+    if key == "theme.preset" {
+        options.extend(
+            theme_presets.iter().map(|preset| (preset.token.to_owned(), preset.label.clone())),
+        );
+    }
+    options.extend(
+        declared.iter().map(|(value, label)| ((*value).to_owned(), choice_label(value, label))),
+    );
+    if !current.is_empty() && !options.iter().any(|(candidate, _)| candidate == current) {
+        options.insert(0, (current.to_owned(), humanize_choice_token(current)));
+    }
+    options
+}
+
 /// Title-case a raw config token (`gruvbox-dark` → `Gruvbox Dark`) so a value
 /// that has no declared display label still reads like the rest of the list.
 fn humanize_choice_token(token: &str) -> String {
@@ -5623,13 +5665,13 @@ mod tests {
     use super::{
         NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH, ScrollMetrics,
         ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
-        canonical_combo, combo_for_capture, conflicting_action, content_scroll_offset,
-        focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
-        key_combo_text, offset_from_drag, offset_from_track_click, palette_color_at, px,
-        release_inline_input, revert_inline_input, search_display_text, utf16_range_to_utf8,
-        workspace_badge_color_controls, workspace_root_controls_match_query,
-        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
-        workspace_roots_match_query,
+        build_theme_preset_cache, canonical_combo, choice_options_from_cache, combo_for_capture,
+        conflicting_action, content_scroll_offset, focus_targets_match, inline_commit_value,
+        inline_placeholder, is_modifier_key, key_combo_text, offset_from_drag,
+        offset_from_track_click, palette_color_at, px, release_inline_input, revert_inline_input,
+        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
+        workspace_root_controls_match_query, workspace_root_focus_index,
+        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig};
@@ -5727,6 +5769,24 @@ mod tests {
         assert_eq!(controls.len(), 2);
         assert_eq!(controls[0].key, "workspaces.badge_colors.0");
         assert_eq!(controls[1].label, "Badge color 2");
+    }
+
+    // @lat: [[test#GPUI Settings Window#Theme preset cache]]
+    #[test]
+    fn cached_theme_presets_feed_the_choice_list() {
+        let presets = build_theme_preset_cache();
+        let options =
+            choice_options_from_cache("theme.preset", "dracula", &[("custom", "Custom")], &presets);
+
+        assert_eq!(presets.len(), scribe_common::theme::all_preset_names().len());
+        assert_eq!(options.len(), presets.len() + 1);
+        assert_eq!(options.first(), Some(&(String::from("3024-day"), String::from("3024 Day"))));
+        assert_eq!(options.last(), Some(&(String::from("custom"), String::from("Custom"))));
+        let dracula = presets
+            .iter()
+            .find(|preset| preset.token == "dracula")
+            .expect("Dracula must be cached");
+        assert_eq!(dracula.theme.name, "dracula");
     }
 
     #[test]
