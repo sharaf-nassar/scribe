@@ -1,10 +1,9 @@
 # gh-ci-run-bar research
 
-Research artifact for `specs/023-gh-ci-run-bar.md`. Covers the ownership
-conclusion (Story 1 milestone) and the UX design rules (Story 2). The
-transport/trigger verification (Story 1 remainder, bead scribe-gygu.2) is
-still pending and will be appended here — its ETag/webhook/ref-backend
-claims must be verified against live GitHub docs before the approval gate.
+Research artifact for `specs/023-gh-ci-run-bar.md`. Records the completed
+Story 1 ownership and transport findings plus the Story 2 UX design rules.
+GitHub claims use current official documentation; temporary fixtures verify
+the Git ref backends supported by the host Git version.
 
 ## Ownership conclusion (Story 1 milestone)
 
@@ -170,12 +169,181 @@ desktop-notification wiring (bell path) is the natural post-v1 opt-in
 for run completion, but v1 adds no desktop notifications (spec
 Non-Goal); no other in-app surface is repurposed.
 
-## Transport & trigger verification (Story 1 remainder)
+## Transport and trigger verification (Story 1 remainder)
 
-Pending — tracked as bead scribe-gygu.2. Must verify against live GitHub
-docs: ETag/304 rate-limit accounting, `gh webhook forward` support status
-and permissions, fine-grained PAT scopes for Actions reads, plus the
-ref-watch prototype across loose refs / packed-refs / reftable /
-worktree indirection, protocol N/N-1 gating needs, and final numeric
-bounds. The approval gate (scribe-gygu.5) stays blocked until this
-section is filled in.
+Verified against current documentation and temporary Git fixtures on
+2026-08-14. The default should be push-gated conditional REST polling.
+Nothing else meets the local-first, no-hosted-service, and zero-idle-request
+constraints at the same time.
+
+### Numeric contract
+
+- **Steady state:** 0 GitHub HTTP requests. Do not run an API auth probe when
+  enabling the setting or while idle. `gh auth token` and the first API call
+  happen only after a qualifying local ref change.
+- **Detection:** debounce ref events for 250 ms, issue the first run-list GET
+  within 1 s, then poll every 5 s. A run that GitHub's REST API can already
+  see appears within 5 s plus request time; the product acceptance bound is
+  10 s.
+- **Discovery window:** 120 s after the latest qualifying pushed head. A new
+  head replaces the old window. If no run appears, close silently. Once a run
+  appears, track until every run for that head is terminal. A no-run gate costs
+  at most 24 requests: one at time zero, then one every 5 s through 115 s.
+- **Ceiling:** one GitHub request every 5 s across the server, or 720 request
+  attempts per rolling hour. Repositories share this scheduler. Expanded job
+  detail consumes the same request slots instead of starting another timer.
+- **Caching:** retain the `ETag` per exact URL and send `If-None-Match` on the
+  next GET. Stop on terminal state. Honor `Retry-After` and
+  `X-RateLimit-Reset`; do not query `/rate_limit` merely to inspect quota.
+
+The discovery URL is stable and specific:
+`GET /repos/{owner}/{repo}/actions/runs?head_sha={sha}&event=push&per_page=100`.
+GitHub documents `head_sha` filtering and `Actions: read` for this endpoint.
+The jobs endpoint uses the same fine-grained permission. See the official
+[workflow-run endpoint](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#list-workflow-runs-for-a-repository)
+and [workflow-job endpoint](https://docs.github.com/en/rest/actions/workflow-jobs?apiVersion=2026-03-10#list-jobs-for-a-workflow-run).
+
+The 720 ceiling counts network attempts, not only rate-limit charges.
+Authenticated conditional GETs that return `304 Not Modified` do not count
+against the primary limit, but they remain HTTP traffic. GitHub gives normal
+authenticated user requests a 5,000-per-hour primary limit and unauthenticated
+requests a 60-per-hour IP limit. Sources: [conditional request guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api?apiVersion=2022-11-28#use-conditional-requests-if-appropriate)
+and [REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28).
+
+### Transport comparison
+
+| Transport | Auth and permission | Requests and latency | Failure and offline behavior | Decision |
+|---|---|---|---|---|
+| Event-gated REST polling | `gh auth token --hostname github.com`; classic PAT/OAuth needs `repo` for private repos, fine-grained PAT needs repository `Actions: read`. Scribe does not use unauthenticated access even for public repos. | 0 idle. Immediate GET, then 5 s. Maximum 720 attempts/hour server-wide. `ETag` reduces primary-rate charges on unchanged responses. | A missed or unrecognized ref update misses the run. Fetch can produce a false gate, bounded to 120 s. Before a run is seen, offline/auth failure stays hidden. After observation, retain last state as stale and back off. | **Default.** It uses existing auth, no repo mutation, and no hosted receiver. |
+| Opt-in `gh webhook forward` | This is the separately installed `cli/gh-webhook` extension, not a core `gh` command. Repository forwarding needs admin access and webhook creation rights. A fine-grained token needs repository `Webhooks: write`; organization forwarding needs `admin:org_hook`. | No REST polling while connected, but a long-lived WebSocket and webhook setup remain. Delivery is normally event-latency. | GitHub supports it only for testing and development. The command must keep running, only one user can forward a repo or organization at once, and no durable replay is promised after disconnection. | **Reject for product use.** Keep it as a maintainer test tool only. |
+| Continuous ETag polling | Same Actions read permission as event-gated polling. Correct authorization is required for the documented `304` primary-limit exemption. | At 5 s it makes 720 HTTP requests/hour while idle. A `304` may cost no primary quota, but it still uses network and GitHub documents no general request-free subscription. | Reconciles after transient failures, but offline mode keeps waking and retrying unless another gate stops it. Rate-limit responses require the documented delay. | **Reject as default or automatic fallback.** It violates zero idle traffic. |
+| Standard repository, organization, or GitHub App webhook | Creating a repository webhook needs owner/admin access. Fine-grained tokens need `Webhooks: write`; a GitHub App subscribing to `workflow_run` needs `Actions: read`. | Genuine HTTP push, no polling. `workflow_run` has `requested`, `in_progress`, and `completed` activity types. | Needs a GitHub-reachable receiver or relay. Deliveries may be delayed or reordered. GitHub does not automatically redeliver failures, including receiver downtime. The receiver must verify signatures and answer promptly. | **Future hosted option only.** It conflicts with v1's no-hosted-service scope and asks for more privilege. |
+
+Official sources: [`gh webhook forward`](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/using-the-github-cli-to-forward-webhooks-for-testing),
+[the extension's forwarding source](https://github.com/cli/gh-webhook/blob/main/webhook/forward.go),
+[repository webhook permissions](https://docs.github.com/en/rest/repos/webhooks?apiVersion=2026-03-10#create-a-repository-webhook),
+[`workflow_run` payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_run),
+[`workflow_run` activity types](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run),
+and [failed delivery behavior](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries).
+The official [`gh run watch` manual](https://cli.github.com/manual/gh_run_watch)
+confirms a 3 s refresh interval, so it is polling rather than an Actions
+stream. No supported Actions SSE or general client WebSocket subscription was
+found in the official REST, GraphQL, CLI, or webhook documentation. This last
+sentence is an inference from the documented interfaces, not an API guarantee.
+
+### `gh` degradation matrix
+
+The server always passes `--hostname github.com`. It accepts `gh`'s active
+account and environment-token precedence instead of creating another account
+selector. See [`gh auth token`](https://cli.github.com/manual/gh_auth_token),
+[`gh auth status`](https://cli.github.com/manual/gh_auth_status), and
+[`gh` environment variables](https://cli.github.com/manual/gh_help_environment).
+
+| Condition | Required behavior |
+|---|---|
+| `gh` absent | Executable lookup fails. Log once, hide the bar, and make no API request. Do not install anything or fall back to anonymous access. |
+| `gh` present but unauthenticated | `gh auth token --hostname github.com` exits nonzero. Log once, hide the bar, and make no API request. Never prompt from the server. |
+| Multiple hosts | The explicit hostname prevents a GHES account from being selected. GHES remains outside v1. |
+| Multiple accounts on `github.com` | Without `--user`, `gh auth token` selects the active account. Use only that account. Never probe all stored users or call `gh auth switch`. If it cannot read the pushed repo, degrade as insufficient permission. |
+| Fine-grained PAT | Direct workflow-run and workflow-job REST calls work only when the token includes the target repository and `Actions: read`. Do not use `gh run watch`; its manual says fine-grained PATs are unsupported because that command also needs Checks data. |
+| Insufficient permission | GitHub may return `403`, or `404` for a hidden private resource. Before observation, hide and stop the window. During an observed run, mark stale. Do not retry every 5 s. |
+| Revoked or expired token | `gh auth token` may still return a locally stored token. On the first API authentication failure, discard the in-memory token and stop the window. Keep an observed run stale. A later push gate can retry after the user fixes `gh` auth. |
+| Offline or DNS/TLS failure | Before observation, keep the bar hidden and retry with bounded backoff until the 120 s discovery deadline. During an observed run, keep last-known state stale. Never block terminal work. |
+
+GitHub says revoked or expired tokens can no longer authenticate API requests.
+For private resources it may answer `404` when authentication or permission is
+wrong. Sources: [token expiration and revocation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation)
+and [REST troubleshooting](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api?apiVersion=2022-11-28#404-not-found-for-an-existing-resource).
+
+### Ref-state prototype
+
+Temporary repositories under `/tmp` tested a named remote push, `pack-refs`, a
+second push, and a linked worktree. Fixtures were deleted afterward; no project
+repository state changed.
+
+An actual `notify` 8.2 watcher saw loose-ref lock/create/write/rename bursts,
+the `packed-refs.new` rename and loose-ref removals from `pack-refs`, and a
+linked worktree's private `HEAD` plus shared branch-ref events. A local
+commit-style `git update-ref` changed only `refs/heads/*`; the later successful
+named-remote push separately updated `refs/remotes/origin/*`. Debouncing and
+comparing logical snapshots cleanly separates those two operations. Repacking
+caused events but no logical OID change, so it did not qualify as a push gate.
+
+| Layout | Observed result | Watch rule |
+|---|---|---|
+| Loose refs | A successful `git push -u origin main` created `refs/remotes/origin/main` at the pushed OID. | Watch `$GIT_COMMON_DIR/refs` recursively. |
+| Packed refs | `git pack-refs --all` removed the loose remote-tracking file while `git show-ref` still resolved it from `packed-refs`. The next successful push recreated a loose remote-tracking ref at the new OID. | Also watch `$GIT_COMMON_DIR` non-recursively so atomic `packed-refs` replacement triggers a rescan. Never parse the file. |
+| Linked worktree | Its `.git` file pointed at `.git/worktrees/<id>`. `git rev-parse --absolute-git-dir` returned that private directory, while `git rev-parse --path-format=absolute --git-common-dir` and `--git-path refs/remotes/origin/main` returned the shared main `.git` paths. | Resolve paths through Git. Do not append `/HEAD` or `/refs` to the worktree's `.git` file path. |
+| Reftable | Host Git is 2.43.0 and `git init -h` has no `--ref-format`, so it cannot create a real reftable fixture. Current Git documents binary tables under `$GIT_DIR/reftable/` and `tables.list` as the live stack. Direct loose/packed parsing therefore cannot support it. | Watch the resolved common `reftable` directory non-recursively, then ask Git for the snapshot. A Git binary that can open the repo also owns reftable decoding. |
+
+Git explicitly says callers should use commands such as `git rev-parse` and
+`git update-ref` instead of assuming paths inside `$GIT_DIR`. Its layout docs
+also define gitfiles, shared `packed-refs`, and the reftable stack. Sources:
+[worktree refs and path resolution](https://git-scm.com/docs/git-worktree#_refs),
+[repository layout](https://git-scm.com/docs/gitrepository-layout), and
+[reftable layout](https://git-scm.com/docs/reftable).
+
+Implementation should use one canonical snapshot after any watch event:
+`git for-each-ref` over the configured remote-tracking namespace, with OIDs and
+ref names in a delimiter-safe format. A qualifying gate is a changed remote
+tracking ref whose new OID equals a local branch tip and whose remote push URL
+canonicalizes to `github.com/{owner}/{repo}`. The API query remains the source
+of truth. Fetches may still cause harmless false gates. Pushes to a raw URL or
+to a destination that has no configured remote-tracking mapping can leave no
+local ref change and are a documented v1 miss.
+
+No new watcher crate is needed. Workspace `Cargo.toml:53` already pins
+`notify = "8"`, and `crates/scribe-client/Cargo.toml:27` already uses it.
+`notify` 8.2 provides both a platform [`RecommendedWatcher`](https://docs.rs/notify/8.2.0/notify/type.RecommendedWatcher.html)
+and a stdlib-based [`PollWatcher`](https://docs.rs/notify/8.2.0/notify/poll/struct.PollWatcher.html).
+Use the native watcher first. If it cannot watch the resolved paths or reports
+an overflow, fall back to `PollWatcher` on only the small ref paths at a 2 s
+interval. That fallback performs local filesystem reads, not GitHub requests.
+
+### Protocol compatibility
+
+An unknown top-level MessagePack enum variant fails Serde decode. Framing does
+consume the whole length-prefixed body first, so stream alignment survives
+(`crates/scribe-common/src/framing.rs:13-41`). The established server loop
+explicitly discards a client-frame `Deserialization` error and continues
+(`crates/scribe-server/src/ipc_server.rs:6064-6083`). The client is different:
+its reader propagates every `read_message::<ServerMessage>` error and exits
+(`crates/scribe-client/src/main.rs:11561-11575`), after which the connection
+supervisor reconnects (`crates/scribe-client/src/main.rs:10124`). Sending a new
+CI `ServerMessage` to an N-1 local client could therefore cause a reconnect
+loop. It does not safely discard only the new frame.
+
+Remote and LAN transports already require an exact
+`REMOTE_PROTOCOL_VERSION` match, and the source requires a bump for every
+remote-visible semantic change (`crates/scribe-common/src/protocol.rs:15-38`).
+The local Unix socket has no version gate because client and server normally
+ship together, but hot upgrade creates a real N/N-1 overlap. Add a
+default-false CI capability to `ClientMessage::Hello`, matching the existing
+capability pattern at `crates/scribe-common/src/protocol.rs:407-433`, and emit
+CI frames only to clients that advertised it. The existing backward-decode
+test at `crates/scribe-common/src/protocol.rs:1599-1627` shows how a missing
+Hello field defaults safely; implementation must add the equivalent CI test
+and a test proving the server does not send CI frames without the capability.
+
+The client-to-server dismiss variant needs no separate N-1 gate. An old server
+already discards an unknown client frame and preserves the connection. A new
+client should still treat dismiss as best effort because an old server will
+not synchronize it. Bump `REMOTE_PROTOCOL_VERSION` for remote/LAN peers and
+retain the Hello capability for local hot-upgrade safety.
+
+### Recommended architecture and fallback
+
+Keep the server ownership already chosen above. Resolve each repo through Git,
+watch its ref storage with the already-installed `notify`, and open one shared
+120 s polling window only when a remote-tracking OID changes to a local pushed
+head. Fetch run rollup immediately and every 5 s through the server-wide
+720-request/hour scheduler, using ETags. Fetch job detail only while expanded
+and from the same scheduler. Advertise CI support in `Hello`; never send the
+new server frame to an N-1 client.
+
+Concrete fallback: if native filesystem notifications are unavailable or
+overflow, replace only that repo's watcher with `notify::PollWatcher` at 2 s.
+The transport stays push-gated REST, and idle GitHub request count stays zero.
+If Git cannot resolve the repo or `gh` cannot authenticate, disable the tracker
+for that repo with one diagnostic log entry. Do not fall back to continuous
+ETag polling or a production `gh webhook forward` process.
