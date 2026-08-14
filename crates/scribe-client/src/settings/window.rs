@@ -259,6 +259,7 @@ impl SettingsColors {
 /// The settings window view: a page selector plus the live-editing content pane.
 pub struct SettingsWindow {
     config: ScribeConfig,
+    theme: Theme,
     theme_presets: Vec<PresetEntry>,
     colors: SettingsColors,
     page: SettingsPage,
@@ -406,6 +407,7 @@ fn theme_preset_preview(
 enum SettingsFocusTarget {
     Page(SettingsPage),
     Control(Control),
+    PromptBarColorReset(String),
     Action(String),
     WorkspaceRootInput,
     WorkspaceRootBrowse,
@@ -490,7 +492,11 @@ fn focus_targets_match(a: &SettingsFocusTarget, b: &SettingsFocusTarget) -> bool
     match (a, b) {
         (SettingsFocusTarget::Page(a), SettingsFocusTarget::Page(b)) => a == b,
         (SettingsFocusTarget::Control(a), SettingsFocusTarget::Control(b)) => a.key == b.key,
-        (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b)) => a == b,
+        (
+            SettingsFocusTarget::PromptBarColorReset(a),
+            SettingsFocusTarget::PromptBarColorReset(b),
+        )
+        | (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b)) => a == b,
         (SettingsFocusTarget::WorkspaceRootInput, SettingsFocusTarget::WorkspaceRootInput)
         | (SettingsFocusTarget::WorkspaceRootBrowse, SettingsFocusTarget::WorkspaceRootBrowse)
         | (SettingsFocusTarget::WorkspaceRootAdd, SettingsFocusTarget::WorkspaceRootAdd) => true,
@@ -500,6 +506,29 @@ fn focus_targets_match(a: &SettingsFocusTarget, b: &SettingsFocusTarget) -> bool
         ) => a == b && a_root == b_root,
         _ => false,
     }
+}
+
+fn is_prompt_bar_color_override(key: &str) -> bool {
+    matches!(
+        key,
+        "appearance.prompt_bar_first_row_bg"
+            | "appearance.prompt_bar_second_row_bg"
+            | "appearance.prompt_bar_text"
+            | "appearance.prompt_bar_icon_first"
+            | "appearance.prompt_bar_icon_latest"
+    )
+}
+
+fn push_control_focus_targets(targets: &mut Vec<SettingsFocusTarget>, control: Control) {
+    let reset_key = is_prompt_bar_color_override(&control.key).then(|| control.key.clone());
+    targets.push(SettingsFocusTarget::Control(control));
+    if let Some(key) = reset_key {
+        targets.push(SettingsFocusTarget::PromptBarColorReset(key));
+    }
+}
+
+fn prompt_bar_reset_change(key: &str) -> (&str, &'static str) {
+    (key, "")
 }
 
 fn workspace_root_focus_index(
@@ -717,10 +746,12 @@ impl SettingsWindow {
     /// Build the view, loading the current config (or defaults on failure).
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config = load_config().unwrap_or_default();
+        let theme = scribe_common::config::resolve_theme(&config);
         let theme_presets = build_theme_preset_cache();
         let colors = SettingsColors::resolve(&config);
         let mut settings = Self {
             config,
+            theme,
             theme_presets,
             colors,
             page: SettingsPage::Appearance,
@@ -931,6 +962,7 @@ impl SettingsWindow {
     fn reload(&mut self) {
         if let Ok(config) = load_config() {
             self.colors = SettingsColors::resolve(&config);
+            self.theme = scribe_common::config::resolve_theme(&config);
             self.config = config;
             self.theme_presets = build_theme_preset_cache();
         }
@@ -1090,14 +1122,14 @@ impl SettingsWindow {
                 targets.push(SettingsFocusTarget::WorkspaceRootAdd);
             }
         }
-        targets.extend(self.controls_for_page(self.page).into_iter().filter_map(|control| {
+        for control in self.controls_for_page(self.page) {
             // A control its parent toggle has gated renders inert, so keyboard
             // traversal must skip it too rather than stop on a dead stop.
             if !self.control_matches_search(&control) || !self.control_is_enabled(&control.key) {
-                return None;
+                continue;
             }
-            Some(SettingsFocusTarget::Control(control))
-        }));
+            push_control_focus_targets(&mut targets, control);
+        }
         targets
     }
 
@@ -1303,6 +1335,10 @@ impl SettingsWindow {
     ) {
         match target {
             SettingsFocusTarget::Page(page) => self.select_page(page, window, cx),
+            SettingsFocusTarget::PromptBarColorReset(key) => {
+                let (key, value) = prompt_bar_reset_change(&key);
+                self.select_color(key, value, cx);
+            }
             SettingsFocusTarget::Control(control) => match control.kind {
                 ControlKind::Toggle => self.toggle(&control.key, cx),
                 // Keyboard activation opens the same dropdown a click opens, so
@@ -3950,6 +3986,9 @@ impl SettingsWindow {
             ControlKind::Stepper { min, max, step, decimals } => {
                 self.render_stepper(control, (*min, *max, *step), *decimals, cx)
             }
+            ControlKind::Color if is_prompt_bar_color_override(&control.key) => {
+                self.render_prompt_bar_color_control(control, window, cx)
+            }
             ControlKind::Color => self.render_color_selector(control, window, cx),
             ControlKind::Text => self.render_inline_edit(control, window, cx),
             ControlKind::Keybinding => self.render_keybinding_value(control, cx),
@@ -4442,7 +4481,7 @@ impl SettingsWindow {
             let value = current_value(&self.config, &control.key);
             self.color_hue = value
                 .as_str()
-                .and_then(|value| color_swatch(&self.config, &control.key, value))
+                .and_then(|value| color_swatch(&self.theme, &control.key, value))
                 .map(srgba)
                 .map(gpui::Hsla::from)
                 .map_or(self.color_hue, |color| color.h);
@@ -4733,6 +4772,41 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_prompt_bar_color_control(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let target = SettingsFocusTarget::PromptBarColorReset(control.key.clone());
+        let focused = self.target_is_focused(&target);
+        let key = control.key.clone();
+        let reset = action_button("Reset", &colors)
+            .id(("prompt-bar-color-reset", key_hash(&control.key)))
+            .w(px(52.0))
+            .px(px(0.0))
+            .justify_center()
+            .when(focused, |el| el.border_color(colors.accent))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Reset to theme default")
+            .on_click(cx.listener(move |this, _, _window, ctx| {
+                this.begin_pointer_interaction(&target);
+                this.select_color(&key, "", ctx);
+            }));
+        div()
+            .w(px(VALUE_COLUMN_WIDTH))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .child(self.render_color_selector(control, window, cx))
+            .child(reset)
+            .into_any_element()
+    }
+
     fn render_color_trigger(
         &self,
         control: &Control,
@@ -4747,8 +4821,7 @@ impl SettingsWindow {
         } else {
             value.clone()
         };
-        let swatch =
-            color_swatch(&self.config, &control.key, &value).map_or(colors.input_bg, srgba);
+        let swatch = color_swatch(&self.theme, &control.key, &value).map_or(colors.input_bg, srgba);
         let picker_control = control.clone();
         let pointer_target = SettingsFocusTarget::Control(control.clone());
         div()
@@ -5024,8 +5097,8 @@ impl SettingsWindow {
             self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window);
         let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
         let value = if editing { self.edit_input.clone() } else { saved.clone() };
-        let swatch_color = color_swatch(&self.config, &control.key, &value)
-            .or_else(|| color_swatch(&self.config, &control.key, &saved))
+        let swatch_color = color_swatch(&self.theme, &control.key, &value)
+            .or_else(|| color_swatch(&self.theme, &control.key, &saved))
             .map_or(colors.input_bg, srgba);
         let field = self.render_inline_field(control, window, cx);
         let error = (self.edit_key() == Some(control.key.as_str()))
@@ -5346,13 +5419,30 @@ fn inline_placeholder(key: &str, is_color: bool) -> &'static str {
     }
 }
 
-fn color_swatch(config: &ScribeConfig, key: &str, value: &str) -> Option<[f32; 4]> {
+fn color_swatch(theme: &Theme, key: &str, value: &str) -> Option<[f32; 4]> {
     if key.starts_with("ai_states.") || key.starts_with("claude_states.") {
         let color: scribe_common::config::AiColor =
             serde_json::from_value(Value::String(value.to_owned())).ok()?;
-        return Some(color.resolve(&scribe_common::config::resolve_theme(config).ansi_colors));
+        return Some(color.resolve(&theme.ansi_colors));
     }
-    scribe_common::theme::hex_to_rgba(value).ok()
+    scribe_common::theme::hex_to_rgba(value)
+        .ok()
+        .or_else(|| value.is_empty().then(|| prompt_bar_theme_swatch(theme, key)).flatten())
+}
+
+fn prompt_bar_theme_swatch(theme: &Theme, key: &str) -> Option<[f32; 4]> {
+    if !is_prompt_bar_color_override(key) {
+        return None;
+    }
+    let chrome = theme.chrome;
+    Some(match key {
+        "appearance.prompt_bar_first_row_bg" => chrome.prompt_bar_first_row_bg,
+        "appearance.prompt_bar_second_row_bg" => chrome.prompt_bar_second_row_bg,
+        "appearance.prompt_bar_text" => chrome.prompt_bar_text,
+        "appearance.prompt_bar_icon_first" => chrome.prompt_bar_icon_first,
+        "appearance.prompt_bar_icon_latest" => chrome.prompt_bar_icon_latest,
+        _ => return None,
+    })
 }
 
 fn adjacent_color_preset(current: &str, direction: f64) -> &'static str {
@@ -6237,7 +6327,8 @@ mod tests {
         conflicting_action, content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
         focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
         key_combo_text, move_choice_highlight, offset_from_drag, offset_from_track_click,
-        palette_color_at, px, release_inline_input, replace_pending_theme_preset,
+        palette_color_at, prompt_bar_reset_change, prompt_bar_theme_swatch,
+        push_control_focus_targets, px, release_inline_input, replace_pending_theme_preset,
         revert_inline_input, search_display_text, take_pending_theme_preset, theme_preset_preview,
         utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
         workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
@@ -6245,6 +6336,8 @@ mod tests {
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig, ThemeConfig};
+
+    use crate::settings::model::{SettingsPage, page_controls};
 
     fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
         Keystroke { modifiers, key: key.to_owned(), key_char: None }
@@ -6544,6 +6637,86 @@ mod tests {
         assert_eq!(colors[0], "#445566");
         assert_eq!(colors[1], "#112233");
         assert_eq!(colors[2..], ["#000000"; 8]);
+    }
+
+    // @lat: [[test#GPUI Settings Window#Prompt bar color overrides#Theme defaults follow the live palette]]
+    #[test]
+    fn prompt_bar_theme_swatches_use_the_resolved_cache_and_keep_text_alpha() {
+        let mut config = ScribeConfig::default();
+        config.appearance.theme = String::from("custom");
+        config.theme = Some(ThemeConfig {
+            name: String::from("custom"),
+            foreground: String::from("#e9e8e4"),
+            background: String::from("#1d1f24"),
+            cursor: String::from("#e9e8e4"),
+            cursor_accent: String::from("#141518"),
+            selection: String::from("#262931"),
+            selection_foreground: String::from("#a6a5a0"),
+            colors: ["#141518"; 16].map(str::to_owned).to_vec(),
+        });
+        let theme = config.theme.as_mut().expect("custom theme");
+        theme.colors[3] = String::from("#f5b83a");
+        theme.colors[4] = String::from("#e0584c");
+        let resolved = scribe_common::config::resolve_theme(&config);
+
+        let cases = [
+            ("appearance.prompt_bar_first_row_bg", "#181a1f"),
+            ("appearance.prompt_bar_second_row_bg", "#25272c"),
+            ("appearance.prompt_bar_text", "#e9e8e4"),
+            ("appearance.prompt_bar_icon_first", "#f5b83a"),
+            ("appearance.prompt_bar_icon_latest", "#e0584c"),
+        ];
+        for (key, expected) in cases {
+            let swatch = prompt_bar_theme_swatch(&resolved, key).expect("prompt-bar theme slot");
+            assert_eq!(scribe_common::theme::rgba_to_hex(swatch), expected, "{key}");
+        }
+        assert_eq!(
+            prompt_bar_theme_swatch(&resolved, "appearance.prompt_bar_text")
+                .expect("prompt-bar text")[3]
+                .to_bits(),
+            0.5_f32.to_bits()
+        );
+
+        config.theme.as_mut().expect("custom theme").colors[4] = String::from("#ffc85c");
+        assert_eq!(
+            scribe_common::theme::rgba_to_hex(
+                prompt_bar_theme_swatch(&resolved, "appearance.prompt_bar_icon_latest")
+                    .expect("cached latest icon"),
+            ),
+            "#e0584c"
+        );
+        let reloaded = scribe_common::config::resolve_theme(&config);
+        assert_eq!(
+            scribe_common::theme::rgba_to_hex(
+                prompt_bar_theme_swatch(&reloaded, "appearance.prompt_bar_icon_latest")
+                    .expect("edited latest icon"),
+            ),
+            "#ffc85c"
+        );
+    }
+
+    // @lat: [[test#GPUI Settings Window#Prompt bar color overrides#Reset is a keyboard focus stop]]
+    #[test]
+    fn prompt_bar_reset_follows_its_color_control_and_activates_with_empty_value() {
+        let control = page_controls(SettingsPage::Colors)
+            .into_iter()
+            .find(|control| control.key == "appearance.prompt_bar_text")
+            .expect("prompt-bar text control");
+        let mut targets = Vec::new();
+
+        push_control_focus_targets(&mut targets, control);
+
+        assert!(matches!(
+            targets.as_slice(),
+            [
+                SettingsFocusTarget::Control(target_control),
+                SettingsFocusTarget::PromptBarColorReset(key),
+            ] if target_control.key == "appearance.prompt_bar_text" && key == "appearance.prompt_bar_text"
+        ));
+        let SettingsFocusTarget::PromptBarColorReset(key) = &targets[1] else {
+            panic!("second focus stop must reset the prompt-bar color");
+        };
+        assert_eq!(prompt_bar_reset_change(key), ("appearance.prompt_bar_text", ""));
     }
 
     #[test]

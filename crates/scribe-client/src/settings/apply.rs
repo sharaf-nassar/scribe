@@ -1085,4 +1085,30 @@ mod tests {
         assert_eq!(config.appearance.theme, "custom");
         assert_eq!(config.theme.expect("inline theme").foreground, "#abcdef");
     }
+
+    // @lat: [[test#GPUI Settings Window#Prompt bar color overrides#Reset omits optional TOML keys]]
+    #[test]
+    fn resetting_prompt_bar_colors_omits_their_toml_keys() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        let keys = [
+            "appearance.prompt_bar_first_row_bg",
+            "appearance.prompt_bar_second_row_bg",
+            "appearance.prompt_bar_text",
+            "appearance.prompt_bar_icon_first",
+            "appearance.prompt_bar_icon_latest",
+        ];
+
+        for key in keys {
+            apply_config_key(&mut config, key, &serde_json::json!("#123456"))
+                .expect("override should apply");
+            apply_config_key(&mut config, key, &serde_json::json!(""))
+                .expect("empty reset should apply");
+        }
+
+        let written = toml::to_string_pretty(&config).expect("reset config serializes");
+        for key in keys {
+            let field = key.strip_prefix("appearance.").expect("appearance key");
+            assert!(!written.contains(field), "reset left {field} in TOML: {written}");
+        }
+    }
 }

@@ -4017,6 +4017,22 @@ The shared selector maps clickable interior palette points to canonical hue-corr
 
 The color menu clears its compact trigger and aligns their right edges, preserving the source row while the wider palette is open.
 
+### Prompt bar color overrides
+
+The Colors page names all five prompt-bar parts and keeps each optional override paired with a keyboard-reachable reset action.
+
+#### Theme defaults follow the live palette
+
+An unset override maps from the window's already-resolved `Theme` cache on every render, including the prompt text's 50% alpha; reload replaces the cache after preset or custom-theme edits.
+
+#### Reset is a keyboard focus stop
+
+Each reset follows its color trigger in traversal and activates the same empty-value commit used by pointer input.
+
+#### Reset omits optional TOML keys
+
+Resetting all five overrides clears their `Option<String>` fields and serializes no prompt-bar color keys, rather than persisting empty strings.
+
 ### Keybinding coverage
 
 The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through  without panicking, so no shortcut silently disappears.

@@ -295,11 +295,11 @@ fn colors_controls() -> Vec<Control> {
         controls.push(color(&format!("theme.ansi_bright.{i}"), &format!("ANSI bright {i}")));
     }
     // Prompt-bar color overrides (Colors page tail in the old surface).
-    controls.push(color("appearance.prompt_bar_first_row_bg", "Prompt bar first row"));
-    controls.push(color("appearance.prompt_bar_second_row_bg", "Prompt bar second row"));
-    controls.push(color("appearance.prompt_bar_text", "Prompt bar text"));
-    controls.push(color("appearance.prompt_bar_icon_first", "Prompt bar first icon"));
-    controls.push(color("appearance.prompt_bar_icon_latest", "Prompt bar latest icon"));
+    controls.push(color("appearance.prompt_bar_first_row_bg", "First Row"));
+    controls.push(color("appearance.prompt_bar_second_row_bg", "Second Row"));
+    controls.push(color("appearance.prompt_bar_text", "Text"));
+    controls.push(color("appearance.prompt_bar_icon_first", "First Icon"));
+    controls.push(color("appearance.prompt_bar_icon_latest", "Latest Icon"));
     controls
 }
 
@@ -506,4 +506,20 @@ fn remote_controls() -> Vec<Control> {
             (0.0, 64.0, 1.0, 0),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SettingsPage, page_controls};
+
+    #[test]
+    fn prompt_bar_override_labels_name_the_edited_parts() {
+        let labels = page_controls(SettingsPage::Colors)
+            .into_iter()
+            .filter(|control| control.key.starts_with("appearance.prompt_bar_"))
+            .map(|control| control.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["First Row", "Second Row", "Text", "First Icon", "Latest Icon"]);
+    }
 }
