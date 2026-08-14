@@ -143,8 +143,8 @@ The mockup's primary direction is **trace**: the band is a timeline, not a
 status row. The 40px collapsed band is one aligned system — state
 cluster, job cells, metadata. A conic ring fills as jobs complete and
 collapses to a solid square mark on terminal states. Each job is a cell
-(name over a live track); workflow boundaries are drawn as one-pixel
-rules. The active job is marked three ways at once: its track shimmers,
+(name over a live track); a wider gap marks a workflow boundary. The
+active job is marked three ways at once: its track shimmers,
 its name holds full foreground, and a breathing square dot (the
 workspace-pill dot, smaller) precedes it; done jobs settle solid, queued
 jobs dash, a failed job's name goes red. Beyond ~6 jobs the strip elides
