@@ -307,6 +307,7 @@ pub async fn run() -> Result<(), ScribeError> {
             window_id: None,
             clipboard_gating: false,
             takeover: false,
+            join_window: false,
             // Read the same default-on `terminal.images.enabled` switch the
             // client reads, so the harness daemon stands in for a real viewer
             // instead of mirroring it by hand. A script that wants a text-only

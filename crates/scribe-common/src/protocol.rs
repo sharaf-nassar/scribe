@@ -422,6 +422,10 @@ pub enum ClientMessage {
         /// lost-control reclaim) that atomically swaps the window's writer.
         #[serde(default)]
         takeover: bool,
+        /// Explicit local intent to join a connected window's share. Missing
+        /// stays false so stale restore claims from older clients cannot join.
+        #[serde(default)]
+        join_window: bool,
         /// Terminal-image renderer features. Missing means incapable so local
         /// old/new handshakes remain safely decodable.
         #[serde(default)]
@@ -1596,6 +1600,31 @@ pub struct TrustedNetworkInfo {
 mod tests {
     use super::*;
     use serde::de::IgnoredAny;
+
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum HelloWithoutJoinIntent {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            terminal_images: TerminalImageCapabilities,
+        },
+    }
+
+    #[test]
+    fn hello_without_join_intent_defaults_to_false() {
+        let bytes = rmp_serde::to_vec_named(&HelloWithoutJoinIntent::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            terminal_images: TerminalImageCapabilities::V1,
+        })
+        .expect("serialize old Hello");
+
+        let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded, ClientMessage::Hello { join_window: false, .. }));
+    }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]
     #[test]

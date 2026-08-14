@@ -210,6 +210,7 @@ fn insert_local_fixtures(
             window_id: None,
             clipboard_gating: true,
             takeover: false,
+            join_window: false,
             terminal_images: TerminalImageCapabilities::V1,
         },
     )?;
@@ -392,11 +393,14 @@ fn decode_fixtures(fixtures: &BTreeMap<String, String>) -> Result<(), String> {
 fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     let message: ClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
-    let ClientMessage::Hello { terminal_images, .. } = message else {
+    let ClientMessage::Hello { join_window, terminal_images, .. } = message else {
         return Err(format!("{name} decoded as wrong client message"));
     };
     if name.ends_with("old") && terminal_images != TerminalImageCapabilities::default() {
         return Err("old Hello did not default image capabilities".to_owned());
+    }
+    if name.ends_with("old") && join_window {
+        return Err("old Hello did not default join intent".to_owned());
     }
     let _: LegacyClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("legacy decode {name}: {error}"))?;

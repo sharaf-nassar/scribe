@@ -250,6 +250,12 @@ The owner replies `ServerMessage::RemoteHandshakeReply { accepted, refusal, serv
 
 All per-connection state — the `clipboard_gating` capability bit and clipboard-bridge routing — follows the NEW controller's `Hello` from the moment of the swap; no stale capability survives a takeover ([[server#Remote Control#Takeover and Control]]). On `WindowTakenOver` the displaced client stops sending input, dims and freezes its last frame under a banner naming the controller, and offers one-action reclaim; it expects no further `PtyOutput` (no fan-out in v1) — see [[client#Remote Control#Displaced and Lost Control]].
 
+### Local Share Join Intent
+
+`ClientMessage::Hello.join_window` distinguishes an explicit local share join from an ordinary named restore claim.
+
+Only the `SCRIBE_JOIN_WINDOW` launch path sets the bit. The server requires it before a local claim may join a connected window, while remote join, reconnect, and takeover rules remain unchanged. The field defaults to `false` when absent, so an old client's named claim is safe. Its additive map field is ignored by old servers, matching the existing `terminal_images` compatibility pattern.
+
 ### Disconnect and Sever
 
 `ServerMessage::RemoteDisconnect { reason }` is a best-effort final frame the owner sends before closing a remote connection for a policy reason; v1's only reason is `Disabled` (remote access turned off).

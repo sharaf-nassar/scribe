@@ -295,6 +295,8 @@ A connecting client's `Hello` resolves to one window through [[crates/scribe-ser
 
 A named `Hello` claims that window when no current client owns it — the ordinary bootstrap, which names the window id of the cold-restart snapshot it claimed, so identity, layout, and geometry all line up. An unnamed one (a launch that found nothing claimable) adopts an existing unconnected window instead of minting a new id, and that pick is taken over [[crates/scribe-server/src/ipc_server.rs#windows_in_stable_order]] rather than straight over the `HashSet` of windows with sessions: hash iteration order made the adopted window arbitrary per process, and the adopting client then wrote its opening default over that window's saved geometry.
 
+If a local named claim finds its window connected, it falls through to the same different-window assignment unless `Hello.join_window` explicitly requests a share join. A restore claim alone never proves join intent.
+
 #### Adoption order is stable
 
 Verifies an unnamed `Hello` adopts the same window and fans the rest out in the same order however the window set was built, which is what lets the adopting client line up with the window it landed on.
@@ -793,9 +795,9 @@ Session-initiated clipboard requests route through : an OSC 52 write goes to the
 
 #### Local Additive Join
 
-A share belongs to the window, not to the transport a participant reached it over: with sharing on, a *local* second process that names a connected window in its `Hello` joins that window's share additively, exactly as a remote peer does.
+A share belongs to the window, not to the transport a participant reached it over: with sharing on, a *local* second process that explicitly names a connected window and sets join intent attaches additively, exactly as a remote peer does.
 
-Feature 015 gated `::ShareJoin` on a remote transport, so on one machine a shared window still admitted only its owner — a second local client asking for that window was handed an empty window of its own instead.  now selects `ShareJoin` for either transport whenever `sharing_mode` is not `SingleController`. `SingleController` keeps both legacy arms verbatim, and a `Hello { window_id: None }` — every stock client's handshake — never reaches the connected-window branch at all, so no user-launched client changes behavior.
+Feature 015 gated `::ShareJoin` on a remote transport, so on one machine a shared window still admitted only its owner — a second local client asking for that window was handed an empty window of its own instead.  now selects `ShareJoin` for a local transport only when `Hello.join_window` is true and `sharing_mode` is not `SingleController`. A normal restore may also name a connected window, so the id alone is not intent. Local claims without the bit use `LocalPlain`; remote join, reconnect, and takeover selection is unchanged.
 
 The consequence that matters is two attached sinks on one session: the share admits any participant in a shared mode, so `AttachSessions` adds the joiner's sink to the set additively instead of replacing the incumbent's, and both processes receive the same `PtyOutput`. That is what the visual E2E shared-pane rig runs on (): `scribe-test` keeps observing the very pane the GPUI client renders.
 

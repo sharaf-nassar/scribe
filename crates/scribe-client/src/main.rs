@@ -5256,7 +5256,12 @@ impl TerminalView {
         let window_id = WindowId::new();
         let (shared, sink) = start_window_backend(
             terminal_size,
-            WindowBackend { claim: Some(window_id), initial_session: true, fan_out: false },
+            WindowBackend {
+                claim: Some(window_id),
+                join_intent: LocalJoinIntent::Plain,
+                initial_session: true,
+                fan_out: false,
+            },
         );
         // A deliberately opened window replays no snapshot and inherits no
         // geometry, then its backend creates its own first login shell.
@@ -5276,7 +5281,12 @@ impl TerminalView {
         let terminal_size = self.terminal_size;
         let (shared, sink) = start_window_backend(
             terminal_size,
-            WindowBackend { claim: Some(window_id), initial_session: false, fan_out: false },
+            WindowBackend {
+                claim: Some(window_id),
+                join_intent: LocalJoinIntent::Plain,
+                initial_session: false,
+                fan_out: false,
+            },
         );
         open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(Some(window_id)));
         tracing::info!(%window_id, "reopened a window the server kept sessions for");
@@ -9422,10 +9432,18 @@ struct WindowBackend {
     /// `SCRIBE_JOIN_WINDOW`'s for a share join. `None` asks the server to hand
     /// back any window whose sessions outlived their client.
     claim: Option<WindowId>,
+    /// Whether `claim` came from the explicit local share-join launch path.
+    join_intent: LocalJoinIntent,
     /// Whether this window brings its own first login shell.
     initial_session: bool,
     /// Whether this connection may reopen the other windows `Welcome` reports.
     fan_out: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LocalJoinIntent {
+    Plain,
+    Join,
 }
 
 /// Build one terminal window's backend: fresh shared state plus its own IPC
@@ -9439,7 +9457,7 @@ struct WindowBackend {
 /// Called once from [`main`] for the startup window and again for every window
 /// this process opens afterwards, so the paths cannot drift.
 fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
-    let WindowBackend { claim, initial_session, fan_out } = window;
+    let WindowBackend { claim, join_intent, initial_session, fan_out } = window;
     let Some(process_shutdown) = PROCESS_SHUTDOWN.get().map(Arc::clone) else {
         tracing::error!("terminal backend opened before shutdown handler installation");
         std::process::abort();
@@ -9488,6 +9506,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         in_tx,
         in_rx: Some(in_rx),
         claim,
+        join_intent,
         fan_out,
     });
 
@@ -9772,6 +9791,11 @@ fn main() -> std::process::ExitCode {
         terminal_size,
         WindowBackend {
             claim: join_window.or_else(|| cold_start.snapshot.as_ref().map(|snap| snap.window_id)),
+            join_intent: if join_window.is_some() {
+                LocalJoinIntent::Join
+            } else {
+                LocalJoinIntent::Plain
+            },
             initial_session: bootstrap_initial_session,
             // The bootstrap reopens the server's other windows; a
             // `--restore-child` is already the other half of the client-side
@@ -9998,6 +10022,8 @@ struct IpcThread {
     /// restored sibling, or `SCRIBE_JOIN_WINDOW`'s for a share join. `None` asks
     /// the server to hand back any window whose sessions outlived their client.
     claim: Option<WindowId>,
+    /// Whether this is the explicit `SCRIBE_JOIN_WINDOW` share-join path.
+    join_intent: LocalJoinIntent,
     /// Whether this connection may act on `Welcome`'s `other_windows`. Set for
     /// the process bootstrap and consumed by its first handshake: a redial sees
     /// the same list while those windows' own processes are reconnecting too,
@@ -10441,6 +10467,8 @@ where
             // Clipboard* frame, which is what made the whole surface dead.
             clipboard_gating: true,
             takeover,
+            join_window: matches!(&transport, Transport::Local(_))
+                && matches!(ctx.join_intent, LocalJoinIntent::Join),
             // Spec 020: terminal images are on by default, so this announces
             // the complete v1 renderer unless the user set
             // `terminal.images.enabled = false`. A capable viewer latches the

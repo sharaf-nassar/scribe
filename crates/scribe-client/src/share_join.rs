@@ -1,24 +1,22 @@
 //! Local share-join hook: start this client as a second participant in a window
 //! that another process on THIS machine already holds.
 //!
-//! The stock startup handshake is `Hello { window_id: None }`, which asks the
-//! server to assign a fresh window or adopt an unconnected one. That is right for
-//! a user launching a terminal, and wrong for every case where a live window
-//! already has an owner and this process is meant to join it rather than open its
-//! own: the server answers `SessionList` with only the *calling* window's
+//! A normal startup may name a restored window, while a fresh startup sends
+//! `Hello { window_id: None }`. Neither means "join": only this hook identifies
+//! a launch that should attach to a live owner rather than open its own window.
+//! The server answers `SessionList` with only the *calling* window's
 //! sessions (falling back to unowned ones), so a client that got its own window
 //! renders an empty grid while another process's panes run untouched.
 //!
-//! `SCRIBE_JOIN_WINDOW` names that window explicitly. The server resolves a
-//! non-takeover claim of a connected window as an additive share join whenever
-//! the sharing mode is not `single_controller`, so both processes stay attached
-//! to the same panes and both receive the live output. The visual E2E rig is the
+//! `SCRIBE_JOIN_WINDOW` names that window and sets `Hello.join_window`. The
+//! server resolves that explicit claim as an additive share join whenever the
+//! sharing mode is not `single_controller`, so both processes stay attached to
+//! the same panes and both receive live output. The visual E2E rig is the
 //! first consumer: `scribe-test` creates and holds the session (keeping
 //! `wait-output` / `snapshot` usable) and the GPUI client joins that same window
 //! so the frame under the camera is the pane the assertions drive.
 //!
-//! Unset — the default for every user-launched client — leaves the handshake
-//! byte-identical to before.
+//! Unset, the default for user launches and restore claims, leaves the bit false.
 
 use scribe_common::ids::WindowId;
 
