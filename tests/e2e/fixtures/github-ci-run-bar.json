@@ -1,0 +1,144 @@
+{
+  "runs": [
+    {
+      "workflow_runs": [
+        {
+          "id": 101,
+          "name": "rust-linux",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 102,
+          "name": "rust-macos",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "in_progress",
+          "conclusion": null
+        },
+        {
+          "id": 103,
+          "name": "lat-check",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "queued",
+          "conclusion": null
+        }
+      ]
+    },
+    {
+      "workflow_runs": [
+        {
+          "id": 101,
+          "name": "rust-linux",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 102,
+          "name": "rust-macos",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 103,
+          "name": "lat-check",
+          "head_sha": "__RUNNING_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "workflow_runs": [
+        {
+          "id": 201,
+          "name": "rust-linux",
+          "head_sha": "__FAILURE_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "failure"
+        },
+        {
+          "id": 202,
+          "name": "rust-macos",
+          "head_sha": "__FAILURE_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 203,
+          "name": "lat-check",
+          "head_sha": "__FAILURE_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "workflow_runs": [
+        {
+          "id": 301,
+          "name": "rust-linux",
+          "head_sha": "__CANCELLED_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 302,
+          "name": "rust-macos",
+          "head_sha": "__CANCELLED_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "cancelled"
+        },
+        {
+          "id": 303,
+          "name": "lat-check",
+          "head_sha": "__CANCELLED_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "workflow_runs": [
+        {
+          "id": 401,
+          "name": "rust-linux",
+          "head_sha": "__STALE_HEAD__",
+          "head_branch": "main",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 402,
+          "name": "rust-macos",
+          "head_sha": "__STALE_HEAD__",
+          "head_branch": "main",
+          "status": "in_progress",
+          "conclusion": null
+        },
+        {
+          "id": 403,
+          "name": "lat-check",
+          "head_sha": "__STALE_HEAD__",
+          "head_branch": "main",
+          "status": "queued",
+          "conclusion": null
+        }
+      ]
+    }
+  ]
+}

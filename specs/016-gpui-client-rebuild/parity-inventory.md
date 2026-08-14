@@ -189,7 +189,7 @@ erase a replacement.
 | `TaskLabelCleared` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `PromptReceived` | prompt history | scripted-E2E | `main.rs::on_ai_message` → `AiChrome::record_prompt` | required |
 | `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
-| `CiRunState` | workspace CI run bar | visual-E2E | `main.rs::on_ci_run_message` → `ci_bar::CiRunBars::apply` → `TerminalView::render_ci_run_bars` | required |
+| `CiRunState` | workspace CI run bar | visual-E2E (`just e2e-visual-ci-run-bar`) | `main.rs::on_ci_run_message` → `ci_bar::CiRunBars::apply` → `TerminalView::render_ci_run_bars` | required |
 | `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `session_lifecycle::SessionRegistry::on_session_created` + `main.rs::open_created_tab` | required |
 | `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_session_exited` → tab removal + `AiChrome::forget` | required |
 | `Bell` | terminal bell | scripted-E2E | `main.rs::on_bell_message` queue → `main.rs::TerminalView::poll_bells` → `BellController::on_bell` → `Window::request_attention` | required |

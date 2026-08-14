@@ -1,0 +1,5 @@
+[workspaces]
+roots = ["/tmp"]
+
+[github_ci]
+enabled = true

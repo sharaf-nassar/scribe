@@ -489,6 +489,11 @@ e2e-visual-workspace-ipc:
 e2e-visual-beads-board:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-board.sh
 
+# Run the approved collapsed GitHub CI trace through a watched local push and
+# the loopback Actions fixture. The container has no route beyond loopback.
+e2e-visual-ci-run-bar:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/ci-run-bar-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/ci-run-bar.sh
+
 # Run one real bd refresh through the functional server.
 e2e-func-beads-board:
     TEST_TIMEOUT=60 just e2e-func func/beads-board.sh
@@ -615,6 +620,7 @@ e2e-all-visual: build-release docker-visual
         'visual/ai-task-label.sh|e2e-visual-ai-task-label'
         'visual/beads-board.sh|e2e-visual-beads-board'
         'visual/bell.sh|e2e-visual-bell'
+        'visual/ci-run-bar.sh|e2e-visual-ci-run-bar'
         'visual/clipboard-osc52.sh|e2e-visual-clipboard'
         'visual/codex-reattach-size.sh|e2e-visual-codex-reattach'
         'visual/codex-targeted-resume.sh|e2e-visual-codex-targeted-resume'

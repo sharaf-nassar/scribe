@@ -1666,6 +1666,20 @@ Scripted degraded-path coverage proving the client fails loudly (never hangs) wh
 
 Visual end-to-end tests run the real `scribe-client` window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
 
+### Collapsed CI run bar visual contract
+
+`just e2e-visual-ci-run-bar` checks the approved collapsed trace against a live client in a `--network none` container; expanded job detail remains outside this test.
+
+#### Public push state progression
+
+A watched local repository pushes four heads while a loopback Actions fixture returns running, passed, failed, cancelled, and stale states.
+
+Grayscale pixel masks require each state to retain both its glyph and word without relying on color.
+
+#### Forty-pixel frame stability
+
+The running bar moves the terminal grid down by exactly 40px without changing its columns, marker cells, or shifted frame pixels. The band background and one-pixel ownership underline match the approved trace mockup.
+
 `docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the *server* starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`); the shared-pane rig appends to the same file, which is why both are written up front rather than one clobbering the other. `SCRIBE_VISUAL_APP=settings` swaps the client launch for `scribe-client --settings` (logged to `/output/settings.log`) so the settings window can be driven as its own app, and `SCRIBE_SEED_TRUST=1` plants a trusted network and an approved device into the server's LAN trust stores before it starts.
 
 The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client=info` so those client lines are actually emitted.

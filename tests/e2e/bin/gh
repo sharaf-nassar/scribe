@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 4 ] && [ "$1" = auth ] && [ "$2" = token ] \
+    && [ "$3" = --hostname ] && [ "$4" = github.com ]; then
+    printf '%s\n' scribe-e2e-token
+    exit 0
+fi
+
+printf 'unsupported gh fixture invocation:' >&2
+printf ' %s' "$@" >&2
+printf '\n' >&2
+exit 2
