@@ -3134,6 +3134,10 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Notification dispatcher |  | Notification `replaces_id` coalescing + click-to-focus |
 | Terminal chrome metadata |  | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
 
+### Refused restore claim decision
+
+The `Welcome` assignment drops a refused restore claim before `SessionList`, while matching claims still wait for the cold-versus-warm replay decision.
+
 ### Coverage frontier
 
 Testing-Strategy suites not yet consolidated are blocked on their feature beads landing in `scribe-38e`. Each is tracked here against the parity row whose logic it will cover.

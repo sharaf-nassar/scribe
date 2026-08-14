@@ -1039,8 +1039,8 @@ fn reconcile_retained_binding(
 struct RestoreRuntime {
     store: RestoreStore,
     registry: WindowRegistry,
-    /// The snapshot [`ColdStart`] claimed, held until the first `SessionList`
-    /// says whether it is needed. Taken (and dropped) either way.
+    /// The snapshot [`ColdStart`] claimed, held until `Welcome` refuses it or
+    /// the first `SessionList` says whether it is needed.
     pending: Option<WindowRestoreState>,
     /// The window id of the claimed snapshot. The claim leaves the file on
     /// disk as the last good layout; it is retired here only once this window
@@ -1137,6 +1137,26 @@ enum AssignedGeometry {
     Adopted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreClaimDisposition {
+    Waiting,
+    Warm,
+    Cold,
+}
+
+/// Decide whether an accepted claim is still waiting, warm, or cold.
+fn restore_claim_disposition(
+    claimed: Option<WindowId>,
+    assigned: Option<WindowId>,
+    session_list_seen: bool,
+    live: usize,
+) -> RestoreClaimDisposition {
+    if !session_list_seen || claimed.is_none() || assigned.is_none() || claimed != assigned {
+        return RestoreClaimDisposition::Waiting;
+    }
+    if live > 0 { RestoreClaimDisposition::Warm } else { RestoreClaimDisposition::Cold }
+}
+
 /// How far a restored window's placement has got, which is what decides whether
 /// the window's current bounds are the user's layout or the restore's.
 ///
@@ -1221,6 +1241,24 @@ impl RestoreRuntime {
             }
         }
         runtime
+    }
+
+    /// Adopt the id from `Welcome`, dropping a restore claim the server refused.
+    fn adopt_assigned_window(&mut self, window_id: WindowId) {
+        self.window_id = Some(window_id);
+        let Some(claimed) = self.claimed_window else { return };
+        if claimed == window_id {
+            return;
+        }
+        tracing::info!(
+            %claimed,
+            assigned = %window_id,
+            "server refused the restore claim; keeping the fresh window empty"
+        );
+        self.pending = None;
+        self.claimed_window = None;
+        self.siblings = 0;
+        self.mark_layout_dirty();
     }
 
     /// Take a persisted record as this window's restore baseline, deriving the
@@ -4475,9 +4513,10 @@ impl TerminalView {
     /// two persisted files has settled.
     fn poll_restore(&mut self, cx: &mut Context<Self>) {
         if self.restore.window_id.is_none() {
-            self.restore.window_id =
+            let assigned =
                 self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id());
-            if let Some(window_id) = self.restore.window_id {
+            if let Some(window_id) = assigned {
+                self.restore.adopt_assigned_window(window_id);
                 self.adopt_assigned_geometry(window_id, cx);
             }
         }
@@ -4606,40 +4645,40 @@ impl TerminalView {
     /// Replay the snapshot this process claimed, if the server confirms it is
     /// needed.
     ///
-    /// Three gates, in order. The server must have *answered* the startup
-    /// `ListSessions` — an unanswered list is not an empty one. That answer must
-    /// be empty: a server that kept this window's sessions is restored by the
-    /// ordinary reattach, and replaying on top of it would double every pane.
-    /// And the window must have painted once, because the restored panes are
-    /// sized from the measured grid area; creating them earlier would spawn
-    /// every PTY at the fallback 80x24 and leave the shell's first output
-    /// formatted for a width the pane never had.
+    /// [`RestoreRuntime::adopt_assigned_window`] has already dropped a claim
+    /// `Welcome` refused. Three gates remain, in order. The server must have
+    /// *answered* the startup `ListSessions` — an unanswered list is not an
+    /// empty one. That answer must be empty: a server that kept this window's
+    /// sessions is restored by the ordinary reattach, and replaying on top of
+    /// it would double every pane. And the window must have painted once,
+    /// because restored panes are sized from the measured grid area; creating
+    /// them earlier would spawn every PTY at the fallback 80x24.
     fn replay_cold_restart(&mut self, cx: &mut Context<Self>) {
-        if self.restore.pending.is_none() || !self.shared.session_list_seen.load(Ordering::Acquire)
-        {
+        if self.restore.pending.is_none() {
             return;
         }
         let live = self.shared.tabs.lock().map_or(0, |tabs| tabs.len());
-        if live > 0 {
-            // The claimed snapshot file stays on disk (claim is
-            // non-destructive) until this window durably writes a fresh
-            // snapshot of the server-restored layout.
-            tracing::info!(
+        let disposition = restore_claim_disposition(
+            self.restore.claimed_window,
+            self.restore.window_id,
+            self.shared.session_list_seen.load(Ordering::Acquire),
+            live,
+        );
+        match disposition {
+            RestoreClaimDisposition::Waiting => return,
+            RestoreClaimDisposition::Warm => tracing::info!(
                 live,
                 "server kept this window's sessions — skipping the cold-restart replay"
-            );
+            ),
+            RestoreClaimDisposition::Cold => {}
+        }
+        if disposition != RestoreClaimDisposition::Cold {
+            // The claimed snapshot file stays on disk (claim is
+            // non-destructive) because this window never consumed it.
             self.restore.pending = None;
-            // The snapshot was never consumed, so this window's flush must not
-            // retire it: on the normal path the id it names is the id this
-            // window was just given and the flush supersedes it, but a claim the
-            // server refused (that window is live under another process) names
-            // somebody else's layout, and deleting it is how a layout gets lost.
+            // Saving this same assigned id supersedes its index claim; there
+            // is no different snapshot to retire.
             self.restore.claimed_window = None;
-            // The remaining snapshots describe windows this server also kept,
-            // and `Welcome`'s `other_windows` is already reopening them from
-            // live state. Spawning restore children on top would open each of
-            // those windows a second time, replaying stale panes beside the
-            // real ones.
             self.restore.siblings = 0;
             self.restore.mark_layout_dirty();
             return;
@@ -13267,6 +13306,52 @@ mod tests {
     fn restore_placement_starts_settled_without_a_saved_position() {
         // A window that was never restoring must persist the size it came up at.
         assert!(RestorePlacement::Settled.settled(false));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Refused restore claim decision]]
+    #[test]
+    fn refused_restore_claim_is_dropped_before_session_list() {
+        let claimed = WindowId::new();
+        let assigned = WindowId::new();
+        let snapshot = WindowRestoreState {
+            version: 1,
+            window_id: claimed,
+            focused_workspace_id: WorkspaceId::new(),
+            root: scribe_client::restore_state::WorkspaceLayoutSnapshot::Leaf {
+                workspace_id: WorkspaceId::new(),
+            },
+            workspaces: Vec::new(),
+            launches: Vec::new(),
+        };
+        let mut restore = RestoreRuntime::from_seed(WindowSeed {
+            terminal_size: TerminalSize::default(),
+            restored: Some(snapshot),
+            restore_siblings: 2,
+            restore_geometry: None,
+        });
+
+        // Welcome alone is enough to refuse the claim. No SessionList signal
+        // exists on RestoreRuntime or enters this transition.
+        restore.adopt_assigned_window(assigned);
+
+        assert_eq!(restore.window_id, Some(assigned));
+        assert!(restore.pending.is_none());
+        assert!(restore.claimed_window.is_none());
+        assert_eq!(restore.siblings, 0);
+    }
+
+    #[test]
+    fn matching_restore_claim_waits_for_cold_or_warm_decision() {
+        let claimed = WindowId::new();
+
+        assert_eq!(
+            restore_claim_disposition(Some(claimed), Some(claimed), true, 0),
+            RestoreClaimDisposition::Cold,
+        );
+        assert_eq!(
+            restore_claim_disposition(Some(claimed), Some(claimed), true, 1),
+            RestoreClaimDisposition::Warm,
+        );
     }
 
     #[test]
