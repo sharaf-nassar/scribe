@@ -36,9 +36,17 @@ Verifies  returns `None` below `warn` and while a pulsing attention state owns t
 
 ## Configuration
 
-Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into .
+Unified TOML config for server and client, deserialized from the active install
+flavor's XDG config root into
+[[crates/scribe-common/src/config.rs#ScribeConfig]].
 
-Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The  function reads the file and returns `ScribeConfig::default()` if absent. Prompt-bar configs still deserialize the legacy `prompt_bar_bg` key as a compatibility alias for `prompt_bar_second_row_bg`, while Debian package installs additionally rewrite that legacy key on disk during upgrade so future launches use the exact-fill row model directly.
+Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads
+`~/.config/scribe-dev/config.toml`. `ScribeConfig` has eight top-level sections:
+`appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, `update`,
+`notifications`, and `remote`.
+[[crates/scribe-common/src/config.rs#load_config]] returns
+`ScribeConfig::default()` when the file is absent. Prompt-bar configs still
+accept legacy `prompt_bar_bg` as an alias for `prompt_bar_second_row_bg`.
 
 ### Cached Snapshot
 
@@ -50,9 +58,17 @@ A load failure is not cached, so a transiently unreadable config does not pin an
 
 ### Appearance
 
-Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, and status bar height are all in .
+Font, cursor, opacity, motion, theme name, scrollbar, focus border, tab and status
+dimensions, and the five optional prompt-bar color overrides live in
+[[crates/scribe-common/src/config.rs#AppearanceConfig]].
 
  provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range.  is a three-variant enum (`Block`, `Beam`, `Underline`).
+
+### Inline Custom Theme
+
+[[crates/scribe-common/src/config.rs#ThemeConfig]] supplies foreground,
+background, cursor, selection, and 16 ANSI colors when
+`appearance.theme == "custom"`.
 
 ### AI Context Thresholds
 
@@ -70,7 +86,10 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
- groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, paste confirmation, and OSC 52 clipboard policy settings.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback,
+copy-on-select, the enhanced keyboard-protocol opt-out, AI integration, status
+bar stats, prompt bar, scroll pin, paste confirmation, OSC 52 clipboard policy,
+smart selection, environment persistence, and terminal images.
 
 `paste_confirmation` (bool, default `false`) gates a multi-line or control-character paste behind a confirmation dialog before it reaches the PTY, but only when the focused application has not enabled bracketed paste (spec 011); see .
 
@@ -117,8 +136,6 @@ When a session leaves every configured root, the server clears its workspace nam
  controls auto-update behavior: `enabled` flag, `check_interval_secs` (default 86 400 s), and  (`Stable` or `Beta`).
 
 The updater is intentionally disabled for `scribe-dev` installs so test builds cannot download and install the stable package over the main app.
-
- is an optional inline theme definition used when `appearance.theme == "custom"` to supply foreground, background, cursor, selection, and 16 ANSI colors directly in the config file.
 
 ## Errors
 
@@ -168,7 +185,13 @@ Named sockets in the base directory are `server.sock`, `client.sock`, `settings.
 
 A theme engine providing 5 built-in and 187 community presets, plus a derivation algorithm that produces chrome (UI) colors from the terminal palette.
 
- is the resolved theme struct with RGBA arrays for foreground, background, cursor, selection, 16 ANSI colors, and a  sub-struct.  is the input parameter bag passed to  produces a `Theme` from a preset name (case-insensitive) by checking curated presets first and falling back to the community set.  and  convert between `#rrggbb` strings and `[f32; 4]` RGBA arrays.
+[[crates/scribe-common/src/theme.rs#Theme]] holds foreground, background, cursor,
+selection, 16 ANSI colors, and derived
+[[crates/scribe-common/src/theme.rs#ChromeColors]].
+[[crates/scribe-common/src/theme.rs#ThemeColors]] is its construction input.
+[[crates/scribe-common/src/theme.rs#resolve_preset]] resolves preset names
+case-insensitively, while [[crates/scribe-common/src/theme.rs#hex_to_rgba]] and
+[[crates/scribe-common/src/theme.rs#rgba_to_hex]] convert color representations.
 
 RGBA-to-hex conversion rounds each clamped channel to the nearest byte, and the server reuses that same helper when it synthesizes fallback terminal colors from the configured theme.
 
@@ -176,16 +199,24 @@ RGBA-to-hex conversion rounds each clamped channel to the nearest byte, and the 
 
 Five curated themes ship with Scribe: `minimal-dark` (default), `tokyo-night`, `catppuccin-mocha`, `dracula`, and `solarized-dark`.
 
-These are defined in `theme.rs` as `pub(crate)` builder functions returning `Theme` and are listed in the `CURATED_NAMES` constant. The default is `minimal-dark`, a dark neutral palette with zinc grays and vivid ANSI accents.
+Public builders in `theme.rs` return each curated `Theme`;
+[[crates/scribe-common/src/theme.rs#resolve_preset]] also includes them in the
+same lookup used for community presets. The default is `minimal-dark`.
 
 ### Community Presets
 
 187 color schemes imported from the Tabby terminal emulator, accessible via case-insensitive kebab-case names.
 
-The presets are defined in `theme_community_presets.rs` as a static slice of `ThemeSpec` structs containing hex color strings. Runtime resolution stays lazy except for the settings window, which resolves each preset once when its window-local cache is built or reloaded. The full name list is exposed via .
+The presets are a static slice of hex `ThemeSpec` values in
+`theme_community_presets.rs`. Runtime resolution stays lazy except for the
+settings window, which resolves each preset once when its window-local cache is
+built or reloaded. [[crates/scribe-common/src/theme.rs#all_preset_names]] exposes
+all 192 curated and community names.
 
 ### Chrome Color Derivation
 
- is derived automatically from the terminal foreground, background, and ANSI palette — no manual chrome configuration is required.
+[[crates/scribe-common/src/theme.rs#Theme#derive_chrome]] derives
+[[crates/scribe-common/src/theme.rs#ChromeColors]] from terminal foreground,
+background, and ANSI colors.
 
 The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. Prompt bar colors are also derived as restrained first-row and second-row surfaces, plus muted text, first icon, and latest icon; `AppearanceConfig` can override those surfaces directly. This keeps the chrome visually coherent when a user switches themes or defines a custom palette.

@@ -4001,6 +4001,20 @@ Every page in  exposes controls, and every config-backed control routes cleanly 
 
 The settings window caches all 192 presets, gives each menu row background, foreground, and ANSI 0–7 chips, previews active `Custom` colors, keeps `Custom` last, and opens with the selected row visible.
 
+#### Preset preview order
+
+Each named row previews background, foreground, then ANSI normal 0-7 from its
+resolved theme.
+
+#### Active Custom preview
+
+The Custom row previews inline `[theme]` colors only while Custom is active, so
+a stale inline section cannot masquerade as the selected preset.
+
+#### Selected row visibility
+
+Opening the 193-row menu scrolls its selected final row fully into view.
+
 ### Theme preset filtering
 
 The preset menu narrows its cached rows without changing their selection, preview, or apply paths.

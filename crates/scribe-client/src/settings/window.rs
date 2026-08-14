@@ -6587,6 +6587,7 @@ mod tests {
         assert_eq!(move_choice_highlight(None, 0, 1), None);
     }
 
+    // @lat: [[test#GPUI Settings Window#Theme preset cache#Preset preview order]]
     #[test]
     fn preset_strip_uses_background_foreground_then_normal_ansi() {
         let presets = build_theme_preset_cache();
@@ -6609,6 +6610,7 @@ mod tests {
         );
     }
 
+    // @lat: [[test#GPUI Settings Window#Theme preset cache#Active Custom preview]]
     #[test]
     fn custom_strip_uses_inline_theme_only_while_custom_is_active() {
         let presets = build_theme_preset_cache();
@@ -6719,6 +6721,7 @@ mod tests {
         assert_eq!(prompt_bar_reset_change(key), ("appearance.prompt_bar_text", ""));
     }
 
+    // @lat: [[test#GPUI Settings Window#Theme preset cache#Selected row visibility]]
     #[test]
     fn choice_scroll_keeps_the_last_preset_row_visible() {
         let index = 192;

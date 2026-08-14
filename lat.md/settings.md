@@ -356,19 +356,45 @@ The webview delivery is gone; its feature set lives in . The config-apply path i
 
 ### Page model
 
-The eleven settings pages are described in : each owns an ordered control list keyed by the dotted config key the apply path understands.
+The eleven settings pages are described by
+[[crates/scribe-client/src/settings/model.rs#page_controls]]: each owns an
+ordered control list keyed by the dotted config key the apply path understands.
 
 The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
-The Colors page keeps only the `Custom` escape hatch in its declarative preset control. [[crates/scribe-client/src/settings/window.rs#build_theme_preset_cache]] resolves installed presets into window-local entries at construction and reload, and the shared label, menu, and stepping paths read that cache. The preset menu's native search input filters display labels case-insensitively, reports filtered AccessKit positions, and names an empty result without changing selection or preview behavior. Keyboard focus therefore clones a constant-sized control instead of every resolved theme.
+The Colors page keeps only the `Custom` escape hatch in its declarative preset
+control. [[crates/scribe-client/src/settings/window.rs#build_theme_preset_cache]]
+resolves 192 installed presets into window-local entries at construction and
+reload. Each resolved row previews background, foreground, and ANSI 0-7; the
+`Custom` row previews inline colors only while Custom is active. The native
+search input filters display labels case-insensitively, reports filtered
+AccessKit positions, and names an empty result without changing selection or
+preview behavior. Keyboard focus therefore clones a constant-sized control
+instead of every resolved theme.
 
- renders that model generically — toggles flip, choices cycle, and numeric steppers increment through . Other controls commit immediately like the old live-apply webview. Closed `theme.preset` Left/Right cycling updates its pending label on every step and restarts one 250 ms `cx.spawn` timer; settle or focus movement sends only the final token through the existing apply path, while Escape cancels the task and reveals the saved value without a write. Current values are read back by . Shared colour controls open the selector below, general free-text controls edit inline, keybinding rows list every action's combos via , and Workspaces owns its dedicated path editor plus its dynamic badge-colour controls.
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_control]]
+renders that model generically: toggles flip, choices cycle, and numeric
+steppers increment. Other controls commit immediately like the old live-apply
+webview. Closed `theme.preset` Left/Right cycling updates its pending label on
+every step and restarts one 250 ms `cx.spawn` timer; settle or focus movement
+sends only the final token through the existing apply path, while Escape
+cancels the task and reveals the saved value without a write. Current values
+come from [[crates/scribe-client/src/settings/values.rs#current_value]]. Shared
+colour controls open the selector below, general free-text controls edit inline,
+keybinding rows list every action's combos, and Workspaces owns its path editor
+and dynamic badge-colour controls.
 
 The settings window has a window-local keyboard traversal order: Tab/Down and Up move through the sidebar followed by actionable controls on the selected page; Enter/Space activates the focused page, toggle, choice, stepper, color selector, or action; Left/Right adjust toggles, closed choices, steppers, and color presets. An open color selector sends Tab into its exact-value field. A high-contrast border marks the current stop, and the independently scrollable content pane remains reachable through that ordered traversal. These handlers only live on the settings window, so terminal-window shortcuts are unaffected.
 
 A closed choice opens with Enter or Space. While its menu is open, Up/Down move a neutral-wash highlight through the filtered rows, Enter applies that row, Left/Right and forward or reverse Tab stay inside the menu, and Escape unwinds without applying. AccessKit reports the highlighted row as the active descendant while `aria-selected` continues to name the applied value.
 
-The root takes focus when the window opens, so Ctrl+K and traversal work before any click. Escape clears a preset filter before closing its menu, then clears page search; titlebar window controls claim Enter/Space only, letting settings-wide keys continue to the root.
+The root takes focus when the window opens, so Ctrl+K and traversal work before
+any click. Escape unwinds the innermost state first: an exact color edit restores
+its opening value and closes its picker; otherwise
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#dismiss_transient_state]]
+discards a pending closed-preset step, closes a color picker, clears a preset
+filter, closes its menu, then clears page search. Titlebar window controls claim
+Enter/Space only, letting settings-wide keys continue to the root.
 
 Action controls route through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#run_action]], which is the single live entry point into [[crates/scribe-client/src/settings/server_action.rs]] — the update check, the release list, the keystore preflight, and the whole LAN trust surface below.
 
@@ -388,6 +414,11 @@ second persistence path. The custom canvas maps pointer position to continuous
 saturation and brightness for the chosen hue. Preset, hue, and canvas nodes are
 pointer-only images rather than false tab stops: the outer selector owns
 keyboard preset stepping, and the exact field owns arbitrary keyboard input.
+
+The five prompt-bar controls show their active theme-derived swatches when no
+override is saved. Each trigger is followed by a keyboard-reachable Reset;
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_prompt_bar_color_control]]
+commits an empty value so the optional TOML key is omitted and derivation resumes.
 
 ### Inline editing
 
