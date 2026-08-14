@@ -190,7 +190,7 @@ e2e-func script image="scribe-test-func" runtime_profile="default":
             ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
-    docker run --rm "${runtime_flags[@]}" -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro {{e2e_output}} "$image" /tests/{{script}}
+    docker run --rm "${runtime_flags[@]}" -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -e SCRIBE_GITHUB_API_URL -v ./tests/e2e:/tests:ro {{e2e_output}} "$image" /tests/{{script}}
 
 # Run a functional E2E test under the hardened Docker runtime profile.
 e2e-func-hardened script image="scribe-test-func":
@@ -244,11 +244,16 @@ e2e-visual script image="scribe-test-visual" runtime_profile="default":
             ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
-    docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -v ./tests/e2e:/tests:ro {{e2e_output}} "$image" "/tests/$script"
+    docker run --rm "${runtime_flags[@]}" {{gpu_flags}} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -e SCRIBE_GITHUB_API_URL -v ./tests/e2e:/tests:ro {{e2e_output}} "$image" "/tests/$script"
 
 # Run a visual E2E test under the hardened Docker runtime profile.
 e2e-visual-hardened script image="scribe-test-visual":
     just e2e-visual "{{ script }}" "{{ image }}" runtime_profile=hardened
+
+# Prove the shared loopback Actions fixture is staged in both E2E images.
+e2e-github-actions-api-fixture func_image="scribe-test-func" visual_image="scribe-test-visual":
+    SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 just e2e-func github-actions-api.sh "{{ func_image }}"
+    SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 just e2e-visual github-actions-api.sh "{{ visual_image }}"
 
 # Run a visual E2E test that needs a live pane BOTH the GPUI client and
 # scribe-test can see (SCRIBE_SHARED_PANE=1). The entrypoint creates the session

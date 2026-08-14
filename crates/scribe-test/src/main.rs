@@ -7,6 +7,7 @@ mod daemon;
 mod decode_spike;
 mod decode_storage;
 mod framing_probe;
+mod github_actions_api;
 mod input;
 mod ipc;
 mod ipc_fixtures;
@@ -149,6 +150,8 @@ enum Command {
     },
     /// Refresh the current workspace's Beads board and print its state as JSON.
     BeadsBoard,
+    /// Serve a deterministic loopback-only GitHub Actions API fixture.
+    GithubActionsApi(GithubActionsApiArgs),
     /// Inspect the `SessionReplay` frames the daemon received and the screen it
     /// rebuilt from them.
     Replay {
@@ -439,6 +442,19 @@ enum ServerAction {
     Upgrade,
 }
 
+#[derive(clap::Args)]
+struct GithubActionsApiArgs {
+    /// JSON file containing workflow-run and job progressions.
+    #[arg(long)]
+    scenario: PathBuf,
+    /// JSONL destination for every request the fixture receives.
+    #[arg(long)]
+    request_log: PathBuf,
+    /// Loopback port to listen on.
+    #[arg(long, default_value_t = 8098)]
+    port: u16,
+}
+
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Start the test daemon in the background.
@@ -593,10 +609,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
         Command::BeadsBoard => capture::beads_board(),
+        Command::GithubActionsApi(args) => run_gh_api(&args),
         Command::Replay { action } => run_replay(action),
-        Command::WaitOutput { session_id, pattern, timeout } => {
-            wait::wait_output(&session_id, &pattern, timeout)
-        }
+        Command::WaitOutput { session_id: s, pattern: p, timeout: t } => run_wait(&s, &p, t),
         Command::WaitCwd { session_id, path, timeout } => {
             let path_str = path.to_string_lossy();
             wait::wait_cwd(&session_id, &path_str, timeout)
@@ -663,6 +678,15 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
     }
+}
+
+fn run_gh_api(args: &GithubActionsApiArgs) -> Result<(), TestError> {
+    github_actions_api::run(&args.scenario, &args.request_log, args.port)
+        .map_err(TestError::InfraError)
+}
+
+fn run_wait(session_id: &str, pattern: &str, timeout: u64) -> Result<(), TestError> {
+    wait::wait_output(session_id, pattern, timeout)
 }
 
 fn run_server(action: &ServerAction) -> Result<(), TestError> {

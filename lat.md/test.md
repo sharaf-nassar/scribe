@@ -578,6 +578,16 @@ The Updates page exposes a labelled toggle whose reader and apply path round-tri
 
 The server's process-wide eligibility value follows false, true, and false writes so `ConfigReloaded` can apply the setting without a restart or idle probe.
 
+## GitHub Actions API Fixture
+
+The Docker E2E images share one deterministic GitHub Actions REST fixture for offline CI-tracker tests.
+
+### Loopback scripted API
+
+The fixture binds only `127.0.0.1`, filters workflow runs by `head_sha`, serves per-run jobs, advances finite JSON scenarios, honors ETags, and appends every request to JSONL.
+
+One script proves the same binary and API-base env seam in both `--network none` images.
+
 ## Image Settings and Diagnostics
 
 The functional harness certifies the terminal-image master switch, the resources a disable frees, the diagnostic catalog, and the renderer-failure taxonomy without starting a host Scribe runtime.
