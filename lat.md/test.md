@@ -3969,6 +3969,18 @@ Every page in  exposes controls, and every config-backed control routes cleanly 
 
 The settings window caches all 192 presets, gives each menu row background, foreground, and ANSI 0–7 chips, previews active `Custom` colors, keeps `Custom` last, and opens with the selected row visible.
 
+### Theme preset filtering
+
+The preset menu narrows its cached rows without changing their selection, preview, or apply paths.
+
+#### Display-label matching
+
+Case-insensitive display-label substrings narrow all 193 preset and Custom rows, while an empty filter restores the full list and an unmatched filter yields none.
+
+#### Escape order
+
+Successive Escape presses clear preset-filter text, close its menu, then clear page search so each transient layer unwinds independently.
+
 ### Color selector palette
 
 The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.
