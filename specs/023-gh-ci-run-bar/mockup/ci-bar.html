@@ -144,7 +144,7 @@
   .w-cancelled { color: var(--brblack); }
   .w-stale     { color: var(--yellow); }
 
-  /* pipeline strip: one segment per workflow, live fill */
+  /* pipeline strip: one labeled segment per job, grouped by workflow */
   .strip {
     flex: 1; display: flex; gap: 5px; align-items: center; min-width: 180px;
   }
@@ -170,8 +170,15 @@
   .seg .seg-label {
     position: absolute; top: -15px; left: 1px;
     font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--chrome-text);
+    color: rgba(228, 228, 231, 0.35);
   }
+  .seg.active .seg-label { color: var(--term-fg); }
+  .seg.active .seg-label::before {
+    content: "▸ "; color: var(--blue);
+    animation: caret 1.2s ease-in-out infinite;
+  }
+  .seg.fail .seg-label { color: var(--red); }
+  .seg.grp { margin-left: 10px; }   /* wider gap = workflow boundary */
   .strip.labeled { padding-top: 12px; }
 
   .ci-ref { color: var(--chrome-text); font-size: 11.5px; }
@@ -193,6 +200,9 @@
   .ci-band.failed::before { background: color-mix(in srgb, var(--red) 60%, transparent); }
   .ci-band.failed { box-shadow: inset 0 -8px 18px -14px rgba(239, 68, 68, 0.55); }
   .ci-band.stale-band::before { background: color-mix(in srgb, var(--yellow) 45%, transparent); }
+  /* stale: the active job stays named, but all motion freezes */
+  .ci-band.stale-band .seg.active .fill,
+  .ci-band.stale-band .seg.active .seg-label::before { animation: none; }
 
   /* =========================================================
      Trace panel — expanded view. Jobs as time-positioned
@@ -344,9 +354,12 @@
   <p class="caption">First run observation: the band slides in under the
   titlebar with a single light sweep (the titlebar attention-flash, made
   horizontal). Left: a conic ring filling as jobs complete. Center: the
-  pipeline strip — one labeled segment per workflow, live shimmer on the
-  active one, dashes for queued. The violet hairline under the band is the
-  workspace badge color: this bar belongs to <em>scribe</em>.</p>
+  pipeline strip — one named segment per job, workflow boundaries marked by
+  a wider gap. The active job announces itself three ways at once: its
+  segment shimmers, its name brightens to full foreground, and a breathing
+  ▸ precedes it; done jobs dim to solid, queued jobs dash. The violet
+  hairline is the workspace badge color: this bar belongs to
+  <em>scribe</em>.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -358,8 +371,9 @@
       <span class="ring" style="--ring-p:33%"></span>
       <span class="ci-word w-running">running</span>
       <div class="strip labeled">
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">quality</span><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued"><span class="seg-label">docs</span></div>
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">1m 42s</span>
@@ -397,9 +411,10 @@
     <div class="ci-band">
       <span class="ring" style="--ring-p:33%"></span>
       <span class="ci-word w-running">running</span>
-      <div class="strip">
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:70%"></span></div>
-        <div class="seg queued"></div>
+      <div class="strip labeled">
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:70%"></span></div>
+        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">2m 08s</span>
@@ -438,18 +453,20 @@
 <section class="vignette">
   <div class="label">03 · terminal states — band specimens</div>
   <p class="caption">Success flashes the strip green and auto-clears after
-  ~10 s. Failure keeps its segment glowing and turns the ownership hairline
-  semantic red — it persists until dismissed. Cancelled goes quiet.
-  Stale freezes elapsed and amber-keys the hairline while retrying.
-  Glyph + word always accompany color.</p>
+  ~10 s. Failure keeps its segment glowing, turns the failing job's name
+  red, and re-keys the ownership hairline semantic red — it persists until
+  dismissed. Cancelled goes quiet. Stale freezes elapsed and all motion
+  (the active job stays named, its ▸ stops breathing) and amber-keys the
+  hairline while retrying. Glyph + word always accompany color.</p>
 
   <div class="specimen"><div class="frame-scroll"><div class="window">
     <div class="ci-band">
       <span class="ring done" style="background:var(--green)"></span>
       <span class="ci-word w-success">✓ passed</span>
-      <div class="strip">
-        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      <div class="strip labeled">
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok"><span class="seg-label">rust-macos</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok grp"><span class="seg-label">lat-check</span><span class="fill" style="width:100%"></span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">4m 51s</span>
@@ -462,9 +479,10 @@
     <div class="ci-band failed">
       <span class="ring done" style="background:var(--red)"></span>
       <span class="ci-word w-failure">✕ failed</span>
-      <div class="strip">
-        <div class="seg fail"><span class="fill" style="width:100%"></span></div>
-        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      <div class="strip labeled">
+        <div class="seg fail"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok"><span class="seg-label">rust-macos</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg ok grp"><span class="seg-label">lat-check</span><span class="fill" style="width:100%"></span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">3m 27s</span>
@@ -476,9 +494,10 @@
     <div class="ci-band">
       <span class="ring done" style="background:var(--brblack)"></span>
       <span class="ci-word w-cancelled">⊘ cancelled</span>
-      <div class="strip">
-        <div class="seg"><span class="fill" style="width:34%; background:var(--brblack)"></span></div>
-        <div class="seg ok"><span class="fill" style="width:100%"></span></div>
+      <div class="strip labeled">
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg"><span class="seg-label">rust-macos</span><span class="fill" style="width:34%; background:var(--brblack)"></span></div>
+        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">1m 03s</span>
@@ -490,9 +509,10 @@
     <div class="ci-band stale-band">
       <span class="ring" style="--ring-p:33%; --ring-c:var(--yellow)"></span>
       <span class="ci-word w-running">running</span>
-      <div class="strip">
-        <div class="seg" style="--seg-c:var(--blue)"><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued"></div>
+      <div class="strip labeled">
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">2m 40s</span>
@@ -529,8 +549,9 @@
     <div class="ci-band">
       <span class="ring" style="--ring-p:20%"></span>
       <span class="ci-word w-running">running</span>
-      <div class="strip">
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:38%"></span></div>
+      <div class="strip labeled">
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-linux</span><span class="fill" style="width:38%"></span></div>
+        <div class="seg queued"><span class="seg-label">rust-macos</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">0m 58s</span>
@@ -557,9 +578,10 @@
     <div class="ci-band">
       <span class="ring" style="--ring-p:33%"></span>
       <span class="ci-word w-running">running</span>
-      <div class="strip">
-        <div class="seg active" style="--seg-c:var(--blue)"><span class="fill" style="width:62%"></span></div>
-        <div class="seg queued"></div>
+      <div class="strip labeled">
+        <div class="seg ok"><span class="seg-label">rust-linux</span><span class="fill" style="width:100%"></span></div>
+        <div class="seg active" style="--seg-c:var(--blue)"><span class="seg-label">rust-macos</span><span class="fill" style="width:62%"></span></div>
+        <div class="seg queued grp"><span class="seg-label">lat-check</span></div>
       </div>
       <span class="ci-ref"><b>main</b> @ 4f2a91c</span>
       <span class="ci-elapsed">1m 42s</span>
@@ -573,9 +595,9 @@
   <div class="label">06 · alternate direction — edge</div>
   <p class="caption">For zero chrome cost: collapsed presence is a 2px
   luminous progress line under the titlebar (badge→accent gradient, bright
-  caret at the frontier) plus a translucent micro cluster that fades after a
-  few seconds. Click either to drop the same trace panel. Costs two pixels;
-  the workspace keeps its full height.</p>
+  caret at the frontier) plus a translucent micro cluster naming the active
+  job, fading after a few seconds. Click either to drop the same trace
+  panel. Costs two pixels; the workspace keeps its full height.</p>
   <div class="frame-scroll"><div class="window">
     <div class="titlebar">
       <div class="ws-pill"><span class="dot"></span>scribe</div>
@@ -585,7 +607,7 @@
     </div>
     <div class="edge-line"><div class="edge-fill"></div></div>
     <div class="edge-host">
-      <div class="micro"><b>◐</b> ci 1m 42s</div>
+      <div class="micro"><b>◐</b> rust-macos · 1m 42s</div>
       <div class="term">
         <div><span class="p">➜</span> <span class="c">git push origin main</span></div>
         <div class="o">To github.com:mamba/scribe.git</div>
@@ -608,7 +630,10 @@
     <tr><td style="color:var(--blue)">ring</td>
         <td>conic fill = jobs completed / total; collapses to a solid square on terminal states</td></tr>
     <tr><td style="color:var(--blue)">segment</td>
-        <td>one per workflow; shimmer = live, dashes = queued, glow = terminal emphasis</td></tr>
+        <td>one named segment per job, workflow boundaries as a wider gap;
+            shimmer + bright ▸ name = active, dim solid = done, dashes =
+            queued, red name = failed. Beyond ~6 jobs the strip elides to
+            failed + active jobs plus a “+n” counter segment</td></tr>
     <tr><td style="color:var(--badge)">hairline</td>
         <td>workspace badge color = ownership; turns red/amber on failure/stale</td></tr>
     <tr><td style="color:var(--blue)">trace bar</td>

@@ -140,18 +140,24 @@ status (accessibility rule from the spec review).
 ### Visual direction
 
 The mockup's primary direction is **trace**: the band is a timeline, not a
-status row. Collapsed, a segmented pipeline strip (one segment per
-workflow, live shimmer, queued dashes) shows the run's shape inline, with
-a conic ring filling as jobs complete; expanded, jobs render as
-time-positioned bars on a shared minute-grid axis so parallelism reads at
-a glance. A hairline under the band takes the workspace badge color —
-ownership encoded structurally, which is what disambiguates the band in
-multi-workspace windows. Failure/stale re-key that hairline semantically.
-Motion (appear sweep, shimmer, breathing caret, success exit) routes
-through the existing GPUI animation system and its off switch; terminal
-states are static. An alternate **edge** direction trades the band for a
-2px luminous progress line under the titlebar plus a fading micro
-cluster — zero chrome height; both directions share the trace panel.
+status row. Collapsed, a segmented pipeline strip carries one named
+segment per job (micro-label above each segment; workflow boundaries as a
+wider gap), with a conic ring filling as jobs complete. The active job is
+marked three ways at once: its segment shimmers, its name brightens to
+full foreground, and a breathing ▸ precedes it; done jobs dim to solid,
+queued jobs dash, a failed job's name goes red. Beyond ~6 jobs the strip
+elides to failed + active jobs plus a "+n" counter segment. Expanded,
+jobs render as time-positioned bars on a shared minute-grid axis so
+parallelism reads at a glance. A hairline under the band takes the
+workspace badge color — ownership encoded structurally, which is what
+disambiguates the band in multi-workspace windows. Failure/stale re-key
+that hairline semantically; stale freezes all motion while keeping the
+active job named. Motion (appear sweep, shimmer, breathing caret, success
+exit) routes through the existing GPUI animation system and its off
+switch; terminal states are static. An alternate **edge** direction
+trades the band for a 2px luminous progress line under the titlebar plus
+a fading micro cluster naming the active job — zero chrome height; both
+directions share the trace panel.
 
 ### Notification surface decision
 
