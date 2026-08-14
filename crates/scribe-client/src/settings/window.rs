@@ -348,6 +348,41 @@ fn build_theme_preset_cache() -> Vec<PresetEntry> {
     presets
 }
 
+fn preset_strip_colors(theme: &Theme) -> [[f32; 4]; 10] {
+    [
+        theme.background,
+        theme.foreground,
+        theme.ansi_colors[0],
+        theme.ansi_colors[1],
+        theme.ansi_colors[2],
+        theme.ansi_colors[3],
+        theme.ansi_colors[4],
+        theme.ansi_colors[5],
+        theme.ansi_colors[6],
+        theme.ansi_colors[7],
+    ]
+}
+
+fn theme_preset_preview(
+    config: &ScribeConfig,
+    key: &str,
+    current: &str,
+    option: &str,
+    presets: &[PresetEntry],
+) -> Option<[[f32; 4]; 10]> {
+    if key != "theme.preset" {
+        return None;
+    }
+    if option == "custom" {
+        return (current == "custom")
+            .then(|| preset_strip_colors(&scribe_common::config::resolve_theme(config)));
+    }
+    presets
+        .iter()
+        .find(|preset| preset.token == option)
+        .map(|preset| preset_strip_colors(&preset.theme))
+}
+
 /// One focus stop in the settings window's stable keyboard traversal order.
 /// The sidebar comes first, followed by actionable controls on the selected
 /// page and (on Remote) every live trust mutation row.
@@ -3855,8 +3890,15 @@ impl SettingsWindow {
             .enumerate()
             .map(|(index, (option, label))| {
                 let selected = *option == token;
-                let commit_key = key.to_owned();
-                let commit_value = option.clone();
+                let (commit_key, commit_value) = (key.to_owned(), option.clone());
+                let preview = theme_preset_preview(
+                    &self.config,
+                    &control.key,
+                    &token,
+                    option,
+                    &self.theme_presets,
+                )
+                .map(theme_preview_strip);
                 div()
                     .id(("choice-option", key_hash(&format!("{key}:{option}"))))
                     .focusable()
@@ -3883,7 +3925,8 @@ impl SettingsWindow {
                         this.open_choice = None;
                         this.commit(&commit_key, Value::String(commit_value.clone()), ctx);
                     }))
-                    .child(Text::new_inaccessible(label.clone().into()))
+                    .child(choice_option_label(label))
+                    .children(preview)
                     .child(
                         div()
                             .font_family("Symbols Nerd Font Mono")
@@ -3948,9 +3991,7 @@ impl SettingsWindow {
         let value = current_value(&self.config, key);
         let token = value.as_str().unwrap_or("");
         let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
-        let rows = f32::from(u16::try_from(index).unwrap_or(u16::MAX));
-        let lead = (rows * CHOICE_OPTION_HEIGHT - CHOICE_MENU_LEAD).max(0.0);
-        self.choice_scroll.set_offset(point(px(0.0), px(-lead)));
+        self.choice_scroll.set_offset(point(px(0.0), choice_scroll_offset(index)));
     }
 
     /// Dismiss any open choice dropdown, notifying only when one was showing.
@@ -4729,6 +4770,33 @@ const RELEASE_SUMMARY_MAX: usize = 4;
 
 /// Dimming applied to a control whose parent toggle is off.
 const GATED_OPACITY: f32 = 0.42;
+
+fn choice_scroll_offset(index: usize) -> Pixels {
+    let rows = f32::from(u16::try_from(index).unwrap_or(u16::MAX));
+    px(-(rows * CHOICE_OPTION_HEIGHT - CHOICE_MENU_LEAD).max(0.0))
+}
+
+fn choice_option_label(label: &str) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .child(Text::new_inaccessible(label.to_owned().into()))
+        .into_any_element()
+}
+
+fn theme_preview_strip(colors: [[f32; 4]; 10]) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .h(px(10.0))
+        .flex()
+        .items_center()
+        .gap(px(1.0))
+        .children(
+            colors.into_iter().map(|color| div().w(px(7.0)).h_full().flex_none().bg(srgba(color))),
+        )
+        .into_any_element()
+}
 
 /// An outline that reserves its space without drawing: a keybinding cell keeps
 /// the same geometry whether or not it is the focused or recording row.
@@ -5665,16 +5733,17 @@ mod tests {
     use super::{
         NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH, ScrollMetrics,
         ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
-        build_theme_preset_cache, canonical_combo, choice_options_from_cache, combo_for_capture,
-        conflicting_action, content_scroll_offset, focus_targets_match, inline_commit_value,
-        inline_placeholder, is_modifier_key, key_combo_text, offset_from_drag,
+        build_theme_preset_cache, canonical_combo, choice_options_from_cache, choice_scroll_offset,
+        combo_for_capture, conflicting_action, content_scroll_offset, focus_targets_match,
+        inline_commit_value, inline_placeholder, is_modifier_key, key_combo_text, offset_from_drag,
         offset_from_track_click, palette_color_at, px, release_inline_input, revert_inline_input,
-        search_display_text, utf16_range_to_utf8, workspace_badge_color_controls,
-        workspace_root_controls_match_query, workspace_root_focus_index,
-        workspace_root_matches_query, workspace_root_prompt_options, workspace_roots_match_query,
+        search_display_text, theme_preset_preview, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
+        workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
+        workspace_roots_match_query,
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
-    use scribe_common::config::{KeyComboList, ScribeConfig};
+    use scribe_common::config::{KeyComboList, ScribeConfig, ThemeConfig};
 
     fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
         Keystroke { modifiers, key: key.to_owned(), key_char: None }
@@ -5778,8 +5847,8 @@ mod tests {
         let options =
             choice_options_from_cache("theme.preset", "dracula", &[("custom", "Custom")], &presets);
 
-        assert_eq!(presets.len(), scribe_common::theme::all_preset_names().len());
-        assert_eq!(options.len(), presets.len() + 1);
+        assert_eq!(presets.len(), 192);
+        assert_eq!(options.len(), 193);
         assert_eq!(options.first(), Some(&(String::from("3024-day"), String::from("3024 Day"))));
         assert_eq!(options.last(), Some(&(String::from("custom"), String::from("Custom"))));
         let dracula = presets
@@ -5787,6 +5856,73 @@ mod tests {
             .find(|preset| preset.token == "dracula")
             .expect("Dracula must be cached");
         assert_eq!(dracula.theme.name, "dracula");
+    }
+
+    #[test]
+    fn preset_strip_uses_background_foreground_then_normal_ansi() {
+        let presets = build_theme_preset_cache();
+        let colors = theme_preset_preview(
+            &ScribeConfig::default(),
+            "theme.preset",
+            "minimal-dark",
+            "dracula",
+            &presets,
+        )
+        .expect("resolved presets carry a preview")
+        .map(scribe_common::theme::rgba_to_hex);
+
+        assert_eq!(
+            colors,
+            [
+                "#282a36", "#f8f8f2", "#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9",
+                "#ff79c6", "#8be9fd", "#f8f8f2",
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_strip_uses_inline_theme_only_while_custom_is_active() {
+        let presets = build_theme_preset_cache();
+        let mut config = ScribeConfig::default();
+
+        assert!(
+            theme_preset_preview(&config, "theme.preset", "minimal-dark", "custom", &presets)
+                .is_none()
+        );
+
+        config.appearance.theme = String::from("custom");
+        config.theme = Some(ThemeConfig {
+            name: String::from("custom"),
+            foreground: String::from("#112233"),
+            background: String::from("#445566"),
+            cursor: String::from("#112233"),
+            cursor_accent: String::from("#445566"),
+            selection: String::from("#778899"),
+            selection_foreground: String::from("#112233"),
+            colors: vec![String::from("#000000"); 16],
+        });
+        let colors = theme_preset_preview(&config, "theme.preset", "custom", "custom", &presets)
+            .expect("active custom theme carries its resolved preview")
+            .map(scribe_common::theme::rgba_to_hex);
+
+        assert_eq!(colors[0], "#445566");
+        assert_eq!(colors[1], "#112233");
+        assert_eq!(colors[2..], ["#000000"; 8]);
+    }
+
+    #[test]
+    fn choice_scroll_keeps_the_last_preset_row_visible() {
+        let index = 192;
+        let offset = choice_scroll_offset(index);
+        let viewport_top = -f32::from(offset);
+        let row_top = f32::from(u16::try_from(index).expect("preset index fits"))
+            * super::CHOICE_OPTION_HEIGHT;
+
+        assert_eq!(offset, px(-5670.0));
+        assert!(row_top >= viewport_top);
+        assert!(
+            row_top + super::CHOICE_OPTION_HEIGHT <= viewport_top + super::CHOICE_MENU_MAX_HEIGHT
+        );
     }
 
     #[test]

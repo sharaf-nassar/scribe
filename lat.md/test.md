@@ -3943,7 +3943,7 @@ Every page in  exposes controls, and every config-backed control routes cleanly 
 
 ### Theme preset cache
 
-The settings window resolves every named preset into its cache once, exposes them alphabetically through the shared choice path, and keeps `Custom` last without embedding the full list in cloned focus targets.
+The settings window caches all 192 presets, gives each menu row background, foreground, and ANSI 0–7 chips, previews active `Custom` colors, keeps `Custom` last, and opens with the selected row visible.
 
 ### Color selector palette
 
