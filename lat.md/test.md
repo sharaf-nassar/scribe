@@ -23,6 +23,10 @@ An enabled detector given a normal directory returns without adding a watcher or
 
 Disabling the server-owned control drops its worker and filesystem watchers, closes the internal event stream, and emits nothing for a later push.
 
+#### Receiver reacquires after re-enable
+
+The tracker receives both live transitions and takes a fresh single-consumer event receiver after the watcher restarts.
+
 #### Loose refs emit pushed head
 
 A real push that advances a loose remote-tracking ref emits the canonical repository root, matching local branch-tip SHA, and configured remote's push URL.
@@ -46,6 +50,46 @@ Host Git 2.43 cannot create reftable repositories, so a synthetic resolved-path 
 #### Watcher debounces push events
 
 A real native watcher receives one push's ref burst and emits exactly one internal event with its canonical repository root after the 250 ms debounce.
+
+### Push-target repository resolution
+
+HTTPS, SSH, and scp push URLs canonicalize to the receiving github.com owner/repo, while other hosts and extra path segments are rejected.
+
+### Workflow rollup
+
+Non-terminal workflows keep the rollup queued or running; all-terminal sets use failure, cancelled, then success precedence.
+
+### Shared latest-head window
+
+Multiple roots for one GitHub repository share one tracker, and a newer pushed head replaces the prior discovery window.
+
+### Server-wide request budget
+
+One scheduler enforces the 5-second minimum cadence and 720-attempt rolling-hour ceiling across repositories.
+
+### Zero-idle and auth-failure boundary
+
+An idle tracker performs no auth or HTTP call, and failed token acquisition removes the relevant window before any HTTP request.
+
+### Trusted API request
+
+Production and loopback request URLs use the exact run-list query, while non-loopback API overrides fail before authentication.
+
+### Observation timestamps and terminal stop
+
+Each workflow keeps its first observation time across polls, updates its latest observation, and stops tracking after terminal rollup.
+
+### No-run discovery expiry
+
+An empty discovery window expires at 120 seconds after exactly 24 permitted attempts and never publishes a bar.
+
+### Rate-limit delay
+
+`Retry-After` takes precedence over `X-RateLimit-Reset`, and both delay the shared scheduler without a quota-probe request.
+
+### Hot-upgrade active window
+
+Handoff state preserves an active run without its token, and the successor re-polls it while retaining stale-state fallback.
 
 ## Architecture
 

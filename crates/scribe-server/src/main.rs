@@ -68,7 +68,7 @@ use scribe_server::terminal_image_handoff;
 // `pub` items dead there.
 use scribe_server::beads_board;
 use scribe_server::child_watch;
-use scribe_server::github_ci;
+mod github_ci;
 mod updater;
 mod workspace_manager;
 
@@ -229,8 +229,7 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
         session_manager,
         workspace_manager,
         (lock_guard, listener),
-        cfg.update,
-        launchd_slot,
+        ServerLoopConfig { update: cfg.update, launchd_slot, restored_ci_windows: Vec::new() },
     )
     .await
 }
@@ -330,6 +329,7 @@ async fn run_upgrade_receiver(
             &state.windows,
             &live_sessions,
         )));
+    let restored_ci_windows = state.ci_windows.clone();
 
     // Record completion only after restoration succeeds. A receiver that ACKed
     // but could not rebuild the handed-off state must not announce success.
@@ -344,8 +344,7 @@ async fn run_upgrade_receiver(
         session_manager,
         workspace_manager,
         (lock_guard, listener),
-        cfg.update,
-        launchd_slot,
+        ServerLoopConfig { update: cfg.update, launchd_slot, restored_ci_windows },
     )
     .await
 }
@@ -358,14 +357,20 @@ async fn run_upgrade_receiver(
 /// inside the handoff, then acquires the lock after the predecessor exits.
 /// `_lock_guard` must live until the server shuts down to hold the advisory
 /// flock.
+struct ServerLoopConfig {
+    update: UpdateConfig,
+    launchd_slot: Option<LaunchdSlot>,
+    restored_ci_windows: Vec<github_ci::HandoffCiWindow>,
+}
+
 #[allow(clippy::too_many_lines, reason = "server setup remains one ordered startup transaction")]
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
     (_lock_guard, listener): (ipc_server::ServerLock, tokio::net::UnixListener),
-    update_config: UpdateConfig,
-    launchd_slot: Option<LaunchdSlot>,
+    config: ServerLoopConfig,
 ) -> Result<(), ScribeError> {
+    let ServerLoopConfig { update, launchd_slot, restored_ci_windows } = config;
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
     let git_ref_watcher =
@@ -389,8 +394,7 @@ async fn run_server_loop(
 
     // Spawn the background updater. The handle is passed into the IPC server
     // so that TriggerUpdate / DismissUpdate messages can reach it.
-    let updater_handle =
-        Arc::new(updater::spawn_updater(Arc::clone(&window_shares), update_config));
+    let updater_handle = Arc::new(updater::spawn_updater(Arc::clone(&window_shares), update));
 
     // No-op unless this process came up from an upgrade.
     tokio::spawn(updater::announce_upgrade_completion(Arc::clone(&window_shares)));
@@ -429,19 +433,27 @@ async fn run_server_loop(
     // Feature 013: shared remote-control listener handle, threaded into the IPC
     // server state so the `ConfigReloaded` path can start/stop/rebind it live.
     let remote_control = ipc_server::RemoteControl::new();
+    let ci_dismissals = Arc::default();
+    let github_ci_tracker = github_ci::spawn_tracker(
+        Arc::clone(&git_ref_watcher),
+        Arc::clone(&workspace_manager),
+        Arc::clone(&window_shares),
+        Arc::clone(&ci_dismissals),
+        restored_ci_windows,
+    );
     let server_state = ipc_server::IpcServerState {
         session_manager: Arc::clone(&session_manager),
         workspace_manager: Arc::clone(&workspace_manager),
         beads_boards: beads_board::BeadsBoardCache::default(),
         live_sessions: Arc::clone(&live_sessions),
         window_shares: Arc::clone(&window_shares),
-        ci_dismissals: Arc::default(),
+        ci_dismissals,
         updater_handle: Arc::clone(&updater_handle),
         release_catalog: Arc::clone(&release_catalog),
         release_fetcher: Arc::clone(&release_fetcher),
         env_store: Arc::clone(&env_store),
         remote_control: Arc::clone(&remote_control),
-        git_ref_watcher,
+        git_ref_watcher: Arc::clone(&git_ref_watcher),
     };
 
     // Start the remote-control supervisor: it applies the current `[remote]`
@@ -476,6 +488,7 @@ async fn run_server_loop(
         result = handoff::run_handoff_listener(
             Arc::clone(&workspace_manager),
             Arc::clone(&live_sessions),
+            github_ci_tracker,
         ) => {
             match result {
                 Ok(()) => {

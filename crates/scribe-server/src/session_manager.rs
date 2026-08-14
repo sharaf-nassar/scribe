@@ -1380,6 +1380,7 @@ mod tests_session_cap {
             workspaces: vec![],
             workspace_tree: None,
             windows: vec![],
+            ci_windows: vec![],
         };
         (state, masters, slaves)
     }

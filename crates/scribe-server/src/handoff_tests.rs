@@ -96,6 +96,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         workspaces: vec![],
         workspace_tree: None,
         windows: vec![],
+        ci_windows: vec![],
     };
 
     (state, vec![pty.master], vec![pty.slave])
@@ -178,6 +179,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
         workspaces: vec![],
         workspace_tree: None,
         windows: vec![],
+        ci_windows: vec![],
     };
 
     (state, masters, slaves)
@@ -567,6 +569,7 @@ fn prior_version_payload_decodes_with_absent_child_identity() {
     let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
 
     assert_eq!(decoded.version, 5);
+    assert!(decoded.ci_windows.is_empty(), "older handoff defaults to no active CI windows");
     let session = decoded.sessions.first().expect("one session");
     assert_eq!(session.child_identity, None, "absent field must default to None");
     assert_eq!(session.env_window_id, None, "absent field must default to None");

@@ -12975,6 +12975,7 @@ mod tests {
             workspaces: vec![],
             workspace_tree: None,
             windows: vec![],
+            ci_windows: vec![],
         };
 
         let manager = SessionManager::restore_from_handoff(&state, vec![pty.master], 100).unwrap();

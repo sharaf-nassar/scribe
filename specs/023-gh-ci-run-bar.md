@@ -318,6 +318,14 @@ cheaply re-derivable after hot upgrade (constitution #2/#7).
   active and the panel is open, if phased in.
 - Config: `github_ci.enabled`, default false.
 
+The server tracker records each workflow's first and latest local observation
+times. This gives the bar a stable elapsed clock without adding a provider-date
+parser; a re-observed run keeps its first timestamp by run id.
+
+Hot handoff carries active repository/head descriptors, remaining discovery
+time, roots, and last bounded run state. It never carries the GitHub token. The
+successor re-polls each descriptor before returning to the 5 s cadence.
+
 `github_ci.enabled` changes tracking eligibility live. Saving or reloading the
 setting does not invoke `gh`, test authentication, or make an HTTP request;
 those checks begin only after a later qualifying local-push gate.

@@ -435,12 +435,16 @@ struct RunningGitRefWatcher {
 
 /// Server-owned live enable/disable handle for Git ref watching.
 // @lat: [[server#Sessions#Git Push Detection]]
-pub struct GitRefWatcherControl(Mutex<Option<RunningGitRefWatcher>>);
+pub struct GitRefWatcherControl {
+    running: Mutex<Option<RunningGitRefWatcher>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
 
 impl GitRefWatcherControl {
     #[must_use]
     pub fn new(enabled: bool) -> Self {
-        Self(Mutex::new(Self::start(enabled)))
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Self { running: Mutex::new(Self::start(enabled)), changes }
     }
 
     /// Reconcile the live watcher with the setting and report whether it changed.
@@ -450,6 +454,7 @@ impl GitRefWatcherControl {
             return false;
         }
         *running = Self::start(enabled);
+        self.changes.send_modify(|generation| *generation = generation.wrapping_add(1));
         true
     }
 
@@ -468,6 +473,12 @@ impl GitRefWatcherControl {
         self.lock().as_mut().and_then(|running| running.events.take())
     }
 
+    /// Subscribe to live enable/disable transitions so the tracker can drop or
+    /// reacquire the single-consumer push stream without polling.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
     fn start(enabled: bool) -> Option<RunningGitRefWatcher> {
         match GitRefWatcher::start(enabled) {
             Ok(Some((watcher, events))) => {
@@ -482,7 +493,7 @@ impl GitRefWatcherControl {
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<RunningGitRefWatcher>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -803,6 +814,22 @@ mod tests {
         fixture.commit("two\n");
         fixture.push();
         assert!(events.recv().await.is_err(), "disabled watcher emitted a push event");
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Receiver reacquires after re-enable]]
+    #[tokio::test]
+    async fn live_reenable_notifies_consumer_and_offers_a_fresh_receiver() {
+        let control = GitRefWatcherControl::new(true);
+        let mut changes = control.subscribe_changes();
+        assert!(control.take_event_receiver().is_some());
+
+        assert!(control.set_enabled(false));
+        changes.changed().await.expect("disable notification");
+        assert!(control.take_event_receiver().is_none());
+
+        assert!(control.set_enabled(true));
+        changes.changed().await.expect("enable notification");
+        assert!(control.take_event_receiver().is_some());
     }
 
     // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Loose refs emit pushed head]]

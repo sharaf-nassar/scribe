@@ -175,6 +175,9 @@ pub struct HandoffState {
     /// window's workspace tree.
     #[serde(default)]
     pub windows: Vec<HandoffWindowState>,
+    /// Active GitHub CI windows contain no credential and re-poll on takeover.
+    #[serde(default)]
+    pub ci_windows: Vec<crate::github_ci::HandoffCiWindow>,
 }
 
 /// Per-session state transferred during handoff.
@@ -299,10 +302,18 @@ struct PeerIdentity {
 pub async fn run_handoff_listener(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
+    github_ci_tracker: crate::github_ci::GithubCiTrackerHandle,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
     let listen_async = prepare_handoff_listener(&path)?;
-    wait_for_successful_handoff(&listen_async, &path, &live_sessions, &workspace_manager).await
+    wait_for_successful_handoff(
+        &listen_async,
+        &path,
+        &live_sessions,
+        &workspace_manager,
+        &github_ci_tracker,
+    )
+    .await
 }
 
 async fn wait_for_successful_handoff(
@@ -310,13 +321,16 @@ async fn wait_for_successful_handoff(
     path: &PathBuf,
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
 ) -> Result<(), ScribeError> {
     // Loop so the old server survives a failed handoff (e.g. version
     // mismatch) and keeps serving until a compatible upgrade arrives or
     // postinst cold-restarts via systemctl.
     loop {
         let peer_fd = accept_handoff_peer(listen_async).await?;
-        if process_handoff_peer(&peer_fd, path, live_sessions, workspace_manager).await {
+        if process_handoff_peer(&peer_fd, path, live_sessions, workspace_manager, github_ci_tracker)
+            .await
+        {
             return Ok(());
         }
     }
@@ -379,19 +393,21 @@ async fn process_handoff_peer(
     path: &PathBuf,
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
 ) -> bool {
     if let Err(e) = receive_upgrade_request(peer_fd) {
         warn!("handoff upgrade request failed: {e}");
         return false;
     }
 
-    let payload = match prepare_handoff_payload(live_sessions, workspace_manager).await {
-        Ok(payload) => payload,
-        Err(e) => {
-            warn!("handoff serialization failed: {e}");
-            return false;
-        }
-    };
+    let payload =
+        match prepare_handoff_payload(live_sessions, workspace_manager, github_ci_tracker).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("handoff serialization failed: {e}");
+                return false;
+            }
+        };
 
     if let Err(e) = send_handoff_payload(peer_fd, &payload) {
         warn!("handoff transfer failed: {e}");
@@ -417,8 +433,9 @@ fn receive_upgrade_request(peer_fd: &OwnedFd) -> Result<(), ScribeError> {
 async fn prepare_handoff_payload(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
 ) -> Result<HandoffPayload, ScribeError> {
-    let (state, fds) = serialize_state(live_sessions, workspace_manager).await;
+    let (state, fds) = serialize_state(live_sessions, workspace_manager, github_ci_tracker).await;
     // Named-map encoding (since v6) so additive `#[serde(default)]` fields on
     // the receiver are tolerated regardless of insertion position. Positional
     // `to_vec` would force append-only discipline that the codebase has not
@@ -654,13 +671,21 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
 async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
 ) -> (HandoffState, Vec<Arc<OwnedFd>>) {
     let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
 
     let version = handoff_state_version(&sessions);
-    let state = HandoffState { version, sessions, workspaces, workspace_tree, windows };
+    let state = HandoffState {
+        version,
+        sessions,
+        workspaces,
+        workspace_tree,
+        windows,
+        ci_windows: github_ci_tracker.handoff_windows(),
+    };
 
     (state, fds)
 }

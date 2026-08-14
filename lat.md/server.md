@@ -239,6 +239,24 @@ After a burst, Git plumbing reads local branch tips and every configured remote'
 
 [[crates/scribe-server/src/git_ref_watcher.rs#GitRefWatcher#start|GitRefWatcher::start]] returns `None` before allocating channels, a worker thread, or filesystem watchers when the feature is disabled. Live disable drops and joins the worker; live enable starts it and submits every retained session CWD. Enabled operation still makes no network request; the event only gates later CI polling.
 
+### GitHub Actions Tracking
+
+The server polls GitHub Actions only inside a window opened by a verified local push event.
+
+[[crates/scribe-server/src/github_ci.rs#spawn_tracker]] owns one [[crates/scribe-server/src/github_ci.rs#GithubCiTracker|tracker]] per process. It consumes the watcher receiver, drops active polling on live disable, and uses [[crates/scribe-server/src/git_ref_watcher.rs#GitRefWatcherControl#subscribe_changes]] to reacquire a fresh receiver after re-enable. Startup, enable, and idle paths invoke neither `gh` nor HTTP.
+
+Push-target HTTPS, SSH, and scp URLs must resolve to `github.com/{owner}/{repo}`. The pushed remote wins over any fetch remote, so fork pushes track the repository that received the push. Other hosts and malformed coordinates open no window. One `(github.com, owner/repo)` window shares state across roots and windows, and a newer pushed head replaces the prior head.
+
+[[crates/scribe-server/src/github_ci.rs#HttpGithubApi]] validates the fixed production host or an explicit loopback-only `SCRIBE_GITHUB_API_URL` before invoking `gh auth token --hostname github.com`. The token stays inside the server and only enters an Authorization header for that validated URL.
+
+The run-list request uses `head_sha`, `event=push`, and `per_page=100`, retains an ETag for the exact URL, and handles `304` without replacing state. The server-wide scheduler permits one attempt every 5 seconds and at most 720 attempts per rolling hour. A no-run window expires after 120 seconds, before a 25th request.
+
+All returned workflow runs contribute to a bounded worst-status rollup. Queued or running remains non-terminal until every workflow completes; terminal precedence is failure, cancelled, then success. Each run records its first server observation and latest observation without a date-parsing dependency.
+
+Authentication or permission failure before observation logs once and hides the window without HTTP after failed `gh` auth. Offline failures retry with bounded backoff. Failures after observation publish the last state as stale; terminal state stops polling. Tracker updates route through [[crates/scribe-server/src/ipc_server.rs#publish_ci_run_delta]], which retains capability, repository, and dismissal gates.
+
+[[crates/scribe-server/src/handoff.rs#HandoffState]] carries active descriptors, roots, discovery time, and last bounded state without credentials. The successor re-polls each descriptor once, then resumes normal cadence; older named-map handoffs default to no active CI windows.
+
 ### Clipboard Gating
 
 OSC 52 clipboard reads and writes from PTY-side programs flow through a per-session policy engine before reaching the host clipboard (spec 010). The in-memory `ServerClipboard` buffer is gone; the host clipboard is now the single source of truth.
