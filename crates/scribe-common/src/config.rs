@@ -97,6 +97,8 @@ pub struct ScribeConfig {
     #[serde(default)]
     pub workspaces: WorkspacesConfig,
     #[serde(default)]
+    pub github_ci: GithubCiConfig,
+    #[serde(default)]
     pub update: UpdateConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
@@ -1814,6 +1816,17 @@ impl Default for WorkspacesConfig {
 }
 
 // ---------------------------------------------------------------------------
+// GitHub CI
+// ---------------------------------------------------------------------------
+
+/// Global opt-in for GitHub Actions status tracking.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct GithubCiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Update
 // ---------------------------------------------------------------------------
 
@@ -2275,7 +2288,25 @@ fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AiContextThresholds, ContextBand};
+    use super::{AiContextThresholds, ContextBand, ScribeConfig};
+
+    // @lat: [[test#GitHub CI Opt-in#Config parsing]]
+    #[test]
+    fn github_ci_defaults_off_and_parses_explicit_opt_in() {
+        let default = toml::Value::try_from(ScribeConfig::default()).expect("config serializes");
+        assert_eq!(
+            default.get("github_ci").and_then(|v| v.get("enabled")).and_then(toml::Value::as_bool),
+            Some(false)
+        );
+
+        let parsed: ScribeConfig =
+            toml::from_str("[github_ci]\nenabled = true\n").expect("GitHub CI config parses");
+        let parsed = toml::Value::try_from(parsed).expect("parsed config serializes");
+        assert_eq!(
+            parsed.get("github_ci").and_then(|v| v.get("enabled")).and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
 
     #[test]
     fn ai_context_thresholds_defaults() {

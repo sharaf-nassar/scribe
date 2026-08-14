@@ -9044,6 +9044,7 @@ async fn handle_config_reloaded(server: &IpcServerState) {
         }
     }
     apply_image_master_switch(cfg.images_enabled, &sessions);
+    crate::github_ci::set_github_ci_enabled(cfg.github_ci.enabled);
     apply_reload_to_sessions(&sessions, &term_config, new_scrollback, &cfg).await;
     let sessions_len = sessions.len();
     drop(sessions);

@@ -562,6 +562,22 @@ exact kill-switch transition sequence, every viewer delivery and receipt count,
 and the typed refusal totals. It also refuses any evidence that embedded
 array-shaped payload data.
 
+## GitHub CI Opt-in
+
+Unit checks pin the default-off network boundary and its existing settings and live-reload paths.
+
+### Config parsing
+
+A missing `[github_ci]` table leaves tracking disabled, while an explicit `github_ci.enabled = true` parses as enabled.
+
+### Settings round trip
+
+The Updates page exposes a labelled toggle whose reader and apply path round-trip `github_ci.enabled` without a separate UI persistence route.
+
+### Live projection
+
+The server's process-wide eligibility value follows false, true, and false writes so `ConfigReloaded` can apply the setting without a restart or idle probe.
+
 ## Image Settings and Diagnostics
 
 The functional harness certifies the terminal-image master switch, the resources a disable frees, the diagnostic catalog, and the renderer-failure taxonomy without starting a host Scribe runtime.

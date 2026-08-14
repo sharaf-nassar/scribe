@@ -316,8 +316,11 @@ cheaply re-derivable after hot upgrade (constitution #2/#7).
   stale flag, dismissed flag (syncs across clients).
 - Per-job/step detail (expanded panel): fetched only while a window is
   active and the panel is open, if phased in.
-- Config: one new boolean key, default false (exact key name follows the
-  existing config naming conventions at implementation time).
+- Config: `github_ci.enabled`, default false.
+
+`github_ci.enabled` changes tracking eligibility live. Saving or reloading the
+setting does not invoke `gh`, test authentication, or make an HTTP request;
+those checks begin only after a later qualifying local-push gate.
 
 ## API / Interface Changes
 

@@ -12,6 +12,7 @@ pub mod child_watch;
 pub mod clipboard_state;
 pub mod config;
 pub mod env_store;
+pub mod github_ci;
 pub mod handoff;
 pub mod hook_ingress;
 pub mod image_sharing_probe;

@@ -193,6 +193,7 @@ fn misc_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         );
     }
     let v = match key {
+        "github_ci.enabled" => Value::Bool(config.github_ci.enabled),
         "update.enabled" => Value::Bool(config.update.enabled),
         "update.check_interval_hours" => json!(config.update.check_interval_secs / 3600),
         "update.channel" => enum_str(&config.update.channel),

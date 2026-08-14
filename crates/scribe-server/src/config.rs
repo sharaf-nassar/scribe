@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use scribe_common::config::{ClipboardPolicyConfig, RemoteConfig, UpdateConfig};
+use scribe_common::config::{ClipboardPolicyConfig, GithubCiConfig, RemoteConfig, UpdateConfig};
 use scribe_common::error::ScribeError;
 
 /// Maximum allowed scrollback lines to prevent excessive memory use.
@@ -40,6 +40,8 @@ pub struct ScribeConfig {
     /// reload paths, which own the transition and the resource release it
     /// implies.
     pub images_enabled: bool,
+    /// Whether a qualifying local push may start GitHub CI tracking.
+    pub github_ci: GithubCiConfig,
 }
 
 impl Default for ScribeConfig {
@@ -53,6 +55,7 @@ impl Default for ScribeConfig {
             clipboard_policy: ClipboardPolicyConfig::default(),
             remote: RemoteConfig::default(),
             images_enabled: true,
+            github_ci: GithubCiConfig::default(),
         }
     }
 }
@@ -93,6 +96,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     let clipboard_policy = full.terminal.clipboard_policy;
     let remote = full.remote;
     let images_enabled = full.terminal.images.enabled;
+    let github_ci = full.github_ci;
 
     info!(
         roots = workspace_roots.len(),
@@ -101,6 +105,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         clipboard_read_mode = ?clipboard_policy.read_mode,
         clipboard_write_mode = ?clipboard_policy.write_mode,
         images_enabled,
+        github_ci_enabled = github_ci.enabled,
         "server config loaded"
     );
 
@@ -113,6 +118,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         clipboard_policy,
         remote,
         images_enabled,
+        github_ci,
     })
 }
 

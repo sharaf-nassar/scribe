@@ -446,6 +446,7 @@ pub fn workspace_badge_color_controls(count: usize) -> Vec<Control> {
 
 fn update_controls() -> Vec<Control> {
     vec![
+        toggle("github_ci.enabled", "GitHub CI run status"),
         toggle("update.enabled", "Automatic updates"),
         stepper("update.check_interval_hours", "Check interval (hours)", (1.0, 168.0, 1.0, 0)),
         choice("update.channel", "Channel", vec![("stable", "Stable"), ("beta", "Beta")]),

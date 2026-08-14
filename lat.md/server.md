@@ -509,6 +509,8 @@ Live `ConfigReloaded` handling in  reapplies workspace roots to , then recompute
 
 The config also carries the feature-013 `[remote]` table; the same reload handler pokes the remote-control supervisor so the listener starts, stops, or rebinds live without a restart — see .
 
+`github_ci.enabled` projects into [[crates/scribe-server/src/github_ci.rs#github_ci_enabled]] at startup and on every reload. This atomic eligibility gate defaults off; changing it performs no prerequisite check or network request.
+
 ## Hook Channel
 
 Structured IPC by which AI-tool hook subprocesses report state to the server, replacing the OSC-over-`/dev/tty` path that Claude Code v2.1.139 made unusable.

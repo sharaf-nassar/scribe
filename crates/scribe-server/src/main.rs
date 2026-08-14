@@ -65,6 +65,7 @@ use scribe_server::terminal_image_handoff;
 // `pub` items dead there.
 use scribe_server::beads_board;
 use scribe_server::child_watch;
+use scribe_server::github_ci;
 mod updater;
 mod workspace_manager;
 
@@ -196,6 +197,7 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
     // switch before anything can advertise a capability. Nothing is latched
     // yet, so a disabled start simply never claims one.
     terminal_image_sharing::set_images_master_enabled(cfg.images_enabled);
+    github_ci::set_github_ci_enabled(cfg.github_ci.enabled);
 
     // Feature 013: surface the configured remote-control state at startup. The
     // listener itself is started, stopped, and rebound live off this config by
@@ -292,6 +294,7 @@ async fn run_upgrade_receiver(
     // Spec 020: the successor decides its own image policy from the file it
     // just read, before restoring any handed-off session state.
     terminal_image_sharing::set_images_master_enabled(cfg.images_enabled);
+    github_ci::set_github_ci_enabled(cfg.github_ci.enabled);
 
     // Receive handoff from the old server (blocking until complete). The IPC
     // socket comes back already claimed: `receive_handoff` takes it before it

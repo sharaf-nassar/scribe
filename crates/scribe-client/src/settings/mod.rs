@@ -52,6 +52,22 @@ mod parity_tests {
         }
     }
 
+    // @lat: [[test#GitHub CI Opt-in#Settings round trip]]
+    #[test]
+    fn github_ci_toggle_round_trips_through_the_updates_page() {
+        let control = page_controls(SettingsPage::Updates)
+            .into_iter()
+            .find(|control| control.key == "github_ci.enabled")
+            .expect("Updates page must expose GitHub CI");
+        assert!(matches!(control.kind, ControlKind::Toggle));
+
+        let mut config = ScribeConfig::default();
+        assert_eq!(current_value(&config, &control.key), false);
+        apply_config_key(&mut config, &control.key, &json!(true))
+            .expect("GitHub CI toggle applies");
+        assert_eq!(current_value(&config, &control.key), true);
+    }
+
     #[test]
     fn theme_preset_control_carries_only_the_custom_token() {
         let preset = page_controls(SettingsPage::Colors)

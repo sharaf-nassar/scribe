@@ -41,9 +41,9 @@ flavor's XDG config root into
 [[crates/scribe-common/src/config.rs#ScribeConfig]].
 
 Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads
-`~/.config/scribe-dev/config.toml`. `ScribeConfig` has eight top-level sections:
+`~/.config/scribe-dev/config.toml`. `ScribeConfig` has nine top-level sections:
 `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, `update`,
-`notifications`, and `remote`.
+`notifications`, `remote`, and `github_ci`.
 [[crates/scribe-common/src/config.rs#load_config]] returns
 `ScribeConfig::default()` when the file is absent. Prompt-bar configs still
 accept legacy `prompt_bar_bg` as an alias for `prompt_bar_second_row_bg`.
@@ -130,6 +130,12 @@ Both the server and client terminal cores inherit width from alacritty_terminal'
  holds a list of root directory paths scanned for projects and a badge color palette used to visually distinguish workspaces.
 
 When a session leaves every configured root, the server clears its workspace name and the client removes the badge, leaving only terminal tabs. A nonempty published name selects its badge colour from the configured palette; region accents still style borders and active underlines.
+
+### GitHub CI
+
+[[crates/scribe-common/src/config.rs#GithubCiConfig]] holds the global GitHub Actions tracking opt-in.
+
+`github_ci.enabled` defaults to `false`. Existing config files therefore keep GitHub integration disabled until the user explicitly enables it.
 
 ### Update
 

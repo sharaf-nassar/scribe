@@ -52,6 +52,10 @@ pub(crate) fn apply_config_key(
         key if key.starts_with("workspaces.") => {
             apply_workspace_key(config, key, value)?;
         }
+        "github_ci.enabled" => {
+            config.github_ci.enabled =
+                value.as_bool().ok_or("github_ci.enabled must be a boolean")?;
+        }
         key if key.starts_with("update.") => {
             apply_update_key(config, key, value)?;
         }

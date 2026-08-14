@@ -164,6 +164,10 @@ The settings window writes these keys itself — see [[settings#Settings#GPUI Se
 
 Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer hours, 1–168, stored internally as seconds), and `channel` (stable/beta) to select the release track.
 
+The Updates page also exposes `github_ci.enabled` as "GitHub CI run status". The existing toggle reader and apply path persist it immediately, then `ConfigReloaded` updates [[crates/scribe-server/src/github_ci.rs#github_ci_enabled]] without restarting Scribe.
+
+Enabling the setting only makes later qualifying local pushes eligible for CI tracking. The save and reload paths run no `gh` authentication probe and make no GitHub request, so idle traffic stays zero.
+
 The Updates page also exposes a "Check Now" action button that bypasses the periodic schedule entirely and works even when `enabled = false`. Clicking it sends a webview IPC of type `request_update_check`, which the host translates into a transient connection to `server.sock` carrying a `CheckForUpdates` message — see  for the server-side path. The result (`NoUpdate`, `UpdateAvailable { version, release_url }`, or `Failed { reason }`) is rendered inline as status text next to the button via the JS callback `updateCheckResult`. When the result is `UpdateAvailable`, the same broadcast that the periodic checker would emit also fires, so the regular client-side CTA appears alongside the in-settings status.
 
 The settings binary's transient `server.sock` connection is implemented in  using synchronous std I/O plus the same length-prefixed msgpack framing as the rest of the protocol. Cross-thread delivery of the response back onto the GTK main loop uses `glib::timeout_add_local` polling a `std::sync::mpsc` channel; on macOS it goes through a new `TaoUserEvent::UpdateCheckResult` variant on the existing event-loop proxy. The active glib timeout source is tracked so the window-close path can cancel any in-flight poll before the webview is dropped.
