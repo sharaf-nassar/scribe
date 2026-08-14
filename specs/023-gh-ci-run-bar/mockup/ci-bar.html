@@ -150,7 +150,7 @@
   }
   .seg {
     height: 4px; border-radius: 2px; flex: 1; position: relative;
-    background: rgba(228, 228, 231, 0.10); overflow: hidden;
+    background: rgba(228, 228, 231, 0.10);
   }
   .seg .fill {
     position: absolute; inset: 0 auto 0 0; border-radius: 2px;
@@ -171,6 +171,7 @@
     position: absolute; top: -15px; left: 1px;
     font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
     color: rgba(228, 228, 231, 0.35);
+    white-space: nowrap;
   }
   .seg.active .seg-label { color: var(--term-fg); }
   .seg.active .seg-label::before {
