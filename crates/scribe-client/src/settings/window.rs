@@ -4844,6 +4844,8 @@ impl SettingsWindow {
                     .role(Role::Group)
                     .aria_label(format!("{} colors", control.label))
                     .w(px(COLOR_PICKER_WIDTH))
+                    .ml(px(color_menu_left_offset()))
+                    .mt(px(34.0))
                     .p(px(12.0))
                     .flex()
                     .flex_col()
@@ -5191,6 +5193,10 @@ const COLOR_PALETTE_HEIGHT: f32 = 120.0;
 const COLOR_PALETTE_COLUMNS: u16 = 32;
 const COLOR_PALETTE_ROWS: u16 = 16;
 const COLOR_HUE_STEPS: u16 = 12;
+
+fn color_menu_left_offset() -> f32 {
+    CHOICE_WIDTH - COLOR_PICKER_WIDTH
+}
 
 /// Shared pending line for both keystore probes (the manual action and the
 /// toggle's gated ON transition), so the two surfaces say the same thing.
@@ -6227,8 +6233,8 @@ mod tests {
         ChoiceMenuKey, NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH,
         ScrollMetrics, ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
         build_theme_preset_cache, canonical_combo, choice_menu_key_action,
-        choice_options_from_cache, choice_scroll_offset, combo_for_capture, conflicting_action,
-        content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
+        choice_options_from_cache, choice_scroll_offset, color_menu_left_offset, combo_for_capture,
+        conflicting_action, content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
         focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
         key_combo_text, move_choice_highlight, offset_from_drag, offset_from_track_click,
         palette_color_at, px, release_inline_input, replace_pending_theme_preset,
@@ -6679,6 +6685,14 @@ mod tests {
         );
         assert_eq!(inline_placeholder("appearance.font_family", false), "Not set");
         assert_eq!(inline_placeholder("theme.background", true), "#rrggbb");
+    }
+
+    // @lat: [[test#GPUI Settings Window#Color selector menu geometry]]
+    #[test]
+    fn color_menu_right_aligns_with_its_trigger() {
+        let right_edge = color_menu_left_offset() + super::COLOR_PICKER_WIDTH;
+
+        assert!((right_edge - super::CHOICE_WIDTH).abs() < f32::EPSILON);
     }
 
     // @lat: [[test#GPUI Settings Window#Color selector palette]]

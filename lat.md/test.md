@@ -4013,6 +4013,10 @@ Repeated Left/Right steps update the closed preset label immediately but settle 
 
 The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.
 
+### Color selector menu geometry
+
+The color menu clears its compact trigger and aligns their right edges, preserving the source row while the wider palette is open.
+
 ### Keybinding coverage
 
 The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through  without panicking, so no shortcut silently disappears.

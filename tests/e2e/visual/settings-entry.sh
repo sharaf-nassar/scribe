@@ -79,12 +79,13 @@ SETTINGS_STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}
 # 14px inter-group gap: 38+42+14+28+32+14+28+16 = 212.
 FILTERED_WORKSPACES_X=140
 FILTERED_WORKSPACES_Y=212
-# Fixed 1040×720 composition: the tall color picker snaps inside the right and
-# bottom edges. These points land on its green hue swatch and custom palette.
-COLOR_PICKER_HUE_X=865
-COLOR_PICKER_HUE_Y=513
-COLOR_PICKER_PALETTE_X=930
-COLOR_PICKER_PALETTE_Y=575
+# Fixed 1040×720 composition: the color picker is right-aligned with its
+# trigger and offset below it. These measured points land on its green hue
+# swatch and custom palette.
+COLOR_PICKER_HUE_X=825
+COLOR_PICKER_HUE_Y=547
+COLOR_PICKER_PALETTE_X=890
+COLOR_PICKER_PALETTE_Y=609
 
 TERM_X=0
 TERM_Y=0

@@ -378,9 +378,11 @@ Every color control uses one anchored selector with named presets, a hue strip, 
 
 [[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_color_selector]]
 keeps the saved canonical value and its swatch visible on the compact trigger.
-Enter or Space opens the anchored palette, Left and Right apply presets, and
-Tab enters the exact-value field. Preset and custom-palette choices commit
-immediately through [[crates/scribe-client/src/settings/window.rs#SettingsWindow#select_color]],
+The 280px palette opens 4px below the trigger and aligns its right edge with
+the 240px control, so the source row stays readable. Enter or Space opens the
+anchored palette, Left and Right apply presets, and Tab enters the exact-value
+field. Preset and custom-palette choices commit immediately through
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#select_color]],
 which reuses the existing validator and config writer rather than adding a
 second persistence path. The custom canvas maps pointer position to continuous
 saturation and brightness for the chosen hue. Preset, hue, and canvas nodes are
