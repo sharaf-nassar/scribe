@@ -124,10 +124,12 @@ Acceptance criteria:
   mock, SVG, or annotated screenshot) and referenced from the spec.
 - User has seen and approved the mockup direction.
 
-Delivered: `specs/023-gh-ci-run-bar/mockup/ci-bar.html` (eight full-window
-vignettes in minimal-dark), with the design rules and ownership conclusion
-in `specs/023-gh-ci-run-bar/research.md`. Approval pending at the
-scribe-gygu.5 gate.
+Delivered and APPROVED (user, 2026-08-14):
+`specs/023-gh-ci-run-bar/mockup/ci-bar.html` — the trace direction — is
+the binding visual reference for implementation; implement exactly that
+(recorded on beads scribe-gygu.10/.11/.14 and the epic). Design rules and
+research live in `specs/023-gh-ci-run-bar/research.md`. The transport
+recommendation's approval is tracked at the scribe-gygu.5 gate.
 
 ### Story 4 — Implementation: CI bar in the workspace (sequenced later)
 
