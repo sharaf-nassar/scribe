@@ -579,6 +579,7 @@ e2e: build-release docker-func
         func/ai-state-indicator.sh
         func/attach-lossless.sh
         func/beads-board.sh
+        func/ci-run-bar.sh
         func/ci-run-details.sh
         func/cli-smoke.sh
         func/codex-subagent-hooks.sh

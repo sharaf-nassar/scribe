@@ -4,12 +4,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::{Regex, RegexBuilder};
+use scribe_client::ci_bar::{CiActionMode, CiBarModel, CiRunBars};
 use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
@@ -20,13 +21,16 @@ use scribe_common::protocol::{
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
+use scribe_common::terminal_images::TerminalImageCapabilities;
+use tokio::io::AsyncRead;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::cmd_socket::{
-    DaemonRequest, DaemonResponse, ReplayFrameInfo, daemon_socket_path, send_request,
+    CiRunObservation, DaemonRequest, DaemonResponse, ReplayFrameInfo, daemon_socket_path,
+    send_request,
 };
 use crate::replay::ReplayView;
 
@@ -169,6 +173,8 @@ struct DaemonState {
     last_action: Option<AutomationAction>,
     /// Most recent terminal Beads-board reply, paired with its workspace.
     beads_board: Option<(WorkspaceId, BeadsBoardState)>,
+    /// Production client state seam fed by capability-gated CI IPC.
+    ci_runs: CiRunBars,
 }
 
 impl DaemonState {
@@ -181,6 +187,7 @@ impl DaemonState {
             envelope_ids: HashMap::new(),
             last_action: None,
             beads_board: None,
+            ci_runs: CiRunBars::default(),
         }
     }
 }
@@ -307,6 +314,180 @@ pub fn set_ci_run_details_interest(
             reason: format!("unexpected daemon response: {other:?}"),
         }),
     }
+}
+
+/// Print the client-model CI observation for one repository as JSON.
+pub fn print_ci_run_state(repo_root: PathBuf) -> Result<(), ScribeError> {
+    let response = send_request(&DaemonRequest::RequestCiRunState { repo_root })?;
+    match response {
+        DaemonResponse::CiRunState { observation } => print_ci_observation(&observation),
+        DaemonResponse::Error { message } => Err(ScribeError::IpcError { reason: message }),
+        other => Err(ScribeError::ProtocolError {
+            reason: format!("unexpected daemon response: {other:?}"),
+        }),
+    }
+}
+
+/// Join the daemon's window as a capable viewer and print the first matching CI projection.
+pub async fn observe_ci_run(
+    window_id: WindowId,
+    repo_root: PathBuf,
+    head_sha: String,
+    stale: bool,
+    timeout: Duration,
+) -> Result<(), ScribeError> {
+    let stream = crate::ipc::connect().await?;
+    let (mut reader, mut writer) = stream.into_split();
+    crate::ipc::send(
+        &mut writer,
+        &ClientMessage::Hello {
+            window_id: Some(window_id),
+            clipboard_gating: false,
+            takeover: false,
+            join_window: true,
+            terminal_images: TerminalImageCapabilities::default(),
+            ci_run_bar: true,
+        },
+    )
+    .await?;
+    let target = CiRunTarget { head_sha: &head_sha, stale };
+    let observation =
+        observe_shared_ci_messages(&mut reader, window_id, &repo_root, target, timeout).await?;
+    print_ci_observation(&observation)
+}
+
+fn print_ci_observation(observation: &CiRunObservation) -> Result<(), ScribeError> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, observation).map_err(|error| {
+        ScribeError::ProtocolError { reason: format!("failed to encode CI observation: {error}") }
+    })?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CiRunTarget<'a> {
+    head_sha: &'a str,
+    stale: bool,
+}
+
+async fn observe_shared_ci_messages<R>(
+    reader: &mut R,
+    window_id: WindowId,
+    repo_root: &Path,
+    target: CiRunTarget<'_>,
+    timeout: Duration,
+) -> Result<CiRunObservation, ScribeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let CiRunTarget { head_sha, stale } = target;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut participant_id = None;
+    let mut joined = false;
+    let mut ci_runs = CiRunBars::default();
+
+    loop {
+        let message =
+            tokio::time::timeout_at(deadline, read_message(reader)).await.map_err(|_| {
+                ScribeError::IpcError {
+                    reason: format!(
+                        "timed out waiting for CI head {head_sha} stale={stale} as a shared viewer"
+                    ),
+                }
+            })??;
+        match message {
+            ServerMessage::Welcome {
+                window_id: assigned,
+                participant_id: assigned_participant,
+                ..
+            } => {
+                if assigned != window_id {
+                    return Err(ScribeError::ProtocolError {
+                        reason: format!(
+                            "shared observer joined {assigned}, expected daemon window {window_id}"
+                        ),
+                    });
+                }
+                participant_id = assigned_participant;
+                if participant_id.is_none() {
+                    return Err(ScribeError::ProtocolError {
+                        reason: "shared observer was not registered as a participant".to_owned(),
+                    });
+                }
+            }
+            ServerMessage::ShareRoster {
+                window_id: roster_window,
+                participants,
+                mode: scribe_common::config::SharingMode::SharedSingleTypist,
+                holder: Some(holder),
+            } if roster_window == window_id => {
+                let Some(self_id) = participant_id else {
+                    continue;
+                };
+                let viewer = participants.iter().find(|participant| {
+                    participant.participant_id == self_id && !participant.is_holder
+                });
+                let owner = participants.iter().find(|participant| {
+                    participant.participant_id == holder && participant.is_holder
+                });
+                if !joined
+                    && participants.len() == 2
+                    && viewer.is_some()
+                    && owner.is_some()
+                    && holder != self_id
+                {
+                    joined = true;
+                    signal_ci_observer_ready(window_id, self_id, participants.len())?;
+                }
+            }
+            ServerMessage::CiRunState { repo_root: received_root, delta }
+                if joined && received_root == repo_root =>
+            {
+                ci_runs.apply(received_root, delta);
+                if ci_runs
+                    .get(repo_root)
+                    .is_some_and(|state| state.head_sha == head_sha && state.stale == stale)
+                {
+                    return Ok(ci_run_observation(&ci_runs, repo_root, false));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn signal_ci_observer_ready(
+    window_id: WindowId,
+    participant_id: u64,
+    participants: usize,
+) -> Result<(), ScribeError> {
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "READY: joined {} as viewer {participant_id} with {participants} participants",
+        window_id.to_full_string()
+    )?;
+    stderr.flush()?;
+    Ok(())
+}
+
+fn ci_run_observation(
+    ci_runs: &CiRunBars,
+    repo_root: &Path,
+    owner_controls: bool,
+) -> CiRunObservation {
+    let state = ci_runs.get(repo_root).cloned();
+    let (action_mode, open_url) = state.as_ref().map_or((None, None), |state| {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let model = CiBarModel::build(state, now, owner_controls);
+        let mode = match model.action_mode {
+            CiActionMode::Owner => "owner",
+            CiActionMode::ReadOnly => "read_only",
+        };
+        (Some(mode.to_owned()), model.open_url)
+    });
+    CiRunObservation { state, action_mode, open_url }
 }
 
 /// Run the daemon event loop (foreground). This is the `daemon run` entry.
@@ -453,7 +634,9 @@ async fn dispatch_server_message(
         | ServerMessage::ReleaseList { .. }
         | ServerMessage::WindowList { .. }
         | ServerMessage::RunAction { .. }
-        | ServerMessage::ActionDispatched { .. }) => {
+        | ServerMessage::ActionDispatched { .. }
+        | ServerMessage::CiRunState { .. }
+        | ServerMessage::CiRunDetails { .. }) => {
             dispatch_window_message(msg, state, notifiers).await;
         }
         msg @ (ServerMessage::CodexTaskLabelChanged { .. }
@@ -495,8 +678,6 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageLive { .. }
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
-        | ServerMessage::CiRunState { .. }
-        | ServerMessage::CiRunDetails { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
@@ -608,6 +789,12 @@ async fn dispatch_window_message(
         }
         ServerMessage::ActionDispatched { window_id } => {
             debug!(%window_id, "action dispatched (ignored by test daemon)");
+        }
+        ServerMessage::CiRunState { repo_root, delta } => {
+            state.lock().await.ci_runs.apply(repo_root, delta);
+        }
+        ServerMessage::CiRunDetails { repo_root, details } => {
+            state.lock().await.ci_runs.apply_details(repo_root, details);
         }
         other => debug!(?other, "ignored non-window server message in window dispatcher"),
     }
@@ -1017,7 +1204,8 @@ async fn process_request(
         }
         request @ (DaemonRequest::RequestAiChrome { .. }
         | DaemonRequest::RequestBeadsBoard
-        | DaemonRequest::SetCiRunDetailsInterest { .. }) => {
+        | DaemonRequest::SetCiRunDetailsInterest { .. }
+        | DaemonRequest::RequestCiRunState { .. }) => {
             handle_chrome_request(request, state, notifiers, server_writer).await
         }
         DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
@@ -1057,8 +1245,16 @@ async fn handle_chrome_request(
         DaemonRequest::SetCiRunDetailsInterest { repo_root, head_sha, interested } => {
             handle_ci_detail_interest(repo_root, head_sha, interested, server_writer).await
         }
+        DaemonRequest::RequestCiRunState { repo_root } => {
+            handle_ci_run_state(repo_root, state).await
+        }
         _ => DaemonResponse::Error { message: "invalid chrome request".to_owned() },
     }
+}
+
+async fn handle_ci_run_state(repo_root: PathBuf, state: &SharedState) -> DaemonResponse {
+    let observation = ci_run_observation(&state.lock().await.ci_runs, &repo_root, true);
+    DaemonResponse::CiRunState { observation }
 }
 
 async fn handle_ci_detail_interest(
@@ -2160,4 +2356,97 @@ async fn send_to_server(
 ) -> Result<(), ScribeError> {
     let mut guard = writer.lock().await;
     crate::ipc::send(&mut guard, msg).await
+}
+
+#[cfg(test)]
+mod tests {
+    use scribe_common::config::SharingMode;
+    use scribe_common::framing::write_message;
+    use scribe_common::protocol::{
+        CiRunDelta, CiRunState, CiRunStatus, CiWorkflowRun, CiWorkflowStatus, ParticipantInfo,
+    };
+    use tokio::io::duplex;
+
+    use super::*;
+
+    fn participant(participant_id: u64, is_holder: bool) -> ParticipantInfo {
+        ParticipantInfo {
+            participant_id,
+            device_name: "local".to_owned(),
+            login_name: String::new(),
+            is_local: true,
+            is_holder,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_ci_observer_projects_fanout_as_read_only() {
+        let window_id = WindowId::new();
+        let repo_root = PathBuf::from("/work/scribe");
+        let (mut server, mut observer) = duplex(4096);
+        let observed_root = repo_root.clone();
+        let task = tokio::spawn(async move {
+            observe_shared_ci_messages(
+                &mut observer,
+                window_id,
+                &observed_root,
+                CiRunTarget { head_sha: "head-a", stale: false },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+        });
+
+        write_message(
+            &mut server,
+            &ServerMessage::Welcome {
+                window_id,
+                other_windows: Vec::new(),
+                clipboard_gating: true,
+                participant_id: Some(2),
+                terminal_images: TerminalImageCapabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut server,
+            &ServerMessage::ShareRoster {
+                window_id,
+                participants: vec![participant(1, true), participant(2, false)],
+                mode: SharingMode::SharedSingleTypist,
+                holder: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut server,
+            &ServerMessage::CiRunState {
+                repo_root: repo_root.clone(),
+                delta: CiRunDelta::Set(CiRunState {
+                    repository: "acme/scribe".to_owned(),
+                    head_sha: "head-a".to_owned(),
+                    branch: "main".to_owned(),
+                    workflows: vec![CiWorkflowRun {
+                        run_id: 42,
+                        name: "quality".to_owned(),
+                        status: CiWorkflowStatus::Queued,
+                        conclusion: None,
+                        started_at_epoch_secs: None,
+                        updated_at_epoch_secs: None,
+                    }],
+                    rollup: CiRunStatus::Queued,
+                    stale: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let observation = task.await.unwrap();
+        assert_eq!(observation.state.unwrap().head_sha, "head-a");
+        assert_eq!(observation.action_mode.as_deref(), Some("read_only"));
+        assert!(observation.open_url.is_none());
+    }
 }

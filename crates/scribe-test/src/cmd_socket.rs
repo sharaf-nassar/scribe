@@ -4,7 +4,7 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
-use scribe_common::protocol::{AiResumeMode, AutomationAction, BeadsBoardState};
+use scribe_common::protocol::{AiResumeMode, AutomationAction, BeadsBoardState, CiRunState};
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -129,6 +129,10 @@ pub enum DaemonRequest {
         head_sha: String,
         interested: bool,
     },
+    /// Read one repository through the production client's CI state/model seam.
+    RequestCiRunState {
+        repo_root: PathBuf,
+    },
     /// Ask what `SessionReplay` frames the daemon has applied for a session.
     ///
     /// `min_frames` blocks until that many frames have been applied — the
@@ -189,6 +193,9 @@ pub enum DaemonResponse {
     BeadsBoard {
         state: BeadsBoardState,
     },
+    CiRunState {
+        observation: CiRunObservation,
+    },
     /// The window id the server assigned the daemon (`Welcome`), or an error
     /// when no `Welcome` has arrived yet.
     WindowId {
@@ -219,6 +226,14 @@ pub enum DaemonResponse {
     Error {
         message: String,
     },
+}
+
+/// Test-only projection of the state and actions a client would render.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CiRunObservation {
+    pub state: Option<CiRunState>,
+    pub action_mode: Option<String>,
+    pub open_url: Option<String>,
 }
 
 /// One applied `SessionReplay`, as the harness observed it.

@@ -41,6 +41,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use scribe_common::ai_state::AiProvider;
+use scribe_common::ids::WindowId;
 use scribe_common::protocol::AiResumeMode;
 
 // ---------------------------------------------------------------------------
@@ -477,6 +478,24 @@ enum DaemonAction {
         #[arg(long, action = clap::ArgAction::Set)]
         interested: bool,
     },
+    /// Print client-model CI state for one repository as JSON.
+    CiState {
+        #[arg(long)]
+        repo_root: PathBuf,
+    },
+    /// Join the daemon window and print one fanout CI state as a viewer.
+    CiObserver {
+        #[arg(long)]
+        window_id: WindowId,
+        #[arg(long)]
+        repo_root: PathBuf,
+        #[arg(long)]
+        head_sha: String,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        stale: bool,
+        #[arg(long, default_value_t = 10_000)]
+        timeout: u64,
+    },
     /// Internal: run the daemon in the foreground (not user-facing).
     Run,
 }
@@ -798,6 +817,20 @@ fn run_daemon(action: &DaemonAction) -> Result<(), TestError> {
             daemon::set_ci_run_details_interest(repo_root.clone(), head_sha.clone(), *interested)
                 .map_err(|e| TestError::InfraError(e.to_string()))
         }
+        DaemonAction::CiState { repo_root } => {
+            drop(rt);
+            daemon::print_ci_run_state(repo_root.clone())
+                .map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        DaemonAction::CiObserver { window_id, repo_root, head_sha, stale, timeout } => rt
+            .block_on(daemon::observe_ci_run(
+                *window_id,
+                repo_root.clone(),
+                head_sha.clone(),
+                *stale,
+                std::time::Duration::from_millis(*timeout),
+            ))
+            .map_err(|e| TestError::InfraError(e.to_string())),
         DaemonAction::Run => {
             rt.block_on(daemon::run()).map_err(|e| TestError::InfraError(e.to_string()))
         }

@@ -687,6 +687,20 @@ The fixture binds only `127.0.0.1`, filters workflow runs by `head_sha`, serves 
 
 One script proves the same binary and API-base env seam in both `--network none` images.
 
+## GitHub CI Functional E2E
+
+Docker coverage drives the real push watcher, tracker, capable IPC, and client state model against the loopback Actions fixture.
+
+[[crates/scribe-test/src/daemon.rs#handle_ci_run_state]] exposes the owner's state, while [[crates/scribe-test/src/daemon.rs#observe_shared_ci_messages]] requires a real two-participant share before projecting fanout. Both reuse [[crates/scribe-client/src/ci_bar.rs#CiRunBars#apply]] and [[crates/scribe-client/src/ci_bar.rs#CiBarModel#build]].
+
+### Push-gated client state progression
+
+A local bare-repository push produces the first visible state within 10 seconds, progresses to success, and leaves the last running state stale when the API disappears.
+
+The same run proves zero requests after a disabled push and across one enabled idle scheduler interval. Before the enabled push, a second capable local connection sets explicit join intent and proves it is the non-holder in the daemon window's two-person roster.
+
+That participant stays connected through the final production `CiRunState` fanout. Its client model receives exactly the owner's head and state, exposes no host action, and leaves the daemon owner with its trusted run URL.
+
 ## Image Settings and Diagnostics
 
 The functional harness certifies the terminal-image master switch, the resources a disable frees, the diagnostic catalog, and the renderer-failure taxonomy without starting a host Scribe runtime.
