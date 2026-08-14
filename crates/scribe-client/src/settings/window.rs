@@ -312,6 +312,9 @@ pub struct SettingsWindow {
     /// Config key of the choice control whose dropdown is currently open, or
     /// `None` when no menu is showing. At most one menu is open at a time.
     open_choice: Option<String>,
+    /// Token of the open menu row moved by Up/Down. This stays separate from
+    /// the applied value so keyboard browsing never previews or commits early.
+    choice_highlight: Option<String>,
     /// Scroll position of that dropdown. Shared because only one is ever open,
     /// and rewound on open so the live value is on screen even in the ~190-entry
     /// theme preset list.
@@ -414,6 +417,15 @@ enum DismissedTransient {
     ChoiceFilter,
     ChoiceMenu,
     PageSearch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChoiceMenuKey {
+    Previous,
+    Next,
+    Apply,
+    Dismiss,
+    Swallow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -709,6 +721,7 @@ impl SettingsWindow {
             should_move: false,
             scroll_handle: ScrollHandle::new(),
             open_choice: None,
+            choice_highlight: None,
             choice_scroll: ScrollHandle::new(),
             open_color: None,
             color_hue: 0.0,
@@ -1484,7 +1497,7 @@ impl SettingsWindow {
         self.input_selection = NativeInputSelection::Caret;
         self.clear_active_input_error();
         if filters_choice {
-            self.choice_scroll.set_offset(Point::default());
+            self.align_choice_highlight();
         }
     }
 
@@ -1502,7 +1515,7 @@ impl SettingsWindow {
         self.input_selection = NativeInputSelection::Caret;
         self.clear_active_input_error();
         if filters_choice {
-            self.choice_scroll.set_offset(Point::default());
+            self.align_choice_highlight();
         }
     }
 
@@ -1647,6 +1660,18 @@ impl SettingsWindow {
             self.handle_search_key(event, window, cx);
             return;
         }
+        // An open choice owns navigation before either its filter input or the
+        // page traversal can see it. Printable filter text still propagates to
+        // GPUI's native input path.
+        if self.open_choice.is_some() {
+            let handled = self.handle_open_choice_key(event, window, cx)
+                || (self.choice_filter_handle.is_focused(window)
+                    && self.handle_native_input_key(event, window, cx));
+            if handled {
+                cx.stop_propagation();
+            }
+            return;
+        }
         if (self.workspace_root_handle.is_focused(window)
             || self.edit_handle.is_focused(window)
             || self.choice_filter_handle.is_focused(window))
@@ -1717,7 +1742,7 @@ impl SettingsWindow {
         ) {
             Some(DismissedTransient::ChoiceFilter) => {
                 self.choice_filter_marked_range = None;
-                self.choice_scroll.set_offset(Point::default());
+                self.align_choice_highlight();
             }
             Some(DismissedTransient::ChoiceMenu) => {
                 self.choice_filter_marked_range = None;
@@ -1730,6 +1755,26 @@ impl SettingsWindow {
             None => return false,
         }
         cx.notify();
+        true
+    }
+
+    fn handle_open_choice_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(action) = choice_menu_key_action(&event.keystroke.key, event.keystroke.modifiers)
+        else {
+            return false;
+        };
+        match action {
+            ChoiceMenuKey::Previous => self.move_choice_menu_highlight(-1, cx),
+            ChoiceMenuKey::Next => self.move_choice_menu_highlight(1, cx),
+            ChoiceMenuKey::Apply => self.apply_choice_highlight(window, cx),
+            ChoiceMenuKey::Dismiss => self.cancel_native_input(window, cx),
+            ChoiceMenuKey::Swallow => {}
+        }
         true
     }
 
@@ -2445,7 +2490,7 @@ impl EntityInputHandler for SettingsWindow {
         self.input_selection = NativeInputSelection::Caret;
         self.clear_active_input_error();
         if filters_choice {
-            self.choice_scroll.set_offset(Point::default());
+            self.align_choice_highlight();
         }
         cx.notify();
     }
@@ -2476,7 +2521,7 @@ impl EntityInputHandler for SettingsWindow {
         self.input_selection = NativeInputSelection::Caret;
         self.clear_active_input_error();
         if filters_choice {
-            self.choice_scroll.set_offset(Point::default());
+            self.align_choice_highlight();
         }
         cx.notify();
     }
@@ -3943,6 +3988,7 @@ impl SettingsWindow {
             .enumerate()
             .map(|(index, (option, label))| {
                 let selected = *option == token;
+                let highlighted = self.choice_highlight.as_deref() == Some(option.as_str());
                 let (commit_key, commit_value) = (control.key.clone(), option.clone());
                 let preview = theme_preset_preview(
                     &self.config,
@@ -3972,6 +4018,9 @@ impl SettingsWindow {
                     .text_sm()
                     .text_color(if selected { colors.accent } else { colors.text })
                     .cursor_pointer()
+                    .when(highlighted, |row| {
+                        row.bg(colors.control_hover_bg).aria_active_descendant()
+                    })
                     .hover(move |style| style.bg(colors.control_hover_bg))
                     .active(move |style| style.bg(colors.control_pressed_bg))
                     .on_click(cx.listener(move |this, _, choice_window, ctx| {
@@ -4028,6 +4077,7 @@ impl SettingsWindow {
             .id(("choice-menu", key_hash(&control.key)))
             .role(Role::Menu)
             .aria_label(control.label.clone())
+            .when(theme_menu, |menu| menu.track_focus(&self.choice_filter_handle))
             .w(px(CHOICE_WIDTH))
             .mt(px(34.0))
             .max_h(px(CHOICE_MENU_MAX_HEIGHT))
@@ -4076,7 +4126,6 @@ impl SettingsWindow {
             .child(
                 div()
                     .id("theme-preset-filter")
-                    .track_focus(&focus)
                     .role(Role::SearchInput)
                     .aria_label("Filter themes")
                     .aria_placeholder("Filter themes")
@@ -4168,11 +4217,97 @@ impl SettingsWindow {
         let value = current_value(&self.config, key);
         let token = value.as_str().unwrap_or("");
         let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
+        self.choice_highlight = options.get(index).map(|(candidate, _)| candidate.clone());
         self.choice_scroll.set_offset(point(px(0.0), choice_scroll_offset(index)));
+    }
+
+    fn open_choice_control(&self) -> Option<Control> {
+        let open_key = self.open_choice.as_deref()?;
+        let SettingsFocusTarget::Control(control) = self.focused_target()? else {
+            return None;
+        };
+        if !matches!(control.kind, ControlKind::Choice(_)) || control.key != open_key {
+            return None;
+        }
+        Some(control)
+    }
+
+    fn align_choice_highlight(&mut self) {
+        let Some(control) = self.open_choice_control() else {
+            self.choice_highlight = None;
+            return;
+        };
+        let ControlKind::Choice(declared) = &control.kind else {
+            return;
+        };
+        let selected = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let options = self.choice_options(&control.key, declared);
+        let query = if control.key == "theme.preset" { &self.choice_filter } else { "" };
+        let filtered = filter_choice_options(&options, query);
+        let highlighted = self.choice_highlight.as_deref();
+        let index = highlighted
+            .and_then(|token| filtered.iter().position(|(candidate, _)| candidate == token))
+            .or_else(|| filtered.iter().position(|(candidate, _)| candidate == &selected))
+            .or((!filtered.is_empty()).then_some(0));
+        self.choice_highlight =
+            index.and_then(|index| filtered.get(index)).map(|row| row.0.clone());
+        self.choice_scroll.set_offset(point(px(0.0), index.map_or(px(0.0), choice_scroll_offset)));
+    }
+
+    fn move_choice_menu_highlight(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let Some(control) = self.open_choice_control() else {
+            return;
+        };
+        let ControlKind::Choice(declared) = &control.kind else {
+            return;
+        };
+        let selected = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let options = self.choice_options(&control.key, declared);
+        let query = if control.key == "theme.preset" { &self.choice_filter } else { "" };
+        let filtered = filter_choice_options(&options, query);
+        let current = self
+            .choice_highlight
+            .as_deref()
+            .and_then(|token| filtered.iter().position(|(candidate, _)| candidate == token))
+            .or_else(|| filtered.iter().position(|(candidate, _)| candidate == &selected));
+        let Some(next) = move_choice_highlight(current, filtered.len(), direction) else {
+            self.choice_highlight = None;
+            return;
+        };
+        let Some((token, _)) = filtered.get(next) else {
+            return;
+        };
+        self.choice_highlight = Some(token.clone());
+        self.choice_scroll.set_offset(point(px(0.0), choice_scroll_offset(next)));
+        cx.notify();
+    }
+
+    fn apply_choice_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(control) = self.open_choice_control() else {
+            return;
+        };
+        let ControlKind::Choice(declared) = &control.kind else {
+            return;
+        };
+        let options = self.choice_options(&control.key, declared);
+        let query = if control.key == "theme.preset" { &self.choice_filter } else { "" };
+        let filtered = filter_choice_options(&options, query);
+        let Some(token) = self
+            .choice_highlight
+            .as_deref()
+            .filter(|token| filtered.iter().any(|(candidate, _)| candidate == token))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.clear_choice_menu_state();
+        window.focus(&self.focus_handle, cx);
+        self.commit(&control.key, Value::String(token), cx);
     }
 
     fn clear_choice_menu_state(&mut self) -> bool {
         let was_open = self.open_choice.take().is_some();
+        self.choice_highlight = None;
         self.choice_filter.clear();
         self.choice_filter_marked_range = None;
         if self.active_input == Some(NativeInputTarget::ChoiceFilter) {
@@ -5270,6 +5405,32 @@ fn filter_choice_options<'a>(
     options.iter().filter(|(_, label)| label.to_lowercase().contains(&query)).collect()
 }
 
+fn choice_menu_key_action(key: &str, modifiers: Modifiers) -> Option<ChoiceMenuKey> {
+    if modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+    match key {
+        "up" => Some(ChoiceMenuKey::Previous),
+        "down" => Some(ChoiceMenuKey::Next),
+        "enter" => Some(ChoiceMenuKey::Apply),
+        "escape" => Some(ChoiceMenuKey::Dismiss),
+        "left" | "right" | "tab" => Some(ChoiceMenuKey::Swallow),
+        _ => None,
+    }
+}
+
+fn move_choice_highlight(current: Option<usize>, count: usize, direction: isize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match current.filter(|index| *index < count) {
+        Some(index) if direction.is_negative() => Some((index + count - 1) % count),
+        Some(index) => Some((index + 1) % count),
+        None if direction.is_negative() => Some(count - 1),
+        None => Some(0),
+    }
+}
+
 fn dismiss_choice_or_search(
     choice_filter: &mut String,
     open_choice: &mut Option<String>,
@@ -5949,12 +6110,13 @@ fn logical_i32(value: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH, ScrollMetrics,
-        ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
-        build_theme_preset_cache, canonical_combo, choice_options_from_cache, choice_scroll_offset,
-        combo_for_capture, conflicting_action, content_scroll_offset, dismiss_choice_or_search,
-        filter_choice_options, focus_targets_match, inline_commit_value, inline_placeholder,
-        is_modifier_key, key_combo_text, offset_from_drag, offset_from_track_click,
+        ChoiceMenuKey, NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH,
+        ScrollMetrics, ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
+        build_theme_preset_cache, canonical_combo, choice_menu_key_action,
+        choice_options_from_cache, choice_scroll_offset, combo_for_capture, conflicting_action,
+        content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
+        focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
+        key_combo_text, move_choice_highlight, offset_from_drag, offset_from_track_click,
         palette_color_at, px, release_inline_input, revert_inline_input, search_display_text,
         theme_preset_preview, utf16_range_to_utf8, workspace_badge_color_controls,
         workspace_root_controls_match_query, workspace_root_focus_index,
@@ -6117,6 +6279,49 @@ mod tests {
             Some(super::DismissedTransient::PageSearch)
         );
         assert!(search.is_empty());
+    }
+
+    // @lat: [[test#GPUI Settings Window#Theme preset filtering#Keyboard routing]]
+    #[test]
+    fn open_choice_keys_stay_inside_the_menu() {
+        let modifiers = Modifiers::default();
+        assert_eq!(choice_menu_key_action("up", modifiers), Some(ChoiceMenuKey::Previous));
+        assert_eq!(choice_menu_key_action("down", modifiers), Some(ChoiceMenuKey::Next));
+        assert_eq!(choice_menu_key_action("enter", modifiers), Some(ChoiceMenuKey::Apply));
+        assert_eq!(choice_menu_key_action("escape", modifiers), Some(ChoiceMenuKey::Dismiss));
+        assert_eq!(choice_menu_key_action("left", modifiers), Some(ChoiceMenuKey::Swallow));
+        assert_eq!(choice_menu_key_action("right", modifiers), Some(ChoiceMenuKey::Swallow));
+        assert_eq!(choice_menu_key_action("tab", modifiers), Some(ChoiceMenuKey::Swallow));
+        assert_eq!(choice_menu_key_action("space", modifiers), None);
+    }
+
+    // @lat: [[test#GPUI Settings Window#Theme preset filtering#Modified Tab routing]]
+    #[test]
+    fn open_choice_swallows_plain_and_shift_tab() {
+        assert_eq!(
+            choice_menu_key_action("tab", Modifiers::default()),
+            Some(ChoiceMenuKey::Swallow)
+        );
+        assert_eq!(
+            choice_menu_key_action("tab", Modifiers { shift: true, ..Modifiers::default() }),
+            Some(ChoiceMenuKey::Swallow)
+        );
+    }
+
+    // @lat: [[test#GPUI Settings Window#Theme preset filtering#Filtered highlight]]
+    #[test]
+    fn choice_highlight_moves_only_through_filtered_rows() {
+        let options = vec![
+            (String::from("day"), String::from("Day")),
+            (String::from("dark"), String::from("Dark")),
+            (String::from("darker"), String::from("Darker")),
+        ];
+        let filtered = filter_choice_options(&options, "dark");
+
+        assert_eq!(move_choice_highlight(Some(0), filtered.len(), 1), Some(1));
+        assert_eq!(move_choice_highlight(Some(1), filtered.len(), 1), Some(0));
+        assert_eq!(move_choice_highlight(Some(0), filtered.len(), -1), Some(1));
+        assert_eq!(move_choice_highlight(None, 0, 1), None);
     }
 
     #[test]

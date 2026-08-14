@@ -3981,6 +3981,18 @@ Case-insensitive display-label substrings narrow all 193 preset and Custom rows,
 
 Successive Escape presses clear preset-filter text, close its menu, then clear page search so each transient layer unwinds independently.
 
+#### Keyboard routing
+
+Open-menu key routing sends Up/Down, Enter, and Escape to menu actions, consumes Left/Right and Tab, and leaves Space to the native filter input.
+
+#### Modified Tab routing
+
+An open menu consumes both Tab and Shift+Tab so reverse traversal cannot move page focus behind the menu.
+
+#### Filtered highlight
+
+Highlight movement wraps at both ends using the filtered row count and yields no row for an empty result.
+
 ### Color selector palette
 
 The shared selector maps clickable interior palette points to canonical hue-correct colors, while keyboard preset stepping moves both directions through the fixed order.
