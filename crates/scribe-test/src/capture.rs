@@ -57,6 +57,24 @@ pub fn ai_chrome(session_id: &str) -> Result<(), TestError> {
     }
 }
 
+/// Refresh the current workspace's Beads board and print its terminal state.
+pub fn beads_board() -> Result<(), TestError> {
+    let response = send_request(&DaemonRequest::RequestBeadsBoard)
+        .map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::BeadsBoard { state } => {
+            serde_json::to_writer(io::stdout().lock(), &state)
+                .map_err(|e| TestError::InfraError(format!("failed to serialize board: {e}")))?;
+            writeln!(io::stdout())
+                .map_err(|e| TestError::InfraError(format!("failed to write board: {e}")))?;
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
 /// Capture a text snapshot of a session and save it as JSON.
 pub fn snapshot(session_id: &str, path: &Path) -> Result<(), TestError> {
     let id = SessionId::from_str(session_id)

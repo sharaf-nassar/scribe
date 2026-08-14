@@ -231,7 +231,7 @@ fn bd_search_dirs(path: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
 async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<Vec<u8>, RunError> {
     let mut command = Command::new(&bd.exe);
     command
-        .args(["--readonly", "--json", "--no-color", "-C"])
+        .args(["--readonly", "--json", "-C"])
         .arg(project_root)
         .args(command_args)
         // `-C` does not cover everything: `bd context` resolves the repository
@@ -555,7 +555,7 @@ mod tests {
         // Stands in for a `--json` failure: the reason goes to stdout, not stderr.
         fs::write(
             &fake,
-            "#!/bin/sh\nprintf '{\"error\":\"envelope %s, ran in %s\"}' \"${BD_JSON_ENVELOPE:-unset}\" \"$(pwd)\"\nexit 1\n",
+            "#!/bin/sh\nprintf '{\"error\":\"envelope %s, ran in %s, args %s\"}' \"${BD_JSON_ENVELOPE:-unset}\" \"$(pwd)\" \"$*\"\nexit 1\n",
         )
             .expect("write fake bd");
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
@@ -566,7 +566,11 @@ mod tests {
         let expected = root.canonicalize().expect("canonical project root");
         assert_eq!(
             error.message(),
-            format!("bd failed: envelope 1, ran in {}", expected.display())
+            format!(
+                "bd failed: envelope 1, ran in {}, args --readonly --json -C {} context",
+                expected.display(),
+                root.display()
+            )
         );
         fs::remove_dir_all(scratch).expect("remove scratch dir");
     }
@@ -577,11 +581,8 @@ mod tests {
         let scratch = std::env::temp_dir().join(format!("scribe-bd-no-project-{nonce}"));
         fs::create_dir_all(&scratch).expect("create scratch dir");
         let fake = scratch.join("bd");
-        fs::write(
-            &fake,
-            "#!/bin/sh\nprintf 'Error: cannot use -C directory \"/tmp\": no beads project found' >&2\nexit 1\n",
-        )
-        .expect("write fake bd");
+        fs::write(&fake, "#!/bin/sh\nprintf 'Error: no beads project found' >&2\nexit 1\n")
+            .expect("write fake bd");
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
         let bd = Bd { exe: fake, search_path: None };
 

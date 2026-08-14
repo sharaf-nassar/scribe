@@ -15,7 +15,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
-    AiLaunchSpec, AiResumeMode, AutomationAction, ClientMessage, ServerMessage, TerminalSize,
+    AiLaunchSpec, AiResumeMode, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
+    ClientMessage, ServerMessage, TerminalSize,
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -166,6 +167,8 @@ struct DaemonState {
     envelope_ids: HashMap<SessionId, String>,
     /// Most recent action the server asked this daemon window to run.
     last_action: Option<AutomationAction>,
+    /// Most recent terminal Beads-board reply, paired with its workspace.
+    beads_board: Option<(WorkspaceId, BeadsBoardState)>,
 }
 
 impl DaemonState {
@@ -177,6 +180,7 @@ impl DaemonState {
             window_id: None,
             envelope_ids: HashMap::new(),
             last_action: None,
+            beads_board: None,
         }
     }
 }
@@ -189,6 +193,7 @@ struct WaitNotifiers {
     workspace_info: Arc<Notify>,
     session_created: Arc<Notify>,
     replay: Arc<Notify>,
+    beads_board: Arc<Notify>,
 }
 
 impl WaitNotifiers {
@@ -200,6 +205,7 @@ impl WaitNotifiers {
             workspace_info: Arc::new(Notify::new()),
             session_created: Arc::new(Notify::new()),
             replay: Arc::new(Notify::new()),
+            beads_board: Arc::new(Notify::new()),
         }
     }
 }
@@ -472,12 +478,26 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageLive { .. }
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
-        | ServerMessage::BeadsBoard { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
         | ServerMessage::ShareEnded { .. } => {}
+        ServerMessage::BeadsBoard { workspace_id, state: board, .. } => {
+            if !matches!(board, BeadsBoardState::Loading { .. }) {
+                state_beads_board(workspace_id, board, state, notifiers).await;
+            }
+        }
     }
+}
+
+async fn state_beads_board(
+    workspace_id: WorkspaceId,
+    board: BeadsBoardState,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    state.lock().await.beads_board = Some((workspace_id, board));
+    notifiers.beads_board.notify_waiters();
 }
 
 async fn dispatch_session_message(
@@ -979,6 +999,9 @@ async fn process_request(
         DaemonRequest::RequestAiChrome { session_id } => {
             handle_request_ai_chrome(session_id, state).await
         }
+        DaemonRequest::RequestBeadsBoard => {
+            handle_request_beads_board(state, notifiers, server_writer).await
+        }
         DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
             handle_replay_status(session_id, min_frames, timeout_ms, state, notifiers).await
         }
@@ -996,10 +1019,43 @@ async fn process_request(
             state.lock().await.last_action = None;
             DaemonResponse::Ok
         }
-        DaemonRequest::Shutdown => {
-            handle_shutdown(shutdown);
-            DaemonResponse::Ok
+        DaemonRequest::Shutdown => handle_shutdown(shutdown),
+    }
+}
+
+async fn handle_request_beads_board(
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    let Some(workspace_id) = state.lock().await.last_workspace_id else {
+        return DaemonResponse::Error { message: "no workspace recorded".to_owned() };
+    };
+    state.lock().await.beads_board = None;
+    let request = ClientMessage::RequestBeadsBoard {
+        workspace_id,
+        protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+    };
+    if let Err(error) = send_to_server(server_writer, &request).await {
+        return DaemonResponse::Error {
+            message: format!("failed to request Beads board: {error}"),
+        };
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some((reply_workspace, board)) = state.lock().await.beads_board.clone()
+            && reply_workspace == workspace_id
+        {
+            return DaemonResponse::BeadsBoard { state: board };
         }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return DaemonResponse::Error {
+                message: "timed out waiting for Beads board".to_owned(),
+            };
+        }
+        drop(tokio::time::timeout(remaining, notifiers.beads_board.notified()).await);
     }
 }
 
@@ -2007,9 +2063,10 @@ async fn check_exit_status(session_id: SessionId, state: &SharedState) -> Option
 }
 
 /// Signal the daemon to shut down.
-fn handle_shutdown(shutdown: &Arc<Notify>) {
+fn handle_shutdown(shutdown: &Arc<Notify>) -> DaemonResponse {
     info!("shutdown requested");
     shutdown.notify_one();
+    DaemonResponse::Ok
 }
 
 /// Report the window id the server assigned this daemon.

@@ -147,6 +147,8 @@ enum Command {
         /// Target session ID.
         session_id: String,
     },
+    /// Refresh the current workspace's Beads board and print its state as JSON.
+    BeadsBoard,
     /// Inspect the `SessionReplay` frames the daemon received and the screen it
     /// rebuilt from them.
     Replay {
@@ -590,6 +592,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Screenshot { session_id, path } => capture::screenshot(&session_id, &path),
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
+        Command::BeadsBoard => capture::beads_board(),
         Command::Replay { action } => run_replay(action),
         Command::WaitOutput { session_id, pattern, timeout } => {
             wait::wait_output(&session_id, &pattern, timeout)

@@ -1,5 +1,11 @@
 FROM rust:1.95-trixie
 
+ADD --checksum=sha256:b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34 \
+    https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_amd64.tar.gz \
+    /tmp/beads.tar.gz
+
+RUN tar -xzf /tmp/beads.tar.gz -C /usr/local/bin bd && rm /tmp/beads.tar.gz
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-jetbrains-mono \

@@ -1088,15 +1088,17 @@ Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 
 
 An `empty_output_frames` counter rides alongside it, incremented (and logged) whenever a zero-byte `PtyOutput` arrives. The byte counters cannot express that event — an empty frame moves neither of them — yet it is exactly the waste the server's [[server#Server#Sessions#PTY Reader Task|empty-frame send guard]] exists to prevent, so the harness records it separately and lets a test assert on it.
 
-All sessions are keyed by `SessionId` inside , which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, the `window_id` assigned in `Welcome`, and the most recent automation action received in `RunAction`.
+All sessions are keyed by `SessionId` inside , which also tracks workspace and session-create responses, the `window_id` assigned in `Welcome`, the most recent automation action, and the first terminal Beads-board reply for the active refresh request.
 
 ### Request Handling
 
-Each incoming connection receives one  and returns one . Wait-type requests (WaitOutput, WaitCwd, WaitIdle, AssertExit) block on `Arc<Notify>` channels until the condition is met or the timeout fires.
+Each incoming connection receives one  and returns one . Wait-type requests (WaitOutput, WaitCwd, WaitIdle, AssertExit, RequestBeadsBoard) block on `Arc<Notify>` channels until the condition is met or the timeout fires.
+
+The Beads-board wait loops through its stored-state check after either notification or timeout. A reply stored between that check and waiter registration therefore wins before the deadline error.
 
 ### Notification System
 
- holds six `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, `session_created`, and `replay`.
+ holds seven `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, `session_created`, `replay`, and `beads_board`.
 
 The server-reader task fires the matching channel on each incoming `ServerMessage`, waking whichever wait handler is blocked on it.
 
@@ -1106,9 +1108,9 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by . The helper  creates a short-lived tokio runtime, connects, sends one , and receives one .
 
-Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `AssertNoEmptyOutput`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, `LastAction`, `ClearAction`, and `Shutdown`.
+Key request variants include `RequestBeadsBoard` alongside the session, wait, assertion, replay, and daemon-control requests.
 
-Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `ReplayStatus { applied, failed, live_bytes, last }`, `WindowId { window_id }`, `LastAction { action }`, `AssertFailed { message }`, and `Error { message }`.
+`BeadsBoard { state }` carries the first non-loading response. `scribe-test beads-board` prints that state as JSON so a functional script can assert the real server-owned refresh without a GPUI client.
 
 `WindowId` (surfaced as `scribe-test daemon window-id`, printed by ) exists so a second process can be pointed at the daemon's window instead of claiming one of its own — the join target the shared-pane visual rig passes to the GPUI client as `SCRIBE_JOIN_WINDOW` (). It errors rather than returning a placeholder when no `Welcome` has arrived, because joining "no window" would silently reproduce the empty-window bug it exists to prevent.
 
@@ -1411,6 +1413,12 @@ The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integrati
 Covered surface is `windows`, explicit-window `action new-tab`, `profile active`, `profile list`, and a server-absent `windows` failure. Window enumeration must return only the connected daemon window, proving the transient CLI request creates no extra window. Action dispatch must arrive at that daemon as `RunAction(NewTab)`. Profile reads must identify the active profile without changing the profile store, and server absence must return nonzero with useful socket error text.
 
 Bare interactive passthrough is intentionally not exercised. Profile-writing commands (`save`, `switch`, `import`, and `export`) and the GUI effect of routed actions are also outside this smoke test; the action oracle covers routing only.
+
+### Real Beads Board Refresh
+
+The functional image uses Beads v1.1.0 to prove one rooted workspace refresh against the server's real `bd` process contract.
+
+`just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready. This covers executable discovery, project-root working directory, command flags, JSON envelopes, and queue classification without touching the host's Beads database.
 
 ### AI Shell Environment Matrix
 

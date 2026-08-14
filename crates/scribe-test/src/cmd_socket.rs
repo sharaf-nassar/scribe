@@ -4,7 +4,7 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
-use scribe_common::protocol::{AiResumeMode, AutomationAction};
+use scribe_common::protocol::{AiResumeMode, AutomationAction, BeadsBoardState};
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -121,6 +121,8 @@ pub enum DaemonRequest {
     RequestAiChrome {
         session_id: SessionId,
     },
+    /// Refresh the current workspace's Beads board through the real server.
+    RequestBeadsBoard,
     /// Ask what `SessionReplay` frames the daemon has applied for a session.
     ///
     /// `min_frames` blocks until that many frames have been applied — the
@@ -177,6 +179,9 @@ pub enum DaemonResponse {
     AiChrome {
         prompt_bar: Option<String>,
         tab: Option<String>,
+    },
+    BeadsBoard {
+        state: BeadsBoardState,
     },
     /// The window id the server assigned the daemon (`Welcome`), or an error
     /// when no `Welcome` has arrived yet.

@@ -483,6 +483,10 @@ e2e-visual-workspace-ipc:
 # Run the workspace Beads board visual contract.
 e2e-visual-beads-board:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-board.sh
+
+# Run one real bd refresh through the functional server.
+e2e-func-beads-board:
+    TEST_TIMEOUT=60 just e2e-func func/beads-board.sh
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
 # response and the bridge read reply leaving the client, and the seeded config
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run
@@ -560,6 +564,7 @@ e2e: build-release docker-func
         func/ai-shell-env-zsh.sh
         func/ai-state-indicator.sh
         func/attach-lossless.sh
+        func/beads-board.sh
         func/cli-smoke.sh
         func/codex-subagent-hooks.sh
         func/cold-restart.sh
