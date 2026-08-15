@@ -1649,10 +1649,14 @@ matching server response on the client wire, compares every painted field,
 relation, reversed comment, and queue classifier with the direct `bd show`,
 requires a substantial panel repaint, and copies the painted full ID. Evidence
 is written to `beads-real-detail-evidence.json`, `beads-real-bd-show.json`,
-and the board/detail screenshots. This
-covers executable discovery, project-root working directory, command flags,
-JSON envelopes, queue classification, detail shapes, and rendering without
-touching the host's Beads database.
+and the board/detail screenshots. The wire shape is pinned separately by
+[[protocol#Client Messages#Beads issue detail#Named MessagePack round trip]],
+while server unit coverage calls
+[[crates/scribe-server/src/beads_board.rs#load_issue_detail]] twice and checks
+the exact uncached argv.
+Together they cover executable discovery, project-root working directory,
+command flags, JSON envelopes, queue classification, detail shapes, and
+rendering without touching the host's Beads database.
 
 #### Guarded Beads Write Contract
 
@@ -1883,7 +1887,8 @@ changes to `NotDetected`.
 The run then opens a short navigation fixture,
 requires a dependent click to send one fresh detail request, proves the source
 ID remains before the reply, and injects the matching response before requiring
-the target ID.
+the target ID. The matching unit seam is
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#navigate_to_dependent]].
 
 Rust build-model tests cover the complete anatomy, omission of every sparse
 section, closed facts without verbs, blocked upstream-node count, hidden-count
@@ -1898,7 +1903,15 @@ automatic-close notices.
 State tests also require
 the ID intent to drain exactly once and dependent navigation to ignore replies
 for another workspace or issue until its matching response can swap and
-re-anchor the panel.
+re-anchor the panel. The server-side companion gate is
+[[crates/scribe-server/src/ipc_server.rs#beads_detail_request_root]]. It keeps
+remote, shared, and foreign-window requests outside the detail loader.
+
+This fixture matrix complements
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh]]: injected
+messages isolate every visual and lifecycle state, while the real-bd run proves
+the same typed request and response across discovery, subprocess, parser, IPC,
+paint, and clipboard boundaries.
 
 #### Guarded status and claim intents
 

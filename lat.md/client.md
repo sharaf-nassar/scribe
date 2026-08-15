@@ -940,17 +940,32 @@ requests paint last-good state immediately. Only one refresh may run per root,
 and failures preserve last-good state. Commands use direct argv, read-only
 mode, bounded output, a five-second deadline, and process-group cleanup.
 
-Issue detail never reads that snapshot. Each request runs
+Issue detail never reads that snapshot.
+[[crates/scribe-server/src/beads_board.rs#load_issue_detail]] runs
 `bd show --json --include-comments --include-dependents` and a fresh
 `bd ready --limit 0` in the canonical project root with the same executable
-resolution, envelope check, deadline, and cleanup. The parser accepts bd's
+resolution, envelope check, deadline, and cleanup.
+[[crates/scribe-server/src/beads_board.rs#parse_issue_detail]] accepts bd's
 object, one-element array, and wrapped `issues` payloads. It caps text fields
 at 64 KiB, returns the newest 50 comments in newest-first order with an
 omitted count, and uses exact ready membership with the board's queue
 precedence for the queue and basis fields. A missing issue becomes the typed
-empty detail response. Parent-epic titles are resolved from the returned
-`parent-child` dependency without another command. Other command or schema
-failures remain errors.
+empty response documented by
+[[protocol#Client Messages#Beads issue detail]]. Parent-epic titles come from
+the returned `parent-child` dependency without another command. Other command
+or schema failures remain errors.
+
+The correlated response repeats the workspace and issue ids and carries
+[[crates/scribe-common/src/protocol.rs#BeadsIssueDetail]] on success: bounded
+text, labels, people, lifecycle dates, blockers, dependents, comments, and the
+server-selected queue plus its basis. `None` means the issue vanished.
+
+[[crates/scribe-server/src/ipc_server.rs#handle_request_beads_issue_detail]]
+admits the request through
+[[crates/scribe-server/src/ipc_server.rs#beads_detail_request_root]]. Only the
+local `SingleController` owner may read a workspace that belongs to its own
+window, and that workspace supplies the project root. Remote, shared,
+displaced, and foreign-workspace requests never reach `bd`.
 
 Every command also runs *in* the project root, not only with `-C` pointing at
 it: `bd context` resolves the repository through git in its own working
@@ -1039,8 +1054,10 @@ press and active drag consume all three terminal mouse-reporting funnels, the
 source hover cannot expire while lifted, and the grid clears either card or
 resize state on release inside or outside its bounds.
 
-When `Welcome.beads_detail` is enabled, clicking a card opens an issue panel
-immediately and parks one workspace-scoped detail request. The panel remains
+When `Welcome.beads_detail` is enabled,
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] parks one
+workspace-scoped request as soon as a card is clicked.
+[[crates/scribe-client/src/beads_panel.rs#panel_geometry]] keeps the panel
 under its source lane, with a 12px workspace inset and a 4px gap below the
 board. Its 560px target width shrinks with the region but does not open below
 400px; height is the lesser of 70% of the region and the space remaining
@@ -1052,21 +1069,44 @@ The loading frame keeps the clicked card's priority, title, and epic over a
 placeholder while the detail request is outstanding. Opening lifts and widens
 from the source lane into the settled layout over 120ms through the shared
 animation policy, so reduced motion still lands on the identical final frame.
-Its backdrop, close mark, and Esc all dismiss it. A missing detail or a later
-`NotDetected` board closes it and leaves a five-second notice at its former
-anchor. Panel, notice, and reply state are keyed by workspace and issue id so
-neighbouring regions remain independent. A missing or later disabled
-capability leaves the existing board unchanged.
+[[crates/scribe-client/src/main.rs#dispatch_server_message]] correlates a reply
+through [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#update]] by both
+workspace and issue id. Its backdrop, close mark, and Esc all dismiss it. A
+missing detail or a later `NotDetected` board closes it and leaves a
+five-second notice at its former anchor. State stays keyed by workspace, so
+neighbouring regions remain independent.
 
-The panel follows `.impeccable/mocks/beads-card-detail.html`: a full-bleed
-identity head, derived queue row, dependency spine, sparse body fields,
-newest-first comments, dependents, and the original status-rail appearance.
-Theme slots supply every colour. The newest collapsed comment gets two lines
-and each older collapsed comment gets one; clicking one expands it in place. A
-data-derived presentation model owns sparse-section presence, upstream and
-hidden-comment counts; closed details retain close facts but omit write verbs.
-Queue words are lifted through the board palette's body-text contrast solver
-before they paint on the card surface.
+[[crates/scribe-client/src/main.rs#on_welcome]] latches `beads_detail` before a
+card may open. An absent bit leaves the board read-only, and a later disabled
+bit clears open panels and their parked requests. This client gate complements
+the server's owner, sharing-mode, window-membership, and rooted-workspace gate;
+neither side treats the capability bit as authorization by itself.
+
+[[crates/scribe-client/src/beads_panel.rs#render]] renders the panel anatomy from
+`.impeccable/mocks/beads-card-detail.html`: a full-bleed identity head, derived
+queue row, dependency spine, sparse body fields, newest-first comments,
+dependents, and the original status-rail appearance. Theme slots supply every
+colour. The newest collapsed comment gets two lines and each older collapsed
+comment gets one; clicking one expands it in place.
+[[crates/scribe-client/src/beads_panel.rs#PanelPresentation#from_detail]] owns
+sparse-section presence, upstream and hidden-comment counts; closed details
+retain close facts but omit write verbs. Queue words pass through the board
+palette's body-text contrast solver before they paint on the card surface.
+
+The identity ID calls
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#copy_issue_id]] and parks
+its full, unshortened value for the window's take-once clipboard drain. Hover
+reveals the copy glyph without moving the row. Each dependent on the UNBLOCKS
+line calls
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#navigate_to_dependent]].
+The source panel remains while the fresh request is in flight; only its
+matching reply swaps the card head, body, and queue lane.
+
+[[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures]] proves the
+mock-derived anatomy and lifecycle matrix. The independent
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh]] run proves
+the same request, response, painted fields, and copied identity against a real
+checksum-pinned `bd` repository.
 
 `Welcome.beads_write` independently enables the three status words plus claim
 and close. Every click parks one typed write with status and assignee guards
@@ -1101,14 +1141,6 @@ failures retain persisted content and paint the shared coral notice; the next
 applied result clears it. A reconnect requests a board for each unknown
 in-flight outcome, and [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#sync_board]]
 uses the first ready snapshot once before rereading the open detail.
-
-The identity ID is one click target for its full, unshortened value. Hover
-reveals its copy glyph; the click parks that value for the window's existing
-clipboard surface, whose take-once drain prevents a later frame from replaying
-the write. Every dependent on the UNBLOCKS line is a workspace-scoped
-navigation target. Clicking one queues a fresh detail request while retaining
-the source panel; wrong-workspace and wrong-ID replies cannot replace it, and
-the matching reply atomically swaps the card head, detail body, and queue lane.
 
 The board takes its structure, sizes, and weights from
 `.impeccable/mocks/beads-compact-live-overview.html` while
