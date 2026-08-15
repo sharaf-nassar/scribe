@@ -1666,7 +1666,8 @@ The network-none functional image proves its patched bd artifact before Scribe m
 flags, atomic field/status/label/comment updates, explicit empty-assignee
 matching, rc13 structured mismatches, native actor and claim lease, native
 close timestamps/reason, and reopen cleanup. Stale attempts must leave every
-observed value and comment row unchanged.
+observed value and comment row unchanged. This is the executable proof for
+[[server#Server#Beads issue writes#Capability and admission]].
 
 #### Server Beads Issue Writes
 
@@ -1683,11 +1684,9 @@ A seeded mutation between guard capture and the Scribe request must return
 then forces both nonzero exit and the 15-second server timeout; neither may
 replace the last-good board or persisted title.
 
-The derived real-bd GPUI run compares detail with direct `bd show`, then uses
-the transparent wire tap as the pane-byte oracle. Text typed while the inline
-editor owns focus emits no `KeyInput`. Forced nonzero and timeout results keep
-the loaded detail, paint the coral notice, and the timeout asks for both board
-and detail again before the persisted issue is reread.
+The run writes `beads-write-fields.json`, `beads-write-final-show.json`, and
+`beads-write-last-good.json`. These preserve direct `bd show` evidence for
+field, lifecycle, conflict, and failure assertions.
 
 ##### Root fan-out
 
@@ -1698,6 +1697,23 @@ workspaces on one root and an equally authorized window on another root. Both
 matching workspace ids receive the refreshed board; the unrelated root does
 not.
 
+#### Real GPUI write persistence
+
+The real-bd GPUI run proves editor isolation, failure notices, and timeout convergence through the shipped client instead of an injected fixture.
+
+`just e2e-func-beads-board` compares loaded detail with direct `bd show`, then
+uses the transparent wire tap as the pane-byte oracle. Text typed while the
+inline editor owns focus must emit zero `KeyInput` frames and no write. Forced
+nonzero and timeout writes must return typed failures, keep the persisted
+title, and change at least 500 panel pixels for each coral notice. Timeout must
+request both board and detail again.
+
+Evidence is `beads-real-detail-evidence.json`,
+`beads-write-gpui-final-show.json`, `beads-write-last-good.png`,
+`beads-write-nonzero-notice.png`, and `beads-write-timeout-notice.png`. The run
+uses the default `SingleController` owner because the shared-pane rig correctly
+has no Beads detail or write capability.
+
 #### Beads Write Executor Unit Contract
 
 Docker-only server unit tests pin argv, capability, deadline, cache, and generation behavior without touching the host runtime.
@@ -1707,6 +1723,14 @@ and focused client Beads tests inside `docker/Dockerfile.func`. The suite covers
 every server verb and supplied guard, strict build-marker parsing,
 stale-refresh rejection, last-good cache retention, root-scoped multi-window
 push, timed-out process cleanup, panel write intents, and typed IPC lowering.
+
+The load-bearing server tests are
+`composes_every_write_verb_with_supplied_atomic_guards`,
+`generation_fence_discards_refreshes_started_before_a_write`,
+`write_timeout_kills_the_whole_bd_process_group`, and
+`beads_board_refresh_reaches_each_authorized_same_root_workspace`. Their
+adjacent `@lat` comments link them to this executor section and
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes#Root fan-out]].
 
 ### AI Shell Environment Matrix
 
@@ -1975,10 +1999,10 @@ visible until that matching authoritative reply arrives.
 
 #### Write failure notice lifecycle
 
-A failed issue write paints its one-line notice until a later write succeeds.
+A failed issue write paints one coral line until five seconds pass or a later write succeeds.
 
-The next applied result removes the prior failure notice before requesting
-fresh detail.
+The exact expiry removes the notice. The next applied result clears it early
+before requesting fresh detail.
 
 #### Write timeout convergence
 

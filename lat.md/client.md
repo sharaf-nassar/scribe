@@ -1005,31 +1005,105 @@ authoritative check there.
 
 ### Guarded issue writes
 
-Typed issue writes run only for the exact `scribe-guards-7505e173f265` bd build proven by the functional-image semantic contract.
+The client turns loaded issue detail into guarded write intents and never treats a draft as persisted tracker state.
 
-Scribe still resolves the user's installed `bd` at runtime and does not bundle
-it in a Scribe release. The functional image reproducibly builds upstream
-commit `7505e173f2659ba6e1f955b86d81a4f9e21810ca` from a checksum-pinned source
-archive and applies `docker/beads-guarded-writes.patch`. That bounded patch
-puts status and assignee guards inside native update, claim, close, reopen,
-label, and comment transactions. The build marker keeps `beads_write` false
-for every binary that did not pass that exact semantic contract.
+[[crates/scribe-client/src/main.rs#on_welcome]] latches
+`Welcome.beads_write` through
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#set_write_enabled]]. A
+missing bit, a loading panel, or closed detail makes
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#can_write]] false. The
+server separately enforces [[server#Server#Beads issue writes#Capability and admission]];
+the client bit is not authorization.
 
-All 14 protocol verbs become direct argv in the server. Every supplied guard
-is forwarded; an unguarded text edit is last-writer-wins, while a guarded text
-edit uses the same atomic compare-and-set as other updates. Claim, close,
-reopen, and comments retain their native lifecycle, lease, actor, and event
-semantics. Exit 13 becomes `PreconditionFailed`; other nonzero exits, timeout,
-and invalid success envelopes become `Failed` without replacing last-good
-board state.
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#queue_write]] copies the
+loaded status and assignee into every intent. Its per-workspace and per-issue
+fence allows one pending or in-flight write and rejects an intent for a panel
+that has already navigated elsewhere.
+[[crates/scribe-client/src/main.rs#TerminalView#send_beads_issue_write]] is the
+single IPC exit. Send failure cancels any card overlay, retains loaded detail,
+and paints the same failure notice as a server result.
 
-Writes serialize per canonical root and use a separate 15-second deadline with
-bounded output and process-group cleanup. Each committed write increments that
-root's generation. Older refreshes are discarded, and a forced authoritative
-refresh is pushed after the result to every authorized local
-`SingleController` window whose workspace has that project root. Unrelated
-roots and shared or remote participants receive nothing. One structured log
-records root, issue, verb, generation, outcome, and elapsed time per attempt.
+#### Inline editor and apply matrix
+
+One window-scoped editor owns native text input, field mapping, commit rules, and focus until a draft applies or cancels.
+
+[[crates/scribe-client/src/beads_panel.rs#EditField#verb]] maps title,
+description, acceptance, notes, design, spec-id set or clear, labels, and the
+comment composer to typed protocol verbs. Single-line Enter applies. Plain
+Enter stays text in multiline fields, while modified Enter applies. Switching
+fields applies a changed prior draft; clicking the active field preserves it;
+Escape cancels without a write.
+The [[test#Test Harness#GPUI Beads Inline Editing#Text fields map to typed writes|editor matrix]]
+pins those rules without deriving expected verbs from the implementation.
+
+[[crates/scribe-client/src/beads_panel.rs#BeadsEditor]] owns the edit session
+and starts with the saved value selected. Its paint-time GPUI
+`ElementInputHandler` applies UTF-16 replacement and marked composition to the
+same draft. [[crates/scribe-client/src/main.rs#TerminalView#handle_beads_editor_key]]
+routes armed keys before overlays, bindings, vi mode, and PTY encoding.
+Printable keys stay unstopped so GPUI can deliver text; Enter, Escape, and
+modified controls stay on the panel's key route.
+[[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] includes
+[[crates/scribe-client/src/beads_panel.rs#BeadsEditor#has_keyboard_focus]] in
+its claimed-focus decision, so the repaint requested by a click cannot blur
+and commit the editor back to the terminal.
+
+#### Pickers, labels, comments, and status rail
+
+Every visible write control enters the same guarded queue and waits for authoritative detail before repainting persisted values.
+
+[[crates/scribe-client/src/beads_panel.rs#priority_pick_row]] offers P0 through
+P4. [[crates/scribe-client/src/beads_panel.rs#type_pick_row]] uses the pinned
+build's complete built-in type list. Labels remain inline text;
+[[crates/scribe-client/src/beads_panel.rs#parse_labels]] splits comma or
+whitespace input and removes repeats while keeping first-seen order.
+
+[[crates/scribe-client/src/beads_panel.rs#comments]] renders the newest-comment
+composer through the same editor. Blank drafts emit nothing. `AddComment`
+never inserts a local row; only a matching uncached detail reply repaints the
+thread. [[crates/scribe-client/src/beads_panel.rs#status_rail]] lowers open,
+in-progress, and closed targets plus native claim and close. An applied close
+replaces the panel with `closed <id> · undo`; undo before the five-second
+deadline sends guarded `UndoClose`, while the exact deadline sends nothing.
+The [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Priority type and label editing|picker]],
+[[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Comment composer authoritative refresh|comment]],
+and [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents|rail]]
+checks pin typed intents and authoritative repaint.
+
+#### Results, deadlines, and reconnect
+
+Write results resolve an in-flight fence, preserve last-good detail, and request only the reads needed to converge with the tracker.
+
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#finish_write]] removes the
+matching in-flight intent. `Applied` clears an earlier error and requests fresh
+detail, except close, which opens undo. `PreconditionFailed` reports that
+someone else won and rereads detail. `Failed` retains loaded content and paints
+one coral notice without rereading detail. The notice expires after five
+seconds or clears early on the next applied result.
+
+Each sent write gets a 15-second client deadline.
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#expire_writes]] and a
+server timeout both force a board request plus uncached detail through
+[[crates/scribe-client/src/main.rs#TerminalView#poll_beads_writes]]. On
+reconnect, [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#reconnected]]
+marks unknown outcomes. [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#sync_board]]
+uses the first ready snapshot once to release those fences and reread each open
+issue; later snapshots cannot replay reconciliation.
+
+[[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write timeout convergence]]
+and [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Reconnect write reconciliation]]
+pin those unknown-outcome paths. The live focus regression is
+[[test#Test Harness#GPUI Beads Inline Editing#Armed editor survives terminal focus repair]].
+
+[[test#Test Harness#GPUI Beads Inline Editing]] pins editor semantics. The
+panel state matrix lives under
+[[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures]], and
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes]]
+proves the complete protocol, server, GPUI, and real-`bd` path.
+
+### Board interaction and issue detail
+
+Board gestures, detail loading, and read-only panel rendering share the Beads state but do not weaken the guarded write boundary above.
 
 Detected workspaces add a separate connected-bead target without changing the
 workspace label's existing click behavior. Hover opens the board over the
@@ -1115,43 +1189,6 @@ mock-derived anatomy and lifecycle matrix. The independent
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh]] run proves
 the same request, response, painted fields, and copied identity against a real
 checksum-pinned `bd` repository.
-
-`Welcome.beads_write` independently enables the three status words plus claim
-and close. Every click parks one typed write with status and assignee guards
-copied from the loaded detail; claim and close retain their native verbs.
-Inline title, description, acceptance, notes, design, and spec-id applies enter
-the same guarded queue. Stale editor intents are rejected if the workspace has
-already moved to another issue. A draft never mutates loaded detail. Applied
-writes keep the previous text visible until fresh persisted detail arrives;
-failed writes keep it and show the panel's existing failure notice.
-The terminal's repaint-time focus repair treats an armed Beads editor as a
-focus owner; it cannot blur the editor back to the PTY between the click and
-the first native text event.
-Applied status and claim writes request fresh detail. Applied close removes the
-panel and shows `closed <id> · undo` for exactly five seconds. Clicking before
-the deadline sends native guarded undo; clicking at or after it sends nothing.
-Precondition failure keeps the panel, reports that someone else won, and
-refreshes detail. Missing write capability and closed detail leave every rail
-word inert.
-
-The priority mark and issue type unfold bare in-place pick rows. Priority uses
-P0-P4, while type uses the pinned bd build's complete built-in enum. Labels
-remain bare monospace words and reuse the inline editor; comma or whitespace
-separates the final set. Each choice enters the same guarded queue, closes its
-row only when accepted, and waits for fresh detail before repainting values.
-
-The newest comment's composer is another target of the same native editor and
-guarded queue. Sending `AddComment` never appends a client-owned row; an applied
-result requests uncached detail, and only that authoritative reply repaints the
-thread. Blank drafts produce no write.
-
-Every parked write gets a 15-second client deadline. Both a local expiry and a
-server timeout result ask for a board refresh plus an uncached reread through
-[[crates/scribe-client/src/main.rs#TerminalView#poll_beads_writes]]. Other
-failures retain persisted content and paint the shared coral notice; the next
-applied result clears it. A reconnect requests a board for each unknown
-in-flight outcome, and [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#sync_board]]
-uses the first ready snapshot once before rereading the open detail.
 
 The board takes its structure, sizes, and weights from
 `.impeccable/mocks/beads-compact-live-overview.html` while
@@ -1417,26 +1454,6 @@ neighbouring queues, and a band including them would be many-coloured whether
 the ghost was drawn or not. It finally names a rooted workspace and requires the matching
 `RequestBeadsBoard` on the wire tap, so the trigger the injected snapshot
 bypasses stays covered.
-
-### Inline editor key routing
-
-An armed Beads editor must own both GPUI text delivery and the terminal
-window's entire key path, so no editor keystroke reaches the PTY encoder.
-
-The pinned GPUI revision registers `ElementInputHandler` only during paint and
-only for its focused handle. After an un-stopped printable `KeyDown`, GPUI
-calls `replace_text_in_range`; the terminal root's normal unconditional
-`stop_propagation` would suppress that callback. The panel must therefore
-check editor focus first and return without stopping propagation or entering
-overlay, binding, vi, and PTY routes. Enter reaches the input handler as a
-newline. Escape and modified controls remain key-only for the panel listener.
-
-[[crates/scribe-client/src/beads_panel.rs#BeadsEditor]] owns one edit session per
-terminal window. A passage click focuses that entity; changing passages or
-losing focus queues the prior value, while Escape discards it. Single-line
-Enter and modified multiline Enter apply; plain multiline Enter stays native
-text input. The renderer exposes these grounds only after `Welcome` advertises
-`beads_write`, and hover uses a theme-derived lift instead of fixed colours.
 
 ## GPUI Titlebar
 

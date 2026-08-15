@@ -350,6 +350,81 @@ Verifies an unnamed `Hello` adopts the same window and fans the rest out in the 
 
 The set is walked in window-id order, so two sets holding the same ids resolve identically, and `other_windows` follows in that same order rather than in a hash order that changed on every server process.
 
+## Beads issue writes
+
+The server admits one typed issue mutation, executes it against the guarded `bd` contract, then publishes only tracker-confirmed state.
+
+### Capability and admission
+
+Write capability combines connection ownership with an exact executable contract; neither check substitutes for the other.
+
+[[crates/scribe-server/src/ipc_server.rs#beads_detail_connection_available]]
+admits only the local owner of a `SingleController` window. The workspace must
+belong to that window and supply its project root. Remote, shared, displaced,
+and foreign-workspace writers never reach `bd`; the server silently ignores
+their frames. An authorized connection whose executable no longer satisfies
+the contract receives a typed `Failed` result.
+
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]] probes
+`bd version` once per server process and accepts only build
+`scribe-guards-7505e173f265`. The functional image builds upstream commit
+`7505e173f2659ba6e1f955b86d81a4f9e21810ca` from its checksum-pinned archive,
+then applies `docker/beads-guarded-writes.patch`. That patch puts status and
+assignee checks inside native update, label, comment, claim, close, and reopen
+transactions. Scribe releases still use the user's installed `bd`; every
+other build keeps `Welcome.beads_write` false at negotiation time.
+
+The probe result stays cached for the server process. Reads and writes still
+resolve the executable for each command, so installing or replacing `bd`
+changes later command selection but does not renegotiate `beads_write` or
+rerun the marker probe. A restart is required to re-evaluate capability.
+
+### Guarded executor
+
+One canonical project root owns serialization, argv validation, the write deadline, and result mapping.
+
+[[crates/scribe-server/src/ipc_server.rs#handle_beads_issue_write]] resolves the
+authorized project root, then calls
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_issue]]. That method
+canonicalizes the root and holds its per-root write lock through executable
+resolution and the subprocess result.
+
+[[crates/scribe-server/src/beads_board.rs#compose_write_argv]] maps every
+[[protocol#Client Messages#Beads issue writes|typed verb]] directly to native
+`bd` argv and appends each supplied `--if-status` and `--if-assignee`. Text
+updates without guards remain last-writer-wins. Claim, close, reopen, and
+comments keep native actor, lease, lifecycle, and event behavior.
+
+The argv builder rejects an empty, dash-prefixed, or NUL-containing issue id,
+priority above P4, and statuses outside `open`, `in_progress`, and `closed`. It
+caps comment bodies at 64 KiB. An omitted guard means no precondition; an
+explicit empty assignee means the issue must still be unassigned.
+
+[[crates/scribe-server/src/beads_board.rs#run_bd_write]] requires a schema-1
+success envelope and uses the executor's bounded stdout, stderr, and process
+group cleanup with a 15-second write deadline. Exit 13 maps to
+`PreconditionFailed`. Nonzero exit, timeout, spawn failure, invalid argv, and
+invalid success JSON map to `Failed`. None of those failures changes the
+generation or last-good board.
+
+### Generation fence and fan-out
+
+Only a committed generation may replace the board cache or reach another authorized workspace on its project root.
+
+An applied write increments the process-local generation for that canonical
+root while the write lock is held; the counter is not a Beads revision. The
+server sends its correlated result first, then
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#refresh_after_write]] loads
+the authoritative board. [[crates/scribe-server/src/beads_board.rs#apply_refresh_if_current]]
+drops that load if a newer write has already advanced the generation.
+
+[[crates/scribe-server/src/ipc_server.rs#push_beads_board_for_root]] sends the
+accepted snapshot to every authorized local `SingleController` workspace on
+the same canonical root. Other roots and shared or remote participants receive
+nothing. One structured completion log records root, issue, verb, generation,
+outcome, and elapsed milliseconds. The executor and fan-out proofs live under
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes]].
+
 ## Handoff
 
 Zero-downtime server upgrades are implemented in  using Unix file descriptor passing.

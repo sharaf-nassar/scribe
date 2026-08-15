@@ -146,20 +146,25 @@ Named MessagePack preserves request correlation, every detail field, queue basis
 
 `BeadsIssueWrite` carries one workspace-scoped, issue-scoped mutation without exposing `bd` arguments to the client.
 
-The typed verbs are title, description, acceptance, notes, design, spec-id,
-priority, type, labels, status with optional defer clearing, claim, close, undo,
-and comment addition. `BeadsIssueWriteGuards` carries optional fresh-read status
-and assignee preconditions separately from the verb.
+[[crates/scribe-common/src/protocol.rs#BeadsIssueWrite]] defines all 14 verbs:
+six text fields, priority, type, labels, status with optional defer clearing,
+claim, close, undo, and comment addition.
+[[crates/scribe-common/src/protocol.rs#BeadsIssueWriteGuards]] carries optional
+fresh-read status and assignee preconditions separately from the verb.
 
-The correlated `BeadsIssueWriteResult` server message returns `Applied` with a
-generation, `PreconditionFailed`, or `Failed` with a displayable reason. The
-server executes these messages only when its installed `bd` reports the exact
-contract-tested guarded-write build marker. Other builds leave the capability
-off rather than risking a partial or unguarded mutation.
+The correlated
+[[crates/scribe-common/src/protocol.rs#BeadsIssueWriteResult]] returns
+`Applied` with a generation, `PreconditionFailed`, or `Failed` with a
+displayable reason. [[server#Server#Beads issue writes]] owns authorization,
+guarded argv execution, generation fencing, and post-commit publication;
+[[client#Client#Beads Board CLI Data Source#Guarded issue writes]] owns intent
+construction and authoritative repaint.
 
 #### Named MessagePack round trip
 
-Named MessagePack preserves all 14 verb payloads, both optional guards, request correlation, and every result state.
+The protocol test linked to this section proves named MessagePack preserves all
+14 verb payloads, both optional guards, request correlation, and every result
+state.
 
 ### Configuration
 
@@ -230,9 +235,14 @@ opens and clears any open panel if a later `Welcome` removes the capability.
 
 `Welcome.beads_write` advertises typed write support independently from `beads_detail` and defaults to `false` when absent.
 
-A detail-capable server may therefore keep edits inert. Scribe enables writes
-only for the source- and checksum-pinned guarded build validated by the Docker
-semantic contract; bd 1.1.0 and unrecognized upstream builds stay read-only.
+A detail-capable server may therefore keep edits inert. It advertises writes
+only to the local `SingleController` owner and only when
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]] accepts
+the source- and checksum-pinned guarded build. Shared participants, bd 1.1.0,
+and unrecognized upstream builds stay read-only.
+
+The protocol test linked to this section pins defaulting and the two capability
+fields' independent wire shape.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 
