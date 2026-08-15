@@ -1942,6 +1942,34 @@ A picker selection leaves visible detail unchanged until the authoritative detai
 Applied writes request detail refresh, and only that reply replaces the shown
 priority, type, or label value.
 
+#### Comment composer authoritative refresh
+
+The newest-comment composer emits guarded `AddComment` without painting a local thread row.
+
+An applied result requests fresh detail while the prior comment list remains
+visible until that matching authoritative reply arrives.
+
+#### Write failure notice lifecycle
+
+A failed issue write paints its one-line notice until a later write succeeds.
+
+The next applied result removes the prior failure notice before requesting
+fresh detail.
+
+#### Write timeout convergence
+
+Both client deadline expiry and the server's timeout result force board and detail reads.
+
+The client deadline fires at 15 seconds, not before, and releases the unknown
+in-flight write so authoritative state can replace it.
+
+#### Reconnect write reconciliation
+
+The first ready board snapshot after reconnect settles an unknown in-flight write exactly once.
+
+Reconnect asks for that board, releases the write on the first snapshot, and
+rereads the open detail without replaying reconciliation on later snapshots.
+
 ### Shared-pane rig
 
 `SCRIBE_SHARED_PANE=1` (`just e2e-visual-shared <script>`) is how a visual test gets a live pane that BOTH the GPUI client and `scribe-test` can see. Without it the client is blind to the harness's session and the harness is blind to the client's.

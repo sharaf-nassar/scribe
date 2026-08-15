@@ -1089,6 +1089,19 @@ remain bare monospace words and reuse the inline editor; comma or whitespace
 separates the final set. Each choice enters the same guarded queue, closes its
 row only when accepted, and waits for fresh detail before repainting values.
 
+The newest comment's composer is another target of the same native editor and
+guarded queue. Sending `AddComment` never appends a client-owned row; an applied
+result requests uncached detail, and only that authoritative reply repaints the
+thread. Blank drafts produce no write.
+
+Every parked write gets a 15-second client deadline. Both a local expiry and a
+server timeout result ask for a board refresh plus an uncached reread through
+[[crates/scribe-client/src/main.rs#TerminalView#poll_beads_writes]]. Other
+failures retain persisted content and paint the shared coral notice; the next
+applied result clears it. A reconnect requests a board for each unknown
+in-flight outcome, and [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#sync_board]]
+uses the first ready snapshot once before rereading the open detail.
+
 The identity ID is one click target for its full, unshortened value. Hover
 reveals its copy glyph; the click parks that value for the window's existing
 clipboard surface, whose take-once drain prevents a later frame from replaying

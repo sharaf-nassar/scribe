@@ -4537,6 +4537,7 @@ impl TerminalView {
         self.poll_bells(cx);
         self.poll_notifications(cx);
         self.poll_notification_clicks(cx);
+        self.poll_beads_writes(cx);
         let process_shutdown = self.shared.process_shutdown.requested();
         let exit = process_shutdown
             .then_some(ExitReason::QuitRequested)
@@ -4557,6 +4558,23 @@ impl TerminalView {
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
         self.poll_restore(cx);
+    }
+
+    fn poll_beads_writes(&mut self, cx: &mut Context<Self>) {
+        let mut board_refreshes = Vec::new();
+        let expired = self.shared.beads_panels.lock().is_ok_and(|mut panels| {
+            let expired = panels.expire_writes();
+            while let Some(workspace_id) = panels.take_board_refresh() {
+                board_refreshes.push(workspace_id);
+            }
+            expired
+        });
+        for workspace_id in board_refreshes {
+            request_beads_board_or_log(&self.sink, workspace_id, "issue write convergence");
+        }
+        if expired {
+            cx.notify();
+        }
     }
 
     fn finish_exit(&mut self, reason: ExitReason, window: &mut Window, cx: &mut Context<Self>) {
@@ -13640,6 +13658,7 @@ fn on_welcome(
     if let Ok(mut panels) = ctx.beads_panels.lock() {
         panels.set_enabled(beads_detail);
         panels.set_write_enabled(beads_write);
+        panels.reconnected();
     }
     tracing::info!(
         adopted = ?registry.adopted_window(),

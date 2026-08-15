@@ -45,6 +45,7 @@ const BD_ISSUE_TYPES: [&str; 12] = [
     "story",
     "milestone",
 ];
+const WRITE_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelSection {
@@ -315,6 +316,7 @@ enum EditField {
     Design,
     SpecId,
     Labels,
+    Comment,
 }
 
 impl EditField {
@@ -327,11 +329,15 @@ impl EditField {
             Self::Design => "design",
             Self::SpecId => "spec-id",
             Self::Labels => "labels",
+            Self::Comment => "comment",
         }
     }
 
     fn multiline(self) -> bool {
-        matches!(self, Self::Description | Self::Acceptance | Self::Notes | Self::Design)
+        matches!(
+            self,
+            Self::Description | Self::Acceptance | Self::Notes | Self::Design | Self::Comment
+        )
     }
 
     fn verb(self, value: String) -> BeadsIssueWrite {
@@ -345,7 +351,12 @@ impl EditField {
                 BeadsIssueWrite::SetSpecId { spec_id: (!value.is_empty()).then_some(value) }
             }
             Self::Labels => BeadsIssueWrite::SetLabels { labels: parse_labels(&value) },
+            Self::Comment => BeadsIssueWrite::AddComment { body: value },
         }
+    }
+
+    fn changed(self, original: &str, input: &str) -> bool {
+        input != original && (self != Self::Comment || !input.trim().is_empty())
     }
 }
 
@@ -441,7 +452,7 @@ impl EditSession {
 
     fn finish(&mut self) -> Option<BeadsEditIntent> {
         let active = self.active.take()?;
-        (active.input != active.original).then(|| BeadsEditIntent {
+        active.field.changed(&active.original, &active.input).then(|| BeadsEditIntent {
             workspace_id: active.workspace_id,
             issue_id: active.issue_id,
             verb: active.field.verb(active.input),
@@ -716,6 +727,9 @@ pub struct BeadsPanels {
     pending_writes: VecDeque<PanelWriteIntent>,
     in_flight_writes: HashMap<(WorkspaceId, String), PanelWriteIntent>,
     pick_rows: HashMap<WorkspaceId, PanelPickRow>,
+    write_deadlines: HashMap<(WorkspaceId, String), Instant>,
+    pending_board_refreshes: HashSet<WorkspaceId>,
+    reconcile_on_snapshot: HashSet<WorkspaceId>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
     notices: HashMap<WorkspaceId, PanelNotice>,
@@ -733,6 +747,9 @@ impl BeadsPanels {
             self.pending_writes.clear();
             self.in_flight_writes.clear();
             self.pick_rows.clear();
+            self.write_deadlines.clear();
+            self.pending_board_refreshes.clear();
+            self.reconcile_on_snapshot.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
             self.notices.clear();
@@ -744,7 +761,6 @@ impl BeadsPanels {
         self.write_enabled = self.detail_enabled && enabled;
         if !self.write_enabled {
             self.pending_writes.clear();
-            self.in_flight_writes.clear();
             self.pick_rows.clear();
         }
     }
@@ -912,7 +928,8 @@ impl BeadsPanels {
         }
         let issue_id = panel.card.id.clone();
         let key = (workspace_id, issue_id.clone());
-        if self.in_flight_writes.contains_key(&key)
+        if self.reconcile_on_snapshot.contains(&workspace_id)
+            || self.in_flight_writes.contains_key(&key)
             || self
                 .pending_writes
                 .iter()
@@ -933,14 +950,21 @@ impl BeadsPanels {
     }
 
     pub fn take_write(&mut self) -> Option<PanelWriteIntent> {
+        self.take_write_at(Instant::now())
+    }
+
+    fn take_write_at(&mut self, now: Instant) -> Option<PanelWriteIntent> {
         let intent = self.pending_writes.pop_front()?;
-        self.in_flight_writes
-            .insert((intent.workspace_id, intent.issue_id.clone()), intent.clone());
+        let key = (intent.workspace_id, intent.issue_id.clone());
+        self.in_flight_writes.insert(key.clone(), intent.clone());
+        self.write_deadlines.insert(key, now + WRITE_DEADLINE);
         Some(intent)
     }
 
     pub fn write_send_failed(&mut self, workspace_id: WorkspaceId, issue_id: &str, reason: &str) {
-        self.in_flight_writes.remove(&(workspace_id, issue_id.to_owned()));
+        let key = (workspace_id, issue_id.to_owned());
+        self.in_flight_writes.remove(&key);
+        self.write_deadlines.remove(&key);
         let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
         self.notices
             .insert(workspace_id, PanelNotice::new(format!("Issue write dropped: {reason}"), lane));
@@ -962,10 +986,11 @@ impl BeadsPanels {
         result: BeadsIssueWriteResult,
         now: Instant,
     ) {
-        let Some(intent) = self.in_flight_writes.remove(&(workspace_id, issue_id.to_owned()))
-        else {
+        let key = (workspace_id, issue_id.to_owned());
+        let Some(intent) = self.in_flight_writes.remove(&key) else {
             return;
         };
+        self.write_deadlines.remove(&key);
         let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
         match result {
             BeadsIssueWriteResult::Applied { .. }
@@ -1000,16 +1025,88 @@ impl BeadsPanels {
                 self.refresh_open_issue(workspace_id, issue_id);
             }
             BeadsIssueWriteResult::Failed { reason } => {
+                let timed_out = reason.contains("timed out");
                 self.notices.insert(
                     workspace_id,
                     PanelNotice::new_at(format!("Issue write failed: {reason}"), lane, None, now),
                 );
+                if timed_out {
+                    self.force_convergence(workspace_id, issue_id);
+                }
             }
         }
     }
 
+    pub fn expire_writes(&mut self) -> bool {
+        self.expire_writes_at(Instant::now())
+    }
+
+    fn expire_writes_at(&mut self, now: Instant) -> bool {
+        let expired: Vec<_> = self
+            .write_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (workspace_id, issue_id) in &expired {
+            let key = (*workspace_id, issue_id.clone());
+            self.write_deadlines.remove(&key);
+            let lane = self.open.get(workspace_id).map_or(4, |panel| panel.lane);
+            self.notices.insert(
+                *workspace_id,
+                PanelNotice::new_at("Issue write timed out; refreshing".into(), lane, None, now),
+            );
+            self.force_convergence(*workspace_id, issue_id);
+        }
+        !expired.is_empty()
+    }
+
+    fn force_convergence(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
+        self.reconcile_on_snapshot.insert(workspace_id);
+        self.pending_board_refreshes.insert(workspace_id);
+        self.refresh_open_issue(workspace_id, issue_id);
+    }
+
+    pub fn take_board_refresh(&mut self) -> Option<WorkspaceId> {
+        let workspace_id = self.pending_board_refreshes.iter().next().copied()?;
+        self.pending_board_refreshes.take(&workspace_id)
+    }
+
+    pub fn reconnected(&mut self) {
+        let workspaces: Vec<_> =
+            self.in_flight_writes.keys().map(|(workspace_id, _)| *workspace_id).collect();
+        self.reconcile_on_snapshot.extend(workspaces.iter().copied());
+        self.pending_board_refreshes.extend(workspaces);
+    }
+
+    fn reconcile_snapshot(&mut self, workspace_id: WorkspaceId, reread: bool) -> bool {
+        if !self.reconcile_on_snapshot.remove(&workspace_id) {
+            return false;
+        }
+        let issue_ids: Vec<_> = self
+            .in_flight_writes
+            .keys()
+            .filter(|(candidate, _)| *candidate == workspace_id)
+            .map(|(_, issue_id)| issue_id.clone())
+            .collect();
+        for issue_id in issue_ids {
+            let key = (workspace_id, issue_id.clone());
+            self.in_flight_writes.remove(&key);
+            self.write_deadlines.remove(&key);
+            if reread {
+                self.refresh_open_issue(workspace_id, &issue_id);
+            }
+        }
+        true
+    }
+
     fn refresh_open_issue(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
-        if self.open.get(&workspace_id).is_some_and(|panel| panel.card.id == issue_id) {
+        if self.open.get(&workspace_id).is_some_and(|panel| panel.card.id == issue_id)
+            && !self
+                .pending_requests
+                .iter()
+                .any(|request| request.0 == workspace_id && request.1 == issue_id)
+        {
             self.pending_requests.push_back((workspace_id, issue_id.to_owned()));
         }
     }
@@ -1080,6 +1177,9 @@ impl BeadsPanels {
         self.pending_writes.retain(|write| live.contains(&write.workspace_id));
         self.in_flight_writes.retain(|(workspace_id, _), _| live.contains(workspace_id));
         self.pick_rows.retain(|workspace_id, _| live.contains(workspace_id));
+        self.write_deadlines.retain(|(workspace_id, _), _| live.contains(workspace_id));
+        self.pending_board_refreshes.retain(|workspace_id| live.contains(workspace_id));
+        self.reconcile_on_snapshot.retain(|workspace_id| live.contains(workspace_id));
         self.notices.retain(|workspace_id, _| live.contains(workspace_id));
         self.pending_navigation.retain(|workspace_id, _| live.contains(workspace_id));
         if self.last_opened.is_some_and(|workspace_id| !live.contains(&workspace_id)) {
@@ -1136,6 +1236,7 @@ impl BeadsPanels {
 
     pub fn sync_board(&mut self, workspace_id: WorkspaceId, state: &BeadsBoardState) -> bool {
         if matches!(state, BeadsBoardState::NotDetected) {
+            self.reconcile_snapshot(workspace_id, false);
             self.pending_navigation.remove(&workspace_id);
             self.pick_rows.remove(&workspace_id);
             let Some(panel) = self.open.remove(&workspace_id) else { return false };
@@ -1146,15 +1247,17 @@ impl BeadsPanels {
             self.last_opened = Some(workspace_id);
             return true;
         }
+        let reconciled = matches!(state, BeadsBoardState::Ready { .. })
+            && self.reconcile_snapshot(workspace_id, true);
         let Some(snapshot) = board_snapshot(state) else { return false };
-        let Some(panel) = self.open.get_mut(&workspace_id) else { return false };
-        let Some((lane, card)) = snapshot_card(snapshot, &panel.card.id) else { return false };
+        let Some(panel) = self.open.get_mut(&workspace_id) else { return reconciled };
+        let Some((lane, card)) = snapshot_card(snapshot, &panel.card.id) else { return reconciled };
         let changed = panel.lane != lane || panel.card != *card;
         if changed {
             panel.lane = lane;
             panel.card = card.clone();
         }
-        changed
+        changed || reconciled
     }
 
     pub fn navigate_to_dependent(&mut self, workspace_id: WorkspaceId, issue_id: &str) -> bool {
@@ -1841,6 +1944,11 @@ fn editable_text(
         .active_text(wiring.workspace_id, issue_id, field)
         .map(str::to_owned);
     let shown = active.as_deref().unwrap_or(value).to_owned();
+    let display = if field == EditField::Comment && shown.is_empty() {
+        "add a comment…".to_owned()
+    } else {
+        shown.clone()
+    };
     let focus = editor.read(wiring.app).focus.clone();
     let input_focus = focus.clone();
     let input_editor = editor.clone();
@@ -1863,6 +1971,7 @@ fn editable_text(
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
         .on_click(move |_event, window, app| {
+            app.stop_propagation();
             editor.update(app, |editor, cx| {
                 editor.begin(
                     EditTarget { workspace_id, issue_id: &click_issue, field, value: &click_value },
@@ -1872,7 +1981,7 @@ fn editable_text(
             });
             window.refresh();
         })
-        .child(text.child(shown))
+        .child(text.child(display))
         .when(active.is_some(), |surface| {
             surface.child(
                 canvas(
@@ -2123,8 +2232,10 @@ fn comments(
     presentation: &PanelPresentation,
     wiring: PanelContentWiring<'_>,
 ) -> AnyElement {
+    let edit = wiring.edit_wiring();
     let PanelContentWiring { workspace_id, state, colors, scale, .. } = wiring;
-    let comment_wiring = CommentWiring { workspace_id, issue_id: &detail.id, state, colors, scale };
+    let comment_wiring =
+        CommentWiring { workspace_id, issue_id: &detail.id, state, edit, colors, scale };
     let rows = detail
         .comments
         .iter()
@@ -2151,13 +2262,14 @@ fn comments(
 struct CommentWiring<'a> {
     workspace_id: WorkspaceId,
     state: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    edit: EditWiring<'a>,
     colors: &'a BeadsBoardColors,
     scale: f32,
     issue_id: &'a str,
 }
 
 fn comment_row(comment: &BeadsIssueComment, index: usize, wiring: CommentWiring<'_>) -> AnyElement {
-    let CommentWiring { workspace_id, state, colors, scale, issue_id } = wiring;
+    let CommentWiring { workspace_id, state, edit, colors, scale, issue_id } = wiring;
     let expanded =
         state.lock().is_ok_and(|panels| panels.comment_expanded(workspace_id, issue_id, index));
     let click_state = std::sync::Arc::clone(state);
@@ -2205,12 +2317,15 @@ fn comment_row(comment: &BeadsIssueComment, index: usize, wiring: CommentWiring<
                         .text_color(colors.muted)
                         .child(short_date(&comment.created_at)),
                 )
-                .children((index == 0).then(|| {
-                    div()
-                        .ml_auto()
-                        .text_size(at(scale, 10.0))
-                        .text_color(colors.muted)
-                        .child("add a comment…")
+                .children((index == 0 && edit.write_enabled).then(|| {
+                    editable_text(
+                        edit,
+                        issue_id,
+                        EditField::Comment,
+                        "",
+                        div().text_size(at(scale, 10.0)).text_color(colors.muted),
+                    )
+                    .ml_auto()
                 })),
         )
         .child(body)
@@ -3177,6 +3292,140 @@ mod tests {
             panels.visible(workspace).and_then(|panel| panel.detail.as_deref()).unwrap().priority,
             4
         );
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Comment composer authoritative refresh]]
+    #[test]
+    fn comment_composer_queues_guarded_verb_without_repainting_the_thread() {
+        let loaded = full_detail();
+        let saved_comments = loaded.comments.clone();
+        let (workspace, mut panels) = loaded_writable_panels(loaded.clone());
+        let mut edit = EditSession::default();
+        edit.begin(workspace, &loaded.id, EditField::Comment, "");
+        edit.replace_all("Authoritative refresh owns this row");
+
+        assert!(panels.queue_edit(edit.finish().expect("changed comment")));
+        assert_eq!(
+            panels.take_write(),
+            Some(PanelWriteIntent {
+                workspace_id: workspace,
+                issue_id: loaded.id.clone(),
+                verb: BeadsIssueWrite::AddComment {
+                    body: "Authoritative refresh owns this row".into(),
+                },
+                guards: BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            })
+        );
+        assert_eq!(
+            panels
+                .visible(workspace)
+                .and_then(|panel| panel.detail.as_deref())
+                .map(|detail| &detail.comments),
+            Some(&saved_comments),
+            "draft and send must not paint an optimistic comment"
+        );
+
+        panels.finish_write_at(
+            workspace,
+            &loaded.id,
+            BeadsIssueWriteResult::Applied { generation: 9 },
+            Instant::now(),
+        );
+        assert_eq!(panels.take_request(), Some((workspace, loaded.id.clone())));
+        assert_eq!(
+            panels
+                .visible(workspace)
+                .and_then(|panel| panel.detail.as_deref())
+                .map(|detail| &detail.comments),
+            Some(&saved_comments),
+            "applied result only requests the authoritative detail"
+        );
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write failure notice lifecycle]]
+    #[test]
+    fn write_failure_notice_clears_on_the_next_success() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write().is_some());
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Failed { reason: "permission denied".into() },
+            now,
+        );
+        assert_eq!(panels.notice_at(workspace, now), Some("Issue write failed: permission denied"));
+
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write().is_some());
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 10 },
+            now,
+        );
+        assert_eq!(panels.notice_at(workspace, now), None);
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write timeout convergence]]
+    #[test]
+    fn timed_out_write_forces_board_and_detail_convergence() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write_at(now).is_some());
+
+        let just_before = (now + WRITE_DEADLINE)
+            .checked_sub(Duration::from_millis(1))
+            .expect("write deadline exceeds one millisecond");
+        assert!(!panels.expire_writes_at(just_before));
+        assert!(panels.expire_writes_at(now + WRITE_DEADLINE));
+        assert_eq!(panels.take_board_refresh(), Some(workspace));
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+        assert_eq!(
+            panels.notice_at(workspace, now + WRITE_DEADLINE),
+            Some("Issue write timed out; refreshing")
+        );
+        assert!(!panels.claim(workspace), "unknown timeout result blocks another write");
+        panels.sync_board(workspace, &board_with(item(), 1));
+        assert!(panels.claim(workspace), "authoritative board releases the timeout fence");
+
+        let (server_workspace, mut server_panels) = loaded_writable_panels(detail());
+        assert!(server_panels.claim(server_workspace));
+        assert!(server_panels.take_write_at(now).is_some());
+        server_panels.finish_write_at(
+            server_workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Failed { reason: "bd issue write timed out".into() },
+            now + WRITE_DEADLINE,
+        );
+        assert_eq!(server_panels.take_board_refresh(), Some(server_workspace));
+        assert_eq!(server_panels.take_request(), Some((server_workspace, "scribe-5wh1.4".into())));
+        assert!(!server_panels.claim(server_workspace));
+        server_panels.sync_board(server_workspace, &board_with(item(), 1));
+        assert!(server_panels.claim(server_workspace));
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Reconnect write reconciliation]]
+    #[test]
+    fn first_post_reconnect_snapshot_reconciles_in_flight_write_once() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write().is_some());
+        panels.reconnected();
+        assert_eq!(panels.take_board_refresh(), Some(workspace));
+
+        let snapshot = board_with(item(), 1);
+        panels.sync_board(workspace, &snapshot);
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+        assert!(panels.claim(workspace), "first snapshot releases the unknown write outcome");
+
+        panels.sync_board(workspace, &snapshot);
+        assert_eq!(panels.take_request(), None, "later snapshots do not replay reconciliation");
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]
