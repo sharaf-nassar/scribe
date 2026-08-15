@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (49 variants, 48 reachable)
+## Client messages (50 variants, 48 reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -147,26 +147,28 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `RequestBeadsBoard` | workspace Beads board open, hover refresh and pinned poll | visual-E2E | `main.rs::park_workspace_info`, `main.rs::TerminalView::poll_beads_board`, titlebar/region bead hover and click → `ipc_bridge.rs::IpcSink::request_beads_board` — `tests/e2e/visual/beads-board.sh` | required |
 | `RequestBeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
+| `BeadsIssueWrite` | workspace Beads issue detail edits | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 
-**Reachability:** 48 of 49 rows name a live-path symbol; 1 is unwired and 0
+**Reachability:** 48 of 50 rows name a live-path symbol; 2 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (65 variants, 64 reachable)
+## Server messages (66 variants, 64 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
 The live reader's dispatcher `main.rs::dispatch_server_message` handles 59 of
-65 variants and routes the rest to `main.rs::unhandled_server_message`, which
+66 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
 `TrustedNetworkList` — are consumed by the settings
 window's synchronous request/reply helper in `settings/server_action.rs`, and
-each of those rows says so. `BeadsIssueDetail` is the remaining unwired reply;
-the protocol slice lands before the panel consumer. `tools/check-parity-inventory.sh` enforces that:
+each of those rows says so. `BeadsIssueDetail` and `BeadsIssueWriteResult` are
+the remaining unwired replies; their protocol slices land before their panel
+consumers. `tools/check-parity-inventory.sh` enforces that:
 any variant the dispatcher does not handle must either carry a marker cell or
 be annotated a settings-window row, so this column cannot claim a reader arm
 that does not exist.
@@ -242,8 +244,9 @@ erase a replacement.
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 | `BeadsBoard` | workspace Beads board snapshot, loading, unavailable and not-detected states | visual-E2E | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::update` → `beads_board.rs::render` — `tests/e2e/visual/beads-board.sh` | required |
 | `BeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
+| `BeadsIssueWriteResult` | workspace Beads issue detail write outcome | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 
-**Reachability:** 64 of 65 rows name a live-path symbol; 1 is unwired and 0
+**Reachability:** 64 of 66 rows name a live-path symbol; 2 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -464,19 +467,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 49 | 48 | 1 | 0 |
-| Server messages | 65 | 64 | 1 | 0 |
+| Client messages | 50 | 48 | 2 | 0 |
+| Server messages | 66 | 64 | 2 | 0 |
 | Input and keybinding actions | 55 | 55 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **212** | **210** | **2** | **0** |
+| **Total** | **214** | **210** | **4** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **203 rows, of which 201 are
-reachable (99%)** and 2 are not. **1 of those 203** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **205 rows, of which 201 are
+reachable (98%)** and 4 are not. **1 of those 205** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **200 of 203**.
+the in-client figure is **200 of 205**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

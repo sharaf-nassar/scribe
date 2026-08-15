@@ -140,6 +140,24 @@ need another date parser to preserve them.
 
 Named MessagePack preserves request correlation, every detail field, queue basis, related issues, comments, hidden count, and the explicit not-found response.
 
+### Beads issue writes
+
+`BeadsIssueWrite` carries one workspace-scoped, issue-scoped mutation without exposing `bd` arguments to the client.
+
+The typed verbs are title, description, acceptance, notes, design, spec-id,
+priority, type, labels, status with optional defer clearing, claim, close, undo,
+and comment addition. `BeadsIssueWriteGuards` carries optional fresh-read status
+and assignee preconditions separately from the verb.
+
+The correlated `BeadsIssueWriteResult` server message returns `Applied` with a
+generation, `PreconditionFailed`, or `Failed` with a displayable reason. The
+current bd 1.1.0 server never executes these messages because it cannot enforce
+the two guards.
+
+#### Named MessagePack round trip
+
+Named MessagePack preserves all 14 verb payloads, both optional guards, request correlation, and every result state.
+
 ### Configuration
 
 `ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit, shell integration, and workspace-root updates across live sessions.
@@ -198,11 +216,19 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 
 #### Beads detail capability defaults safely
 
-`Welcome.beads_detail` advertises support independently from the board snapshot and future write verbs. The server enables it only for a local owner on an unshared window.
+`Welcome.beads_detail` advertises support independently from the board snapshot and typed write verbs. The server enables it only for a local owner on an unshared window.
 
 Remote, shared, viewer, displaced, and foreign-root requests are rejected. An
 older server omitting the field decodes it as `false`, so the client keeps the
 existing read-only board.
+
+#### Beads write capability defaults safely
+
+`Welcome.beads_write` advertises typed write support independently from `beads_detail` and defaults to `false` when absent.
+
+A detail-capable server may therefore keep edits inert. Scribe does this for bd
+1.1.0 because that release rejects `--if-status` and `--if-assignee`; adding the
+wire types does not enable unsafe server writes.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 

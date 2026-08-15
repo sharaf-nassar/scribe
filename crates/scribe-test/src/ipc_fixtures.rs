@@ -243,6 +243,7 @@ fn insert_local_fixtures(
             participant_id: None,
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: false,
+            beads_write: false,
         },
     )
 }

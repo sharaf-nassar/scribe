@@ -369,6 +369,44 @@ pub struct BeadsIssueDetail {
     pub queue_basis: BeadsIssueQueueBasis,
 }
 
+/// One server-side `bd` write selected by client chrome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsIssueWrite {
+    SetTitle { title: String },
+    SetDescription { description: String },
+    SetAcceptance { acceptance: String },
+    SetNotes { notes: String },
+    SetDesign { design: String },
+    SetSpecId { spec_id: Option<String> },
+    SetPriority { priority: u8 },
+    SetType { issue_type: String },
+    SetLabels { labels: Vec<String> },
+    SetStatus { status: String, clear_defer: bool },
+    Claim,
+    CloseIssue,
+    UndoClose,
+    AddComment { body: String },
+}
+
+/// Optional optimistic-concurrency checks captured from a fresh detail read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsIssueWriteGuards {
+    #[serde(default)]
+    pub if_status: Option<String>,
+    #[serde(default)]
+    pub if_assignee: Option<String>,
+}
+
+/// Outcome of one typed issue write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsIssueWriteResult {
+    Applied { generation: u64 },
+    PreconditionFailed,
+    Failed { reason: String },
+}
+
 /// Aggregate state rendered by the CI run bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -525,6 +563,13 @@ pub enum ClientMessage {
     RequestBeadsIssueDetail {
         workspace_id: WorkspaceId,
         issue_id: String,
+    },
+    /// Request one typed issue mutation. The server owns `bd` argv composition.
+    BeadsIssueWrite {
+        workspace_id: WorkspaceId,
+        issue_id: String,
+        verb: BeadsIssueWrite,
+        guards: BeadsIssueWriteGuards,
     },
     /// Move a session to a different workspace. The workspace-split flow seeds
     /// its session through the old workspace (the new one does not exist yet)
@@ -982,6 +1027,12 @@ pub enum ServerMessage {
         issue_id: String,
         detail: Option<Box<BeadsIssueDetail>>,
     },
+    /// Correlated outcome for one typed issue write.
+    BeadsIssueWriteResult {
+        workspace_id: WorkspaceId,
+        issue_id: String,
+        result: BeadsIssueWriteResult,
+    },
     /// Search results for a `SearchRequest`.
     SearchResults {
         session_id: SessionId,
@@ -1018,6 +1069,10 @@ pub enum ServerMessage {
         /// Missing from an older local server means the board remains read-only.
         #[serde(default)]
         beads_detail: bool,
+        /// Server support for typed Beads issue writes. This stays independent
+        /// from detail reads because bd 1.1.0 cannot enforce write guards.
+        #[serde(default)]
+        beads_write: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -1847,6 +1902,19 @@ mod tests {
         },
     }
 
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutBeadsWrite {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+        },
+    }
+
     #[test]
     fn hello_without_join_intent_defaults_to_false() {
         let bytes = rmp_serde::to_vec_named(&HelloWithoutJoinIntent::Hello {
@@ -2173,6 +2241,124 @@ mod tests {
                 issue_id,
                 detail: None,
             } if decoded_id == workspace_id && issue_id == "scribe-vanished"
+        ));
+    }
+
+    // @lat: [[protocol#Client Messages#Beads issue writes#Named MessagePack round trip]]
+    #[test]
+    fn beads_issue_write_messages_round_trip_every_verb_and_result() {
+        let workspace_id = WorkspaceId::new();
+        let guard_sets = [
+            BeadsIssueWriteGuards {
+                if_status: Some("open".into()),
+                if_assignee: Some("mamba".into()),
+            },
+            BeadsIssueWriteGuards::default(),
+        ];
+        let verbs = vec![
+            BeadsIssueWrite::SetTitle { title: "Protocol writes".into() },
+            BeadsIssueWrite::SetDescription { description: "Typed client intent.".into() },
+            BeadsIssueWrite::SetAcceptance { acceptance: "Every verb round-trips.".into() },
+            BeadsIssueWrite::SetNotes { notes: "No server execution yet.".into() },
+            BeadsIssueWrite::SetDesign { design: "Server composes argv.".into() },
+            BeadsIssueWrite::SetSpecId { spec_id: Some("024-beads-card-detail".into()) },
+            BeadsIssueWrite::SetPriority { priority: 1 },
+            BeadsIssueWrite::SetType { issue_type: "task".into() },
+            BeadsIssueWrite::SetLabels { labels: vec!["protocol".into(), "beads".into()] },
+            BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: true },
+            BeadsIssueWrite::Claim,
+            BeadsIssueWrite::CloseIssue,
+            BeadsIssueWrite::UndoClose,
+            BeadsIssueWrite::AddComment { body: "Ship the protocol first.".into() },
+        ];
+
+        for expected in verbs {
+            for guards in &guard_sets {
+                let message = ClientMessage::BeadsIssueWrite {
+                    workspace_id,
+                    issue_id: "scribe-5wh1.11".into(),
+                    verb: expected.clone(),
+                    guards: guards.clone(),
+                };
+                let bytes = rmp_serde::to_vec_named(&message).expect("serialize issue write");
+                let decoded: ClientMessage =
+                    rmp_serde::from_slice(&bytes).expect("deserialize issue write");
+                assert!(matches!(
+                    decoded,
+                    ClientMessage::BeadsIssueWrite {
+                        workspace_id: decoded_id,
+                        issue_id,
+                        verb,
+                        guards: decoded_guards,
+                    } if decoded_id == workspace_id
+                        && issue_id == "scribe-5wh1.11"
+                        && verb == expected
+                        && decoded_guards == *guards
+                ));
+            }
+        }
+
+        let results = vec![
+            BeadsIssueWriteResult::Applied { generation: 42 },
+            BeadsIssueWriteResult::PreconditionFailed,
+            BeadsIssueWriteResult::Failed { reason: "bd exited 1".into() },
+        ];
+        for expected in results {
+            let message = ServerMessage::BeadsIssueWriteResult {
+                workspace_id,
+                issue_id: "scribe-5wh1.11".into(),
+                result: expected.clone(),
+            };
+            let bytes = rmp_serde::to_vec_named(&message).expect("serialize issue write result");
+            let decoded: ServerMessage =
+                rmp_serde::from_slice(&bytes).expect("deserialize issue write result");
+            assert!(matches!(
+                decoded,
+                ServerMessage::BeadsIssueWriteResult {
+                    workspace_id: decoded_id,
+                    issue_id,
+                    result,
+                } if decoded_id == workspace_id
+                    && issue_id == "scribe-5wh1.11"
+                    && result == expected
+            ));
+        }
+    }
+
+    // @lat: [[protocol#Server Messages#Connection#Beads write capability defaults safely]]
+    #[test]
+    fn beads_write_capability_is_independent_from_detail() {
+        let detail_bytes = rmp_serde::to_vec_named(&WelcomeWithoutBeadsWrite::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+        })
+        .expect("serialize detail-only Welcome");
+        let decoded_detail: ServerMessage =
+            rmp_serde::from_slice(&detail_bytes).expect("deserialize detail-only Welcome");
+        assert!(matches!(
+            decoded_detail,
+            ServerMessage::Welcome { beads_detail: true, beads_write: false, .. }
+        ));
+
+        let message = ServerMessage::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: false,
+            beads_write: true,
+        };
+        let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
+        let decoded_write: ServerMessage =
+            rmp_serde::from_slice(&write_bytes).expect("deserialize write-only Welcome");
+        assert!(matches!(
+            decoded_write,
+            ServerMessage::Welcome { beads_detail: false, beads_write: true, .. }
         ));
     }
 

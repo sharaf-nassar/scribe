@@ -26,12 +26,13 @@
 
 counts modules-total 73
 counts modules-wired 73
-counts server-messages-total 65
+counts server-messages-total 66
 counts server-messages-handled 59
 counts layout-actions-total 37
 counts layout-actions-handled 37
 
 unhandled-server-message BeadsIssueDetail
+unhandled-server-message BeadsIssueWriteResult
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message TrustedDeviceList

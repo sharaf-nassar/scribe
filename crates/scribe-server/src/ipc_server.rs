@@ -5518,6 +5518,7 @@ async fn handle_client_hello(
                 participant_id,
                 terminal_images: claim.terminal_images,
                 beads_detail,
+                beads_write: false,
             };
             send_message(writer, &welcome).await;
 
@@ -5544,6 +5545,7 @@ async fn handle_client_hello(
                 participant_id: None,
                 terminal_images: claim.terminal_images,
                 beads_detail: false,
+                beads_write: false,
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
