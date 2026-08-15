@@ -378,6 +378,11 @@ e2e-visual-multi-window-restore:
 e2e-visual-relaunch-focus:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=120 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/relaunch-focus.sh
 
+# Prove X11 focus recency across one owner and one cold-restore child. This
+# purpose-built case restarts the disposable server, so it must not use the tap.
+e2e-visual-restore-child-focus-recency:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e RUST_LOG=scribe_server=info,scribe_client=debug -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/restore-child-focus-recency.sh
+
 # Run the refused stale-claim E2E. The script removes only the disposable
 # container's client singleton socket so one plain bootstrap reaches the server.
 e2e-visual-refused-claim:
@@ -655,6 +660,7 @@ e2e-all-visual: build-release docker-visual
         'visual/refused-claim.sh|e2e-visual-refused-claim'
         'visual/relaunch-focus.sh|e2e-visual-relaunch-focus'
         'visual/remote-control.sh|e2e-visual-remote-control'
+        'visual/restore-child-focus-recency.sh|e2e-visual-restore-child-focus-recency'
         'visual/scrollbar.sh|e2e-visual-scrollbar'
         'visual/server-lifecycle.sh|e2e-visual-server-lifecycle'
         'visual/server-upgrade-reattach.sh|e2e-visual-server-upgrade-reattach'

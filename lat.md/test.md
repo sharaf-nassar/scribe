@@ -2191,11 +2191,17 @@ The bounded raw-PTY stand-in reproduces Claude's exact alternate-screen suspend 
 
 ### Client relaunch handling
 
-`tests/e2e/visual/relaunch-focus.sh` and `tests/e2e/visual/refused-claim.sh` cover singleton focus handoff and stale-restore refusal against real GPUI windows and the Docker server.
+The Docker visual relaunch cases cover singleton focus routing, cross-process restore-child recency, and stale-restore refusal against real GPUI windows and the server.
 
 #### Plain relaunch focuses the live owner
 
 A second plain client exits successfully before GPUI or server bootstrap, leaves server window and session counts unchanged, and activates the owner's most-recent terminal window.
+
+#### Restore-child focus recency crosses processes
+
+The visual case maps owner and restore-child PIDs to distinct X11 windows and proves focus routing without a network or wire tap.
+
+`tests/e2e/visual/restore-child-focus-recency.sh` covers child and owner handoffs, stale-child fallback, duplicate suppression, timing bounds, and bare updater reclaim.
 
 #### Refused stale claim stays fresh and non-destructive
 
