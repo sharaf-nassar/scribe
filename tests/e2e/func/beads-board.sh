@@ -64,6 +64,13 @@ READY_LANE=${BOARD#*'"ready":['}
 READY_LANE=${READY_LANE%%'],"in_progress"'*}
 printf '%s\n' "$READY_LANE" | grep -Fq '"id":"e2e-ready","title":"Real board refresh"' \
     || fail "seeded ready issue was absent from the Ready lane: $BOARD"
+printf '%s\n' "$BOARD" | grep -Fq '"ready_total":2' \
+    || fail "Ready total included the epic record: $BOARD"
+if printf '%s\n' "$BOARD" | grep -Fq '"id":"e2e-epic"'; then
+    fail "epic appeared as a standalone board card: $BOARD"
+fi
+printf '%s\n' "$BOARD" | grep -Fq '"id":"e2e-detail","title":"Complete card detail","priority":1,"blocker_ids":["e2e-blocker"],"parent_epic_name":"Card detail epic"' \
+    || fail "child card lost its parent epic name: $BOARD"
 
 DETAIL=$(cd "$PROJECT" && bd show e2e-detail --json --include-comments --include-dependents)
 CLOSED=$(cd "$PROJECT" && bd show e2e-closed --json --include-comments --include-dependents)

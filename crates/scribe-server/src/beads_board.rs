@@ -696,6 +696,9 @@ fn classify_snapshot(
     };
 
     for issue in &issues {
+        if issue.issue_type.as_deref() == Some("epic") {
+            continue;
+        }
         if issue.priority > 4 {
             return Err(format!("invalid priority {} for {}", issue.priority, issue.id));
         }
@@ -1071,7 +1074,7 @@ mod tests {
 
         assert_eq!(
             board.backlog.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
-            ["epic", "backlog"]
+            ["backlog"]
         );
         assert_eq!(board.ready[0].id, "ready");
         assert_eq!(board.ready[0].parent_epic_name.as_deref(), Some("Board epic"));
@@ -1087,7 +1090,60 @@ mod tests {
                 board.blocked_total,
                 board.done_total,
             ],
-            [2, 1, 1, 1, 1]
+            [1, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn epics_never_enter_queues_totals_or_the_item_cap() {
+        let mut issues = (0..MAX_ITEMS_PER_QUEUE)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("ready-epic-{index}"),
+                    "title": "Ready epic",
+                    "status": "open",
+                    "priority": 2,
+                    "issue_type": "epic",
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut ready = issues.clone();
+        issues.extend([
+            serde_json::json!({"id":"doing-epic","title":"Doing epic","status":"in_progress","priority":2,"issue_type":"epic"}),
+            serde_json::json!({"id":"blocked-epic","title":"Blocked epic","status":"blocked","priority":2,"issue_type":"epic"}),
+            serde_json::json!({"id":"done-epic","title":"Done epic","status":"closed","priority":2,"issue_type":"epic"}),
+            serde_json::json!({"id":"backlog-epic","title":"Backlog epic","status":"deferred","priority":5,"issue_type":"epic"}),
+            serde_json::json!({"id":"task","title":"Task","status":"open","priority":1,"issue_type":"task"}),
+        ]);
+        ready.push(serde_json::json!({
+            "id": "task",
+            "title": "Task",
+            "status": "open",
+            "priority": 1,
+        }));
+        let list =
+            serde_json::to_vec(&serde_json::json!({"data":{"issues":issues},"schema_version":1}))
+                .expect("serialize list");
+        let ready = serde_json::to_vec(&serde_json::json!({"data":ready,"schema_version":1}))
+            .expect("serialize ready");
+        let empty = br#"{"data":[],"schema_version":1}"#;
+
+        let board = classify_snapshot(&list, &ready, empty).expect("classify board");
+
+        assert_eq!(board.ready.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["task"]);
+        assert!(board.backlog.is_empty());
+        assert!(board.in_progress.is_empty());
+        assert!(board.blocked.is_empty());
+        assert!(board.done.is_empty());
+        assert_eq!(
+            [
+                board.backlog_total,
+                board.ready_total,
+                board.in_progress_total,
+                board.blocked_total,
+                board.done_total,
+            ],
+            [0, 1, 0, 0, 0]
         );
     }
 

@@ -1623,6 +1623,8 @@ The functional image uses Beads v1.1.0 to prove rooted workspace refresh and com
 
 `just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready.
 
+The board omits the seeded epic as a standalone card while its child keeps the epic title as metadata, and queue totals count only non-epic issues.
+
 The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
 
 ### AI Shell Environment Matrix

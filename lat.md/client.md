@@ -931,6 +931,8 @@ server first runs store-free `bd context`, then composes bounded `list`,
 and Done queues. Classification precedence is Done, Blocked, In Progress,
 Ready, then Backlog, so an issue appears in only one queue. Priorities stay as
 Beads P0-P4 values; blocker IDs and parent-epic names travel with each item.
+Epic records supply those parent names but never enter a queue, its total, or
+its 200-card display cap.
 
 One in-memory snapshot is cached per canonical project root for 30 seconds.
 The first request returns Loading immediately and refreshes off-thread; later
