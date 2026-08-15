@@ -1231,17 +1231,17 @@ Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 
 
 An `empty_output_frames` counter rides alongside it, incremented (and logged) whenever a zero-byte `PtyOutput` arrives. The byte counters cannot express that event — an empty frame moves neither of them — yet it is exactly the waste the server's [[server#Server#Sessions#PTY Reader Task|empty-frame send guard]] exists to prevent, so the harness records it separately and lets a test assert on it.
 
-All sessions are keyed by `SessionId` inside , which also tracks workspace and session-create responses, the `window_id` assigned in `Welcome`, the most recent automation action, and the first terminal Beads-board reply for the active refresh request.
+All sessions are keyed by `SessionId` inside , which also tracks workspace and session-create responses, the `window_id` assigned in `Welcome`, the most recent automation action, and terminal Beads board/write replies for active requests.
 
 ### Request Handling
 
-Each incoming connection receives one  and returns one . Wait-type requests (WaitOutput, WaitCwd, WaitIdle, AssertExit, RequestBeadsBoard) block on `Arc<Notify>` channels until the condition is met or the timeout fires.
+Each incoming connection receives one  and returns one . Wait-type requests (WaitOutput, WaitCwd, WaitIdle, AssertExit, RequestBeadsBoard, BeadsIssueWrite) block on `Arc<Notify>` channels until the condition is met or the timeout fires.
 
 The Beads-board wait loops through its stored-state check after either notification or timeout. A reply stored between that check and waiter registration therefore wins before the deadline error.
 
 ### Notification System
 
- holds seven `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, `session_created`, `replay`, and `beads_board`.
+ holds eight `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, `session_created`, `replay`, `beads_board`, and `beads_write`.
 
 The server-reader task fires the matching channel on each incoming `ServerMessage`, waking whichever wait handler is blocked on it.
 
@@ -1251,9 +1251,14 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by . The helper  creates a short-lived tokio runtime, connects, sends one , and receives one .
 
-Key request variants include `RequestBeadsBoard` alongside the session, wait, assertion, replay, and daemon-control requests.
+Key request variants include `RequestBeadsBoard` and `BeadsIssueWrite` alongside the session, wait, assertion, replay, and daemon-control requests.
 
 `BeadsBoard { state }` carries the first non-loading response. `scribe-test beads-board` prints that state as JSON so a functional script can assert the real server-owned refresh without a GPUI client.
+
+`scribe-test beads-write` sends a typed verb plus optional status and assignee
+guards. Its JSON reply includes the typed result and whether the daemon saw the
+post-write board push, so functional tests prove both persistence and server
+convergence without a GPUI client.
 
 `WindowId` (surfaced as `scribe-test daemon window-id`, printed by ) exists so a second process can be pointed at the daemon's window instead of claiming one of its own — the join target the shared-pane visual rig passes to the GPUI client as `SCRIBE_JOIN_WINDOW` (). It errors rather than returning a placeholder when no `Welcome` has arrived, because joining "no window" would silently reproduce the empty-window bug it exists to prevent.
 
@@ -1619,13 +1624,52 @@ Bare interactive passthrough is intentionally not exercised. Profile-writing com
 
 ### Real Beads Board Refresh
 
-The functional image uses Beads v1.1.0 to prove rooted workspace refresh and complete issue-detail fixture shapes against the server's real `bd` process contract.
+The functional image uses the checksum-pinned guarded Beads build to prove rooted workspace reads and writes against the server's real `bd` process contract.
 
 `just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready.
 
 The board omits the seeded epic as a standalone card while its child keeps the epic title as metadata, and queue totals count only non-epic issues.
 
 The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must expose the parent id and title through the `parent-child` relation and preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
+
+#### Guarded Beads Write Contract
+
+The network-none functional image proves its patched bd artifact before Scribe may advertise writes.
+
+`just e2e-func-beads-write-contract` verifies the pinned build marker and guard
+flags, atomic field/status/label/comment updates, explicit empty-assignee
+matching, rc13 structured mismatches, native actor and claim lease, native
+close timestamps/reason, and reopen cleanup. Stale attempts must leave every
+observed value and comment row unchanged.
+
+#### Server Beads Issue Writes
+
+The server functional path proves typed guarded mutations persist and push an authoritative board refresh.
+
+`just e2e-func-beads-issue-write` sends guarded title and comment writes,
+native claim, close, and undo through `scribe-test beads-write`. It re-reads
+the tracker with `bd show`, checks stale close/comment results map to
+`PreconditionFailed` without mutation, and requires `board_pushed: true` after
+successful writes.
+
+##### Root fan-out
+
+A successful refresh reaches every authorized local board on its project root without crossing repository or sharing-mode boundaries.
+
+The focused IPC test uses two local `SingleController` windows with distinct
+workspaces on one root and an equally authorized window on another root. Both
+matching workspace ids receive the refreshed board; the unrelated root does
+not.
+
+#### Beads Write Executor Unit Contract
+
+Docker-only server unit tests pin argv, capability, deadline, cache, and generation behavior without touching the host runtime.
+
+`just docker-unit-beads-write` compiles and runs the Beads-board module tests
+inside `docker/Dockerfile.func`. The suite covers every verb and supplied
+guard, strict build-marker parsing, stale-refresh rejection, last-good cache
+retention, root-scoped multi-window push, and killing a timed-out fake bd
+process with its descendant.
 
 ### AI Shell Environment Matrix
 

@@ -153,8 +153,9 @@ and assignee preconditions separately from the verb.
 
 The correlated `BeadsIssueWriteResult` server message returns `Applied` with a
 generation, `PreconditionFailed`, or `Failed` with a displayable reason. The
-current bd 1.1.0 server never executes these messages because it cannot enforce
-the two guards.
+server executes these messages only when its installed `bd` reports the exact
+contract-tested guarded-write build marker. Other builds leave the capability
+off rather than risking a partial or unguarded mutation.
 
 #### Named MessagePack round trip
 
@@ -229,9 +230,9 @@ opens and clears any open panel if a later `Welcome` removes the capability.
 
 `Welcome.beads_write` advertises typed write support independently from `beads_detail` and defaults to `false` when absent.
 
-A detail-capable server may therefore keep edits inert. Scribe does this for bd
-1.1.0 because that release rejects `--if-status` and `--if-assignee`; adding the
-wire types does not enable unsafe server writes.
+A detail-capable server may therefore keep edits inert. Scribe enables writes
+only for the source- and checksum-pinned guarded build validated by the Docker
+semantic contract; bd 1.1.0 and unrecognized upstream builds stay read-only.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 

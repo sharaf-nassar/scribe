@@ -14,15 +14,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
-    BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis,
+    BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite, BeadsIssueWriteGuards,
+    BeadsIssueWriteResult,
 };
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_ITEMS_PER_QUEUE: usize = 200;
@@ -33,6 +35,7 @@ const MAX_DETAIL_FIELD_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_COMMENTS: usize = 50;
 const MAX_DETAIL_COLLECTION_ITEMS: usize = 200;
 const BD_JSON_SCHEMA_VERSION: u64 = 1;
+const GUARDED_BD_BUILD: &str = "scribe-guards-7505e173f265";
 const SYSTEM_BD_DIRS: [&str; 9] = [
     "/opt/homebrew/bin",
     "/opt/homebrew/opt/beads/bin",
@@ -49,6 +52,7 @@ const SYSTEM_BD_DIRS: [&str; 9] = [
 #[derive(Debug, Clone, Default)]
 pub struct BeadsBoardCache {
     entries: Arc<Mutex<HashMap<PathBuf, CacheEntry>>>,
+    write_capability: Arc<OnceCell<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +62,8 @@ struct CacheEntry {
     last_attempt: Option<Instant>,
     last_error: Option<String>,
     in_flight: bool,
+    generation: u64,
+    write_lock: Arc<Mutex<()>>,
 }
 
 /// Result of looking up a board. `refresh` is true for exactly one concurrent
@@ -86,34 +92,145 @@ impl BeadsBoardCache {
 
     /// Refresh one project previously reserved by [`Self::lookup`].
     pub async fn refresh(&self, key: PathBuf) -> BeadsBoardState {
+        let generation = self.entries.lock().await.entry(key.clone()).or_default().generation;
         let result = Box::pin(load_board(&key)).await;
         let mut entries = self.entries.lock().await;
         let entry = entries.entry(key.clone()).or_default();
         entry.in_flight = false;
-        entry.last_attempt = Some(Instant::now());
-        match result {
-            Ok(LoadResult::NotDetected) => {
-                entry.detected = Some(false);
-                entry.last_good = None;
-                entry.last_error = None;
-            }
-            Ok(LoadResult::Snapshot(snapshot)) => {
-                entry.detected = Some(true);
-                entry.last_good = Some(snapshot);
-                entry.last_error = None;
-            }
-            Err(error) => {
-                // The board's only failure signal: a stuck workspace paints
-                // nothing, so an unexplained missing board is answered here.
-                // Logged on change, since this retries every thirty seconds
-                // for as long as the workspace stays broken.
-                if entry.last_error.as_deref() != Some(error.as_str()) {
-                    tracing::warn!(%error, root = %key.display(), "Beads board refresh failed");
-                }
-                entry.last_error = Some(error);
-            }
-        }
+        apply_refresh_if_current(entry, generation, result, &key);
         entry.state(false)
+    }
+
+    /// Probe the exact contract-tested bd build once per server process.
+    pub async fn write_available(&self) -> bool {
+        *self
+            .write_capability
+            .get_or_init(|| async {
+                let Ok(bd) = resolve_bd_executable() else {
+                    return false;
+                };
+                match probe_guarded_write_build(&bd).await {
+                    Ok(available) => available,
+                    Err(error) => {
+                        tracing::warn!(%error, "Beads guarded-write capability probe failed");
+                        false
+                    }
+                }
+            })
+            .await
+    }
+
+    /// Execute one typed write and advance this root's generation only after
+    /// bd confirms a versioned success envelope.
+    // @lat: [[client#Client#Beads Board CLI Data Source#Guarded issue writes]]
+    pub async fn write_issue(
+        &self,
+        project_root: &Path,
+        issue_id: &str,
+        verb: &BeadsIssueWrite,
+        guards: &BeadsIssueWriteGuards,
+    ) -> BeadsIssueWriteResult {
+        let started = Instant::now();
+        let canonical_root = match project_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                return BeadsIssueWriteResult::Failed {
+                    reason: format!("could not resolve Beads project root: {error}"),
+                };
+            }
+        };
+        let argv = match compose_write_argv(issue_id, verb, guards) {
+            Ok(argv) => argv,
+            Err(reason) => return BeadsIssueWriteResult::Failed { reason },
+        };
+        let write_lock = {
+            Arc::clone(
+                &self.entries.lock().await.entry(canonical_root.clone()).or_default().write_lock,
+            )
+        };
+        let _write_guard = write_lock.lock().await;
+        let result = match resolve_bd_executable() {
+            Ok(bd) => run_bd_write(&bd, &canonical_root, &argv).await,
+            Err(reason) => Err(WriteError::Failed(reason)),
+        };
+        let outcome = match result {
+            Ok(()) => {
+                let mut entries = self.entries.lock().await;
+                let entry = entries.entry(canonical_root.clone()).or_default();
+                entry.generation = entry.generation.wrapping_add(1);
+                BeadsIssueWriteResult::Applied { generation: entry.generation }
+            }
+            Err(WriteError::PreconditionFailed) => BeadsIssueWriteResult::PreconditionFailed,
+            Err(WriteError::Failed(reason)) => BeadsIssueWriteResult::Failed { reason },
+        };
+        let outcome_name = match &outcome {
+            BeadsIssueWriteResult::Applied { .. } => "applied",
+            BeadsIssueWriteResult::PreconditionFailed => "precondition_failed",
+            BeadsIssueWriteResult::Failed { .. } => "failed",
+        };
+        let generation = match &outcome {
+            BeadsIssueWriteResult::Applied { generation } => Some(*generation),
+            _ => None,
+        };
+        tracing::info!(
+            root = %canonical_root.display(),
+            %issue_id,
+            verb = write_verb_name(verb),
+            ?generation,
+            outcome = outcome_name,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Beads issue write finished"
+        );
+        outcome
+    }
+
+    /// Force the authoritative post-write board load. A newer committed write
+    /// fences this result out before it can replace the cache's last-good data.
+    pub async fn refresh_after_write(&self, key: PathBuf, generation: u64) -> BeadsBoardState {
+        let result = Box::pin(load_board(&key)).await;
+        let mut entries = self.entries.lock().await;
+        let entry = entries.entry(key.clone()).or_default();
+        apply_refresh_if_current(entry, generation, result, &key);
+        entry.state(false)
+    }
+}
+
+fn apply_refresh_if_current(
+    entry: &mut CacheEntry,
+    generation: u64,
+    result: Result<LoadResult, String>,
+    key: &Path,
+) -> bool {
+    if entry.generation != generation {
+        return false;
+    }
+    apply_refresh_result(entry, result, key);
+    true
+}
+
+fn apply_refresh_result(entry: &mut CacheEntry, result: Result<LoadResult, String>, key: &Path) {
+    entry.last_attempt = Some(Instant::now());
+    match result {
+        Ok(LoadResult::NotDetected) => {
+            entry.detected = Some(false);
+            entry.last_good = None;
+            entry.last_error = None;
+        }
+        Ok(LoadResult::Snapshot(snapshot)) => {
+            entry.detected = Some(true);
+            entry.last_good = Some(snapshot);
+            entry.last_error = None;
+        }
+        Err(error) => {
+            // The board's only failure signal: a stuck workspace paints
+            // nothing, so an unexplained missing board is answered here.
+            // Logged on change, since this retries every thirty seconds
+            // for as long as the workspace stays broken.
+            if entry.last_error.as_deref() != Some(error.as_str()) {
+                tracing::warn!(%error, root = %key.display(), "Beads board refresh failed");
+            }
+            entry.last_error = Some(error);
+        }
     }
 }
 
@@ -233,6 +350,19 @@ struct Bd {
     search_path: Option<OsString>,
 }
 
+#[derive(Debug)]
+enum WriteError {
+    PreconditionFailed,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct BdOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 fn resolve_bd_executable() -> Result<Bd, String> {
     resolve_bd_executable_from(std::env::var_os("PATH").as_deref(), dirs::home_dir().as_deref())
         .ok_or_else(|| {
@@ -275,6 +405,207 @@ fn bd_search_dirs(path: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     dirs.retain(|dir| seen.insert(dir.clone()));
     dirs
+}
+
+fn compose_write_argv(
+    issue_id: &str,
+    verb: &BeadsIssueWrite,
+    guards: &BeadsIssueWriteGuards,
+) -> Result<Vec<OsString>, String> {
+    if issue_id.is_empty() || issue_id.starts_with('-') || issue_id.contains('\0') {
+        return Err("invalid Beads issue id".into());
+    }
+    let mut argv = Vec::new();
+    let guarded = match verb {
+        BeadsIssueWrite::SetTitle { title } => update_arg(&mut argv, issue_id, "--title", title),
+        BeadsIssueWrite::SetDescription { description } => {
+            update_arg(&mut argv, issue_id, "--description", description)
+        }
+        BeadsIssueWrite::SetAcceptance { acceptance } => {
+            update_arg(&mut argv, issue_id, "--acceptance", acceptance)
+        }
+        BeadsIssueWrite::SetNotes { notes } => update_arg(&mut argv, issue_id, "--notes", notes),
+        BeadsIssueWrite::SetDesign { design } => {
+            update_arg(&mut argv, issue_id, "--design", design)
+        }
+        BeadsIssueWrite::SetSpecId { spec_id } => {
+            update_arg(&mut argv, issue_id, "--spec-id", spec_id.as_deref().unwrap_or(""))
+        }
+        BeadsIssueWrite::SetPriority { priority } => {
+            if *priority > 4 {
+                return Err(format!("invalid Beads priority {priority}; expected 0 through 4"));
+            }
+            update_arg(&mut argv, issue_id, "--priority", &priority.to_string());
+            true
+        }
+        BeadsIssueWrite::SetType { issue_type } => {
+            update_arg(&mut argv, issue_id, "--type", issue_type);
+            true
+        }
+        BeadsIssueWrite::SetLabels { labels } => {
+            update_arg(&mut argv, issue_id, "--set-labels", &labels.join(","));
+            true
+        }
+        BeadsIssueWrite::SetStatus { status, clear_defer } => {
+            if !matches!(status.as_str(), "open" | "in_progress" | "closed") {
+                return Err(format!("unsupported Beads status {status:?}"));
+            }
+            update_arg(&mut argv, issue_id, "--status", status);
+            if *clear_defer {
+                argv.extend([OsString::from("--defer"), OsString::new()]);
+            }
+            true
+        }
+        BeadsIssueWrite::Claim => {
+            argv.extend(["update".into(), issue_id.into(), "--claim".into()]);
+            true
+        }
+        BeadsIssueWrite::CloseIssue => {
+            argv.extend(["close".into(), issue_id.into()]);
+            true
+        }
+        BeadsIssueWrite::UndoClose => {
+            argv.extend(["reopen".into(), issue_id.into()]);
+            true
+        }
+        BeadsIssueWrite::AddComment { body } => {
+            argv.extend([
+                "comments".into(),
+                "add".into(),
+                issue_id.into(),
+                truncate_bytes(body, MAX_DETAIL_FIELD_BYTES).into(),
+            ]);
+            true
+        }
+    };
+    if guarded {
+        if let Some(status) = &guards.if_status {
+            argv.extend(["--if-status".into(), status.into()]);
+        }
+        if let Some(assignee) = &guards.if_assignee {
+            argv.extend(["--if-assignee".into(), assignee.into()]);
+        }
+    }
+    Ok(argv)
+}
+
+fn update_arg(argv: &mut Vec<OsString>, issue_id: &str, flag: &str, value: &str) -> bool {
+    argv.extend(["update".into(), issue_id.into(), flag.into(), value.into()]);
+    true
+}
+
+fn write_verb_name(verb: &BeadsIssueWrite) -> &'static str {
+    match verb {
+        BeadsIssueWrite::SetTitle { .. } => "set_title",
+        BeadsIssueWrite::SetDescription { .. } => "set_description",
+        BeadsIssueWrite::SetAcceptance { .. } => "set_acceptance",
+        BeadsIssueWrite::SetNotes { .. } => "set_notes",
+        BeadsIssueWrite::SetDesign { .. } => "set_design",
+        BeadsIssueWrite::SetSpecId { .. } => "set_spec_id",
+        BeadsIssueWrite::SetPriority { .. } => "set_priority",
+        BeadsIssueWrite::SetType { .. } => "set_type",
+        BeadsIssueWrite::SetLabels { .. } => "set_labels",
+        BeadsIssueWrite::SetStatus { .. } => "set_status",
+        BeadsIssueWrite::Claim => "claim",
+        BeadsIssueWrite::CloseIssue => "close",
+        BeadsIssueWrite::UndoClose => "undo_close",
+        BeadsIssueWrite::AddComment { .. } => "add_comment",
+    }
+}
+
+async fn probe_guarded_write_build(bd: &Bd) -> Result<bool, String> {
+    let output = invoke_bd(bd, None, &["version".into()], COMMAND_TIMEOUT, "version probe").await?;
+    if !output.status.success() {
+        return Err(format!("bd version probe failed: {}", failure_detail(&output)));
+    }
+    guarded_build_from_version_json(&output.stdout)
+}
+
+fn guarded_build_from_version_json(bytes: &[u8]) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid bd version JSON: {error}"))?;
+    let payload = value.get("data").unwrap_or(&value);
+    Ok(payload.get("build").and_then(serde_json::Value::as_str) == Some(GUARDED_BD_BUILD))
+}
+
+async fn run_bd_write(bd: &Bd, project_root: &Path, argv: &[OsString]) -> Result<(), WriteError> {
+    let output = invoke_bd(bd, Some(project_root), argv, WRITE_TIMEOUT, "issue write")
+        .await
+        .map_err(WriteError::Failed)?;
+    if output.status.code() == Some(13) {
+        return Err(WriteError::PreconditionFailed);
+    }
+    if !output.status.success() {
+        return Err(WriteError::Failed(format!("bd failed: {}", failure_detail(&output))));
+    }
+    parse_envelope::<serde_json::Value>(&output.stdout, "write")
+        .map(|_| ())
+        .map_err(WriteError::Failed)
+}
+
+async fn invoke_bd(
+    bd: &Bd,
+    project_root: Option<&Path>,
+    argv: &[OsString],
+    timeout: Duration,
+    operation: &str,
+) -> Result<BdOutput, String> {
+    let mut command = Command::new(&bd.exe);
+    command.arg("--json");
+    if let Some(project_root) = project_root {
+        command.args(["-C"]).arg(project_root).current_dir(project_root);
+    }
+    command
+        .args(argv)
+        .env("BD_JSON_ENVELOPE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(search_path) = &bd.search_path {
+        command.env("PATH", search_path);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "bd disappeared after it was discovered".into()
+        } else {
+            format!("could not start bd: {error}")
+        }
+    })?;
+    let pid = child.id();
+    let stdout_pipe = child.stdout.take().ok_or_else(|| "bd stdout unavailable".to_owned())?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| "bd stderr unavailable".to_owned())?;
+    let completed = Box::pin(tokio::time::timeout(timeout, async {
+        tokio::join!(
+            child.wait(),
+            read_bounded(stdout_pipe, MAX_STDOUT_BYTES),
+            read_bounded(stderr_pipe, MAX_STDERR_BYTES),
+        )
+    }))
+    .await;
+    let Ok((status, stdout, stderr)) = completed else {
+        kill_process_group(pid);
+        drop(child.kill().await);
+        drop(child.wait().await);
+        return Err(format!("bd {operation} timed out"));
+    };
+    Ok(BdOutput {
+        status: status.map_err(|error| format!("could not wait for bd: {error}"))?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+fn failure_detail(output: &BdOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let json = json_error(&output.stdout);
+    if json.is_empty() { format!("exited with {}", output.status) } else { json }
 }
 
 async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<Vec<u8>, RunError> {
@@ -1194,6 +1525,144 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Beads Write Executor Unit Contract]]
+    #[test]
+    fn composes_every_write_verb_with_supplied_atomic_guards() {
+        let guards = BeadsIssueWriteGuards {
+            if_status: Some("open".into()),
+            if_assignee: Some(String::new()),
+        };
+        let cases = [
+            (
+                BeadsIssueWrite::SetTitle { title: "Title".into() },
+                vec!["update", "id", "--title", "Title"],
+            ),
+            (
+                BeadsIssueWrite::SetDescription { description: "Desc".into() },
+                vec!["update", "id", "--description", "Desc"],
+            ),
+            (
+                BeadsIssueWrite::SetAcceptance { acceptance: "Accept".into() },
+                vec!["update", "id", "--acceptance", "Accept"],
+            ),
+            (
+                BeadsIssueWrite::SetNotes { notes: "Notes".into() },
+                vec!["update", "id", "--notes", "Notes"],
+            ),
+            (
+                BeadsIssueWrite::SetDesign { design: "Design".into() },
+                vec!["update", "id", "--design", "Design"],
+            ),
+            (BeadsIssueWrite::SetSpecId { spec_id: None }, vec!["update", "id", "--spec-id", ""]),
+            (
+                BeadsIssueWrite::AddComment { body: "Comment".into() },
+                vec!["comments", "add", "id", "Comment"],
+            ),
+        ];
+
+        for (verb, expected) in cases {
+            let mut expected = expected;
+            expected.extend(["--if-status", "open", "--if-assignee", ""]);
+            let argv = compose_write_argv("id", &verb, &guards).expect("compose argv");
+            assert_eq!(argv, expected.iter().map(OsString::from).collect::<Vec<_>>());
+        }
+
+        let guarded_cases = [
+            (BeadsIssueWrite::SetPriority { priority: 1 }, vec!["update", "id", "--priority", "1"]),
+            (
+                BeadsIssueWrite::SetType { issue_type: "bug".into() },
+                vec!["update", "id", "--type", "bug"],
+            ),
+            (
+                BeadsIssueWrite::SetLabels { labels: vec!["one".into(), "two".into()] },
+                vec!["update", "id", "--set-labels", "one,two"],
+            ),
+            (
+                BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: true },
+                vec!["update", "id", "--status", "open", "--defer", ""],
+            ),
+            (BeadsIssueWrite::Claim, vec!["update", "id", "--claim"]),
+            (BeadsIssueWrite::CloseIssue, vec!["close", "id"]),
+            (BeadsIssueWrite::UndoClose, vec!["reopen", "id"]),
+        ];
+        for (verb, mut expected) in guarded_cases {
+            expected.extend(["--if-status", "open", "--if-assignee", ""]);
+            let argv = compose_write_argv("id", &verb, &guards).expect("compose argv");
+            assert_eq!(argv, expected.iter().map(OsString::from).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn generation_fence_discards_refreshes_started_before_a_write() {
+        let mut entry = CacheEntry { generation: 2, ..CacheEntry::default() };
+        let old = BeadsBoardSnapshot { refreshed_at_epoch_ms: 1, ..Default::default() };
+        let current = BeadsBoardSnapshot { refreshed_at_epoch_ms: 2, ..Default::default() };
+
+        assert!(!apply_refresh_if_current(
+            &mut entry,
+            1,
+            Ok(LoadResult::Snapshot(old)),
+            Path::new("/tmp/fenced"),
+        ));
+        assert!(entry.last_good.is_none());
+        assert!(apply_refresh_if_current(
+            &mut entry,
+            2,
+            Ok(LoadResult::Snapshot(current.clone())),
+            Path::new("/tmp/fenced"),
+        ));
+        assert_eq!(entry.last_good, Some(current));
+    }
+
+    #[test]
+    fn capability_probe_requires_the_contract_tested_build_marker() {
+        assert!(
+            guarded_build_from_version_json(
+                br#"{"data":{"build":"scribe-guards-7505e173f265"},"schema_version":1}"#,
+            )
+            .expect("parse pinned build")
+        );
+        assert!(
+            !guarded_build_from_version_json(br#"{"build":"release"}"#).expect("parse other build")
+        );
+        assert!(guarded_build_from_version_json(b"not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn write_timeout_kills_the_whole_bd_process_group() {
+        let scratch = beads_test_scratch_path("write-timeout");
+        fs::create_dir_all(&scratch).expect("create scratch root");
+        let child_pid = scratch.join("child.pid");
+        let fake = scratch.join("bd");
+        fs::write(
+            &fake,
+            format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", child_pid.display()),
+        )
+        .expect("write fake bd");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let bd = Bd { exe: fake, search_path: None };
+
+        let error = invoke_bd(
+            &bd,
+            Some(&scratch),
+            &["update".into()],
+            Duration::from_millis(100),
+            "issue write",
+        )
+        .await
+        .expect_err("fake bd must time out");
+
+        assert_eq!(error, "bd issue write timed out");
+        let pid_text = fs::read_to_string(&child_pid).expect("read child pid");
+        let pid = pid_text.trim().parse::<i32>().expect("parse child pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "bd child survived timeout");
+        fs::remove_dir_all(scratch).expect("remove scratch root");
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]

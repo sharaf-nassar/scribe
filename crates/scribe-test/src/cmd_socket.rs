@@ -4,7 +4,10 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
-use scribe_common::protocol::{AiResumeMode, AutomationAction, BeadsBoardState, CiRunState};
+use scribe_common::protocol::{
+    AiResumeMode, AutomationAction, BeadsBoardState, BeadsIssueWrite, BeadsIssueWriteGuards,
+    BeadsIssueWriteResult, CiRunState,
+};
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -123,6 +126,12 @@ pub enum DaemonRequest {
     },
     /// Refresh the current workspace's Beads board through the real server.
     RequestBeadsBoard,
+    /// Execute one typed issue write through the real server.
+    BeadsIssueWrite {
+        issue_id: String,
+        verb: BeadsIssueWrite,
+        guards: BeadsIssueWriteGuards,
+    },
     /// Open or close job-detail interest on the daemon's capable connection.
     SetCiRunDetailsInterest {
         repo_root: PathBuf,
@@ -192,6 +201,10 @@ pub enum DaemonResponse {
     },
     BeadsBoard {
         state: BeadsBoardState,
+    },
+    BeadsIssueWrite {
+        result: BeadsIssueWriteResult,
+        board_pushed: bool,
     },
     CiRunState {
         observation: CiRunObservation,

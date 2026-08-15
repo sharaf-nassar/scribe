@@ -147,7 +147,11 @@ docker-func profile="release":
         *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
     esac
     tools/e2e-stage.sh "$profile" scribe-server scribe-test scribe-hook-helper scribe-cli
-    docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.func -t "$image" .
+    docker build --target func-runtime --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.func -t "$image" .
+
+# Compile and run Beads-board server unit tests inside the functional image.
+docker-unit-beads-write:
+    docker build --target beads-write-unit --build-arg BIN_DIR=target/e2e-stage/release -f docker/Dockerfile.func -t scribe-test-beads-write-unit .
 
 # Rebuild visual test container from release or debug binaries
 docker-visual profile="release":
@@ -510,6 +514,14 @@ e2e-visual-ci-run-bar:
 # Run one real bd refresh through the functional server.
 e2e-func-beads-board:
     TEST_TIMEOUT=60 just e2e-func func/beads-board.sh
+
+# Prove the checksum-pinned bd build preserves guarded native write semantics.
+e2e-func-beads-write-contract:
+    TEST_TIMEOUT=90 just e2e-func func/beads-write-contract.sh
+
+# Exercise typed issue writes through the real server and patched bd.
+e2e-func-beads-issue-write:
+    TEST_TIMEOUT=120 just e2e-func func/beads-issue-write.sh
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
 # response and the bridge read reply leaving the client, and the seeded config
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run

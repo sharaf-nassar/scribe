@@ -17,7 +17,8 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
     AiLaunchSpec, AiResumeMode, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
-    ClientMessage, ServerMessage, TerminalSize,
+    BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult, ClientMessage, ServerMessage,
+    TerminalSize,
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -173,6 +174,8 @@ struct DaemonState {
     last_action: Option<AutomationAction>,
     /// Most recent terminal Beads-board reply, paired with its workspace.
     beads_board: Option<(WorkspaceId, BeadsBoardState)>,
+    /// Most recent typed Beads write reply.
+    beads_write: Option<(WorkspaceId, String, BeadsIssueWriteResult)>,
     /// Production client state seam fed by capability-gated CI IPC.
     ci_runs: CiRunBars,
 }
@@ -187,6 +190,7 @@ impl DaemonState {
             envelope_ids: HashMap::new(),
             last_action: None,
             beads_board: None,
+            beads_write: None,
             ci_runs: CiRunBars::default(),
         }
     }
@@ -201,6 +205,7 @@ struct WaitNotifiers {
     session_created: Arc<Notify>,
     replay: Arc<Notify>,
     beads_board: Arc<Notify>,
+    beads_write: Arc<Notify>,
 }
 
 impl WaitNotifiers {
@@ -213,6 +218,7 @@ impl WaitNotifiers {
             session_created: Arc::new(Notify::new()),
             replay: Arc::new(Notify::new()),
             beads_board: Arc::new(Notify::new()),
+            beads_write: Arc::new(Notify::new()),
         }
     }
 }
@@ -679,15 +685,15 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::BeadsIssueDetail { .. }
-        | ServerMessage::BeadsIssueWriteResult { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
         | ServerMessage::ShareEnded { .. } => {}
         ServerMessage::BeadsBoard { workspace_id, state: board, .. } => {
-            if !matches!(board, BeadsBoardState::Loading { .. }) {
-                state_beads_board(workspace_id, board, state, notifiers).await;
-            }
+            state_beads_board(workspace_id, board, state, notifiers).await;
+        }
+        ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
+            state_beads_write(workspace_id, issue_id, result, state, notifiers).await;
         }
     }
 }
@@ -698,8 +704,22 @@ async fn state_beads_board(
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
 ) {
+    if matches!(board, BeadsBoardState::Loading { .. }) {
+        return;
+    }
     state.lock().await.beads_board = Some((workspace_id, board));
     notifiers.beads_board.notify_waiters();
+}
+
+async fn state_beads_write(
+    workspace_id: WorkspaceId,
+    issue_id: String,
+    result: BeadsIssueWriteResult,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    state.lock().await.beads_write = Some((workspace_id, issue_id, result));
+    notifiers.beads_write.notify_waiters();
 }
 
 async fn dispatch_session_message(
@@ -1206,6 +1226,7 @@ async fn process_request(
         }
         request @ (DaemonRequest::RequestAiChrome { .. }
         | DaemonRequest::RequestBeadsBoard
+        | DaemonRequest::BeadsIssueWrite { .. }
         | DaemonRequest::SetCiRunDetailsInterest { .. }
         | DaemonRequest::RequestCiRunState { .. }) => {
             handle_chrome_request(request, state, notifiers, server_writer).await
@@ -1244,6 +1265,10 @@ async fn handle_chrome_request(
         DaemonRequest::RequestBeadsBoard => {
             handle_request_beads_board(state, notifiers, server_writer).await
         }
+        DaemonRequest::BeadsIssueWrite { issue_id, verb, guards } => {
+            handle_beads_issue_write((issue_id, verb, guards), state, notifiers, server_writer)
+                .await
+        }
         DaemonRequest::SetCiRunDetailsInterest { repo_root, head_sha, interested } => {
             handle_ci_detail_interest(repo_root, head_sha, interested, server_writer).await
         }
@@ -1252,6 +1277,67 @@ async fn handle_chrome_request(
         }
         _ => DaemonResponse::Error { message: "invalid chrome request".to_owned() },
     }
+}
+
+async fn handle_beads_issue_write(
+    write: (String, BeadsIssueWrite, BeadsIssueWriteGuards),
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    let (issue_id, verb, guards) = write;
+    let Some(workspace_id) = state.lock().await.last_workspace_id else {
+        return DaemonResponse::Error { message: "no workspace recorded".to_owned() };
+    };
+    {
+        let mut daemon = state.lock().await;
+        daemon.beads_write = None;
+        daemon.beads_board = None;
+    }
+    let message =
+        ClientMessage::BeadsIssueWrite { workspace_id, issue_id: issue_id.clone(), verb, guards };
+    if let Err(error) = send_to_server(server_writer, &message).await {
+        return DaemonResponse::Error { message: format!("failed to write Beads issue: {error}") };
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let result = loop {
+        if let Some((reply_workspace, reply_issue, result)) = state.lock().await.beads_write.clone()
+            && reply_workspace == workspace_id
+            && reply_issue == issue_id
+        {
+            break result;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return DaemonResponse::Error {
+                message: "timed out waiting for Beads issue write".to_owned(),
+            };
+        }
+        drop(tokio::time::timeout(remaining, notifiers.beads_write.notified()).await);
+    };
+
+    let mut board_pushed = false;
+    if matches!(result, BeadsIssueWriteResult::Applied { .. }) {
+        loop {
+            if state
+                .lock()
+                .await
+                .beads_board
+                .as_ref()
+                .is_some_and(|(reply_workspace, _)| *reply_workspace == workspace_id)
+            {
+                board_pushed = true;
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            drop(tokio::time::timeout(remaining, notifiers.beads_board.notified()).await);
+        }
+    }
+    DaemonResponse::BeadsIssueWrite { result, board_pushed }
 }
 
 async fn handle_ci_run_state(repo_root: PathBuf, state: &SharedState) -> DaemonResponse {

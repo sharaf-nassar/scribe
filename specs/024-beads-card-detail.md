@@ -146,8 +146,9 @@ Acceptance criteria:
   `--if-assignee` / `--if-status` guards captured from the fresh detail
   read, so a race with another actor (this repo's own agents claim beads
   concurrently) fails cleanly as a surfaced "someone else won" notice;
-  text-field edits are last-writer-wins in v1. The `beads_write` capability
-  stays off on bd 1.1.0 because that release lacks both guard flags.
+  every supplied guard is applied atomically, including text and comments;
+  only a text write sent without guards is last-writer-wins. `beads_write`
+  stays off for bd 1.1.0 because that release lacks both guard flags.
 
 ### Story 3 — Move a card between queues by dragging
 
@@ -411,15 +412,16 @@ veto.
   Dolt commit + JSONL export; on timeout the client converges via forced
   refresh + detail re-read instead of trusting the failure. The bd 1.1.0
   probe's slowest of 20 timed write attempts was 972ms.
-- Concurrency guards on claim/status/close require `--if-status` and
+- Concurrency guards on every verb require `--if-status` and
   `--if-assignee` captured from the fresh detail read. bd 1.1.0 has neither
   flag: each is rejected as an unknown flag with exit 1, not exit 13. The
-  server must classify that contract as write-incompatible, not as a race;
-  text-field edits remain last-writer-wins once writes are enabled.
+  server must classify that contract as write-incompatible, not as a race.
+  Unguarded text stays last-writer-wins, but supplied guards are never dropped.
 - bd 1.1.0 is the detail-read floor, not the write floor. The write floor is
-  the first harness-verified release whose update command exposes both guard
-  flags and whose mismatch exit contract is measured. Until then the panel
-  stays read-only instead of silently dropping guards.
+  upstream commit `7505e173f2659ba6e1f955b86d81a4f9e21810ca` plus the bounded
+  `docker/beads-guarded-writes.patch`. The Docker build checksum-pins the source
+  archive and marks the artifact `scribe-guards-7505e173f265`; every other
+  build stays read-only instead of silently dropping guards.
 - The inline editor is new client machinery, the feature's largest work
   item: a focusable editor entity implementing `EntityInputHandler` with a
   key-routing carve-out so keystrokes never reach the PTY. Esc precedence:
@@ -475,6 +477,26 @@ Mismatched attempts with each flag returned exit 1 and `unknown flag`, not
 exit 13. The issue JSON before and after both attempts was identical, so bd
 rejects rather than ignores them, but 1.1.0 cannot provide the required
 guarded writes or the planned precondition-failed mapping.
+
+### Guarded write-floor contract probe
+
+The 2026-08-15 network-none Docker probe verified the checksum-pinned patched build as the write floor.
+
+Upstream main already placed field, label, claim, close, reopen, and comment
+operations behind typed transactions, but its CLI rejected guarded claim and
+label-only updates and exposed no guards for close, reopen, or comments. The
+bounded patch removes those stale adapter refusals and threads status/assignee
+preconditions into native close, reopen, batch-close, and comment requests.
+Comment guards execute inside the same SQL transaction or retried unit of work
+as the append; no read-then-write or local lock substitutes for external-writer
+atomicity.
+
+The probe verifies guarded fields, status, labels, comments, native claim actor
+and lease, native close timestamps/reason, reopen cleanup, explicit empty
+assignee, structured mismatch JSON, and rc13. Every stale attempt leaves the
+observed issue and comment thread unchanged. Scribe releases still do not
+bundle bd; the source-built artifact exists only in the functional harness,
+and production capability stays false for binaries without its exact marker.
 
 Default `bd show --json` returns `dependent_count` and `comment_count` but
 neither collection. `--include-dependents` adds `dependents`, whose elements
@@ -570,10 +592,10 @@ native DnD are cheaper and already precedented).
 - `crates/scribe-server/src/beads_board.rs` — detail fetch
   (`bd show --json --include-comments --include-dependents`), server-side
   caps, the write verb set with guards, a separate 15s write deadline,
-  mismatch-exit mapping verified against the eventual write-floor release,
+  mismatch-exit mapping verified against the pinned guarded write floor,
   per-root write generation fence, post-write forced refresh, and a bd
-  contract probe that keeps writes unavailable when either guard flag is
-  absent. bd 1.1.0 remains sufficient for detail reads only.
+  contract probe that keeps writes unavailable unless the exact semantic
+  build marker matches. bd 1.1.0 remains sufficient for detail reads only.
 - `crates/scribe-server/src/ipc_server.rs` — handlers for detail and write,
   gated to local owning controller connections whose window shows the root
   (precedent: `DismissCiRun`), post-write snapshot push to every board on
@@ -670,9 +692,9 @@ No persistent storage changes and no migrations. New wire/in-memory types:
   paint-time `ElementInputHandler` registration, committed text delivery, and
   full PTY-encoder exclusion while editor focus is armed.
 - Protocol: round-trip tests for every new message.
-- Functional e2e (real bd, `--network none`): bd 1.1.0 keeps write controls
-  inert with the measured unsupported-contract result. After the image moves
-  to a verified guard-capable write floor: open panel from a click; one write
+- Functional e2e (real bd, `--network none`): unrecognized builds keep write
+  controls inert; the pinned patched floor must pass its semantic contract
+  before server tests run. With that floor: open panel from a click; one write
   per verb family proven by re-running `bd show` (mandatory, not optional);
   claim/close/undo (undo restores open within the 5s window); comment; a
   seeded guard race surfacing precondition-failed; drag
@@ -706,9 +728,9 @@ No persistent storage changes and no migrations. New wire/in-memory types:
   write deadline and converge-on-timeout (forced refresh + detail re-read).
   The bd 1.1.0 contract probe measured 20 attempts below the deadline, with
   an observed maximum of 972ms.
-- bd 1.1.0 lacks both conditional update flags, so it cannot safely serve
-  concurrency-sensitive writes. Mitigation: keep `beads_write` unavailable
-  until the functional image pins and verifies a guard-capable release;
+- Upstream v1.2.2 still lacks the complete native CLI guard surface, so an
+  arbitrary newer binary is not safely write-capable. Mitigation: gate on the
+  exact contract-tested patched marker and keep all other installs read-only;
   detail reads and the read-only panel remain independently shippable.
 - Ghost/clipping behavior of GPUI DnD inside a region-clipped strip.
   Mitigation: titlebar precedent plus a slice-(c) spike before polishing.
@@ -730,6 +752,9 @@ parallelize with server work inside each slice.
   `--include-dependents`, comment shapes match the probe record, and all 20
   timed attempts stayed below 15s. This unblocks slice a but leaves slice b
   dependent on selecting and probing a guard-capable bd write floor.
+- Completed write-floor node: checksum-pinned upstream main plus the bounded
+  native-transaction patch passes field/status/label/comment, claim,
+  close/reopen, lifecycle, actor, JSON-envelope, and rc13 probes.
 - Slice a (read): detail protocol messages + `beads_detail` capability →
   { server detail fetch/caps/derived-queue/gating ∥ read-only panel entity
   split into: panel layout + palette; anchor/clamp/max-height/re-anchor;
@@ -737,7 +762,7 @@ parallelize with server work inside each slice.
   seeded writable bd fixture + visual detail fixture set → visual panel
   contract + functional detail test → slice-a lat.md update + lat check.
   In parallel: the editor input-handler spike.
-- Slice b (write, after the guard-capable bd floor is pinned): write protocol
+- Slice b (write, with the guard-capable bd floor pinned): write protocol
   messages + `beads_write` capability →
   server write verbs (guards, clear-defer, deadline, fence, push, logging,
   bd-too-old probe) ∥ editor entity + key routing (from the spike) →

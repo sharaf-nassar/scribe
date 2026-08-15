@@ -42,7 +42,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use scribe_common::ai_state::AiProvider;
 use scribe_common::ids::WindowId;
-use scribe_common::protocol::AiResumeMode;
+use scribe_common::protocol::{AiResumeMode, BeadsIssueWrite, BeadsIssueWriteGuards};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -151,6 +151,8 @@ enum Command {
     },
     /// Refresh the current workspace's Beads board and print its state as JSON.
     BeadsBoard,
+    /// Execute one typed Beads issue write through the server.
+    BeadsWrite(BeadsWriteArgs),
     /// Serve a deterministic loopback-only GitHub Actions API fixture.
     GithubActionsApi(GithubActionsApiArgs),
     /// Inspect the `SessionReplay` frames the daemon received and the screen it
@@ -433,6 +435,20 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct BeadsWriteArgs {
+    issue_id: String,
+    verb: String,
+    #[arg(long)]
+    value: Option<String>,
+    #[arg(long)]
+    if_status: Option<String>,
+    #[arg(long)]
+    if_assignee: Option<String>,
+    #[arg(long)]
+    clear_defer: bool,
+}
+
 #[derive(Subcommand)]
 enum ServerAction {
     /// Start the scribe-server process.
@@ -617,6 +633,58 @@ impl From<AiResumeModeArg> for AiResumeMode {
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn parse_beads_write_verb(
+    name: &str,
+    value: Option<String>,
+    clear_defer: bool,
+) -> Result<BeadsIssueWrite, TestError> {
+    let required = |field: &str| {
+        value.ok_or_else(|| {
+            TestError::InfraError(format!("beads-write {name} requires --value for {field}"))
+        })
+    };
+    match name {
+        "set-title" => Ok(BeadsIssueWrite::SetTitle { title: required("title")? }),
+        "set-description" => {
+            Ok(BeadsIssueWrite::SetDescription { description: required("description")? })
+        }
+        "set-acceptance" => {
+            Ok(BeadsIssueWrite::SetAcceptance { acceptance: required("acceptance")? })
+        }
+        "set-notes" => Ok(BeadsIssueWrite::SetNotes { notes: required("notes")? }),
+        "set-design" => Ok(BeadsIssueWrite::SetDesign { design: required("design")? }),
+        "set-spec-id" => Ok(BeadsIssueWrite::SetSpecId { spec_id: Some(required("spec-id")?) }),
+        "clear-spec-id" => Ok(BeadsIssueWrite::SetSpecId { spec_id: None }),
+        "set-priority" => {
+            let raw = required("priority")?;
+            let priority = raw.parse::<u8>().map_err(|error| {
+                TestError::InfraError(format!("invalid beads-write priority {raw:?}: {error}"))
+            })?;
+            Ok(BeadsIssueWrite::SetPriority { priority })
+        }
+        "set-type" => Ok(BeadsIssueWrite::SetType { issue_type: required("type")? }),
+        "set-labels" => Ok(BeadsIssueWrite::SetLabels {
+            labels: required("labels")?
+                .split(',')
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }),
+        "set-status" => Ok(BeadsIssueWrite::SetStatus { status: required("status")?, clear_defer }),
+        "claim" => Ok(BeadsIssueWrite::Claim),
+        "close" => Ok(BeadsIssueWrite::CloseIssue),
+        "undo-close" => Ok(BeadsIssueWrite::UndoClose),
+        "add-comment" => Ok(BeadsIssueWrite::AddComment { body: required("comment")? }),
+        _ => Err(TestError::InfraError(format!("unknown beads-write verb {name:?}"))),
+    }
+}
+
+fn run_beads_write(args: BeadsWriteArgs) -> Result<(), TestError> {
+    let BeadsWriteArgs { issue_id, verb, value, if_status, if_assignee, clear_defer } = args;
+    let verb = parse_beads_write_verb(&verb, value, clear_defer)?;
+    capture::beads_write(issue_id, verb, BeadsIssueWriteGuards { if_status, if_assignee })
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -637,6 +705,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
         Command::BeadsBoard => capture::beads_board(),
+        Command::BeadsWrite(args) => run_beads_write(args),
         Command::GithubActionsApi(args) => run_gh_api(&args),
         Command::Replay { action } => run_replay(action),
         Command::WaitOutput { session_id: s, pattern: p, timeout: t } => run_wait(&s, &p, t),

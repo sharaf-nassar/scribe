@@ -1,10 +1,24 @@
-FROM rust:1.95-trixie
+FROM golang:1.26.5-trixie AS beads-builder
 
-ADD --checksum=sha256:b0f3dd607c3fb989ee08d0a6854fba80d0402971eb108f9af6170bc14d491a34 \
-    https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_amd64.tar.gz \
+ADD --checksum=sha256:7fcfe5370953c429e51ffed6c748a3ef03bebd965be531a7b1f6522bc566e5f8 \
+    https://github.com/gastownhall/beads/archive/7505e173f2659ba6e1f955b86d81a4f9e21810ca.tar.gz \
     /tmp/beads.tar.gz
+COPY docker/beads-guarded-writes.patch /tmp/beads-guarded-writes.patch
 
-RUN tar -xzf /tmp/beads.tar.gz -C /usr/local/bin bd && rm /tmp/beads.tar.gz
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends patch && \
+    mkdir /src /out && \
+    tar -xzf /tmp/beads.tar.gz -C /src --strip-components=1 && \
+    cd /src && \
+    patch --batch --forward -p1 < /tmp/beads-guarded-writes.patch && \
+    CGO_ENABLED=1 go build -tags gms_pure_go \
+        -ldflags='-X main.Build=scribe-guards-7505e173f265 -X main.Commit=7505e173f2659ba6e1f955b86d81a4f9e21810ca' \
+        -o /out/bd ./cmd/bd && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM rust:1.95-trixie AS func-runtime
+
+COPY --from=beads-builder /out/bd /usr/local/bin/bd
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -59,3 +73,16 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/scribe-server /usr/local/bin/scribe-t
 RUN mkdir -p /output
 
 ENTRYPOINT ["/entrypoint.sh"]
+
+FROM func-runtime AS beads-write-unit
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/target \
+    cargo test --locked -p scribe-server beads_board::tests -- --nocapture && \
+    cargo test --locked -p scribe-server \
+        beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture

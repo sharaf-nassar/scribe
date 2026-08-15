@@ -29,11 +29,11 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, CiRunDelta,
-    ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind,
-    REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage,
-    SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
-    WorkspaceListEntry, WorkspaceTreeNode,
+    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, BeadsIssueWrite,
+    BeadsIssueWriteGuards, BeadsIssueWriteResult, CiRunDelta, ClientMessage, ControllerInfo,
+    LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
+    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
+    TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -5511,6 +5511,7 @@ async fn handle_client_hello(
                     ),
                 )
             };
+            let beads_write = beads_detail && server.beads_boards.write_available().await;
             let welcome = ServerMessage::Welcome {
                 window_id,
                 other_windows,
@@ -5518,7 +5519,7 @@ async fn handle_client_hello(
                 participant_id,
                 terminal_images: claim.terminal_images,
                 beads_detail,
-                beads_write: false,
+                beads_write,
             };
             send_message(writer, &welcome).await;
 
@@ -6421,6 +6422,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::ListSessions
         | ClientMessage::RequestBeadsBoard { .. }
         | ClientMessage::RequestBeadsIssueDetail { .. }
+        | ClientMessage::BeadsIssueWrite { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
         }
@@ -6681,6 +6683,9 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
         ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id } => {
             handle_request_beads_issue_detail(workspace_id, issue_id, context).await;
         }
+        ClientMessage::BeadsIssueWrite { workspace_id, issue_id, verb, guards } => {
+            handle_beads_issue_write(workspace_id, issue_id, verb, guards, context).await;
+        }
         ClientMessage::ReportWorkspaceTree { tree } => {
             debug!(window_id = %context.window_id, "received workspace tree from client");
             let mut wm = context.server.workspace_manager.write().await;
@@ -6804,6 +6809,96 @@ async fn handle_request_beads_issue_detail(
             );
             send_error(context.writer, &error).await;
         }
+    }
+}
+
+async fn handle_beads_issue_write(
+    workspace_id: WorkspaceId,
+    issue_id: String,
+    verb: BeadsIssueWrite,
+    guards: BeadsIssueWriteGuards,
+    context: &ClientDispatchContext<'_>,
+) {
+    let Some(project_root) = beads_detail_request_root(
+        &context.server.workspace_manager,
+        &context.server.window_shares,
+        BeadsDetailRequest {
+            window_id: context.window_id,
+            writer: context.writer,
+            is_remote: context.is_remote,
+            workspace_id,
+        },
+    )
+    .await
+    else {
+        debug!(
+            window_id = %context.window_id,
+            %workspace_id,
+            "ignoring unauthorized Beads issue-write request"
+        );
+        return;
+    };
+
+    let result = if context.server.beads_boards.write_available().await {
+        context.server.beads_boards.write_issue(&project_root, &issue_id, &verb, &guards).await
+    } else {
+        BeadsIssueWriteResult::Failed {
+            reason: "installed bd does not satisfy Scribe's guarded-write contract".into(),
+        }
+    };
+    send_message(
+        context.writer,
+        &ServerMessage::BeadsIssueWriteResult {
+            workspace_id,
+            issue_id: issue_id.clone(),
+            result: result.clone(),
+        },
+    )
+    .await;
+
+    let BeadsIssueWriteResult::Applied { generation } = result else {
+        return;
+    };
+    let key = project_root.canonicalize().unwrap_or_else(|_| project_root.clone());
+    let cache = context.server.beads_boards.clone();
+    let workspace_manager = Arc::clone(&context.server.workspace_manager);
+    let window_shares = Arc::clone(&context.server.window_shares);
+    tokio::spawn(async move {
+        let state = cache.refresh_after_write(key, generation).await;
+        push_beads_board_for_root(&workspace_manager, &window_shares, &project_root, state).await;
+    });
+}
+
+async fn push_beads_board_for_root(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    project_root: &Path,
+    state: BeadsBoardState,
+) {
+    let placements =
+        workspace_manager.read().await.window_workspaces_for_project_root(project_root);
+    let recipients = {
+        let shares = window_shares.read().await;
+        placements
+            .into_iter()
+            .filter_map(|(window_id, workspace_id)| {
+                let share = shares.get(&window_id)?;
+                let local = share.local_participant()?;
+                beads_detail_connection_available(Some(share), &local.writer, false)
+                    .then(|| (workspace_id, Arc::clone(&local.writer)))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (workspace_id, writer) in recipients {
+        send_message(
+            &writer,
+            &ServerMessage::BeadsBoard {
+                workspace_id,
+                protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+                state: state.clone(),
+            },
+        )
+        .await;
     }
 }
 
@@ -12896,12 +12991,75 @@ mod tests {
         WindowShare::new_single_controller(Participant::from_claim(&claim, writer))
     }
 
-    fn add_ci_workspace(manager: &mut WorkspaceManager, window_id: WindowId, cwd: &Path) {
+    fn add_ci_workspace(
+        manager: &mut WorkspaceManager,
+        window_id: WindowId,
+        cwd: &Path,
+    ) -> WorkspaceId {
         let workspace_id = manager.create_workspace();
         let session_id = SessionId::new();
         manager.add_session(workspace_id, session_id, None);
         manager.assign_session_to_window(window_id, session_id);
         manager.on_cwd_changed(session_id, cwd);
+        workspace_id
+    }
+
+    // @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes#Root fan-out]]
+    #[tokio::test]
+    async fn beads_board_refresh_reaches_each_authorized_same_root_workspace() {
+        let base = Path::new("/work");
+        let repo = base.join("scribe");
+        let other_repo = base.join("other");
+        let first_window = WindowId::new();
+        let second_window = WindowId::new();
+        let other_window = WindowId::new();
+        let mut manager = WorkspaceManager::new(vec![base.to_path_buf()]);
+        let first_workspace = add_ci_workspace(&mut manager, first_window, &repo.join("src"));
+        let second_workspace = add_ci_workspace(&mut manager, second_window, &repo.join("tests"));
+        add_ci_workspace(&mut manager, other_window, &other_repo.join("src"));
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (first_writer, mut first_client) = ci_test_writer();
+        let (second_writer, mut second_client) = ci_test_writer();
+        let (other_writer, mut other_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(first_window, ci_share(&first_writer, false));
+            shares.insert(second_window, ci_share(&second_writer, false));
+            shares.insert(other_window, ci_share(&other_writer, false));
+        }
+
+        push_beads_board_for_root(
+            &manager,
+            &shares,
+            &repo,
+            BeadsBoardState::Unavailable { message: "refreshed".into() },
+        )
+        .await;
+
+        for (client, expected_workspace) in
+            [(&mut first_client, first_workspace), (&mut second_client, second_workspace)]
+        {
+            let message: ServerMessage = read_message(client).await.unwrap();
+            assert!(matches!(
+                message,
+                ServerMessage::BeadsBoard {
+                    workspace_id,
+                    protocol_version: BEADS_BOARD_PROTOCOL_VERSION,
+                    state: BeadsBoardState::Unavailable { message },
+                } if workspace_id == expected_workspace && message == "refreshed"
+            ));
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut other_client),
+            )
+            .await
+            .is_err(),
+            "a workspace rooted in another repo received the Beads board"
+        );
     }
 
     fn ci_state(head_sha: &str) -> CiRunState {

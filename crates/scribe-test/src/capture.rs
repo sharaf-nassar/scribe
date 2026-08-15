@@ -3,6 +3,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 use scribe_common::ids::SessionId;
+use scribe_common::protocol::{BeadsIssueWrite, BeadsIssueWriteGuards};
 
 use crate::TestError;
 use crate::cmd_socket::{DaemonRequest, DaemonResponse, send_request};
@@ -68,6 +69,29 @@ pub fn beads_board() -> Result<(), TestError> {
                 .map_err(|e| TestError::InfraError(format!("failed to serialize board: {e}")))?;
             writeln!(io::stdout())
                 .map_err(|e| TestError::InfraError(format!("failed to write board: {e}")))?;
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
+/// Execute a typed issue write and print its result plus push observation.
+pub fn beads_write(
+    issue_id: String,
+    verb: BeadsIssueWrite,
+    guards: BeadsIssueWriteGuards,
+) -> Result<(), TestError> {
+    let response = send_request(&DaemonRequest::BeadsIssueWrite { issue_id, verb, guards })
+        .map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        response @ DaemonResponse::BeadsIssueWrite { .. } => {
+            serde_json::to_writer(io::stdout().lock(), &response).map_err(|e| {
+                TestError::InfraError(format!("failed to serialize Beads write: {e}"))
+            })?;
+            writeln!(io::stdout())
+                .map_err(|e| TestError::InfraError(format!("failed to write Beads result: {e}")))?;
             Ok(())
         }
         DaemonResponse::Error { message } => Err(TestError::InfraError(message)),

@@ -988,6 +988,34 @@ server's, which re-checks executability for the real user at every refresh.
 macOS drag-install has no postinstall hook, so runtime resolution is the
 authoritative check there.
 
+### Guarded issue writes
+
+Typed issue writes run only for the exact `scribe-guards-7505e173f265` bd build proven by the functional-image semantic contract.
+
+Scribe still resolves the user's installed `bd` at runtime and does not bundle
+it in a Scribe release. The functional image reproducibly builds upstream
+commit `7505e173f2659ba6e1f955b86d81a4f9e21810ca` from a checksum-pinned source
+archive and applies `docker/beads-guarded-writes.patch`. That bounded patch
+puts status and assignee guards inside native update, claim, close, reopen,
+label, and comment transactions. The build marker keeps `beads_write` false
+for every binary that did not pass that exact semantic contract.
+
+All 14 protocol verbs become direct argv in the server. Every supplied guard
+is forwarded; an unguarded text edit is last-writer-wins, while a guarded text
+edit uses the same atomic compare-and-set as other updates. Claim, close,
+reopen, and comments retain their native lifecycle, lease, actor, and event
+semantics. Exit 13 becomes `PreconditionFailed`; other nonzero exits, timeout,
+and invalid success envelopes become `Failed` without replacing last-good
+board state.
+
+Writes serialize per canonical root and use a separate 15-second deadline with
+bounded output and process-group cleanup. Each committed write increments that
+root's generation. Older refreshes are discarded, and a forced authoritative
+refresh is pushed after the result to every authorized local
+`SingleController` window whose workspace has that project root. Unrelated
+roots and shared or remote participants receive nothing. One structured log
+records root, issue, verb, generation, outcome, and elapsed time per attempt.
+
 Detected workspaces add a separate connected-bead target without changing the
 workspace label's existing click behavior. Hover opens the board over the
 terminal; clicking pins the same fixed-height board above the terminal across

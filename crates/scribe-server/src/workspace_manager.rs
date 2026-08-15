@@ -401,12 +401,25 @@ impl WorkspaceManager {
     /// Connected-window identities containing a workspace rooted at `project_root`.
     #[must_use]
     pub fn windows_for_project_root(&self, project_root: &Path) -> HashSet<WindowId> {
+        self.window_workspaces_for_project_root(project_root)
+            .into_iter()
+            .map(|(window_id, _)| window_id)
+            .collect()
+    }
+
+    /// Connected window/workspace pairs rooted at `project_root`.
+    #[must_use]
+    pub fn window_workspaces_for_project_root(
+        &self,
+        project_root: &Path,
+    ) -> HashSet<(WindowId, WorkspaceId)> {
         self.session_to_window
             .iter()
             .filter_map(|(session_id, window_id)| {
                 let workspace_id = self.session_to_workspace.get(session_id)?;
                 let workspace = self.workspaces.get(workspace_id)?;
-                (workspace.project_root.as_deref() == Some(project_root)).then_some(*window_id)
+                (workspace.project_root.as_deref() == Some(project_root))
+                    .then_some((*window_id, *workspace_id))
             })
             .collect()
     }
