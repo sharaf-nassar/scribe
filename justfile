@@ -498,6 +498,10 @@ e2e-visual-workspace-ipc:
 e2e-visual-beads-board:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-board.sh
 
+# Decode the complete card-detail fixture matrix through the visual wire tap.
+e2e-visual-beads-detail-fixtures:
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-card-detail-fixtures.sh
+
 # Run the approved collapsed GitHub CI trace through a watched local push and
 # the loopback Actions fixture. The container has no route beyond loopback.
 e2e-visual-ci-run-bar:
@@ -630,6 +634,7 @@ e2e-all-visual: build-release docker-visual
         'visual/ai-indicator.sh|e2e-visual-shared'
         'visual/ai-task-label.sh|e2e-visual-ai-task-label'
         'visual/beads-board.sh|e2e-visual-beads-board'
+        'visual/beads-card-detail-fixtures.sh|e2e-visual-beads-detail-fixtures'
         'visual/bell.sh|e2e-visual-bell'
         'visual/ci-run-bar.sh|e2e-visual-ci-run-bar'
         'visual/ci-run-details.sh|e2e-visual-ci-details'

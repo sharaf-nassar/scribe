@@ -1619,9 +1619,11 @@ Bare interactive passthrough is intentionally not exercised. Profile-writing com
 
 ### Real Beads Board Refresh
 
-The functional image uses Beads v1.1.0 to prove one rooted workspace refresh against the server's real `bd` process contract.
+The functional image uses Beads v1.1.0 to prove rooted workspace refresh and complete issue-detail fixture shapes against the server's real `bd` process contract.
 
-`just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready. This covers executable discovery, project-root working directory, command flags, JSON envelopes, and queue classification without touching the host's Beads database.
+`just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready.
+
+The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
 
 ### AI Shell Environment Matrix
 
@@ -1782,6 +1784,14 @@ The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via  so `xdoto
 `openbox` is required, not cosmetic:  runs on the client's live key path and suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
 
 Screenshots are taken full-screen because a Vulkan surface may not be readable per-window, so any test that measures pixels must crop to the client window first. The WM title bar is a saturated light blue that on its own clears a "hundreds of colored pixels" threshold — an uncropped measurement passed for months over a completely black grid.
+
+### Beads card-detail fixtures
+
+`just e2e-visual-beads-detail-fixtures` proves the complete detail fixture matrix is accepted by the existing visual wire tap.
+
+`tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages: a loading board plus closed, blocked, comment-clamped, and hidden-count detail replies. The script substitutes only the live workspace id before sending each record through `scribe-test share-inject` under `--network none`.
+
+The loading message paints its five-card board. The four detail replies must decode and reach the current client's explicit unhandled-message receipt, with no share-tap decode warning. Detail rendering is not claimed before its client wiring exists; scribe-5wh1.4 and scribe-5wh1.5 consume these same fixtures for panel screenshots.
 
 ### Shared-pane rig
 

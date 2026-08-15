@@ -1,0 +1,246 @@
+[
+  {
+    "name": "loading",
+    "message": {
+      "type": "BeadsBoard",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "protocol_version": 1,
+      "state": {
+        "Ready": {
+          "snapshot": {
+            "refreshed_at_epoch_ms": 1786752000000,
+            "backlog": [
+              {
+                "id": "detail-comment-clamped",
+                "title": "Clamp long comments",
+                "priority": 2,
+                "blocker_ids": [],
+                "parent_epic_name": "Card detail panel"
+              },
+              {
+                "id": "detail-hidden-count",
+                "title": "Show hidden comment count",
+                "priority": 3,
+                "blocker_ids": [],
+                "parent_epic_name": null
+              }
+            ],
+            "ready": [
+              {
+                "id": "detail-loading",
+                "title": "Load complete issue detail",
+                "priority": 1,
+                "blocker_ids": [],
+                "parent_epic_name": "Card detail panel"
+              }
+            ],
+            "in_progress": [],
+            "blocked": [
+              {
+                "id": "detail-blocked",
+                "title": "Render blocked issue detail",
+                "priority": 0,
+                "blocker_ids": ["detail-contract", "detail-layout"],
+                "parent_epic_name": "Card detail panel"
+              }
+            ],
+            "done": [
+              {
+                "id": "detail-closed",
+                "title": "Render closed issue detail",
+                "priority": 2,
+                "blocker_ids": [],
+                "parent_epic_name": "Card detail panel"
+              }
+            ],
+            "backlog_total": 2,
+            "ready_total": 1,
+            "in_progress_total": 0,
+            "blocked_total": 1,
+            "done_total": 1
+          },
+          "stale": false,
+          "refresh_error": null
+        }
+      }
+    }
+  },
+  {
+    "name": "closed",
+    "message": {
+      "type": "BeadsIssueDetail",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "issue_id": "detail-closed",
+      "detail": {
+        "id": "detail-closed",
+        "title": "Render closed issue detail",
+        "description": "A completed issue keeps its read-only context visible.",
+        "acceptance_criteria": "Closed state and reason appear without write controls.",
+        "notes": "This fixture covers the closed presentation.",
+        "design": "Use the same field rows as open issues.",
+        "spec_id": "024-beads-card-detail",
+        "status": "closed",
+        "priority": 2,
+        "issue_type": "task",
+        "labels": ["beads", "client"],
+        "assignee": "fixture-owner",
+        "owner": "fixture-author",
+        "created_at": "2026-08-10T09:00:00Z",
+        "updated_at": "2026-08-15T05:00:00Z",
+        "closed_at": "2026-08-15T05:00:00Z",
+        "close_reason": "Panel contract accepted.",
+        "defer_until": null,
+        "due_at": "2026-08-20T00:00:00Z",
+        "estimated_minutes": 60,
+        "external_ref": "fixture://closed",
+        "blockers": [],
+        "dependents": [
+          {"id": "detail-release", "title": "Release the read slice"}
+        ],
+        "comments": [
+          {
+            "author": "Fixture Reviewer",
+            "created_at": "2026-08-15T04:45:00Z",
+            "body": "Closing after visual review."
+          }
+        ],
+        "hidden_comment_count": 0,
+        "queue": "done",
+        "queue_basis": "closed_status"
+      }
+    }
+  },
+  {
+    "name": "blocked",
+    "message": {
+      "type": "BeadsIssueDetail",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "issue_id": "detail-blocked",
+      "detail": {
+        "id": "detail-blocked",
+        "title": "Render blocked issue detail",
+        "description": "Open blockers override the issue's open status.",
+        "acceptance_criteria": "Both blocker chips and classifier notice are visible.",
+        "notes": "Blocker order is deterministic.",
+        "design": "The server selects the queue before serialization.",
+        "spec_id": "024-beads-card-detail",
+        "status": "open",
+        "priority": 0,
+        "issue_type": "feature",
+        "labels": ["blocked", "beads"],
+        "assignee": null,
+        "owner": "fixture-author",
+        "created_at": "2026-08-11T10:00:00Z",
+        "updated_at": "2026-08-15T05:10:00Z",
+        "closed_at": null,
+        "close_reason": null,
+        "defer_until": null,
+        "due_at": null,
+        "estimated_minutes": 120,
+        "external_ref": "fixture://blocked",
+        "blockers": [
+          {"id": "detail-contract", "title": "Freeze detail contract"},
+          {"id": "detail-layout", "title": "Approve panel layout"}
+        ],
+        "dependents": [
+          {"id": "detail-drag", "title": "Add drag-to-queue"}
+        ],
+        "comments": [],
+        "hidden_comment_count": 0,
+        "queue": "blocked",
+        "queue_basis": "open_blockers"
+      }
+    }
+  },
+  {
+    "name": "comment-clamped",
+    "message": {
+      "type": "BeadsIssueDetail",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "issue_id": "detail-comment-clamped",
+      "detail": {
+        "id": "detail-comment-clamped",
+        "title": "Clamp long comments",
+        "description": "Long comments start folded and expand in place.",
+        "acceptance_criteria": "The newest long comment stays within the collapsed line cap.",
+        "notes": "The body is intentionally longer than the folded panel allocation.",
+        "design": "Keep expansion local to the selected comment.",
+        "spec_id": "024-beads-card-detail",
+        "status": "open",
+        "priority": 2,
+        "issue_type": "task",
+        "labels": ["comments"],
+        "assignee": "fixture-owner",
+        "owner": "fixture-author",
+        "created_at": "2026-08-12T11:00:00Z",
+        "updated_at": "2026-08-15T05:20:00Z",
+        "closed_at": null,
+        "close_reason": null,
+        "defer_until": null,
+        "due_at": null,
+        "estimated_minutes": 45,
+        "external_ref": "fixture://comment-clamped",
+        "blockers": [],
+        "dependents": [],
+        "comments": [
+          {
+            "author": "Fixture Reviewer",
+            "created_at": "2026-08-15T05:19:00Z",
+            "body": "This deterministic comment is long enough to wrap across several panel lines. It names the exact folded behavior under review and continues with stable copy so expansion produces an obvious geometry change without depending on generated text or wall-clock data."
+          }
+        ],
+        "hidden_comment_count": 0,
+        "queue": "backlog",
+        "queue_basis": "backlog_fallback"
+      }
+    }
+  },
+  {
+    "name": "hidden-count",
+    "message": {
+      "type": "BeadsIssueDetail",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "issue_id": "detail-hidden-count",
+      "detail": {
+        "id": "detail-hidden-count",
+        "title": "Show hidden comment count",
+        "description": "The server reports comments omitted by its response cap.",
+        "acceptance_criteria": "A visible line reports seven older comments.",
+        "notes": "Returned comments remain newest first.",
+        "design": "Render hidden count after the bounded comment list.",
+        "spec_id": "024-beads-card-detail",
+        "status": "open",
+        "priority": 3,
+        "issue_type": "task",
+        "labels": ["comments", "limits"],
+        "assignee": null,
+        "owner": "fixture-author",
+        "created_at": "2026-08-13T12:00:00Z",
+        "updated_at": "2026-08-15T05:30:00Z",
+        "closed_at": null,
+        "close_reason": null,
+        "defer_until": "2026-08-16T00:00:00Z",
+        "due_at": "2026-08-22T00:00:00Z",
+        "estimated_minutes": 30,
+        "external_ref": "fixture://hidden-count",
+        "blockers": [],
+        "dependents": [],
+        "comments": [
+          {
+            "author": "Fixture Reviewer",
+            "created_at": "2026-08-15T05:29:00Z",
+            "body": "Newest retained comment."
+          },
+          {
+            "author": "Fixture Author",
+            "created_at": "2026-08-15T05:28:00Z",
+            "body": "Second retained comment."
+          }
+        ],
+        "hidden_comment_count": 7,
+        "queue": "backlog",
+        "queue_basis": "backlog_fallback"
+      }
+    }
+  }
+]
