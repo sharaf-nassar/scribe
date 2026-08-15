@@ -198,7 +198,11 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 
 #### Beads detail capability defaults safely
 
-`Welcome.beads_detail` advertises support independently from the board snapshot and future write verbs; an older server omitting it decodes as `false`, so the client keeps the existing read-only board.
+`Welcome.beads_detail` advertises support independently from the board snapshot and future write verbs. The server enables it only for a local owner on an unshared window.
+
+Remote, shared, viewer, displaced, and foreign-root requests are rejected. An
+older server omitting the field decodes it as `false`, so the client keeps the
+existing read-only board.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 

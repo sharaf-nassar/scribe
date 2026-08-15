@@ -16,7 +16,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use scribe_common::protocol::{BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState};
+use scribe_common::protocol::{
+    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
+    BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis,
+};
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +29,9 @@ const MAX_ITEMS_PER_QUEUE: usize = 200;
 const MAX_BLOCKERS_PER_ITEM: usize = 16;
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 512;
+const MAX_DETAIL_FIELD_BYTES: usize = 64 * 1024;
+const MAX_DETAIL_COMMENTS: usize = 50;
+const MAX_DETAIL_COLLECTION_ITEMS: usize = 200;
 const BD_JSON_SCHEMA_VERSION: u64 = 1;
 const SYSTEM_BD_DIRS: [&str; 9] = [
     "/opt/homebrew/bin",
@@ -147,7 +153,7 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
             }
         }
         Err(RunError::NoProject) => return Ok(LoadResult::NotDetected),
-        Err(RunError::Failed(error)) => return Err(error),
+        Err(error) => return Err(error.message()),
     }
 
     let list =
@@ -163,9 +169,51 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
     classify_snapshot(&list, &ready, &blocked).map(LoadResult::Snapshot)
 }
 
+/// Result of a fresh issue-detail query. Missing issues stay distinct from
+/// subprocess and schema failures on the typed wire response.
+pub enum DetailLoadResult {
+    NotFound,
+    Found(Box<BeadsIssueDetail>),
+}
+
+/// Read one issue directly from `bd`; board snapshots never participate.
+pub async fn load_issue_detail(
+    project_root: &Path,
+    issue_id: &str,
+) -> Result<DetailLoadResult, String> {
+    let bd = resolve_bd_executable()?;
+    load_issue_detail_with(&bd, project_root, issue_id).await
+}
+
+async fn load_issue_detail_with(
+    bd: &Bd,
+    project_root: &Path,
+    issue_id: &str,
+) -> Result<DetailLoadResult, String> {
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("could not resolve Beads project root: {error}"))?;
+    let detail = match run_bd(
+        bd,
+        &canonical_root,
+        &["show", issue_id, "--include-comments", "--include-dependents"],
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(RunError::IssueNotFound) => return Ok(DetailLoadResult::NotFound),
+        Err(error) => return Err(error.message()),
+    };
+    let ready =
+        run_bd(bd, &canonical_root, &["ready", "--limit", "0"]).await.map_err(RunError::message)?;
+    let is_ready = parse_collection(&ready, "ready")?.iter().any(|issue| issue.id == issue_id);
+    parse_issue_detail(&detail, is_ready).map(Box::new).map(DetailLoadResult::Found)
+}
+
 #[derive(Debug)]
 enum RunError {
     NoProject,
+    IssueNotFound,
     Failed(String),
 }
 
@@ -173,6 +221,7 @@ impl RunError {
     fn message(self) -> String {
         match self {
             Self::NoProject => "no Beads project found".into(),
+            Self::IssueNotFound => "Beads issue not found".into(),
             Self::Failed(message) => message,
         }
     }
@@ -288,8 +337,11 @@ async fn run_bd(bd: &Bd, project_root: &Path, command_args: &[&str]) -> Result<V
     // stderr, so reading only stderr turns every one of them into a bare status.
     let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
     let detail = if stderr_text.is_empty() { json_error(&stdout_bytes) } else { stderr_text };
-    if detail.contains("no beads project found") {
+    let lowercase = detail.to_ascii_lowercase();
+    if lowercase.contains("no beads project found") {
         Err(RunError::NoProject)
+    } else if lowercase.contains("issue") && lowercase.contains("not found") {
+        Err(RunError::IssueNotFound)
     } else {
         Err(RunError::Failed(if detail.is_empty() {
             format!("bd exited with {status}")
@@ -388,6 +440,235 @@ struct DependencyJson {
     dependency_type: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IssueDetailPayload {
+    Issue(Box<IssueDetailJson>),
+    List { issues: Vec<IssueDetailJson> },
+    Array(Vec<IssueDetailJson>),
+}
+
+impl IssueDetailPayload {
+    fn into_issue(self) -> Result<IssueDetailJson, String> {
+        match self {
+            Self::Issue(issue) => Ok(*issue),
+            Self::List { issues } | Self::Array(issues) => one_detail_issue(issues),
+        }
+    }
+}
+
+fn one_detail_issue(mut issues: Vec<IssueDetailJson>) -> Result<IssueDetailJson, String> {
+    if issues.len() != 1 {
+        return Err(format!("invalid bd show JSON: expected one issue, got {}", issues.len()));
+    }
+    issues.pop().ok_or_else(|| "invalid bd show JSON: issue missing".into())
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueDetailJson {
+    id: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    design: String,
+    #[serde(default)]
+    spec_id: Option<String>,
+    status: String,
+    priority: u8,
+    issue_type: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default, alias = "created_by")]
+    owner: Option<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    #[serde(default)]
+    close_reason: Option<String>,
+    #[serde(default)]
+    defer_until: Option<String>,
+    #[serde(default, alias = "due")]
+    due_at: Option<String>,
+    #[serde(default, alias = "estimate")]
+    estimated_minutes: Option<u32>,
+    #[serde(default)]
+    external_ref: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<DetailRelationJson>,
+    #[serde(default)]
+    blocked_by: Vec<DetailRelationValue>,
+    #[serde(default)]
+    dependents: Vec<DetailRelationJson>,
+    #[serde(default)]
+    comments: Vec<DetailCommentJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailRelationJson {
+    #[serde(default, alias = "depends_on_id", alias = "issue_id")]
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, alias = "type")]
+    dependency_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DetailRelationValue {
+    Id(String),
+    Relation(DetailRelationJson),
+}
+
+impl DetailRelationValue {
+    fn into_relation(self) -> DetailRelationJson {
+        match self {
+            Self::Id(id) => DetailRelationJson {
+                id: id.clone(),
+                title: id,
+                status: None,
+                dependency_type: "blocks".into(),
+            },
+            Self::Relation(relation) => relation,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailCommentJson {
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default, alias = "body")]
+    text: String,
+}
+
+fn parse_issue_detail(bytes: &[u8], ready: bool) -> Result<BeadsIssueDetail, String> {
+    let issue = parse_envelope::<IssueDetailPayload>(bytes, "show")?.into_issue()?;
+    if issue.priority > 4 {
+        return Err(format!("invalid priority {} for {}", issue.priority, issue.id));
+    }
+
+    let has_open_blockers = !issue.blocked_by.is_empty()
+        || issue.dependencies.iter().any(|dependency| {
+            dependency.dependency_type == "blocks" && dependency.status.as_deref() != Some("closed")
+        });
+    let (queue, queue_basis) =
+        classify_issue(&issue.status, QueueSignals { has_open_blockers, ready });
+
+    let blockers = bounded_links(
+        issue
+            .dependencies
+            .into_iter()
+            .filter(|dependency| dependency.dependency_type == "blocks")
+            .chain(issue.blocked_by.into_iter().map(DetailRelationValue::into_relation)),
+    );
+    let dependents = bounded_links(issue.dependents.into_iter().filter(|dependent| {
+        dependent.dependency_type.is_empty() || dependent.dependency_type == "blocks"
+    }));
+    let hidden_comment_count = issue.comments.len().saturating_sub(MAX_DETAIL_COMMENTS);
+    let comments = issue
+        .comments
+        .into_iter()
+        .rev()
+        .take(MAX_DETAIL_COMMENTS)
+        .map(|comment| BeadsIssueComment {
+            author: truncate_bytes(&comment.author, MAX_TITLE_CHARS),
+            created_at: truncate_bytes(&comment.created_at, MAX_TITLE_CHARS),
+            body: truncate_bytes(&comment.text, MAX_DETAIL_FIELD_BYTES),
+        })
+        .collect();
+
+    Ok(BeadsIssueDetail {
+        id: truncate_bytes(&issue.id, MAX_ID_CHARS),
+        title: truncate_bytes(&issue.title, MAX_TITLE_CHARS),
+        description: truncate_bytes(&issue.description, MAX_DETAIL_FIELD_BYTES),
+        acceptance_criteria: truncate_bytes(&issue.acceptance_criteria, MAX_DETAIL_FIELD_BYTES),
+        notes: truncate_bytes(&issue.notes, MAX_DETAIL_FIELD_BYTES),
+        design: truncate_bytes(&issue.design, MAX_DETAIL_FIELD_BYTES),
+        spec_id: bounded_option(issue.spec_id, MAX_TITLE_CHARS),
+        status: truncate_bytes(&issue.status, MAX_ID_CHARS),
+        priority: issue.priority,
+        issue_type: truncate_bytes(&issue.issue_type, MAX_ID_CHARS),
+        labels: issue
+            .labels
+            .into_iter()
+            .take(MAX_DETAIL_COLLECTION_ITEMS)
+            .map(|label| truncate_bytes(&label, MAX_TITLE_CHARS))
+            .collect(),
+        assignee: bounded_option(issue.assignee, MAX_TITLE_CHARS),
+        owner: bounded_option(issue.owner, MAX_TITLE_CHARS),
+        created_at: truncate_bytes(&issue.created_at, MAX_TITLE_CHARS),
+        updated_at: truncate_bytes(&issue.updated_at, MAX_TITLE_CHARS),
+        closed_at: bounded_option(issue.closed_at, MAX_TITLE_CHARS),
+        close_reason: bounded_option(issue.close_reason, MAX_DETAIL_FIELD_BYTES),
+        defer_until: bounded_option(issue.defer_until, MAX_TITLE_CHARS),
+        due_at: bounded_option(issue.due_at, MAX_TITLE_CHARS),
+        estimated_minutes: issue.estimated_minutes,
+        external_ref: bounded_option(issue.external_ref, MAX_DETAIL_FIELD_BYTES),
+        blockers,
+        dependents,
+        comments,
+        hidden_comment_count: hidden_comment_count.try_into().unwrap_or(u32::MAX),
+        queue,
+        queue_basis,
+    })
+}
+
+fn bounded_links(relations: impl Iterator<Item = DetailRelationJson>) -> Vec<BeadsIssueLink> {
+    let mut seen = HashSet::new();
+    relations
+        .filter_map(|relation| {
+            let id = truncate_bytes(&relation.id, MAX_ID_CHARS);
+            if id.is_empty() || !seen.insert(id.clone()) {
+                return None;
+            }
+            let title = if relation.title.is_empty() { id.clone() } else { relation.title };
+            Some(BeadsIssueLink { id, title: truncate_bytes(&title, MAX_TITLE_CHARS) })
+        })
+        .take(MAX_DETAIL_COLLECTION_ITEMS)
+        .collect()
+}
+
+fn bounded_option(value: Option<String>, cap: usize) -> Option<String> {
+    value.map(|value| truncate_bytes(&value, cap))
+}
+
+#[derive(Clone, Copy)]
+struct QueueSignals {
+    has_open_blockers: bool,
+    ready: bool,
+}
+
+fn classify_issue(status: &str, signals: QueueSignals) -> (BeadsIssueQueue, BeadsIssueQueueBasis) {
+    if status == "closed" {
+        (BeadsIssueQueue::Done, BeadsIssueQueueBasis::ClosedStatus)
+    } else if status == "blocked" {
+        (BeadsIssueQueue::Blocked, BeadsIssueQueueBasis::BlockedStatus)
+    } else if signals.has_open_blockers {
+        (BeadsIssueQueue::Blocked, BeadsIssueQueueBasis::OpenBlockers)
+    } else if status == "in_progress" {
+        (BeadsIssueQueue::InProgress, BeadsIssueQueueBasis::InProgressStatus)
+    } else if signals.ready {
+        (BeadsIssueQueue::Ready, BeadsIssueQueueBasis::ReadySet)
+    } else {
+        (BeadsIssueQueue::Backlog, BeadsIssueQueueBasis::BacklogFallback)
+    }
+}
+
 fn classify_snapshot(
     list_json: &[u8],
     ready_json: &[u8],
@@ -440,16 +721,22 @@ fn classify_snapshot(
                 .map(|name| truncate(name, MAX_TITLE_CHARS)),
         };
 
-        let (queue, total) = if issue.status == "closed" {
-            (&mut snapshot.done, &mut snapshot.done_total)
-        } else if issue.status == "blocked" || blocked_by_id.contains_key(issue.id.as_str()) {
-            (&mut snapshot.blocked, &mut snapshot.blocked_total)
-        } else if issue.status == "in_progress" {
-            (&mut snapshot.in_progress, &mut snapshot.in_progress_total)
-        } else if ready_ids.contains(issue.id.as_str()) {
-            (&mut snapshot.ready, &mut snapshot.ready_total)
-        } else {
-            (&mut snapshot.backlog, &mut snapshot.backlog_total)
+        let (queue, total) = match classify_issue(
+            &issue.status,
+            QueueSignals {
+                has_open_blockers: blocked_by_id.contains_key(issue.id.as_str()),
+                ready: ready_ids.contains(issue.id.as_str()),
+            },
+        )
+        .0
+        {
+            BeadsIssueQueue::Done => (&mut snapshot.done, &mut snapshot.done_total),
+            BeadsIssueQueue::Blocked => (&mut snapshot.blocked, &mut snapshot.blocked_total),
+            BeadsIssueQueue::InProgress => {
+                (&mut snapshot.in_progress, &mut snapshot.in_progress_total)
+            }
+            BeadsIssueQueue::Ready => (&mut snapshot.ready, &mut snapshot.ready_total),
+            BeadsIssueQueue::Backlog => (&mut snapshot.backlog, &mut snapshot.backlog_total),
         };
         *total = total.saturating_add(1);
         if queue.len() < MAX_ITEMS_PER_QUEUE {
@@ -480,10 +767,23 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn truncate_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use scribe_common::protocol::{BeadsIssueQueue, BeadsIssueQueueBasis};
 
     use super::*;
 
@@ -585,6 +885,206 @@ mod tests {
         let error = run_bd(&bd, root, &["context"]).await.expect_err("fake bd exits 1");
 
         assert!(matches!(error, RunError::NoProject));
+    }
+
+    fn detail_envelope(data: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "data": data,
+            "schema_version": 1,
+        }))
+        .expect("serialize detail fixture")
+    }
+
+    fn detail_issue() -> serde_json::Value {
+        serde_json::json!({
+            "id": "scribe-42",
+            "title": "Issue detail",
+            "description": "Description",
+            "acceptance_criteria": "Acceptance",
+            "notes": "Notes",
+            "design": "Design",
+            "spec_id": "024",
+            "status": "open",
+            "priority": 2,
+            "issue_type": "task",
+            "labels": ["server"],
+            "assignee": "mamba",
+            "owner": "owner",
+            "created_at": "2026-08-14T10:00:00Z",
+            "updated_at": "2026-08-15T10:00:00Z",
+            "dependencies": [{
+                "depends_on_id": "gate",
+                "title": "Gate",
+                "status": "closed",
+                "dependency_type": "blocks"
+            }],
+            "dependents": [{"id": "child", "title": "Child"}],
+            "comments": []
+        })
+    }
+
+    #[test]
+    fn reads_detail_from_each_supported_envelope_shape() {
+        let issue = detail_issue();
+        let shapes = [
+            issue.clone(),
+            serde_json::json!([issue.clone()]),
+            serde_json::json!({"issues": [issue]}),
+        ];
+
+        for data in shapes {
+            let detail = parse_issue_detail(&detail_envelope(&data), false).expect("parse detail");
+            assert_eq!(detail.id, "scribe-42");
+            assert_eq!(detail.dependents[0].id, "child");
+        }
+    }
+
+    #[test]
+    fn bounds_fields_and_keeps_the_newest_fifty_comments() {
+        let comments = (0..52)
+            .map(|index| {
+                serde_json::json!({
+                    "author": format!("author-{index}"),
+                    "created_at": format!("2026-08-15T10:00:{index:02}Z"),
+                    "text": if index == 51 { "é".repeat(40_000) } else { format!("body-{index}") },
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut issue = detail_issue();
+        issue["description"] = serde_json::Value::String("d".repeat(70_000));
+        issue["comments"] = serde_json::Value::Array(comments);
+
+        let detail =
+            parse_issue_detail(&detail_envelope(&issue), false).expect("parse bounded detail");
+
+        assert_eq!(detail.comments.len(), 50);
+        assert_eq!(detail.hidden_comment_count, 2);
+        assert_eq!(detail.comments[0].author, "author-51");
+        assert_eq!(detail.comments[49].author, "author-2");
+        assert!(detail.description.len() <= 64 * 1024);
+        assert!(detail.comments[0].body.len() <= 64 * 1024);
+        assert!(detail.comments[0].body.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn derives_every_queue_with_snapshot_precedence() {
+        let cases = [
+            ("closed", true, true, (BeadsIssueQueue::Done, BeadsIssueQueueBasis::ClosedStatus)),
+            (
+                "blocked",
+                false,
+                false,
+                (BeadsIssueQueue::Blocked, BeadsIssueQueueBasis::BlockedStatus),
+            ),
+            ("open", true, true, (BeadsIssueQueue::Blocked, BeadsIssueQueueBasis::OpenBlockers)),
+            (
+                "in_progress",
+                false,
+                true,
+                (BeadsIssueQueue::InProgress, BeadsIssueQueueBasis::InProgressStatus),
+            ),
+            ("open", false, true, (BeadsIssueQueue::Ready, BeadsIssueQueueBasis::ReadySet)),
+            (
+                "deferred",
+                false,
+                false,
+                (BeadsIssueQueue::Backlog, BeadsIssueQueueBasis::BacklogFallback),
+            ),
+        ];
+
+        for (status, open_blockers, ready, expected) in cases {
+            assert_eq!(
+                classify_issue(status, QueueSignals { has_open_blockers: open_blockers, ready }),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_a_missing_issue_to_typed_not_found() {
+        let scratch = beads_test_scratch_path("detail-not-found");
+        fs::create_dir_all(&scratch).expect("create scratch root");
+        let fake = scratch.join("bd");
+        fs::write(&fake, "#!/bin/sh\nprintf '%s' '{\"error\":\"issue gone not found\"}'\nexit 1\n")
+            .expect("write fake bd");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let bd = Bd { exe: fake, search_path: None };
+
+        let result = load_issue_detail_with(&bd, &scratch, "gone").await.expect("typed result");
+
+        assert!(matches!(result, DetailLoadResult::NotFound));
+        fs::remove_dir_all(scratch).expect("remove scratch root");
+    }
+
+    #[tokio::test]
+    async fn detail_reads_bypass_snapshot_cache_and_use_exact_argv() {
+        let scratch = beads_test_scratch_path("detail-uncached");
+        fs::create_dir_all(&scratch).expect("create scratch root");
+        let fake = scratch.join("bd");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+if [ "$*" = "--readonly --json -C $PWD ready --limit 0" ]; then
+  printf '%s' '{"data":[{"id":"issue","title":"Issue","status":"open","priority":2}],"schema_version":1}'
+  exit
+fi
+expected="--readonly --json -C $PWD show issue --include-comments --include-dependents"
+[ "$*" = "$expected" ] || { printf '%s' '{"error":"wrong argv"}'; exit 1; }
+calls=0
+[ ! -f calls ] || calls=$(sed -n '1p' calls)
+calls=$((calls + 1))
+printf '%s\n' "$calls" > calls
+printf '{"data":{"id":"issue","title":"call %s","status":"open","priority":2,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' "$calls"
+"#,
+        )
+        .expect("write fake bd");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let bd = Bd { exe: fake, search_path: None };
+
+        let first = load_issue_detail_with(&bd, &scratch, "issue").await.expect("first detail");
+        let second = load_issue_detail_with(&bd, &scratch, "issue").await.expect("second detail");
+
+        let DetailLoadResult::Found(first) = first else { panic!("first issue missing") };
+        let DetailLoadResult::Found(second) = second else { panic!("second issue missing") };
+        assert_eq!(first.title, "call 1");
+        assert_eq!(second.title, "call 2", "detail was reused from a cache");
+        fs::remove_dir_all(scratch).expect("remove scratch root");
+    }
+
+    #[tokio::test]
+    async fn detail_queue_uses_fresh_ready_membership_for_open_p4_issues() {
+        let scratch = beads_test_scratch_path("detail-ready-membership");
+        fs::create_dir_all(&scratch).expect("create scratch root");
+        let fake = scratch.join("bd");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+case "$*" in
+  "--readonly --json -C $PWD show backlog --include-comments --include-dependents")
+    printf '%s' '{"data":{"id":"backlog","title":"Backlog","status":"open","priority":4,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' ;;
+  "--readonly --json -C $PWD show ready --include-comments --include-dependents")
+    printf '%s' '{"data":{"id":"ready","title":"Ready","status":"open","priority":4,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' ;;
+  "--readonly --json -C $PWD ready --limit 0")
+    printf '%s' '{"data":[{"id":"ready","title":"Ready","status":"open","priority":4}],"schema_version":1}' ;;
+  *) printf '%s' '{"error":"wrong argv"}'; exit 1 ;;
+esac
+"#,
+        )
+        .expect("write fake bd");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let bd = Bd { exe: fake, search_path: None };
+
+        let backlog =
+            load_issue_detail_with(&bd, &scratch, "backlog").await.expect("backlog detail");
+        let ready = load_issue_detail_with(&bd, &scratch, "ready").await.expect("ready detail");
+
+        let DetailLoadResult::Found(backlog) = backlog else { panic!("backlog issue missing") };
+        let DetailLoadResult::Found(ready) = ready else { panic!("ready issue missing") };
+        assert_eq!(backlog.queue, BeadsIssueQueue::Backlog);
+        assert_eq!(backlog.queue_basis, BeadsIssueQueueBasis::BacklogFallback);
+        assert_eq!(ready.queue, BeadsIssueQueue::Ready);
+        assert_eq!(ready.queue_basis, BeadsIssueQueueBasis::ReadySet);
+        fs::remove_dir_all(scratch).expect("remove scratch root");
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]

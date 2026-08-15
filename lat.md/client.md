@@ -938,6 +938,16 @@ requests paint last-good state immediately. Only one refresh may run per root,
 and failures preserve last-good state. Commands use direct argv, read-only
 mode, bounded output, a five-second deadline, and process-group cleanup.
 
+Issue detail never reads that snapshot. Each request runs
+`bd show --json --include-comments --include-dependents` and a fresh
+`bd ready --limit 0` in the canonical project root with the same executable
+resolution, envelope check, deadline, and cleanup. The parser accepts bd's
+object, one-element array, and wrapped `issues` payloads. It caps text fields
+at 64 KiB, returns the newest 50 comments in newest-first order with an
+omitted count, and uses exact ready membership with the board's queue
+precedence for the queue and basis fields. A missing issue becomes the typed
+empty detail response. Other command or schema failures remain errors.
+
 Every command also runs *in* the project root, not only with `-C` pointing at
 it: `bd context` resolves the repository through git in its own working
 directory, and a packaged server's is `/`, so `-C` alone makes the first call

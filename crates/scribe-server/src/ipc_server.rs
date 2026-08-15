@@ -42,7 +42,7 @@ use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
-use crate::beads_board::BeadsBoardCache;
+use crate::beads_board::{BeadsBoardCache, DetailLoadResult, load_issue_detail};
 use crate::child_identity::{IdentityCheck, check_child_identity};
 use crate::child_watch::{ChildExit, ChildExitWatcher};
 use crate::git_ref_watcher::GitRefWatcherControl;
@@ -5499,19 +5499,25 @@ async fn handle_client_hello(
             }
             // Feature 015 self-id: tell the client its own registered participant id
             // so it can match itself in a `ShareRoster` exactly (its own `is_holder`).
-            let participant_id = server
-                .window_shares
-                .read()
-                .await
-                .get(&window_id)
-                .and_then(|share| share.participant_id_for_writer(writer));
+            let (participant_id, beads_detail) = {
+                let shares = server.window_shares.read().await;
+                let share = shares.get(&window_id);
+                (
+                    share.and_then(|share| share.participant_id_for_writer(writer)),
+                    beads_detail_connection_available(
+                        share,
+                        writer,
+                        matches!(claim.controller, ControllerIdentity::Remote { .. }),
+                    ),
+                )
+            };
             let welcome = ServerMessage::Welcome {
                 window_id,
                 other_windows,
                 clipboard_gating: true,
                 participant_id,
                 terminal_images: claim.terminal_images,
-                beads_detail: false,
+                beads_detail,
             };
             send_message(writer, &welcome).await;
 
@@ -6670,6 +6676,9 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
         ClientMessage::RequestBeadsBoard { workspace_id, protocol_version } => {
             handle_request_beads_board(workspace_id, protocol_version, context).await;
         }
+        ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id } => {
+            handle_request_beads_issue_detail(workspace_id, issue_id, context).await;
+        }
         ClientMessage::ReportWorkspaceTree { tree } => {
             debug!(window_id = %context.window_id, "received workspace tree from client");
             let mut wm = context.server.workspace_manager.write().await;
@@ -6742,6 +6751,102 @@ async fn handle_request_beads_board(
             .await;
         });
     }
+}
+
+async fn handle_request_beads_issue_detail(
+    workspace_id: WorkspaceId,
+    issue_id: String,
+    context: &ClientDispatchContext<'_>,
+) {
+    let Some(project_root) = beads_detail_request_root(
+        &context.server.workspace_manager,
+        &context.server.window_shares,
+        BeadsDetailRequest {
+            window_id: context.window_id,
+            writer: context.writer,
+            is_remote: context.is_remote,
+            workspace_id,
+        },
+    )
+    .await
+    else {
+        debug!(
+            window_id = %context.window_id,
+            %workspace_id,
+            "ignoring unauthorized Beads issue-detail request"
+        );
+        return;
+    };
+
+    match load_issue_detail(&project_root, &issue_id).await {
+        Ok(DetailLoadResult::Found(detail)) => {
+            send_message(
+                context.writer,
+                &ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail: Some(detail) },
+            )
+            .await;
+        }
+        Ok(DetailLoadResult::NotFound) => {
+            send_message(
+                context.writer,
+                &ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail: None },
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                root = %project_root.display(),
+                %issue_id,
+                %error,
+                "Beads issue-detail query failed"
+            );
+            send_error(context.writer, &error).await;
+        }
+    }
+}
+
+fn beads_detail_connection_available(
+    share: Option<&WindowShare>,
+    writer: &SharedWriter,
+    is_remote: bool,
+) -> bool {
+    !is_remote
+        && share.is_some_and(|share| {
+            matches!(share.mode, scribe_config::SharingMode::SingleController)
+                && share.is_owner_connection(writer)
+        })
+}
+
+struct BeadsDetailRequest<'a> {
+    window_id: WindowId,
+    writer: &'a SharedWriter,
+    is_remote: bool,
+    workspace_id: WorkspaceId,
+}
+
+async fn beads_detail_request_root(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    request: BeadsDetailRequest<'_>,
+) -> Option<PathBuf> {
+    let allowed = {
+        let shares = window_shares.read().await;
+        beads_detail_connection_available(
+            shares.get(&request.window_id),
+            request.writer,
+            request.is_remote,
+        )
+    };
+    if !allowed {
+        return None;
+    }
+
+    let workspaces = workspace_manager.read().await;
+    workspaces
+        .window_contains_workspace(request.window_id, request.workspace_id)
+        .then(|| workspaces.workspace_info(request.workspace_id))
+        .flatten()
+        .and_then(|(_, _, _, root)| root)
 }
 
 async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
@@ -12615,6 +12720,80 @@ mod tests {
         assert!(connection_may_type(&shares, window_id, &local, &create).await);
         assert!(!connection_may_type(&shares, window_id, &remote, &create).await);
         assert!(!connection_may_type(&shares, window_id, &lost_control, &create).await);
+    }
+
+    #[tokio::test]
+    async fn beads_detail_rejects_remote_viewers_and_mismatched_workspaces() {
+        let base = Path::new("/work");
+        let repo = base.join("scribe");
+        let window_id = WindowId::new();
+        let shared_window = WindowId::new();
+        let other_window = WindowId::new();
+        let local = test_writer();
+        let shared_owner = test_writer();
+        let remote = test_writer();
+        let mut share = WindowShare::new(
+            Participant::local(&shared_owner, false),
+            scribe_config::SharingMode::FreeForAll,
+            scribe_config::ControlAcquisition::FreeClaim,
+            None,
+        );
+        share.add_participant(Participant::new(
+            &remote,
+            ControllerIdentity::Remote {
+                device_name: "peer".to_owned(),
+                login_name: "viewer".to_owned(),
+            },
+            ParticipantTransport::Remote,
+            false,
+        ));
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(
+                window_id,
+                WindowShare::new_single_controller(Participant::local(&local, false)),
+            );
+            shares.insert(shared_window, share);
+        }
+
+        let mut manager = WorkspaceManager::new(vec![base.to_path_buf()]);
+        let workspace_id = manager.create_workspace();
+        let session_id = SessionId::new();
+        manager.add_session(workspace_id, session_id, None);
+        manager.assign_session_to_window(window_id, session_id);
+        manager.on_cwd_changed(session_id, &repo.join("src"));
+        let manager = Arc::new(RwLock::new(manager));
+
+        assert_eq!(
+            beads_detail_request_root(
+                &manager,
+                &shares,
+                BeadsDetailRequest { window_id, writer: &local, is_remote: false, workspace_id },
+            )
+            .await,
+            Some(repo)
+        );
+        {
+            let shares = shares.read().await;
+            let shared_window_state = shares.get(&shared_window);
+            assert!(!beads_detail_connection_available(shared_window_state, &shared_owner, false));
+            assert!(!beads_detail_connection_available(shared_window_state, &remote, true));
+        }
+        assert!(
+            beads_detail_request_root(
+                &manager,
+                &shares,
+                BeadsDetailRequest {
+                    window_id: other_window,
+                    writer: &local,
+                    is_remote: false,
+                    workspace_id,
+                },
+            )
+            .await
+            .is_none()
+        );
     }
 
     // @lat: [[lat.md/test#Test Harness#Server handoff#Upgrade takeover replaces a live socket]]
