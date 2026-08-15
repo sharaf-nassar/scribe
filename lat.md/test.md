@@ -1626,11 +1626,33 @@ Bare interactive passthrough is intentionally not exercised. Profile-writing com
 
 The functional image uses the checksum-pinned guarded Beads build to prove rooted workspace reads and writes against the server's real `bd` process contract.
 
-`just e2e-func-beads-board` seeds an isolated git and Beads repository, starts the disposable server with its parent as a workspace root, and requests the board through `scribe-test beads-board`. The terminal reply must classify the seeded issue as ready.
+`just e2e-func-beads-board` derives a visual image with the pinned `bd`, seeds
+an isolated git and Beads repository, and starts the disposable server and GPUI
+client with its parent as a workspace root. The client wire must receive a
+ready board that classifies the seeded records into their expected lanes.
 
 The board omits the seeded epic as a standalone card while its child keeps the epic title as metadata, and queue totals count only non-epic issues.
 
-The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must expose the parent id and title through the `parent-child` relation and preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
+The same repository has deterministic epic, blocker, dependent, closed, and
+deferred issues. Its detailed issue carries every editable text field and two
+ordered comments. Real `bd show --json --include-comments
+--include-dependents` replies must expose the parent id and title through the
+`parent-child` relation and preserve those fields, relation ids, comment bodies
+and authors, close reason, and defer date. The parser accepts real records that
+carry both `owner` and `created_by`, preferring the owner rather than treating
+the pair as a duplicate field.
+
+The functional run hovers the real workspace badge, then presses and releases
+on the blocked card without pointer travel, keeping the gesture inside the
+future two-pixel drag threshold. It requires the exact detail request and
+matching server response on the client wire, compares every painted field,
+relation, reversed comment, and queue classifier with the direct `bd show`,
+requires a substantial panel repaint, and copies the painted full ID. Evidence
+is written to `beads-real-detail-evidence.json`, `beads-real-bd-show.json`,
+and the board/detail screenshots. This
+covers executable discovery, project-root working directory, command flags,
+JSON envelopes, queue classification, detail shapes, and rendering without
+touching the host's Beads database.
 
 #### Guarded Beads Write Contract
 
@@ -1833,22 +1855,30 @@ Screenshots are taken full-screen because a Vulkan surface may not be readable p
 
 ### Beads card-detail fixtures
 
-`just e2e-visual-beads-detail-fixtures` proves a clicked board card requests and renders the comment-clamped detail fixture.
+`just e2e-visual-beads-detail-fixtures` proves a clicked board card requests and renders the mock-approved detail fixture matrix.
 
-`tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages: a loading board plus closed, blocked, comment-clamped, and hidden-count detail replies. The script substitutes the live workspace id and refresh time before sending records through `scribe-test share-inject` under `--network none`.
+`tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages:
+a loading board plus closed, blocked, comment-clamped, and hidden-count detail
+replies. The run mounts and directly reads
+`.impeccable/mocks/beads-card-detail.html`, substitutes the live workspace id
+and refresh time, then sends records through `scribe-test share-inject` under
+`--network none`.
 
 The loading message paints its five-card board. The script clicks the Backlog
 card, requires `RequestBeadsIssueDetail` on the wire tap, and captures the
 card-derived loading head and placeholder before injecting the matching reply.
-It rejects any dropped detail message. Its settled screenshot requires the
-560px panel to start 12px from the region edge and 4px below the board, then
-checks the full head, queue, body, dependency, comment, dependent, and status
-anatomy. The current comment remains two lines while the older comment remains
-one ellipsized line. Hovering the identity ID must reveal its copy glyph; one
-click must write the full ID, and a clipboard sentinel installed afterward
-must survive later frames. The same run reopens after Esc, close-mark, and
-backdrop dismissal, then requires a visible close notice for both a missing
-detail and a workspace whose board changes to `NotDetected`.
+It rejects any dropped detail message. At text scale 1.0, its settled screenshot
+requires the mock's 560px panel to start 12px from the region edge and 4px
+below the board. Sampled pixels assert the spine node and halo, run-in heads,
+status-rail break and stop-short gap, empty-field row omission, epic hue,
+priority ink, and two-line/newest plus one-line/older comment clamp. Clicking
+the newest comment must expand and restore that folded shape. Hovering the
+identity ID must reveal only its copy glyph; one click writes the full ID, and
+a clipboard sentinel installed afterward survives later frames. The same run
+captures the loading, closed, blocked, comment-clamped, and hidden-count
+variants, reopens after Esc, close-mark, and backdrop dismissal, then requires
+a visible close notice for both a missing detail and a workspace whose board
+changes to `NotDetected`.
 
 The run then opens a short navigation fixture,
 requires a dependent click to send one fresh detail request, proves the source

@@ -816,8 +816,10 @@ struct IssueDetailJson {
     labels: Vec<String>,
     #[serde(default)]
     assignee: Option<String>,
-    #[serde(default, alias = "created_by")]
+    #[serde(default)]
     owner: Option<String>,
+    #[serde(default)]
+    created_by: Option<String>,
     #[serde(default)]
     created_at: String,
     #[serde(default)]
@@ -950,7 +952,7 @@ fn parse_issue_detail(bytes: &[u8], ready: bool) -> Result<BeadsIssueDetail, Str
             .collect(),
         parent_epic_name,
         assignee: bounded_option(issue.assignee, MAX_TITLE_CHARS),
-        owner: bounded_option(issue.owner, MAX_TITLE_CHARS),
+        owner: bounded_option(issue.owner.or(issue.created_by), MAX_TITLE_CHARS),
         created_at: truncate_bytes(&issue.created_at, MAX_TITLE_CHARS),
         updated_at: truncate_bytes(&issue.updated_at, MAX_TITLE_CHARS),
         closed_at: bounded_option(issue.closed_at, MAX_TITLE_CHARS),
@@ -1290,6 +1292,17 @@ mod tests {
             assert_eq!(detail.parent_epic_name.as_deref(), Some("Card detail epic"));
             assert_eq!(detail.dependents[0].id, "child");
         }
+    }
+
+    #[test]
+    fn reads_real_bd_owner_alongside_created_by() {
+        let mut issue = detail_issue();
+        issue["created_by"] = serde_json::Value::String("creator".into());
+
+        let detail = parse_issue_detail(&detail_envelope(&serde_json::json!([issue])), false)
+            .expect("parse real bd ownership fields");
+
+        assert_eq!(detail.owner.as_deref(), Some("owner"));
     }
 
     #[test]

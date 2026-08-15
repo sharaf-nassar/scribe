@@ -7,6 +7,7 @@ set -euo pipefail
 CONTROL="${SHARE_TAP_CONTROL:-$XDG_RUNTIME_DIR/scribe/share-tap.sock}"
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+MOCK="${BEADS_DETAIL_MOCK:-/mocks/beads-card-detail.html}"
 
 fail() {
     echo "FAIL: $1"
@@ -21,26 +22,6 @@ window_id() {
 inject() {
     scribe-test share-inject --control "$CONTROL" "$1"
     sleep 0.5
-}
-
-detail_request_count() {
-    python3 - "$RECORD" <<'PY'
-import json, sys
-
-count = 0
-with open(sys.argv[1]) as handle:
-    for line in handle:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        message = row.get("message", {})
-        if (row.get("dir") == "client"
-                and message.get("type") == "RequestBeadsIssueDetail"
-                and message.get("issue_id") == "detail-comment-clamped"):
-            count += 1
-print(count)
-PY
 }
 
 first_workspace() {
@@ -85,6 +66,7 @@ PY
 }
 
 sleep 2
+[ -r "$MOCK" ] || fail "approved mock is not mounted at $MOCK"
 WID=$(window_id)
 [ -n "$WID" ] || fail "no Scribe window"
 WORKSPACE=$(first_workspace) || fail "no SessionList workspace recorded"
@@ -167,6 +149,9 @@ LOADING_PANEL_DIFF=${LOADING_PANEL_DIFF%%.*}
     || fail "loading head and placeholder changed only ${LOADING_PANEL_DIFF:-0}px"
 inject "$COMMENT_MESSAGE"
 sleep 0.5
+# Keep pointer effects outside the measured panel inventory.
+xdotool mousemove --sync --window "$WID" 700 500
+sleep 0.2
 import -window "$WID" /output/beads-detail-comment-clamped.png
 PANEL_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
     /output/beads-detail-comment-clamped.png null: 2>&1 || true)
@@ -181,6 +166,42 @@ read -r PANEL_W PANEL_H PANEL_X PANEL_Y <<<"$(convert \
     || fail "panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}, expected 560px wide at +12+4"
 [ "$PANEL_H" -ge 250 ] \
     || fail "panel anatomy collapsed to ${PANEL_H}px high"
+python3 /tests/visual/beads-card-detail-inventory.py \
+    --mock "$MOCK" \
+    --image /output/beads-detail-comment-clamped.png \
+    --panel 12 235 "$PANEL_W" "$PANEL_H" \
+    --scale 1.0 \
+    --output /output/beads-detail-inventory.json \
+    || fail "mock inventory did not match the text-scale 1.0 panel"
+
+# Clicking the newest comment expands its folded body. Clicking it again must
+# restore the exact two-line/one-line inventory measured above.
+convert /output/beads-detail-comment-clamped.png \
+    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-collapsed.png
+xdotool mousemove --sync --window "$WID" 200 452
+xdotool click 1
+sleep 0.3
+xdotool mousemove --sync --window "$WID" 700 500
+import -window "$WID" /output/beads-detail-comment-expanded.png
+convert /output/beads-detail-comment-expanded.png \
+    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-expanded.png
+EXPAND_DIFF=$(compare -metric AE /tmp/beads-detail-collapsed.png \
+    /tmp/beads-detail-expanded.png null: 2>&1 || true)
+EXPAND_DIFF=${EXPAND_DIFF%%.*}
+[ "${EXPAND_DIFF:-0}" -ge 500 ] \
+    || fail "expanding the newest comment changed only ${EXPAND_DIFF:-0}px"
+xdotool mousemove --sync --window "$WID" 200 452
+xdotool click 1
+sleep 0.3
+xdotool mousemove --sync --window "$WID" 700 500
+import -window "$WID" /output/beads-detail-comment-recollapsed.png
+convert /output/beads-detail-comment-recollapsed.png \
+    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-recollapsed.png
+RECOLLAPSE_DIFF=$(compare -metric AE /tmp/beads-detail-collapsed.png \
+    /tmp/beads-detail-recollapsed.png null: 2>&1 || true)
+RECOLLAPSE_DIFF=${RECOLLAPSE_DIFF%%.*}
+[ "${RECOLLAPSE_DIFF:-9999}" -le 25 ] \
+    || fail "recollapsed comment left ${RECOLLAPSE_DIFF}px changed"
 
 # Hover reveals the approved copy glyph without moving the identity row. One
 # click writes the full id, and replacing the clipboard afterward proves the
@@ -194,6 +215,8 @@ ID_HOVER_DIFF=$(compare -metric AE \
 ID_HOVER_DIFF=${ID_HOVER_DIFF%%.*}
 [ "${ID_HOVER_DIFF:-0}" -ge 10 ] \
     || fail "id hover changed only ${ID_HOVER_DIFF:-0}px"
+[ "$ID_HOVER_DIFF" -le 1000 ] \
+    || fail "id hover moved more than its copy glyph (${ID_HOVER_DIFF}px)"
 xdotool click 1
 sleep 0.2
 COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
@@ -335,6 +358,9 @@ COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 [ "$COPIED" = "detail-loading" ] \
     || fail "dependent click swapped before its reply: '$COPIED'"
 inject "$HIDDEN_MESSAGE"
+xdotool mousemove --sync --window "$WID" 700 500
+sleep 0.2
+import -window "$WID" /output/beads-detail-hidden-count.png
 xdotool mousemove --sync --window "$WID" 90 284
 xdotool click 1
 sleep 0.2
@@ -342,4 +368,47 @@ COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 [ "$COPIED" = "detail-hidden-count" ] \
     || fail "matching dependent reply did not swap the panel: '$COPIED'"
 
-echo "PASS: detail lifecycle, copy, and dependent navigation rendered"
+# Exercise the remaining checked-in settled variants through their real card
+# clicks. Each must request its own ID, paint a distinct panel, and expose that
+# exact identity through the panel's copy target.
+capture_variant() {
+    local name="$1" issue="$2" card_x="$3" message="$4"
+    local before copied diff
+    xdotool key Escape
+    inject "$LOADING_MESSAGE"
+    xdotool mousemove --sync --window "$WID" 66 17
+    sleep 0.2
+    before=$(detail_request_count "$issue")
+    xdotool mousemove --sync --window "$WID" "$card_x" 84
+    xdotool mousedown 1
+    xdotool mouseup 1
+    sleep 0.2
+    [ "$(detail_request_count "$issue")" -eq "$((before + 1))" ] \
+        || fail "$name card click sent no detail request"
+    inject "$message"
+    xdotool mousemove --sync --window "$WID" 700 600
+    sleep 0.2
+    import -window "$WID" "/output/beads-detail-${name}.png"
+    diff=$(compare -metric AE /output/beads-detail-comment-clamped.png \
+        "/output/beads-detail-${name}.png" null: 2>&1 || true)
+    diff=${diff%%.*}
+    [ "${diff:-0}" -ge 1000 ] || fail "$name fixture painted only ${diff:-0} distinct pixels"
+    xdotool mousemove --sync --window "$WID" 466 284
+    xdotool click 1
+    sleep 0.2
+    copied=$(xclip -o -selection clipboard 2>/dev/null || true)
+    [ "$copied" = "$issue" ] || fail "$name panel copied '$copied' instead of '$issue'"
+}
+
+CLOSED_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
+    $1 == "closed" { sub(/^[^\t]*\t/, ""); print; exit }
+')
+BLOCKED_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
+    $1 == "blocked" { sub(/^[^\t]*\t/, ""); print; exit }
+')
+[ -n "$CLOSED_MESSAGE" ] && [ -n "$BLOCKED_MESSAGE" ] \
+    || fail "closed or blocked fixture missing"
+capture_variant blocked detail-blocked 700 "$BLOCKED_MESSAGE"
+capture_variant closed detail-closed 900 "$CLOSED_MESSAGE"
+
+echo "PASS: mock inventory, detail variants, lifecycle, copy, and navigation rendered"

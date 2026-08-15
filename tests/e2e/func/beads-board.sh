@@ -10,53 +10,93 @@ fail() {
 
 ROOT=/tmp/scribe-beads-root
 PROJECT="$ROOT/real-board"
-mkdir -p "$PROJECT"
-git -C "$PROJECT" init --quiet
-git -C "$PROJECT" config user.email e2e@example.invalid
-git -C "$PROJECT" config user.name 'Scribe E2E'
-
-(
-    cd "$PROJECT"
-    bd init --quiet --stealth --prefix e2e
-    bd create 'Card detail epic' --id e2e-epic --type epic --priority 2 >/dev/null
-    bd create 'Open detail blocker' --id e2e-blocker --type task --priority 0 \
-        --description 'Blocks the detail fixture until its contract is met.' >/dev/null
-    bd create 'Complete card detail' --id e2e-detail --type task --priority 1 \
-        --description 'Description fixture for the detail panel.' \
-        --acceptance 'Acceptance fixture survives bd show.' \
-        --notes 'Notes fixture keeps implementation context.' \
-        --design 'Design fixture documents the direct data flow.' \
-        --spec-id '024-beads-card-detail' \
-        --labels 'beads,detail-fixture' \
-        --assignee 'fixture-owner' \
-        --estimate 90 \
-        --external-ref 'fixture://beads-card-detail' \
-        --due '2030-02-01' >/dev/null
-    bd update e2e-detail --parent e2e-epic >/dev/null
-    bd dep add e2e-detail e2e-blocker >/dev/null
-    bd comments add e2e-detail 'Oldest deterministic fixture comment.' \
-        --author 'Fixture Author' >/dev/null
-    bd comments add e2e-detail 'Newest deterministic fixture comment.' \
-        --author 'Fixture Reviewer' >/dev/null
-    bd create 'Detail dependent' --id e2e-dependent --type task --priority 2 >/dev/null
-    bd dep add e2e-dependent e2e-detail >/dev/null
-    bd create 'Closed detail fixture' --id e2e-closed --type task --priority 3 >/dev/null
-    bd close e2e-closed --reason 'Closed fixture reason.' >/dev/null
-    bd create 'Deferred detail fixture' --id e2e-deferred --type task --priority 4 \
-        --defer '2030-03-01' >/dev/null
-    bd create 'Real board refresh' --id e2e-ready --type task --priority 1 >/dev/null
-)
-
-scribe-test daemon stop
-scribe-test server stop
-printf '[workspaces]\nroots = ["%s"]\n' "$ROOT" >"$HOME/.config/scribe/config.toml"
+RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 export BD_NO_DAEMON=1
-scribe-test server start
-scribe-test daemon start
 
-SESSION=$(scribe-test session create --cwd "$PROJECT")
-scribe-test wait-cwd "$SESSION" "$PROJECT"
-BOARD=$(scribe-test beads-board)
+seed_fixture() {
+    mkdir -p "$PROJECT"
+    git -C "$PROJECT" init --quiet
+    git -C "$PROJECT" config user.email e2e@example.invalid
+    git -C "$PROJECT" config user.name 'Scribe E2E'
+    (
+        cd "$PROJECT"
+        bd init --quiet --stealth --prefix e2e
+        bd create 'Card detail epic' --id e2e-epic --type epic --priority 2 >/dev/null
+        bd create 'Open detail blocker' --id e2e-blocker --type task --priority 0 \
+            --description 'Blocks the detail fixture until its contract is met.' >/dev/null
+        bd create 'Complete card detail' --id e2e-detail --type task --priority 1 \
+            --description 'Description fixture for the detail panel.' \
+            --acceptance 'Acceptance fixture survives bd show.' \
+            --notes 'Notes fixture keeps implementation context.' \
+            --design 'Design fixture documents the direct data flow.' \
+            --spec-id '024-beads-card-detail' \
+            --labels 'beads,detail-fixture' \
+            --assignee 'fixture-owner' \
+            --estimate 90 \
+            --external-ref 'fixture://beads-card-detail' \
+            --due '2030-02-01' >/dev/null
+        bd update e2e-detail --parent e2e-epic >/dev/null
+        bd dep add e2e-detail e2e-blocker >/dev/null
+        bd comments add e2e-detail 'Oldest deterministic fixture comment.' \
+            --author 'Fixture Author' >/dev/null
+        bd comments add e2e-detail 'Newest deterministic fixture comment.' \
+            --author 'Fixture Reviewer' >/dev/null
+        bd create 'Detail dependent' --id e2e-dependent --type task --priority 2 >/dev/null
+        bd dep add e2e-dependent e2e-detail >/dev/null
+        bd create 'Closed detail fixture' --id e2e-closed --type task --priority 3 >/dev/null
+        bd close e2e-closed --reason 'Closed fixture reason.' >/dev/null
+        bd create 'Deferred detail fixture' --id e2e-deferred --type task --priority 4 \
+            --defer '2030-03-01' >/dev/null
+        bd create 'Real board refresh' --id e2e-ready --type task --priority 1 >/dev/null
+    )
+}
+
+if [ "${1:-}" = "--seed" ]; then
+    seed_fixture
+    exit 0
+fi
+
+if [ "${SCRIBE_BEADS_PRESEEDED:-0}" != "1" ]; then
+    seed_fixture
+    scribe-test daemon stop
+    scribe-test server stop
+    printf '[workspaces]\nroots = ["%s"]\n' "$ROOT" >"$HOME/.config/scribe/config.toml"
+    scribe-test server start
+    scribe-test daemon start
+    SESSION=$(scribe-test session create --cwd "$PROJECT")
+    scribe-test wait-cwd "$SESSION" "$PROJECT"
+fi
+
+if [ "${SCRIBE_BEADS_PRESEEDED:-0}" = "1" ]; then
+    BOARD=
+    for _ in $(seq 1 50); do
+        BOARD=$(python3 - "$RECORD" <<'PY'
+import json, sys
+
+found = None
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    message = row.get("message", {})
+    state = message.get("state", {})
+    if (row.get("dir") == "server"
+            and message.get("type") == "BeadsBoard"
+            and isinstance(state, dict)
+            and "Ready" in state):
+        found = state
+if found is not None:
+    print(json.dumps(found, separators=(",", ":")))
+PY
+)
+        [ -n "$BOARD" ] && break
+        sleep 0.2
+    done
+    [ -n "$BOARD" ] || fail "client wire recorded no ready Beads board"
+else
+    BOARD=$(scribe-test beads-board)
+fi
 
 printf '%s\n' "$BOARD" | grep -q '"Ready"' \
     || fail "board refresh did not reach Ready: $BOARD"
@@ -75,6 +115,7 @@ printf '%s\n' "$BOARD" | grep -Fq '"id":"e2e-detail","title":"Complete card deta
 DETAIL=$(cd "$PROJECT" && bd show e2e-detail --json --include-comments --include-dependents)
 CLOSED=$(cd "$PROJECT" && bd show e2e-closed --json --include-comments --include-dependents)
 DEFERRED=$(cd "$PROJECT" && bd show e2e-deferred --json --include-comments --include-dependents)
+printf '%s\n' "$DETAIL" >/output/beads-real-bd-show.json
 
 for expected in \
     '"title": "Complete card detail"' \
@@ -122,4 +163,98 @@ printf '%s\n' "$CLOSED" | grep -Eq '"closed_at": "[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
 printf '%s\n' "$DEFERRED" | grep -Fq '"defer_until": "2030-03-01T00:00:00Z"' \
     || fail "deferred fixture omitted defer_until: $DEFERRED"
 
-echo 'PASS: real bd refreshed the board and returned complete deterministic detail fixtures'
+if [ -z "${DISPLAY:-}" ]; then
+    echo 'PASS: real bd refreshed the board and returned complete deterministic detail fixtures'
+    exit 0
+fi
+
+WID=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
+[ -n "$WID" ] || fail "real-bd detail run found no Scribe window"
+xdotool windowactivate --sync "$WID" 2>/dev/null || xdotool windowfocus --sync "$WID"
+import -window "$WID" /output/beads-real-before.png
+
+detail_request_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client"
+            and message.get("type") == "RequestBeadsIssueDetail"
+            and message.get("issue_id") == "e2e-detail"):
+        count += 1
+print(count)
+PY
+}
+
+detail_response_seen() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server"
+            and message.get("type") == "BeadsIssueDetail"
+            and message.get("issue_id") == "e2e-detail"
+            and message.get("detail")):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Hover the rooted workspace's bead and wait for the real board to paint.
+xdotool mousemove --sync --window "$WID" 91 17
+for _ in $(seq 1 30); do
+    sleep 0.2
+    import -window "$WID" /output/beads-real-board.png
+    BOARD_DIFF=$(compare -metric AE /output/beads-real-before.png \
+        /output/beads-real-board.png null: 2>&1 || true)
+    BOARD_DIFF=${BOARD_DIFF%%.*}
+    [ "${BOARD_DIFF:-0}" -ge 10000 ] && break
+done
+[ "${BOARD_DIFF:-0}" -ge 10000 ] || fail "real bd board never painted"
+
+# The press and release stay at one coordinate, inside the future two-pixel
+# drag arm. This must remain a card click and request its complete detail.
+REQUESTS_BEFORE=$(detail_request_count)
+xdotool mousemove --sync --window "$WID" 700 84
+xdotool mousedown 1
+xdotool mouseup 1
+for _ in $(seq 1 30); do
+    [ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 1))" ] && break
+    sleep 0.2
+done
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 1))" ] \
+    || fail "sub-2px card click sent no detail request"
+for _ in $(seq 1 50); do
+    detail_response_seen && break
+    sleep 0.2
+done
+detail_response_seen || fail "real server sent no matching detail response"
+
+python3 /tests/func/assert-beads-detail-wire.py \
+    --bd /output/beads-real-bd-show.json \
+    --wire "$RECORD" \
+    --issue e2e-detail \
+    --output /output/beads-real-detail-evidence.json \
+    || fail "painted detail response diverged from bd show"
+xdotool mousemove --sync --window "$WID" 900 600
+sleep 0.2
+import -window "$WID" /output/beads-real-detail.png
+DETAIL_DIFF=$(compare -metric AE /output/beads-real-board.png \
+    /output/beads-real-detail.png null: 2>&1 || true)
+DETAIL_DIFF=${DETAIL_DIFF%%.*}
+[ "${DETAIL_DIFF:-0}" -ge 20000 ] || fail "real detail panel changed only ${DETAIL_DIFF:-0}px"
+
+# The painted panel's identity target is the final semantic check: it copies
+# the same full id read from bd show and carried on the matched wire response.
+xdotool mousemove --sync --window "$WID" 450 284
+xdotool click 1
+sleep 0.2
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "e2e-detail" ] || fail "painted panel copied '$COPIED' instead of e2e-detail"
+
+echo 'PASS: seeded bd detail matched the request, response, painted panel, and copied identity'

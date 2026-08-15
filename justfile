@@ -168,6 +168,10 @@ docker-visual profile="release":
     tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper
     docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
 
+# Add the pinned bd binary to the visual image for the real read-slice proof.
+docker-beads-read-e2e: docker-visual
+    docker build --target beads-read-e2e -f docker/Dockerfile.func -t scribe-test-beads-read-e2e .
+
 # Run a functional E2E test (e.g. just e2e-func func/smoke.sh)
 e2e-func script image="scribe-test-func" runtime_profile="default":
     #!/usr/bin/env bash
@@ -504,16 +508,16 @@ e2e-visual-beads-board:
 
 # Decode the complete card-detail fixture matrix through the visual wire tap.
 e2e-visual-beads-detail-fixtures:
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-card-detail-fixtures.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/beads-card-detail.html:/mocks/beads-card-detail.html:ro {{e2e_output}} scribe-test-visual /tests/visual/beads-card-detail-fixtures.sh
 
 # Run the approved collapsed GitHub CI trace through a watched local push and
 # the loopback Actions fixture. The container has no route beyond loopback.
 e2e-visual-ci-run-bar:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/ci-run-bar-config.toml)" -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/ci-run-bar.sh
 
-# Run one real bd refresh through the functional server.
-e2e-func-beads-board:
-    TEST_TIMEOUT=60 just e2e-func func/beads-board.sh
+# Run one real bd refresh through the GPUI client and functional server.
+e2e-func-beads-board: docker-beads-read-e2e
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=120 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-beads-read-e2e /tests/func/beads-board.sh
 
 # Prove the checksum-pinned bd build preserves guarded native write semantics.
 e2e-func-beads-write-contract:
@@ -630,7 +634,9 @@ e2e: build-release docker-func
         exit 2
     fi
     for script in "${scripts[@]}"; do
-        if [[ "$script" == func/env-persistence.sh ]]; then
+        if [[ "$script" == func/beads-board.sh ]]; then
+            just e2e-func-beads-board
+        elif [[ "$script" == func/env-persistence.sh ]]; then
             SCRIBE_KEYRING=1 just e2e-func "$script"
         else
             just e2e-func "$script"

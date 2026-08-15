@@ -87,3 +87,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --locked -p scribe-server \
         beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture && \
     cargo test --locked -p scribe-client beads -- --nocapture
+
+# The read-slice proof needs the real GPUI window and the same guarded bd used
+# by the functional harness. Keep both builds authoritative by deriving from
+# the visual image and copying only the already pinned bd binary.
+FROM scribe-test-visual AS beads-read-e2e
+COPY --from=beads-builder /out/bd /usr/local/bin/bd
+COPY --chmod=755 tests/e2e/func/beads-board-visual-entrypoint.sh /entrypoint-beads.sh
+ENTRYPOINT ["/entrypoint-beads.sh"]
