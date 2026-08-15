@@ -160,7 +160,7 @@ use scribe_common::{
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
-    socket::server_socket_path,
+    socket::{ClientFocusGeneration, server_socket_path},
     terminal_images::ImageLimits,
 };
 use tokio::{
@@ -198,6 +198,9 @@ thread_local! {
     /// Owner-local recency target for a duplicate launch's focus handoff.
     // ponytail: persist recency only if restore-child windows must win handoffs.
     static RECENT_TERMINAL_WINDOW: RefCell<Option<WindowHandle<TerminalView>>> = const {
+        RefCell::new(None)
+    };
+    static TERMINAL_FOCUS_REPORTER: RefCell<Option<TerminalFocusReporter>> = const {
         RefCell::new(None)
     };
 }
@@ -8073,6 +8076,8 @@ impl TerminalView {
         if let Some(handle) = window.window_handle().downcast::<TerminalView>() {
             RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(Some(handle)));
         }
+        let window_id = self.shared.lifecycle.lock().ok().and_then(|state| state.window_id());
+        report_terminal_activation(window_id);
         // Focus-on-activate fallback: a notification service that activates the
         // app without reporting which toast was clicked leaves this as the only
         // link between the click and the pane that asked for attention. The
@@ -9954,15 +9959,122 @@ const fn terminal_singleton_required(exemptions: [bool; 4]) -> bool {
     !exemptions[0] && !exemptions[1] && !exemptions[2] && !exemptions[3]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalFocusTarget {
+    Owner,
+    RestoreChild { generation: ClientFocusGeneration, window_id: WindowId },
+}
+
+struct TerminalFocusBroker {
+    sequence: u64,
+    winner_sequence: u64,
+    target: TerminalFocusTarget,
+}
+
+impl TerminalFocusBroker {
+    const fn new() -> Self {
+        Self { sequence: 0, winner_sequence: 0, target: TerminalFocusTarget::Owner }
+    }
+
+    fn record_owner(&mut self) {
+        self.record(TerminalFocusTarget::Owner);
+    }
+
+    #[cfg(test)]
+    fn record_restore_child(&mut self, generation: ClientFocusGeneration, window_id: WindowId) {
+        self.record(TerminalFocusTarget::RestoreChild { generation, window_id });
+    }
+
+    fn record(&mut self, target: TerminalFocusTarget) {
+        let receipt = self.reserve_receipt();
+        self.record_at(receipt, target);
+    }
+
+    fn reserve_receipt(&mut self) -> u64 {
+        self.sequence = self.sequence.saturating_add(1);
+        self.sequence
+    }
+
+    fn record_restore_child_at(
+        &mut self,
+        receipt: u64,
+        generation: ClientFocusGeneration,
+        window_id: WindowId,
+    ) {
+        self.record_at(receipt, TerminalFocusTarget::RestoreChild { generation, window_id });
+    }
+
+    fn record_at(&mut self, receipt: u64, target: TerminalFocusTarget) {
+        if receipt > self.winner_sequence {
+            self.winner_sequence = receipt;
+            self.target = target;
+        }
+    }
+
+    const fn target(&self) -> TerminalFocusTarget {
+        self.target
+    }
+
+    fn prune_restore_child(&mut self, generation: ClientFocusGeneration) -> bool {
+        if !matches!(
+            self.target,
+            TerminalFocusTarget::RestoreChild { generation: current, .. } if current == generation
+        ) {
+            return false;
+        }
+        self.target = TerminalFocusTarget::Owner;
+        true
+    }
+
+    #[cfg(test)]
+    const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Clone)]
+enum TerminalFocusReporter {
+    Owner(Arc<Mutex<TerminalFocusBroker>>),
+    RestoreChild(std::sync::mpsc::Sender<WindowId>),
+}
+
+fn report_terminal_activation(window_id: Option<WindowId>) {
+    TERMINAL_FOCUS_REPORTER.with(|slot| match slot.borrow().as_ref() {
+        Some(TerminalFocusReporter::Owner(broker)) => {
+            if let Ok(mut broker) = broker.lock() {
+                broker.record_owner();
+            }
+        }
+        Some(TerminalFocusReporter::RestoreChild(publisher)) => {
+            if let Some(window_id) = window_id
+                && publisher.send(window_id).is_err()
+            {
+                tracing::debug!(%window_id, "restore-child focus publisher stopped");
+            }
+        }
+        None => {}
+    });
+}
+
+enum TerminalFocusAction {
+    ActivateOwner,
+    ActivateRestoreChild(std::sync::mpsc::SyncSender<bool>),
+}
+
+struct TerminalFocusListener {
+    broker: Arc<Mutex<TerminalFocusBroker>>,
+    focus_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalFocusAction>,
+}
+
 fn start_terminal_focus_listener(
     listener: std::os::unix::net::UnixListener,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<()>, String> {
-    use scribe_client::settings::singleton;
-
+) -> Result<TerminalFocusListener, String> {
     listener
         .set_nonblocking(false)
         .map_err(|error| format!("failed to configure terminal singleton listener: {error}"))?;
     let (focus_tx, focus_rx) = unbounded_channel();
+    let broker = Arc::new(Mutex::new(TerminalFocusBroker::new()));
+    let listener_broker = Arc::clone(&broker);
     std::thread::Builder::new()
         .name("scribe-client-singleton".to_owned())
         .spawn(move || {
@@ -9974,38 +10086,256 @@ fn start_terminal_focus_listener(
                         return;
                     }
                 };
-                if singleton::verify_peer_uid(&stream)
-                    && singleton::read_command(&stream)
-                        .is_some_and(|command| command.cmd == "focus")
-                    && focus_tx.send(()).is_err()
-                {
-                    return;
-                }
+                handle_terminal_focus_connection(&stream, &listener_broker, &focus_tx);
             }
         })
         .map_err(|error| format!("failed to start terminal singleton listener: {error}"))?;
-    Ok(focus_rx)
+    Ok(TerminalFocusListener { broker, focus_rx })
+}
+
+fn handle_terminal_focus_connection(
+    stream: &std::os::unix::net::UnixStream,
+    broker: &Arc<Mutex<TerminalFocusBroker>>,
+    focus_tx: &tokio::sync::mpsc::UnboundedSender<TerminalFocusAction>,
+) {
+    use scribe_client::settings::singleton::{self, TerminalFocusCommand};
+
+    let command = singleton::read_terminal_focus_command(stream)
+        .inspect_err(|error| tracing::warn!(%error, "terminal singleton command was rejected"));
+    let Ok(command) = command else {
+        return;
+    };
+    match &command {
+        TerminalFocusCommand::Focus { .. } if singleton::verify_peer_uid(stream) => {
+            route_terminal_focus(broker, focus_tx);
+        }
+        TerminalFocusCommand::AnnounceActivation { generation, window_id, .. } => {
+            let receipt = match broker.lock() {
+                Ok(mut registry) => registry.reserve_receipt(),
+                Err(_) => return,
+            };
+            if let Err(error) = singleton::authenticate_activation_announcement(stream, &command) {
+                tracing::warn!(%error, "restore-child activation was rejected");
+                return;
+            }
+            if let Ok(mut registry) = broker.lock() {
+                registry.record_restore_child_at(receipt, *generation, *window_id);
+            }
+        }
+        TerminalFocusCommand::Focus { .. } => {}
+    }
+}
+
+fn route_terminal_focus(
+    broker: &Arc<Mutex<TerminalFocusBroker>>,
+    focus_tx: &tokio::sync::mpsc::UnboundedSender<TerminalFocusAction>,
+) {
+    use scribe_client::settings::singleton::{self, FocusEndpointResult};
+
+    let target = broker.lock().map_or(TerminalFocusTarget::Owner, |broker| broker.target());
+    if let TerminalFocusTarget::RestoreChild { generation, window_id } = target {
+        match singleton::request_focus_endpoint(generation) {
+            Ok(FocusEndpointResult::Activated { .. }) => return,
+            Ok(result) => tracing::debug!(?result, %window_id, "restore-child focus fell back"),
+            Err(error) => {
+                tracing::debug!(%error, %window_id, "restore-child focus target was unavailable");
+            }
+        }
+        if let Ok(mut broker) = broker.lock() {
+            broker.prune_restore_child(generation);
+        }
+    }
+    drop(focus_tx.send(TerminalFocusAction::ActivateOwner));
 }
 
 async fn drive_terminal_focus(
-    mut focus_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut focus_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalFocusAction>,
     app: &mut AsyncApp,
 ) {
-    while focus_rx.recv().await.is_some() {
+    while let Some(action) = focus_rx.recv().await {
         let target = RECENT_TERMINAL_WINDOW.with(|recent| *recent.borrow());
-        let Some(window_handle) = target else {
-            continue;
-        };
-        if window_handle.update(app, |_, window, _| window.activate_window()).is_err() {
+        let activated = target.is_some_and(|window_handle| {
+            window_handle.update(app, |_, window, _| window.activate_window()).is_ok()
+        });
+        if !activated {
             RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(None));
         }
+        if let TerminalFocusAction::ActivateRestoreChild(response) = action
+            && response.send(activated).is_err()
+        {
+            tracing::debug!("restore-child focus requester stopped");
+        }
     }
+}
+
+fn dispatch_focus_endpoint_request(
+    request: &scribe_client::settings::singleton::FocusEndpointRequest,
+    generation: ClientFocusGeneration,
+    activate: impl FnOnce() -> bool,
+) -> scribe_client::settings::singleton::FocusEndpointResult {
+    use scribe_client::settings::singleton::{
+        FocusEndpointRejection, FocusEndpointRequest, FocusEndpointResult,
+        validate_focus_endpoint_request,
+    };
+
+    if validate_focus_endpoint_request(request, generation).is_err() {
+        return FocusEndpointResult::Rejected {
+            reason: FocusEndpointRejection::GenerationMismatch,
+        };
+    }
+    match request {
+        FocusEndpointRequest::Probe { .. } => FocusEndpointResult::Alive { generation },
+        FocusEndpointRequest::Activate { .. } if activate() => {
+            FocusEndpointResult::Activated { generation }
+        }
+        FocusEndpointRequest::Activate { .. } => {
+            FocusEndpointResult::Rejected { reason: FocusEndpointRejection::UnavailableWindow }
+        }
+    }
+}
+
+struct RestoreChildFocusRuntime {
+    shutdown: Arc<AtomicBool>,
+    listener: Option<std::thread::JoinHandle<()>>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RestoreChildFocusRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(listener) = self.listener.take() {
+            drop(listener.join());
+        }
+        if let Some(publisher) = self.publisher.take() {
+            drop(publisher.join());
+        }
+    }
+}
+
+struct RestoreChildFocusStartup {
+    runtime: RestoreChildFocusRuntime,
+    publisher: std::sync::mpsc::Sender<WindowId>,
+    focus_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalFocusAction>,
+}
+
+fn start_restore_child_focus() -> Result<RestoreChildFocusStartup, String> {
+    use scribe_client::settings::singleton::BoundFocusEndpoint;
+
+    let generation = ClientFocusGeneration::new();
+    let endpoint = BoundFocusEndpoint::bind(generation).map_err(|error| error.to_string())?;
+    endpoint
+        .listener()
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure restore-child focus endpoint: {error}"))?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let listener_shutdown = Arc::clone(&shutdown);
+    let (focus_tx, focus_rx) = unbounded_channel();
+    let listener = std::thread::Builder::new()
+        .name("scribe-focus-endpoint".to_owned())
+        .spawn(move || {
+            while !listener_shutdown.load(Ordering::Acquire) {
+                let stream = match endpoint.listener().accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "restore-child focus endpoint stopped");
+                        return;
+                    }
+                };
+                serve_restore_child_focus_connection(stream, generation, &focus_tx);
+            }
+        })
+        .map_err(|error| format!("failed to start restore-child focus endpoint: {error}"))?;
+
+    let (activation_tx, activation_rx) = std::sync::mpsc::channel();
+    let publisher_shutdown = Arc::clone(&shutdown);
+    let publisher = match std::thread::Builder::new()
+        .name("scribe-focus-publisher".to_owned())
+        .spawn(move || {
+            publish_restore_child_activations(&activation_rx, &publisher_shutdown, generation);
+        }) {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            shutdown.store(true, Ordering::Release);
+            drop(listener.join());
+            return Err(format!("failed to start restore-child focus publisher: {error}"));
+        }
+    };
+    Ok(RestoreChildFocusStartup {
+        runtime: RestoreChildFocusRuntime {
+            shutdown,
+            listener: Some(listener),
+            publisher: Some(publisher),
+        },
+        publisher: activation_tx,
+        focus_rx,
+    })
+}
+
+fn publish_restore_child_activations(
+    activation_rx: &std::sync::mpsc::Receiver<WindowId>,
+    shutdown: &AtomicBool,
+    generation: ClientFocusGeneration,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        match activation_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(window_id) => publish_restore_child_activation(generation, window_id),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn publish_restore_child_activation(generation: ClientFocusGeneration, window_id: WindowId) {
+    if let Err(error) =
+        scribe_client::settings::singleton::announce_activation(generation, window_id)
+    {
+        tracing::debug!(%error, %window_id, "restore-child activation dropped");
+    }
+}
+
+fn serve_restore_child_focus_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    generation: ClientFocusGeneration,
+    focus_tx: &tokio::sync::mpsc::UnboundedSender<TerminalFocusAction>,
+) {
+    use scribe_client::settings::singleton::{
+        self, ExpectedClientRole, FocusEndpointRejection, FocusEndpointResult,
+    };
+
+    if singleton::verify_focus_peer(&stream, ExpectedClientRole::SingletonOwner).is_err() {
+        drop(singleton::write_focus_endpoint_result(
+            &mut stream,
+            &FocusEndpointResult::Rejected { reason: FocusEndpointRejection::Unauthorized },
+        ));
+        return;
+    }
+    let Ok(request) = singleton::read_focus_endpoint_request(&stream) else {
+        drop(singleton::write_focus_endpoint_result(
+            &mut stream,
+            &FocusEndpointResult::Rejected { reason: FocusEndpointRejection::Malformed },
+        ));
+        return;
+    };
+    let result = dispatch_focus_endpoint_request(&request, generation, || {
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        focus_tx.send(TerminalFocusAction::ActivateRestoreChild(response_tx)).is_ok()
+            && response_rx.recv_timeout(singleton::FOCUS_IO_TIMEOUT).unwrap_or(false)
+    });
+    drop(singleton::write_focus_endpoint_result(&mut stream, &result));
 }
 
 enum TerminalSingletonStartup {
     Exempt,
     AlreadyRunning,
-    Primary { socket_path: PathBuf, focus_rx: tokio::sync::mpsc::UnboundedReceiver<()> },
+    Primary {
+        socket_path: PathBuf,
+        broker: Arc<Mutex<TerminalFocusBroker>>,
+        focus_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalFocusAction>,
+    },
 }
 
 fn prepare_terminal_singleton(required: bool) -> Result<TerminalSingletonStartup, String> {
@@ -10017,10 +10347,53 @@ fn prepare_terminal_singleton(required: bool) -> Result<TerminalSingletonStartup
     match singleton::acquire_terminal()? {
         SingletonResult::AlreadyRunning => Ok(TerminalSingletonStartup::AlreadyRunning),
         SingletonResult::Primary { listener, socket_path } => {
-            let focus_rx = start_terminal_focus_listener(listener).inspect_err(|_| {
+            let focus = start_terminal_focus_listener(listener).inspect_err(|_| {
                 singleton::cleanup_socket(&socket_path);
             })?;
-            Ok(TerminalSingletonStartup::Primary { socket_path, focus_rx })
+            Ok(TerminalSingletonStartup::Primary {
+                socket_path,
+                broker: focus.broker,
+                focus_rx: focus.focus_rx,
+            })
+        }
+    }
+}
+
+enum TerminalFocusSetup {
+    Exempt,
+    Owner {
+        broker: Arc<Mutex<TerminalFocusBroker>>,
+        focus_rx: tokio::sync::mpsc::UnboundedReceiver<TerminalFocusAction>,
+    },
+    RestoreChild,
+}
+
+enum TerminalFocusLaunch {
+    AlreadyRunning,
+    Start { socket_path: Option<PathBuf>, setup: TerminalFocusSetup },
+}
+
+fn prepare_terminal_focus_launch(restore_child: bool) -> Result<TerminalFocusLaunch, String> {
+    let explicit_join = std::env::var_os(scribe_client::share_join::JOIN_WINDOW_ENV).is_some();
+    let remote_dial = std::env::var_os(remote_handshake::REMOTE_DIAL_ENV).is_some();
+    let lan_dial = std::env::var_os(remote_handshake::LAN_DIAL_ENV).is_some();
+    let required =
+        terminal_singleton_required([restore_child, explicit_join, remote_dial, lan_dial]);
+    match prepare_terminal_singleton(required)? {
+        TerminalSingletonStartup::Exempt => Ok(TerminalFocusLaunch::Start {
+            socket_path: None,
+            setup: if restore_child && !explicit_join && !remote_dial && !lan_dial {
+                TerminalFocusSetup::RestoreChild
+            } else {
+                TerminalFocusSetup::Exempt
+            },
+        }),
+        TerminalSingletonStartup::AlreadyRunning => Ok(TerminalFocusLaunch::AlreadyRunning),
+        TerminalSingletonStartup::Primary { socket_path, broker, focus_rx } => {
+            Ok(TerminalFocusLaunch::Start {
+                socket_path: Some(socket_path),
+                setup: TerminalFocusSetup::Owner { broker, focus_rx },
+            })
         }
     }
 }
@@ -10030,14 +10403,40 @@ fn run_terminal_app(
     sink: IpcSink,
     terminal_size: TerminalSize,
     cold_start: ColdStart,
-    focus_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    focus_setup: TerminalFocusSetup,
 ) {
+    let restore_child_runtime = Arc::new(Mutex::new(None));
+    let runtime_slot = Arc::clone(&restore_child_runtime);
     application().run(move |cx: &mut App| {
         gpui_tokio::init(cx);
         scribe_client::fonts::register_embedded_fonts(cx);
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
         app_shortcuts::register(cx);
+        let focus_rx = match focus_setup {
+            TerminalFocusSetup::Exempt => None,
+            TerminalFocusSetup::Owner { broker, focus_rx } => {
+                TERMINAL_FOCUS_REPORTER.with(|slot| {
+                    slot.replace(Some(TerminalFocusReporter::Owner(broker)));
+                });
+                Some(focus_rx)
+            }
+            TerminalFocusSetup::RestoreChild => match start_restore_child_focus() {
+                Ok(focus) => {
+                    TERMINAL_FOCUS_REPORTER.with(|slot| {
+                        slot.replace(Some(TerminalFocusReporter::RestoreChild(focus.publisher)));
+                    });
+                    if let Ok(mut slot) = runtime_slot.lock() {
+                        *slot = Some(focus.runtime);
+                    }
+                    Some(focus.focus_rx)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "restore-child focus transport is unavailable");
+                    None
+                }
+            },
+        };
         if let Some(terminal_window) = open_window(cx, &shared, &sink, terminal_size, cold_start) {
             RECENT_TERMINAL_WINDOW.with(|recent| recent.replace(Some(terminal_window)));
             cx.on_action(move |_: &Quit, cx| {
@@ -10049,6 +10448,9 @@ fn run_terminal_app(
         }
         cx.activate(true);
     });
+    if let Ok(mut slot) = restore_child_runtime.lock() {
+        drop(slot.take());
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -10100,27 +10502,18 @@ fn main() -> std::process::ExitCode {
     }
 
     let restore_child = restore_replay::is_restore_child(std::env::args());
-    let join_window = scribe_client::share_join::join_window_from_env();
-    let singleton_required = terminal_singleton_required([
-        restore_child,
-        std::env::var_os(scribe_client::share_join::JOIN_WINDOW_ENV).is_some(),
-        std::env::var_os(remote_handshake::REMOTE_DIAL_ENV).is_some(),
-        std::env::var_os(remote_handshake::LAN_DIAL_ENV).is_some(),
-    ]);
-    let (terminal_socket_path, focus_rx) = match prepare_terminal_singleton(singleton_required) {
-        Ok(TerminalSingletonStartup::Exempt) => (None, None),
-        Ok(TerminalSingletonStartup::AlreadyRunning) => {
+    let (terminal_socket_path, focus_setup) = match prepare_terminal_focus_launch(restore_child) {
+        Ok(TerminalFocusLaunch::AlreadyRunning) => {
             tracing::info!("terminal client already running; sent focus and exiting");
             return std::process::ExitCode::SUCCESS;
         }
-        Ok(TerminalSingletonStartup::Primary { socket_path, focus_rx }) => {
-            (Some(socket_path), Some(focus_rx))
-        }
+        Ok(TerminalFocusLaunch::Start { socket_path, setup }) => (socket_path, setup),
         Err(error) => {
             tracing::error!(%error, "failed to acquire terminal singleton");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let join_window = scribe_client::share_join::join_window_from_env();
 
     // Claimed before the backend connects: the claimed snapshot's geometry is
     // what the window is opened at, and it is only findable under that
@@ -10157,7 +10550,7 @@ fn main() -> std::process::ExitCode {
         },
     );
 
-    run_terminal_app(shared, sink, terminal_size, cold_start, focus_rx);
+    run_terminal_app(shared, sink, terminal_size, cold_start, focus_setup);
     if let Some(socket_path) = terminal_socket_path {
         scribe_client::settings::singleton::cleanup_socket(&socket_path);
     }
@@ -13570,6 +13963,97 @@ mod tests {
         assert!(!terminal_singleton_required([false, false, false, true]));
     }
 
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Broker activation receipts stay ordered]]
+    #[test]
+    fn terminal_focus_broker_uses_activation_receipt_order() {
+        let generation = scribe_common::socket::ClientFocusGeneration::new();
+        let first_window = WindowId::new();
+        let second_window = WindowId::new();
+        let mut broker = TerminalFocusBroker::new();
+
+        broker.record_restore_child(generation, first_window);
+        broker.record_owner();
+        broker.record_restore_child(generation, second_window);
+
+        assert_eq!(broker.sequence(), 3);
+        assert_eq!(
+            broker.target(),
+            TerminalFocusTarget::RestoreChild { generation, window_id: second_window }
+        );
+    }
+
+    #[test]
+    fn terminal_focus_broker_does_not_let_slow_auth_reorder_receipts() {
+        let generation = scribe_common::socket::ClientFocusGeneration::new();
+        let window_id = WindowId::new();
+        let mut broker = TerminalFocusBroker::new();
+
+        let child_receipt = broker.reserve_receipt();
+        broker.record_owner();
+        broker.record_restore_child_at(child_receipt, generation, window_id);
+
+        assert_eq!(broker.sequence(), 2);
+        assert_eq!(broker.target(), TerminalFocusTarget::Owner);
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Owner replacement resets external recency]]
+    #[test]
+    fn terminal_focus_broker_owner_replacement_resets_external_recency() {
+        let generation = scribe_common::socket::ClientFocusGeneration::new();
+        let mut old_owner = TerminalFocusBroker::new();
+        old_owner.record_restore_child(generation, WindowId::new());
+
+        let replacement = TerminalFocusBroker::new();
+
+        assert_eq!(replacement.sequence(), 0);
+        assert_eq!(replacement.target(), TerminalFocusTarget::Owner);
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Stale external winner falls back to the owner]]
+    #[test]
+    fn terminal_focus_broker_prunes_only_the_failed_winner_to_owner_fallback() {
+        let first = scribe_common::socket::ClientFocusGeneration::new();
+        let second = scribe_common::socket::ClientFocusGeneration::new();
+        let window_id = WindowId::new();
+        let mut broker = TerminalFocusBroker::new();
+        broker.record_restore_child(first, window_id);
+
+        assert!(!broker.prune_restore_child(second));
+        assert_eq!(
+            broker.target(),
+            TerminalFocusTarget::RestoreChild { generation: first, window_id }
+        );
+        assert!(broker.prune_restore_child(first));
+        assert_eq!(broker.target(), TerminalFocusTarget::Owner);
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Restore-child activation acknowledgement reflects GPUI success]]
+    #[test]
+    fn restore_child_focus_endpoint_acknowledges_only_successful_activation() {
+        use scribe_client::settings::singleton::{
+            FocusEndpointRejection, FocusEndpointRequest, FocusEndpointResult,
+        };
+
+        let generation = scribe_common::socket::ClientFocusGeneration::new();
+
+        assert_eq!(
+            dispatch_focus_endpoint_request(
+                &FocusEndpointRequest::Activate { generation },
+                generation,
+                || true,
+            ),
+            FocusEndpointResult::Activated { generation }
+        );
+        assert_eq!(
+            dispatch_focus_endpoint_request(
+                &FocusEndpointRequest::Activate { generation },
+                generation,
+                || false,
+            ),
+            FocusEndpointResult::Rejected { reason: FocusEndpointRejection::UnavailableWindow }
+        );
+    }
+
     // @lat: [[test#Test Harness#Terminal Client Singleton#Focus command reaches the owner]]
     #[test]
     fn terminal_singleton_listener_forwards_focus_commands() {
@@ -13584,18 +14068,22 @@ mod tests {
         let socket_path = dir.join("client.sock");
         drop(std::fs::remove_file(&socket_path));
         let listener = UnixListener::bind(&socket_path).expect("test listener should bind");
-        let mut focus_rx =
-            start_terminal_focus_listener(listener).expect("focus listener should start");
+        let focus = start_terminal_focus_listener(listener).expect("focus listener should start");
+        let mut focus_rx = focus.focus_rx;
 
         let mut stream = UnixStream::connect(&socket_path).expect("focus sender should connect");
         singleton::write_command(&mut stream, &SettingsWindowCommand::focus(None))
             .expect("focus command should send");
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while focus_rx.try_recv().is_err() && Instant::now() < deadline {
+        let action = loop {
+            if let Ok(action) = focus_rx.try_recv() {
+                break action;
+            }
+            assert!(Instant::now() < deadline, "focus command should reach the GPUI receiver");
             std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(Instant::now() < deadline, "focus command should reach the GPUI receiver");
+        };
+        assert!(matches!(action, TerminalFocusAction::ActivateOwner));
 
         singleton::cleanup_socket(&socket_path);
         drop(std::fs::remove_dir_all(&dir));

@@ -1347,6 +1347,22 @@ A socket inode left by a dead owner is removed and rebound so the updater's one 
 
 The primary's same-UID listener forwards a focus command to the GPUI receiver that raises the owner's most-recent terminal window.
 
+### Broker activation receipts stay ordered
+
+Owner and restore-child positive activation receipts replace one broker winner in receipt order, including when child authentication completes after a newer owner receipt.
+
+### Owner replacement resets external recency
+
+A newly constructed singleton-owner broker starts with the owner target and no sequence inherited from the previous owner.
+
+### Stale external winner falls back to the owner
+
+Pruning affects only the matching failed restore-child generation and changes that winner to the owner's recent terminal target.
+
+### Restore-child activation acknowledgement reflects GPUI success
+
+An endpoint returns `Activated` only when GPUI accepted activation of its current recent terminal handle; an unavailable handle returns a typed rejection.
+
 ### Client paths stay flavor scoped
 
 The terminal lock and focus socket share the server socket's flavor runtime directory and use distinct `client.lock` and `client.sock` names.

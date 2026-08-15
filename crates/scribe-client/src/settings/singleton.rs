@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
-const FOCUS_IO_TIMEOUT: Duration = Duration::from_millis(100);
+pub const FOCUS_IO_TIMEOUT: Duration = Duration::from_millis(100);
 const CLEANUP_LIMIT: usize = 64;
 const CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 

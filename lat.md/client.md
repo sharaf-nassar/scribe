@@ -815,7 +815,13 @@ A plain local launch focuses the running terminal client and exits before GPUI s
 
 The advisory lock covers only bind-or-connect, preventing launch races without blocking later focus senders. A dead owner's stale socket is removed and rebound. The updater's bare replacement therefore becomes primary after every old client exits.
 
-The owner accepts same-UID `focus` commands and activates its own most-recently-focused terminal window. Recency stays process-local; restore children and explicit join clients remain independent processes.
+The owner accepts same-UID `focus` commands and routes them through [[crates/scribe-client/src/main.rs#TerminalFocusBroker]]. Positive owner and authenticated restore-child activation receipts replace one in-memory winner. A reserved sequence keeps receipt order even when child authentication finishes after a newer owner event.
+
+Each eligible restore child starts one [[crates/scribe-client/src/main.rs#start_restore_child_focus]] endpoint after GPUI starts. Every terminal window in that process updates the same `RECENT_TERMINAL_WINDOW`; the endpoint acknowledges activation only after GPUI updates that handle and accepts `activate_window()`.
+
+[[crates/scribe-client/src/main.rs#route_terminal_focus]] uses the existing bounded transport for an external winner. A missing, stale, timed-out, rejected, or unavailable child is pruned and the owner's recent terminal receives the same handoff. A replacement owner constructs a fresh broker, so external recency resets.
+
+Explicit joins and remote or LAN dial clients neither own the singleton nor publish restore-child recency. The duplicate plain-launch return remains before cold-start resolution, backend attachment, restore claims, GPUI startup, and session creation.
 
 ## GPUI Window Chrome Layout
 
