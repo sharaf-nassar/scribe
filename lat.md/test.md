@@ -1672,11 +1672,22 @@ observed value and comment row unchanged.
 
 The server functional path proves typed guarded mutations persist and push an authoritative board refresh.
 
-`just e2e-func-beads-issue-write` sends guarded title and comment writes,
-native claim, close, and undo through `scribe-test beads-write`. It re-reads
-the tracker with `bd show`, checks stale close/comment results map to
-`PreconditionFailed` without mutation, and requires `board_pushed: true` after
-successful writes.
+`just e2e-func-beads-issue-write` sends one representative of every write
+family through `scribe-test beads-write`: title, description, acceptance,
+notes, design, spec id, priority, type, labels, status, guarded comment, claim,
+close, and undo. It re-reads the tracker with `bd show` after each grouped
+family and requires `board_pushed: true` after every successful write.
+
+A seeded mutation between guard capture and the Scribe request must return
+`PreconditionFailed` without landing its comment. A deterministic `bd` shim
+then forces both nonzero exit and the 15-second server timeout; neither may
+replace the last-good board or persisted title.
+
+The derived real-bd GPUI run compares detail with direct `bd show`, then uses
+the transparent wire tap as the pane-byte oracle. Text typed while the inline
+editor owns focus emits no `KeyInput`. Forced nonzero and timeout results keep
+the loaded detail, paint the coral notice, and the timeout asks for both board
+and detail again before the persisted issue is reread.
 
 ##### Root fan-out
 
@@ -4514,6 +4525,14 @@ applying and reopening the server value.
 
 Escape drops the active draft without producing a write, leaving the next
 Escape available to close the panel.
+
+### Armed editor survives terminal focus repair
+
+The terminal repaint focus repair recognizes the Beads editor as an active focus owner instead of blurring and committing it back to the PTY.
+
+The claimed-focus decision includes the editor beside terminal, titlebar,
+update, and CI controls. This keeps the active edit alive across the repaint
+that its click requests, so subsequent native text stays on the editor path.
 
 ### Text fields map to typed writes
 

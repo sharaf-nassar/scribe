@@ -515,6 +515,10 @@ impl BeadsEditor {
         Self { focus, session: EditSession::default(), panels, _blur: blur }
     }
 
+    pub fn has_keyboard_focus(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     fn begin(&mut self, target: EditTarget<'_>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(intent) =
             self.session.begin(target.workspace_id, target.issue_id, target.field, target.value)

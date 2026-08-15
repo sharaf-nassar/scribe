@@ -1461,7 +1461,7 @@ struct TerminalFocus {
     cursor_blink: CursorBlink,
 }
 
-fn focus_is_unclaimed(claims: [bool; 4]) -> bool {
+fn focus_is_unclaimed(claims: [bool; 5]) -> bool {
     !claims.into_iter().any(std::convert::identity)
 }
 
@@ -9610,6 +9610,7 @@ impl TerminalView {
             self.ci_action_focus.values().any(|(toggle, open, dismiss)| {
                 toggle.is_focused(window) || open.is_focused(window) || dismiss.is_focused(window)
             }),
+            self.beads_editor.read(cx).has_keyboard_focus(window),
         ]);
         if focus_is_unclaimed {
             window.focus(&self.focus.root, cx);
@@ -14222,8 +14223,15 @@ mod tests {
     // @lat: [[test#Test Harness#GPUI CI Run Bar#CI controls retain keyboard focus]]
     #[test]
     fn ci_control_claim_prevents_terminal_focus_restore() {
-        assert!(!focus_is_unclaimed([false, false, false, true]));
-        assert!(focus_is_unclaimed([false; 4]));
+        assert!(!focus_is_unclaimed([false, false, false, true, false]));
+        assert!(focus_is_unclaimed([false; 5]));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Armed editor survives terminal focus repair]]
+    #[test]
+    fn beads_editor_claim_prevents_terminal_focus_restore() {
+        assert!(!focus_is_unclaimed([false, false, false, false, true]));
+        assert!(focus_is_unclaimed([false; 5]));
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]

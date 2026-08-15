@@ -1124,6 +1124,9 @@ the same guarded queue. Stale editor intents are rejected if the workspace has
 already moved to another issue. A draft never mutates loaded detail. Applied
 writes keep the previous text visible until fresh persisted detail arrives;
 failed writes keep it and show the panel's existing failure notice.
+The terminal's repaint-time focus repair treats an armed Beads editor as a
+focus owner; it cannot blur the editor back to the PTY between the click and
+the first native text event.
 Applied status and claim writes request fresh detail. Applied close removes the
 panel and shows `closed <id> · undo` for exactly five seconds. Clicking before
 the deadline sends native guarded undo; clicking at or after it sends nothing.

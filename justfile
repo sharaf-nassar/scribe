@@ -517,7 +517,7 @@ e2e-visual-ci-run-bar:
 
 # Run one real bd refresh through the GPUI client and functional server.
 e2e-func-beads-board: docker-beads-read-e2e
-    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=120 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-beads-read-e2e /tests/func/beads-board.sh
+    docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-beads-read-e2e /tests/func/beads-board.sh
 
 # Prove the checksum-pinned bd build preserves guarded native write semantics.
 e2e-func-beads-write-contract:
@@ -525,7 +525,7 @@ e2e-func-beads-write-contract:
 
 # Exercise typed issue writes through the real server and patched bd.
 e2e-func-beads-issue-write:
-    TEST_TIMEOUT=120 just e2e-func func/beads-issue-write.sh
+    TEST_TIMEOUT=180 just e2e-func func/beads-issue-write.sh
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
 # response and the bridge read reply leaving the client, and the seeded config
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run

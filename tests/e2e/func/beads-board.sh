@@ -189,6 +189,76 @@ print(count)
 PY
 }
 
+board_request_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if row.get("dir") == "client" and message.get("type") == "RequestBeadsBoard":
+        count += 1
+print(count)
+PY
+}
+
+write_request_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client"
+            and message.get("type") == "BeadsIssueWrite"
+            and message.get("issue_id") == "e2e-detail"):
+        count += 1
+print(count)
+PY
+}
+
+key_input_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    if row.get("dir") == "client" and row.get("message", {}).get("type") == "KeyInput":
+        count += 1
+print(count)
+PY
+}
+
+write_failure_seen() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+needle = sys.argv[2].lower()
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server"
+            and message.get("type") == "BeadsIssueWriteResult"
+            and message.get("issue_id") == "e2e-detail"):
+        result = json.dumps(message.get("result", {}), separators=(",", ":")).lower()
+        if "failed" in result and needle in result:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+wait_for_write_failure() {
+    local needle="$1" attempts="$2"
+    for _ in $(seq 1 "$attempts"); do
+        write_failure_seen "$needle" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 detail_response_seen() {
     python3 - "$RECORD" <<'PY'
 import json, sys
@@ -257,4 +327,91 @@ sleep 0.2
 COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 [ "$COPIED" = "e2e-detail" ] || fail "painted panel copied '$COPIED' instead of e2e-detail"
 
-echo 'PASS: seeded bd detail matched the request, response, painted panel, and copied identity'
+# The real editor owns keyboard input while armed. The transparent wire tap is
+# the byte-level pane oracle: cancelled title text must create neither KeyInput
+# frames nor a write request.
+WRITES_BEFORE=$(write_request_count)
+KEYS_BEFORE=$(key_input_count)
+xdotool mousemove --sync --window "$WID" 560 258
+xdotool click 1
+sleep 0.2
+xdotool type --clearmodifiers --delay 5 -- 'EDITOR_KEYS_STAY_LOCAL'
+sleep 0.2
+KEYS_AFTER=$(key_input_count)
+[ "$KEYS_AFTER" -eq "$KEYS_BEFORE" ] \
+    || fail "armed Beads editor forwarded keystrokes to the pane program"
+[ "$(write_request_count)" -eq "$WRITES_BEFORE" ] \
+    || fail "typing into the armed editor committed before Enter"
+xdotool key --clearmodifiers Escape
+sleep 0.2
+[ "$(write_request_count)" -eq "$WRITES_BEFORE" ] \
+    || fail "cancelling the armed editor queued a write"
+
+# Install the deterministic bd fault shim after the capability handshake. It
+# delegates every read and targets only writes for this fixture.
+mv /usr/local/bin/bd /usr/local/bin/bd-real
+ln -s /tests/fixtures/bd-write-fault.sh /usr/local/bin/bd
+rm -f /tmp/scribe-beads-write-fault-mode
+
+xdotool mousemove --sync --window "$WID" 900 600
+sleep 0.2
+import -window "$WID" /output/beads-write-last-good.png
+
+printf '%s\n' nonzero:e2e-detail >/tmp/scribe-beads-write-fault-mode
+xdotool mousemove --sync --window "$WID" 560 258
+xdotool click 1
+xdotool type --clearmodifiers --delay 5 -- 'must not persist'
+xdotool key --clearmodifiers Return
+wait_for_write_failure 'forced nonzero write' 50 \
+    || fail "GPUI nonzero write produced no typed Failed result"
+rm -f /tmp/scribe-beads-write-fault-mode
+NONZERO_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
+printf '%s\n' "$NONZERO_SHOW" | grep -Fq '"title": "Complete card detail"' \
+    || fail "GPUI nonzero write replaced last-good detail: $NONZERO_SHOW"
+xdotool mousemove --sync --window "$WID" 900 600
+sleep 0.2
+import -window "$WID" /output/beads-write-nonzero-notice.png
+NONZERO_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
+    /output/beads-write-nonzero-notice.png null: 2>&1 || true)
+NONZERO_NOTICE_DIFF=${NONZERO_NOTICE_DIFF%%.*}
+[ "${NONZERO_NOTICE_DIFF:-0}" -ge 500 ] \
+    || fail "nonzero write painted no failure notice (${NONZERO_NOTICE_DIFF:-0}px)"
+
+# Let the first one-line notice expire so the timeout proof starts from the
+# same visible last-good detail. Timeout convergence must request both board
+# and detail again while the persisted issue remains untouched.
+sleep 5.2
+TIMEOUT_DETAIL_BEFORE=$(detail_request_count)
+TIMEOUT_BOARD_BEFORE=$(board_request_count)
+printf '%s\n' timeout:e2e-detail >/tmp/scribe-beads-write-fault-mode
+xdotool mousemove --sync --window "$WID" 560 258
+xdotool click 1
+xdotool type --clearmodifiers --delay 5 -- 'must not time in'
+xdotool key --clearmodifiers Return
+wait_for_write_failure 'bd issue write timed out' 100 \
+    || fail "GPUI timeout write produced no typed Failed result"
+rm -f /tmp/scribe-beads-write-fault-mode
+for _ in $(seq 1 50); do
+    [ "$(detail_request_count)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
+        && [ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
+        && break
+    sleep 0.2
+done
+[ "$(detail_request_count)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
+    || fail "timeout did not request authoritative detail"
+[ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
+    || fail "timeout did not request an authoritative board"
+TIMEOUT_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
+printf '%s\n' "$TIMEOUT_SHOW" | grep -Fq '"title": "Complete card detail"' \
+    || fail "GPUI timeout write replaced last-good detail: $TIMEOUT_SHOW"
+printf '%s\n' "$TIMEOUT_SHOW" >/output/beads-write-gpui-final-show.json
+xdotool mousemove --sync --window "$WID" 900 600
+sleep 0.2
+import -window "$WID" /output/beads-write-timeout-notice.png
+TIMEOUT_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
+    /output/beads-write-timeout-notice.png null: 2>&1 || true)
+TIMEOUT_NOTICE_DIFF=${TIMEOUT_NOTICE_DIFF%%.*}
+[ "${TIMEOUT_NOTICE_DIFF:-0}" -ge 500 ] \
+    || fail "timeout write painted no failure notice (${TIMEOUT_NOTICE_DIFF:-0}px)"
+
+echo 'PASS: real bd detail persisted, editor input stayed local, and write failures retained last-good state with notices'
