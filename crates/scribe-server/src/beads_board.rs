@@ -1004,10 +1004,8 @@ mod tests {
     async fn maps_a_missing_issue_to_typed_not_found() {
         let scratch = beads_test_scratch_path("detail-not-found");
         fs::create_dir_all(&scratch).expect("create scratch root");
-        let fake = scratch.join("bd");
-        fs::write(&fake, "#!/bin/sh\nprintf '%s' '{\"error\":\"issue gone not found\"}'\nexit 1\n")
-            .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let fake =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bd-detail-not-found.sh");
         let bd = Bd { exe: fake, search_path: None };
 
         let result = load_issue_detail_with(&bd, &scratch, "gone").await.expect("typed result");
@@ -1020,25 +1018,8 @@ mod tests {
     async fn detail_reads_bypass_snapshot_cache_and_use_exact_argv() {
         let scratch = beads_test_scratch_path("detail-uncached");
         fs::create_dir_all(&scratch).expect("create scratch root");
-        let fake = scratch.join("bd");
-        fs::write(
-            &fake,
-            r#"#!/bin/sh
-if [ "$*" = "--readonly --json -C $PWD ready --limit 0" ]; then
-  printf '%s' '{"data":[{"id":"issue","title":"Issue","status":"open","priority":2}],"schema_version":1}'
-  exit
-fi
-expected="--readonly --json -C $PWD show issue --include-comments --include-dependents"
-[ "$*" = "$expected" ] || { printf '%s' '{"error":"wrong argv"}'; exit 1; }
-calls=0
-[ ! -f calls ] || calls=$(sed -n '1p' calls)
-calls=$((calls + 1))
-printf '%s\n' "$calls" > calls
-printf '{"data":{"id":"issue","title":"call %s","status":"open","priority":2,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' "$calls"
-"#,
-        )
-        .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let fake =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bd-detail-uncached.sh");
         let bd = Bd { exe: fake, search_path: None };
 
         let first = load_issue_detail_with(&bd, &scratch, "issue").await.expect("first detail");
@@ -1055,23 +1036,8 @@ printf '{"data":{"id":"issue","title":"call %s","status":"open","priority":2,"is
     async fn detail_queue_uses_fresh_ready_membership_for_open_p4_issues() {
         let scratch = beads_test_scratch_path("detail-ready-membership");
         fs::create_dir_all(&scratch).expect("create scratch root");
-        let fake = scratch.join("bd");
-        fs::write(
-            &fake,
-            r#"#!/bin/sh
-case "$*" in
-  "--readonly --json -C $PWD show backlog --include-comments --include-dependents")
-    printf '%s' '{"data":{"id":"backlog","title":"Backlog","status":"open","priority":4,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' ;;
-  "--readonly --json -C $PWD show ready --include-comments --include-dependents")
-    printf '%s' '{"data":{"id":"ready","title":"Ready","status":"open","priority":4,"issue_type":"task","created_at":"now","updated_at":"now"},"schema_version":1}' ;;
-  "--readonly --json -C $PWD ready --limit 0")
-    printf '%s' '{"data":[{"id":"ready","title":"Ready","status":"open","priority":4}],"schema_version":1}' ;;
-  *) printf '%s' '{"error":"wrong argv"}'; exit 1 ;;
-esac
-"#,
-        )
-        .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bd-detail-ready-membership.sh");
         let bd = Bd { exe: fake, search_path: None };
 
         let backlog =
