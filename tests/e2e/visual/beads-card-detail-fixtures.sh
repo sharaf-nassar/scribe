@@ -23,6 +23,26 @@ inject() {
     sleep 0.5
 }
 
+detail_request_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+
+count = 0
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if (row.get("dir") == "client"
+                and message.get("type") == "RequestBeadsIssueDetail"
+                and message.get("issue_id") == "detail-comment-clamped"):
+            count += 1
+print(count)
+PY
+}
+
 first_workspace() {
     python3 - "$RECORD" <<'PY'
 import json, sys
@@ -113,9 +133,18 @@ COMMENT_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
     $1 == "comment-clamped" { sub(/^[^\t]*\t/, ""); print; exit }
 ')
 [ -n "$COMMENT_MESSAGE" ] || fail "comment-clamped fixture missing"
+REQUESTS_BEFORE=$(detail_request_count)
 xdotool mousemove --sync --window "$WID" 80 84
 xdotool click 1
-sleep 0.3
+sleep 0.2
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 1))" ] \
+    || fail "card click did not send its first detail request"
+import -window "$WID" /output/beads-detail-loading-panel.png
+LOADING_PANEL_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
+    /output/beads-detail-loading-panel.png null: 2>&1 || true)
+LOADING_PANEL_DIFF=${LOADING_PANEL_DIFF%%.*}
+[ "${LOADING_PANEL_DIFF:-0}" -ge 20000 ] \
+    || fail "loading head and placeholder changed only ${LOADING_PANEL_DIFF:-0}px"
 inject "$COMMENT_MESSAGE"
 sleep 0.5
 import -window "$WID" /output/beads-detail-comment-clamped.png
@@ -133,21 +162,65 @@ read -r PANEL_W PANEL_H PANEL_X PANEL_Y <<<"$(convert \
 [ "$PANEL_H" -ge 250 ] \
     || fail "panel anatomy collapsed to ${PANEL_H}px high"
 
-python3 - "$RECORD" <<'PY' || fail "card click sent no detail request"
-import json, sys
+# Each dismissal is proven by opening the card again. A surviving panel or
+# backdrop owns the pointer, so the next card click cannot emit another request.
+xdotool key Escape
+sleep 0.2
+inject "$LOADING_MESSAGE"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.2
+xdotool mousemove --sync --window "$WID" 80 84
+xdotool click 1
+sleep 0.2
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 2))" ] \
+    || fail "Escape did not dismiss the panel"
 
-with open(sys.argv[1]) as handle:
-    for line in handle:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        message = row.get("message", {})
-        if (row.get("dir") == "client"
-                and message.get("type") == "RequestBeadsIssueDetail"
-                and message.get("issue_id") == "detail-comment-clamped"):
-            raise SystemExit(0)
-raise SystemExit(1)
-PY
+xdotool mousemove --sync --window "$WID" 549 258
+xdotool click 1
+sleep 0.2
+inject "$LOADING_MESSAGE"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.2
+xdotool mousemove --sync --window "$WID" 80 84
+xdotool click 1
+sleep 0.2
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 3))" ] \
+    || fail "close mark did not dismiss the panel"
 
-echo "PASS: card detail messages handled and comment-clamped panel rendered"
+xdotool mousemove --sync --window "$WID" 700 500
+xdotool click 1
+sleep 0.2
+inject "$LOADING_MESSAGE"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.2
+xdotool mousemove --sync --window "$WID" 80 84
+xdotool click 1
+sleep 0.2
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 4))" ] \
+    || fail "backdrop did not dismiss the panel"
+
+inject "{\"type\":\"BeadsIssueDetail\",\"workspace_id\":\"$WORKSPACE\",\"issue_id\":\"detail-comment-clamped\",\"detail\":null}"
+import -window "$WID" /output/beads-detail-not-found.png
+NOT_FOUND_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
+    /output/beads-detail-not-found.png null: 2>&1 || true)
+NOT_FOUND_DIFF=${NOT_FOUND_DIFF%%.*}
+[ "${NOT_FOUND_DIFF:-0}" -ge 1000 ] \
+    || fail "not-found close notice changed only ${NOT_FOUND_DIFF:-0}px"
+
+inject "$LOADING_MESSAGE"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.2
+xdotool mousemove --sync --window "$WID" 80 84
+xdotool click 1
+sleep 0.2
+[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 5))" ] \
+    || fail "not-found notice did not yield to a fresh open"
+inject "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$WORKSPACE\",\"protocol_version\":1,\"state\":\"NotDetected\"}"
+import -window "$WID" /output/beads-detail-not-detected.png
+NOT_DETECTED_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
+    /output/beads-detail-not-detected.png null: 2>&1 || true)
+NOT_DETECTED_DIFF=${NOT_DETECTED_DIFF%%.*}
+[ "${NOT_DETECTED_DIFF:-0}" -ge 1000 ] \
+    || fail "NotDetected close notice changed only ${NOT_DETECTED_DIFF:-0}px"
+
+echo "PASS: detail lifecycle loading, dismissal, notice, and final geometry rendered"

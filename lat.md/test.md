@@ -1794,18 +1794,25 @@ Screenshots are taken full-screen because a Vulkan surface may not be readable p
 `tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages: a loading board plus closed, blocked, comment-clamped, and hidden-count detail replies. The script substitutes the live workspace id and refresh time before sending records through `scribe-test share-inject` under `--network none`.
 
 The loading message paints its five-card board. The script clicks the Backlog
-card, requires `RequestBeadsIssueDetail` on the wire tap, injects the matching
-reply, and rejects any dropped detail message. Its screenshot requires the
+card, requires `RequestBeadsIssueDetail` on the wire tap, and captures the
+card-derived loading head and placeholder before injecting the matching reply.
+It rejects any dropped detail message. Its settled screenshot requires the
 560px panel to start 12px from the region edge and 4px below the board, then
 checks the full head, queue, body, dependency, comment, dependent, and status
 anatomy. The current comment remains two lines while the older comment remains
-one ellipsized line.
+one ellipsized line. The same run reopens after Esc, close-mark, and backdrop
+dismissal, then requires a visible close notice for both a missing detail and a
+workspace whose board changes to `NotDetected`.
 
 Rust build-model tests cover the complete anatomy, omission of every sparse
 section, closed facts without verbs, blocked upstream-node count, hidden-count
 line, viewer read-only verbs, and the board palette's 4.5:1 panel-text floor.
 The renderer consumes that model, so these checks exercise production section
-selection rather than a parallel fixture description.
+selection rather than a parallel fixture description. Lifecycle unit tests pin
+the 400px no-open boundary, 0.8 and 1.6 text scales, minimum and maximum board
+height samples, workspace-edge and remaining-height clamps, exact 120ms final
+animation frame, loading head, lane re-anchoring, independent regions, and both
+automatic-close notices.
 
 ### Shared-pane rig
 

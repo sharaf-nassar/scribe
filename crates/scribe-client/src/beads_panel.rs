@@ -1,16 +1,19 @@
 //! Read-only Beads issue panel state and rendering.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, FontWeight, MouseButton, Rgba, Role, SharedString, div, linear_color_stop,
-    linear_gradient, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, ElementId, FontWeight, MouseButton, Rgba, Role,
+    SharedString, div, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
-    BeadsBoardItem, BeadsIssueComment, BeadsIssueDetail, BeadsIssueQueue, BeadsIssueQueueBasis,
+    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
+    BeadsIssueQueue, BeadsIssueQueueBasis,
 };
 
+use crate::animation::AnimationSettings;
 use crate::beads_board::BeadsBoardColors;
 use crate::layout::Rect;
 
@@ -18,6 +21,8 @@ const PANEL_WIDTH: f32 = 560.0;
 const PANEL_MIN_WIDTH: f32 = 400.0;
 const PANEL_MARGIN: f32 = 12.0;
 const PANEL_BOARD_GAP: f32 = 4.0;
+const PANEL_OPEN_DURATION: Duration = Duration::from_millis(120);
+const NOTICE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelSection {
@@ -142,6 +147,20 @@ pub struct PanelGeometry {
     pub max_height: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelLayout {
+    pub geometry: PanelGeometry,
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanelOpenFrame {
+    x: f32,
+    y: f32,
+    width: f32,
+    opacity: f32,
+}
+
 /// Place a panel under its lane while keeping it inside its workspace region.
 pub fn panel_geometry(region: Rect, board: Rect, lane: u8) -> Option<PanelGeometry> {
     let width = PANEL_WIDTH.min(region.width - PANEL_MARGIN * 2.0);
@@ -152,12 +171,43 @@ pub fn panel_geometry(region: Rect, board: Rect, lane: u8) -> Option<PanelGeomet
     let lane_center = board.x + 8.0 + (f32::from(lane) + 0.5) * lane_width;
     let min_x = region.x + PANEL_MARGIN;
     let max_x = region.x + region.width - PANEL_MARGIN - width;
-    Some(PanelGeometry {
+    let y = board.y + board.height + PANEL_BOARD_GAP;
+    let max_height =
+        (region.height * 0.7).min((region.y + region.height - y - PANEL_MARGIN).max(0.0));
+    (max_height > 0.0).then_some(PanelGeometry {
         x: (lane_center - width / 2.0).clamp(min_x, max_x),
-        y: board.y + board.height + PANEL_BOARD_GAP,
+        y,
         width,
-        max_height: region.height * 0.7,
+        max_height,
     })
+}
+
+pub fn panel_layout(region: Rect, board: Rect, lane: u8, scale: f32) -> Option<PanelLayout> {
+    panel_geometry(region, board, lane).map(|geometry| PanelLayout { geometry, scale })
+}
+
+fn panel_open_frame(
+    geometry: PanelGeometry,
+    board: Rect,
+    lane: u8,
+    progress: f32,
+) -> PanelOpenFrame {
+    let progress = progress.clamp(0.0, 1.0);
+    let lane_width = (board.width - 16.0) / 5.0;
+    let lane_center = board.x + 8.0 + (f32::from(lane) + 0.5) * lane_width;
+    let start_width = (lane_width - 16.0).clamp(1.0, geometry.width);
+    let start_x = (lane_center - start_width / 2.0)
+        .clamp(geometry.x, geometry.x + geometry.width - start_width);
+    PanelOpenFrame {
+        x: (geometry.x - start_x).mul_add(progress, start_x),
+        y: 8.0f32.mul_add(progress, geometry.y - 8.0),
+        width: (geometry.width - start_width).mul_add(progress, start_width),
+        opacity: 0.25 + 0.75 * progress,
+    }
+}
+
+fn panel_open_animation(settings: AnimationSettings) -> Animation {
+    settings.transition(PANEL_OPEN_DURATION)
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +215,44 @@ pub struct BeadsPanel {
     pub card: BeadsBoardItem,
     pub lane: u8,
     pub detail: Option<Box<BeadsIssueDetail>>,
+}
+
+impl BeadsPanel {
+    fn title(&self) -> &str {
+        self.detail.as_deref().map_or(self.card.title.as_str(), |detail| detail.title.as_str())
+    }
+
+    fn priority(&self) -> u8 {
+        self.detail.as_deref().map_or(self.card.priority, |detail| detail.priority)
+    }
+
+    fn epic(&self) -> Option<&str> {
+        self.detail
+            .as_deref()
+            .and_then(|detail| detail.parent_epic_name.as_deref())
+            .or(self.card.parent_epic_name.as_deref())
+    }
+
+    fn loading_message(&self) -> Option<&'static str> {
+        self.detail.is_none().then_some("Loading issue detail…")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PanelNotice {
+    text: String,
+    lane: u8,
+    expires_at: Instant,
+}
+
+impl PanelNotice {
+    fn new(text: String, lane: u8) -> Self {
+        Self { text, lane, expires_at: Instant::now() + NOTICE_DURATION }
+    }
+
+    fn active(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
 }
 
 /// Per-workspace panel state plus intents parked for the owning GPUI view.
@@ -175,6 +263,7 @@ pub struct BeadsPanels {
     pending_requests: VecDeque<(WorkspaceId, String)>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
+    notices: HashMap<WorkspaceId, PanelNotice>,
     last_opened: Option<WorkspaceId>,
 }
 
@@ -186,6 +275,7 @@ impl BeadsPanels {
             self.pending_requests.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
+            self.notices.clear();
             self.last_opened = None;
         }
     }
@@ -195,6 +285,7 @@ impl BeadsPanels {
             return;
         }
         let issue_id = card.id.clone();
+        self.notices.remove(&workspace_id);
         self.open.insert(workspace_id, BeadsPanel { card, lane, detail: None });
         self.pending_requests.push_back((workspace_id, issue_id));
         self.last_opened = Some(workspace_id);
@@ -211,9 +302,16 @@ impl BeadsPanels {
             return;
         }
         if let Some(detail) = detail {
+            panel.lane = queue_lane(detail.queue);
             panel.detail = Some(detail);
         } else {
-            self.dismiss(workspace_id);
+            let lane = panel.lane;
+            self.open.remove(&workspace_id);
+            self.notices.insert(
+                workspace_id,
+                PanelNotice::new(format!("Issue {issue_id} no longer exists"), lane),
+            );
+            self.last_opened = Some(workspace_id);
         }
     }
 
@@ -222,7 +320,16 @@ impl BeadsPanels {
     }
 
     pub fn workspaces(&self) -> Vec<WorkspaceId> {
-        self.open.keys().copied().collect()
+        self.open
+            .keys()
+            .copied()
+            .chain(
+                self.notices
+                    .iter()
+                    .filter(|(_, notice)| notice.active())
+                    .map(|(workspace_id, _)| *workspace_id),
+            )
+            .collect()
     }
 
     pub fn take_request(&mut self) -> Option<(WorkspaceId, String)> {
@@ -230,7 +337,8 @@ impl BeadsPanels {
     }
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
-        let removed = self.open.remove(&workspace_id).is_some();
+        let removed = self.open.remove(&workspace_id).is_some()
+            | self.notices.remove(&workspace_id).is_some();
         if self.last_opened == Some(workspace_id) {
             self.last_opened = self.open.keys().next().copied();
         }
@@ -245,6 +353,7 @@ impl BeadsPanels {
         self.open.retain(|workspace_id, _| live.contains(workspace_id));
         self.expanded_comments.retain(|(workspace_id, _, _)| live.contains(workspace_id));
         self.pending_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
+        self.notices.retain(|workspace_id, _| live.contains(workspace_id));
         if self.last_opened.is_some_and(|workspace_id| !live.contains(&workspace_id)) {
             self.last_opened = self.open.keys().next().copied();
         }
@@ -273,6 +382,77 @@ impl BeadsPanels {
     pub fn take_copy(&mut self) -> Option<String> {
         self.pending_copy.take()
     }
+
+    pub fn notice(&self, workspace_id: WorkspaceId) -> Option<&str> {
+        self.notices
+            .get(&workspace_id)
+            .filter(|notice| notice.active())
+            .map(|notice| notice.text.as_str())
+    }
+
+    pub fn notice_lane(&self, workspace_id: WorkspaceId) -> Option<u8> {
+        self.notices.get(&workspace_id).filter(|notice| notice.active()).map(|notice| notice.lane)
+    }
+
+    pub fn expire_notices(&mut self) {
+        self.notices.retain(|_, notice| notice.active());
+    }
+
+    pub fn sync_board(&mut self, workspace_id: WorkspaceId, state: &BeadsBoardState) -> bool {
+        if matches!(state, BeadsBoardState::NotDetected) {
+            let Some(panel) = self.open.remove(&workspace_id) else { return false };
+            self.notices.insert(
+                workspace_id,
+                PanelNotice::new("Beads project is no longer detected".into(), panel.lane),
+            );
+            self.last_opened = Some(workspace_id);
+            return true;
+        }
+        let Some(snapshot) = board_snapshot(state) else { return false };
+        let Some(panel) = self.open.get_mut(&workspace_id) else { return false };
+        let Some((lane, card)) = snapshot_card(snapshot, &panel.card.id) else { return false };
+        let changed = panel.lane != lane || panel.card != *card;
+        if changed {
+            panel.lane = lane;
+            panel.card = card.clone();
+        }
+        changed
+    }
+}
+
+fn queue_lane(queue: BeadsIssueQueue) -> u8 {
+    match queue {
+        BeadsIssueQueue::Backlog => 0,
+        BeadsIssueQueue::Ready => 1,
+        BeadsIssueQueue::InProgress => 2,
+        BeadsIssueQueue::Blocked => 3,
+        BeadsIssueQueue::Done => 4,
+    }
+}
+
+fn board_snapshot(state: &BeadsBoardState) -> Option<&BeadsBoardSnapshot> {
+    match state {
+        BeadsBoardState::Loading { cached } => cached.as_ref(),
+        BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
+        BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+    }
+}
+
+fn snapshot_card<'a>(
+    snapshot: &'a BeadsBoardSnapshot,
+    issue_id: &str,
+) -> Option<(u8, &'a BeadsBoardItem)> {
+    [
+        (0, snapshot.backlog.as_slice()),
+        (1, snapshot.ready.as_slice()),
+        (2, snapshot.in_progress.as_slice()),
+        (3, snapshot.blocked.as_slice()),
+        (4, snapshot.done.as_slice()),
+    ]
+    .into_iter()
+    .find_map(|(lane, cards)| {
+        cards.iter().find(|card| card.id == issue_id).map(|card| (lane, card))
+    })
 }
 
 pub fn comment_line_limit(index: usize, expanded: bool) -> Option<usize> {
@@ -286,11 +466,12 @@ pub struct BeadsPanelRender {
     pub state: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     pub scale: f32,
     pub colors: BeadsBoardColors,
+    pub animations: AnimationSettings,
 }
 
 /// Paint one workspace's backdrop and lane-anchored detail panel.
 pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender) -> Vec<AnyElement> {
-    let Some(geometry) = panel_geometry(wiring.region, wiring.board, panel.lane) else {
+    let Some(layout) = panel_layout(wiring.region, wiring.board, panel.lane, wiring.scale) else {
         return Vec::new();
     };
     let workspace_id = wiring.workspace_id;
@@ -310,18 +491,39 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender) -> Vec<AnyElement> 
             window.refresh();
         })
         .into_any_element();
-    let body = panel_body(panel, wiring, geometry);
+    let body = panel_body(panel, wiring, layout);
     vec![backdrop, body]
 }
 
-fn panel_body(
-    panel: &BeadsPanel,
-    wiring: &BeadsPanelRender,
-    geometry: PanelGeometry,
-) -> AnyElement {
+pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender) -> Option<AnyElement> {
+    let layout = panel_layout(wiring.region, wiring.board, lane, wiring.scale)?;
+    Some(
+        div()
+            .id(SharedString::from(format!("beads-detail-notice-{}", wiring.workspace_id)))
+            .absolute()
+            .left(px(layout.geometry.x))
+            .top(px(layout.geometry.y))
+            .w(px(layout.geometry.width))
+            .px(px(14.0))
+            .py(px(9.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(with_alpha(wiring.colors.blocked_state, 0.65))
+            .bg(wiring.colors.card)
+            .font_family("monospace")
+            .text_size(at(layout.scale, 10.0))
+            .line_height(at(layout.scale, 14.0))
+            .text_color(wiring.colors.panel_state_ink(wiring.colors.blocked_state))
+            .child(text.to_owned())
+            .into_any_element(),
+    )
+}
+
+fn panel_body(panel: &BeadsPanel, wiring: &BeadsPanelRender, layout: PanelLayout) -> AnyElement {
+    let geometry = layout.geometry;
     let colors = &wiring.colors;
     let workspace_id = wiring.workspace_id;
-    let scale = wiring.scale;
+    let scale = layout.scale;
     let presentation = panel.detail.as_deref().map(PanelPresentation::from_detail);
     let surface = div()
         .id(SharedString::from(format!("beads-detail-{workspace_id}")))
@@ -365,10 +567,21 @@ fn panel_body(
                 .justify_center()
                 .text_size(at(scale, 11.0))
                 .text_color(colors.muted)
-                .child("Loading issue detail…"),
+                .child(panel.loading_message().unwrap_or_default()),
         )
     };
-    surface.into_any_element()
+    let board = wiring.board;
+    let lane = panel.lane;
+    surface
+        .with_animation(
+            ElementId::Name(format!("beads-detail-open-{workspace_id}-{}", panel.card.id).into()),
+            panel_open_animation(wiring.animations),
+            move |surface, progress| {
+                let frame = panel_open_frame(geometry, board, lane, progress);
+                surface.left(px(frame.x)).top(px(frame.y)).w(px(frame.width)).opacity(frame.opacity)
+            },
+        )
+        .into_any_element()
 }
 
 fn panel_header(
@@ -378,12 +591,9 @@ fn panel_header(
 ) -> AnyElement {
     let colors = &wiring.colors;
     let scale = wiring.scale;
-    let detail = panel.detail.as_deref();
-    let title = detail.map_or(panel.card.title.as_str(), |issue| issue.title.as_str());
-    let priority = detail.map_or(panel.card.priority, |issue| issue.priority);
-    let epic = detail
-        .and_then(|issue| issue.parent_epic_name.as_deref())
-        .or(panel.card.parent_epic_name.as_deref());
+    let title = panel.title();
+    let priority = panel.priority();
+    let epic = panel.epic();
     let epic =
         presentation.is_none_or(|build| build.has(PanelSection::Epic)).then_some(epic).flatten();
     let close_state = std::sync::Arc::clone(&wiring.state);
@@ -1064,13 +1274,16 @@ fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use scribe_common::ids::WorkspaceId;
     use scribe_common::protocol::{
-        BeadsBoardItem, BeadsIssueComment, BeadsIssueDetail, BeadsIssueLink, BeadsIssueQueue,
-        BeadsIssueQueueBasis,
+        BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
+        BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis,
     };
     use scribe_common::theme::ChromeColors;
 
+    use crate::animation::AnimationSettings;
     use crate::beads_board::{BODY_CONTRAST, contrast};
     use crate::layout::Rect;
 
@@ -1140,6 +1353,19 @@ mod tests {
         }
     }
 
+    fn board_with(item: BeadsBoardItem, lane: u8) -> BeadsBoardState {
+        let mut snapshot = BeadsBoardSnapshot::default();
+        match lane {
+            0 => snapshot.backlog.push(item),
+            1 => snapshot.ready.push(item),
+            2 => snapshot.in_progress.push(item),
+            3 => snapshot.blocked.push(item),
+            4 => snapshot.done.push(item),
+            _ => panic!("invalid fixture lane"),
+        }
+        BeadsBoardState::Ready { snapshot, stale: false, refresh_error: None }
+    }
+
     fn chrome_slots(fill: [f32; 4]) -> ChromeColors {
         ChromeColors {
             tab_bar_bg: fill,
@@ -1169,7 +1395,7 @@ mod tests {
 
         assert_eq!(
             panel_geometry(region, board, 4),
-            Some(PanelGeometry { x: 328.0, y: 222.0, width: 560.0, max_height: 420.0 })
+            Some(PanelGeometry { x: 328.0, y: 222.0, width: 560.0, max_height: 406.0 })
         );
         assert_eq!(
             panel_geometry(
@@ -1179,6 +1405,115 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn named_board_height_and_text_scale_samples_stay_inside_the_region() {
+        let region = Rect { x: 10.0, y: 20.0, width: 800.0, height: 600.0 };
+        let samples = [
+            (
+                "minimum board at 0.8x",
+                Rect { x: 10.0, y: 20.0, width: 800.0, height: 79.8 },
+                0,
+                0.8,
+                PanelLayout {
+                    geometry: PanelGeometry { x: 22.0, y: 103.8, width: 560.0, max_height: 420.0 },
+                    scale: 0.8,
+                },
+            ),
+            (
+                "maximum board at 1.6x",
+                Rect { x: 10.0, y: 20.0, width: 800.0, height: 520.0 },
+                4,
+                1.6,
+                PanelLayout {
+                    geometry: PanelGeometry { x: 238.0, y: 544.0, width: 560.0, max_height: 64.0 },
+                    scale: 1.6,
+                },
+            ),
+        ];
+
+        for (name, board, lane, scale, expected) in samples {
+            assert_eq!(panel_layout(region, board, lane, scale), Some(expected), "{name}");
+        }
+        let too_narrow = Rect { width: 423.0, ..region };
+        let too_narrow_board = Rect { height: 197.0, ..too_narrow };
+        assert!(panel_layout(too_narrow, too_narrow_board, 0, 1.0).is_none());
+        let floor = Rect { width: 424.0, ..region };
+        let floor_board = Rect { height: 197.0, ..floor };
+        let width =
+            panel_layout(floor, floor_board, 0, 1.0).expect("400px panel floor").geometry.width;
+        assert!((width - 400.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn open_animation_finishes_at_the_asserted_layout_after_120ms() {
+        let geometry = PanelGeometry { x: 22.0, y: 221.0, width: 560.0, max_height: 420.0 };
+        let board = Rect { x: 10.0, y: 20.0, width: 800.0, height: 197.0 };
+        let start = panel_open_frame(geometry, board, 0, 0.0);
+        let end = panel_open_frame(geometry, board, 0, 1.0);
+        let animation = panel_open_animation(AnimationSettings::resolve_with_env(true, None));
+
+        assert!(start.width < geometry.width);
+        assert!(start.x >= board.x + 8.0);
+        assert_eq!(end, PanelOpenFrame { x: 22.0, y: 221.0, width: 560.0, opacity: 1.0 });
+        assert_eq!(animation.duration, Duration::from_millis(120));
+    }
+
+    #[test]
+    fn loading_panel_keeps_the_clicked_card_head_over_its_placeholder() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+
+        let panel = panels.visible(workspace).expect("loading panel");
+        assert_eq!(panel.title(), "Render the read-only detail panel");
+        assert_eq!(panel.priority(), 1);
+        assert_eq!(panel.epic(), Some("Beads card detail"));
+        assert_eq!(panel.loading_message(), Some("Loading issue detail…"));
+    }
+
+    #[test]
+    fn detail_and_board_updates_reanchor_only_the_matching_workspace() {
+        let left = WorkspaceId::new();
+        let right = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(left, item(), 0);
+        let mut right_item = item();
+        right_item.id = "scribe-right".into();
+        panels.open(right, right_item.clone(), 4);
+
+        let mut left_detail = detail();
+        left_detail.queue = BeadsIssueQueue::InProgress;
+        panels.update(left, "scribe-5wh1.4", Some(Box::new(left_detail)));
+        assert_eq!(panels.visible(left).map(|panel| panel.lane), Some(2));
+        assert_eq!(panels.visible(right).map(|panel| panel.lane), Some(4));
+
+        assert!(panels.sync_board(right, &board_with(right_item, 1)));
+        assert_eq!(panels.visible(left).map(|panel| panel.lane), Some(2));
+        assert_eq!(panels.visible(right).map(|panel| panel.lane), Some(1));
+        assert!(panels.dismiss(left));
+        assert!(panels.visible(right).is_some());
+    }
+
+    #[test]
+    fn vanished_issue_and_not_detected_workspace_close_with_a_notice() {
+        let vanished = WorkspaceId::new();
+        let missing_project = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(vanished, item(), 0);
+        panels.open(missing_project, item(), 1);
+
+        panels.update(vanished, "scribe-5wh1.4", None);
+        assert!(panels.visible(vanished).is_none());
+        assert_eq!(panels.notice(vanished), Some("Issue scribe-5wh1.4 no longer exists"));
+
+        assert!(panels.sync_board(missing_project, &BeadsBoardState::NotDetected));
+        assert!(panels.visible(missing_project).is_none());
+        assert_eq!(panels.notice(missing_project), Some("Beads project is no longer detected"));
     }
 
     #[test]

@@ -9069,6 +9069,7 @@ impl TerminalView {
             .beads_panels
             .lock()
             .map(|mut panels| {
+                panels.expire_notices();
                 panels.retain_regions(&live);
                 panel_copy = panels.take_copy();
                 while let Some(request) = panels.take_request() {
@@ -9364,7 +9365,7 @@ impl TerminalView {
     }
 
     fn render_beads_panels(&self, cx: &App) -> Vec<gpui::AnyElement> {
-        let open = self
+        let layers = self
             .shared
             .beads_panels
             .lock()
@@ -9372,16 +9373,23 @@ impl TerminalView {
                 panels
                     .workspaces()
                     .into_iter()
-                    .filter_map(|workspace_id| {
-                        panels.visible(workspace_id).cloned().map(|panel| (workspace_id, panel))
+                    .map(|workspace_id| {
+                        (
+                            workspace_id,
+                            panels.visible(workspace_id).cloned(),
+                            panels.notice(workspace_id).map(str::to_owned),
+                            panels.notice_lane(workspace_id),
+                        )
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
         let viewport = self.pane_viewport();
-        open.into_iter()
-            .flat_map(|(workspace_id, panel)| {
+        let animations = AnimationSettings::from_config(&self.config.config().config);
+        layers
+            .into_iter()
+            .flat_map(|(workspace_id, panel, notice, notice_lane)| {
                 let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
                     return Vec::new();
                 };
@@ -9390,17 +9398,24 @@ impl TerminalView {
                 else {
                     return Vec::new();
                 };
-                beads_panel::render(
-                    &panel,
-                    &BeadsPanelRender {
-                        region,
-                        board,
-                        workspace_id,
-                        state: Arc::clone(&self.shared.beads_panels),
-                        scale: boards.text_scale(),
-                        colors: self.beads_colors,
-                    },
-                )
+                let wiring = BeadsPanelRender {
+                    region,
+                    board,
+                    workspace_id,
+                    state: Arc::clone(&self.shared.beads_panels),
+                    scale: boards.text_scale(),
+                    colors: self.beads_colors,
+                    animations,
+                };
+                let mut elements = panel
+                    .as_ref()
+                    .map_or_else(Vec::new, |panel| beads_panel::render(panel, &wiring));
+                if let (Some(text), Some(lane)) = (notice, notice_lane)
+                    && let Some(notice_element) = beads_panel::render_notice(&text, lane, &wiring)
+                {
+                    elements.push(notice_element);
+                }
+                elements
             })
             .collect()
     }
@@ -12508,6 +12523,9 @@ async fn dispatch_server_message(
         info @ ServerMessage::WorkspaceInfo { .. } => on_workspace_info(ctx, info),
         ServerMessage::BeadsBoard { workspace_id, state, .. } => {
             let loading = matches!(state, scribe_common::protocol::BeadsBoardState::Loading { .. });
+            if let Ok(mut panels) = ctx.beads_panels.lock() {
+                panels.sync_board(workspace_id, &state);
+            }
             if let Ok(mut boards) = ctx.beads_boards.lock() {
                 boards.update(workspace_id, state);
                 ctx.generation.fetch_add(1, Ordering::Release);

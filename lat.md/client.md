@@ -996,11 +996,22 @@ hidden boards do not poll.
 
 When `Welcome.beads_detail` is enabled, clicking a card opens a read-only panel
 immediately and parks one workspace-scoped detail request. The panel remains
-under its source lane, clamps within the workspace, reaches at most 70% of the
-region height, and scrolls internally. Its backdrop, close mark, and Esc all
-dismiss it; panel state and replies are keyed by workspace and issue id so
-neighbouring regions cannot consume each other's response. A missing or later
-disabled capability leaves the existing board unchanged.
+under its source lane, with a 12px workspace inset and a 4px gap below the
+board. Its 560px target width shrinks with the region but does not open below
+400px; height is the lesser of 70% of the region and the space remaining
+inside it, with overflow scrolling internally. The layout carries the live
+board text scale from 0.8 through 1.6, and a detail or board refresh that moves
+the issue re-anchors the panel to its new lane.
+
+The loading frame keeps the clicked card's priority, title, and epic over a
+placeholder while the detail request is outstanding. Opening lifts and widens
+from the source lane into the settled layout over 120ms through the shared
+animation policy, so reduced motion still lands on the identical final frame.
+Its backdrop, close mark, and Esc all dismiss it. A missing detail or a later
+`NotDetected` board closes it and leaves a five-second notice at its former
+anchor. Panel, notice, and reply state are keyed by workspace and issue id so
+neighbouring regions remain independent. A missing or later disabled
+capability leaves the existing board unchanged.
 
 The panel follows `.impeccable/mocks/beads-card-detail.html`: a full-bleed
 identity head, derived queue row, dependency spine, sparse body fields,
