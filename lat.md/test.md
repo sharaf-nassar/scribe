@@ -3690,8 +3690,14 @@ release, and hold a hover-opened board until that release.
 The Docker Beads-board visual moves the native ghost over another card, over a
 rejected lane, and below the board clip. Pixel assertions require the over-card
 repaint, the no-drop wash change, stable terminal rows and hover overlay, and
-an outside ghost origin within 3px of the pointer offset. Drop writes,
-optimistic placement, rollback, and undo remain separate stages.
+an outside ghost origin within 3px of the pointer offset.
+
+Drop coverage runs every Backlog, Ready, and In-progress source against all
+five targets. It requires rejected and same-lane drops to queue nothing, and
+maps accepted targets to clear-defer open, native claim, or native close. The
+overlay cases pin its uncommitted and committed generation states, successful
+snapshot settlement, failure and fence-stale rollback, and classifier-won
+notice routing.
 
 ### Region reports every tab and which is active
 

@@ -21,7 +21,7 @@ use scribe_common::protocol::{
 };
 
 use crate::animation::AnimationSettings;
-use crate::beads_board::BeadsBoardColors;
+use crate::beads_board::{BeadsBoardColors, CardDragState};
 use crate::layout::Rect;
 use crate::settings::window::{utf8_range_to_utf16, utf16_range_to_utf8};
 
@@ -926,26 +926,72 @@ impl BeadsPanels {
         if !self.write_enabled || detail.status == "closed" {
             return false;
         }
-        let issue_id = panel.card.id.clone();
-        let key = (workspace_id, issue_id.clone());
-        if self.reconcile_on_snapshot.contains(&workspace_id)
-            || self.in_flight_writes.contains_key(&key)
-            || self
-                .pending_writes
-                .iter()
-                .any(|write| write.workspace_id == workspace_id && write.issue_id == issue_id)
-        {
-            return false;
-        }
-        self.pending_writes.push_back(PanelWriteIntent {
+        let intent = PanelWriteIntent {
             workspace_id,
-            issue_id,
+            issue_id: panel.card.id.clone(),
             verb,
             guards: BeadsIssueWriteGuards {
                 if_status: Some(detail.status.clone()),
                 if_assignee: Some(detail.assignee.clone().unwrap_or_default()),
             },
+        };
+        self.park_write(intent)
+    }
+
+    /// Translate one completed board gesture into the existing guarded write
+    /// queue. Derived lanes and same-lane drops never enter the queue.
+    pub fn queue_card_drop(&mut self, drag: &CardDragState) -> bool {
+        if !self.write_enabled || drag.source_lane > 2 {
+            return false;
+        }
+        let Some(target_lane) = drag.hovered_lane else { return false };
+        let verb = match target_lane {
+            1 if drag.source_lane != 1 => {
+                BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: true }
+            }
+            2 if drag.source_lane != 2 => BeadsIssueWrite::Claim,
+            4 => BeadsIssueWrite::CloseIssue,
+            _ => return false,
+        };
+        let detail = self.open.get(&drag.workspace_id).and_then(|panel| {
+            (panel.card.id == drag.source.id).then_some(panel.detail.as_deref()).flatten()
         });
+        if detail.is_some_and(|detail| detail.status == "closed") {
+            return false;
+        }
+        let guards = detail.map_or_else(
+            || BeadsIssueWriteGuards {
+                if_status: match drag.source_lane {
+                    1 => Some("open".into()),
+                    2 => Some("in_progress".into()),
+                    _ => None,
+                },
+                if_assignee: None,
+            },
+            |detail| BeadsIssueWriteGuards {
+                if_status: Some(detail.status.clone()),
+                if_assignee: Some(detail.assignee.clone().unwrap_or_default()),
+            },
+        );
+        self.park_write(PanelWriteIntent {
+            workspace_id: drag.workspace_id,
+            issue_id: drag.source.id.clone(),
+            verb,
+            guards,
+        })
+    }
+
+    fn park_write(&mut self, intent: PanelWriteIntent) -> bool {
+        let key = (intent.workspace_id, intent.issue_id.clone());
+        if self.reconcile_on_snapshot.contains(&intent.workspace_id)
+            || self.in_flight_writes.contains_key(&key)
+            || self.pending_writes.iter().any(|write| {
+                write.workspace_id == intent.workspace_id && write.issue_id == intent.issue_id
+            })
+        {
+            return false;
+        }
+        self.pending_writes.push_back(intent);
         true
     }
 
@@ -968,6 +1014,18 @@ impl BeadsPanels {
         let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
         self.notices
             .insert(workspace_id, PanelNotice::new(format!("Issue write dropped: {reason}"), lane));
+    }
+
+    pub fn classifier_won(&mut self, workspace_id: WorkspaceId, issue_id: &str, lane: u8) {
+        let lane_name = ["Backlog", "Ready", "In progress", "Blocked", "Done"]
+            .get(usize::from(lane))
+            .copied()
+            .unwrap_or("board");
+        self.notices.insert(
+            workspace_id,
+            PanelNotice::new(format!("{issue_id} stayed {lane_name}; classifier won"), lane),
+        );
+        self.last_opened = Some(workspace_id);
     }
 
     pub fn finish_write(
@@ -2719,6 +2777,16 @@ mod tests {
             .expect("loaded issue detail")
     }
 
+    fn card_drop(source_lane: u8, target_lane: u8) -> crate::beads_board::CardDragState {
+        crate::beads_board::CardDragState {
+            workspace_id: WorkspaceId::new(),
+            source: item(),
+            source_lane,
+            pointer: crate::beads_board::CardDragPoint { x: 0.0, y: 0.0 },
+            hovered_lane: Some(target_lane),
+        }
+    }
+
     fn chrome_slots(fill: [f32; 4]) -> ChromeColors {
         ChromeColors {
             tab_bar_bg: fill,
@@ -3426,6 +3494,104 @@ mod tests {
 
         panels.sync_board(workspace, &snapshot);
         assert_eq!(panels.take_request(), None, "later snapshots do not replay reconciliation");
+    }
+
+    #[test]
+    fn card_drop_matrix_queues_only_native_writable_targets() {
+        for source_lane in 0..=2 {
+            let source_status = match source_lane {
+                1 => Some("open"),
+                2 => Some("in_progress"),
+                _ => None,
+            };
+            for target_lane in 0..=4 {
+                let drag = card_drop(source_lane, target_lane);
+                let mut panels = BeadsPanels::default();
+                panels.set_enabled(true);
+                panels.set_write_enabled(true);
+
+                let expected = match target_lane {
+                    1 if source_lane != 1 => Some(BeadsIssueWrite::SetStatus {
+                        status: "open".into(),
+                        clear_defer: true,
+                    }),
+                    2 if source_lane != 2 => Some(BeadsIssueWrite::Claim),
+                    4 => Some(BeadsIssueWrite::CloseIssue),
+                    _ => None,
+                };
+                assert_eq!(
+                    panels.queue_card_drop(&drag),
+                    expected.is_some(),
+                    "source {source_lane} -> target {target_lane} acceptance"
+                );
+                let write = panels.take_write();
+                assert_eq!(write.as_ref().map(|write| &write.verb), expected.as_ref());
+                assert_eq!(
+                    write.as_ref().map(|write| write.workspace_id),
+                    expected.as_ref().map(|_| drag.workspace_id)
+                );
+                assert_eq!(
+                    write.as_ref().map(|write| write.issue_id.as_str()),
+                    expected.as_ref().map(|_| drag.source.id.as_str())
+                );
+                assert_eq!(
+                    write.as_ref().map(|write| write.guards.if_status.as_deref()),
+                    expected.as_ref().map(|_| source_status)
+                );
+                assert_eq!(
+                    write.as_ref().map(|write| write.guards.if_assignee.as_deref()),
+                    expected.as_ref().map(|_| None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_drop_claim_reuses_fresh_detail_guards() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        let drag = crate::beads_board::CardDragState {
+            workspace_id: workspace,
+            source: item(),
+            source_lane: 1,
+            pointer: crate::beads_board::CardDragPoint { x: 0.0, y: 0.0 },
+            hovered_lane: Some(2),
+        };
+
+        assert!(panels.queue_card_drop(&drag));
+        let write = panels.take_write().expect("guarded claim");
+        assert_eq!(write.verb, BeadsIssueWrite::Claim);
+        assert_eq!(write.guards.if_status.as_deref(), Some("open"));
+        assert_eq!(write.guards.if_assignee.as_deref(), Some("maintainer"));
+    }
+
+    #[test]
+    fn card_drop_queue_honors_in_flight_and_reconnect_fences() {
+        let mut first = card_drop(1, 2);
+        let workspace = first.workspace_id;
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.set_write_enabled(true);
+
+        assert!(panels.queue_card_drop(&first));
+        assert!(panels.take_write().is_some());
+        assert!(!panels.queue_card_drop(&first), "same issue is already in flight");
+
+        panels.reconnected();
+        first.source.id = "scribe-5wh1.5".into();
+        assert!(!panels.queue_card_drop(&first), "workspace is awaiting a snapshot");
+        panels.sync_board(workspace, &board_with(item(), 1));
+        assert!(panels.queue_card_drop(&first), "authoritative snapshot releases the fence");
+    }
+
+    #[test]
+    fn classifier_won_drop_surfaces_a_lane_notice() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+
+        panels.classifier_won(workspace, "scribe-5wh1.4", 3);
+
+        assert_eq!(panels.notice(workspace), Some("scribe-5wh1.4 stayed Blocked; classifier won"));
+        assert_eq!(panels.notice_lane(workspace), Some(3));
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]

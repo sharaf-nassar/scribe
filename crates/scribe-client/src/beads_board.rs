@@ -12,7 +12,9 @@ use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
 use scribe_common::ids::WorkspaceId;
-use scribe_common::protocol::{BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState};
+use scribe_common::protocol::{
+    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueWriteResult,
+};
 
 /// One of the things whose hover keeps a board open. They overlap, so each is
 /// tracked on its own rather than as a single flag.
@@ -62,6 +64,9 @@ pub struct BeadsBoards {
     card_press: Option<CardDragPress>,
     /// Card drag currently tracked by GPUI's native drag stream.
     card_drag: Option<CardDragState>,
+    /// Cards painted in their requested lane until a write result and the
+    /// authoritative board snapshot settle that request.
+    optimistic_drops: HashMap<(WorkspaceId, String), OptimisticDrop>,
 }
 
 /// One board's bottom bar, held by the pointer.
@@ -104,6 +109,13 @@ pub struct CardDragState {
     pub hovered_lane: Option<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OptimisticDrop {
+    source_lane: u8,
+    target_lane: u8,
+    generation: Option<u64>,
+}
+
 /// The visible card GPUI carries in its window-layer drag root.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardDragGhost {
@@ -113,11 +125,41 @@ pub struct CardDragGhost {
 }
 
 impl BeadsBoards {
-    pub fn update(&mut self, workspace_id: WorkspaceId, state: BeadsBoardState) {
+    /// Replace one server snapshot and report cards whose authoritative lane
+    /// differed from both ends of an applied drop.
+    pub fn update(
+        &mut self,
+        workspace_id: WorkspaceId,
+        state: BeadsBoardState,
+    ) -> Vec<(String, u8)> {
         if !matches!(state, BeadsBoardState::Unavailable { .. }) {
             self.retry_after.remove(&workspace_id);
         }
+        let snapshot = match &state {
+            BeadsBoardState::Loading { cached } => cached.as_ref(),
+            BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
+            BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+        };
+        let settled: Vec<_> = self
+            .optimistic_drops
+            .keys()
+            .filter(|(candidate, _)| *candidate == workspace_id)
+            .cloned()
+            .collect();
+        let mut classifier_won = Vec::new();
+        for key in settled {
+            let Some(drop) = self.optimistic_drops.remove(&key) else { continue };
+            let actual_lane = snapshot.and_then(|snapshot| snapshot_card_lane(snapshot, &key.1));
+            if let Some(actual_lane) = actual_lane
+                && drop.generation.is_some()
+                && actual_lane != drop.source_lane
+                && actual_lane != drop.target_lane
+            {
+                classifier_won.push((key.1, actual_lane));
+            }
+        }
         self.states.insert(workspace_id, state);
+        classifier_won
     }
 
     pub fn detected(&self, workspace_id: WorkspaceId) -> bool {
@@ -305,8 +347,52 @@ impl BeadsBoards {
     /// Clear an armed press or active drag. Only an active drag reports true;
     /// a false result leaves GPUI's ordinary click path live.
     pub fn end_card_drag(&mut self) -> bool {
+        self.take_card_drag().is_some()
+    }
+
+    /// Clear the press and return the completed native drag, if one lifted.
+    pub fn take_card_drag(&mut self) -> Option<CardDragState> {
         self.card_press = None;
-        self.card_drag.take().is_some()
+        self.card_drag.take()
+    }
+
+    /// Paint an accepted drop immediately while its queued write runs.
+    pub fn apply_card_drop(&mut self, drag: CardDragState) {
+        let Some(target_lane) = drag.hovered_lane else { return };
+        if let Some(snapshot) = self.states.get_mut(&drag.workspace_id).and_then(state_snapshot_mut)
+        {
+            move_snapshot_card(snapshot, drag.source_lane, target_lane, &drag.source.id);
+        }
+        self.optimistic_drops.insert(
+            (drag.workspace_id, drag.source.id),
+            OptimisticDrop { source_lane: drag.source_lane, target_lane, generation: None },
+        );
+    }
+
+    /// Tag a committed overlay or snap a failed write back to its source.
+    pub fn finish_card_drop(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        result: &BeadsIssueWriteResult,
+    ) {
+        let key = (workspace_id, issue_id.to_owned());
+        if let BeadsIssueWriteResult::Applied { generation } = result {
+            if let Some(drop) = self.optimistic_drops.get_mut(&key) {
+                drop.generation = Some(*generation);
+            }
+            return;
+        }
+        self.cancel_card_drop(workspace_id, issue_id);
+    }
+
+    pub fn cancel_card_drop(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
+        let Some(drop) = self.optimistic_drops.remove(&(workspace_id, issue_id.to_owned())) else {
+            return;
+        };
+        if let Some(snapshot) = self.states.get_mut(&workspace_id).and_then(state_snapshot_mut) {
+            move_snapshot_card(snapshot, drop.target_lane, drop.source_lane, issue_id);
+        }
     }
 
     /// The shortest board that still shows a lane head with one issue under it.
@@ -357,6 +443,7 @@ impl BeadsBoards {
         self.hovered.retain(|workspace_id, _| live.contains(workspace_id));
         self.pinned.retain(|workspace_id| live.contains(workspace_id));
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
+        self.optimistic_drops.retain(|(workspace_id, _), _| live.contains(workspace_id));
         if self.card_press.as_ref().is_some_and(|press| !live.contains(&press.workspace_id))
             || self.card_drag.as_ref().is_some_and(|drag| !live.contains(&drag.workspace_id))
         {
@@ -422,6 +509,70 @@ impl CardDragGhost {
 
 fn card_drag_source(lane: u8) -> bool {
     lane <= 2
+}
+
+fn state_snapshot_mut(state: &mut BeadsBoardState) -> Option<&mut BeadsBoardSnapshot> {
+    match state {
+        BeadsBoardState::Loading { cached } => cached.as_mut(),
+        BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
+        BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+    }
+}
+
+fn snapshot_card_lane(snapshot: &BeadsBoardSnapshot, issue_id: &str) -> Option<u8> {
+    [&snapshot.backlog, &snapshot.ready, &snapshot.in_progress, &snapshot.blocked, &snapshot.done]
+        .into_iter()
+        .position(|cards| cards.iter().any(|card| card.id == issue_id))
+        .and_then(|lane| u8::try_from(lane).ok())
+}
+
+fn lane_cards_mut(snapshot: &mut BeadsBoardSnapshot, lane: u8) -> Option<&mut Vec<BeadsBoardItem>> {
+    match lane {
+        0 => Some(&mut snapshot.backlog),
+        1 => Some(&mut snapshot.ready),
+        2 => Some(&mut snapshot.in_progress),
+        3 => Some(&mut snapshot.blocked),
+        4 => Some(&mut snapshot.done),
+        _ => None,
+    }
+}
+
+fn lane_total_mut(snapshot: &mut BeadsBoardSnapshot, lane: u8) -> Option<&mut u32> {
+    match lane {
+        0 => Some(&mut snapshot.backlog_total),
+        1 => Some(&mut snapshot.ready_total),
+        2 => Some(&mut snapshot.in_progress_total),
+        3 => Some(&mut snapshot.blocked_total),
+        4 => Some(&mut snapshot.done_total),
+        _ => None,
+    }
+}
+
+fn move_snapshot_card(
+    snapshot: &mut BeadsBoardSnapshot,
+    source_lane: u8,
+    target_lane: u8,
+    issue_id: &str,
+) -> bool {
+    if source_lane > 4 || target_lane > 4 {
+        return false;
+    }
+    let Some(index) = lane_cards_mut(snapshot, source_lane)
+        .and_then(|cards| cards.iter().position(|card| card.id == issue_id))
+    else {
+        return false;
+    };
+    let Some(card) = lane_cards_mut(snapshot, source_lane).map(|cards| cards.remove(index)) else {
+        return false;
+    };
+    let Some(source_total) = lane_total_mut(snapshot, source_lane) else { return false };
+    *source_total = source_total.saturating_sub(1);
+    let Some(target_total) = lane_total_mut(snapshot, target_lane) else { return false };
+    *target_total = target_total.saturating_add(1);
+    lane_cards_mut(snapshot, target_lane).is_some_and(|cards| {
+        cards.push(card);
+        true
+    })
 }
 
 fn lane_wash_strength(lane: u8, hovered_lane: Option<u8>) -> f32 {
@@ -1900,6 +2051,36 @@ mod tests {
         Rect { x: 100.0, y: 50.0, width: 500.0, height: 200.0 }
     }
 
+    fn drag_state(workspace_id: WorkspaceId, source_lane: u8, target_lane: u8) -> CardDragState {
+        CardDragState {
+            workspace_id,
+            source: drag_item(),
+            source_lane,
+            pointer: drag_point(0.0, 0.0),
+            hovered_lane: Some(target_lane),
+        }
+    }
+
+    fn drag_snapshot(lane: u8) -> BeadsBoardState {
+        let mut snapshot = BeadsBoardSnapshot::default();
+        if let Some(cards) = lane_cards_mut(&mut snapshot, lane) {
+            cards.push(drag_item());
+        }
+        if let Some(total) = lane_total_mut(&mut snapshot, lane) {
+            *total = 1;
+        }
+        BeadsBoardState::Ready { snapshot, stale: false, refresh_error: None }
+    }
+
+    fn board_card_lane(boards: &BeadsBoards, workspace_id: WorkspaceId) -> Option<u8> {
+        let snapshot = match boards.state(workspace_id)? {
+            BeadsBoardState::Loading { cached } => cached.as_ref(),
+            BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
+            BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+        }?;
+        snapshot_card_lane(snapshot, "scribe-drag.1")
+    }
+
     // @lat: [[test#GPUI Client Headless Suites#Beads card drag tracking]]
     #[test]
     fn card_drag_arms_only_past_the_native_two_pixel_boundary() {
@@ -1914,6 +2095,97 @@ mod tests {
         assert!(boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0)));
         assert!(boards.start_card_drag(drag_point(152.001, 100.0), drag_board()));
         assert!(boards.card_drag().is_some(), "travel past 2px did not lift the card");
+    }
+
+    #[test]
+    fn accepted_drop_moves_optimistically_until_its_generation_snapshot() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, drag_snapshot(1));
+        let drag = drag_state(workspace, 1, 2);
+
+        boards.apply_card_drop(drag.clone());
+        assert_eq!(board_card_lane(&boards, workspace), Some(2));
+        assert_eq!(
+            boards
+                .optimistic_drops
+                .get(&(workspace, drag.source.id.clone()))
+                .map(|drop| { (drop.source_lane, drop.target_lane, drop.generation) }),
+            Some((1, 2, None))
+        );
+
+        boards.finish_card_drop(
+            workspace,
+            &drag.source.id,
+            &BeadsIssueWriteResult::Applied { generation: 17 },
+        );
+        assert_eq!(
+            boards
+                .optimistic_drops
+                .get(&(workspace, drag.source.id.clone()))
+                .map(|drop| drop.generation),
+            Some(Some(17))
+        );
+
+        assert!(boards.update(workspace, drag_snapshot(2)).is_empty());
+        assert_eq!(board_card_lane(&boards, workspace), Some(2));
+        assert!(!boards.optimistic_drops.contains_key(&(workspace, drag.source.id)));
+    }
+
+    #[test]
+    fn failed_drop_reverts_to_its_source_lane() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, drag_snapshot(0));
+        let drag = drag_state(workspace, 0, 4);
+        boards.apply_card_drop(drag.clone());
+
+        boards.finish_card_drop(
+            workspace,
+            &drag.source.id,
+            &BeadsIssueWriteResult::Failed { reason: "bd rejected close".into() },
+        );
+
+        assert_eq!(board_card_lane(&boards, workspace), Some(0));
+        assert!(!boards.optimistic_drops.contains_key(&(workspace, drag.source.id)));
+    }
+
+    #[test]
+    fn fence_stale_snapshot_reverts_an_applied_overlay() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, drag_snapshot(1));
+        let drag = drag_state(workspace, 1, 4);
+        boards.apply_card_drop(drag.clone());
+        boards.finish_card_drop(
+            workspace,
+            &drag.source.id,
+            &BeadsIssueWriteResult::Applied { generation: 19 },
+        );
+
+        assert!(boards.update(workspace, drag_snapshot(1)).is_empty());
+
+        assert_eq!(board_card_lane(&boards, workspace), Some(1));
+        assert!(!boards.optimistic_drops.contains_key(&(workspace, drag.source.id)));
+    }
+
+    #[test]
+    fn authoritative_classifier_lane_wins_with_a_notice_outcome() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, drag_snapshot(1));
+        let drag = drag_state(workspace, 1, 4);
+        boards.apply_card_drop(drag.clone());
+        boards.finish_card_drop(
+            workspace,
+            &drag.source.id,
+            &BeadsIssueWriteResult::Applied { generation: 23 },
+        );
+
+        assert_eq!(boards.update(workspace, drag_snapshot(3)), [(drag.source.id.clone(), 3)]);
+
+        assert_eq!(board_card_lane(&boards, workspace), Some(3));
+        assert!(!boards.optimistic_drops.contains_key(&(workspace, drag.source.id)));
     }
 
     #[test]
@@ -2372,7 +2644,7 @@ mod tests {
             .try_into()
             .expect("epoch fits");
         let mut boards = BeadsBoards::default();
-        boards.update(
+        let _ = boards.update(
             workspace,
             BeadsBoardState::Ready {
                 snapshot: BeadsBoardSnapshot { refreshed_at_epoch_ms: now, ..Default::default() },
@@ -2388,7 +2660,8 @@ mod tests {
     fn unavailable_board_schedules_one_retry_per_interval() {
         let workspace = WorkspaceId::new();
         let mut boards = BeadsBoards::default();
-        boards.update(workspace, BeadsBoardState::Unavailable { message: "missing bd".into() });
+        let _ =
+            boards.update(workspace, BeadsBoardState::Unavailable { message: "missing bd".into() });
 
         assert_eq!(boards.due_retry(Duration::from_secs(30)), Some(workspace));
         assert_eq!(boards.due_retry(Duration::from_secs(30)), None);

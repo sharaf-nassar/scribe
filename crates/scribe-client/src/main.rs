@@ -7140,12 +7140,23 @@ impl TerminalView {
     /// The board is left at whatever height the drag reached; a hovered one
     /// then closes on the grace period the drag was holding open.
     fn release_board(&mut self, cx: &mut Context<Self>) -> bool {
-        let released = self.shared.beads_boards.lock().is_ok_and(|mut boards| {
-            let card = boards.blocks_pty_mouse();
-            boards.end_card_drag();
-            let resize = boards.end_resize();
-            card || resize
-        });
+        let (released, drag) =
+            self.shared.beads_boards.lock().map_or((false, None), |mut boards| {
+                let card = boards.blocks_pty_mouse();
+                let drag = boards.take_card_drag();
+                let resize = boards.end_resize();
+                (card || resize, drag)
+            });
+        if let Some(drag) = drag {
+            let accepted = self
+                .shared
+                .beads_panels
+                .lock()
+                .is_ok_and(|mut panels| panels.queue_card_drop(&drag));
+            if accepted && let Ok(mut boards) = self.shared.beads_boards.lock() {
+                boards.apply_card_drop(drag);
+            }
+        }
         if released {
             cx.notify();
         }
@@ -9220,9 +9231,13 @@ impl TerminalView {
             self.sink.write_beads_issue(workspace_id, issue_id.clone(), write.verb, write.guards);
         let Err(error) = result else { return };
         tracing::debug!(%error, %workspace_id, %issue_id, "Beads issue write dropped");
+        if let Ok(mut boards) = self.shared.beads_boards.lock() {
+            boards.cancel_card_drop(workspace_id, &issue_id);
+        }
         if let Ok(mut panels) = self.shared.beads_panels.lock() {
             panels.write_send_failed(workspace_id, &issue_id, &error.to_string());
         }
+        self.shared.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Match repository-keyed CI snapshots to the regions that own them.
@@ -12636,9 +12651,18 @@ async fn dispatch_server_message(
             if let Ok(mut panels) = ctx.beads_panels.lock() {
                 panels.sync_board(workspace_id, &state);
             }
-            if let Ok(mut boards) = ctx.beads_boards.lock() {
-                boards.update(workspace_id, state);
-                ctx.generation.fetch_add(1, Ordering::Release);
+            let classifier_won = ctx.beads_boards.lock().map_or_else(
+                |_| Vec::new(),
+                |mut boards| {
+                    let classifier_won = boards.update(workspace_id, state);
+                    ctx.generation.fetch_add(1, Ordering::Release);
+                    classifier_won
+                },
+            );
+            if let Some((issue_id, lane)) = classifier_won.into_iter().last()
+                && let Ok(mut panels) = ctx.beads_panels.lock()
+            {
+                panels.classifier_won(workspace_id, &issue_id, lane);
             }
             if loading {
                 let sink = ctx.sink.clone();
@@ -12655,6 +12679,9 @@ async fn dispatch_server_message(
             }
         }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
+            if let Ok(mut boards) = ctx.beads_boards.lock() {
+                boards.finish_card_drop(workspace_id, &issue_id, &result);
+            }
             if let Ok(mut panels) = ctx.beads_panels.lock() {
                 panels.finish_write(workspace_id, &issue_id, result);
                 ctx.generation.fetch_add(1, Ordering::Release);

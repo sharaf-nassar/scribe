@@ -1049,10 +1049,18 @@ mutex mutation, with no request, IPC, or subprocess.
 GPUI carries a full-size source-card ghost in its native window drag root, so
 the ghost paints above cards and beyond lane clipping without a second pointer
 tracker. Hovering Backlog or Blocked reduces only that lane's wash to one third
-as the no-drop cue; writes and snap-back remain later drop work. The armed
-press and active drag consume all three terminal mouse-reporting funnels, the
-source hover cannot expire while lifted, and the grid clears either card or
-resize state on release inside or outside its bounds.
+as the no-drop cue. Releases over Backlog, Blocked, the source lane, or outside
+the board snap back without a write. Ready clears defer with status `open`, In
+progress claims, and Done closes with the panel's same five-second undo.
+
+Accepted cards move between the existing snapshot queues immediately, tagged
+until their write result supplies its generation. Failure moves the card back;
+the next authoritative snapshot replaces the overlay. If an applied write
+classifies into neither its source nor requested lane, the server's lane wins
+and a five-second notice names that result. The armed press and active drag
+consume all three terminal mouse-reporting funnels, the source hover cannot
+expire while lifted, and the grid clears either card or resize state on release
+inside or outside its bounds.
 
 When `Welcome.beads_detail` is enabled,
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] parks one
