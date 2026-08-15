@@ -1051,6 +1051,14 @@ hidden-comment counts, and inert verbs; closed details retain close facts but
 omit verbs. Queue words are lifted through the board palette's body-text
 contrast solver before they paint on the card surface.
 
+The identity ID is one click target for its full, unshortened value. Hover
+reveals its copy glyph; the click parks that value for the window's existing
+clipboard surface, whose take-once drain prevents a later frame from replaying
+the write. Every dependent on the UNBLOCKS line is a workspace-scoped
+navigation target. Clicking one queues a fresh detail request while retaining
+the source panel; wrong-workspace and wrong-ID replies cannot replace it, and
+the matching reply atomically swaps the card head, detail body, and queue lane.
+
 The board takes its structure, sizes, and weights from
 `.impeccable/mocks/beads-compact-live-overview.html` while
 [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors#from_theme]] reads

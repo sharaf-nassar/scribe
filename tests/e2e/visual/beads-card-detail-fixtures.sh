@@ -64,6 +64,26 @@ else:
 PY
 }
 
+detail_request_count() {
+    python3 - "$RECORD" "${1:-}" <<'PY'
+import json, sys
+
+count = 0
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if (row.get("dir") == "client"
+                and message.get("type") == "RequestBeadsIssueDetail"
+                and (not sys.argv[2] or message.get("issue_id") == sys.argv[2])):
+            count += 1
+print(count)
+PY
+}
+
 sleep 2
 WID=$(window_id)
 [ -n "$WID" ] || fail "no Scribe window"
@@ -162,6 +182,29 @@ read -r PANEL_W PANEL_H PANEL_X PANEL_Y <<<"$(convert \
 [ "$PANEL_H" -ge 250 ] \
     || fail "panel anatomy collapsed to ${PANEL_H}px high"
 
+# Hover reveals the approved copy glyph without moving the identity row. One
+# click writes the full id, and replacing the clipboard afterward proves the
+# parked intent cannot replay on a later frame.
+xdotool mousemove --sync --window "$WID" 90 284
+sleep 0.2
+import -window "$WID" /output/beads-detail-id-hover.png
+ID_HOVER_DIFF=$(compare -metric AE \
+    /output/beads-detail-comment-clamped.png \
+    /output/beads-detail-id-hover.png null: 2>&1 || true)
+ID_HOVER_DIFF=${ID_HOVER_DIFF%%.*}
+[ "${ID_HOVER_DIFF:-0}" -ge 10 ] \
+    || fail "id hover changed only ${ID_HOVER_DIFF:-0}px"
+xdotool click 1
+sleep 0.2
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "detail-comment-clamped" ] \
+    || fail "panel id copied '$COPIED'"
+printf '%s' "clipboard-not-replayed" | xclip -selection clipboard >/dev/null 2>&1
+sleep 0.4
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "clipboard-not-replayed" ] \
+    || fail "panel id copy replayed after its click"
+
 # Each dismissal is proven by opening the card again. A surviving panel or
 # backdrop owns the pointer, so the next card click cannot emit another request.
 xdotool key Escape
@@ -223,4 +266,80 @@ NOT_DETECTED_DIFF=${NOT_DETECTED_DIFF%%.*}
 [ "${NOT_DETECTED_DIFF:-0}" -ge 1000 ] \
     || fail "NotDetected close notice changed only ${NOT_DETECTED_DIFF:-0}px"
 
-echo "PASS: detail lifecycle loading, dismissal, notice, and final geometry rendered"
+# Open the Ready card with a short dependent-navigation detail synthesized
+# from the checked-in typed fixture. Its dependent uses the existing hidden
+# count fixture as the matching response.
+HIDDEN_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
+    $1 == "hidden-count" { sub(/^[^\t]*\t/, ""); print; exit }
+')
+[ -n "$HIDDEN_MESSAGE" ] || fail "hidden-count fixture missing"
+NAV_MESSAGE=$(python3 - "$HIDDEN_MESSAGE" <<'PY'
+import json, sys
+
+message = json.loads(sys.argv[1])
+message["issue_id"] = "detail-loading"
+detail = message["detail"]
+detail.update({
+    "id": "detail-loading",
+    "title": "Load complete issue detail",
+    "description": "",
+    "acceptance_criteria": "",
+    "notes": "",
+    "design": "",
+    "spec_id": None,
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "labels": [],
+    "assignee": None,
+    "owner": None,
+    "defer_until": None,
+    "due_at": None,
+    "estimated_minutes": None,
+    "external_ref": None,
+    "blockers": [],
+    "dependents": [{
+        "id": "detail-hidden-count",
+        "title": "Show hidden comment count"
+    }],
+    "comments": [],
+    "hidden_comment_count": 0,
+    "queue": "ready",
+    "queue_basis": "ready_set"
+})
+print(json.dumps(message, separators=(",", ":")))
+PY
+)
+
+xdotool key Escape
+inject "$LOADING_MESSAGE"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.2
+xdotool mousemove --sync --window "$WID" 280 84
+xdotool click 1
+sleep 0.2
+inject "$NAV_MESSAGE"
+TARGET_REQUESTS=$(detail_request_count "detail-hidden-count")
+xdotool mousemove --sync --window "$WID" 155 340
+xdotool click 1
+sleep 0.3
+[ "$(detail_request_count "detail-hidden-count")" -eq "$((TARGET_REQUESTS + 1))" ] \
+    || fail "dependent chip sent no fresh detail request"
+
+# The source stays visible while its request is in flight. Only the matching
+# hidden-count reply retargets the panel.
+xdotool mousemove --sync --window "$WID" 90 284
+xdotool click 1
+sleep 0.2
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "detail-loading" ] \
+    || fail "dependent click swapped before its reply: '$COPIED'"
+inject "$HIDDEN_MESSAGE"
+xdotool mousemove --sync --window "$WID" 90 284
+xdotool click 1
+sleep 0.2
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "detail-hidden-count" ] \
+    || fail "matching dependent reply did not swap the panel: '$COPIED'"
+
+echo "PASS: detail lifecycle, copy, and dependent navigation rendered"

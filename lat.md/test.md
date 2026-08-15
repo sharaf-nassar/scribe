@@ -1844,9 +1844,16 @@ It rejects any dropped detail message. Its settled screenshot requires the
 560px panel to start 12px from the region edge and 4px below the board, then
 checks the full head, queue, body, dependency, comment, dependent, and status
 anatomy. The current comment remains two lines while the older comment remains
-one ellipsized line. The same run reopens after Esc, close-mark, and backdrop
-dismissal, then requires a visible close notice for both a missing detail and a
-workspace whose board changes to `NotDetected`.
+one ellipsized line. Hovering the identity ID must reveal its copy glyph; one
+click must write the full ID, and a clipboard sentinel installed afterward
+must survive later frames. The same run reopens after Esc, close-mark, and
+backdrop dismissal, then requires a visible close notice for both a missing
+detail and a workspace whose board changes to `NotDetected`.
+
+The run then opens a short navigation fixture,
+requires a dependent click to send one fresh detail request, proves the source
+ID remains before the reply, and injects the matching response before requiring
+the target ID.
 
 Rust build-model tests cover the complete anatomy, omission of every sparse
 section, closed facts without verbs, blocked upstream-node count, hidden-count
@@ -1857,6 +1864,11 @@ the 400px no-open boundary, 0.8 and 1.6 text scales, minimum and maximum board
 height samples, workspace-edge and remaining-height clamps, exact 120ms final
 animation frame, loading head, lane re-anchoring, independent regions, and both
 automatic-close notices.
+
+State tests also require
+the ID intent to drain exactly once and dependent navigation to ignore replies
+for another workspace or issue until its matching response can swap and
+re-anchor the panel.
 
 ### Shared-pane rig
 

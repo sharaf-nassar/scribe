@@ -261,6 +261,7 @@ pub struct BeadsPanels {
     detail_enabled: bool,
     open: HashMap<WorkspaceId, BeadsPanel>,
     pending_requests: VecDeque<(WorkspaceId, String)>,
+    pending_navigation: HashMap<WorkspaceId, String>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
     notices: HashMap<WorkspaceId, PanelNotice>,
@@ -273,6 +274,7 @@ impl BeadsPanels {
         if !enabled {
             self.open.clear();
             self.pending_requests.clear();
+            self.pending_navigation.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
             self.notices.clear();
@@ -286,6 +288,7 @@ impl BeadsPanels {
         }
         let issue_id = card.id.clone();
         self.notices.remove(&workspace_id);
+        self.pending_navigation.remove(&workspace_id);
         self.open.insert(workspace_id, BeadsPanel { card, lane, detail: None });
         self.pending_requests.push_back((workspace_id, issue_id));
         self.last_opened = Some(workspace_id);
@@ -297,22 +300,38 @@ impl BeadsPanels {
         issue_id: &str,
         detail: Option<Box<BeadsIssueDetail>>,
     ) {
-        let Some(panel) = self.open.get_mut(&workspace_id) else { return };
-        if panel.card.id != issue_id {
-            return;
-        }
-        if let Some(detail) = detail {
+        if self.pending_navigation.get(&workspace_id).is_some_and(|target| target == issue_id) {
+            self.pending_navigation.remove(&workspace_id);
+            let Some(detail) = detail else {
+                self.close_missing(workspace_id, issue_id);
+                return;
+            };
+            let Some(panel) = self.open.get_mut(&workspace_id) else { return };
+            panel.card = card_from_detail(&detail);
             panel.lane = queue_lane(detail.queue);
             panel.detail = Some(detail);
-        } else {
-            let lane = panel.lane;
-            self.open.remove(&workspace_id);
-            self.notices.insert(
-                workspace_id,
-                PanelNotice::new(format!("Issue {issue_id} no longer exists"), lane),
-            );
-            self.last_opened = Some(workspace_id);
+            return;
         }
+        let Some(current) = self.open.get(&workspace_id) else { return };
+        if current.card.id != issue_id {
+            return;
+        }
+        let Some(detail) = detail else {
+            self.close_missing(workspace_id, issue_id);
+            return;
+        };
+        let Some(panel) = self.open.get_mut(&workspace_id) else { return };
+        panel.lane = queue_lane(detail.queue);
+        panel.detail = Some(detail);
+    }
+
+    fn close_missing(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
+        let Some(panel) = self.open.remove(&workspace_id) else { return };
+        self.notices.insert(
+            workspace_id,
+            PanelNotice::new(format!("Issue {issue_id} no longer exists"), panel.lane),
+        );
+        self.last_opened = Some(workspace_id);
     }
 
     pub fn visible(&self, workspace_id: WorkspaceId) -> Option<&BeadsPanel> {
@@ -337,6 +356,7 @@ impl BeadsPanels {
     }
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.pending_navigation.remove(&workspace_id);
         let removed = self.open.remove(&workspace_id).is_some()
             | self.notices.remove(&workspace_id).is_some();
         if self.last_opened == Some(workspace_id) {
@@ -354,6 +374,7 @@ impl BeadsPanels {
         self.expanded_comments.retain(|(workspace_id, _, _)| live.contains(workspace_id));
         self.pending_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
         self.notices.retain(|workspace_id, _| live.contains(workspace_id));
+        self.pending_navigation.retain(|workspace_id, _| live.contains(workspace_id));
         if self.last_opened.is_some_and(|workspace_id| !live.contains(&workspace_id)) {
             self.last_opened = self.open.keys().next().copied();
         }
@@ -375,8 +396,12 @@ impl BeadsPanels {
         }
     }
 
-    pub fn copy(&mut self, text: String) {
-        self.pending_copy = Some(text);
+    pub fn copy_issue_id(&mut self, workspace_id: WorkspaceId) -> bool {
+        let Some(panel) = self.open.get(&workspace_id) else { return false };
+        let issue_id =
+            panel.detail.as_deref().map_or(panel.card.id.as_str(), |detail| detail.id.as_str());
+        self.pending_copy = Some(issue_id.to_owned());
+        true
     }
 
     pub fn take_copy(&mut self) -> Option<String> {
@@ -400,6 +425,7 @@ impl BeadsPanels {
 
     pub fn sync_board(&mut self, workspace_id: WorkspaceId, state: &BeadsBoardState) -> bool {
         if matches!(state, BeadsBoardState::NotDetected) {
+            self.pending_navigation.remove(&workspace_id);
             let Some(panel) = self.open.remove(&workspace_id) else { return false };
             self.notices.insert(
                 workspace_id,
@@ -417,6 +443,19 @@ impl BeadsPanels {
             panel.card = card.clone();
         }
         changed
+    }
+
+    pub fn navigate_to_dependent(&mut self, workspace_id: WorkspaceId, issue_id: &str) -> bool {
+        let Some(detail) = self.open.get(&workspace_id).and_then(|panel| panel.detail.as_deref())
+        else {
+            return false;
+        };
+        if !detail.dependents.iter().any(|dependent| dependent.id == issue_id) {
+            return false;
+        }
+        self.pending_navigation.insert(workspace_id, issue_id.to_owned());
+        self.pending_requests.push_back((workspace_id, issue_id.to_owned()));
+        true
     }
 }
 
@@ -453,6 +492,16 @@ fn snapshot_card<'a>(
     .find_map(|(lane, cards)| {
         cards.iter().find(|card| card.id == issue_id).map(|card| (lane, card))
     })
+}
+
+fn card_from_detail(detail: &BeadsIssueDetail) -> BeadsBoardItem {
+    BeadsBoardItem {
+        id: detail.id.clone(),
+        title: detail.title.clone(),
+        priority: detail.priority,
+        blocker_ids: detail.blockers.iter().map(|blocker| blocker.id.clone()).collect(),
+        parent_epic_name: detail.parent_epic_name.clone(),
+    }
 }
 
 pub fn comment_line_limit(index: usize, expanded: bool) -> Option<usize> {
@@ -700,10 +749,10 @@ fn identity_left(
 ) -> AnyElement {
     let detail = panel.detail.as_deref();
     let issue_id = detail.map_or(panel.card.id.as_str(), |issue| issue.id.as_str());
-    let id_copy = issue_id.to_owned();
     let copy_state = std::sync::Arc::clone(&wiring.state);
     let workspace_id = wiring.workspace_id;
     let colors = &wiring.colors;
+    let copy_group = SharedString::from(format!("beads-detail-copy-{workspace_id}-{issue_id}"));
     div()
         .flex_1()
         .min_w(px(0.0))
@@ -716,20 +765,30 @@ fn identity_left(
         .overflow_hidden()
         .child(
             div()
+                .group(copy_group.clone())
                 .id(SharedString::from(format!("beads-detail-id-{workspace_id}-{issue_id}")))
                 .role(Role::Button)
                 .aria_label(format!("Copy issue {issue_id}"))
+                .flex()
+                .items_center()
                 .font_family("monospace")
                 .cursor_pointer()
                 .text_color(colors.queue_name)
                 .hover(|id| id.text_color(colors.title))
                 .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-                .on_click(move |_event, _window, _app| {
+                .on_click(move |_event, window, _app| {
                     if let Ok(mut panels) = copy_state.lock() {
-                        panels.copy(id_copy.clone());
+                        panels.copy_issue_id(workspace_id);
                     }
+                    window.refresh();
                 })
-                .child(issue_id.to_owned()),
+                .child(issue_id.to_owned())
+                .child(
+                    div()
+                        .opacity(0.0)
+                        .group_hover(copy_group, |glyph| glyph.opacity(1.0))
+                        .child("⧉"),
+                ),
         )
         .children(detail.is_some().then(|| separator(colors).into_any_element()))
         .children(detail.map(|issue| issue.issue_type.clone()))
@@ -875,9 +934,7 @@ fn detail_content(
                 .has(PanelSection::Comments)
                 .then(|| comments(detail, presentation, wiring)),
         )
-        .children(
-            presentation.has(PanelSection::Dependents).then(|| unblocks(detail, colors, scale)),
-        )
+        .children(presentation.has(PanelSection::Dependents).then(|| unblocks(detail, wiring)))
         .into_any_element()
 }
 
@@ -1091,7 +1148,8 @@ fn comment_row(comment: &BeadsIssueComment, index: usize, wiring: CommentWiring<
         .into_any_element()
 }
 
-fn unblocks(detail: &BeadsIssueDetail, colors: &BeadsBoardColors, scale: f32) -> AnyElement {
+fn unblocks(detail: &BeadsIssueDetail, wiring: PanelContentWiring<'_>) -> AnyElement {
+    let PanelContentWiring { workspace_id, state, colors, scale } = wiring;
     div()
         .relative()
         .mt(px(10.0))
@@ -1102,9 +1160,22 @@ fn unblocks(detail: &BeadsIssueDetail, colors: &BeadsBoardColors, scale: f32) ->
         .line_height(at(scale, 14.0))
         .child(runin("Unblocks", colors, scale))
         .children(detail.dependents.iter().map(|dependent| {
+            let target = dependent.id.clone();
+            let navigate_state = std::sync::Arc::clone(state);
             div()
+                .id(SharedString::from(format!("beads-dependent-{workspace_id}-{}", dependent.id)))
+                .role(Role::Button)
+                .aria_label(format!("Open dependent {}", dependent.id))
                 .flex()
                 .gap(px(5.0))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+                .on_click(move |_event, window, _app| {
+                    if let Ok(mut panels) = navigate_state.lock() {
+                        panels.navigate_to_dependent(workspace_id, &target);
+                    }
+                    window.refresh();
+                })
                 .child(
                     div()
                         .font_family("monospace")
@@ -1531,6 +1602,71 @@ mod tests {
         assert!(panels.visible(workspace).is_some_and(|panel| panel.detail.is_none()));
         panels.update(workspace, "scribe-5wh1.4", Some(Box::new(detail())));
         assert!(panels.visible(workspace).is_some_and(|panel| panel.detail.is_some()));
+    }
+
+    #[test]
+    fn issue_id_copy_is_exactly_once_through_the_parked_surface() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(detail())));
+
+        assert!(panels.copy_issue_id(workspace));
+        assert_eq!(panels.take_copy().as_deref(), Some("scribe-5wh1.4"));
+        assert_eq!(panels.take_copy(), None, "one click must yield one clipboard write");
+    }
+
+    #[test]
+    fn dependent_navigation_waits_for_its_matching_detail_reply() {
+        let workspace = WorkspaceId::new();
+        let other = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(full_detail())));
+
+        assert!(panels.navigate_to_dependent(workspace, "next-1"));
+        assert_eq!(panels.take_request(), Some((workspace, "next-1".into())));
+        assert_eq!(
+            panels.visible(workspace).map(|panel| panel.card.id.as_str()),
+            Some("scribe-5wh1.4")
+        );
+
+        let mut next = detail();
+        next.id = "next-1".into();
+        next.title = "Dependent work".into();
+        next.queue = BeadsIssueQueue::Blocked;
+        next.queue_basis = BeadsIssueQueueBasis::OpenBlockers;
+        panels.update(other, "next-1", Some(Box::new(next.clone())));
+        panels.update(workspace, "wrong-id", Some(Box::new(next.clone())));
+        assert_eq!(
+            panels.visible(workspace).map(|panel| panel.card.id.as_str()),
+            Some("scribe-5wh1.4")
+        );
+
+        panels.update(workspace, "next-1", Some(Box::new(next)));
+        let panel = panels.visible(workspace).expect("matching reply swaps the panel");
+        assert_eq!(panel.card.id, "next-1");
+        assert_eq!(panel.card.title, "Dependent work");
+        assert_eq!(panel.lane, 3);
+        assert_eq!(panel.detail.as_deref().map(|detail| detail.id.as_str()), Some("next-1"));
+    }
+
+    #[test]
+    fn missing_dependent_closes_the_panel_with_the_lifecycle_notice() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(full_detail())));
+
+        assert!(panels.navigate_to_dependent(workspace, "next-1"));
+        panels.update(workspace, "next-1", None);
+
+        assert!(panels.visible(workspace).is_none());
+        assert_eq!(panels.notice(workspace), Some("Issue next-1 no longer exists"));
     }
 
     #[test]
