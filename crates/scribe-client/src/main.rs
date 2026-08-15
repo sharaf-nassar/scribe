@@ -4010,6 +4010,9 @@ impl TerminalView {
     /// leaves the client's own gesture — selection, primary-selection paste,
     /// context menu — alone.
     fn forward_mouse_press(&mut self, event: &MouseDownEvent) -> bool {
+        if self.card_drag_owns_pointer() {
+            return true;
+        }
         let modes = self.focused_mouse_modes();
         if !modes.forwards_buttons(event.modifiers.shift) {
             return false;
@@ -4040,6 +4043,11 @@ impl TerminalView {
     /// mid-drag, or Shift is held now) — otherwise the next pointer move would
     /// report a phantom drag with a button the user is no longer holding.
     fn forward_mouse_release(&mut self, event: &MouseUpEvent) -> bool {
+        if self.card_drag_owns_pointer() {
+            self.pointer.report_button = None;
+            self.pointer.report_cell = None;
+            return true;
+        }
         let modes = self.focused_mouse_modes();
         let was_forwarded = self.pointer.report_button.take().is_some();
         self.pointer.report_cell = None;
@@ -4069,6 +4077,9 @@ impl TerminalView {
     /// the moves its motion level suppresses: mode 1000 reports nothing, but it
     /// still must not hand the drag back to the client's selection.
     fn forward_mouse_motion(&mut self, event: &MouseMoveEvent) -> bool {
+        if self.card_drag_owns_pointer() {
+            return true;
+        }
         let modes = self.focused_mouse_modes();
         if !modes.forwards_buttons(event.modifiers.shift) {
             return false;
@@ -4095,6 +4106,12 @@ impl TerminalView {
         );
         self.send_pty_bytes("motion", bytes);
         true
+    }
+
+    /// A lifted board card consumes every pointer phase before terminal mouse
+    /// reporting. Treat a poisoned store as owned rather than leak input.
+    fn card_drag_owns_pointer(&self) -> bool {
+        self.shared.beads_boards.lock().map_or(true, |boards| boards.blocks_pty_mouse())
     }
 
     /// Route one wheel event to whichever of the three consumers claims it.
@@ -7100,12 +7117,17 @@ impl TerminalView {
         self.finish_selection(cx);
     }
 
-    /// Let go of a board's bottom bar, reporting whether one was held.
+    /// Let go of either board gesture, reporting whether one was held.
     ///
     /// The board is left at whatever height the drag reached; a hovered one
     /// then closes on the grace period the drag was holding open.
     fn release_board(&mut self, cx: &mut Context<Self>) -> bool {
-        let released = self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.end_resize());
+        let released = self.shared.beads_boards.lock().is_ok_and(|mut boards| {
+            let card = boards.blocks_pty_mouse();
+            boards.end_card_drag();
+            let resize = boards.end_resize();
+            card || resize
+        });
         if released {
             cx.notify();
         }
@@ -9032,6 +9054,7 @@ impl TerminalView {
         let beads_boards = self.render_beads_boards(cx);
         let beads_panels = self.render_beads_panels(cx);
         div()
+            .id("terminal-grid")
             .flex_1()
             .relative()
             .bg(surface(self.terminal_colors.background, self.opacity))
@@ -9062,6 +9085,12 @@ impl TerminalView {
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseUpEvent, _window, ctx| {
                     view.release_over_grid(event, ctx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseUpEvent, _window, ctx| {
+                    view.release_board(ctx);
                 }),
             )
             // Middle click is the X11 primary-selection paste, and it is a
@@ -9408,6 +9437,7 @@ impl TerminalView {
                             hover_state: Arc::clone(&self.shared.beads_boards),
                             panel_state: Arc::clone(&self.shared.beads_panels),
                             workspace_id: *workspace_id,
+                            drag_target: boards.drag_target(*workspace_id),
                             scale,
                             colors,
                         },

@@ -3622,14 +3622,21 @@ Pinning it here is what keeps the board a region citizen. The band it replaced s
 
 ### Beads card drag tracking
 
-Unit coverage pins the state-only first drag stage to GPUI's native threshold and the board's lane geometry.
+Unit coverage pins card-drag tracking and presentation to GPUI's native threshold and the board's lane geometry.
 
 Exactly 2px remains click-eligible while 2.001px activates. Backlog, Ready,
 and In-progress arm; Blocked and Done do not. Active state retains the source
 card and lane, updates the pointer and hovered lane, and reports no target at
-the board's right or bottom boundary. The existing Docker Beads-board visual
-continues to cover ordinary card clicks and board controls; painted ghosts,
-drop behavior, PTY isolation, and writes remain assigned to dependent stages.
+the board's right or bottom boundary. Further cases require the ghost only
+during an active lift at the source card's exact size, reduce only hovered
+Backlog and Blocked washes, gate PTY pointer routing from press through
+release, and hold a hover-opened board until that release.
+
+The Docker Beads-board visual moves the native ghost over another card, over a
+rejected lane, and below the board clip. Pixel assertions require the over-card
+repaint, the no-drop wash change, stable terminal rows and hover overlay, and
+an outside ghost origin within 3px of the pointer offset. Drop writes,
+optimistic placement, rollback, and undo remain separate stages.
 
 ### Region reports every tab and which is active
 

@@ -1029,9 +1029,15 @@ Once armed, the board stores the workspace, source card and lane, current
 window pointer, and hovered lane. Native drag moves keep updating even outside
 the card; the five-lane lookup shares the board's 8px horizontal inset and
 returns no target outside the strip. Each move is fixed arithmetic plus one
-mutex mutation, with no request, IPC, or subprocess. This slice paints only an
-empty native marker; ghost, drop behavior, writes, and optimistic placement
-belong to later drag stages.
+mutex mutation, with no request, IPC, or subprocess.
+
+GPUI carries a full-size source-card ghost in its native window drag root, so
+the ghost paints above cards and beyond lane clipping without a second pointer
+tracker. Hovering Backlog or Blocked reduces only that lane's wash to one third
+as the no-drop cue; writes and snap-back remain later drop work. The armed
+press and active drag consume all three terminal mouse-reporting funnels, the
+source hover cannot expire while lifted, and the grid clears either card or
+resize state on release inside or outside its bounds.
 
 When `Welcome.beads_detail` is enabled, clicking a card opens an issue panel
 immediately and parks one workspace-scoped detail request. The panel remains

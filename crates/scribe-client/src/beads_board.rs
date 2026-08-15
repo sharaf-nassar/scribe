@@ -104,6 +104,14 @@ pub struct CardDragState {
     pub hovered_lane: Option<u8>,
 }
 
+/// The visible card GPUI carries in its window-layer drag root.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardDragGhost {
+    pub source: BeadsBoardItem,
+    pub width: f32,
+    pub height: f32,
+}
+
 impl BeadsBoards {
     pub fn update(&mut self, workspace_id: WorkspaceId, state: BeadsBoardState) {
         if !matches!(state, BeadsBoardState::Unavailable { .. }) {
@@ -276,6 +284,24 @@ impl BeadsBoards {
         self.card_drag.as_ref()
     }
 
+    /// Rejected-lane presentation for one board, read while its caller already
+    /// holds the shared store guard.
+    pub fn drag_target(&self, workspace_id: WorkspaceId) -> Option<u8> {
+        self.card_drag.as_ref().and_then(|drag| {
+            (drag.workspace_id == workspace_id).then_some(drag.hovered_lane).flatten()
+        })
+    }
+
+    /// Describe the active drag's native ghost at the source card's size.
+    pub fn card_drag_ghost(&self, board: Rect, scale: f32) -> Option<CardDragGhost> {
+        self.card_drag.as_ref().map(|drag| CardDragGhost::new(drag.source.clone(), board, scale))
+    }
+
+    /// Whether the board owns pointer routing before it reaches the PTY.
+    pub fn blocks_pty_mouse(&self) -> bool {
+        self.card_press.is_some() || self.card_drag.is_some()
+    }
+
     /// Clear an armed press or active drag. Only an active drag reports true;
     /// a false result leaves GPUI's ordinary click path live.
     pub fn end_card_drag(&mut self) -> bool {
@@ -362,15 +388,18 @@ impl BeadsBoards {
 
     pub fn expire_hover(&mut self) -> bool {
         let now = Instant::now();
-        let held = self.resizing();
+        let held_resize = self.resizing();
+        let held_drag = self.card_drag.as_ref().map(|drag| drag.workspace_id);
         let due: Vec<WorkspaceId> = self
             .hover_expires
             .iter()
             .filter(|(_, deadline)| now >= **deadline)
             .map(|(workspace_id, _)| *workspace_id)
-            // A drag of the bottom bar takes the pointer off the board it is
-            // resizing, and closing the board mid-gesture would end the drag.
-            .filter(|workspace_id| held != Some(*workspace_id))
+            // A drag takes the pointer off its board; closing that board
+            // mid-gesture would discard either resize or card state.
+            .filter(|workspace_id| {
+                held_resize != Some(*workspace_id) && held_drag != Some(*workspace_id)
+            })
             .collect();
         for workspace_id in &due {
             self.hovered.remove(workspace_id);
@@ -380,8 +409,23 @@ impl BeadsBoards {
     }
 }
 
+impl CardDragGhost {
+    fn new(source: BeadsBoardItem, board: Rect, scale: f32) -> Self {
+        let lane_width = (board.width - 2.0 * LANES_SIDE_PADDING) / 5.0;
+        Self {
+            source,
+            width: (lane_width - 2.0 * LANE_CARD_PADDING - LANE_BODY_RIGHT_PADDING).max(1.0),
+            height: (ISSUE_HEIGHT - CARD_GAP) * scale,
+        }
+    }
+}
+
 fn card_drag_source(lane: u8) -> bool {
     lane <= 2
+}
+
+fn lane_wash_strength(lane: u8, hovered_lane: Option<u8>) -> f32 {
+    if hovered_lane == Some(lane) && matches!(lane, 0 | 3) { LANE_WASH / 3.0 } else { LANE_WASH }
 }
 
 fn card_drag_lane(board: Rect, pointer: CardDragPoint) -> Option<u8> {
@@ -648,6 +692,8 @@ const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
 const LANE_HEAD_HEIGHT: f32 = 36.0;
 const LANES_SIDE_PADDING: f32 = 8.0;
+const LANE_CARD_PADDING: f32 = 8.0;
+const LANE_BODY_RIGHT_PADDING: f32 = 4.0;
 /// One issue's share of a lane: the card itself, then the gap that separates it
 /// from the next.
 const ISSUE_HEIGHT: f32 = 50.0;
@@ -746,6 +792,8 @@ pub struct BeadsBoardRender {
     pub hover_state: std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     pub panel_state: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     pub workspace_id: WorkspaceId,
+    /// Hovered lane copied from the caller's existing board-store guard.
+    pub drag_target: Option<u8>,
     /// Text scale shared by every board in this window.
     pub scale: f32,
     /// The live theme's board palette.
@@ -780,18 +828,45 @@ struct BoardStores<'a> {
     boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     rect: Rect,
+    drag_target: Option<u8>,
 }
 
 /// Marker registered with GPUI's native drag arm for eligible Beads cards.
 struct BeadsCardDrag;
 
-/// Empty cursor overlay for this state-only slice. A painted ghost belongs to
-/// its dependent task; the marker is enough to receive native drag moves now.
-struct BeadsCardDragMarker;
+/// The native drag payload. GPUI paints this entity as a window root after
+/// normal and deferred content, so it follows the pointer outside lane clips.
+struct BeadsCardDragGhost {
+    model: CardDragGhost,
+    colors: BeadsBoardColors,
+    metrics: Metrics,
+}
 
-impl Render for BeadsCardDragMarker {
+impl Render for BeadsCardDragGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
+        let item = &self.model.source;
+        let mark = self.colors.priority_mark(item.priority);
+        div()
+            .w(px(self.model.width))
+            .h(px(self.model.height))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .overflow_hidden()
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(self.colors.card_border_hover)
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(self.colors.card_hover_top, 0.0),
+                linear_color_stop(self.colors.card_hover, 1.0),
+            ))
+            .shadow_lg()
+            .pt(px(CARD_PAD_TOP))
+            .px(px(8.0))
+            .pb(px(6.0))
+            .child(issue_title(item, mark, &self.colors, self.metrics))
+            .child(drag_ghost_meta(item, &self.colors, self.metrics))
     }
 }
 
@@ -819,8 +894,16 @@ pub fn render(
     state: Option<&BeadsBoardState>,
     wiring: BeadsBoardRender,
 ) -> AnyElement {
-    let BeadsBoardRender { rect, overlay, hover_state, panel_state, workspace_id, scale, colors } =
-        wiring;
+    let BeadsBoardRender {
+        rect,
+        overlay,
+        hover_state,
+        panel_state,
+        workspace_id,
+        drag_target,
+        scale,
+        colors,
+    } = wiring;
     let colors = &colors;
     // The rect is the strip the region gave the board, already clamped to what
     // that region has: painting to it rather than to a height of its own is
@@ -828,8 +911,6 @@ pub fn render(
     let metrics = Metrics { scale, height: rect.height };
     let (snapshot, status) = board_content(state);
     let drag_move = std::sync::Arc::clone(&hover_state);
-    let drag_end = std::sync::Arc::clone(&hover_state);
-    let drag_end_out = std::sync::Arc::clone(&hover_state);
     let board = div()
         .id(SharedString::from(format!("beads-board-{workspace_id}")))
         .aria_label(format!("{workspace_name} Beads overview"))
@@ -850,16 +931,6 @@ pub fn render(
                 window.refresh();
             }
         })
-        .on_mouse_up(MouseButton::Left, move |_, window, _app| {
-            if drag_end.lock().is_ok_and(|mut boards| boards.end_card_drag()) {
-                window.refresh();
-            }
-        })
-        .on_mouse_up_out(MouseButton::Left, move |_, window, _app| {
-            if drag_end_out.lock().is_ok_and(|mut boards| boards.end_card_drag()) {
-                window.refresh();
-            }
-        })
         .on_hover({
             let hover_state = std::sync::Arc::clone(&hover_state);
             move |hovered: &bool, _window, _app| {
@@ -873,7 +944,7 @@ pub fn render(
         Some(snapshot) => board.child(lanes(
             snapshot,
             workspace_id,
-            BoardStores { boards: &hover_state, panels: &panel_state, rect },
+            BoardStores { boards: &hover_state, panels: &panel_state, rect, drag_target },
             colors,
             metrics,
         )),
@@ -1125,11 +1196,11 @@ fn lane(
         .flex_1()
         .min_w(px(0.0))
         .relative()
-        .px(px(8.0))
+        .px(px(LANE_CARD_PADDING))
         // The wash comes first so everything else sits on it. It is what makes
         // a lane read as a column of its own rather than as five sets of rows
         // sharing one ground.
-        .child(lane_wash(spec))
+        .child(lane_wash(spec, lane_wash_strength(spec.index, stores.drag_target)))
         .child(lane_head(spec, colors, metrics))
         .child(lane_body(spec, workspace_id, stores, colors, metrics))
         .into_any_element()
@@ -1148,10 +1219,10 @@ fn lane(
 /// step. Both sides of a boundary compute the same midpoint of the same two
 /// queues, which is what makes the two gradients meet without a seam of their
 /// own.
-fn lane_wash(spec: &Lane<'_>) -> AnyElement {
-    let own = alpha(spec.state, LANE_WASH);
+fn lane_wash(spec: &Lane<'_>, strength: f32) -> AnyElement {
+    let own = alpha(spec.state, strength);
     let meeting = |neighbour: Option<Rgba>| {
-        neighbour.map_or(own, |other| alpha(mix(spec.state, other, 0.5), LANE_WASH))
+        neighbour.map_or(own, |other| alpha(mix(spec.state, other, 0.5), strength))
     };
     div()
         .absolute()
@@ -1331,7 +1402,7 @@ fn lane_body(
                 },
             )
             .h(px(metrics.issues()))
-            .pr(px(4.0)),
+            .pr(px(LANE_BODY_RIGHT_PADDING)),
         )
         .child(
             div()
@@ -1378,6 +1449,8 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     let arm_state = std::sync::Arc::clone(state);
     let start_state = std::sync::Arc::clone(state);
     let draggable = card_drag_source(lane);
+    let drag_source = item.clone();
+    let drag_colors = *colors;
     let mark = colors.priority_mark(item.priority);
     let card_element = div()
         .id(SharedString::from(format!("beads-card-{workspace_id}-{}", item.id)))
@@ -1390,8 +1463,7 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(colors.card_border)
-        // Lit from the top, which is the whole of the card's relief: a flat
-        // fill on a flat ground is the shape the board had before.
+        // Top light is the card's whole relief over the flat board ground.
         .bg(linear_gradient(
             180.0,
             linear_color_stop(colors.card_top, 0.0),
@@ -1410,12 +1482,8 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |event, _window, app| {
             if let Ok(mut boards) = arm_state.lock() {
-                boards.arm_card_drag(
-                    workspace_id,
-                    dragged.clone(),
-                    lane,
-                    card_drag_point(event.position),
-                );
+                let pointer = card_drag_point(event.position);
+                boards.arm_card_drag(workspace_id, dragged.clone(), lane, pointer);
             }
             app.stop_propagation();
         })
@@ -1427,11 +1495,17 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         });
     let card_element = if draggable {
         card_element.on_drag(BeadsCardDrag, move |_, _, window, app| {
-            if let Ok(mut boards) = start_state.lock() {
-                boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
-            }
+            let ghost = start_state
+                .lock()
+                .map_or(None, |mut boards| {
+                    boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
+                    boards.card_drag_ghost(board_rect, metrics.scale)
+                })
+                .unwrap_or_else(|| {
+                    CardDragGhost::new(drag_source.clone(), board_rect, metrics.scale)
+                });
             window.refresh();
-            app.new(|_| BeadsCardDragMarker)
+            app.new(move |_| BeadsCardDragGhost { model: ghost, colors: drag_colors, metrics })
         })
     } else {
         card_element
@@ -1443,15 +1517,19 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         .pt(px(CARD_PAD_TOP))
         .px(px(8.0))
         .pb(px(6.0))
-        .child(issue_title(item, mark, card))
+        .child(issue_title(item, mark, colors, metrics))
         .child(issue_meta(item, card))
         .into_any_element()
 }
 
 /// The priority badge and the title, which owns the rest of its line: the
 /// title is the only line a reader scans, so nothing else shares its row.
-fn issue_title(item: &BeadsBoardItem, mark: PriorityMark, card: CardContext<'_>) -> AnyElement {
-    let CardContext { colors, metrics, .. } = card;
+fn issue_title(
+    item: &BeadsBoardItem,
+    mark: PriorityMark,
+    colors: &BeadsBoardColors,
+    metrics: Metrics,
+) -> AnyElement {
     div()
         .h(metrics.at(TITLE_LINE))
         .flex()
@@ -1481,6 +1559,44 @@ fn issue_title(item: &BeadsBoardItem, mark: PriorityMark, card: CardContext<'_>)
                 .text_color(colors.title)
                 .child(item.title.clone()),
         )
+        .into_any_element()
+}
+
+/// The ghost's non-interactive metadata; its source card remains the only
+/// clipboard and panel target during the gesture.
+fn drag_ghost_meta(
+    item: &BeadsBoardItem,
+    colors: &BeadsBoardColors,
+    metrics: Metrics,
+) -> AnyElement {
+    div()
+        .h(metrics.at(12.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .overflow_hidden()
+        .child(
+            div()
+                .flex_none()
+                .font_family("monospace")
+                .text_size(metrics.at(9.0))
+                .line_height(metrics.at(12.0))
+                .font_weight(FontWeight(500.0))
+                .text_color(colors.muted)
+                .child(short_id(&item.id).to_owned()),
+        )
+        .child(div().flex_1().min_w(px(0.0)))
+        .children(item.parent_epic_name.as_ref().map(|name| {
+            div()
+                .min_w(px(0.0))
+                .ml(px(8.0))
+                .truncate()
+                .text_right()
+                .text_size(metrics.at(9.0))
+                .line_height(metrics.at(12.0))
+                .text_color(colors.epic)
+                .child(short_epic(name))
+        }))
         .into_any_element()
 }
 
@@ -1841,6 +1957,80 @@ mod tests {
         assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), None);
         assert!(boards.end_card_drag());
         assert!(boards.card_drag().is_none());
+    }
+
+    #[test]
+    fn card_drag_ghost_exists_only_for_the_active_gesture() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.card_drag_ghost(drag_board(), 1.0).is_none());
+
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        boards.start_card_drag(drag_point(160.0, 100.0), drag_board());
+        let ghost = boards.card_drag_ghost(drag_board(), 1.0).expect("active ghost");
+        assert_eq!(ghost.source.id, "scribe-drag.1");
+        assert!((ghost.width - 76.8).abs() < 0.001);
+        assert!((ghost.height - 46.0).abs() < 0.001);
+
+        boards.end_card_drag();
+        assert!(boards.card_drag_ghost(drag_board(), 1.0).is_none());
+    }
+
+    #[test]
+    fn only_hovered_backlog_and_blocked_washes_dim_as_no_drop_targets() {
+        for lane in 0..=4 {
+            let expected = if matches!(lane, 0 | 3) { LANE_WASH / 3.0 } else { LANE_WASH };
+            assert!((lane_wash_strength(lane, Some(lane)) - expected).abs() < f32::EPSILON);
+        }
+        assert!((lane_wash_strength(3, Some(0)) - LANE_WASH).abs() < f32::EPSILON);
+        assert!((lane_wash_strength(0, None) - LANE_WASH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn drag_target_is_read_from_the_existing_board_guard_per_workspace() {
+        let workspace = WorkspaceId::new();
+        let other = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        boards.start_card_drag(drag_point(210.0, 100.0), drag_board());
+
+        assert_eq!(boards.drag_target(workspace), Some(1));
+        assert_eq!(boards.drag_target(other), None);
+    }
+
+    #[test]
+    fn active_card_drag_owns_pty_pointer_routing() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(!boards.blocks_pty_mouse());
+
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        assert!(boards.blocks_pty_mouse(), "the press phase must not leak pointer motion");
+        boards.start_card_drag(drag_point(160.0, 100.0), drag_board());
+        assert!(boards.blocks_pty_mouse());
+
+        boards.end_card_drag();
+        assert!(!boards.blocks_pty_mouse());
+    }
+
+    #[test]
+    fn active_card_drag_holds_a_hover_opened_board_until_release() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.hover(workspace, HoverSource::Board, true);
+        boards.hover(workspace, HoverSource::Board, false);
+        boards.hover_expires.insert(
+            workspace,
+            Instant::now().checked_sub(Duration::from_millis(1)).expect("one millisecond fits"),
+        );
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        boards.start_card_drag(drag_point(160.0, 100.0), drag_board());
+
+        assert!(!boards.expire_hover());
+        assert_eq!(boards.visible(), [(workspace, false)]);
+        boards.end_card_drag();
+        assert!(boards.expire_hover());
+        assert!(boards.visible().is_empty());
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]

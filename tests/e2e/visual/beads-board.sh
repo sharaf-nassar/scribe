@@ -317,6 +317,110 @@ for _ in $(seq 1 20); do
 done
 [ "${COPIED:-}" = "sc-70" ] || fail "clicking the id copied '${COPIED:-}' instead of sc-70"
 
+# GPUI's native drag root must carry the source card above other cards and
+# beyond the board's clipping edge. Start in the Ready card's title row: its
+# metadata line is a nested copy target that deliberately owns its own press.
+LANE_W=$(( (WIN_W - 16) / 5 ))
+CARD_W=$(( LANE_W - 20 ))
+CARD_H=46
+SOURCE_LEFT=$(( 16 + LANE_W ))
+SOURCE_TOP=70
+PRESS_X=$(( SOURCE_LEFT + 70 ))
+PRESS_Y=$(( SOURCE_TOP + 14 ))
+PRESS_OFFSET_Y=$(( PRESS_Y - SOURCE_TOP ))
+TITLE_TOP=$(( SOURCE_TOP + 6 ))
+TITLE_BOTTOM=$(( TITLE_TOP + 17 ))
+META_TOP=$(( TITLE_BOTTOM + 2 ))
+[ "$PRESS_X" -gt "$SOURCE_LEFT" ] \
+    && [ "$PRESS_X" -lt "$(( SOURCE_LEFT + CARD_W ))" ] \
+    && [ "$PRESS_Y" -ge "$TITLE_TOP" ] \
+    && [ "$PRESS_Y" -lt "$TITLE_BOTTOM" ] \
+    && [ "$PRESS_Y" -lt "$META_TOP" ] \
+    || fail "drag press ($PRESS_X,$PRESS_Y) is outside title bounds or inside metadata"
+DONE_LEFT=$(( 16 + 4 * LANE_W ))
+xdotool mousemove --sync --window "$WID" "$PRESS_X" "$PRESS_Y"
+sleep 0.2
+import -window "$WID" /output/beads-board-drag-base.png
+xdotool mousedown 1
+ARM_X=$(( PRESS_X + 3 ))
+ARM_OFFSET_X=$(( ARM_X - SOURCE_LEFT ))
+xdotool mousemove --sync --window "$WID" "$ARM_X" "$PRESS_Y"
+sleep 0.1
+
+# Same card geometry over the Done card: a substantial changed area proves the
+# source card is painted above the existing lane content, not clipped into it.
+OVER_X=$(( DONE_LEFT + ARM_OFFSET_X ))
+OVER_Y=$(( SOURCE_TOP + PRESS_OFFSET_Y ))
+xdotool mousemove --sync --window "$WID" "$OVER_X" "$OVER_Y"
+sleep 0.25
+import -window "$WID" /output/beads-board-drag-over-cards.png
+OVER_CHANGED=$(convert /output/beads-board-drag-base.png \
+    /output/beads-board-drag-over-cards.png -compose difference -composite \
+    -crop "${CARD_W}x${CARD_H}+${DONE_LEFT}+${SOURCE_TOP}" +repage \
+    -colorspace Gray -threshold 5% -format "%[fx:mean*w*h]" info:)
+awk -v changed="$OVER_CHANGED" 'BEGIN { exit !(changed >= 200) }' \
+    || fail "drag ghost did not paint above the Done card (${OVER_CHANGED}px changed)"
+
+# Backlog is a rejected target. Its bare lower wash must repaint while hovered;
+# the unit contract pins that repaint to the reduced no-drop strength.
+xdotool mousemove --sync --window "$WID" 28 "$PRESS_Y"
+sleep 0.25
+import -window "$WID" /output/beads-board-drag-no-drop.png
+convert /output/beads-board-drag-base.png \
+    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-wash-before.png
+convert /output/beads-board-drag-no-drop.png \
+    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-wash-no-drop.png
+NO_DROP_CHANGED=$(compare -metric AE /tmp/beads-wash-before.png \
+    /tmp/beads-wash-no-drop.png null: 2>&1 || true)
+NO_DROP_CHANGED=${NO_DROP_CHANGED%%.*}
+[ "${NO_DROP_CHANGED:-0}" -ge "$(( LANE_W * 4 ))" ] \
+    || fail "Backlog no-drop wash changed only ${NO_DROP_CHANGED}px"
+
+# Stay outside the strip beyond its 150ms hover grace. The board must remain
+# open for the gesture, the terminal geometry must stay fixed, and the ghost's
+# opaque bounds must land within 3px of pointer minus the source press offset.
+OUT_X=$(( WIN_W / 2 ))
+OUT_Y=320
+# GPUI captures cursor_offset on the move that crosses its threshold, not on
+# mouse-down, so the 3px arm step belongs to the horizontal offset.
+EXPECTED_X=$(( OUT_X - ARM_OFFSET_X ))
+EXPECTED_Y=$(( OUT_Y - PRESS_OFFSET_Y ))
+xdotool mousemove --sync --window "$WID" "$OUT_X" "$OUT_Y"
+sleep 0.5
+import -window "$WID" /output/beads-board-drag-outside.png
+DRAG_GROUND=$(convert /output/beads-board-drag-outside.png \
+    -format "%[pixel:p{4,68}]" info:)
+[ "$DRAG_GROUND" = "$BOARD_GROUND" ] || fail "hover board closed during card drag"
+DRAG_ROWS=$(latest_rows)
+[ "$DRAG_ROWS" -eq "$BASE_ROWS" ] \
+    || fail "card drag changed terminal rows ($BASE_ROWS -> $DRAG_ROWS)"
+CROP_X=$(( EXPECTED_X - 8 ))
+CROP_Y=$(( EXPECTED_Y - 8 ))
+GHOST_BOUNDS=$(convert /output/beads-board-drag-base.png \
+    /output/beads-board-drag-outside.png -compose difference -composite \
+    -crop "$(( CARD_W + 16 ))x$(( CARD_H + 16 ))+${CROP_X}+${CROP_Y}" +repage \
+    -colorspace Gray -threshold 12% -trim -format '%X,%Y,%w,%h' info:)
+if [[ "$GHOST_BOUNDS" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
+    GHOST_X=$(( CROP_X + BASH_REMATCH[1] ))
+    GHOST_Y=$(( CROP_Y + BASH_REMATCH[2] ))
+    GHOST_W=${BASH_REMATCH[3]} GHOST_H=${BASH_REMATCH[4]}
+else
+    fail "could not measure outside drag ghost (${GHOST_BOUNDS:-empty})"
+fi
+[ "$(( GHOST_X - EXPECTED_X ))" -ge -3 ] \
+    && [ "$(( GHOST_X - EXPECTED_X ))" -le 3 ] \
+    && [ "$(( GHOST_Y - EXPECTED_Y ))" -ge -3 ] \
+    && [ "$(( GHOST_Y - EXPECTED_Y ))" -le 3 ] \
+    && [ "$GHOST_W" -ge "$(( CARD_W - 6 ))" ] \
+    && [ "$GHOST_H" -ge "$(( CARD_H - 6 ))" ] \
+    || fail "ghost ${GHOST_W}x${GHOST_H}+${GHOST_X}+${GHOST_Y}, expected ${CARD_W}x${CARD_H}+${EXPECTED_X}+${EXPECTED_Y} within 3px"
+xdotool mouseup 1
+
+# The release lets the hover overlay close; reopen it for the remaining board
+# controls, which continue from the same baseline.
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.5
+
 # The board's own text-size control: the buttons sit in the strip's top right,
 # plus on the left and minus on its right, and pressing one has to repaint the
 # board rather than only move state.
