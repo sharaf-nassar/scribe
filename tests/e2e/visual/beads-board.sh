@@ -195,6 +195,39 @@ print(rows[-1] if rows else 0)
 PY
 }
 
+# Measure one synchronized native-drag waypoint against pointer minus GPUI's
+# threshold-crossing offset. ImageMagick reports the trimmed delta's `%X/%Y`.
+assert_drag_frame() {
+    local current="$1" pointer_x="$2" pointer_y="$3" label="$4"
+    local expected_x expected_y crop_x crop_y bounds ghost_x ghost_y ghost_w ghost_h rows
+    expected_x=$(( pointer_x - ARM_OFFSET_X ))
+    expected_y=$(( pointer_y - PRESS_OFFSET_Y ))
+    crop_x=$(( expected_x - 8 ))
+    crop_y=$(( expected_y - 8 ))
+    bounds=$(convert /output/beads-board-drag-base.png "$current" \
+        -compose difference -composite \
+        -crop "$(( CARD_W + 16 ))x$(( CARD_H + 16 ))+${crop_x}+${crop_y}" +repage \
+        -colorspace Gray -threshold 12% -trim -format '%X,%Y,%w,%h' info:)
+    if [[ "$bounds" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
+        ghost_x=$(( crop_x + BASH_REMATCH[1] ))
+        ghost_y=$(( crop_y + BASH_REMATCH[2] ))
+        ghost_w=${BASH_REMATCH[3]}
+        ghost_h=${BASH_REMATCH[4]}
+    else
+        fail "could not measure $label drag ghost (${bounds:-empty})"
+    fi
+    [ "$(( ghost_x - expected_x ))" -ge -3 ] \
+        && [ "$(( ghost_x - expected_x ))" -le 3 ] \
+        && [ "$(( ghost_y - expected_y ))" -ge -3 ] \
+        && [ "$(( ghost_y - expected_y ))" -le 3 ] \
+        && [ "$ghost_w" -ge "$(( CARD_W - 6 ))" ] \
+        && [ "$ghost_h" -ge "$(( CARD_H - 6 ))" ] \
+        || fail "$label ghost ${ghost_w}x${ghost_h}+${ghost_x}+${ghost_y}, expected ${CARD_W}x${CARD_H}+${expected_x}+${expected_y} within 3px"
+    rows=$(latest_rows)
+    [ "$rows" -eq "$BASE_ROWS" ] \
+        || fail "$label drag changed terminal rows ($BASE_ROWS -> $rows)"
+}
+
 # The newest workspace the server described that is not $1.
 other_workspace() {
     python3 - "$RECORD" "$1" <<'PY'
@@ -354,6 +387,7 @@ OVER_Y=$(( SOURCE_TOP + PRESS_OFFSET_Y ))
 xdotool mousemove --sync --window "$WID" "$OVER_X" "$OVER_Y"
 sleep 0.25
 import -window "$WID" /output/beads-board-drag-over-cards.png
+assert_drag_frame /output/beads-board-drag-over-cards.png "$OVER_X" "$OVER_Y" over-card
 OVER_CHANGED=$(convert /output/beads-board-drag-base.png \
     /output/beads-board-drag-over-cards.png -compose difference -composite \
     -crop "${CARD_W}x${CARD_H}+${DONE_LEFT}+${SOURCE_TOP}" +repage \
@@ -363,9 +397,11 @@ awk -v changed="$OVER_CHANGED" 'BEGIN { exit !(changed >= 200) }' \
 
 # Backlog is a rejected target. Its bare lower wash must repaint while hovered;
 # the unit contract pins that repaint to the reduced no-drop strength.
-xdotool mousemove --sync --window "$WID" 28 "$PRESS_Y"
+BACKLOG_X=$(( ARM_OFFSET_X + 20 ))
+xdotool mousemove --sync --window "$WID" "$BACKLOG_X" "$PRESS_Y"
 sleep 0.25
 import -window "$WID" /output/beads-board-drag-no-drop.png
+assert_drag_frame /output/beads-board-drag-no-drop.png "$BACKLOG_X" "$PRESS_Y" no-drop
 convert /output/beads-board-drag-base.png \
     -crop "${LANE_W}x8+8+220" +repage /tmp/beads-wash-before.png
 convert /output/beads-board-drag-no-drop.png \
@@ -381,39 +417,13 @@ NO_DROP_CHANGED=${NO_DROP_CHANGED%%.*}
 # opaque bounds must land within 3px of pointer minus the source press offset.
 OUT_X=$(( WIN_W / 2 ))
 OUT_Y=320
-# GPUI captures cursor_offset on the move that crosses its threshold, not on
-# mouse-down, so the 3px arm step belongs to the horizontal offset.
-EXPECTED_X=$(( OUT_X - ARM_OFFSET_X ))
-EXPECTED_Y=$(( OUT_Y - PRESS_OFFSET_Y ))
 xdotool mousemove --sync --window "$WID" "$OUT_X" "$OUT_Y"
 sleep 0.5
 import -window "$WID" /output/beads-board-drag-outside.png
 DRAG_GROUND=$(convert /output/beads-board-drag-outside.png \
     -format "%[pixel:p{4,68}]" info:)
 [ "$DRAG_GROUND" = "$BOARD_GROUND" ] || fail "hover board closed during card drag"
-DRAG_ROWS=$(latest_rows)
-[ "$DRAG_ROWS" -eq "$BASE_ROWS" ] \
-    || fail "card drag changed terminal rows ($BASE_ROWS -> $DRAG_ROWS)"
-CROP_X=$(( EXPECTED_X - 8 ))
-CROP_Y=$(( EXPECTED_Y - 8 ))
-GHOST_BOUNDS=$(convert /output/beads-board-drag-base.png \
-    /output/beads-board-drag-outside.png -compose difference -composite \
-    -crop "$(( CARD_W + 16 ))x$(( CARD_H + 16 ))+${CROP_X}+${CROP_Y}" +repage \
-    -colorspace Gray -threshold 12% -trim -format '%X,%Y,%w,%h' info:)
-if [[ "$GHOST_BOUNDS" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
-    GHOST_X=$(( CROP_X + BASH_REMATCH[1] ))
-    GHOST_Y=$(( CROP_Y + BASH_REMATCH[2] ))
-    GHOST_W=${BASH_REMATCH[3]} GHOST_H=${BASH_REMATCH[4]}
-else
-    fail "could not measure outside drag ghost (${GHOST_BOUNDS:-empty})"
-fi
-[ "$(( GHOST_X - EXPECTED_X ))" -ge -3 ] \
-    && [ "$(( GHOST_X - EXPECTED_X ))" -le 3 ] \
-    && [ "$(( GHOST_Y - EXPECTED_Y ))" -ge -3 ] \
-    && [ "$(( GHOST_Y - EXPECTED_Y ))" -le 3 ] \
-    && [ "$GHOST_W" -ge "$(( CARD_W - 6 ))" ] \
-    && [ "$GHOST_H" -ge "$(( CARD_H - 6 ))" ] \
-    || fail "ghost ${GHOST_W}x${GHOST_H}+${GHOST_X}+${GHOST_Y}, expected ${CARD_W}x${CARD_H}+${EXPECTED_X}+${EXPECTED_Y} within 3px"
+assert_drag_frame /output/beads-board-drag-outside.png "$OUT_X" "$OUT_Y" outside
 xdotool mouseup 1
 
 # The release lets the hover overlay close; reopen it for the remaining board

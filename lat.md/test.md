@@ -1658,6 +1658,21 @@ Together they cover executable discovery, project-root working directory,
 command flags, JSON envelopes, queue classification, detail shapes, and
 rendering without touching the host's Beads database.
 
+#### Card drag writes and pointer isolation
+
+The real-board GPUI path proves accepted and rejected card drops against seeded `bd` state while preserving the terminal pane's exclusive pointer boundary.
+
+Ready to In progress must use native claim and retain actor and lease fields.
+Done must use native close and paint a five-second board-side Undo that restores
+open state without a close timestamp. Backlog to Ready clears a seeded defer;
+an issue secretly blocked after the painted snapshot must land in Blocked and
+paint the classifier-won notice after the authoritative refresh.
+
+Same-lane and derived Backlog drops send no write and leave `bd` unchanged.
+The client remains the `SingleController` owner throughout: xdotool enables
+1003/1006 reporting in its visible pane, and the passive wire tap must record
+none of the card drag's press, motion, or release as SGR `KeyInput` frames.
+
 #### Guarded Beads Write Contract
 
 The network-none functional image proves its patched bd artifact before Scribe may advertise writes.
@@ -3723,9 +3738,10 @@ Backlog and Blocked washes, gate PTY pointer routing from press through
 release, and hold a hover-opened board until that release.
 
 The Docker Beads-board visual moves the native ghost over another card, over a
-rejected lane, and below the board clip. Pixel assertions require the over-card
-repaint, the no-drop wash change, stable terminal rows and hover overlay, and
-an outside ghost origin within 3px of the pointer offset.
+rejected lane, and below the board clip. At every synchronized waypoint,
+ImageMagick `%X/%Y` bounds must place it within 3px of the threshold-crossing
+pointer offset while terminal rows stay unchanged. Pixel assertions also
+require the over-card repaint, no-drop wash, and hover overlay.
 
 Drop coverage runs every Backlog, Ready, and In-progress source against all
 five targets. It requires rejected and same-lane drops to queue nothing, and
