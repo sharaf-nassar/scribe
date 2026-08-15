@@ -34,6 +34,7 @@ use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
 };
+use scribe_client::beads_panel::{self, BeadsPanelRender, BeadsPanels};
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client::ci_bar::{self, CiBarColors, CiBarModel, CiRunBars};
@@ -663,6 +664,8 @@ struct Shared {
     remote: Arc<Mutex<RemoteChrome>>,
     /// Server-owned Beads snapshots plus this window's hover/pin intent.
     beads_boards: Arc<Mutex<BeadsBoards>>,
+    /// Read-only issue panels and their parked detail requests.
+    beads_panels: Arc<Mutex<BeadsPanels>>,
 }
 
 /// State shared across the IPC reader and GPUI view for a fresh window's first
@@ -7970,6 +7973,12 @@ impl TerminalView {
         if self.share_prompt_pending() && self.run_share_key(event, cx) {
             return true;
         }
+        if event.keystroke.key == "escape"
+            && self.shared.beads_panels.lock().is_ok_and(|mut panels| panels.dismiss_latest())
+        {
+            cx.notify();
+            return true;
+        }
         let overlay_free = self.dialog.is_none()
             && self.find_overlay.is_none()
             && !self.remote_connect.is_active();
@@ -8974,6 +8983,7 @@ impl TerminalView {
         // it belongs in the grid band with them rather than in a window-wide
         // band that would span every region.
         let beads_boards = self.render_beads_boards(cx);
+        let beads_panels = self.render_beads_panels(cx);
         div()
             .flex_1()
             .relative()
@@ -8983,6 +8993,7 @@ impl TerminalView {
             .children(region_bars)
             .children(ci_bars)
             .children(beads_boards)
+            .children(beads_panels)
             // Dividers paint last, over panes, region bars, and boards alike:
             // a region divider runs the full height of the split, so two
             // regions with boards open must still read as two regions.
@@ -9051,6 +9062,21 @@ impl TerminalView {
     fn sync_beads_board_strips(&mut self, cx: &App) {
         let live = self.shell.region_workspaces(cx);
         let mut copied = None;
+        let mut panel_copy = None;
+        let mut detail_requests = Vec::new();
+        let panel_workspaces = self
+            .shared
+            .beads_panels
+            .lock()
+            .map(|mut panels| {
+                panels.retain_regions(&live);
+                panel_copy = panels.take_copy();
+                while let Some(request) = panels.take_request() {
+                    detail_requests.push(request);
+                }
+                panels.workspaces()
+            })
+            .unwrap_or_default();
         let mut strips = HashMap::new();
         self.visible_beads_boards = self
             .shared
@@ -9059,7 +9085,8 @@ impl TerminalView {
             .map(|mut boards| {
                 boards.retain_regions(&live);
                 copied = boards.take_copy();
-                let visible = boards.visible();
+                let mut visible = boards.visible();
+                include_open_panel_boards(&mut visible, &panel_workspaces, &boards);
                 strips = visible
                     .iter()
                     .filter(|(_, pinned)| *pinned)
@@ -9072,6 +9099,14 @@ impl TerminalView {
         // reach the window's clipboard handle, so the copy lands here.
         if let Some(text) = copied {
             self.write_clipboard(text);
+        }
+        if let Some(text) = panel_copy {
+            self.write_clipboard(text);
+        }
+        for (workspace_id, issue_id) in detail_requests {
+            if let Err(error) = self.sink.request_beads_issue_detail(workspace_id, issue_id) {
+                tracing::debug!(%error, "Beads issue detail request dropped");
+            }
         }
         self.shell.set_pinned_boards(strips);
     }
@@ -9304,6 +9339,7 @@ impl TerminalView {
                             rect,
                             overlay: !pinned,
                             hover_state: Arc::clone(&self.shared.beads_boards),
+                            panel_state: Arc::clone(&self.shared.beads_panels),
                             workspace_id: *workspace_id,
                             scale,
                             colors,
@@ -9324,6 +9360,48 @@ impl TerminalView {
                 ))
             })
             .flat_map(|(board, grip)| [board, grip])
+            .collect()
+    }
+
+    fn render_beads_panels(&self, cx: &App) -> Vec<gpui::AnyElement> {
+        let open = self
+            .shared
+            .beads_panels
+            .lock()
+            .map(|panels| {
+                panels
+                    .workspaces()
+                    .into_iter()
+                    .filter_map(|workspace_id| {
+                        panels.visible(workspace_id).cloned().map(|panel| (workspace_id, panel))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
+        let viewport = self.pane_viewport();
+        open.into_iter()
+            .flat_map(|(workspace_id, panel)| {
+                let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
+                    return Vec::new();
+                };
+                let Some(board) =
+                    self.shell.board_rect(workspace_id, boards.height(workspace_id), viewport, cx)
+                else {
+                    return Vec::new();
+                };
+                beads_panel::render(
+                    &panel,
+                    &BeadsPanelRender {
+                        region,
+                        board,
+                        workspace_id,
+                        state: Arc::clone(&self.shared.beads_panels),
+                        scale: boards.text_scale(),
+                        colors: self.beads_colors,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -9851,6 +9929,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
         beads_boards: Arc::new(Mutex::new(BeadsBoards::default())),
+        beads_panels: Arc::new(Mutex::new(BeadsPanels::default())),
     };
     let (out_tx, out_rx) = outbound_channel();
     let (in_tx, in_rx) = inbound_channel();
@@ -11284,6 +11363,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         clipboard: Arc::clone(&ctx.shared.clipboard),
         remote: Arc::clone(&ctx.shared.remote),
         beads_boards: Arc::clone(&ctx.shared.beads_boards),
+        beads_panels: Arc::clone(&ctx.shared.beads_panels),
         out_tx: ctx.out_tx.clone(),
         in_tx: ctx.in_tx.clone(),
         sink: ctx.sink.clone(),
@@ -11798,6 +11878,8 @@ struct ReaderCtx {
     remote: Arc<Mutex<RemoteChrome>>,
     /// Beads-board states written by the reader and painted by the window.
     beads_boards: Arc<Mutex<BeadsBoards>>,
+    /// Beads issue detail panels written by the reader and painted by the window.
+    beads_panels: Arc<Mutex<BeadsPanels>>,
     out_tx: OutboundSender,
     in_tx: InboundSender,
     sink: IpcSink,
@@ -12199,6 +12281,18 @@ fn request_beads_board_or_log(sink: &IpcSink, workspace_id: WorkspaceId, reason:
     }
 }
 
+fn include_open_panel_boards(
+    visible: &mut Vec<(WorkspaceId, bool)>,
+    panel_workspaces: &[WorkspaceId],
+    boards: &BeadsBoards,
+) {
+    for workspace_id in panel_workspaces {
+        if !visible.iter().any(|(visible_id, _)| visible_id == workspace_id) {
+            visible.push((*workspace_id, boards.is_pinned(*workspace_id)));
+        }
+    }
+}
+
 /// Drop an exited session from the registry, the AI chrome, and the tab strip.
 ///
 /// Split out of [`dispatch_server_message`] so the dispatch table reads as one
@@ -12424,6 +12518,12 @@ async fn dispatch_server_message(
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     request_beads_board_or_log(&sink, workspace_id, "loading retry");
                 });
+            }
+        }
+        ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail } => {
+            if let Ok(mut panels) = ctx.beads_panels.lock() {
+                panels.update(workspace_id, &issue_id, detail);
+                ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
         // The four provider task-label notices all land in the tab strip's
@@ -13394,7 +13494,12 @@ fn on_welcome(
     welcome: ServerMessage,
 ) {
     let ServerMessage::Welcome {
-        window_id, other_windows, participant_id, clipboard_gating, ..
+        window_id,
+        other_windows,
+        participant_id,
+        clipboard_gating,
+        beads_detail,
+        ..
     } = welcome
     else {
         return;
@@ -13414,6 +13519,9 @@ fn on_welcome(
     // refuse to act on a frame that arrived without a negotiated capability.
     if let Ok(mut bridge) = ctx.clipboard.lock() {
         bridge.set_gating(clipboard_gating);
+    }
+    if let Ok(mut panels) = ctx.beads_panels.lock() {
+        panels.set_enabled(beads_detail);
     }
     tracing::info!(
         adopted = ?registry.adopted_window(),

@@ -24,14 +24,13 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 73
-counts modules-wired 73
+counts modules-total 74
+counts modules-wired 74
 counts server-messages-total 66
-counts server-messages-handled 59
+counts server-messages-handled 60
 counts layout-actions-total 37
 counts layout-actions-handled 37
 
-unhandled-server-message BeadsIssueDetail
 unhandled-server-message BeadsIssueWriteResult
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList

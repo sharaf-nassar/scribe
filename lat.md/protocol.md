@@ -133,6 +133,8 @@ vanished issue from a successful read.
 bounded record: text fields, labels, people, lifecycle dates, related issues,
 the newest 50 comments and hidden count, plus the server-selected queue and
 [[crates/scribe-common/src/protocol.rs#BeadsIssueQueueBasis|selection basis]].
+The optional parent-epic title comes from the same response's `parent-child`
+dependency, so rendering the panel head needs no additional `bd` process.
 Timestamps stay as the ISO-8601 text returned by `bd`; the protocol does not
 need another date parser to preserve them.
 
@@ -220,7 +222,8 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 
 Remote, shared, viewer, displaced, and foreign-root requests are rejected. An
 older server omitting the field decodes it as `false`, so the client keeps the
-existing read-only board.
+existing read-only board. The client latches the bit before accepting card
+opens and clears any open panel if a later `Welcome` removes the capability.
 
 #### Beads write capability defaults safely
 

@@ -568,6 +568,14 @@ fn parse_issue_detail(bytes: &[u8], ready: bool) -> Result<BeadsIssueDetail, Str
         });
     let (queue, queue_basis) =
         classify_issue(&issue.status, QueueSignals { has_open_blockers, ready });
+    let parent_epic_name = issue
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.dependency_type == "parent-child")
+        .and_then(|dependency| {
+            (!dependency.title.is_empty())
+                .then(|| truncate_bytes(&dependency.title, MAX_TITLE_CHARS))
+        });
 
     let blockers = bounded_links(
         issue
@@ -609,6 +617,7 @@ fn parse_issue_detail(bytes: &[u8], ready: bool) -> Result<BeadsIssueDetail, Str
             .take(MAX_DETAIL_COLLECTION_ITEMS)
             .map(|label| truncate_bytes(&label, MAX_TITLE_CHARS))
             .collect(),
+        parent_epic_name,
         assignee: bounded_option(issue.assignee, MAX_TITLE_CHARS),
         owner: bounded_option(issue.owner, MAX_TITLE_CHARS),
         created_at: truncate_bytes(&issue.created_at, MAX_TITLE_CHARS),
@@ -915,12 +924,21 @@ mod tests {
             "owner": "owner",
             "created_at": "2026-08-14T10:00:00Z",
             "updated_at": "2026-08-15T10:00:00Z",
-            "dependencies": [{
-                "depends_on_id": "gate",
-                "title": "Gate",
-                "status": "closed",
-                "dependency_type": "blocks"
-            }],
+            "parent": "epic",
+            "dependencies": [
+                {
+                    "depends_on_id": "gate",
+                    "title": "Gate",
+                    "status": "closed",
+                    "dependency_type": "blocks"
+                },
+                {
+                    "depends_on_id": "epic",
+                    "title": "Card detail epic",
+                    "status": "open",
+                    "dependency_type": "parent-child"
+                }
+            ],
             "dependents": [{"id": "child", "title": "Child"}],
             "comments": []
         })
@@ -938,6 +956,7 @@ mod tests {
         for data in shapes {
             let detail = parse_issue_detail(&detail_envelope(&data), false).expect("parse detail");
             assert_eq!(detail.id, "scribe-42");
+            assert_eq!(detail.parent_epic_name.as_deref(), Some("Card detail epic"));
             assert_eq!(detail.dependents[0].id, "child");
         }
     }

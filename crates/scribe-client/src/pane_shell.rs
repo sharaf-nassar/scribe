@@ -521,6 +521,22 @@ impl PaneShell {
             .map(|content| Rect { height: height.min(content.height), ..content })
     }
 
+    /// Full region bounds used to clamp workspace-owned overlays.
+    pub fn workspace_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        viewport: Rect,
+        cx: &App,
+    ) -> Option<Rect> {
+        self.workspace
+            .read(cx)
+            .layout()
+            .compute_workspace_rects(viewport)
+            .into_iter()
+            .find(|(id, _)| *id == workspace_id)
+            .map(|(_, rect)| rect)
+    }
+
     /// The tab-bar strip each lower region reserves at its top, in region
     /// left-to-right, top-to-bottom order.
     pub fn region_bar_rects(&self, viewport: Rect, cx: &App) -> Vec<(WorkspaceId, Rect)> {

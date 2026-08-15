@@ -347,6 +347,9 @@ pub struct BeadsIssueDetail {
     pub priority: u8,
     pub issue_type: String,
     pub labels: Vec<String>,
+    /// Parent epic title resolved by the server from the `parent-child` relation.
+    #[serde(default)]
+    pub parent_epic_name: Option<String>,
     pub assignee: Option<String>,
     pub owner: Option<String>,
     /// ISO-8601 timestamp from `bd`, kept verbatim.
@@ -2157,6 +2160,7 @@ mod tests {
             priority: 1,
             issue_type: "task".into(),
             labels: vec!["protocol".into(), "beads".into()],
+            parent_epic_name: Some("Beads card detail".into()),
             assignee: Some("mamba".into()),
             owner: Some("maintainer".into()),
             created_at: "2026-08-14T18:00:00Z".into(),

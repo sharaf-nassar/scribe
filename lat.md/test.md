@@ -1625,7 +1625,7 @@ The functional image uses Beads v1.1.0 to prove rooted workspace refresh and com
 
 The board omits the seeded epic as a standalone card while its child keeps the epic title as metadata, and queue totals count only non-epic issues.
 
-The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
+The same repository has deterministic epic, blocker, dependent, closed, and deferred issues. Its detailed issue carries every editable text field and two ordered comments. Real `bd show --json --include-comments --include-dependents` replies must expose the parent id and title through the `parent-child` relation and preserve those fields, relation ids, comment bodies and authors, close reason, and defer date. This covers executable discovery, project-root working directory, command flags, JSON envelopes, queue classification, and detail shapes without touching the host's Beads database.
 
 ### AI Shell Environment Matrix
 
@@ -1789,11 +1789,23 @@ Screenshots are taken full-screen because a Vulkan surface may not be readable p
 
 ### Beads card-detail fixtures
 
-`just e2e-visual-beads-detail-fixtures` proves the complete detail fixture matrix is accepted by the existing visual wire tap.
+`just e2e-visual-beads-detail-fixtures` proves a clicked board card requests and renders the comment-clamped detail fixture.
 
-`tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages: a loading board plus closed, blocked, comment-clamped, and hidden-count detail replies. The script substitutes only the live workspace id before sending each record through `scribe-test share-inject` under `--network none`.
+`tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages: a loading board plus closed, blocked, comment-clamped, and hidden-count detail replies. The script substitutes the live workspace id and refresh time before sending records through `scribe-test share-inject` under `--network none`.
 
-The loading message paints its five-card board. The four detail replies must decode and reach the current client's explicit unhandled-message receipt, with no share-tap decode warning. Detail rendering is not claimed before its client wiring exists; scribe-5wh1.4 and scribe-5wh1.5 consume these same fixtures for panel screenshots.
+The loading message paints its five-card board. The script clicks the Backlog
+card, requires `RequestBeadsIssueDetail` on the wire tap, injects the matching
+reply, and rejects any dropped detail message. Its screenshot requires the
+560px panel to start 12px from the region edge and 4px below the board, then
+checks the full head, queue, body, dependency, comment, dependent, and status
+anatomy. The current comment remains two lines while the older comment remains
+one ellipsized line.
+
+Rust build-model tests cover the complete anatomy, omission of every sparse
+section, closed facts without verbs, blocked upstream-node count, hidden-count
+line, viewer read-only verbs, and the board palette's 4.5:1 panel-text floor.
+The renderer consumes that model, so these checks exercise production section
+selection rather than a parallel fixture description.
 
 ### Shared-pane rig
 

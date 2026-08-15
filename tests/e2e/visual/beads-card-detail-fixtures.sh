@@ -55,7 +55,7 @@ import -window "$WID" /output/beads-detail-before.png
 # Each fixture is already a complete ServerMessage. The runtime workspace id is
 # the only substitution. Loading sends a board and withholds the detail reply.
 DETAIL_MESSAGES=$(python3 - /tests/fixtures/beads-card-detail.json "$WORKSPACE" <<'PY'
-import json, sys
+import json, sys, time
 
 with open(sys.argv[1]) as handle:
     fixtures = json.load(handle)
@@ -66,6 +66,8 @@ if names != expected:
 for fixture in fixtures:
     message = fixture["message"]
     message["workspace_id"] = sys.argv[2]
+    if message["type"] == "BeadsBoard":
+        message["state"]["Ready"]["snapshot"]["refreshed_at_epoch_ms"] = int(time.time() * 1000)
     print(f'{fixture["name"]}\t{json.dumps(message, separators=(",", ":"))}')
 PY
 )
@@ -80,15 +82,20 @@ done <<<"$DETAIL_MESSAGES"
 DETAIL_DROPS_AFTER=$(grep -c \
     'server message not wired into the GPUI client.*BeadsIssueDetail' \
     "$CLIENT_LOG" 2>/dev/null || true)
-[ "$(( DETAIL_DROPS_AFTER - DETAIL_DROPS_BEFORE ))" -eq 4 ] \
-    || fail "share-inject decoded $(( DETAIL_DROPS_AFTER - DETAIL_DROPS_BEFORE )) of 4 detail fixtures"
+[ "$(( DETAIL_DROPS_AFTER - DETAIL_DROPS_BEFORE ))" -eq 0 ] \
+    || fail "client dropped $(( DETAIL_DROPS_AFTER - DETAIL_DROPS_BEFORE )) handled detail fixtures"
 if grep -q 'could not decode an injection' /output/share-tap.log; then
     fail "share-tap rejected a card-detail fixture"
 fi
 
-# The loading variant's board is handled today. Hovering its badge must reveal
-# the five fixture cards. Detail messages remain intentionally unwired until
-# the panel tasks replace the receipt oracle above with panel screenshots.
+# The real no-project reply may race the matrix above, so restore the fixture
+# board immediately before the pointer sequence that consumes it.
+LOADING_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
+    $1 == "loading" { sub(/^[^\t]*\t/, ""); print; exit }
+')
+[ -n "$LOADING_MESSAGE" ] || fail "loading fixture missing"
+inject "$LOADING_MESSAGE"
+# Hovering its badge must reveal the five fixture cards.
 xdotool mousemove --sync --window "$WID" 66 17
 sleep 0.5
 import -window "$WID" /output/beads-detail-loading.png
@@ -98,4 +105,49 @@ LOADING_DIFF=${LOADING_DIFF%%.*}
 [ "${LOADING_DIFF:-0}" -ge 10000 ] \
     || fail "loading fixture board changed only ${LOADING_DIFF:-0}px"
 
-echo "PASS: loading board rendered and 4 card-detail variants decoded through share-inject"
+# Open the first Backlog card, then answer its request with the matching detail.
+# The recovered mock fixes the collapsed thread at two lines for the newest
+# comment and one line for every older comment; unit coverage pins those line
+# limits while this capture proves the panel is actually lowered in the window.
+COMMENT_MESSAGE=$(printf '%s\n' "$DETAIL_MESSAGES" | awk -F '\t' '
+    $1 == "comment-clamped" { sub(/^[^\t]*\t/, ""); print; exit }
+')
+[ -n "$COMMENT_MESSAGE" ] || fail "comment-clamped fixture missing"
+xdotool mousemove --sync --window "$WID" 80 84
+xdotool click 1
+sleep 0.3
+inject "$COMMENT_MESSAGE"
+sleep 0.5
+import -window "$WID" /output/beads-detail-comment-clamped.png
+PANEL_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
+    /output/beads-detail-comment-clamped.png null: 2>&1 || true)
+PANEL_DIFF=${PANEL_DIFF%%.*}
+[ "${PANEL_DIFF:-0}" -ge 30000 ] \
+    || fail "detail panel changed only ${PANEL_DIFF:-0}px"
+read -r PANEL_W PANEL_H PANEL_X PANEL_Y <<<"$(convert \
+    /output/beads-detail-loading.png /output/beads-detail-comment-clamped.png \
+    -compose difference -composite -crop "600x400+0+231" +repage \
+    -threshold 10% -trim -format '%w %h %X %Y' info:)"
+[ "$PANEL_W" -eq 560 ] && [ "$PANEL_X" = "+12" ] && [ "$PANEL_Y" = "+4" ] \
+    || fail "panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}, expected 560px wide at +12+4"
+[ "$PANEL_H" -ge 250 ] \
+    || fail "panel anatomy collapsed to ${PANEL_H}px high"
+
+python3 - "$RECORD" <<'PY' || fail "card click sent no detail request"
+import json, sys
+
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if (row.get("dir") == "client"
+                and message.get("type") == "RequestBeadsIssueDetail"
+                and message.get("issue_id") == "detail-comment-clamped"):
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+
+echo "PASS: card detail messages handled and comment-clamped panel rendered"

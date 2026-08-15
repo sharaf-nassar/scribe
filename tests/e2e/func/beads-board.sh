@@ -93,6 +93,8 @@ for expected in \
     '"estimated_minutes": 90' \
     '"external_ref": "fixture://beads-card-detail"' \
     '"parent": "e2e-epic"' \
+    '"title": "Card detail epic"' \
+    '"dependency_type": "parent-child"' \
     '"id": "e2e-blocker"' \
     '"id": "e2e-dependent"' \
     '"author": "Fixture Author"' \

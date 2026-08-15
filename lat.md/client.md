@@ -948,7 +948,9 @@ object, one-element array, and wrapped `issues` payloads. It caps text fields
 at 64 KiB, returns the newest 50 comments in newest-first order with an
 omitted count, and uses exact ready membership with the board's queue
 precedence for the queue and basis fields. A missing issue becomes the typed
-empty detail response. Other command or schema failures remain errors.
+empty detail response. Parent-epic titles are resolved from the returned
+`parent-child` dependency without another command. Other command or schema
+failures remain errors.
 
 Every command also runs *in* the project root, not only with `-C` pointing at
 it: `bd context` resolves the repository through git in its own working
@@ -991,6 +993,24 @@ workspace label's existing click behavior. Hover opens the board over the
 terminal; clicking pins the same fixed-height board above the terminal across
 that workspace's tabs. A focused pinned board refreshes every 60 seconds;
 hidden boards do not poll.
+
+When `Welcome.beads_detail` is enabled, clicking a card opens a read-only panel
+immediately and parks one workspace-scoped detail request. The panel remains
+under its source lane, clamps within the workspace, reaches at most 70% of the
+region height, and scrolls internally. Its backdrop, close mark, and Esc all
+dismiss it; panel state and replies are keyed by workspace and issue id so
+neighbouring regions cannot consume each other's response. A missing or later
+disabled capability leaves the existing board unchanged.
+
+The panel follows `.impeccable/mocks/beads-card-detail.html`: a full-bleed
+identity head, derived queue row, dependency spine, sparse body fields,
+newest-first comments, dependents, and inert read-only status rail. Theme
+slots supply every colour. The newest collapsed comment gets two lines and
+each older collapsed comment gets one; clicking one expands it in place. A
+data-derived presentation model owns sparse-section presence, upstream and
+hidden-comment counts, and inert verbs; closed details retain close facts but
+omit verbs. Queue words are lifted through the board palette's body-text
+contrast solver before they paint on the card surface.
 
 The board takes its structure, sizes, and weights from
 `.impeccable/mocks/beads-compact-live-overview.html` while

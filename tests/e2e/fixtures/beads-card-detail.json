@@ -83,6 +83,7 @@
         "priority": 2,
         "issue_type": "task",
         "labels": ["beads", "client"],
+        "parent_epic_name": "Card detail panel",
         "assignee": "fixture-owner",
         "owner": "fixture-author",
         "created_at": "2026-08-10T09:00:00Z",
@@ -128,6 +129,7 @@
         "priority": 0,
         "issue_type": "feature",
         "labels": ["blocked", "beads"],
+        "parent_epic_name": "Card detail panel",
         "assignee": null,
         "owner": "fixture-author",
         "created_at": "2026-08-11T10:00:00Z",
@@ -170,6 +172,7 @@
         "priority": 2,
         "issue_type": "task",
         "labels": ["comments"],
+        "parent_epic_name": "Card detail panel",
         "assignee": "fixture-owner",
         "owner": "fixture-author",
         "created_at": "2026-08-12T11:00:00Z",
@@ -187,6 +190,11 @@
             "author": "Fixture Reviewer",
             "created_at": "2026-08-15T05:19:00Z",
             "body": "This deterministic comment is long enough to wrap across several panel lines. It names the exact folded behavior under review and continues with stable copy so expansion produces an obvious geometry change without depending on generated text or wall-clock data."
+          },
+          {
+            "author": "Fixture Author",
+            "created_at": "2026-08-14T18:00:00Z",
+            "body": "This older deterministic comment is also deliberately long. Its collapsed presentation stays on one line while the newest comment above keeps two, matching the approved mock annotation."
           }
         ],
         "hidden_comment_count": 0,
@@ -213,6 +221,7 @@
         "priority": 3,
         "issue_type": "task",
         "labels": ["comments", "limits"],
+        "parent_epic_name": "Card detail panel",
         "assignee": null,
         "owner": "fixture-author",
         "created_at": "2026-08-13T12:00:00Z",

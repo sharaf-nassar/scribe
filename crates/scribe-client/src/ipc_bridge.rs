@@ -1261,6 +1261,15 @@ impl IpcSink {
         })
     }
 
+    /// Ask for one uncached Beads issue detail record.
+    pub fn request_beads_issue_detail(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_id: String,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id })
+    }
+
     /// Asks the server to terminate `session_id`, backing the `close_tab`
     /// shortcut. The tab leaves the strip once `SessionExited` arrives.
     ///

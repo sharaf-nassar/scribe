@@ -8,6 +8,7 @@ use gpui::{
     linear_gradient, prelude::*, px, uniform_list,
 };
 
+use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
 use scribe_common::ids::WorkspaceId;
@@ -445,6 +446,11 @@ impl BeadsBoardColors {
         readable(state, Rgba { a: 1.0, ..self.ground }, BODY_CONTRAST)
     }
 
+    /// Lift a queue state from mark contrast to body-text contrast on a panel.
+    pub(crate) fn panel_state_ink(&self, state: Rgba) -> Rgba {
+        readable(state, self.card, BODY_CONTRAST)
+    }
+
     fn priority(&self, priority: u8) -> Rgba {
         self.priorities.get(usize::from(priority)).copied().unwrap_or(self.muted)
     }
@@ -499,7 +505,7 @@ fn vividness(color: Rgba) -> f32 {
 /// and the lower one a dot, a chevron, or a hairline-thin mark needs. The text
 /// floor is WCAG AA for body text; marks carry no reading load, so holding
 /// them to it would only wash the queue colours out.
-const BODY_CONTRAST: f32 = 4.5;
+pub(crate) const BODY_CONTRAST: f32 = 4.5;
 const MARK_CONTRAST: f32 = 3.0;
 
 const RED: usize = 1;
@@ -611,6 +617,7 @@ pub struct BeadsBoardRender {
     /// region already reserved for it.
     pub overlay: bool,
     pub hover_state: std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    pub panel_state: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     pub workspace_id: WorkspaceId,
     /// Text scale shared by every board in this window.
     pub scale: f32,
@@ -620,6 +627,7 @@ pub struct BeadsBoardRender {
 
 /// One queue's column, as the mock lays it out.
 struct Lane<'a> {
+    index: u8,
     name: &'static str,
     /// What this queue says when it holds nothing. Written per queue because
     /// an empty one means something different in each: no work waiting, none
@@ -637,6 +645,13 @@ struct Lane<'a> {
     blend: LaneBlend,
     /// In progress is the lane the eye should land on.
     accent: LaneAccent,
+}
+
+/// Shared stores lane builders need after the snapshot borrow ends.
+#[derive(Clone, Copy)]
+struct BoardStores<'a> {
+    boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -663,7 +678,8 @@ pub fn render(
     state: Option<&BeadsBoardState>,
     wiring: BeadsBoardRender,
 ) -> AnyElement {
-    let BeadsBoardRender { rect, overlay, hover_state, workspace_id, scale, colors } = wiring;
+    let BeadsBoardRender { rect, overlay, hover_state, panel_state, workspace_id, scale, colors } =
+        wiring;
     let colors = &colors;
     // The rect is the strip the region gave the board, already clamped to what
     // that region has: painting to it rather than to a height of its own is
@@ -693,7 +709,13 @@ pub fn render(
         })
         .child(text_size_controls(&hover_state, workspace_id, colors));
     let board = match snapshot {
-        Some(snapshot) => board.child(lanes(snapshot, workspace_id, &hover_state, colors, metrics)),
+        Some(snapshot) => board.child(lanes(
+            snapshot,
+            workspace_id,
+            BoardStores { boards: &hover_state, panels: &panel_state },
+            colors,
+            metrics,
+        )),
         // The mock draws no empty, loading, or unavailable state, so those keep
         // the one line of copy the board has always shown for them.
         None => board.child(
@@ -818,12 +840,13 @@ fn scale_button(
 fn lanes(
     snapshot: &BeadsBoardSnapshot,
     workspace_id: WorkspaceId,
-    state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    stores: BoardStores<'_>,
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
     let mut specs = [
         Lane {
+            index: 0,
             name: "Backlog",
             empty: "Empty",
             total: snapshot.backlog_total,
@@ -834,6 +857,7 @@ fn lanes(
             accent: LaneAccent::None,
         },
         Lane {
+            index: 1,
             name: "Ready",
             empty: "None ready",
             total: snapshot.ready_total,
@@ -844,6 +868,7 @@ fn lanes(
             accent: LaneAccent::None,
         },
         Lane {
+            index: 2,
             name: "In progress",
             empty: "Idle",
             total: snapshot.in_progress_total,
@@ -854,6 +879,7 @@ fn lanes(
             accent: LaneAccent::Progress,
         },
         Lane {
+            index: 3,
             name: "Blocked",
             empty: "Clear",
             total: snapshot.blocked_total,
@@ -864,6 +890,7 @@ fn lanes(
             accent: LaneAccent::None,
         },
         Lane {
+            index: 4,
             name: "Done",
             empty: "None yet",
             total: snapshot.done_total,
@@ -891,7 +918,7 @@ fn lanes(
         .px(px(8.0))
         .pb(px(7.0))
         .child(rail(colors, metrics))
-        .children(specs.iter().map(|spec| lane(spec, workspace_id, state, colors, metrics)))
+        .children(specs.iter().map(|spec| lane(spec, workspace_id, stores, colors, metrics)))
         .into_any_element()
 }
 
@@ -929,7 +956,7 @@ fn rail_segment(from: Rgba, to: Rgba) -> AnyElement {
 fn lane(
     spec: &Lane<'_>,
     workspace_id: WorkspaceId,
-    state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    stores: BoardStores<'_>,
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
@@ -943,7 +970,7 @@ fn lane(
         // sharing one ground.
         .child(lane_wash(spec))
         .child(lane_head(spec, colors, metrics))
-        .child(lane_body(spec, workspace_id, state, colors, metrics))
+        .child(lane_body(spec, workspace_id, stores, colors, metrics))
         .into_any_element()
 }
 
@@ -1085,7 +1112,7 @@ fn lane_head(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> An
 fn lane_body(
     spec: &Lane<'_>,
     workspace_id: WorkspaceId,
-    state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    stores: BoardStores<'_>,
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
@@ -1102,8 +1129,10 @@ fn lane_body(
     // is gone, so it re-reads this queue from the shared state; an index that
     // outlives its snapshot resolves to nothing rather than to a stale card.
     let queue = spec.queue;
-    let closure_state = std::sync::Arc::clone(state);
+    let closure_state = std::sync::Arc::clone(stores.boards);
+    let closure_panels = std::sync::Arc::clone(stores.panels);
     let closure_colors = *colors;
+    let lane_index = spec.index;
     div()
         .relative()
         .h(px(metrics.body()))
@@ -1128,6 +1157,8 @@ fn lane_body(
                                 CardContext {
                                     workspace_id,
                                     state: &closure_state,
+                                    panels: &closure_panels,
+                                    lane: lane_index,
                                     colors: &closure_colors,
                                     metrics,
                                 },
@@ -1177,9 +1208,14 @@ fn empty_lane(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> A
 /// One issue as a raised card: a gradient fill under a hairline, with the
 /// title's own line above its metadata.
 fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
-    let CardContext { colors, metrics, .. } = card;
+    let CardContext { workspace_id, panels, lane, colors, metrics, .. } = card;
+    let panels = std::sync::Arc::clone(panels);
+    let selected = item.clone();
     let mark = colors.priority_mark(item.priority);
     div()
+        .id(SharedString::from(format!("beads-card-{workspace_id}-{}", item.id)))
+        .role(Role::Button)
+        .aria_label(format!("Open issue {}", item.id))
         .h(metrics.at(ISSUE_HEIGHT - CARD_GAP))
         .flex_none()
         .relative()
@@ -1203,6 +1239,14 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
                 ))
                 .border_color(colors.card_border_hover)
                 .shadow_xs()
+        })
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            if let Ok(mut panels) = panels.lock() {
+                panels.open(workspace_id, selected.clone(), lane);
+            }
+            window.refresh();
         })
         .flex()
         .flex_col()
@@ -1253,7 +1297,7 @@ fn issue_title(item: &BeadsBoardItem, mark: PriorityMark, card: CardContext<'_>)
 
 /// The id at the left of the card's second line and the epic at its right.
 fn issue_meta(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
-    let CardContext { workspace_id, state, colors, metrics } = card;
+    let CardContext { workspace_id, state, colors, metrics, .. } = card;
     div()
         .h(metrics.at(12.0))
         .flex()
@@ -1290,6 +1334,8 @@ fn issue_meta(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
 struct CardContext<'a> {
     workspace_id: WorkspaceId,
     state: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    lane: u8,
     colors: &'a BeadsBoardColors,
     metrics: Metrics,
 }
@@ -1373,7 +1419,7 @@ fn short_id(id: &str) -> &str {
 /// beneath it were each tried in front of the name, and none of them said
 /// anything the hue was not already saying.
 fn epic_label(name: &str, issue_id: &str, card: CardContext<'_>) -> AnyElement {
-    let CardContext { workspace_id, state, colors, metrics } = card;
+    let CardContext { workspace_id, state, colors, metrics, .. } = card;
     div()
         // Sized by its own content, so the spacer before it decides where it
         // sits: the row's right edge.
@@ -1466,7 +1512,7 @@ fn mix(from: Rgba, to: Rgba, amount: f32) -> Rgba {
 }
 
 /// WCAG contrast ratio between two opaque colours.
-fn contrast(a: Rgba, b: Rgba) -> f32 {
+pub(crate) fn contrast(a: Rgba, b: Rgba) -> f32 {
     let (high, low) = {
         let (a, b) = (luminance(a), luminance(b));
         if a >= b { (a, b) } else { (b, a) }
