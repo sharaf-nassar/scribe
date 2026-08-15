@@ -1635,13 +1635,7 @@ mod tests {
         let scratch = beads_test_scratch_path("write-timeout");
         fs::create_dir_all(&scratch).expect("create scratch root");
         let child_pid = scratch.join("child.pid");
-        let fake = scratch.join("bd");
-        fs::write(
-            &fake,
-            format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", child_pid.display()),
-        )
-        .expect("write fake bd");
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod fake bd");
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bd-write-timeout.sh");
         let bd = Bd { exe: fake, search_path: None };
 
         let error = invoke_bd(
