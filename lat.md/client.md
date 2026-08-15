@@ -1053,8 +1053,8 @@ and commit the editor back to the terminal.
 Every visible write control enters the same guarded queue and waits for authoritative detail before repainting persisted values.
 
 [[crates/scribe-client/src/beads_panel.rs#priority_pick_row]] offers P0 through
-P4. [[crates/scribe-client/src/beads_panel.rs#type_pick_row]] uses the pinned
-build's complete built-in type list. Labels remain inline text;
+P4. [[crates/scribe-client/src/beads_panel.rs#type_pick_row]] uses the official
+CLI's built-in type list. Labels remain inline text;
 [[crates/scribe-client/src/beads_panel.rs#parse_labels]] splits comma or
 whitespace input and removes repeats while keeping first-seen order.
 

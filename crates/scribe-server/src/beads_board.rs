@@ -5,16 +5,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
@@ -35,7 +36,6 @@ const MAX_DETAIL_FIELD_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_COMMENTS: usize = 50;
 const MAX_DETAIL_COLLECTION_ITEMS: usize = 200;
 const BD_JSON_SCHEMA_VERSION: u64 = 1;
-const GUARDED_BD_BUILD: &str = "scribe-guards-7505e173f265";
 const SYSTEM_BD_DIRS: [&str; 9] = [
     "/opt/homebrew/bin",
     "/opt/homebrew/opt/beads/bin",
@@ -52,7 +52,6 @@ const SYSTEM_BD_DIRS: [&str; 9] = [
 #[derive(Debug, Clone, Default)]
 pub struct BeadsBoardCache {
     entries: Arc<Mutex<HashMap<PathBuf, CacheEntry>>>,
-    write_capability: Arc<OnceCell<bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -63,7 +62,21 @@ struct CacheEntry {
     last_error: Option<String>,
     in_flight: bool,
     generation: u64,
-    write_lock: Arc<Mutex<()>>,
+}
+
+pub struct BeadsIssueWriteOutcome {
+    pub result: BeadsIssueWriteResult,
+    pub lock: Option<File>,
+}
+
+struct WriteIssueRequest<'a> {
+    bd: &'a Bd,
+    lock_tmp: &'a Path,
+    canonical_root: &'a Path,
+    issue_id: &'a str,
+    verb: &'a BeadsIssueWrite,
+    guards: &'a BeadsIssueWriteGuards,
+    timeout: Duration,
 }
 
 /// Result of looking up a board. `refresh` is true for exactly one concurrent
@@ -101,23 +114,9 @@ impl BeadsBoardCache {
         entry.state(false)
     }
 
-    /// Probe the exact contract-tested bd build once per server process.
-    pub async fn write_available(&self) -> bool {
-        *self
-            .write_capability
-            .get_or_init(|| async {
-                let Ok(bd) = resolve_bd_executable() else {
-                    return false;
-                };
-                match probe_guarded_write_build(&bd).await {
-                    Ok(available) => available,
-                    Err(error) => {
-                        tracing::warn!(%error, "Beads guarded-write capability probe failed");
-                        false
-                    }
-                }
-            })
-            .await
+    /// Report whether an official bd executable is installed for this process.
+    pub fn write_available() -> bool {
+        write_available_from(std::env::var_os("PATH").as_deref(), dirs::home_dir().as_deref())
     }
 
     /// Execute one typed write and advance this root's generation only after
@@ -129,46 +128,43 @@ impl BeadsBoardCache {
         issue_id: &str,
         verb: &BeadsIssueWrite,
         guards: &BeadsIssueWriteGuards,
-    ) -> BeadsIssueWriteResult {
+    ) -> BeadsIssueWriteOutcome {
         let started = Instant::now();
         let canonical_root = match project_root.canonicalize() {
             Ok(root) => root,
             Err(error) => {
-                return BeadsIssueWriteResult::Failed {
-                    reason: format!("could not resolve Beads project root: {error}"),
+                return BeadsIssueWriteOutcome {
+                    result: BeadsIssueWriteResult::Failed {
+                        reason: format!("could not resolve Beads project root: {error}"),
+                    },
+                    lock: None,
                 };
             }
         };
-        let argv = match compose_write_argv(issue_id, verb, guards) {
-            Ok(argv) => argv,
-            Err(reason) => return BeadsIssueWriteResult::Failed { reason },
-        };
-        let write_lock = {
-            Arc::clone(
-                &self.entries.lock().await.entry(canonical_root.clone()).or_default().write_lock,
-            )
-        };
-        let _write_guard = write_lock.lock().await;
-        let result = match resolve_bd_executable() {
-            Ok(bd) => run_bd_write(&bd, &canonical_root, &argv).await,
-            Err(reason) => Err(WriteError::Failed(reason)),
-        };
-        let outcome = match result {
-            Ok(()) => {
-                let mut entries = self.entries.lock().await;
-                let entry = entries.entry(canonical_root.clone()).or_default();
-                entry.generation = entry.generation.wrapping_add(1);
-                BeadsIssueWriteResult::Applied { generation: entry.generation }
+        let outcome = match resolve_bd_executable() {
+            Ok(bd) => {
+                self.write_issue_with_bd(WriteIssueRequest {
+                    bd: &bd,
+                    lock_tmp: Path::new("/tmp"),
+                    canonical_root: &canonical_root,
+                    issue_id,
+                    verb,
+                    guards,
+                    timeout: WRITE_TIMEOUT,
+                })
+                .await
             }
-            Err(WriteError::PreconditionFailed) => BeadsIssueWriteResult::PreconditionFailed,
-            Err(WriteError::Failed(reason)) => BeadsIssueWriteResult::Failed { reason },
+            Err(reason) => BeadsIssueWriteOutcome {
+                result: BeadsIssueWriteResult::Failed { reason },
+                lock: None,
+            },
         };
-        let outcome_name = match &outcome {
+        let outcome_name = match &outcome.result {
             BeadsIssueWriteResult::Applied { .. } => "applied",
             BeadsIssueWriteResult::PreconditionFailed => "precondition_failed",
             BeadsIssueWriteResult::Failed { .. } => "failed",
         };
-        let generation = match &outcome {
+        let generation = match &outcome.result {
             BeadsIssueWriteResult::Applied { generation } => Some(*generation),
             _ => None,
         };
@@ -184,9 +180,74 @@ impl BeadsBoardCache {
         outcome
     }
 
+    async fn write_issue_with_bd(&self, request: WriteIssueRequest<'_>) -> BeadsIssueWriteOutcome {
+        let argv = match compose_write_argv(request.issue_id, request.verb) {
+            Ok(argv) => argv,
+            Err(reason) => {
+                return BeadsIssueWriteOutcome {
+                    result: BeadsIssueWriteResult::Failed { reason },
+                    lock: None,
+                };
+            }
+        };
+        let lock = match acquire_project_write_lock_at(
+            request.lock_tmp,
+            scribe_common::socket::current_uid(),
+            request.canonical_root,
+        )
+        .await
+        {
+            Ok(lock) => lock,
+            Err(reason) => {
+                return BeadsIssueWriteOutcome {
+                    result: BeadsIssueWriteResult::Failed { reason },
+                    lock: None,
+                };
+            }
+        };
+        let result = match fresh_issue_matches_guards(
+            request.bd,
+            request.canonical_root,
+            request.issue_id,
+            request.guards,
+        )
+        .await
+        {
+            Ok(true) => {
+                run_bd_write(request.bd, request.canonical_root, &argv, request.timeout).await
+            }
+            Ok(false) => Err(WriteError::PreconditionFailed),
+            Err(reason) => Err(WriteError::Failed(reason)),
+        };
+        match result {
+            Ok(()) => {
+                let mut entries = self.entries.lock().await;
+                let entry = entries.entry(request.canonical_root.to_path_buf()).or_default();
+                entry.generation = entry.generation.wrapping_add(1);
+                BeadsIssueWriteOutcome {
+                    result: BeadsIssueWriteResult::Applied { generation: entry.generation },
+                    lock: Some(lock),
+                }
+            }
+            Err(WriteError::PreconditionFailed) => BeadsIssueWriteOutcome {
+                result: BeadsIssueWriteResult::PreconditionFailed,
+                lock: None,
+            },
+            Err(WriteError::Failed(reason)) => BeadsIssueWriteOutcome {
+                result: BeadsIssueWriteResult::Failed { reason },
+                lock: None,
+            },
+        }
+    }
+
     /// Force the authoritative post-write board load. A newer committed write
     /// fences this result out before it can replace the cache's last-good data.
-    pub async fn refresh_after_write(&self, key: PathBuf, generation: u64) -> BeadsBoardState {
+    pub async fn refresh_after_write(
+        &self,
+        key: PathBuf,
+        generation: u64,
+        _lock: File,
+    ) -> BeadsBoardState {
         let result = Box::pin(load_board(&key)).await;
         let mut entries = self.entries.lock().await;
         let entry = entries.entry(key.clone()).or_default();
@@ -370,6 +431,10 @@ fn resolve_bd_executable() -> Result<Bd, String> {
         })
 }
 
+fn write_available_from(path: Option<&OsStr>, home: Option<&Path>) -> bool {
+    resolve_bd_executable_from(path, home).is_some()
+}
+
 fn resolve_bd_executable_from(path: Option<&OsStr>, home: Option<&Path>) -> Option<Bd> {
     let dirs = bd_search_dirs(path, home);
     // Spawn the entry as found: a mise shim is a symlink to the mise binary
@@ -407,44 +472,41 @@ fn bd_search_dirs(path: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-fn compose_write_argv(
-    issue_id: &str,
-    verb: &BeadsIssueWrite,
-    guards: &BeadsIssueWriteGuards,
-) -> Result<Vec<OsString>, String> {
+fn compose_write_argv(issue_id: &str, verb: &BeadsIssueWrite) -> Result<Vec<OsString>, String> {
     if issue_id.is_empty() || issue_id.starts_with('-') || issue_id.contains('\0') {
         return Err("invalid Beads issue id".into());
     }
     let mut argv = Vec::new();
-    let guarded = match verb {
-        BeadsIssueWrite::SetTitle { title } => update_arg(&mut argv, issue_id, "--title", title),
+    match verb {
+        BeadsIssueWrite::SetTitle { title } => {
+            update_arg(&mut argv, issue_id, "--title", title);
+        }
         BeadsIssueWrite::SetDescription { description } => {
-            update_arg(&mut argv, issue_id, "--description", description)
+            update_arg(&mut argv, issue_id, "--description", description);
         }
         BeadsIssueWrite::SetAcceptance { acceptance } => {
-            update_arg(&mut argv, issue_id, "--acceptance", acceptance)
+            update_arg(&mut argv, issue_id, "--acceptance", acceptance);
         }
-        BeadsIssueWrite::SetNotes { notes } => update_arg(&mut argv, issue_id, "--notes", notes),
+        BeadsIssueWrite::SetNotes { notes } => {
+            update_arg(&mut argv, issue_id, "--notes", notes);
+        }
         BeadsIssueWrite::SetDesign { design } => {
-            update_arg(&mut argv, issue_id, "--design", design)
+            update_arg(&mut argv, issue_id, "--design", design);
         }
         BeadsIssueWrite::SetSpecId { spec_id } => {
-            update_arg(&mut argv, issue_id, "--spec-id", spec_id.as_deref().unwrap_or(""))
+            update_arg(&mut argv, issue_id, "--spec-id", spec_id.as_deref().unwrap_or(""));
         }
         BeadsIssueWrite::SetPriority { priority } => {
             if *priority > 4 {
                 return Err(format!("invalid Beads priority {priority}; expected 0 through 4"));
             }
             update_arg(&mut argv, issue_id, "--priority", &priority.to_string());
-            true
         }
         BeadsIssueWrite::SetType { issue_type } => {
             update_arg(&mut argv, issue_id, "--type", issue_type);
-            true
         }
         BeadsIssueWrite::SetLabels { labels } => {
             update_arg(&mut argv, issue_id, "--set-labels", &labels.join(","));
-            true
         }
         BeadsIssueWrite::SetStatus { status, clear_defer } => {
             if !matches!(status.as_str(), "open" | "in_progress" | "closed") {
@@ -454,19 +516,15 @@ fn compose_write_argv(
             if *clear_defer {
                 argv.extend([OsString::from("--defer"), OsString::new()]);
             }
-            true
         }
         BeadsIssueWrite::Claim => {
             argv.extend(["update".into(), issue_id.into(), "--claim".into()]);
-            true
         }
         BeadsIssueWrite::CloseIssue => {
             argv.extend(["close".into(), issue_id.into()]);
-            true
         }
         BeadsIssueWrite::UndoClose => {
             argv.extend(["reopen".into(), issue_id.into()]);
-            true
         }
         BeadsIssueWrite::AddComment { body } => {
             argv.extend([
@@ -475,23 +533,13 @@ fn compose_write_argv(
                 issue_id.into(),
                 truncate_bytes(body, MAX_DETAIL_FIELD_BYTES).into(),
             ]);
-            true
-        }
-    };
-    if guarded {
-        if let Some(status) = &guards.if_status {
-            argv.extend(["--if-status".into(), status.into()]);
-        }
-        if let Some(assignee) = &guards.if_assignee {
-            argv.extend(["--if-assignee".into(), assignee.into()]);
         }
     }
     Ok(argv)
 }
 
-fn update_arg(argv: &mut Vec<OsString>, issue_id: &str, flag: &str, value: &str) -> bool {
+fn update_arg(argv: &mut Vec<OsString>, issue_id: &str, flag: &str, value: &str) {
     argv.extend(["update".into(), issue_id.into(), flag.into(), value.into()]);
-    true
 }
 
 fn write_verb_name(verb: &BeadsIssueWrite) -> &'static str {
@@ -513,28 +561,30 @@ fn write_verb_name(verb: &BeadsIssueWrite) -> &'static str {
     }
 }
 
-async fn probe_guarded_write_build(bd: &Bd) -> Result<bool, String> {
-    let output = invoke_bd(bd, None, &["version".into()], COMMAND_TIMEOUT, "version probe").await?;
-    if !output.status.success() {
-        return Err(format!("bd version probe failed: {}", failure_detail(&output)));
-    }
-    guarded_build_from_version_json(&output.stdout)
+async fn fresh_issue_matches_guards(
+    bd: &Bd,
+    project_root: &Path,
+    issue_id: &str,
+    guards: &BeadsIssueWriteGuards,
+) -> Result<bool, String> {
+    let bytes = run_bd(bd, project_root, &["show", issue_id]).await.map_err(RunError::message)?;
+    let issue = parse_envelope::<IssueDetailPayload>(&bytes, "show")?.into_issue()?;
+    Ok(guards.if_status.as_ref().is_none_or(|status| status == &issue.status)
+        && guards
+            .if_assignee
+            .as_deref()
+            .is_none_or(|assignee| assignee == issue.assignee.as_deref().unwrap_or("")))
 }
 
-fn guarded_build_from_version_json(bytes: &[u8]) -> Result<bool, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|error| format!("invalid bd version JSON: {error}"))?;
-    let payload = value.get("data").unwrap_or(&value);
-    Ok(payload.get("build").and_then(serde_json::Value::as_str) == Some(GUARDED_BD_BUILD))
-}
-
-async fn run_bd_write(bd: &Bd, project_root: &Path, argv: &[OsString]) -> Result<(), WriteError> {
-    let output = invoke_bd(bd, Some(project_root), argv, WRITE_TIMEOUT, "issue write")
+async fn run_bd_write(
+    bd: &Bd,
+    project_root: &Path,
+    argv: &[OsString],
+    timeout: Duration,
+) -> Result<(), WriteError> {
+    let output = invoke_bd(bd, project_root, argv, timeout, "issue write")
         .await
         .map_err(WriteError::Failed)?;
-    if output.status.code() == Some(13) {
-        return Err(WriteError::PreconditionFailed);
-    }
     if !output.status.success() {
         return Err(WriteError::Failed(format!("bd failed: {}", failure_detail(&output))));
     }
@@ -543,19 +593,70 @@ async fn run_bd_write(bd: &Bd, project_root: &Path, argv: &[OsString]) -> Result
         .map_err(WriteError::Failed)
 }
 
+fn project_write_lock_path(tmp: &Path, uid: u32, canonical_root: &Path) -> PathBuf {
+    let digest = Sha256::digest(canonical_root.as_os_str().as_encoded_bytes());
+    let name = format!("{digest:x}");
+    tmp.join(format!("scribe-beads-writes-{uid}")).join(format!("{name}.lock"))
+}
+
+async fn acquire_project_write_lock_at(
+    tmp: &Path,
+    uid: u32,
+    canonical_root: &Path,
+) -> Result<File, String> {
+    let path = project_write_lock_path(tmp, uid, canonical_root);
+    tokio::task::spawn_blocking(move || open_and_lock_project_file(&path, uid))
+        .await
+        .map_err(|error| format!("Beads write-lock task failed: {error}"))?
+}
+
+fn open_and_lock_project_file(path: &Path, uid: u32) -> Result<File, String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+
+    let directory = path.parent().ok_or_else(|| "Beads write lock has no parent".to_owned())?;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("could not create Beads write-lock directory: {error}")),
+    }
+    let directory_metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("could not inspect Beads write-lock directory: {error}"))?;
+    if !directory_metadata.is_dir() || directory_metadata.uid() != uid {
+        return Err("Beads write-lock directory is not a uid-owned directory".into());
+    }
+    fs::set_permissions(directory, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|error| format!("could not secure Beads write-lock directory: {error}"))?;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file =
+        options.open(path).map_err(|error| format!("could not open Beads write lock: {error}"))?;
+    let file_metadata =
+        file.metadata().map_err(|error| format!("could not inspect Beads write lock: {error}"))?;
+    if !file_metadata.is_file() || file_metadata.uid() != uid {
+        return Err("Beads write lock is not a uid-owned file".into());
+    }
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| format!("could not secure Beads write lock: {error}"))?;
+    file.lock().map_err(|error| format!("could not acquire Beads write lock: {error}"))?;
+    Ok(file)
+}
+
 async fn invoke_bd(
     bd: &Bd,
-    project_root: Option<&Path>,
+    project_root: &Path,
     argv: &[OsString],
     timeout: Duration,
     operation: &str,
 ) -> Result<BdOutput, String> {
     let mut command = Command::new(&bd.exe);
-    command.arg("--json");
-    if let Some(project_root) = project_root {
-        command.args(["-C"]).arg(project_root).current_dir(project_root);
-    }
     command
+        .args(["--json", "-C"])
+        .arg(project_root)
+        .current_dir(project_root)
         .args(argv)
         .env("BD_JSON_ENVELOPE", "1")
         .stdin(Stdio::null())
@@ -1542,11 +1643,7 @@ mod tests {
 
     // @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Beads Write Executor Unit Contract]]
     #[test]
-    fn composes_every_write_verb_with_supplied_atomic_guards() {
-        let guards = BeadsIssueWriteGuards {
-            if_status: Some("open".into()),
-            if_assignee: Some(String::new()),
-        };
+    fn composes_every_write_verb_for_the_official_cli_without_private_guards() {
         let cases = [
             (
                 BeadsIssueWrite::SetTitle { title: "Title".into() },
@@ -1576,13 +1673,11 @@ mod tests {
         ];
 
         for (verb, expected) in cases {
-            let mut expected = expected;
-            expected.extend(["--if-status", "open", "--if-assignee", ""]);
-            let argv = compose_write_argv("id", &verb, &guards).expect("compose argv");
+            let argv = compose_write_argv("id", &verb).expect("compose argv");
             assert_eq!(argv, expected.iter().map(OsString::from).collect::<Vec<_>>());
         }
 
-        let guarded_cases = [
+        let lifecycle_cases = [
             (BeadsIssueWrite::SetPriority { priority: 1 }, vec!["update", "id", "--priority", "1"]),
             (
                 BeadsIssueWrite::SetType { issue_type: "bug".into() },
@@ -1600,11 +1695,227 @@ mod tests {
             (BeadsIssueWrite::CloseIssue, vec!["close", "id"]),
             (BeadsIssueWrite::UndoClose, vec!["reopen", "id"]),
         ];
-        for (verb, mut expected) in guarded_cases {
-            expected.extend(["--if-status", "open", "--if-assignee", ""]);
-            let argv = compose_write_argv("id", &verb, &guards).expect("compose argv");
+        for (verb, expected) in lifecycle_cases {
+            let argv = compose_write_argv("id", &verb).expect("compose argv");
             assert_eq!(argv, expected.iter().map(OsString::from).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn official_bd_on_path_enables_writes_without_a_version_probe() {
+        let scratch = beads_test_scratch_path("official-capability");
+        fs::create_dir_all(&scratch).expect("create bin dir");
+        let bd = scratch.join("bd");
+        fs::write(&bd, "#!/bin/sh\nexit 99\n").expect("write official bd stand-in");
+        fs::set_permissions(&bd, fs::Permissions::from_mode(0o755)).expect("chmod bd stand-in");
+        let path = std::env::join_paths([&scratch]).expect("join test PATH");
+
+        assert!(write_available_from(Some(&path), None));
+
+        fs::remove_dir_all(scratch).expect("remove bin dir");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_write_lock_serializes_one_root_without_blocking_another() {
+        let scratch = beads_test_scratch_path("write-locks");
+        let locks = scratch.join("tmp");
+        let first_root = scratch.join("first");
+        let second_root = scratch.join("second");
+        for path in [&locks, &first_root, &second_root] {
+            fs::create_dir_all(path).expect("create lock fixture directory");
+        }
+        let first_root = first_root.canonicalize().expect("canonical first root");
+        let second_root = second_root.canonicalize().expect("canonical second root");
+        let uid = scribe_common::socket::current_uid();
+        let first = acquire_project_write_lock_at(&locks, uid, &first_root)
+            .await
+            .expect("take first-root lock");
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let same_locks = locks.clone();
+        let same_root = first_root.clone();
+        tokio::spawn(async move {
+            let lock = acquire_project_write_lock_at(&same_locks, uid, &same_root)
+                .await
+                .expect("take queued first-root lock");
+            drop(acquired_tx.send(lock));
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acquired_rx).await.is_err(),
+            "a second writer entered the same root"
+        );
+        let other = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_project_write_lock_at(&locks, uid, &second_root),
+        )
+        .await
+        .expect("different-root lock blocked")
+        .expect("take different-root lock");
+        drop(other);
+        drop(first);
+        let queued = tokio::time::timeout(Duration::from_secs(1), &mut acquired_rx)
+            .await
+            .expect("same-root lock stayed blocked")
+            .expect("same-root lock task ended");
+        drop(queued);
+        fs::remove_dir_all(scratch).expect("remove lock fixture");
+    }
+
+    #[tokio::test]
+    async fn project_write_lock_has_a_deterministic_private_safe_path() {
+        let scratch = beads_test_scratch_path("write-lock-path");
+        let locks = scratch.join("tmp");
+        let root = scratch.join("project with spaces");
+        fs::create_dir_all(&locks).expect("create temporary root");
+        fs::create_dir_all(&root).expect("create project root");
+        let root = root.canonicalize().expect("canonical project root");
+        let uid = scribe_common::socket::current_uid();
+        let expected = project_write_lock_path(&locks, uid, &root);
+
+        let lock = acquire_project_write_lock_at(&locks, uid, &root).await.expect("take lock");
+
+        assert_eq!(project_write_lock_path(&locks, uid, &root), expected);
+        assert_eq!(
+            expected
+                .parent()
+                .expect("lock parent")
+                .metadata()
+                .expect("lock dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(expected.metadata().expect("lock metadata").permissions().mode() & 0o777, 0o600);
+        let name = expected.file_name().and_then(OsStr::to_str).expect("ASCII lock name");
+        assert_eq!(Path::new(name).extension().and_then(OsStr::to_str), Some("lock"));
+        assert!(name[..name.len() - 5].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!name.contains("project"));
+        drop(lock);
+        fs::remove_dir_all(scratch).expect("remove lock fixture");
+    }
+
+    fn serialized_write_fixture(label: &str, status: &str, assignee: &str) -> (PathBuf, Bd) {
+        let scratch = beads_test_scratch_path(label);
+        fs::create_dir_all(&scratch).expect("create serialized write root");
+        fs::write(scratch.join("status"), status).expect("write fixture status");
+        fs::write(scratch.join("assignee"), assignee).expect("write fixture assignee");
+        let fake =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bd-write-serialized.sh");
+        (scratch, Bd { exe: fake, search_path: None })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_guards_are_checked_only_after_entering_the_project_lock() {
+        let (root, bd) = serialized_write_fixture("fresh-guard", "open", "");
+        let root = root.canonicalize().expect("canonical project root");
+        let locks = root.join("locks");
+        fs::create_dir_all(&locks).expect("create lock base");
+        let uid = scribe_common::socket::current_uid();
+        let held = acquire_project_write_lock_at(&locks, uid, &root).await.expect("hold root lock");
+        let cache = BeadsBoardCache::default();
+        let queued_root = root.clone();
+        let queued_locks = locks.clone();
+        let queued = tokio::spawn(async move {
+            cache
+                .write_issue_with_bd(WriteIssueRequest {
+                    bd: &bd,
+                    lock_tmp: &queued_locks,
+                    canonical_root: &queued_root,
+                    issue_id: "issue",
+                    verb: &BeadsIssueWrite::AddComment { body: "must not land".into() },
+                    guards: &BeadsIssueWriteGuards {
+                        if_status: Some("open".into()),
+                        if_assignee: Some(String::new()),
+                    },
+                    timeout: Duration::from_millis(250),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fs::write(root.join("status"), "in_progress").expect("advance fixture status");
+        drop(held);
+
+        let outcome = queued.await.expect("join queued write");
+
+        assert!(matches!(outcome.result, BeadsIssueWriteResult::PreconditionFailed));
+        assert!(!root.join("writes").exists(), "stale guarded write reached bd");
+        fs::remove_dir_all(root).expect("remove serialized write root");
+    }
+
+    #[tokio::test]
+    async fn applied_result_retains_the_project_lock_for_authoritative_refresh() {
+        let (root, bd) = serialized_write_fixture("refresh-lock", "open", "");
+        let root = root.canonicalize().expect("canonical project root");
+        let locks = root.join("locks");
+        fs::create_dir_all(&locks).expect("create lock base");
+        let cache = BeadsBoardCache::default();
+
+        let outcome = cache
+            .write_issue_with_bd(WriteIssueRequest {
+                bd: &bd,
+                lock_tmp: &locks,
+                canonical_root: &root,
+                issue_id: "issue",
+                verb: &BeadsIssueWrite::SetTitle { title: "Applied".into() },
+                guards: &BeadsIssueWriteGuards::default(),
+                timeout: Duration::from_millis(250),
+            })
+            .await;
+
+        assert!(matches!(outcome.result, BeadsIssueWriteResult::Applied { .. }));
+        let lock = outcome.lock.expect("applied result must retain its lock");
+        {
+            let blocked =
+                acquire_project_write_lock_at(&locks, scribe_common::socket::current_uid(), &root);
+            tokio::pin!(blocked);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut blocked).await.is_err(),
+                "next same-root writer entered before authoritative refresh"
+            );
+            drop(lock);
+            tokio::time::timeout(Duration::from_secs(1), &mut blocked)
+                .await
+                .expect("same-root writer stayed blocked")
+                .expect("take released lock");
+        }
+        fs::remove_dir_all(root).expect("remove serialized write root");
+    }
+
+    #[tokio::test]
+    async fn timed_out_write_releases_the_project_lock() {
+        let (root, bd) = serialized_write_fixture("timeout-lock", "open", "");
+        fs::write(root.join("mode"), "timeout").expect("enable timeout mode");
+        let root = root.canonicalize().expect("canonical project root");
+        let locks = root.join("locks");
+        fs::create_dir_all(&locks).expect("create lock base");
+        let cache = BeadsBoardCache::default();
+
+        let outcome = cache
+            .write_issue_with_bd(WriteIssueRequest {
+                bd: &bd,
+                lock_tmp: &locks,
+                canonical_root: &root,
+                issue_id: "issue",
+                verb: &BeadsIssueWrite::SetTitle { title: "Never applied".into() },
+                guards: &BeadsIssueWriteGuards::default(),
+                timeout: Duration::from_millis(100),
+            })
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            BeadsIssueWriteResult::Failed { ref reason } if reason == "bd issue write timed out"
+        ));
+        assert!(outcome.lock.is_none());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_project_write_lock_at(&locks, scribe_common::socket::current_uid(), &root),
+        )
+        .await
+        .expect("timeout leaked the project lock")
+        .expect("take released project lock");
+        fs::remove_dir_all(root).expect("remove serialized write root");
     }
 
     #[test]
@@ -1629,20 +1940,6 @@ mod tests {
         assert_eq!(entry.last_good, Some(current));
     }
 
-    #[test]
-    fn capability_probe_requires_the_contract_tested_build_marker() {
-        assert!(
-            guarded_build_from_version_json(
-                br#"{"data":{"build":"scribe-guards-7505e173f265"},"schema_version":1}"#,
-            )
-            .expect("parse pinned build")
-        );
-        assert!(
-            !guarded_build_from_version_json(br#"{"build":"release"}"#).expect("parse other build")
-        );
-        assert!(guarded_build_from_version_json(b"not json").is_err());
-    }
-
     #[tokio::test]
     async fn write_timeout_kills_the_whole_bd_process_group() {
         let scratch = beads_test_scratch_path("write-timeout");
@@ -1651,15 +1948,10 @@ mod tests {
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bd-write-timeout.sh");
         let bd = Bd { exe: fake, search_path: None };
 
-        let error = invoke_bd(
-            &bd,
-            Some(&scratch),
-            &["update".into()],
-            Duration::from_millis(100),
-            "issue write",
-        )
-        .await
-        .expect_err("fake bd must time out");
+        let error =
+            invoke_bd(&bd, &scratch, &["update".into()], Duration::from_millis(100), "issue write")
+                .await
+                .expect_err("fake bd must time out");
 
         assert_eq!(error, "bd issue write timed out");
         let pid_text = fs::read_to_string(&child_pid).expect("read child pid");

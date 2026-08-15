@@ -168,7 +168,7 @@ docker-visual profile="release":
     tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper
     docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
 
-# Add the pinned bd binary to the visual image for the real read-slice proof.
+# Add the official bd release binary to the visual image for the real read-slice proof.
 docker-beads-read-e2e: docker-visual
     docker build --target beads-read-e2e -f docker/Dockerfile.func -t scribe-test-beads-read-e2e .
 
@@ -519,11 +519,11 @@ e2e-visual-ci-run-bar:
 e2e-func-beads-board: docker-beads-read-e2e
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-beads-read-e2e /tests/func/beads-board.sh
 
-# Prove the checksum-pinned bd build preserves guarded native write semantics.
+# Prove the representative official bd write semantics Scribe relies on.
 e2e-func-beads-write-contract:
     TEST_TIMEOUT=90 just e2e-func func/beads-write-contract.sh
 
-# Exercise typed issue writes through the real server and patched bd.
+# Exercise typed issue writes through the real server and official bd.
 e2e-func-beads-issue-write:
     TEST_TIMEOUT=180 just e2e-func func/beads-issue-write.sh
 # Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt

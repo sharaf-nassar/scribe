@@ -173,9 +173,11 @@ struct DaemonState {
     /// Most recent action the server asked this daemon window to run.
     last_action: Option<AutomationAction>,
     /// Most recent terminal Beads-board reply, paired with its workspace.
-    beads_board: Option<(WorkspaceId, BeadsBoardState)>,
+    beads_board: Option<(WorkspaceId, BeadsBoardState, u64)>,
     /// Most recent typed Beads write reply.
-    beads_write: Option<(WorkspaceId, String, BeadsIssueWriteResult)>,
+    beads_write: Option<(WorkspaceId, String, BeadsIssueWriteResult, u64)>,
+    /// Arrival order for Beads result and board publication assertions.
+    beads_sequence: u64,
     /// Production client state seam fed by capability-gated CI IPC.
     ci_runs: CiRunBars,
 }
@@ -191,6 +193,7 @@ impl DaemonState {
             last_action: None,
             beads_board: None,
             beads_write: None,
+            beads_sequence: 0,
             ci_runs: CiRunBars::default(),
         }
     }
@@ -707,7 +710,11 @@ async fn state_beads_board(
     if matches!(board, BeadsBoardState::Loading { .. }) {
         return;
     }
-    state.lock().await.beads_board = Some((workspace_id, board));
+    let mut state = state.lock().await;
+    state.beads_sequence = state.beads_sequence.wrapping_add(1);
+    let sequence = state.beads_sequence;
+    state.beads_board = Some((workspace_id, board, sequence));
+    drop(state);
     notifiers.beads_board.notify_waiters();
 }
 
@@ -718,7 +725,11 @@ async fn state_beads_write(
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
 ) {
-    state.lock().await.beads_write = Some((workspace_id, issue_id, result));
+    let mut state = state.lock().await;
+    state.beads_sequence = state.beads_sequence.wrapping_add(1);
+    let sequence = state.beads_sequence;
+    state.beads_write = Some((workspace_id, issue_id, result, sequence));
+    drop(state);
     notifiers.beads_write.notify_waiters();
 }
 
@@ -1301,12 +1312,13 @@ async fn handle_beads_issue_write(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let result = loop {
-        if let Some((reply_workspace, reply_issue, result)) = state.lock().await.beads_write.clone()
+    let (result, result_sequence) = loop {
+        if let Some((reply_workspace, reply_issue, result, sequence)) =
+            state.lock().await.beads_write.clone()
             && reply_workspace == workspace_id
             && reply_issue == issue_id
         {
-            break result;
+            break (result, sequence);
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1318,16 +1330,15 @@ async fn handle_beads_issue_write(
     };
 
     let mut board_pushed = false;
+    let mut result_before_board = false;
     if matches!(result, BeadsIssueWriteResult::Applied { .. }) {
         loop {
-            if state
-                .lock()
-                .await
-                .beads_board
-                .as_ref()
-                .is_some_and(|(reply_workspace, _)| *reply_workspace == workspace_id)
+            if let Some((reply_workspace, _, board_sequence)) =
+                state.lock().await.beads_board.as_ref()
+                && *reply_workspace == workspace_id
             {
                 board_pushed = true;
+                result_before_board = result_sequence < *board_sequence;
                 break;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1337,7 +1348,7 @@ async fn handle_beads_issue_write(
             drop(tokio::time::timeout(remaining, notifiers.beads_board.notified()).await);
         }
     }
-    DaemonResponse::BeadsIssueWrite { result, board_pushed }
+    DaemonResponse::BeadsIssueWrite { result, board_pushed, result_before_board }
 }
 
 async fn handle_ci_run_state(repo_root: PathBuf, state: &SharedState) -> DaemonResponse {
@@ -1381,7 +1392,7 @@ async fn handle_request_beads_board(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some((reply_workspace, board)) = state.lock().await.beads_board.clone()
+        if let Some((reply_workspace, board, _)) = state.lock().await.beads_board.clone()
             && reply_workspace == workspace_id
         {
             return DaemonResponse::BeadsBoard { state: board };

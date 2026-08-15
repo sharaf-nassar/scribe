@@ -1624,9 +1624,9 @@ Bare interactive passthrough is intentionally not exercised. Profile-writing com
 
 ### Real Beads Board Refresh
 
-The functional image uses the checksum-pinned guarded Beads build to prove rooted workspace reads and writes against the server's real `bd` process contract.
+The functional image uses the official Beads release to prove rooted workspace reads and writes against the server's real `bd` process contract.
 
-`just e2e-func-beads-board` derives a visual image with the pinned `bd`, seeds
+`just e2e-func-beads-board` derives a visual image with official `bd`, seeds
 an isolated git and Beads repository, and starts the disposable server and GPUI
 client with its parent as a workspace root. The client wire must receive a
 ready board that classifies the seeded records into their expected lanes.
@@ -1669,26 +1669,26 @@ proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
 during each gesture. The behavior belongs to
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
-#### Guarded Beads Write Contract
+#### Official Beads Write Contract
 
-The network-none functional image proves its patched bd artifact before Scribe may advertise writes.
+The network-none functional image proves the representative official CLI verbs Scribe invokes.
 
-`just e2e-func-beads-write-contract` verifies the pinned build marker and guard
-flags, atomic field/status/label/comment updates, explicit empty-assignee
-matching, rc13 structured mismatches, native actor and claim lease, native
-close timestamps/reason, and reopen cleanup. Stale attempts must leave every
-observed value and comment row unchanged. This is the executable proof for
-[[server#Server#Beads issue writes#Capability and admission]].
+`just e2e-func-beads-write-contract` verifies official bd 1.1.0 field, label,
+comment, claim, close, and reopen behavior. It pins native actor resolution,
+claim state, close facts, and reopen cleanup without depending on private
+flags or build metadata. This is the executable proof for
+[[server#Server#Beads issue writes#Serialized executor]].
 
 #### Server Beads Issue Writes
 
-The server functional path proves typed guarded mutations persist and push an authoritative board refresh.
+The server functional path proves typed serialized mutations persist and push an authoritative board refresh.
 
 `just e2e-func-beads-issue-write` sends one representative of every write
 family through `scribe-test beads-write`: title, description, acceptance,
 notes, design, spec id, priority, type, labels, status, guarded comment, claim,
 close, and undo. It re-reads the tracker with `bd show` after each grouped
-family and requires `board_pushed: true` after every successful write.
+family and requires `board_pushed: true` plus `result_before_board: true` after
+every successful write.
 
 A seeded mutation between guard capture and the Scribe request must return
 `PreconditionFailed` without landing its comment. A deterministic `bd` shim
@@ -1731,12 +1731,15 @@ Docker-only server unit tests pin argv, capability, deadline, cache, and generat
 
 `just docker-unit-beads-write` compiles and runs the Beads-board module tests
 and focused client Beads tests inside `docker/Dockerfile.func`. The suite covers
-every server verb and supplied guard, strict build-marker parsing,
-stale-refresh rejection, last-good cache retention, root-scoped multi-window
-push, timed-out process cleanup, panel write intents, and typed IPC lowering.
+every ordinary server argv, PATH capability, fresh guard rejection, stable
+private lock paths and modes, same-root serialization, distinct-root
+independence, timeout release, stale-refresh rejection, last-good cache
+retention, root-scoped multi-window push, panel intents, and typed IPC lowering.
 
 The load-bearing server tests are
-`composes_every_write_verb_with_supplied_atomic_guards`,
+`composes_every_write_verb_for_the_official_cli_without_private_guards`,
+`fresh_guards_are_checked_only_after_entering_the_project_lock`,
+`project_write_lock_serializes_one_root_without_blocking_another`,
 `generation_fence_discards_refreshes_started_before_a_write`,
 `write_timeout_kills_the_whole_bd_process_group`, and
 `beads_board_refresh_reaches_each_authorized_same_root_workspace`. Their
@@ -1991,7 +1994,7 @@ guards without losing the user's context.
 
 Priority and type rows unfold exclusively and each accepted choice sends one typed write with fresh detail guards.
 
-The type list matches the pinned bd built-in enum. Label edits compose comma or
+The type list matches the official bd built-in enum. Label edits compose comma or
 whitespace-separated words into one stable, deduplicated `SetLabels` value.
 
 #### Persisted picker repaint

@@ -50,6 +50,8 @@ write_applied() {
         || fail "$verb was not applied: $result"
     printf '%s\n' "$result" | grep -Fq '"board_pushed":true' \
         || fail "$verb did not push a board refresh: $result"
+    printf '%s\n' "$result" | grep -Fq '"result_before_board":true' \
+        || fail "$verb published its board before its result: $result"
 }
 
 write_applied write-target set-title open '' --value 'Persisted through Scribe'

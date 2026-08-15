@@ -205,6 +205,7 @@ pub enum DaemonResponse {
     BeadsIssueWrite {
         result: BeadsIssueWriteResult,
         board_pushed: bool,
+        result_before_board: bool,
     },
     CiRunState {
         observation: CiRunObservation,

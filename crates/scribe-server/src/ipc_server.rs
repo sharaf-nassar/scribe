@@ -5511,7 +5511,7 @@ async fn handle_client_hello(
                     ),
                 )
             };
-            let beads_write = beads_detail && server.beads_boards.write_available().await;
+            let beads_write = beads_detail && BeadsBoardCache::write_available();
             let welcome = ServerMessage::Welcome {
                 window_id,
                 other_windows,
@@ -6839,13 +6839,17 @@ async fn handle_beads_issue_write(
         return;
     };
 
-    let result = if context.server.beads_boards.write_available().await {
+    let outcome = if BeadsBoardCache::write_available() {
         context.server.beads_boards.write_issue(&project_root, &issue_id, &verb, &guards).await
     } else {
-        BeadsIssueWriteResult::Failed {
-            reason: "installed bd does not satisfy Scribe's guarded-write contract".into(),
+        crate::beads_board::BeadsIssueWriteOutcome {
+            result: BeadsIssueWriteResult::Failed {
+                reason: "bd is not installed or executable".into(),
+            },
+            lock: None,
         }
     };
+    let result = outcome.result.clone();
     send_message(
         context.writer,
         &ServerMessage::BeadsIssueWriteResult {
@@ -6859,12 +6863,15 @@ async fn handle_beads_issue_write(
     let BeadsIssueWriteResult::Applied { generation } = result else {
         return;
     };
+    let Some(lock) = outcome.lock else {
+        return;
+    };
     let key = project_root.canonicalize().unwrap_or_else(|_| project_root.clone());
     let cache = context.server.beads_boards.clone();
     let workspace_manager = Arc::clone(&context.server.workspace_manager);
     let window_shares = Arc::clone(&context.server.window_shares);
     tokio::spawn(async move {
-        let state = cache.refresh_after_write(key, generation).await;
+        let state = cache.refresh_after_write(key, generation, lock).await;
         push_beads_board_for_root(&workspace_manager, &window_shares, &project_root, state).await;
     });
 }

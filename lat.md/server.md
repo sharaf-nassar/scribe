@@ -352,60 +352,60 @@ The set is walked in window-id order, so two sets holding the same ids resolve i
 
 ## Beads issue writes
 
-The server admits one typed issue mutation, executes it against the guarded `bd` contract, then publishes only tracker-confirmed state.
+The server admits one typed issue mutation, serializes Scribe writers per project root, and publishes only tracker-confirmed state.
 
 ### Capability and admission
 
-Write capability combines connection ownership with an exact executable contract; neither check substitutes for the other.
+Write capability combines connection ownership with an installed `bd` executable; neither check substitutes for the other.
 
 [[crates/scribe-server/src/ipc_server.rs#beads_detail_connection_available]]
 admits only the local owner of a `SingleController` window. The workspace must
 belong to that window and supply its project root. Remote, shared, displaced,
 and foreign-workspace writers never reach `bd`; the server silently ignores
-their frames. An authorized connection whose executable no longer satisfies
-the contract receives a typed `Failed` result.
+their frames.
 
-[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]] probes
-`bd version` once per server process and accepts only build
-`scribe-guards-7505e173f265`. The functional image builds upstream commit
-`7505e173f2659ba6e1f955b86d81a4f9e21810ca` from its checksum-pinned archive,
-then applies `docker/beads-guarded-writes.patch`. That patch puts status and
-assignee checks inside native update, label, comment, claim, close, and reopen
-transactions. Scribe releases still use the user's installed `bd`; every
-other build keeps `Welcome.beads_write` false at negotiation time.
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]]
+advertises writes when executable discovery finds `bd` on PATH or a standard
+user install path. Each write resolves it again, so disappearance returns a
+typed `Failed` result without invoking a fallback binary.
 
-The probe result stays cached for the server process. Reads and writes still
-resolve the executable for each command, so installing or replacing `bd`
-changes later command selection but does not renegotiate `beads_write` or
-rerun the marker probe. A restart is required to re-evaluate capability.
+### Serialized executor
 
-### Guarded executor
-
-One canonical project root owns serialization, argv validation, the write deadline, and result mapping.
+One canonical project root owns Scribe serialization, fresh guard checks, argv validation, the write deadline, and result mapping.
 
 [[crates/scribe-server/src/ipc_server.rs#handle_beads_issue_write]] resolves the
 authorized project root, then calls
-[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_issue]]. That method
-canonicalizes the root and holds its per-root write lock through executable
-resolution and the subprocess result.
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_issue]]. The
+method canonicalizes the root and takes a standard-library advisory file lock
+whose SHA-256 filename identifies that root under
+`/tmp/scribe-beads-writes-{uid}`. Scribe verifies the directory and file are
+owned by the effective uid and enforces modes 0700 and 0600.
+
+Every Scribe server process for that uid uses the same lock path. Different
+roots use different files and proceed independently. Direct external `bd`
+processes do not take Scribe's lock, so this is serialization among Scribe
+writers, not a database-wide transaction boundary.
+
+After entering the lock, the server runs a fresh `bd show` and compares each
+supplied status and assignee guard. An explicit empty assignee means the issue
+must still be unassigned. A mismatch returns `PreconditionFailed` without a
+write. An external process can still race after that read because it does not
+honor the Scribe lock.
 
 [[crates/scribe-server/src/beads_board.rs#compose_write_argv]] maps every
-[[protocol#Client Messages#Beads issue writes|typed verb]] directly to native
-`bd` argv and appends each supplied `--if-status` and `--if-assignee`. Text
-updates without guards remain last-writer-wins. Claim, close, reopen, and
-comments keep native actor, lease, lifecycle, and event behavior.
+[[protocol#Client Messages#Beads issue writes|typed verb]] directly to ordinary
+`bd` argv without private compare-and-set flags. Claim, close, reopen, and
+comments retain the official CLI's actor, lease, lifecycle, and event behavior.
 
 The argv builder rejects an empty, dash-prefixed, or NUL-containing issue id,
 priority above P4, and statuses outside `open`, `in_progress`, and `closed`. It
-caps comment bodies at 64 KiB. An omitted guard means no precondition; an
-explicit empty assignee means the issue must still be unassigned.
+caps comment bodies at 64 KiB. An omitted guard means no precondition.
 
 [[crates/scribe-server/src/beads_board.rs#run_bd_write]] requires a schema-1
-success envelope and uses the executor's bounded stdout, stderr, and process
-group cleanup with a 15-second write deadline. Exit 13 maps to
-`PreconditionFailed`. Nonzero exit, timeout, spawn failure, invalid argv, and
-invalid success JSON map to `Failed`. None of those failures changes the
-generation or last-good board.
+success envelope and uses bounded stdout, stderr, process-group cleanup, and a
+15-second write deadline. Nonzero exit, timeout, spawn failure, invalid argv,
+and invalid success JSON map to `Failed`. Those paths do not advance the
+generation or last-good board, and dropping the file releases the lock.
 
 ### Generation fence and fan-out
 
@@ -414,9 +414,11 @@ Only a committed generation may replace the board cache or reach another authori
 An applied write increments the process-local generation for that canonical
 root while the write lock is held; the counter is not a Beads revision. The
 server sends its correlated result first, then
-[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#refresh_after_write]] loads
-the authoritative board. [[crates/scribe-server/src/beads_board.rs#apply_refresh_if_current]]
-drops that load if a newer write has already advanced the generation.
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#refresh_after_write]]
+loads the authoritative board while retaining the file lock. Only after the
+refresh settles does it release the lock and fan the board out.
+[[crates/scribe-server/src/beads_board.rs#apply_refresh_if_current]] rejects a
+load whose generation is already stale.
 
 [[crates/scribe-server/src/ipc_server.rs#push_beads_board_for_root]] sends the
 accepted snapshot to every authorized local `SingleController` workspace on

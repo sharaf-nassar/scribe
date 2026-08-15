@@ -124,8 +124,8 @@ Acceptance criteria:
 - Enter applies a single-line field. Plain Enter remains text in multiline
   fields; a modified Enter applies. Switching fields or blurring applies a
   changed draft. Clicking the same field keeps it. Esc cancels.
-- Priority unfolds P0 through P4. Type unfolds the pinned guarded build's
-  complete built-in type list. Label input splits on commas or whitespace and
+- Priority unfolds P0 through P4. Type unfolds the official CLI's complete
+  built-in type list. Label input splits on commas or whitespace and
   removes repeats while preserving first appearance.
 - The rail's bare words write `open`, `in_progress`, or `closed` with
   `clear_defer: false`. Claim and close use their native verbs.
@@ -179,8 +179,8 @@ Acceptance criteria:
 - If the same issue is open, a drop reuses fresh detail status and assignee
   guards. Otherwise Ready and In-progress sources contribute their known
   snapshot status, while assignee and Backlog status remain unguarded because
-  compact cards do not carry them. The server applies every supplied guard
-  atomically.
+  compact cards do not carry them. The server checks every supplied guard from
+  a fresh read while holding the project lock used by all Scribe writers.
 - An accepted drop moves the snapshot card immediately and records an
   optimistic overlay. `Applied` tags it with the root generation. Failure
   restores the source lane. The next authoritative snapshot removes the
@@ -226,7 +226,7 @@ Acceptance criteria:
 - The server owns all `bd` execution. Root-scoped reads and writes resolve an
   absolute executable, supply `-C`, set cwd to the canonical project root,
   require schema-1 JSON, bound output, use direct argv, and kill the process
-  group on deadline. The rootless version probe only checks the guarded marker.
+  group on deadline.
 - Detail reads use a five-second deadline. Writes use a separate 15-second
   deadline because Dolt commit and export are part of the verb.
 - Detail and writes require the local owner of a rooted workspace in a
@@ -234,15 +234,13 @@ Acceptance criteria:
   requests never reach `bd`.
 - `Welcome.beads_detail` and `Welcome.beads_write` default false when absent.
   They are server-to-client fields only. Operationally the server advertises
-  writes only when detail is available and the guarded build probe passes.
-- Scribe does not bundle Beads. Upstream bd 1.1.0 and unrecognized builds keep
-  writes disabled. The accepted marker is
-  `scribe-guards-7505e173f265`, built from commit
-  `7505e173f2659ba6e1f955b86d81a4f9e21810ca` plus
-  `docker/beads-guarded-writes.patch`.
-- The guarded-build probe runs once per server process. Each read and write
-  resolves the executable again, but replacing `bd` does not renegotiate
-  `beads_write` until the next server process.
+  writes only when detail is available and executable discovery finds `bd`.
+- Scribe releases do not bundle Beads. They use the official `bd` installed on
+  PATH or a standard user install path. Docker evidence installs the official
+  v1.1.0 release binary.
+- Capability negotiation and every read or write resolve the executable. A
+  client that connected before installation remains read-only until its next
+  connection because `Welcome.beads_write` is fixed for that connection.
 - The server composes exactly the shipped verbs. It rejects empty,
   dash-prefixed, or NUL-containing ids, priorities above P4, and unsupported
   statuses. It truncates comment bodies to the 64KiB field cap.
@@ -264,7 +262,7 @@ in the stories above.
 - Backlog is a source but not a target. Ready clears defer and writes open. In
   progress claims. Done closes. Blocked and Done are not sources.
 - Close is reasonless and immediate. Scribe supplies the five-second Undo.
-- Type is a picker over the patched build's built-in enum. Defer remains
+- Type is a picker over the official CLI's built-in enum. Defer remains
   display-only except for Ready-drop clearing.
 - Detail fetches on open, dependent navigation, conflicts, successful
   non-close writes while that issue remains open, timeouts, and reconnect
@@ -278,12 +276,13 @@ in the stories above.
 - Comment detail is newest-first and capped at 50 after parsing Beads' oldest-
   first response. The hidden count preserves the omitted total.
 
-The network-none guarded-build contract proves status and assignee checks run
-inside native update, label, comment, claim, close, and reopen transactions.
-Exit 13 plus structured guard-mismatch JSON maps to `PreconditionFailed`.
-Nonzero exit, timeout, spawn failure, invalid argv, and invalid success JSON
-map to `Failed` without advancing generation or replacing last-good board
-state.
+The network-none official CLI contract proves representative field, label,
+comment, claim, close, and reopen behavior. Scribe's unit and server functional
+tests prove fresh guard rejection under the per-root advisory lock. Direct
+external `bd` processes do not honor that lock and can race Scribe after its
+fresh read. Nonzero exit, timeout, spawn failure, invalid argv, and invalid
+success JSON map to `Failed` without advancing generation or replacing
+last-good board state.
 
 ## Architecture approach
 
@@ -366,8 +365,9 @@ No persistent Scribe storage changed and no migration exists.
   navigation target, notices, pending and in-flight writes, deadlines,
   reconnect fences, expanded comments, one parked copy, one window editor,
   and board-owned arm, drag, and optimistic-drop records.
-- Server state adds one write lock and process-local generation per canonical
-  root plus one process-wide guarded-build probe result.
+- Server state adds one process-local generation per canonical root. A stable
+  SHA-256 path under `/tmp/scribe-beads-writes-{uid}` supplies the cross-process
+  advisory lock without storing a lock object in the cache.
 
 ## API and interface changes
 
@@ -380,8 +380,8 @@ No persistent Scribe storage changed and no migration exists.
 - `ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result }`
   correlates one mutation outcome.
 - `ServerMessage::Welcome` adds `beads_detail` and `beads_write`. Older servers
-  decode as incapable. A current local owner with ordinary upstream Beads may
-  read detail but sees inert write controls.
+  decode as incapable. A current local owner with installed official Beads may
+  read detail and use typed write controls.
 
 ## Testing strategy
 
@@ -393,10 +393,11 @@ All runtime suites use their existing Docker just recipe with
 - Named MessagePack round trips cover the detail request, complete response,
   not-found response, every write verb with both guards and with neither,
   every result, and independent default-false `Welcome` fields.
-- Server tests cover detail envelope shapes and caps, argv for every verb,
-  optional and empty-assignee guards, marker parsing, rc13 mapping, timeout
-  process-group cleanup, last-good preservation, generation fencing, and
-  same-root authorized fan-out.
+- Server tests cover detail envelope shapes and caps, ordinary argv for every
+  verb, marker-free PATH capability, optional and empty-assignee guards, fresh
+  rejection under lock, safe lock paths and modes, same-root serialization,
+  distinct-root independence, timeout cleanup, last-good preservation,
+  generation fencing, and same-root authorized fan-out.
 - Client tests cover panel anatomy and sparse omission, loading, closed and
   blocked forms, 4.5:1 text contrast, comment clamp and hidden count, 400px
   floor, 70% height, min/max board height, 0.8 and 1.6 text scale, 120ms final
@@ -428,13 +429,13 @@ All runtime suites use their existing Docker just recipe with
 
 ### Functional evidence
 
-- `just e2e-func-beads-write-contract` proves the exact marker, guarded native
-  field, label, status, comment, claim, close, and reopen behavior, explicit
-  unassigned matching, rc13 mismatch JSON, actor and lease, close facts, and
-  reopen cleanup.
+- `just e2e-func-beads-write-contract` proves official bd 1.1.0 field, label,
+  comment, claim, close, and reopen behavior, including actor resolution,
+  claim state, close facts, and reopen cleanup.
 - `just e2e-func-beads-issue-write` sends one representative of every write
-  family through the real server, requires `board_pushed: true`, and rereads
-  with `bd show`. A seeded guard race leaves its comment absent. Forced
+  family through the real server, requires `board_pushed: true` and
+  `result_before_board: true`, and rereads with `bd show`. A seeded stale guard
+  leaves its comment absent. Forced
   nonzero and timeout results preserve the persisted title and last-good
   board. Evidence is `beads-write-fields.json`,
   `beads-write-final-show.json`, and `beads-write-last-good.json`.
@@ -456,8 +457,8 @@ All runtime suites use their existing Docker just recipe with
   panel.
 - Shared, remote, displaced, and foreign-window clients receive no detail or
   write capability. They keep the compact board.
-- Most upstream Beads installs are detail-only because Scribe requires the
-  exact patched marker for writes and does not ship that binary.
+- Missing `bd` leaves a local owner detail-only. Installing the official CLI
+  enables writes on the next connection.
 - Editor arrow, Delete, and Tab keys are consumed rather than providing caret
   navigation. Editing starts selected and supports replacement, Backspace,
   composition, commit, and cancel.
@@ -473,8 +474,8 @@ All runtime suites use their existing Docker just recipe with
 
 The implementation landed in dependency order; every stage below is complete.
 
-1. Probe bd 1.1.0 and the checksum-pinned guarded build. Pin the marker,
-   guard semantics, actor/lifecycle behavior, and deadlines.
+1. Resolve official bd from PATH. Pin ordinary argv, Scribe lock and guard
+   semantics, actor/lifecycle behavior, and deadlines.
 2. Add typed detail protocol, parser, owner/root gate, complete fixtures, and
    the read-only panel with lifecycle, copy, and dependent navigation.
 3. Add typed write protocol, server executor, generation fence, root fan-out,
@@ -483,7 +484,7 @@ The implementation landed in dependency order; every stage below is complete.
 4. Add strict drag tracking and source restrictions, then native ghost, no-drop
    wash, PTY gate, hover hold-open, optimistic settlement, classifier notice,
    and Undo.
-5. Prove read, write, and drag through unit, visual, guarded-build, server IPC,
+5. Prove read, write, and drag through unit, visual, official-bd, server IPC,
    and real-bd GPUI suites.
 6. Consolidate the canonical read, guarded-write, and drag architecture in
    `lat.md`, then sync this spec to those shipped contracts.

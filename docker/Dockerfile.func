@@ -1,24 +1,12 @@
-FROM golang:1.26.5-trixie AS beads-builder
-
-ADD --checksum=sha256:7fcfe5370953c429e51ffed6c748a3ef03bebd965be531a7b1f6522bc566e5f8 \
-    https://github.com/gastownhall/beads/archive/7505e173f2659ba6e1f955b86d81a4f9e21810ca.tar.gz \
+FROM debian:trixie-slim AS beads-release
+ARG TARGETARCH
+ADD https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_linux_${TARGETARCH}.tar.gz \
     /tmp/beads.tar.gz
-COPY docker/beads-guarded-writes.patch /tmp/beads-guarded-writes.patch
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends patch && \
-    mkdir /src /out && \
-    tar -xzf /tmp/beads.tar.gz -C /src --strip-components=1 && \
-    cd /src && \
-    patch --batch --forward -p1 < /tmp/beads-guarded-writes.patch && \
-    CGO_ENABLED=1 go build -tags gms_pure_go \
-        -ldflags='-X main.Build=scribe-guards-7505e173f265 -X main.Commit=7505e173f2659ba6e1f955b86d81a4f9e21810ca' \
-        -o /out/bd ./cmd/bd && \
-    rm -rf /var/lib/apt/lists/*
+RUN tar -xzf /tmp/beads.tar.gz -C /usr/local/bin bd
 
 FROM rust:1.95-trixie AS func-runtime
 
-COPY --from=beads-builder /out/bd /usr/local/bin/bd
+COPY --from=beads-release /usr/local/bin/bd /usr/local/bin/bd
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -88,10 +76,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture && \
     cargo test --locked -p scribe-client beads -- --nocapture
 
-# The read-slice proof needs the real GPUI window and the same guarded bd used
-# by the functional harness. Keep both builds authoritative by deriving from
-# the visual image and copying only the already pinned bd binary.
+# The read-slice proof needs the real GPUI window and the same official bd used
+# by the functional harness.
 FROM scribe-test-visual AS beads-read-e2e
-COPY --from=beads-builder /out/bd /usr/local/bin/bd
+COPY --from=beads-release /usr/local/bin/bd /usr/local/bin/bd
 COPY --chmod=755 tests/e2e/func/beads-board-visual-entrypoint.sh /entrypoint-beads.sh
 ENTRYPOINT ["/entrypoint-beads.sh"]

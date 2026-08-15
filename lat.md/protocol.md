@@ -237,9 +237,9 @@ opens and clears any open panel if a later `Welcome` removes the capability.
 
 A detail-capable server may therefore keep edits inert. It advertises writes
 only to the local `SingleController` owner and only when
-[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]] accepts
-the source- and checksum-pinned guarded build. Shared participants, bd 1.1.0,
-and unrecognized upstream builds stay read-only.
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#write_available]] finds
+an executable `bd` on PATH or a standard user install path. Shared and remote
+participants stay read-only regardless of executable availability.
 
 The protocol test linked to this section pins defaulting and the two capability
 fields' independent wire shape.
