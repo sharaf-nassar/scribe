@@ -4057,6 +4057,7 @@ impl SettingsWindow {
         let key = control.key.clone();
         let declared = options.to_vec();
         let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let close_target = pointer_target.clone();
         let open = self.open_choice.as_deref() == Some(control.key.as_str());
         let button = div()
             .id(("choice", key_hash(&control.key)))
@@ -4084,6 +4085,13 @@ impl SettingsWindow {
                 style.bg(colors.control_hover_bg).border_color(colors.strong_border)
             })
             .active(move |style| style.bg(colors.control_pressed_bg))
+            .when(open, |button| {
+                button.capture_any_mouse_down(cx.listener(
+                    move |this, event: &MouseDownEvent, choice_window, ctx| {
+                        this.press_open_choice_trigger(event, &close_target, choice_window, ctx);
+                    },
+                ))
+            })
             .on_click(cx.listener(move |this, _, choice_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
                 this.toggle_choice_menu(&key, &declared, choice_window, ctx);
@@ -4106,13 +4114,7 @@ impl SettingsWindow {
             // inside it — the control stops responding to clicks entirely.
             .h(px(30.0))
             .flex_none()
-            .when(open, |el| {
-                el.on_mouse_down_out(cx.listener(move |this, _, choice_window, ctx| {
-                    this.close_choice_menu(ctx);
-                    choice_window.focus(&this.focus_handle, ctx);
-                }))
-                .child(self.render_choice_menu(control, &effective, window, cx))
-            })
+            .when(open, |el| el.child(self.render_choice_menu(control, &effective, window, cx)))
             .child(button)
             .into_any_element()
     }
@@ -4223,6 +4225,11 @@ impl SettingsWindow {
             .id(("choice-menu", key_hash(&control.key)))
             .role(Role::Menu)
             .aria_label(control.label.clone())
+            .occlude()
+            .on_mouse_down_out(cx.listener(move |this, _, choice_window, ctx| {
+                this.close_choice_menu(ctx);
+                choice_window.focus(&this.focus_handle, ctx);
+            }))
             .when(theme_menu, |menu| menu.track_focus(&self.choice_filter_handle))
             .w(px(CHOICE_WIDTH))
             .mt(px(34.0))
@@ -4473,6 +4480,22 @@ impl SettingsWindow {
         was_open
     }
 
+    fn press_open_choice_trigger(
+        &mut self,
+        event: &MouseDownEvent,
+        target: &SettingsFocusTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        self.begin_pointer_interaction(target);
+        self.close_choice_menu(cx);
+        window.focus(&self.focus_handle, cx);
+        cx.stop_propagation();
+    }
+
     /// Open one shared color palette, initialized from the live value's hue.
     fn toggle_color_picker(&mut self, control: &Control, cx: &mut Context<Self>) {
         if self.open_color.as_deref() == Some(control.key.as_str()) {
@@ -4526,6 +4549,20 @@ impl SettingsWindow {
         if self.open_color.as_deref() == Some(key) {
             self.close_color_picker(cx);
         }
+    }
+
+    fn press_open_color_trigger(
+        &mut self,
+        event: &MouseDownEvent,
+        target: &SettingsFocusTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        self.begin_pointer_interaction(target);
+        self.close_color_picker(cx);
+        cx.stop_propagation();
     }
 
     /// A keybinding row's value: its combos as key caps, or the listening state
@@ -4755,19 +4792,13 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let open = self.open_color.as_deref() == Some(control.key.as_str());
-        let close_key = control.key.clone();
         div()
             .id(("color-selector-shell", key_hash(&control.key)))
             .relative()
             .w(px(CHOICE_WIDTH))
             .h(px(30.0))
             .flex_none()
-            .when(open, |el| {
-                el.on_mouse_down_out(cx.listener(move |this, _, _window, ctx| {
-                    this.close_color_picker_for(&close_key, ctx);
-                }))
-                .child(self.render_color_menu(control, window, cx))
-            })
+            .when(open, |el| el.child(self.render_color_menu(control, window, cx)))
             .child(self.render_color_trigger(control, open, cx))
             .into_any_element()
     }
@@ -4824,6 +4855,7 @@ impl SettingsWindow {
         let swatch = color_swatch(&self.theme, &control.key, &value).map_or(colors.input_bg, srgba);
         let picker_control = control.clone();
         let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let close_target = pointer_target.clone();
         div()
             .id(("color-selector", key_hash(&control.key)))
             .role(Role::ComboBox)
@@ -4848,6 +4880,13 @@ impl SettingsWindow {
                 style.bg(colors.control_hover_bg).border_color(colors.strong_border)
             })
             .active(move |style| style.bg(colors.control_pressed_bg))
+            .when(open, |trigger| {
+                trigger.capture_any_mouse_down(cx.listener(
+                    move |this, event: &MouseDownEvent, _window, ctx| {
+                        this.press_open_color_trigger(event, &close_target, ctx);
+                    },
+                ))
+            })
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
                 this.toggle_color_picker(&picker_control, ctx);
@@ -4892,6 +4931,7 @@ impl SettingsWindow {
     ) -> gpui::AnyElement {
         let colors = self.colors;
         let current = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let close_key = control.key.clone();
         let presets = self.render_color_presets(control, &current, cx);
         let hue_steps = self.render_color_hue_steps(control, cx);
         let palette = self.render_custom_color_palette(control, &current, cx);
@@ -4916,6 +4956,10 @@ impl SettingsWindow {
                     .id(("color-menu", key_hash(&control.key)))
                     .role(Role::Group)
                     .aria_label(format!("{} colors", control.label))
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(move |this, _, _window, ctx| {
+                        this.close_color_picker_for(&close_key, ctx);
+                    }))
                     .w(px(COLOR_PICKER_WIDTH))
                     .ml(px(color_menu_left_offset()))
                     .mt(px(34.0))

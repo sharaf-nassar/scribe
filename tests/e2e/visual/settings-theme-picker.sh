@@ -100,9 +100,31 @@ click_settings_at() {
     sleep 0.6
 }
 
+mouse_down_settings_at() {
+    xdotool mousemove "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))"
+    sleep 0.3
+    xdotool mousedown 1
+}
+
+mouse_up_settings() {
+    xdotool mouseup 1
+    sleep 0.6
+}
+
 changed_pixels() {
     local before="$1" after="$2" value
     value=$(compare -metric AE "$before" "$after" null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
+}
+
+changed_region_pixels() {
+    local before="$1" after="$2" x="$3" y="$4" width="$5" height="$6" value
+    convert "$before" -crop "${width}x${height}+${x}+${y}" +repage \
+        /tmp/settings-theme-picker-before.png
+    convert "$after" -crop "${width}x${height}+${x}+${y}" +repage \
+        /tmp/settings-theme-picker-after.png
+    value=$(compare -metric AE /tmp/settings-theme-picker-before.png \
+        /tmp/settings-theme-picker-after.png null: 2>&1 || true)
     printf '%s' "${value%%.*}"
 }
 
@@ -147,7 +169,7 @@ raise SystemExit(1)
 PY
 }
 
-assert_dracula_strip() {
+find_dracula_strip() {
     python3 - "$1" <<'PY'
 import re
 import subprocess
@@ -179,6 +201,7 @@ for py in range(460):
             and max(abs(channel - wanted) for channel, wanted in zip(color, target)) <= 5
             for color, target in zip(actual, expected)
         ):
+            print(px + 720, py + 100)
             raise SystemExit(0)
 raise SystemExit("Dracula preview strip pixels were not found")
 PY
@@ -249,6 +272,18 @@ if "prompt_bar_first_row_bg" in appearance:
 PY
 }
 
+assert_assignment_once() {
+    python3 - "$CONFIG_FILE" "$1" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+count = len(re.findall(rf"^\s*{re.escape(sys.argv[2])}\s*=", text, re.MULTILINE))
+if count != 1:
+    raise SystemExit(f"{sys.argv[2]} assignment count: expected 1, got {count}")
+PY
+}
+
 # Phase 0: open the real settings window from the running client.
 wait_for_client_log "X11 active-window guard enabled" \
     || fail "PHASE 0 FAIL: client focus guard never became ready"
@@ -275,60 +310,121 @@ FILTER_CHANGED=$(changed_pixels \
     /output/theme-picker-01-menu.png /output/theme-picker-02-filtered.png)
 [ "$FILTER_CHANGED" -ge "$FILTER_CHANGE_MIN" ] \
     || fail "PHASE 1 FAIL: filtering repainted $FILTER_CHANGED px (min $FILTER_CHANGE_MIN)"
-assert_dracula_strip /output/theme-picker-02-filtered.png \
+read -r DRACULA_X DRACULA_Y <<<"$(find_dracula_strip \
+    /output/theme-picker-02-filtered.png)" \
     || fail "PHASE 1 FAIL: filtered Dracula row has no known preview strip"
 echo "PHASE 1 PASS: preset menu narrowed to the pixel-verified Dracula row"
 
+# @lat: [[test#Visual E2E Tests#Settings theme picker#Held preset press stays inside the menu]]
+# Phase 2: keep the pointer down across a painted frame. The deferred menu
+# must stay open, block the color selector below it, and commit only on release.
+RELOADS_BEFORE=$(count_reloads)
+mouse_down_settings_at "$DRACULA_X" "$DRACULA_Y"
+sleep 0.2
+shot /output/theme-picker-03-held-dracula.png
+mouse_up_settings
+find_dracula_strip /output/theme-picker-03-held-dracula.png >/dev/null \
+    || fail "PHASE 2 FAIL: Dracula mousedown dismissed the deferred menu"
+UNDERLAY_CHANGED=$(changed_region_pixels \
+    /output/theme-picker-02-filtered.png /output/theme-picker-03-held-dracula.png \
+    320 "$(( DRACULA_Y - 4 ))" 350 8)
+[ "$UNDERLAY_CHANGED" -le 20 ] \
+    || fail "PHASE 2 FAIL: covered Colors row repainted $UNDERLAY_CHANGED px while held"
+wait_for_reload_count "$(( RELOADS_BEFORE + 1 ))" \
+    || fail "PHASE 2 FAIL: held Dracula click produced no client hot reload"
+sleep 1
+RELOADS_AFTER=$(count_reloads)
+[ "$RELOADS_AFTER" -eq "$(( RELOADS_BEFORE + 1 ))" ] \
+    || fail "PHASE 2 FAIL: held Dracula click produced $(( RELOADS_AFTER - RELOADS_BEFORE )) hot reloads, expected 1"
+assert_preset dracula || fail "PHASE 2 FAIL: held click did not save Dracula"
+assert_assignment_once theme \
+    || fail "PHASE 2 FAIL: appearance.theme was not serialized exactly once"
+xdotool mousemove "$(( WIN_X + 400 ))" "$(( WIN_Y + 100 ))"
+shot /output/theme-picker-04-held-applied.png
+if find_solid_color /output/theme-picker-04-held-applied.png \
+    '#ef4444' 650 100 350 500 >/dev/null; then
+    fail "PHASE 2 FAIL: covered color selector opened after the held Dracula click"
+fi
+echo "PHASE 2 PASS: held Dracula click stayed in the menu, persisted once, and opened no covered selector"
+
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Keyboard apply persists once]]
-# Phase 2: Down and Enter choose the filtered row without pointer selection.
+# Phase 3: move away from Dracula, then choose it again with Down and Enter.
+send_keys Return
+type_text "custom"
 RELOADS_BEFORE=$(count_reloads)
 send_keys Down
 send_keys Return
 wait_for_reload_count "$(( RELOADS_BEFORE + 1 ))" \
-    || fail "PHASE 2 FAIL: preset apply produced no client hot reload"
+    || fail "PHASE 3 FAIL: keyboard setup did not save Custom"
+send_keys Return
+type_text "dracula"
+RELOADS_BEFORE=$(count_reloads)
+send_keys Down
+send_keys Return
+wait_for_reload_count "$(( RELOADS_BEFORE + 1 ))" \
+    || fail "PHASE 3 FAIL: preset apply produced no client hot reload"
 sleep 1
 RELOADS_AFTER=$(count_reloads)
 [ "$RELOADS_AFTER" -eq "$(( RELOADS_BEFORE + 1 ))" ] \
-    || fail "PHASE 2 FAIL: preset apply produced $(( RELOADS_AFTER - RELOADS_BEFORE )) hot reloads, expected 1"
-assert_preset dracula || fail "PHASE 2 FAIL: Dracula was not saved to appearance.theme"
-shot /output/theme-picker-03-applied.png
-AMBER_CLOSED=$(color_count /output/theme-picker-03-applied.png '#f5b83a' 720 100 300 460)
+    || fail "PHASE 3 FAIL: preset apply produced $(( RELOADS_AFTER - RELOADS_BEFORE )) hot reloads, expected 1"
+assert_preset dracula || fail "PHASE 3 FAIL: Dracula was not saved to appearance.theme"
+shot /output/theme-picker-05-applied.png
+AMBER_CLOSED=$(color_count /output/theme-picker-05-applied.png '#f5b83a' 720 100 300 460)
 send_keys Return
-shot /output/theme-picker-04-selected.png
-AMBER_OPEN=$(color_count /output/theme-picker-04-selected.png '#f5b83a' 720 100 300 460)
+shot /output/theme-picker-06-selected.png
+AMBER_OPEN=$(color_count /output/theme-picker-06-selected.png '#f5b83a' 720 100 300 460)
 [ "$AMBER_OPEN" -gt "$(( AMBER_CLOSED + 10 ))" ] \
-    || fail "PHASE 2 FAIL: selected menu chrome added only $(( AMBER_OPEN - AMBER_CLOSED )) amber px"
+    || fail "PHASE 3 FAIL: selected menu chrome added only $(( AMBER_OPEN - AMBER_CLOSED )) amber px"
 send_keys Escape
-echo "PHASE 2 PASS: keyboard applied Dracula, saved TOML, painted selected chrome, and hot-reloaded once"
+echo "PHASE 3 PASS: keyboard applied Dracula, saved TOML, painted selected chrome, and hot-reloaded once"
 
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Derived swatch keeps its trigger visible]]
-# Phase 3: filter to First Row, then prove its unset Dracula-derived swatch
+# Phase 4: filter to First Row, then prove its unset Dracula-derived swatch
 # survives underneath the open color menu.
 send_keys ctrl+k
 type_text "First Row"
-shot /output/theme-picker-05-derived-swatch.png
+shot /output/theme-picker-07-derived-swatch.png
 read -r SWATCH_X SWATCH_Y <<<"$(find_solid_color \
-    /output/theme-picker-05-derived-swatch.png '#232531' 650 100 350 500)" \
-    || fail "PHASE 3 FAIL: unset First Row swatch is not Dracula-derived #232531"
+    /output/theme-picker-07-derived-swatch.png '#232531' 650 100 350 500)" \
+    || fail "PHASE 4 FAIL: unset First Row swatch is not Dracula-derived #232531"
 click_settings_at "$SWATCH_X" "$SWATCH_Y"
-shot /output/theme-picker-06-color-menu.png
-VISIBLE_SWATCH=$(color_count /output/theme-picker-06-color-menu.png '#232531' \
+shot /output/theme-picker-08-color-menu.png
+VISIBLE_SWATCH=$(color_count /output/theme-picker-08-color-menu.png '#232531' \
     "$(( SWATCH_X - 4 ))" "$(( SWATCH_Y - 4 ))" 8 8)
 [ "$VISIBLE_SWATCH" -ge 56 ] \
-    || fail "PHASE 3 FAIL: open color menu obscured its trigger swatch ($VISIBLE_SWATCH/64 px)"
-echo "PHASE 3 PASS: unset derived swatch is #232531 and its trigger remains visible"
+    || fail "PHASE 4 FAIL: open color menu obscured its trigger swatch ($VISIBLE_SWATCH/64 px)"
+echo "PHASE 4 PASS: unset derived swatch is #232531 and its trigger remains visible"
 
+# @lat: [[test#Visual E2E Tests#Settings theme picker#Held color preset persists once]]
 # @lat: [[test#Visual E2E Tests#Settings theme picker#Reset omits the override key]]
-# Phase 4: create an override, close the menu, move to Reset, and activate it.
-send_keys Right
-assert_prompt_override '#000000' \
-    || fail "PHASE 4 FAIL: keyboard preset did not write the First Row override"
+# Phase 5: hold one color preset through a frame, then close and reset it.
+read -r RED_X RED_Y <<<"$(find_solid_color \
+    /output/theme-picker-08-color-menu.png '#ef4444' 650 100 350 500)" \
+    || fail "PHASE 5 FAIL: red color preset was not visible"
+RELOADS_BEFORE=$(count_reloads)
+mouse_down_settings_at "$RED_X" "$RED_Y"
+sleep 0.2
+shot /output/theme-picker-09-held-color-preset.png
+mouse_up_settings
+find_solid_color /output/theme-picker-09-held-color-preset.png \
+    '#ef4444' 650 100 350 500 >/dev/null \
+    || fail "PHASE 5 FAIL: color-preset mousedown dismissed the deferred menu"
+wait_for_reload_count "$(( RELOADS_BEFORE + 1 ))" \
+    || fail "PHASE 5 FAIL: held color preset produced no client hot reload"
+sleep 1
+RELOADS_AFTER=$(count_reloads)
+[ "$RELOADS_AFTER" -eq "$(( RELOADS_BEFORE + 1 ))" ] \
+    || fail "PHASE 5 FAIL: held color preset produced $(( RELOADS_AFTER - RELOADS_BEFORE )) hot reloads, expected 1"
+assert_prompt_override '#ef4444' \
+    || fail "PHASE 5 FAIL: held preset did not write canonical #ef4444"
+assert_assignment_once prompt_bar_first_row_bg \
+    || fail "PHASE 5 FAIL: First Row override was not serialized exactly once"
 send_keys Escape
 send_keys Down
 send_keys Return
 assert_prompt_override_absent \
-    || fail "PHASE 4 FAIL: Reset serialized an empty prompt-bar override"
-shot /output/theme-picker-07-reset.png
-echo "PHASE 4 PASS: Reset removed prompt_bar_first_row_bg from TOML"
+    || fail "PHASE 5 FAIL: Reset serialized an empty prompt-bar override"
+shot /output/theme-picker-10-reset.png
+echo "PHASE 5 PASS: held color preset persisted once and Reset removed the override"
 
-echo "ALL PHASES PASS: settings theme picker preview, filter, keyboard apply, swatch, and reset"
+echo "ALL PHASES PASS: held menu clicks, preview, filter, keyboard apply, swatch, and reset"

@@ -1869,6 +1869,10 @@ The settings regression opens the selector, applies a keyboard preset and a poin
 
 Typing Dracula narrows the open preset menu to a row whose ten painted chips match the built-in background, foreground, and ANSI 0-7 colors.
 
+#### Held preset press stays inside the menu
+
+A Dracula pointer press held across a frame keeps the deferred menu open, leaves covered Colors rows inert, then persists once on release without opening a color selector.
+
 #### Keyboard apply persists once
 
 Enter opens Preset, Down highlights the filtered Dracula row, and Enter applies it without pointer selection, writes `appearance.theme`, paints selected chrome, and emits one client hot-reload line.
@@ -1876,6 +1880,10 @@ Enter opens Preset, Down highlights the filtered Dracula row, and Enter applies 
 #### Derived swatch keeps its trigger visible
 
 An unset First Row override paints the Dracula-derived `#232531` swatch, and opening its color menu leaves that trigger swatch unobscured.
+
+#### Held color preset persists once
+
+A color-preset press held across a frame keeps its deferred palette open and writes one canonical override with one live reload on release.
 
 #### Reset omits the override key
 
