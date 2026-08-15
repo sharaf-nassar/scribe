@@ -1114,6 +1114,16 @@ struct RestoreRuntime {
     /// asserted into, taken by the first paint. `None` once applied, or for a
     /// record whose state owns no `_NET_WM_STATE` atoms.
     pending_state: Option<WindowState>,
+    /// Where that assert is aiming, when the last `_NET_WM_STATE_ADD` went
+    /// out, and how many have gone out. A client message sent before the
+    /// window manager has managed the window is dropped rather than queued —
+    /// EWMH 5.7 addresses mapped windows — and Mutter takes long enough to
+    /// map that the first-paint assert can lose that race. Kept until the
+    /// live state reads back as the one asserted, re-asserting on the same
+    /// [`RESTORE_DEBOUNCE`] the position verify waits, and given up after
+    /// [`STATE_ASSERT_ATTEMPTS`] so a window manager that refuses the state
+    /// is argued with a bounded number of times rather than looped against.
+    state_target: Option<StateAssert>,
     /// The virtual desktop the restored window still has to be sent back to,
     /// taken by the first paint. `None` once applied, or when the record names
     /// no desktop.
@@ -1169,6 +1179,22 @@ fn restore_claim_disposition(
     if live > 0 { RestoreClaimDisposition::Warm } else { RestoreClaimDisposition::Cold }
 }
 
+/// How many `_NET_WM_STATE_ADD` messages a restore may send before adopting
+/// whatever state the window manager left the window in. Four spans about two
+/// seconds at [`RESTORE_DEBOUNCE`] pacing, which covers a compositor still
+/// managing the map; a window manager that has refused four idempotent adds
+/// is enforcing something real.
+const STATE_ASSERT_ATTEMPTS: u8 = 4;
+
+/// One in-flight window-state assert: what was asked, when the last add went
+/// out, and how many have gone out.
+#[derive(Debug, Clone, Copy)]
+struct StateAssert {
+    state: WindowState,
+    asked_at: Instant,
+    attempts: u8,
+}
+
 /// How far a restored window's placement has got, which is what decides whether
 /// the window's current bounds are the user's layout or the restore's.
 ///
@@ -1193,15 +1219,18 @@ enum RestorePlacement {
 impl RestorePlacement {
     /// Advance the placement and report whether the restore has converged.
     ///
-    /// `position_pending` is true while [`RestoreRuntime::pending_position`] or
-    /// [`RestoreRuntime::position_target`] still hold work.
+    /// `restore_pending` is true while [`RestoreRuntime::pending_position`],
+    /// [`RestoreRuntime::position_target`], [`RestoreRuntime::pending_state`],
+    /// or [`RestoreRuntime::state_target`] still hold work — a capture taken
+    /// while the state assert is in flight is the windowed reading the assert
+    /// exists to undo, and persisting it demotes the record to windowed.
     /// [`TerminalView::verify_restored_position`] runs immediately before every
-    /// geometry capture, so both being empty means the landing has just been
-    /// checked — or that there was never a position to restore, which is why a
-    /// window opened without one starts [`Self::Settled`].
-    fn settled(&mut self, position_pending: bool) -> bool {
+    /// geometry capture, so all being empty means the landing has just been
+    /// checked — or that there was never anything to restore, which is why a
+    /// window opened without a record starts [`Self::Settled`].
+    fn settled(&mut self, restore_pending: bool) -> bool {
         *self = match *self {
-            Self::Restoring if position_pending => Self::Restoring,
+            Self::Restoring if restore_pending => Self::Restoring,
             Self::Restoring => Self::Verifying(Instant::now()),
             Self::Verifying(at) if at.elapsed() < RESTORE_DEBOUNCE => Self::Verifying(at),
             _ => Self::Settled,
@@ -1229,6 +1258,7 @@ impl RestoreRuntime {
             monitor: None,
             pending_minimize: None,
             pending_state: None,
+            state_target: None,
             pending_desktop: None,
             assigned_geometry: if restore_geometry.is_none() {
                 AssignedGeometry::Unread
@@ -1248,7 +1278,10 @@ impl RestoreRuntime {
         };
         if let Some(geometry) = restore_geometry {
             runtime.adopt_geometry_record(geometry);
-            if runtime.pending_position.is_some() {
+            // A record with only a state to reach keeps the placement open
+            // too: persisting the pre-assert reading would demote the record
+            // to windowed exactly the way a pre-move reading misplaced one.
+            if runtime.pending_position.is_some() || runtime.pending_state.is_some() {
                 runtime.placement = RestorePlacement::Restoring;
             }
         }
@@ -1837,12 +1870,69 @@ impl TerminalView {
     /// idempotent, so doing it after a move that already restored the state
     /// costs one ignored client message.
     fn apply_saved_window_state(&mut self, window: &Window) {
-        let Some(state) = self.restore.pending_state.take() else { return };
-        if monitor::assert_window_state(window, state) {
-            tracing::info!(?state, "asserting the restored window's saved state");
-        } else {
-            tracing::debug!(?state, "no X11 window state to assert; keeping what the WM chose");
+        if let Some(state) = self.restore.pending_state.take() {
+            if monitor::assert_window_state(window, state) {
+                tracing::info!(?state, "asserting the restored window's saved state");
+                self.restore.state_target =
+                    Some(StateAssert { state, asked_at: Instant::now(), attempts: 1 });
+            } else {
+                tracing::debug!(?state, "no X11 window state to assert; keeping what the WM chose");
+            }
+            return;
         }
+        self.verify_restored_state(window);
+    }
+
+    /// Check that the asserted state actually took, re-asserting until it does.
+    ///
+    /// The first assert goes out around the first paint, which on X11 can be
+    /// before the window manager has managed the window at all — GPUI's map is
+    /// a request the WM answers when it likes, and Mutter answers it through a
+    /// placement pass and a map animation. EWMH 5.7's `_NET_WM_STATE` client
+    /// message addresses mapped windows, so one sent early is not queued but
+    /// dropped, and the window relaunches windowed while its record says
+    /// maximized. Unlike the position — where the WM's different answer is
+    /// respected — the add is re-sent: it is idempotent, and the only party
+    /// that asked for windowed here is the race. [`STATE_ASSERT_ATTEMPTS`]
+    /// bounds the argument, and the give-up is logged so a refusing window
+    /// manager is visible rather than silent.
+    fn verify_restored_state(&mut self, window: &Window) {
+        let Some(StateAssert { state, asked_at, attempts }) = self.restore.state_target else {
+            return;
+        };
+        if asked_at.elapsed() < RESTORE_DEBOUNCE {
+            return;
+        }
+        // The same EWMH reading capture trusts; GPUI's own answer is only the
+        // off-X11 fallback, and an armed target means X11 answered the assert.
+        let fallback = window
+            .is_fullscreen()
+            .then_some(WindowState::Fullscreen)
+            .or_else(|| window.is_maximized().then_some(WindowState::Maximized))
+            .unwrap_or_default();
+        let observed = monitor::observed_window_state(
+            window,
+            ObservedWindowState { state: fallback, ..ObservedWindowState::default() },
+        )
+        .state;
+        if observed == state {
+            tracing::info!(?state, attempts, "the restored window's saved state landed");
+            self.restore.state_target = None;
+            return;
+        }
+        if attempts >= STATE_ASSERT_ATTEMPTS {
+            tracing::warn!(
+                ?state,
+                ?observed,
+                attempts,
+                "the window manager kept the restored window out of its saved state; giving up"
+            );
+            self.restore.state_target = None;
+            return;
+        }
+        monitor::assert_window_state(window, state);
+        self.restore.state_target =
+            Some(StateAssert { state, asked_at: Instant::now(), attempts: attempts + 1 });
     }
 
     /// Put a restored window back on its saved virtual desktop, once.
@@ -1960,7 +2050,10 @@ impl TerminalView {
     /// record it was aiming at intact for the next start to try again from.
     fn capture_geometry(&mut self, window: &Window, cx: &App) {
         let settled = self.restore.placement.settled(
-            self.restore.pending_position.is_some() || self.restore.position_target.is_some(),
+            self.restore.pending_position.is_some()
+                || self.restore.position_target.is_some()
+                || self.restore.pending_state.is_some()
+                || self.restore.state_target.is_some(),
         );
         // RandR connector name where available; GPUI's X11 display uuid is a
         // nil placeholder and must never be persisted (see `monitor`).
@@ -13503,6 +13596,50 @@ mod tests {
         let runtime = RestoreRuntime::from_seed(seed(Some(minimized)));
         assert_eq!(runtime.pending_minimize, Some(WindowState::Maximized));
         assert_eq!(runtime.pending_state, Some(WindowState::Maximized));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Cold Restart Restore#The state assert is verified and re-sent until it lands]]
+    #[test]
+    fn a_state_only_record_keeps_the_placement_open_until_the_assert_clears() {
+        let seed = |restore_geometry| WindowSeed {
+            terminal_size: TerminalSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 },
+            restored: None,
+            restore_siblings: 0,
+            restore_geometry,
+        };
+        // A maximized record with no saved origin: nothing to move, only a
+        // state to reach. Persisting the pre-assert reading here is exactly
+        // the demotion that made one lost race permanent.
+        let mut maximized = WindowGeometry::default();
+        maximized.state = WindowState::Maximized;
+        maximized.width = 2160;
+        maximized.height = 3765;
+        let mut runtime = RestoreRuntime::from_seed(seed(Some(maximized)));
+        assert_eq!(runtime.pending_position, None);
+        assert_eq!(runtime.placement, RestorePlacement::Restoring);
+
+        // While the assert holds work — queued or in flight — captures are
+        // adopted as baseline, never persisted.
+        let in_flight =
+            StateAssert { state: WindowState::Maximized, asked_at: Instant::now(), attempts: 1 };
+        for target in [None, Some(in_flight)] {
+            runtime.state_target = target;
+            let pending = runtime.pending_state.is_some() || runtime.state_target.is_some();
+            assert!(!runtime.placement.settled(pending));
+            assert_eq!(runtime.placement, RestorePlacement::Restoring);
+            runtime.pending_state = None;
+        }
+
+        // The assert clearing is what lets the placement converge, through the
+        // same verify grace a position landing gets.
+        runtime.state_target = None;
+        assert!(!runtime.placement.settled(false));
+        assert!(matches!(runtime.placement, RestorePlacement::Verifying(_)));
+        if let RestorePlacement::Verifying(at) = &mut runtime.placement {
+            *at = Instant::now().checked_sub(RESTORE_DEBOUNCE).unwrap();
+        }
+        assert!(runtime.placement.settled(false));
+        assert_eq!(runtime.placement, RestorePlacement::Settled);
     }
 
     // @lat: [[test#Window geometry compat#X11 restore has one state transition]]

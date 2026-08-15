@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, FontWeight, MouseButton, Rgba, Role, SharedString, div, linear_color_stop,
-    linear_gradient, prelude::*, px,
+    linear_gradient, prelude::*, px, uniform_list,
 };
 
 use crate::layout::Rect;
@@ -627,6 +627,10 @@ struct Lane<'a> {
     empty: &'static str,
     total: u32,
     items: &'a [BeadsBoardItem],
+    /// This queue's items off a later snapshot: the lane body is virtualised,
+    /// and its visible rows are built at layout time from the shared state
+    /// rather than from the borrow the build frame held.
+    queue: fn(&BeadsBoardSnapshot) -> &[BeadsBoardItem],
     /// The queue's colour, worn by its node and the rail beneath it.
     state: Rgba,
     /// The queues either side, which this lane's wash travels to meet.
@@ -824,6 +828,7 @@ fn lanes(
             empty: "Empty",
             total: snapshot.backlog_total,
             items: &snapshot.backlog,
+            queue: |board| &board.backlog,
             state: colors.backlog_state,
             blend: LaneBlend::NONE,
             accent: LaneAccent::None,
@@ -833,6 +838,7 @@ fn lanes(
             empty: "None ready",
             total: snapshot.ready_total,
             items: &snapshot.ready,
+            queue: |board| &board.ready,
             state: colors.ready_state,
             blend: LaneBlend::NONE,
             accent: LaneAccent::None,
@@ -842,6 +848,7 @@ fn lanes(
             empty: "Idle",
             total: snapshot.in_progress_total,
             items: &snapshot.in_progress,
+            queue: |board| &board.in_progress,
             state: colors.progress_state,
             blend: LaneBlend::NONE,
             accent: LaneAccent::Progress,
@@ -851,6 +858,7 @@ fn lanes(
             empty: "Clear",
             total: snapshot.blocked_total,
             items: &snapshot.blocked,
+            queue: |board| &board.blocked,
             state: colors.blocked_state,
             blend: LaneBlend::NONE,
             accent: LaneAccent::None,
@@ -860,6 +868,7 @@ fn lanes(
             empty: "None yet",
             total: snapshot.done_total,
             items: &snapshot.done,
+            queue: |board| &board.done,
             state: colors.done_state,
             blend: LaneBlend::NONE,
             accent: LaneAccent::None,
@@ -1087,24 +1096,48 @@ fn lane_body(
             .child(empty_lane(spec, colors, metrics))
             .into_any_element();
     }
-    // ponytail: renders every issue the snapshot carries, which the server caps
-    // at 200 a queue. Swap in a virtualised list if a full queue ever drags.
-    let issues = spec
-        .items
-        .iter()
-        .map(|item| issue(item, CardContext { workspace_id, state, colors, metrics }));
+    // Virtualised: a full queue is 200 rows and only ~3 are visible, so the
+    // closure builds cards for the range uniform_list asks for and no more.
+    // It runs at layout time, after the build frame's borrow of the snapshot
+    // is gone, so it re-reads this queue from the shared state; an index that
+    // outlives its snapshot resolves to nothing rather than to a stale card.
+    let queue = spec.queue;
+    let closure_state = std::sync::Arc::clone(state);
+    let closure_colors = *colors;
     div()
         .relative()
         .h(px(metrics.body()))
         .child(
-            div()
-                .id(SharedString::from(format!("beads-lane-{workspace_id}-{}", spec.name)))
-                .h(px(metrics.issues()))
-                .pr(px(4.0))
-                .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .children(issues),
+            uniform_list(
+                SharedString::from(format!("beads-lane-{workspace_id}-{}", spec.name)),
+                spec.items.len(),
+                move |range, _window, _app| {
+                    let Ok(boards) = closure_state.lock() else { return Vec::new() };
+                    let (snapshot, _) = board_content(boards.state(workspace_id));
+                    let Some(snapshot) = snapshot else { return Vec::new() };
+                    let items = queue(snapshot);
+                    range
+                        .filter_map(|index| items.get(index))
+                        .map(|item| {
+                            // The row is the uniform unit, the card's gap and
+                            // all: uniform_list measures an item's taffy size,
+                            // which a margin is outside of, so the gap rides
+                            // inside a fixed-height row as padding instead.
+                            div().h(metrics.at(ISSUE_HEIGHT)).pb(metrics.at(CARD_GAP)).child(issue(
+                                item,
+                                CardContext {
+                                    workspace_id,
+                                    state: &closure_state,
+                                    colors: &closure_colors,
+                                    metrics,
+                                },
+                            ))
+                        })
+                        .collect()
+                },
+            )
+            .h(px(metrics.issues()))
+            .pr(px(4.0)),
         )
         .child(
             div()
@@ -1149,7 +1182,6 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     div()
         .h(metrics.at(ISSUE_HEIGHT - CARD_GAP))
         .flex_none()
-        .mb(metrics.at(CARD_GAP))
         .relative()
         .overflow_hidden()
         .rounded(px(CARD_RADIUS))

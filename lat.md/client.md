@@ -296,7 +296,7 @@ A maximized or fullscreen window is placed the same way, because the window mana
 
 The state is asserted in its own right by [[crates/scribe-client/src/monitor.rs#assert_window_state]], because GPUI's X11 operation is a *toggle*. `WindowBounds::Maximized` reaches `zoom()` before GPUI maps the window, but its `set_wm_hints` call sends `_NET_WM_STATE_TOGGLE` on GPUI's X connection; Scribe's idempotent `_NET_WM_STATE_ADD` uses another connection after the map. X11 orders requests per connection, not across connections, so either can land last and a late GPUI toggle can undo the correct add.
 
-[[crates/scribe-client/src/main.rs#x11_creation_bounds]] removes that second owner: on X11, maximized and fullscreen records create a window at their saved restore rect, so GPUI emits no state toggle, and Scribe sends the only transition as an ADD. The earliest public hook is the root-view builder after GPUI maps the platform window; Scribe asserts there before a root view exists or an application frame can paint, then [[crates/scribe-client/src/main.rs#TerminalView#apply_saved_window_state]] repeats the idempotent ADD after the placement move. True pre-map EWMH state needs an upstream GPUI creation API and remains unavailable. Wayland keeps `WindowBounds::Maximized`/`Fullscreen`, whose native request is state-setting rather than toggling through a second X connection.
+[[crates/scribe-client/src/main.rs#x11_creation_bounds]] removes that second owner: on X11, maximized and fullscreen records create a window at their saved restore rect, so GPUI emits no state toggle, and Scribe sends the only transition as an ADD. The earliest public hook is the root-view builder after GPUI maps the platform window; Scribe asserts there before a root view exists or an application frame can paint, then [[crates/scribe-client/src/main.rs#TerminalView#apply_saved_window_state]] repeats the idempotent ADD after the placement move — and, because every one of those sends can race the window manager still managing the window, [[crates/scribe-client/src/main.rs#TerminalView#verify_restored_state]] reads the state back on the restore debounce and re-sends the ADD a bounded number of times until it lands (see [[client#Client#GPUI Client Spike#Cold Restart Restore#The state assert is verified and re-sent until it lands|the verified assert]]). True pre-map EWMH state needs an upstream GPUI creation API and remains unavailable. Wayland keeps `WindowBounds::Maximized`/`Fullscreen`, whose native request is state-setting rather than toggling through a second X connection.
 
 What the window manager cannot be talked out of is a strut, a snap, an off-screen clamp, or a decision to use the active monitor. [[crates/scribe-client/src/main.rs#TerminalView#verify_restored_position]] therefore checks the landing rather than correcting it: once the request has had `RESTORE_DEBOUNCE` to be answered — it is asynchronous, so a reading taken beside it reports a position the window has not reached — it compares [[crates/scribe-client/src/monitor.rs#window_monitor_name]] against the monitor the record names. Same monitor is logged as a success; a different one is logged as an explicit give-up, because re-asserting against a window manager that is enforcing something real is how a placement loop starts. Nothing is checked when the record names no monitor, or when the platform cannot resolve the live one.
 
@@ -306,17 +306,7 @@ What the window manager cannot be talked out of is a strut, a snap, an off-scree
 
 [[crates/scribe-client/src/main.rs#TerminalView#capture_geometry]] runs on every frame and every bounds change, and it used to arm the debounced flush unconditionally. Wherever the window manager actually dropped a restored window — right monitor or wrong — that placement was written back over the saved record half a second later, so one bad start destroyed the only position the next start had to aim at, and every placement defect became self-reinforcing.
 
-The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/main.rs#RestoreRuntime]]'s `pending_position` or `position_target` still hold work, `Verifying` for one more `RESTORE_DEBOUNCE` after the landing has been checked (a window manager still nudging the window with a strut or a snap must not have that reading adopted as the user's layout), then `Settled`. A window opened without a saved position starts `Settled`, so nothing about a fresh window's first-frame capture changes.
-
-While unsettled the reading is still tracked as the live geometry — the change detection needs a baseline — but it is also recorded as `saved_geometry`, which is what "already on disk" means to both [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_if_due]] and the unconditional quit-time [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_now]]. That keeps both flushes off the record without a second suppression flag, and the user's next move or resize differs from the baseline and arms the flush exactly as before.
-
-#### A restore never saves over the record it aims at
-
-[[crates/scribe-client/src/main.rs#RestorePlacement]] gates geometry persistence on the restore having converged, so a misplaced restore stays a one-restart annoyance instead of corrupting the record permanently.
-
-[[crates/scribe-client/src/main.rs#TerminalView#capture_geometry]] runs on every frame and every bounds change, and it used to arm the debounced flush unconditionally. Wherever the window manager actually dropped a restored window — right monitor or wrong — that placement was written back over the saved record half a second later, so one bad start destroyed the only position the next start had to aim at, and every placement defect became self-reinforcing.
-
-The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/main.rs#RestoreRuntime]]'s `pending_position` or `position_target` still hold work, `Correcting` for one `RESTORE_DEBOUNCE` after the single correction goes out (that move is another asynchronous `ConfigureRequest`, so bounds read beside it still report the placement it is undoing), then `Settled`. A window opened without a saved position starts `Settled`, so nothing about a fresh window's first-frame capture changes.
+The gate is a three-state advance: `Restoring` while [[crates/scribe-client/src/main.rs#RestoreRuntime]]'s `pending_position`, `position_target`, `pending_state`, or `state_target` still hold work — the state assert is restore work exactly as the move is, and a capture taken while it is in flight is the windowed reading it exists to undo — `Verifying` for one more `RESTORE_DEBOUNCE` after the landing has been checked (a window manager still nudging the window with a strut or a snap must not have that reading adopted as the user's layout), then `Settled`. A window opened without a record starts `Settled`, so nothing about a fresh window's first-frame capture changes.
 
 While unsettled the reading is still tracked as the live geometry — the change detection needs a baseline — but it is also recorded as `saved_geometry`, which is what "already on disk" means to both [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_if_due]] and the unconditional quit-time [[crates/scribe-client/src/main.rs#TerminalView#flush_geometry_now]]. That keeps both flushes off the record without a second suppression flag, and the user's next move or resize differs from the baseline and arms the flush exactly as before.
 
@@ -449,6 +439,12 @@ A window opened at its own record named that window in `Hello`, so it has nothin
 Verifies a maximized or fullscreen record queues its state for an explicit `_NET_WM_STATE_ADD`, from both halves of the restore: the window opened at the record and the window that only learned which record it has afterwards.
 
 The second is the one with nothing to fall back on — it was never opened with `WindowBounds::Maximized` at all. A windowed record queues nothing, since it owns no atoms. A minimized record queues the state it *unminimizes into* rather than minimization itself, so a window that was maximized before it was minimized comes back as both.
+
+#### The state assert is verified and re-sent until it lands
+
+The add is not fire-and-forget: the first one goes out around the first paint, which can be before the window manager has managed the window at all, and EWMH's `_NET_WM_STATE` message addresses mapped windows — one sent early is dropped, not queued.
+
+Mutter answers GPUI's map through a placement pass and a map animation, so a maximized window relaunched by a package update raced that map and came back windowed. The assert now arms a target the frame loop verifies on the restore debounce, re-sending the idempotent add a bounded number of times before logging a give-up; unlike the position, where the window manager's different answer is respected, the only party that asked for windowed here is the race. A record whose only work is the state also keeps the placement open, so a capture taken while the assert is in flight is adopted as baseline rather than persisted — one lost race no longer demotes a maximized record to windowed permanently.
 
 #### Replayed prompts reach the live AI chrome
 
@@ -1095,7 +1091,13 @@ word. The rail stops a clear gap short of the text-size controls at the other
 end for the same reason — a line that runs under a button looks like it means
 something.
 Lanes scroll, showing three of their 50px issue rows at a time with a
-chevron marking the rest. A card gives its whole first line to P0-P4 and the
+chevron marking the rest. A lane body is a virtualised `uniform_list`, so only
+the visible rows are built each frame: a full queue is 200 items and a window
+can hold several boards, and building every clipped card made the whole client
+drag as boards opened. The list's closure runs at layout time, after the build
+frame's borrow of the snapshot is gone, so it re-reads its queue from the
+shared board state and an index that outlives its snapshot resolves to
+nothing. A card gives its whole first line to P0-P4 and the
 title, since the title is the only line a reader scans; beneath it sit the
 issue's ID at the left and its parent epic at the right, pushed there by a
 grown spacer between them rather than by justify-content: a grown container
