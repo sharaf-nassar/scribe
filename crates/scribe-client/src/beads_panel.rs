@@ -1,21 +1,28 @@
-//! Read-only Beads issue panel state and rendering.
+//! Beads issue panel state, inline text editing, and rendering.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Range,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, ElementId, FontWeight, MouseButton, Rgba, Role,
-    SharedString, div, linear_color_stop, linear_gradient, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent, MouseButton, Pixels, Point,
+    Rgba, Role, SharedString, Subscription, UTF16Selection, Window, canvas, div, linear_color_stop,
+    linear_gradient, prelude::*, px,
 };
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
-    BeadsIssueQueue, BeadsIssueQueueBasis,
+    BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite,
 };
 
 use crate::animation::AnimationSettings;
 use crate::beads_board::BeadsBoardColors;
 use crate::layout::Rect;
+use crate::settings::window::{utf8_range_to_utf16, utf16_range_to_utf8};
 
 const PANEL_WIDTH: f32 = 560.0;
 const PANEL_MIN_WIDTH: f32 = 400.0;
@@ -255,13 +262,390 @@ impl PanelNotice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditField {
+    Title,
+    Description,
+    Acceptance,
+    Notes,
+    Design,
+    SpecId,
+}
+
+impl EditField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Description => "description",
+            Self::Acceptance => "acceptance",
+            Self::Notes => "notes",
+            Self::Design => "design",
+            Self::SpecId => "spec-id",
+        }
+    }
+
+    fn multiline(self) -> bool {
+        matches!(self, Self::Description | Self::Acceptance | Self::Notes | Self::Design)
+    }
+
+    fn verb(self, value: String) -> BeadsIssueWrite {
+        match self {
+            Self::Title => BeadsIssueWrite::SetTitle { title: value },
+            Self::Description => BeadsIssueWrite::SetDescription { description: value },
+            Self::Acceptance => BeadsIssueWrite::SetAcceptance { acceptance: value },
+            Self::Notes => BeadsIssueWrite::SetNotes { notes: value },
+            Self::Design => BeadsIssueWrite::SetDesign { design: value },
+            Self::SpecId => {
+                BeadsIssueWrite::SetSpecId { spec_id: (!value.is_empty()).then_some(value) }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKeyAction {
+    Commit,
+    Cancel,
+    Text,
+    Consume,
+}
+
+fn edit_key_action(field: EditField, event: &KeyDownEvent) -> EditKeyAction {
+    match event.keystroke.key.as_str() {
+        "escape" => EditKeyAction::Cancel,
+        "enter" if !field.multiline() || event.keystroke.modifiers.modified() => {
+            EditKeyAction::Commit
+        }
+        "backspace" | "delete" | "tab" | "up" | "down" | "left" | "right" => EditKeyAction::Consume,
+        _ => EditKeyAction::Text,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeadsEditIntent {
+    pub workspace_id: WorkspaceId,
+    pub issue_id: String,
+    pub verb: BeadsIssueWrite,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveEdit {
+    workspace_id: WorkspaceId,
+    issue_id: String,
+    field: EditField,
+    original: String,
+    input: String,
+    marked: Option<Range<usize>>,
+    select_all: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EditTarget<'a> {
+    workspace_id: WorkspaceId,
+    issue_id: &'a str,
+    field: EditField,
+    value: &'a str,
+}
+
+#[derive(Debug, Default)]
+struct EditSession {
+    active: Option<ActiveEdit>,
+}
+
+impl EditSession {
+    fn begin(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        field: EditField,
+        value: &str,
+    ) -> Option<BeadsEditIntent> {
+        if self.active.as_ref().is_some_and(|active| {
+            active.workspace_id == workspace_id
+                && active.issue_id == issue_id
+                && active.field == field
+        }) {
+            return None;
+        }
+        let pending = self.finish();
+        self.active = Some(ActiveEdit {
+            workspace_id,
+            issue_id: issue_id.to_owned(),
+            field,
+            original: value.to_owned(),
+            input: value.to_owned(),
+            marked: None,
+            select_all: true,
+        });
+        pending
+    }
+
+    fn finish(&mut self) -> Option<BeadsEditIntent> {
+        let active = self.active.take()?;
+        (active.input != active.original).then(|| BeadsEditIntent {
+            workspace_id: active.workspace_id,
+            issue_id: active.issue_id,
+            verb: active.field.verb(active.input),
+        })
+    }
+
+    fn cancel(&mut self) {
+        self.active = None;
+    }
+
+    #[cfg(test)]
+    fn replace_all(&mut self, value: &str) {
+        if let Some(active) = self.active.as_mut() {
+            value.clone_into(&mut active.input);
+            active.marked = None;
+            active.select_all = false;
+        }
+    }
+
+    fn input(&self) -> Option<&str> {
+        self.active.as_ref().map(|active| active.input.as_str())
+    }
+
+    fn backspace(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        if active.select_all {
+            active.input.clear();
+            active.select_all = false;
+        } else {
+            active.input.pop();
+        }
+        active.marked = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeadsEditorKeyRoute {
+    Inactive,
+    Text,
+    Consumed,
+    Finished,
+}
+
+/// One native text-input owner per terminal window.
+pub struct BeadsEditor {
+    focus: FocusHandle,
+    session: EditSession,
+    panels: Arc<Mutex<BeadsPanels>>,
+    _blur: Subscription,
+}
+
+impl BeadsEditor {
+    pub fn new(
+        panels: Arc<Mutex<BeadsPanels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        let blur = cx.on_blur(&focus, window, |editor, _window, cx| editor.commit(cx));
+        Self { focus, session: EditSession::default(), panels, _blur: blur }
+    }
+
+    fn begin(&mut self, target: EditTarget<'_>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(intent) =
+            self.session.begin(target.workspace_id, target.issue_id, target.field, target.value)
+        {
+            self.queue(intent);
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    pub fn route_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> BeadsEditorKeyRoute {
+        let Some(field) = self.session.active.as_ref().map(|active| active.field) else {
+            return BeadsEditorKeyRoute::Inactive;
+        };
+        match edit_key_action(field, event) {
+            EditKeyAction::Commit => {
+                self.commit(cx);
+                BeadsEditorKeyRoute::Finished
+            }
+            EditKeyAction::Cancel => {
+                self.session.cancel();
+                cx.notify();
+                BeadsEditorKeyRoute::Finished
+            }
+            EditKeyAction::Text => BeadsEditorKeyRoute::Text,
+            EditKeyAction::Consume => {
+                if event.keystroke.key == "backspace" {
+                    self.session.backspace();
+                    cx.notify();
+                }
+                BeadsEditorKeyRoute::Consumed
+            }
+        }
+    }
+
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.session.active.is_some() {
+            self.session.cancel();
+            cx.notify();
+        }
+    }
+
+    pub fn commit(&mut self, cx: &mut Context<Self>) {
+        if let Some(intent) = self.session.finish() {
+            self.queue(intent);
+        }
+        cx.notify();
+    }
+
+    fn queue(&self, intent: BeadsEditIntent) {
+        if let Ok(mut panels) = self.panels.lock() {
+            panels.queue_write(intent);
+        }
+    }
+
+    fn active_text(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        field: EditField,
+    ) -> Option<&str> {
+        self.session.active.as_ref().and_then(|active| {
+            (active.workspace_id == workspace_id
+                && active.issue_id == issue_id
+                && active.field == field)
+                .then_some(active.input.as_str())
+        })
+    }
+}
+
+impl EntityInputHandler for BeadsEditor {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let input = self.session.input()?;
+        let range = utf16_range_to_utf8(input, range);
+        actual_range.replace(utf8_range_to_utf16(input, &range));
+        Some(input[range].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let active = self.session.active.as_ref()?;
+        let end = active.input.encode_utf16().count();
+        let range = if active.select_all { 0..end } else { end..end };
+        Some(UTF16Selection { range, reversed: false })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let active = self.session.active.as_ref()?;
+        active.marked.as_ref().map(|range| utf8_range_to_utf16(&active.input, range))
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.active.as_mut().is_some_and(|active| active.marked.take().is_some()) {
+            cx.notify();
+            window.refresh();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.session.active.as_mut() else { return };
+        let range = if active.select_all {
+            0..active.input.len()
+        } else {
+            range
+                .map(|range| utf16_range_to_utf8(&active.input, range))
+                .or_else(|| active.marked.take())
+                .unwrap_or(active.input.len()..active.input.len())
+        };
+        active.input.replace_range(range, text);
+        active.marked = None;
+        active.select_all = false;
+        cx.notify();
+        window.refresh();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.session.active.as_mut() else { return };
+        let range = if active.select_all {
+            0..active.input.len()
+        } else {
+            range
+                .map(|range| utf16_range_to_utf8(&active.input, range))
+                .or_else(|| active.marked.take())
+                .unwrap_or(active.input.len()..active.input.len())
+        };
+        let start = range.start;
+        active.input.replace_range(range, text);
+        active.marked = (!text.is_empty()).then_some(start..start + text.len());
+        active.select_all = false;
+        cx.notify();
+        window.refresh();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.session.input()?.encode_utf16().count())
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.session.input()?.encode_utf16().count())
+    }
+}
+
 /// Per-workspace panel state plus intents parked for the owning GPUI view.
 #[derive(Debug, Default)]
 pub struct BeadsPanels {
     detail_enabled: bool,
+    write_enabled: bool,
     open: HashMap<WorkspaceId, BeadsPanel>,
     pending_requests: VecDeque<(WorkspaceId, String)>,
     pending_navigation: HashMap<WorkspaceId, String>,
+    pending_writes: VecDeque<BeadsEditIntent>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
     notices: HashMap<WorkspaceId, PanelNotice>,
@@ -275,11 +659,23 @@ impl BeadsPanels {
             self.open.clear();
             self.pending_requests.clear();
             self.pending_navigation.clear();
+            self.pending_writes.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
             self.notices.clear();
             self.last_opened = None;
         }
+    }
+
+    pub fn set_write_enabled(&mut self, enabled: bool) {
+        self.write_enabled = enabled;
+        if !enabled {
+            self.pending_writes.clear();
+        }
+    }
+
+    pub fn write_enabled(&self) -> bool {
+        self.write_enabled
     }
 
     pub fn open(&mut self, workspace_id: WorkspaceId, card: BeadsBoardItem, lane: u8) {
@@ -353,6 +749,16 @@ impl BeadsPanels {
 
     pub fn take_request(&mut self) -> Option<(WorkspaceId, String)> {
         self.pending_requests.pop_front()
+    }
+
+    fn queue_write(&mut self, intent: BeadsEditIntent) {
+        if self.write_enabled {
+            self.pending_writes.push_back(intent);
+        }
+    }
+
+    pub fn take_write(&mut self) -> Option<BeadsEditIntent> {
+        self.pending_writes.pop_front()
     }
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
@@ -508,23 +914,50 @@ pub fn comment_line_limit(index: usize, expanded: bool) -> Option<usize> {
     (!expanded).then_some(if index == 0 { 2 } else { 1 })
 }
 
-pub struct BeadsPanelRender {
+pub struct BeadsPanelRender<'a> {
     pub region: Rect,
     pub board: Rect,
     pub workspace_id: WorkspaceId,
-    pub state: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    pub state: Arc<Mutex<BeadsPanels>>,
+    pub editor: Entity<BeadsEditor>,
+    pub terminal_focus: FocusHandle,
+    pub app: &'a App,
+    pub write_enabled: bool,
     pub scale: f32,
     pub colors: BeadsBoardColors,
     pub animations: AnimationSettings,
 }
 
+#[derive(Clone, Copy)]
+struct EditWiring<'a> {
+    workspace_id: WorkspaceId,
+    editor: &'a Entity<BeadsEditor>,
+    app: &'a App,
+    write_enabled: bool,
+    colors: &'a BeadsBoardColors,
+}
+
+impl BeadsPanelRender<'_> {
+    fn edit_wiring(&self) -> EditWiring<'_> {
+        EditWiring {
+            workspace_id: self.workspace_id,
+            editor: &self.editor,
+            app: self.app,
+            write_enabled: self.write_enabled,
+            colors: &self.colors,
+        }
+    }
+}
+
 /// Paint one workspace's backdrop and lane-anchored detail panel.
-pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender) -> Vec<AnyElement> {
+pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender<'_>) -> Vec<AnyElement> {
     let Some(layout) = panel_layout(wiring.region, wiring.board, panel.lane, wiring.scale) else {
         return Vec::new();
     };
     let workspace_id = wiring.workspace_id;
     let close_state = std::sync::Arc::clone(&wiring.state);
+    let close_editor = wiring.editor.clone();
+    let close_focus = wiring.terminal_focus.clone();
     let backdrop = div()
         .id(SharedString::from(format!("beads-detail-backdrop-{workspace_id}")))
         .absolute()
@@ -533,7 +966,9 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender) -> Vec<AnyElement> 
         .w(px(wiring.region.width))
         .h(px(wiring.region.height))
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-        .on_click(move |_event, window, _app| {
+        .on_click(move |_event, window, app| {
+            close_editor.update(app, BeadsEditor::commit);
+            window.focus(&close_focus, app);
             if let Ok(mut panels) = close_state.lock() {
                 panels.dismiss(workspace_id);
             }
@@ -544,7 +979,7 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender) -> Vec<AnyElement> 
     vec![backdrop, body]
 }
 
-pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender) -> Option<AnyElement> {
+pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender<'_>) -> Option<AnyElement> {
     let layout = panel_layout(wiring.region, wiring.board, lane, wiring.scale)?;
     Some(
         div()
@@ -568,7 +1003,11 @@ pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender) -> Option<
     )
 }
 
-fn panel_body(panel: &BeadsPanel, wiring: &BeadsPanelRender, layout: PanelLayout) -> AnyElement {
+fn panel_body(
+    panel: &BeadsPanel,
+    wiring: &BeadsPanelRender<'_>,
+    layout: PanelLayout,
+) -> AnyElement {
     let geometry = layout.geometry;
     let colors = &wiring.colors;
     let workspace_id = wiring.workspace_id;
@@ -600,7 +1039,15 @@ fn panel_body(panel: &BeadsPanel, wiring: &BeadsPanelRender, layout: PanelLayout
     let surface = if let (Some(detail), Some(presentation)) =
         (panel.detail.as_deref(), presentation.as_ref())
     {
-        let content = PanelContentWiring { workspace_id, state: &wiring.state, colors, scale };
+        let content = PanelContentWiring {
+            workspace_id,
+            state: &wiring.state,
+            editor: &wiring.editor,
+            app: wiring.app,
+            write_enabled: wiring.write_enabled,
+            colors,
+            scale,
+        };
         surface.child(detail_content(detail, presentation, content)).child(status_rail(
             detail,
             presentation,
@@ -636,17 +1083,21 @@ fn panel_body(panel: &BeadsPanel, wiring: &BeadsPanelRender, layout: PanelLayout
 fn panel_header(
     panel: &BeadsPanel,
     presentation: Option<&PanelPresentation>,
-    wiring: &BeadsPanelRender,
+    wiring: &BeadsPanelRender<'_>,
 ) -> AnyElement {
     let colors = &wiring.colors;
     let scale = wiring.scale;
+    let detail = panel.detail.as_deref();
     let title = panel.title();
     let priority = panel.priority();
     let epic = panel.epic();
     let epic =
         presentation.is_none_or(|build| build.has(PanelSection::Epic)).then_some(epic).flatten();
     let close_state = std::sync::Arc::clone(&wiring.state);
+    let close_editor = wiring.editor.clone();
+    let close_focus = wiring.terminal_focus.clone();
     let workspace_id = wiring.workspace_id;
+    let title = header_title(detail, title, wiring);
     div()
         .flex_none()
         .px(px(16.0))
@@ -667,17 +1118,7 @@ fn panel_header(
                         .text_color(priority_color(colors, priority))
                         .child(format!("P{priority}")),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(at(scale, 15.0))
-                        .line_height(at(scale, 20.0))
-                        .font_weight(FontWeight(660.0))
-                        .text_color(colors.title)
-                        .child(title.to_owned()),
-                )
+                .child(title)
                 .children(epic.map(|name| {
                     div()
                         .flex_none()
@@ -702,7 +1143,9 @@ fn panel_header(
                         .on_mouse_down(MouseButton::Left, |_, _window, app| {
                             app.stop_propagation();
                         })
-                        .on_click(move |_event, window, _app| {
+                        .on_click(move |_event, window, app| {
+                            close_editor.update(app, BeadsEditor::commit);
+                            window.focus(&close_focus, app);
                             if let Ok(mut panels) = close_state.lock() {
                                 panels.dismiss(workspace_id);
                             }
@@ -715,10 +1158,49 @@ fn panel_header(
         .into_any_element()
 }
 
+fn header_title(
+    detail: Option<&BeadsIssueDetail>,
+    title: &str,
+    wiring: &BeadsPanelRender<'_>,
+) -> AnyElement {
+    let colors = &wiring.colors;
+    let scale = wiring.scale;
+    detail.map_or_else(
+        || {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(at(scale, 15.0))
+                .line_height(at(scale, 20.0))
+                .font_weight(FontWeight(660.0))
+                .text_color(colors.title)
+                .child(title.to_owned())
+                .into_any_element()
+        },
+        |detail| {
+            editable_text(
+                wiring.edit_wiring(),
+                &detail.id,
+                EditField::Title,
+                title,
+                div()
+                    .truncate()
+                    .text_size(at(scale, 15.0))
+                    .line_height(at(scale, 20.0))
+                    .font_weight(FontWeight(660.0))
+                    .text_color(colors.title),
+            )
+            .flex_1()
+            .into_any_element()
+        },
+    )
+}
+
 fn identity_row(
     panel: &BeadsPanel,
     presentation: Option<&PanelPresentation>,
-    wiring: &BeadsPanelRender,
+    wiring: &BeadsPanelRender<'_>,
 ) -> AnyElement {
     div()
         .mt(px(7.0))
@@ -745,7 +1227,7 @@ fn identity_row(
 fn identity_left(
     panel: &BeadsPanel,
     presentation: Option<&PanelPresentation>,
-    wiring: &BeadsPanelRender,
+    wiring: &BeadsPanelRender<'_>,
 ) -> AnyElement {
     let detail = panel.detail.as_deref();
     let issue_id = detail.map_or(panel.card.id.as_str(), |issue| issue.id.as_str());
@@ -824,7 +1306,7 @@ fn identity_left(
 fn identity_docs(
     detail: &BeadsIssueDetail,
     presentation: Option<&PanelPresentation>,
-    wiring: &BeadsPanelRender,
+    wiring: &BeadsPanelRender<'_>,
 ) -> AnyElement {
     let colors = &wiring.colors;
     div()
@@ -850,7 +1332,16 @@ fn identity_docs(
                         .flex()
                         .gap(px(4.0))
                         .child(runin("Spec", colors, wiring.scale))
-                        .child(div().truncate().child(spec.clone()))
+                        .child(
+                            editable_text(
+                                wiring.edit_wiring(),
+                                &detail.id,
+                                EditField::SpecId,
+                                spec,
+                                div().truncate(),
+                            )
+                            .flex_1(),
+                        )
                 }),
         )
         .children(presentation.is_some_and(|build| build.has(PanelSection::Design)).then(|| {
@@ -859,17 +1350,109 @@ fn identity_docs(
                 .flex()
                 .gap(px(4.0))
                 .child(runin("Design", colors, wiring.scale))
-                .child(div().truncate().child(detail.design.clone()))
+                .child(
+                    editable_text(
+                        wiring.edit_wiring(),
+                        &detail.id,
+                        EditField::Design,
+                        &detail.design,
+                        div().truncate(),
+                    )
+                    .flex_1(),
+                )
         }))
         .into_any_element()
+}
+
+fn editable_text(
+    wiring: EditWiring<'_>,
+    issue_id: &str,
+    field: EditField,
+    value: &str,
+    text: gpui::Div,
+) -> gpui::Stateful<gpui::Div> {
+    let id =
+        SharedString::from(format!("beads-edit-{}-{issue_id}-{}", wiring.workspace_id, field.id()));
+    if !wiring.write_enabled {
+        return text.id(id).min_w(px(0.0)).child(value.to_owned());
+    }
+    let editor = wiring.editor.clone();
+    let active = editor
+        .read(wiring.app)
+        .active_text(wiring.workspace_id, issue_id, field)
+        .map(str::to_owned);
+    let shown = active.as_deref().unwrap_or(value).to_owned();
+    let focus = editor.read(wiring.app).focus.clone();
+    let input_focus = focus.clone();
+    let input_editor = editor.clone();
+    let click_issue = issue_id.to_owned();
+    let click_value = value.to_owned();
+    let workspace_id = wiring.workspace_id;
+    let hover = with_alpha(wiring.colors.title, 0.07);
+    div()
+        .id(id)
+        .role(Role::TextInput)
+        .aria_label(format!("Edit issue {}", field.id()))
+        .aria_value(shown.clone())
+        .min_w(px(0.0))
+        .relative()
+        .rounded(px(2.0))
+        .cursor_text()
+        .when(active.is_some(), |surface| surface.bg(hover).track_focus(&focus))
+        .when(active.is_none(), |surface| {
+            surface.hover(move |hovered| hovered.bg(hover).shadow_sm())
+        })
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, app| {
+            editor.update(app, |editor, cx| {
+                editor.begin(
+                    EditTarget { workspace_id, issue_id: &click_issue, field, value: &click_value },
+                    window,
+                    cx,
+                );
+            });
+            window.refresh();
+        })
+        .child(text.child(shown))
+        .when(active.is_some(), |surface| {
+            surface.child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, app| {
+                        window.handle_input(
+                            &input_focus,
+                            ElementInputHandler::new(bounds, input_editor.clone()),
+                            app,
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+        })
 }
 
 #[derive(Clone, Copy)]
 struct PanelContentWiring<'a> {
     workspace_id: WorkspaceId,
-    state: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    state: &'a Arc<Mutex<BeadsPanels>>,
+    editor: &'a Entity<BeadsEditor>,
+    app: &'a App,
+    write_enabled: bool,
     colors: &'a BeadsBoardColors,
     scale: f32,
+}
+
+impl PanelContentWiring<'_> {
+    fn edit_wiring(&self) -> EditWiring<'_> {
+        EditWiring {
+            workspace_id: self.workspace_id,
+            editor: self.editor,
+            app: self.app,
+            write_enabled: self.write_enabled,
+            colors: self.colors,
+        }
+    }
 }
 
 fn detail_content(
@@ -877,9 +1460,14 @@ fn detail_content(
     presentation: &PanelPresentation,
     wiring: PanelContentWiring<'_>,
 ) -> AnyElement {
-    let PanelContentWiring { workspace_id, state: _, colors, scale } = wiring;
+    let PanelContentWiring { workspace_id, colors, scale, .. } = wiring;
     let queue = queue_color(colors, presentation.queue());
     let blockers = detail.blockers.iter().take(presentation.blocker_count());
+    let facts =
+        presentation.has(PanelSection::Facts).then(|| optional_facts(detail, colors, scale));
+    let comments =
+        presentation.has(PanelSection::Comments).then(|| comments(detail, presentation, wiring));
+    let dependents = presentation.has(PanelSection::Dependents).then(|| unblocks(detail, wiring));
     div()
         .id(SharedString::from(format!("beads-detail-scroll-{workspace_id}")))
         .flex_1()
@@ -911,31 +1499,80 @@ fn detail_content(
         )
         .children(blockers.map(|blocker| blocker_row(blocker, colors, scale)))
         .child(queue_row(detail, presentation, colors, scale))
-        .children(
-            presentation
-                .has(PanelSection::Description)
-                .then(|| paragraph(&detail.description, colors.title, scale, 11.0, 1.55)),
-        )
-        .children(
-            presentation
-                .has(PanelSection::Acceptance)
-                .then(|| passage("Acceptance", &detail.acceptance_criteria, colors, scale)),
-        )
-        .children(
-            presentation
-                .has(PanelSection::Notes)
-                .then(|| passage("Notes", &detail.notes, colors, scale)),
-        )
-        .children(
-            presentation.has(PanelSection::Facts).then(|| optional_facts(detail, colors, scale)),
-        )
-        .children(
-            presentation
-                .has(PanelSection::Comments)
-                .then(|| comments(detail, presentation, wiring)),
-        )
-        .children(presentation.has(PanelSection::Dependents).then(|| unblocks(detail, wiring)))
+        .children(presentation.has(PanelSection::Description).then(|| {
+            editable_passage(
+                detail,
+                PassageEdit {
+                    field: EditField::Description,
+                    label: None,
+                    value: &detail.description,
+                    color: colors.title,
+                },
+                wiring,
+            )
+        }))
+        .children(presentation.has(PanelSection::Acceptance).then(|| {
+            editable_passage(
+                detail,
+                PassageEdit {
+                    field: EditField::Acceptance,
+                    label: Some("Acceptance"),
+                    value: &detail.acceptance_criteria,
+                    color: colors.queue_name,
+                },
+                wiring,
+            )
+        }))
+        .children(presentation.has(PanelSection::Notes).then(|| {
+            editable_passage(
+                detail,
+                PassageEdit {
+                    field: EditField::Notes,
+                    label: Some("Notes"),
+                    value: &detail.notes,
+                    color: colors.queue_name,
+                },
+                wiring,
+            )
+        }))
+        .children(facts)
+        .children(comments)
+        .children(dependents)
         .into_any_element()
+}
+
+#[derive(Clone, Copy)]
+struct PassageEdit<'a> {
+    field: EditField,
+    label: Option<&'static str>,
+    value: &'a str,
+    color: Rgba,
+}
+
+fn editable_passage(
+    detail: &BeadsIssueDetail,
+    passage: PassageEdit<'_>,
+    wiring: PanelContentWiring<'_>,
+) -> AnyElement {
+    let text = div()
+        .flex_1()
+        .text_size(at(wiring.scale, 11.0))
+        .line_height(at(wiring.scale, if passage.label.is_some() { 16.5 } else { 17.05 }))
+        .text_color(passage.color);
+    let content =
+        editable_text(wiring.edit_wiring(), &detail.id, passage.field, passage.value, text)
+            .flex_1();
+    match passage.label {
+        Some(label) => div()
+            .mt(px(8.0))
+            .flex()
+            .items_start()
+            .gap(px(7.0))
+            .child(runin(label, wiring.colors, wiring.scale))
+            .child(content)
+            .into_any_element(),
+        None => content.into_any_element(),
+    }
 }
 
 fn blocker_row(
@@ -991,33 +1628,6 @@ fn queue_row(
         .into_any_element()
 }
 
-fn paragraph(text: &str, color: Rgba, scale: f32, size: f32, line: f32) -> AnyElement {
-    div()
-        .text_size(at(scale, size))
-        .line_height(at(scale, size * line))
-        .text_color(color)
-        .child(text.to_owned())
-        .into_any_element()
-}
-
-fn passage(label: &'static str, text: &str, colors: &BeadsBoardColors, scale: f32) -> AnyElement {
-    div()
-        .mt(px(8.0))
-        .flex()
-        .items_start()
-        .gap(px(7.0))
-        .child(runin(label, colors, scale))
-        .child(
-            div()
-                .flex_1()
-                .text_size(at(scale, 11.0))
-                .line_height(at(scale, 16.5))
-                .text_color(colors.queue_name)
-                .child(text.to_owned()),
-        )
-        .into_any_element()
-}
-
 fn optional_facts(detail: &BeadsIssueDetail, colors: &BeadsBoardColors, scale: f32) -> AnyElement {
     let mut facts = Vec::new();
     if let Some(closed) = detail.closed_at.as_deref() {
@@ -1054,7 +1664,7 @@ fn comments(
     presentation: &PanelPresentation,
     wiring: PanelContentWiring<'_>,
 ) -> AnyElement {
-    let PanelContentWiring { workspace_id, state, colors, scale } = wiring;
+    let PanelContentWiring { workspace_id, state, colors, scale, .. } = wiring;
     let comment_wiring = CommentWiring { workspace_id, issue_id: &detail.id, state, colors, scale };
     let rows = detail
         .comments
@@ -1149,7 +1759,7 @@ fn comment_row(comment: &BeadsIssueComment, index: usize, wiring: CommentWiring<
 }
 
 fn unblocks(detail: &BeadsIssueDetail, wiring: PanelContentWiring<'_>) -> AnyElement {
-    let PanelContentWiring { workspace_id, state, colors, scale } = wiring;
+    let PanelContentWiring { workspace_id, state, colors, scale, .. } = wiring;
     div()
         .relative()
         .mt(px(10.0))
@@ -1350,7 +1960,7 @@ mod tests {
     use scribe_common::ids::WorkspaceId;
     use scribe_common::protocol::{
         BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
-        BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis,
+        BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite,
     };
     use scribe_common::theme::ChromeColors;
 
@@ -1790,6 +2400,82 @@ mod tests {
         let presentation = PanelPresentation::from_detail(&detail());
 
         assert_eq!(presentation.verbs(), &[ReadOnlyVerb::Claim, ReadOnlyVerb::CloseIssue]);
+    }
+
+    fn key_down(key: &str, modifiers: gpui::Modifiers) -> gpui::KeyDownEvent {
+        gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke { modifiers, key: key.into(), key_char: None },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[test]
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Enter commit matrix]]
+    fn editor_enter_matrix_distinguishes_single_and_multiline_fields() {
+        let plain_enter = key_down("enter", gpui::Modifiers::default());
+        let modified_enter =
+            key_down("enter", gpui::Modifiers { shift: true, ..gpui::Modifiers::default() });
+
+        assert_eq!(edit_key_action(EditField::Title, &plain_enter), EditKeyAction::Commit);
+        assert_eq!(edit_key_action(EditField::Description, &plain_enter), EditKeyAction::Text);
+        assert_eq!(edit_key_action(EditField::Description, &modified_enter), EditKeyAction::Commit);
+        assert_eq!(
+            edit_key_action(
+                EditField::Title,
+                &key_down("x", gpui::Modifiers { alt: true, ..gpui::Modifiers::default() },),
+            ),
+            EditKeyAction::Text
+        );
+    }
+
+    #[test]
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Passage changes commit drafts]]
+    fn switching_passages_commits_the_previous_value() {
+        let workspace_id = WorkspaceId::new();
+        let mut edit = EditSession::default();
+        assert_eq!(edit.begin(workspace_id, "scribe-5wh1.13", EditField::Title, "Old title"), None);
+        edit.replace_all("New title");
+
+        let committed = edit.begin(workspace_id, "scribe-5wh1.13", EditField::Description, "Body");
+
+        assert_eq!(
+            committed,
+            Some(BeadsEditIntent {
+                workspace_id,
+                issue_id: "scribe-5wh1.13".into(),
+                verb: BeadsIssueWrite::SetTitle { title: "New title".into() },
+            })
+        );
+        assert_eq!(edit.input(), Some("Body"));
+    }
+
+    #[test]
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Repeated clicks preserve drafts]]
+    fn clicking_the_active_passage_keeps_its_draft() {
+        let workspace_id = WorkspaceId::new();
+        let mut edit = EditSession::default();
+        edit.begin(workspace_id, "scribe-5wh1.13", EditField::Title, "Old title");
+        edit.replace_all("Draft title");
+
+        let committed = edit.begin(workspace_id, "scribe-5wh1.13", EditField::Title, "Old title");
+
+        assert_eq!(committed, None);
+        assert_eq!(edit.input(), Some("Draft title"));
+    }
+
+    #[test]
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Escape cancels editing]]
+    fn escape_cancels_without_emitting_a_write() {
+        let workspace_id = WorkspaceId::new();
+        let mut edit = EditSession::default();
+        edit.begin(workspace_id, "scribe-5wh1.13", EditField::Notes, "Saved notes");
+        edit.replace_all("Half typed");
+
+        edit.cancel();
+
+        assert_eq!(edit.finish(), None);
+        assert_eq!(edit.input(), None);
     }
 
     #[test]

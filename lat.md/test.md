@@ -4346,6 +4346,31 @@ Printable, Enter, Escape, and Ctrl-C keys all take the editor branch. The
 entity receives text while the real encoder records nothing; restoring
 terminal focus makes the next printable key encode normally.
 
+## GPUI Beads Inline Editing
+
+Production editor state and routing tests pin when text applies, cancels, or
+stays in the active passage.
+
+### Enter commit matrix
+
+Enter applies a title, plain Enter remains text in multiline passages, and
+modifier-Enter applies multiline text.
+
+### Passage changes commit drafts
+
+Arming another passage emits the changed field's typed write and seeds the new
+passage with its saved value.
+
+### Repeated clicks preserve drafts
+
+Clicking the passage already being edited keeps its unsaved text instead of
+applying and reopening the server value.
+
+### Escape cancels editing
+
+Escape drops the active draft without producing a write, leaving the next
+Escape available to close the panel.
+
 ## GPUI Status Bar
 
 Unit tests for , the ported window-status-bar segment model, proving connection/pane feedback and every parity segment (command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds correctly without a live window.

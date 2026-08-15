@@ -5585,7 +5585,7 @@ fn workspace_root_matches_query(query: &str, root: &str) -> bool {
         || root.to_lowercase().contains(query)
 }
 
-fn utf16_range_to_utf8(text: &str, range: Range<usize>) -> Range<usize> {
+pub(crate) fn utf16_range_to_utf8(text: &str, range: Range<usize>) -> Range<usize> {
     utf16_offset_to_utf8(text, range.start)..utf16_offset_to_utf8(text, range.end)
 }
 
@@ -5600,7 +5600,7 @@ fn utf16_offset_to_utf8(text: &str, offset: usize) -> usize {
     text.len()
 }
 
-fn utf8_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+pub(crate) fn utf8_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
     let to_utf16 = |offset: usize| text[..offset.min(text.len())].encode_utf16().count();
     to_utf16(range.start)..to_utf16(range.end)
 }

@@ -53,8 +53,8 @@ use scribe_common::{
     framing::write_message,
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
-        AiLaunchSpec, AutomationAction, ClientMessage, PromptMarkKind, TerminalSize,
-        WorkspaceTreeNode,
+        AiLaunchSpec, AutomationAction, BeadsIssueWrite, BeadsIssueWriteGuards, ClientMessage,
+        PromptMarkKind, TerminalSize, WorkspaceTreeNode,
     },
     terminal_images::{TerminalImageLiveMessage, TerminalImageReplayMessage, TerminalImageUpdate},
 };
@@ -1268,6 +1268,21 @@ impl IpcSink {
         issue_id: String,
     ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id })
+    }
+
+    /// Apply one typed Beads text-field edit.
+    pub fn beads_issue_write(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_id: String,
+        verb: BeadsIssueWrite,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::BeadsIssueWrite {
+            workspace_id,
+            issue_id,
+            verb,
+            guards: BeadsIssueWriteGuards::default(),
+        })
     }
 
     /// Asks the server to terminate `session_id`, backing the `close_tab`

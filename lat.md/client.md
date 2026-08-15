@@ -1337,6 +1337,13 @@ check editor focus first and return without stopping propagation or entering
 overlay, binding, vi, and PTY routes. Enter reaches the input handler as a
 newline. Escape and modified controls remain key-only for the panel listener.
 
+[[crates/scribe-client/src/beads_panel.rs#BeadsEditor]] owns one edit session per
+terminal window. A passage click focuses that entity; changing passages or
+losing focus queues the prior value, while Escape discards it. Single-line
+Enter and modified multiline Enter apply; plain multiline Enter stays native
+text input. The renderer exposes these grounds only after `Welcome` advertises
+`beads_write`, and hover uses a theme-derived lift instead of fixed colours.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

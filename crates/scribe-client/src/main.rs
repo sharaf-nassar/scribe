@@ -34,7 +34,9 @@ use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
 };
-use scribe_client::beads_panel::{self, BeadsPanelRender, BeadsPanels};
+use scribe_client::beads_panel::{
+    self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels,
+};
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client::ci_bar::{self, CiBarColors, CiBarModel, CiRunBars};
@@ -1515,6 +1517,8 @@ struct TerminalView {
     /// The Beads board's palette, derived from the theme like every other
     /// per-surface palette here.
     beads_colors: BeadsBoardColors,
+    /// Window-exclusive native input owner for one armed Beads passage.
+    beads_editor: Entity<BeadsEditor>,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
     /// Font metrics the terminal grid paints with, rebuilt on a font reload
@@ -2180,6 +2184,8 @@ impl TerminalView {
             &config.config().theme.ansi_colors,
             opacity,
         );
+        let beads_editor =
+            cx.new(|ctx| BeadsEditor::new(Arc::clone(&shared.beads_panels), window, ctx));
         let (zoom, font) = Self::opening_font(&config, &seed);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
@@ -2196,6 +2202,7 @@ impl TerminalView {
             stats: SystemStatsCollector::new(),
             status_colors,
             beads_colors,
+            beads_editor,
             stats_config,
             font,
             zoom,
@@ -7950,6 +7957,46 @@ impl TerminalView {
         true
     }
 
+    /// Give an armed Beads passage the key before panel Escape or PTY routing.
+    fn handle_beads_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let route =
+            self.beads_editor.update(cx, |editor, editor_cx| editor.route_key(event, editor_cx));
+        match route {
+            BeadsEditorKeyRoute::Text => true,
+            BeadsEditorKeyRoute::Consumed => {
+                cx.stop_propagation();
+                cx.notify();
+                true
+            }
+            BeadsEditorKeyRoute::Finished => {
+                cx.stop_propagation();
+                window.focus(&self.focus.root, cx);
+                cx.notify();
+                true
+            }
+            BeadsEditorKeyRoute::Inactive => false,
+        }
+    }
+
+    fn handle_modal_or_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.window_displaced() || self.share_prompt_pending() {
+            cx.stop_propagation();
+            self.handle_overlay_key(event, cx);
+            return true;
+        }
+        self.handle_beads_editor_key(event, window, cx)
+    }
+
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -9064,6 +9111,7 @@ impl TerminalView {
         let mut copied = None;
         let mut panel_copy = None;
         let mut detail_requests = Vec::new();
+        let mut writes = Vec::new();
         let panel_workspaces = self
             .shared
             .beads_panels
@@ -9074,6 +9122,9 @@ impl TerminalView {
                 panel_copy = panels.take_copy();
                 while let Some(request) = panels.take_request() {
                     detail_requests.push(request);
+                }
+                while let Some(write) = panels.take_write() {
+                    writes.push(write);
                 }
                 panels.workspaces()
             })
@@ -9107,6 +9158,13 @@ impl TerminalView {
         for (workspace_id, issue_id) in detail_requests {
             if let Err(error) = self.sink.request_beads_issue_detail(workspace_id, issue_id) {
                 tracing::debug!(%error, "Beads issue detail request dropped");
+            }
+        }
+        for write in writes {
+            if let Err(error) =
+                self.sink.beads_issue_write(write.workspace_id, write.issue_id, write.verb)
+            {
+                tracing::debug!(%error, "Beads issue write dropped");
             }
         }
         self.shell.set_pinned_boards(strips);
@@ -9365,12 +9423,12 @@ impl TerminalView {
     }
 
     fn render_beads_panels(&self, cx: &App) -> Vec<gpui::AnyElement> {
-        let layers = self
+        let (layers, write_enabled) = self
             .shared
             .beads_panels
             .lock()
             .map(|panels| {
-                panels
+                let open = panels
                     .workspaces()
                     .into_iter()
                     .map(|workspace_id| {
@@ -9381,7 +9439,8 @@ impl TerminalView {
                             panels.notice_lane(workspace_id),
                         )
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (open, panels.write_enabled())
             })
             .unwrap_or_default();
         let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
@@ -9403,6 +9462,10 @@ impl TerminalView {
                     board,
                     workspace_id,
                     state: Arc::clone(&self.shared.beads_panels),
+                    editor: self.beads_editor.clone(),
+                    terminal_focus: self.focus.root.clone(),
+                    app: cx,
+                    write_enabled,
                     scale: boards.text_scale(),
                     colors: self.beads_colors,
                     animations,
@@ -9583,20 +9646,6 @@ impl Render for TerminalView {
                 },
             ))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
-                // Claim every key the window sees, at every level below.
-                //
-                // Once an input handler is registered — which the IME wiring
-                // now does on every frame — gpui's platform layer follows an
-                // un-stopped `KeyDown` with
-                // `input_handler.replace_text_in_range(key_char)`, the "insert
-                // the typed character into the focused text field" behaviour a
-                // text editor wants. A terminal has already encoded that
-                // keystroke itself, so letting it through types every printable
-                // character twice, and turns keys consumed by vi mode or a
-                // binding into stray PTY bytes. A genuine input method never
-                // uses that path: composed text arrives through the platform's
-                // own commit callback, which propagation does not gate.
-                ctx.stop_propagation();
                 if view.focus.cursor_blink.show_now() {
                     ctx.notify();
                 }
@@ -9604,8 +9653,13 @@ impl Render for TerminalView {
                 // compositor overlay owns the screen the keystroke was never
                 // meant for this window, so it reaches no consumer at all.
                 if view.compositor_overlay_active(event) {
+                    ctx.stop_propagation();
                     return;
                 }
+                if view.handle_modal_or_editor_key(event, win, ctx) {
+                    return;
+                }
+                ctx.stop_propagation();
                 // An active overlay owns every key, including plain Tab. With
                 // no overlay, plain Tab continues the chrome tab-stop order
                 // only while chrome already has focus (the status-bar update
@@ -13517,6 +13571,7 @@ fn on_welcome(
         participant_id,
         clipboard_gating,
         beads_detail,
+        beads_write,
         ..
     } = welcome
     else {
@@ -13540,6 +13595,7 @@ fn on_welcome(
     }
     if let Ok(mut panels) = ctx.beads_panels.lock() {
         panels.set_enabled(beads_detail);
+        panels.set_write_enabled(beads_write);
     }
     tracing::info!(
         adopted = ?registry.adopted_window(),
