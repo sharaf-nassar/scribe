@@ -146,7 +146,10 @@ pub enum PromptBarHover {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptRowModel {
     pub icon: char,
+    /// Single logical line painted inside the fixed-height row.
     pub text: String,
+    /// Unprojected prompt revealed by the hover tooltip.
+    pub full_text: String,
 }
 
 /// Pure, display-independent prompt-bar model: the rows plus the right-cluster
@@ -292,14 +295,9 @@ pub fn build_model(
     if data.prompts.prompt_count == 0 {
         return None;
     }
-    let first = PromptRowModel {
-        icon: ICON_FIRST,
-        text: data.prompts.first_prompt.clone().unwrap_or_default(),
-    };
-    let latest = (data.prompts.prompt_count >= 2).then(|| PromptRowModel {
-        icon: ICON_LATEST,
-        text: data.prompts.latest_prompt.clone().unwrap_or_default(),
-    });
+    let first = prompt_row_model(ICON_FIRST, data.prompts.first_prompt.as_deref());
+    let latest = (data.prompts.prompt_count >= 2)
+        .then(|| prompt_row_model(ICON_LATEST, data.prompts.latest_prompt.as_deref()));
     let (context_label, context_color) = context_indicator
         .map_or((None, None), |ind| (Some(format_context_label(ind.percent)), Some(ind.color)));
     Some(PromptBarModel {
@@ -312,13 +310,30 @@ pub fn build_model(
     })
 }
 
+fn first_logical_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
+}
+
+fn prompt_row_model(icon: char, full_text: Option<&str>) -> PromptRowModel {
+    let full_text = full_text.unwrap_or_default();
+    PromptRowModel {
+        icon,
+        text: first_logical_line(full_text).to_owned(),
+        full_text: full_text.to_owned(),
+    }
+}
+
 /// Whether `text` would be truncated inside a prompt row `bar_width` pixels
 /// wide at `cell_w` pixels per glyph. Drives the hover tooltip that reveals the
 /// full prompt when it is clipped.
 #[must_use]
 pub fn is_prompt_truncated(text: &str, bar_width: f32, cell_w: f32) -> bool {
+    let display_text = first_logical_line(text);
+    if display_text.len() != text.len() {
+        return true;
+    }
     let usable = bar_width - ROW_SIDE_PAD * 2.0 - cell_w - ICON_TEXT_GAP;
-    let char_count = f32::from(u16::try_from(text.chars().count()).unwrap_or(u16::MAX));
+    let char_count = f32::from(u16::try_from(display_text.chars().count()).unwrap_or(u16::MAX));
     char_count * cell_w > usable
 }
 
@@ -471,7 +486,7 @@ fn prompt_row(
     if !wiring.truncated {
         return body;
     }
-    let text = row.text.clone();
+    let text = row.full_text.clone();
     let text_size = wiring.text_size;
     body.tooltip(move |_window, cx| {
         cx.new(|_| PromptTooltip { text: text.clone(), style, text_size }).into()
@@ -588,7 +603,7 @@ pub fn render(
         height: row_h,
     };
 
-    let first_wiring = wiring("prompt-row-first", PromptBarHover::First, &model.first.text);
+    let first_wiring = wiring("prompt-row-first", PromptBarHover::First, &model.first.full_text);
 
     if let Some(latest) = &model.latest {
         // Two-prompt state: timer on row 1, count + context drop to row 2.
@@ -608,7 +623,7 @@ pub fn render(
                     text_color: colors.text,
                     height: row_h,
                 },
-                &wiring("prompt-row-latest", PromptBarHover::Latest, &latest.text),
+                &wiring("prompt-row-latest", PromptBarHover::Latest, &latest.full_text),
                 Some(count_cluster(model, colors, false).into_any_element()),
             ));
     } else {
@@ -787,6 +802,28 @@ mod tests {
         assert!(build_model(&PromptBarData::default(), at(0), None).is_none());
     }
 
+    // @lat: [[client#GPUI Prompt Bar#Multiline prompts paint one logical line and retain full text]]
+    #[gpui::test]
+    fn model_projects_first_logical_line_for_both_rows() {
+        let first = "google_cloud_run_v2_service.app\nlocations/us-west1/services/cue-server";
+        let latest = "short\r\nsecond line";
+        let data = PromptBarData::from(SessionPromptState {
+            prompt_count: 2,
+            first_prompt: Some(first.into()),
+            latest_prompt: Some(latest.into()),
+            ..SessionPromptState::default()
+        });
+
+        let model = build_model(&data, at(0), None).expect("two prompts render");
+        assert_eq!(model.first.text, "google_cloud_run_v2_service.app");
+        assert_eq!(model.first.full_text, first);
+        let latest_row = model.latest.unwrap();
+        assert_eq!(latest_row.text, "short");
+        assert_eq!(latest_row.full_text, latest);
+        assert_eq!(data.prompts.first_prompt.as_deref(), Some(first));
+        assert_eq!(data.prompts.latest_prompt.as_deref(), Some(latest));
+    }
+
     // @lat: [[client#GPUI Prompt Bar#Truncation predicate gates the hover tooltip]]
     #[gpui::test]
     fn truncation_predicate_flags_overflow() {
@@ -795,5 +832,8 @@ mod tests {
         assert!(!is_prompt_truncated("hi", 400.0, cell_w));
         // A narrow bar cannot fit a long prompt.
         assert!(is_prompt_truncated(&"x".repeat(80), 120.0, cell_w));
+        // An omitted logical-line suffix earns a tooltip even when the first
+        // line fits with room to spare.
+        assert!(is_prompt_truncated("short\r\nsecond line", 10_000.0, cell_w));
     }
 }
