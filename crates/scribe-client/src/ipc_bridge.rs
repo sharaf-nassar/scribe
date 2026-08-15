@@ -1270,19 +1270,15 @@ impl IpcSink {
         self.enqueue(ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id })
     }
 
-    /// Apply one typed Beads text-field edit.
-    pub fn beads_issue_write(
+    /// Send one typed, guarded Beads issue mutation.
+    pub fn write_beads_issue(
         &self,
         workspace_id: WorkspaceId,
         issue_id: String,
         verb: BeadsIssueWrite,
+        guards: BeadsIssueWriteGuards,
     ) -> Result<(), SinkError> {
-        self.enqueue(ClientMessage::BeadsIssueWrite {
-            workspace_id,
-            issue_id,
-            verb,
-            guards: BeadsIssueWriteGuards::default(),
-        })
+        self.enqueue(ClientMessage::BeadsIssueWrite { workspace_id, issue_id, verb, guards })
     }
 
     /// Asks the server to terminate `session_id`, backing the `close_tab`
@@ -2076,6 +2072,41 @@ mod tests {
 
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::ConfigReloaded));
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Beads issue write reaches the wire]]
+    #[tokio::test]
+    async fn beads_issue_write_preserves_the_typed_verb_and_guards() {
+        let workspace_id = WorkspaceId::new();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        sink.write_beads_issue(
+            workspace_id,
+            "scribe-5wh1.16".into(),
+            scribe_common::protocol::BeadsIssueWrite::Claim,
+            scribe_common::protocol::BeadsIssueWriteGuards {
+                if_status: Some("open".into()),
+                if_assignee: Some(String::new()),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await.unwrap(),
+            ClientMessage::BeadsIssueWrite {
+                workspace_id: sent_workspace,
+                issue_id,
+                verb: scribe_common::protocol::BeadsIssueWrite::Claim,
+                guards: scribe_common::protocol::BeadsIssueWriteGuards {
+                    if_status: Some(status),
+                    if_assignee: Some(assignee),
+                },
+            } if sent_workspace == workspace_id
+                && issue_id == "scribe-5wh1.16"
+                && status == "open"
+                && assignee.is_empty()
+        ));
     }
 
     // @lat: [[test#GPUI CI Run Bar#Dismissal carries repository and head]]

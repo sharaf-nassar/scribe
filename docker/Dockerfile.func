@@ -85,4 +85,5 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
     cargo test --locked -p scribe-server beads_board::tests -- --nocapture && \
     cargo test --locked -p scribe-server \
-        beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture
+        beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture && \
+    cargo test --locked -p scribe-client beads -- --nocapture

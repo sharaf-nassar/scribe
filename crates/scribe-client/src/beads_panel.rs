@@ -1,4 +1,4 @@
-//! Beads issue panel state, inline text editing, and rendering.
+//! Beads issue panel state, inline editing, guarded writes, and rendering.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -16,7 +16,8 @@ use gpui::{
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
-    BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite,
+    BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite, BeadsIssueWriteGuards,
+    BeadsIssueWriteResult,
 };
 
 use crate::animation::AnimationSettings;
@@ -53,14 +54,13 @@ enum PanelSection {
     StatusRail,
 }
 
-/// Inert words shown in the read-only slice; they carry no write operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadOnlyVerb {
+enum PanelVerb {
     Claim,
     CloseIssue,
 }
 
-const OPEN_VERBS: [ReadOnlyVerb; 2] = [ReadOnlyVerb::Claim, ReadOnlyVerb::CloseIssue];
+const OPEN_VERBS: [PanelVerb; 2] = [PanelVerb::Claim, PanelVerb::CloseIssue];
 
 /// Data-derived panel shape consumed by the renderer and its build tests.
 #[derive(Debug, Clone)]
@@ -70,7 +70,7 @@ struct PanelPresentation {
     hidden_comment_count: Option<u32>,
     queue: BeadsIssueQueue,
     queue_basis: BeadsIssueQueueBasis,
-    verbs: &'static [ReadOnlyVerb],
+    verbs: &'static [PanelVerb],
 }
 
 impl PanelPresentation {
@@ -132,7 +132,7 @@ impl PanelPresentation {
         self.queue_basis
     }
 
-    fn verbs(&self) -> &'static [ReadOnlyVerb] {
+    fn verbs(&self) -> &'static [PanelVerb] {
         self.verbs
     }
 }
@@ -250,15 +250,39 @@ struct PanelNotice {
     text: String,
     lane: u8,
     expires_at: Instant,
+    undo: Option<UndoClose>,
+}
+
+#[derive(Debug, Clone)]
+struct UndoClose {
+    issue_id: String,
+    assignee: String,
 }
 
 impl PanelNotice {
     fn new(text: String, lane: u8) -> Self {
-        Self { text, lane, expires_at: Instant::now() + NOTICE_DURATION }
+        Self::new_at(text, lane, None, Instant::now())
+    }
+
+    fn closed_at(issue_id: String, assignee: String, lane: u8, now: Instant) -> Self {
+        Self::new_at(
+            format!("closed {issue_id} · undo"),
+            lane,
+            Some(UndoClose { issue_id, assignee }),
+            now,
+        )
+    }
+
+    fn new_at(text: String, lane: u8, undo: Option<UndoClose>, now: Instant) -> Self {
+        Self { text, lane, expires_at: now + NOTICE_DURATION, undo }
+    }
+
+    fn active_at(&self, now: Instant) -> bool {
+        now < self.expires_at
     }
 
     fn active(&self) -> bool {
-        Instant::now() < self.expires_at
+        self.active_at(Instant::now())
     }
 }
 
@@ -500,7 +524,7 @@ impl BeadsEditor {
 
     fn queue(&self, intent: BeadsEditIntent) {
         if let Ok(mut panels) = self.panels.lock() {
-            panels.queue_write(intent);
+            panels.queue_edit(intent);
         }
     }
 
@@ -637,6 +661,15 @@ impl EntityInputHandler for BeadsEditor {
     }
 }
 
+/// One guarded issue mutation waiting for the owning view's IPC sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelWriteIntent {
+    pub workspace_id: WorkspaceId,
+    pub issue_id: String,
+    pub verb: BeadsIssueWrite,
+    pub guards: BeadsIssueWriteGuards,
+}
+
 /// Per-workspace panel state plus intents parked for the owning GPUI view.
 #[derive(Debug, Default)]
 pub struct BeadsPanels {
@@ -645,7 +678,8 @@ pub struct BeadsPanels {
     open: HashMap<WorkspaceId, BeadsPanel>,
     pending_requests: VecDeque<(WorkspaceId, String)>,
     pending_navigation: HashMap<WorkspaceId, String>,
-    pending_writes: VecDeque<BeadsEditIntent>,
+    pending_writes: VecDeque<PanelWriteIntent>,
+    in_flight_writes: HashMap<(WorkspaceId, String), PanelWriteIntent>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
     notices: HashMap<WorkspaceId, PanelNotice>,
@@ -656,10 +690,12 @@ impl BeadsPanels {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.detail_enabled = enabled;
         if !enabled {
+            self.write_enabled = false;
             self.open.clear();
             self.pending_requests.clear();
             self.pending_navigation.clear();
             self.pending_writes.clear();
+            self.in_flight_writes.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
             self.notices.clear();
@@ -668,9 +704,10 @@ impl BeadsPanels {
     }
 
     pub fn set_write_enabled(&mut self, enabled: bool) {
-        self.write_enabled = enabled;
-        if !enabled {
+        self.write_enabled = self.detail_enabled && enabled;
+        if !self.write_enabled {
             self.pending_writes.clear();
+            self.in_flight_writes.clear();
         }
     }
 
@@ -741,7 +778,9 @@ impl BeadsPanels {
             .chain(
                 self.notices
                     .iter()
-                    .filter(|(_, notice)| notice.active())
+                    .filter(|(workspace_id, notice)| {
+                        !self.open.contains_key(workspace_id) && notice.active()
+                    })
                     .map(|(workspace_id, _)| *workspace_id),
             )
             .collect()
@@ -751,14 +790,191 @@ impl BeadsPanels {
         self.pending_requests.pop_front()
     }
 
-    fn queue_write(&mut self, intent: BeadsEditIntent) {
-        if self.write_enabled {
-            self.pending_writes.push_back(intent);
+    fn queue_edit(&mut self, intent: BeadsEditIntent) -> bool {
+        if self.open.get(&intent.workspace_id).is_none_or(|panel| panel.card.id != intent.issue_id)
+        {
+            return false;
+        }
+        self.queue_write(intent.workspace_id, intent.verb)
+    }
+
+    pub fn write_status(&mut self, workspace_id: WorkspaceId, status: &str) -> bool {
+        if !matches!(status, "open" | "in_progress" | "closed") {
+            return false;
+        }
+        self.queue_write(
+            workspace_id,
+            BeadsIssueWrite::SetStatus { status: status.into(), clear_defer: false },
+        )
+    }
+
+    pub fn claim(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.queue_write(workspace_id, BeadsIssueWrite::Claim)
+    }
+
+    pub fn close_issue(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.queue_write(workspace_id, BeadsIssueWrite::CloseIssue)
+    }
+
+    pub fn can_write(&self, workspace_id: WorkspaceId) -> bool {
+        self.write_enabled
+            && self.open.get(&workspace_id).is_some_and(|panel| {
+                panel.detail.as_deref().is_some_and(|detail| detail.status != "closed")
+            })
+    }
+
+    fn queue_write(&mut self, workspace_id: WorkspaceId, verb: BeadsIssueWrite) -> bool {
+        let Some(panel) = self.open.get(&workspace_id) else { return false };
+        let Some(detail) = panel.detail.as_deref() else { return false };
+        if !self.write_enabled || detail.status == "closed" {
+            return false;
+        }
+        let issue_id = panel.card.id.clone();
+        let key = (workspace_id, issue_id.clone());
+        if self.in_flight_writes.contains_key(&key)
+            || self
+                .pending_writes
+                .iter()
+                .any(|write| write.workspace_id == workspace_id && write.issue_id == issue_id)
+        {
+            return false;
+        }
+        self.pending_writes.push_back(PanelWriteIntent {
+            workspace_id,
+            issue_id,
+            verb,
+            guards: BeadsIssueWriteGuards {
+                if_status: Some(detail.status.clone()),
+                if_assignee: Some(detail.assignee.clone().unwrap_or_default()),
+            },
+        });
+        true
+    }
+
+    pub fn take_write(&mut self) -> Option<PanelWriteIntent> {
+        let intent = self.pending_writes.pop_front()?;
+        self.in_flight_writes
+            .insert((intent.workspace_id, intent.issue_id.clone()), intent.clone());
+        Some(intent)
+    }
+
+    pub fn write_send_failed(&mut self, workspace_id: WorkspaceId, issue_id: &str, reason: &str) {
+        self.in_flight_writes.remove(&(workspace_id, issue_id.to_owned()));
+        let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
+        self.notices
+            .insert(workspace_id, PanelNotice::new(format!("Issue write dropped: {reason}"), lane));
+    }
+
+    pub fn finish_write(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        result: BeadsIssueWriteResult,
+    ) {
+        self.finish_write_at(workspace_id, issue_id, result, Instant::now());
+    }
+
+    fn finish_write_at(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        result: BeadsIssueWriteResult,
+        now: Instant,
+    ) {
+        let Some(intent) = self.in_flight_writes.remove(&(workspace_id, issue_id.to_owned()))
+        else {
+            return;
+        };
+        let lane = self.open.get(&workspace_id).map_or(4, |panel| panel.lane);
+        match result {
+            BeadsIssueWriteResult::Applied { .. }
+                if matches!(intent.verb, BeadsIssueWrite::CloseIssue) =>
+            {
+                self.open.remove(&workspace_id);
+                self.notices.insert(
+                    workspace_id,
+                    PanelNotice::closed_at(
+                        issue_id.to_owned(),
+                        intent.guards.if_assignee.unwrap_or_default(),
+                        lane,
+                        now,
+                    ),
+                );
+                self.last_opened = Some(workspace_id);
+            }
+            BeadsIssueWriteResult::Applied { .. } => {
+                self.notices.remove(&workspace_id);
+                self.refresh_open_issue(workspace_id, issue_id);
+            }
+            BeadsIssueWriteResult::PreconditionFailed => {
+                self.notices.insert(
+                    workspace_id,
+                    PanelNotice::new_at(
+                        "Someone else won; refreshing issue detail".into(),
+                        lane,
+                        None,
+                        now,
+                    ),
+                );
+                self.refresh_open_issue(workspace_id, issue_id);
+            }
+            BeadsIssueWriteResult::Failed { reason } => {
+                self.notices.insert(
+                    workspace_id,
+                    PanelNotice::new_at(format!("Issue write failed: {reason}"), lane, None, now),
+                );
+            }
         }
     }
 
-    pub fn take_write(&mut self) -> Option<BeadsEditIntent> {
-        self.pending_writes.pop_front()
+    fn refresh_open_issue(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
+        if self.open.get(&workspace_id).is_some_and(|panel| panel.card.id == issue_id) {
+            self.pending_requests.push_back((workspace_id, issue_id.to_owned()));
+        }
+    }
+
+    pub fn undo(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.undo_at(workspace_id, Instant::now())
+    }
+
+    fn undo_at(&mut self, workspace_id: WorkspaceId, now: Instant) -> bool {
+        if !self.write_enabled {
+            return false;
+        }
+        let Some(notice) = self.notices.remove(&workspace_id) else { return false };
+        if !notice.active_at(now) {
+            return false;
+        }
+        let Some(undo) = notice.undo.clone() else {
+            self.notices.insert(workspace_id, notice);
+            return false;
+        };
+        let key = (workspace_id, undo.issue_id.clone());
+        if self.in_flight_writes.contains_key(&key)
+            || self
+                .pending_writes
+                .iter()
+                .any(|write| write.workspace_id == workspace_id && write.issue_id == undo.issue_id)
+        {
+            self.notices.insert(workspace_id, notice);
+            return false;
+        }
+        self.pending_writes.push_back(PanelWriteIntent {
+            workspace_id,
+            issue_id: undo.issue_id,
+            verb: BeadsIssueWrite::UndoClose,
+            guards: BeadsIssueWriteGuards {
+                if_status: Some("closed".into()),
+                if_assignee: Some(undo.assignee),
+            },
+        });
+        true
+    }
+
+    pub fn undo_available(&self, workspace_id: WorkspaceId) -> bool {
+        self.notices
+            .get(&workspace_id)
+            .is_some_and(|notice| notice.active() && notice.undo.is_some())
     }
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
@@ -779,6 +995,8 @@ impl BeadsPanels {
         self.open.retain(|workspace_id, _| live.contains(workspace_id));
         self.expanded_comments.retain(|(workspace_id, _, _)| live.contains(workspace_id));
         self.pending_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
+        self.pending_writes.retain(|write| live.contains(&write.workspace_id));
+        self.in_flight_writes.retain(|(workspace_id, _), _| live.contains(workspace_id));
         self.notices.retain(|workspace_id, _| live.contains(workspace_id));
         self.pending_navigation.retain(|workspace_id, _| live.contains(workspace_id));
         if self.last_opened.is_some_and(|workspace_id| !live.contains(&workspace_id)) {
@@ -815,9 +1033,13 @@ impl BeadsPanels {
     }
 
     pub fn notice(&self, workspace_id: WorkspaceId) -> Option<&str> {
+        self.notice_at(workspace_id, Instant::now())
+    }
+
+    fn notice_at(&self, workspace_id: WorkspaceId, now: Instant) -> Option<&str> {
         self.notices
             .get(&workspace_id)
-            .filter(|notice| notice.active())
+            .filter(|notice| notice.active_at(now))
             .map(|notice| notice.text.as_str())
     }
 
@@ -981,26 +1203,42 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender<'_>) -> Vec<AnyEleme
 
 pub fn render_notice(text: &str, lane: u8, wiring: &BeadsPanelRender<'_>) -> Option<AnyElement> {
     let layout = panel_layout(wiring.region, wiring.board, lane, wiring.scale)?;
-    Some(
-        div()
-            .id(SharedString::from(format!("beads-detail-notice-{}", wiring.workspace_id)))
-            .absolute()
-            .left(px(layout.geometry.x))
-            .top(px(layout.geometry.y))
-            .w(px(layout.geometry.width))
-            .px(px(14.0))
-            .py(px(9.0))
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(with_alpha(wiring.colors.blocked_state, 0.65))
-            .bg(wiring.colors.card)
-            .font_family("monospace")
-            .text_size(at(layout.scale, 10.0))
-            .line_height(at(layout.scale, 14.0))
-            .text_color(wiring.colors.panel_state_ink(wiring.colors.blocked_state))
-            .child(text.to_owned())
-            .into_any_element(),
-    )
+    let workspace_id = wiring.workspace_id;
+    let undo = wiring.state.lock().is_ok_and(|panels| panels.undo_available(workspace_id));
+    let notice = div()
+        .id(SharedString::from(format!("beads-detail-notice-{workspace_id}")))
+        .absolute()
+        .left(px(layout.geometry.x))
+        .top(px(layout.geometry.y))
+        .w(px(layout.geometry.width))
+        .px(px(14.0))
+        .py(px(9.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(with_alpha(wiring.colors.blocked_state, 0.65))
+        .bg(wiring.colors.card)
+        .font_family("monospace")
+        .text_size(at(layout.scale, 10.0))
+        .line_height(at(layout.scale, 14.0))
+        .text_color(wiring.colors.panel_state_ink(wiring.colors.blocked_state))
+        .child(text.to_owned());
+    let notice = if undo {
+        let state = std::sync::Arc::clone(&wiring.state);
+        notice
+            .role(Role::Button)
+            .aria_label("Undo issue close")
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+            .on_click(move |_event, window, _app| {
+                if let Ok(mut panels) = state.lock() {
+                    panels.undo(workspace_id);
+                }
+                window.refresh();
+            })
+    } else {
+        notice
+    };
+    Some(notice.into_any_element())
 }
 
 fn panel_body(
@@ -1051,8 +1289,7 @@ fn panel_body(
         surface.child(detail_content(detail, presentation, content)).child(status_rail(
             detail,
             presentation,
-            colors,
-            scale,
+            content,
         ))
     } else {
         surface.child(
@@ -1805,10 +2042,11 @@ fn unblocks(detail: &BeadsIssueDetail, wiring: PanelContentWiring<'_>) -> AnyEle
 fn status_rail(
     detail: &BeadsIssueDetail,
     presentation: &PanelPresentation,
-    colors: &BeadsBoardColors,
-    scale: f32,
+    wiring: PanelContentWiring<'_>,
 ) -> AnyElement {
+    let PanelContentWiring { workspace_id, state, colors, .. } = wiring;
     let current = detail.status.as_str();
+    let writable = state.lock().is_ok_and(|panels| panels.can_write(workspace_id));
     div()
         .relative()
         .flex_none()
@@ -1826,44 +2064,104 @@ fn status_rail(
                 .h(px(1.0))
                 .bg(colors.hairline),
         )
-        .children([("open", "open"), ("in progress", "in_progress"), ("closed", "closed")].map(
-            |(shown, status)| {
-                let active = current == status;
-                div()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .px(px(9.0))
-                    .bg(colors.card)
-                    .text_size(at(scale, 10.0))
-                    .line_height(at(scale, 16.0))
-                    .font_weight(if active { FontWeight(600.0) } else { FontWeight(400.0) })
-                    .text_color(if active { colors.title } else { colors.muted })
-                    .children(active.then(|| {
-                        div().size(px(7.0)).rounded_full().bg(colors.ready_state).shadow_sm()
-                    }))
-                    .child(shown)
-            },
-        ))
-        .children(presentation.verbs().iter().map(|verb| {
-            let (label, state) = match verb {
-                ReadOnlyVerb::Claim => ("claim", colors.ready_state),
-                ReadOnlyVerb::CloseIssue => ("close issue", colors.done_state),
-            };
-            let word = div()
-                .font_family("monospace")
-                .text_size(at(scale, 10.0))
-                .line_height(at(scale, 16.0))
-                .font_weight(FontWeight(600.0))
-                .text_color(colors.panel_state_ink(state))
-                .child(label);
-            match verb {
-                ReadOnlyVerb::Claim => word.ml_auto(),
-                ReadOnlyVerb::CloseIssue => word.ml(px(16.0)),
-            }
-        }))
+        .children(
+            [("open", "open"), ("in progress", "in_progress"), ("closed", "closed")]
+                .map(|(shown, status)| status_word(shown, status, current, writable, wiring)),
+        )
+        .children(presentation.verbs().iter().map(|verb| panel_verb_word(*verb, writable, wiring)))
         .into_any_element()
+}
+
+fn status_word(
+    shown: &'static str,
+    status: &'static str,
+    current: &str,
+    writable: bool,
+    wiring: PanelContentWiring<'_>,
+) -> AnyElement {
+    let PanelContentWiring { workspace_id, state, colors, scale, .. } = wiring;
+    let active = current == status;
+    let word = div()
+        .relative()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .px(px(9.0))
+        .bg(colors.card)
+        .text_size(at(scale, 10.0))
+        .line_height(at(scale, 16.0))
+        .font_weight(if active { FontWeight(600.0) } else { FontWeight(400.0) })
+        .text_color(if active { colors.title } else { colors.muted })
+        .children(
+            active.then(|| div().size(px(7.0)).rounded_full().bg(colors.ready_state).shadow_sm()),
+        )
+        .child(shown);
+    if !writable {
+        return word.into_any_element();
+    }
+    let click_state = std::sync::Arc::clone(state);
+    word.id(SharedString::from(format!("beads-detail-status-{workspace_id}-{status}")))
+        .role(Role::Button)
+        .aria_label(format!("Set issue status to {shown}"))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            queue_status(&click_state, workspace_id, status);
+            window.refresh();
+        })
+        .into_any_element()
+}
+
+fn panel_verb_word(verb: PanelVerb, writable: bool, wiring: PanelContentWiring<'_>) -> AnyElement {
+    let PanelContentWiring { workspace_id, state, colors, scale, .. } = wiring;
+    let (label, tone, key) = match verb {
+        PanelVerb::Claim => ("claim", colors.ready_state, "claim"),
+        PanelVerb::CloseIssue => ("close issue", colors.done_state, "close"),
+    };
+    let word = div()
+        .font_family("monospace")
+        .text_size(at(scale, 10.0))
+        .line_height(at(scale, 16.0))
+        .font_weight(FontWeight(600.0))
+        .text_color(colors.panel_state_ink(tone))
+        .child(label);
+    let word = match verb {
+        PanelVerb::Claim => word.ml_auto(),
+        PanelVerb::CloseIssue => word.ml(px(16.0)),
+    };
+    if !writable {
+        return word.into_any_element();
+    }
+    let click_state = std::sync::Arc::clone(state);
+    word.id(SharedString::from(format!("beads-detail-verb-{workspace_id}-{key}")))
+        .role(Role::Button)
+        .aria_label(label)
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            queue_panel_verb(&click_state, workspace_id, verb);
+            window.refresh();
+        })
+        .into_any_element()
+}
+
+fn queue_status(state: &std::sync::Mutex<BeadsPanels>, workspace_id: WorkspaceId, status: &str) {
+    if let Ok(mut panels) = state.lock() {
+        panels.write_status(workspace_id, status);
+    }
+}
+
+fn queue_panel_verb(
+    state: &std::sync::Mutex<BeadsPanels>,
+    workspace_id: WorkspaceId,
+    verb: PanelVerb,
+) {
+    if let Ok(mut panels) = state.lock() {
+        match verb {
+            PanelVerb::Claim => panels.claim(workspace_id),
+            PanelVerb::CloseIssue => panels.close_issue(workspace_id),
+        };
+    }
 }
 
 fn queue_basis(presentation: &PanelPresentation) -> String {
@@ -1955,12 +2253,13 @@ fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use scribe_common::ids::WorkspaceId;
     use scribe_common::protocol::{
         BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
         BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite,
+        BeadsIssueWriteGuards, BeadsIssueWriteResult,
     };
     use scribe_common::theme::ChromeColors;
 
@@ -2045,6 +2344,19 @@ mod tests {
             _ => panic!("invalid fixture lane"),
         }
         BeadsBoardState::Ready { snapshot, stale: false, refresh_error: None }
+    }
+
+    fn loaded_writable_panels(mut issue: BeadsIssueDetail) -> (WorkspaceId, BeadsPanels) {
+        issue.assignee = Some("maintainer".into());
+        let workspace = WorkspaceId::new();
+        let issue_id = issue.id.clone();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.set_write_enabled(true);
+        panels.open(workspace, item(), 1);
+        assert_eq!(panels.take_request(), Some((workspace, issue_id.clone())));
+        panels.update(workspace, &issue_id, Some(Box::new(issue)));
+        (workspace, panels)
     }
 
     fn chrome_slots(fill: [f32; 4]) -> ChromeColors {
@@ -2379,6 +2691,176 @@ mod tests {
     }
 
     #[test]
+    fn inline_edit_intent_uses_the_loaded_issue_guards() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.queue_edit(BeadsEditIntent {
+            workspace_id: workspace,
+            issue_id: "scribe-5wh1.4".into(),
+            verb: BeadsIssueWrite::SetTitle { title: "Persisted title".into() },
+        }));
+
+        assert_eq!(
+            panels.take_write(),
+            Some(PanelWriteIntent {
+                workspace_id: workspace,
+                issue_id: "scribe-5wh1.4".into(),
+                verb: BeadsIssueWrite::SetTitle { title: "Persisted title".into() },
+                guards: BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            })
+        );
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]
+    #[test]
+    fn status_rail_and_claim_queue_native_verbs_with_fresh_detail_guards() {
+        for (target, expected) in [
+            ("open", BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: false }),
+            (
+                "in_progress",
+                BeadsIssueWrite::SetStatus { status: "in_progress".into(), clear_defer: false },
+            ),
+            ("closed", BeadsIssueWrite::SetStatus { status: "closed".into(), clear_defer: false }),
+        ] {
+            let (workspace, mut panels) = loaded_writable_panels(detail());
+            assert!(panels.write_status(workspace, target));
+            assert_eq!(
+                panels.take_write(),
+                Some(PanelWriteIntent {
+                    workspace_id: workspace,
+                    issue_id: "scribe-5wh1.4".into(),
+                    verb: expected,
+                    guards: BeadsIssueWriteGuards {
+                        if_status: Some("open".into()),
+                        if_assignee: Some("maintainer".into()),
+                    },
+                })
+            );
+        }
+
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert_eq!(
+            panels.take_write().map(|intent| (intent.verb, intent.guards)),
+            Some((
+                BeadsIssueWrite::Claim,
+                BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            ))
+        );
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Close undo deadline]]
+    #[test]
+    fn applied_close_opens_an_exact_five_second_guarded_undo_window() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.close_issue(workspace));
+        assert_eq!(
+            panels.take_write().map(|intent| (intent.verb, intent.guards)),
+            Some((
+                BeadsIssueWrite::CloseIssue,
+                BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            ))
+        );
+
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 7 },
+            now,
+        );
+        assert!(panels.visible(workspace).is_none());
+        assert_eq!(
+            panels.notice_at(workspace, now + Duration::from_millis(4_999)),
+            Some("closed scribe-5wh1.4 · undo")
+        );
+        assert!(panels.undo_at(workspace, now + Duration::from_millis(4_999)));
+        assert_eq!(
+            panels.take_write().map(|intent| (intent.verb, intent.guards)),
+            Some((
+                BeadsIssueWrite::UndoClose,
+                BeadsIssueWriteGuards {
+                    if_status: Some("closed".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn undo_at_or_after_the_five_second_deadline_writes_nothing() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.close_issue(workspace));
+        assert!(panels.take_write().is_some());
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 8 },
+            now,
+        );
+
+        assert!(!panels.undo_at(workspace, now + Duration::from_secs(5)));
+        assert_eq!(panels.take_write(), None);
+        assert_eq!(panels.notice_at(workspace, now + Duration::from_secs(5)), None);
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write capability and closed issue gates]]
+    #[test]
+    fn missing_write_capability_and_closed_details_queue_no_verbs() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.set_write_enabled(false);
+        panels.open(workspace, item(), 1);
+        panels.take_request();
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(detail())));
+        assert!(!panels.write_status(workspace, "closed"));
+        assert!(!panels.claim(workspace));
+        assert!(!panels.close_issue(workspace));
+        assert_eq!(panels.take_write(), None);
+
+        let mut closed = detail();
+        closed.status = "closed".into();
+        let (closed_workspace, mut closed_panels) = loaded_writable_panels(closed);
+        assert!(!closed_panels.write_status(closed_workspace, "open"));
+        assert!(!closed_panels.claim(closed_workspace));
+        assert!(!closed_panels.close_issue(closed_workspace));
+        assert_eq!(closed_panels.take_write(), None);
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Conflict result notice]]
+    #[test]
+    fn precondition_failure_surfaces_someone_else_won_and_refreshes_detail() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.claim(workspace));
+        assert!(panels.take_write().is_some());
+
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::PreconditionFailed,
+            now,
+        );
+
+        assert_eq!(
+            panels.notice_at(workspace, now),
+            Some("Someone else won; refreshing issue detail")
+        );
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+        assert!(panels.visible(workspace).is_some());
+    }
+
+    #[test]
     fn blocked_detail_build_counts_every_upstream_node() {
         let presentation = PanelPresentation::from_detail(&full_detail());
 
@@ -2396,10 +2878,10 @@ mod tests {
     }
 
     #[test]
-    fn viewer_build_exposes_only_inert_read_only_verbs() {
+    fn open_detail_build_exposes_claim_and_close_verbs() {
         let presentation = PanelPresentation::from_detail(&detail());
 
-        assert_eq!(presentation.verbs(), &[ReadOnlyVerb::Claim, ReadOnlyVerb::CloseIssue]);
+        assert_eq!(presentation.verbs(), &[PanelVerb::Claim, PanelVerb::CloseIssue]);
     }
 
     fn key_down(key: &str, modifiers: gpui::Modifiers) -> gpui::KeyDownEvent {

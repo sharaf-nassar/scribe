@@ -1666,10 +1666,10 @@ not.
 Docker-only server unit tests pin argv, capability, deadline, cache, and generation behavior without touching the host runtime.
 
 `just docker-unit-beads-write` compiles and runs the Beads-board module tests
-inside `docker/Dockerfile.func`. The suite covers every verb and supplied
-guard, strict build-marker parsing, stale-refresh rejection, last-good cache
-retention, root-scoped multi-window push, and killing a timed-out fake bd
-process with its descendant.
+and focused client Beads tests inside `docker/Dockerfile.func`. The suite covers
+every server verb and supplied guard, strict build-marker parsing,
+stale-refresh rejection, last-good cache retention, root-scoped multi-window
+push, timed-out process cleanup, panel write intents, and typed IPC lowering.
 
 ### AI Shell Environment Matrix
 
@@ -1857,7 +1857,7 @@ the target ID.
 
 Rust build-model tests cover the complete anatomy, omission of every sparse
 section, closed facts without verbs, blocked upstream-node count, hidden-count
-line, viewer read-only verbs, and the board palette's 4.5:1 panel-text floor.
+line, open-detail verbs, and the board palette's 4.5:1 panel-text floor.
 The renderer consumes that model, so these checks exercise production section
 selection rather than a parallel fixture description. Lifecycle unit tests pin
 the 400px no-open boundary, 0.8 and 1.6 text scales, minimum and maximum board
@@ -1869,6 +1869,34 @@ State tests also require
 the ID intent to drain exactly once and dependent navigation to ignore replies
 for another workspace or issue until its matching response can swap and
 re-anchor the panel.
+
+#### Guarded status and claim intents
+
+Each status target and native claim carry fresh status and assignee guards from the loaded detail.
+
+The tests also require an inline edit to enter that same guarded queue and pin
+`clear_defer: false` so a rail status change cannot silently alter a deferred
+issue.
+
+#### Close undo deadline
+
+Applied native close replaces the panel with a guarded undo action for exactly five seconds.
+
+The inside-boundary case sends `UndoClose` with closed status and the captured
+assignee, while the exact deadline queues no write.
+
+#### Write capability and closed issue gates
+
+Missing write capability and closed issue detail expose no actionable panel verbs.
+
+Both cases reject status, claim, and close before any intent reaches IPC.
+
+#### Conflict result notice
+
+A guarded-write precondition failure tells the user someone else won and requests fresh detail.
+
+The panel stays open so the authoritative detail reply can replace stale
+guards without losing the user's context.
 
 ### Shared-pane rig
 
@@ -2478,6 +2506,13 @@ The host-isolation policy remains authoritative in [CLAUDE.md](../CLAUDE.md) and
 ## GPUI IPC Bridge
 
 Unit tests for the GPUI client's  — the inbound coalescing drain and the outbound  — proving keystroke-before-output ordering and Zed-style 4 ms / 100-event coalescing over the frozen IPC protocol.
+
+### Beads issue write reaches the wire
+
+The outbound sink preserves one typed Beads verb and both optimistic-concurrency guards.
+
+Its explicit empty-assignee fixture proves absence and an expected unassigned
+value remain distinct across client protocol lowering.
 
 ### Coalesce collapses per pane
 

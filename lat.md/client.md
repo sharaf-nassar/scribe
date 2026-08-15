@@ -1033,7 +1033,7 @@ mutex mutation, with no request, IPC, or subprocess. This slice paints only an
 empty native marker; ghost, drop behavior, writes, and optimistic placement
 belong to later drag stages.
 
-When `Welcome.beads_detail` is enabled, clicking a card opens a read-only panel
+When `Welcome.beads_detail` is enabled, clicking a card opens an issue panel
 immediately and parks one workspace-scoped detail request. The panel remains
 under its source lane, with a 12px workspace inset and a 4px gap below the
 board. Its 560px target width shrinks with the region but does not open below
@@ -1054,13 +1054,25 @@ capability leaves the existing board unchanged.
 
 The panel follows `.impeccable/mocks/beads-card-detail.html`: a full-bleed
 identity head, derived queue row, dependency spine, sparse body fields,
-newest-first comments, dependents, and inert read-only status rail. Theme
-slots supply every colour. The newest collapsed comment gets two lines and
-each older collapsed comment gets one; clicking one expands it in place. A
+newest-first comments, dependents, and the original status-rail appearance.
+Theme slots supply every colour. The newest collapsed comment gets two lines
+and each older collapsed comment gets one; clicking one expands it in place. A
 data-derived presentation model owns sparse-section presence, upstream and
-hidden-comment counts, and inert verbs; closed details retain close facts but
-omit verbs. Queue words are lifted through the board palette's body-text
-contrast solver before they paint on the card surface.
+hidden-comment counts; closed details retain close facts but omit write verbs.
+Queue words are lifted through the board palette's body-text contrast solver
+before they paint on the card surface.
+
+`Welcome.beads_write` independently enables the three status words plus claim
+and close. Every click parks one typed write with status and assignee guards
+copied from the loaded detail; claim and close retain their native verbs.
+Inline text applies enter the same guarded queue, and stale editor intents are
+rejected if the workspace has already moved to another issue.
+Applied status and claim writes request fresh detail. Applied close removes the
+panel and shows `closed <id> · undo` for exactly five seconds. Clicking before
+the deadline sends native guarded undo; clicking at or after it sends nothing.
+Precondition failure keeps the panel, reports that someone else won, and
+refreshes detail. Missing write capability and closed detail leave every rail
+word inert.
 
 The identity ID is one click target for its full, unshortened value. Hover
 reveals its copy glyph; the click parks that value for the window's existing

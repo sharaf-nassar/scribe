@@ -35,7 +35,7 @@ use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
 };
 use scribe_client::beads_panel::{
-    self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels,
+    self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels, PanelWriteIntent,
 };
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
@@ -9111,7 +9111,7 @@ impl TerminalView {
         let mut copied = None;
         let mut panel_copy = None;
         let mut detail_requests = Vec::new();
-        let mut writes = Vec::new();
+        let mut issue_writes = Vec::new();
         let panel_workspaces = self
             .shared
             .beads_panels
@@ -9124,7 +9124,7 @@ impl TerminalView {
                     detail_requests.push(request);
                 }
                 while let Some(write) = panels.take_write() {
-                    writes.push(write);
+                    issue_writes.push(write);
                 }
                 panels.workspaces()
             })
@@ -9160,14 +9160,22 @@ impl TerminalView {
                 tracing::debug!(%error, "Beads issue detail request dropped");
             }
         }
-        for write in writes {
-            if let Err(error) =
-                self.sink.beads_issue_write(write.workspace_id, write.issue_id, write.verb)
-            {
-                tracing::debug!(%error, "Beads issue write dropped");
-            }
+        for write in issue_writes {
+            self.send_beads_issue_write(write);
         }
         self.shell.set_pinned_boards(strips);
+    }
+
+    fn send_beads_issue_write(&self, write: PanelWriteIntent) {
+        let workspace_id = write.workspace_id;
+        let issue_id = write.issue_id;
+        let result =
+            self.sink.write_beads_issue(workspace_id, issue_id.clone(), write.verb, write.guards);
+        let Err(error) = result else { return };
+        tracing::debug!(%error, %workspace_id, %issue_id, "Beads issue write dropped");
+        if let Ok(mut panels) = self.shared.beads_panels.lock() {
+            panels.write_send_failed(workspace_id, &issue_id, &error.to_string());
+        }
     }
 
     /// Match repository-keyed CI snapshots to the regions that own them.
@@ -12595,6 +12603,12 @@ async fn dispatch_server_message(
         ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail } => {
             if let Ok(mut panels) = ctx.beads_panels.lock() {
                 panels.update(workspace_id, &issue_id, detail);
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+        }
+        ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
+            if let Ok(mut panels) = ctx.beads_panels.lock() {
+                panels.finish_write(workspace_id, &issue_id, result);
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
