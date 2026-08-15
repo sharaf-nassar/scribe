@@ -4424,8 +4424,8 @@ terminal focus makes the next printable key encode normally.
 
 ## GPUI Beads Inline Editing
 
-Production editor state and routing tests pin when text applies, cancels, or
-stays in the active passage.
+Production editor state and routing tests pin when text applies, cancels, stays
+in the active passage, or repaints from persisted detail.
 
 ### Enter commit matrix
 
@@ -4446,6 +4446,27 @@ applying and reopening the server value.
 
 Escape drops the active draft without producing a write, leaving the next
 Escape available to close the panel.
+
+### Text fields map to typed writes
+
+Every editable text passage maps its draft to the matching typed protocol verb.
+
+The matrix covers title, description, acceptance, notes, design, spec-id set,
+and spec-id clear without deriving expectations from the implementation.
+
+### Applied edits wait for persisted detail
+
+An applied edit sends one guarded write and leaves the loaded value visible until fresh detail arrives.
+
+The result requests uncached detail. Only that reply replaces the rendered
+title, so the client never treats its draft as persisted state.
+
+### Failed edits retain persisted detail
+
+A failed edit leaves the loaded value intact and uses the existing panel failure notice.
+
+No detail refresh is requested for a rejected write because the server reports
+that nothing committed.
 
 ## GPUI Status Bar
 

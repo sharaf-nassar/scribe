@@ -2359,6 +2359,13 @@ mod tests {
         (workspace, panels)
     }
 
+    fn loaded_detail(panels: &BeadsPanels, workspace_id: WorkspaceId) -> &BeadsIssueDetail {
+        panels
+            .visible(workspace_id)
+            .and_then(|panel| panel.detail.as_deref())
+            .expect("loaded issue detail")
+    }
+
     fn chrome_slots(fill: [f32; 4]) -> ChromeColors {
         ChromeColors {
             tab_bar_bg: fill,
@@ -2690,13 +2697,14 @@ mod tests {
         assert!(presentation.verbs().is_empty());
     }
 
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Applied edits wait for persisted detail]]
     #[test]
-    fn inline_edit_intent_uses_the_loaded_issue_guards() {
+    fn applied_edit_uses_guards_and_waits_for_persisted_detail() {
         let (workspace, mut panels) = loaded_writable_panels(detail());
         assert!(panels.queue_edit(BeadsEditIntent {
             workspace_id: workspace,
             issue_id: "scribe-5wh1.4".into(),
-            verb: BeadsIssueWrite::SetTitle { title: "Persisted title".into() },
+            verb: BeadsIssueWrite::SetTitle { title: "Draft title".into() },
         }));
 
         assert_eq!(
@@ -2704,13 +2712,96 @@ mod tests {
             Some(PanelWriteIntent {
                 workspace_id: workspace,
                 issue_id: "scribe-5wh1.4".into(),
-                verb: BeadsIssueWrite::SetTitle { title: "Persisted title".into() },
+                verb: BeadsIssueWrite::SetTitle { title: "Draft title".into() },
                 guards: BeadsIssueWriteGuards {
                     if_status: Some("open".into()),
                     if_assignee: Some("maintainer".into()),
                 },
             })
         );
+        assert_eq!(panels.take_write(), None);
+        assert_eq!(loaded_detail(&panels, workspace).title, "Render the read-only detail panel");
+
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 9 },
+            Instant::now(),
+        );
+        assert_eq!(loaded_detail(&panels, workspace).title, "Render the read-only detail panel");
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+
+        let mut persisted = detail();
+        persisted.title = "Persisted title".into();
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(persisted)));
+        assert_eq!(loaded_detail(&panels, workspace).title, "Persisted title");
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Text fields map to typed writes]]
+    #[test]
+    fn every_text_field_maps_to_its_typed_write() {
+        for (field, value, expected) in [
+            (
+                EditField::Title,
+                "New title",
+                BeadsIssueWrite::SetTitle { title: "New title".into() },
+            ),
+            (
+                EditField::Description,
+                "New description",
+                BeadsIssueWrite::SetDescription { description: "New description".into() },
+            ),
+            (
+                EditField::Acceptance,
+                "New acceptance",
+                BeadsIssueWrite::SetAcceptance { acceptance: "New acceptance".into() },
+            ),
+            (
+                EditField::Notes,
+                "New notes",
+                BeadsIssueWrite::SetNotes { notes: "New notes".into() },
+            ),
+            (
+                EditField::Design,
+                "New design",
+                BeadsIssueWrite::SetDesign { design: "New design".into() },
+            ),
+            (
+                EditField::SpecId,
+                "025-next-spec",
+                BeadsIssueWrite::SetSpecId { spec_id: Some("025-next-spec".into()) },
+            ),
+        ] {
+            assert_eq!(field.verb(value.into()), expected);
+        }
+        assert_eq!(
+            EditField::SpecId.verb(String::new()),
+            BeadsIssueWrite::SetSpecId { spec_id: None }
+        );
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Failed edits retain persisted detail]]
+    #[test]
+    fn failed_edit_retains_persisted_detail_and_shows_the_notice() {
+        let now = Instant::now();
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.queue_edit(BeadsEditIntent {
+            workspace_id: workspace,
+            issue_id: "scribe-5wh1.4".into(),
+            verb: BeadsIssueWrite::SetDescription { description: "Draft body".into() },
+        }));
+        assert!(panels.take_write().is_some());
+
+        panels.finish_write_at(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Failed { reason: "bd rejected edit".into() },
+            now,
+        );
+
+        assert_eq!(loaded_detail(&panels, workspace).description, "Description");
+        assert_eq!(panels.notice_at(workspace, now), Some("Issue write failed: bd rejected edit"));
+        assert_eq!(panels.take_request(), None);
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]

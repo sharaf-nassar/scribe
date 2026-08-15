@@ -1065,8 +1065,11 @@ before they paint on the card surface.
 `Welcome.beads_write` independently enables the three status words plus claim
 and close. Every click parks one typed write with status and assignee guards
 copied from the loaded detail; claim and close retain their native verbs.
-Inline text applies enter the same guarded queue, and stale editor intents are
-rejected if the workspace has already moved to another issue.
+Inline title, description, acceptance, notes, design, and spec-id applies enter
+the same guarded queue. Stale editor intents are rejected if the workspace has
+already moved to another issue. A draft never mutates loaded detail. Applied
+writes keep the previous text visible until fresh persisted detail arrives;
+failed writes keep it and show the panel's existing failure notice.
 Applied status and claim writes request fresh detail. Applied close removes the
 panel and shows `closed <id> · undo` for exactly five seconds. Clicking before
 the deadline sends native guarded undo; clicking at or after it sends nothing.
