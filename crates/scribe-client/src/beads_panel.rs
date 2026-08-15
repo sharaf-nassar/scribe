@@ -31,6 +31,20 @@ const PANEL_MARGIN: f32 = 12.0;
 const PANEL_BOARD_GAP: f32 = 4.0;
 const PANEL_OPEN_DURATION: Duration = Duration::from_millis(120);
 const NOTICE_DURATION: Duration = Duration::from_secs(5);
+const BD_ISSUE_TYPES: [&str; 12] = [
+    "bug",
+    "feature",
+    "task",
+    "epic",
+    "chore",
+    "decision",
+    "message",
+    "molecule",
+    "gate",
+    "spike",
+    "story",
+    "milestone",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelSection {
@@ -58,6 +72,12 @@ enum PanelSection {
 enum PanelVerb {
     Claim,
     CloseIssue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelPickRow {
+    Priority,
+    IssueType,
 }
 
 const OPEN_VERBS: [PanelVerb; 2] = [PanelVerb::Claim, PanelVerb::CloseIssue];
@@ -294,6 +314,7 @@ enum EditField {
     Notes,
     Design,
     SpecId,
+    Labels,
 }
 
 impl EditField {
@@ -305,6 +326,7 @@ impl EditField {
             Self::Notes => "notes",
             Self::Design => "design",
             Self::SpecId => "spec-id",
+            Self::Labels => "labels",
         }
     }
 
@@ -322,8 +344,21 @@ impl EditField {
             Self::SpecId => {
                 BeadsIssueWrite::SetSpecId { spec_id: (!value.is_empty()).then_some(value) }
             }
+            Self::Labels => BeadsIssueWrite::SetLabels { labels: parse_labels(&value) },
         }
     }
+}
+
+fn parse_labels(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|label| !label.is_empty())
+        .fold(Vec::new(), |mut labels, label| {
+            if !labels.iter().any(|existing| existing == label) {
+                labels.push(label.to_owned());
+            }
+            labels
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,6 +715,7 @@ pub struct BeadsPanels {
     pending_navigation: HashMap<WorkspaceId, String>,
     pending_writes: VecDeque<PanelWriteIntent>,
     in_flight_writes: HashMap<(WorkspaceId, String), PanelWriteIntent>,
+    pick_rows: HashMap<WorkspaceId, PanelPickRow>,
     expanded_comments: HashSet<(WorkspaceId, String, usize)>,
     pending_copy: Option<String>,
     notices: HashMap<WorkspaceId, PanelNotice>,
@@ -696,6 +732,7 @@ impl BeadsPanels {
             self.pending_navigation.clear();
             self.pending_writes.clear();
             self.in_flight_writes.clear();
+            self.pick_rows.clear();
             self.expanded_comments.clear();
             self.pending_copy = None;
             self.notices.clear();
@@ -708,6 +745,7 @@ impl BeadsPanels {
         if !self.write_enabled {
             self.pending_writes.clear();
             self.in_flight_writes.clear();
+            self.pick_rows.clear();
         }
     }
 
@@ -721,6 +759,7 @@ impl BeadsPanels {
         }
         let issue_id = card.id.clone();
         self.notices.remove(&workspace_id);
+        self.pick_rows.remove(&workspace_id);
         self.pending_navigation.remove(&workspace_id);
         self.open.insert(workspace_id, BeadsPanel { card, lane, detail: None });
         self.pending_requests.push_back((workspace_id, issue_id));
@@ -739,6 +778,7 @@ impl BeadsPanels {
                 self.close_missing(workspace_id, issue_id);
                 return;
             };
+            self.pick_rows.remove(&workspace_id);
             let Some(panel) = self.open.get_mut(&workspace_id) else { return };
             panel.card = card_from_detail(&detail);
             panel.lane = queue_lane(detail.queue);
@@ -753,6 +793,7 @@ impl BeadsPanels {
             self.close_missing(workspace_id, issue_id);
             return;
         };
+        self.pick_rows.remove(&workspace_id);
         let Some(panel) = self.open.get_mut(&workspace_id) else { return };
         panel.lane = queue_lane(detail.queue);
         panel.detail = Some(detail);
@@ -760,6 +801,7 @@ impl BeadsPanels {
 
     fn close_missing(&mut self, workspace_id: WorkspaceId, issue_id: &str) {
         let Some(panel) = self.open.remove(&workspace_id) else { return };
+        self.pick_rows.remove(&workspace_id);
         self.notices.insert(
             workspace_id,
             PanelNotice::new(format!("Issue {issue_id} no longer exists"), panel.lane),
@@ -814,6 +856,45 @@ impl BeadsPanels {
 
     pub fn close_issue(&mut self, workspace_id: WorkspaceId) -> bool {
         self.queue_write(workspace_id, BeadsIssueWrite::CloseIssue)
+    }
+
+    fn pick_row(&self, workspace_id: WorkspaceId) -> Option<PanelPickRow> {
+        self.pick_rows.get(&workspace_id).copied()
+    }
+
+    fn toggle_pick_row(&mut self, workspace_id: WorkspaceId, row: PanelPickRow) -> bool {
+        if !self.can_write(workspace_id) {
+            return false;
+        }
+        if self.pick_rows.get(&workspace_id) == Some(&row) {
+            self.pick_rows.remove(&workspace_id);
+        } else {
+            self.pick_rows.insert(workspace_id, row);
+        }
+        true
+    }
+
+    fn set_priority(&mut self, workspace_id: WorkspaceId, priority: u8) -> bool {
+        if priority > 4
+            || !self.queue_write(workspace_id, BeadsIssueWrite::SetPriority { priority })
+        {
+            return false;
+        }
+        self.pick_rows.remove(&workspace_id);
+        true
+    }
+
+    fn set_issue_type(&mut self, workspace_id: WorkspaceId, issue_type: &str) -> bool {
+        if !BD_ISSUE_TYPES.contains(&issue_type)
+            || !self.queue_write(
+                workspace_id,
+                BeadsIssueWrite::SetType { issue_type: issue_type.to_owned() },
+            )
+        {
+            return false;
+        }
+        self.pick_rows.remove(&workspace_id);
+        true
     }
 
     pub fn can_write(&self, workspace_id: WorkspaceId) -> bool {
@@ -979,6 +1060,7 @@ impl BeadsPanels {
 
     pub fn dismiss(&mut self, workspace_id: WorkspaceId) -> bool {
         self.pending_navigation.remove(&workspace_id);
+        self.pick_rows.remove(&workspace_id);
         let removed = self.open.remove(&workspace_id).is_some()
             | self.notices.remove(&workspace_id).is_some();
         if self.last_opened == Some(workspace_id) {
@@ -997,6 +1079,7 @@ impl BeadsPanels {
         self.pending_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
         self.pending_writes.retain(|write| live.contains(&write.workspace_id));
         self.in_flight_writes.retain(|(workspace_id, _), _| live.contains(workspace_id));
+        self.pick_rows.retain(|workspace_id, _| live.contains(workspace_id));
         self.notices.retain(|workspace_id, _| live.contains(workspace_id));
         self.pending_navigation.retain(|workspace_id, _| live.contains(workspace_id));
         if self.last_opened.is_some_and(|workspace_id| !live.contains(&workspace_id)) {
@@ -1054,6 +1137,7 @@ impl BeadsPanels {
     pub fn sync_board(&mut self, workspace_id: WorkspaceId, state: &BeadsBoardState) -> bool {
         if matches!(state, BeadsBoardState::NotDetected) {
             self.pending_navigation.remove(&workspace_id);
+            self.pick_rows.remove(&workspace_id);
             let Some(panel) = self.open.remove(&workspace_id) else { return false };
             self.notices.insert(
                 workspace_id,
@@ -1082,6 +1166,7 @@ impl BeadsPanels {
             return false;
         }
         self.pending_navigation.insert(workspace_id, issue_id.to_owned());
+        self.pick_rows.remove(&workspace_id);
         self.pending_requests.push_back((workspace_id, issue_id.to_owned()));
         true
     }
@@ -1344,17 +1429,7 @@ fn panel_header(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .mr(px(6.0))
-                        .font_family("monospace")
-                        .text_size(at(scale, 11.0))
-                        .line_height(at(scale, 20.0))
-                        .font_weight(FontWeight(700.0))
-                        .text_color(priority_color(colors, priority))
-                        .child(format!("P{priority}")),
-                )
+                .child(priority_pick_row(detail, priority, wiring))
                 .child(title)
                 .children(epic.map(|name| {
                     div()
@@ -1392,6 +1467,73 @@ fn panel_header(
                 ),
         )
         .child(identity_row(panel, presentation, wiring))
+        .into_any_element()
+}
+
+fn priority_pick_row(
+    detail: Option<&BeadsIssueDetail>,
+    priority: u8,
+    wiring: &BeadsPanelRender<'_>,
+) -> AnyElement {
+    let workspace_id = wiring.workspace_id;
+    let writable = wiring.write_enabled && detail.is_some_and(|issue| issue.status != "closed");
+    let expanded = writable
+        && wiring
+            .state
+            .lock()
+            .is_ok_and(|panels| panels.pick_row(workspace_id) == Some(PanelPickRow::Priority));
+    let mark = div()
+        .flex_none()
+        .mr(px(6.0))
+        .font_family("monospace")
+        .text_size(at(wiring.scale, 11.0))
+        .line_height(at(wiring.scale, 20.0))
+        .font_weight(FontWeight(700.0))
+        .text_color(priority_color(&wiring.colors, priority));
+    if expanded {
+        return mark
+            .flex()
+            .gap(px(6.0))
+            .children((0..=4).map(|choice| {
+                let state = Arc::clone(&wiring.state);
+                div()
+                    .id(SharedString::from(format!(
+                        "beads-detail-priority-{workspace_id}-{choice}"
+                    )))
+                    .role(Role::Button)
+                    .aria_label(format!("Set issue priority to P{choice}"))
+                    .cursor_pointer()
+                    .font_weight(if choice == priority {
+                        FontWeight(700.0)
+                    } else {
+                        FontWeight(400.0)
+                    })
+                    .text_color(priority_color(&wiring.colors, choice))
+                    .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+                    .on_click(move |_event, window, _app| {
+                        queue_priority(&state, workspace_id, choice);
+                        window.refresh();
+                    })
+                    .child(format!("P{choice}"))
+            }))
+            .into_any_element();
+    }
+    let mark = mark.child(format!("P{priority}"));
+    if !writable {
+        return mark.into_any_element();
+    }
+    let state = Arc::clone(&wiring.state);
+    mark.id(SharedString::from(format!("beads-detail-priority-{workspace_id}")))
+        .role(Role::Button)
+        .aria_label("Edit issue priority")
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            if let Ok(mut panels) = state.lock() {
+                panels.toggle_pick_row(workspace_id, PanelPickRow::Priority);
+            }
+            window.refresh();
+        })
         .into_any_element()
 }
 
@@ -1510,20 +1652,8 @@ fn identity_left(
                 ),
         )
         .children(detail.is_some().then(|| separator(colors).into_any_element()))
-        .children(detail.map(|issue| issue.issue_type.clone()))
-        .children(
-            detail
-                .filter(|_| presentation.is_some_and(|build| build.has(PanelSection::Labels)))
-                .into_iter()
-                .flat_map(|issue| {
-                    issue.labels.iter().flat_map(|label| {
-                        [
-                            separator(colors).into_any_element(),
-                            div().child(label.clone()).into_any_element(),
-                        ]
-                    })
-                }),
-        )
+        .children(detail.map(|issue| type_pick_row(issue, wiring)))
+        .children(detail.and_then(|issue| identity_labels(issue, presentation, wiring)))
         .children(
             detail
                 .filter(|_| presentation.is_some_and(|build| build.has(PanelSection::Owner)))
@@ -1537,6 +1667,98 @@ fn identity_left(
                     )
                 }),
         )
+        .into_any_element()
+}
+
+fn identity_labels(
+    issue: &BeadsIssueDetail,
+    presentation: Option<&PanelPresentation>,
+    wiring: &BeadsPanelRender<'_>,
+) -> Option<AnyElement> {
+    if !presentation.is_some_and(|build| build.has(PanelSection::Labels))
+        && (!wiring.write_enabled || issue.status == "closed")
+    {
+        return None;
+    }
+    let labels = if issue.labels.is_empty() { "+label".into() } else { issue.labels.join(" ") };
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .child(separator(&wiring.colors))
+            .child(editable_text(
+                wiring.edit_wiring(),
+                &issue.id,
+                EditField::Labels,
+                &labels,
+                div().font_family("monospace"),
+            ))
+            .into_any_element(),
+    )
+}
+
+fn type_pick_row(issue: &BeadsIssueDetail, wiring: &BeadsPanelRender<'_>) -> AnyElement {
+    let workspace_id = wiring.workspace_id;
+    let writable = wiring.write_enabled && issue.status != "closed";
+    let expanded = writable
+        && wiring
+            .state
+            .lock()
+            .is_ok_and(|panels| panels.pick_row(workspace_id) == Some(PanelPickRow::IssueType));
+    if expanded {
+        return div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex_wrap()
+            .gap(px(6.0))
+            .children(BD_ISSUE_TYPES.map(|issue_type| {
+                let state = Arc::clone(&wiring.state);
+                div()
+                    .id(SharedString::from(format!(
+                        "beads-detail-type-{workspace_id}-{issue_type}"
+                    )))
+                    .role(Role::Button)
+                    .aria_label(format!("Set issue type to {issue_type}"))
+                    .cursor_pointer()
+                    .font_family("monospace")
+                    .font_weight(if issue_type == issue.issue_type {
+                        FontWeight(600.0)
+                    } else {
+                        FontWeight(400.0)
+                    })
+                    .text_color(if issue_type == issue.issue_type {
+                        wiring.colors.title
+                    } else {
+                        wiring.colors.muted
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+                    .on_click(move |_event, window, _app| {
+                        queue_issue_type(&state, workspace_id, issue_type);
+                        window.refresh();
+                    })
+                    .child(issue_type)
+            }))
+            .into_any_element();
+    }
+    let shown = div().font_family("monospace").child(issue.issue_type.clone());
+    if !writable {
+        return shown.into_any_element();
+    }
+    let state = Arc::clone(&wiring.state);
+    shown
+        .id(SharedString::from(format!("beads-detail-type-{workspace_id}")))
+        .role(Role::Button)
+        .aria_label("Edit issue type")
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, _app| {
+            if let Ok(mut panels) = state.lock() {
+                panels.toggle_pick_row(workspace_id, PanelPickRow::IssueType);
+            }
+            window.refresh();
+        })
         .into_any_element()
 }
 
@@ -2148,6 +2370,22 @@ fn panel_verb_word(verb: PanelVerb, writable: bool, wiring: PanelContentWiring<'
 fn queue_status(state: &std::sync::Mutex<BeadsPanels>, workspace_id: WorkspaceId, status: &str) {
     if let Ok(mut panels) = state.lock() {
         panels.write_status(workspace_id, status);
+    }
+}
+
+fn queue_priority(state: &std::sync::Mutex<BeadsPanels>, workspace_id: WorkspaceId, priority: u8) {
+    if let Ok(mut panels) = state.lock() {
+        panels.set_priority(workspace_id, priority);
+    }
+}
+
+fn queue_issue_type(
+    state: &std::sync::Mutex<BeadsPanels>,
+    workspace_id: WorkspaceId,
+    issue_type: &str,
+) {
+    if let Ok(mut panels) = state.lock() {
+        panels.set_issue_type(workspace_id, issue_type);
     }
 }
 
@@ -2802,6 +3040,143 @@ mod tests {
         assert_eq!(loaded_detail(&panels, workspace).description, "Description");
         assert_eq!(panels.notice_at(workspace, now), Some("Issue write failed: bd rejected edit"));
         assert_eq!(panels.take_request(), None);
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Priority type and label editing]]
+    #[test]
+    fn priority_and_type_pick_rows_unfold_exclusively_for_writable_details() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+
+        assert_eq!(panels.pick_row(workspace), None);
+        assert!(panels.toggle_pick_row(workspace, PanelPickRow::Priority));
+        assert_eq!(panels.pick_row(workspace), Some(PanelPickRow::Priority));
+        assert!(panels.toggle_pick_row(workspace, PanelPickRow::IssueType));
+        assert_eq!(panels.pick_row(workspace), Some(PanelPickRow::IssueType));
+        assert!(panels.toggle_pick_row(workspace, PanelPickRow::IssueType));
+        assert_eq!(panels.pick_row(workspace), None);
+
+        panels.set_write_enabled(false);
+        assert!(!panels.toggle_pick_row(workspace, PanelPickRow::Priority));
+        assert_eq!(panels.pick_row(workspace), None);
+    }
+
+    #[test]
+    fn type_pick_row_uses_the_pinned_bd_builtin_enum() {
+        assert_eq!(
+            BD_ISSUE_TYPES,
+            [
+                "bug",
+                "feature",
+                "task",
+                "epic",
+                "chore",
+                "decision",
+                "message",
+                "molecule",
+                "gate",
+                "spike",
+                "story",
+                "milestone",
+            ]
+        );
+    }
+
+    #[test]
+    fn picker_selections_queue_one_typed_guarded_write() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.toggle_pick_row(workspace, PanelPickRow::Priority));
+        assert!(panels.set_priority(workspace, 4));
+        assert_eq!(panels.pick_row(workspace), None);
+        assert_eq!(
+            panels.take_write(),
+            Some(PanelWriteIntent {
+                workspace_id: workspace,
+                issue_id: "scribe-5wh1.4".into(),
+                verb: BeadsIssueWrite::SetPriority { priority: 4 },
+                guards: BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            })
+        );
+        assert_eq!(panels.take_write(), None);
+
+        let (type_workspace, mut type_panels) = loaded_writable_panels(detail());
+        assert!(type_panels.toggle_pick_row(type_workspace, PanelPickRow::IssueType));
+        assert!(type_panels.set_issue_type(type_workspace, "decision"));
+        assert_eq!(type_panels.pick_row(type_workspace), None);
+        assert_eq!(
+            type_panels.take_write(),
+            Some(PanelWriteIntent {
+                workspace_id: type_workspace,
+                issue_id: "scribe-5wh1.4".into(),
+                verb: BeadsIssueWrite::SetType { issue_type: "decision".into() },
+                guards: BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            })
+        );
+        assert_eq!(type_panels.take_write(), None);
+    }
+
+    #[test]
+    fn label_editor_composes_add_remove_and_set_into_one_set_labels_verb() {
+        assert_eq!(
+            EditField::Labels.verb("client,server client ui".into()),
+            BeadsIssueWrite::SetLabels {
+                labels: vec!["client".into(), "server".into(), "ui".into()],
+            }
+        );
+
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.queue_edit(BeadsEditIntent {
+            workspace_id: workspace,
+            issue_id: "scribe-5wh1.4".into(),
+            verb: EditField::Labels.verb("server,docs".into()),
+        }));
+        assert_eq!(
+            panels.take_write().map(|write| (write.verb, write.guards)),
+            Some((
+                BeadsIssueWrite::SetLabels { labels: vec!["server".into(), "docs".into()] },
+                BeadsIssueWriteGuards {
+                    if_status: Some("open".into()),
+                    if_assignee: Some("maintainer".into()),
+                },
+            ))
+        );
+        assert_eq!(panels.take_write(), None);
+    }
+
+    // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Persisted picker repaint]]
+    #[test]
+    fn picker_write_repaints_only_after_persisted_detail_reply() {
+        let (workspace, mut panels) = loaded_writable_panels(detail());
+        assert!(panels.set_priority(workspace, 4));
+        assert_eq!(
+            panels.visible(workspace).and_then(|panel| panel.detail.as_deref()).unwrap().priority,
+            1
+        );
+
+        assert!(panels.take_write().is_some());
+        panels.finish_write(
+            workspace,
+            "scribe-5wh1.4",
+            BeadsIssueWriteResult::Applied { generation: 9 },
+        );
+        assert_eq!(
+            panels.visible(workspace).and_then(|panel| panel.detail.as_deref()).unwrap().priority,
+            1
+        );
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+
+        let mut persisted = detail();
+        persisted.priority = 4;
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(persisted)));
+        assert_eq!(
+            panels.visible(workspace).and_then(|panel| panel.detail.as_deref()).unwrap().priority,
+            4
+        );
     }
 
     // @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Guarded status and claim intents]]

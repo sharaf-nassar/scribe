@@ -1083,6 +1083,12 @@ Precondition failure keeps the panel, reports that someone else won, and
 refreshes detail. Missing write capability and closed detail leave every rail
 word inert.
 
+The priority mark and issue type unfold bare in-place pick rows. Priority uses
+P0-P4, while type uses the pinned bd build's complete built-in enum. Labels
+remain bare monospace words and reuse the inline editor; comma or whitespace
+separates the final set. Each choice enters the same guarded queue, closes its
+row only when accepted, and waits for fresh detail before repainting values.
+
 The identity ID is one click target for its full, unshortened value. Hover
 reveals its copy glyph; the click parks that value for the window's existing
 clipboard surface, whose take-once drain prevents a later frame from replaying

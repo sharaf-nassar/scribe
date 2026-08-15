@@ -1928,6 +1928,20 @@ A guarded-write precondition failure tells the user someone else won and request
 The panel stays open so the authoritative detail reply can replace stale
 guards without losing the user's context.
 
+#### Priority type and label editing
+
+Priority and type rows unfold exclusively and each accepted choice sends one typed write with fresh detail guards.
+
+The type list matches the pinned bd built-in enum. Label edits compose comma or
+whitespace-separated words into one stable, deduplicated `SetLabels` value.
+
+#### Persisted picker repaint
+
+A picker selection leaves visible detail unchanged until the authoritative detail reply arrives.
+
+Applied writes request detail refresh, and only that reply replaces the shown
+priority, type, or label value.
+
 ### Shared-pane rig
 
 `SCRIBE_SHARED_PANE=1` (`just e2e-visual-shared <script>`) is how a visual test gets a live pane that BOTH the GPUI client and `scribe-test` can see. Without it the client is blind to the harness's session and the harness is blind to the client's.
