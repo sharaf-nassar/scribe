@@ -1329,7 +1329,7 @@ Raw replay into blank or dirty primary and alternate terminals reproduces exactl
 
 ## Terminal Client Singleton
 
-Unit checks cover terminal-client launch gating, focus handoff, stale-owner recovery, and flavor-scoped paths without starting a Scribe runtime process.
+Unit checks cover terminal-client launch gating, authenticated restore-child focus transport, bounded cleanup, stale-owner recovery, and flavor-scoped paths without starting a Scribe runtime process.
 
 ### Plain local launch owns the singleton
 
@@ -1350,6 +1350,50 @@ The primary's same-UID listener forwards a focus command to the GPUI receiver th
 ### Client paths stay flavor scoped
 
 The terminal lock and focus socket share the server socket's flavor runtime directory and use distinct `client.lock` and `client.sock` names.
+
+### Focus endpoints stay short and flavor scoped
+
+Stable and dev generations produce the same short strict-prefix filename under different flavor runtime directories, preventing cross-flavor endpoint discovery.
+
+### Legacy focus frame stays byte compatible
+
+The existing focus writer still emits the exact newline-delimited JSON bytes older singleton owners accept.
+
+### Typed focus transport frames round trip
+
+Activation announcements, activation requests, and endpoint results retain their generation, endpoint, and window identity through newline JSON framing.
+
+### Malformed focus transport is rejected
+
+Malformed, truncated, unknown, and oversized singleton frames fail parsing instead of becoming an activation event.
+
+### Peer claims fail closed
+
+Peer decisions reject wrong UID, invalid PID, wrong executable, wrong flavor, and a process without the required `--restore-child` role.
+
+### Endpoint path and generation fail closed
+
+An announcement naming another generation's path and a request carrying another generation are both rejected before activation.
+
+### Focus endpoint permissions are private
+
+Binding a restore-child endpoint leaves its parent directory at 0700 and its socket inode at 0600.
+
+### Focus endpoint reads time out
+
+A connected endpoint that sends no result returns a typed timeout at the 100 ms transport bound.
+
+### Crash debris cleanup is bounded and conservative
+
+The strict-prefix cleanup removes a proven-dead endpoint while preserving a live endpoint and unrelated runtime socket.
+
+### Orderly cleanup preserves a replacement generation
+
+Dropping an old endpoint does not unlink a replacement socket that now occupies the same path with another inode.
+
+### Legacy acquisition ignores focus endpoint debris
+
+A rollback-style client still acquires `client.sock` when strict-prefix focus endpoint debris exists beside it.
 
 ## Server Lifecycle
 

@@ -1,8 +1,58 @@
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use nix::unistd::geteuid;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::app::{AppIdentity, current_identity};
+
+/// Filename prefix reserved for private restore-child focus endpoints.
+pub const CLIENT_FOCUS_SOCKET_PREFIX: &str = "client-focus-";
+
+/// Random process generation carried by restore-child focus transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClientFocusGeneration(Uuid);
+
+impl ClientFocusGeneration {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Short random tag used only in the Unix socket filename.
+    #[must_use]
+    pub fn socket_tag(self) -> String {
+        self.0.simple().to_string()[..16].to_owned()
+    }
+
+    #[must_use]
+    pub fn socket_name(self) -> String {
+        format!("{CLIENT_FOCUS_SOCKET_PREFIX}{}.sock", self.socket_tag())
+    }
+}
+
+impl Default for ClientFocusGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ClientFocusGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for ClientFocusGeneration {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
 
 /// Returns the platform-specific runtime directory for scribe sockets.
 ///
@@ -75,6 +125,20 @@ pub fn client_socket_path() -> PathBuf {
     runtime_dir().join("client.sock")
 }
 
+/// Returns the private focus endpoint path for one restore-child generation.
+#[must_use]
+pub fn client_focus_socket_path(generation: ClientFocusGeneration) -> PathBuf {
+    client_focus_socket_path_for(current_identity(), geteuid().as_raw(), generation)
+}
+
+fn client_focus_socket_path_for(
+    identity: AppIdentity,
+    uid: u32,
+    generation: ClientFocusGeneration,
+) -> PathBuf {
+    platform_runtime_dir(identity, uid).join(generation.socket_name())
+}
+
 /// Returns the lock file path for terminal-client singleton acquisition.
 #[must_use]
 pub fn client_lock_path() -> PathBuf {
@@ -129,7 +193,11 @@ mod tests {
 
 #[cfg(test)]
 mod shared_runtime_tests {
-    use super::{client_lock_path, client_socket_path, server_socket_path};
+    use super::{
+        ClientFocusGeneration, client_focus_socket_path_for, client_lock_path, client_socket_path,
+        server_socket_path,
+    };
+    use crate::app::AppIdentity;
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Client paths stay flavor scoped]]
     #[test]
@@ -141,5 +209,19 @@ mod shared_runtime_tests {
         assert_eq!(client_lock_path().parent(), Some(runtime_dir));
         assert_eq!(client_socket_path().file_name().unwrap(), "client.sock");
         assert_eq!(client_lock_path().file_name().unwrap(), "client.lock");
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Focus endpoints stay short and flavor scoped]]
+    #[test]
+    fn focus_endpoint_paths_stay_short_and_flavor_scoped() {
+        let generation: ClientFocusGeneration =
+            "12345678-90ab-cdef-1234-567890abcdef".parse().unwrap();
+        let stable = client_focus_socket_path_for(AppIdentity::stable(), 1000, generation);
+        let dev = client_focus_socket_path_for(AppIdentity::dev(), 1000, generation);
+
+        assert_ne!(stable.parent(), dev.parent());
+        assert_eq!(stable.file_name(), dev.file_name());
+        assert_eq!(stable.file_name().unwrap(), "client-focus-1234567890abcdef.sock");
+        assert!(stable.file_name().unwrap().to_string_lossy().len() < 40);
     }
 }

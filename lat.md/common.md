@@ -187,6 +187,14 @@ Platform-specific socket and lock file paths for all Scribe singleton processes,
 
 Named sockets in the base directory are `server.sock`, `client.sock`, `settings.sock`, and `handoff.sock`. `client.lock` and `settings.lock` serialize singleton acquisition; the bound sockets own process lifetime. Flavor-specific base directories prevent stable and dev clients from handing focus to each other.
 
+Restore children use [[crates/scribe-common/src/socket.rs#ClientFocusGeneration]] to bind one `client-focus-<16 lowercase hex>.sock` endpoint through [[crates/scribe-client/src/settings/singleton.rs#BoundFocusEndpoint]]. The full random generation stays in every frame while the short tag keeps Unix paths portable. The binder sets the runtime directory to 0700 and the socket to 0600.
+
+[[crates/scribe-client/src/settings/singleton.rs#TerminalFocusCommand]], [[crates/scribe-client/src/settings/singleton.rs#FocusEndpointRequest]], and [[crates/scribe-client/src/settings/singleton.rs#FocusEndpointResult]] use newline-delimited JSON capped at 4096 bytes. Reads and writes time out after 100 ms. The old `{"cmd":"focus","anchor":...}` bytes remain unchanged.
+
+[[crates/scribe-client/src/settings/singleton.rs#verify_focus_peer]] checks kernel UID and PID, executable path, install flavor, and plain-owner or `--restore-child` role. Announcement validation also requires the exact generation-derived path, 0600 socket mode, and matching publisher and endpoint PIDs.
+
+[[crates/scribe-client/src/settings/singleton.rs#spawn_focus_endpoint_cleanup]] runs one detached scan of at most 64 strict-prefix sockets for at most 500 ms. It preserves live authenticated endpoints and indeterminate entries, removes only sockets that refuse a local connection, and never scans unrelated runtime files.
+
 ## Theme System
 
 A theme engine providing 5 built-in and 187 community presets, plus a derivation algorithm that produces chrome (UI) colors from the terminal palette.
