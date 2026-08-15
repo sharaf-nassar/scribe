@@ -13335,9 +13335,210 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
+    use gpui::{ElementInputHandler, EntityInputHandler, UTF16Selection};
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    struct EditorInputProbe {
+        focus: FocusHandle,
+        text: String,
+    }
+
+    impl EntityInputHandler for EditorInputProbe {
+        fn text_for_range(
+            &mut self,
+            _range: Range<usize>,
+            _actual_range: &mut Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<String> {
+            Some(self.text.clone())
+        }
+
+        fn selected_text_range(
+            &mut self,
+            _ignore_disabled_input: bool,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<UTF16Selection> {
+            let end = self.text.encode_utf16().count();
+            Some(UTF16Selection { range: end..end, reversed: false })
+        }
+
+        fn marked_text_range(
+            &self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Range<usize>> {
+            None
+        }
+
+        fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+        fn replace_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            text: &str,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.text.push_str(text);
+            cx.notify();
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            new_text: &str,
+            _new_selected_range: Option<Range<usize>>,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.text.push_str(new_text);
+            cx.notify();
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _range: Range<usize>,
+            element_bounds: Bounds<Pixels>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Bounds<Pixels>> {
+            Some(element_bounds)
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _point: Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<usize> {
+            Some(self.text.encode_utf16().count())
+        }
+    }
+
+    struct EditorWindowProbe {
+        editor: Entity<EditorInputProbe>,
+        terminal_focus: FocusHandle,
+        editor_keys: Vec<String>,
+        pty_bytes: Vec<Vec<u8>>,
+    }
+
+    impl EditorWindowProbe {
+        fn route_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+            if self.editor.read(cx).focus.is_focused(window) {
+                self.editor_keys.push(event.keystroke.key.clone());
+                return;
+            }
+            cx.stop_propagation();
+            if let Some(bytes) = encode_key(event) {
+                self.pty_bytes.push(bytes);
+            }
+        }
+    }
+
+    impl Render for EditorWindowProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let editor = self.editor.clone();
+            let editor_focus = editor.read(cx).focus.clone();
+            let input_focus = editor_focus.clone();
+            div()
+                .track_focus(&self.terminal_focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.route_key(event, window, cx);
+                }))
+                .size_full()
+                .child(
+                    div().track_focus(&editor_focus).size_full().child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, (), window, app| {
+                                window.handle_input(
+                                    &input_focus,
+                                    ElementInputHandler::new(bounds, editor.clone()),
+                                    app,
+                                );
+                            },
+                        )
+                        .size_full(),
+                    ),
+                )
+        }
+    }
+
+    fn editor_probe_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (WindowHandle<EditorWindowProbe>, Entity<EditorInputProbe>, FocusHandle, FocusHandle) {
+        let window = cx.update(|app| {
+            app.open_window(WindowOptions::default(), |_, app| {
+                let editor = app
+                    .new(|app| EditorInputProbe { focus: app.focus_handle(), text: String::new() });
+                app.new(|app| EditorWindowProbe {
+                    editor,
+                    terminal_focus: app.focus_handle(),
+                    editor_keys: Vec::new(),
+                    pty_bytes: Vec::new(),
+                })
+            })
+            .unwrap()
+        });
+        let (editor, editor_focus, terminal_focus) = window
+            .update(cx, |probe, _, app| {
+                (
+                    probe.editor.clone(),
+                    probe.editor.read(app).focus.clone(),
+                    probe.terminal_focus.clone(),
+                )
+            })
+            .unwrap();
+        (window, editor, editor_focus, terminal_focus)
+    }
+
+    fn focus_and_draw_probe(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::AnyWindowHandle,
+        focus: &FocusHandle,
+    ) {
+        cx.update_window(window, |_, window, app| {
+            window.focus(focus, app);
+            window.draw(app).clear();
+        })
+        .unwrap();
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Editor Input Spike#Focused editor owns the key path]]
+    #[gpui::test]
+    fn focused_beads_editor_receives_text_without_leaking_keys_to_the_pty(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, editor, editor_focus, terminal_focus) = editor_probe_window(cx);
+
+        focus_and_draw_probe(cx, window.into(), &editor_focus);
+        assert!(
+            cx.update_window(window.into(), |_, window, _| editor_focus.is_focused(window))
+                .unwrap()
+        );
+
+        for key in ["x", "enter", "escape", "ctrl-c"] {
+            cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse(key).unwrap());
+        }
+
+        assert_eq!(editor.read_with(cx, |editor, _| editor.text.clone()), "x\n");
+        window
+            .update(cx, |probe, _, _| {
+                assert_eq!(probe.editor_keys, ["x", "enter", "escape", "c"]);
+                assert!(probe.pty_bytes.is_empty());
+            })
+            .unwrap();
+
+        focus_and_draw_probe(cx, window.into(), &terminal_focus);
+        cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse("z").unwrap());
+        window.update(cx, |probe, _, _| assert_eq!(probe.pty_bytes, [b"z".to_vec()])).unwrap();
+    }
 
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
     #[test]

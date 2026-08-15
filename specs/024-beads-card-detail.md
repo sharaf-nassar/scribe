@@ -537,6 +537,17 @@ panel entity is window-exclusive for editing while its open/anchor state
 stays keyed per workspace, so two regions can each show a panel but only one
 edit is armed at a time.
 
+The editor spike verified the main-window routing constraint against the
+pinned GPUI revision. `Window::handle_input` must re-register the focused
+editor's `ElementInputHandler` during every paint. While that focus is armed,
+the terminal root must return before both its unconditional
+`stop_propagation` and PTY encoder: an un-stopped printable `KeyDown` is what
+makes GPUI call `replace_text_in_range`. Enter arrives there as `"\n"`;
+Escape and modified controls remain key-only and belong to the panel's key
+listener. A headless window test sends printable, Enter, Escape, and Ctrl-C
+through this branch and observes no call to the real terminal encoder, then
+restores terminal focus and observes normal encoding.
+
 Drag rides GPUI's native drag-and-drop exactly as the titlebar does
 (`on_drag` ghost entity, `has_active_drag` click-swallow): the ~2px arm,
 click swallowing, and a window-layer ghost that escapes lane clipping come
@@ -655,6 +666,9 @@ No persistent storage changes and no migrations. New wire/in-memory types:
   optimistic state; anchor/clamp at named sample points (min/max board
   height, 0.8×/1.6× text scale, 400px floor, 70% max height with internal
   scroll); panel re-anchor on lane change; per-workspace keying.
+  The completed editor spike separately proves focus acquisition,
+  paint-time `ElementInputHandler` registration, committed text delivery, and
+  full PTY-encoder exclusion while editor focus is armed.
 - Protocol: round-trip tests for every new message.
 - Functional e2e (real bd, `--network none`): bd 1.1.0 keeps write controls
   inert with the measured unsupported-contract result. After the image moves

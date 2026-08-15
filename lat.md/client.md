@@ -1239,6 +1239,19 @@ the ghost was drawn or not. It finally names a rooted workspace and requires the
 `RequestBeadsBoard` on the wire tap, so the trigger the injected snapshot
 bypasses stays covered.
 
+### Inline editor key routing
+
+An armed Beads editor must own both GPUI text delivery and the terminal
+window's entire key path, so no editor keystroke reaches the PTY encoder.
+
+The pinned GPUI revision registers `ElementInputHandler` only during paint and
+only for its focused handle. After an un-stopped printable `KeyDown`, GPUI
+calls `replace_text_in_range`; the terminal root's normal unconditional
+`stop_propagation` would suppress that callback. The panel must therefore
+check editor focus first and return without stopping propagation or entering
+overlay, binding, vi, and PTY routes. Enter reaches the input handler as a
+newline. Escape and modified controls remain key-only for the panel listener.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

@@ -4215,6 +4215,20 @@ both interest edges on the wire.
 Terminal repaint recognizes focused CI toggle, open, and dismiss controls as
 valid focus owners so it does not route their next keystroke into the PTY.
 
+## GPUI Beads Editor Input Spike
+
+A headless GPUI window proves the proposed Beads editor can own native text
+input inside the terminal window without leaking any armed key to the PTY.
+
+### Focused editor owns the key path
+
+The test focuses a minimal entity, registers its `ElementInputHandler` during
+paint, and proves armed keys never enter the terminal encoder.
+
+Printable, Enter, Escape, and Ctrl-C keys all take the editor branch. The
+entity receives text while the real encoder records nothing; restoring
+terminal focus makes the next printable key encode normally.
+
 ## GPUI Status Bar
 
 Unit tests for , the ported window-status-bar segment model, proving connection/pane feedback and every parity segment (command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds correctly without a live window.
