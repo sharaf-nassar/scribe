@@ -1,819 +1,500 @@
 # beads-card-detail
 
-## Problem Statement
+## Status
 
-The workspace Beads board shows five queues of cards but is read-only and
-shallow: a card carries only id, title, priority, blockers, and epic, and the
-only interactions are click-to-copy and scrolling. To read an issue's
-description or acceptance criteria, edit any field, comment, claim, close, or
-move an issue between queues, the user must leave the terminal for the `bd`
-CLI — losing exactly the context the board exists to keep in view.
+Shipped on 2026-08-15 under epic `scribe-5wh1`.
 
-This feature makes the board a full working surface: clicking a card opens an
-anchored detail panel — rendered pixel-perfect to the approved mockup
-`.impeccable/mocks/beads-card-detail.html` — where every bd-editable field can
-be viewed and edited with correct persistence through bd, and cards can be
-dragged directly between queues with an extremely smooth, non-laggy drag.
+The as-built architecture lives in the canonical
+[client](../lat.md/client.md#guarded-issue-writes),
+[protocol](../lat.md/protocol.md#beads-issue-writes),
+[server](../lat.md/server.md#beads-issue-writes), and
+[test](../lat.md/test.md#real-beads-board-refresh) sections. This document
+records product scope, behavior, limits, and the evidence that closed the
+feature.
+
+## Problem statement
+
+The original workspace board exposed five shallow queues. Cards carried only
+id, title, priority, blockers, and epic metadata. Reading full issue content,
+editing, commenting, claiming, closing, or moving work still required `bd`.
+
+The shipped board keeps that compact overview and adds a complete issue panel
+plus guarded drag-to-queue writes. The server remains the only process that
+invokes `bd`; the client sends typed requests and repaints from authoritative
+responses.
 
 ## Goals
 
-- Clicking a card on a hovered or pinned board opens the detail panel for that
-  issue, anchored under its lane, populated with the issue's full field set
-  (description, acceptance criteria, notes, design, spec, labels, people,
-  dates, dependencies, comments) — data the board snapshot does not carry
-  today, so a new server request supplies it.
-- The panel is judged pixel-perfect against
-  `.impeccable/mocks/beads-card-detail.html` by the Docker visual e2e suite,
-  the same way `tests/e2e/visual/beads-board.sh` judges the board against
-  `.impeccable/mocks/beads-compact-live-overview.html`.
-- Every bd-editable field listed in Constraints round-trips: edit in panel →
-  server runs the bd verb → board snapshot refreshes → panel and board repaint
-  the persisted value. Verified end-to-end in the functional harness against a
-  real bd project fixture.
-- A failed write never destroys state: the panel keeps last-good values,
-  surfaces the failure non-destructively, and the board keeps its last-good
-  snapshot (same posture as the existing refresh path).
-- Dragging a card to another lane moves the issue between queues via the
-  matching bd verb. The drag is smooth by construction and by measurement: the
-  ghost follows the pointer with at most one frame of latency, no synchronous
-  bd or IPC I/O happens on the render path, the write runs off-thread on drop
-  with optimistic placement and revert on failure. The visual suite drives a
-  scripted drag and requires the ghost to track the synthetic pointer
-  trajectory and the board to stay frame-stable (no stall, no perturbed
-  terminal rows below).
-- A plain click still opens the panel: drag engages only past GPUI's ~2px
-  drag-arm threshold, mirroring the titlebar's click-swallowed handling.
-- All pointer gestures on the board are consumed by the board's press chain
-  (as `press_board_edge` consumes the resize grip press) so a mouse-reporting
-  terminal application below never sees them.
+- A click within the 2px drag boundary opens an issue panel under the source
+  lane. Fresh detail supplies text, labels, people, dates, graph links, and
+  comments that do not belong in the board snapshot.
+- The tracked, owner-approved mock
+  `.impeccable/mocks/beads-card-detail.html` defines panel geometry,
+  typography, hierarchy, and collapsed-comment behavior. Live theme colors
+  replace its fixed sample palette.
+- Title, description, acceptance, notes, design, spec id, priority, type,
+  labels, status, claim, close, Undo, and comments persist through typed
+  server-side `bd` verbs.
+- Local drafts never become tracker truth. Applied writes request
+  authoritative data; conflicts, failures, and timeouts preserve last-good
+  detail and board state.
+- Eligible cards drag through GPUI's native window drag layer. Accepted drops
+  paint optimistically, then settle from a refreshed snapshot or roll back on
+  failure.
+- Card drag press, motion, and release never reach PTY mouse reporting. Editor
+  keystrokes never reach terminal key encoding.
 
-## Non-Goals
+## Non-goals
 
-- Creating new issues from the board or panel.
-- Editing the dependency graph (adding/removing blocks links) or reparenting;
-  the panel shows the graph, it does not rewire it.
-- Reordering cards within a lane — queues have no user-defined order.
-- Dragging cards between regions/workspaces.
-- Comment editing or deletion (bd's thread is append-only).
-- Dolt sync operations (`bd dolt push`/`pull`) or any git-side effects.
-- Editing sparse lifecycle fields (due, defer date, estimate, external ref,
-  metadata) — they render when set, but phase-one editing is limited to the
-  field list in Constraints. (Open question 2 records the defer exception.)
-- Reopening closed issues from the panel — a Done issue's panel shows no
-  write verbs. (The transient post-close undo is not reopening: it is a
-  guarded status-open within the undo window only.)
-- Keyboard-driven panel operation: the panel is pointer-driven except Esc;
-  key routing while editing IS specified (keystrokes never reach the PTY),
-  but keyboard navigation/activation of fields is follow-up work.
-- Opening an issue without a visible card: no open-by-id, no board
-  search/filter; long-closed issues fall off the Done lane and are
-  CLI-territory.
-- Bundling a Beads reader or touching Dolt directly — everything continues to
-  go through the installed `bd` CLI per the existing server contract.
+- Creating issues from the board or panel.
+- Adding, removing, or reparenting dependency links.
+- Reordering cards within a lane.
+- Dragging cards between regions or workspaces.
+- Editing or deleting existing comments.
+- Running Dolt sync or producing git side effects.
+- Editing due, defer, estimate, external-ref, metadata, assignee, owner, or
+  lifecycle dates. A Ready drop may clear defer as part of its status verb.
+- Reopening an already closed issue from its panel. Undo exists only for five
+  seconds after Scribe itself applies `CloseIssue`.
+- Keyboard navigation among panel controls. Esc and editor input routing are
+  supported; pointer activation remains the control model.
+- Opening an issue without a visible card. There is no open-by-id, search, or
+  filter path.
+- Bundling Beads or touching Dolt directly.
 
-## Backlog Inputs
+## Backlog inputs
 
-None. No `source_backlog` or epic was supplied, and no open P4 issues in the
-tracker describe this feature.
+No external backlog issue fed this work. Implementation was tracked by the
+new `scribe-5wh1` epic and its dependent slices.
 
-## Target Epic
+## Target epic
 
-Resolved: no existing epic covers this feature; this run creates a new epic
-("Beads board card detail panel and drag-to-queue") at bead creation.
+`scribe-5wh1`, "Beads board card detail panel and drag-to-queue", owns the
+shipped work.
 
-## User Stories
+## User stories
 
 ### Story 1 — Read an issue in full from its card
 
-As a developer working in Scribe, I want to click a board card and read the
-whole issue — description, acceptance criteria, notes, design, spec, labels,
-people, dates, dependents, comments — so that I never have to leave the
-terminal to know what a bead actually says.
+As a developer working in Scribe, I want to open a board card and read the
+whole issue without leaving the terminal.
 
 Acceptance criteria:
-- Clicking a card (press + release within GPUI's drag-arm threshold) on a
-  hovered or pinned board opens the detail panel for that issue, anchored
-  under the clicked card's lane and clamped to the region.
-- The panel renders the full anatomy of the approved mock: full-bleed head
-  (bare heat-ink priority mark, title, epic in its hue, close ×; identity row
-  with id/type/labels/filed-by left and SPEC/DESIGN pointers right; state row
-  with derived queue word in queue colour, derivation phrase, and
-  assignee/date facts right), dependency-thread spine with queue-coloured
-  haloed node and coral UNBLOCKS junction, typeset body (description lead,
-  run-in ACCEPTANCE and NOTES heads), newest-first comment thread, footer
-  status rail with claim / close issue verbs.
-- Field data comes from a new workspace-scoped detail request (the board
-  snapshot's truncated items are not the source); opening shows the panel
-  immediately with a loading state if the detail fetch is still in flight.
-- Empty fields render no row. A closed issue's close reason and date appear in
-  the state row. Blockers, when present, appear as upstream nodes on the
-  thread above the issue's own node.
-- The ID click-copies in full through the existing copy surface. Dependent
-  chips on the UNBLOCKS line navigate the open panel to that issue.
-- Esc, ×, or a click outside closes the panel. Long content scrolls inside a
-  max height of ~70% of the region.
-- The panel is keyed per workspace like hover/pin/snapshot state; two regions
-  can each show their own panel without interference.
+
+- Releasing a card at or inside 2px of the press remains a click. It opens the
+  detail panel on hovered and pinned boards.
+- The panel anchors below the source lane, stays inside its workspace region,
+  targets 560px width, and does not open when less than 400px is available
+  after 12px side margins.
+- The panel starts 4px below the board. Its maximum height is the lesser of
+  70% of region height and remaining region space; overflow scrolls inside.
+- Opening lifts and widens the source-card frame into the final geometry over
+  120ms. Disabled motion paints the same asserted final layout immediately.
+- A card-derived priority, title, and epic remain visible over the loading
+  placeholder while the uncached request runs.
+- The settled panel matches the approved anatomy: full-width head, identity
+  and state rows, dependency spine, sparse body, newest-first comments,
+  dependents, and status rail.
+- Empty optional sections disappear. Closed detail keeps close facts and
+  exposes no write verbs. Blockers render as upstream nodes.
+- The newest collapsed comment uses two lines. Older collapsed comments use
+  one line. Clicking a comment expands or collapses it in place, and a visible
+  hidden count reports comments beyond the newest 50.
+- Hovering the identity id reveals its copy glyph without reflow. One click
+  drains the full id through the existing take-once clipboard path.
+- A dependent click sends one fresh detail request. The source stays visible
+  until the reply matches both workspace and target issue, then the panel
+  swaps and re-anchors.
+- Esc, the close mark, and the backdrop dismiss. A not-found detail reply or a
+  later `NotDetected` board closes the panel and leaves a five-second notice.
+- Panel state is keyed by workspace. Two regions may keep independent panels;
+  one window-scoped editor owns at most one active draft.
 
 ### Story 2 — Edit any field and trust it persisted
 
-As a developer, I want to edit issue fields directly in the panel and see the
-persisted result, so that quick corrections do not require the CLI.
+As a developer, I want panel edits to show tracker-confirmed values, so quick
+changes do not require a separate CLI session.
 
 Acceptance criteria:
-- Every passage is click-to-edit in place using the settings window's
-  single-inline-editor pattern: title, description, acceptance criteria,
-  notes, design, spec-id, labels.
-- Clicking the priority mark unfolds the P0–P4 pick row in place; picking
-  writes the priority.
-- The status rail writes exactly `open`, `in_progress`, `closed`; Ready,
-  Blocked, and Backlog remain derived and are presented as such.
-- The status rail's three words are click targets writing exactly their
-  status (visually as mocked — words breaking the rail, no button chrome).
-- Claim runs the claim verb (assignee = actor, status in_progress); close
-  issue closes with no reason prompt, then shows a transient
-  "closed <id> · undo" affordance for a few seconds whose undo writes
-  status open (guarded).
-- "add a comment…" posts a comment; the thread shows it after refresh.
-- A committed edit runs the bd verb server-side, then refreshes the board
-  snapshot; the panel repaints from persisted data, not from the local edit
-  buffer. Functional e2e proves persistence by re-running `bd show` inside
-  the harness fixture.
-- A failed write (bd exit non-zero, timeout, envelope mismatch) leaves the
-  previous value in place and surfaces the failure without destroying the
-  edit target or the board.
-- Concurrent-writer safety: claim, status, close, and undo writes carry
-  `--if-assignee` / `--if-status` guards captured from the fresh detail
-  read, so a race with another actor (this repo's own agents claim beads
-  concurrently) fails cleanly as a surfaced "someone else won" notice;
-  every supplied guard is applied atomically, including text and comments;
-  only a text write sent without guards is last-writer-wins. `beads_write`
-  stays off for bd 1.1.0 because that release lacks both guard flags.
+
+- Title, description, acceptance, notes, design, spec id, labels, and the
+  comment composer use one window-scoped `BeadsEditor`.
+- A new edit starts with the stored value selected. Native UTF-16 replacement
+  and marked composition update the draft.
+- Enter applies a single-line field. Plain Enter remains text in multiline
+  fields; a modified Enter applies. Switching fields or blurring applies a
+  changed draft. Clicking the same field keeps it. Esc cancels.
+- Priority unfolds P0 through P4. Type unfolds the pinned guarded build's
+  complete built-in type list. Label input splits on commas or whitespace and
+  removes repeats while preserving first appearance.
+- The rail's bare words write `open`, `in_progress`, or `closed` with
+  `clear_defer: false`. Claim and close use their native verbs.
+- Applied `CloseIssue` removes the panel and shows
+  `closed <id> · undo`. A click before five seconds sends guarded
+  `UndoClose`; the exact deadline sends nothing.
+- A nonblank comment queues `AddComment` and leaves the current thread intact.
+  Only the matching uncached detail reply adds the persisted row.
+- Every panel write copies current detail status and assignee into optional
+  guards. `None` means no guard; `Some("")` means the issue must remain
+  unassigned.
+- One pending or in-flight write is allowed per workspace and issue. A panel
+  that navigated elsewhere rejects its stale intent.
+- An applied non-close write clears an earlier error and rereads open detail.
+  A precondition failure reports "Someone else won" and rereads. Other
+  failures keep detail unchanged and show one coral line for five seconds or
+  until the next applied result.
+- A 15-second client expiry or server timeout marks the outcome unknown,
+  requests a board refresh plus detail reread, and blocks another write until
+  the first authoritative Ready snapshot reconciles it.
+- Reconnect gives every in-flight write the same unknown-outcome treatment.
+  Only the first post-reconnect Ready snapshot releases each fence and rereads
+  the open issue.
+- While the editor owns keyboard focus, terminal focus repair leaves it alone.
+  Printable input, Enter, Escape, modifiers, and composition never enter the
+  PTY path.
 
 ### Story 3 — Move a card between queues by dragging
 
-As a developer triaging work, I want to drag a card from one lane to another,
-so that status changes are one gesture instead of a CLI round trip.
+As a developer triaging work, I want a card drop to use the same guarded write
+path as the panel.
 
 Acceptance criteria:
-- Pressing a card and moving past the drag-arm threshold lifts a drag ghost
-  of the card that follows the pointer with at most one frame of latency;
-  releasing within the threshold still counts as the click that opens the
-  panel.
-- Drag sources: only Backlog, Ready, and In-progress cards can be lifted;
-  Done and Blocked cards are not drag sources (reopening and unblocking are
-  not drag semantics).
-- Lane targets map to verbs per the server's classification precedence
-  (`classify_snapshot` in `crates/scribe-server/src/beads_board.rs`):
-  Done = close (then the same transient undo as the panel's close verb);
-  In progress = claim (guarded — a race with another actor's claim fails
-  cleanly); Ready = status `open` with any defer date cleared (the
-  classifier's next snapshot is authoritative if the issue still fails
-  `bd ready`); Backlog is not a drop target — bd has no clean
-  "make it backlog" verb — and rejects like Blocked.
-- Blocked and Backlog are rejected drop targets: a no-drop presentation
-  while hovering (the lane's wash dims within the board's colour
-  discipline) and snap-back on release, with no write issued.
-- On a legal drop the card optimistically appears in the target lane while
-  the write runs off-thread; on failure the card reverts to its source lane
-  and the failure surfaces non-destructively.
-- No synchronous bd or IPC I/O occurs on the render path during a drag; the
-  per-frame drag update is O(1) state mutation plus paint.
-- The whole gesture is consumed by the board press chain: a mouse-reporting
-  application in the pane below receives none of the press/move/release, and
-  starting a drag on a hover-opened board holds the board open for the
-  gesture's duration (as the resize-grip drag already does).
-- The visual suite scripts a drag from Ready to In progress and asserts the
-  ghost sits within 3px of the synthetic pointer at each `--sync` waypoint,
-  the card lands in the target lane, and the terminal rows below repaint
-  unperturbed (frame-stability check); the functional suite proves the
-  drop's verb landed in real bd.
+
+- Backlog, Ready, and In-progress cards register the native drag arm. Blocked
+  and Done cards cannot lift.
+- Euclidean travel strictly greater than 2px starts a drag. Release at or
+  inside the boundary remains the normal panel-opening click.
+- Drag state stores workspace, source card, source lane, current window
+  pointer, and hovered lane. Every move performs fixed arithmetic and one
+  state mutation, with no subprocess, IPC request, or other synchronous I/O.
+- Five target lanes share the board's 8px horizontal inset. The right and
+  bottom edges are outside, so an out-of-board pointer has no target.
+- GPUI paints a source-sized ghost in its native window drag root. It remains
+  above other cards and outside lane clipping.
+- Hovering Backlog or Blocked reduces that lane's wash to one third. A release
+  on either lane, the source lane, or no target queues no write.
+- Ready queues typed `SetStatus { status: "open", clear_defer: true }`. In
+  progress queues `Claim`. Done queues `CloseIssue` and uses the same
+  five-second Undo path as a panel close.
+- If the same issue is open, a drop reuses fresh detail status and assignee
+  guards. Otherwise Ready and In-progress sources contribute their known
+  snapshot status, while assignee and Backlog status remain unguarded because
+  compact cards do not carry them. The server applies every supplied guard
+  atomically.
+- An accepted drop moves the snapshot card immediately and records an
+  optimistic overlay. `Applied` tags it with the root generation. Failure
+  restores the source lane. The next authoritative snapshot removes the
+  overlay.
+- If the classifier returns a third lane after an applied write, that lane
+  wins and a five-second board notice names the outcome.
+- From the armed press through release, the board consumes terminal mouse
+  press, motion, and release. A hover-opened board remains open until the
+  gesture ends, including while the pointer is outside it.
+- Visual evidence measures the ghost within 3px of pointer minus the
+  threshold-crossing cursor offset over another card, over a no-drop lane,
+  and outside the board. Functional evidence proves persisted claim, close
+  and Undo, defer clearing,
+  classifier-won behavior, rejected drops, and zero PTY mouse-frame growth.
 
 ### Story 4 — See the graph and act on state truthfully
 
-As a developer, I want the panel's state and graph claims to reflect bd's
-actual semantics, so that what I read and drag matches what persists.
+As a developer, I want queue and graph claims to match the server's Beads
+classification.
 
 Acceptance criteria:
-- The state row's queue word matches the server classification for the issue
-  at snapshot time; the derivation phrase matches (e.g. Ready shows upstream
-  clear; Blocked shows its blockers as upstream thread nodes).
-- The UNBLOCKS junction lists the issue's dependents (issues whose
-  dependencies include this one), each clickable-through; the count and set
-  come from bd data, not inference.
-- Status writes that produce derived-queue changes land where the classifier
-  puts them (e.g. status `open` on an issue with open blockers lands in
-  Blocked, and the UI communicates that rather than pretending the drop
-  target won).
-- All panel colours derive from the live theme exactly as the board's do
-  (chrome slots + ANSI queue hues + solved priority tints, contrast-lifted
-  per the board's floors); an opacity or theme edit rebuilds the panel
-  palette. No hardcoded palette values.
+
+- The detail response carries the server-selected queue and derivation basis.
+  The client does not reclassify detail.
+- Classification precedence remains Done, Blocked, In progress, Ready, then
+  Backlog.
+- The UNBLOCKS row lists dependents returned by
+  `bd show --include-dependents`. Blockers render above the issue node.
+- The first authoritative snapshot after a write wins over optimistic target
+  placement. An issue set open while still blocked therefore returns to
+  Blocked and receives the classifier notice.
+- All panel colors come from live theme slots, ANSI queue hues, and the board's
+  contrast solver. Panel text clears 4.5:1 against its actual ground; marks
+  use the board's non-text floor. No mock color is copied literally.
 
 ## Constraints
 
-- Visual source of truth: `.impeccable/mocks/beads-card-detail.html`
-  (user-approved 2026-08-14). Pixel-perfect target; the spec, implementation,
-  and visual e2e reference this file directly, the same way the board
-  references `.impeccable/mocks/beads-compact-live-overview.html`. Board
-  cards keep their filled priority badge; the panel uses the bare heat-ink
-  mark (both from the same solved heat scale).
-- All bd writes go through the server, which owns the bd subprocess contract:
-  absolute executable resolution, `-C` plus cwd in the project root,
-  versioned JSON envelope pinned to schema 1, five-second deadline,
-  process-group cleanup, direct argv. The current contract is read-only
-  (`--readonly` posture); a deliberate, minimal read-write verb set must be
-  added without weakening the read path: update (title, description,
-  acceptance, notes, design, spec-id, priority, type, labels via
-  add/remove/set, status with an optional defer-clear), claim, close
-  (reasonless; undo is a guarded status open), comment add, and the uncached
-  detail read (`bd show --json --include-comments`). Assignee changes happen
-  only through claim and undo. The functional suite exercises writes against
-  real bd; the checked-in fake bd scripts remain server unit fixtures only.
-- Every successful write triggers a board snapshot refresh for that root so
-  client repaints persisted state; failure preserves last-good state
-  server-side and panel-side (mirrors the existing cache posture).
-- Client architecture constraints: the panel paints inside its workspace's
-  region like both board modes (never window-wide); hover/pin/snapshot/panel
-  state stays keyed per workspace; the board's free-function build pattern
-  (no window-handle reach; parked copy/intent state lifted by the view)
-  extends to panel intents (edits, verbs, navigation); the existing press
-  chain (`TerminalView::press_board_edge` and siblings) grows the card
-  press/drag/click resolution.
-- The board's per-window text-size stepping and per-workspace board height
-  interact with the panel: the panel adopts the board's text scale, and its
-  anchor/clamp math must hold at all board heights and text scales.
-- Performance budget (constitution 4): drag ghost latency ≤ 1 frame behind
-  the pointer; no synchronous subprocess/IPC on the render path during drag
-  or panel open; snapshot refresh after a write stays off-thread. Named
-  verification: the visual-suite scripted drag (ghost-tracking +
-  frame-stability assertions) plus the functional suite's persistence checks;
-  code-level, the drag update path is reviewable as O(1) per frame.
-- Validation runs ONLY in the Docker e2e harness (`just e2e-func` /
-  `just e2e-visual`, `--network none`), never against the host install. The
-  functional image's checked-in fake `bd` fixtures grow write-verb coverage;
-  the real-bd refresh test may grow a real write round-trip.
-- Typed protocol additions (constitution 1): new request/response messages
-  for issue detail and issue writes are named MessagePack messages in
-  `crates/scribe-common/src/protocol.rs` with round-trip tests, not a generic
-  passthrough that would let the client compose bd argv.
-- Trust boundary (constitution 5): writes originate only from direct user
-  gestures in chrome (panel/board), never from PTY content; bd argv is
-  composed server-side from typed fields with direct argv (no shell); the
-  actor recorded on writes is the local user identity bd already resolves.
-- `lat.md` stays synchronized (constitution 7): the Beads Board CLI Data
-  Source section and test specs grow the panel, write path, and drag
-  behavior; `lat check` passes.
+- The visual artifact is the tracked, owner-approved
+  `.impeccable/mocks/beads-card-detail.html`, approved 2026-08-14, SHA-256
+  `d85a36cf2ec2a687379f86908d4e27dca2708364ba68d0367927bb08645f609e`.
+  The mock governs geometry, type, hierarchy, and comment folds. This spec
+  governs behavior. The live theme governs color.
+- The server owns all `bd` execution. Root-scoped reads and writes resolve an
+  absolute executable, supply `-C`, set cwd to the canonical project root,
+  require schema-1 JSON, bound output, use direct argv, and kill the process
+  group on deadline. The rootless version probe only checks the guarded marker.
+- Detail reads use a five-second deadline. Writes use a separate 15-second
+  deadline because Dolt commit and export are part of the verb.
+- Detail and writes require the local owner of a rooted workspace in a
+  `SingleController` window. Remote, shared, displaced, and foreign-window
+  requests never reach `bd`.
+- `Welcome.beads_detail` and `Welcome.beads_write` default false when absent.
+  They are server-to-client fields only. Operationally the server advertises
+  writes only when detail is available and the guarded build probe passes.
+- Scribe does not bundle Beads. Upstream bd 1.1.0 and unrecognized builds keep
+  writes disabled. The accepted marker is
+  `scribe-guards-7505e173f265`, built from commit
+  `7505e173f2659ba6e1f955b86d81a4f9e21810ca` plus
+  `docker/beads-guarded-writes.patch`.
+- The guarded-build probe runs once per server process. Each read and write
+  resolves the executable again, but replacing `bd` does not renegotiate
+  `beads_write` until the next server process.
+- The server composes exactly the shipped verbs. It rejects empty,
+  dash-prefixed, or NUL-containing ids, priorities above P4, and unsupported
+  statuses. It truncates comment bodies to the 64KiB field cap.
+- Only direct panel and board gestures create write intents. PTY content cannot
+  reach the path, and no generic protocol message lets a client supply `bd`
+  argv.
+- The panel and board remain region citizens. Panel, board, hover, pin, notice,
+  and optimistic state stay keyed by workspace.
+- Drag tracking remains O(1) per frame and contains no synchronous I/O.
+- Runtime evidence runs only through Docker just recipes with
+  `--network none`. The Linux X11/Lavapipe visual run proves the native GPUI
+  drag geometry used here; it is not a native macOS Metal run.
 
-## Open Questions
+## Resolved decisions and Beads contract
 
-1. **Backlog vs Ready drop verb.** Classification: Ready = membership in
-   `bd ready` output; Backlog = open issues not in it (deferred issues and
-   whatever else `bd ready` excludes). What exact verb should a drop into
-   Backlog run — `bd update --defer <date>` (park; then what date), priority
-   P4 (bd's "backlog" priority convention), or should Backlog reject drops
-   like Blocked? Needs a decision; affects both drag and the status rail copy.
-2. **Defer editing.** If Backlog-drop uses defer, does the panel also need to
-   surface/edit the defer date (currently in the render-when-set, no-edit
-   bucket)?
-3. **In-progress drop: claim or bare status?** Dropping into In progress can
-   run `--claim` (assigns to the actor) or bare `--status in_progress`
-   (leaves assignee untouched). Which default? Claim matches bd's model of
-   in-progress work but self-assigns on behalf of the user.
-4. **Close reason UX.** `bd close --reason` is optional. Does the close verb
-   prompt inline for a reason (extra step on every close) or close
-   immediately with no reason (faster, loses information)? Mock shows no
-   prompt.
-5. **Concurrency guards.** Should every panel write carry `--if-status` /
-   `--if-assignee` guards captured at panel-open time (fails cleanly on
-   races, but may annoy on stale panels), or only the claim/status verbs?
-6. **Detail freshness.** Does an open panel poll (like the pinned board's
-   60s) or fetch once on open with refresh only after writes? Does the
-   detail read share the 30s snapshot cache or bypass it?
-7. **Actor identity.** bd resolves actor from git user.name/$USER on the
-   server host. Comments and edits will be attributed to that identity — is
-   that acceptable, or should Scribe pass an explicit `--actor`?
-8. **Closed-issue panel.** Which verbs remain on a Done card's panel —
-   nothing, or reopen (status open)? Reopen is currently a Non-Goal;
-   confirm.
-9. **Type editing surface.** Type (`feature`/`task`/`bug`/…) is in the verb
-   set but the mock shows it as plain text in the identity row — is it a
-   pick row like priority, or inline text with validation?
-10. **Blocked-drop affordance detail.** Reject-on-release with snap-back is
-    specified; is a hover-time signal (lane dim / no-drop cursor) required
-    too, and what does it look like within the board's colour discipline?
-11. **Drag source restrictions.** May Done cards be dragged out (implies
-    reopen semantics, currently a Non-Goal)? May Blocked cards be dragged
-    (their blockers persist; only closed/in_progress/open writes apply)?
-12. **Panel width at narrow regions.** The mock's 560px panel needs a rule
-    for regions narrower than the panel plus margins (clamp to region width?
-    minimum readable width?).
-13. **Comment length bounds.** `--include-comments` is unbounded and "may be
-    slow on issues with many comments" per bd help — does the detail request
-    cap comment count/bytes like the snapshot caps items?
+All product questions were resolved on 2026-08-15 and are reflected directly
+in the stories above.
 
-## Clarifications
+- Backlog is a source but not a target. Ready clears defer and writes open. In
+  progress claims. Done closes. Blocked and Done are not sources.
+- Close is reasonless and immediate. Scribe supplies the five-second Undo.
+- Type is a picker over the patched build's built-in enum. Defer remains
+  display-only except for Ready-drop clearing.
+- Detail fetches on open, dependent navigation, conflicts, successful
+  non-close writes while that issue remains open, timeouts, and reconnect
+  reconciliation. It does not poll.
+- Closed detail has no verbs. Unsupported-bd local owners receive a read-only
+  panel because detail stays available while write remains false. Shared and
+  remote participants receive no detail capability, so they keep the compact
+  board rather than opening a viewer panel.
+- Beads resolves actor identity from the project environment. Scribe does not
+  pass `--actor`.
+- Comment detail is newest-first and capped at 50 after parsing Beads' oldest-
+  first response. The hidden count preserves the omitted total.
 
-Answered by the owner at the clarify gate (2026-08-15): all recommended
-options accepted, no technical decisions vetoed.
+The network-none guarded-build contract proves status and assignee checks run
+inside native update, label, comment, claim, close, and reopen transactions.
+Exit 13 plus structured guard-mismatch JSON maps to `PreconditionFailed`.
+Nonzero exit, timeout, spawn failure, invalid argv, and invalid success JSON
+map to `Failed` without advancing generation or replacing last-good board
+state.
 
-**Q1: Full edit coverage vs trimmed v1 edit set?**
-A: Full coverage — title, description, acceptance criteria, notes, design,
-spec-id, labels, priority, type, status/claim/close/undo, comments. Type
-edits via a pick row over bd's enumerated types, like priority.
+## Architecture approach
 
-**Q2: Are the status rail words click targets?**
-A: Yes — the three words write their status while keeping the mock's
-appearance (words breaking the rail, no button chrome).
+The shipped design has three layers. Typed protocol messages carry data and
+intent. The server authorizes and executes Beads commands. The client owns
+per-workspace presentation plus one window-scoped editor.
 
-**Q3: Drag verb mappings?**
-A: In-progress drop = claim (guarded). Backlog is not a drop target
-(rejected like Blocked; bd has no clean parking verb). Drag sources are
-Backlog/Ready/In-progress cards only; Done and Blocked cards cannot be
-lifted. Ready drop = status open + defer cleared; the classifier's next
-snapshot is authoritative.
+### Read path
 
-**Q4: Close friction and misdrop recovery?**
-A: Reasonless close everywhere (footer verb and drag-to-Done), followed by a
-transient "closed <id> · undo" affordance for a few seconds; undo writes
-status open with guards. No confirm dialog.
+`RequestBeadsIssueDetail` runs uncached
+`bd show --json --include-comments --include-dependents` plus
+`bd ready --limit 0`. The response repeats workspace and issue ids, includes
+the server-derived queue, and returns `None` only for a vanished issue.
 
-**Q5: Open animation?**
-A: In v1 — a short (~120ms) card-lift/scale animation from the clicked card
-to the panel; the animation's end state must satisfy the visual assertions.
+The client parks requests in `BeadsPanels`, renders through the existing free
+function, and keeps `BeadsEditor` as the only GPUI entity added for text input.
+There is no separate `BeadsDetailPanel` entity.
 
-**Open-question resolutions** (gate answers plus unvetoed technical
-decisions): OQ1 Backlog rejected as drop target, Ready drop clears defer;
-OQ2 no defer editing in v1 (only the implicit clear on a Ready drop); OQ3
-claim; OQ4 reasonless + transient undo; OQ5 guards on claim/status/close/
-undo only; OQ6 fetch on open + refresh after own writes, no poll; OQ7 host
-identity, no --actor; OQ8 Done panels show no write verbs; OQ9 type is a
-pick row, in scope; OQ10 no-drop = lane wash dims + snap-back; OQ11 Done and
-Blocked cards are not drag sources; OQ12 the panel clamps to the region
-width minus margins with a 400px floor — narrower regions get no panel —
-and visual assertions pin text scale 1.0 at full width; OQ13 the server caps
-the thread at the newest 50 comments with per-field byte caps and a visible
-hidden count.
+### Write path
 
-## Spec Review
+`BeadsPanels` lowers panel and drag gestures into `PanelWriteIntent`. The
+terminal view has one IPC exit for those intents. The server validates the
+root and connection, serializes writes per canonical root, composes argv from
+the typed verb, and returns the correlated result before starting refresh.
 
-Six parallel review passes (requirements, gaps, ambiguity, feasibility,
-scope, stakeholders) against the draft and the constitution. Cross-dimension
-hits were merged; product decisions go to the clarify gate, technical
-questions were resolved by code investigation and are recorded below for
-veto.
+An applied write increments a process-local generation for that canonical
+root. `refresh_after_write` discards loads that began before a newer committed
+generation, then fans the accepted snapshot to every authorized local
+`SingleController` workspace on the same root.
 
-### Critical Questions (answer before planning)
+### Drag path
 
-1. Full edit coverage vs a trimmed v1 edit set — the owner asked for "all
-   fields", and the review confirms the inline editor is new client
-   machinery either way, but labels/design/spec-id/type editing add surface
-   for verbs the CLI serves rarely; confirm full coverage or name the trim.
-   Flagged by: scope, feasibility.
-2. Status rail writability — the spec says the rail writes
-   open/in_progress/closed but the approved mock renders the status words
-   inert (only claim/close issue are buttons); two engineers build different
-   panels. Flagged by: ambiguity.
-3. Drag verb sub-mappings — drag itself is owner-requested and stays, but
-   three mappings are undefined: In-progress drop (claim vs bare status),
-   Backlog drop (no clean bd verb exists — reject like Blocked, or defer),
-   and drag sources (may Done/Blocked cards be lifted). A Backlog→Ready drop
-   is a no-op as drafted. Flagged by: requirements, scope, stakeholders,
-   ambiguity.
-4. Close friction and misdrop recovery — close is one unconfirmed gesture
-   (drag-to-Done especially) while reopen is a Non-Goal, so a misdrop is
-   unrecoverable from the UI; choose reasonless-close + transient undo,
-   confirm-on-close, or documented CLI-only recovery. Flagged by: gaps,
-   stakeholders, requirements.
-5. Open animation — the mock's annotations promise a card-grows-into-panel
-   open animation the spec never adopts; in v1 or Non-Goal? Flagged by:
-   ambiguity.
+Eligible card elements register GPUI `on_drag`. `BeadsBoards` stores the arm,
+active drag, pointer target, and optimistic overlay. GPUI owns the window-layer
+ghost. Terminal mouse routing checks the shared drag state before encoding PTY
+reports. Drop release reuses the normal guarded write queue.
 
-### Technical Decisions (self-resolved — veto at the gate to override)
+## Affected components
 
-- "Pixel-perfect" operationalized per the board precedent: structure, sizes,
-  and weights from the mock, colours from the live theme, verified by an
-  enumerated sampled-assertion inventory at text scale 1.0 (spine node +
-  halo, run-in heads, rail break and stop-short gap, empty-field row
-  omission, epic hue, priority ink, comment clamp) — not image diffing.
-- New typed protocol messages (issue detail request/response, typed write
-  verbs) gated by a Hello/Welcome capability bit (precedent: `ci_run_bar`);
-  an old server leaves the board read-only with no wedged panel; the
-  compatibility decision is documented per constitution 7.
-- Writes are accepted only from local, owning controller connections whose
-  window shows that root (precedent: `DismissCiRun` gating); shared/remote
-  viewers get a read-only panel. With writes local-only, the bd actor is the
-  host identity and needs no `--actor` override.
-- Write/refresh ordering: writes serialize per canonical root behind a
-  generation fence; a refresh that started before the last committed write
-  is discarded; a successful write forces an immediate refresh pushed to
-  every board on that root, and an open panel re-fetches detail.
-- Writes get their own deadline (15s, vs 5s reads) because bd writes hit
-  Dolt commit + JSONL export; on timeout the client converges via forced
-  refresh + detail re-read instead of trusting the failure. The bd 1.1.0
-  probe's slowest of 20 timed write attempts was 972ms.
-- Concurrency guards on every verb require `--if-status` and
-  `--if-assignee` captured from the fresh detail read. bd 1.1.0 has neither
-  flag: each is rejected as an unknown flag with exit 1, not exit 13. The
-  server must classify that contract as write-incompatible, not as a race.
-  Unguarded text stays last-writer-wins, but supplied guards are never dropped.
-- bd 1.1.0 is the detail-read floor, not the write floor. The write floor is
-  upstream commit `7505e173f2659ba6e1f955b86d81a4f9e21810ca` plus the bounded
-  `docker/beads-guarded-writes.patch`. The Docker build checksum-pins the source
-  archive and marks the artifact `scribe-guards-7505e173f265`; every other
-  build stays read-only instead of silently dropping guards.
-- The inline editor is new client machinery, the feature's largest work
-  item: a focusable editor entity implementing `EntityInputHandler` with a
-  key-routing carve-out so keystrokes never reach the PTY. Esc precedence:
-  cancel edit → close panel → terminal. Commit matrix: Enter commits
-  one-line fields; blur or clicking another passage commits; Esc cancels;
-  multi-line fields commit on blur or modifier-Enter. Editing is
-  window-exclusive.
-- Drag uses GPUI's native drag-and-drop as the titlebar does (`on_drag`
-  ghost entity, `has_active_drag` click-swallow): the 2px arm, click
-  swallowing, and a window-layer ghost that escapes lane clipping come for
-  free; the press chain's only growth is gating PTY mouse forwarding during
-  a drag.
-- Ghost budget verified stepwise in the visual suite (xdotool move `--sync`
-  → screenshot → ghost within N px of the pointer at each waypoint;
-  terminal rows below unperturbed); the per-frame drag update is reviewed
-  O(1) with no synchronous I/O.
-- Persistence proof is mandatory in the functional suite against real bd
-  (write → `bd show` round-trip for at least one verb per family); the
-  visual image has no bd and injects snapshots, so it carries geometry/ghost
-  assertions only.
-- Detail read is
-  `bd show --json --include-comments --include-dependents`: default output
-  has `dependent_count` but no dependent ids, so the second flag is required.
-  The server applies caps (latest N comments, per-field byte caps) and a
-  visible hidden-count when truncated; detail supersedes snapshot
-  truncation.
-- Panel data: fetch on open, refresh after own writes, no poll. Loading
-  state renders the head from card data over a placeholder body and is
-  exempt from pixel assertions. The panel tracks its issue by id, re-anchors
-  on lane change, and closes with a notice on 404/NotDetected.
-- Failure surface: a one-line coral-inked notice inside the panel (drag
-  failures revert the card with the same notice on the board), auto-clearing
-  on the next success; every write attempt logs one structured server line
-  (verb, issue, outcome, bd error detail).
-- Client-side write deadline and reconnect reconciliation: optimistic state
-  reconciles against the first post-reconnect snapshot.
-- The server write-verb surface is trimmed to exactly what the shipped UI
-  invokes (constitution 5).
-- Mock authority: spec text governs behavior, the mock governs appearance.
-  Annotation behaviors adopted: comments expand in place, the ID shows its
-  copy glyph on hover. The open animation is gate question 5.
-- Non-Goals additions: keyboard-driven panel operation (Esc only, key
-  routing still specified), open-by-id/board search, reopen from the panel
-  (a Done issue's panel shows no write verbs).
+- `crates/scribe-common/src/protocol.rs` defines detail request/response,
+  14 typed write verbs, optional guards, three result states, and the two
+  default-false `Welcome` fields. `BEADS_BOARD_PROTOCOL_VERSION` remains 1
+  because the board snapshot shape did not change.
+- `crates/scribe-server/src/beads_board.rs` owns detail parsing and caps,
+  executable probing, typed argv, per-root write serialization and generation,
+  deadlines, last-good cache behavior, and authoritative refresh.
+- `crates/scribe-server/src/ipc_server.rs` owns rooted owner admission,
+  request/result correlation, result-before-refresh ordering, and same-root
+  board fan-out.
+- `crates/scribe-client/src/beads_panel.rs` owns `BeadsPanels`, panel geometry
+  and rendering, loading and notice lifecycle, copy/navigation, pickers,
+  comments, status actions, write fences, reconnect convergence, and the
+  `BeadsEditor` entity.
+- `crates/scribe-client/src/beads_board.rs` owns drag arm and target state,
+  native ghost presentation, no-drop wash strength, optimistic card movement,
+  rollback, and classifier settlement.
+- `crates/scribe-client/src/main.rs` owns capability latching, IPC drains,
+  editor key precedence and focus arbitration, panel dismissal, PTY mouse
+  gating, and server-message reconciliation.
+- `docker/Dockerfile.func`, `docker/Dockerfile.visual`, and `tests/e2e/`
+  contain the patched Beads build, isolated project fixtures, visual matrix,
+  wire tap, and real-bd receipts.
 
-### bd 1.1.0 contract probe
+## Data model
 
-The 2026-08-15 Docker functional probe measured the pinned CLI without
-touching the host tracker and found one write-blocking contract mismatch.
+No persistent Scribe storage changed and no migration exists.
 
-`bd update --help` lists neither `--if-status` nor `--if-assignee`.
-Mismatched attempts with each flag returned exit 1 and `unknown flag`, not
-exit 13. The issue JSON before and after both attempts was identical, so bd
-rejects rather than ignores them, but 1.1.0 cannot provide the required
-guarded writes or the planned precondition-failed mapping.
+- `BeadsIssueDetail` carries id, title, description, acceptance, notes,
+  design, optional spec id, status, priority, type, labels, optional parent
+  epic title, assignee, owner, timestamps, close facts, defer, due, estimate,
+  external ref, blockers, dependents, newest 50 comments, hidden count, queue,
+  and queue basis. Text remains bounded to 64KiB per field.
+- `BeadsIssueWrite` has `SetTitle`, `SetDescription`, `SetAcceptance`,
+  `SetNotes`, `SetDesign`, `SetSpecId`, `SetPriority`, `SetType`, `SetLabels`,
+  `SetStatus`, `Claim`, `CloseIssue`, `UndoClose`, and `AddComment`.
+- `BeadsIssueWriteGuards` carries optional `if_status` and `if_assignee`.
+- `BeadsIssueWriteResult` is `Applied { generation }`,
+  `PreconditionFailed`, or `Failed { reason }`.
+- Client state consists of the per-workspace open panel, requests,
+  navigation target, notices, pending and in-flight writes, deadlines,
+  reconnect fences, expanded comments, one parked copy, one window editor,
+  and board-owned arm, drag, and optimistic-drop records.
+- Server state adds one write lock and process-local generation per canonical
+  root plus one process-wide guarded-build probe result.
 
-### Guarded write-floor contract probe
+## API and interface changes
 
-The 2026-08-15 network-none Docker probe verified the checksum-pinned patched build as the write floor.
+- `ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id }` asks for
+  one fresh issue.
+- `ClientMessage::BeadsIssueWrite { workspace_id, issue_id, verb, guards }`
+  sends one typed mutation without exposing `bd` argv.
+- `ServerMessage::BeadsIssueDetail { workspace_id, issue_id, detail }`
+  correlates success or not-found.
+- `ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result }`
+  correlates one mutation outcome.
+- `ServerMessage::Welcome` adds `beads_detail` and `beads_write`. Older servers
+  decode as incapable. A current local owner with ordinary upstream Beads may
+  read detail but sees inert write controls.
 
-Upstream main already placed field, label, claim, close, reopen, and comment
-operations behind typed transactions, but its CLI rejected guarded claim and
-label-only updates and exposed no guards for close, reopen, or comments. The
-bounded patch removes those stale adapter refusals and threads status/assignee
-preconditions into native close, reopen, batch-close, and comment requests.
-Comment guards execute inside the same SQL transaction or retried unit of work
-as the append; no read-then-write or local lock substitutes for external-writer
-atomicity.
+## Testing strategy
 
-The probe verifies guarded fields, status, labels, comments, native claim actor
-and lease, native close timestamps/reason, reopen cleanup, explicit empty
-assignee, structured mismatch JSON, and rc13. Every stale attempt leaves the
-observed issue and comment thread unchanged. Scribe releases still do not
-bundle bd; the source-built artifact exists only in the functional harness,
-and production capability stays false for binaries without its exact marker.
+All runtime suites use their existing Docker just recipe with
+`--network none`; none touch the host Scribe process or tracker.
 
-Default `bd show --json` returns `dependent_count` and `comment_count` but
-neither collection. `--include-dependents` adds `dependents`, whose elements
-contain `id`, `title`, `status`, `priority`, `issue_type`, `created_at`,
-`updated_at`, and `dependency_type`. Dependent-chip ids therefore require
-that flag.
+### Unit and protocol evidence
 
-`bd comments add --json` returns one object with `author`, nanosecond RFC3339
-`created_at`, `id`, `issue_id`, `schema_version: 1`, and `text`.
-`bd comments <id> --json` returns an array whose elements have `id`,
-`issue_id`, `author`, `text`, and second-resolution `created_at`.
-`bd show --json --include-comments` embeds the same element shape in the
-issue's `comments` array; observed order was oldest first.
+- Named MessagePack round trips cover the detail request, complete response,
+  not-found response, every write verb with both guards and with neither,
+  every result, and independent default-false `Welcome` fields.
+- Server tests cover detail envelope shapes and caps, argv for every verb,
+  optional and empty-assignee guards, marker parsing, rc13 mapping, timeout
+  process-group cleanup, last-good preservation, generation fencing, and
+  same-root authorized fan-out.
+- Client tests cover panel anatomy and sparse omission, loading, closed and
+  blocked forms, 4.5:1 text contrast, comment clamp and hidden count, 400px
+  floor, 70% height, min/max board height, 0.8 and 1.6 text scale, 120ms final
+  frame, re-anchoring, two-region independence, copy and navigation, editor
+  commit/focus rules, all write surfaces, notice expiry, timeout and reconnect,
+  strict drag threshold, target/source matrices, PTY ownership, optimism,
+  rollback, classifier outcomes, and exact Undo deadline.
+- `just docker-unit-beads-write` runs the focused server and client contract in
+  the functional build image.
 
-The 20 timed write attempts took, in order, 504, 517, 490, 480, 477, 459,
-972, 622, 459, 485, 558, 513, 448, 421, 483, 429, 663, 582, 67, and 68ms.
-The first 18 succeeded across field, label, status, comment, claim, close,
-and reopen verbs. The last two were the rejected guard attempts. All were
-below 15,000ms; maximum was 972ms.
+### Visual evidence
 
-### Non-Blocking Observations
+- `just e2e-visual-beads-detail-fixtures` mounts the tracked mock, injects
+  loading, closed, blocked, comment-clamped, and hidden-count fixtures, and
+  checks the 560px geometry, 12px/4px offsets, anatomy pixels, sparse omission,
+  epic and priority ink, two-line/newest and one-line/older comment folds,
+  expand/re-collapse, ID hover/copy, dependent navigation, three dismissals,
+  and not-found/NotDetected notices.
+- Its main evidence includes `beads-detail-inventory.json`,
+  `beads-detail-loading-panel.png`, `beads-detail-comment-clamped.png`,
+  `beads-detail-comment-expanded.png`, `beads-detail-id-hover.png`,
+  `beads-detail-hidden-count.png`, `beads-detail-not-found.png`, and
+  `beads-detail-not-detected.png`.
+- `just e2e-visual-beads-board` captures
+  `beads-board-drag-over-cards.png`, `beads-board-drag-no-drop.png`, and
+  `beads-board-drag-outside.png`. Each synchronized waypoint measures the
+  source-sized ghost within 3px of pointer offset and keeps terminal row count
+  unchanged. It also checks the rejected-lane wash repaint and hover hold-open.
 
-- The feature decomposes into independently shippable slices with distinct
-  risk: (a) detail read + read-only panel, (b) write verbs + editing, (c)
-  drag — beads should sequence a→b→c even with all three in scope.
-- Day-after asks to expect: open-by-id/search, keyboard navigation,
-  dependency editing, issue creation — all recorded as Non-Goals.
-- Scale/latency bounds: no panel-open latency target exists beyond the bd
-  deadline; anchor/clamp behavior should be tested at named sample points
-  (min/max board height, 0.8×/1.6× text scale, narrowest region) rather
-  than "all".
-- Agent-authored comment threads are the long ones; the comment cap must
-  surface truncation, never silently drop the tail.
-- Dependent-chip navigation stays (approved mock behavior) but is the first
-  candidate to simplify if the read slice needs to shrink.
+### Functional evidence
 
-## Architecture Approach
+- `just e2e-func-beads-write-contract` proves the exact marker, guarded native
+  field, label, status, comment, claim, close, and reopen behavior, explicit
+  unassigned matching, rc13 mismatch JSON, actor and lease, close facts, and
+  reopen cleanup.
+- `just e2e-func-beads-issue-write` sends one representative of every write
+  family through the real server, requires `board_pushed: true`, and rereads
+  with `bd show`. A seeded guard race leaves its comment absent. Forced
+  nonzero and timeout results preserve the persisted title and last-good
+  board. Evidence is `beads-write-fields.json`,
+  `beads-write-final-show.json`, and `beads-write-last-good.json`.
+- `just e2e-func-beads-board` proves real detail parsing and ID copy, zero
+  editor `KeyInput`, zero premature or cancelled editor writes, nonzero and
+  timeout notices with at least 500 changed panel pixels, and timeout
+  board/detail rereads. It then proves native drag claim, close and Undo,
+  defer clearing, classifier-won notice, same/derived-lane rejection, and zero
+  SGR mouse-frame growth.
+- Its main receipts are `beads-real-detail-evidence.json`,
+  `beads-real-bd-show.json`, `beads-write-gpui-final-show.json`,
+  `beads-write-last-good.png`, `beads-write-nonzero-notice.png`,
+  `beads-write-timeout-notice.png`, `beads-drag-close-notice.png`,
+  `beads-drag-classifier-notice.png`, and `beads-drag-functional.png`.
 
-Three independently shippable slices on one epic, sequenced by risk: (a) a
-typed detail read plus the read-only panel, (b) the write verb set plus
-inline editing, (c) drag-to-queue. The server remains the only process that
-touches bd (constitution 1, 5): the client sends typed intents and paints
-typed results, and bd argv is composed server-side from typed fields.
+## Deliberate limits and recovery behavior
 
-Slice a ships the mock's full anatomy with every write affordance rendered
-but inert — exactly the presentation a shared viewer or an old server gets
-permanently — so the visual contract is the full inventory from slice a and
-interactivity is what slice b adds. The capability surface splits
-accordingly: `beads_detail` (slice a) gates the panel, `beads_write`
-(slice b) arms its verbs; a server is never in a state where it advertises
-writes it cannot handle. Client-side work parallelizes against protocol
-types plus injected fixtures rather than serializing behind server work.
-
-The panel is a new per-window GPUI entity (`BeadsDetailPanel`) rather than
-an extension of the board's free-function build: the board build stays a
-free function with parked intents, but editing needs focus, an
-`EntityInputHandler`, and key interception — capabilities only an entity
-carries (the GPUI overlays and settings window set this precedent). The
-panel entity is window-exclusive for editing while its open/anchor state
-stays keyed per workspace, so two regions can each show a panel but only one
-edit is armed at a time.
-
-The editor spike verified the main-window routing constraint against the
-pinned GPUI revision. `Window::handle_input` must re-register the focused
-editor's `ElementInputHandler` during every paint. While that focus is armed,
-the terminal root must return before both its unconditional
-`stop_propagation` and PTY encoder: an un-stopped printable `KeyDown` is what
-makes GPUI call `replace_text_in_range`. Enter arrives there as `"\n"`;
-Escape and modified controls remain key-only and belong to the panel's key
-listener. A headless window test sends printable, Enter, Escape, and Ctrl-C
-through this branch and observes no call to the real terminal encoder, then
-restores terminal focus and observes normal encoding.
-
-Drag rides GPUI's native drag-and-drop exactly as the titlebar does
-(`on_drag` ghost entity, `has_active_drag` click-swallow): the ~2px arm,
-click swallowing, and a window-layer ghost that escapes lane clipping come
-from the framework; the press chain's only growth is gating PTY mouse
-forwarding while a drag is active. Alternatives rejected: a modal dialog
-surface (the anchored panel is the approved design), client-side bd
-invocation (trust boundary), a generic bd-passthrough message (would let
-the client compose argv; constitution 1 and 5), and extending the
-window-status-bar press chain with card rects (element listeners plus
-native DnD are cheaper and already precedented).
-
-## Affected Components
-
-- `crates/scribe-common/src/protocol.rs` — new typed messages (detail
-  request/response, write request/result), a `beads_write` capability bit on
-  Hello/Welcome (precedent: `ci_run_bar`), round-trip tests.
-  `BEADS_BOARD_PROTOCOL_VERSION` stays 1: the additions are new named
-  messages, not changes to the snapshot payload; documented per
-  constitution 7.
-- `crates/scribe-server/src/beads_board.rs` — detail fetch
-  (`bd show --json --include-comments --include-dependents`), server-side
-  caps, the write verb set with guards, a separate 15s write deadline,
-  mismatch-exit mapping verified against the pinned guarded write floor,
-  per-root write generation fence, post-write forced refresh, and a bd
-  contract probe that keeps writes unavailable unless the exact semantic
-  build marker matches. bd 1.1.0 remains sufficient for detail reads only.
-- `crates/scribe-server/src/ipc_server.rs` — handlers for detail and write,
-  gated to local owning controller connections whose window shows the root
-  (precedent: `DismissCiRun`), post-write snapshot push to every board on
-  that root, one structured log line per write attempt.
-- `crates/scribe-client/src/beads_board.rs` — card press/click resolution,
-  selected-card state, drag source wiring and no-drop lane dimming,
-  optimistic overlay and revert, board-side transient notices (undo,
-  failure).
-- New `crates/scribe-client/src/beads_panel.rs` — the panel entity: layout
-  per the mock, theme-derived palette with the board's contrast lifting,
-  anchor/clamp math against `PaneShell::board_rect` with the 70%-of-region
-  max height and internal scroll, re-anchoring when the issue changes lanes,
-  the 120ms open animation, ID click-copy and dependent-chip navigation
-  intents, comments expanding in place with the hover copy glyph, the
-  read-only (verbs-inert) presentation for closed issues and non-owning
-  viewers, and the inline editor (`EntityInputHandler`) with the commit
-  matrix and key carve-out.
-- `crates/scribe-client/src/main.rs` — per-workspace panel state beside
-  hover/pin/snapshot, PTY mouse-forwarding gate during drag, hover-board
-  hold-open while a drag or open panel is active, client-side write deadline
-  and reconnect reconciliation of optimistic state, panel entity wiring and
-  dismissal routing (Esc precedence).
-- `docker/Dockerfile.func` and `tests/e2e/` — a writable bd project fixture,
-  functional persistence/drag suites, visual panel-contract and
-  ghost-tracking suites.
-- `lat.md/` — client, protocol, server, and test sections.
-
-## Data Model
-
-No persistent storage changes and no migrations. New wire/in-memory types:
-
-- `BeadsIssueDetail`: id, title, description, acceptance, notes, design,
-  spec id, status, priority, type, labels, assignee, owner/filed-by,
-  created/updated/closed timestamps, close reason, defer/due/estimate/
-  external-ref when set, blockers (id+title), dependents (id+title),
-  comments (author, timestamp, body) capped to the newest 50 with a
-  hidden-count, per-field byte caps, and the server-derived queue plus its
-  derivation basis (the same `classify_snapshot` precedence), so the state
-  row never re-derives client-side.
-- `BeadsIssueWrite` verb enum: SetTitle, SetDescription, SetAcceptance,
-  SetNotes, SetDesign, SetSpecId, SetPriority, SetType, SetLabels,
-  SetStatus(open|in_progress|closed, with a clear-defer flag on open so a
-  Ready drop parks nothing), Claim, CloseIssue, UndoClose, AddComment — each
-  carrying optional `if_status`/`if_assignee` guards captured from the
-  fresh (uncached) detail read.
-- `BeadsIssueWriteResult`: Applied { generation } |
-  PreconditionFailed | Failed { reason }.
-- Client: per-workspace panel state (open issue id, detail, loading/error,
-  undo window), window-exclusive edit state, drag state (source card,
-  target lane, optimistic overlay tagged with the write generation).
-- Server: per-canonical-root write generation counter; refreshes started
-  before the latest committed write are discarded on completion.
-
-## API / Interface Changes
-
-- `ClientMessage`: `RequestBeadsIssueDetail { workspace_id, issue_id }`,
-  `BeadsIssueWrite { workspace_id, issue_id, verb, guards }`.
-- `ServerMessage`: `BeadsIssueDetail { workspace_id, detail | not_found }`,
-  `BeadsIssueWriteResult { workspace_id, issue_id, result }`; the existing
-  board snapshot message is reused for post-write pushes.
-- `Welcome` advertises `beads_detail` and `beads_write` separately; a client
-  on an old server shows today's read-only board, and a client on a
-  detail-only server shows the panel with inert verbs — never a wedged
-  panel, never an armed editor the server cannot serve. No breaking
-  changes; all additions are new named MessagePack messages with round-trip
-  tests.
-- UI surfaces: click-to-open panel; inline editors; priority and type pick
-  rows; writable status rail; claim/close/undo; comment composer; drag with
-  ghost, no-drop affordances, optimistic placement.
-
-## Testing Strategy
-
-- Server unit: verb→argv composition including guards, labels, and the
-  clear-defer status flag; mismatch-exit mapping for the verified write
-  floor; bd 1.1.0's unknown-guard exit 1 maps to an unsupported write
-  contract; non-zero-exit and timeout failure paths preserve last-good;
-  write deadline stays distinct from the read deadline; generation fence
-  discards a stale refresh; detail caps, hidden counts, and derived-queue
-  field; detail parsing across bd's three envelope shapes; write gating
-  rejects remote/viewer writes.
-- Client unit: panel build from a detail fixture (empty-field row omission,
-  closed-issue state row with no write verbs, blocked upstream nodes,
-  comment clamp with expand-in-place, hidden-count line, viewer read-only
-  presentation); palette contrast floors on the panel's grounds; editor
-  commit matrix (Enter, blur, Esc, click-elsewhere, modifier-Enter); ID
-  click-copy and dependent-navigation intents; drag state machine (arm
-  threshold, source restrictions — Done/Blocked cards not liftable,
-  optimistic overlay, revert, rejected targets, hover-board hold-open
-  during drag); write-timeout converge and post-reconnect reconciliation of
-  optimistic state; anchor/clamp at named sample points (min/max board
-  height, 0.8×/1.6× text scale, 400px floor, 70% max height with internal
-  scroll); panel re-anchor on lane change; per-workspace keying.
-  The completed editor spike separately proves focus acquisition,
-  paint-time `ElementInputHandler` registration, committed text delivery, and
-  full PTY-encoder exclusion while editor focus is armed.
-- Protocol: round-trip tests for every new message.
-- Functional e2e (real bd, `--network none`): unrecognized builds keep write
-  controls inert; the pinned patched floor must pass its semantic contract
-  before server tests run. With that floor: open panel from a click; one write
-  per verb family proven by re-running `bd show` (mandatory, not optional);
-  claim/close/undo (undo restores open within the 5s window); comment; a
-  seeded guard race surfacing precondition-failed; drag
-  Ready→In progress recording the claim in bd, drag→Done recording close
-  plus the board-side undo, drag Backlog→Ready clearing a seeded defer; a
-  seeded blocked issue set to open landing in Blocked with the
-  classifier-won notice; rejected drops writing nothing; PTY isolation — a
-  mouse-reporting app below receives none of a drag's press/move/release
-  and an armed editor's keystrokes never reach the PTY; issue-vanished
-  panel closure.
-- Visual e2e (injected snapshots and detail fixtures, no bd): the panel
-  judged against `.impeccable/mocks/beads-card-detail.html` via the
-  enumerated assertion inventory at text scale 1.0 (including the comment
-  fold and hover copy glyph); a fixture set covering loading, closed,
-  blocked, comment-clamped, and hidden-count variants; drag ghost within
-  3px of the pointer at each `xdotool --sync` waypoint with terminal-row
-  stability; no-drop lane dim; the 120ms open animation's end state equals
-  the asserted panel.
-- Constitution 3: every story's verification path is harness-reachable and
-  named above; constitution 4's budget is verified by the waypoint test plus
-  the reviewed O(1) drag update. `lat check` gates the docs.
-
-## Risks
-
-- The inline editor is the largest work item and easy to underestimate (the
-  settings editor is entity-woven, not reusable). Mitigation: slice (a)
-  ships value first; the editor spike runs in parallel with slice (a),
-  registering a minimal `ElementInputHandler` for the panel in the main
-  window before slice (b) commits to layout.
-- bd write latency (Dolt commit + export) vs the deadline. Mitigation: 15s
-  write deadline and converge-on-timeout (forced refresh + detail re-read).
-  The bd 1.1.0 contract probe measured 20 attempts below the deadline, with
-  an observed maximum of 972ms.
-- Upstream v1.2.2 still lacks the complete native CLI guard surface, so an
-  arbitrary newer binary is not safely write-capable. Mitigation: gate on the
-  exact contract-tested patched marker and keep all other installs read-only;
-  detail reads and the read-only panel remain independently shippable.
-- Ghost/clipping behavior of GPUI DnD inside a region-clipped strip.
-  Mitigation: titlebar precedent plus a slice-(c) spike before polishing.
-- Optimistic-revert flicker from stale refreshes. Mitigation: the
-  generation fence, unit-tested.
-- Live host server skew (cannot restart it). Mitigation: capability bit;
-  the board degrades to today's read-only behavior.
-- Rollback: all changes are additive protocol plus board/panel-local
-  modules; reverting removes the UI without data loss.
+- A region narrower than the 400px panel floor keeps the board but opens no
+  panel.
+- Shared, remote, displaced, and foreign-window clients receive no detail or
+  write capability. They keep the compact board.
+- Most upstream Beads installs are detail-only because Scribe requires the
+  exact patched marker for writes and does not ship that binary.
+- Editor arrow, Delete, and Tab keys are consumed rather than providing caret
+  navigation. Editing starts selected and supports replacement, Backspace,
+  composition, commit, and cancel.
+- A timed-out write has an unknown outcome. Scribe never retries the mutation;
+  it reads board and detail until authoritative state returns.
+- A failed optimistic drop restores the source immediately. A successful drop
+  remains provisional until the authoritative snapshot removes its overlay.
+- Docker X11/Lavapipe supplies the shipped visual evidence. Native macOS Metal
+  validation, when required, remains restricted to the repository's hosted
+  macOS workflow.
 
 ## Sequencing
 
-Order is expressed as dependency edges; no step codes. Client items depend
-on protocol types and fixtures, not on server internals, so they
-parallelize with server work inside each slice.
+The implementation landed in dependency order; every stage below is complete.
 
-- Completed first node: the bd 1.1.0 contract spike proved unknown guards
-  reject with exit 1 and preserve state, dependent ids need
-  `--include-dependents`, comment shapes match the probe record, and all 20
-  timed attempts stayed below 15s. This unblocks slice a but leaves slice b
-  dependent on selecting and probing a guard-capable bd write floor.
-- Completed write-floor node: checksum-pinned upstream main plus the bounded
-  native-transaction patch passes field/status/label/comment, claim,
-  close/reopen, lifecycle, actor, JSON-envelope, and rc13 probes.
-- Slice a (read): detail protocol messages + `beads_detail` capability →
-  { server detail fetch/caps/derived-queue/gating ∥ read-only panel entity
-  split into: panel layout + palette; anchor/clamp/max-height/re-anchor;
-  open animation; loading/vanish states; copy + dependent navigation } →
-  seeded writable bd fixture + visual detail fixture set → visual panel
-  contract + functional detail test → slice-a lat.md update + lat check.
-  In parallel: the editor input-handler spike.
-- Slice b (write, with the guard-capable bd floor pinned): write protocol
-  messages + `beads_write` capability →
-  server write verbs (guards, clear-defer, deadline, fence, push, logging,
-  bd-too-old probe) ∥ editor entity + key routing (from the spike) →
-  edit surfaces as separate items: text-field editors; priority + type pick
-  rows; status rail writes; claim/close/undo; labels; comment composer;
-  failure notices + timeout converge + reconnect reconciliation →
-  functional persistence suite → slice-b lat.md update + lat check.
-- Slice c (drag, drop-commit needs slice b's server verbs; the state
-  machine and ghost need only slice a): drag state machine + source
-  restrictions ∥ ghost + no-drop affordances + PTY-forwarding gate +
-  hover hold-open → optimistic overlay/revert wired to write results →
-  functional drag verbs (all drop cases) + visual ghost tracking →
-  slice-c lat.md update + lat check.
-- Final (after all): cross-cutting lat.md consolidation, spec sync to
-  as-built, full lat check.
+1. Probe bd 1.1.0 and the checksum-pinned guarded build. Pin the marker,
+   guard semantics, actor/lifecycle behavior, and deadlines.
+2. Add typed detail protocol, parser, owner/root gate, complete fixtures, and
+   the read-only panel with lifecycle, copy, and dependent navigation.
+3. Add typed write protocol, server executor, generation fence, root fan-out,
+   editor focus path, all field controls, notices, timeout convergence, and
+   reconnect reconciliation.
+4. Add strict drag tracking and source restrictions, then native ghost, no-drop
+   wash, PTY gate, hover hold-open, optimistic settlement, classifier notice,
+   and Undo.
+5. Prove read, write, and drag through unit, visual, guarded-build, server IPC,
+   and real-bd GPUI suites.
+6. Consolidate the canonical read, guarded-write, and drag architecture in
+   `lat.md`, then sync this spec to those shipped contracts.
 
-## Backlog Refinement
+## Canonical documentation
 
-None — the run has no backlog inputs; no P4 sources exist for this feature.
-
-## Alignment fixes applied
-
-- Split the capability bit into `beads_detail` / `beads_write` so a server
-  never advertises writes it cannot handle (B, must).
-- Defined slice a as the full mock anatomy with inert write affordances —
-  the same presentation viewers and detail-only servers get — so the visual
-  contract is complete from slice a (B, must).
-- Un-serialized client work from server work and split the three oversized
-  sequencing edges into bead-sized items (B, must/should).
-- Added the bd 1.1.0 contract spike as the first node, folding in the
-  write-latency measurement with a concrete method (B, must; B12).
-- Added SetStatus clear-defer so the Ready drop is expressible; verb→argv
-  test named (A, must).
-- Added the bd version probe / typed bd-too-old error to components, tests,
-  and sequencing (A+B, must).
-- Added hover-board hold-open during drag to plan and client tests (A,
-  must).
-- Detail response now carries the server-derived queue and derivation basis
-  (A, must).
-- Spec-synced Story 3's visual AC (no fake-bd in the visual suite; verb
-  proof lives in functional) and the Constraints verb list (no direct
-  assignee verb, reasonless close, uncached detail, fake-bd scripts are
-  server unit fixtures only) (A19/A20, B10).
-- Named per-slice lat.md + lat check nodes; seeded writable bd fixture and
-  visual detail fixture set are explicit work items (B, should).
-- Pinned numbers: ghost within 3px per waypoint, 5s undo window, 70% max
-  height, 120ms open animation, 400px panel floor (B, should).
-- Added test coverage for: closed-issue no-verbs panel, viewer read-only
-  presentation, non-zero-exit and timeout failure paths with converge,
-  PTY isolation (drag and editor), drag source restrictions, drag-to-Done
-  and drag-to-Ready functional cases, blocked-classifier-won case, ID
-  copy + dependent navigation, expand-in-place comments + hover glyph
-  visual assertions, max-height scroll clamp, reconnect reconciliation,
-  re-anchor on lane change, guards-from-fresh-detail (uncached) (A5-A18).
+- [Client Beads data source](../lat.md/client.md#beads-board-cli-data-source)
+- [Guarded issue writes](../lat.md/client.md#guarded-issue-writes)
+- [Board interaction and issue detail](../lat.md/client.md#board-interaction-and-issue-detail)
+- [Protocol detail and writes](../lat.md/protocol.md#beads-issue-detail)
+- [Server Beads issue writes](../lat.md/server.md#beads-issue-writes)
+- [Real Beads Board Refresh](../lat.md/test.md#real-beads-board-refresh)
+- [Beads card-detail fixtures](../lat.md/test.md#beads-card-detail-fixtures)
+- [Beads card drag tracking](../lat.md/test.md#beads-card-drag-tracking)
