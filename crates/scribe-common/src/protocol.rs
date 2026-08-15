@@ -232,7 +232,10 @@ pub struct AiLaunchSpec {
     pub conversation_id: Option<String>,
 }
 
-/// Version of the local workspace Beads-board protocol.
+/// Version of the local workspace Beads-board snapshot payload.
+///
+/// Detail reads use separate named messages, so adding them does not change
+/// the board snapshot schema or require a version bump.
 pub const BEADS_BOARD_PROTOCOL_VERSION: u32 = 1;
 
 /// One issue rendered by the workspace Beads board.
@@ -288,6 +291,82 @@ pub enum BeadsBoardState {
     },
     /// `bd` could not be invoked and no last-good snapshot exists.
     Unavailable { message: String },
+}
+
+/// Queue assigned by the server using the board classifier's precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsIssueQueue {
+    Backlog,
+    Ready,
+    InProgress,
+    Blocked,
+    Done,
+}
+
+/// Fact that caused the server to assign an issue to its queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsIssueQueueBasis {
+    ClosedStatus,
+    BlockedStatus,
+    OpenBlockers,
+    InProgressStatus,
+    ReadySet,
+    BacklogFallback,
+}
+
+/// One issue related to the detailed issue through a blocking edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsIssueLink {
+    pub id: String,
+    pub title: String,
+}
+
+/// One newest-first comment in a detailed issue response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsIssueComment {
+    pub author: String,
+    /// ISO-8601 timestamp from `bd`, kept verbatim.
+    pub created_at: String,
+    pub body: String,
+}
+
+/// Complete, bounded issue data returned by a detail read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsIssueDetail {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: String,
+    pub notes: String,
+    pub design: String,
+    pub spec_id: Option<String>,
+    pub status: String,
+    /// Native Beads priority (`0` is highest, `4` is lowest).
+    pub priority: u8,
+    pub issue_type: String,
+    pub labels: Vec<String>,
+    pub assignee: Option<String>,
+    pub owner: Option<String>,
+    /// ISO-8601 timestamp from `bd`, kept verbatim.
+    pub created_at: String,
+    /// ISO-8601 timestamp from `bd`, kept verbatim.
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub close_reason: Option<String>,
+    pub defer_until: Option<String>,
+    pub due_at: Option<String>,
+    pub estimated_minutes: Option<u32>,
+    pub external_ref: Option<String>,
+    pub blockers: Vec<BeadsIssueLink>,
+    pub dependents: Vec<BeadsIssueLink>,
+    /// Newest 50 comments at most, in newest-first order.
+    pub comments: Vec<BeadsIssueComment>,
+    /// Older comments omitted from `comments` by the server cap.
+    pub hidden_comment_count: u32,
+    pub queue: BeadsIssueQueue,
+    pub queue_basis: BeadsIssueQueueBasis,
 }
 
 /// Aggregate state rendered by the CI run bar.
@@ -441,6 +520,11 @@ pub enum ClientMessage {
     RequestBeadsBoard {
         workspace_id: WorkspaceId,
         protocol_version: u32,
+    },
+    /// Request an uncached, complete issue read for one workspace board.
+    RequestBeadsIssueDetail {
+        workspace_id: WorkspaceId,
+        issue_id: String,
     },
     /// Move a session to a different workspace. The workspace-split flow seeds
     /// its session through the old workspace (the new one does not exist yet)
@@ -892,6 +976,12 @@ pub enum ServerMessage {
         protocol_version: u32,
         state: BeadsBoardState,
     },
+    /// Complete issue data, or `None` when the requested issue vanished.
+    BeadsIssueDetail {
+        workspace_id: WorkspaceId,
+        issue_id: String,
+        detail: Option<Box<BeadsIssueDetail>>,
+    },
     /// Search results for a `SearchRequest`.
     SearchResults {
         session_id: SessionId,
@@ -924,6 +1014,10 @@ pub enum ServerMessage {
         /// older local server means unsupported.
         #[serde(default)]
         terminal_images: TerminalImageCapabilities,
+        /// Server support for the additive Beads issue-detail messages.
+        /// Missing from an older local server means the board remains read-only.
+        #[serde(default)]
+        beads_detail: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -1741,6 +1835,18 @@ mod tests {
         },
     }
 
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutBeadsDetail {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+        },
+    }
+
     #[test]
     fn hello_without_join_intent_defaults_to_false() {
         let bytes = rmp_serde::to_vec_named(&HelloWithoutJoinIntent::Hello {
@@ -1769,6 +1875,23 @@ mod tests {
 
         let decoded: ClientMessage = rmp_serde::from_slice(&bytes).expect("deserialize old Hello");
         assert!(matches!(decoded, ClientMessage::Hello { ci_run_bar: false, .. }));
+    }
+
+    // @lat: [[protocol#Server Messages#Connection#Beads detail capability defaults safely]]
+    #[test]
+    fn welcome_without_beads_detail_capability_defaults_to_false() {
+        let bytes = rmp_serde::to_vec_named(&WelcomeWithoutBeadsDetail::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+        })
+        .expect("serialize old Welcome");
+
+        let decoded: ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize old Welcome");
+        assert!(matches!(decoded, ServerMessage::Welcome { beads_detail: false, .. }));
     }
 
     // @lat: [[protocol#Server Messages#CI Run State#State message round trip]]
@@ -1950,6 +2073,106 @@ mod tests {
                     refresh_error: Some(_),
                 },
             } if decoded_id == workspace_id && blocked == vec![item]
+        ));
+    }
+
+    fn sample_beads_issue_detail() -> BeadsIssueDetail {
+        BeadsIssueDetail {
+            id: "scribe-5wh1.2".into(),
+            title: "Add issue detail protocol".into(),
+            description: "Carry the complete issue.".into(),
+            acceptance_criteria: "Named MessagePack round trips.".into(),
+            notes: "Read-only slice.".into(),
+            design: "Server derives the queue.".into(),
+            spec_id: Some("024-beads-card-detail".into()),
+            status: "open".into(),
+            priority: 1,
+            issue_type: "task".into(),
+            labels: vec!["protocol".into(), "beads".into()],
+            assignee: Some("mamba".into()),
+            owner: Some("maintainer".into()),
+            created_at: "2026-08-14T18:00:00Z".into(),
+            updated_at: "2026-08-15T04:00:00Z".into(),
+            closed_at: None,
+            close_reason: None,
+            defer_until: Some("2026-08-16T00:00:00Z".into()),
+            due_at: Some("2026-08-20T00:00:00Z".into()),
+            estimated_minutes: Some(90),
+            external_ref: Some("GH-24".into()),
+            blockers: vec![BeadsIssueLink {
+                id: "scribe-blocker".into(),
+                title: "Select the read contract".into(),
+            }],
+            dependents: vec![BeadsIssueLink {
+                id: "scribe-dependent".into(),
+                title: "Render the detail panel".into(),
+            }],
+            comments: vec![BeadsIssueComment {
+                author: "maintainer".into(),
+                created_at: "2026-08-15T04:01:00Z".into(),
+                body: "Ship the read slice first.".into(),
+            }],
+            hidden_comment_count: 7,
+            queue: BeadsIssueQueue::Blocked,
+            queue_basis: BeadsIssueQueueBasis::OpenBlockers,
+        }
+    }
+
+    // @lat: [[protocol#Client Messages#Beads issue detail#Named MessagePack round trip]]
+    #[test]
+    fn beads_issue_detail_messages_round_trip_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let request = ClientMessage::RequestBeadsIssueDetail {
+            workspace_id,
+            issue_id: "scribe-5wh1.2".into(),
+        };
+        let request_bytes =
+            rmp_serde::to_vec_named(&request).expect("serialize issue detail request");
+        let decoded_request: ClientMessage =
+            rmp_serde::from_slice(&request_bytes).expect("deserialize issue detail request");
+        assert!(matches!(
+            decoded_request,
+            ClientMessage::RequestBeadsIssueDetail { workspace_id: decoded_id, issue_id }
+                if decoded_id == workspace_id && issue_id == "scribe-5wh1.2"
+        ));
+
+        let detail = sample_beads_issue_detail();
+        let response = ServerMessage::BeadsIssueDetail {
+            workspace_id,
+            issue_id: detail.id.clone(),
+            detail: Some(Box::new(detail.clone())),
+        };
+        let response_bytes =
+            rmp_serde::to_vec_named(&response).expect("serialize issue detail response");
+        let decoded_response: ServerMessage =
+            rmp_serde::from_slice(&response_bytes).expect("deserialize issue detail response");
+        assert!(matches!(
+            decoded_response,
+            ServerMessage::BeadsIssueDetail {
+                workspace_id: decoded_id,
+                issue_id,
+                detail: Some(decoded),
+            } if decoded_id == workspace_id
+                && issue_id == "scribe-5wh1.2"
+                && *decoded == detail
+        ));
+
+        let not_found = ServerMessage::BeadsIssueDetail {
+            workspace_id,
+            issue_id: "scribe-vanished".into(),
+            detail: None,
+        };
+        let not_found_bytes =
+            rmp_serde::to_vec_named(&not_found).expect("serialize missing issue detail");
+        let decoded_not_found: ServerMessage =
+            rmp_serde::from_slice(&not_found_bytes).expect("deserialize missing issue detail");
+        assert!(matches!(
+            decoded_not_found,
+            ServerMessage::BeadsIssueDetail {
+                workspace_id: decoded_id,
+                issue_id,
+                detail: None,
+            } if decoded_id == workspace_id && issue_id == "scribe-vanished"
         ));
     }
 

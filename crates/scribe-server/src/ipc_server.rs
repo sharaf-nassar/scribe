@@ -5511,6 +5511,7 @@ async fn handle_client_hello(
                 clipboard_gating: true,
                 participant_id,
                 terminal_images: claim.terminal_images,
+                beads_detail: false,
             };
             send_message(writer, &welcome).await;
 
@@ -5536,6 +5537,7 @@ async fn handle_client_hello(
                 // A lost-control landing registers no participant.
                 participant_id: None,
                 terminal_images: claim.terminal_images,
+                beads_detail: false,
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
@@ -6410,6 +6412,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::MoveSession { .. }
         | ClientMessage::ListSessions
         | ClientMessage::RequestBeadsBoard { .. }
+        | ClientMessage::RequestBeadsIssueDetail { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
         }

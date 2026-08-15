@@ -678,6 +678,7 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageLive { .. }
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
+        | ServerMessage::BeadsIssueDetail { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
@@ -2405,6 +2406,7 @@ mod tests {
                 clipboard_gating: true,
                 participant_id: Some(2),
                 terminal_images: TerminalImageCapabilities::default(),
+                beads_detail: false,
             },
         )
         .await

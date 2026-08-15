@@ -11756,6 +11756,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::SessionList { .. } => "SessionList",
         ServerMessage::WorkspaceInfo { .. } => "WorkspaceInfo",
         ServerMessage::BeadsBoard { .. } => "BeadsBoard",
+        ServerMessage::BeadsIssueDetail { .. } => "BeadsIssueDetail",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::TerminalImageLive { .. } => "TerminalImageLive",

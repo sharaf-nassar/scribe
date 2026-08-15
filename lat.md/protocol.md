@@ -121,6 +121,25 @@ Named MessagePack preserves the repository root and head SHA carried by `Dismiss
 Named MessagePack preserves the repository root, head SHA, and open/closed
 state carried by `SetCiRunDetailsInterest`.
 
+### Beads issue detail
+
+`RequestBeadsIssueDetail` asks for one uncached, workspace-scoped issue record without exposing `bd` arguments to the client.
+
+The matching `BeadsIssueDetail` server message repeats the workspace and issue
+ids so clients can reject a stale reply. Its optional detail distinguishes a
+vanished issue from a successful read.
+
+[[crates/scribe-common/src/protocol.rs#BeadsIssueDetail]] carries the complete
+bounded record: text fields, labels, people, lifecycle dates, related issues,
+the newest 50 comments and hidden count, plus the server-selected queue and
+[[crates/scribe-common/src/protocol.rs#BeadsIssueQueueBasis|selection basis]].
+Timestamps stay as the ISO-8601 text returned by `bd`; the protocol does not
+need another date parser to preserve them.
+
+#### Named MessagePack round trip
+
+Named MessagePack preserves request correlation, every detail field, queue basis, related issues, comments, hidden count, and the explicit not-found response.
+
 ### Configuration
 
 `ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit, shell integration, and workspace-root updates across live sessions.
@@ -176,6 +195,10 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 `Welcome` responds to Hello with the assigned window ID and a list of other unconnected windows that have sessions. `WindowClosed` and `QuitRequested` are shutdown acknowledgments.
 
 `Welcome.clipboard_gating: bool` advertises the server's OSC 52 gating capability (spec 010 C7 — see [[protocol#Client Messages#Connection]] for the matching client-side flag and negotiation semantics).
+
+#### Beads detail capability defaults safely
+
+`Welcome.beads_detail` advertises support independently from the board snapshot and future write verbs; an older server omitting it decodes as `false`, so the client keeps the existing read-only board.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 
