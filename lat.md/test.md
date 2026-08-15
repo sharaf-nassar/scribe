@@ -3555,6 +3555,17 @@ The strip keeps its region's x and width, and clamps rather than going negative 
 
 Pinning it here is what keeps the board a region citizen. The band it replaced spanned the window, so pinning a board in one region pushed every other region's panes down and shrank PTYs that had nothing to do with it.
 
+### Beads card drag tracking
+
+Unit coverage pins the state-only first drag stage to GPUI's native threshold and the board's lane geometry.
+
+Exactly 2px remains click-eligible while 2.001px activates. Backlog, Ready,
+and In-progress arm; Blocked and Done do not. Active state retains the source
+card and lane, updates the pointer and hovered lane, and reports no target at
+the board's right or bottom boundary. The existing Docker Beads-board visual
+continues to cover ordinary card clicks and board controls; painted ghosts,
+drop behavior, PTY isolation, and writes remain assigned to dependent stages.
+
 ### Region reports every tab and which is active
 
 Verifies one region's wire payload names every tab of that region, in strip order, with the live split at the active tab's index — the report the server persists as the window's layout.

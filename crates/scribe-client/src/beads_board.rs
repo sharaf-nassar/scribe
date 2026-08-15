@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, FontWeight, MouseButton, Rgba, Role, SharedString, div, linear_color_stop,
-    linear_gradient, prelude::*, px, uniform_list,
+    AnyElement, Context, DragMoveEvent, FontWeight, MouseButton, Pixels, Point, Render, Rgba, Role,
+    SharedString, Window, div, linear_color_stop, linear_gradient, prelude::*, px, uniform_list,
 };
 
 use crate::beads_panel::BeadsPanels;
@@ -58,6 +58,10 @@ pub struct BeadsBoards {
     heights: HashMap<WorkspaceId, f32>,
     /// The bottom-bar drag in flight, if any.
     resize: Option<BoardResize>,
+    /// Eligible card press waiting for GPUI's native drag arm.
+    card_press: Option<CardDragPress>,
+    /// Card drag currently tracked by GPUI's native drag stream.
+    card_drag: Option<CardDragState>,
 }
 
 /// One board's bottom bar, held by the pointer.
@@ -70,6 +74,34 @@ struct BoardResize {
     workspace_id: WorkspaceId,
     press_y: f32,
     from_height: f32,
+}
+
+/// GPUI's pinned drag arm uses this exact value with a strict greater-than
+/// comparison. Keeping the state boundary beside the board makes its unit
+/// contract explicit while `on_drag` remains the runtime authority.
+const CARD_DRAG_THRESHOLD: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CardDragPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone)]
+struct CardDragPress {
+    workspace_id: WorkspaceId,
+    source: BeadsBoardItem,
+    source_lane: u8,
+    origin: CardDragPoint,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardDragState {
+    pub workspace_id: WorkspaceId,
+    pub source: BeadsBoardItem,
+    pub source_lane: u8,
+    pub pointer: CardDragPoint,
+    pub hovered_lane: Option<u8>,
 }
 
 impl BeadsBoards {
@@ -195,6 +227,62 @@ impl BeadsBoards {
         self.resize.take().is_some()
     }
 
+    /// Arm one eligible card press. GPUI decides whether it becomes a drag;
+    /// Done and Blocked never register that native drag in the first place.
+    pub fn arm_card_drag(
+        &mut self,
+        workspace_id: WorkspaceId,
+        source: BeadsBoardItem,
+        source_lane: u8,
+        origin: CardDragPoint,
+    ) -> bool {
+        self.card_press = None;
+        self.card_drag = None;
+        if !card_drag_source(source_lane) {
+            return false;
+        }
+        self.card_press = Some(CardDragPress { workspace_id, source, source_lane, origin });
+        true
+    }
+
+    /// Promote the armed press once GPUI's native `on_drag` fires.
+    pub fn start_card_drag(&mut self, pointer: CardDragPoint, board: Rect) -> bool {
+        let Some(press) = self.card_press.as_ref() else { return false };
+        let travel = (pointer.x - press.origin.x).hypot(pointer.y - press.origin.y);
+        if travel <= CARD_DRAG_THRESHOLD {
+            return false;
+        }
+        self.card_drag = Some(CardDragState {
+            workspace_id: press.workspace_id,
+            source: press.source.clone(),
+            source_lane: press.source_lane,
+            pointer,
+            hovered_lane: card_drag_lane(board, pointer),
+        });
+        self.card_press = None;
+        true
+    }
+
+    /// Store one native drag move in constant work; no request or subprocess
+    /// belongs on this path.
+    pub fn update_card_drag(&mut self, pointer: CardDragPoint, board: Rect) -> bool {
+        let Some(drag) = self.card_drag.as_mut() else { return false };
+        drag.pointer = pointer;
+        drag.hovered_lane = card_drag_lane(board, pointer);
+        true
+    }
+
+    pub fn card_drag(&self) -> Option<&CardDragState> {
+        self.card_drag.as_ref()
+    }
+
+    /// Clear an armed press or active drag. Only an active drag reports true;
+    /// a false result leaves GPUI's ordinary click path live.
+    pub fn end_card_drag(&mut self) -> bool {
+        self.card_press = None;
+        self.card_drag.take().is_some()
+    }
+
     /// The shortest board that still shows a lane head with one issue under it.
     fn min_height(&self) -> f32 {
         Metrics { scale: self.text_scale(), height: 0.0 }.min_height()
@@ -243,6 +331,11 @@ impl BeadsBoards {
         self.hovered.retain(|workspace_id, _| live.contains(workspace_id));
         self.pinned.retain(|workspace_id| live.contains(workspace_id));
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
+        if self.card_press.as_ref().is_some_and(|press| !live.contains(&press.workspace_id))
+            || self.card_drag.as_ref().is_some_and(|drag| !live.contains(&drag.workspace_id))
+        {
+            self.end_card_drag();
+        }
     }
 
     /// Report the pointer entering or leaving one of the things that keep
@@ -285,6 +378,39 @@ impl BeadsBoards {
         }
         !due.is_empty()
     }
+}
+
+fn card_drag_source(lane: u8) -> bool {
+    lane <= 2
+}
+
+fn card_drag_lane(board: Rect, pointer: CardDragPoint) -> Option<u8> {
+    let left = board.x + LANES_SIDE_PADDING;
+    let right = board.x + board.width - LANES_SIDE_PADDING;
+    if pointer.x < left
+        || pointer.x >= right
+        || pointer.y < board.y
+        || pointer.y >= board.y + board.height
+    {
+        return None;
+    }
+    let lane_width = (right - left) / 5.0;
+    let x = pointer.x - left;
+    Some(if x < lane_width {
+        0
+    } else if x < lane_width * 2.0 {
+        1
+    } else if x < lane_width * 3.0 {
+        2
+    } else if x < lane_width * 4.0 {
+        3
+    } else {
+        4
+    })
+}
+
+fn card_drag_point(position: Point<Pixels>) -> CardDragPoint {
+    CardDragPoint { x: f32::from(position.x), y: f32::from(position.y) }
 }
 
 /// Height a board opens at, shared by the paint and by the region reservation
@@ -521,6 +647,7 @@ const WHITE: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
 const LANE_HEAD_HEIGHT: f32 = 36.0;
+const LANES_SIDE_PADDING: f32 = 8.0;
 /// One issue's share of a lane: the card itself, then the gap that separates it
 /// from the next.
 const ISSUE_HEIGHT: f32 = 50.0;
@@ -652,6 +779,20 @@ struct Lane<'a> {
 struct BoardStores<'a> {
     boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    rect: Rect,
+}
+
+/// Marker registered with GPUI's native drag arm for eligible Beads cards.
+struct BeadsCardDrag;
+
+/// Empty cursor overlay for this state-only slice. A painted ghost belongs to
+/// its dependent task; the marker is enough to receive native drag moves now.
+struct BeadsCardDragMarker;
+
+impl Render for BeadsCardDragMarker {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -686,6 +827,9 @@ pub fn render(
     // what keeps a dragged board from hanging past its own terminal.
     let metrics = Metrics { scale, height: rect.height };
     let (snapshot, status) = board_content(state);
+    let drag_move = std::sync::Arc::clone(&hover_state);
+    let drag_end = std::sync::Arc::clone(&hover_state);
+    let drag_end_out = std::sync::Arc::clone(&hover_state);
     let board = div()
         .id(SharedString::from(format!("beads-board-{workspace_id}")))
         .aria_label(format!("{workspace_name} Beads overview"))
@@ -699,6 +843,23 @@ pub fn render(
         .bg(colors.ground)
         .border_b_1()
         .border_color(colors.hairline)
+        .on_drag_move(move |event: &DragMoveEvent<BeadsCardDrag>, window, _app| {
+            if let Ok(mut boards) = drag_move.lock()
+                && boards.update_card_drag(card_drag_point(event.event.position), rect)
+            {
+                window.refresh();
+            }
+        })
+        .on_mouse_up(MouseButton::Left, move |_, window, _app| {
+            if drag_end.lock().is_ok_and(|mut boards| boards.end_card_drag()) {
+                window.refresh();
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_, window, _app| {
+            if drag_end_out.lock().is_ok_and(|mut boards| boards.end_card_drag()) {
+                window.refresh();
+            }
+        })
         .on_hover({
             let hover_state = std::sync::Arc::clone(&hover_state);
             move |hovered: &bool, _window, _app| {
@@ -712,7 +873,7 @@ pub fn render(
         Some(snapshot) => board.child(lanes(
             snapshot,
             workspace_id,
-            BoardStores { boards: &hover_state, panels: &panel_state },
+            BoardStores { boards: &hover_state, panels: &panel_state, rect },
             colors,
             metrics,
         )),
@@ -915,7 +1076,7 @@ fn lanes(
         .relative()
         .h_full()
         .flex()
-        .px(px(8.0))
+        .px(px(LANES_SIDE_PADDING))
         .pb(px(7.0))
         .child(rail(colors, metrics))
         .children(specs.iter().map(|spec| lane(spec, workspace_id, stores, colors, metrics)))
@@ -1133,6 +1294,7 @@ fn lane_body(
     let closure_panels = std::sync::Arc::clone(stores.panels);
     let closure_colors = *colors;
     let lane_index = spec.index;
+    let board_rect = stores.rect;
     div()
         .relative()
         .h(px(metrics.body()))
@@ -1159,6 +1321,7 @@ fn lane_body(
                                     state: &closure_state,
                                     panels: &closure_panels,
                                     lane: lane_index,
+                                    board_rect,
                                     colors: &closure_colors,
                                     metrics,
                                 },
@@ -1208,11 +1371,15 @@ fn empty_lane(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> A
 /// One issue as a raised card: a gradient fill under a hairline, with the
 /// title's own line above its metadata.
 fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
-    let CardContext { workspace_id, panels, lane, colors, metrics, .. } = card;
+    let CardContext { workspace_id, state, panels, lane, board_rect, colors, metrics } = card;
     let panels = std::sync::Arc::clone(panels);
     let selected = item.clone();
+    let dragged = item.clone();
+    let arm_state = std::sync::Arc::clone(state);
+    let start_state = std::sync::Arc::clone(state);
+    let draggable = card_drag_source(lane);
     let mark = colors.priority_mark(item.priority);
-    div()
+    let card_element = div()
         .id(SharedString::from(format!("beads-card-{workspace_id}-{}", item.id)))
         .role(Role::Button)
         .aria_label(format!("Open issue {}", item.id))
@@ -1241,13 +1408,35 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
                 .shadow_xs()
         })
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_mouse_down(MouseButton::Left, move |event, _window, app| {
+            if let Ok(mut boards) = arm_state.lock() {
+                boards.arm_card_drag(
+                    workspace_id,
+                    dragged.clone(),
+                    lane,
+                    card_drag_point(event.position),
+                );
+            }
+            app.stop_propagation();
+        })
         .on_click(move |_event, window, _app| {
             if let Ok(mut panels) = panels.lock() {
                 panels.open(workspace_id, selected.clone(), lane);
             }
             window.refresh();
+        });
+    let card_element = if draggable {
+        card_element.on_drag(BeadsCardDrag, move |_, _, window, app| {
+            if let Ok(mut boards) = start_state.lock() {
+                boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
+            }
+            window.refresh();
+            app.new(|_| BeadsCardDragMarker)
         })
+    } else {
+        card_element
+    };
+    card_element
         .flex()
         .flex_col()
         .gap(px(2.0))
@@ -1336,6 +1525,7 @@ struct CardContext<'a> {
     state: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     lane: u8,
+    board_rect: Rect,
     colors: &'a BeadsBoardColors,
     metrics: Metrics,
 }
@@ -1574,6 +1764,83 @@ mod tests {
         let mut visible = boards.visible();
         visible.sort_by_key(|(workspace_id, _)| workspace_id.to_string());
         visible
+    }
+
+    fn drag_item() -> BeadsBoardItem {
+        BeadsBoardItem {
+            id: "scribe-drag.1".into(),
+            title: "Track the card drag".into(),
+            priority: 1,
+            blocker_ids: Vec::new(),
+            parent_epic_name: Some("Beads card detail".into()),
+        }
+    }
+
+    fn drag_point(x: f32, y: f32) -> CardDragPoint {
+        CardDragPoint { x, y }
+    }
+
+    fn drag_board() -> Rect {
+        Rect { x: 100.0, y: 50.0, width: 500.0, height: 200.0 }
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Beads card drag tracking]]
+    #[test]
+    fn card_drag_arms_only_past_the_native_two_pixel_boundary() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        assert!(boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0)));
+        assert!(!boards.start_card_drag(drag_point(152.0, 100.0), drag_board()));
+        assert!(boards.card_drag().is_none(), "exactly 2px must remain a click");
+        assert!(!boards.end_card_drag(), "a within-threshold release swallowed the click");
+
+        assert!(boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0)));
+        assert!(boards.start_card_drag(drag_point(152.001, 100.0), drag_board()));
+        assert!(boards.card_drag().is_some(), "travel past 2px did not lift the card");
+    }
+
+    #[test]
+    fn only_backlog_ready_and_in_progress_cards_can_lift() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        for lane in 0..=4 {
+            assert_eq!(
+                boards.arm_card_drag(workspace, drag_item(), lane, drag_point(150.0, 100.0)),
+                lane <= 2,
+                "lane {lane} source restriction"
+            );
+            boards.end_card_drag();
+        }
+    }
+
+    #[test]
+    fn card_drag_tracks_source_pointer_and_lane_or_no_target() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let item = drag_item();
+        boards.arm_card_drag(workspace, item.clone(), 0, drag_point(150.0, 100.0));
+        assert!(boards.start_card_drag(drag_point(160.0, 100.0), drag_board()));
+
+        let initial_drag = boards.card_drag().expect("active card drag");
+        assert_eq!(initial_drag.workspace_id, workspace);
+        assert_eq!(initial_drag.source, item);
+        assert_eq!(initial_drag.source_lane, 0);
+        assert_eq!(initial_drag.pointer, drag_point(160.0, 100.0));
+        assert_eq!(initial_drag.hovered_lane, Some(0));
+
+        assert!(boards.update_card_drag(drag_point(210.0, 120.0), drag_board()));
+        let moved_drag = boards.card_drag().expect("updated card drag");
+        assert_eq!(moved_drag.pointer, drag_point(210.0, 120.0));
+        assert_eq!(moved_drag.hovered_lane, Some(1));
+
+        assert!(boards.update_card_drag(drag_point(600.0, 120.0), drag_board()));
+        assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), None);
+        assert!(boards.update_card_drag(drag_point(300.0, 250.0), drag_board()));
+        assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), None);
+        assert!(boards.end_card_drag());
+        assert!(boards.card_drag().is_none());
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]

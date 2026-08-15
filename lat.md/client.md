@@ -1022,6 +1022,17 @@ terminal; clicking pins the same fixed-height board above the terminal across
 that workspace's tabs. A focused pinned board refreshes every 60 seconds;
 hidden boards do not poll.
 
+Backlog, Ready, and In-progress cards register GPUI's native drag arm; Blocked
+and Done cards do not. The pinned GPUI boundary is strict travel beyond 2px,
+so a release at or inside it remains the existing click that opens the panel.
+Once armed, the board stores the workspace, source card and lane, current
+window pointer, and hovered lane. Native drag moves keep updating even outside
+the card; the five-lane lookup shares the board's 8px horizontal inset and
+returns no target outside the strip. Each move is fixed arithmetic plus one
+mutex mutation, with no request, IPC, or subprocess. This slice paints only an
+empty native marker; ghost, drop behavior, writes, and optimistic placement
+belong to later drag stages.
+
 When `Welcome.beads_detail` is enabled, clicking a card opens a read-only panel
 immediately and parks one workspace-scoped detail request. The panel remains
 under its source lane, with a 12px workspace inset and a 4px gap below the
