@@ -146,7 +146,8 @@ Acceptance criteria:
   `--if-assignee` / `--if-status` guards captured from the fresh detail
   read, so a race with another actor (this repo's own agents claim beads
   concurrently) fails cleanly as a surfaced "someone else won" notice;
-  text-field edits are last-writer-wins in v1.
+  text-field edits are last-writer-wins in v1. The `beads_write` capability
+  stays off on bd 1.1.0 because that release lacks both guard flags.
 
 ### Story 3 — Move a card between queues by dragging
 
@@ -408,14 +409,17 @@ veto.
   every board on that root, and an open panel re-fetches detail.
 - Writes get their own deadline (15s, vs 5s reads) because bd writes hit
   Dolt commit + JSONL export; on timeout the client converges via forced
-  refresh + detail re-read instead of trusting the failure.
-- Concurrency guards on claim/status/close using `--if-status` /
-  `--if-assignee` captured from the fresh detail read; bd exit 13 maps to a
-  typed precondition-failed variant surfaced as a race; text-field edits are
-  last-writer-wins in v1.
-- bd version floor 1.1.0 (the harness version); guard flags must be verified
-  reject-not-ignore; an older bd surfaces "bd too old" rather than silently
-  dropping guards.
+  refresh + detail re-read instead of trusting the failure. The bd 1.1.0
+  probe's slowest of 20 timed write attempts was 972ms.
+- Concurrency guards on claim/status/close require `--if-status` and
+  `--if-assignee` captured from the fresh detail read. bd 1.1.0 has neither
+  flag: each is rejected as an unknown flag with exit 1, not exit 13. The
+  server must classify that contract as write-incompatible, not as a race;
+  text-field edits remain last-writer-wins once writes are enabled.
+- bd 1.1.0 is the detail-read floor, not the write floor. The write floor is
+  the first harness-verified release whose update command exposes both guard
+  flags and whose mismatch exit contract is measured. Until then the panel
+  stays read-only instead of silently dropping guards.
 - The inline editor is new client machinery, the feature's largest work
   item: a focusable editor entity implementing `EntityInputHandler` with a
   key-routing carve-out so keystrokes never reach the PTY. Esc precedence:
@@ -436,9 +440,10 @@ veto.
   (write → `bd show` round-trip for at least one verb per family); the
   visual image has no bd and injects snapshots, so it carries geometry/ghost
   assertions only.
-- Detail read is `bd show --json --include-comments` (plus
-  `--include-dependents` if default output lacks dependent ids — verify),
-  with server-side caps (latest N comments, per-field byte caps) and a
+- Detail read is
+  `bd show --json --include-comments --include-dependents`: default output
+  has `dependent_count` but no dependent ids, so the second flag is required.
+  The server applies caps (latest N comments, per-field byte caps) and a
   visible hidden-count when truncated; detail supersedes snapshot
   truncation.
 - Panel data: fetch on open, refresh after own writes, no poll. Loading
@@ -459,6 +464,36 @@ veto.
 - Non-Goals additions: keyboard-driven panel operation (Esc only, key
   routing still specified), open-by-id/board search, reopen from the panel
   (a Done issue's panel shows no write verbs).
+
+### bd 1.1.0 contract probe
+
+The 2026-08-15 Docker functional probe measured the pinned CLI without
+touching the host tracker and found one write-blocking contract mismatch.
+
+`bd update --help` lists neither `--if-status` nor `--if-assignee`.
+Mismatched attempts with each flag returned exit 1 and `unknown flag`, not
+exit 13. The issue JSON before and after both attempts was identical, so bd
+rejects rather than ignores them, but 1.1.0 cannot provide the required
+guarded writes or the planned precondition-failed mapping.
+
+Default `bd show --json` returns `dependent_count` and `comment_count` but
+neither collection. `--include-dependents` adds `dependents`, whose elements
+contain `id`, `title`, `status`, `priority`, `issue_type`, `created_at`,
+`updated_at`, and `dependency_type`. Dependent-chip ids therefore require
+that flag.
+
+`bd comments add --json` returns one object with `author`, nanosecond RFC3339
+`created_at`, `id`, `issue_id`, `schema_version: 1`, and `text`.
+`bd comments <id> --json` returns an array whose elements have `id`,
+`issue_id`, `author`, `text`, and second-resolution `created_at`.
+`bd show --json --include-comments` embeds the same element shape in the
+issue's `comments` array; observed order was oldest first.
+
+The 20 timed write attempts took, in order, 504, 517, 490, 480, 477, 459,
+972, 622, 459, 485, 558, 513, 448, 421, 483, 429, 663, 582, 67, and 68ms.
+The first 18 succeeded across field, label, status, comment, claim, close,
+and reopen verbs. The last two were the rejected guard attempts. All were
+below 15,000ms; maximum was 972ms.
 
 ### Non-Blocking Observations
 
@@ -522,12 +557,12 @@ native DnD are cheaper and already precedented).
   messages, not changes to the snapshot payload; documented per
   constitution 7.
 - `crates/scribe-server/src/beads_board.rs` — detail fetch
-  (`bd show --json --include-comments`, plus `--include-dependents` if
-  default output lacks dependent ids), server-side caps, the write verb set
-  with guards, a separate 15s write deadline, exit-13 mapping to a typed
-  precondition-failed, per-root write generation fence, post-write forced
-  refresh, and a bd contract probe surfacing a typed bd-too-old error
-  instead of silently degraded guards (version floor 1.1.0).
+  (`bd show --json --include-comments --include-dependents`), server-side
+  caps, the write verb set with guards, a separate 15s write deadline,
+  mismatch-exit mapping verified against the eventual write-floor release,
+  per-root write generation fence, post-write forced refresh, and a bd
+  contract probe that keeps writes unavailable when either guard flag is
+  absent. bd 1.1.0 remains sufficient for detail reads only.
 - `crates/scribe-server/src/ipc_server.rs` — handlers for detail and write,
   gated to local owning controller connections whose window shows the root
   (precedent: `DismissCiRun`), post-write snapshot push to every board on
@@ -601,12 +636,13 @@ No persistent storage changes and no migrations. New wire/in-memory types:
 ## Testing Strategy
 
 - Server unit: verb→argv composition including guards, labels, and the
-  clear-defer status flag; exit-13 mapping; non-zero-exit and timeout
-  failure paths preserving last-good; write deadline distinct from read
-  deadline; generation fence discards a stale refresh; detail caps, hidden
-  counts, and derived-queue field; detail parsing across bd's three
-  envelope shapes; write gating (remote/viewer writes rejected); bd-too-old
-  probe.
+  clear-defer status flag; mismatch-exit mapping for the verified write
+  floor; bd 1.1.0's unknown-guard exit 1 maps to an unsupported write
+  contract; non-zero-exit and timeout failure paths preserve last-good;
+  write deadline stays distinct from the read deadline; generation fence
+  discards a stale refresh; detail caps, hidden counts, and derived-queue
+  field; detail parsing across bd's three envelope shapes; write gating
+  rejects remote/viewer writes.
 - Client unit: panel build from a detail fixture (empty-field row omission,
   closed-issue state row with no write verbs, blocked upstream nodes,
   comment clamp with expand-in-place, hidden-count line, viewer read-only
@@ -620,10 +656,12 @@ No persistent storage changes and no migrations. New wire/in-memory types:
   height, 0.8×/1.6× text scale, 400px floor, 70% max height with internal
   scroll); panel re-anchor on lane change; per-workspace keying.
 - Protocol: round-trip tests for every new message.
-- Functional e2e (real bd, `--network none`): open panel from a click; one
-  write per verb family proven by re-running `bd show` (mandatory, not
-  optional); claim/close/undo (undo restores open within the 5s window);
-  comment; a seeded guard race surfacing precondition-failed; drag
+- Functional e2e (real bd, `--network none`): bd 1.1.0 keeps write controls
+  inert with the measured unsupported-contract result. After the image moves
+  to a verified guard-capable write floor: open panel from a click; one write
+  per verb family proven by re-running `bd show` (mandatory, not optional);
+  claim/close/undo (undo restores open within the 5s window); comment; a
+  seeded guard race surfacing precondition-failed; drag
   Ready→In progress recording the claim in bd, drag→Done recording close
   plus the board-side undo, drag Backlog→Ready clearing a seeded defer; a
   seeded blocked issue set to open landing in Blocked with the
@@ -651,9 +689,13 @@ No persistent storage changes and no migrations. New wire/in-memory types:
   registering a minimal `ElementInputHandler` for the panel in the main
   window before slice (b) commits to layout.
 - bd write latency (Dolt commit + export) vs the deadline. Mitigation: 15s
-  write deadline, converge-on-timeout (forced refresh + detail re-read);
-  the bd contract spike measures real write latency in the func fixture
-  (N=20 writes, all under the deadline) to validate the number.
+  write deadline and converge-on-timeout (forced refresh + detail re-read).
+  The bd 1.1.0 contract probe measured 20 attempts below the deadline, with
+  an observed maximum of 972ms.
+- bd 1.1.0 lacks both conditional update flags, so it cannot safely serve
+  concurrency-sensitive writes. Mitigation: keep `beads_write` unavailable
+  until the functional image pins and verifies a guard-capable release;
+  detail reads and the read-only panel remain independently shippable.
 - Ghost/clipping behavior of GPUI DnD inside a region-clipped strip.
   Mitigation: titlebar precedent plus a slice-(c) spike before polishing.
 - Optimistic-revert flicker from stale refreshes. Mitigation: the
@@ -669,10 +711,11 @@ Order is expressed as dependency edges; no step codes. Client items depend
 on protocol types and fixtures, not on server internals, so they
 parallelize with server work inside each slice.
 
-- First node (blocks the write design, runs during slice a): the bd 1.1.0
-  contract spike — verify guard flags reject-not-ignore, exit-13 behavior,
-  dependents presence in `bd show --json`, comment shapes, and measured
-  write latency against the 15s deadline.
+- Completed first node: the bd 1.1.0 contract spike proved unknown guards
+  reject with exit 1 and preserve state, dependent ids need
+  `--include-dependents`, comment shapes match the probe record, and all 20
+  timed attempts stayed below 15s. This unblocks slice a but leaves slice b
+  dependent on selecting and probing a guard-capable bd write floor.
 - Slice a (read): detail protocol messages + `beads_detail` capability →
   { server detail fetch/caps/derived-queue/gating ∥ read-only panel entity
   split into: panel layout + palette; anchor/clamp/max-height/re-anchor;
@@ -680,7 +723,8 @@ parallelize with server work inside each slice.
   seeded writable bd fixture + visual detail fixture set → visual panel
   contract + functional detail test → slice-a lat.md update + lat check.
   In parallel: the editor input-handler spike.
-- Slice b (write): write protocol messages + `beads_write` capability →
+- Slice b (write, after the guard-capable bd floor is pinned): write protocol
+  messages + `beads_write` capability →
   server write verbs (guards, clear-defer, deadline, fence, push, logging,
   bd-too-old probe) ∥ editor entity + key routing (from the spike) →
   edit surfaces as separate items: text-field editors; priority + type pick
