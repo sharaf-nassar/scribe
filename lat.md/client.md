@@ -1111,30 +1111,66 @@ terminal; clicking pins the same fixed-height board above the terminal across
 that workspace's tabs. A focused pinned board refreshes every 60 seconds;
 hidden boards do not poll.
 
-Backlog, Ready, and In-progress cards register GPUI's native drag arm; Blocked
-and Done cards do not. The pinned GPUI boundary is strict travel beyond 2px,
-so a release at or inside it remains the existing click that opens the panel.
-Once armed, the board stores the workspace, source card and lane, current
-window pointer, and hovered lane. Native drag moves keep updating even outside
-the card; the five-lane lookup shares the board's 8px horizontal inset and
-returns no target outside the strip. Each move is fixed arithmetic plus one
-mutex mutation, with no request, IPC, or subprocess.
+The [Story 3 drag contract](../specs/024-beads-card-detail.md#story-3--move-a-card-between-queues-by-dragging)
+allows Backlog, Ready, and In-progress sources; Blocked and Done never register
+the native arm. [[crates/scribe-client/src/beads_board.rs#BeadsBoards#arm_card_drag]]
+captures the workspace, source card, lane, and press point in
+[[crates/scribe-client/src/beads_board.rs#CardDragState]].
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#start_card_drag]] promotes
+it only when Euclidean travel is strictly greater than 2px. A release at or
+inside 2px stays a card click.
 
-GPUI carries a full-size source-card ghost in its native window drag root, so
-the ghost paints above cards and beyond lane clipping without a second pointer
-tracker. Hovering Backlog or Blocked reduces only that lane's wash to one third
-as the no-drop cue. Releases over Backlog, Blocked, the source lane, or outside
-the board snap back without a write. Ready clears defer with status `open`, In
-progress claims, and Done closes with the panel's same five-second undo.
+[[crates/scribe-client/src/beads_board.rs#issue]] registers GPUI's `on_drag`
+and builds [[crates/scribe-client/src/beads_board.rs#BeadsCardDragGhost]] in the
+native window drag root. GPUI keeps the cursor offset captured on the
+threshold-crossing move, so the source-sized ghost follows beyond card and lane
+clipping without another pointer tracker.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#update_card_drag]] stores
+the window pointer and target from
+[[crates/scribe-client/src/beads_board.rs#card_drag_lane]], whose five equal
+lanes share the board's 8px inset and exclude the right and bottom edges.
 
-Accepted cards move between the existing snapshot queues immediately, tagged
-until their write result supplies its generation. Failure moves the card back;
-the next authoritative snapshot replaces the overlay. If an applied write
-classifies into neither its source nor requested lane, the server's lane wins
-and a five-second notice names that result. The armed press and active drag
-consume all three terminal mouse-reporting funnels, the source hover cannot
-expire while lifted, and the grid clears either card or resize state on release
-inside or outside its bounds.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#expire_hover]] exempts the
+source workspace while its card is lifted, and
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#drag_target]] exposes a
+target only to that workspace. From the armed press through release,
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#blocks_pty_mouse]] makes
+[[crates/scribe-client/src/main.rs#TerminalView#card_drag_owns_pointer]] consume
+terminal press, motion, and release routing.
+[[crates/scribe-client/src/main.rs#TerminalView#release_board]] then clears the
+gesture even when the pointer leaves the board.
+
+Release passes the completed state to
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#queue_card_drop]]. Backlog,
+Blocked, the source lane, and no target reject without entering the write
+queue. Ready queues guarded `SetStatus { status: "open", clear_defer: true }`,
+In progress queues native `Claim`, and Done queues native `CloseIssue` through
+the fence in [[client#Client#Beads Board CLI Data Source#Guarded issue writes]].
+An applied close reaches
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#finish_write]] and allows
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#undo]] to queue guarded
+`UndoClose` for five seconds. At the deadline it writes nothing.
+
+After the queue accepts, release calls
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#apply_card_drop]] to move
+the snapshot card and record an overlay with no generation. A matching applied
+result gives it a generation through
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#finish_card_drop]];
+failure calls [[crates/scribe-client/src/beads_board.rs#BeadsBoards#cancel_card_drop]]
+and restores the source lane. The next
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#update]] replaces every
+overlay with the authoritative snapshot, including a fence-stale source-lane
+result. A third classifier lane returns an outcome through
+[[crates/scribe-client/src/main.rs#dispatch_server_message]] and
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#classifier_won]] paints
+the five-second notice.
+
+[[test#Test Harness#GPUI Client Headless Suites#Beads card drag tracking]] pins
+the state and result transitions. The
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation|real-bd run]]
+proves the guarded verbs and PTY boundary, while the
+[Docker visual run](../tests/e2e/visual/beads-board.sh) checks the native ghost
+within 3px of the pointer offset at each synchronized waypoint.
 
 When `Welcome.beads_detail` is enabled,
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] parks one

@@ -1660,18 +1660,14 @@ rendering without touching the host's Beads database.
 
 #### Card drag writes and pointer isolation
 
-The real-board GPUI path proves accepted and rejected card drops against seeded `bd` state while preserving the terminal pane's exclusive pointer boundary.
+The network-none real-bd GPUI run proves the production drag contract and terminal-pointer boundary through the shipped client.
 
-Ready to In progress must use native claim and retain actor and lease fields.
-Done must use native close and paint a five-second board-side Undo that restores
-open state without a close timestamp. Backlog to Ready clears a seeded defer;
-an issue secretly blocked after the painted snapshot must land in Blocked and
-paint the classifier-won notice after the authoritative refresh.
-
-Same-lane and derived Backlog drops send no write and leave `bd` unchanged.
-The client remains the `SingleController` owner throughout: xdotool enables
-1003/1006 reporting in its visible pane, and the passive wire tap must record
-none of the card drag's press, motion, or release as SGR `KeyInput` frames.
+[The script](../tests/e2e/func/beads-board.sh) checks native claim fields,
+close and board-side Undo, defer clearing, classifier-won repaint, and zero
+writes for rejected or same-lane drops. It keeps the `SingleController` owner,
+proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
+during each gesture. The behavior belongs to
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
 #### Guarded Beads Write Contract
 
@@ -3727,28 +3723,17 @@ Pinning it here is what keeps the board a region citizen. The band it replaced s
 
 ### Beads card drag tracking
 
-Unit coverage pins card-drag tracking and presentation to GPUI's native threshold and the board's lane geometry.
+Unit and Docker visual coverage pin the client drag contract at its state-machine and rendered boundaries.
 
-Exactly 2px remains click-eligible while 2.001px activates. Backlog, Ready,
-and In-progress arm; Blocked and Done do not. Active state retains the source
-card and lane, updates the pointer and hovered lane, and reports no target at
-the board's right or bottom boundary. Further cases require the ghost only
-during an active lift at the source card's exact size, reduce only hovered
-Backlog and Blocked washes, gate PTY pointer routing from press through
-release, and hold a hover-opened board until that release.
-
-The Docker Beads-board visual moves the native ghost over another card, over a
-rejected lane, and below the board clip. At every synchronized waypoint,
-ImageMagick `%X/%Y` bounds must place it within 3px of the threshold-crossing
-pointer offset while terminal rows stay unchanged. Pixel assertions also
-require the over-card repaint, no-drop wash, and hover overlay.
-
-Drop coverage runs every Backlog, Ready, and In-progress source against all
-five targets. It requires rejected and same-lane drops to queue nothing, and
-maps accepted targets to clear-defer open, native claim, or native close. The
-overlay cases pin its uncommitted and committed generation states, successful
-snapshot settlement, failure and fence-stale rollback, and classifier-won
-notice routing.
+Tests beside this section's code mention cover the strict threshold, source
+and target matrices, workspace hover and PTY ownership, guarded queue fences,
+generation-tagged overlays, rollback, classifier outcomes, and the five-second
+Undo deadline. [The visual script](../tests/e2e/visual/beads-board.sh) checks
+the native ghost over a card, a rejected lane, and outside the board while
+terminal rows remain fixed. The as-built rules and production links live in
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
+the real-bd receipt is
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
 
 ### Region reports every tab and which is active
 
