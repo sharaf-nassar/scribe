@@ -262,6 +262,7 @@ fn apply_terminal_key(
         | "terminal.codex_code_integration"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll"
+        | "terminal.focus_follows_mouse"
         | "terminal.keyboard_protocol_enhanced"
         | "terminal.paste_confirmation"
         | "terminal.images.enabled"
@@ -373,6 +374,10 @@ fn apply_terminal_behavior_key(
         "terminal.natural_scroll" => {
             config.terminal.scroll.natural_scroll =
                 value.as_bool().ok_or("natural_scroll must be a boolean")?;
+        }
+        "terminal.focus_follows_mouse" => {
+            config.terminal.focus.focus_follows_mouse =
+                value.as_bool().ok_or("focus_follows_mouse must be a boolean")?;
         }
         "terminal.keyboard_protocol_enhanced" => {
             config.terminal.keyboard_protocol_enhanced =
@@ -1005,6 +1010,20 @@ mod tests {
         .expect("codex toggle should apply");
 
         assert!(!config.terminal.ai_integration.codex_code.enabled());
+    }
+
+    #[test]
+    fn applies_focus_follows_mouse_toggle() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+
+        apply_config_key(
+            &mut config,
+            "terminal.focus_follows_mouse",
+            &serde_json::Value::Bool(false),
+        )
+        .expect("focus-follows-mouse toggle should apply");
+
+        assert!(!config.terminal.focus.focus_follows_mouse);
     }
 
     #[test]

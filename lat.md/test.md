@@ -2314,11 +2314,22 @@ Both halves were invisible to every headless test. The crate contained no scroll
 
 The third oracle is what makes the run end-to-end. Each tracking phase starts a real `cat -v` in the pane behind the DEC modes under test and a non-canonical, non-echoing line discipline, so every byte the client forwards is printed straight back onto the pane as visible text (`^ plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and every phase needs a screenshot diff *and* a recorded `Resize` before it passes.
 
-Two closing phases assert that the wheel is a *pointer* gesture rather than a focus-relative one, which is how it was wrong: every wheel event resolved against the focused pane, so a split window could only be scrolled where the keyboard already was. Phase 10 splits the window, then wheels the top-left corner and the bottom-right one and requires the two `terminal scrollback moved` lines to name **different** sessions — a single reported session is exactly what a focus-relative wheel produces, so the pair is the assertion and neither half alone would fail. The top-left corner must name the rig's own `SESSION`, and `focused pane moved` must not appear at all between the two: scrolling a pane may not quietly take the keyboard away from its neighbour.
+Phase 10 covers default-on focus-follows-mouse. One button-free crossing must
+add exactly one `focused pane moved` line and zero `KeyInput` frames. Motion
+inside the same pane, over chrome, outside the window, and across a split with
+the button held must add none; the first free move after release focuses once.
 
-Phase 12 covers the other scroll gesture. The split leaves the original pane on the left, so a press nine pixels inside the window's centre line lands in that unfocused pane's overlay scrollbar — clear of the divider's own 4 px band — and must *not* move the focus. The contrast is what makes it an assertion rather than a coincidence: the same press in the middle of that same pane is an ordinary click and must focus it. A miss on the hit zone focuses the pane and fails the first check, so the phase cannot pass by aiming at nothing.
+Phase 11 rewrites `terminal.focus_follows_mouse = false` under the running
+client and waits for its watcher. Hover then stays inert, wheels in opposite
+corners still name different sessions, and a normal click still focuses. This
+pins the opt-out, live reload, pointer-relative wheel, and unchanged click path
+in one state transition.
 
-Phase 11 covers the background case. A second X client (`xmessage`, parked in the corner the wheel is not aimed at) takes the activation, and the phase refuses to run unless `xdotool getactivewindow` confirms Scribe actually lost it — openbox is click-to-focus, so parking the pointer over Scribe cannot hand it back, and a phase that silently kept the activation would prove nothing. The wheel must then still move the pane under the pointer, and Scribe must still be in the background afterwards.
+Phase 12 hands OS activation to `xmessage`, then moves across Scribe's panes.
+Internal pane focus must change while `_NET_ACTIVE_WINDOW` stays on `xmessage`;
+the wheel must still move the pointed-at pane without raising Scribe. Phase 13
+holds a scrollbar press while crossing the split and requires focus to stay
+put until the first button-free move after release.
 
 `ctrl+-` must log `level=-1`, repaint the grid, and publish a smaller cell box with *more* columns; two `ctrl+=` presses must reach `level=1` with a bigger cell box and fewer columns than both the zoomed-out grid and the baseline. The column assertions are the point: a client that rescales glyphs inside a frozen `cols`x`rows` box also repaints and also emits a `Resize`, so pixels and frame counts alone cannot tell a real zoom from a cosmetic one. `ctrl+0` must return `level=0`, republish the pre-zoom geometry field for field, and leave a frame within a few hundred pixels of the pre-zoom capture — the seeded rows are short enough that no zoom level wraps them, so a restored grid is a restored image.
 

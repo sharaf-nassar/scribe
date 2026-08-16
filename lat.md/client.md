@@ -2307,6 +2307,24 @@ Click sequencing is tracked by , which records each press time and position to c
 
 OSC 133 `click_events=1` prompt click-to-move is evaluated on mouse release through , only when the press/release left an empty selection. Dragging the live prompt row therefore keeps normal text selection, while a plain click can still send arrow-key movement.
 
+#### Focus follows mouse
+
+Button-free motion into a different painted terminal pane focuses it through the normal session activation path; same-pane, chrome, outside-window, disabled, and pressed motion do nothing.
+
+[[crates/scribe-client/src/main.rs#TerminalView#move_over_grid]] runs the hover
+decision after active board, divider, and scrollbar drags, then resolves the
+target through [[crates/scribe-client/src/main.rs#TerminalView#pane_at]].
+[[crates/scribe-client/src/main.rs#hover_focus_target]] accepts only an enabled,
+button-free move onto a session other than the focused one. The target then
+goes through [[crates/scribe-client/src/main.rs#TerminalView#activate_session_tab]],
+the same path as pointer tab activation.
+
+The focus move returns before application mouse reporting, selection, link,
+scroll, or click handling, so it emits no synthetic pointer input. It changes
+only Scribe's internal pane focus and never requests OS window activation.
+`terminal.focus_follows_mouse` defaults ON and is read from the live config;
+turning it off restores click-to-focus without changing click behavior.
+
 ### Drag And Drop
 
 Dropped files and directories are pasted into the focused shell using shell-aware quoting, so GUI drag-and-drop becomes a safe path insertion workflow instead of raw bytes.
@@ -2321,7 +2339,7 @@ When a terminal application enables mouse mode, button, motion, and scroll event
 
 [[crates/scribe-client/src/main.rs#TerminalView#attach_wheel]] hangs the wheel off each pane element rather than off the shared grid band, so GPUI's own hit test decides which terminal a scroll belongs to.
 
-The wheel is a pointer gesture: hovering a pane scrolls it whether or not it holds focus, and whether or not the window is the active one — the behaviour every other tiling application has, and the reason a wheel must never move the focus to make itself work. [[crates/scribe-client/src/main.rs#TerminalView#scroll_pane]] therefore takes the hovered session rather than reading `active_session`, and all three wheel consumers are addressed by it: [[crates/scribe-client/src/main.rs#TerminalView#session_mouse_modes]] reads that pane's DEC modes, [[crates/scribe-client/src/main.rs#TerminalView#send_pty_bytes_to]] addresses its PTY, and [[crates/scribe-client/src/main.rs#TerminalView#scroll_session]] moves its viewport and pulses its scrollbar. The focused-pane wrappers ([[crates/scribe-client/src/main.rs#TerminalView#send_pty_bytes]], [[crates/scribe-client/src/main.rs#TerminalView#scroll_terminal]]) remain for the scroll chords, which are keyboard gestures and do belong to the focused pane.
+The wheel resolves from the pointed-at pane whether or not the window is active. With focus-follows-mouse disabled, this proves wheel routing stays independent of keyboard focus; with it enabled, ordinary pointer travel may already have focused that pane, but the wheel handler itself never changes focus. [[crates/scribe-client/src/main.rs#TerminalView#scroll_pane]] takes the hovered session rather than reading `active_session`, and all three wheel consumers are addressed by it: [[crates/scribe-client/src/main.rs#TerminalView#session_mouse_modes]] reads that pane's DEC modes, [[crates/scribe-client/src/main.rs#TerminalView#send_pty_bytes_to]] addresses its PTY, and [[crates/scribe-client/src/main.rs#TerminalView#scroll_session]] moves its viewport and pulses its scrollbar. The focused-pane wrappers ([[crates/scribe-client/src/main.rs#TerminalView#send_pty_bytes]], [[crates/scribe-client/src/main.rs#TerminalView#scroll_terminal]]) remain for scroll chords.
 
 A pane still waiting on `SessionCreated` gets no listener at all — there is nothing to scroll yet.
 
@@ -2337,7 +2355,12 @@ That split is what divides the pointer surface in two. Gestures a *click* preced
 
 [[crates/scribe-client/src/main.rs#TerminalView#press_scrollbar]] resolves its pane from the pointer and is ordered *ahead* of [[crates/scribe-client/src/main.rs#TerminalView#press_focuses_pane]] in [[crates/scribe-client/src/main.rs#TerminalView#press_grid]].
 
-Dragging a thumb is scrolling, so it obeys the same rule the wheel does: a pane you can see is a pane you can scroll, without a focus-stealing click first. Behind the focusing click it would have cost two clicks on every unfocused pane, and the priority comment on `press_grid` had already claimed the scrollbar went first — the focusing click was inserted ahead of it without that being revisited. [[crates/scribe-client/src/main.rs#TerminalView#update_scrollbar_hover]] sweeps every pane rather than the focused one for the same reason, which is also what clears the hover on the pane the pointer just left.
+Dragging a thumb is scrolling, so the press is claimed before click-to-focus and
+the held gesture never switches panes. Button-free travel over that pane may
+focus it first when focus-follows-mouse is enabled. The distinction keeps
+pressed scrollbar motion stable without making the scrollbar a hole in the
+hover-focus surface. [[crates/scribe-client/src/main.rs#TerminalView#update_scrollbar_hover]]
+sweeps every pane, which also clears the hover on the pane the pointer left.
 
 [[crates/scribe-client/src/main.rs#TerminalView#scrollbar_layout]] takes the named pane's own rect. It had always accepted a `session_id` and then measured the focused pane, which was invisible while every caller passed the focused session and wrong the moment one did not.
 

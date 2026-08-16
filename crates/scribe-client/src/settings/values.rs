@@ -134,6 +134,7 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "terminal.copy_on_select" => Value::Bool(t.clipboard.copy_on_select),
         "terminal.claude_copy_cleanup" => Value::Bool(t.clipboard.claude_copy_cleanup),
         "terminal.natural_scroll" => Value::Bool(t.scroll.natural_scroll),
+        "terminal.focus_follows_mouse" => Value::Bool(t.focus.focus_follows_mouse),
         "terminal.keyboard_protocol_enhanced" => Value::Bool(t.keyboard_protocol_enhanced),
         "terminal.paste_confirmation" => Value::Bool(t.paste_confirmation),
         "terminal.images.enabled" => Value::Bool(t.images.enabled),
@@ -245,5 +246,14 @@ mod tests {
         assert_eq!(current_value(&config, "workspaces.badge_colors.1"), "#abcdef");
         assert!(current_value(&config, "workspaces.badge_colors.2").is_null());
         assert!(current_value(&config, "workspaces.badge_colors.nope").is_null());
+    }
+
+    #[test]
+    fn reads_focus_follows_mouse_value() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), true);
+
+        config.terminal.focus.focus_follows_mouse = false;
+        assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), false);
     }
 }

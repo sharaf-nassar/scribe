@@ -103,7 +103,13 @@ The Colors page also exposes five prompt bar color overrides labeled First Row, 
 
 ### Terminal Keys
 
-Terminal page general section — scrollback lines, natural scrolling, copy on select, enhanced keyboard protocol, the paste-confirmation toggle, the persist-environment toggle, and the OSC 52 Clipboard policy subsection.
+Terminal page general section — scrollback lines, natural scrolling, copy on select, focus follows mouse, enhanced keyboard protocol, paste confirmation, environment persistence, and the OSC 52 Clipboard policy subsection.
+
+The "Focus follows mouse" toggle writes the flat
+`terminal.focus_follows_mouse` boolean through
+[[crates/scribe-client/src/settings/apply.rs#apply_config_key]]. It defaults ON,
+reads back through the settings value model, and applies live through the
+running client's existing config watcher.
 
 AI integration settings moved to the AI page. The paste-confirmation toggle is keyed `terminal.paste_confirmation`, defaults OFF, and routes through  like the other terminal bool toggles. It gates a multi-line or control-character paste client-side — only when the focused app has not enabled bracketed paste — per , with no server round-trip.
 

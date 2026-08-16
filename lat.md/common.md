@@ -86,10 +86,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback,
-copy-on-select, the enhanced keyboard-protocol opt-out, AI integration, status
-bar stats, prompt bar, scroll pin, paste confirmation, OSC 52 clipboard policy,
-smart selection, environment persistence, and terminal images.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups terminal behavior,
+input, chrome, AI integration, clipboard policy, environment persistence, and
+terminal images.
 
 `paste_confirmation` (bool, default `false`) gates a multi-line or control-character paste behind a confirmation dialog before it reaches the PTY, but only when the focused application has not enabled bracketed paste (spec 011); see .
 
@@ -100,6 +99,14 @@ smart selection, environment persistence, and terminal images.
 Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (`Option<f32>`, 8–32, unset by default), `prompt_bar_position` (: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon. Unset, the strip follows `appearance.font_size` so its text matches the terminal text beside it; a value pins an explicit size and is clamped to 8–32 when written through the settings stepper.
 
  independently toggles CPU, memory, GPU, and network display.  wraps a single `enabled` flag for shell prompt marks.  maps an  to the matching integration toggle.
+
+`focus_follows_mouse` is a flat `[terminal]` boolean that defaults to `true`.
+The client reads it from the live config on each pointer decision, so the file
+watcher and settings save path change running windows without a restart.
+
+#### Focus follows mouse defaults on and persists an opt-out
+
+Verifies the absent key enables hover focus and an explicit `false` survives the same TOML serialization round trip used by [[crates/scribe-common/src/config.rs#save_config]].
 
 #### Prompt bar font size follows the terminal
 

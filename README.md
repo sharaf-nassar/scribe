@@ -118,6 +118,7 @@ cursor_shape = "block"
 [terminal]
 scrollback_lines = 10000
 copy_on_select = true
+focus_follows_mouse = true
 claude_code_integration = true
 keyboard_protocol_enhanced = true
 
@@ -129,6 +130,12 @@ roots = ["~/work", "~/projects"]
 ```
 
 Open the graphical settings editor with `Ctrl+,` to modify configuration without editing the file directly.
+
+`terminal.focus_follows_mouse` defaults to `true`. Button-free pointer motion
+into a different painted pane moves terminal focus there without clicking,
+raising the window, or sending mouse input to the application. Turn off the
+Terminal page's **Focus follows mouse** toggle to keep click-to-focus only;
+changes apply to running windows.
 
 ### Terminal images
 

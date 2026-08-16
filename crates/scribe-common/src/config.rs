@@ -965,6 +965,21 @@ impl Default for TerminalPromptBarConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalFocusConfig {
+    /// Focus a painted terminal pane when the pointer enters it without a
+    /// button held. Enabled by default; click-to-focus remains unchanged when
+    /// disabled.
+    #[serde(default = "default_true")]
+    pub focus_follows_mouse: bool,
+}
+
+impl Default for TerminalFocusConfig {
+    fn default() -> Self {
+        Self { focus_follows_mouse: true }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalEnvPersistenceConfig {
     /// Persist exported terminal environment variables across Scribe sessions
@@ -1095,6 +1110,8 @@ pub struct TerminalConfig {
     pub env_persistence: TerminalEnvPersistenceConfig,
     #[serde(default, flatten)]
     pub prompt_bar: TerminalPromptBarConfig,
+    #[serde(default, flatten)]
+    pub focus: TerminalFocusConfig,
     /// Enable the enhanced (Kitty) keyboard protocol when an application
     /// negotiates it. When `false`, key encoding stays legacy regardless of
     /// negotiation.
@@ -1132,6 +1149,7 @@ impl Default for TerminalConfig {
             scroll: TerminalScrollConfig::default(),
             env_persistence: TerminalEnvPersistenceConfig::default(),
             prompt_bar: TerminalPromptBarConfig::default(),
+            focus: TerminalFocusConfig::default(),
             keyboard_protocol_enhanced: true,
             clipboard_policy: ClipboardPolicyConfig::default(),
             paste_confirmation: false,
@@ -2383,6 +2401,22 @@ danger_color = "#ff0000"
             toml::from_str("[terminal]\nprompt_bar_font_size = 22.0\n")
                 .expect("explicit override parses");
         assert_eq!(parsed.terminal.prompt_bar.font_size, Some(22.0));
+    }
+
+    // @lat: [[common#Configuration#Terminal#Focus follows mouse defaults on and persists an opt-out]]
+    #[test]
+    fn focus_follows_mouse_defaults_on_and_persists_false() {
+        let default = super::ScribeConfig::default();
+        assert!(default.terminal.focus.focus_follows_mouse);
+
+        let parsed: super::ScribeConfig =
+            toml::from_str("[terminal]\nfocus_follows_mouse = false\n")
+                .expect("explicit opt-out parses");
+        assert!(!parsed.terminal.focus.focus_follows_mouse);
+
+        let written = toml::to_string_pretty(&parsed).expect("config serializes");
+        let round_trip: super::ScribeConfig = toml::from_str(&written).expect("config reparses");
+        assert!(!round_trip.terminal.focus.focus_follows_mouse);
     }
 }
 

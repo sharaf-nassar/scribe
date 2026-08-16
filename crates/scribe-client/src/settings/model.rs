@@ -348,6 +348,7 @@ fn terminal_controls() -> Vec<Control> {
         toggle("terminal.copy_on_select", "Copy on select"),
         toggle("terminal.claude_copy_cleanup", "AI copy cleanup"),
         toggle("terminal.natural_scroll", "Natural scroll"),
+        toggle("terminal.focus_follows_mouse", "Focus follows mouse"),
         toggle("terminal.keyboard_protocol_enhanced", "Enhanced keyboard protocol"),
         toggle("terminal.paste_confirmation", "Paste confirmation"),
         toggle("terminal.images.enabled", "Terminal images"),
@@ -511,7 +512,7 @@ fn remote_controls() -> Vec<Control> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsPage, page_controls};
+    use super::{ControlKind, SettingsPage, page_controls};
 
     #[test]
     fn prompt_bar_override_labels_name_the_edited_parts() {
@@ -522,5 +523,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(labels, ["First Row", "Second Row", "Text", "First Icon", "Latest Icon"]);
+    }
+
+    #[test]
+    fn terminal_page_exposes_focus_follows_mouse_toggle() {
+        let control = page_controls(SettingsPage::Terminal)
+            .into_iter()
+            .find(|control| control.key == "terminal.focus_follows_mouse")
+            .expect("focus-follows-mouse control");
+
+        assert_eq!(control.label, "Focus follows mouse");
+        assert!(matches!(control.kind, ControlKind::Toggle));
     }
 }

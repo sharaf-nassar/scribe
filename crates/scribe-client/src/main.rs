@@ -801,6 +801,18 @@ enum GridDrag {
     Link,
 }
 
+fn hover_focus_target(
+    enabled: bool,
+    pressed_button: Option<MouseButton>,
+    hovered: Option<SessionId>,
+    focused: Option<SessionId>,
+) -> Option<SessionId> {
+    if !enabled || pressed_button.is_some() {
+        return None;
+    }
+    hovered.filter(|session_id| Some(*session_id) != focused)
+}
+
 /// Everything the *focused* pane alone gets for one frame.
 ///
 /// The four travel together because they share one reason: each is driven by
@@ -7101,6 +7113,17 @@ impl TerminalView {
             return;
         }
         self.update_scrollbar_hover(event.position, cx);
+        if let Some(session_id) = hover_focus_target(
+            self.config.config().config.terminal.focus.focus_follows_mouse,
+            event.pressed_button,
+            self.pane_at(event.position),
+            self.focused_session(),
+        ) {
+            tracing::info!(%session_id, "focused pane moved");
+            self.activate_session_tab(session_id, cx);
+            cx.notify();
+            return;
+        }
         // The link rule follows the pointer, and it is read off the window at
         // paint time rather than tracked here — so the move only has to ask for
         // the repaint that will re-read it. Gated on Ctrl so an ordinary mouse
@@ -14003,6 +14026,21 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn hover_focus_requires_enabled_button_free_different_pane() {
+        let focused = SessionId::new();
+        let hovered = SessionId::new();
+
+        assert_eq!(hover_focus_target(true, None, Some(hovered), Some(focused)), Some(hovered));
+        assert_eq!(hover_focus_target(false, None, Some(hovered), Some(focused)), None);
+        assert_eq!(
+            hover_focus_target(true, Some(MouseButton::Left), Some(hovered), Some(focused)),
+            None
+        );
+        assert_eq!(hover_focus_target(true, None, None, Some(focused)), None);
+        assert_eq!(hover_focus_target(true, None, Some(focused), Some(focused)), None);
+    }
 
     struct EditorInputProbe {
         focus: FocusHandle,
