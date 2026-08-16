@@ -206,12 +206,16 @@ impl WorkspaceManager {
     ///
     /// Matches the CWD against configured roots. When a match is found the
     /// first path component after the root prefix becomes the workspace name.
-    /// The name updates whenever the user moves to a different project root.
+    /// Only the first session in workspace order may update or clear the shared
+    /// name and project root.
     ///
     /// Returns `Some(ServerMessage::WorkspaceNamed { … })` when the name
     /// changes, `None` otherwise.
     pub fn on_cwd_changed(&mut self, session_id: SessionId, cwd: &Path) -> Option<ServerMessage> {
         let workspace_id = *self.session_to_workspace.get(&session_id)?;
+        if self.workspaces.get(&workspace_id)?.sessions.first() != Some(&session_id) {
+            return None;
+        }
 
         // Extract name and project root from roots. Clone to avoid borrowing
         // self while the mutable borrow of workspaces is needed below.
@@ -800,6 +804,47 @@ mod tests {
         assert!(matches!(
             msg,
             Some(ServerMessage::WorkspaceNamed { name, .. }) if name == "second"
+        ));
+    }
+
+    // @lat: [[server#Workspaces#Auto-Naming]]
+    #[test]
+    fn only_first_session_controls_workspace_name_and_project_root() {
+        let mut mgr = manager_with_roots(vec!["/work"]);
+        let ws_id = mgr.create_workspace();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        mgr.add_session(ws_id, first, None);
+        mgr.add_session(ws_id, second, None);
+
+        assert!(matches!(
+            mgr.on_cwd_changed(first, Path::new("/work/first/src")),
+            Some(ServerMessage::WorkspaceNamed { name, project_root, .. })
+                if name == "first" && project_root == Some(PathBuf::from("/work/first"))
+        ));
+        assert!(mgr.on_cwd_changed(second, Path::new("/work/second/src")).is_none());
+        assert!(mgr.on_cwd_changed(second, Path::new("/tmp")).is_none());
+        let info = mgr.workspace_info(ws_id).expect("workspace info");
+        assert_eq!(info.0.as_deref(), Some("first"));
+        assert_eq!(info.3, Some(PathBuf::from("/work/first")));
+
+        assert!(matches!(
+            mgr.on_cwd_changed(first, Path::new("/work/renamed/src")),
+            Some(ServerMessage::WorkspaceNamed { name, project_root, .. })
+                if name == "renamed" && project_root == Some(PathBuf::from("/work/renamed"))
+        ));
+        assert!(matches!(
+            mgr.on_cwd_changed(first, Path::new("/tmp")),
+            Some(ServerMessage::WorkspaceNamed { name, project_root, .. })
+                if name.is_empty() && project_root.is_none()
+        ));
+
+        mgr.reorder_sessions(ws_id, &[second, first]);
+        assert!(mgr.on_cwd_changed(first, Path::new("/work/ignored")).is_none());
+        assert!(matches!(
+            mgr.on_cwd_changed(second, Path::new("/work/promoted/src")),
+            Some(ServerMessage::WorkspaceNamed { name, project_root, .. })
+                if name == "promoted" && project_root == Some(PathBuf::from("/work/promoted"))
         ));
     }
 

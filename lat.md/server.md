@@ -322,6 +322,8 @@ When a session's CWD changes (via OSC 7 or /proc fallback), the server matches i
 
 The first path component after the matching root becomes the workspace name; the full `root / name` path becomes the project root. Moving to a different project under the same root updates both. When the CWD moves outside all configured roots, the name and project root are cleared (an empty-string name is sent to the client). The project root is sent to the client so AI tabs can open at the workspace root directory instead of inheriting the current tab's CWD.
 
+Only the first session in a workspace's stored order controls its shared name and project root. Other sessions' CWD reports do nothing. Reordering the session list transfers authority to the new first session on its next report.
+
 On `ConfigReloaded`, the server replaces live workspace roots and re-evaluates each session's stored CWD or `/proc` fallback so newly added roots name already-open panes without requiring a server restart or another `cd`.
 
 ### CWD Fallback Detection
