@@ -39,6 +39,14 @@ A remote-tracking ref packed before the next push remains visible because the de
 
 Running `git pack-refs --all` without changing an OID produces no push event even though the watched storage files change.
 
+#### Access events do not mimic generations
+
+Non-mutating access to an exact ref path may request a logical rescan but cannot qualify that path as evidence of a same-OID generation.
+
+#### Loose tags mark same-OID generations
+
+A mutating event for an exact loose tag at a tracked branch-tip OID marks the emitted push gate as a new same-OID generation.
+
 #### Linked worktrees resolve indirection
 
 A real linked-worktree push resolves its private git dir and shared common dir through Git, then emits that worktree's canonical root and pushed branch-tip SHA.
@@ -62,6 +70,10 @@ Non-terminal workflows keep the rollup queued or running; all-terminal sets use 
 ### Shared latest-head window
 
 Multiple roots for one GitHub repository share one tracker, and a newer pushed head replaces the prior discovery window.
+
+### Active same-SHA generation
+
+A trusted same-OID generation replaces an active window, filters its observed run ids, ignores an old-only response, and publishes only the later run.
 
 ### Server-wide request budget
 
@@ -700,6 +712,10 @@ owns those release checks against a real repository.
 ### Push-gated client state progression
 
 A local bare-repository push produces the first visible state within 10 seconds, progresses to success, and leaves the last running state stale when the API disappears.
+
+After a failed run 104, a loose tag delete and recreate at the same tracked OID opens a new generation. An old-only response stays in discovery, then run 105 alone owns the running and successful rollups and browser URL.
+
+Unrelated local refs, access events, and `pack-refs` storage rewrites make no request. The same run retains the disabled and enabled-idle zero-request checks and the shared scheduler cadence.
 
 The same run proves zero requests after a disabled push and across one enabled idle scheduler interval. Before the enabled push, a second capable local connection sets explicit join intent and proves it is the non-holder in the daemon window's two-person roster.
 

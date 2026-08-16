@@ -605,6 +605,7 @@ struct PollWindow {
     discovery_deadline: Option<Instant>,
     next_attempt: Instant,
     etag: Option<String>,
+    generation_cutoff: u64,
     observed: Option<CiRunState>,
     offline_backoff: Duration,
     transient_logged: bool,
@@ -619,6 +620,7 @@ impl PollWindow {
             discovery_deadline: now.checked_add(DISCOVERY_WINDOW),
             next_attempt: now,
             etag: None,
+            generation_cutoff: 0,
             observed: None,
             offline_backoff: POLL_INTERVAL,
             transient_logged: false,
@@ -704,6 +706,7 @@ enum PollStep {
 #[derive(Default)]
 pub struct GithubCiTracker {
     windows: HashMap<GithubRepository, PollWindow>,
+    run_watermarks: HashMap<GithubRepository, u64>,
     details: HashMap<(PathBuf, String), DetailTrace>,
     scheduler: PollScheduler,
     token: Option<SecretToken>,
@@ -723,6 +726,7 @@ impl GithubCiTracker {
         };
         if let Some(window) = self.windows.get_mut(&repository)
             && window.head_sha == push.head_sha
+            && !push.same_oid_generation
         {
             if window.roots.len() < MAX_REPOSITORY_ROOTS {
                 window.roots.insert(push.repository_root);
@@ -741,13 +745,11 @@ impl GithubCiTracker {
                 publications(&previous.roots, &CiRunDelta::Cleared { head_sha: state.head_sha })
             })
         });
-        self.windows.insert(
-            repository.clone(),
-            PollWindow {
-                roots,
-                ..PollWindow::new(repository, push.repository_root, push.head_sha, now)
-            },
-        );
+        let mut window =
+            PollWindow::new(repository.clone(), push.repository_root, push.head_sha, now);
+        window.roots = roots;
+        window.generation_cutoff = self.run_watermarks.get(&repository).copied().unwrap_or(0);
+        self.windows.insert(repository, window);
         Some(PushResult {
             #[cfg(test)]
             new_head: true,
@@ -1015,10 +1017,21 @@ impl GithubCiTracker {
         window.next_attempt = observation.at + POLL_INTERVAL;
         window.offline_backoff = POLL_INTERVAL;
         window.transient_logged = false;
+        observation.workflows.retain(|workflow| workflow.run_id > window.generation_cutoff);
         if observation.workflows.is_empty() {
             return Vec::new();
         }
         observation.workflows.truncate(MAX_WORKFLOWS);
+        let watermark = observation
+            .workflows
+            .iter()
+            .map(|workflow| workflow.run_id)
+            .max()
+            .unwrap_or(window.generation_cutoff);
+        self.run_watermarks
+            .entry(key.clone())
+            .and_modify(|current| *current = (*current).max(watermark))
+            .or_insert(watermark);
         let first_seen = window.observed.as_ref().map(|state| {
             state
                 .workflows
@@ -1416,7 +1429,12 @@ mod tests {
                 remote_name: "upstream".into(),
                 push_url: url.into(),
             },
+            same_oid_generation: false,
         }
+    }
+
+    fn generation_push(url: &str, root: &str, head: &str) -> PushDetected {
+        PushDetected { same_oid_generation: true, ..push(url, root, head) }
     }
 
     fn run(
@@ -1813,11 +1831,11 @@ mod tests {
     }
 
     fn runs_response(status: CiWorkflowStatus, conclusion: Option<CiRunConclusion>) -> ApiResponse {
-        ApiResponse::Runs {
-            etag: Some("etag".into()),
-            branch: "main".into(),
-            workflows: vec![run(1, status, conclusion)],
-        }
+        workflows_response(vec![run(1, status, conclusion)])
+    }
+
+    fn workflows_response(workflows: Vec<CiWorkflowRun>) -> ApiResponse {
+        ApiResponse::Runs { etag: Some("etag".into()), branch: "main".into(), workflows }
     }
 
     // @lat: [[test#GitHub CI Tracking#Observation timestamps and terminal stop]]
@@ -1843,6 +1861,40 @@ mod tests {
         assert_eq!(second.rollup, CiRunStatus::Success);
         assert_eq!(api.etags.lock().unwrap().as_slice(), &[None, Some("etag".into())]);
         assert_eq!(tracker.window_count(), 0);
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Active same-SHA generation]]
+    #[tokio::test]
+    async fn same_sha_generation_reopens_an_active_window() {
+        let start = Instant::now();
+        let old = run(104, CiWorkflowStatus::InProgress, None);
+        let api = RunsApi::with_responses(vec![
+            workflows_response(vec![old.clone()]),
+            workflows_response(vec![old.clone()]),
+            workflows_response(vec![old, run(105, CiWorkflowStatus::InProgress, None)]),
+        ]);
+        let mut tracker = GithubCiTracker::default();
+        tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
+        let first = tracker.poll_one(start, 1_000, &api).await;
+        let CiRunDelta::Set(first) = &first[0].1 else { panic!("expected state") };
+        assert_eq!(first.workflows.iter().map(|run| run.run_id).collect::<Vec<_>>(), [104]);
+
+        let reopened = tracker
+            .accept_push(
+                generation_push("git@github.com:acme/widget.git", "/a", "head-a"),
+                start + Duration::from_secs(1),
+            )
+            .expect("trusted generation");
+        assert!(reopened.new_head, "same-SHA generation was treated as a duplicate root");
+
+        let old_only = tracker.poll_one(start + Duration::from_secs(5), 1_005, &api).await;
+        assert!(old_only.is_empty());
+        assert_eq!(tracker.window_count(), 1);
+
+        let active = tracker.poll_one(start + Duration::from_secs(10), 1_010, &api).await;
+        let CiRunDelta::Set(active) = &active[0].1 else { panic!("expected new generation") };
+        assert_eq!(active.workflows.iter().map(|run| run.run_id).collect::<Vec<_>>(), [105]);
+        assert_eq!(active.rollup, CiRunStatus::Running);
     }
 
     // @lat: [[test#GitHub CI Tracking#Rate-limit delay]]

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use notify::{Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{
+    Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher as _,
+};
 use thiserror::Error;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{debug, warn};
@@ -27,6 +29,7 @@ pub struct PushDetected {
     pub repository_root: PathBuf,
     pub head_sha: String,
     pub remote_repository: RemoteRepository,
+    pub same_oid_generation: bool,
 }
 
 #[derive(Debug, Error)]
@@ -117,6 +120,7 @@ struct RemoteTip {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LogicalSnapshot {
     local_heads: BTreeSet<String>,
+    local_tags: BTreeMap<String, String>,
     remote_refs: BTreeMap<RemoteRef, RemoteTip>,
 }
 
@@ -128,6 +132,11 @@ fn logical_snapshot(repository: &Repository) -> Result<LogicalSnapshot, GitRefWa
     )?)
     .into_values()
     .collect();
+    let local_tags = parse_refs(&git_output(
+        &repository.root,
+        "local tag snapshot",
+        ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/tags"],
+    )?);
 
     let mut remote_refs = BTreeMap::new();
     let remote_names = git_output(&repository.root, "remote list", ["remote"])?;
@@ -162,7 +171,7 @@ fn logical_snapshot(repository: &Repository) -> Result<LogicalSnapshot, GitRefWa
             );
         }
     }
-    Ok(LogicalSnapshot { local_heads, remote_refs })
+    Ok(LogicalSnapshot { local_heads, local_tags, remote_refs })
 }
 
 fn fetch_destination_pattern(refspec: &str) -> Option<String> {
@@ -189,15 +198,43 @@ fn detect_pushes(
     repository: &Repository,
     before: &LogicalSnapshot,
     after: &LogicalSnapshot,
+    changed_paths: Option<&BTreeSet<PathBuf>>,
 ) -> Vec<PushDetected> {
+    let same_oid_generations = changed_paths
+        .filter(|paths| {
+            !paths.contains(&repository.common_dir.join("packed-refs"))
+                && !paths
+                    .iter()
+                    .any(|path| path.starts_with(repository.common_dir.join("reftable")))
+        })
+        .map(|paths| {
+            let mut oids = after
+                .remote_refs
+                .iter()
+                .filter(|(remote_ref, _)| {
+                    paths.contains(&repository.common_dir.join(&remote_ref.ref_name))
+                })
+                .map(|(_, tip)| tip.oid.clone())
+                .collect::<BTreeSet<_>>();
+            oids.extend(
+                after
+                    .local_tags
+                    .iter()
+                    .filter(|(ref_name, _)| paths.contains(&repository.common_dir.join(ref_name)))
+                    .map(|(_, oid)| oid.clone()),
+            );
+            oids
+        })
+        .unwrap_or_default();
     let mut seen = BTreeSet::new();
     after
         .remote_refs
         .iter()
         .filter(|(remote_ref, tip)| {
             before.remote_refs.get(*remote_ref).is_none_or(|old| old.oid != tip.oid)
-                && after.local_heads.contains(&tip.oid)
+                || same_oid_generations.contains(&tip.oid)
         })
+        .filter(|(_, tip)| after.local_heads.contains(&tip.oid))
         .filter(|(remote_ref, tip)| {
             seen.insert((remote_ref.remote_name.clone(), tip.push_url.clone(), tip.oid.clone()))
         })
@@ -208,6 +245,11 @@ fn detect_pushes(
                 remote_name: remote_ref.remote_name.clone(),
                 push_url: tip.push_url.clone(),
             },
+            same_oid_generation: before
+                .remote_refs
+                .get(remote_ref)
+                .is_some_and(|old| old.oid == tip.oid)
+                && same_oid_generations.contains(&tip.oid),
         })
         .collect()
 }
@@ -228,7 +270,7 @@ fn watch_paths(repository: &Repository) -> Vec<(PathBuf, RecursiveMode)> {
 }
 
 enum WorkerEvent {
-    Changed(PathBuf),
+    Changed { repository: PathBuf, paths: Vec<PathBuf> },
     Fallback { repository: PathBuf, reason: String },
     Stop,
 }
@@ -298,7 +340,15 @@ fn notify_handler(
                 repository: repository.clone(),
                 reason: String::from("native watcher requested a full rescan"),
             },
-            Ok(_) => WorkerEvent::Changed(repository.clone()),
+            Ok(event) => {
+                let paths = matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                )
+                .then_some(event.paths)
+                .unwrap_or_default();
+                WorkerEvent::Changed { repository: repository.clone(), paths }
+            }
             Err(error) => {
                 WorkerEvent::Fallback { repository: repository.clone(), reason: error.to_string() }
             }
@@ -407,10 +457,11 @@ impl WatchedRepository {
     fn rescan(
         &mut self,
         worker: &std::sync::mpsc::Sender<WorkerEvent>,
+        changed_paths: Option<&BTreeSet<PathBuf>>,
     ) -> Result<Vec<PushDetected>, GitRefWatchError> {
         self.ensure_paths(worker)?;
         let next = logical_snapshot(&self.repository)?;
-        let events = detect_pushes(&self.repository, &self.snapshot, &next);
+        let events = detect_pushes(&self.repository, &self.snapshot, &next, changed_paths);
         self.snapshot = next;
         Ok(events)
     }
@@ -558,9 +609,9 @@ fn worker_loop(
     repositories: &RepositoryMap,
     pushes: &Sender<PushDetected>,
 ) {
-    let mut deadlines = HashMap::<PathBuf, Instant>::new();
+    let mut pending = HashMap::<PathBuf, (Instant, Option<BTreeSet<PathBuf>>)>::new();
     loop {
-        let message = deadlines.values().min().map_or_else(
+        let message = pending.values().map(|(deadline, _)| deadline).min().map_or_else(
             || receiver.recv().ok(),
             |deadline| match receiver
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -571,8 +622,14 @@ fn worker_loop(
             },
         );
         match message {
-            Some(WorkerEvent::Changed(repository)) => {
-                deadlines.insert(repository, Instant::now() + DEBOUNCE);
+            Some(WorkerEvent::Changed { repository, paths }) => {
+                let deadline = Instant::now() + DEBOUNCE;
+                let entry =
+                    pending.entry(repository).or_insert_with(|| (deadline, Some(BTreeSet::new())));
+                entry.0 = deadline;
+                if let Some(changed_paths) = &mut entry.1 {
+                    changed_paths.extend(paths);
+                }
             }
             Some(WorkerEvent::Fallback { repository, reason }) => {
                 warn!(repository = %repository.display(), %reason, "git ref watcher overflow or error; switching to polling fallback");
@@ -581,22 +638,24 @@ fn worker_loop(
                 {
                     warn!(repository = %repository.display(), %error, "git ref polling fallback failed");
                 }
-                deadlines.insert(repository, Instant::now() + DEBOUNCE);
+                pending.insert(repository, (Instant::now() + DEBOUNCE, None));
             }
             Some(WorkerEvent::Stop) => return,
             None => {}
         }
 
         let now = Instant::now();
-        let due: Vec<_> = deadlines
+        let due: Vec<_> = pending
             .iter()
-            .filter_map(|(repository, deadline)| (*deadline <= now).then_some(repository.clone()))
+            .filter_map(|(repository, (deadline, _))| {
+                (*deadline <= now).then_some(repository.clone())
+            })
             .collect();
         for repository in due {
-            deadlines.remove(&repository);
+            let changed_paths = pending.remove(&repository).and_then(|(_, paths)| paths);
             let result = lock_repositories(repositories)
                 .get_mut(&repository)
-                .map(|watched| watched.rescan(worker));
+                .map(|watched| watched.rescan(worker, changed_paths.as_ref()));
             match result {
                 Some(Ok(events)) => {
                     send_push_events(pushes, events);
@@ -696,16 +755,18 @@ fn decode_git_output(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use notify::RecursiveMode;
+    use notify::event::AccessKind;
+    use notify::{Event, EventKind, RecursiveMode};
 
     use super::{
-        GitRefWatcher, GitRefWatcherControl, Repository, detect_pushes, git_command,
-        logical_snapshot, watch_paths,
+        GitRefWatcher, GitRefWatcherControl, Repository, WorkerEvent, detect_pushes, git_command,
+        logical_snapshot, notify_handler, watch_paths,
     };
 
     struct Fixture {
@@ -776,9 +837,47 @@ mod tests {
         let head = fixture.commit("two\n");
         fixture.push();
         let after = logical_snapshot(&repo).expect("snapshot after push");
-        let detected = detect_pushes(&repo, &before, &after);
+        let detected = detect_pushes(&repo, &before, &after, None);
         assert_eq!(detected[0].head_sha, head);
         detected
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Access events do not mimic generations]]
+    #[test]
+    fn access_event_paths_cannot_gate_same_oid_generations() {
+        let repository = PathBuf::from("/tmp/repository/.git");
+        let tag = repository.join("refs/tags/release");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut handler = notify_handler(repository.clone(), tx);
+
+        handler(Ok(Event::new(EventKind::Access(AccessKind::Read)).add_path(tag)));
+
+        match rx.recv().expect("watcher event") {
+            WorkerEvent::Changed { repository: observed, paths } => {
+                assert_eq!(observed, repository);
+                assert!(paths.is_empty());
+            }
+            WorkerEvent::Fallback { .. } | WorkerEvent::Stop => {
+                panic!("access event changed watcher mode")
+            }
+        }
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Loose tags mark same-OID generations]]
+    #[test]
+    fn loose_tag_path_marks_a_same_oid_generation() {
+        let fixture = Fixture::new();
+        run(&fixture.work, ["tag", "release"]);
+        let repository = Repository::discover(&fixture.work)
+            .expect("discover repository")
+            .expect("fixture is a repository");
+        let snapshot = logical_snapshot(&repository).expect("logical snapshot");
+        let changed_paths = BTreeSet::from([repository.common_dir.join("refs/tags/release")]);
+
+        let detected = detect_pushes(&repository, &snapshot, &snapshot, Some(&changed_paths));
+
+        assert_eq!(detected.len(), 1);
+        assert!(detected[0].same_oid_generation);
     }
 
     // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Disabled construction creates no watcher]]
@@ -867,7 +966,7 @@ mod tests {
         run(&fixture.work, ["pack-refs", "--all"]);
         let after = logical_snapshot(&repo).expect("snapshot after pack");
 
-        assert!(detect_pushes(&repo, &before, &after).is_empty());
+        assert!(detect_pushes(&repo, &before, &after, None).is_empty());
     }
 
     // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Linked worktrees resolve indirection]]
@@ -895,7 +994,7 @@ mod tests {
         let head = run(&linked, ["rev-parse", "HEAD"]);
         run(&linked, ["push", "origin", "HEAD:main"]);
         let after = logical_snapshot(&repo).expect("snapshot linked push");
-        let detected = detect_pushes(&repo, &before, &after);
+        let detected = detect_pushes(&repo, &before, &after, None);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].repository_root, linked);
         assert_eq!(detected[0].head_sha, head);

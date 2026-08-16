@@ -235,7 +235,11 @@ Git resolves the worktree root, private git dir, and shared common dir, so a lin
 
 Each repository watches its git dirs and common dir non-recursively, `refs` recursively, and `reftable` non-recursively. Native `notify` events debounce for 250 ms. A watch error or rescan request replaces that repository's native watcher with a 2 s `PollWatcher`; the fallback reads only local ref paths.
 
-After a burst, Git plumbing reads local branch tips and every configured remote's tracking namespace. A changed remote-tracking OID qualifies only when it equals a local branch tip. Repacking refs therefore emits nothing, while a qualifying change emits [[crates/scribe-server/src/git_ref_watcher.rs#PushDetected|PushDetected]] with the canonical repository root, head SHA, remote name, and push URL.
+After a burst, Git plumbing reads local branch and tag tips plus every configured remote's tracking namespace. A changed remote-tracking OID qualifies only when it equals a local branch tip.
+
+The debounce retains exact paths from mutating notify events. An exact loose remote-tracking ref or tag can qualify a repeated generation at the same OID when that OID is both a local branch tip and an existing tracked remote tip.
+
+Access events cannot qualify a generation. A burst that touches `packed-refs` or `reftable` also cannot infer one, so storage rewrites emit nothing. Tags at untracked OIDs infer no destination. A qualifying event emits [[crates/scribe-server/src/git_ref_watcher.rs#PushDetected|PushDetected]] with the canonical repository root, head SHA, remote name, and push URL.
 
 [[crates/scribe-server/src/git_ref_watcher.rs#GitRefWatcher#start|GitRefWatcher::start]] returns `None` before allocating channels, a worker thread, or filesystem watchers when the feature is disabled. Live disable drops and joins the worker; live enable starts it and submits every retained session CWD. Enabled operation still makes no network request; the event only gates later CI polling.
 
@@ -252,6 +256,10 @@ Push-target HTTPS, SSH, and scp URLs must resolve to `github.com/{owner}/{repo}`
 The run-list request uses `head_sha`, `event=push`, and `per_page=100`, retains an ETag for the exact URL, and handles `304` without replacing state. The server-wide scheduler permits one attempt every 5 seconds and at most 720 attempts per rolling hour. A no-run window expires after 120 seconds, before a 25th request. Transient failures back off through 5, 10, 20, then 30 seconds.
 
 Up to 100 returned workflow runs contribute to the worst-status rollup. Queued or running remains non-terminal until every workflow completes; terminal precedence is failure, cancelled, then success. Each run records its first server observation and latest observation without a date-parsing dependency.
+
+The tracker retains the highest run id observed for each repository. A new window snapshots that value as its generation cutoff and ignores older or equal runs before rollup, publication, detail selection, and terminal-stop decisions. An old-only response remains in discovery.
+
+A trusted same-OID generation replaces even an active window. Ordinary same-head events still merge repository roots without resetting polling, so duplicate watcher delivery cannot discard live state.
 
 Authentication or permission failure before observation logs once and hides the window without HTTP after failed `gh` auth. Offline failures retry with bounded backoff. Failures after observation publish the last state as stale; terminal state stops polling. Tracker updates route through [[crates/scribe-server/src/ipc_server.rs#publish_ci_run_delta]], which retains capability, repository, and dismissal gates.
 

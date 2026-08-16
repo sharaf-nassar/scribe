@@ -87,6 +87,20 @@ wait_state() {
     done
 }
 
+wait_request_count() {
+    local expected="$1" timeout_ms="$2" label="$3"
+    local started now count
+    started=$(date +%s%3N)
+    while true; do
+        count=$(request_count)
+        [ "$count" -eq "$expected" ] && return 0
+        now=$(date +%s%3N)
+        [ "$(( now - started ))" -le "$timeout_ms" ] \
+            || fail "timed out waiting for $label request $expected (got $count)"
+        sleep 0.1
+    done
+}
+
 export SCRIBE_GITHUB_API_URL="$API_URL"
 ! grep -Eq '^[^[:space:]]+[[:space:]]+00000000[[:space:]]' /proc/net/route \
     || fail "container has a default route despite --network none"
@@ -102,16 +116,19 @@ git -C "$REPO" commit --allow-empty -m disabled >/dev/null
 git -C "$REPO" branch state-disabled
 git -C "$REPO" commit --allow-empty -m flow >/dev/null
 git -C "$REPO" branch state-flow
+git -C "$REPO" commit --allow-empty -m generation >/dev/null
+git -C "$REPO" branch state-generation
 git -C "$REPO" commit --allow-empty -m stale >/dev/null
 git -C "$REPO" branch state-stale
 
 FLOW_HEAD=$(git -C "$REPO" rev-parse state-flow)
+GENERATION_HEAD=$(git -C "$REPO" rev-parse state-generation)
 STALE_HEAD=$(git -C "$REPO" rev-parse state-stale)
 python3 - /tests/fixtures/github-actions-api.json "$SCENARIO" \
-    "$FLOW_HEAD" "$STALE_HEAD" <<'PY'
+    "$FLOW_HEAD" "$GENERATION_HEAD" "$STALE_HEAD" <<'PY'
 import json, sys
 
-source, target, flow_head, stale_head = sys.argv[1:]
+source, target, flow_head, generation_head, stale_head = sys.argv[1:]
 with open(source, encoding="utf-8") as handle:
     scenario = json.load(handle)
 for snapshot in scenario["runs"]:
@@ -119,14 +136,37 @@ for snapshot in scenario["runs"]:
         if run["head_sha"] == "1111111111111111111111111111111111111111":
             run["head_sha"] = flow_head
             run["head_branch"] = "main"
-scenario["runs"][-1]["workflow_runs"].append({
-    "id": 102,
-    "name": "stale",
-    "head_sha": stale_head,
+old = {
+    "id": 104,
+    "name": "old failure",
+    "head_sha": generation_head,
+    "head_branch": "main",
+    "status": "completed",
+    "conclusion": "failure",
+}
+active = {
+    "id": 105,
+    "name": "new generation",
+    "head_sha": generation_head,
     "head_branch": "main",
     "status": "in_progress",
     "conclusion": None,
-})
+}
+success = dict(active, status="completed", conclusion="success")
+scenario["runs"].extend([
+    {"workflow_runs": [old]},
+    {"workflow_runs": [old]},
+    {"workflow_runs": [old, active]},
+    {"workflow_runs": [old, success]},
+    {"workflow_runs": [{
+        "id": 401,
+        "name": "stale",
+        "head_sha": stale_head,
+        "head_branch": "main",
+        "status": "in_progress",
+        "conclusion": None,
+    }]},
+])
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(scenario, handle)
 PY
@@ -167,7 +207,7 @@ assert_no_requests idle
 
 WINDOW=$(scribe-test daemon window-id)
 scribe-test daemon ci-observer --window-id "$WINDOW" --repo-root "$REPO" \
-    --head-sha "$STALE_HEAD" --stale true --timeout 30000 \
+    --head-sha "$STALE_HEAD" --stale true --timeout 55000 \
     >"$OBSERVER_OUT" 2>"$OBSERVER_LOG" &
 OBSERVER_PID=$!
 for _ in {1..50}; do
@@ -206,16 +246,57 @@ grep -q '"if_none_match":"\\"runs-0\\"","status":200' "$API_LOG" \
 grep -q '"if_none_match":"\\"runs-1\\"","status":200' "$API_LOG" \
     || fail "terminal refresh omitted the second run ETag"
 
+git -C "$REPO" tag ci-generation "$GENERATION_HEAD"
+push_head state-generation
+wait_state "$GENERATION_HEAD" failure false 10000 prior_generation_failure
+[ "$(request_count)" -eq 4 ] \
+    || fail "prior generation used $(request_count) requests instead of 4"
+
+# An unrelated local ref write is not evidence of another pushed generation.
+git -C "$REPO" update-ref refs/heads/unrelated "$GENERATION_HEAD"
+sleep 2
+[ "$(request_count)" -eq 4 ] \
+    || fail "unrelated ref write opened a CI polling window"
+
+# Coalesce a loose tag delete/recreate at the same tracked OID. The first API
+# response still contains only the old failed run and must not close the new
+# generation before run 105 appears.
+git -C "$REPO" update-ref -d refs/tags/ci-generation
+git -C "$REPO" update-ref refs/tags/ci-generation "$GENERATION_HEAD"
+wait_request_count 5 7000 same_sha_old_only
+OLD_ONLY_STATE=$(scribe-test daemon ci-state --repo-root "$REPO")
+state_matches "$OLD_ONLY_STATE" "$GENERATION_HEAD" failure false \
+    || fail "old-only response replaced the retained terminal state"
+wait_state "$GENERATION_HEAD" running false 7000 same_sha_running
+[ "$(request_count)" -eq 6 ] \
+    || fail "same-SHA active generation used $(request_count) requests instead of 6"
+GENERATION_STATE=$(scribe-test daemon ci-state --repo-root "$REPO")
+python3 -c '
+import json, sys
+state = json.loads(sys.argv[1])
+assert state["open_url"].endswith("/105")
+assert [run["run_id"] for run in state["state"]["workflows"]] == [105]
+' "$GENERATION_STATE" || fail "old run 104 poisoned active generation state or link"
+wait_state "$GENERATION_HEAD" success false 7000 same_sha_success
+[ "$(request_count)" -eq 7 ] \
+    || fail "same-SHA success used $(request_count) requests instead of 7"
+
+# Storage-only packing may remove loose ref files, but it is not a push gate.
+git -C "$REPO" pack-refs --all
+sleep 6
+[ "$(request_count)" -eq 7 ] \
+    || fail "packed-refs rewrite opened a CI polling window"
+
 push_head state-stale
 wait_state "$STALE_HEAD" running false 10000 stale_head_running
-[ "$(request_count)" -eq 4 ] \
-    || fail "stale-head discovery used $(request_count) requests instead of 4"
+[ "$(request_count)" -eq 8 ] \
+    || fail "stale-head discovery used $(request_count) requests instead of 8"
 kill "$FIXTURE_PID"
 wait "$FIXTURE_PID" 2>/dev/null || true
 FIXTURE_PID=""
 wait_state "$STALE_HEAD" running true 7000 stale_state
-[ "$(request_count)" -eq 4 ] \
-    || fail "idle or disabled traffic changed the four-request contract"
+[ "$(request_count)" -eq 8 ] \
+    || fail "idle or disabled traffic changed the eight-request contract"
 
 OWNER_STATE=$(scribe-test daemon ci-state --repo-root "$REPO")
 if ! wait "$OBSERVER_PID"; then
@@ -233,5 +314,6 @@ assert viewer["action_mode"] == "read_only" and viewer["open_url"] is None
 ' "$OWNER_STATE" "$VIEWER_STATE" || fail "shared viewer state or actions diverged from owner"
 
 # @lat: [[test#GitHub CI Functional E2E#Push-gated client state progression]]
-echo "PASS: real push gated four requests; state arrived in ${FIRST_LATENCY}ms," \
-    "completed, became stale, and a joined viewer received read-only fanout"
+echo "PASS: ref gates used eight requests; first state arrived in ${FIRST_LATENCY}ms," \
+    "same-SHA generation ignored run 104, completed on 105, became stale," \
+    "and a joined viewer received read-only fanout"

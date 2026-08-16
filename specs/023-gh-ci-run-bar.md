@@ -244,11 +244,11 @@ only while at least one matching panel is open.
 
 ## Architecture Approach
 
-The server-owned CI tracker detects the user's local push by watching workspace
-repos' ref state, opens a bounded polling window against the GitHub
-Actions API using the user's `gh` credentials, aggregates all workflow
-runs for the pushed head commit, and broadcasts CI state to attached
-clients over new IPC messages. The GPUI client renders the state as a
+The server-owned CI tracker detects the user's local push or trusted same-OID
+generation by watching workspace repos' ref state, then opens a bounded polling
+window against the GitHub Actions API using the user's `gh` credentials,
+aggregates all workflow runs for the pushed head commit, and broadcasts CI
+state to attached clients over new IPC messages. The GPUI client renders the state as a
 dynamic chrome band at the top of the workspace, following the per-pane
 prompt bar precedent (bands appear/disappear with grid re-measure).
 
@@ -322,6 +322,12 @@ The server tracker records each workflow's first and latest local observation
 times. This gives the bar a stable elapsed clock without adding a provider-date
 parser; a re-observed run keeps its first timestamp by run id.
 
+The tracker also retains the highest observed run id per repository. Each new
+window snapshots it as a generation cutoff. Older or equal runs never enter
+rollup, details, link selection, or terminal-stop decisions for that window.
+A trusted same-OID ref event replaces an active window too; ordinary same-head
+events keep merging roots without resetting the window.
+
 Hot handoff carries active repository/head descriptors, remaining discovery
 time, roots, and last bounded run state. It never carries the GitHub token. The
 successor re-polls each descriptor before returning to the 5 s cadence.
@@ -359,7 +365,9 @@ Docker E2E images with `--network none`; none can validate github.com itself.
 - `tests/e2e/func/ci-run-bar.sh` uses a real local push and the fake API to
   assert zero requests while disabled and idle, first state within 10 seconds,
   5-second refreshes, queued/running/success progression, ETag reuse, stale
-  fallback, and identical read-only viewer state.
+  fallback, and identical read-only viewer state. It also re-creates a loose
+  tag at the same tracked OID after failed run 104, keeps polling through an
+  old-only response, and proves run 105 alone owns the new state and URL.
 - `tests/e2e/func/ci-run-details.sh` proves job requests are absent while the
   panel is closed, start after open interest, and stop after close interest.
 - `tests/e2e/visual/ci-run-bar.sh` checks the 40px collapsed reflow, terminal
@@ -400,9 +408,13 @@ evidence with an offline rerun.
 - A synthetic fixture checks the reftable watch path because the audited host
   Git cannot create a real reftable repository. Loose refs, packed refs, and
   linked worktrees use real repositories.
-- Only a qualifying local remote-tracking ref change opens a window. Remote
-  SSH pushes, scheduled runs, teammate pushes, and later manual re-runs remain
-  invisible.
+- A remote-tracking OID change or an exact mutating event for a loose tracked
+  ref can open a window. A loose tag at an OID already shared by a local branch
+  and tracked remote may also reopen that OID. Tags at untracked OIDs cannot
+  infer a destination. Access events and packed or reftable storage rewrites
+  remain non-triggers.
+- Remote SSH pushes, scheduled runs, teammate pushes, manual re-runs without a
+  local ref event, and no-op pushes that write no ref remain invisible.
 - Terminal snapshots stop polling but stay visible in the client until owner
   dismissal or replacement by an observed later head.
 
