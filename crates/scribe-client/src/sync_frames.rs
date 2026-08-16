@@ -18,8 +18,8 @@
 //!
 //! A whole-pane rebuild — a decoded `SessionReplay`, or self-resetting ANSI from
 //! a `ScreenSnapshot` — is not output in this sense: it replaces the pane rather
-//! than advancing it. [`present_rebuild`] therefore applies it as a burst
-//! boundary of its own, never folded into the commit on either side of it.
+//! than advancing it. [`flush_before_rebuild`] therefore seals and flushes the
+//! preceding burst before the terminal applies the replacement as one update.
 
 use std::{
     collections::VecDeque,
@@ -252,26 +252,18 @@ pub fn present_next_burst<T: OutputTarget>(queue: &mut SyncFrameQueue, target: &
     drain_until_frame(queue, target).is_some_and(|outcome| outcome.needs_redraw)
 }
 
-/// Applies a whole-pane rebuild as a burst boundary of its own, reporting
-/// whether `target` now owes a repaint.
+/// Seals and flushes output queued before a whole-pane rebuild.
 ///
 /// A rebuild is a full state replacement, not an advance, so it is exempt from
 /// pacing on both sides. Everything the pane already had queued is committed
 /// first, in arrival order, because those bytes describe the screen the server
-/// snapshotted; the rebuild itself then reaches the parser whole, bypassing
-/// the splitter entirely, because it is one logical frame the server already
-/// assembled and re-splitting it could only tear it.
+/// snapshotted. This deliberately does not publish: the terminal captures the
+/// flushed viewport, replaces its state, restores that viewport, and publishes
+/// the final result once.
 #[must_use]
-pub fn present_rebuild<T: OutputTarget>(
-    queue: &mut SyncFrameQueue,
-    target: &mut T,
-    bytes: &[u8],
-) -> bool {
+pub fn flush_before_rebuild<T: OutputTarget>(queue: &mut SyncFrameQueue, target: &mut T) -> bool {
     queue.seal_frame_boundary();
-    let flushed = advance_all_committed(queue, target);
-    let rebuilt = target.advance_output(bytes).needs_redraw;
-    target.publish_content();
-    flushed.needs_redraw | rebuilt
+    advance_all_committed(queue, target).needs_redraw
 }
 
 /// Aggregate result of draining every queued committed frame.
@@ -291,8 +283,8 @@ pub struct DrainSummary {
 /// collapsed a run of committed frames into a single redraw. It survives as the
 /// way tests assert what a queue hands its target across a whole backlog;
 /// production reaches the same advancing half through [`present_next_burst`],
-/// which paces, and [`present_rebuild`], which publishes only once the bytes
-/// that replace the pane have landed.
+/// which paces, and [`flush_before_rebuild`], whose caller publishes only once
+/// the bytes that replace the pane have landed.
 #[cfg(test)]
 pub fn drain_all_committed<T: OutputTarget>(
     queue: &mut SyncFrameQueue,
@@ -724,7 +716,9 @@ mod tests {
         queue.queue_output_frames(&[BSU, b"held"].concat());
         assert!(queue.raw_sync_deadline().is_some(), "the open update armed an expiry");
 
-        assert!(present_rebuild(&mut queue, &mut target, b"rebuilt"));
+        assert!(flush_before_rebuild(&mut queue, &mut target));
+        assert!(target.advance_output(b"rebuilt").needs_redraw);
+        target.publish_content();
 
         // Everything queued ahead of the rebuild lands first and whole, the
         // half-open update is sealed rather than dropped, and the rebuild itself

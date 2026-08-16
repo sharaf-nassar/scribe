@@ -77,6 +77,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture && \
     cargo test --locked -p scribe-client beads -- --nocapture
 
+FROM func-base AS client-rebuild-unit
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo test --locked -p scribe-client --bin scribe-client \
+        tests::equivalent_rebuild_keeps_the_scrolled_content_anchor -- --exact --nocapture && \
+    cargo test --locked -p scribe-client --bin scribe-client \
+        tests::rebuild_keeps_a_scrolled_anchor_when_authority_appends_rows -- --exact --nocapture && \
+    cargo test --locked -p scribe-client --bin scribe-client \
+        tests::rebuild_leaves_the_live_bottom_at_the_live_bottom -- --exact --nocapture && \
+    cargo test --locked -p scribe-client --bin scribe-client \
+        tests::rebuild_clamps_a_dropped_anchor_to_the_oldest_surviving_row -- --exact --nocapture && \
+    cargo test --locked -p scribe-client --bin scribe-client \
+        tests::queued_real_ed3_before_rebuild_keeps_the_live_bottom_authoritative -- --exact --nocapture
+
 # The read-slice proof needs the real GPUI window and the same official bd used
 # by the functional harness.
 FROM scribe-test-visual AS beads-read-e2e

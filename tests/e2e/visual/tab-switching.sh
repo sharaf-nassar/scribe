@@ -42,6 +42,9 @@ CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 SESSION="${SESSION:?the entrypoint must export a created SESSION}"
 HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
+SCROLLBACK_MARKER="TAB_SCROLLBACK_READY"
+# Minimal Dark's 50%-alpha prompt text over its first-row background.
+PROMPT_TEXT_COLOR='rgb(118,118,121)'
 
 # Titlebar geometry from crates/scribe-client/src/titlebar.rs: the client band
 # is 34 px tall and each tab is a fixed 176 px wide. This shared-pane rig runs
@@ -440,6 +443,29 @@ shot() {
     echo "captured $1"
 }
 
+count_log() {
+    grep -acF "$1" "$CLIENT_LOG" 2>/dev/null || true
+}
+
+wait_for_log_growth() {
+    local pattern="$1" baseline="$2" timeout_secs="${3:-15}" now started
+    started=$(date +%s)
+    while true; do
+        now=$(count_log "$pattern")
+        if [ "$now" -gt "$baseline" ]; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
+last_log_line() {
+    grep -F "$1" "$CLIENT_LOG" 2>/dev/null | tail -1 | sed -e 's/\x1b\[[0-9;]*m//g'
+}
+
 fail() {
     echo "FAIL: $1"
     echo "--- client log tail ---"
@@ -461,6 +487,23 @@ if ! wait_for_attach_to "$SESSION" 0 20; then
 fi
 shot /output/00-tab-switching-attached.png
 echo "PHASE 0 PASS: client attached to shared-pane session $SESSION"
+
+# Keep the original tab in scrollback before the new tab hides it. Returning
+# to it below delivers a SessionReplay at the prompt-bar geometry, which must
+# keep this viewport rather than reset it to the live bottom.
+scribe-test send "$SESSION" \
+    '\x15for i in $(seq 1 200); do echo "tab-scrollback-$i"; done; echo TAB_SCROLLBACK_READY\n'
+scribe-test wait-output "$SESSION" "$SCROLLBACK_MARKER" --timeout 20000
+SCROLL_BEFORE=$(count_log "terminal scrollback moved")
+send_keys shift+Prior
+if ! wait_for_log_growth "terminal scrollback moved" "$SCROLL_BEFORE"; then
+    fail "phase 0: shift+PageUp never entered the original tab's scrollback"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"offset=0"*) fail "phase 0: original tab stayed at the live bottom: $LINE" ;;
+esac
+echo "PHASE 0 PASS: original tab is scrolled away from the live bottom"
 
 # ── Phase 1: create a second tab through the live chord ───────────
 CREATES_BEFORE=$(count_client CreateSession)
@@ -521,18 +564,32 @@ if [ "${BAR_W:-0}" -lt 100 ] || [ "${BAR_H:-0}" -lt 20 ]; then
 fi
 ABOVE_INK=$(convert /output/02-tab-switching-key-prev.png \
     -crop "$((BAR_W - 28))x${BAR_H}+$((BAR_X + 14))+$((BAR_Y - BAR_H))" \
-    +repage -colorspace Gray -threshold 12% -format '%[fx:mean*w*h]' info:)
+    +repage -alpha off -fuzz 1% -fill black +opaque "$PROMPT_TEXT_COLOR" \
+    -fill white -opaque "$PROMPT_TEXT_COLOR" -format '%[fx:mean*w*h]' info:)
 BAR_INK=$(convert /output/02-tab-switching-key-prev.png \
     -crop "${BAR_W}x${BAR_H}+${BAR_X}+${BAR_Y}" +repage \
-    -colorspace Gray -threshold 12% -format '%[fx:mean*w*h]' info:)
+    -alpha off -fuzz 1% -fill black +opaque "$PROMPT_TEXT_COLOR" \
+    -fill white -opaque "$PROMPT_TEXT_COLOR" -format '%[fx:mean*w*h]' info:)
 if [ "${ABOVE_INK%.*}" -gt 50 ]; then
     fail "phase 2: ${ABOVE_INK%.*} prompt-colored pixels escaped above the visible bar"
 fi
 if [ "${BAR_INK%.*}" -lt 2000 ]; then
     fail "phase 2: prompt text missed the visible bar (${BAR_INK%.*} lit pixels)"
 fi
+# @lat: [[test#Visual E2E Tests#Tab switching is live#Returned tab preserves its scrolled viewport]]
+SCROLL_END_BEFORE=$(count_log "terminal scrollback moved")
+send_keys shift+End
+if ! wait_for_log_growth "terminal scrollback moved" "$SCROLL_END_BEFORE"; then
+    fail "phase 2: shift+End never reached the returned tab's viewport"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"moved=true"*"offset=0"*) ;;
+    *) fail "phase 2: replay reset the returned tab's scrollback: $LINE" ;;
+esac
 echo "PHASE 2 PASS: ctrl+Prior attached $SESSION and first replay reserved prompt rows ($PLAIN_ROWS -> $AI_ATTACH_ROWS)"
 echo "PHASE 2 PASS: large prompt text stays inside its visible bottom bar"
+echo "PHASE 2 PASS: returned tab kept its scrolled viewport through the replay"
 
 # Park over the original tab's grid before switching. The relative move in
 # phase 3 must then resolve against the newly painted tab, not this hidden

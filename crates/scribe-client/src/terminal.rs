@@ -62,7 +62,8 @@ use vte::ansi::{Color, CursorShape as TerminalCursorShape, Handler as _};
 
 use crate::session_lifecycle::PromptAnchor;
 use crate::sync_frames::{
-    FeedOutputResult, OutputTarget, SyncFrameQueue, present_next_burst as present_queued_burst,
+    FeedOutputResult, OutputTarget, SyncFrameQueue, flush_before_rebuild,
+    present_next_burst as present_queued_burst,
 };
 
 /// One rendered terminal cell: its character plus the raw SGR state the paint
@@ -321,15 +322,41 @@ impl DisplayOnlyTerminal {
     /// Rebuilds the content snapshot when advances left it stale, reporting
     /// whether it rebuilt.
     ///
-    /// Every drain path calls this before it returns, so a snapshot read off
-    /// the pane is never behind the grid: what the pacer skips is the rebuild
-    /// per intermediate frame, never the rebuild itself.
+    /// Every completed presentation calls this before it returns, so a snapshot
+    /// read off the pane is never behind the grid: what the pacer skips is the
+    /// rebuild per intermediate frame, never the rebuild itself.
     pub fn publish_content(&mut self) -> bool {
         if !self.content_stale {
             return false;
         }
         self.make_content();
         true
+    }
+
+    /// Replace the terminal from authoritative ANSI and publish the final
+    /// viewport exactly once.
+    ///
+    /// The pane queue must be flushed first. That makes the viewport captured
+    /// here authoritative when queued output includes a real ED 3. A scrolled
+    /// anchor is shifted by any oldest rows the replacement dropped, while a
+    /// live-bottom viewport stays at the live bottom.
+    fn rebuild(&mut self, bytes: &[u8], columns: usize, lines: usize, kept_rows: usize) -> bool {
+        let old_history = self.history_size();
+        let viewport_top = (self.display_offset() > 0).then(|| self.viewport_top_abs());
+        let reshaped = columns > 0 && lines > 0 && self.dimensions() != (columns, lines);
+        if reshaped {
+            self.term.resize(TerminalDimensions { columns, lines });
+        }
+        let rebuilt = self.advance_output(bytes).needs_redraw;
+        let trimmed = self.trim_history_without_publish(kept_rows) > 0;
+        let new_history = self.history_size();
+        let restored = viewport_top.is_some_and(|old_top| {
+            let dropped = old_history.saturating_sub(new_history);
+            self.scroll_to_abs_without_publish(old_top.saturating_sub(dropped).min(new_history))
+        });
+        self.content_stale |= reshaped || trimmed || restored;
+        self.publish_content();
+        rebuilt || reshaped || trimmed || restored
     }
 
     /// Advances one committed frame and publishes the snapshot it produced.
@@ -477,13 +504,17 @@ impl DisplayOnlyTerminal {
     /// can skip the repaint and the scroll-derived bookkeeping for a scroll
     /// that hit the end of the scrollback.
     pub fn scroll(&mut self, scroll: Scroll) -> bool {
-        let before = self.term.grid().display_offset();
-        self.term.scroll_display(scroll);
-        let changed = self.term.grid().display_offset() != before;
+        let changed = self.scroll_without_publish(scroll);
         if changed {
             self.make_content();
         }
         changed
+    }
+
+    fn scroll_without_publish(&mut self, scroll: Scroll) -> bool {
+        let before = self.term.grid().display_offset();
+        self.term.scroll_display(scroll);
+        self.term.grid().display_offset() != before
     }
 
     /// How far the viewport is scrolled into the scrollback, in rows.
@@ -512,6 +543,14 @@ impl DisplayOnlyTerminal {
     /// it is the same two-step the server uses, so both ends land on the same
     /// surviving rows.
     pub fn trim_history(&mut self, kept_rows: usize) -> usize {
+        let dropped = self.trim_history_without_publish(kept_rows);
+        if dropped > 0 {
+            self.make_content();
+        }
+        dropped
+    }
+
+    fn trim_history_without_publish(&mut self, kept_rows: usize) -> usize {
         let before = self.history_size();
         if kept_rows >= before {
             return 0;
@@ -520,11 +559,7 @@ impl DisplayOnlyTerminal {
         let grid = self.term.grid_mut();
         grid.update_history(kept_rows.min(max_rows));
         grid.update_history(max_rows);
-        let dropped = before.saturating_sub(self.history_size());
-        if dropped > 0 {
-            self.make_content();
-        }
-        dropped
+        before.saturating_sub(self.history_size())
     }
 
     /// The viewport measurements the overlay scrollbar sizes its thumb from.
@@ -592,7 +627,17 @@ impl DisplayOnlyTerminal {
     /// the failure jump land here, so they cannot drift from each other or from
     /// [`Self::scroll`]'s snapshot bookkeeping.
     pub fn scroll_to_abs(&mut self, abs_pos: usize) -> bool {
-        self.scroll_to_offset(self.history_size().saturating_sub(abs_pos))
+        let changed = self.scroll_to_abs_without_publish(abs_pos);
+        if changed {
+            self.make_content();
+        }
+        changed
+    }
+
+    fn scroll_to_abs_without_publish(&mut self, abs_pos: usize) -> bool {
+        let offset = self.history_size().saturating_sub(abs_pos);
+        let delta = grid_i32(offset).saturating_sub(grid_i32(self.display_offset()));
+        delta != 0 && self.scroll_without_publish(Scroll::Delta(delta))
     }
 
     /// Scroll the viewport to an absolute `display_offset`.
@@ -993,6 +1038,19 @@ pub struct PaneStream {
 }
 
 impl PaneStream {
+    /// Flush queued output, replace the grid, and publish one final snapshot.
+    pub fn rebuild(
+        &mut self,
+        bytes: &[u8],
+        columns: usize,
+        lines: usize,
+        kept_rows: usize,
+    ) -> bool {
+        let flushed = flush_before_rebuild(&mut self.queue, &mut self.terminal);
+        let rebuilt = self.terminal.rebuild(bytes, columns, lines, kept_rows);
+        flushed || rebuilt
+    }
+
     /// Whether either half of the pipeline is holding a synchronized update
     /// that needs a timeout flush if its terminator never arrives.
     #[must_use]

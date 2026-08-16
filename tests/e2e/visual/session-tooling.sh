@@ -103,6 +103,10 @@ count_log() {
     grep -acF "$1" "$CLIENT_LOG" 2>/dev/null || true
 }
 
+last_log_line() {
+    grep -F "$1" "$CLIENT_LOG" 2>/dev/null | tail -1 | sed -e 's/\x1b\[[0-9;]*m//g'
+}
+
 wait_for_log_growth() {
     local pattern="$1" baseline="$2" timeout_secs="${3:-15}" now started
     started=$(date +%s)
@@ -318,6 +322,25 @@ if [ "$MARKER_INK" -le "$BASE_INK" ]; then
 fi
 echo "PHASE 2 PASS: '$MARKER' is on screen and in the server's Term (ink $MARKER_INK)"
 
+# Seed real history and leave the live pane scrolled away from its bottom. The
+# font reload below drives Resize -> RequestSnapshot -> ScreenSnapshot, so this
+# is the non-tab resync path that must retain the viewport.
+send_keys Return
+type_text 'for i in $(seq 1 200); do echo "snapshot-scrollback-$i"; done'
+send_keys Return Return
+SCROLL_BEFORE=$(count_log "terminal scrollback moved")
+focus
+send_keys shift+Prior
+if ! wait_for_log_growth "terminal scrollback moved" "$SCROLL_BEFORE"; then
+    fail "PHASE 2b FAIL: shift+PageUp never entered the pane's scrollback"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"offset=0"*) fail "PHASE 2b FAIL: the pane stayed at the live bottom: $LINE" ;;
+esac
+shot /output/02-scrolled-before-snapshot.png
+echo "PHASE 2b PASS: the pane is scrolled before the resize resync"
+
 # ── Phase 3: a cell-metric change asks for a fresh screen ─────────
 # Editing the font size hot-reloads the running client, which republishes its
 # cell metrics as a `Resize` and — because a display-only client cannot
@@ -382,10 +405,25 @@ if cmp -s /output/01-marker-typed.png /output/02-snapshot-repaint.png; then
 fi
 echo "PHASE 5 PASS: the snapshot repainted the window (ink $MARKER_INK -> $AFTER_INK)"
 
+# @lat: [[test#Visual E2E Tests#Subscribe and snapshot session tooling#ScreenSnapshot resize resync preserves scrollback]]
+SCROLL_END_BEFORE=$(count_log "terminal scrollback moved")
+focus
+send_keys shift+End
+if ! wait_for_log_growth "terminal scrollback moved" "$SCROLL_END_BEFORE"; then
+    fail "PHASE 5b FAIL: shift+End never reached the resynced pane"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"moved=true"*"offset=0"*) ;;
+    *) fail "PHASE 5b FAIL: ScreenSnapshot reset the viewport: $LINE" ;;
+esac
+echo "PHASE 5b PASS: the ScreenSnapshot resync preserved the scrolled viewport"
+
 echo ""
 echo "PASS: visual session-tooling test"
 echo "  Inspect screenshots in test-output/:"
 echo "    00-attached.png           — relaunched client attached to the harness session"
 echo "    01-marker-typed.png       — the marker typed into the attached pane"
+echo "    02-scrolled-before-snapshot.png — the pane before its resize resync"
 echo "    02-snapshot-repaint.png   — pane repainted from the server's ScreenSnapshot"
 echo "  Wire record: test-output/share-wire.jsonl"

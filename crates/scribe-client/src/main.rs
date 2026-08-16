@@ -183,7 +183,7 @@ use crate::{
     },
     pane_shell::{ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
-    sync_frames::{present_next_burst, present_rebuild},
+    sync_frames::present_next_burst,
     terminal::{
         Content, DisplayOnlyTerminal, HoveredLink, PaneFrame, PaneGrid, PaneGrids, PaneStream,
         Scroll,
@@ -11894,33 +11894,45 @@ fn resolve_batch_panes(
 /// The arms share the stream because they are ordered against each other:
 /// output advances the grid, a prompt mark reads the row the output left the
 /// cursor on, and a legacy `ScrollBottom` can only act at the live tail. A
-/// rebuild is the one arm that reshapes the grid before it writes and normalizes
-/// legacy replay history afterwards, because it is state rather than a delta —
-/// see [`reshape_for_rebuild`].
+/// rebuild flushes that ordered output, remembers the resulting viewport,
+/// reshapes and replaces the grid, normalizes legacy replay history, then
+/// restores a scrolled absolute anchor. It does that here rather than in either
+/// producer because a rebuild is state rather than a delta — see
+/// [`PaneStream::rebuild`].
 fn apply_pane_op(
     op: &PaneOp,
     session: SessionId,
     stream: &mut PaneStream,
     prompt_marks: &Arc<Mutex<PromptMarks>>,
 ) -> usize {
-    let PaneStream { queue, terminal: grid } = stream;
     match op {
         PaneOp::Output(bytes) => {
+            let PaneStream { queue, terminal: grid } = stream;
             queue.queue_output_frames(bytes);
             usize::from(present_next_burst(queue, grid))
         }
         PaneOp::Rebuild { bytes, cols, rows, scrollback_rows } => {
-            reshape_for_rebuild(session, grid, *cols, *rows);
-            let rebuilt = present_rebuild(queue, grid, bytes);
+            let (columns, lines) = (usize::from(*cols), usize::from(*rows));
+            let current = stream.terminal.dimensions();
+            if columns > 0 && lines > 0 && current != (columns, lines) {
+                tracing::info!(
+                    %session,
+                    from_cols = current.0,
+                    from_rows = current.1,
+                    to_cols = columns,
+                    to_rows = lines,
+                    "reshaped a pane to its rebuild's geometry"
+                );
+            }
             let kept_rows = usize::try_from(*scrollback_rows).unwrap_or(usize::MAX);
-            let trimmed = grid.trim_history(kept_rows);
-            usize::from(rebuilt || trimmed > 0)
+            usize::from(stream.rebuild(bytes, columns, lines, kept_rows))
         }
         PaneOp::PromptMark { kind, exit_code } => {
-            apply_prompt_mark(prompt_marks, session, *kind, *exit_code, grid);
+            apply_prompt_mark(prompt_marks, session, *kind, *exit_code, &stream.terminal);
             0
         }
         PaneOp::ScrollBottom => {
+            let grid = &mut stream.terminal;
             // Older servers emitted this after a suppressed ED 3. Never let a
             // delayed legacy frame override a viewport the user is reading.
             if grid.display_offset() != 0 {
@@ -11931,64 +11943,31 @@ fn apply_pane_op(
             tracing::info!(%session, moved, "processed legacy server ScrollBottom at the live bottom");
             usize::from(moved)
         }
-        PaneOp::TrimScrollback { kept_rows } => apply_trim_scrollback(
-            prompt_marks,
-            session,
-            grid.trim_history(*kept_rows),
-            *kept_rows,
-            grid,
-        ),
-        PaneOp::TerminalImageLive(message) => match grid.apply_image_live(message.clone()) {
-            Ok(committed) => usize::from(committed),
-            Err(error) => {
-                tracing::warn!(%session, %error, "rejected terminal image live burst");
-                0
+        PaneOp::TrimScrollback { kept_rows } => {
+            let dropped = stream.terminal.trim_history(*kept_rows);
+            apply_trim_scrollback(prompt_marks, session, dropped, *kept_rows, &stream.terminal)
+        }
+        PaneOp::TerminalImageLive(message) => {
+            match stream.terminal.apply_image_live(message.clone()) {
+                Ok(committed) => usize::from(committed),
+                Err(error) => {
+                    tracing::warn!(%session, %error, "rejected terminal image live burst");
+                    0
+                }
             }
-        },
-        PaneOp::TerminalImageReplay(message) => match grid.apply_image_replay(message.clone()) {
-            Ok(committed) => usize::from(committed),
-            Err(error) => {
-                // The staged snapshot is already discarded; the pane keeps the
-                // scene it last committed until the server sends a fresh one.
-                tracing::warn!(%session, %error, "rejected terminal image replay burst");
-                0
+        }
+        PaneOp::TerminalImageReplay(message) => {
+            match stream.terminal.apply_image_replay(message.clone()) {
+                Ok(committed) => usize::from(committed),
+                Err(error) => {
+                    // The staged snapshot is already discarded; the pane keeps the
+                    // scene it last committed until the server sends a fresh one.
+                    tracing::warn!(%session, %error, "rejected terminal image replay burst");
+                    0
+                }
             }
-        },
+        }
     }
-}
-
-/// Reshape a pane's grid to the geometry a rebuild was rendered at, before the
-/// rebuild bytes reach the parser.
-///
-/// A rebuild is state, not a delta: the snapshot ANSI emits every row as exactly
-/// `cols` printable characters and ends on an absolute CUP in snapshot
-/// coordinates, so it only describes the server's screen when the receiving grid
-/// is that same shape. The two sides routinely disagree while a window is being
-/// dragged — the client reshapes its own grid the instant the layout moves
-/// ([`TerminalView::publish_pane_sizes`]) and asks for the authoritative screen in the
-/// same breath, while the server debounces its `Term` resize and answers from
-/// the size it still has. Replaying a one-column-too-wide rebuild into the
-/// narrower grid autowraps every row, scrolls the whole screen into scrollback,
-/// and leaves the viewport blank with the cursor parked mid-screen.
-///
-/// The reshape is therefore driven by the rebuild rather than by the layout: it
-/// only has to hold until the size the client actually asked for comes back as
-/// a rebuild of its own, which the pending `RequestSnapshot` guarantees.
-fn reshape_for_rebuild(session: SessionId, grid: &mut DisplayOnlyTerminal, cols: u16, rows: u16) {
-    let (columns, lines) = (usize::from(cols), usize::from(rows));
-    let current = grid.dimensions();
-    if columns == 0 || lines == 0 || current == (columns, lines) {
-        return;
-    }
-    tracing::info!(
-        %session,
-        from_cols = current.0,
-        from_rows = current.1,
-        to_cols = columns,
-        to_rows = lines,
-        "reshaped a pane to its rebuild's geometry"
-    );
-    grid.resize(columns, lines);
 }
 
 /// Shift a pane's absolute-row anchors past the scrollback rows the trim just
@@ -15392,6 +15371,32 @@ mod tests {
         }
     }
 
+    /// A replay fixture with numbered scrollback rows, so preserving an
+    /// absolute viewport anchor cannot accidentally pass by restoring the old
+    /// display offset instead.
+    fn numbered_snapshot_with_history(history_rows: u32) -> ScreenSnapshot {
+        let mut snapshot = numbered_snapshot(20, 3);
+        let cols = usize::from(snapshot.cols);
+        let history_len = usize::try_from(history_rows).unwrap_or(usize::MAX);
+        snapshot.scrollback_rows = history_rows;
+        snapshot.scrollback = vec![blank_screen_cell(); cols.saturating_mul(history_len)];
+        for row in 0..history_len {
+            for (col, ch) in format!("history {row:02}").chars().enumerate() {
+                snapshot.scrollback[row * cols + col].c = ch;
+            }
+        }
+        snapshot
+    }
+
+    fn rebuild_op(snapshot: &ScreenSnapshot) -> PaneOp {
+        PaneOp::Rebuild {
+            bytes: scribe_common::screen_replay::snapshot_to_ansi(snapshot),
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            scrollback_rows: snapshot.scrollback_rows,
+        }
+    }
+
     /// Recreate the primary-screen prefix emitted before replay bytes became
     /// self-resetting. New clients prepend RIS before applying this form, then
     /// normalize the one blank history row its ED 2 creates.
@@ -15546,5 +15551,191 @@ mod tests {
         .expect("pane applies the plain ED 3 output");
 
         assert_eq!(pane.frame().unwrap().metrics.display_offset, 0);
+    }
+
+    // @lat: [[client#Input#Resize Coordination#Rebuild preserves a scrolled viewport]]
+    #[gpui::test]
+    fn equivalent_rebuild_keeps_the_scrolled_content_anchor(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let snapshot = numbered_snapshot_with_history(8);
+        let mut grids = PaneGrids::new(20, 3);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| {
+            apply_pane_op(&rebuild_op(&snapshot), session, stream, &prompt_marks)
+        })
+        .expect("pane accepts the initial replay");
+        pane.with_terminal(|terminal| terminal.scroll_to_abs(4))
+            .expect("pane scrolls to history 04");
+
+        pane.with_stream(|stream| {
+            apply_pane_op(&rebuild_op(&snapshot), session, stream, &prompt_marks)
+        })
+        .expect("pane accepts the equivalent replay");
+
+        assert_eq!(
+            pane.with_terminal(|terminal| {
+                (
+                    terminal.viewport_top_abs(),
+                    terminal.display_offset(),
+                    terminal.content().row_text(0).trim_end().to_owned(),
+                )
+            }),
+            Some((4, 4, "history 04".to_owned()))
+        );
+    }
+
+    #[gpui::test]
+    fn rebuild_keeps_a_scrolled_anchor_when_authority_appends_rows(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 3);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(8)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the initial replay");
+        pane.with_terminal(|terminal| terminal.scroll_to_abs(4))
+            .expect("pane scrolls to history 04");
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(12)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the appended replay");
+
+        assert_eq!(
+            pane.with_terminal(|terminal| {
+                (
+                    terminal.viewport_top_abs(),
+                    terminal.display_offset(),
+                    terminal.content().row_text(0).trim_end().to_owned(),
+                )
+            }),
+            Some((4, 8, "history 04".to_owned()))
+        );
+    }
+
+    #[gpui::test]
+    fn rebuild_leaves_the_live_bottom_at_the_live_bottom(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 3);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(8)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the initial replay");
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(12)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the appended replay");
+
+        assert_eq!(
+            pane.with_terminal(|terminal| (terminal.viewport_top_abs(), terminal.display_offset())),
+            Some((12, 0))
+        );
+    }
+
+    #[gpui::test]
+    fn rebuild_clamps_a_dropped_anchor_to_the_oldest_surviving_row(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 3);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(12)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the initial replay");
+        pane.with_terminal(|terminal| terminal.scroll_to_abs(8))
+            .expect("pane scrolls to history 08");
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(4)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the shortened replay");
+
+        assert_eq!(
+            pane.with_terminal(|terminal| {
+                (
+                    terminal.viewport_top_abs(),
+                    terminal.display_offset(),
+                    terminal.content().row_text(0).trim_end().to_owned(),
+                )
+            }),
+            Some((0, 4, "history 00".to_owned()))
+        );
+    }
+
+    #[gpui::test]
+    fn queued_real_ed3_before_rebuild_keeps_the_live_bottom_authoritative(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 3);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(8)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the initial replay");
+        pane.with_terminal(|terminal| terminal.scroll_to_abs(4))
+            .expect("pane scrolls into history");
+        pane.with_stream(|stream| stream.queue.queue_output_frames(b"\x1b[3J"))
+            .expect("real ED 3 waits ahead of the rebuild");
+
+        pane.with_stream(|stream| {
+            apply_pane_op(
+                &rebuild_op(&numbered_snapshot_with_history(4)),
+                session,
+                stream,
+                &prompt_marks,
+            )
+        })
+        .expect("pane accepts the post-ED-3 replay");
+
+        assert_eq!(
+            pane.with_terminal(|terminal| (terminal.history_size(), terminal.display_offset())),
+            Some((4, 0))
+        );
     }
 }

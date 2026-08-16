@@ -180,8 +180,8 @@ erase a replacement.
 | Variant | Surface | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
 | `PtyOutput` | terminal stream | golden | `main.rs::dispatch_server_message` → `main.rs::on_pane_output_message` → `main.rs::forward_output` (gated on the attached session) | required |
-| `ScreenSnapshot` | tooling snapshot | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::apply_screen_snapshot` → `screen_replay::snapshot_to_ansi` | required |
-| `SessionReplay` | reconnect replay | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::forward_replay` → `session_lifecycle::decode_replay` | required |
+| `ScreenSnapshot` | tooling snapshot | scripted-E2E, visual-E2E | `main.rs::on_pane_output_message` → `main.rs::apply_screen_snapshot` → `screen_replay::snapshot_to_ansi`; `tests/e2e/visual/session-tooling.sh` preserves a scrolled viewport through resize resync | required |
+| `SessionReplay` | reconnect replay | scripted-E2E, visual-E2E | `main.rs::on_pane_output_message` → `main.rs::forward_replay` → `session_lifecycle::decode_replay`; `tests/e2e/visual/tab-switching.sh` preserves a returned tab's scrolled viewport | required |
 | `AiStateChanged` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `ai_indicator::AiStateTracker::update` | required |
 | `AiStateCleared` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
 | `CwdChanged` | tab metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_cwd` → `StatusBarData.cwd` | required |

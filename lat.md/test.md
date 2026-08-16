@@ -1771,6 +1771,15 @@ registry and Git download caches. The unit stage inherits the package-only
 functional base, so it needs no staged release binaries. Its build target is
 not shared, so a linked worktree always compiles and runs its own source.
 
+#### GPUI Rebuild Viewport Unit Contract
+
+Docker-only client unit tests keep whole-pane replay validation independent of host Cargo and staged runtime binaries.
+
+`just docker-unit-client-rebuild` builds the `client-rebuild-unit` stage from
+the package-only functional base and runs only the five exact viewport-anchor
+tests. The stage keeps Cargo's download caches but no build target, so each
+linked worktree compiles its own current source.
+
 The load-bearing server tests are
 `composes_every_write_verb_for_the_official_cli_without_private_guards`,
 `fresh_guards_are_checked_only_after_entering_the_project_lock`,
@@ -2226,6 +2235,14 @@ Switching between a tab with Scribe prompt chrome and a plain tab must paint eac
 
 The script sends a real `PromptReceived` for the hidden original tab, leaving the selected second tab plain. On plain-to-prompt switch, the wire-recorded `AttachSessions` and first `SessionReplay` must agree on a row count below the plain pane's published count. On prompt-to-plain switch, both must agree on the original larger count. Checking attach and replay ordering distinguishes the first painted state from eventual convergence: the broken path attached with the outgoing tab's rows, then corrected itself through `Resize` and `RequestSnapshot` one round trip later.
 
+The screenshot masks the theme's prompt-text colour rather than all bright pixels. The returned viewport contains ordinary scrollback text, which is valid terminal ink directly above the bar.
+
+#### Returned tab preserves its scrolled viewport
+
+The original tab builds history and pages up before the new tab hides it. Its prompt-geometry `SessionReplay` must leave the viewport scrolled.
+
+Returning to the original tab then makes `shift+End` move to the live bottom. If the replay reset the viewport, that command would be a no-op.
+
 Phases 6–10 extend the oracle to multi-workspace windows, and they are where the two selection paths stop agreeing. A live `ctrl+alt+backslash` splits the window into a second workspace region (settled on the `MoveSession` frame that re-files the seed session under the new region). Phase 7 then pins [[lat.md/test#Test Harness#GPUI Client Headless Suites#GPUI tab session strip#Digit select is workspace-scoped]] on the running client: with focus in the second region, whose only tab is already selected, `alt+1` must put nothing on the wire — an attach of the first region's tab 0 there would be the window-global indexing `TabSessions::select_in_workspace` exists to prevent. Moving the focus back into the first region with `ctrl+Prior`, which walks the strip globally and so does cross regions, `alt+1` must then attach that region's first tab. Phase 8 keeps the cross-region assertion for the path that still owns it: a pointer click on the first tab — offset past the workspace badge pill — attaches it from focus in the second region.
 
 The client is then killed and relaunched so the fresh window rebuilds both regions from the server's persisted workspace tree (`adopt_server_topology` → `PaneShell::adopt_server_tree`), and the same cross-region click must still switch tabs on that adoption-built layout. The adopted strip's order follows the server's `SessionList`, which is not creation order, so the adopted-layout phase asserts order-independently: adoption restores tab 0, `ctrl+Prior` wraps the selection onto the last tab (the second region's), and the click on tab 0 must attach a different session than that, with every typed key routed to the clicked session. Focus assertions for sessions the client created itself run against the wire's per-session `KeyInput` frames rather than `scribe-test wait-output`, which can only observe daemon-owned sessions — a limitation that produced deterministic false failures before the oracle was switched.
@@ -2410,6 +2427,12 @@ The trim phase drives the server's real AI path — arm the pane with `ScribeAiL
 Neither message could be proven by a headless test, because the gap was reachability — the frames existed in the frozen protocol and nowhere in the client. The run therefore reuses the  wire tap (`SCRIBE_SHARE_TAP=1`) purely as a recorder, truncating `/output/share-wire.jsonl` at each phase boundary so a frame found afterwards can only have come from the action that phase performed. Phase 0 is the same daemon-stop-and-relaunch preamble as `overlay-actions.sh`, which is what puts the client on the `ListSessions` →  path.
 
 The `Subscribe` half asserts a client frame naming the attached session, that its record line follows the `AttachSessions` that authorises it, and that `scribe-server` logged no `Subscribe denied for unattached session`. The `RequestSnapshot` half types a marker into the pane, edits `appearance.font_size` under the running window so  fires, then asserts the request follows its `Resize`, that the server answered with a `ScreenSnapshot` whose per-cell grid contains the marker, and that the client logged `repainted pane from server screen snapshot` with the same `cols`/`rows` the recorded frame carried — tying the repaint to that exact reply rather than to some other snapshot.
+
+#### ScreenSnapshot resize resync preserves scrollback
+
+The session-tooling run fills history and pages up before a font-size reload drives a `ScreenSnapshot`. That resync must leave the viewport scrolled.
+
+A following `shift+End` must move to offset zero, which rules out a resync that silently returned the pane to the live bottom.
 ### Terminal bell attention routing
 
 `tests/e2e/visual/bell.sh` is the app-level oracle for the `Bell` parity row: it drives a real BEL byte out of a real shell and asserts what the running client does with it (see ).
@@ -2835,7 +2858,7 @@ An empty queue does not reach the target at all, so a pacer tick on an idle pane
 
 ### Applies a rebuild as its own burst
 
-A rebuild handed to [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] behind a queued commit and a still-open `CSI ? 2026 h` reaches the target as a frame of its own, concatenated onto neither.
+A rebuild preceded by [[crates/scribe-client/src/sync_frames.rs#flush_before_rebuild]] behind a queued commit and a still-open `CSI ? 2026 h` reaches the target as a frame of its own, concatenated onto neither.
 
 The queued commit lands first and the half-open update is sealed and committed rather than dropped, which is the ordering a `SessionReplay` depends on: folded into a neighbouring commit it would be swallowed by a synchronized update the pane it replaces had opened. The whole boundary publishes one snapshot: the frames it clears out of the way are replaced by the rebuild before anything paints.
 
