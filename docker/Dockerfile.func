@@ -4,7 +4,7 @@ ADD https://github.com/gastownhall/beads/releases/download/v1.1.0/beads_1.1.0_li
     /tmp/beads.tar.gz
 RUN tar -xzf /tmp/beads.tar.gz -C /usr/local/bin bd
 
-FROM rust:1.95-trixie AS func-runtime
+FROM rust:1.95-trixie AS func-base
 
 COPY --from=beads-release /usr/local/bin/bd /usr/local/bin/bd
 
@@ -32,6 +32,8 @@ RUN apt-get update && \
         openssh-server \
         zsh \
     && rm -rf /var/lib/apt/lists/*
+
+FROM func-base AS func-runtime
 
 ARG BIN_DIR=target/e2e-stage/release
 
@@ -62,7 +64,7 @@ RUN mkdir -p /output
 
 ENTRYPOINT ["/entrypoint.sh"]
 
-FROM func-runtime AS beads-write-unit
+FROM func-base AS beads-write-unit
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && \
     rm -rf /var/lib/apt/lists/*
@@ -70,7 +72,6 @@ WORKDIR /workspace
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/workspace/target \
     cargo test --locked -p scribe-server beads_board::tests -- --nocapture && \
     cargo test --locked -p scribe-server \
         beads_board_refresh_reaches_each_authorized_same_root_workspace -- --nocapture && \

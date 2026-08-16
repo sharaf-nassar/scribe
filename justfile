@@ -151,7 +151,8 @@ docker-func profile="release":
 
 # Compile and run Beads-board server unit tests inside the functional image.
 docker-unit-beads-write:
-    docker build --target beads-write-unit --build-arg BIN_DIR=target/e2e-stage/release -f docker/Dockerfile.func -t scribe-test-beads-write-unit .
+    bash tests/docker-unit-beads-write-isolation.sh
+    docker build --no-cache-filter beads-write-unit --target beads-write-unit --build-arg BIN_DIR=target/e2e-stage/release -f docker/Dockerfile.func -t scribe-test-beads-write-unit .
 
 # Rebuild visual test container from release or debug binaries
 docker-visual profile="release":

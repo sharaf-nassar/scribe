@@ -1754,6 +1754,11 @@ private lock paths and modes, same-root serialization, distinct-root
 independence, timeout release, stale-refresh rejection, last-good cache
 retention, root-scoped multi-window push, panel intents, and typed IPC lowering.
 
+The recipe invalidates only its `beads-write-unit` stage and keeps Cargo's
+registry and Git download caches. The unit stage inherits the package-only
+functional base, so it needs no staged release binaries. Its build target is
+not shared, so a linked worktree always compiles and runs its own source.
+
 The load-bearing server tests are
 `composes_every_write_verb_for_the_official_cli_without_private_guards`,
 `fresh_guards_are_checked_only_after_entering_the_project_lock`,
