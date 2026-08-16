@@ -1038,16 +1038,33 @@ The [[test#Test Harness#GPUI Beads Inline Editing#Text fields map to typed write
 pins those rules without deriving expected verbs from the implementation.
 
 [[crates/scribe-client/src/beads_panel.rs#BeadsEditor]] owns the edit session
-and starts with the saved value selected. Its paint-time GPUI
-`ElementInputHandler` applies UTF-16 replacement and marked composition to the
-same draft. [[crates/scribe-client/src/main.rs#TerminalView#handle_beads_editor_key]]
-routes armed keys before overlays, bindings, vi mode, and PTY encoding.
-Printable keys stay unstopped so GPUI can deliver text; Enter, Escape, and
-modified controls stay on the panel's key route.
+and stores one active field's selection and current shaped text layout.
+[[crates/scribe-client/src/beads_panel.rs#editable_text]] maps a real
+pointer position through GPUI's multiline `StyledText` layout before handing
+the shared native input owner the collapsed caret or drag range. Cursor motion,
+selection drag, Backspace, and Delete snap to Unicode grapheme boundaries.
+Platform UTF-16 replacement and marked ranges retain exact valid character
+boundaries, so an IME can replace a combining mark without deleting its base.
+Each active draft render refreshes the retained layout used for native point
+indexing and range bounds.
+
+Inactive one-line fields may keep their visual ellipsis, but activation clears
+text overflow on the shaped draft so native bounds and pointer indexing cover
+the full logical value. A pointer release outside the field maps through that
+layout, clamps to the nearest source edge, extends the selection, and ends the
+drag.
+
+Every editable field is a tab stop with Enter/Space activation and AccessKit
+Click and set-value actions. Description, acceptance, notes, design, and comment keep
+their wrapped text rather than passing through a one-line shaping path.
+[[crates/scribe-client/src/main.rs#TerminalView#handle_beads_editor_key]] routes
+armed keys before overlays, bindings, vi mode, and PTY encoding. Printable
+keys stay unstopped so GPUI can deliver text; Enter, Escape, selection, and
+editing controls stay on the panel's key route.
 [[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] includes
 [[crates/scribe-client/src/beads_panel.rs#BeadsEditor#has_keyboard_focus]] in
-its claimed-focus decision, so the repaint requested by a click cannot blur
-and commit the editor back to the terminal.
+its claimed-focus decision. The shared handle contains focused inactive fields,
+so a repaint between Tab focus and activation cannot restore terminal focus.
 
 #### Pickers, labels, comments, and status rail
 

@@ -9633,7 +9633,7 @@ impl TerminalView {
             self.ci_action_focus.values().any(|(toggle, open, dismiss)| {
                 toggle.is_focused(window) || open.is_focused(window) || dismiss.is_focused(window)
             }),
-            self.beads_editor.read(cx).has_keyboard_focus(window),
+            self.beads_editor.read(cx).has_keyboard_focus(window, cx),
         ]);
         if focus_is_unclaimed {
             window.focus(&self.focus.root, cx);

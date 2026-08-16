@@ -521,33 +521,75 @@ DETAIL_DIFF=$(compare -metric AE /output/beads-real-board.png \
 DETAIL_DIFF=${DETAIL_DIFF%%.*}
 [ "${DETAIL_DIFF:-0}" -ge 20000 ] || fail "real detail panel changed only ${DETAIL_DIFF:-0}px"
 
+panel_bounds() {
+    local before="$1" after="$2"
+    convert "$before" "$after" -compose difference -composite -threshold 10% -trim \
+        -format '%w %h %X %Y' info:
+}
+
+# The field targets follow the painted panel rather than a lane-specific or
+# fixed-window offset. This keeps the real input proof valid when the panel
+# centers inside a resized or split terminal region.
+read -r PANEL_W PANEL_H PANEL_X PANEL_Y \
+    <<<"$(panel_bounds /output/beads-real-board.png /output/beads-real-detail.png)"
+[ "$PANEL_W" -eq 590 ] && [ "$PANEL_H" -ge 120 ] \
+    || fail "resolved detail panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}"
+# `shadow_lg` makes the difference image 30px wider than the 560px surface.
+# Its detected left/top edges still match the surface, so only the width is
+# normalized before deriving field coordinates.
+PANEL_W=560
+PANEL_LEFT=${PANEL_X#+}
+PANEL_TOP=${PANEL_Y#+}
+PANEL_ID_X=32
+PANEL_ID_Y=60
+PANEL_OUTSIDE_X=$(( PANEL_LEFT + PANEL_W + 16 ))
+[ "$PANEL_OUTSIDE_X" -lt "$WIN_W" ] || PANEL_OUTSIDE_X=$(( PANEL_LEFT - 16 ))
+PANEL_OUTSIDE_Y=$(( PANEL_TOP + PANEL_H + 16 ))
+[ "$PANEL_OUTSIDE_Y" -lt "$HEIGHT" ] || PANEL_OUTSIDE_Y=$(( PANEL_TOP - 16 ))
+panel_move() {
+    xdotool mousemove --sync --window "$WID" "$(( PANEL_LEFT + $1 ))" "$(( PANEL_TOP + $2 ))"
+}
+
+panel_move_outside() {
+    xdotool mousemove --sync --window "$WID" "$PANEL_OUTSIDE_X" "$PANEL_OUTSIDE_Y"
+}
+
 # The painted panel's identity target is the final semantic check: it copies
 # the same full id read from bd show and carried on the matched wire response.
-xdotool mousemove --sync --window "$WID" 450 284
+panel_move "$PANEL_ID_X" "$PANEL_ID_Y"
 xdotool click 1
 sleep 0.2
 COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 [ "$COPIED" = "e2e-detail" ] || fail "painted panel copied '$COPIED' instead of e2e-detail"
 
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Real pointer editor checkpoint]]
 # The real editor owns keyboard input while armed. The transparent wire tap is
-# the byte-level pane oracle: cancelled title text must create neither KeyInput
-# frames nor a write request.
-WRITES_BEFORE=$(write_request_count)
+# the byte-level pane oracle, and the MessagePack name proves the pointer path
+# committed the title through the serialized SetTitle variant.
+EDITOR_TITLE='Complete card detail pointer checked'
+EDITOR_WRITES_BEFORE=$(issue_write_count e2e-detail set_title)
+EDITOR_APPLIED_BEFORE=$(issue_applied_count e2e-detail)
 KEYS_BEFORE=$(key_input_count)
-xdotool mousemove --sync --window "$WID" 560 258
+panel_move 188 23
 xdotool click 1
 sleep 0.2
-xdotool type --clearmodifiers --delay 5 -- 'EDITOR_KEYS_STAY_LOCAL'
+xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 5 -- "$EDITOR_TITLE"
 sleep 0.2
 KEYS_AFTER=$(key_input_count)
 [ "$KEYS_AFTER" -eq "$KEYS_BEFORE" ] \
     || fail "armed Beads editor forwarded keystrokes to the pane program"
-[ "$(write_request_count)" -eq "$WRITES_BEFORE" ] \
+[ "$(issue_write_count e2e-detail set_title)" -eq "$EDITOR_WRITES_BEFORE" ] \
     || fail "typing into the armed editor committed before Enter"
-xdotool key --clearmodifiers Escape
-sleep 0.2
-[ "$(write_request_count)" -eq "$WRITES_BEFORE" ] \
-    || fail "cancelling the armed editor queued a write"
+xdotool key --clearmodifiers Return
+wait_for_write e2e-detail set_title "$EDITOR_WRITES_BEFORE"
+wait_for_applied e2e-detail "$EDITOR_APPLIED_BEFORE"
+EDITOR_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
+printf '%s\n' "$EDITOR_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
+    || fail "pointer title edit did not persist exactly once: $EDITOR_SHOW"
+printf '%s\n' 'PASS: real pointer editor committed set_title without KeyInput leakage' \
+    >/output/beads-editor-pointer-checkpoint.txt
+echo 'CHECKPOINT: real pointer editor committed set_title without KeyInput leakage'
 
 # Install the deterministic bd fault shim after the capability handshake. It
 # delegates every read and targets only writes for this fixture.
@@ -560,7 +602,7 @@ sleep 0.2
 import -window "$WID" /output/beads-write-last-good.png
 
 printf '%s\n' nonzero:e2e-detail >/tmp/scribe-beads-write-fault-mode
-xdotool mousemove --sync --window "$WID" 560 258
+panel_move 188 23
 xdotool click 1
 xdotool type --clearmodifiers --delay 5 -- 'must not persist'
 xdotool key --clearmodifiers Return
@@ -568,9 +610,9 @@ wait_for_write_failure 'forced nonzero write' 50 \
     || fail "GPUI nonzero write produced no typed Failed result"
 rm -f /tmp/scribe-beads-write-fault-mode
 NONZERO_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
-printf '%s\n' "$NONZERO_SHOW" | grep -Fq '"title": "Complete card detail"' \
+printf '%s\n' "$NONZERO_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
     || fail "GPUI nonzero write replaced last-good detail: $NONZERO_SHOW"
-xdotool mousemove --sync --window "$WID" 900 600
+panel_move_outside
 sleep 0.2
 import -window "$WID" /output/beads-write-nonzero-notice.png
 NONZERO_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \
@@ -586,7 +628,7 @@ sleep 5.2
 TIMEOUT_DETAIL_BEFORE=$(detail_request_count)
 TIMEOUT_BOARD_BEFORE=$(board_request_count)
 printf '%s\n' timeout:e2e-detail >/tmp/scribe-beads-write-fault-mode
-xdotool mousemove --sync --window "$WID" 560 258
+panel_move 188 23
 xdotool click 1
 xdotool type --clearmodifiers --delay 5 -- 'must not time in'
 xdotool key --clearmodifiers Return
@@ -604,10 +646,10 @@ done
 [ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
     || fail "timeout did not request an authoritative board"
 TIMEOUT_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
-printf '%s\n' "$TIMEOUT_SHOW" | grep -Fq '"title": "Complete card detail"' \
+printf '%s\n' "$TIMEOUT_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
     || fail "GPUI timeout write replaced last-good detail: $TIMEOUT_SHOW"
 printf '%s\n' "$TIMEOUT_SHOW" >/output/beads-write-gpui-final-show.json
-xdotool mousemove --sync --window "$WID" 900 600
+panel_move_outside
 sleep 0.2
 import -window "$WID" /output/beads-write-timeout-notice.png
 TIMEOUT_NOTICE_DIFF=$(compare -metric AE /output/beads-write-last-good.png \

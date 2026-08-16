@@ -1743,6 +1743,18 @@ Evidence is `beads-real-detail-evidence.json`,
 uses the default `SingleController` owner because the shared-pane rig correctly
 has no Beads detail or write capability.
 
+#### Real pointer editor checkpoint
+
+The live functional proof derives its field coordinates from the painted detail surface and proves pointer activation commits one serialized title write without leaking keys to the terminal.
+
+The image-difference bound includes the panel shadow, so the script normalizes
+its known 590px outer width to the 560px surface before targeting the title.
+It uses explicit select-all, submits with Enter, requires exactly one
+`set_title` wire verb and Applied result, and confirms the exact `bd show`
+value. It writes `beads-editor-pointer-checkpoint.txt` before the independent
+card-drag assertions, so any later drag failure cannot obscure this editor
+result.
+
 #### Beads Write Executor Unit Contract
 
 Docker-only server unit tests pin argv, capability, deadline, cache, and generation behavior without touching the host runtime.
@@ -4577,6 +4589,73 @@ in the active passage, or repaints from persisted detail.
 
 Enter applies a title, plain Enter remains text in multiline passages, and
 modifier-Enter applies multiline text.
+
+### Pointer activation keeps a collapsed caret
+
+Clicks at the beginning, middle, or end of a rendered passage create a
+collapsed native selection so the next replacement preserves unrelated text.
+
+### Pointer drag updates the native selection
+
+A real mouse-down, move, and mouse-up sequence selects text across a literal
+newline and reports the resulting non-empty range through native input.
+
+### Pointer release outside extends the native selection
+
+`pointer_release_outside_extends_selection_to_both_text_edges` releases a real
+drag beyond each horizontal edge and proves the native UTF-16 selection reaches
+zero or the full source length before the gesture ends.
+
+### Active truncated fields retain the full native layout
+
+`active_truncated_fields_keep_full_logical_layout` activates narrow, long Title
+and Spec fields and proves logical-end bounds and pointer indexing resolve the
+full source rather than the inactive ellipsis.
+
+### Literal newlines produce distinct native caret bounds
+
+The shaped multiline layout maps carets before and after a literal newline to
+different visual lines for native candidate-window placement.
+
+### Inserted text refreshes native layout
+
+Typing after pointer activation redraws the draft and maps the new end offset
+through that current layout instead of the activation snapshot.
+
+### Marked composition refreshes native layout
+
+IME marked text redraws the draft and maps its new end offset through the
+current shaped layout.
+
+### Keyboard activation enters the shared editor
+
+Tab focus followed by Enter or Space and an intervening render arms the same
+window-scoped native input owner as pointer activation. Focus repair cannot
+consume the control key.
+
+### Accessible click enters the shared editor
+
+An AccessKit Click action arms the same window-scoped native input owner as
+pointer and keyboard activation.
+
+### Active title Enter commits through the shared input
+
+An Enter press while a title is active reaches the shared input handler and commits its draft instead of re-running field activation.
+
+### Grapheme-aware deletion
+
+Backspace and Delete move across one Unicode grapheme at a time, so emoji and
+combining marks cannot be split or erased as a whole draft.
+
+### Grapheme-aware cursor navigation
+
+Arrow selection, explicit select-all, and pointer drag keep their caret ranges
+on Unicode grapheme boundaries.
+
+### IME ranges preserve adjacent graphemes
+
+Platform replacement and marked ranges keep exact valid character boundaries,
+so replacing only a combining mark does not delete its adjacent base letter.
 
 ### Passage changes commit drafts
 

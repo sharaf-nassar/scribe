@@ -6031,6 +6031,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ttf-parser",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
  "wgpu",

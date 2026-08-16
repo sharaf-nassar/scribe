@@ -8,10 +8,10 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent, MouseButton, Pixels, Point,
-    Rgba, Role, SharedString, Subscription, UTF16Selection, Window, canvas, div, linear_color_stop,
-    linear_gradient, prelude::*, px,
+    AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent,
+    MouseButton, Pixels, Point, Rgba, Role, SharedString, StyledText, Subscription, TextLayout,
+    UTF16Selection, Window, canvas, div, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
@@ -24,6 +24,7 @@ use crate::animation::AnimationSettings;
 use crate::beads_board::{BeadsBoardColors, CardDragState};
 use crate::layout::Rect;
 use crate::settings::window::{utf8_range_to_utf16, utf16_range_to_utf8};
+use unicode_segmentation::UnicodeSegmentation;
 
 const PANEL_WIDTH: f32 = 560.0;
 const PANEL_MIN_WIDTH: f32 = 400.0;
@@ -305,7 +306,7 @@ impl PanelNotice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EditField {
     Title,
     Description,
@@ -374,11 +375,17 @@ fn parse_labels(value: &str) -> Vec<String> {
 enum EditKeyAction {
     Commit,
     Cancel,
+    SelectAll,
     Text,
     Consume,
 }
 
 fn edit_key_action(field: EditField, event: &KeyDownEvent) -> EditKeyAction {
+    if event.keystroke.key == "a"
+        && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+    {
+        return EditKeyAction::SelectAll;
+    }
     match event.keystroke.key.as_str() {
         "escape" => EditKeyAction::Cancel,
         "enter" if !field.multiline() || event.keystroke.modifiers.modified() => {
@@ -403,8 +410,10 @@ struct ActiveEdit {
     field: EditField,
     original: String,
     input: String,
+    selection: Range<usize>,
+    selection_reversed: bool,
     marked: Option<Range<usize>>,
-    select_all: bool,
+    selecting: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -413,6 +422,12 @@ struct EditTarget<'a> {
     issue_id: &'a str,
     field: EditField,
     value: &'a str,
+}
+
+struct BeginEdit {
+    cursor: Option<usize>,
+    layout: Option<TextLayout>,
+    extend_selection: bool,
 }
 
 #[derive(Debug, Default)]
@@ -442,8 +457,10 @@ impl EditSession {
             field,
             original: value.to_owned(),
             input: value.to_owned(),
+            selection: value.len()..value.len(),
+            selection_reversed: false,
             marked: None,
-            select_all: true,
+            selecting: false,
         });
         pending
     }
@@ -465,8 +482,9 @@ impl EditSession {
     fn replace_all(&mut self, value: &str) {
         if let Some(active) = self.active.as_mut() {
             value.clone_into(&mut active.input);
+            active.selection = active.input.len()..active.input.len();
+            active.selection_reversed = false;
             active.marked = None;
-            active.select_all = false;
         }
     }
 
@@ -476,14 +494,158 @@ impl EditSession {
 
     fn backspace(&mut self) {
         let Some(active) = self.active.as_mut() else { return };
-        if active.select_all {
-            active.input.clear();
-            active.select_all = false;
-        } else {
-            active.input.pop();
+        if active.selection.is_empty() {
+            let cursor = active_cursor(active);
+            let previous = previous_grapheme_boundary(&active.input, cursor);
+            active.selection = previous..cursor;
         }
+        delete_selection(active);
+    }
+
+    fn delete(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        if active.selection.is_empty() {
+            let cursor = active_cursor(active);
+            let next = next_grapheme_boundary(&active.input, cursor);
+            active.selection = cursor..next;
+        }
+        delete_selection(active);
+    }
+
+    fn move_left(&mut self, extend: bool) {
+        let Some(active) = self.active.as_mut() else { return };
+        let cursor = active_cursor(active);
+        let target = if active.selection.is_empty() || extend {
+            previous_grapheme_boundary(&active.input, cursor)
+        } else {
+            active.selection.start
+        };
+        if extend {
+            select_to(active, target);
+        } else {
+            move_to(active, target);
+        }
+    }
+
+    fn move_right(&mut self, extend: bool) {
+        let Some(active) = self.active.as_mut() else { return };
+        let cursor = active_cursor(active);
+        let target = if active.selection.is_empty() || extend {
+            next_grapheme_boundary(&active.input, cursor)
+        } else {
+            active.selection.end
+        };
+        if extend {
+            select_to(active, target);
+        } else {
+            move_to(active, target);
+        }
+    }
+
+    fn select_all(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        active.selection = 0..active.input.len();
+        active.selection_reversed = false;
         active.marked = None;
     }
+
+    fn move_to(&mut self, offset: usize) {
+        if let Some(active) = self.active.as_mut() {
+            move_to(active, offset);
+        }
+    }
+
+    fn select_to(&mut self, offset: usize) {
+        if let Some(active) = self.active.as_mut() {
+            select_to(active, offset);
+        }
+    }
+
+    fn is_active(&self, target: EditTarget<'_>) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.workspace_id == target.workspace_id
+                && active.issue_id == target.issue_id
+                && active.field == target.field
+        })
+    }
+
+    fn set_selecting(&mut self, selecting: bool) {
+        if let Some(active) = self.active.as_mut() {
+            active.selecting = selecting;
+        }
+    }
+
+    fn is_selecting(&self, target: EditTarget<'_>) -> bool {
+        self.is_active(target) && self.active.as_ref().is_some_and(|active| active.selecting)
+    }
+}
+
+fn active_cursor(active: &ActiveEdit) -> usize {
+    if active.selection_reversed { active.selection.start } else { active.selection.end }
+}
+
+fn move_to(active: &mut ActiveEdit, offset: usize) {
+    let offset = nearest_grapheme_boundary(&active.input, offset);
+    active.selection = offset..offset;
+    active.selection_reversed = false;
+    active.marked = None;
+}
+
+fn select_to(active: &mut ActiveEdit, offset: usize) {
+    let offset = nearest_grapheme_boundary(&active.input, offset);
+    if active.selection_reversed {
+        active.selection.start = offset;
+    } else {
+        active.selection.end = offset;
+    }
+    if active.selection.end < active.selection.start {
+        active.selection_reversed = !active.selection_reversed;
+        active.selection = active.selection.end..active.selection.start;
+    }
+    active.marked = None;
+}
+
+fn delete_selection(active: &mut ActiveEdit) {
+    let range = grapheme_range(&active.input, active.selection.clone());
+    active.input.replace_range(range.clone(), "");
+    active.selection = range.start..range.start;
+    active.selection_reversed = false;
+    active.marked = None;
+}
+
+fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .rev()
+        .find_map(|(index, _)| (index < offset).then_some(index))
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .find_map(|(index, _)| (index > offset).then_some(index))
+        .unwrap_or(text.len())
+}
+
+fn nearest_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    let mut previous = 0;
+    for (next, _) in text.grapheme_indices(true).skip(1) {
+        if next >= offset {
+            return if offset - previous <= next - offset { previous } else { next };
+        }
+        previous = next;
+    }
+    text.len()
+}
+
+fn grapheme_range(text: &str, range: Range<usize>) -> Range<usize> {
+    if range.is_empty() {
+        let caret = nearest_grapheme_boundary(text, range.start);
+        return caret..caret;
+    }
+    let start = previous_grapheme_boundary(text, range.start.saturating_add(1));
+    let end = next_grapheme_boundary(text, range.end.saturating_sub(1));
+    start..end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +660,7 @@ pub enum BeadsEditorKeyRoute {
 pub struct BeadsEditor {
     focus: FocusHandle,
     session: EditSession,
+    layout: Option<TextLayout>,
     panels: Arc<Mutex<BeadsPanels>>,
     _blur: Subscription,
 }
@@ -510,21 +673,83 @@ impl BeadsEditor {
     ) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |editor, _window, cx| editor.commit(cx));
-        Self { focus, session: EditSession::default(), panels, _blur: blur }
+        Self { focus, session: EditSession::default(), layout: None, panels, _blur: blur }
     }
 
-    pub fn has_keyboard_focus(&self, window: &Window) -> bool {
-        self.focus.is_focused(window)
+    pub fn has_keyboard_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
     }
 
-    fn begin(&mut self, target: EditTarget<'_>, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin(
+        &mut self,
+        target: EditTarget<'_>,
+        activation: BeginEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_active = self.session.is_active(target);
+        let selecting = activation.layout.is_some();
         if let Some(intent) =
             self.session.begin(target.workspace_id, target.issue_id, target.field, target.value)
         {
             self.queue(intent);
         }
+        let cursor = activation.cursor.unwrap_or_else(|| self.session.input().map_or(0, str::len));
+        if activation.extend_selection && was_active {
+            self.session.select_to(cursor);
+        } else {
+            self.session.move_to(cursor);
+        }
+        self.session.set_selecting(selecting);
+        if let Some(layout) = activation.layout {
+            self.layout = Some(layout);
+        } else if !was_active {
+            self.layout = None;
+        }
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    fn set_value(
+        &mut self,
+        target: EditTarget<'_>,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(intent) =
+            self.session.begin(target.workspace_id, target.issue_id, target.field, target.value)
+        {
+            self.queue(intent);
+        }
+        if let Some(active) = self.session.active.as_mut() {
+            active.input = value;
+            active.selection = active.input.len()..active.input.len();
+            active.selection_reversed = false;
+            active.marked = None;
+            active.selecting = false;
+        }
+        self.layout = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn extend_pointer_selection(
+        &mut self,
+        target: EditTarget<'_>,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.is_selecting(target) {
+            self.session.select_to(cursor);
+            cx.notify();
+        }
+    }
+
+    fn end_pointer_selection(&mut self, target: EditTarget<'_>) {
+        if self.session.is_active(target) {
+            self.session.set_selecting(false);
+        }
     }
 
     pub fn route_key(
@@ -542,15 +767,25 @@ impl BeadsEditor {
             }
             EditKeyAction::Cancel => {
                 self.session.cancel();
+                self.layout = None;
                 cx.notify();
                 BeadsEditorKeyRoute::Finished
             }
+            EditKeyAction::SelectAll => {
+                self.session.select_all();
+                cx.notify();
+                BeadsEditorKeyRoute::Consumed
+            }
             EditKeyAction::Text => BeadsEditorKeyRoute::Text,
             EditKeyAction::Consume => {
-                if event.keystroke.key == "backspace" {
-                    self.session.backspace();
-                    cx.notify();
+                match event.keystroke.key.as_str() {
+                    "backspace" => self.session.backspace(),
+                    "delete" => self.session.delete(),
+                    "left" => self.session.move_left(event.keystroke.modifiers.shift),
+                    "right" => self.session.move_right(event.keystroke.modifiers.shift),
+                    _ => return BeadsEditorKeyRoute::Consumed,
                 }
+                cx.notify();
                 BeadsEditorKeyRoute::Consumed
             }
         }
@@ -559,6 +794,7 @@ impl BeadsEditor {
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.session.active.is_some() {
             self.session.cancel();
+            self.layout = None;
             cx.notify();
         }
     }
@@ -567,6 +803,7 @@ impl BeadsEditor {
         if let Some(intent) = self.session.finish() {
             self.queue(intent);
         }
+        self.layout = None;
         cx.notify();
     }
 
@@ -600,7 +837,7 @@ impl EntityInputHandler for BeadsEditor {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         let input = self.session.input()?;
-        let range = utf16_range_to_utf8(input, range);
+        let range = grapheme_range(input, utf16_range_to_utf8(input, range));
         actual_range.replace(utf8_range_to_utf16(input, &range));
         Some(input[range].to_owned())
     }
@@ -612,9 +849,10 @@ impl EntityInputHandler for BeadsEditor {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let active = self.session.active.as_ref()?;
-        let end = active.input.encode_utf16().count();
-        let range = if active.select_all { 0..end } else { end..end };
-        Some(UTF16Selection { range, reversed: false })
+        Some(UTF16Selection {
+            range: utf8_range_to_utf16(&active.input, &active.selection),
+            reversed: active.selection_reversed,
+        })
     }
 
     fn marked_text_range(
@@ -641,17 +879,15 @@ impl EntityInputHandler for BeadsEditor {
         cx: &mut Context<Self>,
     ) {
         let Some(active) = self.session.active.as_mut() else { return };
-        let range = if active.select_all {
-            0..active.input.len()
-        } else {
-            range
-                .map(|range| utf16_range_to_utf8(&active.input, range))
-                .or_else(|| active.marked.take())
-                .unwrap_or(active.input.len()..active.input.len())
-        };
+        let range = range
+            .map(|range| utf16_range_to_utf8(&active.input, range))
+            .or_else(|| active.marked.take())
+            .unwrap_or_else(|| active.selection.clone());
+        let cursor = range.start + text.len();
         active.input.replace_range(range, text);
+        active.selection = cursor..cursor;
+        active.selection_reversed = false;
         active.marked = None;
-        active.select_all = false;
         cx.notify();
         window.refresh();
     }
@@ -660,44 +896,59 @@ impl EntityInputHandler for BeadsEditor {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range: Option<Range<usize>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(active) = self.session.active.as_mut() else { return };
-        let range = if active.select_all {
-            0..active.input.len()
-        } else {
-            range
-                .map(|range| utf16_range_to_utf8(&active.input, range))
-                .or_else(|| active.marked.take())
-                .unwrap_or(active.input.len()..active.input.len())
-        };
+        let range = range
+            .map(|range| utf16_range_to_utf8(&active.input, range))
+            .or_else(|| active.marked.take())
+            .unwrap_or_else(|| active.selection.clone());
         let start = range.start;
         active.input.replace_range(range, text);
         active.marked = (!text.is_empty()).then_some(start..start + text.len());
-        active.select_all = false;
+        let selected = new_selected_range.map_or_else(
+            || start + text.len()..start + text.len(),
+            |selected_range| {
+                let selected_range = utf16_range_to_utf8(text, selected_range);
+                start + selected_range.start..start + selected_range.end
+            },
+        );
+        active.selection = selected;
+        active.selection_reversed = false;
         cx.notify();
         window.refresh();
     }
 
     fn bounds_for_range(
         &mut self,
-        _range: Range<usize>,
-        bounds: Bounds<Pixels>,
+        range: Range<usize>,
+        _bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(bounds)
+        let input = self.session.input()?;
+        let layout = self.layout.as_ref()?;
+        let range = utf16_range_to_utf8(input, range);
+        let start = layout.position_for_index(range.start)?;
+        let end = layout.position_for_index(range.end)?;
+        let width =
+            if start.y == end.y { (end.x - start.x).max(Pixels::ZERO) } else { Pixels::ZERO };
+        Some(Bounds::new(start, gpui::size(width, layout.line_height())))
     }
 
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
+        point: Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.session.input()?.encode_utf16().count())
+        let input = self.session.input()?;
+        let layout = self.layout.as_ref()?;
+        let index = layout.index_for_position(point).unwrap_or_else(|index| index);
+        let index = nearest_grapheme_boundary(input, index);
+        Some(utf8_range_to_utf16(input, &(index..index)).start)
     }
 
     fn text_length_utf16(
@@ -1501,6 +1752,8 @@ fn panel_body(
     let presentation = panel.detail.as_deref().map(PanelPresentation::from_detail);
     let surface = div()
         .id(SharedString::from(format!("beads-detail-{workspace_id}")))
+        .track_focus(&wiring.editor.read(wiring.app).focus)
+        .tab_stop(false)
         .aria_label(format!("Issue {} detail", panel.card.id))
         .absolute()
         .left(px(geometry.x))
@@ -1978,7 +2231,7 @@ fn identity_docs(
                         &detail.id,
                         EditField::Design,
                         &detail.design,
-                        div().truncate(),
+                        div().min_w(px(0.0)),
                     )
                     .flex_1(),
                 )
@@ -1986,78 +2239,249 @@ fn identity_docs(
         .into_any_element()
 }
 
+#[derive(Clone)]
+struct EditableTextState {
+    workspace_id: WorkspaceId,
+    editor: Entity<BeadsEditor>,
+    issue_id: String,
+    field: EditField,
+    value: String,
+    layout: TextLayout,
+}
+
+impl EditableTextState {
+    fn target(&self) -> EditTarget<'_> {
+        EditTarget {
+            workspace_id: self.workspace_id,
+            issue_id: &self.issue_id,
+            field: self.field,
+            value: &self.value,
+        }
+    }
+}
+
 fn editable_text(
     wiring: EditWiring<'_>,
     issue_id: &str,
     field: EditField,
     value: &str,
-    text: gpui::Div,
+    mut text: gpui::Div,
 ) -> gpui::Stateful<gpui::Div> {
     let id =
         SharedString::from(format!("beads-edit-{}-{issue_id}-{}", wiring.workspace_id, field.id()));
     if !wiring.write_enabled {
         return text.id(id).min_w(px(0.0)).child(value.to_owned());
     }
-    let editor = wiring.editor.clone();
-    let active = editor
+    let beads_editor = wiring.editor.clone();
+    let active_text = beads_editor
         .read(wiring.app)
         .active_text(wiring.workspace_id, issue_id, field)
         .map(str::to_owned);
-    let shown = active.as_deref().unwrap_or(value).to_owned();
+    let active = active_text.is_some();
+    if active {
+        text.text_style().text_overflow = None;
+    }
+    let shown = active_text.unwrap_or_else(|| value.to_owned());
     let display = if field == EditField::Comment && shown.is_empty() {
         "add a comment…".to_owned()
     } else {
         shown.clone()
     };
-    let focus = editor.read(wiring.app).focus.clone();
-    let input_focus = focus.clone();
-    let input_editor = editor.clone();
-    let click_issue = issue_id.to_owned();
-    let click_value = value.to_owned();
-    let workspace_id = wiring.workspace_id;
+    let styled = StyledText::new(display);
+    let focus = beads_editor.read(wiring.app).focus.clone();
+    let state = EditableTextState {
+        workspace_id: wiring.workspace_id,
+        editor: beads_editor,
+        issue_id: issue_id.to_owned(),
+        field,
+        value: value.to_owned(),
+        layout: styled.layout().clone(),
+    };
     let hover = with_alpha(wiring.colors.title, 0.07);
-    div()
+    let surface = div()
         .id(id)
         .role(Role::TextInput)
         .aria_label(format!("Edit issue {}", field.id()))
+        .aria_description("Press Enter or Space to edit")
         .aria_value(shown.clone())
+        .focusable()
+        .tab_stop(true)
         .min_w(px(0.0))
         .relative()
         .rounded(px(2.0))
         .cursor_text()
-        .when(active.is_some(), |surface| surface.bg(hover).track_focus(&focus))
-        .when(active.is_none(), |surface| {
-            surface.hover(move |hovered| hovered.bg(hover).shadow_sm())
+        .when(active, |surface| surface.bg(hover).track_focus(&focus))
+        .when(!active, |surface| surface.hover(move |hovered| hovered.bg(hover).shadow_sm()));
+    let surface = editable_a11y_surface(surface, state.clone());
+    let surface = editable_keyboard_surface(surface, state.clone());
+    let surface = editable_pointer_start_surface(
+        surface,
+        state.clone(),
+        field == EditField::Comment && shown.is_empty(),
+    );
+    let surface = editable_pointer_selection_surface(surface, state.clone());
+    let surface = surface.child(text.child(styled));
+    if active {
+        editable_input_surface(surface, focus, state.editor, state.layout)
+    } else {
+        surface
+    }
+}
+
+fn editable_a11y_surface(
+    surface: gpui::Stateful<gpui::Div>,
+    state: EditableTextState,
+) -> gpui::Stateful<gpui::Div> {
+    let click_state = state.clone();
+    surface
+        .on_a11y_action(AccessibleAction::SetValue, move |data, window, app| {
+            handle_editable_accessible_action(
+                AccessibleAction::SetValue,
+                data,
+                &state,
+                window,
+                app,
+            );
         })
-        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-        .on_click(move |_event, window, app| {
-            app.stop_propagation();
-            editor.update(app, |editor, cx| {
-                editor.begin(
-                    EditTarget { workspace_id, issue_id: &click_issue, field, value: &click_value },
+        .on_a11y_action(AccessibleAction::Click, move |data, window, app| {
+            handle_editable_accessible_action(
+                AccessibleAction::Click,
+                data,
+                &click_state,
+                window,
+                app,
+            );
+        })
+}
+
+fn handle_editable_accessible_action(
+    action: AccessibleAction,
+    data: Option<&gpui::accesskit::ActionData>,
+    state: &EditableTextState,
+    window: &mut Window,
+    app: &mut App,
+) {
+    match (action, data) {
+        (AccessibleAction::Click, _) => {
+            state.editor.update(app, |beads_editor, cx| {
+                beads_editor.begin(
+                    state.target(),
+                    BeginEdit { cursor: None, layout: None, extend_selection: false },
                     window,
                     cx,
                 );
             });
+        }
+        (AccessibleAction::SetValue, Some(gpui::accesskit::ActionData::Value(replacement))) => {
+            state.editor.update(app, |beads_editor, cx| {
+                beads_editor.set_value(state.target(), replacement.to_string(), window, cx);
+            });
+        }
+        _ => return,
+    }
+    app.stop_propagation();
+}
+
+fn editable_keyboard_surface(
+    surface: gpui::Stateful<gpui::Div>,
+    state: EditableTextState,
+) -> gpui::Stateful<gpui::Div> {
+    surface.on_key_down(move |event: &KeyDownEvent, window, app| {
+        if event.keystroke.modifiers.modified()
+            || !matches!(event.keystroke.key.as_str(), "enter" | "space")
+            || state.editor.read(app).session.is_active(state.target())
+        {
+            return;
+        }
+        state.editor.update(app, |beads_editor, cx| {
+            beads_editor.begin(
+                state.target(),
+                BeginEdit { cursor: None, layout: None, extend_selection: false },
+                window,
+                cx,
+            );
+        });
+        app.stop_propagation();
+    })
+}
+
+fn editable_pointer_start_surface(
+    surface: gpui::Stateful<gpui::Div>,
+    state: EditableTextState,
+    pointer_empty: bool,
+) -> gpui::Stateful<gpui::Div> {
+    surface.on_mouse_down(MouseButton::Left, move |event, window, app| {
+        app.stop_propagation();
+        let cursor = (!pointer_empty)
+            .then(|| state.layout.index_for_position(event.position).unwrap_or_else(|index| index));
+        state.editor.update(app, |beads_editor, cx| {
+            beads_editor.begin(
+                state.target(),
+                BeginEdit {
+                    cursor,
+                    layout: Some(state.layout.clone()),
+                    extend_selection: event.modifiers.shift,
+                },
+                window,
+                cx,
+            );
+        });
+        window.refresh();
+    })
+}
+
+fn editable_pointer_selection_surface(
+    surface: gpui::Stateful<gpui::Div>,
+    state: EditableTextState,
+) -> gpui::Stateful<gpui::Div> {
+    let move_state = state.clone();
+    let release_state = state.clone();
+    surface
+        .on_mouse_move(move |event, window, app| {
+            let cursor =
+                move_state.layout.index_for_position(event.position).unwrap_or_else(|index| index);
+            move_state.editor.update(app, |beads_editor, cx| {
+                beads_editor.extend_pointer_selection(move_state.target(), cursor, cx);
+            });
             window.refresh();
         })
-        .child(text.child(display))
-        .when(active.is_some(), |surface| {
-            surface.child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, (), window, app| {
-                        window.handle_input(
-                            &input_focus,
-                            ElementInputHandler::new(bounds, input_editor.clone()),
-                            app,
-                        );
-                    },
-                )
-                .absolute()
-                .size_full(),
-            )
+        .on_mouse_up(MouseButton::Left, move |_event, _window, app| {
+            release_state.editor.update(app, |beads_editor, _| {
+                beads_editor.end_pointer_selection(release_state.target());
+            });
         })
+        .on_mouse_up_out(MouseButton::Left, move |event, window, app| {
+            let input_len = state.editor.read(app).session.input().map_or(0, str::len);
+            let cursor = match state.layout.index_for_position(event.position) {
+                Ok(index) => index,
+                Err(0) => 0,
+                Err(_) => input_len,
+            };
+            state.editor.update(app, |beads_editor, cx| {
+                beads_editor.extend_pointer_selection(state.target(), cursor, cx);
+                beads_editor.end_pointer_selection(state.target());
+            });
+            window.refresh();
+        })
+}
+
+fn editable_input_surface(
+    surface: gpui::Stateful<gpui::Div>,
+    focus: FocusHandle,
+    editor: Entity<BeadsEditor>,
+    layout: TextLayout,
+) -> gpui::Stateful<gpui::Div> {
+    surface.child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, (), window, app| {
+                editor.update(app, |editor, _| editor.layout = Some(layout.clone()));
+                window.handle_input(&focus, ElementInputHandler::new(bounds, editor.clone()), app);
+            },
+        )
+        .absolute()
+        .size_full(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2666,7 +3090,14 @@ fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use gpui::{
+        EntityInputHandler, Modifiers, Render, WindowHandle, WindowOptions, div, point, px,
+    };
 
     use scribe_common::ids::WorkspaceId;
     use scribe_common::protocol::{
@@ -3830,6 +4261,495 @@ mod tests {
             is_held: false,
             prefer_character_input: false,
         }
+    }
+
+    struct PointerEditorProbe {
+        editor: Entity<BeadsEditor>,
+        root_focus: FocusHandle,
+        workspace_id: WorkspaceId,
+        colors: BeadsBoardColors,
+        field: EditField,
+        value: &'static str,
+    }
+
+    impl PointerEditorProbe {
+        fn route_editor_key(
+            &mut self,
+            event: &KeyDownEvent,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            match self.editor.update(cx, |editor, editor_cx| editor.route_key(event, editor_cx)) {
+                BeadsEditorKeyRoute::Text | BeadsEditorKeyRoute::Inactive => {}
+                BeadsEditorKeyRoute::Consumed => {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                BeadsEditorKeyRoute::Finished => {
+                    cx.stop_propagation();
+                    window.focus(&self.root_focus, cx);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    impl Render for PointerEditorProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if !self.root_focus.is_focused(window)
+                && !self.editor.read(cx).has_keyboard_focus(window, cx)
+            {
+                window.focus(&self.root_focus, cx);
+            }
+            let editor_focus = self.editor.read(cx).focus.clone();
+            let text = div()
+                .w(px(if matches!(self.field, EditField::Title | EditField::SpecId) {
+                    48.0
+                } else {
+                    160.0
+                }))
+                .text_size(px(16.0))
+                .line_height(px(22.0));
+            let text = if matches!(self.field, EditField::Title | EditField::SpecId) {
+                text.truncate()
+            } else {
+                text
+            };
+            div()
+                .track_focus(&self.root_focus)
+                .on_key_down(cx.listener(Self::route_editor_key))
+                .size_full()
+                .p(px(8.0))
+                .child(div().track_focus(&editor_focus).tab_stop(false).child(editable_text(
+                    EditWiring {
+                        workspace_id: self.workspace_id,
+                        editor: &self.editor,
+                        app: cx,
+                        write_enabled: true,
+                        colors: &self.colors,
+                    },
+                    "scribe-pointer",
+                    self.field,
+                    self.value,
+                    text,
+                )))
+        }
+    }
+
+    fn editor_probe_window(
+        cx: &mut gpui::TestAppContext,
+        field: EditField,
+        value: &'static str,
+    ) -> (WindowHandle<PointerEditorProbe>, Entity<BeadsEditor>) {
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        let workspace_id = WorkspaceId::new();
+        let colors = BeadsBoardColors::from_theme(
+            &chrome_slots([0.12, 0.12, 0.12, 1.0]),
+            &[[0.5, 0.5, 0.5, 1.0]; 16],
+            1.0,
+        );
+        let window = cx.update(|app| {
+            let panels = Arc::clone(&panels);
+            app.open_window(WindowOptions::default(), move |window, app| {
+                let editor =
+                    app.new(|editor_cx| BeadsEditor::new(Arc::clone(&panels), window, editor_cx));
+                app.new(|app| PointerEditorProbe {
+                    editor,
+                    root_focus: app.focus_handle(),
+                    workspace_id,
+                    colors,
+                    field,
+                    value,
+                })
+            })
+            .expect("open pointer editor probe")
+        });
+        let editor = window
+            .update(cx, |probe, _, _| probe.editor.clone())
+            .expect("read pointer editor probe");
+        (window, editor)
+    }
+
+    fn pointer_editor_probe_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (WindowHandle<PointerEditorProbe>, Entity<BeadsEditor>) {
+        editor_probe_window(cx, EditField::Description, "prefix middle suffix")
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Pointer activation keeps a collapsed caret]]
+    #[gpui::test]
+    fn pointer_activation_keeps_a_collapsed_native_selection(cx: &mut gpui::TestAppContext) {
+        let mut carets = Vec::new();
+        for position in
+            [point(px(9.0), px(14.0)), point(px(76.0), px(14.0)), point(px(164.0), px(36.0))]
+        {
+            let (window, editor) = pointer_editor_probe_window(cx);
+            cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+                .expect("draw probe");
+            let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+            test_window.simulate_click(position, Modifiers::default());
+            let selection = cx
+                .update_window(window.into(), |_, window, app| {
+                    editor.update(app, |editor, editor_cx| {
+                        editor
+                            .selected_text_range(false, window, editor_cx)
+                            .expect("active selection")
+                    })
+                })
+                .expect("read native selection");
+
+            assert!(selection.range.is_empty(), "pointer selected the entire field");
+            carets.push(selection.range.start);
+            test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+            test_window.simulate_input("!");
+            let input = editor
+                .read_with(&test_window, |editor, _| editor.session.input().map(str::to_owned));
+            assert!(input.as_deref().is_some_and(|input| {
+                input.contains("prefix") && input.contains("middle") && input.contains("suffix")
+            }));
+        }
+        assert_eq!(carets[0], 0);
+        assert!(carets[0] < carets[1] && carets[1] < carets[2]);
+        assert_eq!(carets[2], "prefix middle suffix".encode_utf16().count());
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Pointer drag updates the native selection]]
+    #[gpui::test]
+    fn pointer_drag_updates_the_real_native_selection(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Description, "first\nsecond");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw drag probe");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        test_window.simulate_mouse_down(
+            point(px(10.0), px(14.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        test_window.simulate_mouse_move(
+            point(px(55.0), px(36.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        test_window.simulate_mouse_up(
+            point(px(55.0), px(36.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        let selection = cx
+            .update_window(window.into(), |_, window, app| {
+                editor.update(app, |editor, editor_cx| {
+                    editor.selected_text_range(false, window, editor_cx).expect("drag selection")
+                })
+            })
+            .expect("read drag selection");
+
+        assert!(!selection.range.is_empty());
+        assert!(selection.range.start < 6 && selection.range.end > 6);
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Pointer release outside extends the native selection]]
+    #[gpui::test]
+    fn pointer_release_outside_extends_selection_to_both_text_edges(cx: &mut gpui::TestAppContext) {
+        let value = "prefix middle suffix";
+        for (release, edge) in [(point(px(-10.0), px(14.0)), 0), (point(px(2_000.0), px(14.0)), 1)]
+        {
+            let (window, editor) = pointer_editor_probe_window(cx);
+            cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+                .expect("draw release-out probe");
+            let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+            test_window.simulate_mouse_down(
+                point(px(80.0), px(14.0)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            test_window.simulate_mouse_up(release, MouseButton::Left, Modifiers::default());
+
+            let selection = cx
+                .update_window(window.into(), |_, window, app| {
+                    editor.update(app, |editor, editor_cx| {
+                        editor
+                            .selected_text_range(false, window, editor_cx)
+                            .expect("release-out selection")
+                    })
+                })
+                .expect("read release-out selection");
+
+            if edge == 0 {
+                assert_eq!(selection.range.start, 0);
+            } else {
+                assert_eq!(selection.range.end, value.encode_utf16().count());
+            }
+            assert!(!selection.range.is_empty());
+        }
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Active truncated fields retain the full native layout]]
+    #[gpui::test]
+    fn active_truncated_fields_keep_full_logical_layout(cx: &mut gpui::TestAppContext) {
+        for (field, value) in [
+            (EditField::Title, "title-abcdefghijklmnopqrstuvwxyz-0123456789"),
+            (EditField::SpecId, "spec-abcdefghijklmnopqrstuvwxyz-0123456789"),
+        ] {
+            let (window, editor) = editor_probe_window(cx, field, value);
+            cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+                .expect("draw narrow truncated probe");
+            cx.update_window(window.into(), |_, window, app| window.focus_next(app))
+                .expect("focus narrow field");
+            cx.dispatch_keystroke(
+                window.into(),
+                gpui::Keystroke::parse("space").expect("parse Space"),
+            );
+            cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+                .expect("draw active narrow field");
+
+            let end = value.encode_utf16().count();
+            let (bounds, pointer_index) = cx
+                .update_window(window.into(), |_, window, app| {
+                    editor.update(app, |editor, editor_cx| {
+                        let bounds = editor
+                            .bounds_for_range(
+                                end..end,
+                                Bounds::new(
+                                    point(px(8.0), px(8.0)),
+                                    gpui::size(px(48.0), px(22.0)),
+                                ),
+                                window,
+                                editor_cx,
+                            )
+                            .expect("logical end bounds");
+                        let pointer_index = editor
+                            .character_index_for_point(bounds.origin, window, editor_cx)
+                            .expect("logical pointer index");
+                        (bounds, pointer_index)
+                    })
+                })
+                .expect("read full active layout");
+
+            assert!(bounds.origin.x > px(48.0));
+            assert_eq!(pointer_index, end);
+        }
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Literal newlines produce distinct native caret bounds]]
+    #[gpui::test]
+    fn multiline_native_caret_bounds_follow_the_requested_line(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Description, "first\nsecond");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw multiline probe");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        test_window.simulate_click(point(px(20.0), px(14.0)), Modifiers::default());
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+
+        let field_bounds = Bounds::new(point(px(8.0), px(8.0)), gpui::size(px(160.0), px(44.0)));
+        let (first, second) = cx
+            .update_window(window.into(), |_, window, app| {
+                editor.update(app, |editor, editor_cx| {
+                    (
+                        editor
+                            .bounds_for_range(0..0, field_bounds, window, editor_cx)
+                            .expect("first-line caret bounds"),
+                        editor
+                            .bounds_for_range(6..6, field_bounds, window, editor_cx)
+                            .expect("second-line caret bounds"),
+                    )
+                })
+            })
+            .expect("read multiline caret bounds");
+
+        assert_eq!(first.origin.y, px(8.0));
+        assert_eq!(second.origin.y, px(30.0));
+        assert_ne!(first.origin, second.origin);
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Inserted text refreshes native layout]]
+    #[gpui::test]
+    fn native_layout_tracks_text_inserted_after_activation(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Description, "ab\ncd");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw insertion probe");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        test_window.simulate_click(point(px(164.0), px(36.0)), Modifiers::default());
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+        test_window.simulate_input("X");
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+
+        let caret = cx
+            .update_window(window.into(), |_, window, app| {
+                editor.update(app, |editor, editor_cx| {
+                    editor.bounds_for_range(
+                        6..6,
+                        Bounds::new(point(px(8.0), px(8.0)), gpui::size(px(160.0), px(44.0))),
+                        window,
+                        editor_cx,
+                    )
+                })
+            })
+            .expect("read inserted caret bounds")
+            .expect("current layout maps inserted text");
+
+        assert_eq!(caret.origin.y, px(30.0));
+        assert!(caret.origin.x > px(8.0));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Marked composition refreshes native layout]]
+    #[gpui::test]
+    fn native_layout_tracks_marked_composition_after_activation(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Description, "ab\ncd");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw composition probe");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        test_window.simulate_click(point(px(164.0), px(36.0)), Modifiers::default());
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+        test_window.update(|test_window_ref, app| {
+            editor.update(app, |editor, editor_cx| {
+                editor.replace_and_mark_text_in_range(None, "XY", None, test_window_ref, editor_cx);
+            });
+        });
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+
+        let caret = cx
+            .update_window(window.into(), |_, window, app| {
+                editor.update(app, |editor, editor_cx| {
+                    editor.bounds_for_range(
+                        7..7,
+                        Bounds::new(point(px(8.0), px(8.0)), gpui::size(px(160.0), px(44.0))),
+                        window,
+                        editor_cx,
+                    )
+                })
+            })
+            .expect("read composition caret bounds")
+            .expect("current layout maps marked composition");
+
+        assert_eq!(caret.origin.y, px(30.0));
+        assert!(caret.origin.x > px(8.0));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Keyboard activation enters the shared editor]]
+    #[gpui::test]
+    fn space_activation_survives_a_real_focus_repair_render(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = pointer_editor_probe_window(cx);
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw probe");
+        cx.update_window(window.into(), |_, window, app| window.focus_next(app))
+            .expect("focus editable field");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("render between focus and activation");
+
+        cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse("space").expect("parse Space"));
+
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.session.input().map(str::to_owned)),
+            Some("prefix middle suffix".to_owned())
+        );
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Accessible click enters the shared editor]]
+    #[gpui::test]
+    fn accessible_click_enters_the_shared_editor(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = pointer_editor_probe_window(cx);
+        let workspace_id =
+            window.update(cx, |probe, _, _| probe.workspace_id).expect("read probe workspace");
+        cx.update_window(window.into(), |_, window, app| {
+            let state = EditableTextState {
+                workspace_id,
+                editor: editor.clone(),
+                issue_id: "scribe-pointer".to_owned(),
+                field: EditField::Description,
+                value: "prefix middle suffix".to_owned(),
+                layout: TextLayout::default(),
+            };
+            handle_editable_accessible_action(AccessibleAction::Click, None, &state, window, app);
+        })
+        .expect("dispatch accessible click");
+
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.session.input().map(str::to_owned)),
+            Some("prefix middle suffix".to_owned())
+        );
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Active title Enter commits through the shared input]]
+    #[gpui::test]
+    fn active_title_enter_commits_through_the_shared_input(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Title, "saved title");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw title probe");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        test_window.simulate_click(point(px(48.0), px(14.0)), Modifiers::default());
+        test_window.update(|test_window_ref, app| test_window_ref.draw(app).clear());
+        test_window.simulate_input(" revised");
+
+        assert!(editor.read_with(&test_window, |editor, _| {
+            editor.session.input().is_some_and(|input| input != "saved title")
+        }));
+        cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse("enter").expect("parse Enter"));
+
+        assert!(editor.read_with(cx, |editor, _| editor.session.input().is_none()));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Grapheme-aware deletion]]
+    #[test]
+    fn backspace_removes_one_grapheme_without_clearing_the_draft() {
+        let mut edit = EditSession::default();
+        edit.begin(WorkspaceId::new(), "scribe-5wh1.13", EditField::Notes, "draft 👩‍👩‍👧‍👦");
+
+        edit.backspace();
+
+        assert_eq!(edit.input(), Some("draft "));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Grapheme-aware cursor navigation]]
+    #[test]
+    fn navigation_selection_and_delete_keep_graphemes_intact() {
+        let mut edit = EditSession::default();
+        edit.begin(WorkspaceId::new(), "scribe-5wh1.13", EditField::Notes, "a👩‍👩‍👧‍👦b");
+
+        edit.move_left(false);
+        edit.move_left(true);
+        edit.backspace();
+        edit.delete();
+
+        assert_eq!(edit.input(), Some("a"));
+        edit.select_all();
+        edit.backspace();
+        assert_eq!(edit.input(), Some(""));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#IME ranges preserve adjacent graphemes]]
+    #[gpui::test]
+    fn ime_marked_ranges_preserve_adjacent_combining_graphemes(cx: &mut gpui::TestAppContext) {
+        let (window, editor) = editor_probe_window(cx, EditField::Description, "a\u{301}b");
+        let workspace_id =
+            window.update(cx, |probe, _, _| probe.workspace_id).expect("read probe workspace");
+        cx.update_window(window.into(), |_, window, app| {
+            editor.update(app, |editor, editor_cx| {
+                editor.begin(
+                    EditTarget {
+                        workspace_id,
+                        issue_id: "scribe-pointer",
+                        field: EditField::Description,
+                        value: "a\u{301}b",
+                    },
+                    BeginEdit { cursor: Some(0), layout: None, extend_selection: false },
+                    window,
+                    editor_cx,
+                );
+                editor.replace_and_mark_text_in_range(
+                    Some(1..2),
+                    "\u{302}",
+                    Some(1..1),
+                    window,
+                    editor_cx,
+                );
+                assert_eq!(editor.session.input(), Some("a\u{302}b"));
+                assert_eq!(editor.marked_text_range(window, editor_cx), Some(1..2));
+                editor.replace_text_in_range(None, "", window, editor_cx);
+                assert_eq!(editor.session.input(), Some("ab"));
+            });
+        })
+        .expect("replace combining mark through native input");
     }
 
     #[test]
