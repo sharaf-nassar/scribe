@@ -444,7 +444,9 @@ pub fn badge_width_px(badge: &GroupBadge) -> f32 {
     px_units(badge.label.chars().count() + 2) * CHAR_WIDTH + if badge.beads { 42.0 } else { 16.0 }
 }
 
-fn beads_graph_icon(color: Rgba) -> AnyElement {
+/// Connected-node Beads mark shared by workspace badges in both tab bars.
+#[must_use]
+pub fn beads_graph_icon(color: Rgba) -> AnyElement {
     div()
         .relative()
         .size(px(16.0))
@@ -838,47 +840,41 @@ impl TitlebarView {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
             .child(badge.label.clone());
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h_full()
-            .bg(tag_bg)
-            .child(label)
-            .when(badge.beads, |row| {
-                let focus = self
-                    .beads_focus_handles
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| self.focus_handle.clone());
-                row.child(
-                    div()
-                        .id(ElementId::from(format!("workspace-beads-{index}")))
-                        .role(Role::Button)
-                        .aria_label(format!("Open {} Beads board", badge.label))
-                        .track_focus(&focus)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(26.0))
-                        .h_full()
-                        .text_color(self.colors.accent)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(self.colors.gradient_top))
-                        .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
-                            ctx.emit(TitlebarEvent::BeadsHover { index, hovered: *hovered });
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
-                            ctx.stop_propagation();
-                        })
-                        .on_click(cx.listener(move |_this, _, window, ctx| {
-                            window.focus(&focus, ctx);
-                            ctx.emit(TitlebarEvent::ToggleBeadsBoard { index });
-                        }))
-                        .child(beads_graph_icon(self.colors.accent)),
-                )
-            })
-            .into_any_element()
+        let mut row = div().flex().flex_none().items_center().h_full().bg(tag_bg);
+        if badge.beads {
+            let focus = self
+                .beads_focus_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| self.focus_handle.clone());
+            row = row.child(
+                div()
+                    .id(ElementId::from(format!("workspace-beads-{index}")))
+                    .role(Role::Button)
+                    .aria_label(format!("Open {} Beads board", badge.label))
+                    .track_focus(&focus)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(26.0))
+                    .h_full()
+                    .text_color(self.colors.accent)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(self.colors.gradient_top))
+                    .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
+                        ctx.emit(TitlebarEvent::BeadsHover { index, hovered: *hovered });
+                    }))
+                    .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
+                        ctx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |_this, _, window, ctx| {
+                        window.focus(&focus, ctx);
+                        ctx.emit(TitlebarEvent::ToggleBeadsBoard { index });
+                    }))
+                    .child(beads_graph_icon(self.colors.accent)),
+            );
+        }
+        row.child(label).into_any_element()
     }
 
     fn render_equalize_button(

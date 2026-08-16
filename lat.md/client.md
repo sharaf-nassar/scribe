@@ -1112,6 +1112,13 @@ terminal; clicking pins the same fixed-height board above the terminal across
 that workspace's tabs. A focused pinned board refreshes every 60 seconds;
 hidden boards do not poll.
 
+The titlebar and lower-region badges place the shared
+[[crates/scribe-client/src/titlebar.rs#beads_graph_icon|connected-node mark]]
+before the label. The mark owns board hover and pinning; the label keeps
+workspace selection. The Docker visual contract exact-compares foreground
+masks so each bar's fill and antialiasing blend cannot affect the assertion.
+Its row checks normalize protocol UUIDs to the logger's `ws-` display form.
+
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#update]] treats
 `NotDetected` as workspace loss and clears that workspace's pin, hover expiry,
 resize, and card gesture. Neighbouring boards remain untouched. `Unavailable`

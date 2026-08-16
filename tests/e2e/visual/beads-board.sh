@@ -182,6 +182,8 @@ latest_rows() {
 import re, sys
 ansi = re.compile(r'\x1b\[[0-9;]*m')
 want = sys.argv[2] if len(sys.argv) > 2 else ""
+if want and not want.startswith("ws-"):
+    want = f"ws-{want[:8]}"
 rows = []
 with open(sys.argv[1], errors='replace') as fh:
     for line in fh:
@@ -194,6 +196,29 @@ with open(sys.argv[1], errors='replace') as fh:
         if match: rows.append(int(match.group(1)))
 print(rows[-1] if rows else 0)
 PY
+}
+
+# Crop the 16px connected-node mark from a badge target. The target is 26px
+# wide, so its centered mark sits 13px from the badge's leading edge. Compare
+# the foreground masks because each bar blends antialiasing into its own fill.
+badge_mark() {
+    local image="$1" center_x="$2" center_y="$3" output="$4" background
+    background=$(convert "$image" \
+        -format "%[pixel:p{$(( center_x - 8 )),$(( center_y - 8 ))}]" info:)
+    convert "$image" -crop "16x16+$(( center_x - 8 ))+$(( center_y - 8 ))" \
+        +repage -transparent "$background" -alpha extract "$output"
+}
+
+assert_matching_badge_marks() {
+    local title_mark="$1" region_mark="$2" ink diff
+    ink=$(identify -format '%[fx:mean*w*h]' "$title_mark")
+    ink=${ink%%.*}
+    [ "${ink:-0}" -eq 59 ] \
+        || fail "titlebar Beads mark has ${ink:-0}px of foreground, expected 59px"
+    diff=$(compare -metric AE "$title_mark" "$region_mark" null: 2>&1 || true)
+    diff=${diff%%.*}
+    [ "${diff:-1}" -eq 0 ] \
+        || fail "titlebar and lower-region Beads marks differ by ${diff:-unknown}px"
 }
 
 # Measure one synchronized native-drag waypoint against pointer minus GPUI's
@@ -275,8 +300,10 @@ inject "$(sample_board "$WORKSPACE")"
 import -window "$(window_id)" /output/beads-board-base.png
 BASE_ROWS=$(latest_rows)
 [ "$BASE_ROWS" -gt 0 ] || fail "no baseline grid geometry"
-# Single-workspace titlebar: badge begins at x=0, graph target follows its label.
-xdotool mousemove --sync --window "$WID" 66 17
+# Single-workspace titlebar: the graph target leads the label at the bar edge.
+TOP_BADGE_ICON_X=13
+TOP_BADGE_ICON_Y=17
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.5
 import -window "$WID" /output/beads-board-hover.png
 HOVER_DIFF=$(compare -metric AE /output/beads-board-base.png /output/beads-board-hover.png null: 2>&1 || true)
@@ -429,7 +456,7 @@ xdotool mouseup 1
 
 # The release lets the hover overlay close; reopen it for the remaining board
 # controls, which continue from the same baseline.
-xdotool mousemove --sync --window "$WID" 66 17
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.5
 
 # The board's own text-size control: the buttons sit in the strip's top right,
@@ -449,11 +476,74 @@ xdotool click 1
 sleep 0.6
 # Back to the bead before capturing: the baseline was taken with the pointer
 # there, and a button under the pointer wears its hover fill.
-xdotool mousemove --sync --window "$WID" 66 17
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.5
 import -window "$WID" /output/beads-board-restored.png
 RESTORED_DIFF=$(compare -metric AE /output/beads-board-hover.png /output/beads-board-restored.png null: 2>&1 || true)
 RESTORED_DIFF=${RESTORED_DIFF%%.*}
+
+# The lower-region badge is the same 34px chrome as the titlebar, but it is a
+# separate render path. Restore the named top badge, split that workspace
+# horizontally, then derive the lower bar's center from the live window bounds
+# instead of the old fixed one-pane board coordinate.
+inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":null}"
+inject "$(sample_board "$WORKSPACE")"
+focus
+GRID_HEIGHT=$(( WIN_H - 34 - 24 ))
+TOP_REGION_FOCUS_Y=$(( 34 + GRID_HEIGHT / 4 ))
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 4 ))" "$TOP_REGION_FOCUS_Y"
+xdotool click 1
+xdotool key --clearmodifiers ctrl+alt+minus
+for _ in $(seq 1 20); do
+    LOWER_WS=$(other_workspace "$WORKSPACE" || true)
+    [ -n "${LOWER_WS:-}" ] && [ "$LOWER_WS" != "$WORKSPACE" ] && break
+    sleep 0.3
+done
+[ -n "${LOWER_WS:-}" ] && [ "$LOWER_WS" != "$WORKSPACE" ] \
+    || fail "horizontal split created no lower workspace"
+inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$LOWER_WS\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":null}"
+inject "$(sample_board "$LOWER_WS")"
+focus
+
+# `TITLEBAR_HEIGHT` and `REGION_TAB_BAR_HEIGHT` are both 34px; their marks are
+# vertically centered. The lower half starts at the midpoint of the live grid.
+LOWER_BADGE_ICON_X=13
+LOWER_BADGE_ICON_Y=$(( 34 + GRID_HEIGHT / 2 + 17 ))
+LOWER_BADGE_LABEL_X=44
+import -window "$WID" /output/beads-board-lower-badge.png
+badge_mark /output/beads-board-restored.png \
+    "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y" /tmp/beads-titlebar-mark.png
+badge_mark /output/beads-board-lower-badge.png \
+    "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y" /tmp/beads-region-mark.png
+assert_matching_badge_marks /tmp/beads-titlebar-mark.png /tmp/beads-region-mark.png
+
+# The label still selects its workspace and must not consume the board's pin
+# action. Hovering the leading icon opens the board, and its click pins it.
+LOWER_ROWS=$(latest_rows "$LOWER_WS")
+xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_LABEL_X" "$LOWER_BADGE_ICON_Y"
+xdotool click 1
+sleep 0.3
+[ "$(latest_rows "$LOWER_WS")" -eq "$LOWER_ROWS" ] \
+    || fail "lower workspace label changed its Beads reservation"
+import -window "$WID" /output/beads-board-lower-before-hover.png
+xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y"
+sleep 0.5
+import -window "$WID" /output/beads-board-lower-hover.png
+LOWER_HOVER_DIFF=$(compare -metric AE /output/beads-board-lower-before-hover.png \
+    /output/beads-board-lower-hover.png null: 2>&1 || true)
+LOWER_HOVER_DIFF=${LOWER_HOVER_DIFF%%.*}
+[ "${LOWER_HOVER_DIFF:-0}" -ge 10000 ] \
+    || fail "lower Beads icon hover changed only ${LOWER_HOVER_DIFF}px"
+xdotool click 1
+for _ in $(seq 1 20); do
+    LOWER_PINNED_ROWS=$(latest_rows "$LOWER_WS")
+    [ "$LOWER_PINNED_ROWS" -lt "$LOWER_ROWS" ] && break
+    sleep 0.2
+done
+[ "${LOWER_PINNED_ROWS:-$LOWER_ROWS}" -lt "$LOWER_ROWS" ] \
+    || fail "lower Beads icon click did not pin its board"
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
+
 [ "${RESTORED_DIFF:-9999}" -le 400 ] \
     || fail "the smaller-text button did not undo the larger one (${RESTORED_DIFF}px left over)"
 
@@ -534,7 +624,7 @@ inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$SECOND\",\"name\":\"bead
 inject "$(sample_board "$SECOND")"
 WID=$(window_id)
 eval "$(xdotool getwindowgeometry --shell "$WID")"
-xdotool mousemove --sync --window "$WID" "$(( WIDTH / 2 + 66 ))" 17
+xdotool mousemove --sync --window "$WID" "$(( WIDTH / 2 + TOP_BADGE_ICON_X ))" "$TOP_BADGE_ICON_Y"
 sleep 0.5
 xdotool click 1
 for _ in $(seq 1 20); do
@@ -596,7 +686,7 @@ import -window "$(window_id)" /output/beads-board-rooted-not-detected.png
 # Restore the snapshot and pin it again so root loss proves the same cleanup
 # independently rather than passing on the board the rooted case closed.
 inject "$(sample_board "$WORKSPACE")"
-xdotool mousemove --sync --window "$WID" 66 17
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.3
 xdotool click 1
 for _ in $(seq 1 20); do
@@ -630,4 +720,5 @@ echo "PASS: Beads Constellation rendered for $WORKSPACE; pin rows $BASE_ROWS -> 
     "bar drag $EDGE -> $GROWN_EDGE reserved $PIN_ROWS -> $GROWN_ROWS rows;" \
     "split pinned=$SPLIT_PINNED other=$SPLIT_OTHER; both pinned=$BOTH_PINNED other=$BOTH_OTHER;" \
     "rooted NotDetected rows=$ROOTED_NOT_DETECTED_ROWS;" \
-    "rootless NotDetected rows=$ROOTLESS_NOT_DETECTED_ROWS"
+    "rootless NotDetected rows=$ROOTLESS_NOT_DETECTED_ROWS;" \
+    "lower badge rows $LOWER_ROWS -> $LOWER_PINNED_ROWS"

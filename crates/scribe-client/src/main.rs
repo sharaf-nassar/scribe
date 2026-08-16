@@ -144,7 +144,8 @@ use scribe_client::{
     },
     tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
-        TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView, title_columns,
+        TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView,
+        beads_graph_icon, title_columns,
     },
 };
 use scribe_common::ai_state::{AiProvider, AiState};
@@ -6715,59 +6716,58 @@ impl TerminalView {
                     view.select_session_tab(first, ctx);
                 }))
                 .child(badge.label.clone());
-            let pill = div().flex().flex_none().items_center().h_full().bg(tone).child(label).when(
-                badge.beads,
-                |pill| {
-                    pill.child(
-                        div()
-                            .id(ElementId::from(format!("region-beads-{workspace_id}")))
-                            .role(gpui::Role::Button)
-                            .aria_label(format!("Open {} Beads board", badge.label))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(26.0))
-                            .h_full()
-                            .text_color(colors.accent)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(colors.gradient_top))
-                            .on_hover(cx.listener(move |view, hovered: &bool, _window, ctx| {
-                                let refresh =
-                                    view.shared.beads_boards.lock().is_ok_and(|mut boards| {
-                                        boards.hover(workspace_id, HoverSource::Bead, *hovered);
-                                        boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
-                                    });
-                                if *hovered && refresh {
-                                    request_beads_board_or_log(
-                                        &view.sink,
-                                        workspace_id,
-                                        "region hover refresh",
-                                    );
-                                }
-                                ctx.notify();
-                            }))
-                            .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
-                                ctx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |view, _, _window, ctx| {
-                                let refresh =
-                                    view.shared.beads_boards.lock().is_ok_and(|mut boards| {
-                                        boards.toggle_pin(workspace_id);
-                                        boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
-                                    });
-                                if refresh {
-                                    request_beads_board_or_log(
-                                        &view.sink,
-                                        workspace_id,
-                                        "region pin refresh",
-                                    );
-                                }
-                                ctx.notify();
-                            }))
-                            .child("⌘"),
-                    )
-                },
-            );
+            let mut pill = div().flex().flex_none().items_center().h_full().bg(tone);
+            if badge.beads {
+                pill = pill.child(
+                    div()
+                        .id(ElementId::from(format!("region-beads-{workspace_id}")))
+                        .role(gpui::Role::Button)
+                        .aria_label(format!("Open {} Beads board", badge.label))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(26.0))
+                        .h_full()
+                        .text_color(colors.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(colors.gradient_top))
+                        .on_hover(cx.listener(move |view, hovered: &bool, _window, ctx| {
+                            let refresh =
+                                view.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                                    boards.hover(workspace_id, HoverSource::Bead, *hovered);
+                                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                                });
+                            if *hovered && refresh {
+                                request_beads_board_or_log(
+                                    &view.sink,
+                                    workspace_id,
+                                    "region hover refresh",
+                                );
+                            }
+                            ctx.notify();
+                        }))
+                        .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
+                            ctx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |view, _, _window, ctx| {
+                            let refresh =
+                                view.shared.beads_boards.lock().is_ok_and(|mut boards| {
+                                    boards.toggle_pin(workspace_id);
+                                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+                                });
+                            if refresh {
+                                request_beads_board_or_log(
+                                    &view.sink,
+                                    workspace_id,
+                                    "region pin refresh",
+                                );
+                            }
+                            ctx.notify();
+                        }))
+                        .child(beads_graph_icon(colors.accent)),
+                );
+            }
+            let pill = pill.child(label);
             row = row.child(pill);
         }
         row = row.children(bar.tabs.iter().enumerate().map(|(index, (session_id, tab))| {
