@@ -281,11 +281,13 @@ PY
 }
 
 issue_position() {
-    python3 - "$RECORD" "$1" <<'PY'
+    python3 - "$RECORD" "$1" "${2:-0}" <<'PY'
 import json, sys
 
 snapshot = None
-for line in open(sys.argv[1]):
+for line_number, line in enumerate(open(sys.argv[1]), 1):
+    if line_number <= int(sys.argv[3]):
+        continue
     try:
         row = json.loads(line)
     except ValueError:
@@ -315,6 +317,16 @@ wait_for_lane() {
         sleep 0.2
     done
     fail "$issue did not reach lane $expected (last ${position:-missing})"
+}
+
+wait_for_lane_after_result() {
+    local issue="$1" expected="$2" result_line="$3" position
+    for _ in $(seq 1 50); do
+        position=$(issue_position "$issue" "$result_line" 2>/dev/null || true)
+        [ "${position%% *}" = "$expected" ] && return 0
+        sleep 0.2
+    done
+    fail "$issue did not reach lane $expected after write result (last ${position:-missing})"
 }
 
 issue_write_count() {
@@ -378,6 +390,42 @@ wait_for_applied() {
         sleep 0.2
     done
     fail "$issue returned no applied write result"
+}
+
+issue_write_result_after() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+
+for line_number, line in enumerate(open(sys.argv[1]), 1):
+    if line_number <= int(sys.argv[3]):
+        continue
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server"
+            and message.get("type") == "BeadsIssueWriteResult"
+            and message.get("issue_id") == sys.argv[2]):
+        print(line_number, json.dumps(message.get("result"), separators=(",", ":")))
+        raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+wait_for_applied_line() {
+    local issue="$1" after_line="$2" result line payload
+    for _ in $(seq 1 50); do
+        result=$(issue_write_result_after "$issue" "$after_line" 2>/dev/null || true)
+        [ -n "$result" ] && break
+        sleep 0.2
+    done
+    [ -n "${result:-}" ] || fail "$issue returned no write result"
+    line=${result%% *}
+    payload=${result#* }
+    printf '%s\n' "$payload" | grep -Fq '"applied"' \
+        || fail "$issue returned non-Applied result: $payload"
+    printf '%s\n' "$line"
 }
 
 mouse_report_count() {
@@ -619,10 +667,12 @@ printf '%s\n' "$CLOSED_DROP" | grep -Eq '"closed_at": "[0-9]{4}-' \
     || fail "Done drop omitted native closed_at: $CLOSED_DROP"
 import -window "$WID" /output/beads-drag-close-notice.png
 UNDO_BEFORE=$(issue_write_count e2e-close undo_close)
+UNDO_RECORD_BEFORE=$(wc -l <"$RECORD")
 xdotool mousemove --sync --window "$WID" "$(( WIN_W - 100 ))" 255
 xdotool click 1
 wait_for_write e2e-close undo_close "$UNDO_BEFORE"
-wait_for_lane e2e-close 1
+UNDO_RESULT_LINE=$(wait_for_applied_line e2e-close "$UNDO_RECORD_BEFORE")
+wait_for_lane_after_result e2e-close 1 "$UNDO_RESULT_LINE"
 REOPENED_DROP=$(cd "$PROJECT" && bd show e2e-close --json)
 printf '%s\n' "$REOPENED_DROP" | grep -Fq '"status": "open"' \
     || fail "board-side Undo did not restore open: $REOPENED_DROP"

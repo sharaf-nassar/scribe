@@ -1680,8 +1680,9 @@ The network-none real-bd GPUI run proves the production drag contract and termin
 
 [The script](../tests/e2e/func/beads-board.sh) checks native claim status,
 actor, and start time,
-close and board-side Undo, defer clearing, classifier-won repaint, and zero
-writes for rejected or same-lane drops. It keeps the `SingleController` owner,
+close and board-side Undo after its Applied result and a later board snapshot,
+defer clearing, classifier-won repaint, and zero writes for rejected or
+same-lane drops. It keeps the `SingleController` owner,
 proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
 during each gesture. The behavior belongs to
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
