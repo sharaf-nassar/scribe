@@ -923,10 +923,11 @@ Three channels carry a project root to the client — the session list,
 `WorkspaceInfo`, and the `WorkspaceNamed` a CWD change produces — and each one
 looked like the whole story on its own. They all park through
 [[crates/scribe-client/src/main.rs#park_workspace_info]], which asks for the
-board of every rooted entry it parks, so the request cannot be forgotten by a
-fourth channel. Naming matters most: a fresh server cannot name a workspace
-until one of its shells reports a CWD, which is after the session list. The
-server first runs store-free `bd context`, then composes bounded `list`,
+board of every entry it parks. This includes a rootless update: the server must
+answer `NotDetected` so the client can retire an earlier board. Naming matters
+most: a fresh server cannot name a workspace until one of its shells reports a
+CWD, which is after the session list. The server first runs store-free
+`bd context`, then composes bounded `list`,
 `ready`, and `blocked` JSON into exact Backlog, Ready, In Progress, Blocked,
 and Done queues. Classification precedence is Done, Blocked, In Progress,
 Ready, then Backlog, so an issue appears in only one queue. Priorities stay as
@@ -1110,6 +1111,16 @@ workspace label's existing click behavior. Hover opens the board over the
 terminal; clicking pins the same fixed-height board above the terminal across
 that workspace's tabs. A focused pinned board refreshes every 60 seconds;
 hidden boards do not poll.
+
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#update]] treats
+`NotDetected` as workspace loss and clears that workspace's pin, hover expiry,
+resize, and card gesture. Neighbouring boards remain untouched. `Unavailable`
+keeps the board pinned and retryable because a backend failure does not mean
+the workspace stopped being a Beads project. The Docker visual contract sends
+a rooted `WorkspaceNamed`, requires its request, and checks that a
+`NotDetected` reply restores only that region's terminal rows. It then restores
+and repins the board before proving the same request and cleanup after a
+rootless `WorkspaceNamed`.
 
 The [Story 3 drag contract](../specs/024-beads-card-detail.md#story-3--move-a-card-between-queues-by-dragging)
 allows Backlog, Ready, and In-progress sources; Blocked and Done never register

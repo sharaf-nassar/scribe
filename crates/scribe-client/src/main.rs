@@ -13105,14 +13105,13 @@ fn on_workspace_info(ctx: &ReaderCtx, message: ServerMessage) {
 }
 
 /// Park server-owned workspace metadata for the GPUI thread, asking for the
-/// Beads board of every entry that arrives carrying a project root.
+/// Beads board of every entry.
 ///
-/// Parking and asking are one step on purpose. A rooted workspace parked
-/// without a request paints no board until something unrelated asks, and the
-/// three channels that carry a root — the session list, `WorkspaceInfo`, and
-/// the `WorkspaceNamed` a CWD change produces — each looked like the whole
-/// story on their own. Routing them through here is what keeps a fourth from
-/// silently reintroducing that gap.
+/// Parking and asking are one step on purpose. A workspace gaining a root must
+/// discover its board, while one losing its root must receive `NotDetected` so
+/// an old pinned board closes. The session list, `WorkspaceInfo`, and
+/// `WorkspaceNamed` all route through here so neither transition gets parked
+/// without a request.
 fn park_workspace_info(ctx: &ReaderCtx, infos: impl IntoIterator<Item = WorkspaceInfo>) {
     let Ok(mut parked) = ctx.workspaces.lock() else {
         tracing::warn!("workspace info mutex poisoned; dropping workspace metadata");
@@ -13120,16 +13119,11 @@ fn park_workspace_info(ctx: &ReaderCtx, infos: impl IntoIterator<Item = Workspac
     };
     let first_new = parked.len();
     parked.extend(infos);
-    let rooted: Vec<WorkspaceId> = parked
-        .get(first_new..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|info| info.project_root.is_some())
-        .map(|info| info.workspace_id)
-        .collect();
+    let updated: Vec<WorkspaceId> =
+        parked.get(first_new..).unwrap_or_default().iter().map(|info| info.workspace_id).collect();
     drop(parked);
-    for workspace_id in rooted {
-        request_beads_board_or_log(&ctx.sink, workspace_id, "rooted workspace parked");
+    for workspace_id in updated {
+        request_beads_board_or_log(&ctx.sink, workspace_id, "workspace metadata parked");
     }
 }
 

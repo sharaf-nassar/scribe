@@ -161,9 +161,10 @@ print(max(sum(abs(a - b) for a, b in zip(row[x], row[x - 1])) for x in xs[1:]))
 PY
 }
 
-requested_board() {
+board_request_count() {
     python3 - "$RECORD" "$1" <<'PY'
 import json, sys
+count = 0
 with open(sys.argv[1]) as fh:
     for line in fh:
         try: row = json.loads(line)
@@ -171,8 +172,8 @@ with open(sys.argv[1]) as fh:
         msg = row.get("message", {})
         if (row.get("dir") == "client" and msg.get("type") == "RequestBeadsBoard"
                 and msg.get("workspace_id") == sys.argv[2]):
-            raise SystemExit
-raise SystemExit(1)
+            count += 1
+print(count)
 PY
 }
 
@@ -573,11 +574,60 @@ EMPTY_SLOT=$(convert /output/beads-board-empty.png \
     || fail "an empty queue left its lane blank instead of saying so"
 
 # A workspace usually gains its root from CWD naming, which lands after the
-# SessionList that seeds the eager requests. Asserted last because the real
-# reply it provokes would overwrite the injected board above.
+# SessionList that seeds the eager requests. Both gaining and losing that root
+# must ask again, and either answer may retire only this workspace's board.
+ROOTED_REQUESTS=$(board_request_count "$WORKSPACE")
 inject "{\"type\":\"WorkspaceNamed\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"project_root\":\"/work/scribe\"}"
-requested_board "$WORKSPACE" || fail "naming a rooted workspace did not request its board"
+[ "$(board_request_count "$WORKSPACE")" -gt "$ROOTED_REQUESTS" ] \
+    || fail "naming a rooted workspace did not request its board"
+
+inject "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$WORKSPACE\",\"protocol_version\":1,\"state\":\"NotDetected\"}"
+for _ in $(seq 1 20); do
+    ROOTED_NOT_DETECTED_ROWS=$(latest_rows "$PINNED_WS")
+    [ "$ROOTED_NOT_DETECTED_ROWS" -gt "$BOTH_PINNED" ] && break
+    sleep 0.2
+done
+[ "${ROOTED_NOT_DETECTED_ROWS:-$BOTH_PINNED}" -gt "$BOTH_PINNED" ] \
+    || fail "NotDetected left the newly rooted workspace's pinned board open"
+[ "$(latest_rows "$OTHER_WS")" -eq "$BOTH_OTHER" ] \
+    || fail "rooted NotDetected disturbed the neighbouring workspace's board"
+import -window "$(window_id)" /output/beads-board-rooted-not-detected.png
+
+# Restore the snapshot and pin it again so root loss proves the same cleanup
+# independently rather than passing on the board the rooted case closed.
+inject "$(sample_board "$WORKSPACE")"
+xdotool mousemove --sync --window "$WID" 66 17
+sleep 0.3
+xdotool click 1
+for _ in $(seq 1 20); do
+    REPINNED_ROWS=$(latest_rows "$PINNED_WS")
+    [ "$REPINNED_ROWS" -lt "$ROOTED_NOT_DETECTED_ROWS" ] && break
+    sleep 0.2
+done
+[ "${REPINNED_ROWS:-$ROOTED_NOT_DETECTED_ROWS}" -lt "$ROOTED_NOT_DETECTED_ROWS" ] \
+    || fail "restored board did not repin before the rootless transition"
+[ "$(latest_rows "$OTHER_WS")" -eq "$BOTH_OTHER" ] \
+    || fail "repinning the restored board disturbed its neighbour"
+
+ROOTLESS_REQUESTS=$(board_request_count "$WORKSPACE")
+inject "{\"type\":\"WorkspaceNamed\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"\",\"project_root\":null}"
+[ "$(board_request_count "$WORKSPACE")" -gt "$ROOTLESS_REQUESTS" ] \
+    || fail "clearing a workspace root did not request its board"
+
+inject "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$WORKSPACE\",\"protocol_version\":1,\"state\":\"NotDetected\"}"
+for _ in $(seq 1 20); do
+    ROOTLESS_NOT_DETECTED_ROWS=$(latest_rows "$PINNED_WS")
+    [ "$ROOTLESS_NOT_DETECTED_ROWS" -gt "$REPINNED_ROWS" ] && break
+    sleep 0.2
+done
+[ "${ROOTLESS_NOT_DETECTED_ROWS:-$REPINNED_ROWS}" -gt "$REPINNED_ROWS" ] \
+    || fail "NotDetected left the newly rootless workspace's pinned board open"
+[ "$(latest_rows "$OTHER_WS")" -eq "$BOTH_OTHER" ] \
+    || fail "rootless NotDetected disturbed the neighbouring workspace's board"
+import -window "$(window_id)" /output/beads-board-rootless-not-detected.png
 
 echo "PASS: Beads Constellation rendered for $WORKSPACE; pin rows $BASE_ROWS -> $PIN_ROWS;" \
     "bar drag $EDGE -> $GROWN_EDGE reserved $PIN_ROWS -> $GROWN_ROWS rows;" \
-    "split pinned=$SPLIT_PINNED other=$SPLIT_OTHER; both pinned=$BOTH_PINNED other=$BOTH_OTHER"
+    "split pinned=$SPLIT_PINNED other=$SPLIT_OTHER; both pinned=$BOTH_PINNED other=$BOTH_OTHER;" \
+    "rooted NotDetected rows=$ROOTED_NOT_DETECTED_ROWS;" \
+    "rootless NotDetected rows=$ROOTLESS_NOT_DETECTED_ROWS"

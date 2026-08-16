@@ -135,6 +135,19 @@ impl BeadsBoards {
         if !matches!(state, BeadsBoardState::Unavailable { .. }) {
             self.retry_after.remove(&workspace_id);
         }
+        if matches!(state, BeadsBoardState::NotDetected) {
+            self.hovered.remove(&workspace_id);
+            self.pinned.remove(&workspace_id);
+            self.hover_expires.remove(&workspace_id);
+            if self.resize.is_some_and(|drag| drag.workspace_id == workspace_id) {
+                self.resize = None;
+            }
+            if self.card_press.as_ref().is_some_and(|press| press.workspace_id == workspace_id)
+                || self.card_drag.as_ref().is_some_and(|drag| drag.workspace_id == workspace_id)
+            {
+                self.end_card_drag();
+            }
+        }
         let snapshot = match &state {
             BeadsBoardState::Loading { cached } => cached.as_ref(),
             BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
@@ -2660,10 +2673,48 @@ mod tests {
     fn unavailable_board_schedules_one_retry_per_interval() {
         let workspace = WorkspaceId::new();
         let mut boards = BeadsBoards::default();
+        boards.toggle_pin(workspace);
         let _ =
             boards.update(workspace, BeadsBoardState::Unavailable { message: "missing bd".into() });
 
+        assert!(boards.is_pinned(workspace), "a temporary backend failure closed the board");
         assert_eq!(boards.due_retry(Duration::from_secs(30)), Some(workspace));
         assert_eq!(boards.due_retry(Duration::from_secs(30)), None);
+    }
+
+    // @lat: [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]]
+    #[test]
+    fn not_detected_closes_only_that_workspaces_board_and_gestures() {
+        let missing = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.toggle_pin(missing);
+        boards.hover(missing, HoverSource::Board, true);
+        boards.hover(missing, HoverSource::Board, false);
+        boards.toggle_pin(neighbour);
+        boards.hover(neighbour, HoverSource::Board, true);
+        boards.start_resize(missing, 100.0);
+        boards.arm_card_drag(missing, drag_item(), 1, drag_point(150.0, 100.0));
+
+        let _ = boards.update(missing, BeadsBoardState::NotDetected);
+
+        assert_eq!(visible_sorted(&boards), [(neighbour, true)]);
+        assert!(!boards.hover_expires.contains_key(&missing));
+        assert_eq!(boards.resizing(), None);
+        assert!(!boards.blocks_pty_mouse());
+        assert!(boards.is_pinned(neighbour));
+        assert_eq!(boards.hovered.get(&neighbour), Some(&(HoverSource::Board as u8)));
+
+        boards.toggle_pin(missing);
+        boards.start_resize(missing, 100.0);
+        boards.arm_card_drag(missing, drag_item(), 1, drag_point(150.0, 100.0));
+        assert!(boards.start_card_drag(drag_point(160.0, 100.0), drag_board()));
+
+        let _ = boards.update(missing, BeadsBoardState::NotDetected);
+
+        assert_eq!(boards.resizing(), None);
+        assert!(!boards.blocks_pty_mouse());
+        assert!(boards.card_drag().is_none());
+        assert_eq!(visible_sorted(&boards), [(neighbour, true)]);
     }
 }
