@@ -9,7 +9,7 @@
 # path's swallow arm, so the client had neither marks nor a way to reach them.
 # Every phase below therefore drives the real window and asserts something only
 # the wired path can produce: a recorded mark, a viewport that lands on the row
-# a specific mark named, and a server-driven snap back to the live bottom.
+# a specific mark named, and a preserved viewport across a suppressed AI ED 3.
 #
 # The window is driven through XTEST (`xdotool key`, no `--window`): GPUI reads
 # the keyboard through XInput2 and ignores the synthetic XSendEvent input that
@@ -340,30 +340,31 @@ if [ "${DIFF:-0}" -lt "$VIEWPORT_DIFF_MIN" ]; then
 fi
 echo "PHASE 5 PASS: ctrl+shift+b skipped the two successful commands and landed on the failure at row $FAIL_TARGET (+$DIFF px)"
 
-# ── Phase 6: a server ScrollBottom snaps the viewport ─────────────
-# The server emits `ScrollBottom` when it suppresses an AI session's ED 3, so
-# the pane is armed as an AI session (OSC 1337 `ScribeAiLaunch`) and then emits
-# a real ED 3. Both go out in one printf, which puts the arming event in the
-# same PTY chunk the filter inspects.
-send_keys shift+Prior
-LINE=$(last_log_line "terminal scrollback moved")
-case "$LINE" in
-    *"offset=0"*) fail "PHASE 6 FAIL: could not scroll away from the bottom first: $LINE" ;;
-esac
+# ── Phase 6: suppressed AI ED 3 preserves the viewed prompt ──────
+# Phase 5 left the viewport on the failed command. Arm the server's AI ED 3
+# filter and clear there, then prove the viewed prompt did not move. The later
+# explicit bottom chord must still move, which rules out a merely stale log.
+FAIL_OFFSET=$(log_field "$LINE" offset)
+if [ "${FAIL_OFFSET:-0}" -le 0 ]; then
+    fail "PHASE 6 FAIL: failure jump did not leave a viewed anchor: $LINE"
+fi
+capture /output/pm-06-viewed-anchor.png
 BASE=$(count_log "server snapped the pane to the live bottom")
 scribe-test send "$SESSION" \
     "printf '\033]1337;ScribeAiLaunch=claude_code\007\033[3J'; echo PM_ED3_SENT\n"
 scribe-test wait-output "$SESSION" "PM_ED3_SENT" --timeout 20000
-if ! wait_for_log_growth "server snapped the pane to the live bottom" "$BASE" 20; then
-    fail "PHASE 6 FAIL: the server's ScrollBottom never reached the client"
+sleep 1
+if [ "$(count_log "server snapped the pane to the live bottom")" -ne "$BASE" ]; then
+    fail "PHASE 6 FAIL: suppressed AI ED 3 emitted a synthetic ScrollBottom"
 fi
-LINE=$(last_log_line "server snapped the pane to the live bottom")
-case "$LINE" in
-    *"moved=true"*) ;;
-    *) fail "PHASE 6 FAIL: the snap did not move a scrolled-up viewport: $LINE" ;;
-esac
-# The viewport is only genuinely at the bottom if an explicit scroll_bottom now
-# has nothing left to do.
+capture /output/pm-06-after-suppressed-ed3.png
+DIFF=$(window_diff /output/pm-06-viewed-anchor.png /output/pm-06-after-suppressed-ed3.png)
+if [ "${DIFF:-0}" -ge "$VIEWPORT_DIFF_MIN" ]; then
+    fail "PHASE 6 FAIL: suppressed ED 3 moved the viewed prompt ($DIFF px)"
+fi
+
+# The viewport is only still on the viewed prompt if an explicit scroll_bottom
+# has work left to do and then reports the live offset.
 BASE=$(count_log "terminal scrollback moved")
 send_keys shift+End
 if ! wait_for_log_growth "terminal scrollback moved" "$BASE"; then
@@ -371,11 +372,11 @@ if ! wait_for_log_growth "terminal scrollback moved" "$BASE"; then
 fi
 LINE=$(last_log_line "terminal scrollback moved")
 case "$LINE" in
-    *"moved=false"*"offset=0"*) ;;
-    *) fail "PHASE 6 FAIL: the server snap left the viewport off the live bottom: $LINE" ;;
+    *"moved=true"*"offset=0"*) ;;
+    *) fail "PHASE 6 FAIL: shift+End did not move the preserved viewport: $LINE" ;;
 esac
 capture /output/pm-06-scroll-bottom.png
-echo "PHASE 6 PASS: the server's ScrollBottom snapped the view to the live bottom — $LINE"
+echo "PHASE 6 PASS: suppressed ED 3 preserved the prompt (+$DIFF px), then shift+End moved it — $LINE"
 
 echo ""
 echo "PASS: visual prompt-marks test"
@@ -388,4 +389,6 @@ echo "    pm-03-jump-up-1.png      — parked on the newest prompt mark"
 echo "    pm-03-jump-up-2.png      — parked one mark further up"
 echo "    pm-04-jump-down.png      — back down one mark"
 echo "    pm-05-jump-failure.png   — parked on the failed command"
-echo "    pm-06-scroll-bottom.png  — after the server's ScrollBottom snap"
+echo "    pm-06-viewed-anchor.png  — the viewed prompt before suppressed ED 3"
+echo "    pm-06-after-suppressed-ed3.png — the same viewed prompt afterward"
+echo "    pm-06-scroll-bottom.png  — after the explicit scroll to the live bottom"

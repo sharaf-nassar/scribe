@@ -37,7 +37,10 @@ use crate::terminal_images::{
 /// image capability, live-update, and replay contract exactly.
 ///
 /// Bumped to `6` for the remote-visible CI run state and dismissal messages.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 6;
+///
+/// Bumped to `7` because suppressed AI ED 3 no longer emits `ScrollBottom`,
+/// changing the terminal-frame semantics visible to remote peers.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 7;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1150,10 +1153,9 @@ pub enum ServerMessage {
         session_id: SessionId,
         history_rows: u32,
     },
-    /// The server suppressed an ED 3 (clear scrollback) sequence from an AI
-    /// session.  The client should reset `display_offset` to 0 so the
-    /// viewport snaps to the live terminal, matching the scroll-to-bottom
-    /// side-effect of a real ED 3.
+    /// Legacy bottom-snap frame retained for named `MessagePack` compatibility.
+    /// Clients preserve a nonzero `display_offset` so an old server cannot
+    /// override a viewport the user is reading.
     ScrollBottom {
         session_id: SessionId,
     },

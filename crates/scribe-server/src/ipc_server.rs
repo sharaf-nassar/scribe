@@ -10239,12 +10239,6 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
         |delivered_bytes| {
             // Step 1: Fast path — forward filtered bytes to the UI client.
             send_pty_output(client_writer, session_id, delivered_bytes, chunk_commit);
-            // Step 1b: Pair a suppressed ED 3 with the chunk cursor before
-            // the Term feed, preserving the existing client frame order.
-            if suppressed_ed3 {
-                let msg = ServerMessage::ScrollBottom { session_id };
-                send_to_client(client_writer, Some(chunk_commit), &msg);
-            }
         },
         |observer, delivered_bytes, image_result| {
             feed_term_image_result_observed(
@@ -10872,8 +10866,8 @@ async fn read_pty_bytes(
 /// zero-byte frame would still be allocated, serialized, queued, coalesced,
 /// and parsed by every attached client for no visible effect. Dropping it here
 /// covers every producer, and costs the client nothing: an empty chunk leaves
-/// the commit cursor where it was, so the companion `ScrollBottom` and
-/// `TrimScrollback` frames still carry the cursor value the attach path needs.
+/// the commit cursor where it was, while an accompanying `TrimScrollback`
+/// frame carries the cursor value the attach path needs.
 fn send_pty_output(client_writer: &ClientWriter, session_id: SessionId, bytes: &[u8], commit: u64) {
     if bytes.is_empty() {
         return;
@@ -13388,6 +13382,96 @@ mod tests {
         assert!(
             matches!(first, ServerMessage::ScrollBottom { .. }),
             "an empty chunk must not be framed at all, got {first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suppressed_ai_ed3_forwards_filtered_output_without_scroll_bottom() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, _live_sessions, slaves) = live_session_with_sink(80, 24, &writer).await;
+
+        nix::unistd::write(
+            &slaves[0],
+            b"\x1b]1337;ScribeAiLaunch=claude_code\x07before\x1b[3Jafter",
+        )
+        .unwrap();
+
+        let first: ServerMessage =
+            tokio::time::timeout(std::time::Duration::from_secs(3), read_message(&mut client_read))
+                .await
+                .expect("filtered output arrived")
+                .expect("filtered output decoded");
+        assert!(matches!(
+            first,
+            ServerMessage::PtyOutput { session_id: id, data }
+                if id == session_id
+                    && data.windows(4).all(|window| window != b"\x1b[3J")
+                    && data.ends_with(b"beforeafter")
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                read_message::<ServerMessage, _>(&mut client_read),
+            )
+            .await
+            .is_err(),
+            "a suppressed ED 3 must not synthesize ScrollBottom after its output"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_ai_ed3_stays_on_the_pty_output_wire() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, _live_sessions, slaves) = live_session_with_sink(80, 24, &writer).await;
+
+        nix::unistd::write(&slaves[0], b"before\x1b[3Jafter").unwrap();
+
+        let message: ServerMessage =
+            tokio::time::timeout(std::time::Duration::from_secs(3), read_message(&mut client_read))
+                .await
+                .expect("plain ED 3 arrived")
+                .expect("plain ED 3 decoded");
+        assert!(matches!(
+            message,
+            ServerMessage::PtyOutput { session_id: id, data }
+                if id == session_id && data.ends_with(b"before\x1b[3Jafter")
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_pty_append_stays_a_single_output_frame() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, _live_sessions, slaves) = live_session_with_sink(80, 24, &writer).await;
+
+        nix::unistd::write(&slaves[0], b"plain append").unwrap();
+
+        let message: ServerMessage =
+            tokio::time::timeout(std::time::Duration::from_secs(3), read_message(&mut client_read))
+                .await
+                .expect("plain append arrived")
+                .expect("plain append decoded");
+        assert!(matches!(
+            message,
+            ServerMessage::PtyOutput { session_id: id, data }
+                if id == session_id && data.ends_with(b"plain append")
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                read_message::<ServerMessage, _>(&mut client_read),
+            )
+            .await
+            .is_err(),
+            "a plain append must not add a synthetic positional frame"
         );
     }
 

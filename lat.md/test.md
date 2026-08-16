@@ -2363,13 +2363,13 @@ The seed length is what makes the comparison sharp. At 178 columns each marker o
 
 ### Prompt marks and mark-relative jumps
 
-`tests/e2e/visual/prompt-marks.sh` is the app-level oracle for : OSC 133 ingestion, the three mark-relative jumps, and the server's `ScrollBottom` snap, none of which the client could reach before.
+`tests/e2e/visual/prompt-marks.sh` is the app-level oracle for : OSC 133 ingestion, the three mark-relative jumps, and a preserved viewed anchor across suppressed AI ED 3.
 
 It runs on the  so a real shell writes real OSC 133 bytes into the very pane the window renders — the server's OSC interceptor and its `PromptMark` emission are therefore on trial alongside the client. Three commands are recorded with the middle one exiting non-zero, and each block's filler rows carry a bar that grows at a per-block rate, so two viewports parked on different marks are visibly different frames rather than near-identical walls of text.
 
 The expected landing rows are read back out of the client's own `prompt mark recorded` lines rather than hard-coded, which keeps the assertions independent of how many rows the window happens to have. Pressing `ctrl+shift+b` before any mark exists must log `prompt jump found no mark` and leave the frame alone (FR-011) — a different observation from the chord being swallowed, which produces no line at all. `ctrl+shift+z` twice must walk to two successively older marks, `ctrl+shift+x` must land back on the first of them, and `ctrl+shift+b` must land on the *middle* command's row, which separates the wired behaviour from both the newest mark (what a plain jump-up reaches) and the oldest.
 
-The final phase scrolls away from the bottom, then arms the pane as an AI session and emits a real ED 3 so the server suppresses it and sends `ScrollBottom`. The snap is asserted twice: the client logs it with `moved=true`, and a following `scroll_bottom` chord must report `moved=false offset=0`, which is the only way to show the viewport genuinely ended at the live tail.
+The final phase starts on the failed command's viewed anchor, arms the pane as an AI session, and emits a real ED 3. The server must filter the sequence without emitting `ScrollBottom`; the before/after frames stay below the full-viewport difference threshold. A later `scroll_bottom` chord must report `moved=true offset=0`, proving the user still had a view to leave before choosing the live tail.
 
 ### The command-mark scrollbar paints its thumb and ticks
 

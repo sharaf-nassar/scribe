@@ -86,11 +86,11 @@ Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is
 
 The PTY reader's `ai_provider` is managed by : it is set when an AI tool announces itself via `AiStateChanged` and pre-armed via the  when shell integration sees the user run an AI binary, and it is cleared on `AiStateCleared` so subsequent plain-shell bytes (vim, less, etc.) bypass the filter. The pre-arm is what keeps `<tool> --resume` working across the cleared state — its initial `\x1b[3J` arrives after the shell has already armed `ai_provider` to the correct provider. Same-chunk pre-arm and ED 3 are both honored:  inspects the chunk's OSC events for either an `AiStateChanged` or an `AiProviderArmed` carrying an ED-3-using provider before deciding whether the filter applies to the chunk.
 
-### Scroll-Bottom on Suppression
+### ScrollBottom compatibility
 
-When the filter suppresses ED 3, the PTY reader sends a `::ScrollBottom` so the client snaps the viewport to bottom.
+The PTY reader does not synthesize `::ScrollBottom` for a suppressed ED 3. A scrolled client keeps the prompt it is reading while filtered redraw bytes and any `TrimScrollback` stay in their normal order.
 
-A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_history`. Stripping it without this compensating message would leave the viewport stuck at a stale scroll position while the live terminal redraws below the visible area.
+`ServerMessage::ScrollBottom` remains decodable for an older server, but the client ignores it while `display_offset` is nonzero so a legacy frame cannot dissolve split-scroll or override the viewed anchor. Unsuppressed non-AI ED 3 still crosses the PTY unchanged and keeps alacritty's normal clear-history boundary.
 
 ### Baseline Trim on Repaint
 

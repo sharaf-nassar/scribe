@@ -474,10 +474,10 @@ e2e-visual-mouse-reporting:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/mouse-reporting.sh
 
 # Run the prompt-mark E2E: OSC 133 ingestion plus prompt_jump_up /
-# prompt_jump_down / jump_to_failure and the server's ScrollBottom snap, all
-# against the real window. Needs the shared-pane rig (so `scribe-test` writes
-# the OSC 133 bytes into the very pane the client renders) and a longer budget
-# than the default 60 s for its six phases.
+# prompt_jump_down / jump_to_failure and suppressed-ED-3 anchor preservation,
+# all against the real window. Needs the shared-pane rig (so `scribe-test`
+# writes the OSC 133 bytes into the very pane the client renders) and a longer
+# budget than the default 60 s for its six phases.
 e2e-visual-prompt-marks:
     docker run --rm --network none {{gpu_flags}} -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{e2e_output}} scribe-test-visual /tests/visual/prompt-marks.sh
 

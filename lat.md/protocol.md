@@ -192,6 +192,8 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 `TrimScrollback` prunes a client's history back to the current AI redraw epoch baseline before a redraw when suppressed ED 3 clears would otherwise stack duplicate inline transcript frames into scrollback.
 
+`ScrollBottom` remains a named MessagePack variant for old-server decoding, but the current server never synthesizes it for suppressed AI ED 3. A client receiving the legacy frame preserves a nonzero display offset rather than moving a viewport the user is reading.
+
 #### SessionReplay
 
 Unified primitive for rebuilding a client's Term on reattach, defined in [[crates/scribe-common/src/screen_replay.rs#SessionReplay]].
@@ -336,6 +338,8 @@ Terminal-images v1 bumps the constant to `5` because capabilities, live output b
 
 CI run state bumps the constant to `6` because state and dismissal cross tailnet and LAN connections. Job-detail demand and snapshots extend unreleased v6 under the same `ci_run_bar` capability rather than advancing it again. Local mixed-generation safety still comes from the default-false gate.
 
+Suppressed AI ED 3 changes bump the constant to `7`: the server no longer emits a synthetic `ScrollBottom`, and newer clients preserve a scrolled viewport on receipt of that legacy frame. Both effects change terminal-frame semantics on remote connections.
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -351,6 +355,7 @@ Deleting four message variants and six supporting types left
 Feature 018 later advanced it to `4` for structured AI launch, and
 terminal-images v1 advances it to `5`.
 CI run state later advances it to `6`.
+Suppressed AI ED 3 terminal-frame semantics later advance it to `7`.
 
 Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
 
@@ -431,7 +436,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, and `6` for CI run state — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, and `7` for suppressed AI ED 3 terminal-frame semantics — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 

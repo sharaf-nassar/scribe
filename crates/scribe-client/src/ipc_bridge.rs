@@ -125,12 +125,11 @@ const RESYNC_MAX_DELAY: Duration = Duration::from_secs(2);
 ///
 /// The three non-output variants are here rather than applied straight from the
 /// reader because all of them are *positional*: an OSC 133 mark names the row
-/// the cursor is on, a suppressed-ED-3 `ScrollBottom` names the moment the
-/// viewport must snap, and a `TrimScrollback` names a scrollback size measured
-/// after a particular chunk. The server emits each of them after the
-/// `PtyOutput` chunk they describe, and the reader forwards messages in arrival
-/// order, so routing them down the same FIFO is what makes them land against a
-/// grid that already holds the output they describe.
+/// the cursor is on, a legacy `ScrollBottom` is ordered beside its old output,
+/// and a `TrimScrollback` names a scrollback size measured after a particular
+/// chunk. The reader forwards messages in arrival order, so routing them down
+/// the same FIFO is what makes them land against a grid that already holds the
+/// output they describe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
     /// Output bytes destined for the named pane's `write_output`.
@@ -158,8 +157,7 @@ pub enum InboundEvent {
     /// `click_events` flag is dropped at the reader: click-to-move has no
     /// surface in this client, so carrying it here would be dead state.
     PromptMark { session_id: SessionId, kind: PromptMarkKind, exit_code: Option<i32> },
-    /// The server suppressed an ED 3 for the named pane, so its viewport must
-    /// snap to the live bottom the way a real ED 3 would have left it.
+    /// A legacy server requested a bottom snap for the named pane.
     ScrollBottom { session_id: SessionId },
     /// The server trimmed the named pane's scrollback back to `kept_rows`, so
     /// the display grid has to drop the same oldest rows.
@@ -188,7 +186,7 @@ pub enum PaneOp {
     /// An OSC 133 mark to anchor against the grid as it stands after every
     /// preceding [`PaneOp::Output`] in this batch.
     PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
-    /// Snap the pane's viewport to the live bottom.
+    /// Process a legacy server bottom-snap request.
     ScrollBottom,
     /// Drop the pane's oldest scrollback rows until `kept_rows` remain, and
     /// shift every surviving absolute-row anchor by however many went.

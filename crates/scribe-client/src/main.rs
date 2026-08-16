@@ -11773,10 +11773,10 @@ fn resolve_batch_panes(
 ///
 /// The arms share the stream because they are ordered against each other:
 /// output advances the grid, a prompt mark reads the row the output left the
-/// cursor on, and the suppressed-ED-3 snap resets the offset the output
-/// scrolled. A rebuild is the one arm that reshapes the grid before it writes
-/// and normalizes legacy replay history afterwards, because it is state rather
-/// than a delta — see [`reshape_for_rebuild`].
+/// cursor on, and a legacy `ScrollBottom` can only act at the live tail. A
+/// rebuild is the one arm that reshapes the grid before it writes and normalizes
+/// legacy replay history afterwards, because it is state rather than a delta —
+/// see [`reshape_for_rebuild`].
 fn apply_pane_op(
     op: &PaneOp,
     session: SessionId,
@@ -11801,11 +11801,14 @@ fn apply_pane_op(
             0
         }
         PaneOp::ScrollBottom => {
-            // A real ED 3 resets the display offset inside `clear_history`; the
-            // server stripped the sequence, so the snap is replayed here.
+            // Older servers emitted this after a suppressed ED 3. Never let a
+            // delayed legacy frame override a viewport the user is reading.
+            if grid.display_offset() != 0 {
+                return 0;
+            }
             grid.set_split_scroll_eligibility(SplitScrollEligibility::default());
             let moved = grid.scroll(Scroll::Bottom);
-            tracing::info!(%session, moved, "server snapped the pane to the live bottom");
+            tracing::info!(%session, moved, "processed legacy server ScrollBottom at the live bottom");
             usize::from(moved)
         }
         PaneOp::TrimScrollback { kept_rows } => apply_trim_scrollback(
@@ -12639,10 +12642,10 @@ async fn dispatch_server_message(
         ai @ (ServerMessage::AiStateChanged { .. }
         | ServerMessage::AiStateCleared { .. }
         | ServerMessage::PromptReceived { .. }) => on_ai_message(ctx, ai),
-        // OSC 133 marks, the suppressed-ED-3 snap and the AI scrollback trim are
-        // all positional: each describes the grid *after* output the server has
-        // already sent, so they are routed as one onto the same ordered inbound
-        // channel as that output rather than applied here.
+        // OSC 133 marks, legacy ScrollBottom, and AI scrollback trims are all
+        // positional: each describes the grid after output the server already
+        // sent, so they share its ordered inbound channel rather than applying
+        // here.
         positional @ (ServerMessage::PromptMark { .. }
         | ServerMessage::ScrollBottom { .. }
         | ServerMessage::TrimScrollback { .. }) => {
@@ -13276,11 +13279,11 @@ fn on_terminal_image_message(ctx: &ReaderCtx, message: ServerMessage) {
 
 /// Forward one positional pane event onto the ordered inbound channel.
 ///
-/// A prompt mark's anchor row and a suppressed-ED-3 snap only mean anything
+/// A prompt mark's anchor row and a legacy `ScrollBottom` only mean anything
 /// relative to the output around them, so both travel the same FIFO the pane's
 /// bytes do and are applied by the drain, not here. Anything other than those
-/// two variants is a routing error in [`dispatch_server_message`], not a
-/// protocol event, so it is counted as unhandled rather than silently dropped.
+/// variants is a routing error in [`dispatch_server_message`], not a protocol
+/// event, so it is counted as unhandled rather than silently dropped.
 fn on_positional_pane_message(ctx: &ReaderCtx, message: ServerMessage) {
     let (session_id, event) = match message {
         ServerMessage::PromptMark { session_id, kind, exit_code, .. } => {
@@ -13994,11 +13997,11 @@ fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) 
 
 /// Hand one event to the coalescing drain, preserving arrival order.
 ///
-/// Every pane-affecting message goes through here so output and the positional
-/// events interleaved with it (prompt marks, the suppressed-ED-3 snap) cannot
-/// be reordered relative to each other. The queue behind it is bounded and
-/// never blocks the reader: an overflow is absorbed by the drain's resync
-/// rather than by stalling the socket read.
+/// Every pane-affecting message goes through here so output and positional
+/// events interleaved with it (prompt marks and legacy `ScrollBottom`) cannot be
+/// reordered relative to each other. The queue behind it is bounded and never
+/// blocks the reader: an overflow is absorbed by the drain's resync rather than
+/// by stalling the socket read.
 fn forward_inbound(in_tx: &InboundSender, event: InboundEvent) {
     if in_tx.send(event).is_err() {
         tracing::warn!("inbound drain closed; dropping pane event");
@@ -15217,5 +15220,69 @@ mod tests {
         assert_eq!(frame.metrics.history_size, 3);
         assert_eq!(pane.with_terminal(|terminal| terminal.scroll(Scroll::Delta(1))), Some(true));
         assert_eq!(pane.frame().unwrap().metrics.display_offset, 1);
+    }
+
+    #[gpui::test]
+    fn legacy_scroll_bottom_keeps_a_scrolled_split_viewport(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 8);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+        pane.with_terminal(|terminal| {
+            terminal.feed_output(
+                (1..=12)
+                    .map(|row| format!("line {row:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+                    .as_bytes(),
+            );
+            assert!(terminal.scroll(Scroll::Delta(4)));
+            assert!(terminal.set_split_scroll_eligibility(SplitScrollEligibility {
+                scroll_pin_enabled: true,
+                ai_provider_enabled: true,
+            }));
+        })
+        .expect("pane accepts the scrolled split state");
+
+        let redraws = pane
+            .with_stream(|stream| {
+                apply_pane_op(&PaneOp::ScrollBottom, session, stream, &prompt_marks)
+            })
+            .expect("pane accepts the legacy frame");
+
+        assert_eq!(redraws, 0, "a legacy frame must not redraw a viewed viewport");
+        pane.with_terminal(|terminal| {
+            assert_eq!(terminal.display_offset(), 4, "the viewed anchor remains in place");
+            assert!(terminal.pin_rows() > 0, "the split-scroll pin remains eligible");
+            assert!(terminal.scroll(Scroll::Bottom), "an explicit bottom action still moves");
+            assert_eq!(terminal.display_offset(), 0);
+        })
+        .expect("pane exposes the preserved viewport");
+    }
+
+    #[gpui::test]
+    fn plain_ed3_output_keeps_the_terminal_clear_boundary(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        let mut grids = PaneGrids::new(20, 8);
+        let pane = grids.pane(session);
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+        pane.with_terminal(|terminal| {
+            terminal.feed_output(
+                (1..=12)
+                    .map(|row| format!("line {row:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+                    .as_bytes(),
+            );
+            assert!(terminal.scroll(Scroll::Delta(4)));
+        })
+        .expect("pane accepts scrollback");
+
+        pane.with_stream(|stream| {
+            apply_pane_op(&PaneOp::Output(b"\x1b[3J".to_vec()), session, stream, &prompt_marks)
+        })
+        .expect("pane applies the plain ED 3 output");
+
+        assert_eq!(pane.frame().unwrap().metrics.display_offset, 0);
     }
 }
