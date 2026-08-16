@@ -588,10 +588,6 @@ fn move_snapshot_card(
     })
 }
 
-fn lane_wash_strength(lane: u8, hovered_lane: Option<u8>) -> f32 {
-    if hovered_lane == Some(lane) && matches!(lane, 0 | 3) { LANE_WASH / 3.0 } else { LANE_WASH }
-}
-
 fn card_drag_lane(board: Rect, pointer: CardDragPoint) -> Option<u8> {
     let left = board.x + LANES_SIDE_PADDING;
     let right = board.x + board.width - LANES_SIDE_PADDING;
@@ -898,12 +894,6 @@ const CARD_PAD_TOP: f32 = 6.0;
 /// line.
 const TITLE_LINE: f32 = 17.0;
 
-/// The wash that zones a lane's column, and the halo behind its node. Both are
-/// laid translucent so the rail they cross still shows through.
-const LANE_WASH: f32 = 0.05;
-const NODE_HALO: f32 = 0.12;
-const NODE_HALO_ACTIVE: f32 = 0.2;
-
 const TEXT_SCALE_STEP: f32 = 0.1;
 const MIN_TEXT_SCALE_STEPS: i8 = -2;
 const MAX_TEXT_SCALE_STEPS: i8 = 6;
@@ -980,8 +970,6 @@ struct Lane<'a> {
     queue: fn(&BeadsBoardSnapshot) -> &[BeadsBoardItem],
     /// The queue's colour, worn by its node and the rail beneath it.
     state: Rgba,
-    /// The queues either side, which this lane's wash travels to meet.
-    blend: LaneBlend,
     /// In progress is the lane the eye should land on.
     accent: LaneAccent,
 }
@@ -1038,18 +1026,6 @@ impl Render for BeadsCardDragGhost {
 enum LaneAccent {
     None,
     Progress,
-}
-
-/// The queues either side of a lane, or nothing where the board ends.
-#[derive(Clone, Copy)]
-struct LaneBlend {
-    left: Option<Rgba>,
-    right: Option<Rgba>,
-}
-
-impl LaneBlend {
-    /// A lane that has not been told its neighbours yet, which washes flat.
-    const NONE: Self = Self { left: None, right: None };
 }
 
 /// Paint the compact live overview over the top of its own region.
@@ -1240,7 +1216,7 @@ fn lanes(
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
-    let mut specs = [
+    let specs = [
         Lane {
             index: 0,
             name: "Backlog",
@@ -1249,7 +1225,6 @@ fn lanes(
             items: &snapshot.backlog,
             queue: |board| &board.backlog,
             state: colors.backlog_state,
-            blend: LaneBlend::NONE,
             accent: LaneAccent::None,
         },
         Lane {
@@ -1260,7 +1235,6 @@ fn lanes(
             items: &snapshot.ready,
             queue: |board| &board.ready,
             state: colors.ready_state,
-            blend: LaneBlend::NONE,
             accent: LaneAccent::None,
         },
         Lane {
@@ -1271,7 +1245,6 @@ fn lanes(
             items: &snapshot.in_progress,
             queue: |board| &board.in_progress,
             state: colors.progress_state,
-            blend: LaneBlend::NONE,
             accent: LaneAccent::Progress,
         },
         Lane {
@@ -1282,7 +1255,6 @@ fn lanes(
             items: &snapshot.blocked,
             queue: |board| &board.blocked,
             state: colors.blocked_state,
-            blend: LaneBlend::NONE,
             accent: LaneAccent::None,
         },
         Lane {
@@ -1293,20 +1265,9 @@ fn lanes(
             items: &snapshot.done,
             queue: |board| &board.done,
             state: colors.done_state,
-            blend: LaneBlend::NONE,
             accent: LaneAccent::None,
         },
     ];
-    // Each lane's wash reaches its neighbours' colours at the two boundaries it
-    // owns, so the queue it hands over to has to travel with it. Filled once
-    // the five are known rather than written into each by hand.
-    let states: Vec<Rgba> = specs.iter().map(|lane| lane.state).collect();
-    for (index, spec) in specs.iter_mut().enumerate() {
-        spec.blend = LaneBlend {
-            left: index.checked_sub(1).and_then(|left| states.get(left).copied()),
-            right: states.get(index + 1).copied(),
-        };
-    }
     div()
         .relative()
         .h_full()
@@ -1356,59 +1317,18 @@ fn lane(
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
+    let target = stores.drag_target == Some(spec.index);
+    let target_border = if matches!(spec.index, 0 | 3) { colors.muted } else { spec.state };
     div()
         .flex_1()
         .min_w(px(0.0))
         .relative()
         .px(px(LANE_CARD_PADDING))
-        // The wash comes first so everything else sits on it. It is what makes
-        // a lane read as a column of its own rather than as five sets of rows
-        // sharing one ground.
-        .child(lane_wash(spec, lane_wash_strength(spec.index, stores.drag_target)))
+        .when(target, |lane| {
+            lane.child(div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(target_border))
+        })
         .child(lane_head(spec, colors, metrics))
         .child(lane_body(spec, workspace_id, stores, colors, metrics))
-        .into_any_element()
-}
-
-/// The queue's colour zoning its column, over the whole depth of the strip.
-///
-/// One band per queue, run edge to edge so the five meet with no ground between
-/// them: the board reads as five columns of colour rather than as five headings
-/// over one shared ground. Translucent rather than mixed into a solid, because
-/// the rail is painted before the lanes and a solid wash would erase the length
-/// of it that crosses this column.
-///
-/// The colour is flat across the middle third and travels to meet its
-/// neighbours over the outer two, so a boundary is a crossing rather than a
-/// step. Both sides of a boundary compute the same midpoint of the same two
-/// queues, which is what makes the two gradients meet without a seam of their
-/// own.
-fn lane_wash(spec: &Lane<'_>, strength: f32) -> AnyElement {
-    let own = alpha(spec.state, strength);
-    let meeting = |neighbour: Option<Rgba>| {
-        neighbour.map_or(own, |other| alpha(mix(spec.state, other, 0.5), strength))
-    };
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .top_0()
-        // Past the padding the lanes hold at the bottom for the chevron, so a
-        // column runs the full depth and stops on the board's own bottom bar
-        // instead of a hand's width above it.
-        .bottom(px(-LANES_BOTTOM_PAD))
-        .flex()
-        .child(div().flex_1().bg(linear_gradient(
-            90.0,
-            linear_color_stop(meeting(spec.blend.left), 0.0),
-            linear_color_stop(own, 1.0),
-        )))
-        .child(div().flex_1().bg(own))
-        .child(div().flex_1().bg(linear_gradient(
-            90.0,
-            linear_color_stop(own, 0.0),
-            linear_color_stop(meeting(spec.blend.right), 1.0),
-        )))
         .into_any_element()
 }
 
@@ -1421,7 +1341,6 @@ fn lane_head(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> An
     // The count wears its queue's own colour, lifted to carry words rather
     // than to be a mark: it sits on the board's ground with nothing behind it.
     let count_ink = colors.count_ink(spec.state);
-    let halo = if spec.accent == LaneAccent::Progress { NODE_HALO_ACTIVE } else { NODE_HALO };
     div()
         .relative()
         .h(px(metrics.head()))
@@ -1463,9 +1382,8 @@ fn lane_head(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> An
                 .items_center()
                 .gap(px(6.0))
                 // Opaque, so the queue line breaks the rail rather than
-                // sitting on top of it — and opaque in the wash's own colour,
-                // since a patch of bare ground would read as a hole in it.
-                .bg(mix(colors.ground, spec.state, LANE_WASH))
+                // sitting on top of it.
+                .bg(colors.ground)
                 .child(
                     div()
                         .flex_none()
@@ -1485,22 +1403,6 @@ fn lane_head(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> An
                         .text_color(count_ink)
                         .child(spec.total.to_string()),
                 ),
-        )
-        // The halo comes last, after the patch the queue line lays down: the
-        // halo reaches past the node and the patch starts at the node's edge,
-        // so anything painted before it comes back with a bite out of it. It
-        // washes over the node as well as around it, which a glow of the
-        // node's own colour is welcome to do — the dot keeps its colour and
-        // its rim picks the hue up. Absolute either way, so it takes no place
-        // in the row.
-        .child(
-            div()
-                .absolute()
-                .left(px(1.0))
-                .top(metrics.at(10.0))
-                .size(metrics.at(15.0))
-                .rounded_full()
-                .bg(alpha(spec.state, halo)),
         )
         .into_any_element()
 }
@@ -2259,16 +2161,6 @@ mod tests {
 
         boards.end_card_drag();
         assert!(boards.card_drag_ghost(drag_board(), 1.0).is_none());
-    }
-
-    #[test]
-    fn only_hovered_backlog_and_blocked_washes_dim_as_no_drop_targets() {
-        for lane in 0..=4 {
-            let expected = if matches!(lane, 0 | 3) { LANE_WASH / 3.0 } else { LANE_WASH };
-            assert!((lane_wash_strength(lane, Some(lane)) - expected).abs() < f32::EPSILON);
-        }
-        assert!((lane_wash_strength(3, Some(0)) - LANE_WASH).abs() < f32::EPSILON);
-        assert!((lane_wash_strength(0, None) - LANE_WASH).abs() < f32::EPSILON);
     }
 
     #[test]

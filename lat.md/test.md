@@ -3797,8 +3797,10 @@ Tests beside this section's code mention cover the strict threshold, source
 and target matrices, workspace hover and PTY ownership, guarded queue fences,
 generation-tagged overlays, rollback, classifier outcomes, and the five-second
 Undo deadline. [The visual script](../tests/e2e/visual/beads-board.sh) checks
-the native ghost over a card, a rejected lane, and outside the board while
-terminal rows remain fixed. The as-built rules and production links live in
+neutral lane ground in normal and pinned boards. It checks compact borders for
+accepted and rejected targets independently, then measures the native ghost
+over a card, a rejected lane, and outside the board while terminal rows remain
+fixed. The as-built rules and production links live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].

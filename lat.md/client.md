@@ -1279,10 +1279,11 @@ card**: a gradient fill lit from the top under a hairline border, rounded at
 4px. The pointer brightens the fill and the border and lifts the card on a
 small shadow. Elevation is light in every theme — the card is the ground
 carried toward white, which on a pale theme lands on the white a paper card
-would be and leaves the border and the shadow to carry the lift. Each queue's
-total is written in its own colour with nothing behind it — lifted again for
-the floor a word has to clear, since the same colour is only a mark on the rail
-— and a wash of the queue's own colour zones each column.
+would be and leaves the border and the shadow to carry the lift. The lane
+ground remains neutral. Queue colour stays on compact dots, the one-pixel rail,
+labels, counts, empty-lane borders, and priority badges. A drag target overlays
+a one-pixel lane border. It is semantic for an accepted target and muted for a
+rejected one, without tinting or moving the lane or card.
 
 An issue's **priority is a filled badge** at the head of its title, and
 nothing else on the card carries it. Earlier passes spread the colour along the
@@ -1497,9 +1498,8 @@ every thirty seconds and would otherwise bury the log in repeats.
 
 The Docker visual contract injects a deterministic snapshot through the real
 MessagePack reader and captures both interaction modes in
-`tests/e2e/visual/beads-board.sh`. It requires the board's ground — sampled in the strip's own
-padding, since a lane is covered by its cards and its wash — to sample identical
-to the tab bar's, which is the same chrome slot, so a colour hardcoded back
+`tests/e2e/visual/beads-board.sh`. It requires the board and every bare lane
+ground to sample identical to the tab bar's chrome slot, so a colour hardcoded
 into the board fails. It reads the fill inside a card against that ground and
 requires it to sit above it, so a card flattened back onto the strip fails. It
 puts the pointer on a card's ID and requires the board
@@ -1518,14 +1518,11 @@ still separates the two open boards. It reads the badge of three priorities down
 different hues — and requires each to carry measurably less colour than the
 rank above it. The three are compared as a ratio rather than a margin: the ranks are
 about a fifth apart by design, so a fixed number of levels would either pass a
-flat ramp or fail a fine one. It reads a row of bare wash along the strip's bottom padding and requires the
-largest jump between two neighbouring pixels to stay inside rounding, so a
-queue colour that meets the next as a step rather than a crossing fails. It
-then injects a board whose every queue has run dry and requires the first
-card's slot not to be one flat colour, sampled across the middle third of the
-lane where the wash is flat — the outer thirds are travelling toward the
-neighbouring queues, and a band including them would be many-coloured whether
-the ghost was drawn or not. It finally names a rooted workspace and requires the matching
+flat ramp or fail a fine one. During a drag it checks compact border feedback
+for an accepted Done target and a rejected Backlog target, while the rejected
+lane's lower ground stays unchanged. It then injects a board whose every queue
+has run dry and requires the first card's slot not to be one flat colour. It
+finally names a rooted workspace and requires the matching
 `RequestBeadsBoard` on the wire tap, so the trigger the injected snapshot
 bypasses stays covered.
 

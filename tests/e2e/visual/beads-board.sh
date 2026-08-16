@@ -141,26 +141,6 @@ print(999)
 PY
 }
 
-# The largest jump between two neighbouring pixels along a row of bare queue
-# wash. The five bands travel into one another, so this stays inside rounding;
-# a flat band per queue steps by an order more where two meet.
-wash_step() {
-    local dump=/tmp/wash-row.txt
-    convert "$1" -crop "${2}x1+0+${3}" +repage txt:- > "$dump"
-    python3 - "$dump" <<'PY'
-import re, sys
-row = {}
-for line in open(sys.argv[1]):
-    m = re.match(r'(\d+),\d+: \((\d+),(\d+),(\d+)', line)
-    if m:
-        row[int(m.group(1))] = tuple(int(m.group(i)) for i in (2, 3, 4))
-# The strip keeps its own margins unpainted, so the ends of the row step from
-# the board's ground into the first band and out of the last.
-xs = [x for x in sorted(row) if 12 <= x <= max(row) - 12]
-print(max(sum(abs(a - b) for a, b in zip(row[x], row[x - 1])) for x in xs[1:]))
-PY
-}
-
 board_request_count() {
     python3 - "$RECORD" "$1" <<'PY'
 import json, sys
@@ -224,16 +204,24 @@ assert_matching_badge_marks() {
 # Measure one synchronized native-drag waypoint against pointer minus GPUI's
 # threshold-crossing offset. ImageMagick reports the trimmed delta's `%X/%Y`.
 assert_drag_frame() {
-    local current="$1" pointer_x="$2" pointer_y="$3" label="$4"
-    local expected_x expected_y crop_x crop_y bounds ghost_x ghost_y ghost_w ghost_h rows
+    local current="$1" pointer_x="$2" pointer_y="$3" label="$4" target_border_x="${5:-}"
+    local expected_x expected_y crop_x crop_y border_crop_x bounds ghost_x ghost_y ghost_w ghost_h rows
+    local -a target_mask=()
     expected_x=$(( pointer_x - ARM_OFFSET_X ))
     expected_y=$(( pointer_y - PRESS_OFFSET_Y ))
     crop_x=$(( expected_x - 8 ))
     crop_y=$(( expected_y - 8 ))
+    # Target borders are asserted independently at their waypoints. Remove
+    # only that known two-pixel raster footprint from the ghost's delta.
+    if [ -n "$target_border_x" ]; then
+        border_crop_x=$(( target_border_x - crop_x ))
+        target_mask=(-fill black -draw "rectangle ${border_crop_x},0 $(( border_crop_x + 1 )),$(( CARD_H + 15 ))")
+    fi
     bounds=$(convert /output/beads-board-drag-base.png "$current" \
         -compose difference -composite \
         -crop "$(( CARD_W + 16 ))x$(( CARD_H + 16 ))+${crop_x}+${crop_y}" +repage \
-        -colorspace Gray -threshold 12% -trim -format '%X,%Y,%w,%h' info:)
+        -colorspace Gray -threshold 12% "${target_mask[@]}" \
+        -trim -format '%X,%Y,%w,%h' info:)
     if [[ "$bounds" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
         ghost_x=$(( crop_x + BASH_REMATCH[1] ))
         ghost_y=$(( crop_y + BASH_REMATCH[2] ))
@@ -321,6 +309,17 @@ CHROME_GROUND=$(convert /output/beads-board-hover.png \
 [ "$BOARD_GROUND" = "$CHROME_GROUND" ] \
     || fail "board ground $BOARD_GROUND is not the chrome's $CHROME_GROUND"
 
+# The board stays neutral between the compact foreground marks. Every lane's
+# bare lower area must match the board ground instead of carrying its queue
+# colour as a full-height wash.
+LANE_W=$(( (WIN_W - 16) / 5 ))
+for lane in 0 1 2 3 4; do
+    LANE_GROUND=$(convert /output/beads-board-hover.png \
+        -format "%[pixel:p{$(( 8 + lane * LANE_W + 4 )),220}]" info:)
+    [ "$LANE_GROUND" = "$BOARD_GROUND" ] \
+        || fail "lane $lane ground $LANE_GROUND is tinted instead of neutral $BOARD_GROUND"
+done
+
 # An issue is a raised card, not a row on the bare strip: the fill inside it
 # has to read lighter than the ground it sits on, in every theme, or the board
 # is flat again. Sampled across the first card's lower padding, which carries
@@ -381,7 +380,6 @@ done
 # GPUI's native drag root must carry the source card above other cards and
 # beyond the board's clipping edge. Start in the Ready card's title row: its
 # metadata line is a nested copy target that deliberately owns its own press.
-LANE_W=$(( (WIN_W - 16) / 5 ))
 CARD_W=$(( LANE_W - 20 ))
 CARD_H=46
 SOURCE_LEFT=$(( 16 + LANE_W ))
@@ -415,7 +413,6 @@ OVER_Y=$(( SOURCE_TOP + PRESS_OFFSET_Y ))
 xdotool mousemove --sync --window "$WID" "$OVER_X" "$OVER_Y"
 sleep 0.25
 import -window "$WID" /output/beads-board-drag-over-cards.png
-assert_drag_frame /output/beads-board-drag-over-cards.png "$OVER_X" "$OVER_Y" over-card
 OVER_CHANGED=$(convert /output/beads-board-drag-base.png \
     /output/beads-board-drag-over-cards.png -compose difference -composite \
     -crop "${CARD_W}x${CARD_H}+${DONE_LEFT}+${SOURCE_TOP}" +repage \
@@ -423,22 +420,41 @@ OVER_CHANGED=$(convert /output/beads-board-drag-base.png \
 awk -v changed="$OVER_CHANGED" 'BEGIN { exit !(changed >= 200) }' \
     || fail "drag ghost did not paint above the Done card (${OVER_CHANGED}px changed)"
 
-# Backlog is a rejected target. Its bare lower wash must repaint while hovered;
-# the unit contract pins that repaint to the reduced no-drop strength.
+# An accepting target gets a compact semantic border, not a lane-sized tint.
+DONE_BORDER_X=$(( 8 + (4 * (WIN_W - 16) + 2) / 5 ))
+DONE_BORDER_CHANGED=$(convert /output/beads-board-drag-base.png \
+    /output/beads-board-drag-over-cards.png -compose difference -composite \
+    -crop "2x100+${DONE_BORDER_X}+120" +repage -colorspace Gray -threshold 5% \
+    -format "%[fx:mean*w*h]" info:)
+awk -v changed="$DONE_BORDER_CHANGED" 'BEGIN { exit !(changed >= 80) }' \
+    || fail "Done target border changed only ${DONE_BORDER_CHANGED}px"
+assert_drag_frame /output/beads-board-drag-over-cards.png \
+    "$OVER_X" "$OVER_Y" over-card "$DONE_BORDER_X"
+
+# Backlog is a rejected target. It gets a compact neutral border while the
+# bare lower lane remains the same board ground.
 BACKLOG_X=$(( ARM_OFFSET_X + 20 ))
 xdotool mousemove --sync --window "$WID" "$BACKLOG_X" "$PRESS_Y"
 sleep 0.25
 import -window "$WID" /output/beads-board-drag-no-drop.png
-assert_drag_frame /output/beads-board-drag-no-drop.png "$BACKLOG_X" "$PRESS_Y" no-drop
+BACKLOG_BORDER_X=8
+NO_DROP_BORDER_CHANGED=$(convert /output/beads-board-drag-base.png \
+    /output/beads-board-drag-no-drop.png -compose difference -composite \
+    -crop "2x100+${BACKLOG_BORDER_X}+120" +repage -colorspace Gray -threshold 5% \
+    -format "%[fx:mean*w*h]" info:)
+awk -v changed="$NO_DROP_BORDER_CHANGED" 'BEGIN { exit !(changed >= 80) }' \
+    || fail "Backlog no-drop border changed only ${NO_DROP_BORDER_CHANGED}px"
+assert_drag_frame /output/beads-board-drag-no-drop.png \
+    "$BACKLOG_X" "$PRESS_Y" no-drop "$BACKLOG_BORDER_X"
 convert /output/beads-board-drag-base.png \
-    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-wash-before.png
+    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-ground-before.png
 convert /output/beads-board-drag-no-drop.png \
-    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-wash-no-drop.png
-NO_DROP_CHANGED=$(compare -metric AE /tmp/beads-wash-before.png \
-    /tmp/beads-wash-no-drop.png null: 2>&1 || true)
-NO_DROP_CHANGED=${NO_DROP_CHANGED%%.*}
-[ "${NO_DROP_CHANGED:-0}" -ge "$(( LANE_W * 4 ))" ] \
-    || fail "Backlog no-drop wash changed only ${NO_DROP_CHANGED}px"
+    -crop "${LANE_W}x8+8+220" +repage /tmp/beads-ground-no-drop.png
+NO_DROP_GROUND_CHANGED=$(compare -metric AE /tmp/beads-ground-before.png \
+    /tmp/beads-ground-no-drop.png null: 2>&1 || true)
+NO_DROP_GROUND_CHANGED=${NO_DROP_GROUND_CHANGED%%.*}
+[ "${NO_DROP_GROUND_CHANGED:-999}" -le 20 ] \
+    || fail "Backlog no-drop tinted ${NO_DROP_GROUND_CHANGED}px of neutral ground"
 
 # Stay outside the strip beyond its 150ms hover grace. The board must remain
 # open for the gesture, the terminal geometry must stay fixed, and the ghost's
@@ -565,11 +581,13 @@ import -window "$(window_id)" /output/beads-board-pinned.png
 EDGE=$(board_bottom /output/beads-board-pinned.png)
 [ "${EDGE:-999}" -lt 400 ] || fail "could not find the board's bottom bar (got ${EDGE})"
 
-# One queue's colour reaches the next as a crossing, not as a step. Read along
-# the strip's own bottom padding, which is bare wash the full width.
-WASH_STEP=$(wash_step /output/beads-board-pinned.png "$WIN_W" "$(( EDGE - 6 ))")
-[ "${WASH_STEP:-99}" -le 2 ] \
-    || fail "the queue washes meet at a ${WASH_STEP}-unit step instead of blending"
+# Pinned boards use the same neutral lane ground as hover boards.
+for lane in 0 1 2 3 4; do
+    PINNED_LANE_GROUND=$(convert /output/beads-board-pinned.png \
+        -format "%[pixel:p{$(( 8 + lane * LANE_W + 4 )),$(( EDGE - 8 ))}]" info:)
+    [ "$PINNED_LANE_GROUND" = "$BOARD_GROUND" ] \
+        || fail "pinned lane $lane ground $PINNED_LANE_GROUND is tinted instead of neutral $BOARD_GROUND"
+done
 xdotool mousemove --sync --window "$WID" 40 "$EDGE"
 xdotool mousedown 1
 xdotool mousemove --sync --window "$WID" 40 "$(( EDGE + 60 ))"
@@ -654,9 +672,7 @@ BOTH_PINNED=$(latest_rows "$PINNED_WS")
 inject "$(empty_board "$WORKSPACE")"
 import -window "$(window_id)" /output/beads-board-empty.png
 # The first card's slot in the left region's first lane, taken across the middle
-# third of the lane where the wash is flat: the outer thirds travel toward the
-# neighbouring queues, and a band including them would be many-coloured whether
-# the ghost was drawn or not. Over the flat third, one colour means no ghost.
+# third of the lane. One colour means the empty-state ghost is missing.
 LANE_W=$(( (WIDTH / 2 - 16) / 5 ))
 EMPTY_SLOT=$(convert /output/beads-board-empty.png \
     -crop "$(( LANE_W / 3 ))x20+$(( 8 + LANE_W / 3 ))+86" +repage -format %k info:)
