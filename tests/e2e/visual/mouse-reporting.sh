@@ -165,16 +165,22 @@ click() {
 # split without a hard-coded status-bar or decoration offset.
 point_at_jump_control() {
     local pane_right="$1" x y w h
+    local -a controls
     capture /output/mouse-jump-target.png
-    read -r x y w h <<EOF
-$(convert /output/mouse-jump-target.png \
+    mapfile -t controls < <(convert /output/mouse-jump-target.png \
     -crop "60x60+$(( pane_right - 80 ))+$(( WIN_H - 110 ))" +repage \
-    -fuzz 3% -transparent '#0e0e10' -trim -format '%X %Y %w %h' info:)
-EOF
-    x="${x#+}"
-    y="${y#+}"
-    [ "$w" -ge 28 ] && [ "$w" -le 32 ] && [ "$h" -ge 28 ] && [ "$h" -le 32 ] \
-        || fail "FAIL: jump control geometry was ${w}x${h}+${x}+${y}"
+    -fuzz 3% -transparent '#0e0e10' -alpha extract -threshold 0 \
+    -define connected-components:verbose=true -connected-components 8 null: 2>&1 \
+        | awk '$NF != "gray(0)" {
+            geometry = $2
+            gsub(/[x+]/, " ", geometry)
+            split(geometry, part)
+            if (part[1] >= 28 && part[1] <= 32 && part[2] >= 28 && part[2] <= 32)
+                print part[3], part[4], part[1], part[2]
+        }')
+    [ "${#controls[@]}" -eq 1 ] \
+        || fail "FAIL: expected one 30px jump control, found ${#controls[@]} (${controls[*]:-none})"
+    read -r x y w h <<<"${controls[0]}"
     point_at "$(( pane_right - 80 + x + w / 2 ))" \
         "$(( WIN_H - 110 + y + h / 2 ))"
 }

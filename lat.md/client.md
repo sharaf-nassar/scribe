@@ -2374,7 +2374,7 @@ A pane still waiting on `SessionCreated` gets no listener at all — there is no
 
 Every pane records where it painted its grid into its own `GridBounds` sink, keyed by session in `TerminalView::pane_bounds`, so a hit test can never disagree with what paint drew.
 
-The sinks are minted in [[crates/scribe-client/src/main.rs#TerminalView#prepare_pane_surfaces]] beside the scrollbar state and retired with it in [[crates/scribe-client/src/main.rs#TerminalView#retire_scrollbars]], because a closed pane's last rect must not keep answering for a region some other pane now occupies. [[crates/scribe-client/src/main.rs#TerminalView#pane_at]] resolves the pointer to a session against them; [[crates/scribe-client/src/main.rs#TerminalView#focused_grid_bounds]] is the focused pane's entry.
+[[crates/scribe-client/src/main.rs#TerminalView#prepare_pane_surfaces]] keeps sinks only for sessions in the current pane placements. Hidden tabs therefore lose their last rect before pointer hit-testing can focus or scroll them, while visible split panes keep separate sinks. Scrollbar animation state has a longer lifetime and is retired only when [[crates/scribe-client/src/main.rs#TerminalView#retire_scrollbars]] sees that the session closed. [[crates/scribe-client/src/main.rs#TerminalView#pane_at]] resolves the pointer to a session against the remaining sinks; [[crates/scribe-client/src/main.rs#TerminalView#focused_grid_bounds]] is the focused pane's entry.
 
 That split is what divides the pointer surface in two. Selection, Ctrl+click links,
 and smart selection stay focus-relative because

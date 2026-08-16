@@ -2214,6 +2214,12 @@ Phase 3 also pins the announced grid. `AttachSessions` carries per-session `dime
 
 The phase guards its own oracle first. The defect announced exactly `COLUMNS`, so a rig whose pane happens to measure that same width cannot distinguish a fixed client from a broken one — the assertion would pass vacuously. Phase 3 therefore fails loudly when the published width equals the seed, demanding the container geometry change rather than the check be deleted. This container measures 119, one column off the seed, which is precisely why the guard is worth stating.
 
+#### Pointer motion stays on the switched tab
+
+After a keyboard tab switch, moving the pointer inside the terminal must not reactivate the hidden outgoing tab, and typed input must still target the selected session.
+
+Phase 3 parks the pointer over the original tab's grid, switches forward, then moves eight pixels. It rejects any new attach for the hidden original session and checks the following sentinel's `KeyInput` frames reach only the new session. This catches stale overlapping pane bounds through the same focus-follows-mouse path that exposed the bug.
+
 #### First replay uses selected tab prompt geometry
 
 Switching between a tab with Scribe prompt chrome and a plain tab must paint each first `SessionReplay` at that selected tab's row count, without a corrective second geometry pass.
@@ -2944,6 +2950,14 @@ That is what keeps the highlight attached to content rather than to a screen pos
 ### Empty selection paints nothing
 
 An empty range (a plain click), a zero-row viewport, and a zero-column viewport all yield no spans, so the paint path never has to guard against a degenerate highlight.
+
+## GPUI Painted Pane Bounds
+
+Painted pane bounds expose hit rectangles only for sessions in the current layout.
+
+### Hidden tabs retire hit rectangles
+
+Preparing a frame drops a hidden tab's stale rectangle while preserving the separate left and right rectangles of two visible split sessions.
 
 ## GPUI Animation Policy
 

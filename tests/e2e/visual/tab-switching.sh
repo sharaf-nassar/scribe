@@ -534,7 +534,15 @@ fi
 echo "PHASE 2 PASS: ctrl+Prior attached $SESSION and first replay reserved prompt rows ($PLAIN_ROWS -> $AI_ATTACH_ROWS)"
 echo "PHASE 2 PASS: large prompt text stays inside its visible bottom bar"
 
+# Park over the original tab's grid before switching. The relative move in
+# phase 3 must then resolve against the newly painted tab, not this hidden
+# tab's last rectangle.
+focus_terminal
+xdotool mousemove --sync "$(( TERM_X + 400 ))" "$(( TERM_Y + 300 ))"
+sleep 0.8
+
 # ── Phase 3: keyboard switch forward to the new tab ───────────────
+# @lat: [[test#Visual E2E Tests#Tab switching is live#Pointer motion stays on the switched tab]]
 ATTACH_NEW_BEFORE=$(count_attach_to "$NEW_SESSION")
 REPLAY_NEW_BEFORE=$(count_server_to SessionReplay "$NEW_SESSION")
 send_keys ctrl+Next
@@ -554,6 +562,23 @@ if [ "$PLAIN_ATTACH_ROWS" != "$PLAIN_REPLAY_ROWS" ]; then
 fi
 if [ "$PLAIN_ATTACH_ROWS" != "$PLAIN_ROWS" ] || [ "$PLAIN_ATTACH_ROWS" -le "$AI_ATTACH_ROWS" ]; then
     fail "phase 3: plain-tab first replay used $PLAIN_ATTACH_ROWS rows; expected restored $PLAIN_ROWS above prompt tab's $AI_ATTACH_ROWS"
+fi
+
+ATTACH_ORIGINAL_HOVER_BEFORE=$(count_attach_to "$SESSION")
+xdotool mousemove_relative --sync -- 8 0
+sleep 0.8
+if [ "$(count_attach_to "$SESSION")" -ne "$ATTACH_ORIGINAL_HOVER_BEFORE" ]; then
+    fail "phase 3: pointer motion switched back to hidden tab $SESSION"
+fi
+KEYS_NEW_HOVER_BEFORE=$(count_keys_to "$NEW_SESSION")
+KEYS_ORIGINAL_HOVER_BEFORE=$(count_keys_to "$SESSION")
+type_text "echo TAB_SWITCH_HOVER_STAYS_NEW"
+press_keys Return
+if ! wait_for_count_growth "count_keys_to '$NEW_SESSION'" "$KEYS_NEW_HOVER_BEFORE" 15; then
+    fail "phase 3: typed input did not stay on switched tab $NEW_SESSION after pointer motion"
+fi
+if [ "$(count_keys_to "$SESSION")" -ne "$KEYS_ORIGINAL_HOVER_BEFORE" ]; then
+    fail "phase 3: typed input returned to hidden tab $SESSION after pointer motion"
 fi
 shot /output/03-tab-switching-key-next.png
 # Both tabs share this rig's single pane, so each switch must announce that

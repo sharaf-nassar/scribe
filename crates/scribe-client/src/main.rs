@@ -817,6 +817,16 @@ fn hover_focus_target(
     hovered.filter(|session_id| Some(*session_id) != focused)
 }
 
+fn prepare_pane_bounds(
+    pane_bounds: &mut HashMap<SessionId, GridBounds>,
+    painted: &HashSet<SessionId>,
+) {
+    pane_bounds.retain(|session_id, _| painted.contains(session_id));
+    for session_id in painted {
+        pane_bounds.entry(*session_id).or_default();
+    }
+}
+
 /// Everything the *focused* pane alone gets for one frame.
 ///
 /// The four travel together because they share one reason: each is driven by
@@ -6371,24 +6381,25 @@ impl TerminalView {
 
     /// Mint the per-pane state the render closure below only borrows.
     ///
-    /// Both maps outlive the elements that read them — the scrollbar fade is a
-    /// wall-clock animation across frames, and a bounds sink is written during
-    /// paint and read by the *next* frame's pointer events — so they live here
-    /// and are minted before the closure takes `self` immutably.
+    /// The scrollbar fade is a wall-clock animation across frames, while each
+    /// bounds sink is written during paint and read by the next frame's pointer
+    /// events. Both live here so they can be minted before the closure takes
+    /// `self` immutably, but only bounds for this frame's placements survive.
     fn prepare_pane_surfaces(
         &mut self,
         placements: &[pane_shell::PanePlacement],
         cx: &Context<Self>,
     ) -> Rc<HashSet<SessionId>> {
-        let sessions = placements.iter().filter_map(|placement| placement.session_id);
-        for session_id in sessions.clone() {
-            self.scrollbars.panes.entry(session_id).or_default();
-            self.pane_bounds.entry(session_id).or_default();
+        let sessions: HashSet<_> =
+            placements.iter().filter_map(|placement| placement.session_id).collect();
+        prepare_pane_bounds(&mut self.pane_bounds, &sessions);
+        for session_id in &sessions {
+            self.scrollbars.panes.entry(*session_id).or_default();
             self.jump_button_focus
-                .entry(session_id)
+                .entry(*session_id)
                 .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true));
         }
-        Rc::new(sessions.collect())
+        Rc::new(sessions)
     }
 
     /// Lower the pane layout onto absolutely positioned grid elements.
@@ -7286,15 +7297,13 @@ impl TerminalView {
         }
     }
 
-    /// Drop the per-pane paint state for sessions that are no longer on screen.
+    /// Drop long-lived pane chrome for sessions that no longer exist.
     ///
-    /// Keyed by session, so this is the same retirement the pane grids get: a
-    /// closed tab must not leave its fade timer (or a stale drag) behind, and a
-    /// retired pane's last painted rect must not keep answering hit tests for a
-    /// region some other pane now occupies.
+    /// A closed tab must not leave its fade timer, focus handle, or an in-flight
+    /// scrollbar drag behind. Painted bounds have a shorter lifetime and are
+    /// retired from the current placements in [`Self::prepare_pane_surfaces`].
     fn retire_scrollbars(&mut self, live: &HashSet<SessionId>) {
         self.scrollbars.panes.retain(|session_id, _| live.contains(session_id));
-        self.pane_bounds.retain(|session_id, _| live.contains(session_id));
         self.jump_button_focus.retain(|session_id, _| live.contains(session_id));
         if self.scrollbars.drag.is_some_and(|session| !live.contains(&session)) {
             self.scrollbars.drag = None;
@@ -14154,6 +14163,36 @@ mod tests {
         );
         assert_eq!(hover_focus_target(true, None, None, Some(focused)), None);
         assert_eq!(hover_focus_target(true, None, Some(focused), Some(focused)), None);
+    }
+
+    #[test]
+    // @lat: [[test#GPUI Painted Pane Bounds#Hidden tabs retire hit rectangles]]
+    fn painted_bounds_only_cover_visible_split_sessions() {
+        let hidden = SessionId::new();
+        let left = SessionId::new();
+        let right = SessionId::new();
+        let left_rect = Bounds::new(gpui::point(px(0.0), px(0.0)), size(px(100.0), px(80.0)));
+        let right_rect = Bounds::new(gpui::point(px(100.0), px(0.0)), size(px(100.0), px(80.0)));
+        let mut pane_bounds = HashMap::from([
+            (
+                hidden,
+                Rc::new(std::cell::Cell::new(Some(Bounds::new(
+                    gpui::point(px(0.0), px(0.0)),
+                    size(px(200.0), px(80.0)),
+                )))),
+            ),
+            (left, Rc::new(std::cell::Cell::new(Some(left_rect)))),
+            (right, Rc::new(std::cell::Cell::new(Some(right_rect)))),
+        ]);
+
+        prepare_pane_bounds(&mut pane_bounds, &HashSet::from([left, right]));
+
+        assert!(!pane_bounds.contains_key(&hidden));
+        assert_eq!(pane_bounds.get(&left).and_then(|bounds| bounds.get()), Some(left_rect));
+        assert_eq!(pane_bounds.get(&right).and_then(|bounds| bounds.get()), Some(right_rect));
+        assert!(left_rect.contains(&gpui::point(px(50.0), px(40.0))));
+        assert!(!left_rect.contains(&gpui::point(px(150.0), px(40.0))));
+        assert!(right_rect.contains(&gpui::point(px(150.0), px(40.0))));
     }
 
     struct EditorInputProbe {
