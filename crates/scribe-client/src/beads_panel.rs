@@ -189,21 +189,19 @@ struct PanelOpenFrame {
     opacity: f32,
 }
 
-/// Place a panel under its lane while keeping it inside its workspace region.
-pub fn panel_geometry(region: Rect, board: Rect, lane: u8) -> Option<PanelGeometry> {
+/// Place a panel below its board, centered inside its workspace region.
+pub fn panel_geometry(region: Rect, board: Rect, _lane: u8) -> Option<PanelGeometry> {
     let width = PANEL_WIDTH.min(region.width - PANEL_MARGIN * 2.0);
     if width < PANEL_MIN_WIDTH {
         return None;
     }
-    let lane_width = (board.width - 16.0) / 5.0;
-    let lane_center = board.x + 8.0 + (f32::from(lane) + 0.5) * lane_width;
     let min_x = region.x + PANEL_MARGIN;
     let max_x = region.x + region.width - PANEL_MARGIN - width;
     let y = board.y + board.height + PANEL_BOARD_GAP;
     let max_height =
         (region.height * 0.7).min((region.y + region.height - y - PANEL_MARGIN).max(0.0));
     (max_height > 0.0).then_some(PanelGeometry {
-        x: (lane_center - width / 2.0).clamp(min_x, max_x),
+        x: (region.x + (region.width - width) / 2.0).clamp(min_x, max_x),
         y,
         width,
         max_height,
@@ -2814,13 +2812,13 @@ mod tests {
     }
 
     #[test]
-    fn panel_geometry_anchors_under_the_lane_and_obeys_the_narrow_floor() {
+    fn panel_geometry_centers_in_its_region_and_obeys_the_narrow_floor() {
         let region = Rect { x: 100.0, y: 40.0, width: 800.0, height: 600.0 };
         let board = Rect { x: 100.0, y: 40.0, width: 800.0, height: 178.0 };
 
         assert_eq!(
             panel_geometry(region, board, 4),
-            Some(PanelGeometry { x: 328.0, y: 222.0, width: 560.0, max_height: 406.0 })
+            Some(PanelGeometry { x: 220.0, y: 222.0, width: 560.0, max_height: 406.0 })
         );
         assert_eq!(
             panel_geometry(
@@ -2833,6 +2831,63 @@ mod tests {
     }
 
     #[test]
+    fn panel_layout_centers_in_its_terminal_region_across_splits_resizes_and_scales() {
+        let samples = [
+            (
+                "full window",
+                Rect { x: 0.0, y: 0.0, width: 1310.0, height: 871.0 },
+                Rect { x: 0.0, y: 0.0, width: 1310.0, height: 197.0 },
+                4,
+                1.0,
+                375.0,
+                655.0,
+            ),
+            (
+                "right active split at 0.8x",
+                Rect { x: 655.0, y: 0.0, width: 655.0, height: 871.0 },
+                Rect { x: 655.0, y: 0.0, width: 655.0, height: 197.0 },
+                4,
+                0.8,
+                702.5,
+                982.5,
+            ),
+            (
+                "resized active region at 1.6x",
+                Rect { x: 200.0, y: 0.0, width: 960.0, height: 871.0 },
+                Rect { x: 200.0, y: 0.0, width: 960.0, height: 197.0 },
+                4,
+                1.6,
+                400.0,
+                680.0,
+            ),
+        ];
+
+        for (name, region, board, lane, scale, expected_x, expected_midpoint) in samples {
+            let loading = panel_layout(region, board, lane, scale).expect("loading panel layout");
+            let resolved = panel_layout(region, board, lane, scale).expect("resolved panel layout");
+
+            assert!((loading.scale - scale).abs() < f32::EPSILON, "{name}");
+            assert!((loading.geometry.x - expected_x).abs() < f32::EPSILON, "{name}");
+            assert!(
+                (loading.geometry.x + loading.geometry.width / 2.0 - expected_midpoint).abs()
+                    < f32::EPSILON,
+                "{name}"
+            );
+            assert!(
+                (resolved.geometry.x - loading.geometry.x).abs() < f32::EPSILON,
+                "{name} arrival x"
+            );
+            assert!(
+                (resolved.geometry.x + resolved.geometry.width / 2.0
+                    - (loading.geometry.x + loading.geometry.width / 2.0))
+                    .abs()
+                    < f32::EPSILON,
+                "{name} arrival midpoint"
+            );
+        }
+    }
+
+    #[test]
     fn named_board_height_and_text_scale_samples_stay_inside_the_region() {
         let region = Rect { x: 10.0, y: 20.0, width: 800.0, height: 600.0 };
         let samples = [
@@ -2842,7 +2897,7 @@ mod tests {
                 0,
                 0.8,
                 PanelLayout {
-                    geometry: PanelGeometry { x: 22.0, y: 103.8, width: 560.0, max_height: 420.0 },
+                    geometry: PanelGeometry { x: 130.0, y: 103.8, width: 560.0, max_height: 420.0 },
                     scale: 0.8,
                 },
             ),
@@ -2852,7 +2907,7 @@ mod tests {
                 4,
                 1.6,
                 PanelLayout {
-                    geometry: PanelGeometry { x: 238.0, y: 544.0, width: 560.0, max_height: 64.0 },
+                    geometry: PanelGeometry { x: 130.0, y: 544.0, width: 560.0, max_height: 64.0 },
                     scale: 1.6,
                 },
             ),

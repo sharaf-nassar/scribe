@@ -158,18 +158,76 @@ PANEL_DIFF=$(compare -metric AE /output/beads-detail-loading.png \
 PANEL_DIFF=${PANEL_DIFF%%.*}
 [ "${PANEL_DIFF:-0}" -ge 30000 ] \
     || fail "detail panel changed only ${PANEL_DIFF:-0}px"
-read -r PANEL_W PANEL_H PANEL_X PANEL_Y <<<"$(convert \
-    /output/beads-detail-loading.png /output/beads-detail-comment-clamped.png \
-    -compose difference -composite -crop "600x400+0+231" +repage \
-    -threshold 10% -trim -format '%w %h %X %Y' info:)"
-[ "$PANEL_W" -eq 560 ] && [ "$PANEL_X" = "+12" ] && [ "$PANEL_Y" = "+4" ] \
-    || fail "panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}, expected 560px wide at +12+4"
-[ "$PANEL_H" -ge 250 ] \
-    || fail "panel anatomy collapsed to ${PANEL_H}px high"
+panel_bounds() {
+    local before="$1" after="$2"
+    local image_width
+    image_width=$(identify -format '%w' "$after")
+    convert "$before" "$after" -compose difference -composite \
+        -crop "${image_width}x400+0+231" +repage -threshold 10% -trim \
+        -format '%w %h %X %Y' info:
+}
+
+# The fixture has one terminal region, so the client screenshot's horizontal
+# pixel bounds are the active terminal region rather than the Xvfb desktop.
+# @lat: [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Panel midpoint follows the active terminal region]]
+assert_panel_midpoint() {
+    local state="$1" panel_w="$2" panel_x="$3" image="$4"
+    local region_width
+    region_width=$(identify -format '%w' "$image")
+    python3 - "$state" "$panel_w" "$panel_x" "$region_width" <<'PY'
+import sys
+
+state, panel_width, panel_x, region_width = sys.argv[1:]
+panel_width = float(panel_width)
+panel_x = float(panel_x.lstrip("+"))
+region_width = float(region_width)
+panel_midpoint = panel_x + panel_width / 2
+region_midpoint = region_width / 2
+delta = abs(panel_midpoint - region_midpoint)
+if delta > 1:
+    raise SystemExit(
+        f"{state} panel midpoint {panel_midpoint:.1f} differs from active "
+        f"terminal region midpoint {region_midpoint:.1f} by {delta:.1f}px"
+    )
+print(
+    f"{state} panel midpoint {panel_midpoint:.1f} matches active terminal "
+    f"region midpoint {region_midpoint:.1f} (delta {delta:.1f}px)"
+)
+PY
+}
+
+read -r LOADING_PANEL_W LOADING_PANEL_H LOADING_PANEL_X LOADING_PANEL_Y \
+    <<<"$(panel_bounds /output/beads-detail-loading.png /output/beads-detail-loading-panel.png)"
+read -r PANEL_W PANEL_H PANEL_X PANEL_Y \
+    <<<"$(panel_bounds /output/beads-detail-loading.png /output/beads-detail-comment-clamped.png)"
+[ "$PANEL_W" -eq 560 ] && [ "$PANEL_H" -ge 250 ] \
+    || fail "resolved panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}"
+[ "$LOADING_PANEL_W" -eq 560 ] \
+    || fail "loading panel width was ${LOADING_PANEL_W}px"
+PANEL_LEFT=${PANEL_X#+}
+PANEL_TOP=$((231 + ${PANEL_Y#+}))
+PANEL_OUTSIDE_X=$((PANEL_LEFT + PANEL_W + 32))
+PANEL_OUTSIDE_Y=$((PANEL_TOP + PANEL_H + 32))
+panel_move() {
+    xdotool mousemove --sync --window "$WID" "$((PANEL_LEFT + $1))" "$((PANEL_TOP + $2))"
+}
+
+panel_move_outside() {
+    xdotool mousemove --sync --window "$WID" "$PANEL_OUTSIDE_X" "$PANEL_OUTSIDE_Y"
+}
+
+assert_panel_midpoint loading "$LOADING_PANEL_W" "$LOADING_PANEL_X" \
+    /output/beads-detail-loading-panel.png \
+    || fail "loading panel was not centered in the active terminal region"
+assert_panel_midpoint resolved "$PANEL_W" "$PANEL_X" \
+    /output/beads-detail-comment-clamped.png \
+    || fail "resolved panel was not centered in the active terminal region"
+[ "$PANEL_X" = "$LOADING_PANEL_X" ] \
+    || fail "panel arrived at ${PANEL_X}, after loading at ${LOADING_PANEL_X}"
 python3 /tests/visual/beads-card-detail-inventory.py \
     --mock "$MOCK" \
     --image /output/beads-detail-comment-clamped.png \
-    --panel 12 235 "$PANEL_W" "$PANEL_H" \
+    --panel "$PANEL_LEFT" "$PANEL_TOP" "$PANEL_W" "$PANEL_H" \
     --scale 1.0 \
     --output /output/beads-detail-inventory.json \
     || fail "mock inventory did not match the text-scale 1.0 panel"
@@ -177,26 +235,26 @@ python3 /tests/visual/beads-card-detail-inventory.py \
 # Clicking the newest comment expands its folded body. Clicking it again must
 # restore the exact two-line/one-line inventory measured above.
 convert /output/beads-detail-comment-clamped.png \
-    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-collapsed.png
-xdotool mousemove --sync --window "$WID" 200 452
+    -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage /tmp/beads-detail-collapsed.png
+panel_move 188 217
 xdotool click 1
 sleep 0.3
-xdotool mousemove --sync --window "$WID" 700 500
+panel_move_outside
 import -window "$WID" /output/beads-detail-comment-expanded.png
 convert /output/beads-detail-comment-expanded.png \
-    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-expanded.png
+    -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage /tmp/beads-detail-expanded.png
 EXPAND_DIFF=$(compare -metric AE /tmp/beads-detail-collapsed.png \
     /tmp/beads-detail-expanded.png null: 2>&1 || true)
 EXPAND_DIFF=${EXPAND_DIFF%%.*}
 [ "${EXPAND_DIFF:-0}" -ge 500 ] \
     || fail "expanding the newest comment changed only ${EXPAND_DIFF:-0}px"
-xdotool mousemove --sync --window "$WID" 200 452
+panel_move 188 217
 xdotool click 1
 sleep 0.3
-xdotool mousemove --sync --window "$WID" 700 500
+panel_move_outside
 import -window "$WID" /output/beads-detail-comment-recollapsed.png
 convert /output/beads-detail-comment-recollapsed.png \
-    -crop "560x${PANEL_H}+12+235" +repage /tmp/beads-detail-recollapsed.png
+    -crop "${PANEL_W}x${PANEL_H}+${PANEL_LEFT}+${PANEL_TOP}" +repage /tmp/beads-detail-recollapsed.png
 RECOLLAPSE_DIFF=$(compare -metric AE /tmp/beads-detail-collapsed.png \
     /tmp/beads-detail-recollapsed.png null: 2>&1 || true)
 RECOLLAPSE_DIFF=${RECOLLAPSE_DIFF%%.*}
@@ -206,7 +264,7 @@ RECOLLAPSE_DIFF=${RECOLLAPSE_DIFF%%.*}
 # Hover reveals the approved copy glyph without moving the identity row. One
 # click writes the full id, and replacing the clipboard afterward proves the
 # parked intent cannot replay on a later frame.
-xdotool mousemove --sync --window "$WID" 90 284
+panel_move 78 49
 sleep 0.2
 import -window "$WID" /output/beads-detail-id-hover.png
 ID_HOVER_DIFF=$(compare -metric AE \
@@ -241,7 +299,7 @@ sleep 0.2
 [ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 2))" ] \
     || fail "Escape did not dismiss the panel"
 
-xdotool mousemove --sync --window "$WID" 549 258
+panel_move 537 23
 xdotool click 1
 sleep 0.2
 inject "$LOADING_MESSAGE"
@@ -253,7 +311,7 @@ sleep 0.2
 [ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 3))" ] \
     || fail "close mark did not dismiss the panel"
 
-xdotool mousemove --sync --window "$WID" 700 500
+panel_move_outside
 xdotool click 1
 sleep 0.2
 inject "$LOADING_MESSAGE"
@@ -343,7 +401,7 @@ xdotool click 1
 sleep 0.2
 inject "$NAV_MESSAGE"
 TARGET_REQUESTS=$(detail_request_count "detail-hidden-count")
-xdotool mousemove --sync --window "$WID" 155 340
+panel_move 143 105
 xdotool click 1
 sleep 0.3
 [ "$(detail_request_count "detail-hidden-count")" -eq "$((TARGET_REQUESTS + 1))" ] \
@@ -351,17 +409,17 @@ sleep 0.3
 
 # The source stays visible while its request is in flight. Only the matching
 # hidden-count reply retargets the panel.
-xdotool mousemove --sync --window "$WID" 90 284
+panel_move 78 49
 xdotool click 1
 sleep 0.2
 COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
 [ "$COPIED" = "detail-loading" ] \
     || fail "dependent click swapped before its reply: '$COPIED'"
 inject "$HIDDEN_MESSAGE"
-xdotool mousemove --sync --window "$WID" 700 500
+panel_move_outside
 sleep 0.2
 import -window "$WID" /output/beads-detail-hidden-count.png
-xdotool mousemove --sync --window "$WID" 90 284
+panel_move 78 49
 xdotool click 1
 sleep 0.2
 COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
@@ -386,14 +444,14 @@ capture_variant() {
     [ "$(detail_request_count "$issue")" -eq "$((before + 1))" ] \
         || fail "$name card click sent no detail request"
     inject "$message"
-    xdotool mousemove --sync --window "$WID" 700 600
+    panel_move_outside
     sleep 0.2
     import -window "$WID" "/output/beads-detail-${name}.png"
     diff=$(compare -metric AE /output/beads-detail-comment-clamped.png \
         "/output/beads-detail-${name}.png" null: 2>&1 || true)
     diff=${diff%%.*}
     [ "${diff:-0}" -ge 1000 ] || fail "$name fixture painted only ${diff:-0} distinct pixels"
-    xdotool mousemove --sync --window "$WID" 466 284
+    panel_move 454 49
     xdotool click 1
     sleep 0.2
     copied=$(xclip -o -selection clipboard 2>/dev/null || true)

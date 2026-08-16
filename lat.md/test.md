@@ -1933,6 +1933,10 @@ Screenshots are taken full-screen because a Vulkan surface may not be readable p
 
 `just e2e-visual-beads-detail-fixtures` proves a clicked board card requests and renders the mock-approved detail fixture matrix.
 
+#### Panel midpoint follows the active terminal region
+
+The visual fixture derives loading and resolved panel bounds from screenshots and requires each midpoint to match its one-pane terminal region within one pixel, preventing a lane-anchored arrival jump.
+
 `tests/e2e/fixtures/beads-card-detail.json` stores five direct server messages:
 a loading board plus closed, blocked, comment-clamped, and hidden-count detail
 replies. The run mounts and directly reads
@@ -1943,18 +1947,19 @@ and refresh time, then sends records through `scribe-test share-inject` under
 The loading message paints its five-card board. The script clicks the Backlog
 card, requires `RequestBeadsIssueDetail` on the wire tap, and captures the
 card-derived loading head and placeholder before injecting the matching reply.
-It rejects any dropped detail message. At text scale 1.0, its settled screenshot
-requires the mock's 560px panel to start 12px from the region edge and 4px
-below the board. Sampled pixels assert the spine node and halo, run-in heads,
-status-rail break and stop-short gap, empty-field row omission, epic hue,
-priority ink, and two-line/newest plus one-line/older comment clamp. Clicking
-the newest comment must expand and restore that folded shape. Hovering the
-identity ID must reveal only its copy glyph; one click writes the full ID, and
-a clipboard sentinel installed afterward survives later frames. The same run
-captures the loading, closed, blocked, comment-clamped, and hidden-count
-variants, reopens after Esc, close-mark, and backdrop dismissal, then requires
-a visible close notice for both a missing detail and a workspace whose board
-changes to `NotDetected`.
+It rejects any dropped detail message. At text scale 1.0, its screenshots derive
+the mock's 560px loading and settled panel bounds, require both midpoint values
+to match the active terminal region, and require no horizontal arrival jump; the
+panel remains 4px below the board. Sampled pixels assert the spine node and
+halo, run-in heads, status-rail break and stop-short gap, empty-field row
+omission, epic hue, priority ink, and two-line/newest plus one-line/older comment
+clamp. Clicking the newest comment must expand and restore that folded shape.
+Hovering the identity ID must reveal only its copy glyph; one click writes the
+full ID, and a clipboard sentinel installed afterward survives later frames. The
+same run captures the loading, closed, blocked, comment-clamped, and hidden-count
+variants, reopens after Esc, close-mark, and backdrop dismissal, then requires a
+visible close notice for both a missing detail and a workspace whose board changes
+to `NotDetected`.
 
 The run then opens a short navigation fixture,
 requires a dependent click to send one fresh detail request, proves the source

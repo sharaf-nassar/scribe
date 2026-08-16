@@ -1186,18 +1186,21 @@ within 3px of the pointer offset at each synchronized waypoint.
 When `Welcome.beads_detail` is enabled,
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] parks one
 workspace-scoped request as soon as a card is clicked.
-[[crates/scribe-client/src/beads_panel.rs#panel_geometry]] keeps the panel
-under its source lane, with a 12px workspace inset and a 4px gap below the
-board. Its 560px target width shrinks with the region but does not open below
-400px; height is the lesser of 70% of the region and the space remaining
-inside it, with overflow scrolling internally. The layout carries the live
-board text scale from 0.8 through 1.6, and a detail or board refresh that moves
-the issue re-anchors the panel to its new lane.
+[[crates/scribe-client/src/beads_panel.rs#panel_geometry]] centers the panel in
+its owning terminal workspace region, while the clicked board still supplies
+its vertical origin: a 12px workspace inset and a 4px gap below the board. Its
+560px target width shrinks with the region but does not open below 400px; height
+is the lesser of 70% of the region and the space remaining inside it, with
+overflow scrolling internally. The layout carries the live board text scale
+from 0.8 through 1.6, and re-centers whenever the owning region changes after a
+split or resize.
 
 The loading frame keeps the clicked card's priority, title, and epic over a
-placeholder while the detail request is outstanding. Opening lifts and widens
-from the source lane into the settled layout over 120ms through the shared
-animation policy, so reduced motion still lands on the identical final frame.
+placeholder while the detail request is outstanding. Loading and resolved
+content share that centered layout, so a reply cannot move the panel sideways.
+Opening lifts and widens from the source lane into the settled layout over 120ms
+through the shared animation policy, so reduced motion still lands on the
+identical final frame.
 [[crates/scribe-client/src/main.rs#dispatch_server_message]] correlates a reply
 through [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#update]] by both
 workspace and issue id. Its backdrop, close mark, and Esc all dismiss it. A
