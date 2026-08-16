@@ -405,7 +405,7 @@ honor the Scribe lock.
 [[crates/scribe-server/src/beads_board.rs#compose_write_argv]] maps every
 [[protocol#Client Messages#Beads issue writes|typed verb]] directly to ordinary
 `bd` argv without private compare-and-set flags. Claim, close, reopen, and
-comments retain the official CLI's actor, lease, lifecycle, and event behavior.
+comments retain the official CLI's actor, start time, lifecycle, and event behavior.
 
 The argv builder rejects an empty, dash-prefixed, or NUL-containing issue id,
 priority above P4, and statuses outside `open`, `in_progress`, and `closed`. It

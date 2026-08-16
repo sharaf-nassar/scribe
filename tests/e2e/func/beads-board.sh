@@ -593,16 +593,18 @@ xdotool mousemove --sync --window "$WID" 91 17
 sleep 0.5
 
 CLAIM_BEFORE=$(issue_write_count e2e-ready claim)
+CLAIM_APPLIED_BEFORE=$(issue_applied_count e2e-ready)
 drag_issue e2e-ready 2
 wait_for_write e2e-ready claim "$CLAIM_BEFORE"
+wait_for_applied e2e-ready "$CLAIM_APPLIED_BEFORE"
 wait_for_lane e2e-ready 2
 CLAIMED=$(cd "$PROJECT" && bd show e2e-ready --json)
 printf '%s\n' "$CLAIMED" | grep -Fq '"status": "in_progress"' \
     || fail "Ready drag did not claim through native bd: $CLAIMED"
 printf '%s\n' "$CLAIMED" | grep -Fq '"assignee": "Scribe E2E"' \
     || fail "native claim did not resolve the local actor: $CLAIMED"
-printf '%s\n' "$CLAIMED" | grep -Eq '"lease_expires_at": "[^" ]+' \
-    || fail "native claim omitted lease state: $CLAIMED"
+printf '%s\n' "$CLAIMED" | grep -Eq '"started_at": "[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
+    || fail "native claim omitted started_at: $CLAIMED"
 
 CLOSE_BEFORE=$(issue_write_count e2e-close close_issue)
 CLOSE_APPLIED_BEFORE=$(issue_applied_count e2e-close)

@@ -1678,7 +1678,8 @@ rendering without touching the host's Beads database.
 
 The network-none real-bd GPUI run proves the production drag contract and terminal-pointer boundary through the shipped client.
 
-[The script](../tests/e2e/func/beads-board.sh) checks native claim fields,
+[The script](../tests/e2e/func/beads-board.sh) checks native claim status,
+actor, and start time,
 close and board-side Undo, defer clearing, classifier-won repaint, and zero
 writes for rejected or same-lane drops. It keeps the `SingleController` owner,
 proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
@@ -1691,7 +1692,7 @@ The network-none functional image proves the representative official CLI verbs S
 
 `just e2e-func-beads-write-contract` verifies official bd 1.1.0 field, label,
 comment, claim, close, and reopen behavior. It pins native actor resolution,
-claim state, close facts, and reopen cleanup without depending on private
+claim start state, close facts, and reopen cleanup without depending on private
 flags or build metadata. This is the executable proof for
 [[server#Server#Beads issue writes#Serialized executor]].
 
