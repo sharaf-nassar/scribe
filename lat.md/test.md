@@ -1806,7 +1806,7 @@ The stub must see the vendor/config order and integration marker, with `SCRIBE_O
 
 Three scripts cover the AI state indicator, context-window percentage, and Codex root/subagent hook isolation through the structured hook channel.
 
-Transport and readback are the two things these scripts get right that a naive version cannot. AI state, prompt text, and context % travel over the hook channel — OSC 1337 parsing for them was removed by spec 003 FR-022 — so the scripts run `scribe-hook-helper` inside the session shell, where the server exports `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID`. Readback cannot use a screen snapshot:  returns the server's PTY grid, and the prompt bar and tab label are client chrome that never appears in it. `scribe-test ai-chrome` renders the session's live AI state through  instead, emitting one `prompt-bar:` line whenever a percentage exists and one `tab:` line only from the warn band up.
+Transport and readback are the two things these scripts get right that a naive version cannot. AI state, prompt text, and context % travel over the hook channel — OSC 1337 parsing for them was removed by spec 003 FR-022 — so the scripts run `scribe-hook-helper` inside the session shell, where the server exports `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID`. Readback cannot use a screen snapshot:  returns the server's PTY grid, and the prompt bar and tab label are client chrome that never appears in it. `scribe-test ai-chrome` renders the session's live AI state through  instead, emitting prompt-bar and tab lines whenever a percentage exists, except while an attention pulse suppresses the tab suffix.
 
 Both scripts park the shell in `read` after firing hook events. A returning shell prompt (OSC 133;A) tells the server the AI tool exited, and  then synthesizes an `AiStateCleared` that would wipe the state the helper just set. Parking the shell reproduces production, where hooks fire while the AI tool owns the foreground; releasing the parked shell is how each phase resets to a clean slate.
 
@@ -1814,7 +1814,7 @@ Both scripts park the shell in `read` after firing hook events. A returning shel
 
 Seven-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating prompt-bar and tab inline % across all threshold bands for Claude and Codex.
 
-Claude phases set `processing` plus a prompt and a context refresh of 50/72/91. Phase 1 asserts `50%` renders on exactly one chrome surface and Phase 4 reads that as the tab inline being suppressed below `warn=70`; phases 2 and 3 assert the Warn/Danger values render on two surfaces (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks at 51/73/92.
+Claude phases set `processing` plus a prompt and a context refresh of 50/72/91. Every phase requires the value on two chrome surfaces (prompt bar + tab inline), including the 50% Ok band. Codex repeats the same provider-symmetric checks at 51/73/92.
 
 #### AI State Indicator E2E
 

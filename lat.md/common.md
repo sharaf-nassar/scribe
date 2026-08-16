@@ -22,7 +22,7 @@ Verifies that a state-only hook from the same conversation still inherits the li
 
 Single source of truth for how a context-window fill percentage is spelled on screen, shared by every surface that displays one.
 
-Two surfaces show the percentage and they disagree on both shape and gating: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`) in every band, while the tab label appends a bare suffix (` 72%`) only from the warn band up.  and  own those two strings and the suffix's gating, so the GPUI prompt bar (), the GPUI tab bar (), and the E2E harness that asserts on them () cannot drift apart.
+Two surfaces show the percentage in every band but use different shapes: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`), while the tab label appends a bare suffix (` 72%`).  and  own those strings and pulse suppression, so the GPUI prompt bar (), the GPUI tab bar (), and the E2E harness that asserts on them () cannot drift apart.
 
 Only text is shared. Band colors stay with each surface because they resolve through different palettes — the prompt bar reads the configured  hex colors while the tab bar uses its own fixed band colors.
 
@@ -30,9 +30,9 @@ Only text is shared. Band colors stay with each surface because they resolve thr
 
 Verifies  lights segments by `div_ceil` (any non-zero percentage fills at least one) and clamps above 100%.
 
-### Tab suffix is gated on the warn band
+### Tab suffix shows known context unless pulsing
 
-Verifies  returns `None` below `warn` and while a pulsing attention state owns the UX, and the bare ` NN%` suffix otherwise.
+Verifies  returns the bare ` NN%` suffix for every known percentage and `None` while a pulsing attention state owns the UX.
 
 ## Configuration
 

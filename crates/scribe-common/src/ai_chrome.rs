@@ -2,7 +2,7 @@
 //!
 //! Two client surfaces display the AI context-window fill percentage: the
 //! per-pane prompt bar renders a segmented meter (`▰▰▱ 72%`) and the tab label
-//! appends a bare suffix (` 72%`) once usage reaches the warn band. Both strings
+//! appends a bare suffix (` 72%`) whenever usage is known. Both strings
 //! are produced here so the prompt bar, the tab bar, and the E2E harness that
 //! asserts on them all agree on one spelling.
 //!
@@ -46,13 +46,12 @@ pub fn context_meter_label(percent: u8) -> String {
 /// Format the tab-inline context suffix (`" 72%"`), or `None` when the tab must
 /// not show one.
 ///
-/// The suffix is suppressed below `warn` — the prompt-bar meter alone carries
-/// the Ok band — and while `pulsing` is set, because a `PermissionPrompt` /
-/// `WaitingForInput` session already draws attention through its pulse and the
-/// suffix must not compete with it.
+/// The suffix is suppressed while `pulsing` is set, because a
+/// `PermissionPrompt` / `WaitingForInput` session already draws attention
+/// through its pulse and the suffix must not compete with it.
 #[must_use]
-pub fn tab_context_suffix_text(percent: u8, warn: u8, pulsing: bool) -> Option<String> {
-    if pulsing || percent < warn {
+pub fn tab_context_suffix_text(percent: u8, pulsing: bool) -> Option<String> {
+    if pulsing {
         return None;
     }
     Some(format!(" {percent}%"))
@@ -73,12 +72,12 @@ mod tests {
         assert_eq!(context_meter_label(255), "▰▰▰ 100%");
     }
 
-    // @lat: [[common#AI Context Chrome#Tab suffix is gated on the warn band]]
+    // @lat: [[common#AI Context Chrome#Tab suffix shows known context unless pulsing]]
     #[test]
-    fn tab_suffix_gated_on_warn_and_pulse() {
-        assert_eq!(tab_context_suffix_text(50, 70, false), None);
-        assert_eq!(tab_context_suffix_text(70, 70, false).as_deref(), Some(" 70%"));
-        assert_eq!(tab_context_suffix_text(91, 70, false).as_deref(), Some(" 91%"));
-        assert_eq!(tab_context_suffix_text(91, 70, true), None);
+    fn tab_suffix_shows_known_context_unless_pulsing() {
+        assert_eq!(tab_context_suffix_text(50, false).as_deref(), Some(" 50%"));
+        assert_eq!(tab_context_suffix_text(70, false).as_deref(), Some(" 70%"));
+        assert_eq!(tab_context_suffix_text(91, false).as_deref(), Some(" 91%"));
+        assert_eq!(tab_context_suffix_text(50, true), None);
     }
 }

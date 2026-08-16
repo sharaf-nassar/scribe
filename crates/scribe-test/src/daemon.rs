@@ -1712,14 +1712,9 @@ async fn handle_request_ai_chrome(session_id: SessionId, state: &SharedState) ->
     let Some(percent) = context else {
         return DaemonResponse::AiChrome { prompt_bar: None, tab: None };
     };
-    let thresholds = scribe_common::config::load_config()
-        .unwrap_or_default()
-        .terminal
-        .ai_session
-        .context_thresholds;
     DaemonResponse::AiChrome {
         prompt_bar: Some(scribe_common::ai_chrome::context_meter_label(percent)),
-        tab: scribe_common::ai_chrome::tab_context_suffix_text(percent, thresholds.warn, pulsing),
+        tab: scribe_common::ai_chrome::tab_context_suffix_text(percent, pulsing),
     }
 }
 

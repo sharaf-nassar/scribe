@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Validates that the prompt-bar right cluster and tab-inline % display
 # correctly across the three context threshold bands:
-#   Ok     (< 70)  — only prompt bar shows %, tab suppresses it
+#   Ok     (< 70)  — both prompt bar and tab show %
 #   Warn   (>= 70) — both prompt bar and tab show %
 #   Danger (>= 90) — both prompt bar and tab show %
 #
@@ -73,14 +73,13 @@ assert_band() {
     fi
 }
 
-# ── Phase 1 + 4: Ok band (50%) — prompt bar only ─────────────────────────────
-# At 50% (below warn=70) the prompt bar renders "50%" but the tab-inline
-# suppresses it, so "50%" appears on exactly one chrome surface.
+# ── Phase 1 + 4: Ok band (50%) — prompt bar + tab ────────────────────────────
+# Known context is visible in both chrome surfaces in every threshold band.
 hold_ai_state claude_code 50 phase-one
-assert_band "50%" 1 "PHASE 1"
+assert_band "50%" 2 "PHASE 1"
 release_ai_state
 echo "PHASE 1 PASS: context=50 (Ok band) rendered as 50% in prompt bar"
-echo "PHASE 4 PASS: 50% on 1 surface (tab suppressed below warn threshold)"
+echo "PHASE 4 PASS: 50% on 2 surfaces (prompt bar + tab both rendered)"
 
 # ── Phase 2: Warn band (72%) — prompt bar + tab ───────────────────────────────
 hold_ai_state claude_code 72 phase-two
@@ -94,12 +93,12 @@ assert_band "91%" 2 "PHASE 3"
 release_ai_state
 echo "PHASE 3 PASS: 91% on 2 surfaces (prompt bar + tab both rendered)"
 
-# ── Phase 5: Codex Ok band (51%) — prompt bar only ────────────────────────────
+# ── Phase 5: Codex Ok band (51%) — prompt bar + tab ──────────────────────────
 # Provider-symmetric: the same bands must hold for Codex.
 hold_ai_state codex_code 51 phase-five
-assert_band "51%" 1 "PHASE 5"
+assert_band "51%" 2 "PHASE 5"
 release_ai_state
-echo "PHASE 5 PASS: Codex context=51 (Ok band) rendered as 51% in prompt bar"
+echo "PHASE 5 PASS: Codex 51% on 2 surfaces (prompt bar + tab both rendered)"
 
 # ── Phase 6: Codex Warn band (73%) — prompt bar + tab ──────────────────────────
 hold_ai_state codex_code 73 phase-six

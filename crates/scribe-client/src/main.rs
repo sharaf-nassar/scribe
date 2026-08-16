@@ -6871,7 +6871,7 @@ impl TerminalView {
             .px_2()
             .bg(bg)
             .text_color(fg)
-            .text_sm()
+            .text_xs()
             .border_r_1()
             .border_color(colors.separator)
             .cursor_pointer()

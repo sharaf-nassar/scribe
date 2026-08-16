@@ -20,8 +20,10 @@ use crate::opacity::scale_alpha;
 /// ease-out so it decays smoothly rather than cutting off.
 pub const TAB_FLASH_SECS: f32 = 0.45;
 
-/// Warn-band color for the context-% suffix (`#d4a017`), matching the legacy
-/// client's `AiStateTracker` bands.
+/// Ok-band color for the context-% suffix (`#5fa05f`).
+pub const CONTEXT_OK_COLOR: Rgba = Rgba { r: 0.373, g: 0.627, b: 0.373, a: 1.0 };
+
+/// Warn-band color for the context-% suffix (`#d4a017`).
 pub const CONTEXT_WARN_COLOR: Rgba = Rgba { r: 0.831, g: 0.627, b: 0.090, a: 1.0 };
 
 /// Danger-band color for the context-% suffix (`#c83030`).
@@ -146,21 +148,27 @@ impl TabBarColors {
 pub struct ContextSuffix {
     /// Formatted text, always `" NN%"` (single leading space).
     pub text: String,
-    /// Band color (warn or danger).
+    /// Band color (Ok, Warn, or Danger).
     pub color: Rgba,
 }
 
 /// Compute the colored context-% suffix for a tab, or `None` when it should not
 /// be shown.
 ///
-/// Returns `None` below `warn`, or when `pulsing` is set (a `PermissionPrompt` /
+/// Returns `None` when `pulsing` is set (a `PermissionPrompt` /
 /// `WaitingForInput` session already draws attention through its pulse and must
-/// not compete with the suffix). At or above `danger` the suffix is the danger
-/// band; between `warn` and `danger` it is the warn band.
+/// not compete with the suffix). Known context uses the fixed Ok, Warn, or
+/// Danger color for its threshold band.
 #[must_use]
 pub fn context_suffix(percent: u8, warn: u8, danger: u8, pulsing: bool) -> Option<ContextSuffix> {
-    let text = scribe_common::ai_chrome::tab_context_suffix_text(percent, warn, pulsing)?;
-    let color = if percent >= danger { CONTEXT_DANGER_COLOR } else { CONTEXT_WARN_COLOR };
+    let text = scribe_common::ai_chrome::tab_context_suffix_text(percent, pulsing)?;
+    let color = if percent >= danger {
+        CONTEXT_DANGER_COLOR
+    } else if percent >= warn {
+        CONTEXT_WARN_COLOR
+    } else {
+        CONTEXT_OK_COLOR
+    };
     Some(ContextSuffix { text, color })
 }
 
@@ -314,9 +322,9 @@ pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_DANGER_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors, badge_label,
-        context_suffix, flash_blend, px_units, reorder_target_index, tab_display_title,
-        tab_flash_intensity,
+        CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors,
+        badge_label, context_suffix, flash_blend, px_units, reorder_target_index,
+        tab_display_title, tab_flash_intensity,
     };
     use gpui::Rgba;
 
@@ -379,12 +387,14 @@ mod tests {
     // @lat: [[client#GPUI Titlebar#Context suffix bands and suppression]]
     #[test]
     fn context_suffix_bands_and_suppresses() {
-        assert_eq!(context_suffix(50, 70, 90, false), None);
+        let ok = context_suffix(50, 70, 90, false).expect("known Ok-band context is visible");
+        assert_eq!(ok.text, " 50%");
+        assert_eq!(ok.color, CONTEXT_OK_COLOR);
         let warn = context_suffix(70, 70, 90, false).unwrap();
         assert_eq!(warn.text, " 70%");
         assert_eq!(warn.color, CONTEXT_WARN_COLOR);
         assert_eq!(context_suffix(92, 70, 90, false).unwrap().color, CONTEXT_DANGER_COLOR);
-        assert_eq!(context_suffix(85, 70, 90, true), None, "pulsing suppresses");
+        assert_eq!(context_suffix(50, 70, 90, true), None, "pulsing suppresses");
     }
 
     // @lat: [[client#GPUI Titlebar#Badge shown only for named multi-workspace]]
