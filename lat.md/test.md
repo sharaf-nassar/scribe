@@ -2320,11 +2320,11 @@ The copy phase drags a real mouse selection across the pane and first requires r
 
 ### Terminal viewport navigation
 
-`tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for : scrollback paging, font zoom, vi / copy mode, split-scroll, and the smart-selection context menu, each of which shipped as a unit-tested module with no caller.
+`tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for : scrollback paging, jump control, font zoom, vi / copy mode, split-scroll, and the smart-selection context menu, each of which shipped as a unit-tested module with no caller.
 
-It runs on the  with `terminal.scroll_pin = true` seeded through `SCRIBE_EXTRA_CONFIG`, because split-scroll is opt-in and the pin can only appear in a client whose config asked for it. Every phase asserts a log line the wired path alone writes *and* a pixel effect, because either alone is weak: a log line does not prove the frame changed, and a screenshot diff does not prove which code produced it.
+It starts on the  with `terminal.scroll_pin = false`, so the plain terminal path cannot borrow the AI pin gate. The split-scroll phase hot-reloads the opt-in before posting its provider event. Every phase asserts a log line the wired path alone writes *and* a pixel effect, because either alone is weak: a log line does not prove the frame changed, and a screenshot diff does not prove which code produced it.
 
-`shift+PageUp` must produce a `terminal scrollback moved` line with a non-zero offset and repaint the whole viewport — the second half is what would have caught the original defect, where the snapshot read the live screen and ignored the display offset entirely, so scrolling logged fine and changed nothing on screen. `shift+End` must report offset 0 again. `ctrl+-` must step the zoom level to `-1` and rescale the grid; `ctrl+0` must return it to `0`.
+`shift+PageUp` must produce a `terminal scrollback moved` line with a non-zero offset and repaint the whole viewport — the second half is what would have caught the original defect, where the snapshot read the live screen and ignored the display offset entirely, so scrolling logged fine and changed nothing on screen. One click on the plain pane's bottom-right control uses the real 24px status-bar boundary, must log its local route and report offset 0, then a second click there must be inert. `shift+End` must report offset 0 again. `ctrl+-` must step the zoom level to `-1` and rescale the grid; `ctrl+0` must return it to `0`.
 
 The vi-mode phase asserts three things, because the mode is only correct if all three hold: `ctrl+shift+space` logs `active=true`, three `k` presses add the hollow cursor box to the frame, and the daemon's own screen snapshot contains no `kkk` — a copy mode that leaks its motions into the shell is worse than no copy mode. `Escape` must log `active=false`.
 
@@ -4318,6 +4318,11 @@ Covers the split-scroll live-bottom logic in  — eligibility, pin sizing, curso
 
  stacks a scrollback top portion, a 1px divider, and a pinned bottom of the requested height, docking the jump-to-bottom chip inside the top portion where  resolves it.
 
+### Jump controls clear the scrollbar and hide in tiny panes
+
+`jump_button_rect` keeps the 30px square control clear of the expanded overlay
+scrollbar and returns nothing when a pane cannot contain it safely.
+
 ### Pin height clamps to the content rect
 
 A pin height larger than the content rect collapses the top portion to zero rather than overflowing, so an oversized pin request stays inside the pane.
@@ -4380,9 +4385,24 @@ That is the gate which turns a measured band into exactly one deferred republish
 
 `cell_at` divides the pointer offset by the live cell metrics to name a row and column, and returns nothing outside the grid rect so a click on the titlebar or status bar can never resolve to row 0.
 
-### The jump chip is only hit while the pin is up
+### The jump chip follows every scrolled pane
 
- re-derives the paint pass's split geometry and matches only points inside the docked chip, and matches nothing at all when there is no pin, so an unsplit grid passes every click through.
+`hits_jump_chip` re-derives the paint geometry and accepts a point only while
+that pane has a nonzero display offset. A split pane uses its scrollback top
+portion; an ordinary pane uses its bottom-right canvas corner.
+
+At the live bottom and on a tiny pane it stays inert. The hover and pressed
+states brighten the terminal surface and border while preserving the accent
+icon. The visual mouse-reporting phase enables DECSET 1003, moves one pixel
+onto the control to prove all-motion reporting is live, snapshots the wire,
+then moves one pixel while the button is held and requires zero `KeyInput`
+growth before the control reaches offset zero.
+
+### Keyboard jump activation stays out of the PTY
+
+A focused jump control survives the window's focus-repair render, then Space
+activates it exactly once without encoding a byte for the terminal root. The
+post-scroll render removes the control and restores terminal focus.
 
 ## GPUI Mouse Reporting
 

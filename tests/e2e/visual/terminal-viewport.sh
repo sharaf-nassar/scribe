@@ -14,13 +14,14 @@
 # `xdotool --window` delivers, so window-targeted input would leave the client
 # untouched while the script still "passed".
 #
-# Requires the shared-pane rig plus the split-scroll opt-in:
+# Requires the shared-pane rig:
 #   just e2e-visual-terminal-viewport
-# which exports SESSION and seeds `terminal.scroll_pin = true`.
+# which exports SESSION and starts with `terminal.scroll_pin = false`.
 set -e
 
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
+CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
 # The hook channel's endpoint IS the server socket; `scribe-hook-helper` needs
 # no daemon, only the path and a session id in its environment.
 HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
@@ -119,6 +120,37 @@ send_keys() {
     sleep 0.5
 }
 
+set_scroll_pin() {
+    local enabled="$1" baseline
+    baseline=$(count_log "config hot-reloaded")
+    printf '[terminal]\nscroll_pin = %s\n' "$enabled" >"$CONFIG_FILE"
+    wait_for_log_growth "config hot-reloaded" "$baseline" \
+        || fail "FAIL: scroll_pin=$enabled did not hot-reload"
+    sleep 0.3
+}
+
+# Locate the only 30px foreground component in the pane's lower-right control
+# band, then click its measured centre. This follows the painted grid instead
+# of guessing how X11 window decorations affect client-space coordinates.
+jump_to_bottom() {
+    local x y w h
+    capture /output/vp-jump-target.png
+    read -r x y w h <<EOF
+$(convert /output/vp-jump-target.png \
+    -crop "60x60+$(( WIN_W - 80 ))+$(( WIN_H - 110 ))" +repage \
+    -fuzz 3% -transparent '#0e0e10' -trim -format '%X %Y %w %h' info:)
+EOF
+    x="${x#+}"
+    y="${y#+}"
+    [ "$w" -ge 28 ] && [ "$w" -le 32 ] && [ "$h" -ge 28 ] && [ "$h" -le 32 ] \
+        || fail "FAIL: jump control geometry was ${w}x${h}+${x}+${y}"
+    xdotool mousemove --sync \
+        $(( WIN_X + WIN_W - 80 + x + w / 2 )) \
+        $(( WIN_Y + WIN_H - 110 + y + h / 2 ))
+    xdotool click 1
+    sleep 0.5
+}
+
 count_log() {
     grep -acF "$1" "$CLIENT_LOG" 2>/dev/null || true
 }
@@ -201,6 +233,33 @@ if [ "${DIFF:-0}" -lt "$VIEWPORT_DIFF_MIN" ]; then
     fail "PHASE 2 FAIL: paging up changed $DIFF px (min $VIEWPORT_DIFF_MIN); the snapshot ignored the offset"
 fi
 echo "PHASE 2 PASS: shift+PageUp paged into the scrollback (+$DIFF px) — $LINE"
+
+# ── Phase 2b: one plain-pane click returns to the bottom ─────────
+# No provider hook has run and scroll_pin is false, so this is the ordinary
+# terminal path. The control claims the click before selection or a terminal
+# application's mouse reporter can see it, then scrolls exactly this session.
+BASE_JUMP=$(count_log "terminal jump-to-bottom clicked")
+BASE_SCROLL=$(count_log "terminal scrollback moved")
+focus
+jump_to_bottom
+if ! wait_for_log_growth "terminal jump-to-bottom clicked" "$BASE_JUMP"; then
+    fail "PHASE 2b FAIL: the plain pane's jump control did not claim one click"
+fi
+if ! wait_for_log_growth "terminal scrollback moved" "$BASE_SCROLL"; then
+    fail "PHASE 2b FAIL: the jump control did not route through scroll_session"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"offset=0"*) ;;
+    *) fail "PHASE 2b FAIL: the click left the pane scrolled: $LINE" ;;
+esac
+capture /output/vp-02b-jump-bottom.png
+BASE_JUMP=$(count_log "terminal jump-to-bottom clicked")
+jump_to_bottom
+if wait_for_log_growth "terminal jump-to-bottom clicked" "$BASE_JUMP" 3; then
+    fail "PHASE 2b FAIL: the at-bottom control stayed clickable"
+fi
+echo "PHASE 2b PASS: one plain-pane click returned to offset 0 and then hid"
 
 # ── Phase 3: shift+End returns to the live bottom ─────────────────
 BASE=$(count_log "terminal scrollback moved")
@@ -294,6 +353,7 @@ echo "PHASE 5 PASS: vi mode toggles, paints a cursor (+$DIFF px), and swallows i
 # rig's config) and a session the client believes is an AI pane, which only a
 # real provider hook event can establish.
 send_keys shift+End
+set_scroll_pin true
 hook --provider=claude_code --event=state_changed --state=processing
 BASE=$(count_log "terminal scrollback moved")
 send_keys shift+Prior
@@ -362,6 +422,7 @@ echo "  Inspect screenshots in test-output/:"
 echo "    vp-00-attached.png       — the shared pane before any input"
 echo "    vp-01-bottom.png         — the live bottom after 200 rows"
 echo "    vp-02-scrolled.png       — after shift+PageUp paged into scrollback"
+echo "    vp-02b-jump-bottom.png  — plain-pane click returned to the live view"
 echo "    vp-03-back-at-bottom.png — after shift+End returned to the live view"
 echo "    vp-04-zoomed-out.png     — the grid one zoom step smaller"
 echo "    vp-05-vi-cursor.png      — the vi cursor after twelve upward motions"

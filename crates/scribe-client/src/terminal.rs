@@ -175,6 +175,8 @@ pub struct CursorPlacement {
 pub struct Content {
     /// Visible rows, including blank cells so every row keeps terminal width.
     pub rows: Vec<Vec<Cell>>,
+    /// Rows the pane is scrolled above its live bottom.
+    pub display_offset: usize,
     /// How many trailing rows of [`Self::rows`] show the *live* screen while
     /// the rows above them show scrollback — the split-scroll pin. `0` whenever
     /// split-scroll is inactive, which is the ordinary case.
@@ -868,7 +870,13 @@ impl DisplayOnlyTerminal {
 
         let vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
         let shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
-        self.content = Arc::new(Content { rows, pin_rows, vi_cursor, shell_cursor });
+        self.content = Arc::new(Content {
+            rows,
+            display_offset: self.display_offset(),
+            pin_rows,
+            vi_cursor,
+            shell_cursor,
+        });
         self.content_stale = false;
     }
 

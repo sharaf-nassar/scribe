@@ -233,8 +233,8 @@ pub struct GridColors {
 /// Where the last painted frame put the terminal grid, in window coordinates.
 ///
 /// The shell needs this to answer a mouse event: a right-click resolves to a
-/// grid cell (smart selection) and a left-click may land on the split-scroll
-/// jump chip, and neither can be derived from the event alone because the grid
+/// grid cell (smart selection) and a left-click may land on the jump control,
+/// and neither can be derived from the event alone because the grid
 /// sits under a titlebar of theme-dependent height. The canvas records its own
 /// bounds on every frame instead, and both live on the GPUI thread so a plain
 /// `Cell` is the whole synchronisation story.
@@ -341,6 +341,8 @@ pub struct TerminalElement {
     /// attached to the pane, which is the only case with no viewport to
     /// describe.
     scrollbar: Option<ScrollbarPaint>,
+    /// Whether this pane owns a pending jump-control click.
+    jump_button_pressed: bool,
     /// Immutable CPU scene plus the window-local cache shared by all panes.
     images: Option<TerminalImagesPaint>,
     bounds_sink: GridBounds,
@@ -378,6 +380,7 @@ impl TerminalElement {
             ime: None,
             cursor: None,
             scrollbar: None,
+            jump_button_pressed: false,
             images: None,
             bounds_sink,
         }
@@ -403,6 +406,13 @@ impl TerminalElement {
     #[must_use]
     pub fn with_scrollbar(mut self, scrollbar: Option<ScrollbarPaint>) -> Self {
         self.scrollbar = scrollbar;
+        self
+    }
+
+    /// Mark the pane's jump control pressed until its matching release lands.
+    #[must_use]
+    pub fn with_jump_button_pressed(mut self, pressed: bool) -> Self {
+        self.jump_button_pressed = pressed;
         self
     }
 
@@ -572,6 +582,7 @@ impl TerminalElement {
         paint_line_cursor(cursor, overlay, window);
         self.paint_vi_cursor(overlay, window);
         self.paint_split_scroll(overlay, window);
+        self.paint_jump_button(overlay, window);
         // Last of the grid overlays: the scrollbar floats over the cells (it
         // reserves no gutter), so anything painted after it would sit on top of
         // the thumb. The IME registration below draws nothing.
@@ -1039,7 +1050,7 @@ impl TerminalElement {
         }
     }
 
-    /// Draw the split-scroll divider and the jump-to-bottom chip.
+    /// Draw the split-scroll divider, which only exists while a pin is active.
     ///
     /// The rows themselves already carry the split — the snapshot's trailing
     /// [`Content::pin_rows`] come from the live screen — so all that is left to
@@ -1049,26 +1060,63 @@ impl TerminalElement {
         if self.content.pin_rows == 0 {
             return;
         }
-        let OverlayGeometry { bounds, cell_width, line_height, accent, .. } = overlay;
+        let OverlayGeometry { bounds, line_height, accent, .. } = overlay;
         let geometry = split_scroll::compute_geometry(
             content_rect(bounds, self.content.rows.len(), line_height),
             f32::from(line_height) * grid_f32(self.content.pin_rows),
         );
         window.paint_quad(fill(to_bounds(geometry.divider), accent));
+    }
 
-        let chip = to_bounds(geometry.jump_button);
-        window.paint_quad(fill(chip, Rgba { a: accent.a * CHIP_BACKDROP_ALPHA, ..accent }));
-        // A down chevron built from two strokes: the chip has to read as "jump
-        // to the bottom" without pulling a glyph run into the canvas pass.
-        let arm = px(cell_width.max(MIN_CHEVRON_ARM));
-        let mid_x = chip.left() + chip.size.width / 2.;
-        let mid_y = chip.top() + chip.size.height / 2.;
+    /// Draw the shared per-pane jump-to-bottom control above terminal content.
+    fn paint_jump_button(&self, overlay: OverlayGeometry, window: &mut Window) {
+        if self.content.display_offset == 0 {
+            return;
+        }
+        let OverlayGeometry { bounds, line_height, accent, .. } = overlay;
+        let content = content_rect(bounds, self.content.rows.len(), line_height);
+        let button = if self.content.pin_rows > 0 {
+            split_scroll::compute_geometry(
+                content,
+                f32::from(line_height) * grid_f32(self.content.pin_rows),
+            )
+            .jump_button
+        } else {
+            let Some(button) = split_scroll::jump_button_rect(content) else { return };
+            button
+        };
+        if button.width <= 0.0 || button.height <= 0.0 {
+            return;
+        }
+        let chip = to_bounds(button);
+        let state = if self.jump_button_pressed {
+            JumpButtonState::Pressed
+        } else if chip.contains(&window.mouse_position()) {
+            JumpButtonState::Hovered
+        } else {
+            JumpButtonState::Idle
+        };
+        let paint = jump_button_paint(self.colors.background, accent, state);
+        window.paint_quad(fill(chip, paint.border).corner_radii(px(JUMP_BUTTON_RADIUS)));
+        let inset = px(1.0);
+        let inner = Bounds::new(
+            point(chip.left() + inset, chip.top() + inset),
+            size(chip.size.width - inset * 2.0, chip.size.height - inset * 2.0),
+        );
+        window.paint_quad(fill(inner, paint.surface).corner_radii(px(JUMP_BUTTON_RADIUS - 1.0)));
+
+        // A shaft, stepped head, and baseline make the destination legible
+        // without a glyph run in the canvas paint path.
         let thickness = px(VI_CURSOR_THICKNESS);
+        let mid_x = chip.left() + chip.size.width / 2.;
+        let top = chip.top() + px((f32::from(chip.size.height) - 14.0) / 2.0);
         for stroke in [
-            Bounds::new(point(mid_x - arm, mid_y - thickness), size(arm, thickness * 2.)),
-            Bounds::new(point(mid_x, mid_y - thickness), size(arm, thickness * 2.)),
+            Bounds::new(point(mid_x - thickness / 2.0, top), size(thickness, px(8.0))),
+            Bounds::new(point(mid_x - px(4.0), top + px(6.0)), size(px(8.0), thickness)),
+            Bounds::new(point(mid_x - px(2.0), top + px(8.0)), size(px(4.0), thickness)),
+            Bounds::new(point(mid_x - px(6.0), top + px(12.0)), size(px(12.0), thickness)),
         ] {
-            window.paint_quad(fill(stroke, accent));
+            window.paint_quad(fill(stroke, paint.icon));
         }
     }
 }
@@ -1485,16 +1533,50 @@ struct PaintedCursor {
     shape: CursorShape,
 }
 
-/// Line thickness for the vi-cursor box and the jump chip's chevron.
+/// Line thickness for the vi-cursor box and the jump-control icon.
 const VI_CURSOR_THICKNESS: f32 = 1.5;
 
-/// How much of the accent colour the jump chip's backdrop keeps, so the chip
-/// reads as a control rather than as a solid block of foreground.
-const CHIP_BACKDROP_ALPHA: f32 = 0.35;
+/// Corner radius for the compact terminal jump control.
+const JUMP_BUTTON_RADIUS: f32 = 4.0;
 
-/// Floor for the chevron's arm length, so the chip stays legible at small
-/// font sizes where the cell advance shrinks below it.
-const MIN_CHEVRON_ARM: f32 = 5.0;
+/// Visual state of the jump-to-bottom control.
+#[derive(Clone, Copy)]
+enum JumpButtonState {
+    Idle,
+    Hovered,
+    Pressed,
+}
+
+/// Colours resolved for one jump-control paint pass.
+#[derive(Clone, Copy)]
+struct JumpButtonPaint {
+    surface: Rgba,
+    border: Rgba,
+    icon: Rgba,
+}
+
+fn jump_button_paint(surface: Rgba, accent: Rgba, state: JumpButtonState) -> JumpButtonPaint {
+    let lift = match state {
+        JumpButtonState::Idle => 0.0,
+        JumpButtonState::Hovered => 0.06,
+        JumpButtonState::Pressed => 0.10,
+    };
+    let border_alpha = match state {
+        JumpButtonState::Idle => 0.36,
+        JumpButtonState::Hovered => 0.56,
+        JumpButtonState::Pressed => 0.72,
+    };
+    JumpButtonPaint {
+        surface: Rgba {
+            r: (surface.r + lift).min(1.0),
+            g: (surface.g + lift).min(1.0),
+            b: (surface.b + lift).min(1.0),
+            a: surface.a,
+        },
+        border: Rgba { a: accent.a * border_alpha, ..accent },
+        icon: accent,
+    }
+}
 
 /// The window-space rect of the shell cursor's cell, or `None` when the cursor
 /// is not on a painted row.
@@ -1622,28 +1704,33 @@ fn cell_index(offset: f32, cell_size: f32) -> usize {
     usize::from(low)
 }
 
-/// Whether a window-space position lands on the split-scroll jump chip.
+/// Whether a window-space position lands on a pane's jump-to-bottom control.
 ///
 /// The chip is painted inside the grid canvas, so the shell cannot hit-test it
 /// with a GPUI child element; it re-derives the same geometry the paint pass
-/// used and asks [`split_scroll::hit_test_jump_btn`].
+/// used for a split or plain pane.
 #[must_use]
 pub fn hits_jump_chip(
     bounds: Bounds<Pixels>,
     font: &GridFont,
-    rows: usize,
-    pin_rows: usize,
+    content: &Content,
     position: gpui::Point<Pixels>,
 ) -> bool {
-    if pin_rows == 0 || font.line_height <= 0.0 {
+    if content.display_offset == 0 || font.line_height <= 0.0 {
         return false;
     }
     let line_height = px(font.line_height);
-    let geometry = split_scroll::compute_geometry(
-        content_rect(bounds, rows, line_height),
-        font.line_height * grid_f32(pin_rows),
-    );
-    split_scroll::hit_test_jump_btn(&geometry, f32::from(position.x), f32::from(position.y))
+    let rect = content_rect(bounds, content.rows.len(), line_height);
+    let button = if content.pin_rows > 0 {
+        split_scroll::compute_geometry(rect, font.line_height * grid_f32(content.pin_rows))
+            .jump_button
+    } else {
+        let Some(button) = split_scroll::jump_button_rect(rect) else { return false };
+        button
+    };
+    button.width > 0.0
+        && button.height > 0.0
+        && button.contains(f32::from(position.x), f32::from(position.y))
 }
 
 /// Whether two theme slots are the same colour, compared by bit pattern.
@@ -1970,8 +2057,8 @@ mod tests {
 
     use super::{
         CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridBounds, GridColors, GridFont,
-        MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at, hits_jump_chip, is_painted_cell,
-        record_grid_area, shaped_char,
+        JumpButtonState, MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at, hits_jump_chip,
+        is_painted_cell, jump_button_paint, record_grid_area, shaped_char,
     };
     use gpui::{Bounds, FontStyle, FontWeight, Rgba, point, px, size};
     use scribe_client::color::TerminalColors;
@@ -1984,6 +2071,15 @@ mod tests {
     /// A 400x300 grid at (10, 20), the shape the shell hands the paint path.
     fn grid_bounds() -> Bounds<gpui::Pixels> {
         Bounds::new(point(px(10.), px(20.)), size(px(400.), px(300.)))
+    }
+
+    fn jump_content(rows: usize, pin_rows: usize, display_offset: usize) -> Content {
+        Content {
+            rows: vec![vec![Cell::default()]; rows],
+            pin_rows,
+            display_offset,
+            ..Content::default()
+        }
     }
 
     // @lat: [[test#GPUI Terminal Viewport#A moved grid area asks for a republish]]
@@ -2031,25 +2127,63 @@ mod tests {
         assert!(cell_at(bounds, &font, point(px(10.), px(321.))).is_none());
     }
 
-    // @lat: [[test#GPUI Terminal Viewport#The jump chip is only hit while the pin is up]]
+    // @lat: [[test#GPUI Terminal Viewport#The jump chip follows every scrolled pane]]
     #[test]
-    fn jump_chip_is_only_hit_while_the_pin_is_up() {
+    fn jump_chip_follows_display_offset_across_pinned_and_plain_panes() {
         let font = GridFont::from_appearance(&AppearanceConfig {
             font_size: 10.0,
             line_padding: 0,
             ..AppearanceConfig::default()
         });
         let bounds = grid_bounds();
-        // 20 rows of 13.5px with a 5-row pin: the divider sits at y = 20 + 202.5
-        // - 1, and the chip is docked just above it at the right edge.
-        let chip_x = 10. + 400. - 6. - 14.;
-        let chip_y = 20. + (13.5 * 15.) - 1. - 4. - 12.;
-        assert!(hits_jump_chip(bounds, &font, 20, 5, point(px(chip_x), px(chip_y))));
-        // The same point is inert without a pin, so an unsplit grid passes the
-        // click through to the terminal.
-        assert!(!hits_jump_chip(bounds, &font, 20, 0, point(px(chip_x), px(chip_y))));
-        // A point in the middle of the scrollback portion misses the chip.
-        assert!(!hits_jump_chip(bounds, &font, 20, 5, point(px(200.), px(100.))));
+        // A 30px control clears the overlay scrollbar's widened hit zone.
+        let chip_x = 10. + 400. - 32. - 15.;
+        // The pinned pane docks in the scrollback portion above its divider.
+        assert!(hits_jump_chip(
+            bounds,
+            &font,
+            &jump_content(20, 5, 1),
+            point(px(chip_x), px(198.)),
+        ));
+        // An ordinary terminal gets the same control against the whole pane.
+        assert!(hits_jump_chip(
+            bounds,
+            &font,
+            &jump_content(20, 0, 1),
+            point(px(chip_x), px(267.)),
+        ));
+        // At the live bottom, both variants are inert and invisible.
+        assert!(!hits_jump_chip(
+            bounds,
+            &font,
+            &jump_content(20, 5, 0),
+            point(px(chip_x), px(198.)),
+        ));
+        assert!(!hits_jump_chip(
+            bounds,
+            &font,
+            &jump_content(20, 0, 0),
+            point(px(chip_x), px(267.)),
+        ));
+        // A tiny pane hides the control rather than painting or hit-testing an
+        // inverted rect.
+        let tiny = Bounds::new(point(px(10.), px(20.)), size(px(45.), px(37.)));
+        assert!(!hits_jump_chip(tiny, &font, &jump_content(2, 0, 1), point(px(30.), px(35.)),));
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#The jump chip follows every scrolled pane]]
+    #[test]
+    fn jump_chip_hover_and_press_brighten_its_terminal_surface() {
+        let surface = Rgba { r: 0.08, g: 0.09, b: 0.10, a: 1.0 };
+        let accent = Rgba { r: 0.90, g: 0.65, b: 0.20, a: 1.0 };
+        let idle = jump_button_paint(surface, accent, JumpButtonState::Idle);
+        let hovered = jump_button_paint(surface, accent, JumpButtonState::Hovered);
+        let pressed = jump_button_paint(surface, accent, JumpButtonState::Pressed);
+
+        assert!(hovered.surface.r > idle.surface.r);
+        assert!(pressed.surface.r > hovered.surface.r);
+        assert!(hovered.border.a > idle.border.a);
+        assert_eq!(pressed.icon, accent);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Config live reload#Grid font tracks the live appearance config]]

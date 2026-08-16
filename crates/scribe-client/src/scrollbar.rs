@@ -131,6 +131,13 @@ const WIDTH_LERP_SPEED: f32 = 12.0;
 /// Multiplier applied to the base width to form the drag/click hit zone.
 const HIT_ZONE_MULTIPLIER: f32 = 3.0;
 
+/// Maximum distance from the pane's right edge claimed by the scrollbar.
+///
+/// The jump-to-bottom control uses this instead of duplicating scrollbar
+/// geometry, so its own hit target cannot overlap an expanded thumb's zone.
+pub const SCROLLBAR_HIT_ZONE_INSET: f32 =
+    (SCROLLBAR_WIDTH + HOVER_EXTRA_WIDTH) * HIT_ZONE_MULTIPLIER + RIGHT_INSET;
+
 /// Height of a command tick in physical pixels.
 const MARK_HEIGHT: f32 = 2.0;
 

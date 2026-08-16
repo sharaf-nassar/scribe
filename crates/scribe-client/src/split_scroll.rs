@@ -22,6 +22,7 @@ use alacritty_terminal_gpui::term::Term;
 use alacritty_terminal_gpui::term::cell::Flags;
 
 use crate::layout::Rect;
+use crate::scrollbar::SCROLLBAR_HIT_ZONE_INSET;
 
 /// Minimum number of rows shown in the pinned bottom portion.
 const MIN_PIN_ROWS: usize = 3;
@@ -34,17 +35,14 @@ const MIN_PIN_ROWS: usize = 3;
 /// keeps scrollback readable in the top portion.
 const AI_PROMPT_BLOCK_ROWS: usize = 8;
 
-/// Width of the jump-to-bottom button (pixels).
-const JUMP_BTN_W: f32 = 28.0;
+/// Square edge length of the jump-to-bottom button (pixels).
+const JUMP_BTN_SIZE: f32 = 30.0;
 
-/// Height of the jump-to-bottom button (pixels).
-const JUMP_BTN_H: f32 = 24.0;
+/// Horizontal space reserved for the overlay scrollbar's whole hit zone.
+const JUMP_BTN_INSET_X: f32 = SCROLLBAR_HIT_ZONE_INSET + 3.0;
 
-/// Horizontal inset from the bottom-right corner of the top portion.
-const JUMP_BTN_INSET_X: f32 = 6.0;
-
-/// Vertical inset from the divider so the chip feels docked to the split.
-const JUMP_BTN_INSET_Y: f32 = 4.0;
+/// Vertical inset from the pane or split divider.
+const JUMP_BTN_INSET_Y: f32 = 8.0;
 
 /// Divider thickness (pixels).
 const DIVIDER_H: f32 = 1.0;
@@ -199,12 +197,12 @@ pub fn compute_geometry(content_rect: Rect, pin_height: f32) -> SplitScrollGeome
         height: bottom_h,
     };
 
-    let jump_btn_x = (top_rect.x + top_rect.width - JUMP_BTN_W - JUMP_BTN_INSET_X)
-        .clamp(top_rect.x, top_rect.x + (top_rect.width - JUMP_BTN_W).max(0.0));
-    let jump_btn_y = (top_rect.y + top_rect.height - JUMP_BTN_H - JUMP_BTN_INSET_Y)
-        .clamp(top_rect.y, top_rect.y + (top_rect.height - JUMP_BTN_H).max(0.0));
-    let jump_btn_rect =
-        Rect { x: jump_btn_x, y: jump_btn_y, width: JUMP_BTN_W, height: JUMP_BTN_H };
+    let jump_btn_rect = jump_button_rect(top_rect).unwrap_or(Rect {
+        x: top_rect.x + top_rect.width,
+        y: top_rect.y + top_rect.height,
+        width: 0.0,
+        height: 0.0,
+    });
 
     SplitScrollGeometry {
         top: top_rect,
@@ -214,9 +212,29 @@ pub fn compute_geometry(content_rect: Rect, pin_height: f32) -> SplitScrollGeome
     }
 }
 
+/// Return the shared jump-control rect for a canvas, if it can fit safely.
+///
+/// The right inset preserves room for the non-reserving scrollbar's expanded
+/// thumb. Tiny panes omit the control instead of clamping it into chrome or
+/// producing an inverted hit target.
+#[must_use]
+pub fn jump_button_rect(content_rect: Rect) -> Option<Rect> {
+    let min_width = JUMP_BTN_SIZE + JUMP_BTN_INSET_X;
+    let min_height = JUMP_BTN_SIZE + JUMP_BTN_INSET_Y;
+    if content_rect.width < min_width || content_rect.height < min_height {
+        return None;
+    }
+    Some(Rect {
+        x: content_rect.x + content_rect.width - JUMP_BTN_SIZE - JUMP_BTN_INSET_X,
+        y: content_rect.y + content_rect.height - JUMP_BTN_SIZE - JUMP_BTN_INSET_Y,
+        width: JUMP_BTN_SIZE,
+        height: JUMP_BTN_SIZE,
+    })
+}
+
 /// Hit-test the jump-to-bottom button.
 pub fn hit_test_jump_btn(geo: &SplitScrollGeometry, x: f32, y: f32) -> bool {
-    geo.jump_button.contains(x, y)
+    geo.jump_button.width > 0.0 && geo.jump_button.height > 0.0 && geo.jump_button.contains(x, y)
 }
 
 /// Read the flags of a single cell from the terminal grid.
@@ -325,6 +343,18 @@ mod tests {
         // Jump chip is docked inside the top portion and hit-tests there.
         assert!(hit_test_jump_btn(&geo, geo.jump_button.x + 1.0, geo.jump_button.y + 1.0));
         assert!(!hit_test_jump_btn(&geo, content.x, content.y));
+    }
+
+    // @lat: [[test#GPUI Split-Scroll#Jump controls clear the scrollbar and hide in tiny panes]]
+    #[test]
+    fn jump_controls_clear_the_scrollbar_and_hide_in_tiny_panes() {
+        let content = Rect { x: 5.0, y: 10.0, width: 400.0, height: 300.0 };
+        let button = jump_button_rect(content).expect("room for a 30px control");
+        assert!((button.width - 30.0).abs() < f32::EPSILON);
+        assert!((button.height - 30.0).abs() < f32::EPSILON);
+        // 32px clears the 29px expanded scrollbar hit zone and leaves a gap.
+        assert!(content.x + content.width - (button.x + button.width) >= 32.0);
+        assert!(jump_button_rect(Rect { x: 0.0, y: 0.0, width: 45.0, height: 37.0 }).is_none());
     }
 
     // @lat: [[test#GPUI Split-Scroll#Pin height clamps to the content rect]]

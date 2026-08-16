@@ -160,6 +160,33 @@ click() {
     sleep 0.5
 }
 
+# Find and click a pane's painted 30px jump control. `$1` is the pane's right
+# edge relative to the client window, so this also covers the left side of a
+# split without a hard-coded status-bar or decoration offset.
+point_at_jump_control() {
+    local pane_right="$1" x y w h
+    capture /output/mouse-jump-target.png
+    read -r x y w h <<EOF
+$(convert /output/mouse-jump-target.png \
+    -crop "60x60+$(( pane_right - 80 ))+$(( WIN_H - 110 ))" +repage \
+    -fuzz 3% -transparent '#0e0e10' -trim -format '%X %Y %w %h' info:)
+EOF
+    x="${x#+}"
+    y="${y#+}"
+    [ "$w" -ge 28 ] && [ "$w" -le 32 ] && [ "$h" -ge 28 ] && [ "$h" -le 32 ] \
+        || fail "FAIL: jump control geometry was ${w}x${h}+${x}+${y}"
+    point_at "$(( pane_right - 80 + x + w / 2 ))" \
+        "$(( WIN_H - 110 + y + h / 2 ))"
+}
+
+jump_to_bottom() {
+    point_at_jump_control "$1"
+    xdotool mousedown 1
+    xdotool mousemove_relative --sync 1 0
+    xdotool mouseup 1
+    sleep 0.5
+}
+
 # ── Wire-tap readers ──────────────────────────────────────────────
 # Every KeyInput this session put on the wire, one escaped payload per line
 # (ESC rendered as \x1b, exactly as the client logs it).
@@ -338,6 +365,36 @@ if [ "${DIFF:-0}" -lt "$VIEWPORT_DIFF_MIN" ]; then
     fail "PHASE 2 FAIL: the wheel changed $DIFF px (min $VIEWPORT_DIFF_MIN); the viewport never moved"
 fi
 echo "PHASE 2 PASS: wheel-up paged into the scrollback (+$DIFF px) — $LINE"
+
+# ── Phase 2b: jump control outranks mouse reporting ───────────────
+# The pane is still scrolled. Give its PTY SGR tracking, then click the terminal
+# control. The click must scroll locally and add no KeyInput frame, which proves
+# the control claimed it before application mouse reporting.
+track_with '\033[?1003h\033[?1006h'
+BASE_JUMP=$(count_log "terminal jump-to-bottom clicked")
+focus
+point_at_jump_control "$WIN_W"
+# DECSET 1003 deliberately reports the positioning motion above. Snapshot the
+# wire only after that liveness proof so the delta covers press/jitter/release.
+BASE_INPUT=$(wire_key_input_count)
+xdotool mousedown 1
+xdotool mousemove_relative --sync 1 0
+xdotool mouseup 1
+sleep 0.5
+if ! wait_for_log_growth "terminal jump-to-bottom clicked" "$BASE_JUMP"; then
+    fail "PHASE 2b FAIL: the scrolled pane's jump control did not claim the click"
+fi
+if [ "$(wire_key_input_count)" -ne "$BASE_INPUT" ]; then
+    fail "PHASE 2b FAIL: the jump control leaked mouse input to the tracking PTY"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"offset=0"*) ;;
+    *) fail "PHASE 2b FAIL: the jump control did not reach the live bottom: $LINE" ;;
+esac
+track_with '\033[?1003l\033[?1006l'
+reset_pane
+echo "PHASE 2b PASS: jump control beat SGR reporting and returned to offset 0"
 
 # ── Phase 3: wheel-down returns to the live bottom ────────────────
 for _ in $(seq 1 6); do
@@ -603,6 +660,22 @@ fi
 AFTER_FOCUS=$(count_log "focused pane moved")
 if [ "$AFTER_FOCUS" -ne "$BASE_FOCUS" ]; then
     fail "PHASE 11 FAIL: disabled pointer scrolling stole the focus"
+fi
+# The first wheel left the unfocused top-left pane scrolled. Its control must
+# resolve that pane from its painted bounds and return before click-to-focus.
+BASE_JUMP=$(count_log "terminal jump-to-bottom clicked")
+BASE_FOCUS=$(count_log "focused pane moved")
+jump_to_bottom $(( WIN_W / 2 ))
+if ! wait_for_log_growth "terminal jump-to-bottom clicked" "$BASE_JUMP"; then
+    fail "PHASE 11 FAIL: the unfocused pane's jump control did not claim the click"
+fi
+LINE=$(last_log_line "terminal scrollback moved")
+case "$LINE" in
+    *"offset=0"*) ;;
+    *) fail "PHASE 11 FAIL: the unfocused pane stayed scrolled: $LINE" ;;
+esac
+if [ "$(count_log "focused pane moved")" -ne "$BASE_FOCUS" ]; then
+    fail "PHASE 11 FAIL: the unfocused jump control stole pane focus"
 fi
 point_at $(( WIN_W / 6 )) $(( WIN_H * 2 / 5 ))
 click 1

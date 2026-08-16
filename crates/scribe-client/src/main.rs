@@ -116,7 +116,7 @@ use scribe_client::share::{
 use scribe_client::smart_selection::{
     ActionExpansionContext, ResolvedSmartSelectionAction, SmartSelectionCandidate,
 };
-use scribe_client::split_scroll::{SplitScrollEligibility, SplitScrollState};
+use scribe_client::split_scroll::{self, SplitScrollEligibility, SplitScrollState};
 use scribe_client::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client::sys_stats::SystemStatsCollector;
 use scribe_client::terminal_image_scene::{
@@ -800,6 +800,9 @@ enum GridDrag {
     /// state exists only so the matching release is swallowed rather than
     /// reported to a mouse-tracking application that never saw the press.
     Link,
+    /// A jump-to-bottom press is held until release so the terminal control
+    /// can paint its pressed state without forwarding a mouse report.
+    JumpButton(SessionId),
 }
 
 fn hover_focus_target(
@@ -1442,6 +1445,8 @@ struct PointerState {
     /// one strip per AI pane, and only the pointed-at one may tint or show its
     /// dismiss control.
     prompt_hover: Option<(SessionId, prompt_bar::PromptBarHover)>,
+    /// Scrolled pane whose painted jump control currently owns hover.
+    jump_hover: Option<SessionId>,
 }
 
 impl ClipboardSurfaces {
@@ -1462,6 +1467,7 @@ impl Default for PointerState {
             report_button: None,
             report_cell: None,
             prompt_hover: None,
+            jump_hover: None,
         }
     }
 }
@@ -1543,8 +1549,7 @@ struct TerminalView {
     /// Compiled `terminal.smart_selection` rules, rebuilt on a config reload.
     /// A right-click resolves its menu rows against these.
     smart_selection: CompiledSmartSelection,
-    /// Pixel height of the split-scroll pin as of the last frame, so a click
-    /// can be hit-tested against the jump chip the paint pass drew.
+    /// Pixel height of the focused pane's split-scroll pin on its last frame.
     split_scroll: SplitScrollState,
     /// Where each pane painted its grid last frame, filled in by that pane's
     /// own grid canvas so a pointer position can be lowered onto a cell.
@@ -1668,6 +1673,8 @@ struct TerminalView {
     ci_expanded: HashMap<WorkspaceId, (PathBuf, String)>,
     /// Stable tab stops for each region's toggle plus owner-only actions.
     ci_action_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle, FocusHandle)>,
+    /// Stable tab stops for visible per-pane jump-to-bottom controls.
+    jump_button_focus: HashMap<SessionId, FocusHandle>,
     /// X11 active-window guard, present only when this window has an Xcb/Xlib
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
@@ -2261,6 +2268,7 @@ impl TerminalView {
             visible_ci_runs: Vec::new(),
             ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
+            jump_button_focus: HashMap::new(),
             x11_focus,
             ime: Self::start_ime(cx),
             bell,
@@ -3956,10 +3964,8 @@ impl TerminalView {
             .map_or_else(GridBounds::default, Rc::clone)
     }
 
-    /// The same for the focused pane, which is what every gesture a *click*
-    /// precedes resolves against — selection, links, smart selection and the
-    /// split-scroll chip all run after [`Self::press_focuses_pane`] has made
-    /// the pane under the pointer the focused one.
+    /// The same for the focused pane, used by focus-relative selection, links,
+    /// and smart selection after [`Self::press_focuses_pane`] activates it.
     fn focused_grid_bounds(&self) -> Option<Bounds<Pixels>> {
         self.pane_grid_bounds(self.focused_session()?)
     }
@@ -3975,6 +3981,14 @@ impl TerminalView {
             .iter()
             .find(|(_, sink)| sink.get().is_some_and(|rect| rect.contains(&position)))
             .map(|(session_id, _)| *session_id)
+    }
+
+    /// The pane whose jump control is held down, if any.
+    fn pressed_jump_button(&self) -> Option<SessionId> {
+        match self.pointer.drag {
+            GridDrag::JumpButton(session_id) => Some(session_id),
+            _ => None,
+        }
     }
 
     /// The same, against an arbitrary pane's painted grid rect.
@@ -6364,11 +6378,15 @@ impl TerminalView {
     fn prepare_pane_surfaces(
         &mut self,
         placements: &[pane_shell::PanePlacement],
+        cx: &Context<Self>,
     ) -> Rc<HashSet<SessionId>> {
         let sessions = placements.iter().filter_map(|placement| placement.session_id);
         for session_id in sessions.clone() {
             self.scrollbars.panes.entry(session_id).or_default();
             self.pane_bounds.entry(session_id).or_default();
+            self.jump_button_focus
+                .entry(session_id)
+                .or_insert_with(|| cx.focus_handle().tab_index(0).tab_stop(true));
         }
         Rc::new(sessions.collect())
     }
@@ -6398,7 +6416,7 @@ impl TerminalView {
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, cx);
-        let active_sessions = self.prepare_pane_surfaces(&placements);
+        let active_sessions = self.prepare_pane_surfaces(&placements, cx);
         let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
         // borrows `self` immutably. The state has to outlive the element (the
@@ -6460,10 +6478,6 @@ impl TerminalView {
                 if !underline.is_empty() {
                     pane = pane.cursor_pointer();
                 }
-                // The IME handler is a window-level singleton, so `take` gives
-                // it to the focused pane and to nothing else even if the layout
-                // ever reported two focused placements. The scrollbar is the
-                // opposite: per-pane, so every pane showing a session gets one.
                 let element = TerminalElement::new(
                     content,
                     self.font.clone(),
@@ -6477,6 +6491,7 @@ impl TerminalView {
                 .with_terminal_images(image_paint)
                 .with_cursor(placement.focused.then_some(cursor))
                 .with_scrollbar(placement.session_id.and_then(|s| self.scrollbar_paint(s)))
+                .with_jump_button_pressed(placement.session_id == self.pressed_jump_button())
                 .with_ime(placement.focused.then(|| ime.take()).flatten());
                 let pane = self.compose_pane_content(pane, element.paint(), &placement, cx);
                 let mut pane = Self::attach_wheel(pane, &placement, cx);
@@ -6526,7 +6541,18 @@ impl TerminalView {
                 let actions = self.prompt_bar_actions(session_id, placement.rect.width, cx);
                 prompt_bar::render(&model, &colors, metrics, actions).into_any_element()
             });
-        let grid_slot = div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid);
+        let jump_button = placement.session_id.and_then(|session_id| {
+            self.pane_content(session_id).and_then(|content| {
+                self.jump_button_accessibility(session_id, placement.rect.width, &content, cx)
+            })
+        });
+        let grid_slot = div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(grid)
+            .children(jump_button);
         let pane = pane.flex().flex_col();
         if self.prompt_bar.position == PromptBarPosition::Top {
             pane.children(strip).child(grid_slot)
@@ -7041,26 +7067,21 @@ impl TerminalView {
 
     /// Resolve a left press over the grid band.
     ///
-    /// Consumers in priority order. A divider press is a resize and owns the
-    /// boundary outright. The overlay scrollbar comes next because it is chrome
-    /// painted over the cells: a click on the thumb was never meant for the
-    /// application below it, which is the order the winit client resolved its
-    /// chrome in too — and because it is a scroll gesture, it precedes the
-    /// focusing click rather than waiting behind one. Focusing an unfocused
-    /// pane follows, then the Ctrl-click link, then a mouse-tracking
-    /// application; only when all of them decline does the press mean
-    /// selection.
+    /// Consumers in priority order. A divider, scrollbar, or jump control is
+    /// terminal chrome and claims the press before it can focus a pane, open a
+    /// link, reach a mouse-reporting application, or start a selection.
     fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         if self.press_board_edge(event.position, cx)
             || self.press_divider(event.position, cx)
             || self.press_scrollbar(event.position, cx)
+            || self.press_jump_button(event.position, cx)
             || self.press_focuses_pane(event.position, cx)
             || self.press_opens_link(event, cx)
             || self.forward_mouse_press(event)
         {
             return;
         }
-        self.click_grid(event.position, cx);
+        self.begin_selection(event.position, cx);
     }
 
     /// Focus the unfocused pane under a press, so clicking into any visible
@@ -7106,6 +7127,9 @@ impl TerminalView {
     /// claimed by the scrollbar anyway — before the motion falls through to
     /// mouse reporting and then to extending a selection.
     fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if matches!(self.pointer.drag, GridDrag::JumpButton(_)) {
+            return;
+        }
         if self.drag_board(event.position, cx)
             || self.drag_divider(event.position, cx)
             || self.drag_scrollbar(event.position, cx)
@@ -7113,6 +7137,7 @@ impl TerminalView {
             return;
         }
         self.update_scrollbar_hover(event.position, cx);
+        self.update_jump_hover(event.position, cx);
         if let Some(session_id) = hover_focus_target(
             self.config.config().config.terminal.focus.focus_follows_mouse,
             event.pressed_button,
@@ -7140,6 +7165,9 @@ impl TerminalView {
     /// Resolve a left release over the grid band, ending whichever gesture the
     /// matching press started.
     fn release_over_grid(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.cancel_jump_button(cx) {
+            return;
+        }
         // The press already opened a link, so this release belongs to a gesture
         // that is over. Forwarding it would hand a mouse-tracking application a
         // release with no press.
@@ -7267,6 +7295,7 @@ impl TerminalView {
     fn retire_scrollbars(&mut self, live: &HashSet<SessionId>) {
         self.scrollbars.panes.retain(|session_id, _| live.contains(session_id));
         self.pane_bounds.retain(|session_id, _| live.contains(session_id));
+        self.jump_button_focus.retain(|session_id, _| live.contains(session_id));
         if self.scrollbars.drag.is_some_and(|session| !live.contains(&session)) {
             self.scrollbars.drag = None;
         }
@@ -7328,6 +7357,19 @@ impl TerminalView {
             changed = true;
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Repaint only when the pointer enters or leaves a visible jump control.
+    fn update_jump_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let hovered = self.pane_at(position).and_then(|session_id| {
+            let bounds = self.pane_grid_bounds(session_id)?;
+            let content = self.pane_content(session_id)?;
+            hits_jump_chip(bounds, &self.font, &content, position).then_some(session_id)
+        });
+        if hovered != self.pointer.jump_hover {
+            self.pointer.jump_hover = hovered;
             cx.notify();
         }
     }
@@ -7691,34 +7733,97 @@ impl TerminalView {
         SplitScrollEligibility { scroll_pin_enabled, ai_provider_enabled }
     }
 
-    /// Route a left click on the terminal grid.
-    ///
-    /// The only click target the grid owns today is the split-scroll jump chip,
-    /// which is painted inside the canvas and so cannot be a GPUI child
-    /// element; everything else falls through untouched.
-    fn click_grid(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        if self.hits_split_scroll_chip(position) {
-            tracing::info!("split-scroll jump chip clicked");
-            self.scroll_terminal(Scroll::Bottom, cx);
-            return;
-        }
-        self.begin_selection(position, cx);
-    }
-
-    /// Whether `position` landed on the docked split-scroll jump chip, which
-    /// owns the click ahead of the selection gesture because it is a control
-    /// drawn over the grid rather than content in it.
-    fn hits_split_scroll_chip(&self, position: Point<gpui::Pixels>) -> bool {
-        if self.split_scroll.pin_height <= 0.0 {
-            return false;
-        }
-        let Some(bounds) = self.focused_grid_bounds() else {
+    /// Capture a pane-local jump-to-bottom click before focus and PTY input.
+    fn press_jump_button(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.pane_at(position) else { return false };
+        let Some(bounds) = self.pane_grid_bounds(session_id) else { return false };
+        let Some(content) = self
+            .pane_for(session_id)
+            .and_then(|pane| pane.with_terminal(|terminal| terminal.content()))
+        else {
             return false;
         };
-        let (rows, pin_rows) = self
-            .with_focused_grid(|terminal| (terminal.content().rows.len(), terminal.pin_rows()))
-            .unwrap_or((0, 0));
-        hits_jump_chip(bounds, &self.font, rows, pin_rows, position)
+        if !hits_jump_chip(bounds, &self.font, &content, position) {
+            return false;
+        }
+        self.pointer.drag = GridDrag::JumpButton(session_id);
+        cx.notify();
+        true
+    }
+
+    /// Cancel a held jump-control gesture without reporting its release.
+    fn cancel_jump_button(&mut self, cx: &mut Context<Self>) -> bool {
+        let GridDrag::JumpButton(_) = self.pointer.drag else { return false };
+        self.pointer.drag = GridDrag::Idle;
+        cx.notify();
+        true
+    }
+
+    /// Activate one pane's native jump control.
+    fn activate_jump_button(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        self.pointer.drag = GridDrag::Idle;
+        tracing::info!(%session_id, "terminal jump-to-bottom clicked");
+        self.scroll_session(session_id, Scroll::Bottom, cx);
+    }
+
+    /// Overlay the canvas-painted control with a real accessible GPUI button.
+    fn jump_button_accessibility(
+        &self,
+        session_id: SessionId,
+        pane_width: f32,
+        content: &Content,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if content.display_offset == 0 {
+            return None;
+        }
+        let line_height = self.font.line_height;
+        let rows = f32::from(u16::try_from(content.rows.len()).unwrap_or(u16::MAX));
+        let pin_rows = f32::from(u16::try_from(content.pin_rows).unwrap_or(u16::MAX));
+        let content_rect = Rect { x: 0.0, y: 0.0, width: pane_width, height: line_height * rows };
+        let button = if content.pin_rows > 0 {
+            split_scroll::compute_geometry(content_rect, line_height * pin_rows).jump_button
+        } else {
+            split_scroll::jump_button_rect(content_rect)?
+        };
+        let focus = self.jump_button_focus.get(&session_id)?.clone();
+        let focus_ring = scribe_client::tab_bar::srgba(self.chrome.accent);
+        Some(
+            div()
+                .id(ElementId::from(format!("terminal-jump-bottom-{session_id}")))
+                .absolute()
+                .left(px(button.x))
+                .top(px(button.y))
+                .w(px(button.width))
+                .h(px(button.height))
+                .role(gpui::Role::Button)
+                .aria_label("Jump to bottom")
+                .aria_description("Return this terminal pane to its live output")
+                .track_focus(&focus)
+                .focus_visible(move |style| style.border_1().border_color(focus_ring))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _window, ctx| {
+                        view.pointer.drag = GridDrag::JumpButton(session_id);
+                        ctx.stop_propagation();
+                        ctx.notify();
+                    }),
+                )
+                .on_key_down(|event: &KeyDownEvent, _window, ctx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        ctx.stop_propagation();
+                    }
+                })
+                // GPUI maps Enter, Space, and AccessKit Click to `on_click`.
+                .on_click(cx.listener(move |view, _, _window, ctx| {
+                    view.activate_jump_button(session_id, ctx);
+                    ctx.stop_propagation();
+                }))
+                .into_any_element(),
+        )
     }
 
     /// The link under a window-space pointer position, if any.
@@ -9142,6 +9247,7 @@ impl TerminalView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|view, _event: &MouseUpEvent, _window, ctx| {
+                    view.cancel_jump_button(ctx);
                     view.release_board(ctx);
                 }),
             )
@@ -9632,6 +9738,11 @@ impl TerminalView {
             self.focus.update.is_focused(window),
             self.ci_action_focus.values().any(|(toggle, open, dismiss)| {
                 toggle.is_focused(window) || open.is_focused(window) || dismiss.is_focused(window)
+            }) || self.jump_button_focus.iter().any(|(session_id, focus)| {
+                focus.is_focused(window)
+                    && self
+                        .pane_content(*session_id)
+                        .is_some_and(|content| content.display_offset > 0)
             }),
             self.beads_editor.read(cx).has_keyboard_focus(window, cx),
         ]);
@@ -14025,7 +14136,7 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
 mod tests {
     use std::ops::Range;
 
-    use gpui::{ElementInputHandler, EntityInputHandler, UTF16Selection};
+    use gpui::{ElementInputHandler, EntityInputHandler, InputEvent, UTF16Selection};
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
@@ -14241,6 +14352,118 @@ mod tests {
         focus_and_draw_probe(cx, window.into(), &terminal_focus);
         cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse("z").unwrap());
         window.update(cx, |probe, _, _| assert_eq!(probe.pty_bytes, [b"z".to_vec()])).unwrap();
+    }
+
+    struct JumpButtonFocusProbe {
+        terminal_focus: FocusHandle,
+        button_focus: FocusHandle,
+        button_visible: bool,
+        activations: usize,
+        pty_bytes: Vec<Vec<u8>>,
+    }
+
+    impl JumpButtonFocusProbe {
+        fn route_terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+            cx.stop_propagation();
+            if let Some(bytes) = encode_key(event) {
+                self.pty_bytes.push(bytes);
+            }
+        }
+
+        fn stop_activation_key(event: &KeyDownEvent, _window: &mut Window, cx: &mut App) {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                cx.stop_propagation();
+            }
+        }
+
+        fn activate(&mut self) {
+            self.activations += 1;
+            self.button_visible = false;
+        }
+
+        fn button(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+            let button_focus = self.button_focus.clone();
+            self.button_visible.then(|| {
+                div()
+                    .id("jump-button-focus-probe")
+                    .track_focus(&button_focus)
+                    .role(gpui::Role::Button)
+                    .on_key_down(Self::stop_activation_key)
+                    .on_click(cx.listener(|this, _, _window, _ctx| this.activate()))
+            })
+        }
+    }
+
+    impl Render for JumpButtonFocusProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if !(self.terminal_focus.is_focused(window)
+                || self.button_visible && self.button_focus.is_focused(window))
+            {
+                window.focus(&self.terminal_focus, cx);
+            }
+            let button = self.button(cx);
+            div()
+                .track_focus(&self.terminal_focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, ctx| {
+                    this.route_terminal_key(event, ctx);
+                }))
+                .children(button)
+        }
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Keyboard jump activation stays out of the PTY]]
+    #[gpui::test]
+    fn focused_jump_button_survives_render_and_consumes_space(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|app| {
+            app.open_window(WindowOptions::default(), |_, app| {
+                app.new(|app| JumpButtonFocusProbe {
+                    terminal_focus: app.focus_handle(),
+                    button_focus: app.focus_handle().tab_stop(true),
+                    button_visible: true,
+                    activations: 0,
+                    pty_bytes: Vec::new(),
+                })
+            })
+            .unwrap()
+        });
+        let (button_focus, terminal_focus) = window
+            .update(cx, |probe, _, _| (probe.button_focus.clone(), probe.terminal_focus.clone()))
+            .expect("button focus");
+        focus_and_draw_probe(cx, window.into(), &button_focus);
+
+        assert!(
+            cx.update_window(window.into(), |_, window, _| button_focus.is_focused(window))
+                .expect("read button focus")
+        );
+        let keystroke = gpui::Keystroke::parse("space").expect("parse Space");
+        cx.update_window(window.into(), |_, window, app| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(gpui::KeyUpEvent { keystroke }.to_platform_input(), app);
+        })
+        .expect("dispatch Space activation");
+
+        window
+            .update(cx, |probe, _, _| {
+                assert_eq!(probe.activations, 1);
+                assert!(probe.pty_bytes.is_empty());
+            })
+            .expect("read jump activation");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw hidden jump button");
+        assert!(
+            cx.update_window(window.into(), |_, window, _| terminal_focus.is_focused(window))
+                .expect("read restored terminal focus")
+        );
     }
 
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
