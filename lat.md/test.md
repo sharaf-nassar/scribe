@@ -1650,6 +1650,13 @@ ready board that classifies the seeded records into their expected lanes.
 
 The board omits the seeded epic as a standalone card while its child keeps the epic title as metadata, and queue totals count only non-epic issues.
 
+The fixture also creates an older P0 Ready card, waits one second, then creates
+a newer P4 Ready card. The authoritative snapshot must place the newer card
+first, proving lane order follows creation time rather than priority. Those two
+ordering-only records are then deleted so later detail and drag phases keep
+their focused fixture. The detail click still resolves its card's current lane
+and index from the snapshot instead of assuming priority order keeps it first.
+
 The same repository has deterministic epic, blocker, dependent, closed, and
 deferred issues. Its detailed issue carries every editable text field and two
 ordered comments. Real `bd show --json --include-comments
@@ -1748,9 +1755,10 @@ has no Beads detail or write capability.
 
 The live functional proof derives its field coordinates from the painted detail surface and proves pointer activation commits one serialized title write without leaking keys to the terminal.
 
-The image-difference bound includes the panel shadow, so the script normalizes
-its known 590px outer width to the 560px surface before targeting the title.
-It moves the active caret and bounds the changed title pixels, then selects all
+The image-difference bound crops out the live title and status bands, accepts
+either the exact 560px panel surface or its 590px shadow-inclusive width, then
+normalizes to the surface before targeting the title. It moves the active caret
+and bounds the changed title pixels, then selects all
 and requires a larger highlight diff before typing. It submits with Enter,
 requires exactly one `set_title` wire verb and Applied result, and confirms the
 exact `bd show` value. The retained caret and selection crops plus

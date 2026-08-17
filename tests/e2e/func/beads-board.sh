@@ -48,6 +48,9 @@ seed_fixture() {
         bd create 'Deferred detail fixture' --id e2e-deferred --type task --priority 2 \
             --defer '2030-03-01' >/dev/null
         bd create 'Real board refresh' --id e2e-ready --type task --priority 1 >/dev/null
+        bd create 'Older ready card' --id e2e-order-old --type task --priority 0 >/dev/null
+        sleep 1
+        bd create 'Newer ready card' --id e2e-order-new --type task --priority 4 >/dev/null
         bd create 'Native close and undo' --id e2e-close --type task --priority 2 >/dev/null
         bd create 'Classifier wins after drop' --id e2e-classifier --type task --priority 3 \
             --defer '2030-03-02' >/dev/null
@@ -107,8 +110,28 @@ READY_LANE=${BOARD#*'"ready":['}
 READY_LANE=${READY_LANE%%'],"in_progress"'*}
 printf '%s\n' "$READY_LANE" | grep -Fq '"id":"e2e-ready","title":"Real board refresh"' \
     || fail "seeded ready issue was absent from the Ready lane: $BOARD"
-printf '%s\n' "$BOARD" | grep -Fq '"ready_total":3' \
+printf '%s\n' "$BOARD" | grep -Fq '"ready_total":5' \
     || fail "Ready total included the epic record: $BOARD"
+python3 - "$BOARD" <<'PY'
+import json
+import sys
+
+state = json.loads(sys.argv[1])
+ready = state["Ready"]["snapshot"]["ready"]
+positions = {card["id"]: index for index, card in enumerate(ready)}
+for issue_id in ("e2e-order-old", "e2e-order-new"):
+    if issue_id not in positions:
+        raise SystemExit(f"FAIL: {issue_id} was absent from the Ready lane")
+if positions["e2e-order-new"] >= positions["e2e-order-old"]:
+    raise SystemExit(
+        "FAIL: newer Ready card appeared after older Ready card: "
+        f"new={positions['e2e-order-new']} old={positions['e2e-order-old']}"
+    )
+PY
+(
+    cd "$PROJECT"
+    bd delete e2e-order-old e2e-order-new --force >/dev/null
+)
 if printf '%s\n' "$BOARD" | grep -Fq '"id":"e2e-epic"'; then
     fail "epic appeared as a standalone board card: $BOARD"
 fi
@@ -490,9 +513,15 @@ done
 [ "${BOARD_DIFF:-0}" -ge 10000 ] || fail "real bd board never painted"
 
 # The press and release stay at one coordinate, inside the future two-pixel
-# drag arm. This must remain a card click and request its complete detail.
+# drag arm. Resolve the detail card from the authoritative lane order rather
+# than assuming priority order keeps it first.
+DETAIL_POSITION=$(issue_position e2e-detail) || fail "e2e-detail has no painted card"
+read -r DETAIL_LANE DETAIL_INDEX <<<"$DETAIL_POSITION"
+LANE_WIDTH=$(( (WIN_W - 16) / 5 ))
+DETAIL_X=$(( 16 + DETAIL_LANE * LANE_WIDTH + 70 ))
+DETAIL_Y=$(( 70 + DETAIL_INDEX * 50 + 14 ))
 REQUESTS_BEFORE=$(detail_request_count)
-xdotool mousemove --sync --window "$WID" 700 84
+xdotool mousemove --sync --window "$WID" "$DETAIL_X" "$DETAIL_Y"
 xdotool mousedown 1
 xdotool mouseup 1
 for _ in $(seq 1 30); do
@@ -514,7 +543,7 @@ python3 /tests/func/assert-beads-detail-wire.py \
     --output /output/beads-real-detail-evidence.json \
     || fail "painted detail response diverged from bd show"
 xdotool mousemove --sync --window "$WID" 900 600
-sleep 0.2
+sleep 0.5
 import -window "$WID" /output/beads-real-detail.png
 DETAIL_DIFF=$(compare -metric AE /output/beads-real-board.png \
     /output/beads-real-detail.png null: 2>&1 || true)
@@ -522,8 +551,11 @@ DETAIL_DIFF=${DETAIL_DIFF%%.*}
 [ "${DETAIL_DIFF:-0}" -ge 20000 ] || fail "real detail panel changed only ${DETAIL_DIFF:-0}px"
 
 panel_bounds() {
-    local before="$1" after="$2"
-    convert "$before" "$after" -compose difference -composite -threshold 10% -trim \
+    local before="$1" after="$2" content_height=$(( HEIGHT - 58 ))
+    convert \
+        \( "$before" -crop "${WIN_W}x${content_height}+0+34" \) \
+        \( "$after" -crop "${WIN_W}x${content_height}+0+34" \) \
+        -compose difference -composite -threshold 10% -trim \
         -format '%w %h %X %Y' info:
 }
 
@@ -532,11 +564,11 @@ panel_bounds() {
 # centers inside a resized or split terminal region.
 read -r PANEL_W PANEL_H PANEL_X PANEL_Y \
     <<<"$(panel_bounds /output/beads-real-board.png /output/beads-real-detail.png)"
-[ "$PANEL_W" -eq 590 ] && [ "$PANEL_H" -ge 120 ] \
+[ "$PANEL_H" -ge 120 ] && { [ "$PANEL_W" -eq 560 ] || [ "$PANEL_W" -eq 590 ]; } \
     || fail "resolved detail panel bounds were ${PANEL_W}x${PANEL_H}${PANEL_X}${PANEL_Y}"
-# `shadow_lg` makes the difference image 30px wider than the 560px surface.
-# Its detected left/top edges still match the surface, so only the width is
-# normalized before deriving field coordinates.
+# The threshold may detect the exact 560px surface or include `shadow_lg`'s
+# 15px on each side. Both share the surface's left/top edge, so normalize the
+# width before deriving field coordinates.
 PANEL_W=560
 PANEL_LEFT=${PANEL_X#+}
 PANEL_TOP=${PANEL_Y#+}

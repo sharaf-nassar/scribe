@@ -334,10 +334,13 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
         Err(error) => return Err(error.message()),
     }
 
-    let list =
-        Box::pin(run_bd(&bd, project_root, &["list", "--all", "--limit", "0", "--skip-labels"]))
-            .await
-            .map_err(RunError::message)?;
+    let list = Box::pin(run_bd(
+        &bd,
+        project_root,
+        &["list", "--all", "--limit", "0", "--skip-labels", "--sort", "created"],
+    ))
+    .await
+    .map_err(RunError::message)?;
     let ready = Box::pin(run_bd(&bd, project_root, &["ready", "--limit", "0"]))
         .await
         .map_err(RunError::message)?;
