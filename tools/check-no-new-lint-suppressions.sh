@@ -31,12 +31,13 @@ expected_file=""
 unexpected_file=""
 missing_file=""
 found_keys_file=""
+worktree_prune_file=""
 
 cleanup() {
     if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then
         rm -rf "$temp_dir"
     fi
-    rm -f "$found_file" "$expected_file" "$unexpected_file" "$missing_file" "$found_keys_file"
+    rm -f "$found_file" "$expected_file" "$unexpected_file" "$missing_file" "$found_keys_file" "$worktree_prune_file"
 }
 trap cleanup EXIT
 
@@ -71,6 +72,7 @@ case "$1" in
 esac
 
 repo_root="$(git rev-parse --show-toplevel)"
+worktree_prune_file="$(mktemp)"
 
 case "$mode" in
     staged)
@@ -82,6 +84,12 @@ case "$mode" in
     working-tree)
         scan_root="$repo_root"
         context="the working tree"
+        # Other linked worktrees (e.g. task worktrees under .worktrees/) share
+        # this repo's tracked source but are not part of this working tree's
+        # own suppression inventory, so their checkouts must not feed it.
+        git worktree list --porcelain \
+            | sed -n 's/^worktree //p' \
+            | grep -Fxv "$scan_root" >"$worktree_prune_file" || true
         ;;
     range)
         temp_dir="$(mktemp -d)"
@@ -103,13 +111,24 @@ unexpected_file="$(mktemp)"
 missing_file="$(mktemp)"
 found_keys_file="$(mktemp)"
 
-SCAN_ROOT="$scan_root" perl <<'PERL' >"$found_file"
+SCAN_ROOT="$scan_root" WORKTREE_PRUNE_FILE="$worktree_prune_file" perl <<'PERL' >"$found_file"
 use strict;
 use warnings;
 use File::Find;
 
 my $root = $ENV{SCAN_ROOT} // die "SCAN_ROOT is required\n";
 my @rows;
+
+my %prune_dirs;
+if (my $prune_file = $ENV{WORKTREE_PRUNE_FILE}) {
+    open my $pf, '<', $prune_file or die "open $prune_file: $!\n";
+    while (my $line = <$pf>) {
+        chomp $line;
+        next unless length $line;
+        $prune_dirs{$line} = 1;
+    }
+    close $pf;
+}
 
 sub bracket_delta {
     my ($text) = @_;
@@ -123,7 +142,8 @@ find(
         no_chdir => 1,
         wanted => sub {
             if (-d $File::Find::name
-                && $File::Find::name =~ m{(?:^|/)(?:\.git|target|node_modules|third_party)(?:/|$)}) {
+                && ($File::Find::name =~ m{(?:^|/)(?:\.git|target|node_modules|third_party)(?:/|$)}
+                    || exists $prune_dirs{$File::Find::name})) {
                 $File::Find::prune = 1;
                 return;
             }

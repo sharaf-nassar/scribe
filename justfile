@@ -23,6 +23,10 @@ check:
 lint-suppressions:
     tools/check-no-new-lint-suppressions.sh --working-tree
 
+# Regression coverage for the lint-suppression guard itself.
+lint-suppressions-tests:
+    tools/check-no-new-lint-suppressions-tests.sh
+
 # Ratchet how much of the GPUI client the running binary can actually reach.
 reachability:
     tools/check-reachability.sh --working-tree

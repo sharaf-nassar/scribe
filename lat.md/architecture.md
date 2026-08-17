@@ -125,6 +125,8 @@ New Rust lint suppressions are blocked by a committed baseline so contributors m
 
 `tools/check-no-new-lint-suppressions.sh` scans the staged, working, or CI target tree and compares the discovered suppression inventory against `tools/lint-suppressions-allowlist.txt`. That keeps the repo's three narrowly scoped unavoidable suppressions explicit while rejecting any drift. The guard runs in pre-commit, `just lint-suppressions`, and the normal pull-request quality workflow. `third_party/` is pruned from the scan so vendored upstream suppressions do not need allowlist entries.
 
+In `--working-tree` mode, `git worktree list --porcelain` resolves every other linked worktree of the repo (such as an implement-ready task checkout under `.worktrees/`) and prunes those paths from the walk, since a sibling worktree's own tracked source is not part of this working tree's suppression inventory. Staged and range scans already exclude other worktrees because `git checkout-index` and `git archive` only ever materialize tracked content for the target ref, so this pruning is `--working-tree`-only. `tools/check-no-new-lint-suppressions-tests.sh` (run via `just lint-suppressions-tests`) is the regression coverage: it builds an isolated fixture repo with a nested linked worktree to prove that worktree's suppressions are ignored while a real new suppression in tracked source is still rejected.
+
 ### Reachability Gate
 
 The GPUI client's unreachable surface is pinned by a committed baseline, so a feature that compiles and passes unit tests but is never constructed by the running binary shows up as a number instead of hiding behind a green test run.
