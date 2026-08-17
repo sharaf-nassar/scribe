@@ -417,15 +417,17 @@ P2_EDGE=$(edge_delta /output/beads-board-hover.png 225 184)
 EPIC_GAP=$(epic_right_gap /output/beads-board-hover.png "$WIN_W" 10 97)
 [ "${EPIC_GAP:-999}" -le 6 ] || fail "the epic is ${EPIC_GAP}px short of the card's right edge"
 
-# A truncated normal card reveals its complete fixture title immediately. The
-# long Done card sits against the right viewport edge, so the wrapped popup also
-# proves GPUI clamps the bounded tooltip inside the window. Mask the card's own
-# hover repaint before measuring the popup.
+# Hovering even the bottom padding of a truncated normal card reveals its
+# complete title immediately above that card. The long Done card sits against
+# the right viewport edge, so the wrapped popup also proves the bounded reveal
+# stays inside the window. Mask the card's own hover repaint before measuring.
 TITLE_CARD_LEFT=$(( 16 + 4 * LANE_W ))
 TITLE_CARD_TOP=70
 TITLE_CARD_W=$(( LANE_W - 20 ))
 TITLE_CARD_H=46
-xdotool mousemove --sync --window "$WID" "$(( TITLE_CARD_LEFT + 90 ))" 84
+xdotool mousemove --sync --window "$WID" \
+    "$(( TITLE_CARD_LEFT + TITLE_CARD_W - 10 ))" \
+    "$(( TITLE_CARD_TOP + TITLE_CARD_H - 5 ))"
 sleep 0.1
 import -window "$WID" /output/beads-board-title-tooltip.png
 TOOLTIP_BOUNDS=$(convert /output/beads-board-hover.png \
@@ -445,10 +447,12 @@ fi
     && [ "$TOOLTIP_W" -le 500 ] \
     && [ "$TOOLTIP_H" -ge 30 ] \
     && [ "$TOOLTIP_H" -le 100 ] \
+    && [ "$TOOLTIP_X" -ge 0 ] \
     && [ "$(( TOOLTIP_X + TOOLTIP_W ))" -le "$WIN_W" ] \
-    && [ "$(( TOOLTIP_X + TOOLTIP_W ))" -le "$(( TITLE_CARD_LEFT + 90 ))" ] \
-    && [ "$(( TOOLTIP_Y + TOOLTIP_H ))" -le "$WIN_H" ] \
-    || fail "full-title tooltip ${TOOLTIP_W}x${TOOLTIP_H}+${TOOLTIP_X}+${TOOLTIP_Y} is not wrapped, bounded, and viewport-safe"
+    && [ "$TOOLTIP_X" -lt "$(( TITLE_CARD_LEFT + TITLE_CARD_W ))" ] \
+    && [ "$(( TOOLTIP_X + TOOLTIP_W ))" -gt "$TITLE_CARD_LEFT" ] \
+    && [ "$(( TOOLTIP_Y + TOOLTIP_H ))" -le "$TITLE_CARD_TOP" ] \
+    || fail "full-title tooltip ${TOOLTIP_W}x${TOOLTIP_H}+${TOOLTIP_X}+${TOOLTIP_Y} is not above its card, wrapped, bounded, and viewport-safe"
 TOOLTIP_BG=$(convert /output/beads-board-title-tooltip.png \
     -format "%[pixel:p{$(( TOOLTIP_X + 3 )),$(( TOOLTIP_Y + 3 ))}]" info:)
 [ "$TOOLTIP_BG" = "$BOARD_GROUND" ] \

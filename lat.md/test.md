@@ -3851,12 +3851,13 @@ and target matrices, workspace hover and PTY ownership, guarded queue fences,
 generation-tagged overlays, rollback, classifier outcomes, and the five-second
 Undo deadline. [The visual script](../tests/e2e/visual/beads-board.sh) checks
 neutral lane ground in normal and pinned boards. Its exact long-title fixture
-captures the normal-card reveal after 100ms, below GPUI's default tooltip delay,
-and requires a wrapped bounded box positioned inside the right viewport edge
-with the board's opaque theme ground. The same run then copies the card ID and
-moves the long-titled source through the native drag waypoints, so a tooltip on
-the drag ghost, a broken nested copy target, or lost board hover fails the
-focused path. It checks compact borders for accepted and rejected targets
+hovers the normal card's bottom padding, captures the reveal after 100ms, and
+requires a wrapped bounded box above and horizontally overlapping that card,
+inside the right viewport edge with the board's opaque theme ground. The same
+run then copies the card ID and moves the long-titled source through the native
+drag waypoints, so title-only activation, a tooltip on the drag ghost, a broken
+nested copy target, or lost board hover fails the focused path. It checks
+compact borders for accepted and rejected targets
 independently, then measures the native ghost over a card, a rejected lane, and
 outside the board while terminal rows remain fixed. The full path crops the
 text-size reversal to the grid band between the independently repainting

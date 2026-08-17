@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, Context, DragMoveEvent, FontWeight, MouseButton, Pixels, Point, Render, Rgba, Role,
-    SharedString, Window, div, linear_color_stop, linear_gradient, prelude::*, px, uniform_list,
+    Anchor, AnyElement, Bounds, Context, DragMoveEvent, FontWeight, MouseButton, Pixels, Point,
+    Render, Rgba, Role, SharedString, Window, anchored, div, linear_color_stop, linear_gradient,
+    point, prelude::*, px, uniform_list,
 };
 
 use crate::beads_panel::BeadsPanels;
@@ -994,27 +995,33 @@ struct BeadsCardDragGhost {
     metrics: Metrics,
 }
 
-/// Full issue title shown only by a normal card hover. The native drag ghost
-/// renders its own entity and never receives this tooltip.
+/// Full issue title anchored above the normal card that owns the hover.
 struct BeadsCardTooltip {
     title: String,
+    anchor: Bounds<Pixels>,
     colors: BeadsBoardColors,
     text_size: Pixels,
 }
 
 impl Render for BeadsCardTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .max_w(px(480.0))
-            .bg(alpha(self.colors.ground, 1.0))
-            .border_1()
-            .border_color(alpha(self.colors.title, 0.28))
-            .font_family("monospace")
-            .text_size(self.text_size)
-            .text_color(self.colors.title)
-            .child(self.title.clone())
+        anchored()
+            .anchor(Anchor::BottomLeft)
+            .position(point(self.anchor.origin.x, self.anchor.origin.y - px(4.0)))
+            .snap_to_window_with_margin(px(4.0))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .max_w(px(480.0))
+                    .bg(alpha(self.colors.ground, 1.0))
+                    .border_1()
+                    .border_color(alpha(self.colors.title, 0.28))
+                    .font_family("monospace")
+                    .text_size(self.text_size)
+                    .text_color(self.colors.title)
+                    .child(self.title.clone()),
+            )
     }
 }
 
@@ -1541,8 +1548,12 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     let draggable = card_drag_source(lane);
     let drag_source = item.clone();
     let drag_colors = *colors;
-    let mark = colors.priority_mark(item.priority);
+    let tooltip_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
+    let measured_tooltip_bounds = std::rc::Rc::clone(&tooltip_bounds);
     let card_element = div()
+        .on_children_prepainted(move |children, _window, _app| {
+            measured_tooltip_bounds.set(children.first().copied());
+        })
         .id(SharedString::from(format!("beads-card-{workspace_id}-{}", item.id)))
         .role(Role::Button)
         .aria_label(format!("Open issue {}", item.id))
@@ -1600,41 +1611,43 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     } else {
         card_element
     };
-    card_element
+    with_card_title_tooltip(
+        card_element,
+        item.title.clone(),
+        tooltip_bounds,
+        colors,
+        metrics.at(12.0),
+    )
+    .child(card_contents(item, card, colors.priority_mark(item.priority)))
+    .into_any_element()
+}
+
+fn with_card_title_tooltip(
+    card: gpui::Stateful<gpui::Div>,
+    title: String,
+    popup_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    colors: &BeadsBoardColors,
+    text_size: Pixels,
+) -> gpui::Stateful<gpui::Div> {
+    let colors = *colors;
+    card.tooltip(move |_window, cx| {
+        let anchor = popup_bounds.get().unwrap_or_default();
+        cx.new(|_| BeadsCardTooltip { title: title.clone(), anchor, colors, text_size }).into()
+    })
+    .tooltip_show_delay(Duration::ZERO)
+}
+
+fn card_contents(item: &BeadsBoardItem, card: CardContext<'_>, mark: PriorityMark) -> gpui::Div {
+    div()
+        .size_full()
         .flex()
         .flex_col()
         .gap(px(2.0))
         .pt(px(CARD_PAD_TOP))
         .px(px(8.0))
         .pb(px(6.0))
-        .child(normal_issue_title(item, workspace_id, mark, colors, metrics))
+        .child(issue_title(item, mark, card.colors, card.metrics))
         .child(issue_meta(item, card))
-        .into_any_element()
-}
-
-/// Add the full-title reveal to the normal card title without putting the
-/// tooltip wrapper into the native drag ghost.
-fn normal_issue_title(
-    item: &BeadsBoardItem,
-    workspace_id: WorkspaceId,
-    mark: PriorityMark,
-    colors: &BeadsBoardColors,
-    metrics: Metrics,
-) -> impl IntoElement {
-    let title = item.title.clone();
-    let colors = *colors;
-    div()
-        .id(SharedString::from(format!("beads-card-title-{workspace_id}-{}", item.id)))
-        .child(issue_title(item, mark, &colors, metrics))
-        .tooltip(move |_window, cx| {
-            cx.new(|_| BeadsCardTooltip {
-                title: title.clone(),
-                colors,
-                text_size: metrics.at(12.0),
-            })
-            .into()
-        })
-        .tooltip_show_delay(Duration::ZERO)
 }
 
 /// The priority badge and the title, which owns the rest of its line: the
