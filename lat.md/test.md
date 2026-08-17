@@ -1750,11 +1750,12 @@ The live functional proof derives its field coordinates from the painted detail 
 
 The image-difference bound includes the panel shadow, so the script normalizes
 its known 590px outer width to the 560px surface before targeting the title.
-It uses explicit select-all, submits with Enter, requires exactly one
-`set_title` wire verb and Applied result, and confirms the exact `bd show`
-value. It writes `beads-editor-pointer-checkpoint.txt` before the independent
-card-drag assertions, so any later drag failure cannot obscure this editor
-result.
+It moves the active caret and bounds the changed title pixels, then selects all
+and requires a larger highlight diff before typing. It submits with Enter,
+requires exactly one `set_title` wire verb and Applied result, and confirms the
+exact `bd show` value. The retained caret and selection crops plus
+`beads-editor-pointer-checkpoint.txt` precede independent card-drag assertions,
+so a later drag failure cannot obscure this editor result.
 
 #### Beads Write Executor Unit Contract
 
@@ -4714,6 +4715,14 @@ through that current layout instead of the activation snapshot.
 
 IME marked text redraws the draft and maps its new end offset through the
 current shaped layout.
+
+### Editor visual feedback
+
+The visual range matrix pins caret, selection background, marked underline,
+and overlapping selection-plus-marked styles.
+
+The live pointer checkpoint moves the caret and selects the title, then
+compares bounded image crops before replacing the selected text.
 
 ### Keyboard activation enters the shared editor
 

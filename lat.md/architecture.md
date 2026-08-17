@@ -66,6 +66,27 @@ Integration test harness with PTY capture, IPC helpers, and assertion utilities.
 
 Scripts and helpers used during local development builds.
 
+### lat.md Agent Tooling
+
+Agent-facing lat.md discovery and validation are host-owned, not part of Scribe's runtime or source tree.
+
+The repository keeps architecture and test intent under `lat.md/`, while the
+active agent host provides `lat_search`, `lat_section`, `lat_locate`,
+`lat_expand`, `lat_refs`, and `lat_check`. The host also owns the lifecycle
+policy that reminds agents to search before work and validates references and
+documentation sync when work ends.
+
+Scribe does not register a second project-local Pi extension under
+`.pi/extensions/`. Keeping one registration owner prevents duplicate tool
+names and competing lifecycle hooks when the host already supplies the same
+surface.
+
+This boundary also keeps Pi extension APIs, TypeBox schemas, TUI renderers, and
+their package versions outside the application repository. Removing the local
+extension changes where agent commands are registered; it does not change the
+`lat.md/` format or the requirement to keep those documents synchronized with
+Scribe behavior.
+
 ### Rust Toolchain and CI Images
 
 Scribe pins Rust 1.95 for local builds, release CI, and the functional and visual test images so GPUI builds use one supported compiler and native dependency set.
@@ -167,7 +188,7 @@ Bug workaround, wired in via `[patch.crates-io]` in the root `Cargo.toml`:
 
 - `third_party/unix-ancillary/` — local fork of `unix-ancillary 0.1.0`. Upstream 0.1.0 fails to compile on Apple targets because `ancillary.rs::set_cloexec` references `io::Result`/`io::Error` without importing `std::io`. The fork adds a cfg-gated `use std::io;` that mirrors the function's own cfg. Remove once a fixed release ships on crates.io.
 
-Trust-boundary forks, consumed as path dependencies rather than patches because their public API is deliberately not the upstream one. Both decode untrusted PTY bytes, forbid `unsafe`, drop every encoder and indirect-resource path, and take caller-owned limits, budgets, deadlines, and cancellation hooks. Replacing either with its stock crate, a C decoder, or a generic image library requires a new trust-boundary review — see [[terminal-images#Terminal Images#Bounded Sixel Decoder]] and [[terminal-images#Terminal Images#Bounded Kitty PNG Decoder]]:
+Trust-boundary forks, consumed as path dependencies rather than patches because their public API is deliberately not the upstream one. Both decode untrusted PTY bytes, forbid `unsafe`, drop every encoder and indirect-resource path, and take caller-owned limits, budgets, deadlines, and cancellation hooks. Replacing either with its stock crate, a C decoder, or a generic image library requires a new trust-boundary review — see [[terminal-images#Bounded Sixel Decoder]] and [[terminal-images#Bounded Kitty PNG Decoder]]:
 
 - `third_party/icy-sixel-decoder/` — decoder-only fork of `icy_sixel 0.5.0`, MIT OR Apache-2.0, consumed by `scribe-server`.
 - `third_party/image-png-decoder/` — decoder-only fork of `png 0.18.1` published locally as `scribe-png-decoder`, MIT OR Apache-2.0, consumed by `scribe-common`.

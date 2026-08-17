@@ -1072,7 +1072,10 @@ selection drag, Backspace, and Delete snap to Unicode grapheme boundaries.
 Platform UTF-16 replacement and marked ranges retain exact valid character
 boundaries, so an IME can replace a combining mark without deleting its base.
 Each active draft render refreshes the retained layout used for native point
-indexing and range bounds.
+indexing and range bounds. The same `TextLayout` positions the focused
+collapsed caret, while `StyledText` highlights paint selections across literal
+and wrapped lines. Overlapping selection and IME ranges are split into combined
+runs so marked text keeps its underline inside a selection.
 
 Inactive one-line fields may keep their visual ellipsis, but activation clears
 text overflow on the shaped draft so native bounds and pointer indexing cover

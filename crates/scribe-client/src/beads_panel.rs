@@ -9,9 +9,10 @@ use std::{
 
 use gpui::{
     AccessibleAction, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent,
-    MouseButton, Pixels, Point, Rgba, Role, SharedString, StyledText, Subscription, TextLayout,
-    UTF16Selection, Window, canvas, div, linear_color_stop, linear_gradient, prelude::*, px,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, HighlightStyle,
+    KeyDownEvent, MouseButton, Pixels, Point, Rgba, Role, SharedString, StyledText, Subscription,
+    TextLayout, UTF16Selection, UnderlineStyle, Window, canvas, combine_highlights, div, fill,
+    linear_color_stop, linear_gradient, prelude::*, px, size,
 };
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
@@ -825,6 +826,26 @@ impl BeadsEditor {
                 && active.field == field)
                 .then_some(active.input.as_str())
         })
+    }
+
+    fn visual_feedback(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        field: EditField,
+        color: Rgba,
+    ) -> EditorVisualFeedback {
+        self.session
+            .active
+            .as_ref()
+            .filter(|edit| {
+                edit.workspace_id == workspace_id
+                    && edit.issue_id == issue_id
+                    && edit.field == field
+            })
+            .map_or_else(EditorVisualFeedback::default, |edit| {
+                editor_visual_feedback(edit.selection.clone(), edit.marked.clone(), color)
+            })
     }
 }
 
@@ -2239,6 +2260,49 @@ fn identity_docs(
         .into_any_element()
 }
 
+#[derive(Default)]
+struct EditorVisualFeedback {
+    caret: Option<usize>,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+fn editor_visual_feedback(
+    selection: Range<usize>,
+    marked: Option<Range<usize>>,
+    color: Rgba,
+) -> EditorVisualFeedback {
+    if selection.is_empty() && marked.is_none() {
+        return EditorVisualFeedback { caret: Some(selection.start), highlights: Vec::new() };
+    }
+
+    let caret = selection.is_empty().then_some(selection.start);
+    let selection_highlight = (!selection.is_empty()).then(|| {
+        (
+            selection,
+            HighlightStyle {
+                background_color: Some(with_alpha(color, 0.28).into()),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    let marked_highlight = marked.filter(|range| !range.is_empty()).map(|range| {
+        (
+            range,
+            HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    color: Some(color.into()),
+                    thickness: px(1.0),
+                    wavy: false,
+                }),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    let highlights = combine_highlights(selection_highlight, marked_highlight).collect();
+
+    EditorVisualFeedback { caret, highlights }
+}
+
 #[derive(Clone)]
 struct EditableTextState {
     workspace_id: WorkspaceId,
@@ -2287,7 +2351,13 @@ fn editable_text(
     } else {
         shown.clone()
     };
-    let styled = StyledText::new(display);
+    let visual = beads_editor.read(wiring.app).visual_feedback(
+        wiring.workspace_id,
+        issue_id,
+        field,
+        wiring.colors.title,
+    );
+    let styled = StyledText::new(display).with_highlights(visual.highlights);
     let focus = beads_editor.read(wiring.app).focus.clone();
     let state = EditableTextState {
         workspace_id: wiring.workspace_id,
@@ -2322,7 +2392,13 @@ fn editable_text(
     let surface = editable_pointer_selection_surface(surface, state.clone());
     let surface = surface.child(text.child(styled));
     if active {
-        editable_input_surface(surface, focus, state.editor, state.layout)
+        editable_input_surface(
+            surface,
+            focus,
+            state.editor,
+            state.layout,
+            visual.caret.map(|caret| (caret, wiring.colors.title)),
+        )
     } else {
         surface
     }
@@ -2470,6 +2546,7 @@ fn editable_input_surface(
     focus: FocusHandle,
     editor: Entity<BeadsEditor>,
     layout: TextLayout,
+    caret: Option<(usize, Rgba)>,
 ) -> gpui::Stateful<gpui::Div> {
     surface.child(
         canvas(
@@ -2477,6 +2554,15 @@ fn editable_input_surface(
             move |bounds, (), window, app| {
                 editor.update(app, |editor, _| editor.layout = Some(layout.clone()));
                 window.handle_input(&focus, ElementInputHandler::new(bounds, editor.clone()), app);
+                if focus.is_focused(window)
+                    && let Some((caret, color)) = caret
+                    && let Some(origin) = layout.position_for_index(caret)
+                {
+                    window.paint_quad(fill(
+                        Bounds::new(origin, size(px(2.0), layout.line_height())),
+                        color,
+                    ));
+                }
             },
         )
         .absolute()
@@ -4590,6 +4676,28 @@ mod tests {
 
         assert_eq!(caret.origin.y, px(30.0));
         assert!(caret.origin.x > px(8.0));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Editor visual feedback]]
+    #[test]
+    fn editor_visual_feedback_covers_caret_selection_and_ime_marking() {
+        let color = gpui::rgba(0x66aa_ffff);
+        let collapsed = editor_visual_feedback(3..3, None, color);
+        assert_eq!(collapsed.caret, Some(3));
+        assert!(collapsed.highlights.is_empty());
+
+        let selected = editor_visual_feedback(1..4, Some(2..5), color);
+        assert_eq!(selected.caret, None);
+        assert_eq!(
+            selected.highlights.iter().map(|(range, _)| range.clone()).collect::<Vec<_>>(),
+            vec![1..2, 2..4, 4..5]
+        );
+        assert!(selected.highlights[0].1.background_color.is_some());
+        assert!(selected.highlights[0].1.underline.is_none());
+        assert!(selected.highlights[1].1.background_color.is_some());
+        assert!(selected.highlights[1].1.underline.is_some());
+        assert!(selected.highlights[2].1.background_color.is_none());
+        assert!(selected.highlights[2].1.underline.is_some());
     }
 
     // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Marked composition refreshes native layout]]

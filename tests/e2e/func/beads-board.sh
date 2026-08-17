@@ -450,9 +450,9 @@ PY
 drag_issue() {
     local issue="$1" target_lane="$2" position source_lane index
     local lane_width source_left press_x press_y target_x reports_before reports_after
-    # A native release ends the hover overlay. Use the visual harness's proven
-    # badge path before resolving fresh card geometry for every gesture.
-    xdotool mousemove --sync --window "$WID" 91 17
+    # A native release ends the hover overlay. Re-enter through the painted bead
+    # target before resolving fresh card geometry for every gesture.
+    xdotool mousemove --sync --window "$WID" 13 17
     sleep 0.5
     position=$(issue_position "$issue") || fail "$issue has no painted card"
     read -r source_lane index <<<"$position"
@@ -473,12 +473,12 @@ drag_issue() {
     reports_after=$(mouse_report_count)
     [ "$reports_after" -eq "$reports_before" ] \
         || fail "$issue drag leaked mouse reports ($reports_before -> $reports_after)"
-    xdotool mousemove --sync --window "$WID" 91 17
+    xdotool mousemove --sync --window "$WID" 13 17
     sleep 0.5
 }
 
 # Hover the rooted workspace's bead and wait for the real board to paint.
-xdotool mousemove --sync --window "$WID" 91 17
+xdotool mousemove --sync --window "$WID" 13 17
 for _ in $(seq 1 30); do
     sleep 0.2
     import -window "$WID" /output/beads-real-board.png
@@ -573,7 +573,30 @@ KEYS_BEFORE=$(key_input_count)
 panel_move 188 23
 xdotool click 1
 sleep 0.2
+import -window "$WID" /output/beads-editor-caret-before.png
+xdotool key --clearmodifiers Left
+sleep 0.2
+import -window "$WID" /output/beads-editor-caret-after.png
+EDITOR_VISUAL_CROP="440x32+$(( PANEL_LEFT + 100 ))+$(( PANEL_TOP + 8 ))"
+convert /output/beads-editor-caret-before.png -crop "$EDITOR_VISUAL_CROP" +repage \
+    /output/beads-editor-caret-before-crop.png
+convert /output/beads-editor-caret-after.png -crop "$EDITOR_VISUAL_CROP" +repage \
+    /output/beads-editor-caret-after-crop.png
+CARET_DIFF=$(compare -metric AE /output/beads-editor-caret-before-crop.png \
+    /output/beads-editor-caret-after-crop.png null: 2>&1 || true)
+CARET_DIFF=${CARET_DIFF%%.*}
+[ "${CARET_DIFF:-0}" -ge 20 ] && [ "${CARET_DIFF:-0}" -le 500 ] \
+    || fail "moving the editor caret changed ${CARET_DIFF:-0}px"
 xdotool key --clearmodifiers ctrl+a
+sleep 0.2
+import -window "$WID" /output/beads-editor-selection.png
+convert /output/beads-editor-selection.png -crop "$EDITOR_VISUAL_CROP" +repage \
+    /output/beads-editor-selection-crop.png
+SELECTION_DIFF=$(compare -metric AE /output/beads-editor-caret-after-crop.png \
+    /output/beads-editor-selection-crop.png null: 2>&1 || true)
+SELECTION_DIFF=${SELECTION_DIFF%%.*}
+[ "${SELECTION_DIFF:-0}" -ge 200 ] \
+    || fail "select-all painted only ${SELECTION_DIFF:-0}px"
 xdotool type --clearmodifiers --delay 5 -- "$EDITOR_TITLE"
 sleep 0.2
 KEYS_AFTER=$(key_input_count)
@@ -587,9 +610,10 @@ wait_for_applied e2e-detail "$EDITOR_APPLIED_BEFORE"
 EDITOR_SHOW=$(cd "$PROJECT" && bd show e2e-detail --json)
 printf '%s\n' "$EDITOR_SHOW" | grep -Fq "\"title\": \"$EDITOR_TITLE\"" \
     || fail "pointer title edit did not persist exactly once: $EDITOR_SHOW"
-printf '%s\n' 'PASS: real pointer editor committed set_title without KeyInput leakage' \
+printf '%s\n' \
+    'PASS: real pointer editor painted caret and selection, then committed set_title without KeyInput leakage' \
     >/output/beads-editor-pointer-checkpoint.txt
-echo 'CHECKPOINT: real pointer editor committed set_title without KeyInput leakage'
+echo 'CHECKPOINT: real pointer editor painted feedback and committed without KeyInput leakage'
 
 # Install the deterministic bd fault shim after the capability handshake. It
 # delegates every read and targets only writes for this fixture.
@@ -662,7 +686,7 @@ echo 'PASS: real bd detail persisted, editor input stayed local, and write failu
 
 # @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]]
 xdotool key --clearmodifiers Escape
-xdotool mousemove --sync --window "$WID" 91 17
+xdotool mousemove --sync --window "$WID" 13 17
 sleep 0.5
 
 # Keep SingleController write authority: type the DEC modes through the client
@@ -679,7 +703,7 @@ for _ in $(seq 1 20); do
 done
 [ "$(mouse_report_count)" -ge "$(( PROBE_BEFORE + 2 ))" ] \
     || fail "owner-visible pane did not enable SGR mouse reporting"
-xdotool mousemove --sync --window "$WID" 91 17
+xdotool mousemove --sync --window "$WID" 13 17
 sleep 0.5
 
 CLAIM_BEFORE=$(issue_write_count e2e-ready claim)
