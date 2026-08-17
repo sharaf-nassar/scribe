@@ -734,7 +734,10 @@ printf '%s\n' "$CLOSED_DROP" | grep -Eq '"closed_at": "[0-9]{4}-' \
 import -window "$WID" /output/beads-drag-close-notice.png
 UNDO_BEFORE=$(issue_write_count e2e-close undo_close)
 UNDO_RECORD_BEFORE=$(wc -l <"$RECORD")
-xdotool mousemove --sync --window "$WID" "$(( WIN_W - 100 ))" 255
+# The close notice shares the detail panel's centered geometry, so its Undo
+# target follows the detected panel origin rather than the lane the card was
+# dropped into.
+panel_move 280 16
 xdotool click 1
 wait_for_write e2e-close undo_close "$UNDO_BEFORE"
 UNDO_RESULT_LINE=$(wait_for_applied_line e2e-close "$UNDO_RECORD_BEFORE")
