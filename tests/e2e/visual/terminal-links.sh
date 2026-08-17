@@ -243,7 +243,7 @@ echo "PHASE 4 PASS: a relative link opened as $LINK_DIR/linkme.txt"
 : >"$OPENED"
 mkdir -p "$LINK_DIR/.impeccable/mocks"
 touch "$LINK_DIR/.impeccable/mocks/linkme.html"
-run_in_pane "clear; for i in \$(seq 1 20); do echo '.impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html'; done"
+run_in_pane "clear; for i in \$(seq 1 20); do echo ' .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html'; done"
 shot /output/05-dotpath-grid.png
 click_middle ctrl
 wait_for_open "$LINK_DIR/.impeccable/mocks/linkme.html" 10 \
@@ -256,7 +256,7 @@ echo "PHASE 5 PASS: a dot-prefixed relative link opened as $LINK_DIR/.impeccable
 # itself and not only against a synthetic linkme.html.
 : >"$OPENED"
 touch "$LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html"
-run_in_pane "clear; for i in \$(seq 1 20); do echo '.impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html'; done"
+run_in_pane "clear; for i in \$(seq 1 20); do echo ' .impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html'; done"
 shot /output/07-repro-grid.png
 click_middle ctrl
 wait_for_open "$LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html" 10 \
