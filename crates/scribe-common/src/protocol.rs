@@ -40,7 +40,10 @@ use crate::terminal_images::{
 ///
 /// Bumped to `7` because suppressed AI ED 3 no longer emits `ScrollBottom`,
 /// changing the terminal-frame semantics visible to remote peers.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 7;
+///
+/// Bumped to `8` because remote session metadata may now carry
+/// [`AiProvider::Pi`].
+pub const REMOTE_PROTOCOL_VERSION: u32 = 8;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +260,26 @@ impl ShellTool {
         match self {
             ShellTool::Pi => "pi",
         }
+    }
+}
+
+/// Build Pi launch metadata for a peer's negotiated local capability.
+///
+/// Unsupported peers keep the legacy [`ShellTool::Pi`] representation so they
+/// never deserialize the newer [`AiProvider::Pi`] enum value.
+#[must_use]
+pub fn pi_launch_metadata(pi_provider: bool) -> (Option<AiLaunchSpec>, Option<ShellTool>) {
+    if pi_provider {
+        (
+            Some(AiLaunchSpec {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }),
+            None,
+        )
+    } else {
+        (None, Some(ShellTool::Pi))
     }
 }
 
@@ -690,6 +713,10 @@ pub enum ClientMessage {
         /// never sends an unknown top-level variant to an older local client.
         #[serde(default)]
         ci_run_bar: bool,
+        /// Structured Pi provider support. Missing means the peer must use only
+        /// legacy [`ShellTool::Pi`] launch and session metadata.
+        #[serde(default)]
+        pi_provider: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -1109,6 +1136,10 @@ pub enum ServerMessage {
         /// from detail reads because bd 1.1.0 cannot enforce write guards.
         #[serde(default)]
         beads_write: bool,
+        /// Structured Pi provider support. Missing means the client must keep
+        /// using legacy [`ShellTool::Pi`] metadata.
+        #[serde(default)]
+        pi_provider: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -1667,6 +1698,48 @@ pub struct SessionInfo {
     pub prompt_state: Option<SessionPromptState>,
 }
 
+impl SessionInfo {
+    /// Replace structured Pi metadata with the legacy shell-tool shape when the
+    /// receiving local peer did not advertise Pi provider support.
+    pub fn make_pi_provider_compatible(&mut self, pi_provider: bool) {
+        if pi_provider
+            || (self.ai_state.as_ref().map(|state| state.provider) != Some(AiProvider::Pi)
+                && self.ai_provider_hint != Some(AiProvider::Pi))
+        {
+            return;
+        }
+        self.ai_state = None;
+        self.ai_provider_hint = None;
+        self.shell_tool = Some(ShellTool::Pi);
+        self.task_label = None;
+        self.codex_task_label = None;
+        self.prompt_state = None;
+    }
+}
+
+impl ServerMessage {
+    /// Downgrade this frame for a peer that cannot deserialize
+    /// [`AiProvider::Pi`]. Returns `false` when the frame must be withheld.
+    pub fn make_pi_provider_compatible(&mut self, pi_provider: bool) -> bool {
+        if pi_provider {
+            return true;
+        }
+        match self {
+            ServerMessage::AiStateChanged { ai_state, .. } => ai_state.provider != AiProvider::Pi,
+            ServerMessage::TaskLabelChanged { provider, .. }
+            | ServerMessage::TaskLabelCleared { provider, .. }
+            | ServerMessage::PromptReceived { provider, .. } => *provider != AiProvider::Pi,
+            ServerMessage::SessionList { sessions, .. } => {
+                for session in sessions {
+                    session.make_pi_provider_compatible(false);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+}
+
 /// A single search match location in the terminal grid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
@@ -1929,6 +2002,19 @@ mod tests {
         },
     }
 
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    enum HelloWithoutPiProvider {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            join_window: bool,
+            terminal_images: TerminalImageCapabilities,
+            ci_run_bar: bool,
+        },
+    }
+
     #[derive(Serialize)]
     #[serde(tag = "type")]
     enum WelcomeWithoutBeadsDetail {
@@ -1952,6 +2038,144 @@ mod tests {
             terminal_images: TerminalImageCapabilities,
             beads_detail: bool,
         },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutPiProvider {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+            beads_write: bool,
+        },
+    }
+
+    #[test]
+    fn old_hello_and_welcome_default_pi_provider_to_false() {
+        let hello = HelloWithoutPiProvider::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+        };
+        let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize old Hello");
+        let decoded_hello: ClientMessage =
+            rmp_serde::from_slice(&hello_bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded_hello, ClientMessage::Hello { pi_provider: false, .. }));
+
+        let welcome = WelcomeWithoutPiProvider::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+        };
+        let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize old Welcome");
+        let decoded_welcome: ServerMessage =
+            rmp_serde::from_slice(&welcome_bytes).expect("deserialize old Welcome");
+        assert!(matches!(decoded_welcome, ServerMessage::Welcome { pi_provider: false, .. }));
+    }
+
+    #[test]
+    fn old_peers_ignore_new_pi_provider_capability_fields() {
+        let hello = ClientMessage::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+        };
+        let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize new Hello");
+        let _: HelloWithoutPiProvider =
+            rmp_serde::from_slice(&hello_bytes).expect("old client schema decodes new Hello");
+
+        let welcome = ServerMessage::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            pi_provider: true,
+        };
+        let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize new Welcome");
+        let _: WelcomeWithoutPiProvider =
+            rmp_serde::from_slice(&welcome_bytes).expect("old server schema decodes new Welcome");
+    }
+
+    #[test]
+    fn pi_compatibility_helpers_choose_structured_or_legacy_metadata() {
+        let (structured, structured_tool) = pi_launch_metadata(true);
+        assert!(matches!(
+            structured,
+            Some(AiLaunchSpec {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            })
+        ));
+        assert_eq!(structured_tool, None);
+
+        let (legacy, legacy_tool) = pi_launch_metadata(false);
+        assert_eq!(legacy, None);
+        assert_eq!(legacy_tool, Some(ShellTool::Pi));
+
+        let session_id = SessionId::new();
+        let mut ai_state = AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing);
+        ai_state.context = Some(42);
+        let mut message = ServerMessage::SessionList {
+            sessions: vec![SessionInfo {
+                session_id,
+                workspace_id: WorkspaceId::new(),
+                launch_id: Some("launch-pi".to_owned()),
+                shell_name: "bash".to_owned(),
+                title: None,
+                icon_title: None,
+                context: None,
+                task_label: Some("ship Pi".to_owned()),
+                codex_task_label: None,
+                cwd: None,
+                git_branch: None,
+                ai_state: Some(ai_state),
+                ai_provider_hint: Some(AiProvider::Pi),
+                shell_tool: None,
+                prompt_state: Some(SessionPromptState::default()),
+            }],
+            workspace_tree: None,
+            workspaces: Vec::new(),
+        };
+        assert!(message.make_pi_provider_compatible(false));
+        let ServerMessage::SessionList { sessions, .. } = message else {
+            panic!("expected SessionList");
+        };
+        let session = sessions.first().expect("one session");
+        assert_eq!(session.shell_tool, Some(ShellTool::Pi));
+        assert!(session.ai_state.is_none());
+        assert!(session.ai_provider_hint.is_none());
+        assert!(session.task_label.is_none());
+        assert!(session.prompt_state.is_none());
+
+        let mut live = ServerMessage::AiStateChanged {
+            session_id,
+            ai_state: AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing),
+        };
+        assert!(!live.make_pi_provider_compatible(false));
+    }
+
+    #[test]
+    fn remote_protocol_advances_for_pi_provider_state() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -2392,6 +2616,7 @@ mod tests {
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: false,
             beads_write: true,
+            pi_provider: true,
         };
         let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
         let decoded_write: ServerMessage =

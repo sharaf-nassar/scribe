@@ -213,6 +213,7 @@ fn insert_local_fixtures(
             join_window: false,
             terminal_images: TerminalImageCapabilities::V1,
             ci_run_bar: false,
+            pi_provider: false,
         },
     )?;
     insert_named(
@@ -244,6 +245,7 @@ fn insert_local_fixtures(
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: false,
             beads_write: false,
+            pi_provider: false,
         },
     )
 }

@@ -571,6 +571,9 @@ struct Shared {
     tabs: Arc<Mutex<TabSessions>>,
     /// Server-connection flag driving the status bar's connection dot.
     connected: Arc<AtomicBool>,
+    /// Whether the connected server negotiated structured Pi provider metadata.
+    /// False until each connection's `Welcome` confirms support.
+    pi_provider: Arc<AtomicBool>,
     /// Set by the IPC reader once the server has answered this connection's
     /// first `ListSessions`. Cold-restart replay waits on it: only an *answered*
     /// and empty session list proves the server lost everything, which is the
@@ -10222,6 +10225,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         focused_size: Arc::new(Mutex::new(terminal_size)),
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
+        pi_provider: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
         initial_session: Arc::new(InitialSessionBootstrap::new(initial_session)),
         ai: Arc::new(Mutex::new(AiChrome::new(
@@ -11596,6 +11600,11 @@ where
     // One-shot: the bootstrap's first handshake reopens the server's other
     // windows, and no later handshake on this or any other connection does.
     let fan_out_other_windows = std::mem::take(&mut ctx.fan_out);
+    // Capabilities belong to this connection. Reset before `Hello` so a queued
+    // Pi launch cannot reuse a newer server's answer while reconnecting to an
+    // older one.
+    ctx.shared.pi_provider.store(false, Ordering::Release);
+
     // Write the connection handshake directly before draining the shared
     // outbound queue. A reconnect may have queued UI work while no stream was
     // alive; allowing that work ahead of `Hello` would violate the protocol.
@@ -11620,6 +11629,7 @@ where
             // @lat: [[terminal-images#Terminal Images#Pinned Application Corpus]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
+            pi_provider: true,
         },
     )
     .await
@@ -11663,6 +11673,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         ai: Arc::clone(&ctx.shared.ai),
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
+        pi_provider: Arc::clone(&ctx.shared.pi_provider),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
         initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
@@ -12132,6 +12143,8 @@ struct ReaderCtx {
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
     tabs: Arc<Mutex<TabSessions>>,
+    /// Negotiated structured Pi provider support for this connection.
+    pi_provider: Arc<AtomicBool>,
     /// Latched by the first `SessionList`; see the `session_list_seen` field of
     /// `Shared`.
     session_list_seen: Arc<AtomicBool>,
@@ -13815,12 +13828,14 @@ fn on_welcome(
         clipboard_gating,
         beads_detail,
         beads_write,
+        pi_provider,
         ..
     } = welcome
     else {
         return;
     };
     registry.adopt_window(window_id);
+    ctx.pi_provider.store(pi_provider, Ordering::Release);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
     if ctx.fan_out_other_windows && !other_windows.is_empty() {
         tracing::info!(
@@ -13845,6 +13860,7 @@ fn on_welcome(
         adopted = ?registry.adopted_window(),
         ?participant_id,
         clipboard_gating,
+        pi_provider,
         "welcome: adopted window"
     );
 }

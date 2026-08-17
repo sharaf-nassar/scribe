@@ -1719,9 +1719,9 @@ mod tests {
             tool_argv(ShellKind::PowerShell, Some("/s/scribe.ps1")),
             ["-NoLogo", "-Command", "pi"]
         );
-        // A tool tab is not an AI tab: nothing about it names a provider, so
-        // the launch carries no AI hint for the reader to track.
-        assert_eq!(command_ai_provider_hint(Some(&[String::from("pi")])), None);
+        // Pi is now a first-class provider, so ambient binary detection names
+        // it even while this legacy shell-tool launch shape remains supported.
+        assert_eq!(command_ai_provider_hint(Some(&[String::from("pi")])), Some(AiProvider::Pi));
     }
 
     // @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Typed Pi restore regressions]]

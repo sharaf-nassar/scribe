@@ -352,6 +352,8 @@ CI run state bumps the constant to `6` because state and dismissal cross tailnet
 
 Suppressed AI ED 3 changes bump the constant to `7`: the server no longer emits a synthetic `ScrollBottom`, and newer clients preserve a scrolled viewport on receipt of that legacy frame. Both effects change terminal-frame semantics on remote connections.
 
+Structured Pi provider support bumps the constant to `8` because remote session metadata, live AI state, and task-label frames may now carry `AiProvider::Pi`. The local Unix-socket path stays on additive capability negotiation rather than a version gate: `Hello.pi_provider` / `Welcome.pi_provider` default `false` via serde, and a peer that did not advertise support receives session and live frames downgraded to legacy `ShellTool::Pi` metadata in place of structured Pi state.
+
 ### Remote Transport
 
 A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
@@ -368,6 +370,7 @@ Feature 018 later advanced it to `4` for structured AI launch, and
 terminal-images v1 advances it to `5`.
 CI run state later advances it to `6`.
 Suppressed AI ED 3 terminal-frame semantics later advance it to `7`.
+Structured Pi provider remote state later advances it to `8`.
 
 Local Unix-socket IPC has no version negotiation, so a version bump provides no protection for the mixed-generation path affected by the deletion. It would instead arm the silent LAN-peer rejection forbidden by FR-014 in spec 015.
 
@@ -448,7 +451,7 @@ Server→participant frames announce presence and outcomes. `ShareRoster { windo
 
 Feature 014 adds a second remote transport beside 013's tailnet path: a Tailscale-free LAN link over mutual TLS, found by mDNS and gated by explicit device approval. A separate opt-in, off by default, it reuses 013's post-approval session unchanged.
 
-The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, and `7` for suppressed AI ED 3 terminal-frame semantics — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
+The wire contract is `specs/014-lan-remote-control/contracts/lan-protocol.md`. Every addition is serde-default-tolerant and rides the SAME [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]] — bumped to `2` for 014, `3` for feature 015 ([[protocol#Remote Protocol#Sharing Messages]]), `4` for feature 018 structured AI launch, `5` for terminal-images v1, `6` for CI run state, `7` for suppressed AI ED 3 terminal-frame semantics, and `8` for structured Pi provider remote state — under 013's exact-match policy, so a version mismatch is refused with both versions named. The LAN listener binds `remote.lan.port` (default 46062, distinct from the tailnet 46061) only while enabled and on a trusted network. The owning side is [[server#Remote Control#LAN Accept and Approval]] and the connecting side is [[client#Remote Control#LAN Dial]].
 
 ### LAN Discovery
 

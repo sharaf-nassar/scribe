@@ -356,6 +356,7 @@ pub async fn observe_ci_run(
             join_window: true,
             terminal_images: TerminalImageCapabilities::default(),
             ci_run_bar: true,
+            pi_provider: false,
         },
     )
     .await?;
@@ -528,6 +529,7 @@ pub async fn run() -> Result<(), ScribeError> {
             // @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
+            pi_provider: false,
         },
     )
     .await?;
@@ -2502,6 +2504,7 @@ mod tests {
                 terminal_images: TerminalImageCapabilities::default(),
                 beads_detail: false,
                 beads_write: false,
+                pi_provider: false,
             },
         )
         .await

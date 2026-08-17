@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub enum AiProvider {
     ClaudeCode,
     CodexCode,
+    Pi,
     /// Non-AI infrastructure events emitted by shell integration or the
     /// server itself. Carries env-delta hook events today; reserved for
     /// future structured hook channels that do not represent an AI tool.
@@ -28,7 +29,8 @@ fn default_ai_provider() -> AiProvider {
 /// Iterable set of AI provider variants. Intentionally excludes
 /// [`AiProvider::System`] so UI listings (pickers, settings, new-tab
 /// menus) never surface the synthetic provider.
-const AI_PROVIDERS: [AiProvider; 2] = [AiProvider::ClaudeCode, AiProvider::CodexCode];
+const AI_PROVIDERS: [AiProvider; 3] =
+    [AiProvider::ClaudeCode, AiProvider::CodexCode, AiProvider::Pi];
 
 impl AiProvider {
     /// All *user-visible* AI providers. Does NOT include
@@ -44,6 +46,7 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude_code",
             AiProvider::CodexCode => "codex_code",
+            AiProvider::Pi => "pi",
             AiProvider::System => "system",
         }
     }
@@ -70,6 +73,7 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "Claude Code",
             AiProvider::CodexCode => "Codex",
+            AiProvider::Pi => "Pi",
             AiProvider::System => "System",
         }
     }
@@ -79,6 +83,7 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude",
             AiProvider::CodexCode => "codex",
+            AiProvider::Pi => "pi",
             // No binary represents the System sentinel. Returning an empty
             // string is safe because the only callers (AI command
             // detection, new-tab launchers) iterate [`Self::all`], which
@@ -88,14 +93,16 @@ impl AiProvider {
     }
 
     #[must_use]
+    pub fn supports_resume(self) -> bool {
+        matches!(self, AiProvider::ClaudeCode | AiProvider::CodexCode)
+    }
+
+    #[must_use]
     pub fn resume_args(self) -> &'static [&'static str] {
         match self {
             AiProvider::ClaudeCode => &["--resume"],
             AiProvider::CodexCode => &["resume"],
-            // `System` has no resume semantics. Same rationale as
-            // `binary_name`: it isn't in `all()`, so this arm is unreachable
-            // via the normal launcher paths.
-            AiProvider::System => &[],
+            AiProvider::Pi | AiProvider::System => &[],
         }
     }
 }
@@ -202,6 +209,31 @@ impl AiProcessState {
 #[cfg(test)]
 mod tests {
     use super::{AiProcessState, AiProvider, AiState};
+
+    #[test]
+    fn pi_is_user_visible_and_does_not_resume() {
+        assert_eq!(AiProvider::Pi.id(), "pi");
+        assert_eq!(AiProvider::from_id("pi"), Some(AiProvider::Pi));
+        assert_eq!(AiProvider::Pi.display_name(), "Pi");
+        assert_eq!(AiProvider::Pi.binary_name(), "pi");
+        assert!(!AiProvider::Pi.supports_resume());
+        assert_eq!(AiProvider::Pi.resume_args(), &[] as &[&str]);
+        assert!(AiProvider::all().contains(&AiProvider::Pi));
+        assert!(!AiProvider::all().contains(&AiProvider::System));
+        assert!(AiProvider::ClaudeCode.supports_resume());
+        assert!(AiProvider::CodexCode.supports_resume());
+        assert!(!AiProvider::System.supports_resume());
+    }
+
+    #[test]
+    fn pi_provider_uses_the_stable_serde_id() {
+        let encoded = rmp_serde::to_vec_named(&AiProvider::Pi).expect("Pi provider serializes");
+        let id: String = rmp_serde::from_slice(&encoded).expect("provider id decodes as text");
+        assert_eq!(id, "pi");
+        let decoded: AiProvider =
+            rmp_serde::from_slice(&encoded).expect("Pi provider deserializes");
+        assert_eq!(decoded, AiProvider::Pi);
+    }
 
     #[test]
     fn deserializes_legacy_state_without_provider_as_claude() {

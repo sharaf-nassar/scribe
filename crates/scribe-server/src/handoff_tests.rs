@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use vte::ansi::Processor as AnsiProcessor;
 
+use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{SessionContext, ShellTool};
 use scribe_common::screen::{
@@ -23,7 +24,9 @@ use scribe_common::screen_replay::build_session_replay;
 use scribe_pty::event_listener::ScribeEventListener;
 
 use crate::git_ref_watcher::GitRefWatcherControl;
-use crate::handoff::{HandoffSession, HandoffState};
+use crate::handoff::{
+    HandoffSession, HandoffState, handoff_state_version, handoff_version_accepted,
+};
 use crate::ipc_server::{self, LiveSessionRegistry};
 use crate::session_manager::{SessionManager, build_term_config, snapshot_term};
 use crate::workspace_manager::WorkspaceManager;
@@ -600,6 +603,30 @@ fn current_version_payload_round_trips_child_identity() {
 
     assert_eq!(decoded.sessions.first().expect("one session").child_identity, recorded);
     assert_eq!(decoded.sessions.first().expect("one session").icon_title.as_deref(), Some("icon"));
+}
+
+#[test]
+fn pi_provider_state_requires_v8_and_preserves_safe_handoff_directions() {
+    let (mut state, _masters, _slaves) = make_handoff_state(1);
+    let session = state.sessions.first_mut().expect("one session");
+    session.ai_state = Some(AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing));
+    session.ai_provider_hint = Some(AiProvider::Pi);
+
+    let version = handoff_state_version(&state.sessions);
+    assert_eq!(version, 8);
+    assert!(handoff_version_accepted(6, 8), "new receiver accepts image-free old sender");
+    assert!(handoff_version_accepted(7, 8), "new receiver accepts image-capable old sender");
+    assert!(handoff_version_accepted(8, 8));
+    assert!(!handoff_version_accepted(8, 7), "old receiver refuses unknown Pi enum safely");
+    assert!(!handoff_version_accepted(8, 6), "older receiver refuses unknown Pi enum safely");
+
+    state.version = version;
+    let bytes = rmp_serde::to_vec_named(&state).expect("serialize Pi handoff");
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).expect("deserialize Pi handoff");
+    assert_eq!(
+        decoded.sessions.first().and_then(|restored| restored.ai_provider_hint),
+        Some(AiProvider::Pi)
+    );
 }
 
 // @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Typed Pi restore regressions]]

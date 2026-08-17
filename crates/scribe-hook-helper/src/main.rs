@@ -58,7 +58,7 @@ const PAYLOAD_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Parser, Debug)]
 #[command(name = "scribe-hook-helper", disable_help_flag = true, disable_version_flag = true)]
 struct Cli {
-    /// AI provider id, one of `claude_code`, `codex_code`, or the
+    /// AI provider id, one of `claude_code`, `codex_code`, `pi`, or the
     /// synthetic `system` value used for non-AI events
     /// (`--event=env_delta`). Unknown values cause exit 0 silently per
     /// FR-014. `system` corresponds to [`AiProvider::System`] and is
@@ -350,6 +350,22 @@ mod tests {
         assert_eq!(parse_ai_state("inactive"), Err(()));
         assert_eq!(parse_ai_state("IdlePrompt"), Err(()));
         assert_eq!(parse_ai_state(""), Err(()));
+    }
+
+    #[test]
+    fn pi_provider_uses_the_generic_hook_schema() {
+        let cli = Cli::try_parse_from([
+            "scribe-hook-helper",
+            "--provider=pi",
+            "--event=state_changed",
+            "--state=processing",
+        ])
+        .expect("Pi provider arguments should parse");
+        assert_eq!(AiProvider::from_id(&cli.provider), Some(AiProvider::Pi));
+        assert!(matches!(
+            build_kind(&cli, &Payload::default()),
+            Ok(HookEventKind::StateChanged { state: AiState::Processing, conversation_id: None })
+        ));
     }
 
     // @lat: [[test#Test Harness#AI Hook Helper#Sender lifetime protects macOS peer credentials]]

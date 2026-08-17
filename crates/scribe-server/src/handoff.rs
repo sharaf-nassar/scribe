@@ -97,42 +97,53 @@ use crate::workspace_manager::WorkspaceManager;
 ///
 /// Spec 020 added [`HandoffSession::image_state`], which is additive in the
 /// same `#[serde(default)]` sense — but only in one direction. A v6 server
-/// silently ignores it, which would land the successor showing a session's
-/// text with its images gone. So the payload declares v7 exactly when it
-/// carries image state, and [`handoff_version_accepted`] makes a v6 receiver
-/// refuse that payload and cold-restart instead. An image-free payload — every
-/// current session, and every session once the master switch is off — still
-/// declares v6 and rolls back to an older server untouched.
-const HANDOFF_VERSION: u32 = 7;
+/// silently ignores it, so image-bearing payloads declare v7 while image-free
+/// payloads remain v6.
+///
+/// Pi provider state adds an enum value an older receiver cannot deserialize.
+/// Any payload carrying [`AiProvider::Pi`] therefore declares v8. A v8 receiver
+/// still accepts v6 and v7 senders for forward upgrades, while v6/v7 receivers
+/// refuse v8 before acknowledging so the current server keeps running.
+const HANDOFF_VERSION: u32 = 8;
 
-/// Version an image-free payload declares, and the newest a pre-image server
-/// understands.
+/// Version a payload carrying terminal image state declares.
+const HANDOFF_VERSION_WITH_IMAGES: u32 = 7;
+
+/// Version an image-free, pre-Pi payload declares.
 const HANDOFF_VERSION_WITHOUT_IMAGES: u32 = 6;
 
 /// Version a payload must declare for the sessions it actually carries.
 ///
-/// Downgrading a payload that carries no image state is the whole rollback
-/// story: turning the master image switch off makes the next upgrade payload
-/// v6 again, so an older server accepts it.
+/// For pre-Pi state, turning the master image switch off makes the next
+/// upgrade payload v6 again, so an older server accepts it.
 // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
 #[must_use]
 pub fn handoff_state_version(sessions: &[HandoffSession]) -> u32 {
-    if sessions.iter().any(|session| session.image_state.is_some()) {
+    if sessions.iter().any(session_carries_pi_provider) {
         HANDOFF_VERSION
+    } else if sessions.iter().any(|session| session.image_state.is_some()) {
+        HANDOFF_VERSION_WITH_IMAGES
     } else {
         HANDOFF_VERSION_WITHOUT_IMAGES
     }
 }
 
+fn session_carries_pi_provider(session: &HandoffSession) -> bool {
+    session.ai_state.as_ref().map(|state| state.provider) == Some(AiProvider::Pi)
+        || session.ai_provider_hint == Some(AiProvider::Pi)
+}
+
 /// Whether a receiver supporting `supported` accepts a payload at `version`.
 ///
-/// N and N-1 are accepted so a normal forward upgrade never cold-restarts.
-/// N+1 is refused, which is what turns a rollback to a pre-image server into a
-/// clean cold restart rather than a silent loss of every session's images.
+/// Pre-Pi receivers keep their N/N-1 contract. The v8 receiver additionally
+/// accepts v6 because an old sender deliberately emits v6 for image-free state.
+/// Newer payloads are always refused, preserving safe downgrade behavior.
 // @lat: [[terminal-images#Terminal Images#Image State Across Handoff]]
 #[must_use]
 pub const fn handoff_version_accepted(version: u32, supported: u32) -> bool {
-    version == supported || version == supported.saturating_sub(1)
+    version == supported
+        || version == supported.saturating_sub(1)
+        || (supported == HANDOFF_VERSION && version == HANDOFF_VERSION_WITHOUT_IMAGES)
 }
 
 /// Magic bytes the receiver sends to request an upgrade.
@@ -794,19 +805,16 @@ pub fn receive_handoff() -> Result<ReceivedHandoff, ScribeError> {
     // future incidents are not misdiagnosed as a generic "version mismatch".
     let state = read_state(fd)?;
 
-    // Accept the current version and the immediately previous version (N-1),
-    // so normal forward upgrades never cold-restart. Note that for
-    // cross-encoding cases (pre-v6 senders used positional MessagePack) the
-    // deserialization above usually fails first, and the propagated error
-    // drives the client-side cold-restart fallback. Versions outside this
-    // accepted range hit cold-restart here instead.
+    // Accept v6-v8 so both image-free and image-bearing pre-Pi senders can
+    // upgrade forward. Cross-encoding pre-v6 payloads generally fail decoding
+    // first; newer payloads fail this gate before the receiver acknowledges.
     if !handoff_version_accepted(state.version, HANDOFF_VERSION) {
         return Err(ScribeError::IpcError {
             reason: format!(
-                "handoff version unsupported: got {}, supported {}..={HANDOFF_VERSION} \
+                "handoff version unsupported: got {}, supported \
+                 {HANDOFF_VERSION_WITHOUT_IMAGES}..={HANDOFF_VERSION} \
                  (cold-restart required)",
                 state.version,
-                HANDOFF_VERSION.saturating_sub(1),
             ),
         });
     }

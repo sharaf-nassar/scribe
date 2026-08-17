@@ -2085,6 +2085,8 @@ struct OutputQueueShared {
     /// connection's async mutex because the image fan-out runs inside the
     /// per-session sink lock, where nothing may await.
     image_capabilities: std::sync::atomic::AtomicU32,
+    /// Whether this connection can deserialize structured Pi provider metadata.
+    pi_provider: AtomicBool,
 }
 
 /// Pack a capability set into one atomic word: the low bits are feature bits,
@@ -2178,6 +2180,33 @@ impl OutputSink {
         unpack_image_capabilities(self.0.image_capabilities.load(Ordering::Relaxed))
     }
 
+    /// Record whether this connection can decode structured Pi provider state.
+    pub(crate) fn set_pi_provider_capability(&self, supported: bool) {
+        self.0.pi_provider.store(supported, Ordering::Relaxed);
+    }
+
+    fn pi_compatible_message<'a>(&self, msg: &'a ServerMessage) -> Option<Cow<'a, ServerMessage>> {
+        if self.0.pi_provider.load(Ordering::Relaxed) {
+            return Some(Cow::Borrowed(msg));
+        }
+        match msg {
+            ServerMessage::AiStateChanged { ai_state, .. }
+                if ai_state.provider == AiProvider::Pi =>
+            {
+                None
+            }
+            ServerMessage::TaskLabelChanged { provider: AiProvider::Pi, .. }
+            | ServerMessage::TaskLabelCleared { provider: AiProvider::Pi, .. }
+            | ServerMessage::PromptReceived { provider: AiProvider::Pi, .. } => None,
+            ServerMessage::SessionList { .. } => {
+                let mut compatible = msg.clone();
+                compatible.make_pi_provider_compatible(false);
+                Some(Cow::Owned(compatible))
+            }
+            _ => Some(Cow::Borrowed(msg)),
+        }
+    }
+
     /// Enqueue one `ServerMessage` for the drain task. Never blocks on the link.
     ///
     /// `PtyOutput` is the sole droppable, high-volume stream: while its session is
@@ -2197,6 +2226,10 @@ impl OutputSink {
     /// Returns `false` only when the connection is already closed — the enqueue
     /// equivalent of the pre-queue "dead socket" write error.
     fn enqueue(&self, msg: &ServerMessage) -> bool {
+        let Some(msg) = self.pi_compatible_message(msg) else {
+            return true;
+        };
+        let msg = msg.as_ref();
         let bytes = out_frame_bytes(msg);
         if let ServerMessage::PtyOutput { session_id, .. } = msg {
             return self.enqueue_droppable(*session_id, bytes, msg).is_some();
@@ -2398,6 +2431,7 @@ where
         notify: tokio::sync::Notify::new(),
         // Incapable until this connection's `Hello` says otherwise.
         image_capabilities: std::sync::atomic::AtomicU32::new(0),
+        pi_provider: AtomicBool::new(false),
     });
     let drain = tokio::spawn(output_queue_drain(Arc::clone(&shared), write_half, live_sessions));
     (OutputSink(shared), drain)
@@ -4743,6 +4777,10 @@ async fn record_image_capabilities(
     images
 }
 
+async fn record_pi_provider_capability(writer: &SharedWriter, supported: bool) {
+    writer.lock().await.queue().set_pi_provider_capability(supported);
+}
+
 /// Tear a served connection down after its message loop returns: on a sever, send
 /// the best-effort final `RemoteDisconnect` (T023); always run the detach cleanup
 /// (window ownership released, owning sessions untouched); then, for a remote
@@ -4796,6 +4834,7 @@ async fn claim_hello_window(
         join_window,
         terminal_images,
         ci_run_bar,
+        pi_provider,
         ..
     } = hello
     else {
@@ -4807,6 +4846,7 @@ async fn claim_hello_window(
     if !claim_local_slot(local, LocalSlotKind::Client) {
         return None;
     }
+    record_pi_provider_capability(conn.writer, pi_provider).await;
     let claim = HelloClaim {
         requested_window_id: window_id,
         clipboard_gating,
@@ -5524,6 +5564,7 @@ async fn handle_client_hello(
                 terminal_images: claim.terminal_images,
                 beads_detail,
                 beads_write,
+                pi_provider: true,
             };
             send_message(writer, &welcome).await;
 
@@ -5551,6 +5592,7 @@ async fn handle_client_hello(
                 terminal_images: claim.terminal_images,
                 beads_detail: false,
                 beads_write: false,
+                pi_provider: true,
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
@@ -12744,6 +12786,29 @@ mod tests {
         assert!(is_transient_first_frame(&ClientMessage::QuitAll));
     }
 
+    #[tokio::test]
+    async fn remote_version_mismatch_returns_the_typed_v8_refusal() {
+        let (mut server, mut client) = tokio::io::duplex(4096);
+        send_handshake_reply(
+            &mut server,
+            REMOTE_PROTOCOL_VERSION - 1,
+            Some(RemoteRefusal::IncompatibleVersion),
+        )
+        .await;
+
+        let reply: ServerMessage = read_message(&mut client).await.expect("handshake reply");
+        assert!(matches!(
+            reply,
+            ServerMessage::RemoteHandshakeReply {
+                accepted: false,
+                refusal: Some(RemoteRefusal::IncompatibleVersion),
+                server_remote_protocol_version: 8,
+                version_mismatch: Some(_),
+                ..
+            }
+        ));
+    }
+
     // @lat: [[protocol#Server Messages#Launch identity is local-only]]
     #[test]
     fn session_list_exposes_launch_identity_only_to_local_clients() {
@@ -12768,6 +12833,88 @@ mod tests {
             shell_tool: None,
             env_envelope_id: Some("launch-42".to_owned()),
         }));
+    }
+
+    #[tokio::test]
+    async fn old_client_output_downgrades_pi_and_never_sends_the_unknown_enum() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let session_id = SessionId::new();
+
+        send_message(
+            &writer,
+            &ServerMessage::AiStateChanged {
+                session_id,
+                ai_state: AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing),
+            },
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut client_read),
+            )
+            .await
+            .is_err(),
+            "an old client must not receive AiProvider::Pi"
+        );
+
+        let mut ai_state = AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing);
+        ai_state.context = Some(55);
+        send_message(
+            &writer,
+            &ServerMessage::SessionList {
+                sessions: vec![SessionInfo {
+                    session_id,
+                    workspace_id: WorkspaceId::new(),
+                    launch_id: Some("launch-pi".to_owned()),
+                    shell_name: "bash".to_owned(),
+                    title: None,
+                    icon_title: None,
+                    context: None,
+                    task_label: Some("Pi task".to_owned()),
+                    codex_task_label: None,
+                    cwd: None,
+                    git_branch: None,
+                    ai_state: Some(ai_state),
+                    ai_provider_hint: Some(AiProvider::Pi),
+                    shell_tool: None,
+                    prompt_state: Some(scribe_common::protocol::SessionPromptState::default()),
+                }],
+                workspace_tree: None,
+                workspaces: Vec::new(),
+            },
+        )
+        .await;
+        let list: ServerMessage = read_message(&mut client_read).await.expect("legacy list frame");
+        let ServerMessage::SessionList { sessions, .. } = list else {
+            panic!("expected SessionList");
+        };
+        let session = sessions.first().expect("one session");
+        assert_eq!(session.shell_tool, Some(ShellTool::Pi));
+        assert!(session.ai_state.is_none());
+        assert!(session.ai_provider_hint.is_none());
+        assert!(session.task_label.is_none());
+        assert!(session.prompt_state.is_none());
+
+        writer.lock().await.queue().set_pi_provider_capability(true);
+        send_message(
+            &writer,
+            &ServerMessage::AiStateChanged {
+                session_id,
+                ai_state: AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing),
+            },
+        )
+        .await;
+        let supported: ServerMessage =
+            read_message(&mut client_read).await.expect("structured Pi frame");
+        assert!(matches!(
+            supported,
+            ServerMessage::AiStateChanged { ai_state: received_state, .. }
+                if received_state.provider == AiProvider::Pi
+        ));
     }
 
     // @lat: [[protocol#Server Messages#Launch identity is local-only]]

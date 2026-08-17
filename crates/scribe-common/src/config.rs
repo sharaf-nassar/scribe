@@ -896,6 +896,8 @@ pub struct TerminalAiIntegrationConfig {
     pub claude_code: AiIntegrationToggle,
     #[serde(default, rename = "codex_code_integration")]
     pub codex_code: AiIntegrationToggle,
+    #[serde(default, rename = "pi_integration")]
+    pub pi: AiIntegrationToggle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,6 +1186,7 @@ impl TerminalConfig {
         match provider {
             AiProvider::ClaudeCode => self.ai_integration.claude_code.enabled(),
             AiProvider::CodexCode => self.ai_integration.codex_code.enabled(),
+            AiProvider::Pi => self.ai_integration.pi.enabled(),
             // The synthetic System provider has no AI integration toggle —
             // env-delta is gated on `terminal.env_persistence.enabled` and
             // checked at the hook-ingress call site instead.
@@ -2313,7 +2316,31 @@ fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AiContextThresholds, ContextBand, ScribeConfig};
+    use super::{AiContextThresholds, AiIntegrationToggle, ContextBand, ScribeConfig};
+    use crate::ai_state::AiProvider;
+
+    #[test]
+    fn pi_integration_defaults_on_and_gates_only_pi() {
+        let default = ScribeConfig::default();
+        assert!(default.terminal.ai_integration.pi.enabled());
+        assert!(default.terminal.ai_provider_enabled(AiProvider::Pi));
+        assert!(default.terminal.ai_provider_enabled(AiProvider::ClaudeCode));
+        assert!(default.terminal.ai_provider_enabled(AiProvider::CodexCode));
+        assert!(!default.terminal.ai_provider_enabled(AiProvider::System));
+
+        let parsed: ScribeConfig = toml::from_str(
+            "[terminal]\npi_integration = false\nclaude_code_integration = true\ncodex_code_integration = true\n",
+        )
+        .expect("Pi integration toggle parses");
+        assert!(!parsed.terminal.ai_provider_enabled(AiProvider::Pi));
+        assert!(parsed.terminal.ai_provider_enabled(AiProvider::ClaudeCode));
+        assert!(parsed.terminal.ai_provider_enabled(AiProvider::CodexCode));
+
+        let mut explicit = ScribeConfig::default();
+        explicit.terminal.ai_integration.pi = AiIntegrationToggle::new(false);
+        let written = toml::to_string_pretty(&explicit).expect("config serializes");
+        assert!(written.contains("pi_integration = false"));
+    }
 
     // @lat: [[test#GitHub CI Opt-in#Config parsing]]
     #[test]
