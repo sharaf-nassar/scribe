@@ -235,6 +235,35 @@ wait_for_open "$LINK_DIR/linkme.txt" 10 \
 shot /output/04-after-path-click.png
 echo "PHASE 4 PASS: a relative link opened as $LINK_DIR/linkme.txt"
 
+# ── Phase 5: a dot-prefixed bare relative path keeps its leading '.' ──
+# `.impeccable/mocks/linkme.html` starts with `.` immediately followed by more
+# than a bare `/`, unlike the explicit `./` form Phase 4 already covers — this
+# exercises the bare-relative scanner's start-of-token gate (scribe-gv09): a
+# build that only fixed `./` would still truncate this to `impeccable/...`.
+: >"$OPENED"
+mkdir -p "$LINK_DIR/.impeccable/mocks"
+touch "$LINK_DIR/.impeccable/mocks/linkme.html"
+run_in_pane "clear; for i in \$(seq 1 20); do echo '.impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html .impeccable/mocks/linkme.html'; done"
+shot /output/05-dotpath-grid.png
+click_middle ctrl
+wait_for_open "$LINK_DIR/.impeccable/mocks/linkme.html" 10 \
+    || fail "PHASE 5: Ctrl+click on .impeccable/mocks/linkme.html did not open $LINK_DIR/.impeccable/mocks/linkme.html"
+shot /output/06-after-dotpath-click.png
+echo "PHASE 5 PASS: a dot-prefixed relative link opened as $LINK_DIR/.impeccable/mocks/linkme.html"
+
+# ── Phase 6: the original beads-board-signal-theme.html repro opens ──
+# The exact file from the bug report, so the fix is proven against the repro
+# itself and not only against a synthetic linkme.html.
+: >"$OPENED"
+touch "$LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html"
+run_in_pane "clear; for i in \$(seq 1 20); do echo '.impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html .impeccable/mocks/beads-board-signal-theme.html'; done"
+shot /output/07-repro-grid.png
+click_middle ctrl
+wait_for_open "$LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html" 10 \
+    || fail "PHASE 6: Ctrl+click on beads-board-signal-theme.html did not open $LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html"
+shot /output/08-after-repro-click.png
+echo "PHASE 6 PASS: the original repro opened as $LINK_DIR/.impeccable/mocks/beads-board-signal-theme.html"
+
 echo ""
 echo "PASS: visual terminal-links test"
 echo "  Inspect screenshots in test-output/:"
@@ -245,4 +274,8 @@ echo "    01b-ctrl-released.png      — the rule gone again after Ctrl came up"
 echo "    02-after-ctrl-click.png    — the window after the Ctrl+click"
 echo "    03-path-grid.png           — the same grid filled with a relative path"
 echo "    04-after-path-click.png    — the window after the path Ctrl+click"
+echo "    05-dotpath-grid.png        — the grid filled with a dot-prefixed path"
+echo "    06-after-dotpath-click.png — the window after the dot-path Ctrl+click"
+echo "    07-repro-grid.png          — the grid filled with the original repro path"
+echo "    08-after-repro-click.png   — the window after the repro Ctrl+click"
 echo "  Opened targets: test-output/xdg-open.log"

@@ -2943,7 +2943,7 @@ The  scans visible terminal content for URLs (https, http, ftp, file, mailto, ss
 
 Soft-wrapped rows are joined by `WRAPLINE` before scanning so a link split across terminal rows remains one clickable span. Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Osc8Hyperlink`, `Url`, or `Path`). OSC 8 hyperlinks take precedence over heuristic URL/path detection on overlapping cells (see  below).
 
-An absolute path may follow a delimiter such as a quote, backtick, parenthesis, or equals sign. A slash after an alphanumeric, `.`, `~`, `_`, or `-` remains inside a bare relative path. Backticks terminate both URL and path spans.
+An absolute path may follow a delimiter such as a quote, backtick, parenthesis, or equals sign. A bare relative path may start with an alphanumeric, `.`, `~`, `_`, or `-`, and a slash after any of those characters remains inside the path rather than starting a new absolute one — so `.impeccable/mocks/x`, `_private/x`, `-draft/x`, and `~alice/x` keep their leading character exactly like `src/main.rs` does, while the higher-priority `./`, `../`, and `~/` forms are matched first and never reach this branch. Backticks terminate both URL and path spans.
 
 Every span also carries exact per-row geometry as s — spans are not rectangles, because a hard-break continuation row starts at its indent rather than column 0 and merged OSC 8 runs can have partial middle rows. Hit-testing (`contains_cell`), OSC 8 masking, and the hover underline all consume segments; the bounding `row`/`col_start`/`row_end`/`col_end` fields remain for identity comparison and ordering.
 

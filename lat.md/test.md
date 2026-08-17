@@ -2536,6 +2536,8 @@ Phase 1 clicks a link with no modifier and requires that nothing opened — the 
 
 Phase 3 Ctrl+clicks the URL. Phase 4 is the one that needs a real shell: it `cd`s into a directory, announces it with OSC 7, fills the grid with `./linkme.txt`, and requires the *absolute* path to come out of the opener. A relative link opened without a CWD would reach the OS as `./linkme.txt` and resolve against whatever directory the client process happens to be in, which is exactly the bug the phase exists to catch.
 
+Phase 5 and Phase 6 stay in the same CWD Phase 4 already announced and cover the bare-relative start-of-token gate ([[test#GPUI URL Detection#Bare relative paths keep their leading punctuation]]) rather than the explicit `./` form: Phase 5 creates `.impeccable/mocks/linkme.html` under it and requires the opener to receive the full dot-prefixed absolute path, not `impeccable/mocks/linkme.html` with the leading `.` dropped; Phase 6 repeats the same assertion against `.impeccable/mocks/beads-board-signal-theme.html`, the exact file from the bug report, so the fix is proven against the original repro and not only a synthetic stand-in.
+
 ### Window lifecycle over the wire
 
 `tests/e2e/visual/window-lifecycle.sh` is the app-level oracle for the seven window-lifecycle parity rows: it drives the real client against the real server and reads every frame off the recorded wire (see ).
@@ -2923,6 +2925,14 @@ Unit tests for the GPUI client's ported  scanner —  over Zed's Alacritty fork 
 The path scanner keeps the leading slash when an absolute path follows a quote, backtick, parenthesis, or equals sign, without reclassifying the interior slash in a bare relative path.
 
 Single-quoted, double-quoted, backtick-quoted, parenthesized, and equals-prefixed paths produce the exact rooted path. `PATH=/usr/bin:/opt/bin` remains one span, while explicit and bare relative forms keep their prefixes.
+
+### Bare relative paths keep their leading punctuation
+
+A bare relative path may itself start with `.`, `_`, `-`, or `~` rather than only an alphanumeric, matching what [[crates/scribe-client/src/url_detect.rs#is_path_token_char]] already allows mid-token.
+
+Before this, [[crates/scribe-client/src/url_detect.rs#detect_path_prefix]] rejected the leading character at the scan position it started from, then matched one character later, so `.impeccable/mocks/beads-board-signal-theme.html` was detected and opened as `impeccable/mocks/beads-board-signal-theme.html` — a path that does not exist.
+
+`.impeccable/mocks/beads-board-signal-theme.html`, `_private/notes`, `-draft/notes`, and `~alice/notes` each keep their leading character exactly, alongside each other in one line so none steals a neighbor's prefix. The `./`, `../`, and `~/` explicit forms keep matching first, unaffected by widening the bare-relative start set.
 
 ### Backticks terminate detected URLs
 

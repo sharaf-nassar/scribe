@@ -1046,8 +1046,12 @@ fn detect_path_prefix(chars: &[char], pos: usize) -> Option<(usize, bool)> {
     }
 
     // Bare relative word containing `/` within BARE_PATH_LOOKAHEAD chars.
-    // Require alphanumeric start and at least one `/` in the lookahead window.
-    if chars.get(pos).is_some_and(char::is_ascii_alphanumeric) {
+    // The start character must itself be a valid path-token character (not
+    // just alphanumeric) so a leading `.`, `~`, `_`, or `-` is not dropped —
+    // `is_path_token_char` already allows these for interior characters, and
+    // the start must accept the same set or the scanner silently advances
+    // past it and reports a truncated path.
+    if chars.get(pos).is_some_and(|c| is_path_token_char(*c)) {
         let look_end = (pos + BARE_PATH_LOOKAHEAD).min(chars.len());
         let window = chars.get(pos..look_end).unwrap_or(&[]);
         // Ensure there is a `/` in the window and only path-token characters
@@ -1305,6 +1309,22 @@ mod tests {
         assert_eq!(
             detected_paths("src/main.rs ./build.sh ../parent ~/notes foo/bar"),
             ["src/main.rs", "./build.sh", "../parent", "~/notes", "foo/bar"]
+        );
+    }
+
+    // @lat: [[test#GPUI URL Detection#Bare relative paths keep their leading punctuation]]
+    #[test]
+    fn bare_relative_paths_keep_leading_punctuation() {
+        assert_eq!(
+            detected_paths(
+                ".impeccable/mocks/beads-board-signal-theme.html _private/notes -draft/notes ~alice/notes"
+            ),
+            [
+                ".impeccable/mocks/beads-board-signal-theme.html",
+                "_private/notes",
+                "-draft/notes",
+                "~alice/notes",
+            ]
         );
     }
 
