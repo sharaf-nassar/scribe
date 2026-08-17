@@ -3858,8 +3858,17 @@ moves the long-titled source through the native drag waypoints, so a tooltip on
 the drag ghost, a broken nested copy target, or lost board hover fails the
 focused path. It checks compact borders for accepted and rejected targets
 independently, then measures the native ghost over a card, a rejected lane, and
-outside the board while terminal rows remain fixed. The as-built rules and
-production links live in
+outside the board while terminal rows remain fixed. The full path crops the
+text-size reversal to the grid band between the independently repainting
+titlebar and the status bar's live CPU/MEM sparkline, finds the
+pinned edge from the last long live-height run of board ground, and completes
+single-region pin/resize before changing topology. Its side-by-side fixture
+polls the share-tap wire record, scoped to frames at or after the split, for
+the real (bd-less) test server's own `NotDetected` reply before re-arming the
+pinned region and focusing its neighbour — real and injected messages share one
+ordered relay channel, so a reply already on the wire record is guaranteed to
+reach the client before a later injection. Lower-region badge coverage runs
+last so it cannot perturb those geometry proofs. The as-built rules and production links live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].

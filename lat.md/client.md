@@ -1542,15 +1542,30 @@ puts the pointer on a card's ID and requires the board
 to survive it, then clicks and requires the full ID on the X11 clipboard. It
 measures the epic on every card line that carries one against that card's
 own content edge, reading the card's fill from between the name and the border
-so the border cannot stand in for the name it is checking. It presses both text-size buttons, requiring the first to
-repaint the board and the second to undo it. It finds the pinned board's bottom
-bar by scanning a column the lanes leave clear, drags it sixty pixels down, and
-requires both that the board paints that much taller and that its region's
-published rows drop — then drags it back and requires the rows to return
-exactly. It then splits the window
-and pins a board in each region, requiring that each region gives up its own
-rows, that neither board disturbs the other's, and that the region divider
-still separates the two open boards. It reads the badge of three priorities down one lane — P0, P1 and P2, three
+so the border cannot stand in for the name it is checking. It presses both
+text-size buttons, requiring the first to repaint the board and the second to
+undo it; that comparison crops out both the 34px titlebar and the 24px status
+bar, because an independent badge focus repaint and the status bar's live
+CPU/MEM sparkline can otherwise stand in for a font difference that never
+happened. It finds the pinned board's
+bottom bar from the last long run of known board ground in a live-height column,
+drags it sixty pixels down, and requires both that the board paints that much
+taller and that its region's published rows drop — then drags it back and
+requires the rows to return exactly. Pin and resize run before any split changes
+the topology. The split re-parks `WorkspaceInfo` for the source region too,
+which re-asks the real (bd-less) server for its board and gets a genuine
+`NotDetected` in reply — not simulated. The side-by-side phase waits for that
+real reply on the share-tap wire, scoped to frames recorded at or after the
+split, before installing the controlled snapshot: share-tap relays real and
+injected messages through one ordered channel, so once the real reply is on
+the wire record every later injection is guaranteed to reach the client behind
+it, closing the race a fixed sleep could not. It then pins that
+region, then focuses its neighbour and requires the reservation to remain local.
+It pins a board in the second region too, requiring that neither board disturbs
+the other and that the region divider still separates the two open boards. The
+lower-region badge runs last and exact-compares its connected-node foreground
+mask with the titlebar mark before proving its label selects without pinning and
+its mark hovers and pins. It reads the badge of three priorities down one lane — P0, P1 and P2, three
 different hues — and requires each to carry measurably less colour than the
 rank above it. The three are compared as a ratio rather than a margin: the ranks are
 about a fifth apart by design, so a fixed number of levels would either pass a

@@ -120,25 +120,33 @@ edge_delta() {
         info:
 }
 
-# The y of the board's bottom bar, found by scanning a column the lanes leave
-# clear (they are inset 8px) for the first row that is no longer board ground.
+# The y of the board's bottom bar, found from the last long run of the
+# captured board ground. A split can put unrelated chrome above the board, so
+# the first colour transition in a fixed-height crop is not the board edge.
 board_bottom() {
     local dump=/tmp/board-column.txt
-    convert "$1" -crop "1x600+4+40" +repage txt:- > "$dump"
-    python3 - "$dump" <<'PY'
+    convert "$1" -crop "1x$(( WIN_H - 40 ))+4+40" +repage txt:- > "$dump"
+    python3 - "$dump" "$BOARD_GROUND" <<'PY'
 import re, sys
 rows = []
 for line in open(sys.argv[1]):
     m = re.match(r'\d+,(\d+): \((\d+),(\d+),(\d+)', line)
     if m:
-        rows.append((int(m.group(1)), tuple(int(m.group(i)) for i in (2, 3, 4))))
-rows.sort()
-ground = rows[20][1]
-for y, color in rows[20:]:
-    if sum(abs(a - b) for a, b in zip(color, ground)) > 12:
-        print(y + 40)
-        raise SystemExit
-print(999)
+        rows.append((int(m.group(1)) + 40, tuple(int(m.group(i)) for i in (2, 3, 4))))
+ground = tuple(map(int, re.findall(r'\d+', sys.argv[2])[:3]))
+start = end = bottom = None
+for y, color in sorted(rows):
+    if sum(abs(a - b) for a, b in zip(color, ground)) <= 12:
+        if start is None:
+            start = y
+        end = y
+    elif start is not None:
+        if end - start + 1 >= 30:
+            bottom = end
+        start = end = None
+if start is not None and end - start + 1 >= 30:
+    bottom = end
+print(bottom or 999)
 PY
 }
 
@@ -278,6 +286,64 @@ with open(sys.argv[1], errors='replace') as fh:
             seen.append(match.group(1))
 print(" ".join(seen))
 PY
+}
+
+# Every full workspace id the server has described, in first-seen order.
+server_workspaces() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+seen = []
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        try: row = json.loads(line)
+        except ValueError: continue
+        msg = row.get("message", {})
+        if row.get("dir") != "server" or msg.get("type") != "WorkspaceInfo":
+            continue
+        workspace = msg["workspace_id"]
+        if workspace not in seen:
+            seen.append(workspace)
+print(" ".join(seen))
+PY
+}
+
+# Whether the real upstream server (never `inject`, which hands the client a
+# message directly and is never recorded) has answered NotDetected for $1's
+# Beads board on the wire, at or after record line $2. share-tap appends a
+# genuine relayed frame to $RECORD strictly before handing it to the client's
+# inbound channel, and an injection reaches that same channel only through a
+# later call, so observing this is a real happens-before guarantee against a
+# later `inject` reordering behind an in-flight real reply. The workspace can
+# already carry earlier real NotDetected replies from long before the event
+# under test, so a caller must pass the record's line count from just before
+# the action that is expected to provoke a fresh one.
+server_reported_not_detected() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+skip = int(sys.argv[3])
+with open(sys.argv[1]) as fh:
+    for i, line in enumerate(fh):
+        if i < skip:
+            continue
+        try: row = json.loads(line)
+        except ValueError: continue
+        msg = row.get("message", {})
+        if (row.get("dir") == "server" and msg.get("type") == "BeadsBoard"
+                and msg.get("workspace_id") == sys.argv[2]
+                and msg.get("state") == "NotDetected"):
+            print("1")
+            raise SystemExit
+print("0")
+PY
+}
+
+# Current line count of $RECORD, used to scope a later `server_reported_*`
+# check to events at or after this point. wc -l undercounts a file with no
+# trailing newline by one; share-tap's writer always ends a line with \n, so
+# this is exact for a record that is not actively mid-write, and an
+# undercount would only widen the scanned window, never narrow it.
+record_mark() {
+    wc -l <"$RECORD" 2>/dev/null || echo 0
 }
 
 sleep 2
@@ -520,14 +586,23 @@ if [ "${SCRIBE_E2E_TOOLTIP_ONLY:-0}" = "1" ]; then
 fi
 
 # The board's own text-size control: the buttons sit in the strip's top right,
-# plus on the left and minus on its right, and pressing one has to repaint the
-# board rather than only move state.
+# plus on the left and minus on its right. Compare only the grid band between
+# the 34px titlebar and the 24px status bar: the titlebar's own badge focus
+# repaint is independent of the board font, and the status bar's live CPU/MEM
+# sparkline redraws every frame regardless of the board, so both a genuine
+# 34px top and a genuine 24px bottom must stay out of this proof.
+BOARD_BODY_CROP="${WIN_W}x$(( WIN_H - 34 - 24 ))+0+34"
+convert /output/beads-board-hover.png -crop "$BOARD_BODY_CROP" +repage \
+    /tmp/beads-board-hover-body.png
 xdotool mousemove --sync --window "$WID" "$(( WIN_W - 32 ))" 49
 sleep 0.3
 xdotool click 1
 sleep 0.6
 import -window "$WID" /output/beads-board-larger.png
-LARGER_DIFF=$(compare -metric AE /output/beads-board-hover.png /output/beads-board-larger.png null: 2>&1 || true)
+convert /output/beads-board-larger.png -crop "$BOARD_BODY_CROP" +repage \
+    /tmp/beads-board-larger-body.png
+LARGER_DIFF=$(compare -metric AE /tmp/beads-board-hover-body.png \
+    /tmp/beads-board-larger-body.png null: 2>&1 || true)
 LARGER_DIFF=${LARGER_DIFF%%.*}
 [ "${LARGER_DIFF:-0}" -ge 2000 ] || fail "the larger-text button changed only ${LARGER_DIFF}px"
 xdotool mousemove --sync --window "$WID" "$(( WIN_W - 14 ))" 49
@@ -539,85 +614,28 @@ sleep 0.6
 xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.5
 import -window "$WID" /output/beads-board-restored.png
-RESTORED_DIFF=$(compare -metric AE /output/beads-board-hover.png /output/beads-board-restored.png null: 2>&1 || true)
+convert /output/beads-board-restored.png -crop "$BOARD_BODY_CROP" +repage \
+    /tmp/beads-board-restored-body.png
+RESTORED_DIFF=$(compare -metric AE /tmp/beads-board-hover-body.png \
+    /tmp/beads-board-restored-body.png null: 2>&1 || true)
 RESTORED_DIFF=${RESTORED_DIFF%%.*}
-
-# The lower-region badge is the same 34px chrome as the titlebar, but it is a
-# separate render path. Restore the named top badge, split that workspace
-# horizontally, then derive the lower bar's center from the live window bounds
-# instead of the old fixed one-pane board coordinate.
-inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":null}"
-inject "$(sample_board "$WORKSPACE")"
-focus
-GRID_HEIGHT=$(( WIN_H - 34 - 24 ))
-TOP_REGION_FOCUS_Y=$(( 34 + GRID_HEIGHT / 4 ))
-xdotool mousemove --sync --window "$WID" "$(( WIN_W / 4 ))" "$TOP_REGION_FOCUS_Y"
-xdotool click 1
-xdotool key --clearmodifiers ctrl+alt+minus
-for _ in $(seq 1 20); do
-    LOWER_WS=$(other_workspace "$WORKSPACE" || true)
-    [ -n "${LOWER_WS:-}" ] && [ "$LOWER_WS" != "$WORKSPACE" ] && break
-    sleep 0.3
-done
-[ -n "${LOWER_WS:-}" ] && [ "$LOWER_WS" != "$WORKSPACE" ] \
-    || fail "horizontal split created no lower workspace"
-inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$LOWER_WS\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":null}"
-inject "$(sample_board "$LOWER_WS")"
-focus
-
-# `TITLEBAR_HEIGHT` and `REGION_TAB_BAR_HEIGHT` are both 34px; their marks are
-# vertically centered. The lower half starts at the midpoint of the live grid.
-LOWER_BADGE_ICON_X=13
-LOWER_BADGE_ICON_Y=$(( 34 + GRID_HEIGHT / 2 + 17 ))
-LOWER_BADGE_LABEL_X=44
-import -window "$WID" /output/beads-board-lower-badge.png
-badge_mark /output/beads-board-restored.png \
-    "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y" /tmp/beads-titlebar-mark.png
-badge_mark /output/beads-board-lower-badge.png \
-    "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y" /tmp/beads-region-mark.png
-assert_matching_badge_marks /tmp/beads-titlebar-mark.png /tmp/beads-region-mark.png
-
-# The label still selects its workspace and must not consume the board's pin
-# action. Hovering the leading icon opens the board, and its click pins it.
-LOWER_ROWS=$(latest_rows "$LOWER_WS")
-xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_LABEL_X" "$LOWER_BADGE_ICON_Y"
-xdotool click 1
-sleep 0.3
-[ "$(latest_rows "$LOWER_WS")" -eq "$LOWER_ROWS" ] \
-    || fail "lower workspace label changed its Beads reservation"
-import -window "$WID" /output/beads-board-lower-before-hover.png
-xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y"
-sleep 0.5
-import -window "$WID" /output/beads-board-lower-hover.png
-LOWER_HOVER_DIFF=$(compare -metric AE /output/beads-board-lower-before-hover.png \
-    /output/beads-board-lower-hover.png null: 2>&1 || true)
-LOWER_HOVER_DIFF=${LOWER_HOVER_DIFF%%.*}
-[ "${LOWER_HOVER_DIFF:-0}" -ge 10000 ] \
-    || fail "lower Beads icon hover changed only ${LOWER_HOVER_DIFF}px"
-xdotool click 1
-for _ in $(seq 1 20); do
-    LOWER_PINNED_ROWS=$(latest_rows "$LOWER_WS")
-    [ "$LOWER_PINNED_ROWS" -lt "$LOWER_ROWS" ] && break
-    sleep 0.2
-done
-[ "${LOWER_PINNED_ROWS:-$LOWER_ROWS}" -lt "$LOWER_ROWS" ] \
-    || fail "lower Beads icon click did not pin its board"
-xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
-
 [ "${RESTORED_DIFF:-9999}" -le 400 ] \
     || fail "the smaller-text button did not undo the larger one (${RESTORED_DIFF}px left over)"
 
+# Pin and resize while there is still one region. Later split fixtures must not
+# change the geometry whose edge and row deltas this phase measures.
+TOP_ROWS=$(latest_rows "$WORKSPACE")
 xdotool click 1
 for _ in $(seq 1 20); do
-    PIN_ROWS=$(latest_rows)
-    [ "$PIN_ROWS" -lt "$BASE_ROWS" ] && break
+    PIN_ROWS=$(latest_rows "$WORKSPACE")
+    [ "$PIN_ROWS" -lt "$TOP_ROWS" ] && break
     sleep 0.2
 done
-[ "${PIN_ROWS:-$BASE_ROWS}" -lt "$BASE_ROWS" ] \
-    || fail "pin click did not reserve terminal rows ($BASE_ROWS -> ${PIN_ROWS:-$BASE_ROWS})"
+[ "${PIN_ROWS:-$TOP_ROWS}" -lt "$TOP_ROWS" ] \
+    || fail "pin click did not reserve terminal rows ($TOP_ROWS -> ${PIN_ROWS:-$TOP_ROWS})"
 xdotool mousemove --sync --window "$WID" "$(( WIN_W - 20 ))" "$(( WIN_H - 20 ))"
 sleep 0.3
-import -window "$(window_id)" /output/beads-board-pinned.png
+import -window "$WID" /output/beads-board-pinned.png
 
 # The bottom bar is a resize grip: dragging it down takes rows from this
 # region's terminal, which is the whole point of the strip being a reservation
@@ -661,11 +679,18 @@ done
 [ "${SHRUNK_ROWS:-0}" -eq "$PIN_ROWS" ] \
     || fail "dragging the bar back left $SHRUNK_ROWS rows instead of $PIN_ROWS"
 
-# A pinned board is a citizen of its own region, not a window-wide band: split
-# the window and require that only the pinned region gave up rows. Focus lands
-# in the new region, so this is also what proves a pin outlives the focus that
-# opened it.
+# A pinned board is a citizen of its own region, not a window-wide band. The
+# split re-parks WorkspaceInfo for the source region too, which re-asks the
+# real server for its board; the isolated container has no bd project to find,
+# so the real server genuinely answers NotDetected on its own — this is not
+# simulated. Wait for that real reply on the wire before touching the
+# workspace again: installing the controlled snapshot first would race an
+# in-flight real reply that can land after and silently clear the board this
+# proof depends on. share-tap relays real and injected messages through the
+# same single channel in arrival order, so once the real NotDetected is
+# recorded, every later `inject` is guaranteed to reach the client after it.
 PINNED_WS="ws-${WORKSPACE:0:8}"
+SPLIT_RECORD_MARK=$(record_mark)
 xdotool key --clearmodifiers ctrl+alt+backslash
 for _ in $(seq 1 40); do
     OTHER_WS=$(published_workspaces | tr ' ' '\n' | grep -v "^${PINNED_WS}\$" | tail -1 || true)
@@ -673,9 +698,40 @@ for _ in $(seq 1 40); do
     sleep 0.3
 done
 [ -n "${OTHER_WS:-}" ] || fail "the workspace split never published a second region"
+for _ in $(seq 1 40); do
+    [ "$(server_reported_not_detected "$WORKSPACE" "$SPLIT_RECORD_MARK")" = "1" ] && break
+    sleep 0.2
+done
+[ "$(server_reported_not_detected "$WORKSPACE" "$SPLIT_RECORD_MARK")" = "1" ] \
+    || fail "the real server never answered NotDetected for the split source"
+SPLIT_BASE=$(latest_rows "$PINNED_WS")
+SPLIT_OTHER=$(latest_rows "$OTHER_WS")
+[ "$SPLIT_BASE" -gt 0 ] && [ "$SPLIT_OTHER" -gt 0 ] \
+    || fail "the workspace split did not settle both region geometries"
+
+# Re-arm the left region after its rootless transition, pin it from the
+# positional titlebar badge, then focus the neighbour. Focus is not a pin input:
+# the original region must keep the reservation while the other owns focus.
+inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":\"/work/scribe\"}"
+inject "$(sample_board "$WORKSPACE")"
+WID=$(window_id)
+eval "$(xdotool getwindowgeometry --shell "$WID")"
+xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
+sleep 0.3
+xdotool click 1
+for _ in $(seq 1 20); do
+    SPLIT_PINNED=$(latest_rows "$PINNED_WS")
+    [ "$SPLIT_PINNED" -lt "$SPLIT_BASE" ] && break
+    sleep 0.2
+done
+[ "${SPLIT_PINNED:-$SPLIT_BASE}" -lt "$SPLIT_BASE" ] \
+    || fail "the split region did not reserve rows when pinned"
+xdotool mousemove --sync --window "$WID" "$(( 3 * WIDTH / 4 ))" "$(( HEIGHT / 2 ))"
+xdotool click 1
+sleep 0.3
 SPLIT_PINNED=$(latest_rows "$PINNED_WS")
 SPLIT_OTHER=$(latest_rows "$OTHER_WS")
-import -window "$(window_id)" /output/beads-board-split.png
+import -window "$WID" /output/beads-board-split.png
 [ "$SPLIT_PINNED" -lt "$SPLIT_OTHER" ] \
     || fail "board reserved rows outside its region (pinned $SPLIT_PINNED, other $SPLIT_OTHER)"
 
@@ -775,6 +831,70 @@ done
 [ "$(latest_rows "$OTHER_WS")" -eq "$BOTH_OTHER" ] \
     || fail "rootless NotDetected disturbed the neighbouring workspace's board"
 import -window "$(window_id)" /output/beads-board-rootless-not-detected.png
+
+# The lower-region badge is a separate render path from the titlebar badge.
+# Exercise it last so its stacked topology cannot disturb the single-region
+# resize or the side-by-side reservation proofs above.
+inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$WORKSPACE\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":\"/work/scribe\"}"
+inject "$(sample_board "$WORKSPACE")"
+WID=$(window_id)
+eval "$(xdotool getwindowgeometry --shell "$WID")"
+xdotool mousemove --sync --window "$WID" "$(( WIDTH / 4 ))" "$(( HEIGHT / 2 ))"
+xdotool click 1
+sleep 0.3
+import -window "$WID" /output/beads-board-lower-titlebar.png
+BEFORE_LOWER_SPLIT=" $(server_workspaces) "
+xdotool key --clearmodifiers ctrl+alt+minus
+for _ in $(seq 1 20); do
+    LOWER_WS=""
+    for candidate in $(server_workspaces); do
+        case "$BEFORE_LOWER_SPLIT" in
+            *" $candidate "*) ;;
+            *) LOWER_WS="$candidate" ;;
+        esac
+    done
+    [ -n "$LOWER_WS" ] && break
+    sleep 0.3
+done
+[ -n "${LOWER_WS:-}" ] || fail "stacked split created no lower workspace"
+inject "{\"type\":\"WorkspaceInfo\",\"workspace_id\":\"$LOWER_WS\",\"name\":\"scribe\",\"accent_color\":\"#a78bfa\",\"split_direction\":null,\"project_root\":\"/work/scribe\"}"
+inject "$(sample_board "$LOWER_WS")"
+focus
+
+GRID_HEIGHT=$(( HEIGHT - 34 - 24 ))
+LOWER_BADGE_ICON_X=13
+LOWER_BADGE_ICON_Y=$(( 34 + GRID_HEIGHT / 2 + 17 ))
+LOWER_BADGE_LABEL_X=44
+import -window "$WID" /output/beads-board-lower-badge.png
+badge_mark /output/beads-board-lower-titlebar.png \
+    "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y" /tmp/beads-titlebar-mark.png
+badge_mark /output/beads-board-lower-badge.png \
+    "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y" /tmp/beads-region-mark.png
+assert_matching_badge_marks /tmp/beads-titlebar-mark.png /tmp/beads-region-mark.png
+
+LOWER_ROWS=$(latest_rows "$LOWER_WS")
+xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_LABEL_X" "$LOWER_BADGE_ICON_Y"
+xdotool click 1
+sleep 0.3
+[ "$(latest_rows "$LOWER_WS")" -eq "$LOWER_ROWS" ] \
+    || fail "lower workspace label changed its Beads reservation"
+import -window "$WID" /output/beads-board-lower-before-hover.png
+xdotool mousemove --sync --window "$WID" "$LOWER_BADGE_ICON_X" "$LOWER_BADGE_ICON_Y"
+sleep 0.5
+import -window "$WID" /output/beads-board-lower-hover.png
+LOWER_HOVER_DIFF=$(compare -metric AE /output/beads-board-lower-before-hover.png \
+    /output/beads-board-lower-hover.png null: 2>&1 || true)
+LOWER_HOVER_DIFF=${LOWER_HOVER_DIFF%%.*}
+[ "${LOWER_HOVER_DIFF:-0}" -ge 10000 ] \
+    || fail "lower Beads icon hover changed only ${LOWER_HOVER_DIFF}px"
+xdotool click 1
+for _ in $(seq 1 20); do
+    LOWER_PINNED_ROWS=$(latest_rows "$LOWER_WS")
+    [ "$LOWER_PINNED_ROWS" -lt "$LOWER_ROWS" ] && break
+    sleep 0.2
+done
+[ "${LOWER_PINNED_ROWS:-$LOWER_ROWS}" -lt "$LOWER_ROWS" ] \
+    || fail "lower Beads icon click did not pin its board"
 
 echo "PASS: Beads Constellation rendered for $WORKSPACE; pin rows $BASE_ROWS -> $PIN_ROWS;" \
     "bar drag $EDGE -> $GROWN_EDGE reserved $PIN_ROWS -> $GROWN_ROWS rows;" \
