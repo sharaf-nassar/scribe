@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use scribe_common::ai_state::AiProvider;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
-    AiLaunchSpec, AiResumeMode, LayoutDirection, PaneTreeNode, TerminalSize, WorkspaceTreeNode,
+    AiLaunchSpec, AiResumeMode, LayoutDirection, PaneTreeNode, ShellTool, TerminalSize,
+    WorkspaceTreeNode,
 };
 
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
@@ -46,16 +47,19 @@ pub enum ReplayCommand {
     Custom(Vec<String>),
     AiTargeted { provider: AiProvider, conversation_id: String },
     AiGeneric { provider: AiProvider },
+    Tool(ShellTool),
 }
 
-/// Immutable command/spec pair sent for one session launch.
+/// Immutable launch intent sent for one session.
 ///
-/// AI launches use only `ai_launch`; custom commands use only `command`.
-/// Plain shells leave both fields empty.
-#[derive(Debug, Clone)]
+/// Exactly one field is ever set: AI launches use `ai_launch`, launch-only
+/// tools use `shell_tool`, custom commands use `command`, and a plain shell
+/// leaves all three empty.
+#[derive(Debug, Clone, Default)]
 pub struct SessionLaunchValues {
     pub command: Option<Vec<String>>,
     pub ai_launch: Option<AiLaunchSpec>,
+    pub shell_tool: Option<ShellTool>,
 }
 
 /// One session to re-create during cold-restart replay.
@@ -129,6 +133,16 @@ pub fn new_custom_binding(argv: Vec<String>, cwd: Option<PathBuf>) -> LaunchBind
     }
 }
 
+/// Build a fresh launch-only tool binding with a new launch id.
+#[must_use]
+pub fn new_shell_tool_binding(tool: ShellTool, cwd: Option<PathBuf>) -> LaunchBinding {
+    LaunchBinding {
+        launch_id: new_launch_id(),
+        kind: LaunchKind::ShellTool { tool },
+        fallback_cwd: cwd,
+    }
+}
+
 /// Build a fresh AI launch binding with a new launch id.
 #[must_use]
 pub fn new_ai_binding(
@@ -179,18 +193,24 @@ pub fn ai_launch_values(
     conversation_id: Option<String>,
 ) -> SessionLaunchValues {
     SessionLaunchValues {
-        command: None,
         ai_launch: Some(AiLaunchSpec { provider, resume_mode, conversation_id }),
+        ..SessionLaunchValues::default()
     }
+}
+
+/// Build launch intent for a launch-only tool tab.
+#[must_use]
+pub fn shell_tool_launch_values(tool: ShellTool) -> SessionLaunchValues {
+    SessionLaunchValues { shell_tool: Some(tool), ..SessionLaunchValues::default() }
 }
 
 /// Build wire values for a cold-restart replay command.
 #[must_use]
 pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
     match command {
-        ReplayCommand::Shell => SessionLaunchValues { command: None, ai_launch: None },
+        ReplayCommand::Shell => SessionLaunchValues::default(),
         ReplayCommand::Custom(argv) => {
-            SessionLaunchValues { command: Some(argv.clone()), ai_launch: None }
+            SessionLaunchValues { command: Some(argv.clone()), ..SessionLaunchValues::default() }
         }
         ReplayCommand::AiTargeted { provider, conversation_id } => {
             ai_launch_values(*provider, AiResumeMode::Resume, Some(conversation_id.clone()))
@@ -198,6 +218,7 @@ pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
         ReplayCommand::AiGeneric { provider } => {
             ai_launch_values(*provider, AiResumeMode::Resume, None)
         }
+        ReplayCommand::Tool(tool) => shell_tool_launch_values(*tool),
     }
 }
 
@@ -213,6 +234,7 @@ pub fn replay_command_from_record(record: &LaunchRecord) -> ReplayCommand {
         LaunchKind::Ai { provider, conversation_id: None, .. } => {
             ReplayCommand::AiGeneric { provider: *provider }
         }
+        LaunchKind::ShellTool { tool } => ReplayCommand::Tool(*tool),
     }
 }
 
@@ -832,6 +854,27 @@ mod tests {
         spawn_restore_children(0);
     }
 
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Tool replay relaunches the tool]]
+    #[test]
+    fn tool_replay_uses_structured_launch_only() {
+        let record = LaunchRecord {
+            launch_id: "tool-1".to_owned(),
+            cwd: Some(PathBuf::from("/tmp/proj")),
+            kind: LaunchKind::ShellTool { tool: ShellTool::Pi },
+            prompts: SessionPromptState::default(),
+        };
+        let command = replay_command_from_record(&record);
+        assert!(matches!(command, ReplayCommand::Tool(ShellTool::Pi)));
+
+        // A cold restart relaunches the tool through the same server-owned
+        // shell path a live chord uses: no argv, and no AI intent that would
+        // hand the pane a provider it never had.
+        let launch = replay_launch_values(&command);
+        assert!(launch.command.is_none());
+        assert!(launch.ai_launch.is_none());
+        assert_eq!(launch.shell_tool, Some(ShellTool::Pi));
+    }
+
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Structured AI replay]]
     #[test]
     fn ai_replay_uses_structured_launch_only() {
@@ -848,6 +891,7 @@ mod tests {
         let command = replay_command_from_record(&record);
         let launch = replay_launch_values(&command);
         assert!(launch.command.is_none());
+        assert!(launch.shell_tool.is_none());
         assert_eq!(
             launch.ai_launch,
             Some(AiLaunchSpec {

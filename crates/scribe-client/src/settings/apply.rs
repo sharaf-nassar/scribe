@@ -824,6 +824,7 @@ fn apply_keybinding_tab_actions(
         "new_claude_resume_tab" => kb.new_claude_resume_tab = list.clone(),
         "new_codex_tab" => kb.new_codex_tab = list.clone(),
         "new_codex_resume_tab" => kb.new_codex_resume_tab = list.clone(),
+        "new_pi_tab" => kb.new_pi_tab = list.clone(),
         "close_tab" => kb.close_tab = list.clone(),
         "next_tab" => kb.next_tab = list.clone(),
         "prev_tab" => kb.prev_tab = list.clone(),

@@ -154,6 +154,7 @@ fn all_layout_actions_resolve_from_defaults() {
         (&bindings.new_claude_resume_tab, LayoutAction::NewClaudeResumeTab),
         (&bindings.new_codex_tab, LayoutAction::NewCodexTab),
         (&bindings.new_codex_resume_tab, LayoutAction::NewCodexResumeTab),
+        (&bindings.new_pi_tab, LayoutAction::NewPiTab),
         (&bindings.close_tab, LayoutAction::CloseTab),
         (&bindings.next_tab, LayoutAction::NextTab),
         (&bindings.prev_tab, LayoutAction::PrevTab),

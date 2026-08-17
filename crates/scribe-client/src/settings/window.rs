@@ -6182,6 +6182,7 @@ fn tab_keybinding(key: &str) -> bool {
             | "new_claude_resume_tab"
             | "new_codex_tab"
             | "new_codex_resume_tab"
+            | "new_pi_tab"
             | "close_tab"
             | "next_tab"
             | "prev_tab"

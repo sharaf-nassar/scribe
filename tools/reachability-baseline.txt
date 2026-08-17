@@ -28,8 +28,8 @@ counts modules-total 74
 counts modules-wired 74
 counts server-messages-total 66
 counts server-messages-handled 61
-counts layout-actions-total 37
-counts layout-actions-handled 37
+counts layout-actions-total 38
+counts layout-actions-handled 38
 
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList

@@ -32,8 +32,9 @@ use scribe_common::protocol::{
     AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, BeadsIssueWrite,
     BeadsIssueWriteGuards, BeadsIssueWriteResult, CiRunDelta, ClientMessage, ControllerInfo,
     LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
-    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
-    TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
+    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, ShellTool,
+    TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo, WorkspaceListEntry,
+    WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -1179,6 +1180,7 @@ struct CreateSessionRequest {
     size: Option<TerminalSize>,
     command: Option<Vec<String>>,
     ai_launch: Option<AiLaunchSpec>,
+    shell_tool: Option<ShellTool>,
     env_envelope_id: Option<String>,
 }
 
@@ -1513,6 +1515,8 @@ pub struct LiveSession {
     /// Launch-time AI provider hint used when the session CLI does not emit
     /// explicit provider metadata.
     ai_provider_hint: Option<AiProvider>,
+    /// Launch-only tool identity retained for `SessionList` and handoff restore.
+    shell_tool: Option<ShellTool>,
     /// Prompt history for the running conversation, retained alongside
     /// `ai_state` so a client that attaches after the prompts were submitted
     /// still gets a prompt bar. Cleared with `ai_state`: the provider exiting
@@ -6564,6 +6568,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
             size,
             command,
             ai_launch,
+            shell_tool,
             env_envelope_id,
         } => {
             handle_create_session(
@@ -6574,6 +6579,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
                     size,
                     command,
                     ai_launch,
+                    shell_tool,
                     env_envelope_id,
                 },
                 context,
@@ -7046,6 +7052,7 @@ async fn handle_create_session(
             size: request.size,
             command: request.command,
             ai_launch: request.ai_launch,
+            shell_tool: request.shell_tool,
             env_envelope_id: request.env_envelope_id,
         })
         .await
@@ -7227,54 +7234,33 @@ async fn start_session(
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, icon_title, cwd,
-        context, ai_state, ai_provider_hint, prompt_state, cell_width, cell_height,
+        context, ai_state, ai_provider_hint, shell_tool, prompt_state, cell_width, cell_height,
         env_window_id, env_envelope_id, image_state, ..
     } = session;
     let shared = SharedSessionHandles::new(pty_fd, initial_attachment).await;
     let (terminal_images, terminal_grid_observer) =
         new_session_image_seam(session_id, cell_width, cell_height, image_state.as_deref());
+    #[rustfmt::skip]
     let live = LiveSession {
-        pty_write: Arc::clone(&shared.pty_write),
-        resize_fd: Arc::new(resize_fd),
-        term: Arc::clone(&term),
-        term_commit: Arc::clone(&shared.term_commit),
+        pty_write: Arc::clone(&shared.pty_write), resize_fd: Arc::new(resize_fd),
+        term: Arc::clone(&term), term_commit: Arc::clone(&shared.term_commit),
         terminal_grid_observer: terminal_grid_observer.clone(),
-        terminal_images: Arc::clone(&terminal_images),
-        search_cache: Arc::clone(&shared.search_cache),
-        child_pid,
-        child_identity,
+        terminal_images: Arc::clone(&terminal_images), search_cache: Arc::clone(&shared.search_cache),
+        child_pid, child_identity,
         client_writer: Arc::clone(&shared.client_writer),
-        image_sharing: Arc::clone(&shared.image_sharing),
-        attachment: Arc::clone(&shared.attachment),
-        workspace_id,
-        shell_name,
-        title,
-        icon_title,
-        task_label,
-        cwd,
-        last_cwd_report: None,
-        git_branch_cache: GitBranchCache::default(),
-        context,
-        ai_state,
-        ai_provider_hint,
-        prompt_state,
-        cell_width,
-        cell_height,
-        resize_pacer: std::sync::Mutex::default(),
-        pty,
-        handoff_snapshot,
+        image_sharing: Arc::clone(&shared.image_sharing), attachment: Arc::clone(&shared.attachment),
+        workspace_id, shell_name, title, icon_title, task_label, cwd,
+        last_cwd_report: None, git_branch_cache: GitBranchCache::default(),
+        context, ai_state, ai_provider_hint, shell_tool, prompt_state,
+        cell_width, cell_height, resize_pacer: std::sync::Mutex::default(),
+        pty, handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
-        scrollback_lines: Arc::clone(&shared.scrollback_lines),
-        has_focus: Arc::clone(&shared.has_focus),
-        env_window_id: env_window_id.unwrap_or(window_id),
-        env_envelope_id,
+        scrollback_lines: Arc::clone(&shared.scrollback_lines), has_focus: Arc::clone(&shared.has_focus),
+        env_window_id: env_window_id.unwrap_or(window_id), env_envelope_id,
         clipboard_command_tx: shared.clipboard_command_tx,
-        exit_gate: Arc::clone(&shared.exit_gate),
-        // Moved, never cloned; the entry owns the cap slot and frees it on drop.
-        _slot: slot,
+        exit_gate: Arc::clone(&shared.exit_gate), _slot: slot,
     };
     let ai_provider = register_session(&runtime, session_id, child_pidfd, child_pid, live).await;
-
     spawn_pty_reader(
         PtyReaderInputs {
             ids,
@@ -8687,6 +8673,7 @@ async fn handle_list_sessions(
         }),
         ai_state: s.ai_state.clone(),
         ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
+        shell_tool: s.shell_tool,
         prompt_state: s.prompt_state.clone(),
     };
 
@@ -12451,6 +12438,7 @@ pub async fn serialize_live_for_handoff(
                 .as_ref()
                 .map(|state| state.provider)
                 .or(live.ai_provider_hint),
+            shell_tool: live.shell_tool,
             prompt_state: live.prompt_state.clone(),
             env_window_id: Some(live.env_window_id),
             env_envelope_id: live.env_envelope_id.clone(),
@@ -12777,6 +12765,7 @@ mod tests {
             size: None,
             command: None,
             ai_launch: None,
+            shell_tool: None,
             env_envelope_id: Some("launch-42".to_owned()),
         }));
     }
@@ -12812,6 +12801,7 @@ mod tests {
             size: None,
             command: None,
             ai_launch: None,
+            shell_tool: None,
             env_envelope_id: Some("launch-42".to_owned()),
         };
 
@@ -13512,6 +13502,7 @@ mod tests {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                shell_tool: None,
                 prompt_state: None,
                 env_window_id: None,
                 env_envelope_id: None,

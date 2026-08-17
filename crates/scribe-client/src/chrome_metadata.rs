@@ -16,7 +16,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use scribe_common::{
     ids::{SessionId, WorkspaceId},
-    protocol::{EnvStatusState, SessionContext, SessionInfo, WorkspaceListEntry},
+    protocol::{EnvStatusState, SessionContext, SessionInfo, ShellTool, WorkspaceListEntry},
 };
 
 /// Chrome metadata for one session, as last reported by the server.
@@ -28,6 +28,8 @@ use scribe_common::{
 pub struct SessionChrome {
     /// Stable local launch/environment-envelope identity from `SessionList`.
     pub launch_id: Option<String>,
+    /// Launch-only tool identity retained for warm restore reconstruction.
+    pub shell_tool: Option<ShellTool>,
     /// Working directory from OSC 7 (`CwdChanged`).
     pub cwd: Option<PathBuf>,
     /// Git branch the server detected for `cwd` (`GitBranch`). `None` outside a
@@ -166,6 +168,7 @@ impl ChromeMetadata {
             if let Some(launch_id) = info.launch_id.clone() {
                 entry.launch_id = Some(launch_id);
             }
+            entry.shell_tool = info.shell_tool;
             // The list carries a snapshot, not a transition: only overwrite a
             // field the server actually knows a value for, so a live update
             // that raced ahead of the list is not rolled back to `None`.

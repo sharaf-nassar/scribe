@@ -198,6 +198,16 @@ The shell's live key path runs the configured bindings before the PTY encoder, s
 
 The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send  into the focused workspace (the AI variants through , which the server turns into a plain-tab shell that execs the CLI over itself), `next_tab` / `prev_tab` / `select_tab_N` move the selection and re-, and `close_tab` sends . Every tab shortcut names the region the user is in — the shell's, not the strip's — and [[crates/scribe-client/src/tab_session.rs#TabSessions#select]] counts only that region's tabs, so a digit cannot reach a neighbouring region's. The same switch/close paths are what the titlebar's tab buttons emit, resolved from a row position to a tab through [[crates/scribe-client/src/main.rs#TerminalView#titlebar_slot]], so pointer activation and keyboard shortcuts stay in lockstep instead of maintaining a second tab-only code path.
 
+#### A tool tab binds to its tool
+
+`new_pi_tab` is a launch-only shortcut: it opens one tab in the focused workspace running Pi, and nothing about it is AI chrome.
+
+[[crates/scribe-client/src/main.rs#TerminalView#create_shell_tool_tab|create_shell_tool_tab]] goes through the same [[crates/scribe-client/src/main.rs#TerminalView#create_tab|create_tab]] every other tab shortcut uses, differing only in the [[crates/scribe-client/src/restore_replay.rs#SessionLaunchValues|SessionLaunchValues]] it carries — `shell_tool: Some(ShellTool::Pi)`, no argv and no `ai_launch`, so [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]] owns the argv. Unlike an AI tab it does not retarget to the workspace project root: Pi is not scoped to a project, so it starts in the focused pane's CWD exactly like a plain new tab.
+
+Because Pi is untracked, no provider edge ever arrives for the pane, and [[crates/scribe-client/src/main.rs#update_retained_binding|update_retained_binding]] leaves an existing tool binding alone rather than demoting it — otherwise a later cold restart reopens a bare prompt instead of relaunching Pi.
+
+Warm reconstruction retains the typed tool identity; see [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]].
+
 `new_window` opens a second top-level window in the same process through , rather than re-spawning the binary the way the winit client's `spawn_client_process` had to — GPUI is multi-window, as the settings window already shows.  builds each window's own `Shared` state and its own IPC connection, and `main` calls it for the startup window too, so the two paths cannot drift. Independent state is what makes it a window rather than a mirror: the `Hello` on that second connection carries no window id, so the server registers a *new* window and gives it its own sessions, tab strip, and status line.
 
  is the ordered strip both sides share behind a mutex.  rebuilds it from `SessionList`, appends focused tabs on `SessionCreated`, and drops them on `SessionExited`;  mirrors it into the titlebar on redraw.
@@ -352,6 +362,12 @@ A `SessionInfo` carrying retained prompt history, an AI state, and a provider hi
 
 A retained provider, conversation id, and CWD build an AI resume binding, so the next cold restart sends structured targeted resume intent instead of launching the pane as a shell.
 
+#### Retained shell-tool bindings stay structured
+
+Warm reconstruction recovers typed Pi identity from `SessionList` instead of guessing from the running process.
+
+A fresh client process has no requested-binding queue for a server-retained Pi session. The server includes `SessionInfo.shell_tool`; [[crates/scribe-client/src/chrome_metadata.rs#SessionChrome]] retains it beside the launch id and CWD, and [[crates/scribe-client/src/main.rs#retained_session_binding]] chooses AI metadata first, then `ShellTool`, then a plain shell. Thus a warm reattach rewrites the snapshot with `LaunchKind::ShellTool` instead of silently converting Pi to bash, and the next cold replay launches Pi again.
+
 #### Live AI metadata updates restore
 
 A live AI state edge promotes or updates the persisted binding without replacing its launch id, a partial edge that omits the conversation id preserves the last targeted resume id, and only an explicit provider-clear edge demotes it to a shell.
@@ -467,6 +483,16 @@ Its one caller is the reconnect path described under [[client#Client#GPUI Client
 #### Structured AI replay
 
 An AI resume launch record replays as structured provider, resume-mode, and conversation-id intent with no client-built command argv.
+
+#### Tool launch kind round-trips
+
+[[crates/scribe-client/src/restore_state.rs#LaunchKind|LaunchKind::ShellTool]] serialises as `kind = "shell_tool"` with a `tool` name, so a snapshot written by one launch names the same tool on the next.
+
+#### Tool replay relaunches the tool
+
+A `ShellTool` launch record replays as structured tool intent — no argv and no AI intent — so a cold restart re-runs the tool through the same server-owned shell path a live chord uses, and the replayed pane is not handed a provider it never had.
+
+There is no conversation to target, so unlike an AI record the replay has nothing to resume: it is the fresh launch again.
 
 #### Replayed workspace regains its project root
 
@@ -2930,7 +2956,7 @@ Programs that lay out their own text (Claude Code's Ink renderer, pagers, shell 
 
 The URL scanner joins across hard breaks: whenever a heuristic URL match is the last content on its row (only blank filler follows it to the end of the logical line),  fetches the logical line below and consults  — the join policy — with a `HardBreakContext` (the break column vs the grid's last column, the broken row's cells, and the full next line). The policy returns the column where the URL body resumes (cells before it, e.g. a program-drawn gutter indent, stay outside the span) or `None` to refuse. Joins are capped at `MAX_HARD_JOIN_ROWS` explicit breaks; soft-wrapped rows inside a continuation line do not count against the cap. A continuation never absorbs cells covered by an OSC 8 span (FR-004) — the appended run is cut at the first such cell.
 
-The policy is modelled on kitty, the only major terminal that bridges hard breaks by default (its `url_excluded_characters` docs allow newlines "to accommodate programs such as mutt"; mid-row breaks were declined in kitty#2927): a break is bridged only when the URL ran **exactly to the terminal edge** and the next row resumes with URL characters at column 0. iTerm2 offers the same behaviour opt-in (`ignoreHardNewlinesInURLs`, default off); Alacritty, WezTerm, VTE/GNOME Terminal, Windows Terminal, and Konsole all treat a hard end-of-line as an absolute barrier (their search haystacks insert `\n` exactly at non-wrapped row ends), with OSC 8 as the ecosystem's sanctioned producer-side fix. Scribe extends the kitty rule in three guarded directions: a continuation behind a program-drawn gutter (e.g. Claude Code's banner bar `▏ `) is accepted when the broken row carries the identical gutter run (); a pure-space table-alignment indent is accepted up to a separate 32-column cap even when the broken row has content at that prefix (); and a next row that starts its own scheme prefix is a new link, never a continuation. The admitted false-positive class — a flush-to-edge URL followed by a column-0 word joins — is exactly kitty's default behaviour; kitty's opt-out precedent (`url_excluded_characters "\n"`) is the model if a config toggle is ever wanted.
+The policy is modelled on kitty, the only major terminal that bridges hard breaks by default (its `url_excluded_characters` docs allow newlines "to accommodate programs such as mutt"; mid-row breaks were declined in kitty#2927): a break is bridged only when the URL ran **exactly to the terminal edge** and the next row resumes with URL characters at column 0. iTerm2 offers the same behaviour opt-in (`ignoreHardNewlinesInURLs`, default off); Alacritty, WezTerm, VTE/GNOME Terminal, Windows Terminal, and Konsole all treat a hard end-of-line as an absolute barrier (their search haystacks insert `\n` exactly at non-wrapped row ends), with OSC 8 as the ecosystem's sanctioned producer-side fix. Scribe extends the kitty rule in three guarded directions: a continuation behind a program-drawn gutter (e.g. Claude Code's banner bar `▏`) is accepted when the broken row carries the identical gutter run (); a pure-space table-alignment indent is accepted up to a separate 32-column cap even when the broken row has content at that prefix (); and a next row that starts its own scheme prefix is a new link, never a continuation. The admitted false-positive class — a flush-to-edge URL followed by a column-0 word joins — is exactly kitty's default behaviour; kitty's opt-out precedent (`url_excluded_characters "\n"`) is the model if a config toggle is ever wanted.
 
 Cells consumed as continuation tails are masked from later line scans () so a joined tail such as `articles/15424964` is not re-matched as a fresh bare path on its own row.
 

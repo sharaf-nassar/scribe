@@ -185,6 +185,7 @@ async fn interactive_passthrough() -> Result<(), ScribeError> {
         size: None,
         command: None,
         ai_launch: None,
+        shell_tool: None,
         env_envelope_id: Some(new_launch_id()),
     };
     write_message(&mut write_half, &create_msg).await?;

@@ -53,7 +53,7 @@ use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::app::current_identity;
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::SessionContext;
+use scribe_common::protocol::{SessionContext, ShellTool};
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
 use scribe_common::socket::{current_uid, handoff_socket_path, server_socket_path};
@@ -237,6 +237,10 @@ pub struct HandoffSession {
     /// Launch-time AI provider hint. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub ai_provider_hint: Option<AiProvider>,
+    /// Launch-only tool identity. `#[serde(default)]` keeps older handoffs
+    /// compatible; AI metadata remains authoritative if both are present.
+    #[serde(default)]
+    pub shell_tool: Option<ShellTool>,
     /// Prompt history for the running conversation, carried so a server
     /// upgrade leaves every AI pane's prompt bar intact. `#[serde(default)]`
     /// for backward compat: a sender that predates the field just means the

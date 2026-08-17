@@ -162,7 +162,9 @@ Shared indicator settings cover Claude Code and Codex. The persisted key is now 
 
 All keybinding actions accept a string or array of strings (combo list, max 5 per action).
 
-Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9), clipboard, scrolling, jump to previous prompt, jump to next prompt, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
+Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, Pi, close, next, prev, select 1-9), clipboard, scrolling, jump to previous prompt, jump to next prompt, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
+
+`new_pi_tab` is listed and rebound exactly like the AI rows even though Pi is not an [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|AI provider]] — [[crates/scribe-client/src/settings/model.rs#keybinding_actions]] is the single list the page renders from, so a launch-only action needs no second surface. Its label comes from the same word-mapping in [[crates/scribe-client/src/settings/model.rs#keybinding_label]] that capitalises Claude and Codex.
 
 The settings window writes these keys itself — see [[settings#Settings#GPUI Settings Window#Shortcut capture]] — so a rebind is a keystroke rather than a config-file edit. A captured combo replaces the action's whole list; alternates beyond the first stay a `config.toml` feature.
 
@@ -242,7 +244,7 @@ Vertical rhythm: `.page-header-row` carries a 16px bottom margin into the panel,
 
 The content area below is a single `<article id="release-notes">` that receives the pre-sanitized HTML for the selected release. Both nav buttons start `disabled`; `updateNavBoundaries()` is the single source of truth that toggles the `disabled` attribute as the selection moves — Newer disables at index 0, Older at index `releases.length - 1` — so the picker and buttons stay in sync.
 
-The native `<select>` carries one `<option>` per release labeled `vX.Y.Z — YYYY-MM-DD` with a `[PRE] ` prefix when `prerelease` is true. Native `<select>` cannot render arbitrary HTML, so pre-release affordances live in the option label text and as a `.pre-release-badge` span inside the rendered notes header. Links inside rendered notes and the `[data-external]` GitHub link are delegated to `open_external_url` so the OS browser opens them instead of the webview.
+The native `<select>` carries one `<option>` per release labeled `vX.Y.Z — YYYY-MM-DD` with a `[PRE]` prefix when `prerelease` is true. Native `<select>` cannot render arbitrary HTML, so pre-release affordances live in the option label text and as a `.pre-release-badge` span inside the rendered notes header. Links inside rendered notes and the `[data-external]` GitHub link are delegated to `open_external_url` so the OS browser opens them instead of the webview.
 
 ### Failure UX
 

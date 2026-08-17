@@ -168,6 +168,7 @@ pub fn keybinding_actions() -> Vec<&'static str> {
         "new_claude_resume_tab",
         "new_codex_tab",
         "new_codex_resume_tab",
+        "new_pi_tab",
         "close_tab",
         "next_tab",
         "prev_tab",
@@ -412,6 +413,7 @@ pub fn keybinding_label(action: &str) -> String {
         .map(|word| match word {
             "claude" => "Claude",
             "codex" => "Codex",
+            "pi" => "Pi",
             "prev" => "previous",
             other => other,
         })

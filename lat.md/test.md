@@ -545,6 +545,7 @@ With the single decode slot held by an unrelated session, a seam feeding a
 non-final Kitty chunk blocks in admission. Cancelling exactly that session target
 retires one entry and turns the read into a typed quota boundary with no pending
 transfer, no retained bytes, and nothing published; cancelling the whole session
+
 - what `retire_transfers` does on close - reaches the same queued admission. A
 seam whose own admission outlives a 120 ms queue wait expires the same way, and
 the scheduler counts the expiry.
@@ -1489,7 +1490,7 @@ restores the preinst stash, leaves a running session alive, emits a warning,
 and disables relaunch. It also drives `spawn_upgrade_server` against a fake
 server that keeps writing after its bind-ready line, then runs
 `cleanup_upgrade_state` and asserts the successor's stdout still resolves to
-the state-dir `upgrade.log` — `readlink` reports ` (deleted)` if the log was
+the state-dir `upgrade.log` — `readlink` reports `(deleted)` if the log was
 unlinked underneath it. `just test-install-vulkan-guard` runs the harness in a
 disposable Debian container. The same offline fixture runs both AI-hook
 installers, requires unmatched Claude and Codex `SessionEnd` registrations and
@@ -2195,6 +2196,14 @@ Recording the same chord on a second action must repaint the row with the confli
 
 A bare Backspace on a listening row must write an empty combo list for that action, which is a different config state from the unwritten key the fixture ships with.
 
+#### The launch-only Pi row records and clears like any other
+
+`new_pi_tab` must record `ctrl+alt+p`, clear on Backspace, and take the chord back, four Tabs past `new_claude_tab`.
+
+Pi is [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|launch-only]] — no provider, no resume row beside it — so the one thing the settings page owes it is that it is an ordinary keybinding row and not a second surface. Three captures on that one row prove the write path routes the new key rather than dropping it, which an unrouted action would do silently.
+
+The live half needs more than a tab appearing: the terminal window must produce a real `pi` invocation on the recorded chord and none on the `ctrl+alt+z` default it replaced, so the stub's own record — not the `opened a new tab` line — is the assertion.
+
 ### The settings scrollbar is a control
 
 `tests/e2e/visual/settings-scrollbar.sh` (`just e2e-visual-settings-scrollbar`) is the app-level oracle for the settings content pane's overlay scrollbar: it drives the real window through XTEST and reads the thumb straight out of the pixels.
@@ -2212,6 +2221,24 @@ Six phases run in order. An overflowing page must paint a thumb and then fade it
 `tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
 
 Both chords were claimed by  before the binding dispatcher ever saw them, so only the live window can prove the fix. The script presses `ctrl+shift+q` and waits for the `closing the active tab` line that  alone writes, then presses `ctrl+shift+n` and requires both the `opened a new terminal window` line and a second mapped X11 window — a log line alone would not distinguish "the action ran" from "a window actually appeared". A third phase opens the close dialog on its relocated `ctrl+shift+d` and asserts the frame really repainted, so moving the overlay off `close_tab`'s default did not strand the surface. It reuses the session-adoption preamble documented under .
+
+#### Ctrl+Alt+Z opens one Pi tab that starts like a plain tab
+
+The chord must produce exactly one new tab, and the `pi` stub it runs must record a plain tab's startup: the rc file every other tab reads, the `PATH` that rc exported, `TERM_PROGRAM`, and the focused pane's CWD, with no argv of its own.
+
+No `SCRIBE_RESTORE_ENV_DELTA_FILE` may survive into that environment either, since the launch consumes the staged delta on its way through. A `tests/e2e/bin/pi` stand-in is what makes any of that observable — it dumps its argv and environment, then stays alive so the tab has a live process in it. The CWD assertion is the reason the phase types a `cd` first and reports it by hand: this image ships no shell-integration scripts, so nothing else emits an OSC 7 and the pane's directory has to be something other than the server's `$HOME` fallback or the two are indistinguishable. The tab count is asserted as *exactly one* rather than "at least one", because a chord reaching two handlers is the failure this row exists to catch.
+
+#### Quitting Pi ends its tab
+
+Ctrl+C must make the server finalize the exact session the stub reported through `SCRIBE_SESSION_ID`.
+
+That is what `exec pi` buys: the tool is the PTY's direct child, so quitting it closes the tab rather than dropping the user at a stray prompt. Asserting on the session id rather than on a count is deliberate — an unrelated pane dying elsewhere in the window must not be able to pass this phase. The environment carries the full UUID while the server logs `SessionId`'s prefixed short form, so the phase derives the log id rather than matching the two directly.
+
+#### Typed Pi restore regressions
+
+Three focused unit regressions cover typed Pi continuity beyond the visual launch.
+
+A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`.
 
 ### Tab switching is live
 
@@ -2359,7 +2386,7 @@ Split-scroll needs both halves of its gate, so the phase posts a real `state_cha
 
 Both halves were invisible to every headless test. The crate contained no scroll-wheel handling at all, and `mouse_reporting.rs` was an unwired module with a green golden-byte suite — a suite that cannot tell a wired encoder from an unwired one, which is exactly how the pair survived to the launch gate. The run therefore uses the  plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and asserts against three independent oracles: the client's own log lines, the recorded `KeyInput` bytes, and the pane's own screen.
 
-The third oracle is what makes the run end-to-end. Each tracking phase starts a real `cat -v` in the pane behind the DEC modes under test and a non-canonical, non-echoing line discipline, so every byte the client forwards is printed straight back onto the pane as visible text (`^ plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and every phase needs a screenshot diff *and* a recorded `Resize` before it passes.
+The third oracle is what makes the run end-to-end. Each tracking phase starts a real `cat -v` in the pane behind the DEC modes under test and a non-canonical, non-echoing line discipline, so every byte the client forwards is printed straight back onto the pane as visible text (`^ plus the  wire tap (`SCRIBE_SHARE_TAP=1`), and every phase needs a screenshot diff *and* a recorded`Resize` before it passes.
 
 Phase 10 covers default-on focus-follows-mouse. One button-free crossing must
 add exactly one `focused pane moved` line and zero `KeyInput` frames. Motion
@@ -2433,6 +2460,7 @@ The `Subscribe` half asserts a client frame naming the attached session, that it
 The session-tooling run fills history and pages up before a font-size reload drives a `ScreenSnapshot`. That resync must leave the viewport scrolled.
 
 A following `shift+End` must move to offset zero, which rules out a resync that silently returned the pane to the live bottom.
+
 ### Terminal bell attention routing
 
 `tests/e2e/visual/bell.sh` is the app-level oracle for the `Bell` parity row: it drives a real BEL byte out of a real shell and asserts what the running client does with it (see ).
@@ -2484,6 +2512,7 @@ Every control is reached through a semantic target rather than a coordinate: the
 The single pointer gesture is that seed: a click in the middle of the sidebar's 36px version footer. It exists because nothing holds the GPUI focus handle when the window opens, so the first keystroke would otherwise dispatch to the window root and be dropped; the click hands the root its handle and resets `focus_index` to 0 through `clear_keyboard_navigation`, which is why every phase can count Down presses from a known origin. Phase 0 asserts it sends no frame, so a future sidebar that puts a control there fails loudly instead of silently mutating config.
 
 The footer is the one part of the sidebar that cannot become a control by accident: a `flex_none` `Role::Note` pinned below the nav list, which is its own scroll region, so adding pages scrolls them rather than pushing anything into the seed point. Aiming at the empty background below the last nav item is what the grouped-nav redesign broke — the list grew under the old point and the seed click started selecting Remote, putting four frames on a wire phase 0 requires to stay silent. The point is window-relative (`xdotool mousemove --window`) because under a reparenting WM `getwindowgeometry`'s absolute Y carries the frame offset and absolute arithmetic aims low.
+
 ### A maximized window survives an update
 
 `tests/e2e/visual/maximized-restore.sh` (`just e2e-visual-maximized-restore`) drives the restore path an *update* takes, which is not the one a quit takes.
@@ -2703,7 +2732,7 @@ Use `tests/install/postinst-regressions.sh`; `just test-install-vulkan-guard` ru
 Every supported change class maps to a named sandbox recipe or path; exceptions map to a named limit above.
 
 | Change class | Sandbox route |
-|---|---|
+| --- | --- |
 | `server` | `just e2e`; focused work uses `just e2e-func <script>` under `tests/e2e/func/`. |
 | `client rendering` | `just e2e-all-visual`; focused work uses `just e2e-visual <script>` under `tests/e2e/visual/`. |
 | `CLI` | `just e2e-func func/cli-smoke.sh` (`tests/e2e/func/cli-smoke.sh`). |
@@ -3740,38 +3769,38 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 
 | Headless suite | Spec section | Parity-inventory row(s) whose logic it covers |
 | --- | --- | --- |
-| Pane tree entity ops |  | Input/keybinding "Pane layout" |
-| Pane split-tree logic |  | Input/keybinding "Pane layout" |
-| Workspace tree entity ops |  | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` |
-| Input byte encoder golden |  | `KeyInput`, Terminal shortcuts |
-| Keybindings dispatch |  | Pane/Workspace/Tab/Navigation/View keybinding actions |
-| Config load with removed keys |  | "Removed configuration keys" rows |
-| Config live reload |  | `ConfigReloaded` live reload |
-| Window chrome geometry |  | Rendering/window status-bar and prompt-bar chrome |
-| Window opacity |  | Rendering/window `appearance.opacity` |
-| Update surfaces |  | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
-| Cell-accurate paint path |  | Box drawing, Font fallback, Ligatures |
-| Find overlay |  | `SearchRequest`, `SearchResults`, `find` keybinding |
-| URL/OSC8 detection |  | hover/dwell/open surface |
-| IPC bridge ordering |  | Executor-model ordering risk |
-| Remote connect picker |  | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
-| Remote handshake |  | `RemoteHandshake` preamble + dial-env spawn |
-| Lost control banner |  | `WindowTakenOver` displaced-client reclaim |
-| LAN device approval |  | `LanApprovalRequest`/`LanApprovalDecision` prompt |
-| LAN chrome |  | `LanApprovalRequest`, `LanPeerList`, `LanEnv` shared state |
-| LAN dial preamble |  | `LanHello`, `LanApprovalPending`, `LanApprovalResult` |
-| Remote chrome |  | `RemoteEnv`, `RemotePeerList`, `WindowTakenOver`, `RunAction` shared state |
-| Window sharing |  | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
-| Local share join |  | `Hello` window claim (harness plumbing, no parity row) |
-| Pane dividers |  | "Pane divider drag-resize" chrome |
-| Focus borders |  | "Focused pane/workspace border" chrome |
-| Split-scroll |  | "Split-scroll live-bottom pin" AI-pane chrome |
-| Terminal viewport |  | `scroll_up`/`scroll_down`/`scroll_top`/`scroll_bottom`, vi mode, smart selection reachability |
-| Font zoom |  | "Zoom in/out/reset" View keybinding actions |
-| Mouse reporting |  | "Mouse reporting (X10/SGR-1006, modes 1000/1002/1003)", mouse-wheel scrolling |
-| OSC 52 clipboard bridge |  | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
-| Notification dispatcher |  | Notification `replaces_id` coalescing + click-to-focus |
-| Terminal chrome metadata |  | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
+| Pane tree entity ops | | Input/keybinding "Pane layout" |
+| Pane split-tree logic | | Input/keybinding "Pane layout" |
+| Workspace tree entity ops | | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` |
+| Input byte encoder golden | | `KeyInput`, Terminal shortcuts |
+| Keybindings dispatch | | Pane/Workspace/Tab/Navigation/View keybinding actions |
+| Config load with removed keys | | "Removed configuration keys" rows |
+| Config live reload | | `ConfigReloaded` live reload |
+| Window chrome geometry | | Rendering/window status-bar and prompt-bar chrome |
+| Window opacity | | Rendering/window `appearance.opacity` |
+| Update surfaces | | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
+| Cell-accurate paint path | | Box drawing, Font fallback, Ligatures |
+| Find overlay | | `SearchRequest`, `SearchResults`, `find` keybinding |
+| URL/OSC8 detection | | hover/dwell/open surface |
+| IPC bridge ordering | | Executor-model ordering risk |
+| Remote connect picker | | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
+| Remote handshake | | `RemoteHandshake` preamble + dial-env spawn |
+| Lost control banner | | `WindowTakenOver` displaced-client reclaim |
+| LAN device approval | | `LanApprovalRequest`/`LanApprovalDecision` prompt |
+| LAN chrome | | `LanApprovalRequest`, `LanPeerList`, `LanEnv` shared state |
+| LAN dial preamble | | `LanHello`, `LanApprovalPending`, `LanApprovalResult` |
+| Remote chrome | | `RemoteEnv`, `RemotePeerList`, `WindowTakenOver`, `RunAction` shared state |
+| Window sharing | | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
+| Local share join | | `Hello` window claim (harness plumbing, no parity row) |
+| Pane dividers | | "Pane divider drag-resize" chrome |
+| Focus borders | | "Focused pane/workspace border" chrome |
+| Split-scroll | | "Split-scroll live-bottom pin" AI-pane chrome |
+| Terminal viewport | | `scroll_up`/`scroll_down`/`scroll_top`/`scroll_bottom`, vi mode, smart selection reachability |
+| Font zoom | | "Zoom in/out/reset" View keybinding actions |
+| Mouse reporting | | "Mouse reporting (X10/SGR-1006, modes 1000/1002/1003)", mouse-wheel scrolling |
+| OSC 52 clipboard bridge | | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
+| Notification dispatcher | | Notification `replaces_id` coalescing + click-to-focus |
+| Terminal chrome metadata | | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
 | CI run bar | [[test#GPUI CI Run Bar]] | `CiRunState`, `DismissCiRun`, workspace-region chrome |
 
 ### Refused restore claim decision

@@ -20,7 +20,9 @@ use vte::ansi::Processor as AnsiProcessor;
 use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{AiLaunchSpec, AiResumeMode, SessionContext, TerminalSize};
+use scribe_common::protocol::{
+    AiLaunchSpec, AiResumeMode, SessionContext, ShellTool, TerminalSize,
+};
 use scribe_common::screen::{
     CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, DecPrivateMode, ScreenCell,
     ScreenColor, ScreenSnapshot,
@@ -196,6 +198,8 @@ pub struct ManagedSession {
     pub ai_state: Option<AiProcessState>,
     /// Launch-time AI provider hint derived from the session command.
     pub ai_provider_hint: Option<AiProvider>,
+    /// Launch-only tool identity retained across warm and handoff restore.
+    pub shell_tool: Option<ShellTool>,
     /// Prompt history from handoff, kept next to `ai_state` so a restored
     /// session still answers `SessionList` with the bar the client had.
     /// `None` for fresh sessions.
@@ -278,6 +282,7 @@ fn restored_managed_session(
         context: handoff_session.context.clone(),
         ai_state: handoff_session.ai_state.clone(),
         ai_provider_hint: handoff_session.ai_provider_hint,
+        shell_tool: handoff_session.shell_tool,
         prompt_state: handoff_session.prompt_state.clone(),
         cell_width: handoff_session.cell_width.max(1),
         cell_height: handoff_session.cell_height.max(1),
@@ -328,6 +333,9 @@ pub struct SessionLaunchRequest {
     /// When present, this is authoritative and the dual-written legacy
     /// `command` is ignored.
     pub ai_launch: Option<AiLaunchSpec>,
+    /// Launch-only tool intent, built by the same server-owned argv builder.
+    /// Ignored when `ai_launch` is present.
+    pub shell_tool: Option<ShellTool>,
     /// Optional launch-record id naming an encrypted env envelope to apply
     /// to the new PTY (cold-restart replay). `None` for normal first-time
     /// session creation and for handoff-restored sessions (env stays on the
@@ -335,10 +343,23 @@ pub struct SessionLaunchRequest {
     pub env_envelope_id: Option<String>,
 }
 
+impl SessionLaunchRequest {
+    fn normalize(mut self) -> Self {
+        if self.ai_launch.is_some() {
+            self.shell_tool = None;
+            self.command = None;
+        } else if self.shell_tool.is_some() {
+            self.command = None;
+        }
+        self
+    }
+}
+
 struct PreparedSessionLaunch {
     session_id: SessionId,
     workspace_id: WorkspaceId,
     ai_provider_hint: Option<AiProvider>,
+    shell_tool: Option<ShellTool>,
     term: Term<ScribeEventListener>,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
     shell_name: String,
@@ -405,6 +426,7 @@ impl PreparedSessionLaunch {
             context: None,
             ai_state: None,
             ai_provider_hint: self.ai_provider_hint,
+            shell_tool: self.shell_tool,
             prompt_state: None,
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
@@ -471,6 +493,7 @@ impl SessionManager {
         &self,
         request: SessionLaunchRequest,
     ) -> Result<SessionId, ScribeError> {
+        let request = request.normalize();
         // Reserved first and held across every fallible step below: an error
         // after this point drops `slot` and returns the reservation, so a
         // failed spawn never leaks a slot.
@@ -556,12 +579,14 @@ impl SessionManager {
             .to_owned();
         let integration_enabled = env.integration_enabled;
         let integration_script = session_integration_script(shell.kind, integration_enabled);
+        let exec_command =
+            launch_exec_command(shell.kind, request.ai_launch.as_ref(), request.shell_tool);
         let pty_shell = build_launch_shell(
             shell_binary,
             request.command,
             shell.kind,
             integration_script.as_deref(),
-            request.ai_launch.as_ref(),
+            exec_command.as_deref(),
         )
         .map(|(program, args)| alacritty_terminal::tty::Shell::new(program, args));
         let kitty_window_id = codex_kitty_window_id(
@@ -581,6 +606,7 @@ impl SessionManager {
             session_id,
             workspace_id: request.workspace_id,
             ai_provider_hint,
+            shell_tool: request.shell_tool,
             term,
             event_rx,
             shell_name,
@@ -1038,46 +1064,61 @@ fn build_shell(
     Some((program, args))
 }
 
-/// The PTY shell for a launch, with or without structured AI intent.
+/// The PTY shell for a launch, with or without a trailing tool to exec.
 ///
-/// An AI tab is deliberately not its own session class: it is the ordinary
-/// [`build_shell`] invocation — same binary, same integration attachment, same
-/// startup files — with a command appended that runs the provider. The shell
-/// reads the user's rc exactly as every other tab does, so an AI tab can never
-/// resolve a different `PATH` than the tab beside it.
+/// An AI tab is deliberately not its own session class, and neither is a
+/// launch-only tool tab: each is the ordinary [`build_shell`] invocation —
+/// same binary, same integration attachment, same startup files — with a
+/// command appended that runs the tool. The shell reads the user's rc exactly
+/// as every other tab does, so such a tab can never resolve a different `PATH`
+/// than the tab beside it.
 fn build_launch_shell(
     shell_binary: &str,
     command: Option<Vec<String>>,
     kind: ShellKind,
     integration_script: Option<&str>,
-    ai_launch: Option<&AiLaunchSpec>,
+    exec_command: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
-    let Some(launch) = ai_launch else {
+    let Some(exec) = exec_command else {
         return build_shell(shell_binary, command, kind, integration_script);
     };
-    // PowerShell runs the provider through `-Command`, which is exclusive with
+    // PowerShell runs the tool through `-Command`, which is exclusive with
     // the `-File` integration attachment and has to be the final argument, so
-    // an AI launch drops the script rather than ship an argv where one flag
+    // such a launch drops the script rather than ship an argv where one flag
     // eats another. Every other shell keeps its attachment.
     let script = integration_script.filter(|_| kind != ShellKind::PowerShell);
     let (program, mut args) = build_shell(shell_binary, command, kind, script)?;
-    args.extend(ai_exec_args(kind, launch));
+    args.extend(tool_exec_args(kind, exec));
     Some((program, args))
 }
 
-/// Trailing argv that runs the provider and ends the session with it.
+/// The command a launch runs after its shell's startup files, if any.
 ///
-/// POSIX-family shells `exec` the provider over themselves, so the CLI becomes
+/// Structured AI intent wins over a launch-only tool: a request never carries
+/// both, and preferring AI keeps the provider's resume argv authoritative.
+fn launch_exec_command(
+    kind: ShellKind,
+    ai_launch: Option<&AiLaunchSpec>,
+    shell_tool: Option<ShellTool>,
+) -> Option<String> {
+    if let Some(launch) = ai_launch {
+        return Some(ai_exec_command(kind, launch));
+    }
+    shell_tool.map(|tool| exec_prefixed(kind, tool.binary_name()))
+}
+
+/// Trailing argv that runs `exec` and ends the session with it.
+///
+/// POSIX-family shells `exec` the tool over themselves, so the CLI becomes
 /// the PTY's direct child and quitting it closes the tab instead of dropping
 /// the user at a stray prompt.
-fn ai_exec_args(kind: ShellKind, launch: &AiLaunchSpec) -> Vec<String> {
-    let exec = ai_exec_command(kind, launch);
+fn tool_exec_args(kind: ShellKind, exec: &str) -> Vec<String> {
     match kind {
         // Nushell rejects the grouped short form and takes no integration
         // under any `-c` variant (its vendor autoload is REPL-only).
-        ShellKind::Nushell => vec![String::from("-i"), String::from("-c"), exec],
+        ShellKind::Nushell => vec![String::from("-i"), String::from("-c"), exec.to_owned()],
         // Zsh and fish schedule their restore-delta apply for the first
-        // `precmd` so it lands after the user's rc; an AI tab execs before any
+        // `precmd` so it lands after the user's rc; such a tab execs before any
         // prompt, so that consumer never runs and both the delta and its temp
         // file would be left behind. The `-c` command is the only point that
         // is still after user rc and still before `exec`, so it consumes the
@@ -1095,20 +1136,25 @@ fn ai_exec_args(kind: ShellKind, launch: &AiLaunchSpec) -> Vec<String> {
                 "if test -n \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; and test -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; source \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; command rm -f \"$SCRIBE_RESTORE_ENV_DELTA_FILE\"; end; set -e SCRIBE_RESTORE_ENV_DELTA_FILE; {exec}"
             ),
         ],
-        // PowerShell has neither `-i` nor `exec`. `-Command` is the provider's
+        // PowerShell has neither `-i` nor `exec`. `-Command` is the tool's
         // only job and pwsh exits when it returns, so the tab still ends with
         // the CLI without an exec to replace the process.
-        ShellKind::PowerShell => vec![String::from("-NoLogo"), String::from("-Command"), exec],
+        ShellKind::PowerShell => {
+            vec![String::from("-NoLogo"), String::from("-Command"), exec.to_owned()]
+        }
         // An unknown shell is most likely POSIX-family; `-ic` is the portable
         // guess and is what `sh` itself accepts.
-        ShellKind::Bash | ShellKind::Unknown => vec![String::from("-ic"), exec],
+        ShellKind::Bash | ShellKind::Unknown => vec![String::from("-ic"), exec.to_owned()],
     }
 }
 
+/// `binary`, prefixed with `exec` on every shell that has one.
+fn exec_prefixed(kind: ShellKind, binary: &str) -> String {
+    if kind == ShellKind::PowerShell { binary.to_owned() } else { format!("exec {binary}") }
+}
+
 fn ai_exec_command(kind: ShellKind, launch: &AiLaunchSpec) -> String {
-    let binary = launch.provider.binary_name();
-    let mut command =
-        if kind == ShellKind::PowerShell { binary.to_owned() } else { format!("exec {binary}") };
+    let mut command = exec_prefixed(kind, launch.provider.binary_name());
     if launch.resume_mode == AiResumeMode::Resume {
         for arg in launch.provider.resume_args() {
             command.push(' ');
@@ -1365,6 +1411,7 @@ mod tests_session_cap {
                 context: None,
                 ai_state: None,
                 ai_provider_hint: None,
+                shell_tool: None,
                 prompt_state: None,
                 env_window_id: None,
                 env_envelope_id: None,
@@ -1475,11 +1522,12 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use scribe_common::ids::SessionId;
+    use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 
     use super::{
         AiLaunchSpec, AiProvider, AiResumeMode, EnvLaunchContext, PtyOptionsBuild,
-        build_launch_shell, build_pty_options, build_shell, codex_kitty_window_id,
+        SessionLaunchRequest, ShellTool, build_launch_shell, build_pty_options, build_shell,
+        codex_kitty_window_id, command_ai_provider_hint, launch_exec_command,
         path_with_macos_baseline,
     };
     use crate::shell_integration::ShellKind;
@@ -1568,14 +1616,28 @@ mod tests {
         assert_eq!(shell, Some((String::from("/bin/zsh"), Vec::new())));
     }
 
+    fn launch_argv(
+        kind: ShellKind,
+        integration_script: Option<&str>,
+        launch: Option<&AiLaunchSpec>,
+        tool: Option<ShellTool>,
+    ) -> Vec<String> {
+        let exec = launch_exec_command(kind, launch, tool);
+        build_launch_shell("/bin/shell", None, kind, integration_script, exec.as_deref())
+            .expect("argv")
+            .1
+    }
+
     fn ai_argv(
         kind: ShellKind,
         integration_script: Option<&str>,
         launch: &AiLaunchSpec,
     ) -> Vec<String> {
-        build_launch_shell("/bin/shell", None, kind, integration_script, Some(launch))
-            .expect("argv")
-            .1
+        launch_argv(kind, integration_script, Some(launch), None)
+    }
+
+    fn tool_argv(kind: ShellKind, integration_script: Option<&str>) -> Vec<String> {
+        launch_argv(kind, integration_script, None, Some(ShellTool::Pi))
     }
 
     // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]]
@@ -1630,6 +1692,94 @@ mod tests {
                     String::from("-File"),
                     String::from("/s/scribe.ps1"),
                 ]
+            ))
+        );
+    }
+
+    // @lat: [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]]
+    #[test]
+    fn tool_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
+        // Byte-for-byte the AI-tab argv with the provider swapped for the tool:
+        // same `--rcfile` attachment, same interactive `-c`, same `exec`, so a
+        // Pi tab reads the startup files a plain tab reads and ends when Pi
+        // does. No resume arguments exist to append — Pi is launch-only.
+        assert_eq!(
+            tool_argv(ShellKind::Bash, Some("/s/scribe.bash")),
+            ["--rcfile", "/s/scribe.bash", "-ic", "exec pi"]
+        );
+        let zsh = tool_argv(ShellKind::Zsh, None);
+        assert_eq!(zsh[0], "-ic");
+        assert!(zsh[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", zsh[1]);
+        assert!(zsh[1].ends_with("exec pi"), "{}", zsh[1]);
+        let fish = tool_argv(ShellKind::Fish, None);
+        assert!(fish[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", fish[1]);
+        assert!(fish[1].ends_with("exec pi"), "{}", fish[1]);
+        assert_eq!(tool_argv(ShellKind::Nushell, None), ["-i", "-c", "exec pi"]);
+        assert_eq!(
+            tool_argv(ShellKind::PowerShell, Some("/s/scribe.ps1")),
+            ["-NoLogo", "-Command", "pi"]
+        );
+        // A tool tab is not an AI tab: nothing about it names a provider, so
+        // the launch carries no AI hint for the reader to track.
+        assert_eq!(command_ai_provider_hint(Some(&[String::from("pi")])), None);
+    }
+
+    // @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Typed Pi restore regressions]]
+    #[test]
+    fn structured_launch_intent_ignores_a_simultaneous_legacy_command() {
+        let command = Some(vec!["/bin/false".to_owned(), "legacy".to_owned()]);
+        let tool = SessionLaunchRequest {
+            workspace_id: WorkspaceId::new(),
+            window_id: WindowId::new(),
+            cwd: None,
+            size: None,
+            command: command.clone(),
+            ai_launch: None,
+            shell_tool: Some(ShellTool::Pi),
+            env_envelope_id: None,
+        }
+        .normalize();
+        assert!(tool.command.is_none());
+        assert_eq!(tool.shell_tool, Some(ShellTool::Pi));
+
+        let ai = SessionLaunchRequest {
+            workspace_id: WorkspaceId::new(),
+            window_id: WindowId::new(),
+            cwd: None,
+            size: None,
+            command,
+            ai_launch: Some(AiLaunchSpec {
+                provider: AiProvider::ClaudeCode,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }),
+            shell_tool: Some(ShellTool::Pi),
+            env_envelope_id: None,
+        }
+        .normalize();
+        assert!(ai.command.is_none());
+        assert!(ai.shell_tool.is_none());
+        assert!(ai.ai_launch.is_some());
+    }
+
+    #[test]
+    fn ai_intent_outranks_a_tool_on_the_same_request() {
+        let claude = AiLaunchSpec {
+            provider: AiProvider::ClaudeCode,
+            resume_mode: AiResumeMode::New,
+            conversation_id: None,
+        };
+        assert_eq!(
+            launch_exec_command(ShellKind::Bash, Some(&claude), Some(ShellTool::Pi)).as_deref(),
+            Some("exec claude")
+        );
+        // Neither means the plain-tab argv, unchanged.
+        assert_eq!(launch_exec_command(ShellKind::Bash, None, None), None);
+        assert_eq!(
+            build_launch_shell("/bin/shell", None, ShellKind::Bash, Some("/s/scribe.bash"), None),
+            Some((
+                String::from("/bin/shell"),
+                vec![String::from("--rcfile"), String::from("/s/scribe.bash")]
             ))
         );
     }

@@ -1509,6 +1509,7 @@ async fn handle_create_session(
         size: params.size,
         command: None,
         ai_launch,
+        shell_tool: None,
         env_envelope_id: Some(envelope_id.clone()),
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {

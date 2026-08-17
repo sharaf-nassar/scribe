@@ -20,7 +20,7 @@ use scribe_common::ai_state::AiProvider;
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::{WindowId, WorkspaceId};
 pub use scribe_common::protocol::AiResumeMode;
-use scribe_common::protocol::{LayoutDirection, SessionPromptState};
+use scribe_common::protocol::{LayoutDirection, SessionPromptState, ShellTool};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -124,8 +124,19 @@ pub struct LaunchRecord {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaunchKind {
     Shell,
-    CustomCommand { argv: Vec<String> },
-    Ai { provider: AiProvider, resume_mode: AiResumeMode, conversation_id: Option<String> },
+    CustomCommand {
+        argv: Vec<String>,
+    },
+    Ai {
+        provider: AiProvider,
+        resume_mode: AiResumeMode,
+        conversation_id: Option<String>,
+    },
+    /// A launch-only tool tab (see [`ShellTool`]). Replay re-runs the tool in a
+    /// fresh plain-tab shell; there is no conversation to target.
+    ShellTool {
+        tool: ShellTool,
+    },
 }
 
 /// Runtime binding kept on each pane so restore snapshots can refer to a stable
@@ -597,6 +608,17 @@ mod tests {
                 } if decoded_mode == resume_mode
             ));
         }
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Tool launch kind round-trips]]
+    #[test]
+    fn shell_tool_toml_round_trip_preserves_the_tool() {
+        let original = LaunchKind::ShellTool { tool: ShellTool::Pi };
+        let encoded = toml::to_string(&original).expect("serialize tool launch kind");
+        assert_eq!(encoded, "kind = \"shell_tool\"\ntool = \"pi\"\n");
+
+        let decoded: LaunchKind = toml::from_str(&encoded).expect("deserialize tool launch kind");
+        assert!(matches!(decoded, LaunchKind::ShellTool { tool: ShellTool::Pi }));
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Claim skips non-replayable and remaining count]]

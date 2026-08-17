@@ -22,7 +22,7 @@ Verifies that a state-only hook from the same conversation still inherits the li
 
 Single source of truth for how a context-window fill percentage is spelled on screen, shared by every surface that displays one.
 
-Two surfaces show the percentage in every band but use different shapes: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`), while the tab label appends a bare suffix (` 72%`).  and  own those strings and pulse suppression, so the GPUI prompt bar (), the GPUI tab bar (), and the E2E harness that asserts on them () cannot drift apart.
+Two surfaces show the percentage in every band but use different shapes: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`), while the tab label appends a bare suffix (`72%`).  and  own those strings and pulse suppression, so the GPUI prompt bar (), the GPUI tab bar (), and the E2E harness that asserts on them () cannot drift apart.
 
 Only text is shared. Band colors stay with each surface because they resolve through different palettes — the prompt bar reads the configured  hex colors while the tab bar uses its own fixed band colors.
 
@@ -32,7 +32,7 @@ Verifies  lights segments by `div_ceil` (any non-zero percentage fills at least 
 
 ### Tab suffix shows known context unless pulsing
 
-Verifies  returns the bare ` NN%` suffix for every known percentage and `None` while a pulsing attention state owns the UX.
+Verifies  returns the bare `NN%` suffix for every known percentage and `None` while a pulsing attention state owns the UX.
 
 ## Configuration
 
@@ -114,9 +114,9 @@ Verifies `prompt_bar_font_size` defaults to `None`, that an unset override survi
 
 ### Keybindings
 
- exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, command-jump navigation, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
+ exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, command-jump navigation, zoom, and terminal word motion, including Claude Code and Codex open/resume shortcuts and `new_pi_tab`.
 
-Each field uses , which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to  (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
+Each field uses , which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to  (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents. `new_pi_tab` is the exception: it defaults to `ctrl+alt+z` on every platform, because the tool it launches is not a macOS-native app action and `cmd+alt+z` is redo territory.
 
 On macOS, config load also migrates stale legacy non-mac defaults when a saved keybindings block still looks like an older generated config, so pre-existing Linux-style defaults do not mask the platform-native shortcuts after install.
 

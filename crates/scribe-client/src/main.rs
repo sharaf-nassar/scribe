@@ -92,8 +92,8 @@ use scribe_client::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client::remote_handshake::{self, RemoteDialer};
 use scribe_client::remote_picker::{RemotePickerColors, remote_picker_overlay};
 use scribe_client::restore_replay::{
-    self, GridSize, ReplayLaunch, attach_dimensions_for_session, grid_for_rect, prepare_replay,
-    round_positive_f32_to_u16,
+    self, GridSize, ReplayLaunch, SessionLaunchValues, attach_dimensions_for_session,
+    grid_for_rect, prepare_replay, round_positive_f32_to_u16,
 };
 use scribe_client::restore_state::{
     AiResumeMode, LaunchBinding, LaunchKind, RestoreStore, WindowRestoreState,
@@ -158,9 +158,9 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
-        AiLaunchSpec, AutomationAction, CiRunDetails, CiRunState, ClientMessage,
-        ClipboardSelection, PromptMarkKind, ServerMessage, SessionInfo, TerminalSize,
-        UpdateProgressState, WindowInfo, WorkspaceTreeNode,
+        AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardSelection,
+        PromptMarkKind, ServerMessage, SessionInfo, ShellTool, TerminalSize, UpdateProgressState,
+        WindowInfo, WorkspaceTreeNode,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -957,12 +957,8 @@ struct WindowSeed {
 ///
 /// AI shortcuts bind directly from typed launch intent. Every command without
 /// that intent remains a custom command, regardless of its argv contents.
-fn launch_binding_for(
-    command: Option<&Vec<String>>,
-    ai_launch: Option<&AiLaunchSpec>,
-    cwd: Option<PathBuf>,
-) -> LaunchBinding {
-    if let Some(ai_launch) = ai_launch {
+fn launch_binding_for(launch: &SessionLaunchValues, cwd: Option<PathBuf>) -> LaunchBinding {
+    if let Some(ai_launch) = launch.ai_launch.as_ref() {
         return restore_replay::new_ai_binding(
             ai_launch.provider,
             ai_launch.resume_mode,
@@ -970,14 +966,22 @@ fn launch_binding_for(
             ai_launch.conversation_id.clone(),
         );
     }
-    let Some(argv) = command else {
+    if let Some(tool) = launch.shell_tool {
+        return restore_replay::new_shell_tool_binding(tool, cwd);
+    }
+    let Some(argv) = launch.command.as_ref() else {
         return restore_replay::new_shell_binding(cwd);
     };
     restore_replay::new_custom_binding(argv.clone(), cwd)
 }
 
-type RetainedSessionMetadata =
-    (Option<(AiProvider, Option<String>)>, Option<PathBuf>, Option<String>, bool);
+type RetainedSessionMetadata = (
+    Option<(AiProvider, Option<String>)>,
+    Option<ShellTool>,
+    Option<PathBuf>,
+    Option<String>,
+    bool,
+);
 
 fn update_binding_cwd(binding: &mut LaunchBinding, cwd: Option<&Path>) -> bool {
     let Some(cwd) = cwd else { return false };
@@ -1043,6 +1047,7 @@ fn clear_retained_binding(binding: &mut LaunchBinding, cwd: Option<&Path>) -> bo
 /// it and mint once; provider, conversation and CWD still keep replay targeted.
 fn retained_session_binding(
     ai: Option<(AiProvider, Option<&str>)>,
+    shell_tool: Option<ShellTool>,
     cwd: Option<PathBuf>,
     launch_id: Option<String>,
 ) -> LaunchBinding {
@@ -1052,6 +1057,8 @@ fn retained_session_binding(
             resume_mode: AiResumeMode::Resume,
             conversation_id: conversation_id.map(str::to_owned),
         }
+    } else if let Some(tool) = shell_tool {
+        LaunchKind::ShellTool { tool }
     } else {
         LaunchKind::Shell
     };
@@ -2933,7 +2940,7 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
             LayoutAction::NewTab => {
                 let cwd = self.focused_session_cwd();
-                self.create_tab(self.creating_workspace(cx), None, None, cwd);
+                self.create_tab(self.creating_workspace(cx), SessionLaunchValues::default(), cwd);
             }
             LayoutAction::NewClaudeTab => {
                 self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New, cx);
@@ -2947,6 +2954,7 @@ impl TerminalView {
             LayoutAction::NewCodexResumeTab => {
                 self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume, cx);
             }
+            LayoutAction::NewPiTab => self.create_shell_tool_tab(ShellTool::Pi, cx),
             // Every tab shortcut acts on the region the user is in, which the
             // shell owns; the strip is asked for a tab of that region and can
             // no longer answer with a neighbouring region's.
@@ -3518,8 +3526,10 @@ impl TerminalView {
             ContextMenuAction::RunCommandInWindow(command) => {
                 self.create_tab(
                     self.creating_workspace(cx),
-                    Some(shell_command_argv(&command)),
-                    None,
+                    SessionLaunchValues {
+                        command: Some(shell_command_argv(&command)),
+                        ..SessionLaunchValues::default()
+                    },
                     None,
                 );
             }
@@ -4772,7 +4782,7 @@ impl TerminalView {
 
     /// Reconcile one live session with its retained launch metadata.
     fn sync_launch_binding(&mut self, session_id: SessionId, retained: RetainedSessionMetadata) {
-        let (ai, cwd, launch_id, cleared) = retained;
+        let (ai, shell_tool, cwd, launch_id, cleared) = retained;
         if let Some(binding) = self.restore.bindings.get_mut(&session_id) {
             if reconcile_retained_binding(binding, ai.as_ref(), cwd.as_deref(), cleared) {
                 self.restore.mark_layout_dirty();
@@ -4781,7 +4791,12 @@ impl TerminalView {
         }
 
         let mut binding = self.restore.requested.pop_front().unwrap_or_else(|| {
-            retained_session_binding(retained_ai_ref(ai.as_ref()), cwd.clone(), launch_id)
+            retained_session_binding(
+                retained_ai_ref(ai.as_ref()),
+                shell_tool,
+                cwd.clone(),
+                launch_id,
+            )
         });
         reconcile_retained_binding(&mut binding, ai.as_ref(), cwd.as_deref(), cleared);
         self.restore.bindings.insert(session_id, binding);
@@ -4814,6 +4829,7 @@ impl TerminalView {
                         ai.as_ref().and_then(|ai| ai.conversations.get(session_id).cloned());
                     let metadata =
                         chrome.as_ref().and_then(|metadata| metadata.session(*session_id));
+                    let shell_tool = metadata.and_then(|session| session.shell_tool);
                     let cwd = metadata.and_then(|session| session.cwd.clone());
                     let launch_id = metadata.and_then(|session| session.launch_id.clone());
                     let cleared =
@@ -4822,6 +4838,7 @@ impl TerminalView {
                         *session_id,
                         (
                             provider.map(|provider| (provider, conversation_id)),
+                            shell_tool,
                             cwd,
                             launch_id,
                             cleared,
@@ -4961,6 +4978,7 @@ impl TerminalView {
             cwd: launch.cwd.clone(),
             command: launch.session_launch.command.clone(),
             ai_launch: launch.session_launch.ai_launch.clone(),
+            shell_tool: launch.session_launch.shell_tool,
             launch_id: launch.launch_id.clone(),
         });
         match result {
@@ -5201,8 +5219,7 @@ impl TerminalView {
     fn create_tab(
         &mut self,
         workspace_id: Option<WorkspaceId>,
-        command: Option<Vec<String>>,
-        ai_launch: Option<AiLaunchSpec>,
+        launch: SessionLaunchValues,
         cwd: Option<PathBuf>,
     ) {
         let Some(workspace_id) = workspace_id else {
@@ -5215,15 +5232,16 @@ impl TerminalView {
         // has to relaunch rather than a bare login shell. The binding's launch
         // id rides along as the env-envelope id so the session persists its
         // environment under the same id the next snapshot will point at.
-        let binding = launch_binding_for(command.as_ref(), ai_launch.as_ref(), cwd.clone());
+        let binding = launch_binding_for(&launch, cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
             workspace_id,
             size: self.focused_pane_size,
             cwd,
-            command,
-            ai_launch,
+            command: launch.command,
+            ai_launch: launch.ai_launch,
+            shell_tool: launch.shell_tool,
             launch_id,
         });
         if let Err(error) = result {
@@ -5263,7 +5281,21 @@ impl TerminalView {
         cwd: Option<PathBuf>,
     ) {
         let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
-        self.create_tab(workspace_id, launch.command, launch.ai_launch, cwd);
+        self.create_tab(workspace_id, launch, cwd);
+    }
+
+    /// Ask for a launch-only tool tab.
+    ///
+    /// Unlike an AI tab this stays where the user is: the tool is not scoped to
+    /// a project, so it starts in the focused pane's CWD exactly like a plain
+    /// new tab and falls back to the server's `$HOME` guard when there is none.
+    fn create_shell_tool_tab(&mut self, tool: ShellTool, cx: &App) {
+        let cwd = self.focused_session_cwd();
+        self.create_tab(
+            self.creating_workspace(cx),
+            restore_replay::shell_tool_launch_values(tool),
+            cwd,
+        );
     }
 
     /// Read the focused session's last server-reported OSC 7 directory.
@@ -5731,7 +5763,7 @@ impl TerminalView {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
-        let binding = launch_binding_for(None, None, cwd.clone());
+        let binding = launch_binding_for(&SessionLaunchValues::default(), cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
         let result = self.sink.create_session(SessionLaunch {
@@ -5740,6 +5772,7 @@ impl TerminalView {
             cwd,
             command: None,
             ai_launch: None,
+            shell_tool: None,
             launch_id,
         });
         if let Err(error) = result {
@@ -13022,6 +13055,7 @@ fn request_initial_session(
         cwd: None,
         command: None,
         ai_launch: None,
+        shell_tool: None,
         launch_id,
     }) {
         // The request never entered the ordered queue, so let the next
@@ -14701,6 +14735,7 @@ mod tests {
             git_branch: None,
             ai_state: None,
             ai_provider_hint: provider,
+            shell_tool: None,
             prompt_state: None,
         }
     }
@@ -15019,6 +15054,7 @@ mod tests {
             git_branch: None,
             ai_state: Some(ai_state),
             ai_provider_hint: Some(scribe_common::ai_state::AiProvider::ClaudeCode),
+            shell_tool: None,
             prompt_state: Some(scribe_common::protocol::SessionPromptState {
                 prompt_count: 2,
                 first_prompt: Some("build the thing".to_owned()),
@@ -15047,12 +15083,76 @@ mod tests {
         assert!(ai.visible_prompts(session).is_some());
     }
 
+    // @lat: [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool]]
+    #[test]
+    fn a_tool_tab_binds_to_its_tool_and_survives_untracked_sessions() {
+        let cwd = PathBuf::from("/tmp/paperclip");
+        let launch = restore_replay::shell_tool_launch_values(ShellTool::Pi);
+        // A tool tab sends tool intent only: no argv for the server to spawn
+        // directly, and no AI intent that would make it AI chrome.
+        assert!(launch.command.is_none());
+        assert!(launch.ai_launch.is_none());
+
+        let mut binding = launch_binding_for(&launch, Some(cwd.clone()));
+        let launch_id = binding.launch_id.clone();
+        assert!(matches!(binding.kind, LaunchKind::ShellTool { tool: ShellTool::Pi }));
+        assert_eq!(binding.fallback_cwd, Some(cwd));
+
+        // Pi is untracked, so no provider ever arrives for the pane. The
+        // reconcile pass must leave the tool binding alone rather than
+        // demoting it to a plain shell, or a cold restart reopens a bare
+        // prompt instead of relaunching Pi.
+        assert!(!update_retained_binding(&mut binding, None, Some(Path::new("/tmp/paperclip"))));
+        assert_eq!(binding.launch_id, launch_id);
+        assert!(matches!(binding.kind, LaunchKind::ShellTool { tool: ShellTool::Pi }));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]]
+    #[test]
+    fn warm_session_info_reconstructs_a_shell_tool_binding() {
+        let session = SessionId::new();
+        let workspace = WorkspaceId::new();
+        let cwd = PathBuf::from("/tmp/paperclip");
+        let info = SessionInfo {
+            session_id: session,
+            workspace_id: workspace,
+            launch_id: Some("launch-pi".to_owned()),
+            shell_name: "bash".to_owned(),
+            title: None,
+            icon_title: None,
+            context: None,
+            task_label: None,
+            codex_task_label: None,
+            cwd: Some(cwd.clone()),
+            git_branch: None,
+            ai_state: None,
+            ai_provider_hint: None,
+            shell_tool: Some(ShellTool::Pi),
+            prompt_state: None,
+        };
+        let mut chrome = ChromeMetadata::new();
+        chrome.seed_from_session_list(std::slice::from_ref(&info), &[]);
+        let retained = chrome.session(session).expect("session metadata");
+
+        let binding = retained_session_binding(
+            None,
+            retained.shell_tool,
+            retained.cwd.clone(),
+            retained.launch_id.clone(),
+        );
+
+        assert_eq!(binding.launch_id, "launch-pi");
+        assert_eq!(binding.fallback_cwd, Some(cwd));
+        assert!(matches!(binding.kind, LaunchKind::ShellTool { tool: ShellTool::Pi }));
+    }
+
     // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained AI bindings stay structured]]
     #[test]
     fn retained_ai_metadata_builds_a_targeted_resume_binding() {
         let cwd = PathBuf::from("/tmp/paperclip");
         let binding = retained_session_binding(
             Some((AiProvider::CodexCode, Some("conv-42"))),
+            None,
             Some(cwd.clone()),
             Some("launch-42".to_owned()),
         );

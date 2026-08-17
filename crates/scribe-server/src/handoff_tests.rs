@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use vte::ansi::Processor as AnsiProcessor;
 
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::SessionContext;
+use scribe_common::protocol::{SessionContext, ShellTool};
 use scribe_common::screen::{
     CellFlags, CursorStyle, DecPrivateMode, ScreenCell, ScreenColor, ScreenSnapshot,
 };
@@ -84,6 +84,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         context: None,
         ai_state: None,
         ai_provider_hint: None,
+        shell_tool: None,
         prompt_state: None,
         env_window_id: None,
         env_envelope_id: None,
@@ -164,6 +165,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             }),
             ai_state: None,
             ai_provider_hint: None,
+            shell_tool: None,
             prompt_state: None,
             env_window_id: None,
             env_envelope_id: None,
@@ -574,6 +576,7 @@ fn prior_version_payload_decodes_with_absent_child_identity() {
     assert_eq!(session.child_identity, None, "absent field must default to None");
     assert_eq!(session.env_window_id, None, "absent field must default to None");
     assert_eq!(session.env_envelope_id, None, "absent field must default to None");
+    assert_eq!(session.shell_tool, None, "absent field must default to None");
     assert_eq!(session.child_pid, 4242);
     assert_eq!(session.title.as_deref(), Some("editor"));
     assert_eq!(session.icon_title, None, "absent field must default to None");
@@ -597,6 +600,18 @@ fn current_version_payload_round_trips_child_identity() {
 
     assert_eq!(decoded.sessions.first().expect("one session").child_identity, recorded);
     assert_eq!(decoded.sessions.first().expect("one session").icon_title.as_deref(), Some("icon"));
+}
+
+// @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Typed Pi restore regressions]]
+#[test]
+fn current_version_payload_round_trips_shell_tool() {
+    let (mut state, _masters, _slaves) = make_handoff_state(1);
+    state.sessions.first_mut().expect("one session").shell_tool = Some(ShellTool::Pi);
+
+    let bytes = rmp_serde::to_vec_named(&state).unwrap();
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+
+    assert_eq!(decoded.sessions.first().expect("one session").shell_tool, Some(ShellTool::Pi));
 }
 
 /// The reverse direction of the same upgrade rehearsal: an N-1 receiver must

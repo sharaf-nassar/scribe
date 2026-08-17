@@ -1,5 +1,9 @@
 #!/bin/bash
-[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || { echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2; exit 99; }
+# e2e-timeout: 180
+[ "${SCRIBE_E2E_SANDBOX:-0}" = "1" ] || {
+    echo "FATAL: this script only runs inside the scribe e2e container (use just e2e-func / e2e-visual)." >&2
+    exit 99
+}
 # Scripted E2E: the Tabs-and-windows chords reach their actions.
 #
 # Two parity rows were unreachable for the whole rebuild because the shell
@@ -21,7 +25,14 @@
 #     second mapped X11 window, and makes the server register a second window
 #     through a fresh `Hello`; a dialog or a swallowed chord does none of it;
 #   * Ctrl+Shift+D still opens the close dialog on its relocated chord, so
-#     moving the overlay off `close_tab`'s default did not strand the surface.
+#     moving the overlay off `close_tab`'s default did not strand the surface;
+#   * Ctrl+Alt+Z opens exactly one Pi tab, and the `pi` stub it runs records a
+#     plain tab's startup — the rc file every other tab reads, the integration
+#     marker, the `PATH` that rc exported, the focused pane's CWD, and no
+#     leftover restore-delta file — with no argv of its own. Ctrl+C then ends
+#     the stub and the server finalizes that exact session, which is what
+#     `exec pi` buys: quitting Pi closes its tab rather than dropping the user
+#     at a stray prompt.
 #
 # Phase 0 is the same session-adoption dance `overlay-actions.sh` documents:
 # the entrypoint creates $SESSION after the client launched, so the running
@@ -50,6 +61,17 @@ GRID_Y=0
 GRID_W=0
 GRID_H=0
 
+# The Pi stand-in on /tests/bin writes exactly this file (tests/e2e/bin/pi).
+PI_RECORD=/tmp/pi-invocation.txt
+# The directory the Pi tab must start in. Deliberately not $HOME, so the
+# server's own home fallback cannot be mistaken for the focused pane's CWD.
+PI_CWD=/tmp/scribe-pi-tab-cwd
+PI_CWD_PROBE=/tmp/scribe-pi-cwd-settled
+PI_PROBE=/tmp/scribe-pi-probe.sh
+# Exported by the rc file below, so a Pi tab that skipped normal shell startup
+# records no marker at all.
+PI_RC_MARKER=PI_STARTUP_ORDER=bashrc
+
 # Every mapped Scribe window, newest last.
 list_windows() {
     xdotool search --class '[Ss]cribe' 2>/dev/null || xdotool search --name '[Ss]cribe' 2>/dev/null || true
@@ -72,8 +94,8 @@ focus() {
         echo "FAIL: no Scribe window found"
         exit 1
     fi
-    xdotool windowactivate --sync "$wid" 2>/dev/null \
-        || xdotool windowfocus --sync "$wid" 2>/dev/null || true
+    xdotool windowactivate --sync "$wid" 2>/dev/null ||
+        xdotool windowfocus --sync "$wid" 2>/dev/null || true
     sleep 0.3
     eval "$(xdotool getwindowgeometry --shell "$wid")"
     GRID_X="$X"
@@ -135,7 +157,7 @@ wait_for_log_growth_in() {
         if [ "$now" -gt "$baseline" ]; then
             return 0
         fi
-        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+        if [ $(("$(date +%s)" - started)) -ge "$timeout_secs" ]; then
             return 1
         fi
         sleep 0.3
@@ -276,11 +298,124 @@ fi
 send_keys Escape
 echo "PHASE 3 PASS: the close dialog opens on its relocated chord (+$DIFF px)"
 
+# @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Ctrl+Alt+Z opens one Pi tab that starts like a plain tab]]
+# ── Phase 4: Ctrl+Alt+Z opens exactly one Pi tab ──────────────────
+# Pi is launch-only: no provider, no resume, no AI chrome. What it must inherit
+# is a plain tab's startup, so the rc file below is the oracle — it is the only
+# place `PI_STARTUP_ORDER` and the stub's own `PATH` entry come from, and a Pi
+# tab that resolved its shell differently records neither.
+rm -f "$PI_RECORD" "$PI_CWD_PROBE"
+mkdir -p "$PI_CWD"
+# shellcheck disable=SC2016 # $PATH is written literally; the rc file expands it.
+printf 'export %s\nexport PATH="/tests/bin:$PATH"\n' "$PI_RC_MARKER" >>"$HOME/.bashrc"
+
+# Give the focused pane a CWD of its own, and report it the way a shell would.
+# Sourced rather than typed so the OSC 7 escape survives xdotool verbatim, and
+# emitted by hand because this image ships no shell-integration scripts: with
+# nothing reporting a CWD the client falls back to the server's $HOME guard,
+# which is the very thing this phase has to tell apart from the pane's own
+# directory. The trailing marker file is the gate — it cannot be written until
+# the `cd` and the OSC 7 before it have run.
+cat >"$PI_PROBE" <<'SH'
+cd "$1" || exit 1
+printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "$PWD"
+printf 'ready\n' > "$2"
+SH
+focus
+xdotool type --clearmodifiers --delay 20 ". $PI_PROBE $PI_CWD $PI_CWD_PROBE"
+send_keys Return
+for _ in $(seq 1 60); do
+    [ -s "$PI_CWD_PROBE" ] && break
+    sleep 0.25
+done
+if [ ! -s "$PI_CWD_PROBE" ]; then
+    fail "PHASE 4 FAIL: the focused pane never reached $PI_CWD"
+fi
+# The OSC 7 is already in the PTY stream by now; this covers the server's
+# forward and the client's metadata write.
+sleep 1
+
+PI_TABS_BEFORE=$(count_log "opened a new tab")
+focus
+send_keys ctrl+alt+z
+for _ in $(seq 1 60); do
+    [ -f "$PI_RECORD" ] && break
+    sleep 0.25
+done
+if [ ! -f "$PI_RECORD" ]; then
+    fail "PHASE 4 FAIL: ctrl+alt+z never reached new_pi_tab (no pi invocation)"
+fi
+# One chord, one tab. A second would mean the chord reached two handlers.
+sleep 2
+PI_TABS_AFTER=$(count_log "opened a new tab")
+if [ "$PI_TABS_AFTER" -ne $((PI_TABS_BEFORE + 1)) ]; then
+    fail "PHASE 4 FAIL: ctrl+alt+z opened $((PI_TABS_AFTER - PI_TABS_BEFORE)) tabs, expected 1"
+fi
+
+# Pi is launch-only, so the server appends no resume arguments: everything
+# before the --ENV-- marker must be empty.
+if [ -n "$(awk '/^--ENV--$/ { exit } { print }' "$PI_RECORD")" ]; then
+    echo "argv:"
+    awk '/^--ENV--$/ { exit } { print "  " $0 }' "$PI_RECORD"
+    fail "PHASE 4 FAIL: the pi launch carried argv of its own"
+fi
+# SCRIBE_SHELL_INTEGRATION is deliberately absent from this list: it only exists
+# when the server finds the integration scripts, which this image does not ship.
+for expected in "PWD=$PI_CWD" "$PI_RC_MARKER" "TERM_PROGRAM=Scribe"; do
+    if ! grep -Fqx "$expected" "$PI_RECORD"; then
+        fail "PHASE 4 FAIL: the pi environment is missing '$expected'"
+    fi
+done
+if ! grep -q '^PATH=.*/tests/bin' "$PI_RECORD"; then
+    fail "PHASE 4 FAIL: the pi environment did not inherit the PATH its rc exported"
+fi
+# zsh and fish consume the staged delta in the same `-c` command that execs, so
+# a leaked variable here means the temp file was left behind too.
+if grep -q '^SCRIBE_RESTORE_ENV_DELTA_FILE=' "$PI_RECORD"; then
+    fail "PHASE 4 FAIL: the pi launch leaked SCRIBE_RESTORE_ENV_DELTA_FILE"
+fi
+shot /output/05-pi-tab.png
+echo "PHASE 4 PASS: ctrl+alt+z opened one Pi tab in $PI_CWD with a plain tab's startup"
+
+# @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Quitting Pi ends its tab]]
+# ── Phase 5: quitting Pi ends its tab ─────────────────────────────
+# The shell execs Pi over itself, so Pi is the PTY's direct child and its exit
+# is the session's. Assert on that exact session id rather than on a count, so
+# an unrelated pane dying cannot pass this phase.
+PI_SESSION_UUID=$(sed -n 's/^SCRIBE_SESSION_ID=//p' "$PI_RECORD" | head -1)
+if [ -z "$PI_SESSION_UUID" ]; then
+    fail "PHASE 5 FAIL: the pi environment carried no SCRIBE_SESSION_ID"
+fi
+# The server logs ids through SessionId's Display, which is the prefixed short
+# form rather than the full UUID the environment carries.
+PI_SESSION_LOG_ID="session-$(printf '%s' "$PI_SESSION_UUID" | cut -c1-8)"
+if [ "$(count_server_log "$PI_SESSION_LOG_ID")" -eq 0 ]; then
+    fail "PHASE 5 FAIL: the server never logged the pi session $PI_SESSION_LOG_ID"
+fi
+focus
+send_keys ctrl+c
+EXIT_FOUND=0
+for _ in $(seq 1 60); do
+    if grep -aF "session exit finalized" "$SERVER_LOG" 2>/dev/null |
+        grep -aqF "$PI_SESSION_LOG_ID"; then
+        EXIT_FOUND=1
+        break
+    fi
+    sleep 0.25
+done
+if [ "$EXIT_FOUND" -ne 1 ]; then
+    fail "PHASE 5 FAIL: quitting pi did not end session $PI_SESSION_LOG_ID"
+fi
+shot /output/06-pi-tab-closed.png
+echo "PHASE 5 PASS: quitting pi ended session $PI_SESSION_LOG_ID and its tab"
+
 echo ""
 echo "PASS: visual tab-window-chords test"
 echo "  Inspect screenshots in test-output/:"
-echo "    00-attached.png      — the adopted pane before any chord"
-echo "    01-close-tab.png     — after ctrl+shift+q closed the tab"
-echo "    02-new-window.png    — the second window ctrl+shift+n opened"
-echo "    03-before-dialog.png — the window before the dialog chord"
-echo "    04-close-dialog.png  — the close dialog on ctrl+shift+d"
+echo "    00-attached.png       — the adopted pane before any chord"
+echo "    01-close-tab.png      — after ctrl+shift+q closed the tab"
+echo "    02-new-window.png     — the second window ctrl+shift+n opened"
+echo "    03-before-dialog.png  — the window before the dialog chord"
+echo "    04-close-dialog.png   — the close dialog on ctrl+shift+d"
+echo "    05-pi-tab.png         — the Pi tab ctrl+alt+z opened"
+echo "    06-pi-tab-closed.png  — the window after quitting Pi"

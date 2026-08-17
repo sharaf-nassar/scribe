@@ -250,16 +250,16 @@ erase a replacement.
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
-## Input and keybinding checklist (55 named actions)
+## Input and keybinding checklist (56 named actions)
 
 The GPUI port retains every parsed `Bindings` action from
-`crates/scribe-client/src/input.rs`. All 55 are enumerated individually below,
+`crates/scribe-client/src/input.rs`. All 56 are enumerated individually below,
 because the previous per-subsystem grouping hid where they break: parsing was
-never the problem — `keybindings.rs::translate_key_action` maps all 54 onto a
+never the problem — `keybindings.rs::translate_key_action` maps all 55 onto a
 `KeyAction` — the gap was dispatch, where `main.rs::handle_layout_action`
 implemented nine `LayoutAction` variants and routed the other twenty-six to a
 `tracing::debug!` catch-all that swallowed them. That catch-all is gone: the
-match is exhaustive over all 37 variants, and `tools/check-reachability.sh`
+match is exhaustive over all 38 variants, and `tools/check-reachability.sh`
 fails the build if a new one is ever swallowed again.
 
 Every row's method is `visual-E2E`: each action must be driven through
@@ -289,6 +289,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `new_claude_resume_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewClaudeResumeTab` arm → `ai_tab_command` | required |
 | `new_codex_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewCodexTab` arm → `ai_tab_command` | required |
 | `new_codex_resume_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewCodexResumeTab` arm → `ai_tab_command` | required |
+| `new_pi_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewPiTab` arm → `main.rs::create_shell_tool_tab` → `create_tab` with `ShellTool::Pi`; launch-only, so no AI provider is tracked (`tests/e2e/visual/tab-window-chords.sh` phase 4) | required |
 | `close_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `CloseTab` arm → `close_active_tab`; the chord now outranks the close-dialog overlay via `translate_overlay_chord` (`tests/e2e/visual/tab-window-chords.sh` phase 1) | required |
 | `next_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NextTab` arm → `TabSessions::focus_next` | required |
 | `prev_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `PrevTab` arm → `TabSessions::focus_prev` | required |
@@ -325,7 +326,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `line_start` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `line_end` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 
-**Reachability:** 55 of 55 rows name a live-path symbol; 0 are unwired and 0
+**Reachability:** 56 of 56 rows name a live-path symbol; 0 are unwired and 0
 are missing. The audit's figure at `f56ef95` was 24, with 30 unwired and none
 missing, because every action already parsed and translated and the whole gap
 was dispatch.
@@ -336,13 +337,14 @@ was dispatch.
 `WorkspaceFocusLeft`, `WorkspaceFocusRight`, `WorkspaceFocusUp`,
 `WorkspaceFocusDown`, `NewTab`,
 `NewClaudeTab`, `NewClaudeResumeTab`, `NewCodexTab`, `NewCodexResumeTab`,
+`NewPiTab`,
 `CloseTab`, `NextTab`, `PrevTab`, `SelectTab`, `NewWindow`, `CopySelection`,
 `PasteClipboard`, `ScrollUp`, `ScrollDown`, `ScrollTop`, `ScrollBottom`,
 `PromptJumpUp`, `PromptJumpDown`, `JumpToFailure`, `ZoomIn`, `ZoomOut`, and
-`ZoomReset` — all 37 are executed by `main.rs::handle_layout_action`, whose
-match is exhaustive with no catch-all arm and whose 37/37 figure
-`tools/check-reachability.sh` ratchets. The 55 rows above cover more ground
-than 37 variants because ten of them are not `LayoutAction` at all — the seven
+`ZoomReset` — all 38 are executed by `main.rs::handle_layout_action`, whose
+match is exhaustive with no catch-all arm and whose 38/38 figure
+`tools/check-reachability.sh` ratchets. The 56 rows above cover more ground
+than 38 variants because ten of them are not `LayoutAction` at all — the seven
 terminal shortcuts, `find`, `settings` and `command_palette` — while the nine
 `select_tab_N` bindings collapse onto the single index-carrying `SelectTab`.
 `KeyAction` variants are `Terminal` (reachable via `main.rs::send_key_bytes`),
@@ -469,17 +471,17 @@ with them. They are the launch gate's metric — not the unit-test count.
 | --- | --- | --- | --- | --- |
 | Client messages | 50 | 48 | 2 | 0 |
 | Server messages | 66 | 64 | 2 | 0 |
-| Input and keybinding actions | 55 | 55 | 0 | 0 |
+| Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **214** | **210** | **4** | **0** |
+| **Total** | **215** | **211** | **4** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **205 rows, of which 201 are
-reachable (98%)** and 4 are not. **1 of those 205** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **206 rows, of which 202 are
+reachable (98%)** and 4 are not. **1 of those 206** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **200 of 205**.
+the in-client figure is **201 of 206**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

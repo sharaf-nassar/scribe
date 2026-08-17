@@ -1,0 +1,24 @@
+#!/bin/sh
+# Deterministic Pi stand-in for the `new_pi_tab` chord.
+#
+# Records the same argv/env shape as the `claude` stub, then stays alive until
+# something signals it: the chord test needs a live process to prove the tab
+# ends when Pi does.
+set -eu
+
+record=/tmp/pi-invocation.txt
+temporary="$record.$$"
+
+{
+    for argument do
+        printf '%s\n' "$argument"
+    done
+    printf '%s\n' '--ENV--'
+    env | LC_ALL=C sort
+} > "$temporary"
+mv "$temporary" "$record"
+
+trap 'exit 0' HUP INT TERM
+while :; do
+    sleep 1
+done

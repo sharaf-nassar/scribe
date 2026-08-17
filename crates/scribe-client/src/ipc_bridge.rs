@@ -54,7 +54,7 @@ use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         AiLaunchSpec, AutomationAction, BeadsIssueWrite, BeadsIssueWriteGuards, ClientMessage,
-        PromptMarkKind, TerminalSize, WorkspaceTreeNode,
+        PromptMarkKind, ShellTool, TerminalSize, WorkspaceTreeNode,
     },
     terminal_images::{TerminalImageLiveMessage, TerminalImageReplayMessage, TerminalImageUpdate},
 };
@@ -1075,6 +1075,9 @@ pub struct SessionLaunch {
     /// Structured AI intent. When present, `command` is empty and the server
     /// owns shell resolution and argv construction.
     pub ai_launch: Option<AiLaunchSpec>,
+    /// Launch-only tool intent, built by the server into the same plain-tab
+    /// shell argv an AI launch gets, without any AI provider tracking.
+    pub shell_tool: Option<ShellTool>,
     /// The launch's `LaunchRecord.launch_id`, sent as the env-envelope id the
     /// server keys this session's persisted environment by. Every create path
     /// mints one: without it the session can never write an envelope.
@@ -1174,6 +1177,7 @@ impl IpcSink {
             size: Some(launch.size),
             command: launch.command,
             ai_launch: launch.ai_launch,
+            shell_tool: launch.shell_tool,
             env_envelope_id: Some(launch.launch_id),
         });
         if result.is_err() {
@@ -1686,6 +1690,7 @@ mod tests {
             cwd: None,
             command: None,
             ai_launch: None,
+            shell_tool: None,
             launch_id: "launch".to_owned(),
         }
     }

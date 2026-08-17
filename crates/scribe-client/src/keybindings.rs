@@ -77,6 +77,7 @@ pub struct Bindings {
     pub new_claude_resume_tab: BindingSet,
     pub new_codex_tab: BindingSet,
     pub new_codex_resume_tab: BindingSet,
+    pub new_pi_tab: BindingSet,
     pub close_tab: BindingSet,
     pub next_tab: BindingSet,
     pub prev_tab: BindingSet,
@@ -305,6 +306,7 @@ impl Bindings {
             new_claude_resume_tab: parse_set(&config.new_claude_resume_tab),
             new_codex_tab: parse_set(&config.new_codex_tab),
             new_codex_resume_tab: parse_set(&config.new_codex_resume_tab),
+            new_pi_tab: parse_set(&config.new_pi_tab),
             close_tab: parse_set(&config.close_tab),
             next_tab: parse_set(&config.next_tab),
             prev_tab: parse_set(&config.prev_tab),
@@ -422,6 +424,8 @@ pub enum LayoutAction {
     NewCodexTab,
     /// Open a new tab resuming Codex in the focused workspace.
     NewCodexResumeTab,
+    /// Open a new tab running Pi in the focused workspace.
+    NewPiTab,
     /// Close the active tab in the focused workspace.
     CloseTab,
     /// Switch to the next tab.
@@ -674,7 +678,7 @@ fn workspace_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAct
     ]
 }
 
-fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 18] {
+fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 19] {
     [
         BindingAction { bindings: &bindings.new_window, action: LayoutAction::NewWindow },
         BindingAction { bindings: &bindings.new_claude_tab, action: LayoutAction::NewClaudeTab },
@@ -687,6 +691,7 @@ fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 
             bindings: &bindings.new_codex_resume_tab,
             action: LayoutAction::NewCodexResumeTab,
         },
+        BindingAction { bindings: &bindings.new_pi_tab, action: LayoutAction::NewPiTab },
         BindingAction { bindings: &bindings.new_tab, action: LayoutAction::NewTab },
         BindingAction { bindings: &bindings.close_tab, action: LayoutAction::CloseTab },
         BindingAction { bindings: &bindings.next_tab, action: LayoutAction::NextTab },

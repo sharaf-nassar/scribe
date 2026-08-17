@@ -130,6 +130,7 @@ mod parity_tests {
         assert_eq!(keybinding_label("new_tab"), "New tab");
         assert_eq!(keybinding_label("new_claude_resume_tab"), "New Claude resume tab");
         assert_eq!(keybinding_label("new_codex_tab"), "New Codex tab");
+        assert_eq!(keybinding_label("new_pi_tab"), "New Pi tab");
         assert_eq!(keybinding_label("prev_tab"), "Previous tab");
         assert_eq!(keybinding_label("select_tab_1"), "Select tab 1");
         assert_eq!(keybinding_label("delete_word_backward_ctrl"), "Delete word backward (Ctrl)");

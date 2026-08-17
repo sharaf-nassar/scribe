@@ -235,6 +235,31 @@ pub struct AiLaunchSpec {
     pub conversation_id: Option<String>,
 }
 
+/// A launch-only CLI a tab runs after its shell's startup files.
+///
+/// Deliberately *not* an [`AiProvider`]: a shell tool has no hook channel, no
+/// conversation, and no resume mode, so it is never tracked as AI chrome. The
+/// wire carries the variant rather than a binary name so the server's shell
+/// command string can never be composed from client-supplied text.
+///
+/// This type is also persisted in client restore-state TOML, hence the
+/// explicit `snake_case` renaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellTool {
+    Pi,
+}
+
+impl ShellTool {
+    /// The binary the tab execs.
+    #[must_use]
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            ShellTool::Pi => "pi",
+        }
+    }
+}
+
 /// Version of the local workspace Beads-board snapshot payload.
 ///
 /// Detail reads use separate named messages, so adding them does not change
@@ -544,6 +569,11 @@ pub enum ClientMessage {
         /// this is present; the server owns shell resolution and argv.
         #[serde(default)]
         ai_launch: Option<AiLaunchSpec>,
+        /// Launch-only tool intent. Like `ai_launch` the server owns shell
+        /// resolution and argv, so `command` stays empty; unlike it the tool
+        /// is never tracked as an AI provider.
+        #[serde(default)]
+        shell_tool: Option<ShellTool>,
         /// Cold-restart restore association: the `LaunchRecord.launch_id` whose
         /// persisted env envelope (if present) should be decrypted and applied
         /// to this freshly-spawned PTY. `None` for plain new sessions.
@@ -1626,6 +1656,10 @@ pub struct SessionInfo {
     /// reconnect after an attention state was dismissed locally.
     #[serde(default)]
     pub ai_provider_hint: Option<AiProvider>,
+    /// Launch-only shell tool retained so warm reattach preserves cold-restart
+    /// identity. AI metadata remains authoritative when both are present.
+    #[serde(default)]
+    pub shell_tool: Option<ShellTool>,
     /// Prompt history retained for the session. `None` when the session has
     /// submitted no prompt, and absent entirely on payloads from servers that
     /// predate the field.
@@ -2455,6 +2489,7 @@ mod tests {
                 resume_mode: AiResumeMode::Resume,
                 conversation_id: Some("conversation-42".to_owned()),
             }),
+            shell_tool: None,
             env_envelope_id: Some("launch-42".to_owned()),
         };
 
@@ -2495,7 +2530,42 @@ mod tests {
         let decoded: ClientMessage =
             rmp_serde::from_slice(&bytes).expect("deserialize legacy CreateSession");
 
-        assert!(matches!(decoded, ClientMessage::CreateSession { ai_launch: None, .. }));
+        assert!(matches!(
+            decoded,
+            ClientMessage::CreateSession { ai_launch: None, shell_tool: None, .. }
+        ));
+    }
+
+    // @lat: [[protocol#Client Messages#Session Lifecycle#Launch-only tool intent survives MessagePack]]
+    #[test]
+    fn create_session_shell_tool_round_trips_through_msgpack_named() {
+        let original = ClientMessage::CreateSession {
+            workspace_id: WorkspaceId::new(),
+            split_direction: None,
+            cwd: Some(PathBuf::from("/tmp/project")),
+            size: None,
+            command: None,
+            ai_launch: None,
+            shell_tool: Some(ShellTool::Pi),
+            env_envelope_id: Some("launch-43".to_owned()),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize CreateSession");
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize CreateSession");
+
+        // A tool tab carries no argv and no AI intent: the server owns both, and
+        // the tool is never tracked as a provider.
+        assert!(matches!(
+            decoded,
+            ClientMessage::CreateSession {
+                command: None,
+                ai_launch: None,
+                shell_tool: Some(ShellTool::Pi),
+                ..
+            }
+        ));
+        assert_eq!(ShellTool::Pi.binary_name(), "pi");
     }
 
     /// Mirror of [`ReleaseListResultState`] used purely to assert the
