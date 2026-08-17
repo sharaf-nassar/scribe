@@ -6,6 +6,7 @@ set -euo pipefail
 CONTROL="${SHARE_TAP_CONTROL:-$XDG_RUNTIME_DIR/scribe/share-tap.sock}"
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+LONG_TITLE="Normal-card hover reveals this complete long Beads title in an opaque theme-derived bounded wrapping viewport-safe tooltip"
 
 fail() {
     echo "FAIL: $1"
@@ -54,7 +55,7 @@ sample_board() {
     now=$(date +%s%3N)
     # The four-issue lanes the mock itself shows, so a capture here is
     # comparable to .impeccable/mocks/beads-compact-live-overview.html.
-    printf '%s' "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$workspace\",\"protocol_version\":1,\"state\":{\"Ready\":{\"snapshot\":{\"refreshed_at_epoch_ms\":$now,\"backlog\":[{\"id\":\"sc-70\",\"title\":\"Document cache policy\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-81\",\"title\":\"Parse custom statuses\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-76\",\"title\":\"Expose stale timestamp\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-64\",\"title\":\"Polish empty queue copy\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"ready\":[{\"id\":\"sc-88\",\"title\":\"Add board protocol\",\"priority\":0,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-94\",\"title\":\"Cache stale state\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-32\",\"title\":\"Wire workspace refresh\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-27\",\"title\":\"Add unavailable state\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"in_progress\":[{\"id\":\"sc-1bf\",\"title\":\"Workspace Beads board\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-43\",\"title\":\"Render queue rail\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-55\",\"title\":\"Pin board across tabs\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-49\",\"title\":\"Preserve lane scroll\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"blocked\":[{\"id\":\"sc-91\",\"title\":\"Sync conflict handling\",\"priority\":1,\"blocker_ids\":[\"sc-12\",\"sc-19\"],\"parent_epic_name\":null},{\"id\":\"sc-58\",\"title\":\"Remote workspace reads\",\"priority\":2,\"blocker_ids\":[\"sc-22\"],\"parent_epic_name\":null},{\"id\":\"sc-36\",\"title\":\"Restore cached snapshot\",\"priority\":3,\"blocker_ids\":[\"sc-08\"],\"parent_epic_name\":null},{\"id\":\"sc-18\",\"title\":\"Resolve Dolt lock state\",\"priority\":2,\"blocker_ids\":[\"sc-07\"],\"parent_epic_name\":null}],\"done\":[{\"id\":\"sc-61\",\"title\":\"Fix maximize restore\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-24\",\"title\":\"Detect workspace root\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-16\",\"title\":\"Cache bd availability\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-09\",\"title\":\"Tune titlebar spacing\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"backlog_total\":12,\"ready_total\":4,\"in_progress_total\":5,\"blocked_total\":4,\"done_total\":38},\"stale\":false,\"refresh_error\":null}}}"
+    printf '%s' "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$workspace\",\"protocol_version\":1,\"state\":{\"Ready\":{\"snapshot\":{\"refreshed_at_epoch_ms\":$now,\"backlog\":[{\"id\":\"sc-70\",\"title\":\"Document cache policy\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-81\",\"title\":\"Parse custom statuses\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-76\",\"title\":\"Expose stale timestamp\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-64\",\"title\":\"Polish empty queue copy\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"ready\":[{\"id\":\"sc-88\",\"title\":\"$LONG_TITLE\",\"priority\":0,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-94\",\"title\":\"Cache stale state\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-32\",\"title\":\"Wire workspace refresh\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-27\",\"title\":\"Add unavailable state\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"in_progress\":[{\"id\":\"sc-1bf\",\"title\":\"Workspace Beads board\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-43\",\"title\":\"Render queue rail\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-55\",\"title\":\"Pin board across tabs\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-49\",\"title\":\"Preserve lane scroll\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"blocked\":[{\"id\":\"sc-91\",\"title\":\"Sync conflict handling\",\"priority\":1,\"blocker_ids\":[\"sc-12\",\"sc-19\"],\"parent_epic_name\":null},{\"id\":\"sc-58\",\"title\":\"Remote workspace reads\",\"priority\":2,\"blocker_ids\":[\"sc-22\"],\"parent_epic_name\":null},{\"id\":\"sc-36\",\"title\":\"Restore cached snapshot\",\"priority\":3,\"blocker_ids\":[\"sc-08\"],\"parent_epic_name\":null},{\"id\":\"sc-18\",\"title\":\"Resolve Dolt lock state\",\"priority\":2,\"blocker_ids\":[\"sc-07\"],\"parent_epic_name\":null}],\"done\":[{\"id\":\"sc-61\",\"title\":\"$LONG_TITLE\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-24\",\"title\":\"Detect workspace root\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-16\",\"title\":\"Cache bd availability\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-09\",\"title\":\"Tune titlebar spacing\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"backlog_total\":12,\"ready_total\":4,\"in_progress_total\":5,\"blocked_total\":4,\"done_total\":38},\"stale\":false,\"refresh_error\":null}}}"
 }
 
 # A board whose queues have all run dry, which is the state the lane heads would
@@ -350,6 +351,43 @@ P2_EDGE=$(edge_delta /output/beads-board-hover.png 225 184)
 EPIC_GAP=$(epic_right_gap /output/beads-board-hover.png "$WIN_W" 10 97)
 [ "${EPIC_GAP:-999}" -le 6 ] || fail "the epic is ${EPIC_GAP}px short of the card's right edge"
 
+# A truncated normal card reveals its complete fixture title immediately. The
+# long Done card sits against the right viewport edge, so the wrapped popup also
+# proves GPUI clamps the bounded tooltip inside the window. Mask the card's own
+# hover repaint before measuring the popup.
+TITLE_CARD_LEFT=$(( 16 + 4 * LANE_W ))
+TITLE_CARD_TOP=70
+TITLE_CARD_W=$(( LANE_W - 20 ))
+TITLE_CARD_H=46
+xdotool mousemove --sync --window "$WID" "$(( TITLE_CARD_LEFT + 90 ))" 84
+sleep 0.1
+import -window "$WID" /output/beads-board-title-tooltip.png
+TOOLTIP_BOUNDS=$(convert /output/beads-board-hover.png \
+    /output/beads-board-title-tooltip.png -compose difference -composite \
+    -colorspace Gray -threshold 8% -fill black \
+    -draw "rectangle 0,0 40,34 rectangle $(( TITLE_CARD_LEFT - 4 )),${TITLE_CARD_TOP} $(( TITLE_CARD_LEFT + TITLE_CARD_W + 12 )),$(( TITLE_CARD_TOP + TITLE_CARD_H )) rectangle 0,300 ${WIN_W},${WIN_H}" \
+    -trim -format '%X,%Y,%w,%h' info: 2>/dev/null || true)
+if [[ "$TOOLTIP_BOUNDS" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
+    TOOLTIP_X=${BASH_REMATCH[1]}
+    TOOLTIP_Y=${BASH_REMATCH[2]}
+    TOOLTIP_W=${BASH_REMATCH[3]}
+    TOOLTIP_H=${BASH_REMATCH[4]}
+else
+    fail "normal-card hover did not reveal the full-title tooltip (${TOOLTIP_BOUNDS:-empty})"
+fi
+[ "$TOOLTIP_W" -ge 300 ] \
+    && [ "$TOOLTIP_W" -le 500 ] \
+    && [ "$TOOLTIP_H" -ge 30 ] \
+    && [ "$TOOLTIP_H" -le 100 ] \
+    && [ "$(( TOOLTIP_X + TOOLTIP_W ))" -le "$WIN_W" ] \
+    && [ "$(( TOOLTIP_X + TOOLTIP_W ))" -le "$(( TITLE_CARD_LEFT + 90 ))" ] \
+    && [ "$(( TOOLTIP_Y + TOOLTIP_H ))" -le "$WIN_H" ] \
+    || fail "full-title tooltip ${TOOLTIP_W}x${TOOLTIP_H}+${TOOLTIP_X}+${TOOLTIP_Y} is not wrapped, bounded, and viewport-safe"
+TOOLTIP_BG=$(convert /output/beads-board-title-tooltip.png \
+    -format "%[pixel:p{$(( TOOLTIP_X + 3 )),$(( TOOLTIP_Y + 3 ))}]" info:)
+[ "$TOOLTIP_BG" = "$BOARD_GROUND" ] \
+    || fail "full-title tooltip background $TOOLTIP_BG is not the opaque theme ground $BOARD_GROUND"
+
 # A card's id and epic are copy targets, which take the hover away from the
 # board. The board has to survive the pointer landing on one, past the grace
 # period a leave starts.
@@ -377,9 +415,10 @@ for _ in $(seq 1 20); do
 done
 [ "${COPIED:-}" = "sc-70" ] || fail "clicking the id copied '${COPIED:-}' instead of sc-70"
 
-# GPUI's native drag root must carry the source card above other cards and
-# beyond the board's clipping edge. Start in the Ready card's title row: its
-# metadata line is a nested copy target that deliberately owns its own press.
+# GPUI's native drag root must carry the long-titled source card above other
+# cards and beyond the board's clipping edge without carrying a tooltip. Start
+# in the Ready card's title row: its metadata line is a nested copy target that
+# deliberately owns its own press.
 CARD_W=$(( LANE_W - 20 ))
 CARD_H=46
 SOURCE_LEFT=$(( 16 + LANE_W ))
@@ -474,6 +513,11 @@ xdotool mouseup 1
 # controls, which continue from the same baseline.
 xdotool mousemove --sync --window "$WID" "$TOP_BADGE_ICON_X" "$TOP_BADGE_ICON_Y"
 sleep 0.5
+
+if [ "${SCRIBE_E2E_TOOLTIP_ONLY:-0}" = "1" ]; then
+    echo "PASS: full-title tooltip ${TOOLTIP_W}x${TOOLTIP_H}+${TOOLTIP_X}+${TOOLTIP_Y}; copy=$COPIED; drag preserved rows=$BASE_ROWS"
+    exit 0
+fi
 
 # The board's own text-size control: the buttons sit in the strip's top right,
 # plus on the left and minus on its right, and pressing one has to repaint the

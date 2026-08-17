@@ -994,6 +994,30 @@ struct BeadsCardDragGhost {
     metrics: Metrics,
 }
 
+/// Full issue title shown only by a normal card hover. The native drag ghost
+/// renders its own entity and never receives this tooltip.
+struct BeadsCardTooltip {
+    title: String,
+    colors: BeadsBoardColors,
+    text_size: Pixels,
+}
+
+impl Render for BeadsCardTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(480.0))
+            .bg(alpha(self.colors.ground, 1.0))
+            .border_1()
+            .border_color(alpha(self.colors.title, 0.28))
+            .font_family("monospace")
+            .text_size(self.text_size)
+            .text_color(self.colors.title)
+            .child(self.title.clone())
+    }
+}
+
 impl Render for BeadsCardDragGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let item = &self.model.source;
@@ -1583,9 +1607,34 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         .pt(px(CARD_PAD_TOP))
         .px(px(8.0))
         .pb(px(6.0))
-        .child(issue_title(item, mark, colors, metrics))
+        .child(normal_issue_title(item, workspace_id, mark, colors, metrics))
         .child(issue_meta(item, card))
         .into_any_element()
+}
+
+/// Add the full-title reveal to the normal card title without putting the
+/// tooltip wrapper into the native drag ghost.
+fn normal_issue_title(
+    item: &BeadsBoardItem,
+    workspace_id: WorkspaceId,
+    mark: PriorityMark,
+    colors: &BeadsBoardColors,
+    metrics: Metrics,
+) -> impl IntoElement {
+    let title = item.title.clone();
+    let colors = *colors;
+    div()
+        .id(SharedString::from(format!("beads-card-title-{workspace_id}-{}", item.id)))
+        .child(issue_title(item, mark, &colors, metrics))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| BeadsCardTooltip {
+                title: title.clone(),
+                colors,
+                text_size: metrics.at(12.0),
+            })
+            .into()
+        })
+        .tooltip_show_delay(Duration::ZERO)
 }
 
 /// The priority badge and the title, which owns the rest of its line: the
@@ -1595,7 +1644,7 @@ fn issue_title(
     mark: PriorityMark,
     colors: &BeadsBoardColors,
     metrics: Metrics,
-) -> AnyElement {
+) -> gpui::Div {
     div()
         .h(metrics.at(TITLE_LINE))
         .flex()
@@ -1625,7 +1674,6 @@ fn issue_title(
                 .text_color(colors.title)
                 .child(item.title.clone()),
         )
-        .into_any_element()
 }
 
 /// The ghost's non-interactive metadata; its source card remains the only

@@ -1424,7 +1424,14 @@ grown spacer between them rather than by justify-content: a grown container
 fills its row and then has nothing left to justify, which reads as left
 aligned. A margin on the epic keeps a minimum gap the slack alone cannot
 guarantee once a long name has eaten it, since the two read as one string when
-they meet.
+they meet. [[crates/scribe-client/src/beads_board.rs#normal_issue_title]] gives
+the normal card's title row a zero-delay GPUI tooltip whose
+[[crates/scribe-client/src/beads_board.rs#BeadsCardTooltip]] reveals the full
+title in a 480px-bounded wrapping view. Its opaque background and ink come from
+the live board palette, and GPUI keeps the popup inside the viewport. The
+native drag ghost renders [[crates/scribe-client/src/beads_board.rs#issue_title]]
+directly instead of the normal row's tooltip wrapper, so lifting a card never
+creates a second reveal beside the ghost.
 The ID drops the project prefix that every card on one board repeats, keeping
 the tail after the last `-` — or the whole ID when there is no tail to keep,
 half an ID being worse than a long one. The epic name is cut to 24 characters at a
