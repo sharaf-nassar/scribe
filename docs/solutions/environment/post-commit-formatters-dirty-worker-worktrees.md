@@ -6,8 +6,6 @@ tags: [subagents, formatter, worktree, verification, retry]
 problem_type: environment
 ---
 
-# Post-commit formatters can leave worker worktrees non-canonical
-
 ## Problem
 
 In run `run-20260817T080435.ASYWT5`, workers for `scribe-555f` and

@@ -6,8 +6,6 @@ tags: [pi, extensions, lat, worktree, subagents, startup]
 problem_type: environment
 ---
 
-# Duplicate Pi extensions block workers before task tools run
-
 ## Problem
 
 Every worker in implement-ready run `run-20260817T072654.Aira7W`
