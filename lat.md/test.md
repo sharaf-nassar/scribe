@@ -4059,6 +4059,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Notification dispatcher | | Notification `replaces_id` coalescing + click-to-focus |
 | Terminal chrome metadata | | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
 | CI run bar | [[test#GPUI CI Run Bar]] | `CiRunState`, `DismissCiRun`, workspace-region chrome |
+| Flow layout and paint-path guard | [[test#GPUI Client Headless Suites#Flow layout and paint-path guard]] | `RequestBeadsEpicGraph`, `BeadsEpicGraph`, `IssueFocused` Flow strip |
 
 ### Refused restore claim decision
 
@@ -4139,6 +4140,41 @@ last so it cannot perturb those geometry proofs. The as-built rules and producti
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
+
+### Flow layout and paint-path guard
+
+The Flow layout engine is pure, so its geometry, ordering and wire routing are
+provable without a display server — and one lock invariant is provable there too.
+
+Ranking, ordering and routing are each pinned against a property rather than a
+recorded output. Convergence takes the deepest parent, so a node behind two
+chains ranks below the longer one. The barycenter pass must reproduce an
+inverted rank from its predecessors, which a stable sort alone cannot do. A skip
+edge inserts exactly one dummy per intermediate rank. A shared gutter must split
+into independently lightable intervals — the property a router emitting whole
+edges cannot satisfy, and the reason
+[[crates/scribe-client/src/beads_flow.rs#union_wire_runs]] exists at all.
+
+The row budget is asserted at both scale extremes against the normative mock's
+214×24 node, and a rank too wide fails layout rather than growing an axis the
+strip does not have. An in-memory cycle is rejected instead of looping; `bd`
+cannot store one, so this is the only place cycle admission is reachable at all.
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow epic fixture]] records why the
+E2E fixture carries disconnected and external-blocker shapes instead.
+
+A benchmark holds ranking plus layout under two milliseconds for a 200-node
+epic, which is the admission bound, so the worst graph the server will serve
+stays inside the frame budget.
+
+Two tests guard the paint path instead of the geometry, and they exist because
+the Flow strip once deadlocked every board render. They take the board guard the
+way the render pass does, assert a second lock would fail, and then require the
+snapshot to be readable through that held guard — in Flow and in lanes alike.
+The lanes case is the one that matters most: the original defect looked itself
+up *before* testing whether the workspace was in Flow, so it blanked ordinary
+boards too. The invariant they encode is
+[[client#Client#Beads Flow Layout Engine#Flow mode entry, exit, and scrolling]]'s:
+nothing reachable from the paint path may lock the board store.
 
 ### Beads Flow visual contract
 

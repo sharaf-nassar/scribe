@@ -227,6 +227,7 @@ fn endpoint(
 }
 
 /// Assign each node the maximum blocker distance from any root.
+// @lat: [[client#Client#Beads Flow Layout Engine]]
 pub fn longest_path_ranks(graph: &BeadsEpicGraph) -> Result<Vec<usize>, FlowLayoutError> {
     let indexed = IndexedGraph::new(graph)?;
     longest_path_ranks_indexed(&indexed)
@@ -621,6 +622,7 @@ fn push_run(runs: &mut Vec<EdgeWireRun>, mut run: EdgeWireRun) {
 ///
 /// Higher classes win only on their covered sub-interval, which lets a traced
 /// edge light half a shared gutter without brightening or replacing the rest.
+// @lat: [[test#GPUI Client Headless Suites#Flow layout and paint-path guard]]
 pub fn union_wire_runs(
     runs: &[EdgeWireRun],
     class_for_edge: impl Fn(usize) -> WireClass,
@@ -731,6 +733,7 @@ impl FlowTrace {
     ///
     /// Returns `None` when the id is not in the graph, which is what an
     /// out-of-date hover against a re-opened graph looks like.
+    // @lat: [[client#Client#Beads Flow Layout Engine#Tracing a chain by hovering]]
     pub fn from_hover(graph: &BeadsEpicGraph, hovered_issue_id: &str) -> Option<Self> {
         if !graph.nodes.iter().any(|node| node.id == hovered_issue_id) {
             return None;
@@ -964,6 +967,7 @@ const FLOW_TRACE_DIM: f32 = 0.24;
 /// Mode transitions, wheel routing, node retargeting, trace state, and live
 /// sessions stay outside this function. Their state arrives through the
 /// explicit input seams instead of being recreated by the renderer.
+// @lat: [[client#Client#Beads Flow Layout Engine#Flow mode entry, exit, and scrolling]]
 pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
     let presentation = present_flow(
         render.graph,
@@ -1531,6 +1535,7 @@ fn flow_node_contents(
         .into_any_element()
 }
 
+// @lat: [[client#Client#Beads Flow Layout Engine#Reading liveness from a node]]
 fn node_dot(node: &FlowNodePresentation, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
     let size = px(8.0 * text_scale);
     let dot = div().flex_none().size(size).rounded_full();

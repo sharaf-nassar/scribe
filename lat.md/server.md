@@ -387,13 +387,22 @@ node metadata `assignee` plus `updated_at`. The board still derives open
 blocker lane placement from `bd blocked`; retaining historical closed edges does
 not alter classification or totals.
 
-This is deliberately one list result, not another `bd` command. Flow graph
-assembly can therefore operate within the existing cache's generation fence and
-cannot see a graph from a different tracker read than the board card that
-opened it. Missing assignee and timestamp fields default safely; `updated_at`
+This is deliberately one list result, not another `bd` command. The graph needs
+no extra invocation because the list already answers it: `bd list` returns the
+native `parent` id and typed `blocks` dependencies *including satisfied ones*,
+and the parse simply used to discard all three. Retaining them is what lets the
+epic subgraph ride the existing cache generation, so Flow graph assembly cannot
+see a graph from a different tracker read than the board card that opened it,
+and a second subprocess never enters the interaction path.
+
+Satisfied edges are the reason the full list is retained rather than a
+blocked-only view. `bd blocked` reports what still blocks; a dependency graph
+that omits a closed blocker draws a false picture of what an issue waited on.
+
+Missing assignee and timestamp fields default safely; `updated_at`
 stays an opaque string because only the client presents relative time, so a
 tracker timestamp outside the expected ISO form cannot make the board
-unavailable.
+unavailable — [[client#Client#Beads Flow Layout Engine]] owns that formatting.
 
 ### Flow graph admission
 
@@ -405,14 +414,41 @@ shared, displaced, or wrong-workspace requester receives no graph, and
 `Welcome.beads_flow` only to that same eligible owner.
 
 [[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#epic_graph]] reads
-only the retained source. It refuses an absent or empty epic, more than 200
-members, more than 16 `blocks` edges from one member, external blockers,
-disconnected members, and dependency cycles; every refusal is logged and sent
-as typed `NoGraph`, never as a partial graph. The full retained list means a
-closed epic member falling past the board's 200-card Done paint cap remains in
-Flow. A write advances the cache generation before its authoritative refresh,
+only the retained source. Admission is one server-side predicate rather than
+degenerate-case handling spread through the renderer, so the client only ever
+receives a graph it can lay out. Every refusal is logged and sent as typed
+`NoGraph`, never as a partial graph, because an epic that never opens has to
+stay diagnosable from the server alone.
+
+Each refusal earns its place for a different reason:
+
+- **Absent or empty epic** — there is nothing to rank. This is also the ordinary
+  answer for a card whose `parent_epic_id` names an epic in another workspace's
+  root.
+- **Cycle** — longest-path ranking requires acyclicity and would not terminate.
+  `bd` refuses to store one, so this guards the algorithm rather than a shape
+  the tracker can actually produce.
+- **Disconnected member** — a node with no edge in either direction has no
+  defensible rank, and placing it arbitrarily would assert an ordering the data
+  does not support.
+- **External blocker** — an edge leaving the epic cannot be drawn inside it, and
+  silently dropping it would show a node as ready when it is not.
+- **Over 200 members, or over 16 `blocks` edges from one member** — the bound
+  that keeps layout inside its frame budget. There is deliberately no partial
+  graph: serving a truncated one could cut the opened card out of its own
+  picture.
+
+The bound is the epic subgraph's own, independent of the board's per-queue paint
+cap. That separation is the point — the full retained list means a closed epic
+member falling past the board's 200-card Done cap still appears in Flow, where a
+graph assembled from the painted snapshot would have silently holed the epic.
+
+A write advances the cache generation before its authoritative refresh,
 so `graph_source` refuses to serve the preceding source generation during that
-interval.
+interval. The client's own fence is the other half of that guarantee — see
+[[client#Client#Beads Flow Layout Engine#Flow mode entry, exit, and scrolling]].
+Refusals are asserted end to end by
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow epic admission]].
 
 ### Focused issue liveness
 
@@ -420,13 +456,21 @@ A `LiveSession` keeps ephemeral `focused_issue` state, not an assignee-derived
 approximation.
 
 [[crates/scribe-server/src/ipc_server.rs#set_focused_issue]] is the sole
-registry seam for the forthcoming `issue_focused` hook: it silently drops an
-unknown session, writes the exact issue id for a live one, and emits
+registry seam, and [[server#Server#Hook Channel#Focused issue events]] is its
+one writer: it silently drops an unknown session, writes the exact issue id for
+a live one, and emits
 [[crates/scribe-common/src/protocol.rs#ServerMessage]] `IssueFocused` only to
 the local owner of that session's unshared `SingleController` window. A session
 can have multiple output sinks while shared, so liveness deliberately resolves
 the window owner instead of fanning out through the session writer; remote and
 shared participants see neither set nor clear frames.
+
+Routing every writer through one seam is what makes the join exact rather than
+inferred. The issue id and the session id arrive from the same observation, so
+the registry never has to decide whether a generated assignee slug names the
+agent running in this pane. [[client#Client#Beads Flow Layout Engine#Reading liveness from a node]]
+spends that guarantee: a missing halo is a gap in what Scribe observed, while a
+false one would assert a process that is not there.
 
 `None` is the clear shape. The metadata pipeline sends it after
 `AiStateCleared`; clean session/window close, reader/child-exit finalization,

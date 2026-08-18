@@ -292,9 +292,13 @@ report the same relationship without coupling the wire to Pi, Claude Code, or
 Codex. The server emits it only to the local owner of an unshared
 `SingleController` window — the same boundary as Flow graph admission. Remote
 and shared participants receive neither the binding nor its clear, so liveness
-is local observation rather than shared session metadata. The client handler
-is intentionally deferred with the halo renderer; older clients ignore this
-additive variant during the current protocol-compatible release window.
+is local observation rather than shared session metadata.
+
+Both ends are live: [[server#Server#Hook Channel#Focused issue events]] binds
+the issue an adapter observed, and
+[[client#Client#Beads Flow Layout Engine#Reading liveness from a node]] paints
+it. Older clients ignore this additive variant, so a peer that never handles it
+simply shows no halo.
 
 #### Named MessagePack round trip
 
