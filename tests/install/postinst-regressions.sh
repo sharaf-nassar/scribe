@@ -93,6 +93,41 @@ else
     echo "SKIP: zombie regressions require python3"
 fi
 
+# ── A handoff-ready successor retires a captured predecessor ─────────────
+sleep 60 &
+retired_pid=$!
+LAUNCHER_PIDS+=("$retired_pid")
+retired_start="$(awk '{print $22}' "/proc/$retired_pid/stat")"
+retired_hash="$(sha256sum "/proc/$retired_pid/exe" | cut -d' ' -f1)"
+retired_record="${retired_pid}:${retired_start}:${retired_hash}"
+if ! wait_for_server_process_records_exit 1 "$retired_record"; then
+    echo "FAIL: captured predecessor PID $retired_pid survived the bounded retirement"
+    failures=$((failures + 1))
+elif server_process_record_is_alive "$retired_record"; then
+    echo "FAIL: bounded retirement returned while predecessor PID $retired_pid was alive"
+    failures=$((failures + 1))
+else
+    wait "$retired_pid" 2>/dev/null || true
+    echo "PASS: bounded retirement terminates a captured predecessor"
+fi
+
+# A PID and birth time are insufficient authorization to signal after exec.
+# The captured executable hash must still match at the moment of retirement.
+sleep 60 &
+reused_pid=$!
+LAUNCHER_PIDS+=("$reused_pid")
+reused_start="$(awk '{print $22}' "/proc/$reused_pid/stat")"
+reused_record="${reused_pid}:${reused_start}:not-the-running-executable"
+if wait_for_server_process_records_exit 1 "$reused_record"; then
+    echo "FAIL: bounded retirement accepted a mismatched executable identity"
+    failures=$((failures + 1))
+elif ! kill -0 "$reused_pid" 2>/dev/null; then
+    echo "FAIL: bounded retirement signalled a mismatched executable identity"
+    failures=$((failures + 1))
+else
+    echo "PASS: bounded retirement spares a mismatched executable identity"
+fi
+
 # ── Vulkan guard restores the preinst stash without touching a session ───
 probe_fixture=$(mktemp -d)
 sleep 60 &

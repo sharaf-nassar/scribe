@@ -1488,7 +1488,11 @@ Offline shell harness for Debian `postinst` behavior so packaging regressions ca
 `dist/debian/postinst`, then tests fixtures without a live user session. It
 checks zombie client exits and the Vulkan-less upgrade guard: a failed probe
 restores the preinst stash, leaves a running session alive, emits a warning,
-and disables relaunch. It also drives `spawn_upgrade_server` against a fake
+and disables relaunch. A stubborn predecessor fixture records the real PID,
+start time, and executable hash, then requires the bounded retirement helper to
+escalate and remove that exact process without treating its survival as a
+successful handoff; a mismatched executable hash must remain unsignalled. The
+harness also drives `spawn_upgrade_server` against a fake
 server that keeps writing after its bind-ready line, then runs
 `cleanup_upgrade_state` and asserts the successor's stdout still resolves to
 the state-dir `upgrade.log` — `readlink` reports `(deleted)` if the log was
@@ -1559,6 +1563,13 @@ preservation, target-user deferral, and stable/development package assets.
 Startup and settings tests require repair only while enabled and only once on a
 false-to-true transition; disabling leaves the installed file available for a
 later rollback reversal.
+
+A live development-package smoke verifies the installed source, not only the
+repository copy: starting `scribe-dev` must report an up-to-date managed target,
+the packaged and user-scope extension hashes must match, the extension harness
+must pass against that target, and a real Pi tab must inherit the development
+helper and socket. Interactive input must paint the shared processing tab and
+pane indicators, and closing the tab must terminate Pi cleanly.
 
 ### End-to-end Pi recipes
 

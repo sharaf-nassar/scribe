@@ -462,6 +462,12 @@ On Linux and macOS, the old server also verifies that the peer PID is a permitte
 
 An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. After the ACK, restoration, and session activation succeed, the new server emits `"IPC server listening"` immediately before its accept loop starts. This is the Debian hot-reload watchdog's readiness signal; the socket itself was already bound before the ACK (see [[server#Server#Handoff#Socket Takeover]]), so clients queue in its backlog during restoration. The watchdog reads the line from the state-dir `upgrade.log` it truncated at spawn, while the upgraded server's durable tracing lives in the state-dir `server.log` (see [[server#Server#Startup#Upgrade Path]]).
 
+Readiness also commits predecessor retirement. Debian `postinst` stops the old
+service main process under `KillMode=process`, waits for every exact PID/start
+identity captured before installation, then escalates TERM to KILL for an older
+detached server wedged in runtime teardown. These signals never target the
+successor or handed-off PTY children.
+
 ### Socket Takeover
 
 The receiver claims the IPC socket path before it sends the ACK, because the ACK is what tells the old server to exit.

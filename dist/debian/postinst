@@ -122,26 +122,56 @@ server_process_record_is_alive() {
     return 0
 }
 
+server_process_record_matches_identity() {
+    local record="$1"
+    local pid="" recorded_start="" recorded_hash=""
+    local current_start="" current_hash=""
+
+    IFS=: read -r pid recorded_start recorded_hash <<< "$record"
+    kill -0 "$pid" 2>/dev/null || return 1
+    pid_is_zombie "$pid" && return 1
+
+    current_start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [ -n "$current_start" ] && [ "$current_start" = "$recorded_start" ] || return 1
+
+    current_hash="$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1 || true)"
+    [ -n "$current_hash" ] && [ "$current_hash" = "$recorded_hash" ]
+}
+
 wait_for_server_process_records_exit() {
     local attempts="${1:-50}"
     shift
     local -a records=("$@")
-    local record="" any_alive=0
+    local record="" pid="" any_alive=0 signal=""
 
-    while [ "$attempts" -gt 0 ]; do
-        any_alive=0
+    while :; do
+        while [ "$attempts" -gt 0 ]; do
+            any_alive=0
+            for record in "${records[@]}"; do
+                [ -n "$record" ] || continue
+                if server_process_record_is_alive "$record"; then
+                    any_alive=1
+                fi
+            done
+            [ "$any_alive" = "1" ] || return 0
+            sleep 0.2
+            attempts=$((attempts - 1))
+        done
+
+        case "$signal" in
+            "") signal="TERM" ;;
+            TERM) signal="KILL" ;;
+            KILL) return 1 ;;
+        esac
         for record in "${records[@]}"; do
             [ -n "$record" ] || continue
-            if server_process_record_is_alive "$record"; then
-                any_alive=1
+            if server_process_record_matches_identity "$record"; then
+                IFS=: read -r pid _ <<< "$record"
+                kill "-${signal}" "$pid" 2>/dev/null || true
             fi
         done
-        [ "$any_alive" = "1" ] || return 0
-        sleep 0.2
-        attempts=$((attempts - 1))
+        attempts=5
     done
-
-    return 1
 }
 
 server_process_records_match_installed() {
@@ -295,6 +325,7 @@ compute_server_runtime_generation() {
         emit_function_definition cold_restart_server
         emit_function_definition scan_server_process_records
         emit_function_definition server_process_record_is_alive
+        emit_function_definition server_process_record_matches_identity
         emit_function_definition wait_for_server_process_records_exit
         emit_function_definition server_process_records_match_installed
         emit_function_definition pid_is_zombie
@@ -945,6 +976,12 @@ case "$1" in
                 if [ "$UPGRADE_OK" = "1" ]; then
                     record_server_runtime_generation
                     if [ "$SERVER_PROCESS_SCAN_OK" = "1" ]; then
+                        # Mark a systemd-owned predecessor as intentionally
+                        # stopped before the exact process-identity wait falls
+                        # back to TERM/KILL. KillMode=process preserves every
+                        # handed-off PTY child, and a detached predecessor makes
+                        # this stop a no-op.
+                        run_user_systemctl stop "$SERVICE_NAME" || true
                         if wait_for_server_process_records_exit \
                             50 "${ORIGINAL_SERVER_RECORDS[@]}"; then
                             WORKSPACE_NOTES_CLEANUP_SAFE=1
@@ -955,27 +992,11 @@ case "$1" in
                     echo "  ✓ ${APP_DISPLAY_NAME} server hot-reloaded successfully."
                     echo "    All terminal sessions have been preserved."
 
-                    # The old server exits on its own after handoff (clean exit
-                    # code 0). With Restart=on-failure in the service file,
-                    # systemd will not auto-restart it.
-                    #
-                    # What keeps a duplicate server out is NOT the singleton
-                    # flock: an upgrade receiver holds no lock, so after the
-                    # first hot reload the lock is unheld and a cold start would
-                    # take it uncontested. The receiver instead claims the
-                    # socket path atomically before it acknowledges the handoff,
-                    # so the path always names a live server and any cold start
-                    # racing this window finds one and refuses.
-                    #
-                    # We intentionally do NOT `systemctl stop` or kill server
-                    # processes here:
-                    #  - `systemctl stop` uses KillMode=control-group by default,
-                    #    which sends SIGTERM to ALL processes in the cgroup —
-                    #    including the user's shell sessions from the PTY.
-                    #    This kills the very sessions we're trying to preserve
-                    #    and causes a 90-second hang waiting for bash to exit.
-                    #  - Killing via `kill` would cause systemd to see a
-                    #    signal exit, triggering Restart=on-failure.
+                    # A conforming predecessor exits cleanly after the ACK.
+                    # Older processes can wedge during runtime teardown after
+                    # logging `scribe-server stopped`; the bounded identity
+                    # wait above retires those without touching the successor or
+                    # the handed-off PTY children.
                 else
                     # Handoff failed (likely version mismatch). Cold restart
                     # is mandatory — the new binary can't take over the old
