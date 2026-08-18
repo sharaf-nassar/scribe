@@ -605,6 +605,7 @@ fn current_version_payload_round_trips_child_identity() {
     assert_eq!(decoded.sessions.first().expect("one session").icon_title.as_deref(), Some("icon"));
 }
 
+// @lat: [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]]
 #[test]
 fn pi_provider_state_requires_v8_and_preserves_safe_handoff_directions() {
     let (mut state, _masters, _slaves) = make_handoff_state(1);

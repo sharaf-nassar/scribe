@@ -12786,6 +12786,7 @@ mod tests {
         assert!(is_transient_first_frame(&ClientMessage::QuitAll));
     }
 
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]]
     #[tokio::test]
     async fn remote_version_mismatch_returns_the_typed_v8_refusal() {
         let (mut server, mut client) = tokio::io::duplex(4096);
@@ -12835,6 +12836,7 @@ mod tests {
         }));
     }
 
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Local capability negotiation]]
     #[tokio::test]
     async fn old_client_output_downgrades_pi_and_never_sends_the_unknown_enum() {
         let (server, client) = unix_stream_pair();

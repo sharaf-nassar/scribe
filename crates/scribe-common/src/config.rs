@@ -2319,6 +2319,7 @@ mod tests {
     use super::{AiContextThresholds, AiIntegrationToggle, ContextBand, ScribeConfig};
     use crate::ai_state::AiProvider;
 
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Provider identity and config]]
     #[test]
     fn pi_integration_defaults_on_and_gates_only_pi() {
         let default = ScribeConfig::default();

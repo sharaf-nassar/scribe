@@ -210,6 +210,7 @@ impl AiProcessState {
 mod tests {
     use super::{AiProcessState, AiProvider, AiState};
 
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Provider identity and config]]
     #[test]
     fn pi_is_user_visible_and_does_not_resume() {
         assert_eq!(AiProvider::Pi.id(), "pi");

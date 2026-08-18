@@ -61,6 +61,7 @@ function contextPercent(ctx: { getContextUsage(): { percent: number | null } | u
   }
 }
 
+// @lat: [[server#Server#Hook Channel#Pi Extension Adapter]]
 export default function scribePiExtension(pi: ExtensionAPI) {
   const helper = process.env.SCRIBE_HOOK_HELPER;
   if (

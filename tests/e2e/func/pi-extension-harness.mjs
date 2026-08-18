@@ -157,6 +157,7 @@ async function shutdown(api, reason = "quit") {
   await api.handler("session_shutdown")({ type: "session_shutdown", reason }, makeContext());
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Startup and duplicate guard]]
 async function testStartupAndDuplicateGuard() {
   const logPath = join(tempDir, "startup.jsonl");
   setHarnessEnv(logPath);
@@ -179,6 +180,7 @@ async function testStartupAndDuplicateGuard() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Input sources and order]]
 async function testInputSourcesAndOrder() {
   const logPath = join(tempDir, "input.jsonl");
   setHarnessEnv(logPath);
@@ -215,6 +217,7 @@ async function testInputSourcesAndOrder() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Retry and settle behavior]]
 async function testRetryAndSettleBehavior() {
   const logPath = join(tempDir, "settle.jsonl");
   setHarnessEnv(logPath);
@@ -277,6 +280,7 @@ async function testRetryAndSettleBehavior() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Malformed messages and no polling]]
 async function testMalformedMessagesAndNoPolling() {
   const logPath = join(tempDir, "malformed.jsonl");
   setHarnessEnv(logPath);
@@ -311,6 +315,7 @@ async function testMalformedMessagesAndNoPolling() {
   }
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Callbacks do not await the helper]]
 async function testCallbacksDoNotAwaitHelper() {
   const logPath = join(tempDir, "responsive.jsonl");
   setHarnessEnv(logPath, 500);
@@ -326,6 +331,7 @@ async function testCallbacksDoNotAwaitHelper() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Serial queue cap]]
 async function testSerialQueueCap() {
   const logPath = join(tempDir, "queue.jsonl");
   setHarnessEnv(logPath, 10);
@@ -351,6 +357,7 @@ async function testSerialQueueCap() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Generation-cancelled shutdown and reload]]
 async function testGenerationCancelledShutdownAndReload() {
   const logPath = join(tempDir, "shutdown.jsonl");
   setHarnessEnv(logPath, 60);
@@ -386,6 +393,7 @@ async function testGenerationCancelledShutdownAndReload() {
   return starts(logPath);
 }
 
+// @lat: [[test#Test Harness#Pi Extension Harness#Absent environment, child suppression, and missing helper]]
 async function testAbsentEnvironmentHelperAndChildSuppression() {
   const absentLog = join(tempDir, "absent.jsonl");
   delete process.env.SCRIBE_HOOK_HELPER;

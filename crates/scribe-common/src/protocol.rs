@@ -2054,6 +2054,7 @@ mod tests {
         },
     }
 
+    // @lat: [[test#Test Harness#Pi Provider Compatibility#Local capability negotiation]]
     #[test]
     fn old_hello_and_welcome_default_pi_provider_to_false() {
         let hello = HelloWithoutPiProvider::Hello {

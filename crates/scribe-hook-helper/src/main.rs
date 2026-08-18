@@ -352,6 +352,7 @@ mod tests {
         assert_eq!(parse_ai_state(""), Err(()));
     }
 
+    // @lat: [[test#Test Harness#AI Hook Helper#Pi uses the generic hook schema]]
     #[test]
     fn pi_provider_uses_the_generic_hook_schema() {
         let cli = Cli::try_parse_from([

@@ -1599,7 +1599,7 @@ chrome, `tests/e2e/visual/settings-entry.sh` proves keyboard access, and
 
 ## Pi Extension Harness
 
-`node tests/e2e/func/pi-extension-harness.mjs` drives the real
+`just e2e-pi-extension-harness` drives the real
 [[server#Server#Hook Channel#Pi Extension Adapter|Pi adapter]] against a fake
 Pi API and a fake helper, proving the emission contract without Pi, Scribe, or
 a server.
@@ -1608,10 +1608,13 @@ The harness imports `dist/pi-extension.ts` directly and hands it a stub
 `ExtensionAPI` that records handlers, so every assertion is against the shipped
 source rather than a copy. `SCRIBE_HOOK_HELPER` points at a script that appends
 a start and an end record — argv, stdin, pid, and timestamps — to a log, which
-is what makes ordering, serialization, and payload shape observable. It is a
-plain Node script rather than a Docker recipe because nothing in the contract
-needs a container, and it is deliberately absent from the `e2e-all-func`
-inventory, which maps executable `*.sh` only.
+is what makes ordering, serialization, and payload shape observable. It runs on
+the host rather than in a container because it needs a Node runtime the E2E
+images deliberately do not carry, which is also why it stays out of the
+`e2e-all-func` inventory that maps executable `*.sh` only.
+[[test#Test Harness#Pi Provider Compatibility#End-to-end Pi recipes|`e2e-func-pi-ai-lifecycle`]]
+runs it first, so the extension half is proven before the live server half is
+allowed to depend on it.
 
 Two assertions run across every event the whole run produced, not per case: the
 argv is always exactly `--provider=pi`, a lowercase `--event=` drawn from the
