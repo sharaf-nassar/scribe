@@ -1884,6 +1884,42 @@ and a member blocked from outside the epic, covering both tracker-representable
 admission refusals. Beads rejects cycles at write time, including
 `--no-cycle-check`, so cycle admission stays a unit-only graph case.
 
+#### Flow epic admission
+
+The Flow graph is a server decision over the board's own cached `bd` read, so
+the functional run asserts it through `scribe-test` rather than through pixels.
+
+`scribe-test beads-epic-graph <epic>` prints the typed
+[[protocol#Client Messages#Beads epic graph]] outcome, mirroring `beads-board`
+so a script can assert server-owned admission without a GPUI client. The run
+seeds [the Flow fixture](../tests/e2e/fixtures/beads-flow-epic.sh) under the
+configured root as its own tracker and creates its workspace on the daemon's
+window, which adds no region to the painted client and leaves the later pointer
+phases their single-region geometry.
+
+Asking the board workspace for the Flow epic must answer `no_epic`: the server
+resolves a graph from the requesting workspace's own root, so an id seeded in a
+neighbouring region must not resolve. The admitted graph must carry seven
+members, eight edges, one closed member, and the `flow-foundation` to
+`flow-api` edge whose blocker is closed — the edge `bd blocked` cannot report
+and the reason the graph reads the full list instead. Both inadmissible shapes
+return `no_graph` with a reason, and a non-epic id returns `no_epic`.
+
+#### Flow view entry and retarget
+
+The painted run proves the clarified interaction: one click opens the panel and
+swaps only the strip, and a node moves the panel without moving the epic.
+
+A small admissible epic is seeded into the painted workspace only after every
+lane, detail, and drag assertion has finished, so those keep the board they
+were written against. Clicking its deepest card must produce both a
+`RequestBeadsIssueDetail` and a `RequestBeadsEpicGraph` on the client wire, an
+admitted graph from the server, and a repainted strip. Activating a node
+through its accessible Tab stop must request a different member's detail while
+the epic-graph request count stays put, since the graph is frozen at open.
+Leaving Flow must return usable lanes: a card with no epic opens its panel and
+asks for no graph.
+
 #### Card drag writes and pointer isolation
 
 The network-none real-bd GPUI run proves the production drag contract and terminal-pointer boundary through the shipped client.

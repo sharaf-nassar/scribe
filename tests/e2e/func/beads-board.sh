@@ -189,6 +189,86 @@ printf '%s\n' "$CLOSED" | grep -Eq '"closed_at": "[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
 printf '%s\n' "$DEFERRED" | grep -Fq '"defer_until": "2030-03-01T00:00:00Z"' \
     || fail "deferred fixture omitted defer_until: $DEFERRED"
 
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow epic admission]]
+# The Flow graph is a server-owned decision over the same real `bd` read, so it
+# is asserted here through `scribe-test` rather than through pixels. This runs
+# on the daemon's own window, so it adds no region to the GPUI client and the
+# later pointer phases keep the single-region geometry they were written for.
+# The fixture derives its project path from this root when it is sourced, so it
+# has to be exported first. Seeding it under $ROOT keeps it inside the same
+# configured workspace root as the board fixture without sharing its tracker.
+export BEADS_FLOW_ROOT="$ROOT"
+. /tests/fixtures/beads-flow-epic.sh
+seed_beads_flow_epic_fixture
+verify_beads_flow_epic_fixture
+
+graph_outcome() {
+    scribe-test beads-epic-graph "$1"
+}
+
+# Same epic id, a region that never seeded it: the server resolves the graph
+# from the requesting workspace's own root, so this must not leak across.
+ISOLATED=$(graph_outcome flow-epic)
+printf '%s\n' "$ISOLATED" | grep -Fq '"no_graph"' \
+    || fail "flow-epic leaked into the real-board region: $ISOLATED"
+printf '%s\n' "$ISOLATED" | grep -Fq '"no_epic"' \
+    || fail "cross-region epic miss was not reported as no_epic: $ISOLATED"
+
+# The create is what binds the new workspace to the Flow project root, and a
+# non-Loading board is the real precondition for a graph: assembly reads the
+# cached list rather than issuing a second `bd` query.
+scribe-test session create --cwd "$BEADS_FLOW_PROJECT" >/dev/null
+FLOW_BOARD=$(scribe-test beads-board)
+printf '%s\n' "$FLOW_BOARD" | grep -Fq '"id":"flow-release"' \
+    || fail "the Flow workspace board never carried its own issues: $FLOW_BOARD"
+
+ADMITTED=$(graph_outcome flow-epic)
+printf '%s\n' "$ADMITTED" >/output/beads-flow-graph.json
+python3 - "$ADMITTED" <<'PY'
+import json
+import sys
+
+outcome = json.loads(sys.argv[1])
+graph = outcome.get("graph")
+if graph is None:
+    raise SystemExit(f"FAIL: flow-epic was not admitted: {outcome}")
+nodes = {node["id"]: node for node in graph["nodes"]}
+edges = {(edge["from"], edge["to"]) for edge in graph["edges"]}
+if graph["total"] != 7 or len(nodes) != 7:
+    raise SystemExit(f"FAIL: expected seven members, got {graph['total']}/{len(nodes)}")
+if graph["closed"] != 1:
+    raise SystemExit(f"FAIL: expected one closed member, got {graph['closed']}")
+# The satisfied edge is the load-bearing one: its blocker is closed, so
+# `bd blocked` cannot report it, yet the graph must still draw it.
+if ("flow-foundation", "flow-api") not in edges:
+    raise SystemExit(f"FAIL: satisfied closed-blocker edge missing: {sorted(edges)}")
+if nodes["flow-foundation"]["status"] != "closed":
+    raise SystemExit("FAIL: the satisfied blocker was not carried as closed")
+fan_out = {to for (frm, to) in edges if frm == "flow-foundation"}
+fan_in = {frm for (frm, to) in edges if to == "flow-integration"}
+if fan_out != {"flow-api", "flow-ui", "flow-data"}:
+    raise SystemExit(f"FAIL: fan-out did not survive assembly: {fan_out}")
+if fan_in != {"flow-api", "flow-ui", "flow-data"}:
+    raise SystemExit(f"FAIL: fan-in did not survive assembly: {fan_in}")
+if len(edges) != 8:
+    raise SystemExit(f"FAIL: expected eight edges, got {len(edges)}")
+PY
+
+# Both tracker-representable refusals leave the board in lanes. bd cannot store
+# a cycle, so that admission arm stays a unit case over an in-memory graph.
+REFUSED=$(graph_outcome flow-inadmissible-epic)
+printf '%s\n' "$REFUSED" | grep -Fq '"no_graph"' \
+    || fail "inadmissible epic was not refused: $REFUSED"
+printf '%s\n' "$REFUSED" | grep -Eq '"(disconnected|external_blocker)"' \
+    || fail "inadmissible epic gave no admission reason: $REFUSED"
+
+NOT_AN_EPIC=$(graph_outcome flow-external-blocker)
+printf '%s\n' "$NOT_AN_EPIC" | grep -Fq '"no_epic"' \
+    || fail "a non-epic issue returned something other than no_epic: $NOT_AN_EPIC"
+
+echo 'PASS: real bd admitted the Flow epic with its satisfied blocker edge, refused both' \
+    'inadmissible shapes, and kept epic ids inside their own region'
+
 if [ -z "${DISPLAY:-}" ]; then
     echo 'PASS: real bd refreshed the board and returned complete deterministic detail fixtures'
     exit 0
@@ -827,3 +907,187 @@ printf '%s\n' "$REJECTED" | grep -Fq '"status": "open"' \
 import -window "$WID" /output/beads-drag-functional.png
 echo 'PASS: real bd detail and card drags proved claim, close/Undo, clear-defer,' \
     'classifier notice, rejects, and PTY mouse isolation'
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow view entry and retarget]]
+# Everything above has finished with the single-region board it was written
+# for, so the Flow epic is only seeded into the painted workspace now. The
+# server-owned admission decision is already proven above; what is left is the
+# interaction the clarified model turns on — the panel opening while the strip
+# alone swaps, and a node moving the panel without moving the epic.
+rm -f /usr/local/bin/bd
+mv /usr/local/bin/bd-real /usr/local/bin/bd
+xdotool key --clearmodifiers Escape
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+
+(
+    cd "$PROJECT"
+    bd create 'Painted Flow epic' --id e2e-flow-epic --type epic --priority 2 >/dev/null
+    for issue_id in e2e-flow-a e2e-flow-b e2e-flow-c e2e-flow-d; do
+        bd create "Painted $issue_id" --id "$issue_id" --type task --priority 2 >/dev/null
+        bd update "$issue_id" --parent e2e-flow-epic >/dev/null
+    done
+    bd close e2e-flow-a --reason 'Satisfied painted blocker.' >/dev/null
+    bd dep add e2e-flow-b e2e-flow-a >/dev/null
+    bd dep add e2e-flow-c e2e-flow-a >/dev/null
+    bd dep add e2e-flow-d e2e-flow-b >/dev/null
+    bd dep add e2e-flow-d e2e-flow-c >/dev/null
+)
+
+flow_detail_requests() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client"
+            and message.get("type") == "RequestBeadsIssueDetail"
+            and message.get("issue_id") == sys.argv[2]):
+        count += 1
+print(count)
+PY
+}
+
+# Every detail request for a member of the painted epic other than $1, so a
+# node activation can be proven without depending on which node takes focus.
+flow_sibling_requests() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+members = {"e2e-flow-a", "e2e-flow-b", "e2e-flow-c", "e2e-flow-d"} - {sys.argv[2]}
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client"
+            and message.get("type") == "RequestBeadsIssueDetail"
+            and message.get("issue_id") in members):
+        count += 1
+print(count)
+PY
+}
+
+epic_graph_requests() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client"
+            and message.get("type") == "RequestBeadsEpicGraph"
+            and message.get("epic_id") == sys.argv[2]):
+        count += 1
+print(count)
+PY
+}
+
+epic_graph_admitted() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server"
+            and message.get("type") == "BeadsEpicGraph"
+            and message.get("epic_id") == sys.argv[2]
+            and isinstance(message.get("outcome"), dict)
+            and "graph" in message["outcome"]):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+click_card() {
+    local issue="$1" position lane index lane_width
+    for _ in $(seq 1 50); do
+        position=$(issue_position "$issue" 2>/dev/null || true)
+        [ -n "$position" ] && break
+        sleep 0.2
+    done
+    [ -n "${position:-}" ] || fail "$issue never painted a card"
+    read -r lane index <<<"$position"
+    lane_width=$(( (WIN_W - 16) / 5 ))
+    xdotool mousemove --sync --window "$WID" \
+        "$(( 16 + lane * lane_width + 70 ))" "$(( 70 + index * 50 + 14 ))"
+    xdotool mousedown 1
+    xdotool mouseup 1
+}
+
+# Wait for the seeded epic to reach the painted board before touching it.
+for _ in $(seq 1 50); do
+    issue_position e2e-flow-d >/dev/null 2>&1 && break
+    sleep 0.2
+done
+import -window "$WID" /output/beads-flow-lanes.png
+
+FLOW_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-d)
+FLOW_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
+click_card e2e-flow-d
+for _ in $(seq 1 50); do
+    [ "$(flow_detail_requests e2e-flow-d)" -gt "$FLOW_DETAIL_BEFORE" ] \
+        && [ "$(epic_graph_requests e2e-flow-epic)" -gt "$FLOW_GRAPH_BEFORE" ] \
+        && break
+    sleep 0.2
+done
+# One click owes both: the panel is untouched by Flow and opens as it always
+# has, and only the strip follows the card into its epic.
+[ "$(flow_detail_requests e2e-flow-d)" -gt "$FLOW_DETAIL_BEFORE" ] \
+    || fail "the card click did not open the detail panel"
+[ "$(epic_graph_requests e2e-flow-epic)" -gt "$FLOW_GRAPH_BEFORE" ] \
+    || fail "the card click did not ask for its epic graph"
+for _ in $(seq 1 50); do
+    epic_graph_admitted e2e-flow-epic && break
+    sleep 0.2
+done
+epic_graph_admitted e2e-flow-epic \
+    || fail "the server never admitted the painted epic's graph"
+sleep 0.5
+import -window "$WID" /output/beads-flow-strip.png
+STRIP_DIFF=$(compare -metric AE \
+    \( /output/beads-flow-lanes.png -crop "${WIN_W}x197+0+34" +repage \) \
+    \( /output/beads-flow-strip.png -crop "${WIN_W}x197+0+34" +repage \) \
+    null: 2>&1 || true)
+STRIP_DIFF=${STRIP_DIFF%%.*}
+[ "${STRIP_DIFF:-0}" -ge 5000 ] \
+    || fail "the strip did not repaint into Flow (${STRIP_DIFF:-0}px)"
+
+# A node moves the opened card inside the frozen graph. The epic must not be
+# re-requested: the picture the reader is holding stays exactly as laid out.
+SIBLING_BEFORE=$(flow_sibling_requests e2e-flow-d)
+GRAPH_AFTER_OPEN=$(epic_graph_requests e2e-flow-epic)
+xdotool key --clearmodifiers Tab
+sleep 0.2
+xdotool key --clearmodifiers Return
+for _ in $(seq 1 50); do
+    [ "$(flow_sibling_requests e2e-flow-d)" -gt "$SIBLING_BEFORE" ] && break
+    sleep 0.2
+done
+[ "$(flow_sibling_requests e2e-flow-d)" -gt "$SIBLING_BEFORE" ] \
+    || fail "activating a Flow node did not retarget the detail panel"
+[ "$(epic_graph_requests e2e-flow-epic)" -eq "$GRAPH_AFTER_OPEN" ] \
+    || fail "a node activation re-requested the epic graph"
+
+# Leaving Flow returns the same board: lanes paint again and a card with no
+# epic opens its panel without ever asking for a graph.
+xdotool key --clearmodifiers Escape
+sleep 0.5
+LOOSE_DETAIL_BEFORE=$(flow_detail_requests e2e-ready)
+LOOSE_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
+click_card e2e-ready
+for _ in $(seq 1 50); do
+    [ "$(flow_detail_requests e2e-ready)" -gt "$LOOSE_DETAIL_BEFORE" ] && break
+    sleep 0.2
+done
+[ "$(flow_detail_requests e2e-ready)" -gt "$LOOSE_DETAIL_BEFORE" ] \
+    || fail "lanes stopped opening the panel after a Flow round trip"
+[ "$(epic_graph_requests e2e-flow-epic)" -eq "$LOOSE_GRAPH_BEFORE" ] \
+    || fail "a card with no epic asked for a graph"
+
+import -window "$WID" /output/beads-flow-functional.png
+echo 'PASS: a real card click opened the panel and swapped the strip into Flow, a node' \
+    'retargeted the panel inside the frozen epic, and lanes stayed usable on return'

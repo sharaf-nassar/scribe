@@ -5,8 +5,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::protocol::{
-    AiResumeMode, AutomationAction, BeadsBoardState, BeadsIssueWrite, BeadsIssueWriteGuards,
-    BeadsIssueWriteResult, CiRunState,
+    AiResumeMode, AutomationAction, BeadsBoardState, BeadsEpicGraphOutcome, BeadsIssueWrite,
+    BeadsIssueWriteGuards, BeadsIssueWriteResult, CiRunState,
 };
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,10 @@ pub enum DaemonRequest {
     },
     /// Refresh the current workspace's Beads board through the real server.
     RequestBeadsBoard,
+    /// Assemble one epic's Flow dependency graph through the real server.
+    RequestBeadsEpicGraph {
+        epic_id: String,
+    },
     /// Execute one typed issue write through the real server.
     BeadsIssueWrite {
         issue_id: String,
@@ -201,6 +205,10 @@ pub enum DaemonResponse {
     },
     BeadsBoard {
         state: BeadsBoardState,
+    },
+    BeadsEpicGraph {
+        epic_id: String,
+        outcome: BeadsEpicGraphOutcome,
     },
     BeadsIssueWrite {
         result: BeadsIssueWriteResult,

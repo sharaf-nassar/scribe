@@ -76,6 +76,24 @@ pub fn beads_board() -> Result<(), TestError> {
     }
 }
 
+/// Assemble one epic's Flow graph through the real server and print its outcome.
+pub fn beads_epic_graph(epic_id: String) -> Result<(), TestError> {
+    let response = send_request(&DaemonRequest::RequestBeadsEpicGraph { epic_id })
+        .map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::BeadsEpicGraph { outcome, .. } => {
+            serde_json::to_writer(io::stdout().lock(), &outcome)
+                .map_err(|e| TestError::InfraError(format!("failed to serialize graph: {e}")))?;
+            writeln!(io::stdout())
+                .map_err(|e| TestError::InfraError(format!("failed to write graph: {e}")))?;
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
 /// Execute a typed issue write and print its result plus push observation.
 pub fn beads_write(
     issue_id: String,

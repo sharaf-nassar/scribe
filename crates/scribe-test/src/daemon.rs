@@ -17,8 +17,8 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
     AiLaunchSpec, AiResumeMode, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
-    BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult, ClientMessage, ServerMessage,
-    ShellTool, TerminalSize, pi_launch_metadata,
+    BeadsEpicGraphOutcome, BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult,
+    ClientMessage, ServerMessage, ShellTool, TerminalSize, pi_launch_metadata,
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -176,6 +176,8 @@ struct DaemonState {
     beads_board: Option<(WorkspaceId, BeadsBoardState, u64)>,
     /// Most recent typed Beads write reply.
     beads_write: Option<(WorkspaceId, String, BeadsIssueWriteResult, u64)>,
+    /// Most recent Flow epic-graph reply, paired with the epic it answers.
+    beads_epic_graph: Option<(WorkspaceId, String, BeadsEpicGraphOutcome)>,
     /// Arrival order for Beads result and board publication assertions.
     beads_sequence: u64,
     /// Production client state seam fed by capability-gated CI IPC.
@@ -193,6 +195,7 @@ impl DaemonState {
             last_action: None,
             beads_board: None,
             beads_write: None,
+            beads_epic_graph: None,
             beads_sequence: 0,
             ci_runs: CiRunBars::default(),
         }
@@ -209,6 +212,7 @@ struct WaitNotifiers {
     replay: Arc<Notify>,
     beads_board: Arc<Notify>,
     beads_write: Arc<Notify>,
+    beads_epic_graph: Arc<Notify>,
 }
 
 impl WaitNotifiers {
@@ -222,6 +226,7 @@ impl WaitNotifiers {
             replay: Arc::new(Notify::new()),
             beads_board: Arc::new(Notify::new()),
             beads_write: Arc::new(Notify::new()),
+            beads_epic_graph: Arc::new(Notify::new()),
         }
     }
 }
@@ -701,13 +706,14 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::BeadsIssueDetail { .. }
-        | ServerMessage::BeadsEpicGraph { .. }
         | ServerMessage::IssueFocused { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
         | ServerMessage::ShareEnded { .. } => {}
-        msg @ (ServerMessage::BeadsBoard { .. } | ServerMessage::BeadsIssueWriteResult { .. }) => {
+        msg @ (ServerMessage::BeadsBoard { .. }
+        | ServerMessage::BeadsIssueWriteResult { .. }
+        | ServerMessage::BeadsEpicGraph { .. }) => {
             dispatch_beads_message(msg, state, notifiers).await;
         }
     }
@@ -726,6 +732,10 @@ async fn dispatch_beads_message(
         }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
             state_beads_write(workspace_id, issue_id, result, state, notifiers).await;
+        }
+        ServerMessage::BeadsEpicGraph { workspace_id, epic_id, outcome } => {
+            state.lock().await.beads_epic_graph = Some((workspace_id, epic_id, outcome));
+            notifiers.beads_epic_graph.notify_waiters();
         }
         other => debug!(?other, "ignored non-Beads server message in Beads dispatcher"),
     }
@@ -1267,17 +1277,16 @@ async fn process_request(
         }
         request @ (DaemonRequest::RequestAiChrome { .. }
         | DaemonRequest::RequestBeadsBoard
+        | DaemonRequest::RequestBeadsEpicGraph { .. }
         | DaemonRequest::BeadsIssueWrite { .. }
         | DaemonRequest::SetCiRunDetailsInterest { .. }
         | DaemonRequest::RequestCiRunState { .. }) => {
             handle_chrome_request(request, state, notifiers, server_writer).await
         }
-        DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
-            handle_replay_status(session_id, min_frames, timeout_ms, state, notifiers).await
-        }
-        DaemonRequest::ReplayScreen { session_id } => handle_replay_screen(session_id, state).await,
-        DaemonRequest::AssertReplayMatchesScreen { session_id } => {
-            handle_assert_replay_matches(session_id, state, server_writer).await
+        request @ (DaemonRequest::ReplayStatus { .. }
+        | DaemonRequest::ReplayScreen { .. }
+        | DaemonRequest::AssertReplayMatchesScreen { .. }) => {
+            handle_replay_request(request, state, notifiers, server_writer).await
         }
         DaemonRequest::WindowId => handle_window_id(state).await,
         DaemonRequest::EnvelopeId { session_id } => handle_envelope_id(session_id, state).await,
@@ -1293,6 +1302,28 @@ async fn process_request(
     }
 }
 
+/// The three replay inspections, grouped so the request router stays within
+/// its line budget as new request families land.
+async fn handle_replay_request(
+    request: DaemonRequest,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    match request {
+        DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
+            handle_replay_status(session_id, min_frames, timeout_ms, state, notifiers).await
+        }
+        DaemonRequest::ReplayScreen { session_id } => handle_replay_screen(session_id, state).await,
+        DaemonRequest::AssertReplayMatchesScreen { session_id } => {
+            handle_assert_replay_matches(session_id, state, server_writer).await
+        }
+        _ => DaemonResponse::Error {
+            message: "internal request routing error: expected a replay request".to_owned(),
+        },
+    }
+}
+
 async fn handle_chrome_request(
     request: DaemonRequest,
     state: &SharedState,
@@ -1305,6 +1336,9 @@ async fn handle_chrome_request(
         }
         DaemonRequest::RequestBeadsBoard => {
             handle_request_beads_board(state, notifiers, server_writer).await
+        }
+        DaemonRequest::RequestBeadsEpicGraph { epic_id } => {
+            handle_request_beads_epic_graph(epic_id, state, notifiers, server_writer).await
         }
         DaemonRequest::BeadsIssueWrite { issue_id, verb, guards } => {
             handle_beads_issue_write((issue_id, verb, guards), state, notifiers, server_writer)
@@ -1398,6 +1432,47 @@ async fn handle_ci_detail_interest(
         Err(error) => {
             DaemonResponse::Error { message: format!("failed to set CI detail interest: {error}") }
         }
+    }
+}
+
+/// Ask the real server for one epic's Flow graph and return its typed outcome.
+///
+/// Mirrors [`handle_request_beads_board`] for the same reason that one exists:
+/// a functional script can then assert the server-owned admission decision
+/// against real `bd` without standing up a GPUI client.
+async fn handle_request_beads_epic_graph(
+    epic_id: String,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    let Some(workspace_id) = state.lock().await.last_workspace_id else {
+        return DaemonResponse::Error { message: "no workspace recorded".to_owned() };
+    };
+    state.lock().await.beads_epic_graph = None;
+    let request = ClientMessage::RequestBeadsEpicGraph { workspace_id, epic_id: epic_id.clone() };
+    if let Err(error) = send_to_server(server_writer, &request).await {
+        return DaemonResponse::Error {
+            message: format!("failed to request Beads epic graph: {error}"),
+        };
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some((reply_workspace, reply_epic, outcome)) =
+            state.lock().await.beads_epic_graph.clone()
+            && reply_workspace == workspace_id
+            && reply_epic == epic_id
+        {
+            return DaemonResponse::BeadsEpicGraph { epic_id, outcome };
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return DaemonResponse::Error {
+                message: "timed out waiting for Beads epic graph".to_owned(),
+            };
+        }
+        drop(tokio::time::timeout(remaining, notifiers.beads_epic_graph.notified()).await);
     }
 }
 
@@ -1527,7 +1602,11 @@ async fn handle_create_session(
     notifiers: &Arc<WaitNotifiers>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    // Step 1: Create a workspace.
+    // Step 1: Create a workspace. Clear the recorded id first for the same
+    // reason the session id is cleared below: a second create would otherwise
+    // read the previous workspace back immediately and put the new session in
+    // it, silently ignoring this request's `cwd` and its Beads project root.
+    state.lock().await.last_workspace_id = None;
     if let Err(e) = send_to_server(server_writer, &ClientMessage::CreateWorkspace).await {
         return DaemonResponse::Error { message: format!("failed to send CreateWorkspace: {e}") };
     }

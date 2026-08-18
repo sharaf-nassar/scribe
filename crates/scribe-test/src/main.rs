@@ -151,6 +151,11 @@ enum Command {
     },
     /// Refresh the current workspace's Beads board and print its state as JSON.
     BeadsBoard,
+    /// Assemble one epic's Flow dependency graph and print its outcome as JSON.
+    BeadsEpicGraph {
+        /// Epic whose dependency graph the server should admit or refuse.
+        epic_id: String,
+    },
     /// Execute one typed Beads issue write through the server.
     BeadsWrite(BeadsWriteArgs),
     /// Serve a deterministic loopback-only GitHub Actions API fixture.
@@ -709,6 +714,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
         Command::BeadsBoard => capture::beads_board(),
+        Command::BeadsEpicGraph { epic_id } => capture::beads_epic_graph(epic_id),
         Command::BeadsWrite(args) => run_beads_write(args),
         Command::GithubActionsApi(args) => run_gh_api(&args),
         Command::Replay { action } => run_replay(action),
@@ -718,23 +724,12 @@ fn run(cli: Cli) -> Result<(), TestError> {
             wait::wait_cwd(&session_id, &path_str, timeout)
         }
         Command::WaitIdle { session_id, ms, timeout } => wait::wait_idle(&session_id, ms, timeout),
-        Command::AssertCell { session_id, row, col, expected } => {
-            let ch = extract_char(&expected)?;
-            assert::assert_cell(&session_id, row, col, ch)
-        }
-        Command::AssertCursor { session_id, row, col } => {
-            assert::assert_cursor(&session_id, row, col)
-        }
-        Command::AssertSnapshotMatch { session_id, reference } => {
-            assert::assert_snapshot_match(&session_id, &reference)
-        }
-        Command::AssertNoEmptyOutput { session_id } => assert::assert_no_empty_output(&session_id),
-        Command::AssertExit { session_id, code, timeout } => {
-            assert::assert_exit(&session_id, code, timeout)
-        }
-        Command::AssertSignal { session_id, signal, timeout } => {
-            assert::assert_signal(&session_id, signal, timeout)
-        }
+        command @ (Command::AssertCell { .. }
+        | Command::AssertCursor { .. }
+        | Command::AssertSnapshotMatch { .. }
+        | Command::AssertNoEmptyOutput { .. }
+        | Command::AssertExit { .. }
+        | Command::AssertSignal { .. }) => run_assert(command),
         Command::DecodeSpike { contract, evidence } => {
             decode_spike::run(&contract, &evidence).map_err(TestError::TestFailure)
         }
@@ -778,6 +773,33 @@ fn run(cli: Cli) -> Result<(), TestError> {
             client_scene::verify(&fixtures, &output).map_err(TestError::TestFailure)
         }
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
+    }
+}
+
+/// The screen and exit assertions, grouped so the command router stays within
+/// its line budget as new commands land.
+fn run_assert(command: Command) -> Result<(), TestError> {
+    match command {
+        Command::AssertCell { session_id, row, col, expected } => {
+            let ch = extract_char(&expected)?;
+            assert::assert_cell(&session_id, row, col, ch)
+        }
+        Command::AssertCursor { session_id, row, col } => {
+            assert::assert_cursor(&session_id, row, col)
+        }
+        Command::AssertSnapshotMatch { session_id, reference } => {
+            assert::assert_snapshot_match(&session_id, &reference)
+        }
+        Command::AssertNoEmptyOutput { session_id } => assert::assert_no_empty_output(&session_id),
+        Command::AssertExit { session_id, code, timeout } => {
+            assert::assert_exit(&session_id, code, timeout)
+        }
+        Command::AssertSignal { session_id, signal, timeout } => {
+            assert::assert_signal(&session_id, signal, timeout)
+        }
+        _ => Err(TestError::InfraError(
+            "internal command routing error: expected an assertion".to_owned(),
+        )),
     }
 }
 

@@ -3545,7 +3545,15 @@ mod flow_mode_tests {
         let mut boards = enabled();
         boards.update(workspace, BeadsBoardState::Loading { cached: None });
         boards.toggle_pin(workspace);
+        // Drag the strip off its default height first: a preserved height and a
+        // height reset to the default are indistinguishable otherwise.
+        boards.start_resize(workspace, 100.0);
+        boards.resize_to(160.0, 400.0);
         let pinned_height = boards.height(workspace);
+        assert!(
+            (pinned_height - BEADS_BOARD_HEIGHT).abs() > f32::EPSILON,
+            "the resize must move the height off its default"
+        );
         boards.request_card_flow(workspace, &card("a", Some(EPIC)));
         assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
 
