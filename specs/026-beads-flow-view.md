@@ -620,6 +620,16 @@ Alternatives rejected:
 - **A general graph canvas** — the strip is 197px; a layered DAG with fixed
   ranks is the only layout that reads at that height.
 
+**A cycle is unrepresentable in `bd`, so it is a unit-level concern only.**
+Measured against `bd` 1.1.0: `dep add --no-cycle-check` is a per-edge speed flag
+that still runs a whole-graph check before commit, and `import` loads the issues
+while dropping the closing edge. No fixture can seed one. The admission
+predicate keeps its cycle branch because longest-path ranking requires
+acyclicity and the guard sits at the boundary of a pure algorithm, but it is
+proven by constructing the graph in memory, never through the tracker. E2E
+admission coverage uses the two inadmissible shapes `bd` *can* represent: a
+disconnected member and a member blocked from outside the epic.
+
 **Admission is a server-side predicate, not a layout problem.** Q3 says Flow is
 never entered without a graph, so the server refuses the epic outright when it
 contains a cycle, a node disconnected from every other member, a blocker
@@ -818,8 +828,10 @@ would otherwise have raced on the same file.
   renderer, the trace item, and the halo item all add slots to the same struct
   and would otherwise diverge. Blocks render, trace, halo.
 - **Multi-rank E2E fixture** (P1, new) — a seeded epic with a real fan-out and
-  fan-in, at least five ranks, and a rank wide enough to exercise the row
-  budget. Blocks both E2E items; no fixture existed for this shape.
+  fan-in, at least five ranks, a rank wide enough to exercise the row budget, a
+  satisfied closed blocker edge, and the disconnected and external-blocker
+  members the admission path refuses. Blocks both E2E items; no fixture existed
+  for this shape.
 
 **Server**
 
@@ -938,3 +950,10 @@ Must-fix findings applied directly:
 Should-fix items accepted: the missing acceptance checks listed at the end of
 Testing Strategy, and the derived rank-pitch formula folded into the mock
 revision item.
+
+- **Cycle seeding was unsatisfiable.** The fixture bead's original criterion
+  required seeding a cycle-bearing epic. `bd` refuses cycles on both `dep add`
+  and `import`, so the criterion could never pass. Cycle coverage moved to unit
+  tests on the layout engine and the admission predicate, and the fixture now
+  carries the disconnected and external-blocker shapes instead. Discovered by
+  the fixture worker mid-run and verified independently before the change.
