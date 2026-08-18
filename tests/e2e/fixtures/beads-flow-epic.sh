@@ -65,102 +65,31 @@ seed_beads_flow_epic_fixture() {
 }
 
 verify_beads_flow_epic_fixture() {
+    # The only claim worth re-checking is one about bd itself, not about this
+    # file: a blocker that is already closed stays on the dependency graph but
+    # drops out of `bd blocked`. That asymmetry is why Flow reads the full list
+    # rather than the blocked view, so it is pinned here.
+    #
+    # The epic's shape - ranks, fan-out, fan-in, the closed blocker, and the two
+    # inadmissible members - is written deterministically above and asserted
+    # against the real server in tests/e2e/func/beads-board.sh. Re-deriving it
+    # here proved only that the literals a few lines up are still the literals a
+    # few lines up.
     python3 - "$BEADS_FLOW_PROJECT" <<'PY'
 import json
-import os
 import subprocess
 import sys
 
 project = sys.argv[1]
-env = os.environ | {"BD_JSON_ENVELOPE": "1"}
 payload = json.loads(subprocess.check_output(
-    ["bd", "--readonly", "--json", "list", "--all", "--limit", "0"],
-    cwd=project,
-    env=env,
-    text=True,
-))
-data = payload["data"]
-issues = data["issues"] if isinstance(data, dict) else data
-by_id = {issue["id"]: issue for issue in issues}
-
-flow_members = {
-    "flow-foundation",
-    "flow-api",
-    "flow-ui",
-    "flow-data",
-    "flow-integration",
-    "flow-verification",
-    "flow-release",
-}
-if any(by_id[issue_id].get("parent") != "flow-epic" for issue_id in flow_members):
-    raise SystemExit("FAIL: Flow members did not retain their epic parent")
-
-blockers = {
-    issue_id: {
-        dependency["depends_on_id"]
-        for dependency in by_id[issue_id].get("dependencies", [])
-        if dependency["type"] == "blocks"
-    }
-    for issue_id in flow_members
-}
-ranks = {"flow-foundation": 0}
-while len(ranks) < len(flow_members):
-    for issue_id, predecessors in blockers.items():
-        if issue_id not in ranks and predecessors <= ranks.keys():
-            ranks[issue_id] = 1 + max(ranks[predecessor] for predecessor in predecessors)
-if max(ranks.values()) != 4:
-    raise SystemExit(f"FAIL: expected five ranks, got {ranks}")
-if {"flow-api", "flow-ui", "flow-data"} != {
-    issue_id for issue_id, predecessors in blockers.items()
-    if predecessors == {"flow-foundation"}
-}:
-    raise SystemExit(f"FAIL: fan-out rank missing: {blockers}")
-if blockers["flow-integration"] != {"flow-api", "flow-ui", "flow-data"}:
-    raise SystemExit(f"FAIL: fan-in missing: {blockers}")
-if by_id["flow-foundation"]["status"] != "closed":
-    raise SystemExit("FAIL: satisfied blocker was not closed")
-
-blocked_payload = json.loads(subprocess.check_output(
     ["bd", "--readonly", "--json", "blocked"], cwd=project, text=True,
 ))
-blocked_data = (
-    blocked_payload.get("data", blocked_payload)
-    if isinstance(blocked_payload, dict)
-    else blocked_payload
-)
-blocked_issues = (
-    blocked_data["issues"] if isinstance(blocked_data, dict) else blocked_data
-)
-if "flow-api" in {issue["id"] for issue in blocked_issues}:
+data = payload.get("data", payload) if isinstance(payload, dict) else payload
+issues = data["issues"] if isinstance(data, dict) else data
+if "flow-api" in {issue["id"] for issue in issues}:
     raise SystemExit("FAIL: bd blocked reported a satisfied blocker")
 
-all_blockers = {
-    issue_id: {
-        dependency["depends_on_id"]
-        for dependency in issue.get("dependencies", [])
-        if dependency["type"] == "blocks"
-    }
-    for issue_id, issue in by_id.items()
-}
-if all_blockers["flow-disconnected"] or any(
-    "flow-disconnected" in predecessors for predecessors in all_blockers.values()
-):
-    raise SystemExit("FAIL: disconnected member unexpectedly has a blocks edge")
-if by_id["flow-external-blocked"].get("parent") != "flow-inadmissible-epic":
-    raise SystemExit("FAIL: external-blocker member lost its epic parent")
-if {
-    dependency["depends_on_id"]
-    for dependency in by_id["flow-external-blocked"].get("dependencies", [])
-    if dependency["type"] == "blocks"
-} != {"flow-external-blocker"}:
-    raise SystemExit("FAIL: external blocker dependency missing")
-if by_id["flow-external-blocker"].get("parent"):
-    raise SystemExit("FAIL: external blocker joined the inadmissible epic")
-
-print(
-    "PASS: Flow fixture seeded five ranks, fan-out=3, fan-in=3, "
-    "a satisfied closed blocker, and disconnected/external-blocker refusals"
-)
+print("PASS: bd blocked omits the satisfied blocker the Flow graph keeps")
 PY
 }
 

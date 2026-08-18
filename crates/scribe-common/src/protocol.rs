@@ -503,6 +503,13 @@ pub struct BeadsGraphEdge {
     pub to: String,
 }
 
+/// The most nodes one epic graph may carry.
+///
+/// Both ends share this constant because it is a wire bound, not a local
+/// policy: were the server to admit a graph the client refuses, the strip
+/// would drop it with nothing but a debug line to explain the blank.
+pub const MAX_FLOW_NODES: usize = 200;
+
 /// A complete, admitted epic dependency graph.
 ///
 /// There is deliberately no `truncated` flag. An epic exceeding the server's

@@ -1884,6 +1884,13 @@ and a member blocked from outside the epic, covering both tracker-representable
 admission refusals. Beads rejects cycles at write time, including
 `--no-cycle-check`, so cycle admission stays a unit-only graph case.
 
+The fixture's own check pins only the `bd blocked` asymmetry, which is a claim
+about the tracker rather than about the fixture. Its shape is written from
+literals and asserted against the real server by
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow epic admission]];
+re-deriving it beside the literals proved nothing the seeding did not already
+state.
+
 #### Flow epic admission
 
 The Flow graph is a server decision over the board's own cached `bd` read, so

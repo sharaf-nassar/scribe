@@ -21,7 +21,7 @@ use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
     BeadsEpicGraphRefusal, BeadsGraphEdge, BeadsGraphNode, BeadsIssueComment, BeadsIssueDetail,
     BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite, BeadsIssueWriteGuards,
-    BeadsIssueWriteResult,
+    BeadsIssueWriteResult, MAX_FLOW_NODES,
 };
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -30,7 +30,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_ITEMS_PER_QUEUE: usize = 200;
-const MAX_FLOW_NODES: usize = 200;
 const MAX_FLOW_EDGES_PER_NODE: usize = 16;
 const MAX_BLOCKERS_PER_ITEM: usize = 16;
 const MAX_ID_CHARS: usize = 128;

@@ -721,13 +721,23 @@ never opens is diagnosable.
 
 Client state, per workspace:
 `Option<FlowView { epic_id, cursor_issue_id, graph, layout, scroll_x }>` plus a
-`pending: Option<(epic_id, generation)>` request fence. The fence is what stops
-a late reply from reopening a graph after the user left Flow, clicked a second
-card, or lost the capability on reconnect; a reply whose generation does not
-match is discarded, exactly as the panel already discards a stale detail reply.
-All of it is dropped on mode exit, workspace loss, `NotDetected`, capability
-loss, and window close. Board polling continues while Flow is open and never
-mutates `FlowView.graph` — the graph is frozen per Q5.
+`pending: Option<PendingFlow { epic_id, cursor_issue_id }>` request fence.
+
+The fence is the entry's *presence*, not a counter. Mode exit, workspace loss,
+`NotDetected`, capability loss, and window close each drop the entry, so a
+reply that outlived its request finds nothing to match and cannot reopen a
+graph the reader already left. A reply naming a different epic is refused by
+the `epic_id` check.
+
+Two clicks on the same epic need no further disambiguation. The reply carries
+graph content and no cursor, so the fence holds the cursor as *latest intent*
+and whichever reply arrives first opens at the newest one — the card the reader
+actually asked for — while its twin is spent against the same fence. A request
+id on the wire would buy nothing, because two replies for one frozen epic
+cannot differ.
+
+Board polling continues while Flow is open and never mutates `FlowView.graph`
+— the graph is frozen per Q5.
 
 ## API / Interface Changes
 
@@ -926,8 +936,11 @@ Must-fix findings applied directly:
 - **The reply was an unexplained `Option`.** Replaced with a typed
   `BeadsEpicGraphOutcome` carrying a refusal reason, so an epic that never opens
   is diagnosable.
-- **No request fence existed.** Added `pending: (epic_id, generation)` so a late
-  reply cannot reopen a graph after exit, a second click, or capability loss.
+- **No request fence existed.** Added a `pending` entry holding the epic and the
+  latest cursor, so a late reply cannot reopen a graph after exit, a second
+  click, or capability loss. A monotonic generation was specified alongside it
+  and later removed as dead: presence plus the epic check already discard every
+  case it was meant to catch, and the counter was never compared to anything.
 - **`issue_focused` was inbound-only.** Expanded to the full lifecycle:
   registry binding, outbound liveness frame, and clearing on session end.
 - **Four sequencing races.** Mode state and horizontal scroll both owned

@@ -76,11 +76,10 @@ pub struct BeadsBoards {
     flow_enabled: bool,
     /// The Flow strip each workspace is showing instead of its lanes.
     flows: HashMap<WorkspaceId, FlowView>,
-    /// One in-flight epic-graph request per workspace, newest wins.
+    /// One in-flight epic-graph request per workspace, newest wins. Presence
+    /// is the fence: mode exit, workspace loss and capability withdrawal all
+    /// drop the entry, so a reply that outlived its request finds no match.
     pending_flows: HashMap<WorkspaceId, PendingFlow>,
-    /// Monotonic per-window request epoch. Cleared fences never match again,
-    /// so a reply that outlived its request cannot reopen Flow.
-    flow_generation: u64,
     /// Epic-graph requests the view drains on its next frame, mirroring how
     /// the panel parks its detail requests.
     flow_requests: VecDeque<(WorkspaceId, String)>,
@@ -122,7 +121,6 @@ pub struct FlowView {
 struct PendingFlow {
     epic_id: String,
     cursor_issue_id: String,
-    generation: u64,
 }
 
 /// One board's bottom bar, held by the pointer.
@@ -192,7 +190,6 @@ impl BeadsBoards {
             self.flows.clear();
             self.pending_flows.clear();
             self.flow_requests.clear();
-            self.flow_generation += 1;
         }
     }
 
@@ -206,14 +203,9 @@ impl BeadsBoards {
             return;
         }
         let Some(epic_id) = card.parent_epic_id.clone() else { return };
-        self.flow_generation += 1;
         self.pending_flows.insert(
             workspace_id,
-            PendingFlow {
-                epic_id: epic_id.clone(),
-                cursor_issue_id: card.id.clone(),
-                generation: self.flow_generation,
-            },
+            PendingFlow { epic_id: epic_id.clone(), cursor_issue_id: card.id.clone() },
         );
         self.flow_requests.push_back((workspace_id, epic_id));
     }
@@ -236,7 +228,7 @@ impl BeadsBoards {
         outcome: BeadsEpicGraphOutcome,
     ) -> bool {
         let Some(pending) = self.pending_flows.get(&workspace_id) else { return false };
-        if pending.epic_id != epic_id || pending.generation == 0 {
+        if pending.epic_id != epic_id {
             return false;
         }
         let BeadsEpicGraphOutcome::Graph(graph) = outcome else {
@@ -293,10 +285,7 @@ impl BeadsBoards {
     /// Leave Flow and return to lanes, discarding any request in flight.
     pub fn exit_flow(&mut self, workspace_id: WorkspaceId) -> bool {
         let left = self.flows.remove(&workspace_id).is_some();
-        let cancelled = self.pending_flows.remove(&workspace_id).is_some();
-        if left || cancelled {
-            self.flow_generation += 1;
-        }
+        self.pending_flows.remove(&workspace_id);
         left
     }
 
@@ -305,12 +294,7 @@ impl BeadsBoards {
     /// Escape reaches this only after the detail panel has declined the key,
     /// so a focused panel always dismisses before the strip changes mode.
     pub fn exit_latest_flow(&mut self) -> bool {
-        let latest = self
-            .flows
-            .keys()
-            .copied()
-            .max_by_key(WorkspaceId::as_uuid)
-            .filter(|workspace_id| self.flows.contains_key(workspace_id));
+        let latest = self.flows.keys().copied().max_by_key(WorkspaceId::as_uuid);
         latest.is_some_and(|workspace_id| self.exit_flow(workspace_id))
     }
 
@@ -2349,7 +2333,7 @@ fn short_epic(name: &str) -> String {
 /// The tail after the last `-`, so a project whose own name carries one keeps
 /// working. An id that is all prefix, or has no `-` at all, is left alone —
 /// half an id is worse than a long one.
-fn short_id(id: &str) -> &str {
+pub(crate) fn short_id(id: &str) -> &str {
     id.rsplit_once('-').map_or(id, |(_, tail)| if tail.is_empty() { id } else { tail })
 }
 

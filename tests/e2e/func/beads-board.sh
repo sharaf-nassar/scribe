@@ -281,8 +281,8 @@ eval "$(xdotool getwindowgeometry --shell "$WID")"
 WIN_W=$WIDTH
 import -window "$WID" /output/beads-real-before.png
 
-detail_request_count() {
-    python3 - "$RECORD" <<'PY'
+flow_detail_requests() {
+    python3 - "$RECORD" "$1" <<'PY'
 import json, sys
 count = 0
 for line in open(sys.argv[1]):
@@ -291,7 +291,7 @@ for line in open(sys.argv[1]):
     message = row.get("message", {})
     if (row.get("dir") == "client"
             and message.get("type") == "RequestBeadsIssueDetail"
-            and message.get("issue_id") == "e2e-detail"):
+            and message.get("issue_id") == sys.argv[2]):
         count += 1
 print(count)
 PY
@@ -600,15 +600,15 @@ read -r DETAIL_LANE DETAIL_INDEX <<<"$DETAIL_POSITION"
 LANE_WIDTH=$(( (WIN_W - 16) / 5 ))
 DETAIL_X=$(( 16 + DETAIL_LANE * LANE_WIDTH + 70 ))
 DETAIL_Y=$(( 70 + DETAIL_INDEX * 50 + 14 ))
-REQUESTS_BEFORE=$(detail_request_count)
+REQUESTS_BEFORE=$(flow_detail_requests e2e-detail)
 xdotool mousemove --sync --window "$WID" "$DETAIL_X" "$DETAIL_Y"
 xdotool mousedown 1
 xdotool mouseup 1
 for _ in $(seq 1 30); do
-    [ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 1))" ] && break
+    [ "$(flow_detail_requests e2e-detail)" -eq "$((REQUESTS_BEFORE + 1))" ] && break
     sleep 0.2
 done
-[ "$(detail_request_count)" -eq "$((REQUESTS_BEFORE + 1))" ] \
+[ "$(flow_detail_requests e2e-detail)" -eq "$((REQUESTS_BEFORE + 1))" ] \
     || fail "sub-2px card click sent no detail request"
 for _ in $(seq 1 50); do
     detail_response_seen && break
@@ -761,7 +761,7 @@ NONZERO_NOTICE_DIFF=${NONZERO_NOTICE_DIFF%%.*}
 # same visible last-good detail. Timeout convergence must request both board
 # and detail again while the persisted issue remains untouched.
 sleep 5.2
-TIMEOUT_DETAIL_BEFORE=$(detail_request_count)
+TIMEOUT_DETAIL_BEFORE=$(flow_detail_requests e2e-detail)
 TIMEOUT_BOARD_BEFORE=$(board_request_count)
 printf '%s\n' timeout:e2e-detail >/tmp/scribe-beads-write-fault-mode
 panel_move 188 23
@@ -772,12 +772,12 @@ wait_for_write_failure 'bd issue write timed out' 100 \
     || fail "GPUI timeout write produced no typed Failed result"
 rm -f /tmp/scribe-beads-write-fault-mode
 for _ in $(seq 1 50); do
-    [ "$(detail_request_count)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
+    [ "$(flow_detail_requests e2e-detail)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
         && [ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
         && break
     sleep 0.2
 done
-[ "$(detail_request_count)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
+[ "$(flow_detail_requests e2e-detail)" -gt "$TIMEOUT_DETAIL_BEFORE" ] \
     || fail "timeout did not request authoritative detail"
 [ "$(board_request_count)" -gt "$TIMEOUT_BOARD_BEFORE" ] \
     || fail "timeout did not request an authoritative board"
@@ -933,22 +933,6 @@ sleep 0.5
     bd dep add e2e-flow-d e2e-flow-b >/dev/null
     bd dep add e2e-flow-d e2e-flow-c >/dev/null
 )
-
-flow_detail_requests() {
-    python3 - "$RECORD" "$1" <<'PY'
-import json, sys
-count = 0
-for line in open(sys.argv[1]):
-    try: row = json.loads(line)
-    except ValueError: continue
-    message = row.get("message", {})
-    if (row.get("dir") == "client"
-            and message.get("type") == "RequestBeadsIssueDetail"
-            and message.get("issue_id") == sys.argv[2]):
-        count += 1
-print(count)
-PY
-}
 
 # Every detail request for a member of the painted epic other than $1, so a
 # node activation can be proven without depending on which node takes focus.

@@ -11,12 +11,12 @@ use gpui::{
     AnyElement, App, FocusHandle, KeyDownEvent, MouseButton, Role, SharedString, Window, div,
     prelude::*, px,
 };
-use scribe_common::protocol::{BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue};
+use scribe_common::protocol::{
+    BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue, MAX_FLOW_NODES,
+};
 
-use crate::beads_board::BeadsBoardColors;
+use crate::beads_board::{BeadsBoardColors, short_id};
 use crate::layout::Rect;
-
-const MAX_FLOW_NODES: usize = 200;
 
 fn scalar(value: usize) -> f32 {
     u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
@@ -28,17 +28,17 @@ fn count_to_f32(value: u32) -> f32 {
 
 /// Geometry copied from the normative A3 Flow mock as formulas, not pitches.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FlowMetrics {
-    pub node_width: f32,
-    pub node_height: f32,
-    pub gutter: f32,
-    pub row_gap: f32,
-    pub graph_height: f32,
-    pub left_padding: f32,
+struct FlowMetrics {
+    node_width: f32,
+    node_height: f32,
+    gutter: f32,
+    row_gap: f32,
+    graph_height: f32,
+    left_padding: f32,
 }
 
 impl FlowMetrics {
-    pub const fn standard() -> Self {
+    const fn standard() -> Self {
         Self {
             node_width: 214.0,
             node_height: 24.0,
@@ -49,18 +49,15 @@ impl FlowMetrics {
         }
     }
 
-    #[must_use]
-    pub fn rank_pitch(self, text_scale: f32) -> f32 {
+    fn rank_pitch(self, text_scale: f32) -> f32 {
         (self.node_width + self.gutter) * text_scale
     }
 
-    #[must_use]
-    pub fn row_pitch(self, text_scale: f32) -> f32 {
+    fn row_pitch(self, text_scale: f32) -> f32 {
         (self.node_height + self.row_gap) * text_scale
     }
 
-    #[must_use]
-    pub fn rows_that_fit(self, text_scale: f32) -> Option<usize> {
+    fn rows_that_fit(self, text_scale: f32) -> Option<usize> {
         if !text_scale.is_finite() || text_scale <= 0.0 {
             return None;
         }
@@ -73,12 +70,6 @@ impl FlowMetrics {
                 })
                 .count(),
         )
-    }
-}
-
-impl Default for FlowMetrics {
-    fn default() -> Self {
-        Self::standard()
     }
 }
 
@@ -228,11 +219,6 @@ fn endpoint(
 
 /// Assign each node the maximum blocker distance from any root.
 // @lat: [[client#Client#Beads Flow Layout Engine]]
-pub fn longest_path_ranks(graph: &BeadsEpicGraph) -> Result<Vec<usize>, FlowLayoutError> {
-    let indexed = IndexedGraph::new(graph)?;
-    longest_path_ranks_indexed(&indexed)
-}
-
 fn longest_path_ranks_indexed(indexed: &IndexedGraph) -> Result<Vec<usize>, FlowLayoutError> {
     let mut indegree = vec![0usize; indexed.successors.len()];
     for &(_, to) in &indexed.edges {
@@ -499,7 +485,8 @@ fn centered_row_tops(count: usize, metrics: FlowMetrics, text_scale: f32) -> Vec
     let row_gap = metrics.row_gap * text_scale;
     let total = scalar(count) * node_height + scalar(count.saturating_sub(1)) * row_gap;
     let first = (metrics.graph_height - total) / 2.0;
-    (0..count).map(|row| first + scalar(row) * (node_height + row_gap)).collect()
+    let pitch = metrics.row_pitch(text_scale);
+    (0..count).map(|row| first + scalar(row) * pitch).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -623,7 +610,7 @@ fn push_run(runs: &mut Vec<EdgeWireRun>, mut run: EdgeWireRun) {
 /// Higher classes win only on their covered sub-interval, which lets a traced
 /// edge light half a shared gutter without brightening or replacing the rest.
 // @lat: [[test#GPUI Client Headless Suites#Flow layout and paint-path guard]]
-pub fn union_wire_runs(
+fn union_wire_runs(
     runs: &[EdgeWireRun],
     class_for_edge: impl Fn(usize) -> WireClass,
 ) -> Vec<WireSegment> {
@@ -1142,13 +1129,13 @@ fn relationship_description(graph: &BeadsEpicGraph, issue_id: &str) -> String {
         .edges
         .iter()
         .filter(|edge| edge.to == issue_id)
-        .map(|edge| short_issue_id(&edge.from))
+        .map(|edge| short_id(&edge.from).to_owned())
         .collect::<Vec<_>>();
     let dependents = graph
         .edges
         .iter()
         .filter(|edge| edge.from == issue_id)
-        .map(|edge| short_issue_id(&edge.to))
+        .map(|edge| short_id(&edge.to).to_owned())
         .collect::<Vec<_>>();
     format!(
         "Blockers: {}. Dependents: {}.",
@@ -1159,10 +1146,6 @@ fn relationship_description(graph: &BeadsEpicGraph, issue_id: &str) -> String {
 
 fn relationship_list(ids: &[String]) -> String {
     if ids.is_empty() { "none".into() } else { ids.join(", ") }
-}
-
-fn short_issue_id(id: &str) -> String {
-    id.strip_prefix("scribe-").unwrap_or(id).into()
 }
 
 fn rank_labels(nodes: &[FlowNodePresentation]) -> Vec<FlowRankLabel> {
@@ -1315,7 +1298,7 @@ fn opened_tag(cursor_issue_id: &str, colors: &BeadsBoardColors, text_scale: f32)
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.muted)
-        .child(format!("opened {}", short_issue_id(cursor_issue_id)))
+        .child(format!("opened {}", short_id(cursor_issue_id)))
         .into_any_element()
 }
 
@@ -1643,7 +1626,7 @@ fn node_id(id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
         .font_weight(gpui::FontWeight(500.0))
         .text_size(px(9.5 * text_scale))
         .text_color(colors.muted)
-        .child(short_issue_id(id))
+        .child(short_id(id).to_owned())
         .into_any_element()
 }
 
@@ -1760,7 +1743,8 @@ mod tests {
             &["root-a", "root-b", "middle", "joined"],
             &[("root-a", "joined"), ("root-b", "middle"), ("middle", "joined")],
         );
-        assert_eq!(longest_path_ranks(&graph).unwrap(), vec![0, 0, 1, 2]);
+        let indexed = IndexedGraph::new(&graph).unwrap();
+        assert_eq!(longest_path_ranks_indexed(&indexed).unwrap(), vec![0, 0, 1, 2]);
     }
 
     #[test]
@@ -1832,7 +1816,8 @@ mod tests {
     #[test]
     fn in_memory_cycle_is_rejected_instead_of_looping() {
         let graph = graph(&["a", "b"], &[("a", "b"), ("b", "a")]);
-        assert_eq!(longest_path_ranks(&graph), Err(FlowLayoutError::Cycle));
+        let indexed = IndexedGraph::new(&graph).unwrap();
+        assert_eq!(longest_path_ranks_indexed(&indexed), Err(FlowLayoutError::Cycle));
         assert_eq!(layout_flow(&graph, 1.0), Err(FlowLayoutError::Cycle));
     }
 
@@ -2253,6 +2238,33 @@ mod tests {
         assert_eq!(agent_name(Some("")), None, "an empty claim names nobody");
         assert_eq!(agent_name(Some("   ")), None);
         assert_eq!(agent_name(Some("-leading")), None, "a leading separator names nobody");
+    }
+
+    #[test]
+    fn flow_shortens_ids_the_way_the_lanes_do() {
+        // Flow and the lanes paint the same issue in one strip, so they have
+        // to agree on what a short id is. They once did not: Flow stripped a
+        // literal "scribe-" while the lanes took the tail after the last
+        // separator, which every tracker with a different prefix could see.
+        // These prefixes are the point of the test - a scribe- id passes
+        // either way, which is why nothing caught it.
+        let graph = BeadsEpicGraph {
+            epic_id: "sc-epic".into(),
+            epic_title: "Epic".into(),
+            closed: 0,
+            total: 2,
+            nodes: vec![node("sc-70"), node("nasha-lab-byd.12")],
+            edges: vec![BeadsGraphEdge { from: "sc-70".into(), to: "nasha-lab-byd.12".into() }],
+        };
+        assert_eq!(
+            relationship_description(&graph, "nasha-lab-byd.12"),
+            "Blockers: 70. Dependents: none.",
+            "Flow must shorten to the tail, not strip a hardcoded project prefix",
+        );
+        assert_eq!(
+            relationship_description(&graph, "sc-70"),
+            "Blockers: none. Dependents: byd.12.",
+        );
     }
 
     #[test]

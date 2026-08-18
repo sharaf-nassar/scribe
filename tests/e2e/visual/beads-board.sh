@@ -960,10 +960,14 @@ awk -v v="$(rank_label_ink 1)" 'BEGIN { exit !(v < 0.3) }' ||
 # at the dot centre; a ring state leaves the ground there and carries its hue
 # on the rim 4px out. Reading both points is what separates the two, and it is
 # why "the dot is coloured" is not the assertion.
+# Rows are centred within the band, so two ranks holding the same number of
+# rows share their row centres: rank 2's probes sit at rank 1's y. The names
+# stay distinct because each pairs with its own flow_dot_x. Give either rank a
+# different row count and these must be computed separately again.
 FLOW_R1_TOP=$(flow_dot_y 2 0)
 FLOW_R1_BOT=$(flow_dot_y 2 1)
-FLOW_R2_TOP=$(flow_dot_y 2 0)
-FLOW_R2_BOT=$(flow_dot_y 2 1)
+FLOW_R2_TOP=$FLOW_R1_TOP
+FLOW_R2_BOT=$FLOW_R1_BOT
 assert_ring_dot() {
     local label="$1" x="$2" y="$3" centre rim
     centre=$(px_at /output/beads-flow.png "$x" "$y")
