@@ -9,7 +9,7 @@ use gpui::{
     point, prelude::*, px, uniform_list,
 };
 
-use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, layout_flow};
+use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow};
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
@@ -98,6 +98,9 @@ pub struct FlowView {
     pub graph: BeadsEpicGraph,
     pub layout: FlowLayout,
     pub scroll_x: f32,
+    /// Node the pointer is over, or `None` at rest. Hover is transient view
+    /// state, so it never survives a mode exit or a re-opened graph.
+    pub hovered_issue_id: Option<String>,
 }
 
 /// An epic-graph request waiting for its reply.
@@ -246,6 +249,7 @@ impl BeadsBoards {
                 graph: *graph,
                 layout,
                 scroll_x: 0.0,
+                hovered_issue_id: None,
             },
         );
         true
@@ -294,6 +298,37 @@ impl BeadsBoards {
             return false;
         }
         issue_id.clone_into(&mut flow.cursor_issue_id);
+        true
+    }
+
+    /// Record which node the pointer is over, or clear it on leave.
+    ///
+    /// Returns whether anything changed, so a pointer crossing a node it is
+    /// already tracing does not schedule a repaint. A leave is honoured only
+    /// for the node that owns the current trace: pointers cross node borders
+    /// in an arbitrary order, so an unfiltered leave from the node just
+    /// departed would erase the trace the newly entered node had set.
+    pub fn set_flow_hover(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        entered: bool,
+    ) -> bool {
+        let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
+        let next = if entered {
+            if !flow.graph.nodes.iter().any(|node| node.id == issue_id) {
+                return false;
+            }
+            Some(issue_id.to_owned())
+        } else if flow.hovered_issue_id.as_deref() == Some(issue_id) {
+            None
+        } else {
+            return false;
+        };
+        if flow.hovered_issue_id == next {
+            return false;
+        }
+        flow.hovered_issue_id = next;
         true
     }
 
@@ -1437,6 +1472,10 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
     let layout = flow.layout.clone();
     let cursor_issue_id = flow.cursor_issue_id.clone();
     let scroll_x = flow.scroll_x;
+    let trace = flow
+        .hovered_issue_id
+        .as_deref()
+        .and_then(|hovered| FlowTrace::from_hover(&flow.graph, hovered));
     drop(guard);
     let painted = crate::beads_flow::render(&FlowRender {
         rect,
@@ -1447,7 +1486,7 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
         text_scale: scale,
         colors: *colors,
         node_controls: controls,
-        wire_classes: &[],
+        trace: trace.as_ref(),
     });
     let painted = match painted {
         Ok(painted) => painted,
@@ -3269,6 +3308,63 @@ mod flow_mode_tests {
         // Its twin is spent against the same fence and changes nothing.
         assert!(!boards.apply_epic_graph(workspace, EPIC, graph()));
         assert_eq!(boards.flow(workspace).expect("flow open").cursor_issue_id, "c");
+    }
+
+    #[test]
+    fn hovering_a_node_sets_the_trace_and_leaving_it_clears() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        assert!(boards.set_flow_hover(workspace, "b", true));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+        // Re-entering the node already traced repaints nothing.
+        assert!(!boards.set_flow_hover(workspace, "b", true));
+
+        assert!(boards.set_flow_hover(workspace, "b", false));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
+    }
+
+    #[test]
+    fn a_stale_leave_cannot_erase_the_trace_the_next_node_just_set() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        // Pointers cross borders in an arbitrary order: the enter for the new
+        // node can land before the leave for the old one.
+        assert!(boards.set_flow_hover(workspace, "a", true));
+        assert!(boards.set_flow_hover(workspace, "b", true));
+        assert!(!boards.set_flow_hover(workspace, "a", false));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn hover_is_refused_outside_the_graph_and_outside_flow() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        assert!(!boards.set_flow_hover(workspace, "a", true), "no flow open");
+
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert!(!boards.set_flow_hover(workspace, "not-in-graph", true));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
+    }
+
+    #[test]
+    fn a_reopened_graph_starts_untraced() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert!(boards.set_flow_hover(workspace, "b", true));
+
+        boards.exit_flow(workspace);
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
     }
 
     #[test]

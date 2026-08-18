@@ -1657,6 +1657,20 @@ No second graph is fetched and nothing is re-laid out. The epic, the ranks, and 
 
 A closed panel is not reopened. Clicking a node then moves the cursor alone, because the reader dismissed the panel and a graph click is not a request to bring it back.
 
+### Tracing a chain by hovering
+
+Hovering a node lights the chain it belongs to and dims everything else, which is the question a dependency tracker exists to answer and no column layout can.
+
+[[crates/scribe-client/src/beads_flow.rs#FlowTrace#from_hover]] resolves membership as the ancestor closure, the descendant closure, and the hovered node itself — not a direct-neighbour query, because "what did this wait on" and "what does it release" are both transitive. Hover is state and the renderer is pure, so the closure is computed once per change and handed back through `FlowRender::trace`; `None` is the at-rest Base treatment and needs no separate flag.
+
+An edge lights only when *both* endpoints are lit. A node at the fringe of the closure still has edges leaving the traced path, and brightening those would claim a relationship the trace does not have. Classes go to [[crates/scribe-client/src/beads_flow.rs#union_wire_runs]] rather than to whole edges, which is what lets a traced path light only its half of a shared gutter while the rest of that rail stays dim.
+
+The chip states closure counts, not direct ones: the normative mock reads `releases 3 · blocked by 1` over a node with a single direct dependent, and closure is also what makes the chip describe the five nodes lit beside it. It is placed from the hovered node's own box, so it travels with the graph under a scroll.
+
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#set_flow_hover]] owns the state and returns whether anything changed, so a pointer crossing a node it already traces schedules no repaint. A leave is honoured only for the node that owns the current trace: pointers cross borders in an arbitrary order, so an unfiltered leave from the node just departed would erase the trace the newly entered node had already set. Because the whole trace is one value behind one refresh, entering and leaving each restore every node and wire in a single frame rather than easing elements back independently — there is no per-element animation to interrupt, so a reduced-motion setting changes nothing about the final frame.
+
+Hover never survives its graph. It is cleared when a graph is opened, so a re-entered Flow starts untraced rather than resuming a trace whose pointer left long ago.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

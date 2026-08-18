@@ -706,6 +706,96 @@ fn append_segment(output: &mut Vec<WireSegment>, segment: WireSegment) {
     }
 }
 
+/// The lit subgraph a hovered node raises, and the counts describing it.
+///
+/// Hover is state, and the renderer is pure, so the workspace computes this
+/// once per hover change and hands it back through [`FlowRender`]. Membership
+/// is the ancestor closure, the descendant closure, and the hovered node
+/// itself: the question a dependency tracker exists to answer is what a node
+/// waited on and what it releases, and neither is a direct-neighbour query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowTrace {
+    pub hovered_issue_id: String,
+    /// Issue ids at full opacity. Everything else dims.
+    pub on_path: HashSet<String>,
+    /// Per-edge paint class, indexed to match `BeadsEpicGraph::edges`.
+    pub edge_classes: Vec<WireClass>,
+    /// Nodes the hovered node eventually unblocks.
+    pub releases: usize,
+    /// Nodes the hovered node eventually waited on.
+    pub blocked_by: usize,
+}
+
+impl FlowTrace {
+    /// Resolve the ancestor/descendant closure of `hovered_issue_id`.
+    ///
+    /// Returns `None` when the id is not in the graph, which is what an
+    /// out-of-date hover against a re-opened graph looks like.
+    pub fn from_hover(graph: &BeadsEpicGraph, hovered_issue_id: &str) -> Option<Self> {
+        if !graph.nodes.iter().any(|node| node.id == hovered_issue_id) {
+            return None;
+        }
+        let descendants = reachable(graph, hovered_issue_id, Direction::Forward);
+        let ancestors = reachable(graph, hovered_issue_id, Direction::Backward);
+        let releases = descendants.len();
+        let blocked_by = ancestors.len();
+        let mut on_path = descendants;
+        on_path.extend(ancestors);
+        on_path.insert(hovered_issue_id.to_owned());
+        // An edge lights only when BOTH endpoints are lit. A lit node at the
+        // fringe of the closure still has edges leaving the traced path, and
+        // brightening those would claim a relationship the trace does not have.
+        let edge_classes = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                if on_path.contains(&edge.from) && on_path.contains(&edge.to) {
+                    WireClass::Traced
+                } else {
+                    WireClass::Dimmed
+                }
+            })
+            .collect();
+        Some(Self {
+            hovered_issue_id: hovered_issue_id.to_owned(),
+            on_path,
+            edge_classes,
+            releases,
+            blocked_by,
+        })
+    }
+
+    /// The mock's chip wording, verbatim.
+    fn chip_text(&self) -> String {
+        format!("releases {} · blocked by {}", self.releases, self.blocked_by)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// Breadth-first closure over `blocks` edges in one direction.
+fn reachable(graph: &BeadsEpicGraph, start: &str, direction: Direction) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([start.to_owned()]);
+    while let Some(current) = queue.pop_front() {
+        for edge in &graph.edges {
+            let (near, far) = match direction {
+                Direction::Forward => (&edge.from, &edge.to),
+                Direction::Backward => (&edge.to, &edge.from),
+            };
+            if *near == current && !seen.contains(far) && *far != start {
+                seen.insert(far.clone());
+                queue.push_back(far.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// One Flow-node activation owned by the mode and panel work items.
 ///
 /// Rendering only delivers the issue id. It deliberately knows neither the
@@ -713,11 +803,15 @@ fn append_segment(output: &mut Vec<WireSegment>, segment: WireSegment) {
 /// slice's responsibility.
 pub type FlowNodeActionHandler = Arc<dyn Fn(String, &mut Window, &mut App)>;
 
-/// Focus and activation supplied by the workspace-owned Flow state.
+/// Pointer entering or leaving a node, delivered to the workspace-owned state.
+pub type FlowNodeHoverHandler = Arc<dyn Fn(String, bool, &mut Window, &mut App)>;
+
+/// Focus, activation and hover supplied by the workspace-owned Flow state.
 #[derive(Clone)]
 pub struct FlowNodeControl {
     pub focus: FocusHandle,
     pub on_activate: FlowNodeActionHandler,
+    pub on_hover: FlowNodeHoverHandler,
 }
 
 /// Inputs the workspace-owned mode state supplies to the pure Flow renderer.
@@ -732,9 +826,9 @@ pub struct FlowRender<'a> {
     pub colors: BeadsBoardColors,
     /// Must carry a focus and generic activation seam for every graph node.
     pub node_controls: &'a HashMap<String, FlowNodeControl>,
-    /// Empty means the at-rest Base treatment. The hover-trace slice supplies
-    /// per-edge classes without rewriting graph geometry.
-    pub wire_classes: &'a [WireClass],
+    /// `None` is the at-rest Base treatment. A trace supplies node membership
+    /// and per-edge classes without rewriting graph geometry.
+    pub trace: Option<&'a FlowTrace>,
 }
 
 /// A boundary failure between an admitted graph, its layout, and GPUI chrome.
@@ -786,6 +880,8 @@ struct FlowNodePresentation {
     width: f32,
     height: f32,
     cursor: bool,
+    /// False only while a trace is active and this node sits off its path.
+    on_path: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -795,11 +891,20 @@ struct FlowRankLabel {
     text: &'static str,
 }
 
+/// The floating count chip a hovered node raises.
+#[derive(Debug, Clone, PartialEq)]
+struct FlowChip {
+    text: String,
+    x: f32,
+    y: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct FlowPresentation {
     nodes: Vec<FlowNodePresentation>,
     wires: Vec<WireSegment>,
     rank_labels: Vec<FlowRankLabel>,
+    chip: Option<FlowChip>,
     width: f32,
 }
 
@@ -811,6 +916,12 @@ const FLOW_HBAR_TOP: f32 = FLOW_GRAPH_TOP + FLOW_GRAPH_HEIGHT;
 const FLOW_HBAR_HEIGHT: f32 = 2.0;
 const FLOW_FLOOR_HEIGHT: f32 = 3.0;
 const FLOW_PROGRESS_WIDTH: f32 = 150.0;
+/// Chip offset from the hovered node's own box, read off the mock's
+/// `left:286px;top:104px` chip against its `left:272px;top:74px` node.
+const FLOW_CHIP_OFFSET_X: f32 = 14.0;
+const FLOW_CHIP_GAP_Y: f32 = 6.0;
+/// The mock's `.fl.trace .node { opacity:.24 }`.
+const FLOW_TRACE_DIM: f32 = 0.24;
 
 /// Lower an admitted graph and its layout into the Flow strip.
 ///
@@ -819,7 +930,7 @@ const FLOW_PROGRESS_WIDTH: f32 = 150.0;
 /// explicit input seams instead of being recreated by the renderer.
 pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
     let presentation =
-        present_flow(render.graph, render.layout, render.cursor_issue_id, render.wire_classes)?;
+        present_flow(render.graph, render.layout, render.cursor_issue_id, render.trace)?;
     require_node_controls(&presentation, render.node_controls)?;
     let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.rect.width);
     let board_id = SharedString::from(format!("beads-flow-{}", render.graph.epic_id));
@@ -854,19 +965,34 @@ fn present_flow(
     graph: &BeadsEpicGraph,
     layout: &FlowLayout,
     cursor_issue_id: &str,
-    wire_classes: &[WireClass],
+    trace: Option<&FlowTrace>,
 ) -> Result<FlowPresentation, FlowRenderError> {
-    let nodes = presentation_nodes(graph, layout, cursor_issue_id)?;
+    let nodes = presentation_nodes(graph, layout, cursor_issue_id, trace)?;
     let rank_labels = rank_labels(&nodes);
-    let wires =
-        layout.wire_segments(|edge| wire_classes.get(edge).copied().unwrap_or(WireClass::Base));
-    Ok(FlowPresentation { nodes, wires, rank_labels, width: layout.width })
+    let wires = layout.wire_segments(|edge| {
+        trace.map_or(WireClass::Base, |trace| {
+            trace.edge_classes.get(edge).copied().unwrap_or(WireClass::Dimmed)
+        })
+    });
+    let chip = trace.and_then(|trace| chip_for(&nodes, trace));
+    Ok(FlowPresentation { nodes, wires, rank_labels, chip, width: layout.width })
+}
+
+/// Place the chip under the hovered node, per the mock's offsets.
+fn chip_for(nodes: &[FlowNodePresentation], trace: &FlowTrace) -> Option<FlowChip> {
+    let hovered = nodes.iter().find(|node| node.id == trace.hovered_issue_id)?;
+    Some(FlowChip {
+        text: trace.chip_text(),
+        x: hovered.x + FLOW_CHIP_OFFSET_X,
+        y: hovered.y + hovered.height + FLOW_CHIP_GAP_Y,
+    })
 }
 
 fn presentation_nodes(
     graph: &BeadsEpicGraph,
     layout: &FlowLayout,
     cursor_issue_id: &str,
+    trace: Option<&FlowTrace>,
 ) -> Result<Vec<FlowNodePresentation>, FlowRenderError> {
     let mut seen = HashSet::with_capacity(layout.nodes.len());
     let mut nodes = Vec::with_capacity(layout.nodes.len());
@@ -881,7 +1007,7 @@ fn presentation_nodes(
                 issue_index: positioned.issue_index,
             });
         }
-        nodes.push(node_presentation(node, positioned, graph, cursor_issue_id));
+        nodes.push(node_presentation(node, positioned, graph, cursor_issue_id, trace));
     }
     if nodes.len() != graph.nodes.len() {
         return Err(FlowRenderError::IncompleteLayout {
@@ -889,7 +1015,7 @@ fn presentation_nodes(
             actual: nodes.len(),
         });
     }
-    if !nodes.iter().any(|node| node.cursor) {
+    if !nodes.iter().any(|node| node.id == cursor_issue_id) {
         return Err(FlowRenderError::CursorNotInGraph { issue_id: cursor_issue_id.into() });
     }
     Ok(nodes)
@@ -900,8 +1026,13 @@ fn node_presentation(
     positioned: &FlowNodeLayout,
     graph: &BeadsEpicGraph,
     cursor_issue_id: &str,
+    trace: Option<&FlowTrace>,
 ) -> FlowNodePresentation {
     let state = node_state(node.queue);
+    // A hovered node takes the cursor treatment on top of its own, so the
+    // node the pointer is reading is never the one node without a marker.
+    let cursor =
+        node.id == cursor_issue_id || trace.is_some_and(|trace| trace.hovered_issue_id == node.id);
     FlowNodePresentation {
         id: node.id.clone(),
         title: node.title.clone(),
@@ -913,7 +1044,8 @@ fn node_presentation(
         y: positioned.y,
         width: positioned.width,
         height: positioned.height,
-        cursor: node.id == cursor_issue_id,
+        cursor,
+        on_path: trace.is_none_or(|trace| trace.on_path.contains(&node.id)),
     }
 }
 
@@ -1177,7 +1309,8 @@ fn flow_graph(
         .child(wires(&presentation.wires, colors))
         .children(presentation.nodes.iter().filter_map(|node| {
             controls.get(&node.id).map(|control| flow_node(node, control, colors, text_scale))
-        }));
+        }))
+        .children(presentation.chip.iter().map(|chip| trace_chip(chip, colors, text_scale)));
     div()
         .absolute()
         .left_0()
@@ -1217,6 +1350,26 @@ fn wire(segment: &WireSegment, colors: &BeadsBoardColors) -> AnyElement {
         .into_any_element()
 }
 
+/// The mock's `.fl .unlocks` chip, stating what the lit path contains.
+fn trace_chip(chip: &FlowChip, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(chip.x))
+        .top(px(chip.y))
+        .px(px(7.0))
+        .py(px(3.0))
+        .rounded(px(2.0))
+        .bg(colors.chip)
+        .border_1()
+        .border_color(colors.chip_border)
+        .font_family("monospace")
+        .font_weight(gpui::FontWeight(500.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(colors.queue_name)
+        .child(chip.text.clone())
+        .into_any_element()
+}
+
 fn flow_node(
     node: &FlowNodePresentation,
     control: &FlowNodeControl,
@@ -1225,9 +1378,11 @@ fn flow_node(
 ) -> AnyElement {
     let click_id = node.id.clone();
     let key_id = node.id.clone();
+    let hover_id = node.id.clone();
     let click_focus = control.focus.clone();
     let click_activate = Arc::clone(&control.on_activate);
     let key_activate = Arc::clone(&control.on_activate);
+    let on_hover = Arc::clone(&control.on_hover);
     let hover = colors.button_hover;
     let mut element = div()
         .id(SharedString::from(format!("beads-flow-node-{}", node.id)))
@@ -1247,6 +1402,7 @@ fn flow_node(
         .gap(px(6.0 * text_scale))
         .cursor_pointer()
         .hover(move |element| element.bg(hover))
+        .on_hover(move |entered, window, app| on_hover(hover_id.clone(), *entered, window, app))
         .on_mouse_down(MouseButton::Left, |_, _, app| app.stop_propagation())
         .on_click(move |_, window, app| {
             window.focus(&click_focus, app);
@@ -1264,6 +1420,9 @@ fn flow_node(
         element = element.bg(colors.cursor_fill).child(
             div().absolute().left_0().top_0().bottom_0().w(px(2.0)).bg(colors.cursor_keyline),
         );
+    }
+    if !node.on_path {
+        element = element.opacity(FLOW_TRACE_DIM);
     }
     element.child(flow_node_contents(node, colors, text_scale)).into_any_element()
 }
@@ -1558,7 +1717,7 @@ mod tests {
         graph.nodes[2].queue = BeadsIssueQueue::Blocked;
         graph.nodes[3].queue = BeadsIssueQueue::Done;
         let layout = layout_flow(&graph, 1.0).unwrap();
-        let presentation = present_flow(&graph, &layout, "scribe-blocked", &[]).unwrap();
+        let presentation = present_flow(&graph, &layout, "scribe-blocked", None).unwrap();
 
         assert_eq!(presentation.nodes.iter().filter(|node| node.cursor).count(), 1);
         let blocked = presentation.nodes.iter().find(|node| node.cursor).unwrap();
@@ -1584,8 +1743,8 @@ mod tests {
             &[("scribe-root", "scribe-mid"), ("scribe-mid", "scribe-leaf")],
         );
         let layout = layout_flow(&graph, 1.0).unwrap();
-        let opened = present_flow(&graph, &layout, "scribe-root", &[]).unwrap();
-        let retargeted = present_flow(&graph, &layout, "scribe-leaf", &[]).unwrap();
+        let opened = present_flow(&graph, &layout, "scribe-root", None).unwrap();
+        let retargeted = present_flow(&graph, &layout, "scribe-leaf", None).unwrap();
 
         assert_eq!(retargeted.nodes.iter().filter(|node| node.cursor).count(), 1);
         assert_eq!(
@@ -1631,7 +1790,7 @@ mod tests {
         let graph = graph(&["a", "b"], &[("a", "b")]);
         let layout = layout_flow(&graph, 1.0).unwrap();
         assert_eq!(
-            present_flow(&graph, &layout, "not-here", &[]),
+            present_flow(&graph, &layout, "not-here", None),
             Err(FlowRenderError::CursorNotInGraph { issue_id: "not-here".into() })
         );
     }
@@ -1670,5 +1829,175 @@ mod tests {
             .min()
             .unwrap_or(Duration::MAX);
         assert!(fastest < Duration::from_millis(2), "fastest 200-node layout took {fastest:?}");
+    }
+
+    /// The mock's own epic: `.1 -> {.2,.3}`, `.2 -> .5`, `.3 -> .4`,
+    /// `{.5,.4} -> .6`, `.6 -> .7`, hovering `.3`.
+    fn mock_epic() -> BeadsEpicGraph {
+        graph(
+            &["2a8z.1", "2a8z.2", "2a8z.3", "2a8z.5", "2a8z.4", "2a8z.6", "2a8z.7"],
+            &[
+                ("2a8z.1", "2a8z.2"),
+                ("2a8z.1", "2a8z.3"),
+                ("2a8z.2", "2a8z.5"),
+                ("2a8z.3", "2a8z.4"),
+                ("2a8z.5", "2a8z.6"),
+                ("2a8z.4", "2a8z.6"),
+                ("2a8z.6", "2a8z.7"),
+            ],
+        )
+    }
+
+    #[test]
+    fn trace_lights_ancestors_and_descendants_and_leaves_a_parallel_branch_dark() {
+        let graph = mock_epic();
+        let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
+        let mut lit = trace.on_path.iter().cloned().collect::<Vec<_>>();
+        lit.sort();
+        // Exactly the mock's `on` nodes: the hovered node, its one ancestor,
+        // and its three descendants. `.2` and `.5` are the parallel branch.
+        assert_eq!(lit, vec!["2a8z.1", "2a8z.3", "2a8z.4", "2a8z.6", "2a8z.7"]);
+        assert!(!trace.on_path.contains("2a8z.2"));
+        assert!(!trace.on_path.contains("2a8z.5"));
+    }
+
+    #[test]
+    fn trace_chip_states_the_mock_counts_in_the_mock_wording() {
+        let trace = FlowTrace::from_hover(&mock_epic(), "2a8z.3").unwrap();
+        // Verbatim from the normative mock's `.fl .unlocks` span. These are
+        // closure counts: `.3` has one direct dependent but releases three.
+        assert_eq!(trace.chip_text(), "releases 3 · blocked by 1");
+    }
+
+    #[test]
+    fn trace_dims_every_wire_that_leaves_the_lit_path() {
+        let graph = mock_epic();
+        let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
+        let traced = graph
+            .edges
+            .iter()
+            .zip(&trace.edge_classes)
+            .filter(|(_, class)| **class == WireClass::Traced)
+            .map(|(edge, _)| (edge.from.as_str(), edge.to.as_str()))
+            .collect::<Vec<_>>();
+        // `.1 -> .2` stays dark even though `.1` is lit: one lit endpoint is
+        // not a traced relationship. `.5 -> .6` likewise.
+        assert_eq!(
+            traced,
+            vec![
+                ("2a8z.1", "2a8z.3"),
+                ("2a8z.3", "2a8z.4"),
+                ("2a8z.4", "2a8z.6"),
+                ("2a8z.6", "2a8z.7"),
+            ]
+        );
+        assert!(trace.edge_classes.contains(&WireClass::Dimmed));
+    }
+
+    #[test]
+    fn a_traced_edge_lights_only_its_half_of_a_shared_gutter() {
+        // Two edges share one rail; only the traced one's interval brightens.
+        let runs = [
+            EdgeWireRun {
+                edge_index: 0,
+                axis: WireAxis::Horizontal,
+                offset: 20.0,
+                start: 0.0,
+                end: 40.0,
+            },
+            EdgeWireRun {
+                edge_index: 1,
+                axis: WireAxis::Horizontal,
+                offset: 20.0,
+                start: 20.0,
+                end: 60.0,
+            },
+        ];
+        let segments =
+            union_wire_runs(
+                &runs,
+                |edge| {
+                    if edge == 1 { WireClass::Traced } else { WireClass::Dimmed }
+                },
+            );
+        assert_eq!(
+            segments,
+            vec![
+                WireSegment {
+                    axis: WireAxis::Horizontal,
+                    offset: 20.0,
+                    start: 0.0,
+                    end: 20.0,
+                    class: WireClass::Dimmed,
+                },
+                WireSegment {
+                    axis: WireAxis::Horizontal,
+                    offset: 20.0,
+                    start: 20.0,
+                    end: 60.0,
+                    class: WireClass::Traced,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn presentation_dims_off_path_nodes_and_gives_the_hovered_node_the_cursor() {
+        let graph = mock_epic();
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
+        // Cursor sits elsewhere, so this also proves hover takes the cursor
+        // treatment without stealing the real cursor's.
+        let shown = present_flow(&graph, &layout, "2a8z.1", Some(&trace)).unwrap();
+        let find = |id: &str| shown.nodes.iter().find(|node| node.id == id).cloned().unwrap();
+        assert!(find("2a8z.3").on_path && find("2a8z.3").cursor);
+        assert!(find("2a8z.1").on_path && find("2a8z.1").cursor);
+        assert!(!find("2a8z.2").on_path && !find("2a8z.2").cursor);
+        assert!(!find("2a8z.5").on_path);
+        assert!(find("2a8z.7").on_path);
+    }
+
+    #[test]
+    fn chip_sits_under_the_hovered_node_at_the_mock_offsets() {
+        let graph = mock_epic();
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
+        let shown = present_flow(&graph, &layout, "2a8z.3", Some(&trace)).unwrap();
+        let hovered = shown.nodes.iter().find(|node| node.id == "2a8z.3").unwrap();
+        let chip = shown.chip.clone().unwrap();
+        assert_eq!(chip.text, "releases 3 · blocked by 1");
+        assert!((chip.x - (hovered.x + 14.0)).abs() < f32::EPSILON);
+        assert!((chip.y - (hovered.y + hovered.height + 6.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn leaving_restores_every_node_and_wire_in_one_frame() {
+        let graph = mock_epic();
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        // The at-rest frame and the frame after a hover is cleared are the
+        // same value, so a pointer-leave repaint restores everything at once
+        // rather than easing nodes back independently.
+        let at_rest = present_flow(&graph, &layout, "2a8z.3", None).unwrap();
+        let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
+        let traced = present_flow(&graph, &layout, "2a8z.3", Some(&trace)).unwrap();
+        assert_ne!(at_rest, traced);
+        let released = present_flow(&graph, &layout, "2a8z.3", None).unwrap();
+        assert_eq!(at_rest, released);
+        assert!(released.chip.is_none());
+        assert!(released.nodes.iter().all(|node| node.on_path));
+        assert!(released.wires.iter().all(|wire| wire.class == WireClass::Base));
+    }
+
+    #[test]
+    fn a_hover_on_a_node_outside_the_graph_traces_nothing() {
+        assert!(FlowTrace::from_hover(&mock_epic(), "2a8z.99").is_none());
+    }
+
+    #[test]
+    fn an_isolated_node_traces_only_itself() {
+        let graph = graph(&["alone", "other"], &[]);
+        let trace = FlowTrace::from_hover(&graph, "alone").unwrap();
+        assert_eq!(trace.chip_text(), "releases 0 · blocked by 0");
+        assert_eq!(trace.on_path.len(), 1);
     }
 }

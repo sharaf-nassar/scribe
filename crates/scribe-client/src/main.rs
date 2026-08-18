@@ -10981,6 +10981,7 @@ fn flow_node_control(
     boards: Arc<Mutex<BeadsBoards>>,
     panels: Arc<Mutex<BeadsPanels>>,
 ) -> FlowNodeControl {
+    let hover_boards = Arc::clone(&boards);
     FlowNodeControl {
         focus,
         on_activate: Arc::new(move |issue_id, window, _app| {
@@ -10992,6 +10993,16 @@ fn flow_node_control(
             if let Ok(mut panels) = panels.lock() {
                 panels.navigate_to_issue(workspace_id, &issue_id);
             }
+            window.refresh();
+        }),
+        on_hover: Arc::new(move |issue_id, entered, window, _app| {
+            let Ok(mut hovered) = hover_boards.lock() else { return };
+            if !hovered.set_flow_hover(workspace_id, &issue_id, entered) {
+                return;
+            }
+            drop(hovered);
+            // One refresh per real change repaints every node and wire
+            // together, so entering and leaving each land in a single frame.
             window.refresh();
         }),
     }
