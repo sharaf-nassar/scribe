@@ -603,6 +603,9 @@ enum SessionAction {
 enum AiProviderArg {
     Claude,
     Codex,
+    /// Pi never resumes; the daemon picks the structured or the legacy
+    /// shell-tool launch shape from its own negotiated `Hello` capability.
+    Pi,
 }
 
 impl From<AiProviderArg> for AiProvider {
@@ -610,6 +613,7 @@ impl From<AiProviderArg> for AiProvider {
         match provider {
             AiProviderArg::Claude => Self::ClaudeCode,
             AiProviderArg::Codex => Self::CodexCode,
+            AiProviderArg::Pi => Self::Pi,
         }
     }
 }

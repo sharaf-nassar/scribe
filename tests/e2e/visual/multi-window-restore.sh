@@ -223,6 +223,73 @@ done
 shot /output/04-new-window.png
 echo "PHASE 4 PASS: the new window started empty with a PTY of its own"
 
+# ── Phase 5: a cold restore relaunches Pi fresh, never resumed ────────────
+# Pi is the one AI provider with no resume: `new_pi_tab` is its only launch
+# action, and a cold restart has to bring the tab back as a brand new tracked
+# Pi session rather than reaching for a conversation id. The `pi` stub records
+# every invocation's argv, so "fresh" is asserted as an empty argv block on a
+# record written after the restart — a resume would have to put something in it.
+PI_RECORD=/tmp/pi-invocation.txt
+
+wait_for_pi_record() {
+    local timeout_secs="$1" started
+    started=$(date +%s)
+    while [ ! -f "$PI_RECORD" ]; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+    sleep 0.3
+    return 0
+}
+
+assert_fresh_pi_launch() {
+    [ "$(head -1 "$PI_RECORD")" = "--ENV--" ] \
+        || fail "$1: pi was launched with argv of its own: $(head -3 "$PI_RECORD" | tr '\n' ' ')"
+    grep -q '^SCRIBE_SESSION_ID=.' "$PI_RECORD" \
+        || fail "$1: the Pi tab is not a tracked Scribe session"
+}
+
+rm -f "$PI_RECORD"
+focus
+send_keys ctrl+alt+z
+wait_for_pi_record 20 || fail "PHASE 5: ctrl+alt+z never launched the pi stub"
+assert_fresh_pi_launch "PHASE 5"
+PI_SESSION_BEFORE=$(sed -n 's/^SCRIBE_SESSION_ID=//p' "$PI_RECORD" | head -1)
+# The snapshot debounce has to flush the Pi launch before the client dies.
+sleep 3.0
+shot /output/05-pi-tab.png
+
+# SIGKILL, not the close dialog: an orderly quit clears the snapshots, and a
+# cold restore is exactly the case where nothing got to run. The server is then
+# genuinely restarted, so every PTY dies with it and the empty `SessionList` is
+# what admits the replay.
+REPLAYS_BEFORE=$(count_log "replaying a cold-restart snapshot")
+pkill -KILL -f 'scribe-client' || true
+wait_for_client_exit 20 || fail "PHASE 5: the client survived SIGKILL"
+rm -f "$PI_RECORD"
+scribe-test server stop
+started=$(date +%s)
+while pgrep -x scribe-server >/dev/null 2>&1; do
+    if [ $(( "$(date +%s)" - started )) -ge 20 ]; then
+        fail "PHASE 5: the server process outlived the stop"
+    fi
+    sleep 0.25
+done
+scribe-test server start
+pgrep -x scribe-server >/dev/null 2>&1 || fail "PHASE 5: no replacement server came up"
+launch_client
+wait_for_log_growth "replaying a cold-restart snapshot" "$REPLAYS_BEFORE" 30 \
+    || fail "PHASE 5: the relaunch never replayed a cold-restart snapshot"
+wait_for_pi_record 30 || fail "PHASE 5: the cold restore never relaunched pi"
+assert_fresh_pi_launch "PHASE 5"
+PI_SESSION_AFTER=$(sed -n 's/^SCRIBE_SESSION_ID=//p' "$PI_RECORD" | head -1)
+[ -n "$PI_SESSION_AFTER" ] && [ "$PI_SESSION_AFTER" != "$PI_SESSION_BEFORE" ] \
+    || fail "PHASE 5: the restored Pi tab reused the pre-restart session instead of starting fresh"
+shot /output/05-pi-restored.png
+echo "PHASE 5 PASS: the cold restore relaunched Pi as a fresh tracked session with no resume argv"
+
 echo ""
 echo "PASS: visual multi-window-restore test"
 echo "  Inspect screenshots in test-output/:"
@@ -231,3 +298,5 @@ echo "    01-two-windows.png   — after Ctrl+Shift+N"
 echo "    02-close-dialog.png  — the close dialog before Quit Scribe"
 echo "    03-restored.png      — both windows back after the relaunch"
 echo "    04-new-window.png    — a third, empty window"
+echo "    05-pi-tab.png        — the Pi tab opened by ctrl+alt+z"
+echo "    05-pi-restored.png   — the same tab after a cold restore"

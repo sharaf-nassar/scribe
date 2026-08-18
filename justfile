@@ -213,6 +213,29 @@ e2e-func script image="scribe-test-func" runtime_profile="default":
 e2e-func-hardened script image="scribe-test-func":
     just e2e-func "{{ script }}" "{{ image }}" runtime_profile=hardened
 
+# Prove Claude resume plus negotiated and legacy Pi launch metadata.
+e2e-func-ai-launch-smoke:
+    TEST_TIMEOUT=180 just e2e-func func/ai-launch-smoke.sh
+
+# Drive dist/pi-extension.ts through a fake Pi runtime and a fake hook helper.
+# Runs on the host because the extension is TypeScript loaded by Pi's own Node
+# runtime, which the E2E images deliberately do not carry: this is the oracle
+# for the extension half of the Pi integration (fixed argv, event order,
+# bounded queue, silent failure, no permission event, and a
+# `PI_SUBAGENT_CHILD=1` child that emits nothing).
+e2e-pi-extension-harness:
+    node tests/e2e/func/pi-extension-harness.mjs
+
+# Prove the Pi integration end to end: the extension harness above, then the
+# live server half — a tracked Pi tab, the real `scribe-hook-helper` path, stop
+# classification, the clamped context meter, clear, an abrupt Pi death, and a
+# server-only upgrade that sends an old peer no Pi frames. The script restarts
+# the container's server and daemon twice, so it needs more than the default
+# functional budget.
+e2e-func-pi-ai-lifecycle:
+    just e2e-pi-extension-harness
+    TEST_TIMEOUT=180 just e2e-func func/pi-ai-lifecycle.sh
+
 # Assemble the terminal-image release manifest from the evidence the sibling
 # gates already wrote. Runs no Scribe runtime of its own, so it must follow a
 # green `just e2e` and the terminal-image visual suites rather than replace
@@ -278,7 +301,7 @@ e2e-github-actions-api-fixture func_image="scribe-test-func" visual_image="scrib
 # window's share additively instead of opening an empty window of its own — the
 # only arrangement in which a pixel assertion and `scribe-test wait-output` are
 # talking about the same pane.
-e2e-visual-shared script:
+e2e-visual-shared script="visual/ai-indicator.sh":
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/{{ script }}
 
 # Run the feature-015 sharing/control E2E through the wire tap
@@ -627,6 +650,7 @@ e2e: build-release docker-func
         func/hot-reload.sh
         func/keybindings-validation.sh
         func/multi-window.sh
+        func/pi-ai-lifecycle.sh
         func/reconnect.sh
         func/resize-coalescing.sh
         func/session-exit-status.sh
@@ -645,6 +669,8 @@ e2e: build-release docker-func
     for script in "${scripts[@]}"; do
         if [[ "$script" == func/beads-board.sh ]]; then
             just e2e-func-beads-board
+        elif [[ "$script" == func/pi-ai-lifecycle.sh ]]; then
+            just e2e-func-pi-ai-lifecycle
         elif [[ "$script" == func/env-persistence.sh ]]; then
             SCRIBE_KEYRING=1 just e2e-func "$script"
         else

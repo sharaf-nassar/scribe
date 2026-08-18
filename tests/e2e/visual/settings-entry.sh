@@ -644,6 +644,67 @@ fi
 shot /output/05-gear-click.png
 echo "PHASE 5 PASS: the status-bar gear reached the settings handler"
 
+# ── Phase 6: the Pi integration row is reachable and operable by keyboard ─
+# Pi's provider toggle is an ordinary AI-page row, so the only thing the
+# settings surface owes it is that a keyboard-only user can find it and flip
+# it. `pi integration` matches exactly one page and exactly one control, so
+# the filtered focus ring is two stops long: the page, then the toggle.
+# Whichever of the two the first Down lands on, activating the page rewinds
+# the ring to its start, so the second pass always reaches the toggle.
+focus_settings() {
+    local wid
+    wid=$(list_settings_windows | tail -1)
+    [ -z "$wid" ] && fail "PHASE 6 FAIL: no settings window to drive by keyboard"
+    xdotool windowactivate --sync "$wid" 2>/dev/null \
+        || xdotool windowfocus --sync "$wid" 2>/dev/null || true
+    sleep 0.5
+}
+
+pi_integration_enabled() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as config_file:
+        config = tomllib.load(config_file)
+except FileNotFoundError:
+    config = {}
+
+print(str(config.get("terminal", {}).get("pi_integration", True)).lower())
+PY
+}
+
+focus_settings
+if [ "$(pi_integration_enabled)" != "true" ]; then
+    fail "PHASE 6 FAIL: Pi integration did not start enabled by default"
+fi
+# The search input is append-only and Ctrl+K only focuses it, so phase 2's
+# query has to be dismissed first — Escape is the deliberate clear.
+send_keys ctrl+k
+send_keys Escape
+send_keys ctrl+k
+type_text "pi integration"
+shot /output/06-pi-integration-filtered.png
+# Tab is the documented way out of the search field; Down then walks the ring.
+send_keys Tab
+send_keys Down
+send_keys Return
+if [ "$(pi_integration_enabled)" = "true" ]; then
+    send_keys Down
+    send_keys Return
+fi
+if [ "$(pi_integration_enabled)" != "false" ]; then
+    fail "PHASE 6 FAIL: keyboard activation did not turn Pi integration off"
+fi
+shot /output/06-pi-integration-off.png
+send_keys Return
+if [ "$(pi_integration_enabled)" != "true" ]; then
+    fail "PHASE 6 FAIL: the focused Pi row did not turn back on from the keyboard"
+fi
+shot /output/06-pi-integration-on.png
+echo "PHASE 6 PASS: the Pi integration row was found and toggled with the keyboard alone"
+
 echo ""
 echo "PASS: visual settings-entry test"
 echo "  Inspect screenshots in test-output/:"
@@ -667,3 +728,6 @@ echo "    02-badge-colors-reset.png     — eight default badge colors restored"
 echo "    03-settings-refocused.png     — the same window raised, not duplicated"
 echo "    04-palette-open-settings.png  — palette filtered to 'Open Settings'"
 echo "    05-gear-click.png             — after the status-bar gear click"
+echo "    06-pi-integration-filtered.png — search filtered to the Pi row"
+echo "    06-pi-integration-off.png     — Pi integration toggled off by keyboard"
+echo "    06-pi-integration-on.png      — the same row toggled back on"

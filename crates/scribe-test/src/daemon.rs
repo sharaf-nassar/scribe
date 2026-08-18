@@ -18,7 +18,7 @@ use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{
     AiLaunchSpec, AiResumeMode, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
     BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult, ClientMessage, ServerMessage,
-    TerminalSize,
+    ShellTool, TerminalSize, pi_launch_metadata,
 };
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -231,6 +231,17 @@ type SharedState = Arc<Mutex<DaemonState>>;
 // ---------------------------------------------------------------------------
 // Daemon lifecycle: start / run / stop
 // ---------------------------------------------------------------------------
+
+/// Whether this harness connection advertises structured Pi provider support.
+///
+/// Defaults to `false`, so every existing fixture keeps handshaking as the old
+/// client a new server must downgrade Pi metadata for. A Pi script opts in with
+/// `SCRIBE_TEST_PI_PROVIDER=1` in the environment it starts the daemon from —
+/// the daemon child inherits it, so the capability is fixed for that daemon's
+/// whole lifetime, exactly like a real client's `Hello`.
+fn pi_provider_capability() -> bool {
+    std::env::var_os("SCRIBE_TEST_PI_PROVIDER").is_some_and(|value| value == "1")
+}
 
 /// Spawn the daemon as a background child process, then wait for its socket.
 pub async fn start() -> Result<(), ScribeError> {
@@ -529,7 +540,7 @@ pub async fn run() -> Result<(), ScribeError> {
             // @lat: [[test#Terminal Image Safety and Continuity#Live Capable Viewer]]
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
-            pi_provider: false,
+            pi_provider: pi_provider_capability(),
         },
     )
     .await?;
@@ -1470,6 +1481,28 @@ fn create_session_params(request: DaemonRequest) -> Result<CreateSessionParams, 
     }
 }
 
+/// Build the launch metadata one harness create sends, negotiating Pi the way
+/// the production client does.
+///
+/// A harness that did not advertise `pi_provider` must not put `AiProvider::Pi`
+/// on the wire, so Pi falls back to the legacy [`ShellTool::Pi`] representation
+/// — the same shape an old client sends and an old restore file stores. Every
+/// other provider keeps the structured AI launch unconditionally.
+fn pi_aware_launch(params: &CreateSessionParams) -> (Option<AiLaunchSpec>, Option<ShellTool>) {
+    match params.ai_provider {
+        Some(AiProvider::Pi) => pi_launch_metadata(pi_provider_capability()),
+        Some(provider) => (
+            Some(AiLaunchSpec {
+                provider,
+                resume_mode: params.ai_resume_mode.unwrap_or(AiResumeMode::New),
+                conversation_id: params.ai_conversation_id.clone(),
+            }),
+            None,
+        ),
+        None => (None, None),
+    }
+}
+
 /// Create a workspace, then a session within it.
 async fn handle_create_session(
     params: CreateSessionParams,
@@ -1498,12 +1531,8 @@ async fn handle_create_session(
     // The harness mints a launch id like every other create path unless a test
     // names an existing envelope to restore. Without either, the server has no
     // envelope to key this session's environment by.
+    let (ai_launch, shell_tool) = pi_aware_launch(&params);
     let envelope_id = params.env_envelope_id.unwrap_or_else(new_launch_id);
-    let ai_launch = params.ai_provider.map(|provider| AiLaunchSpec {
-        provider,
-        resume_mode: params.ai_resume_mode.unwrap_or(AiResumeMode::New),
-        conversation_id: params.ai_conversation_id,
-    });
     let msg = ClientMessage::CreateSession {
         workspace_id,
         split_direction: None,
@@ -1511,7 +1540,7 @@ async fn handle_create_session(
         size: params.size,
         command: None,
         ai_launch,
-        shell_tool: None,
+        shell_tool,
         env_envelope_id: Some(envelope_id.clone()),
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {
