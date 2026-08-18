@@ -536,7 +536,7 @@ e2e-visual-workspace-ipc:
 
 # Run the workspace Beads board visual contract.
 e2e-visual-beads-board:
-    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
 
 # Decode the complete card-detail fixture matrix through the visual wire tap.
 e2e-visual-beads-detail-fixtures:

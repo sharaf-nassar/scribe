@@ -4140,6 +4140,65 @@ last so it cannot perturb those geometry proofs. The as-built rules and producti
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
 
+### Beads Flow visual contract
+
+The Flow view is the strip's second rendering, and
+[the visual script](../tests/e2e/visual/beads-board.sh) pins it in the same run
+as the lanes contract, sited before the split so every coordinate is read from
+one full-width region with the board pinned at its default height.
+
+The phase drives the shipped client rather than a fixture: a card carrying
+`parent_epic_id` is clicked, the epic graph is injected with no sleep because
+the pending fence the click opened is cleared by any non-`Graph` outcome, and
+the strip is asserted to swap while the panel opens underneath. Every geometry
+constant is written as the formula `beads_flow.rs` uses — rank pitch as node
+width plus gutter, row tops as the centred-row calculation — so a change to the
+node box fails here instead of silently re-siting each probe.
+
+Every probe sits on rank 1 or 2. The fixture gives both interior ranks two
+nodes on purpose: the cursor assertion checks that the sibling sharing rank 2
+carries neither the keyline nor the fill, because a rank holding one node
+cannot distinguish "styled" from "the only one" — the degenerate-fixture trap
+recorded in
+[viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md).
+State treatments are read at two points per dot, centre and rim, since a filled
+state paints its hue at the centre while a ring leaves the ground there; the
+blocked and ready rims are also compared against each other so two ring states
+cannot collapse into one assertion.
+
+Wire endpoints are asserted at dot centres and nowhere else: each probe reads
+the wire at the centre and again six pixels above it, so a run that drifts off
+the dot fails even though it is still painted. Tracing the cursor node lights
+one half of the vertical gutter fl-a's two out-edges share and dims the other,
+which only an interval-unioned router can produce — a router emitting whole
+edges paints both halves alike. The chip is proven present by difference
+against the untraced capture; its counts are the ancestor and descendant
+closure, deliberately not a direct-neighbour query.
+
+Liveness is injected as the `IssueFocused` frame the server sends, which is the
+exact issue-to-session join the halo answers to. The assertions are symmetric:
+the focused node gains a filled core and a halo outside its dot, the same node
+carries no halo before the frame, and a node that is not focused never gains
+one.
+
+The theme assertion is the one the board's colour rule needs, because a
+hardcoded value survives every other probe and fails only here. Eight rendered
+slots are sampled under hover with the halo lit — wire, traced wire, band,
+progress track, cursor fill, cursor keyline, rank label and agent halo — the
+theme is rewritten, and every slot must move. The original theme is written
+back by name rather than by deleting the file, since a removed config leaves
+the client on the last one it parsed, and the restoration is proven before any
+later phase reads a colour.
+
+Two facts shape the phase's structure. The real bd-less server answers
+`NotDetected` on its own schedule and that reply legitimately clears the pin
+and leaves Flow, so anything that has to wait — both theme reloads — rebuilds
+the whole state afterwards instead of assuming it survived. And the exit is
+Escape, not the band's `← LANES` text: that label, the mode pair and the epic
+chevron are plain divs, and the only pointer handler in the renderer is on a
+node. The chevron's inertness is asserted directly, scoped to the strip because
+the detail panel beneath it repaints on its own.
+
 ### Region reports every tab and which is active
 
 Verifies one region's wire payload names every tab of that region, in strip order, with the live split at the active tab's index — the report the server persists as the window's layout.
