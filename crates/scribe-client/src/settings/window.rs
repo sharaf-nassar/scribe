@@ -531,6 +531,26 @@ fn prompt_bar_reset_change(key: &str) -> (&str, &'static str) {
     (key, "")
 }
 
+/// Whether committing `key`/`value` against `config` is the settings window's
+/// false-to-true `terminal.pi_integration` transition, which retries the same
+/// best-effort Pi extension setup the packaged startup repair uses.
+/// Re-committing an already-enabled toggle, or any other key, is not a
+/// transition and must not re-run setup.
+fn commits_pi_integration_enable(config: &ScribeConfig, key: &str, value: &Value) -> bool {
+    key == "terminal.pi_integration"
+        && value.as_bool() == Some(true)
+        && !config.terminal.ai_integration.pi.enabled()
+}
+
+fn pi_integration_enable_status(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => "Pi integration enabled. New Pi sessions will load the extension.".to_owned(),
+        Err(error) => {
+            format!("Pi integration enabled, but extension setup needs attention — {error}")
+        }
+    }
+}
+
 fn workspace_root_focus_index(
     targets: &[SettingsFocusTarget],
     intended: &SettingsFocusTarget,
@@ -1021,6 +1041,12 @@ impl SettingsWindow {
     /// line, which made a saved edit and a rejected one look identical; it now
     /// confirms in the same place a rejection reports.
     fn commit(&mut self, key: &str, value: Value, cx: &mut Context<Self>) -> bool {
+        // A false-to-true `pi_integration` edit retries the same best-effort
+        // extension setup the packaged startup repair uses (spec 025); a
+        // setup failure (e.g. an unmarked collision at the install target)
+        // must never block the settings write itself, so it only overrides
+        // the status line's success message with a non-blocking notice.
+        let enabling_pi_integration = commits_pi_integration_enable(&self.config, key, &value);
         let mut obj = serde_json::Map::new();
         obj.insert("key".to_owned(), Value::String(key.to_owned()));
         obj.insert("value".to_owned(), value);
@@ -1029,6 +1055,11 @@ impl SettingsWindow {
             Ok(()) => {
                 self.reload();
                 self.status = Some(self.commit_status(key));
+                if enabling_pi_integration {
+                    self.status = Some(pi_integration_enable_status(
+                        crate::hook_setup::repair_pi_extension_if_enabled(),
+                    ));
+                }
                 true
             }
             Err(e) => {
@@ -6121,8 +6152,12 @@ fn colors_section(key: &str) -> &'static str {
 fn ai_section(key: &str) -> &'static str {
     if key.starts_with("ai_states.") {
         "Assistant state signals"
-    } else if matches!(key, "terminal.claude_code_integration" | "terminal.codex_code_integration")
-    {
+    } else if matches!(
+        key,
+        "terminal.claude_code_integration"
+            | "terminal.codex_code_integration"
+            | "terminal.pi_integration"
+    ) {
         "Integrations"
     } else {
         "Assistant surface"
@@ -6369,18 +6404,20 @@ mod tests {
         ScrollMetrics, ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
         build_theme_preset_cache, canonical_combo, choice_menu_key_action,
         choice_options_from_cache, choice_scroll_offset, color_menu_left_offset, combo_for_capture,
-        conflicting_action, content_scroll_offset, dismiss_choice_or_search, filter_choice_options,
-        focus_targets_match, inline_commit_value, inline_placeholder, is_modifier_key,
-        key_combo_text, move_choice_highlight, offset_from_drag, offset_from_track_click,
-        palette_color_at, prompt_bar_reset_change, prompt_bar_theme_swatch,
-        push_control_focus_targets, px, release_inline_input, replace_pending_theme_preset,
-        revert_inline_input, search_display_text, take_pending_theme_preset, theme_preset_preview,
-        utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
+        commits_pi_integration_enable, conflicting_action, content_scroll_offset,
+        dismiss_choice_or_search, filter_choice_options, focus_targets_match, inline_commit_value,
+        inline_placeholder, is_modifier_key, key_combo_text, move_choice_highlight,
+        offset_from_drag, offset_from_track_click, palette_color_at, pi_integration_enable_status,
+        prompt_bar_reset_change, prompt_bar_theme_swatch, push_control_focus_targets, px,
+        release_inline_input, replace_pending_theme_preset, revert_inline_input,
+        search_display_text, take_pending_theme_preset, theme_preset_preview, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
         workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
         workspace_roots_match_query,
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig, ThemeConfig};
+    use serde_json::json;
 
     use crate::settings::model::{SettingsPage, page_controls};
 
@@ -6949,5 +6986,36 @@ mod tests {
         assert_eq!(input, "JetBrains Mono");
         assert!(marked.is_none());
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn pi_integration_enable_transition_is_detected_once() {
+        let mut config = ScribeConfig::default();
+        assert!(config.terminal.ai_integration.pi.enabled(), "Pi integration defaults to enabled");
+
+        // Already enabled: committing `true` again is not a transition, so a
+        // stray re-commit must not repeatedly re-run extension setup.
+        assert!(!commits_pi_integration_enable(&config, "terminal.pi_integration", &json!(true)));
+        // Unrelated keys never trigger Pi setup, even when true.
+        assert!(!commits_pi_integration_enable(
+            &config,
+            "terminal.claude_code_integration",
+            &json!(true)
+        ));
+
+        config.terminal.ai_integration.pi = scribe_common::config::AiIntegrationToggle::new(false);
+        assert!(commits_pi_integration_enable(&config, "terminal.pi_integration", &json!(true)));
+        // Disabling is not an enable transition.
+        assert!(!commits_pi_integration_enable(&config, "terminal.pi_integration", &json!(false)));
+    }
+
+    #[test]
+    fn pi_integration_enable_status_is_keyboard_readable() {
+        let success = pi_integration_enable_status(Ok(()));
+        assert!(success.contains("New Pi sessions"));
+
+        let failure = pi_integration_enable_status(Err("unmarked collision".to_owned()));
+        assert!(failure.contains("needs attention"));
+        assert!(failure.contains("unmarked collision"));
     }
 }

@@ -1,4 +1,5 @@
-//! macOS AI-hook repair for packaged stable installs.
+//! macOS AI-hook repair for packaged stable installs, plus the Pi extension
+//! setup path shared with the settings window.
 //!
 //! Fresh DMG installs have no maintainer script equivalent to Debian's
 //! `postinst`, so Claude Code and Codex never pick up Scribe's hook adapters
@@ -6,23 +7,34 @@
 //! Stable macOS launches therefore probe the user's AI-tool configs and invoke
 //! the bundled setup scripts when the current app bundle's hook paths are
 //! missing.
+//!
+//! [`repair_pi_extension_if_enabled`] runs at packaged startup on every
+//! platform and after a settings-window `terminal.pi_integration` enable
+//! transition. Both call sites share resource discovery and script execution,
+//! so Linux can repair installs whose maintainer script lacked a target user
+//! and behavior cannot drift between platforms.
 
 #[cfg(target_os = "macos")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-#[cfg(target_os = "macos")]
 use scribe_common::app::current_identity;
 #[cfg(target_os = "macos")]
 use serde_json::Value;
 
-/// Best-effort startup repair for the bundled Claude/Codex hook adapters.
+/// Best-effort startup repair for bundled AI integrations.
 ///
-/// No-op on non-macOS platforms, dev builds, or non-bundled runs. Failures are
-/// logged and never block client startup.
+/// Claude and Codex repair remains macOS-only. Pi repair runs independently on
+/// every packaged platform so an unrelated hook failure cannot skip it. Errors
+/// are logged and printed as plain text, but never block client startup.
 pub fn repair_ai_hooks_on_startup() {
     #[cfg(target_os = "macos")]
     if let Err(error) = repair_ai_hooks_on_startup_inner() {
         tracing::warn!(%error, "AI hook startup repair skipped");
+    }
+
+    if let Err(error) = repair_pi_extension_if_enabled() {
+        tracing::warn!(%error, "Pi extension startup repair needs attention");
     }
 }
 
@@ -41,12 +53,20 @@ fn repair_ai_hooks_on_startup_inner() -> Result<(), String> {
 
     let claude_dir = home.join(".claude");
     if claude_dir.is_dir() && claude_needs_setup(&claude_dir, &resources_dir)? {
-        run_setup_script(&resources_dir.join("setup-claude-hooks.sh"), &resources_dir)?;
+        run_setup_script(
+            &resources_dir.join("setup-claude-hooks.sh"),
+            &resources_dir,
+            "--hook-source",
+        )?;
     }
 
     let codex_dir = home.join(".codex");
     if codex_dir.is_dir() && codex_needs_setup(&codex_dir, &resources_dir)? {
-        run_setup_script(&resources_dir.join("setup-codex-hooks.sh"), &resources_dir)?;
+        run_setup_script(
+            &resources_dir.join("setup-codex-hooks.sh"),
+            &resources_dir,
+            "--hook-source",
+        )?;
     }
 
     Ok(())
@@ -101,15 +121,18 @@ fn codex_needs_setup(codex_dir: &Path, resources_dir: &Path) -> Result<bool, Str
     Ok(needs_codex_setup(config_contents.as_deref(), hooks_contents.as_deref(), &expected_hook))
 }
 
-#[cfg(target_os = "macos")]
-fn run_setup_script(script_path: &Path, resources_dir: &Path) -> Result<(), String> {
+fn run_setup_script(
+    script_path: &std::path::Path,
+    resources_dir: &std::path::Path,
+    source_flag: &str,
+) -> Result<(), String> {
     if !script_path.is_file() {
         return Err(format!("setup script {} is missing", script_path.display()));
     }
 
     let output = std::process::Command::new("/bin/bash")
         .arg(script_path)
-        .arg("--hook-source")
+        .arg(source_flag)
         .arg(resources_dir)
         .output()
         .map_err(|error| format!("failed to launch {}: {error}", script_path.display()))?;
@@ -139,6 +162,67 @@ fn run_setup_script(script_path: &Path, resources_dir: &Path) -> Result<(), Stri
         );
     }
     Ok(())
+}
+
+/// Validate one packaged Pi asset directory. Existing package directories are
+/// errors when either required asset is absent; only a genuinely unpackaged
+/// build may no-op.
+fn validate_pi_extension_resource_dir(dir: PathBuf) -> Result<PathBuf, String> {
+    for asset in ["pi-extension.ts", "setup-pi-extension.sh"] {
+        let path = dir.join(asset);
+        if !path.is_file() {
+            return Err(format!("packaged Pi integration asset is missing: {}", path.display()));
+        }
+    }
+    Ok(dir)
+}
+
+/// Directory containing the packaged Pi extension assets: an explicit
+/// override, the macOS app bundle's `Resources` directory, or the Linux share
+/// directory for the active flavor. `None` means this is an unpackaged build.
+fn pi_extension_resource_dir() -> Result<Option<PathBuf>, String> {
+    if let Some(dir) = std::env::var_os("SCRIBE_INSTALL_PREFIX").map(PathBuf::from) {
+        return validate_pi_extension_resource_dir(dir).map(Some);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = bundled_resources_dir() {
+        return validate_pi_extension_resource_dir(dir).map(Some);
+    }
+
+    let share_dir = PathBuf::from("/usr/share").join(current_identity().slug());
+    if share_dir.is_dir() {
+        return validate_pi_extension_resource_dir(share_dir).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn pi_integration_enabled(config: &scribe_common::config::ScribeConfig) -> bool {
+    config.terminal.ai_integration.pi.enabled()
+}
+
+/// Best-effort install/repair of the packaged Pi extension.
+///
+/// Shared by the macOS startup repair path above and the settings window's
+/// `terminal.pi_integration` enable-transition trigger. No-ops when Pi
+/// integration is disabled or no packaged extension source can be found.
+/// Never panics or blocks longer than the setup script itself; a failure is
+/// returned as a plain string for the caller to log or surface as a
+/// non-blocking notice — setup must never block Scribe or Pi.
+pub fn repair_pi_extension_if_enabled() -> Result<(), String> {
+    let config = scribe_common::config::load_config().map_err(|error| error.to_string())?;
+    if !pi_integration_enabled(&config) {
+        return Ok(());
+    }
+    let Some(resources_dir) = pi_extension_resource_dir()? else {
+        return Ok(());
+    };
+    run_setup_script(
+        &resources_dir.join("setup-pi-extension.sh"),
+        &resources_dir,
+        "--extension-source",
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -273,5 +357,45 @@ command = "node /tmp/quill.js"
             None,
             "/Applications/Scribe.app/Contents/Resources/ai-hook-codex.sh",
         ));
+    }
+}
+
+#[cfg(test)]
+mod pi_extension_tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{pi_integration_enabled, validate_pi_extension_resource_dir};
+
+    #[test]
+    fn pi_integration_defaults_enabled_and_respects_toggle() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        assert!(pi_integration_enabled(&config));
+
+        config.terminal.ai_integration.pi = scribe_common::config::AiIntegrationToggle::new(false);
+        assert!(!pi_integration_enabled(&config));
+    }
+
+    #[test]
+    fn packaged_pi_assets_must_both_exist() {
+        let nonce =
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("scribe-pi-assets-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create fixture directory");
+
+        let source_error =
+            validate_pi_extension_resource_dir(dir.clone()).expect_err("source is missing");
+        assert!(source_error.contains("pi-extension.ts"));
+        std::fs::write(dir.join("pi-extension.ts"), "// SCRIBE-MANAGED-PI-EXTENSION\n")
+            .expect("write extension fixture");
+
+        let setup_error =
+            validate_pi_extension_resource_dir(dir.clone()).expect_err("setup is missing");
+        assert!(setup_error.contains("setup-pi-extension.sh"));
+        std::fs::write(dir.join("setup-pi-extension.sh"), "#!/bin/bash\n")
+            .expect("write setup fixture");
+
+        assert_eq!(validate_pi_extension_resource_dir(dir.clone()).expect("assets valid"), dir);
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
     }
 }

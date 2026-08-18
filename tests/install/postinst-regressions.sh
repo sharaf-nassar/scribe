@@ -282,6 +282,180 @@ else
     echo "SKIP: AI SessionEnd hook regressions require python3"
 fi
 
+# ── pi_integration_enabled defaults on and only reads the [terminal] key ─
+pi_fixture=$(mktemp -d)
+pi_config="$pi_fixture/config.toml"
+
+if pi_integration_enabled "$pi_fixture/does-not-exist.toml"; then
+    echo "PASS: pi_integration_enabled defaults to enabled when the config file is missing"
+else
+    echo "FAIL: pi_integration_enabled treated a missing config file as disabled"
+    failures=$((failures + 1))
+fi
+
+printf '[terminal]\npi_integration = false\n' > "$pi_config"
+if pi_integration_enabled "$pi_config"; then
+    echo "FAIL: pi_integration_enabled ignored an explicit false under [terminal]"
+    failures=$((failures + 1))
+else
+    echo "PASS: pi_integration_enabled honors an explicit false under [terminal]"
+fi
+
+printf '[terminal]\npi_integration = true\n' > "$pi_config"
+if pi_integration_enabled "$pi_config"; then
+    echo "PASS: pi_integration_enabled honors an explicit true under [terminal]"
+else
+    echo "FAIL: pi_integration_enabled ignored an explicit true under [terminal]"
+    failures=$((failures + 1))
+fi
+
+# A key of the same name outside [terminal] must not gate setup — only the
+# [terminal] section's own pi_integration key is load-bearing.
+printf '[other]\npi_integration = false\n[terminal]\nclaude_code_integration = true\n' > "$pi_config"
+if pi_integration_enabled "$pi_config"; then
+    echo "PASS: pi_integration_enabled ignores a same-named key outside [terminal]"
+else
+    echo "FAIL: pi_integration_enabled leaked state from an unrelated section"
+    failures=$((failures + 1))
+fi
+rm -rf "$pi_fixture"
+
+if ai_setup_target_known 0 ""; then
+    echo "FAIL: AI setup treated an ambiguous root package invocation as user-scoped"
+    failures=$((failures + 1))
+elif ! ai_setup_target_known 0 1000; then
+    echo "FAIL: AI setup rejected a root invocation with a known sudo/pkexec user"
+    failures=$((failures + 1))
+elif ! ai_setup_target_known 1000 ""; then
+    echo "FAIL: AI setup rejected a direct non-root invocation"
+    failures=$((failures + 1))
+else
+    echo "PASS: AI setup defers ambiguous root installs and accepts known users"
+fi
+
+# ── setup-pi-extension.sh installs, repairs, and never clobbers unowned files
+setup_pi="$repo_root/dist/setup-pi-extension.sh"
+pi_extension_fixture=$(mktemp -d)
+pi_home="$pi_extension_fixture/home"
+mkdir -p "$pi_home/.pi/agent"
+pi_settings="$pi_home/.pi/agent/settings.json"
+printf '{"theme":"user-owned"}\n' > "$pi_settings"
+target="$pi_home/.pi/agent/extensions/scribe-ai-integration.ts"
+
+if ! HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >/dev/null 2>&1; then
+    echo "FAIL: setup-pi-extension.sh failed on a fresh install"
+    failures=$((failures + 1))
+elif ! cmp -s "$target" "$repo_root/dist/pi-extension.ts"; then
+    echo "FAIL: setup-pi-extension.sh did not install the packaged extension content"
+    failures=$((failures + 1))
+elif [ "$(stat -c %a "$target")" != "644" ]; then
+    echo "FAIL: setup-pi-extension.sh installed unexpected permissions $(stat -c %a "$target")"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh creates the marked extension on a fresh install"
+fi
+
+# Plant an unrelated sibling extension that every later step must preserve.
+sibling="$pi_home/.pi/agent/extensions/unrelated-tool.ts"
+printf '// some other extension\n' > "$sibling"
+
+before_inode="$(stat -c %i "$target" 2>/dev/null || true)"
+rerun_log="$pi_extension_fixture/rerun.log"
+if ! HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >"$rerun_log" 2>&1; then
+    echo "FAIL: setup-pi-extension.sh failed on an identical rerun"
+    failures=$((failures + 1))
+elif [ "$(stat -c %i "$target" 2>/dev/null || true)" != "$before_inode" ]; then
+    echo "FAIL: setup-pi-extension.sh rewrote the file when content was unchanged"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh is a no-op when content is already current"
+fi
+
+printf '// SCRIBE-MANAGED-PI-EXTENSION\n// stale content from an older release\n' > "$target"
+before_inode="$(stat -c %i "$target")"
+if ! HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >/dev/null 2>&1; then
+    echo "FAIL: setup-pi-extension.sh failed to repair stale managed content"
+    failures=$((failures + 1))
+elif ! cmp -s "$target" "$repo_root/dist/pi-extension.ts"; then
+    echo "FAIL: setup-pi-extension.sh left stale managed content in place"
+    failures=$((failures + 1))
+elif [ "$(stat -c %i "$target")" = "$before_inode" ]; then
+    echo "FAIL: setup-pi-extension.sh rewrote stale content in place instead of a temp+rename swap"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh atomically replaces stale managed content"
+fi
+
+printf 'not a scribe extension\n' > "$target"
+collision_log="$pi_extension_fixture/collision.log"
+if HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >/dev/null 2>"$collision_log"; then
+    echo "FAIL: setup-pi-extension.sh overwrote an unmarked collision"
+    failures=$((failures + 1))
+elif ! grep -q "not a scribe extension" "$target"; then
+    echo "FAIL: setup-pi-extension.sh modified the unmarked collision target"
+    failures=$((failures + 1))
+elif [ ! -s "$collision_log" ]; then
+    echo "FAIL: setup-pi-extension.sh refused the collision without a readable notice"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh refuses to overwrite an unmarked collision and reports it"
+fi
+
+rm -f "$target"
+ln -s "$pi_extension_fixture/missing-target" "$target"
+if HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >/dev/null 2>&1; then
+    echo "FAIL: setup-pi-extension.sh replaced a dangling symlink collision"
+    failures=$((failures + 1))
+elif [ ! -L "$target" ]; then
+    echo "FAIL: setup-pi-extension.sh modified a dangling symlink collision"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh refuses dangling symlink collisions"
+fi
+
+rm -f "$target"
+mkdir "$target"
+if HOME="$pi_home" bash "$setup_pi" --extension-source "$repo_root/dist" >/dev/null 2>&1; then
+    echo "FAIL: setup-pi-extension.sh replaced a non-regular collision"
+    failures=$((failures + 1))
+elif [ ! -d "$target" ]; then
+    echo "FAIL: setup-pi-extension.sh modified a non-regular collision"
+    failures=$((failures + 1))
+else
+    echo "PASS: setup-pi-extension.sh refuses non-regular collisions without reading them"
+fi
+
+if ! grep -q "some other extension" "$sibling"; then
+    echo "FAIL: an unrelated extension file was disturbed by Pi extension setup"
+    failures=$((failures + 1))
+elif ! grep -q '"theme":"user-owned"' "$pi_settings"; then
+    echo "FAIL: Pi settings.json was modified by extension setup"
+    failures=$((failures + 1))
+else
+    echo "PASS: unrelated Pi extensions and settings survive setup"
+fi
+rm -rf "$pi_extension_fixture"
+
+# ── stable/dev Debian and macOS packages carry flavor-neutral Pi assets ─
+deb_manifest="$repo_root/crates/scribe-server/Cargo.toml"
+macos_builder="$repo_root/dist/macos/build-dmg.sh"
+if [ "$(grep -Fc '"../../dist/pi-extension.ts"' "$deb_manifest")" -ne 2 ] || \
+    ! grep -Fq '"usr/share/scribe/pi-extension.ts"' "$deb_manifest" || \
+    ! grep -Fq '"usr/share/scribe-dev/pi-extension.ts"' "$deb_manifest" || \
+    [ "$(grep -Fc '"../../dist/setup-pi-extension.sh"' "$deb_manifest")" -ne 2 ] || \
+    ! grep -Fq '"usr/share/scribe/setup-pi-extension.sh"' "$deb_manifest" || \
+    ! grep -Fq '"usr/share/scribe-dev/setup-pi-extension.sh"' "$deb_manifest"; then
+    echo "FAIL: stable/dev Debian asset manifests omit Pi integration files"
+    failures=$((failures + 1))
+elif ! grep -Fq 'cp "${DIST_DIR}/pi-extension.ts"' "$macos_builder" || \
+    ! grep -Fq 'cp "${DIST_DIR}/setup-pi-extension.sh"' "$macos_builder" || \
+    ! grep -Fq '"${RESOURCES_DIR}/setup-pi-extension.sh"' "$macos_builder"; then
+    echo "FAIL: macOS bundle assembly omits Pi integration files or setup mode"
+    failures=$((failures + 1))
+else
+    echo "PASS: stable/dev Debian and macOS package definitions include Pi assets"
+fi
+
 # ── Beads diagnostic resolves the target user's home, not root HOME ──
 beads_fixture=$(mktemp -d)
 beads_target_home="$beads_fixture/target-home"

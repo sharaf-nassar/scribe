@@ -91,6 +91,16 @@ assets = [
     "755",
   ],
   [
+    "../../dist/pi-extension.ts",
+    "usr/share/scribe/pi-extension.ts",
+    "644",
+  ],
+  [
+    "../../dist/setup-pi-extension.sh",
+    "usr/share/scribe/setup-pi-extension.sh",
+    "755",
+  ],
+  [
     "../../dist/shell-integration/bash/scribe.bash",
     "usr/share/scribe/shell-integration/bash/",
     "644",
@@ -196,6 +206,16 @@ assets = [
   [
     "../../dist/setup-codex-hooks.sh",
     "usr/share/scribe-dev/setup-codex-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/pi-extension.ts",
+    "usr/share/scribe-dev/pi-extension.ts",
+    "644",
+  ],
+  [
+    "../../dist/setup-pi-extension.sh",
+    "usr/share/scribe-dev/setup-pi-extension.sh",
     "755",
   ],
   [

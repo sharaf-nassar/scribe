@@ -571,6 +571,47 @@ migrate_prompt_bar_config() {
     echo "  Migrated legacy prompt bar colors in ${config_path}."
 }
 
+# pi_integration_enabled CONFIG_PATH
+# Returns 0 (true) unless the config file's [terminal] section sets
+# pi_integration = false. Defaults to enabled — matching
+# TerminalAiIntegrationConfig's Rust default — when the file, section, or key
+# is missing or unreadable.
+pi_integration_enabled() {
+    local config_path="$1"
+    local in_terminal=0
+    local line=""
+
+    [ -r "$config_path" ] || return 0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*\[([[:alnum:]_.-]+)\][[:space:]]*$ ]]; then
+            if [ "${BASH_REMATCH[1]}" = "terminal" ]; then
+                in_terminal=1
+            else
+                in_terminal=0
+            fi
+            continue
+        fi
+
+        if [ "$in_terminal" = "1" ] && \
+            [[ "$line" =~ ^[[:space:]]*pi_integration[[:space:]]*=[[:space:]]*(true|false) ]]; then
+            [ "${BASH_REMATCH[1]}" = "false" ] && return 1
+            return 0
+        fi
+    done < "$config_path"
+
+    return 0
+}
+
+# Automatic user-scoped setup is unsafe when a root package invocation carries
+# no sudo/pkexec caller identity. In that case the normal client startup repair
+# runs later as the real user instead of creating integration files in /root.
+ai_setup_target_known() {
+    local effective_uid="${1:-$(id -u)}"
+    local privileged_uid="${2-$PRIVILEGED_USER_UID}"
+    [ "$effective_uid" != "0" ] || [ -n "$privileged_uid" ]
+}
+
 run_user_command() {
     if [ -n "$PRIVILEGED_USER_UID" ]; then
         local display="$(user_manager_env DISPLAY)"
@@ -1123,6 +1164,34 @@ case "$1" in
                         "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 else
                     "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+                fi
+            fi
+        fi
+
+        # ── Pi AI extension setup (both fresh and upgrade) ───────────────
+        # Unlike Claude/Codex above, this does not require a pre-existing
+        # ~/.pi directory: a fresh enabled install creates Pi's extension
+        # directory itself, ready for Pi's global auto-discovery whenever the
+        # user installs Pi. It is gated on the user's own
+        # terminal.pi_integration setting (default enabled) rather than an
+        # existing-tool probe.
+        SETUP_SCRIPT="${SHARE_DIR}/setup-pi-extension.sh"
+        if [ "$AUTO_SETUP_HOOKS" = "1" ] && [ -x "$SETUP_SCRIPT" ]; then
+            if ! ai_setup_target_known; then
+                echo "  Deferring Pi extension setup until Scribe starts as the target user."
+            else
+                TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
+                PI_CONFIG_PATH="$(user_config_home || true)/${APP_SLUG}/config.toml"
+
+                if [ -n "$TARGET_HOME" ] && pi_integration_enabled "$PI_CONFIG_PATH"; then
+                    echo "  Setting up Pi AI integration extension..."
+                    if [ -n "$PRIVILEGED_USER_UID" ]; then
+                        sudo -u "#${PRIVILEGED_USER_UID}" \
+                            HOME="$TARGET_HOME" \
+                            "$SETUP_SCRIPT" --extension-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+                    else
+                        "$SETUP_SCRIPT" --extension-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+                    fi
                 fi
             fi
         fi

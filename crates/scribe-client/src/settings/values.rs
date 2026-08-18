@@ -141,6 +141,7 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
         "terminal.env_persistence.enabled" => Value::Bool(t.env_persistence.enabled),
         "terminal.claude_code_integration" => Value::Bool(t.ai_integration.claude_code.enabled()),
         "terminal.codex_code_integration" => Value::Bool(t.ai_integration.codex_code.enabled()),
+        "terminal.pi_integration" => Value::Bool(t.ai_integration.pi.enabled()),
         "terminal.prompt_bar" => Value::Bool(t.prompt_bar.enabled),
         // Unset, the strip follows the terminal font, so the stepper opens on
         // the size the user is actually looking at rather than a stale default.

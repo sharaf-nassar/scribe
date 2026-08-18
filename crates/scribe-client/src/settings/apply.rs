@@ -260,6 +260,7 @@ fn apply_terminal_key(
         | "terminal.claude_copy_cleanup"
         | "terminal.claude_code_integration"
         | "terminal.codex_code_integration"
+        | "terminal.pi_integration"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll"
         | "terminal.focus_follows_mouse"
@@ -366,6 +367,11 @@ fn apply_terminal_behavior_key(
                 scribe_common::config::AiIntegrationToggle::new(
                     value.as_bool().ok_or("codex_code_integration must be a boolean")?,
                 );
+        }
+        "terminal.pi_integration" => {
+            config.terminal.ai_integration.pi = scribe_common::config::AiIntegrationToggle::new(
+                value.as_bool().ok_or("pi_integration must be a boolean")?,
+            );
         }
         "terminal.preserve_ai_scrollback" => {
             config.terminal.ai_session.preserve_ai_scrollback =
