@@ -1854,6 +1854,19 @@ Together they cover executable discovery, project-root working directory,
 command flags, JSON envelopes, queue classification, detail shapes, and
 rendering without touching the host's Beads database.
 
+#### Flow epic fixture
+
+[`beads-flow-epic.sh`](../tests/e2e/fixtures/beads-flow-epic.sh) seeds an
+isolated real-`bd` five-rank Flow epic with fan-out, fan-in, a satisfied blocker,
+and two admission refusals for visual and functional contracts.
+
+The closed foundation fans out to three peers, which fan in before two further
+ranks. It keeps satisfied `blocks` edges visible in the full list envelope while
+`bd blocked` omits them. A second epic carries a member with no `blocks` edges
+and a member blocked from outside the epic, covering both tracker-representable
+admission refusals. Beads rejects cycles at write time, including
+`--no-cycle-check`, so cycle admission stays a unit-only graph case.
+
 #### Card drag writes and pointer isolation
 
 The network-none real-bd GPUI run proves the production drag contract and terminal-pointer boundary through the shipped client.
