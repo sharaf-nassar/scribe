@@ -43,7 +43,11 @@ use crate::terminal_images::{
 ///
 /// Bumped to `8` because remote session metadata may now carry
 /// [`AiProvider::Pi`].
-pub const REMOTE_PROTOCOL_VERSION: u32 = 8;
+///
+/// Bumped to `9` for the Beads Flow view: the epic-graph request/reply pair and
+/// the `beads_flow` capability are additive under the same exact-match policy,
+/// so a v8 peer never negotiates a graph it cannot render.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 9;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +304,10 @@ pub struct BeadsBoardItem {
     pub blocker_ids: Vec<String>,
     #[serde(default)]
     pub parent_epic_name: Option<String>,
+    /// Epic id the display name is derived from. This is what decides Flow
+    /// eligibility client-side: no parent epic means no graph to open.
+    #[serde(default)]
+    pub parent_epic_id: Option<String>,
 }
 
 /// A complete, mutually-exclusive five-queue board snapshot.
@@ -459,6 +467,90 @@ pub enum BeadsIssueWriteResult {
     Applied { generation: u64 },
     PreconditionFailed,
     Failed { reason: String },
+}
+
+/// One issue in an epic's dependency graph.
+///
+/// Deliberately narrower than [`BeadsIssueDetail`]: the Flow view paints a
+/// compact node and opens the existing detail panel for everything else, so
+/// the graph carries only what a node renders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsGraphNode {
+    pub id: String,
+    pub title: String,
+    /// Native Beads priority (`0` is highest, `4` is lowest).
+    pub priority: u8,
+    pub status: String,
+    /// Queue assigned by the same classifier the board uses, so a node's state
+    /// treatment cannot disagree with the lane the card came from.
+    pub queue: BeadsIssueQueue,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// ISO-8601 timestamp from `bd`, kept verbatim.
+    pub updated_at: String,
+}
+
+/// One `blocks` edge between two members of the same epic.
+///
+/// `parent-child` defines epic membership, not adjacency, so it never appears
+/// here. Satisfied (closed-blocker) edges are included: the graph shows what a
+/// node waited on, not only what still blocks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsGraphEdge {
+    /// Blocker: the issue that must finish first.
+    pub from: String,
+    /// Dependent: the issue held up by `from`.
+    pub to: String,
+}
+
+/// A complete, admitted epic dependency graph.
+///
+/// There is deliberately no `truncated` flag. An epic exceeding the server's
+/// bound is refused outright ([`BeadsEpicGraphRefusal::TooLarge`]) rather than
+/// served partial, so a cursor node can never be cut out of its own graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeadsEpicGraph {
+    pub epic_id: String,
+    pub epic_title: String,
+    /// Members already closed, for the band's progress readout.
+    pub closed: u32,
+    /// Total members, equal to `nodes.len()` — carried explicitly so the band
+    /// does not have to re-derive it.
+    pub total: u32,
+    pub nodes: Vec<BeadsGraphNode>,
+    pub edges: Vec<BeadsGraphEdge>,
+}
+
+/// Why the server declined to serve a graph for an otherwise valid request.
+///
+/// The client renders none of these — every refusal means "stay in Lanes" —
+/// but the reason is logged server-side so an epic that never opens is
+/// diagnosable instead of mysterious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsEpicGraphRefusal {
+    /// The requested id names no epic, or the epic has no members.
+    NoEpic,
+    /// The `blocks` edges contain a cycle, so no layered ranking exists.
+    Cycle,
+    /// A member shares no edge with any other member.
+    Disconnected,
+    /// A member is blocked by an issue outside the epic.
+    ExternalBlocker,
+    /// The epic exceeds the node or per-node edge bound.
+    TooLarge,
+}
+
+/// Correlated reply to [`ClientMessage::RequestBeadsEpicGraph`].
+///
+/// Typed rather than an `Option` so a refusal carries its reason: the three
+/// arms separate an admitted graph, a deliberate refusal, and a failed read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeadsEpicGraphOutcome {
+    Graph(Box<BeadsEpicGraph>),
+    NoGraph { reason: BeadsEpicGraphRefusal },
+    Unavailable { message: String },
 }
 
 /// Aggregate state rendered by the CI run bar.
@@ -622,6 +714,14 @@ pub enum ClientMessage {
     RequestBeadsIssueDetail {
         workspace_id: WorkspaceId,
         issue_id: String,
+    },
+    /// Request the dependency graph for one epic, to open the Flow view.
+    ///
+    /// Separately bounded from the board snapshot so the board's per-queue cap
+    /// cannot hole an epic whose closed members fall past it.
+    RequestBeadsEpicGraph {
+        workspace_id: WorkspaceId,
+        epic_id: String,
     },
     /// Request one typed issue mutation. The server owns `bd` argv composition.
     BeadsIssueWrite {
@@ -1090,6 +1190,13 @@ pub enum ServerMessage {
         issue_id: String,
         detail: Option<Box<BeadsIssueDetail>>,
     },
+    /// Correlated reply for `RequestBeadsEpicGraph`. The workspace and epic ids
+    /// are repeated so a client can discard a reply it no longer wants.
+    BeadsEpicGraph {
+        workspace_id: WorkspaceId,
+        epic_id: String,
+        outcome: BeadsEpicGraphOutcome,
+    },
     /// Correlated outcome for one typed issue write.
     BeadsIssueWriteResult {
         workspace_id: WorkspaceId,
@@ -1136,6 +1243,12 @@ pub enum ServerMessage {
         /// from detail reads because bd 1.1.0 cannot enforce write guards.
         #[serde(default)]
         beads_write: bool,
+        /// Server support for the additive epic-graph request behind the Flow
+        /// view. Independent from detail reads and writes: a server may serve
+        /// cards without serving graphs. Missing from an older local server
+        /// means the client never leaves the Lanes rendering.
+        #[serde(default)]
+        beads_flow: bool,
         /// Structured Pi provider support. Missing means the client must keep
         /// using legacy [`ShellTool::Pi`] metadata.
         #[serde(default)]
@@ -2054,6 +2167,21 @@ mod tests {
         },
     }
 
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutBeadsFlow {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+            beads_write: bool,
+            pi_provider: bool,
+        },
+    }
+
     // @lat: [[test#Test Harness#Pi Provider Compatibility#Local capability negotiation]]
     #[test]
     fn old_hello_and_welcome_default_pi_provider_to_false() {
@@ -2108,6 +2236,7 @@ mod tests {
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: true,
             beads_write: true,
+            beads_flow: true,
             pi_provider: true,
         };
         let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize new Welcome");
@@ -2175,8 +2304,47 @@ mod tests {
     }
 
     #[test]
-    fn remote_protocol_advances_for_pi_provider_state() {
-        assert_eq!(REMOTE_PROTOCOL_VERSION, 8);
+    fn remote_protocol_advances_for_beads_flow_capability() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 9);
+    }
+
+    /// The bump must keep the refusal legible: a v8 dialer meeting this server
+    /// is told both versions and which side to update, not just "incompatible".
+    #[test]
+    fn version_mismatch_refusal_names_both_versions() {
+        let dialer_version = REMOTE_PROTOCOL_VERSION - 1;
+        let mismatch = RemoteProtocolMismatch::between(dialer_version, REMOTE_PROTOCOL_VERSION)
+            .expect("differing versions mismatch");
+        assert_eq!(mismatch.client_version, dialer_version);
+        assert_eq!(mismatch.server_version, REMOTE_PROTOCOL_VERSION);
+
+        let reply = ServerMessage::RemoteHandshakeReply {
+            accepted: false,
+            refusal: Some(RemoteRefusal::IncompatibleVersion),
+            server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
+            server_scribe_version: "0.1.0".into(),
+            version_mismatch: Some(mismatch),
+        };
+        let bytes = rmp_serde::to_vec_named(&reply).expect("serialize mismatch refusal");
+        let decoded: ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize mismatch refusal");
+        assert!(matches!(
+            decoded,
+            ServerMessage::RemoteHandshakeReply {
+                accepted: false,
+                refusal: Some(RemoteRefusal::IncompatibleVersion),
+                server_remote_protocol_version,
+                version_mismatch: Some(decoded_mismatch),
+                ..
+            } if server_remote_protocol_version == REMOTE_PROTOCOL_VERSION
+                && decoded_mismatch.client_version == dialer_version
+                && decoded_mismatch.server_version == REMOTE_PROTOCOL_VERSION
+        ));
+
+        assert_eq!(
+            RemoteProtocolMismatch::between(REMOTE_PROTOCOL_VERSION, REMOTE_PROTOCOL_VERSION),
+            None
+        );
     }
 
     #[test]
@@ -2377,6 +2545,7 @@ mod tests {
             priority: 2,
             blocker_ids: vec!["scribe-blocker".into()],
             parent_epic_name: Some("Workspace board".into()),
+            parent_epic_id: Some("scribe-1bf".into()),
         };
         let response = ServerMessage::BeadsBoard {
             workspace_id,
@@ -2617,6 +2786,7 @@ mod tests {
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: false,
             beads_write: true,
+            beads_flow: false,
             pi_provider: true,
         };
         let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
@@ -2626,6 +2796,196 @@ mod tests {
             decoded_write,
             ServerMessage::Welcome { beads_detail: false, beads_write: true, .. }
         ));
+    }
+
+    // @lat: [[protocol#Server Messages#Connection#Beads flow capability defaults safely]]
+    #[test]
+    fn beads_flow_capability_is_independent_from_detail_and_write() {
+        let legacy_bytes = rmp_serde::to_vec_named(&WelcomeWithoutBeadsFlow::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            pi_provider: true,
+        })
+        .expect("serialize pre-flow Welcome");
+        let decoded_legacy: ServerMessage =
+            rmp_serde::from_slice(&legacy_bytes).expect("deserialize pre-flow Welcome");
+        assert!(matches!(
+            decoded_legacy,
+            ServerMessage::Welcome { beads_detail: true, beads_write: true, beads_flow: false, .. }
+        ));
+
+        // Every combination is representable: flow is not implied by, and does
+        // not imply, either older capability.
+        for (detail, write, flow) in
+            [(false, false, true), (true, false, true), (false, true, false), (true, true, true)]
+        {
+            let message = ServerMessage::Welcome {
+                window_id: WindowId::new(),
+                other_windows: Vec::new(),
+                clipboard_gating: true,
+                participant_id: None,
+                terminal_images: TerminalImageCapabilities::V1,
+                beads_detail: detail,
+                beads_write: write,
+                beads_flow: flow,
+                pi_provider: true,
+            };
+            let bytes = rmp_serde::to_vec_named(&message).expect("serialize Welcome");
+            let decoded: ServerMessage =
+                rmp_serde::from_slice(&bytes).expect("deserialize Welcome");
+            let ServerMessage::Welcome {
+                beads_detail: got_detail,
+                beads_write: got_write,
+                beads_flow: got_flow,
+                ..
+            } = decoded
+            else {
+                panic!("expected Welcome");
+            };
+            assert_eq!((got_detail, got_write, got_flow), (detail, write, flow));
+        }
+    }
+
+    // @lat: [[protocol#Client Messages#Beads epic graph#Parent epic id defaults safely]]
+    #[test]
+    fn board_item_without_parent_epic_id_defaults_to_none() {
+        #[derive(Serialize)]
+        struct BoardItemWithoutParentEpicId {
+            id: String,
+            title: String,
+            priority: u8,
+            blocker_ids: Vec<String>,
+            parent_epic_name: Option<String>,
+        }
+
+        let bytes = rmp_serde::to_vec_named(&BoardItemWithoutParentEpicId {
+            id: "scribe-1bf.2".into(),
+            title: "Add board cache".into(),
+            priority: 2,
+            blocker_ids: Vec::new(),
+            parent_epic_name: Some("Workspace board".into()),
+        })
+        .expect("serialize pre-flow board item");
+
+        let decoded: BeadsBoardItem =
+            rmp_serde::from_slice(&bytes).expect("deserialize pre-flow board item");
+        assert_eq!(decoded.parent_epic_id, None);
+        assert_eq!(decoded.parent_epic_name.as_deref(), Some("Workspace board"));
+    }
+
+    fn sample_beads_epic_graph() -> BeadsEpicGraph {
+        BeadsEpicGraph {
+            epic_id: "scribe-lpi2".into(),
+            epic_title: "beads-flow-view".into(),
+            closed: 1,
+            total: 3,
+            nodes: vec![
+                BeadsGraphNode {
+                    id: "scribe-lpi2.1".into(),
+                    title: "Add Flow protocol types".into(),
+                    priority: 1,
+                    status: "closed".into(),
+                    queue: BeadsIssueQueue::Done,
+                    assignee: Some("mamba".into()),
+                    updated_at: "2026-08-18T08:00:00Z".into(),
+                },
+                BeadsGraphNode {
+                    id: "scribe-lpi2.3".into(),
+                    title: "Build the Flow layout engine".into(),
+                    priority: 1,
+                    status: "in_progress".into(),
+                    queue: BeadsIssueQueue::InProgress,
+                    assignee: None,
+                    updated_at: "2026-08-18T09:00:00Z".into(),
+                },
+                BeadsGraphNode {
+                    id: "scribe-lpi2.9".into(),
+                    title: "Render the Flow view".into(),
+                    priority: 1,
+                    status: "open".into(),
+                    queue: BeadsIssueQueue::Blocked,
+                    assignee: None,
+                    updated_at: "2026-08-18T09:30:00Z".into(),
+                },
+            ],
+            edges: vec![
+                // A satisfied edge: the blocker is closed and `bd blocked` would
+                // not report it, but the graph still shows what was waited on.
+                BeadsGraphEdge { from: "scribe-lpi2.1".into(), to: "scribe-lpi2.3".into() },
+                BeadsGraphEdge { from: "scribe-lpi2.3".into(), to: "scribe-lpi2.9".into() },
+            ],
+        }
+    }
+
+    // @lat: [[protocol#Client Messages#Beads epic graph#Named MessagePack round trip]]
+    #[test]
+    fn beads_epic_graph_messages_round_trip_through_msgpack_named() {
+        let workspace_id = WorkspaceId::new();
+        let request =
+            ClientMessage::RequestBeadsEpicGraph { workspace_id, epic_id: "scribe-lpi2".into() };
+        let request_bytes = rmp_serde::to_vec_named(&request).expect("serialize graph request");
+        let decoded_request: ClientMessage =
+            rmp_serde::from_slice(&request_bytes).expect("deserialize graph request");
+        assert!(matches!(
+            decoded_request,
+            ClientMessage::RequestBeadsEpicGraph { workspace_id: decoded_id, epic_id }
+                if decoded_id == workspace_id && epic_id == "scribe-lpi2"
+        ));
+
+        let graph = sample_beads_epic_graph();
+        let outcomes = [
+            BeadsEpicGraphOutcome::Graph(Box::new(graph.clone())),
+            BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::NoEpic },
+            BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::Cycle },
+            BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::Disconnected },
+            BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::ExternalBlocker },
+            BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::TooLarge },
+            BeadsEpicGraphOutcome::Unavailable { message: "bd not on PATH".into() },
+        ];
+
+        for expected in outcomes {
+            let message = ServerMessage::BeadsEpicGraph {
+                workspace_id,
+                epic_id: "scribe-lpi2".into(),
+                outcome: expected.clone(),
+            };
+            let bytes = rmp_serde::to_vec_named(&message).expect("serialize graph outcome");
+            let decoded: ServerMessage =
+                rmp_serde::from_slice(&bytes).expect("deserialize graph outcome");
+            assert!(matches!(
+                decoded,
+                ServerMessage::BeadsEpicGraph {
+                    workspace_id: decoded_id,
+                    epic_id,
+                    outcome,
+                } if decoded_id == workspace_id
+                    && epic_id == "scribe-lpi2"
+                    && outcome == expected
+            ));
+        }
+
+        // The graph arm survives field-for-field, including the satisfied edge
+        // and the absent assignee that the live halo depends on.
+        let message = ServerMessage::BeadsEpicGraph {
+            workspace_id,
+            epic_id: graph.epic_id.clone(),
+            outcome: BeadsEpicGraphOutcome::Graph(Box::new(graph.clone())),
+        };
+        let bytes = rmp_serde::to_vec_named(&message).expect("serialize graph");
+        let decoded: ServerMessage = rmp_serde::from_slice(&bytes).expect("deserialize graph");
+        let ServerMessage::BeadsEpicGraph {
+            outcome: BeadsEpicGraphOutcome::Graph(decoded_graph),
+            ..
+        } = decoded
+        else {
+            panic!("expected a graph outcome");
+        };
+        assert_eq!(*decoded_graph, graph);
     }
 
     #[derive(Serialize)]

@@ -2016,6 +2016,7 @@ mod tests {
             priority: 1,
             blocker_ids: Vec::new(),
             parent_epic_name: Some("Beads card detail".into()),
+            parent_epic_id: Some("scribe-5wh1".into()),
         }
     }
 

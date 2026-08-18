@@ -1649,6 +1649,10 @@ fn card_from_detail(detail: &BeadsIssueDetail) -> BeadsBoardItem {
         priority: detail.priority,
         blocker_ids: detail.blockers.iter().map(|blocker| blocker.id.clone()).collect(),
         parent_epic_name: detail.parent_epic_name.clone(),
+        // A detail read resolves the parent epic to a title, never an id, so a
+        // card synthesized here cannot state Flow eligibility. Read it from the
+        // board snapshot's card instead.
+        parent_epic_id: None,
     }
 }
 
@@ -3206,6 +3210,7 @@ mod tests {
             priority: 1,
             blocker_ids: Vec::new(),
             parent_epic_name: Some("Beads card detail".into()),
+            parent_epic_id: Some("scribe-5wh1".into()),
         }
     }
 

@@ -1168,6 +1168,7 @@ fn classify_snapshot(
             parent_epic_name: parent_id
                 .and_then(|id| epic_names.get(id).copied())
                 .map(|name| truncate(name, MAX_TITLE_CHARS)),
+            parent_epic_id: parent_id.map(|id| truncate(id, MAX_ID_CHARS)),
         };
 
         let (queue, total) = match classify_issue(

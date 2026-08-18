@@ -154,6 +154,58 @@ need another date parser to preserve them.
 
 Named MessagePack preserves request correlation, every detail field, queue basis, related issues, comments, hidden count, and the explicit not-found response.
 
+### Beads epic graph
+
+`RequestBeadsEpicGraph` asks for one epic's dependency graph so the board can
+swap its strip into the Flow rendering.
+
+It is bounded separately from the board snapshot: the board caps each queue,
+which would silently hole an epic whose closed members fall past the cap, so the
+graph is assembled from its own epic-scoped pass.
+
+[[crates/scribe-common/src/protocol.rs#BeadsEpicGraph]] carries the epic's id
+and title, its closed/total tally for the band, its
+[[crates/scribe-common/src/protocol.rs#BeadsGraphNode|nodes]] and its
+[[crates/scribe-common/src/protocol.rs#BeadsGraphEdge|edges]]. Edges are `blocks`
+only — `parent-child` defines epic membership, not adjacency — and satisfied
+edges whose blocker already closed are included, so the graph shows what a node
+waited on rather than only what still blocks it. A node carries just what the
+compact Flow node paints; everything else stays with the existing detail read.
+
+There is deliberately no `truncated` flag. An epic over the bound is refused
+outright rather than served partial, which is what stops the opened card from
+being cut out of its own graph.
+
+The reply is
+[[crates/scribe-common/src/protocol.rs#BeadsEpicGraphOutcome]], typed rather
+than an `Option` so a refusal carries its reason: `Graph` for an admitted
+graph, `NoGraph` with a
+[[crates/scribe-common/src/protocol.rs#BeadsEpicGraphRefusal|reason]]
+(no-epic, cycle, disconnected, external blocker, too-large) for a deliberate
+refusal, and `Unavailable` for a failed read. The client renders none of the
+reasons — every non-`Graph` outcome means the board stays in Lanes — but the
+server logs it so an epic that never opens stays diagnosable.
+
+#### Named MessagePack round trip
+
+Named MessagePack preserves request correlation, every graph field including a
+satisfied edge and an absent assignee, all five refusal reasons, and the
+unavailable message.
+
+#### Parent epic id defaults safely
+
+`BeadsBoardItem.parent_epic_id` carries the id the existing display name is
+derived from, and decides Flow eligibility client-side.
+
+A card with no parent epic has no graph to open. An older snapshot omitting the
+field decodes it as `None`, which reads as "not eligible" and keeps that card in
+Lanes.
+
+A card synthesized from a detail read cannot state eligibility: the detail
+response resolves the parent epic to a title and never carries its id, so
+`card_from_detail` leaves the field `None` and eligibility is read from the
+board snapshot's own card.
+
 ### Beads issue writes
 
 `BeadsIssueWrite` carries one workspace-scoped, issue-scoped mutation without exposing `bd` arguments to the client.
@@ -257,6 +309,17 @@ participants stay read-only regardless of executable availability.
 
 The protocol test linked to this section pins defaulting and the two capability
 fields' independent wire shape.
+
+#### Beads flow capability defaults safely
+
+`Welcome.beads_flow` advertises the additive epic-graph request behind the Flow
+view, independently from both `beads_detail` and `beads_write` and defaulting to
+`false` when absent.
+
+The three bits are genuinely orthogonal: a server may serve cards without
+serving graphs, and the test linked to this section pins every combination
+rather than only the pairs. A server omitting the field leaves the client in the
+Lanes rendering, so an older peer never negotiates a view it cannot ask for.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 

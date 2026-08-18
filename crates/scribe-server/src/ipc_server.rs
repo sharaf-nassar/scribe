@@ -5564,6 +5564,9 @@ async fn handle_client_hello(
                 terminal_images: claim.terminal_images,
                 beads_detail,
                 beads_write,
+                // The epic-graph request is not served yet, so the Flow view
+                // stays unadvertised and every client keeps the Lanes board.
+                beads_flow: false,
                 pi_provider: true,
             };
             send_message(writer, &welcome).await;
@@ -5592,6 +5595,7 @@ async fn handle_client_hello(
                 terminal_images: claim.terminal_images,
                 beads_detail: false,
                 beads_write: false,
+                beads_flow: false,
                 pi_provider: true,
             };
             send_message(writer, &welcome).await;
@@ -12788,7 +12792,7 @@ mod tests {
 
     // @lat: [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]]
     #[tokio::test]
-    async fn remote_version_mismatch_returns_the_typed_v8_refusal() {
+    async fn remote_version_mismatch_returns_the_typed_refusal() {
         let (mut server, mut client) = tokio::io::duplex(4096);
         send_handshake_reply(
             &mut server,
@@ -12803,10 +12807,10 @@ mod tests {
             ServerMessage::RemoteHandshakeReply {
                 accepted: false,
                 refusal: Some(RemoteRefusal::IncompatibleVersion),
-                server_remote_protocol_version: 8,
+                server_remote_protocol_version,
                 version_mismatch: Some(_),
                 ..
-            }
+            } if server_remote_protocol_version == REMOTE_PROTOCOL_VERSION
         ));
     }
 

@@ -245,6 +245,7 @@ fn insert_local_fixtures(
             terminal_images: TerminalImageCapabilities::V1,
             beads_detail: false,
             beads_write: false,
+            beads_flow: false,
             pi_provider: false,
         },
     )

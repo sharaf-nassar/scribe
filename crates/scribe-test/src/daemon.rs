@@ -675,10 +675,9 @@ async fn dispatch_server_message(
             dispatch_notice_message(msg);
         }
         // Test daemon does not exercise env-persistence (feature 006), OSC 52
-        // clipboard gating (spec 010), remote window control (feature 013), or
-        // LAN remote control (feature 014) flows yet. The feature 014 LAN
-        // messages below are consumed by the client/settings surfaces (tasks
-        // T014/T018/T019/T020/T024); this is a behavior-preserving no-op arm.
+        // clipboard gating (spec 010), remote window control (feature 013), LAN
+        // remote control (feature 014), or the Beads epic graph (spec 026) yet.
+        // Those reach client/settings surfaces; a behavior-preserving no-op arm.
         ServerMessage::EnvPreflightResult { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::ClipboardPromptRequest { .. }
@@ -701,16 +700,32 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageReplay { .. }
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::BeadsIssueDetail { .. }
+        | ServerMessage::BeadsEpicGraph { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
         | ServerMessage::ShareEnded { .. } => {}
+        msg @ (ServerMessage::BeadsBoard { .. } | ServerMessage::BeadsIssueWriteResult { .. }) => {
+            dispatch_beads_message(msg, state, notifiers).await;
+        }
+    }
+}
+
+/// Board snapshots and write results, the two Beads messages the test daemon
+/// records for `wait` assertions.
+async fn dispatch_beads_message(
+    msg: ServerMessage,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    match msg {
         ServerMessage::BeadsBoard { workspace_id, state: board, .. } => {
             state_beads_board(workspace_id, board, state, notifiers).await;
         }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
             state_beads_write(workspace_id, issue_id, result, state, notifiers).await;
         }
+        other => debug!(?other, "ignored non-Beads server message in Beads dispatcher"),
     }
 }
 
@@ -2533,6 +2548,7 @@ mod tests {
                 terminal_images: TerminalImageCapabilities::default(),
                 beads_detail: false,
                 beads_write: false,
+                beads_flow: false,
                 pi_provider: false,
             },
         )
