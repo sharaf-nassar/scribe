@@ -2554,6 +2554,21 @@ pressed scrollbar motion stable without making the scrollbar a hole in the
 hover-focus surface. [[crates/scribe-client/src/main.rs#TerminalView#update_scrollbar_hover]]
 sweeps every pane, which also clears the hover on the pane the pointer left.
 
+The hit-test the sweep runs is a LEVEL condition over `metrics.history_size`,
+the pane's painted rect, and `scrollbars.panes` membership — all three can
+change with the pointer perfectly still, so a sweep driven only by
+[[crates/scribe-client/src/main.rs#TerminalView#move_over_grid]] went stale in
+both directions: a pane that gained scrollback under a resting pointer never
+revealed the bar, and a pointer that left the platform window through the hit
+zone left `hover` stuck true, which pinned
+[[crates/scribe-client/src/scrollbar.rs#ScrollbarState#tick_fade_at]] at full
+opacity and repainted the window on every 16 ms tick forever. The fix re-runs
+the same sweep from [[crates/scribe-client/src/main.rs#TerminalView#poll_scrollbar_fades]]
+— the idle tick already ticking the fades — against a `PointerState::last_position`
+that `move_over_grid` keeps current and a grid-band `on_mouse_exit` listener
+clears on `MouseExited`, so the level condition is re-tested on a clock as
+well as on motion, with no second timer.
+
 [[crates/scribe-client/src/main.rs#TerminalView#scrollbar_layout]] takes the named pane's own rect. It had always accepted a `session_id` and then measured the focused pane, which was invisible while every caller passed the focused session and wrong the moment one did not.
 
 #### GPUI Rebuild Golden Oracle

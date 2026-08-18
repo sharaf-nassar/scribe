@@ -4901,6 +4901,18 @@ The running client's use of that core is asserted separately, in .
 
 The visual scrollbar E2E creates a real tab, wheels it before any switch or generated history, and requires offset zero plus an unchanged right-edge strip; it then returns to the harness pane and proves real history exposes the thumb.
 
+### Hover is level-triggered off the idle tick, not motion
+
+[[crates/scribe-client/src/main.rs#TerminalView#update_scrollbar_hover]]'s hit-test is a level condition over live metrics and pane rects, not an edge to latch once on motion, so the visual scrollbar E2E's phases 7-10 drive both directions a motion-only sweep left stale.
+
+Phases 7 and 8 run in source order right after phase 1, ahead of phase 2's own OSC 133 records — that gap is the only point where `$SESSION`, the shared pane `scribe-test send` can reach, still has zero scrollback; the PASS/FAIL text keeps the phase-7/8 numbers from the acceptance criteria even though phases 2-6 print first.
+
+STALE-FALSE (phase 7): with `$SESSION`'s own scrollback still zero, the pointer parks inside the hit zone and `scribe-test send` grows real history over the wire, so no client-side input event of any kind — mouse or keyboard — ever reaches the client. The right-edge strip has to change by at least `THUMB_DIFF_MIN` with no intervening `MouseMoveEvent` at all, which only the idle tick's re-run of the hover pass can produce.
+
+STALE-TRUE (phase 8): with hover still live from phase 7, the pointer moves straight out of the platform window through the same hit zone that set it. Past the 1.5s idle delay plus the 0.3s fade ramp the strip must be back at the phase-1 rested baseline, proving the grid band's `on_mouse_exit` listener cleared `PointerState::last_position` and the next idle tick's hover re-run cleared `hover` in turn — `tick_fade_at` no longer short-circuits to full opacity forever. A further pair of captures across another idle window has to stay pixel-stable, which is the black-box proxy for "a rested window does not repaint on the idle tick."
+
+Two controls guard the fix against regressing the paths that already worked, run after phase 6 once `$SESSION` no longer has zero scrollback to offer: phase 9 opens its own tab — its session id is client-minted and unreachable by `scribe-test send`, so typed keystrokes fill it instead — and proves ordinary motion into the hit zone still reveals the bar with no prior scroll; phase 10 splits that same tab's pane and proves both the left pane's inner edge (against the shared divider) and the right pane's outer edge reveal on hover, since a split moves each pane's hit zone exactly the way a resize or a pane close does.
+
 ### Thumb sizes and positions from the viewport
 
 `compute_thumb` sizes the thumb from the visible-to-total row ratio (floored at ) and positions it down the track from the display offset, right-aligned inside the pane with the fixed inset.

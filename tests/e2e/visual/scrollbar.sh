@@ -127,6 +127,16 @@ strip() {
         -crop "${STRIP_W}x${h}+$(( WIN_W - STRIP_W ))+${GRID_TOP_INSET_PX}" +repage "$2"
 }
 
+# The same right-edge strip, cropped from a side-by-side split's LEFT pane
+# instead of the window's own right edge: a left pane's overlay hugs the
+# shared divider at the window's horizontal midpoint rather than WIN_W.
+strip_left() {
+    local h
+    h=$(( WIN_H - GRID_TOP_INSET_PX - GRID_BOTTOM_INSET_PX ))
+    convert "$1" \
+        -crop "${STRIP_W}x${h}+$(( WIN_W / 2 - STRIP_W ))+${GRID_TOP_INSET_PX}" +repage "$2"
+}
+
 strip_diff() {
     local value
     value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
@@ -314,6 +324,69 @@ echo "PHASE 1 PASS: new-tab wheel stayed at offset 0 with no overlay (${WHEEL_DI
 # known full session id so later phases can add real history through scribe-test.
 send_keys ctrl+Prior
 
+# @lat: [[test#GPUI Command Scrollbar#Hover is level-triggered off the idle tick, not motion]]
+# ── Phase 7: scrollback growing under a parked pointer reveals ────
+# scribe-re54 STALE-FALSE: `update_scrollbar_hover`'s hit-test is a LEVEL
+# condition over `metrics.history_size`, but before the fix it was only ever
+# re-run on mouse motion. A pane that gains scrollback while the pointer
+# already sits inside the hit zone must still reveal the bar with no further
+# motion at all — this phase pins that down.
+#
+# This runs here, ahead of phase 2's own OSC 133 records, because $SESSION —
+# the shared pane `scribe-test send` can reach — has zero scrollback only in
+# this window. Injecting over the wire is what proves the mouse (and every
+# other client-side input event) is never touched: a tab minted by
+# Ctrl+Shift+T carries a session id this harness never sees in a form
+# `scribe-test send` accepts, so it cannot stand in here.
+focus
+xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 0.5
+capture /output/sb-07-parked-empty.png
+strip /output/sb-07-parked-empty.png /output/sb-07-parked-empty-strip.png
+
+scribe-test send "$SESSION" "i=1; while [ \$i -le 60 ]; do echo \"hst-\$i\"; i=\$((i+1)); done; echo HST_FILLED\n"
+scribe-test wait-output "$SESSION" HST_FILLED --timeout 20000
+sleep 4
+
+capture /output/sb-07-parked-filled.png
+strip /output/sb-07-parked-filled.png /output/sb-07-parked-filled-strip.png
+DIFF=$(strip_diff /output/sb-07-parked-empty-strip.png /output/sb-07-parked-filled-strip.png)
+if [ "${DIFF:-0}" -lt "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 7 FAIL: scrollback arrived under a parked pointer but the strip changed only ${DIFF}px (min $THUMB_DIFF_MIN); hover stayed stale-false"
+fi
+echo "PHASE 7 PASS: scrollback under a stationary pointer revealed the bar with no mouse motion (${DIFF}px)"
+
+# ── Phase 8: the pointer leaving through the hit zone re-arms fade ─
+# scribe-re54 STALE-TRUE: hover was already live at the end of phase 7 (the
+# pointer never moved), so leaving through the exact zone that set it — with
+# nothing else ever touching the pointer — is what the fix's `MouseExited`
+# clear, plus the idle tick's re-run of the hover pass, has to catch.
+# `tick_fade_at` used to short-circuit to `opacity = 1.0` forever while
+# `hover` stayed stuck, which is also what made the idle tick repaint at
+# 60 fps with the window not even hovered.
+OUTSIDE_X=$(( WIN_X + WIN_W + 40 ))
+xdotool mousemove "$OUTSIDE_X" $(( WIN_Y + WIN_H / 2 ))
+sleep 4
+
+capture /output/sb-08-after-exit.png
+strip /output/sb-08-after-exit.png /output/sb-08-after-exit-strip.png
+FADED=$(strip_diff /output/sb-01-strip.png /output/sb-08-after-exit-strip.png)
+if [ "${FADED:-0}" -ge "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 8 FAIL: the overlay never faded after the pointer left through the hit zone (${FADED}px still painted)"
+fi
+
+# A rested window with the pointer away from every hit zone must not repaint
+# on the idle tick either: two more captures across a further idle window
+# have to be as stable as phase 1's rested control was.
+sleep 1
+capture /output/sb-08-still-rested.png
+strip /output/sb-08-still-rested.png /output/sb-08-still-rested-strip.png
+IDLE_DIFF=$(strip_diff /output/sb-08-after-exit-strip.png /output/sb-08-still-rested-strip.png)
+if [ "${IDLE_DIFF:-0}" -ge "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 8 FAIL: the rested strip is not stable across idle ticks (${IDLE_DIFF}px between two captures)"
+fi
+echo "PHASE 8 PASS: the overlay faded back out after an exit through the hit zone (${FADED}px) and stayed rested through further idle ticks (${IDLE_DIFF}px)"
+
 # ── Phase 2: three OSC 133 command records fill the scrollback ────
 # The middle command exits non-zero, so the three ticks must not all be the
 # same hue. `prompt mark recorded` is written only by the drain's PromptMark
@@ -425,12 +498,100 @@ if [ "${FADED:-0}" -ge "$THUMB_DIFF_MIN" ]; then
 fi
 echo "PHASE 6 PASS: the overlay faded back out after the pointer left (${FADED}px in the strip)"
 
+# ── Phase 9: control — moving into the zone alone still reveals ───
+# The fix must not turn hover back into something that needs a scroll action
+# first: ordinary motion into the hit zone, on a pane that already has
+# scrollback and with no prior scroll, still has to reveal the bar.
+#
+# A fresh tab gives that pane. Its session id is minted inside the client
+# rather than by this harness, so typed keystrokes (never a mouse event, but
+# also not `scribe-test send`) fill it — unlike phase 7, this phase is not
+# proving the injection channel, only that ordinary hover still works.
+focus
+TABS_BEFORE=$(count_log "opened a new tab")
+send_keys ctrl+shift+t
+if ! wait_for_log_growth "opened a new tab" "$TABS_BEFORE" 20; then
+    fail "PHASE 9 FAIL: Ctrl+Shift+T never opened the control tab"
+fi
+sleep 1
+# shellcheck disable=SC2016 # single-quoted: this is typed into the remote
+# shell verbatim and must expand there, not in this script.
+xdotool type --clearmodifiers --delay 20 \
+    'i=1; while [ $i -le 60 ]; do echo "hst-$i"; i=$((i+1)); done'
+xdotool key --clearmodifiers Return
+sleep 1.5
+
+xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 0.5
+capture /output/sb-09-move-in.png
+strip /output/sb-09-move-in.png /output/sb-09-move-in-strip.png
+MOVE_DIFF=$(strip_diff /output/sb-01-strip.png /output/sb-09-move-in-strip.png)
+if [ "${MOVE_DIFF:-0}" -lt "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 9 FAIL: moving into the hit zone with no prior scroll revealed only ${MOVE_DIFF}px"
+fi
+echo "PHASE 9 PASS: moving into the hit zone alone revealed the bar (${MOVE_DIFF}px)"
+xdotool mousemove $(( WIN_X + WIN_W / 4 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 2.5
+
+# ── Phase 10: control — a split pane reveals at each of its edges ─
+# Splitting moves the hit zone under a pointer that never moves — the same
+# family of stale geometry as a resize or a pane close — so both edges of a
+# fresh split must still reveal on ordinary hover. `split_focused_pane` keeps
+# the existing session as the first (left) child and mints a new, blank one
+# as the second (right) child, so only the right pane needs filler.
+BASE_SPLIT=$(count_log "split the focused pane")
+send_keys ctrl+shift+backslash
+if ! wait_for_log_growth "split the focused pane" "$BASE_SPLIT" 15; then
+    fail "PHASE 10 FAIL: ctrl+shift+backslash never split the pane"
+fi
+sleep 1
+# shellcheck disable=SC2016 # single-quoted: this is typed into the remote
+# shell verbatim and must expand there, not in this script.
+xdotool type --clearmodifiers --delay 20 \
+    'i=1; while [ $i -le 10 ]; do echo "sp-$i"; i=$((i+1)); done'
+xdotool key --clearmodifiers Return
+sleep 1.5
+
+xdotool mousemove $(( WIN_X + WIN_W / 4 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 2.5
+capture /output/sb-10-rested.png
+strip_left /output/sb-10-rested.png /output/sb-10-rested-left-strip.png
+
+xdotool mousemove $(( WIN_X + WIN_W / 2 - 6 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 0.5
+capture /output/sb-10-left.png
+strip_left /output/sb-10-left.png /output/sb-10-left-strip.png
+LEFT_DIFF=$(strip_diff /output/sb-10-rested-left-strip.png /output/sb-10-left-strip.png)
+if [ "${LEFT_DIFF:-0}" -lt "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 10 FAIL: the split's left pane inner edge revealed only ${LEFT_DIFF}px"
+fi
+
+xdotool mousemove $(( WIN_X + WIN_W / 4 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 2.5
+capture /output/sb-10-rested2.png
+strip /output/sb-10-rested2.png /output/sb-10-rested2-strip.png
+
+xdotool mousemove $(( WIN_X + WIN_W - 6 )) $(( WIN_Y + WIN_H / 2 ))
+sleep 0.5
+capture /output/sb-10-right.png
+strip /output/sb-10-right.png /output/sb-10-right-strip.png
+RIGHT_DIFF=$(strip_diff /output/sb-10-rested2-strip.png /output/sb-10-right-strip.png)
+if [ "${RIGHT_DIFF:-0}" -lt "$THUMB_DIFF_MIN" ]; then
+    fail "PHASE 10 FAIL: the split's right pane outer edge revealed only ${RIGHT_DIFF}px"
+fi
+echo "PHASE 10 PASS: the split revealed at the left pane's inner edge (${LEFT_DIFF}px) and the right pane's outer edge (${RIGHT_DIFF}px)"
+
 echo ""
 echo "PASS: visual scrollbar test"
 echo "  Inspect screenshots in test-output/:"
-echo "    sb-00-attached.png     — the shared pane on attach"
-echo "    sb-01-rested.png       — the rested strip, with the overlay faded out"
-echo "    sb-01-empty-wheel.png  — New Tab wheel input before real scrollback"
-echo "    sb-03-thumb.png        — the thumb and command ticks on screen"
-echo "    sb-05-after-trim.png   — the ticks after a server scrollback trim"
-echo "    sb-06-faded.png        — the overlay faded back out"
+echo "    sb-00-attached.png       — the shared pane on attach"
+echo "    sb-01-rested.png         — the rested strip, with the overlay faded out"
+echo "    sb-01-empty-wheel.png    — New Tab wheel input before real scrollback"
+echo "    sb-03-thumb.png          — the thumb and command ticks on screen"
+echo "    sb-05-after-trim.png     — the ticks after a server scrollback trim"
+echo "    sb-06-faded.png          — the overlay faded back out"
+echo "    sb-07-parked-filled.png  — STALE-FALSE: scrollback revealed the bar under a parked pointer"
+echo "    sb-08-after-exit.png     — STALE-TRUE: the bar faded after the pointer left through the hit zone"
+echo "    sb-09-move-in.png        — control: ordinary hover still reveals with no prior scroll"
+echo "    sb-10-left.png           — control: a split's left pane reveals at its inner edge"
+echo "    sb-10-right.png          — control: a split's right pane reveals at its outer edge"

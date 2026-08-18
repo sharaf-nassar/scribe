@@ -22,10 +22,10 @@ use std::{
 
 use gpui::{
     App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId, Entity, FocusHandle,
-    Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription, Task,
-    TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowOptions, canvas, div, prelude::*, px, relative, size,
+    Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription,
+    Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -1490,6 +1490,14 @@ struct PointerState {
     prompt_hover: Option<(SessionId, prompt_bar::PromptBarHover)>,
     /// Scrolled pane whose painted jump control currently owns hover.
     jump_hover: Option<SessionId>,
+    /// The last position `move_over_grid` saw, cleared on `MouseExitEvent`.
+    ///
+    /// This is the level condition [`TerminalView::update_scrollbar_hover`]
+    /// samples from the idle tick: `None` means the pointer is outside every
+    /// hit zone (including "outside the window"), so a re-run against it
+    /// clears hover even when the pointer left through a hit zone and no
+    /// further motion ever fires.
+    last_position: Option<Point<Pixels>>,
 }
 
 impl ClipboardSurfaces {
@@ -1511,6 +1519,7 @@ impl Default for PointerState {
             report_cell: None,
             prompt_hover: None,
             jump_hover: None,
+            last_position: None,
         }
     }
 }
@@ -7218,6 +7227,19 @@ impl TerminalView {
     /// what makes the thumb grabbable, and a press on it would have been
     /// claimed by the scrollbar anyway — before the motion falls through to
     /// mouse reporting and then to extending a selection.
+    /// Forgets where the pointer was once it leaves the grid band, which is
+    /// what the platform window exit looks like from here. The level-triggered
+    /// hover sweep reads `last_position`, so a cleared one is how every pane
+    /// learns the pointer is nowhere and re-arms its fade.
+    fn forget_pointer_position(
+        &mut self,
+        _event: &MouseExitEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.pointer.last_position = None;
+    }
+
     fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if matches!(self.pointer.drag, GridDrag::JumpButton(_)) {
             return;
@@ -7228,7 +7250,8 @@ impl TerminalView {
         {
             return;
         }
-        self.update_scrollbar_hover(event.position, cx);
+        self.pointer.last_position = Some(event.position);
+        self.update_scrollbar_hover(self.pointer.last_position, cx);
         self.update_jump_hover(event.position, cx);
         if let Some(session_id) = hover_focus_target(
             self.config.config().config.terminal.focus.focus_follows_mouse,
@@ -7369,10 +7392,17 @@ impl TerminalView {
         animating
     }
 
-    /// Idle-tick hook: advance the fades and repaint while any is still on
-    /// screen. Returning early when nothing is animating keeps a rested window
-    /// from repainting sixty times a second.
+    /// Idle-tick hook: re-run the hover pass, advance the fades, and repaint
+    /// while any is still on screen. Returning early when nothing is
+    /// animating keeps a rested window from repainting sixty times a second.
+    ///
+    /// Hover is re-evaluated here, ahead of the fade tick, because it is a
+    /// level condition over `metrics.history_size`, the pane's painted rect,
+    /// and `scrollbars.panes` membership — all three can change with the
+    /// pointer still, and this is the same 16 ms wake already visiting every
+    /// scrollbar state, so re-testing it here adds no new timer.
     fn poll_scrollbar_fades(&mut self, cx: &mut Context<Self>) {
+        self.update_scrollbar_hover(self.pointer.last_position, cx);
         if self.tick_scrollbar_fades() {
             cx.notify();
         }
@@ -7421,20 +7451,30 @@ impl TerminalView {
     /// the pointer is over — a bar that fades in on an unfocused pane and then
     /// refuses to widen under the pointer is a control that lies. Sweeping all
     /// of them is also what clears the hover the pointer just left.
-    fn update_scrollbar_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let hovered = self.pane_at(position);
+    ///
+    /// `position` is `None` when the pointer has left the platform window (or
+    /// no motion has ever been seen), which forces `inside` false for every
+    /// pane instead of hit-testing a stale in-window position. Called both from
+    /// `move_over_grid`, edge-triggered on motion, and from
+    /// [`Self::poll_scrollbar_fades`], level-triggered off the idle tick — the
+    /// hit test is a level condition over live metrics and pane rects, not just
+    /// the pointer, so it has to be re-run on a clock as well as on motion.
+    fn update_scrollbar_hover(&mut self, position: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let hovered = position.and_then(|position| self.pane_at(position));
         let mut changed = false;
         for (session_id, state) in &self.scrollbars.panes {
             let width = state.borrow().current_width(self.scrollbars.style.width);
             let inside = hovered == Some(*session_id)
-                && self.scrollbar_layout(*session_id).is_some_and(|layout| {
-                    hit_test_scrollbar(
-                        &layout,
-                        f32::from(position.x),
-                        f32::from(position.y),
-                        width.max(self.scrollbars.style.width),
-                    )
-                });
+                && position.zip(self.scrollbar_layout(*session_id)).is_some_and(
+                    |(position, layout)| {
+                        hit_test_scrollbar(
+                            &layout,
+                            f32::from(position.x),
+                            f32::from(position.y),
+                            width.max(self.scrollbars.style.width),
+                        )
+                    },
+                );
             let mut state = state.borrow_mut();
             if inside == state.hover {
                 continue;
@@ -9337,6 +9377,7 @@ impl TerminalView {
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _window, ctx| {
                 view.move_over_grid(event, ctx);
             }))
+            .on_mouse_exit(cx.listener(Self::forget_pointer_position))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseUpEvent, _window, ctx| {
