@@ -681,6 +681,81 @@ mod tests {
         assert_eq!(provider, AiProvider::CodexCode);
         assert_eq!(label, "Ship a thing");
     }
+
+    // Pi is a third generic provider with no dedicated match arm anywhere in
+    // `translate` — these pin that the dispatcher, the caps, and the
+    // machine-injected filter never special-cased Claude/Codex and silently
+    // excluded the newest provider.
+
+    #[test]
+    fn translate_state_changed_yields_ai_state_changed_for_pi() {
+        let event =
+            HookEventKind::StateChanged { state: AiState::Processing, conversation_id: None };
+        let Some(MetadataEvent::AiStateChanged(ai_state)) = translate(AiProvider::Pi, event) else {
+            panic!("expected AiStateChanged");
+        };
+        assert_eq!(ai_state.state, AiState::Processing);
+        assert_eq!(ai_state.provider, AiProvider::Pi);
+    }
+
+    #[test]
+    fn translate_session_stopped_classifies_pi_like_any_other_provider() {
+        let event = HookEventKind::SessionStopped {
+            last_message: "Want me to proceed?".to_owned(),
+            conversation_id: None,
+        };
+        let Some(MetadataEvent::AiStateChanged(ai_state)) = translate(AiProvider::Pi, event) else {
+            panic!("expected AiStateChanged");
+        };
+        assert_eq!(ai_state.state, AiState::WaitingForInput);
+        assert_eq!(ai_state.provider, AiProvider::Pi);
+    }
+
+    #[test]
+    fn translate_prompt_received_drops_machine_injected_for_pi() {
+        let injected = HookEventKind::PromptReceived {
+            text: "<system-reminder>\nignore me\n</system-reminder>".to_owned(),
+            conversation_id: None,
+        };
+        assert!(translate(AiProvider::Pi, injected).is_none());
+
+        let typed = HookEventKind::PromptReceived {
+            text: "  fix the flaky test  ".to_owned(),
+            conversation_id: None,
+        };
+        let Some(MetadataEvent::PromptReceived { text, provider }) =
+            translate(AiProvider::Pi, typed)
+        else {
+            panic!("expected PromptReceived");
+        };
+        assert_eq!(text, "fix the flaky test");
+        assert_eq!(provider, AiProvider::Pi);
+    }
+
+    #[test]
+    fn translate_task_label_changed_truncates_oversize_for_pi() {
+        let oversize_label = "L".repeat(TASK_LABEL_CAP_BYTES + 50);
+        let event = HookEventKind::TaskLabelChanged { label: oversize_label };
+        let Some(MetadataEvent::TaskLabelChanged { label, provider }) =
+            translate(AiProvider::Pi, event)
+        else {
+            panic!("expected TaskLabelChanged");
+        };
+        assert_eq!(label.chars().count(), TASK_LABEL_CAP_BYTES);
+        assert_eq!(provider, AiProvider::Pi);
+    }
+
+    #[test]
+    fn translate_context_changed_clamps_for_pi() {
+        let event = HookEventKind::ContextChanged { fill_percent: 150 };
+        let Some(MetadataEvent::AiContextChanged { provider, context }) =
+            translate(AiProvider::Pi, event)
+        else {
+            panic!("expected AiContextChanged");
+        };
+        assert_eq!(context, 100);
+        assert_eq!(provider, AiProvider::Pi);
+    }
 }
 
 /// Targeted tests for the [`handle_env_changed`] free function — the

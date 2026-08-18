@@ -15321,6 +15321,27 @@ mod tests {
     }
 
     #[test]
+    fn tab_context_suffix_applies_the_same_thresholds_to_pi() {
+        let mut tracker = AiStateTracker::default();
+        let session_id = SessionId::new();
+        let thresholds = AiContextThresholds::default();
+        tracker.update(
+            session_id,
+            scribe_common::ai_state::AiProcessState {
+                context: Some(95),
+                ..scribe_common::ai_state::AiProcessState::new_with_provider(
+                    AiProvider::Pi,
+                    AiState::Processing,
+                )
+            },
+        );
+        let suffix = tab_context_suffix_for(&tracker, session_id, &thresholds)
+            .expect("a Pi context percentage must produce a tab suffix like any other provider");
+        assert_eq!(suffix.text, " 95%");
+        assert_eq!(suffix.color, scribe_client::tab_bar::CONTEXT_DANGER_COLOR);
+    }
+
+    #[test]
     fn restore_prompts_never_overwrites_a_live_prompt() {
         let mut ai = AiChrome::new(scribe_common::config::AiStateStylesConfig::default());
         let session = SessionId::new();

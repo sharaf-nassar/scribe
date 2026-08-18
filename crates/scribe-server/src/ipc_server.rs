@@ -12917,6 +12917,57 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn old_client_output_drops_pi_task_label_and_prompt_events() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let session_id = SessionId::new();
+
+        for msg in [
+            ServerMessage::TaskLabelChanged {
+                session_id,
+                provider: AiProvider::Pi,
+                task_label: "Pi task".to_owned(),
+            },
+            ServerMessage::TaskLabelCleared { session_id, provider: AiProvider::Pi },
+            ServerMessage::PromptReceived {
+                session_id,
+                provider: AiProvider::Pi,
+                text: "fix the bug".to_owned(),
+            },
+        ] {
+            send_message(&writer, &msg).await;
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut client_read),
+            )
+            .await
+            .is_err(),
+            "an old client must not receive Pi task-label or prompt events"
+        );
+
+        writer.lock().await.queue().set_pi_provider_capability(true);
+        send_message(
+            &writer,
+            &ServerMessage::TaskLabelChanged {
+                session_id,
+                provider: AiProvider::Pi,
+                task_label: "Pi task".to_owned(),
+            },
+        )
+        .await;
+        let supported: ServerMessage =
+            read_message(&mut client_read).await.expect("structured Pi frame");
+        assert!(matches!(
+            supported,
+            ServerMessage::TaskLabelChanged { provider: AiProvider::Pi, .. }
+        ));
+    }
+
     // @lat: [[protocol#Server Messages#Launch identity is local-only]]
     #[tokio::test]
     async fn create_session_requires_the_current_window_owner() {
@@ -14230,6 +14281,24 @@ mod tests {
     }
 
     #[test]
+    fn ai_scrollback_preservation_covers_pi() {
+        let pi = AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing);
+        let events = [MetadataEvent::AiStateChanged(pi.clone())];
+
+        assert!(ai_state_uses_ed3_filter(Some(&pi)));
+        assert!(chunk_mentions_ed3_provider(&events));
+        assert!(should_apply_ed3_filter(None, chunk_mentions_ed3_provider(&events)));
+    }
+
+    #[test]
+    fn pi_never_triggers_the_claude_picker_filter() {
+        assert!(ai_provider_uses_claude_picker_filter(Some(AiProvider::ClaudeCode)));
+        assert!(!ai_provider_uses_claude_picker_filter(Some(AiProvider::CodexCode)));
+        assert!(!ai_provider_uses_claude_picker_filter(Some(AiProvider::Pi)));
+        assert!(!ai_provider_uses_claude_picker_filter(None));
+    }
+
+    #[test]
     fn codex_task_label_metadata_preserves_legacy_wire_variant() {
         let session_id = SessionId::new();
         let Some((changed_message, changed_cwd)) = convert_metadata_event(
@@ -14260,6 +14329,44 @@ mod tests {
         assert!(matches!(
             cleared_message,
             ServerMessage::CodexTaskLabelCleared { session_id: sid } if sid == session_id
+        ));
+    }
+
+    #[test]
+    fn pi_task_label_uses_the_generic_wire_variant_not_codex_legacy() {
+        let session_id = SessionId::new();
+        let Some((changed_message, changed_cwd)) = convert_metadata_event(
+            MetadataEvent::TaskLabelChanged {
+                provider: AiProvider::Pi,
+                label: String::from("fix the flaky test"),
+            },
+            session_id,
+        ) else {
+            panic!("convert_metadata_event returned None for TaskLabelChanged");
+        };
+
+        assert!(changed_cwd.is_none());
+        assert!(matches!(
+            changed_message,
+            ServerMessage::TaskLabelChanged {
+                session_id: sid,
+                provider: AiProvider::Pi,
+                task_label,
+            } if sid == session_id && task_label == "fix the flaky test"
+        ));
+
+        let Some((cleared_message, cleared_cwd)) = convert_metadata_event(
+            MetadataEvent::TaskLabelCleared { provider: AiProvider::Pi },
+            session_id,
+        ) else {
+            panic!("convert_metadata_event returned None for TaskLabelCleared");
+        };
+
+        assert!(cleared_cwd.is_none());
+        assert!(matches!(
+            cleared_message,
+            ServerMessage::TaskLabelCleared { session_id: sid, provider: AiProvider::Pi }
+                if sid == session_id
         ));
     }
 

@@ -620,6 +620,50 @@ mod tests {
         assert!(!tracker.has_claude_session(session_id));
     }
 
+    // @lat: [[client#GPUI AI Indicator#Provider toggle gates the indicator]]
+    #[gpui::test]
+    fn pi_indicator_respects_provider_toggle() {
+        let mut tracker = AiStateTracker::default();
+        let session_id = SessionId::new();
+        let terminal = TerminalConfig {
+            ai_integration: scribe_common::config::TerminalAiIntegrationConfig {
+                pi: scribe_common::config::AiIntegrationToggle::new(false),
+                ..scribe_common::config::TerminalAiIntegrationConfig::default()
+            },
+            ..TerminalConfig::default()
+        };
+        tracker.update(
+            session_id,
+            AiProcessState::new_with_provider(AiProvider::Pi, AiState::Processing),
+        );
+        assert_eq!(tracker.tab_indicator_color(session_id, &ANSI_COLORS, &terminal), None);
+    }
+
+    // @lat: [[client#GPUI AI Indicator#Provider toggle gates the indicator]]
+    #[gpui::test]
+    fn disabling_pi_integration_leaves_claude_and_codex_indicators_on() {
+        let mut tracker = AiStateTracker::default();
+        let claude = SessionId::new();
+        let codex = SessionId::new();
+        let terminal = TerminalConfig {
+            ai_integration: scribe_common::config::TerminalAiIntegrationConfig {
+                pi: scribe_common::config::AiIntegrationToggle::new(false),
+                ..scribe_common::config::TerminalAiIntegrationConfig::default()
+            },
+            ..TerminalConfig::default()
+        };
+        tracker.update(
+            claude,
+            AiProcessState::new_with_provider(AiProvider::ClaudeCode, AiState::Processing),
+        );
+        tracker.update(
+            codex,
+            AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
+        );
+        assert!(tracker.tab_indicator_color(claude, &ANSI_COLORS, &terminal).is_some());
+        assert!(tracker.tab_indicator_color(codex, &ANSI_COLORS, &terminal).is_some());
+    }
+
     // --- Pulse envelope (Layer 1) + stale clear (Layer 2) ------------------
 
     // @lat: [[client#GPUI AI Indicator#Processing pulse rests after idle window]]
