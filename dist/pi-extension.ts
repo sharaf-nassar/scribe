@@ -16,7 +16,8 @@ type EventName =
   | "prompt_received"
   | "task_label_changed"
   | "task_label_cleared"
-  | "context_changed";
+  | "context_changed"
+  | "issue_focused";
 
 type Payload = Record<string, string | number>;
 type QueuedEvent = { event: EventName; payload: Payload; generation: number };
@@ -33,6 +34,48 @@ function taskLabel(prompt: string): string {
     return Array.from(normalized).slice(0, TASK_LABEL_LIMIT).join("");
   }
   return "";
+}
+
+// Shell separators that end one simple command. Splitting on these keeps a
+// claim buried in a chain (`cd x && bd update id --claim`) observable without
+// pulling in a real shell parser.
+const COMMAND_SEPARATORS = /\r?\n|;|&&|\|\||[|&]/;
+
+// Tracker ids are lowercase, hyphenated, with an optional dotted child suffix:
+// `scribe-lpi2`, `scribe-lpi2.13`, `bd-42`. Anchored, so a generated assignee
+// slug like `codex-implement-ready-run-20260818T085731.REeEi4` cannot match.
+const ISSUE_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:\.\d+)*$/;
+
+/**
+ * Extract the issue id from a bash command that claims a Beads issue, or
+ * `undefined` when the command claims nothing.
+ *
+ * Conservative by design: a false positive pins a halo to the wrong issue,
+ * which is worse than showing none at all, so every condition must hold — the
+ * segment's command word is `bd`, `--claim` is present as its own token, and
+ * the id is a positional rather than some flag's value.
+ */
+function claimedIssueId(command: string): string | undefined {
+  for (const segment of command.split(COMMAND_SEPARATORS)) {
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    // Skip leading `VAR=value` prefixes so `BD_NO_DAEMON=1 bd …` still counts.
+    let start = 0;
+    while (tokens[start] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[start])) start += 1;
+    const argv0 = tokens[start];
+    if (!argv0 || (argv0 !== "bd" && !argv0.endsWith("/bd"))) continue;
+    const args = tokens.slice(start + 1);
+    if (!args.includes("--claim")) continue;
+    for (let index = 0; index < args.length; index += 1) {
+      const token = args[index];
+      if (token.startsWith("-")) continue;
+      // A bare value belonging to a preceding `--flag value` pair is not a
+      // positional id (`--actor someone` must never be read as one).
+      const previous = args[index - 1];
+      if (previous?.startsWith("-") && !previous.includes("=")) continue;
+      if (ISSUE_ID.test(token)) return token;
+    }
+  }
+  return undefined;
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -184,6 +227,21 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     else enqueue("session_stopped", { last_message: latestAssistant });
     const percent = contextPercent(ctx);
     if (percent !== undefined) enqueue("context_changed", { fill_percent: percent });
+  });
+
+  // The exact issue-to-session join behind Flow's live-agent halo: the id
+  // comes from the observed claim and the session from SCRIBE_SESSION_ID in
+  // this process's own environment, so nothing has to guess whether a
+  // generated assignee string names the agent running in this pane.
+  //
+  // Observation only — the handler never blocks and never mutates
+  // `event.input`, so a claim that Scribe cannot report still runs normally.
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return;
+    const command = (event.input as { command?: unknown })?.command;
+    if (typeof command !== "string" || !command) return;
+    const issueId = claimedIssueId(command);
+    if (issueId) enqueue("issue_focused", { issue_id: issueId });
   });
 
   pi.on("session_shutdown", () => {

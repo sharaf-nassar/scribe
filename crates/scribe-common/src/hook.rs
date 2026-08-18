@@ -31,6 +31,15 @@ pub const TASK_LABEL_CAP_BYTES: usize = 256;
 /// fields don't share a misleading limit.
 pub const CONVERSATION_ID_CAP_BYTES: usize = 256;
 
+/// Cap on `IssueFocused::issue_id`. Matches the Beads board's own
+/// `MAX_ID_CHARS`, so an id the board could never display cannot enter the
+/// liveness registry either.
+///
+/// Unlike the text caps above, an oversize value here is **dropped rather than
+/// truncated**: an issue id is an identity, and a truncated one either matches
+/// nothing or — worse — matches a different issue.
+pub const ISSUE_ID_CAP_BYTES: usize = 128;
+
 /// One hook event delivered over the channel.
 ///
 /// Carries the routing key (`session_id`), the producing AI tool
@@ -97,6 +106,23 @@ pub enum HookEventKind {
 
     /// Context-window fill percentage. Server clamps to 0..=100.
     ContextChanged { fill_percent: u8 },
+
+    /// Adapter observed this session start work on a specific tracker issue —
+    /// for Pi, a `bd … --claim` seen through its `tool_call` hook.
+    ///
+    /// Deliberately provider-neutral: it carries the issue id and nothing else,
+    /// so a Claude Code or Codex adapter can report the same relationship with
+    /// no transport change. The server binds it to the sending session, which
+    /// makes liveness an exact join rather than a guess at whether a generated
+    /// assignee string names the agent running in this pane.
+    ///
+    /// There is no clearing variant. The binding already dies with the session
+    /// via `StateCleared`, session exit, and disconnect, so an adapter that
+    /// only ever sets it cannot leak a stale halo.
+    IssueFocused {
+        /// Dropped server-side when longer than `ISSUE_ID_CAP_BYTES`.
+        issue_id: String,
+    },
 
     /// Exported environment variables changed in the shell since its previous
     /// emit (or, when `baseline_ready` is set, the post-rc snapshot the server

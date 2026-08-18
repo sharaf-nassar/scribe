@@ -1618,7 +1618,7 @@ allowed to depend on it.
 
 Two assertions run across every event the whole run produced, not per case: the
 argv is always exactly `--provider=pi`, a lowercase `--event=` drawn from the
-seven known names, and `--payload-stdin` with parseable JSON behind it; and no
+eight known names, and `--payload-stdin` with parseable JSON behind it; and no
 payload ever carries `permission_prompt`, the state Pi cannot observe.
 
 ### Startup and duplicate guard
@@ -1652,7 +1652,24 @@ without throwing and without emitting; the settle that follows still reports,
 with empty text.
 
 The harness also counts `setInterval` calls and requires zero, since a polling
-adapter would keep waking a machine that is doing nothing.
+adapter would keep waking a machine that is doing nothing. It pins exactly one
+`tool_call` handler, the issue-focus observer below — the adapter must never
+turn a tool call into a permission event.
+
+### Issue focus from a claim
+
+A `bd … --claim` seen through `tool_call` emits one
+[[server#Server#Hook Channel#Focused issue events|`issue_focused`]] event
+carrying just the claimed id, and the handler returns `undefined` with
+`event.input` unchanged — observation must not block or rewrite the tool.
+
+The recognised forms cover a chained command with an env prefix and an absolute
+helper path, and a global flag before the verb. The rejected set is the load
+bearing half, because a false positive halos the wrong issue: a `bd` command
+without `--claim`, the same claim quoted inside a `git commit -m`, a bare
+`echo --claim`, a `bdx` lookalike, an empty and a non-string command, an absent
+command, and the identical claim under a non-`bash` tool. It also pins that an
+`--actor codex-implement-ready-run-…` value is never mistaken for the id.
 
 ### Callbacks do not await the helper
 

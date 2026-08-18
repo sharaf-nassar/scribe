@@ -759,6 +759,22 @@ ingress, the stop classifier, and the schema are untouched.
 The full lifecycle, queue, shutdown, and silent-failure oracle is
 [[test#Test Harness#Pi Extension Harness]].
 
+It is also the only adapter that reports issue focus. Its `tool_call` handler
+reads `event.toolName === "bash"` and inspects `event.input.command` for a
+`bd … --claim`, emitting [[server#Server#Hook Channel#Focused issue events]]
+with the claimed id. Because the extension already knows `SCRIBE_SESSION_ID`
+from its own environment, issue and session come from the same observation —
+an exact join, not a guess at whether a generated assignee slug names the agent
+in this pane.
+
+Command matching is deliberately conservative, because a false positive pins
+the halo to the wrong issue and that is worse than showing none: the segment's
+command word must be `bd` (or end `/bd`), `--claim` must appear as its own
+token, and the id must be a positional matching an anchored tracker-id pattern
+rather than some flag's value. The handler is pure observation — it never
+blocks the tool and never mutates `event.input`, so a claim Scribe cannot
+report still runs normally.
+
 [[dist/pi-extension.ts#scribePiExtension]] is the Scribe-owned adapter Pi loads
 from its user-scope extension directory. It shells out to
 `scribe-hook-helper --provider=pi --event=<name> --payload-stdin` and puts every
@@ -867,6 +883,16 @@ The pattern mirrors `CheckForUpdates` / `ListReleases` at `ipc_server.rs` `estab
 
 `HookEventKind::EnvChanged` events take a separate path: they have no `MetadataEvent` representation and instead route to , which folds them into the server-owned  registry. `baseline_ready: true` records a ; `baseline_ready: false` builds an , folds it via , and (if the session has an `env_envelope_id`) arms the 100 ms persist debounce via . The entire path is gated on `terminal.env_persistence.enabled` — when off, the event is dropped with a debug log before any state mutation. A session that arrives without an `env_envelope_id` has one minted in place by [[crates/scribe-server/src/hook_ingress.rs#bootstrap_envelope_id|bootstrap_envelope_id]] on its first foldable delta, so persistence starts without waiting for a restart; see [[server#Server#Env Persistence#Envelope Id Minting|Envelope Id Minting]].
 
+### Focused issue events
+
+`HookEventKind::IssueFocused { issue_id }` binds a live agent to the exact tracker issue it is working on, feeding the Beads Flow live-agent halo.
+
+It routes like `EnvChanged` rather than through `translate`: there is no `MetadataEvent` for it, so [[crates/scribe-server/src/hook_ingress.rs#handle|handle]] short-circuits and calls [[crates/scribe-server/src/ipc_server.rs#set_focused_issue|set_focused_issue]], the seam the focused-issue registry already owns. That seam keeps the unknown-session drop, the no-change short-circuit, and the local-owner delivery gate in one place, so ingress adds no second registry.
+
+The id is validated by [[crates/scribe-server/src/hook_ingress.rs#accepted_issue_id|accepted_issue_id]] and **dropped, never truncated**, when blank or longer than `ISSUE_ID_CAP_BYTES` (128, matching the board's own `MAX_ID_CHARS`). Every other capped field on this channel is truncated because a clipped prompt or label still says something true; an identity does not survive that treatment, since a clipped id either matches no issue or silently names a different one.
+
+There is no clearing variant. The binding already dies with the session through `StateCleared`, session exit, and disconnect, so an adapter that only ever sets it cannot strand a stale halo. That is what keeps the event provider-neutral: an adapter reports *what it observed*, never lifecycle bookkeeping.
+
 The synthetic `AiProvider::System` variant in  is the provider id for non-AI hook events. The helper accepts `--provider=system` (via ) so env-delta events can flow through the same wire format as AI hooks. `System` is intentionally absent from  so UI surfaces that list AI providers (pickers, new-tab launchers, integration settings) never display it.
 
 ### Stop Classifier
@@ -877,9 +903,9 @@ One provider-independent Rust function (with inline `#[cfg(test)]` rule tests) r
 
 ### Schema
 
-`HookEvent { session_id, provider, kind }` with eight `kind` variants on the wire.
+`HookEvent { session_id, provider, kind }` with nine `kind` variants on the wire.
 
-`StateChanged`, `SessionStopped` (server-classified), `StateCleared`, `PromptReceived`, `TaskLabelChanged`, `TaskLabelCleared`, `ContextChanged`, `EnvChanged`. Server-side caps: prompt and task-label 256 chars, last-message 16 KiB. `EnvChanged` is the env-delta variant added by feature 006: `added` / `removed` are filtered through the  and the `baseline_ready: true` flag flips capture into baseline-record mode (see the `EnvStoreState` section below). See  and `specs/003-ai-hook-channel/data-model.md`.
+`StateChanged`, `SessionStopped` (server-classified), `StateCleared`, `PromptReceived`, `TaskLabelChanged`, `TaskLabelCleared`, `ContextChanged`, `EnvChanged`, `IssueFocused`. Server-side caps: prompt and task-label 256 chars, last-message 16 KiB. `EnvChanged` is the env-delta variant added by feature 006: `added` / `removed` are filtered through the  and the `baseline_ready: true` flag flips capture into baseline-record mode (see the `EnvStoreState` section below). See  and `specs/003-ai-hook-channel/data-model.md`.
 
 ### Adding a Provider
 

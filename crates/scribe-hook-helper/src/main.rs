@@ -125,6 +125,7 @@ struct Payload {
     added: Option<BTreeMap<String, String>>,
     removed: Option<Vec<String>>,
     baseline_ready: Option<bool>,
+    issue_id: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -143,6 +144,11 @@ enum EventKind {
     /// `--removed-json` carry the delta; `--baseline-ready` flips the
     /// server into post-rc baseline-capture mode.
     EnvDelta,
+    /// Adapter observed this session claim a tracker issue. The id arrives
+    /// only on stdin (`{"issue_id": "…"}`): there is no argv fallback,
+    /// because this selector postdates the argv transport and adding one
+    /// would leak the id into world-readable `/proc/<pid>/cmdline`.
+    IssueFocused,
 }
 
 fn main() {
@@ -294,6 +300,13 @@ fn build_kind(cli: &Cli, payload: &Payload) -> Result<HookEventKind, ()> {
             let pct: u8 = u8::try_from(pct).unwrap_or(100).min(100);
             Ok(HookEventKind::ContextChanged { fill_percent: pct })
         }
+        EventKind::IssueFocused => {
+            let issue_id = payload.issue_id.clone().ok_or(())?;
+            if issue_id.is_empty() {
+                return Err(());
+            }
+            Ok(HookEventKind::IssueFocused { issue_id })
+        }
         EventKind::EnvDelta => {
             let added: Vec<(String, String)> = match payload.added.clone() {
                 Some(map) => map.into_iter().collect(),
@@ -431,6 +444,22 @@ mod tests {
 
     fn parse_payload(json: &str) -> Payload {
         serde_json::from_str(json).expect("payload should parse")
+    }
+
+    // @lat: [[server#Server#Hook Channel#Focused issue events]]
+    #[test]
+    fn build_kind_issue_focused_requires_a_non_empty_stdin_id() {
+        let cli = make_cli(EventKind::IssueFocused);
+        // No argv fallback exists for this selector, so an absent or blank
+        // stdin id is the only way it can arrive and must drop silently.
+        assert!(build_kind(&cli, &Payload::default()).is_err());
+        assert!(build_kind(&cli, &parse_payload(r#"{"issue_id": ""}"#)).is_err());
+
+        let payload = parse_payload(r#"{"issue_id": "scribe-lpi2.13"}"#);
+        match build_kind(&cli, &payload).expect("should build") {
+            HookEventKind::IssueFocused { issue_id } => assert_eq!(issue_id, "scribe-lpi2.13"),
+            _ => panic!("expected IssueFocused"),
+        }
     }
 
     #[test]

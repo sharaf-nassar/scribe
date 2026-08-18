@@ -135,6 +135,7 @@ function assertFixedArgv(entries) {
     "task_label_changed",
     "task_label_cleared",
     "context_changed",
+    "issue_focused",
   ]);
   for (const entry of entries) {
     assert.equal(entry.argv.length, 3, "helper argv must contain fixed selectors only");
@@ -307,12 +308,63 @@ async function testMalformedMessagesAndNoPolling() {
       { event: "session_stopped", payload: { last_message: "" } },
     ]);
     assert.equal(intervalCalls, 0, "extension must not poll");
-    assert.equal(api.count("tool_call"), 0, "tool calls must not become permission events");
+    assert.equal(api.count("tool_call"), 1, "tool calls feed issue focus only");
     await shutdown(api);
     return starts(logPath);
   } finally {
     globalThis.setInterval = realSetInterval;
   }
+}
+
+// @lat: [[test#Test Harness#Pi Extension Harness#Issue focus from a claim]]
+async function testIssueFocusedFromBdClaim() {
+  const logPath = join(tempDir, "issue-focused.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  extensionFactory(api);
+  const toolCall = api.handler("tool_call");
+
+  const call = (input, toolName = "bash") =>
+    toolCall({ type: "tool_call", toolCallId: "t1", toolName, input }, makeContext());
+
+  // Observation must never block the tool or rewrite its arguments.
+  const input = { command: "bd update scribe-lpi2.13 --claim" };
+  assert.equal(call(input), undefined, "tool_call must not block or defer");
+  assert.deepEqual(input, { command: "bd update scribe-lpi2.13 --claim" });
+  await waitFor(async () => (await starts(logPath)).length >= 1, "claim did not emit");
+  assert.deepEqual(parsedCalls(await starts(logPath)), [
+    { event: "issue_focused", payload: { issue_id: "scribe-lpi2.13" } },
+  ]);
+
+  // Forms that must still resolve the id.
+  call({ command: "cd /repo && BD_NO_DAEMON=1 /usr/local/bin/bd update scribe-lpi2.9 --claim" });
+  call({ command: "bd --actor codex-implement-ready-run-20260818T085731.REeEi4 update bd-42 --claim" });
+  await waitFor(async () => (await starts(logPath)).length >= 3, "chained/global-flag claims missing");
+  assert.deepEqual(parsedCalls((await starts(logPath)).slice(1, 3)), [
+    { event: "issue_focused", payload: { issue_id: "scribe-lpi2.9" } },
+    { event: "issue_focused", payload: { issue_id: "bd-42" } },
+  ]);
+
+  // Nothing below is a claim, so none may emit.
+  const before = (await starts(logPath)).length;
+  for (const command of [
+    "bd update scribe-lpi2.13",
+    "bd list --all",
+    "git commit -m 'bd update scribe-lpi2.13 --claim'",
+    "echo --claim",
+    "bdx update scribe-lpi2.13 --claim",
+    "",
+  ]) {
+    call({ command });
+  }
+  call({ command: 123 });
+  call({}, "bash");
+  call({ command: "bd update scribe-lpi2.13 --claim" }, "read");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal((await starts(logPath)).length, before, "non-claim commands must not emit");
+
+  await shutdown(api);
+  return starts(logPath);
 }
 
 // @lat: [[test#Test Harness#Pi Extension Harness#Callbacks do not await the helper]]
@@ -433,6 +485,7 @@ try {
   allStarts.push(...await testInputSourcesAndOrder());
   allStarts.push(...await testRetryAndSettleBehavior());
   allStarts.push(...await testMalformedMessagesAndNoPolling());
+  allStarts.push(...await testIssueFocusedFromBdClaim());
   allStarts.push(...await testCallbacksDoNotAwaitHelper());
   allStarts.push(...await testSerialQueueCap());
   allStarts.push(...await testGenerationCancelledShutdownAndReload());

@@ -16,14 +16,16 @@ use std::time::Instant;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
 use scribe_common::hook::{
-    CONVERSATION_ID_CAP_BYTES, HookEvent, HookEventKind, LAST_MESSAGE_CAP_BYTES,
-    PROMPT_TEXT_CAP_BYTES, TASK_LABEL_CAP_BYTES,
+    CONVERSATION_ID_CAP_BYTES, HookEvent, HookEventKind, ISSUE_ID_CAP_BYTES,
+    LAST_MESSAGE_CAP_BYTES, PROMPT_TEXT_CAP_BYTES, TASK_LABEL_CAP_BYTES,
 };
 use scribe_common::ids::{SessionId, WindowId};
 use scribe_pty::metadata::MetadataEvent;
 
 use crate::env_store::{EnvChangeEvent, EnvStoreState, StartupBaseline};
-use crate::ipc_server::{ClientWriter, IpcServerState, MetadataRuntime, send_metadata_event};
+use crate::ipc_server::{
+    ClientWriter, IpcServerState, MetadataRuntime, send_metadata_event, set_focused_issue,
+};
 use crate::stop_classifier;
 
 /// Handle one inbound `HookEvent` from a hook subprocess.
@@ -56,6 +58,25 @@ pub async fn handle(server: &IpcServerState, event: HookEvent) {
         return;
     }
 
+    // Issue-focus events have no `MetadataEvent` representation either: they
+    // fold into the live-session registry that publishes agent liveness to the
+    // local Flow owner. `set_focused_issue` owns the unknown-session drop, the
+    // no-change short-circuit, and the local-owner delivery gate, so this arm
+    // deliberately adds no second registry of its own.
+    if let HookEventKind::IssueFocused { issue_id } = kind {
+        let Some(issue_id) = accepted_issue_id(&issue_id) else {
+            tracing::debug!(
+                target: "scribe_server::hook_ingress",
+                %session_id, ?provider,
+                "issue_focused carried an unusable issue id — dropped"
+            );
+            return;
+        };
+        set_focused_issue(session_id, Some(issue_id), &server.live_sessions, &server.window_shares)
+            .await;
+        return;
+    }
+
     let Some(client_writer) = lookup_client_writer(server, session_id).await else {
         // `warn!` (not `debug!`) so this is visible at default log level —
         // it's the single most useful diagnostic when a user reports
@@ -84,6 +105,21 @@ pub async fn handle(server: &IpcServerState, event: HookEvent) {
         },
     )
     .await;
+}
+
+/// Accept an issue id from the hook channel, or reject it outright.
+///
+/// Every other capped field on this channel is truncated, because a clipped
+/// prompt or label still says something true. An identity does not survive
+/// that treatment: a truncated id either matches no issue or silently names a
+/// different one, so an oversize value is dropped instead. Empty and
+/// whitespace-only values are dropped for the same reason.
+fn accepted_issue_id(issue_id: &str) -> Option<String> {
+    let trimmed = issue_id.trim();
+    if trimmed.is_empty() || trimmed.len() > ISSUE_ID_CAP_BYTES {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 /// Per-event input collected from [`HookEventKind::EnvChanged`] before we
@@ -385,6 +421,18 @@ fn translate(provider: AiProvider, kind: HookEventKind) -> Option<MetadataEvent>
             );
             None
         }
+
+        // IssueFocused routes to the live-session registry for the same
+        // reason, and reaches `translate` only if that short-circuit is
+        // bypassed. Drop silently rather than panicking the handler.
+        HookEventKind::IssueFocused { .. } => {
+            tracing::debug!(
+                target: "scribe_server::hook_ingress",
+                ?provider,
+                "translate() unexpectedly received IssueFocused; dropping"
+            );
+            None
+        }
     }
 }
 
@@ -444,7 +492,9 @@ fn is_machine_injected(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ai_state, sanitize_conversation_id, translate};
+    use super::{
+        ISSUE_ID_CAP_BYTES, accepted_issue_id, build_ai_state, sanitize_conversation_id, translate,
+    };
     use scribe_common::ai_state::{AiProvider, AiState};
     use scribe_common::hook::{
         CONVERSATION_ID_CAP_BYTES, HookEventKind, LAST_MESSAGE_CAP_BYTES, PROMPT_TEXT_CAP_BYTES,
@@ -502,6 +552,30 @@ mod tests {
             translate(AiProvider::ClaudeCode, event),
             Some(MetadataEvent::AiStateCleared)
         ));
+    }
+
+    // @lat: [[server#Server#Hook Channel#Focused issue events]]
+    #[test]
+    fn accepted_issue_id_trims_and_rejects_empty_or_oversize() {
+        assert_eq!(accepted_issue_id("  scribe-lpi2.13 ").as_deref(), Some("scribe-lpi2.13"));
+        assert_eq!(accepted_issue_id(""), None);
+        assert_eq!(accepted_issue_id("   "), None);
+
+        let at_cap = "a".repeat(ISSUE_ID_CAP_BYTES);
+        assert_eq!(accepted_issue_id(&at_cap), Some(at_cap.clone()));
+
+        // One byte over is dropped, never truncated: a clipped identity would
+        // bind the halo to nothing, or to a different issue entirely.
+        assert_eq!(accepted_issue_id(&"a".repeat(ISSUE_ID_CAP_BYTES + 1)), None);
+    }
+
+    // `IssueFocused` routes to the live-session registry before `translate`,
+    // exactly as `EnvChanged` does; reaching `translate` means the caller
+    // bypassed that short-circuit, and the fail-open contract says drop.
+    #[test]
+    fn translate_issue_focused_is_never_a_metadata_event() {
+        let event = HookEventKind::IssueFocused { issue_id: "scribe-lpi2.13".to_owned() };
+        assert!(translate(AiProvider::Pi, event).is_none());
     }
 
     #[test]
