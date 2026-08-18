@@ -155,7 +155,7 @@ are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (68 variants, 65 reachable)
+## Server messages (68 variants, 66 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
@@ -167,7 +167,7 @@ silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
 `TrustedNetworkList` — are consumed by the settings
 window's synchronous request/reply helper in `settings/server_action.rs`, and
-each of those rows says so. `BeadsIssueDetail`, `BeadsIssueWriteResult`, and `IssueFocused` are the
+each of those rows says so. `BeadsIssueDetail` and `BeadsIssueWriteResult` are the
 remaining unwired replies; their protocol slices land before their panel
 consumers. `tools/check-parity-inventory.sh` enforces that:
 any variant the dispatcher does not handle must either carry a marker cell or
@@ -247,9 +247,9 @@ erase a replacement.
 | `BeadsIssueDetail` | workspace Beads issue detail panel | unit | — (unwired; protocol-only slice, panel wiring pending) | required |
 | `BeadsIssueWriteResult` | workspace Beads issue detail write outcome | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `BeadsEpicGraph` | workspace Beads Flow epic dependency graph reply | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::apply_epic_graph` → `beads_board.rs::flow_strip` | required |
-| `IssueFocused` | local unshared Flow live-agent issue binding | unit | — (unwired; halo rendering pending) | required |
+| `IssueFocused` | local unshared Flow live-agent issue binding | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::set_focused_issue` → `beads_flow.rs::node_dot` | required |
 
-**Reachability:** 65 of 68 rows name a live-path symbol; 3 are unwired and 0
+**Reachability:** 66 of 68 rows name a live-path symbol; 2 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -473,18 +473,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
 | Client messages | 51 | 49 | 2 | 0 |
-| Server messages | 68 | 65 | 3 | 0 |
+| Server messages | 68 | 66 | 2 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **218** | **213** | **5** | **0** |
+| **Total** | **218** | **214** | **4** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **209 rows, of which 204 are
-reachable (98%)** and 5 are not. **1 of those 209** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **209 rows, of which 205 are
+reachable (98%)** and 4 are not. **1 of those 209** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **203 of 209**.
+the in-client figure is **204 of 209**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

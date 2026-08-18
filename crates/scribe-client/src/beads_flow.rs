@@ -829,6 +829,12 @@ pub struct FlowRender<'a> {
     /// `None` is the at-rest Base treatment. A trace supplies node membership
     /// and per-edge classes without rewriting graph geometry.
     pub trace: Option<&'a FlowTrace>,
+    /// Issues an agent session is live on in this window, right now.
+    ///
+    /// Membership alone decides the halo. A node's `assignee` names the agent
+    /// but never implies it is running: bd records who claimed an issue, and
+    /// a claim outlives the process that made it.
+    pub live_issue_ids: &'a HashSet<String>,
 }
 
 /// A boundary failure between an admitted graph, its layout, and GPUI chrome.
@@ -882,6 +888,36 @@ struct FlowNodePresentation {
     cursor: bool,
     /// False only while a trace is active and this node sits off its path.
     on_path: bool,
+    /// Whether an agent session is running on this issue in this window.
+    liveness: FlowLiveness,
+}
+
+/// Whether a machine is on this issue right now, and which one.
+///
+/// One field rather than a flag beside an optional name, because a name
+/// without liveness is not a state this view has: `bd`'s assignee outlives the
+/// process that set it, so a name alone must never reach the halo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlowLiveness {
+    Idle,
+    /// The agent's short name is absent when `bd` recorded no assignee. The
+    /// halo still stands: the missing field is the label, not the evidence.
+    Running {
+        agent: Option<String>,
+    },
+}
+
+impl FlowLiveness {
+    const fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    fn agent(&self) -> Option<&str> {
+        match self {
+            Self::Running { agent } => agent.as_deref(),
+            Self::Idle => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -929,8 +965,13 @@ const FLOW_TRACE_DIM: f32 = 0.24;
 /// sessions stay outside this function. Their state arrives through the
 /// explicit input seams instead of being recreated by the renderer.
 pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
-    let presentation =
-        present_flow(render.graph, render.layout, render.cursor_issue_id, render.trace)?;
+    let presentation = present_flow(
+        render.graph,
+        render.layout,
+        render.cursor_issue_id,
+        render.trace,
+        render.live_issue_ids,
+    )?;
     require_node_controls(&presentation, render.node_controls)?;
     let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.rect.width);
     let board_id = SharedString::from(format!("beads-flow-{}", render.graph.epic_id));
@@ -966,8 +1007,9 @@ fn present_flow(
     layout: &FlowLayout,
     cursor_issue_id: &str,
     trace: Option<&FlowTrace>,
+    live_issue_ids: &HashSet<String>,
 ) -> Result<FlowPresentation, FlowRenderError> {
-    let nodes = presentation_nodes(graph, layout, cursor_issue_id, trace)?;
+    let nodes = presentation_nodes(graph, layout, cursor_issue_id, trace, live_issue_ids)?;
     let rank_labels = rank_labels(&nodes);
     let wires = layout.wire_segments(|edge| {
         trace.map_or(WireClass::Base, |trace| {
@@ -993,6 +1035,7 @@ fn presentation_nodes(
     layout: &FlowLayout,
     cursor_issue_id: &str,
     trace: Option<&FlowTrace>,
+    live_issue_ids: &HashSet<String>,
 ) -> Result<Vec<FlowNodePresentation>, FlowRenderError> {
     let mut seen = HashSet::with_capacity(layout.nodes.len());
     let mut nodes = Vec::with_capacity(layout.nodes.len());
@@ -1007,7 +1050,14 @@ fn presentation_nodes(
                 issue_index: positioned.issue_index,
             });
         }
-        nodes.push(node_presentation(node, positioned, graph, cursor_issue_id, trace));
+        nodes.push(node_presentation(&NodePresentationInput {
+            node,
+            positioned,
+            graph,
+            cursor_issue_id,
+            trace,
+            live_issue_ids,
+        }));
     }
     if nodes.len() != graph.nodes.len() {
         return Err(FlowRenderError::IncompleteLayout {
@@ -1021,18 +1071,30 @@ fn presentation_nodes(
     Ok(nodes)
 }
 
-fn node_presentation(
-    node: &BeadsGraphNode,
-    positioned: &FlowNodeLayout,
-    graph: &BeadsEpicGraph,
-    cursor_issue_id: &str,
-    trace: Option<&FlowTrace>,
-) -> FlowNodePresentation {
+/// The per-node inputs `node_presentation` reads, grouped to keep it inside
+/// the crate's argument budget as the renderer gained its liveness seam.
+struct NodePresentationInput<'a> {
+    node: &'a BeadsGraphNode,
+    positioned: &'a FlowNodeLayout,
+    graph: &'a BeadsEpicGraph,
+    cursor_issue_id: &'a str,
+    trace: Option<&'a FlowTrace>,
+    live_issue_ids: &'a HashSet<String>,
+}
+
+fn node_presentation(input: &NodePresentationInput<'_>) -> FlowNodePresentation {
+    let &NodePresentationInput { node, positioned, graph, cursor_issue_id, trace, live_issue_ids } =
+        input;
     let state = node_state(node.queue);
     // A hovered node takes the cursor treatment on top of its own, so the
     // node the pointer is reading is never the one node without a marker.
     let cursor =
         node.id == cursor_issue_id || trace.is_some_and(|trace| trace.hovered_issue_id == node.id);
+    let liveness = if live_issue_ids.contains(&node.id) {
+        FlowLiveness::Running { agent: agent_name(node.assignee.as_deref()) }
+    } else {
+        FlowLiveness::Idle
+    };
     FlowNodePresentation {
         id: node.id.clone(),
         title: node.title.clone(),
@@ -1046,7 +1108,19 @@ fn node_presentation(
         height: positioned.height,
         cursor,
         on_path: trace.is_none_or(|trace| trace.on_path.contains(&node.id)),
+        liveness,
     }
+}
+
+/// Shorten `bd`'s assignee into the agent name the mock shows.
+///
+/// A run assignee is a generated `codex-implement-ready-run-<stamp>.<id>`,
+/// which cannot fit a 214px node beside a title. The leading segment is the
+/// agent itself, which is the part that answers "who is on this".
+fn agent_name(assignee: Option<&str>) -> Option<String> {
+    let assignee = assignee?.trim();
+    let name = assignee.split('-').next().unwrap_or(assignee).trim();
+    if name.is_empty() { None } else { Some(name.to_owned()) }
 }
 
 const fn node_state(queue: BeadsIssueQueue) -> FlowNodeState {
@@ -1387,7 +1461,7 @@ fn flow_node(
     let mut element = div()
         .id(SharedString::from(format!("beads-flow-node-{}", node.id)))
         .role(Role::Button)
-        .aria_label(format!("{} {}, {}", node.id, node.title, node.state.label()))
+        .aria_label(node_accessible_name(node))
         .aria_description(node.description.clone())
         .track_focus(&control.focus)
         .tab_stop(true)
@@ -1427,6 +1501,18 @@ fn flow_node(
     element.child(flow_node_contents(node, colors, text_scale)).into_any_element()
 }
 
+/// The node's spoken name. Liveness is announced because the halo is not
+/// available to a reader who cannot see it, and it is the one fact on the
+/// node that the state label does not already carry.
+fn node_accessible_name(node: &FlowNodePresentation) -> String {
+    let base = format!("{} {}, {}", node.id, node.title, node.state.label());
+    match &node.liveness {
+        FlowLiveness::Running { agent: Some(agent) } => format!("{base}, {agent} running now"),
+        FlowLiveness::Running { agent: None } => format!("{base}, running now"),
+        FlowLiveness::Idle => base,
+    }
+}
+
 fn flow_node_contents(
     node: &FlowNodePresentation,
     colors: &BeadsBoardColors,
@@ -1437,17 +1523,37 @@ fn flow_node_contents(
         .flex()
         .items_center()
         .gap(px(6.0 * text_scale))
-        .child(node_dot(node.state, colors, text_scale))
+        .child(node_dot(node, colors, text_scale))
         .child(priority_text(node.priority, colors, text_scale))
         .child(node_title(node, colors, text_scale))
+        .children(node.liveness.agent().map(|agent| agent_line(agent, colors, text_scale)))
         .child(node_id(&node.id, colors, text_scale))
         .into_any_element()
 }
 
-fn node_dot(state: FlowNodeState, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+fn node_dot(node: &FlowNodePresentation, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
     let size = px(8.0 * text_scale);
     let dot = div().flex_none().size(size).rounded_full();
-    match state {
+    // A live node's dot outranks its queue treatment: the ring says a machine
+    // is on this issue now, which is the one fact a reader is scanning for.
+    if node.liveness.is_running() {
+        let ring = px(3.0 * text_scale);
+        return dot
+            .bg(colors.progress_state)
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .left(-ring)
+                    .top(-ring)
+                    .right(-ring)
+                    .bottom(-ring)
+                    .rounded_full()
+                    .bg(colors.agent_halo),
+            )
+            .into_any_element();
+    }
+    match node.state {
         FlowNodeState::Done => dot.bg(colors.done_state).into_any_element(),
         FlowNodeState::Ready => dot.border_1().border_color(colors.ready_state).into_any_element(),
         FlowNodeState::Blocked => {
@@ -1456,6 +1562,24 @@ fn node_dot(state: FlowNodeState, colors: &BeadsBoardColors, text_scale: f32) ->
         FlowNodeState::InProgress => dot.bg(colors.progress_state).into_any_element(),
         FlowNodeState::Backlog => dot.bg(colors.muted).into_any_element(),
     }
+}
+
+/// The mock's `.fl .node .agent`: who is running, and a dot saying they are.
+fn agent_line(agent: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.0 * text_scale))
+        .font_family("monospace")
+        .font_weight(gpui::FontWeight(500.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(colors.agent)
+        .child(agent.to_owned())
+        .child(
+            div().flex_none().size(px(4.0 * text_scale)).rounded_full().bg(colors.progress_state),
+        )
+        .into_any_element()
 }
 
 fn priority_text(priority: u8, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
@@ -1476,20 +1600,31 @@ fn node_title(
     colors: &BeadsBoardColors,
     text_scale: f32,
 ) -> AnyElement {
-    let color = match node.state {
-        FlowNodeState::Done => colors.muted,
-        FlowNodeState::Blocked => colors.queue_name,
-        FlowNodeState::Ready | FlowNodeState::InProgress | FlowNodeState::Backlog => colors.title,
+    // Live lifts the title above every queue treatment, done included: a
+    // machine running on a closed issue is still the line worth reading.
+    let color = if node.liveness.is_running() {
+        colors.title
+    } else {
+        match node.state {
+            FlowNodeState::Done => colors.muted,
+            FlowNodeState::Blocked => colors.queue_name,
+            FlowNodeState::Ready | FlowNodeState::InProgress | FlowNodeState::Backlog => {
+                colors.title
+            }
+        }
+    };
+    let weight = if node.liveness.is_running() {
+        650.0
+    } else if node.state == FlowNodeState::Done {
+        550.0
+    } else {
+        600.0
     };
     div()
         .flex_1()
         .min_w(px(0.0))
         .truncate()
-        .font_weight(gpui::FontWeight(if node.state == FlowNodeState::Done {
-            550.0
-        } else {
-            600.0
-        }))
+        .font_weight(gpui::FontWeight(weight))
         .text_size(px(12.0 * text_scale))
         .text_color(color)
         .child(node.title.clone())
@@ -1588,6 +1723,16 @@ mod tests {
                 .map(|(from, to)| BeadsGraphEdge { from: (*from).into(), to: (*to).into() })
                 .collect(),
         }
+    }
+
+    /// No agent session is running, which is every test that is not about
+    /// liveness.
+    fn no_live() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn live_on(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
     }
 
     fn ids_in_rank<'a>(
@@ -1717,7 +1862,8 @@ mod tests {
         graph.nodes[2].queue = BeadsIssueQueue::Blocked;
         graph.nodes[3].queue = BeadsIssueQueue::Done;
         let layout = layout_flow(&graph, 1.0).unwrap();
-        let presentation = present_flow(&graph, &layout, "scribe-blocked", None).unwrap();
+        let presentation =
+            present_flow(&graph, &layout, "scribe-blocked", None, &no_live()).unwrap();
 
         assert_eq!(presentation.nodes.iter().filter(|node| node.cursor).count(), 1);
         let blocked = presentation.nodes.iter().find(|node| node.cursor).unwrap();
@@ -1743,8 +1889,8 @@ mod tests {
             &[("scribe-root", "scribe-mid"), ("scribe-mid", "scribe-leaf")],
         );
         let layout = layout_flow(&graph, 1.0).unwrap();
-        let opened = present_flow(&graph, &layout, "scribe-root", None).unwrap();
-        let retargeted = present_flow(&graph, &layout, "scribe-leaf", None).unwrap();
+        let opened = present_flow(&graph, &layout, "scribe-root", None, &no_live()).unwrap();
+        let retargeted = present_flow(&graph, &layout, "scribe-leaf", None, &no_live()).unwrap();
 
         assert_eq!(retargeted.nodes.iter().filter(|node| node.cursor).count(), 1);
         assert_eq!(
@@ -1790,7 +1936,7 @@ mod tests {
         let graph = graph(&["a", "b"], &[("a", "b")]);
         let layout = layout_flow(&graph, 1.0).unwrap();
         assert_eq!(
-            present_flow(&graph, &layout, "not-here", None),
+            present_flow(&graph, &layout, "not-here", None, &no_live()),
             Err(FlowRenderError::CursorNotInGraph { issue_id: "not-here".into() })
         );
     }
@@ -1948,7 +2094,7 @@ mod tests {
         let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
         // Cursor sits elsewhere, so this also proves hover takes the cursor
         // treatment without stealing the real cursor's.
-        let shown = present_flow(&graph, &layout, "2a8z.1", Some(&trace)).unwrap();
+        let shown = present_flow(&graph, &layout, "2a8z.1", Some(&trace), &no_live()).unwrap();
         let find = |id: &str| shown.nodes.iter().find(|node| node.id == id).cloned().unwrap();
         assert!(find("2a8z.3").on_path && find("2a8z.3").cursor);
         assert!(find("2a8z.1").on_path && find("2a8z.1").cursor);
@@ -1962,7 +2108,7 @@ mod tests {
         let graph = mock_epic();
         let layout = layout_flow(&graph, 1.0).unwrap();
         let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
-        let shown = present_flow(&graph, &layout, "2a8z.3", Some(&trace)).unwrap();
+        let shown = present_flow(&graph, &layout, "2a8z.3", Some(&trace), &no_live()).unwrap();
         let hovered = shown.nodes.iter().find(|node| node.id == "2a8z.3").unwrap();
         let chip = shown.chip.clone().unwrap();
         assert_eq!(chip.text, "releases 3 · blocked by 1");
@@ -1977,11 +2123,11 @@ mod tests {
         // The at-rest frame and the frame after a hover is cleared are the
         // same value, so a pointer-leave repaint restores everything at once
         // rather than easing nodes back independently.
-        let at_rest = present_flow(&graph, &layout, "2a8z.3", None).unwrap();
+        let at_rest = present_flow(&graph, &layout, "2a8z.3", None, &no_live()).unwrap();
         let trace = FlowTrace::from_hover(&graph, "2a8z.3").unwrap();
-        let traced = present_flow(&graph, &layout, "2a8z.3", Some(&trace)).unwrap();
+        let traced = present_flow(&graph, &layout, "2a8z.3", Some(&trace), &no_live()).unwrap();
         assert_ne!(at_rest, traced);
-        let released = present_flow(&graph, &layout, "2a8z.3", None).unwrap();
+        let released = present_flow(&graph, &layout, "2a8z.3", None, &no_live()).unwrap();
         assert_eq!(at_rest, released);
         assert!(released.chip.is_none());
         assert!(released.nodes.iter().all(|node| node.on_path));
@@ -1999,5 +2145,120 @@ mod tests {
         let trace = FlowTrace::from_hover(&graph, "alone").unwrap();
         assert_eq!(trace.chip_text(), "releases 0 · blocked by 0");
         assert_eq!(trace.on_path.len(), 1);
+    }
+
+    /// A graph whose nodes all carry a claim, so assignment is held constant
+    /// and liveness is the only variable the halo can be reading.
+    fn claimed_graph() -> BeadsEpicGraph {
+        let mut graph = graph(&["flow-1", "flow-2", "flow-3"], &[("flow-1", "flow-2")]);
+        for node in &mut graph.nodes {
+            node.assignee = Some("codex-implement-ready-run-20260818T085731.REeEi4".into());
+        }
+        graph
+    }
+
+    fn presented(graph: &BeadsEpicGraph, live: &HashSet<String>) -> Vec<FlowNodePresentation> {
+        let layout = layout_flow(graph, 1.0).unwrap();
+        present_flow(graph, &layout, "flow-1", None, live).unwrap().nodes
+    }
+
+    #[test]
+    fn a_live_binding_paints_the_halo_and_agent_line_on_exactly_one_node() {
+        let graph = claimed_graph();
+        let nodes = presented(&graph, &live_on(&["flow-2"]));
+
+        let live = nodes.iter().filter(|node| node.liveness.is_running()).collect::<Vec<_>>();
+        assert_eq!(live.len(), 1, "exactly one node is live");
+        assert_eq!(live[0].id, "flow-2");
+        assert_eq!(live[0].liveness.agent(), Some("codex"));
+        assert!(
+            nodes
+                .iter()
+                .filter(|node| node.id != "flow-2")
+                .all(|node| node.liveness.agent().is_none()),
+            "no idle node carries an agent line"
+        );
+    }
+
+    #[test]
+    fn assignment_without_liveness_paints_no_halo() {
+        let graph = claimed_graph();
+        // Every node is claimed; nothing is running.
+        let nodes = presented(&graph, &no_live());
+        assert!(
+            nodes.iter().all(|node| node.liveness == FlowLiveness::Idle),
+            "a claim is not a running process, so it earns no halo"
+        );
+    }
+
+    #[test]
+    fn a_binding_for_an_issue_outside_this_graph_paints_nothing() {
+        // The frame reached this window, but names an issue no node here has:
+        // another region's epic, or an agent working outside the open graph.
+        let graph = claimed_graph();
+        let nodes = presented(&graph, &live_on(&["flow-99"]));
+        assert!(nodes.iter().all(|node| node.liveness == FlowLiveness::Idle));
+    }
+
+    #[test]
+    fn clearing_the_binding_restores_the_ordinary_treatment() {
+        let graph = claimed_graph();
+        let lit = presented(&graph, &live_on(&["flow-2"]));
+        let cleared = presented(&graph, &no_live());
+        assert_ne!(lit, cleared, "the halo is visible while the binding stands");
+        assert_eq!(
+            cleared,
+            presented(&graph, &no_live()),
+            "clearing returns the exact pre-halo presentation, in one pass"
+        );
+        assert!(cleared.iter().all(|node| node.liveness == FlowLiveness::Idle));
+    }
+
+    #[test]
+    fn a_live_node_without_assignee_data_keeps_the_halo_and_drops_the_line() {
+        // bd recorded no assignee, but a session is demonstrably running on
+        // the issue. The halo reports the observed process; only the name is
+        // missing, and a missing name is not a reason to hide the fact.
+        let graph = graph(&["flow-1", "flow-2"], &[("flow-1", "flow-2")]);
+        let nodes = presented(&graph, &live_on(&["flow-2"]));
+        let live = nodes.iter().find(|node| node.id == "flow-2").unwrap();
+        assert!(live.liveness.is_running());
+        assert!(live.liveness.agent().is_none(), "no name to show, no placeholder invented");
+        assert_eq!(node_accessible_name(live), "flow-2 Node flow-2, ready, running now");
+    }
+
+    #[test]
+    fn a_live_node_announces_its_agent_to_a_screen_reader() {
+        let graph = claimed_graph();
+        let nodes = presented(&graph, &live_on(&["flow-2"]));
+        let live = nodes.iter().find(|node| node.id == "flow-2").unwrap();
+        let idle = nodes.iter().find(|node| node.id == "flow-3").unwrap();
+        assert_eq!(node_accessible_name(live), "flow-2 Node flow-2, ready, codex running now");
+        assert_eq!(node_accessible_name(idle), "flow-3 Node flow-3, ready");
+    }
+
+    #[test]
+    fn an_agent_name_is_the_leading_segment_of_a_generated_assignee() {
+        assert_eq!(
+            agent_name(Some("codex-implement-ready-run-20260818T085731.REeEi4")).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(agent_name(Some("Sharaf Nassar")).as_deref(), Some("Sharaf Nassar"));
+        assert_eq!(agent_name(None), None);
+        assert_eq!(agent_name(Some("")), None, "an empty claim names nobody");
+        assert_eq!(agent_name(Some("   ")), None);
+        assert_eq!(agent_name(Some("-leading")), None, "a leading separator names nobody");
+    }
+
+    #[test]
+    fn liveness_outranks_a_done_nodes_recessive_treatment() {
+        // A machine running on a closed issue is still the line worth
+        // reading, so the halo is not filtered by queue.
+        let mut graph = claimed_graph();
+        graph.nodes[1].queue = BeadsIssueQueue::Done;
+        let nodes = presented(&graph, &live_on(&["flow-2"]));
+        let live = nodes.iter().find(|node| node.id == "flow-2").unwrap();
+        assert!(live.liveness.is_running());
+        assert_eq!(live.state, FlowNodeState::Done, "the queue state is unchanged");
     }
 }

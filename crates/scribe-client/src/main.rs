@@ -13017,6 +13017,17 @@ async fn dispatch_server_message(
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
+        ServerMessage::IssueFocused { session_id, issue_id } => {
+            // The server sends this to the window's local owner alone, so an
+            // arriving binding is by construction live in this window. `None`
+            // is the clear the agent's departure, session end, or disconnect
+            // all produce, which is what stops a halo outliving its work.
+            if let Ok(mut boards) = ctx.beads_boards.lock()
+                && boards.set_focused_issue(session_id, issue_id)
+            {
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+        }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
             if let Ok(mut boards) = ctx.beads_boards.lock() {
                 boards.finish_card_drop(workspace_id, &issue_id, &result);

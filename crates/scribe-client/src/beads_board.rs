@@ -13,7 +13,7 @@ use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layo
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
-use scribe_common::ids::WorkspaceId;
+use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
     BeadsIssueWriteResult,
@@ -84,6 +84,14 @@ pub struct BeadsBoards {
     /// Epic-graph requests the view drains on its next frame, mirroring how
     /// the panel parks its detail requests.
     flow_requests: VecDeque<(WorkspaceId, String)>,
+    /// Issue each live agent session in this window is working on right now.
+    ///
+    /// Keyed by session rather than by issue because the binding's lifetime is
+    /// the session's: an ended session clears its own entry without disturbing
+    /// another agent that happens to be on the same issue. The server already
+    /// delivers these to the window's local owner alone, so every entry here
+    /// is by construction live *here*.
+    live_issues: HashMap<SessionId, String>,
 }
 
 /// One workspace's frozen Flow graph and the cursor it opened at.
@@ -299,6 +307,35 @@ impl BeadsBoards {
         }
         issue_id.clone_into(&mut flow.cursor_issue_id);
         true
+    }
+
+    /// Bind or clear the issue a live agent session is working on.
+    ///
+    /// `None` clears, which is the same frame the server sends when the agent
+    /// moves on, its session ends, or its client disconnects — so a halo can
+    /// never outlive the work it reports. Returns whether anything changed,
+    /// so a repeated binding schedules no repaint.
+    ///
+    /// This is the whole liveness rule: the halo follows an exact
+    /// issue-to-session join, never an assignee string. An agent Scribe
+    /// cannot see leaves no entry here and therefore paints no halo.
+    pub fn set_focused_issue(&mut self, session_id: SessionId, issue_id: Option<String>) -> bool {
+        match issue_id {
+            Some(issue_id) => {
+                if self.live_issues.get(&session_id) == Some(&issue_id) {
+                    return false;
+                }
+                self.live_issues.insert(session_id, issue_id);
+                true
+            }
+            None => self.live_issues.remove(&session_id).is_some(),
+        }
+    }
+
+    /// Issues a live session in this window is on, for the Flow renderer.
+    #[must_use]
+    pub fn live_issue_ids(&self) -> HashSet<String> {
+        self.live_issues.values().cloned().collect()
     }
 
     /// Record which node the pointer is over, or clear it on leave.
@@ -933,6 +970,11 @@ pub struct BeadsBoardColors {
     /// The agent line on a node a session is live on. Distinct from
     /// `progress_state`, which the live dot itself keeps.
     pub agent: Rgba,
+    /// The ring around a live node's dot. The mock composites the progress
+    /// hue at 20% over whatever the node sits on, so it is a real alpha
+    /// rather than a tint into the ground: a live node can also be the
+    /// cursor, and a ring mixed into the ground would erase that fill.
+    pub agent_halo: Rgba,
 }
 
 impl BeadsBoardColors {
@@ -995,6 +1037,11 @@ impl BeadsBoardColors {
         // amounts are the mock's own alphas: a colour composited at alpha `a`
         // over the ground is that ground mixed `a` of the way to it.
         let tint = |amount: f32| mix(ink, border_target, amount);
+        // Lifted here rather than inline because the live halo is this exact
+        // mark thinned: deriving the ring from the raw ANSI slot would leave
+        // it a different hue from the dot it surrounds on any theme whose
+        // blue needs the lift.
+        let progress_state = readable(progress, ink, MARK_CONTRAST);
         Self {
             ground,
             card_top: mix(card, WHITE, 0.03),
@@ -1022,7 +1069,7 @@ impl BeadsBoardColors {
             epic,
             backlog_state: readable(muted, ink, MARK_CONTRAST),
             ready_state: readable(slot(ansi[BRIGHT_CYAN]), ink, MARK_CONTRAST),
-            progress_state: readable(progress, ink, MARK_CONTRAST),
+            progress_state,
             blocked_state: readable(blocked, ink, MARK_CONTRAST),
             done_state: readable(slot(ansi[BRIGHT_GREEN]), ink, MARK_CONTRAST),
             priorities: [
@@ -1065,6 +1112,10 @@ impl BeadsBoardColors {
             // instead of taking a hue of its own. Carrying it toward the title
             // is what keeps it apart from the dot it annotates.
             agent: anywhere(mix(progress, text, 0.28)),
+            // The dot itself stays the progress hue, so the ring is that same
+            // hue thinned rather than a second colour: the halo reads as the
+            // dot's own glow instead of as another mark beside it.
+            agent_halo: alpha(progress_state, 0.2),
         }
     }
 
@@ -1476,6 +1527,7 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
         .hovered_issue_id
         .as_deref()
         .and_then(|hovered| FlowTrace::from_hover(&flow.graph, hovered));
+    let live_issue_ids = guard.live_issue_ids();
     drop(guard);
     let painted = crate::beads_flow::render(&FlowRender {
         rect,
@@ -1487,6 +1539,7 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
         colors: *colors,
         node_controls: controls,
         trace: trace.as_ref(),
+        live_issue_ids: &live_issue_ids,
     });
     let painted = match painted {
         Ok(painted) => painted,
@@ -3025,6 +3078,18 @@ mod tests {
                 colors.agent, colors.progress_state,
                 "the {name} agent line cannot be told from an in-progress node"
             );
+            // The halo is the dot's own hue thinned, so it stays that hue and
+            // only its alpha moves. A ring in a second colour would read as
+            // another mark beside the dot rather than as the dot glowing.
+            assert_eq!(
+                (colors.agent_halo.r, colors.agent_halo.g, colors.agent_halo.b),
+                (colors.progress_state.r, colors.progress_state.g, colors.progress_state.b),
+                "the {name} halo left the progress hue"
+            );
+            assert!(
+                colors.agent_halo.a < colors.progress_state.a,
+                "the {name} halo is not thinner than the dot it surrounds"
+            );
         }
     }
 
@@ -3049,6 +3114,7 @@ mod tests {
             ("band", base.band, retheme.band),
             ("chip", base.chip, retheme.chip),
             ("rank label", base.rank_label, retheme.rank_label),
+            ("agent", base.agent, retheme.agent),
         ] {
             assert_ne!(before, after, "a theme edit left {name} where it was");
         }
@@ -3059,6 +3125,59 @@ mod tests {
         assert!(faded.ground.a < base.ground.a, "an opacity edit never reached the strip");
         assert_eq!(faded.rank_label, base.rank_label);
         assert_eq!(faded.wire, base.wire);
+
+        // The halo is a state mark, so it follows the ANSI ramp the dot comes
+        // from rather than the chrome — and it follows it all the way through
+        // the contrast lift, which is what keeps ring and dot the same hue on
+        // a theme whose blue needs raising.
+        let mut vivid = ansi;
+        vivid[BRIGHT_BLUE] = [0.15, 0.15, 0.9, 1.0];
+        let recoloured = BeadsBoardColors::from_theme(&dark, &vivid, 1.0);
+        assert_ne!(recoloured.agent_halo, base.agent_halo, "the halo ignored its own hue");
+        assert_eq!(recoloured.agent_halo, alpha(recoloured.progress_state, 0.2));
+    }
+
+    /// Liveness is a binding per session, so an ended session clears its own
+    /// entry and leaves any other agent on the same issue alone.
+    // @lat: [[client#Client#Beads Flow Layout Engine#Reading liveness from a node]]
+    #[test]
+    fn a_focused_issue_binding_lives_and_dies_with_its_session() {
+        let mut boards = BeadsBoards::default();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        assert!(boards.live_issue_ids().is_empty());
+
+        assert!(boards.set_focused_issue(first, Some("flow-2".into())));
+        assert_eq!(boards.live_issue_ids(), HashSet::from(["flow-2".to_owned()]));
+        assert!(
+            !boards.set_focused_issue(first, Some("flow-2".into())),
+            "a repeated binding schedules no repaint"
+        );
+
+        // Two agents on one issue: the first to leave must not take the halo
+        // with it, because the second is still running.
+        assert!(boards.set_focused_issue(second, Some("flow-2".into())));
+        assert!(boards.set_focused_issue(first, None));
+        assert_eq!(boards.live_issue_ids(), HashSet::from(["flow-2".to_owned()]));
+
+        assert!(boards.set_focused_issue(second, None), "session end clears the binding");
+        assert!(boards.live_issue_ids().is_empty());
+        assert!(!boards.set_focused_issue(second, None), "clearing twice changes nothing");
+    }
+
+    /// An agent moving between issues is one binding moving, never two.
+    // @lat: [[client#Client#Beads Flow Layout Engine#Reading liveness from a node]]
+    #[test]
+    fn an_agent_moving_issues_leaves_no_halo_behind() {
+        let mut boards = BeadsBoards::default();
+        let session = SessionId::new();
+        boards.set_focused_issue(session, Some("flow-1".into()));
+        assert!(boards.set_focused_issue(session, Some("flow-2".into())));
+        assert_eq!(
+            boards.live_issue_ids(),
+            HashSet::from(["flow-2".to_owned()]),
+            "the issue it left is no longer live"
+        );
     }
 
     /// A card cannot reach the window's clipboard, so it parks the text and

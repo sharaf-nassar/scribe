@@ -1671,6 +1671,18 @@ The chip states closure counts, not direct ones: the normative mock reads `relea
 
 Hover never survives its graph. It is cleared when a graph is opened, so a re-entered Flow starts untraced rather than resuming a trace whose pointer left long ago.
 
+### Reading liveness from a node
+
+A halo on a node means a machine is running on that issue *here, now* — not that someone claimed it.
+
+The two facts come from different places and only one of them is evidence. `bd` records an assignee, which outlives the process that set it: a run that crashed last week still owns its issues. Scribe additionally knows which of its own sessions is alive, so [[crates/scribe-client/src/beads_board.rs#BeadsBoards#set_focused_issue]] keys liveness on [[crates/scribe-common/src/protocol.rs#ServerMessage]]'s `IssueFocused` binding and nothing else. `assignee` supplies only the agent's name once the binding has already established that something is running. That is why an agent Scribe cannot see paints no halo rather than a guess: a missing halo is a gap in what Scribe can observe, while a false one would be a claim about a process that is not there.
+
+Bindings are keyed by session, not by issue, because their lifetime is the session's. Two agents on one issue each hold their own entry, so the first to exit leaves the halo standing for the second. `None` clears, and it is the same frame the server sends when the agent moves on, its session ends, or its client disconnects — one message shape for every way liveness can end, which is what stops a halo outliving its work. The server delivers these to the window's registered local owner alone ([[crates/scribe-server/src/ipc_server.rs#set_focused_issue]]), so a binding cannot cross windows and the client needs no ownership check of its own.
+
+The renderer receives the live set as `FlowRender::live_issue_ids` and stays pure. [[crates/scribe-client/src/beads_flow.rs#node_dot]] gives a live node the progress hue filled with a ring of [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]]'s `agent_halo` — that same mark at a fifth of its alpha, so ring and dot cannot drift apart across themes — and liveness outranks the queue treatment, including Done's recessive one, because a machine running on a closed issue is still the line worth reading. [[crates/scribe-client/src/beads_flow.rs#agent_name]] shortens `bd`'s generated `codex-implement-ready-run-<stamp>.<id>` to its leading segment; the full string cannot fit a 214px node beside a title, and the leading segment is the part that answers who is on this. A live node with no recorded assignee keeps its halo and simply shows no name, since the absent field is the label rather than the evidence.
+
+[[crates/scribe-client/src/beads_flow.rs#node_accessible_name]] appends the same fact to the node's spoken name. A halo is unavailable to a reader who cannot see it, and liveness is the one thing on the node that the state label does not already carry.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.
