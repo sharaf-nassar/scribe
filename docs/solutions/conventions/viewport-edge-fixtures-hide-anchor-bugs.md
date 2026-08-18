@@ -1,6 +1,7 @@
 ---
 title: Viewport-edge visual fixtures hide overlay anchor bugs
 date: 2026-08-18
+last_updated: 2026-08-18
 component: tests/e2e/visual, scribe-client overlays
 tags: [e2e, visual-tests, gpui, anchored, tooltip, test-oracle, degenerate-fixture]
 problem_type: convention
@@ -80,3 +81,17 @@ To measure without dirtying the repo, copy `tests/e2e/` to scratch, patch the
 fixture and the probe there, and mount the copy — the visual harness only needs
 `-v <scratch>/e2e:/tests:ro -v <scratch>/out:/output` against the prebuilt
 `scribe-test-visual` image.
+
+## Second instance: single-pane fixtures and pane-relative anchors
+
+The same collapse hit `tests/e2e/visual/find-overlay.sh`, which is single-pane
+end to end. The find box is supposed to anchor to the focused pane and in fact
+anchors to the window, but in a one-pane window those two corners differ only
+by a chrome band, so every shipped phase passed with the bug present. The
+property became observable only after splitting the pane and focusing the half
+*away* from the window corner. See
+`docs/solutions/runtime-errors/gpui-overlay-mount-point-decides-anchor.md`.
+
+Generalised: a fixture with one of something cannot distinguish "anchored to
+the container" from "anchored to that one instance". Pane-, region-, and
+tab-relative anchors all need a fixture with at least two.
