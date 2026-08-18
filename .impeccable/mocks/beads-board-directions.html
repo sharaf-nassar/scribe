@@ -1,0 +1,1165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scribe Beads — board direction A2</title>
+<style>
+  :root {
+    color-scheme: dark;
+    /* Live-theme derived slots. Every colour here maps to a chrome slot or an
+       ANSI index the GPUI board already reads. */
+    --page:#08090c;
+    --ground:#15171c;      /* board ground == tab-bar chrome slot */
+    --terminal:#0b0d11;
+    --card:#1f2229; --card-top:#262a31;
+    --card-hover:#252932; --card-hover-top:#2d323b;
+    --line:#ffffff12; --line-strong:#ffffff1f;
+    --text:#e9ebf0; --muted:#8d94a1; --quiet:#666d7a;
+
+    --backlog:#727b88; --ready:#4cc7d6; --progress:#8296ff;
+    --blocked:#ef6f6b; --done:#68c98c;
+
+    --p0:#e2555f; --p1:#d68d38; --p2:#c4ae3c; --p3:#8f96a2; --p4:#6d7480;
+    --epic:#b8737f;
+
+    --sans:"Noto Sans Display","Noto Sans",sans-serif;
+    --mono:"JetBrains Mono","Noto Sans Mono",monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:var(--page); }
+  body {
+    color:var(--text); font-family:var(--sans);
+    text-rendering:geometricPrecision; padding:28px 24px 60px;
+  }
+
+  /* ---------- page scaffolding (not part of the design) ---------- */
+  h1 { font-size:15px; font-weight:700; letter-spacing:-.01em; margin:0 0 4px; }
+  .lede { color:var(--muted); font-size:12px; line-height:1.55; max-width:96ch; margin:0 0 26px; }
+  .lede code { font:12px var(--mono); color:#c4cad4; }
+  .case { margin:0 0 30px; }
+  .case > h2 {
+    font-size:12px; font-weight:700; letter-spacing:.14em; text-transform:uppercase;
+    color:#cfd4dd; margin:0 0 3px;
+  }
+  .case > h2 span { color:var(--quiet); font-weight:600; letter-spacing:.04em; text-transform:none; margin-left:8px; }
+  .case > p { color:var(--muted); font-size:12px; line-height:1.6; margin:0 0 10px; max-width:104ch; }
+  .formula { font:500 12px/1.9 var(--mono); color:#c4cad4; margin:0 0 10px; }
+  .formula b { color:#e9ebf0; font-weight:600; }
+  .state { color:var(--quiet); font:600 9.5px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; margin:14px 0 5px; }
+  .frame {
+    width:100%; border:1px solid #2a2f38; background:var(--ground);
+    overflow:hidden;
+  }
+  .peek { height:26px; background:var(--terminal); border-top:1px solid var(--line-strong);
+    font:12px/26px var(--mono); color:#4f5561; padding:0 10px; }
+
+  /* board strip: the real reserved height */
+  .board { height:197px; position:relative; background:var(--ground); }
+
+  /* =================================================================
+     CURRENT — what ships today, for comparison
+     ================================================================= */
+  .cur .lanes { height:100%; padding:0 8px 7px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); }
+  .cur .rail { position:absolute; left:24px; right:64px; top:17px; height:1px; background:#ffffff1a; }
+  .cur .lane { --state:var(--backlog); min-width:0; padding:0 8px; }
+  .cur .lane.ready { --state:var(--ready); } .cur .lane.progress { --state:var(--progress); }
+  .cur .lane.blocked { --state:var(--blocked); } .cur .lane.done { --state:var(--done); }
+  .cur .head { height:36px; display:flex; align-items:flex-start; padding:0 4px; }
+  .cur .node { width:9px; height:9px; margin-top:13px; flex:none; border-radius:50%; background:var(--state); border:2px solid var(--ground); }
+  .cur .qline { margin:7px 0 0; padding:0 6px 0 11px; display:flex; align-items:center; gap:6px; background:var(--ground); }
+  .cur .qname { font-size:12px; line-height:20px; font-weight:650; color:#d8dbe1; white-space:nowrap; }
+  .cur .qcount { font:600 10px/13px var(--mono); color:#878e9a; }
+  .cur .card {
+    height:46px; margin-bottom:4px; padding:6px 8px; border-radius:4px;
+    border:1px solid var(--line-strong);
+    background:linear-gradient(180deg,var(--card-top),var(--card));
+    display:grid; grid-template-rows:17px 13px; row-gap:1px;
+  }
+  .cur .top { display:flex; align-items:center; gap:6px; min-width:0; }
+  .cur .badge { flex:none; padding:0 4px; border-radius:3px; font:700 9px/13px var(--mono); color:#14161a; background:var(--pri); }
+  .cur .title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:600; color:#e8ebf1; }
+  .cur .meta { display:flex; align-items:center; font:500 9px/13px var(--mono); color:#828a97; }
+  .cur .meta .epic { margin-left:auto; color:var(--epic); font-family:var(--sans); font-size:9px; }
+  .cur .empty {
+    height:46px; border:1px dashed color-mix(in srgb,var(--state) 30%,transparent); border-radius:4px;
+    display:grid; place-items:center; font-size:9.5px; color:var(--muted);
+  }
+  .cur .zoom { position:absolute; top:5px; right:6px; display:flex; gap:3px; }
+  .cur .zoom i { width:15px; height:15px; border:1px solid var(--line-strong); border-radius:3px; color:var(--muted); font:400 10px/13px var(--sans); text-align:center; font-style:normal; }
+
+  /* =================================================================
+     D1 — LEDGER : no cards, typographic hierarchy, hue only at the head
+     ================================================================= */
+  .d1 .lanes { height:100%; padding:8px 10px 7px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:14px; }
+  .d1 .lane { --state:var(--backlog); min-width:0; display:flex; flex-direction:column; }
+  .d1 .lane.ready { --state:var(--ready); } .d1 .lane.progress { --state:var(--progress); }
+  .d1 .lane.blocked { --state:var(--blocked); } .d1 .lane.done { --state:var(--done); }
+  .d1 .bar { height:2px; background:var(--state); flex:none; }
+  .d1 .lane.void .bar { background:color-mix(in srgb,var(--state) 34%,transparent); }
+  .d1 .head { height:28px; flex:none; display:flex; align-items:baseline; gap:7px; padding-top:7px; }
+  .d1 .qname { font:700 9.5px/1 var(--sans); letter-spacing:.13em; text-transform:uppercase; color:#aeb5c1; white-space:nowrap; }
+  .d1 .lane.progress .qname { color:#e7eaf0; }
+  .d1 .qcount { margin-left:auto; font:600 15px/1 var(--mono); font-variant-numeric:tabular-nums; color:#e9ebf0; }
+  /* the text-size controls own the strip's top right; the last head keeps clear of them */
+  .d1 .lane:last-child .head { padding-right:40px; }
+  .d1 .lane.void .qcount { color:#5c636f; }
+  .d1 .rows { min-height:0; flex:1; overflow:hidden; }
+  .d1 .row {
+    height:34px; display:grid; grid-template-columns:20px minmax(0,1fr); column-gap:6px;
+    grid-template-rows:18px 14px; align-content:center; cursor:pointer;
+  }
+  /* A2 gives a row real air: three breathing rows beat four crowded ones on a
+     strip you only glance at. */
+  .dr .row { height:51px; grid-template-rows:19px 15px; row-gap:4px; }
+  /* Whole rows only. A body sized to three exact rows never shows the top half
+     of a fourth, which reads as clipping rather than as scrolling; the lane's
+     own chevron is what says there is more. */
+  .dr .rows { order:3; flex:0 0 153px; height:153px; }
+  .dr .title { line-height:19px; }
+  .dr .pri { line-height:19px; }
+  .dr .id, .dr .epic, .dr .age { line-height:15px; }
+  .d1 .row + .row { box-shadow:inset 0 1px 0 var(--line); }
+  .d1 .row:hover { background:#ffffff08; }
+  .d1 .pri { grid-column:1; grid-row:1; font:700 9.5px/18px var(--mono); letter-spacing:.03em; color:var(--pri); }
+  .d1 .title { grid-column:2; grid-row:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:12px; font-weight:600; line-height:18px; letter-spacing:-.008em; color:#e9ebf0; }
+  .d1 .sub { grid-column:2; grid-row:2; display:flex; align-items:center; gap:8px; min-width:0; }
+  .d1 .id { font:500 9.5px/14px var(--mono); color:#7a828f; }
+  .d1 .epic { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9.5px; line-height:14px; color:#767d8a; }
+  .d1 .age { margin-left:auto; font:500 9.5px/14px var(--mono); color:#5f6673; }
+  .d1 .void-note { font-size:9.5px; line-height:16px; color:#5f6673; padding-top:2px; }
+  .d1 .more { font:500 9.5px/14px var(--mono); color:#5f6673; padding-top:3px; }
+  .d1 .zoom { position:absolute; top:6px; right:8px; display:flex; gap:3px; }
+  .d1 .zoom i { width:15px; height:15px; border:1px solid var(--line-strong); border-radius:2px; color:var(--muted); font:400 10px/13px var(--sans); text-align:center; font-style:normal; }
+
+  /* =================================================================
+     A2 — LEDGER + RAIL : the two lanes that are never drag sources
+                          collapse to vertical tabs on the right
+     ================================================================= */
+  /* Track widths are set per strip, so a board can show what it actually
+     allocates: an empty queue keeps a legible head and gives its slack to the
+     queues holding work. The 20px left gutter holds the text-size steppers,
+     which the right rail evicted from the top corner. */
+  .dr .lanes { padding:5px 10px 7px 44px; column-gap:16px; }
+  /* Borderless glyphs on the head's own line. Two outlined boxes stacked in a
+     gutter were four extra edges spent on the least important control. */
+  .dr .zoom { top:5px; right:auto; left:8px; flex-direction:row; gap:1px; }
+  .dr .zoom i {
+    width:12px; height:17px; border:0; border-radius:0;
+    font:400 11px/17px var(--sans); color:#5f6673;
+  }
+  .dr .zoom i:hover { color:#dfe3ea; }
+  /* One header band across the whole strip. Five heads floating on bare ground
+     read as five separate labels; a band with a seam under it makes them one
+     row and gives the board a spine to hang the lanes off. */
+  /* Not a bar. A filled 34px band spent a sixth of the strip announcing five
+     words; the heads group from one hairline and their own aligned seams, and
+     everything reclaimed goes to the rows. */
+  .dr .headband {
+    position:absolute; left:0; right:0; top:0; height:24px; z-index:0;
+    border-bottom:1px solid var(--line);
+  }
+  .dr .lanes { position:relative; z-index:1; }
+  .dr .lane { position:relative; }
+  /* The bar carries the hue at the lane's own start and lets go across it, so
+     five queues read as a direction rather than as five equal slabs. */
+  /* The hue stops floating above the head and becomes the band's own seam under
+     it, so one rule carries the band edge and the queue identity instead of a
+     slab, a hairline, and a gutter line each carrying a third of it. */
+  .dr .head { order:1; height:17px; padding-top:0; }
+  /* The label takes its own queue's hue, pulled two thirds of the way to the
+     chrome ink so it tints rather than colours: enough to name the column
+     without competing with the priority glyphs, which are the only saturated
+     marks on the strip. */
+  .dr .lane .qname,
+  .dr .lane.progress .qname { line-height:17px; color:color-mix(in srgb,var(--state) 40%,#c3c9d4); }
+  .dr .lane.void .qname { color:color-mix(in srgb,var(--state) 32%,#7a828f); }
+  .dr .drawer .qname { color:color-mix(in srgb,var(--state) 40%,#c3c9d4); }
+  /* With the label carrying identity the count is supporting data, so it drops
+     to meta size and muted ink and stops competing for the line. */
+  .dr .qcount { font-size:11px; line-height:17px; letter-spacing:.02em; color:#cdd3dd; }
+  .dr .lane.void .qcount { color:#767d8a; }
+  .dr .lane-epic { line-height:17px; }
+  .dr .lane .bar {
+    order:2;
+    background:linear-gradient(90deg,var(--state),color-mix(in srgb,var(--state) 12%,transparent));
+  }
+  .dr .lane.void .bar {
+    background:linear-gradient(90deg,color-mix(in srgb,var(--state) 34%,transparent),
+                                    color-mix(in srgb,var(--state) 9%,transparent));
+  }
+  /* The empty note starts where a title would, not at the lane's edge. */
+  .dr .void-note { padding-left:26px; }
+  /* The lane's own overflow mark, same glyph the shipped board uses. */
+  .dr .chev {
+    position:absolute; right:1px; bottom:0; font:400 10px/10px var(--sans);
+    font-style:normal; color:#5f6673;
+  }
+  /* The strip terminates in its own bar, which is also the resize grip. */
+  .dr .floor { position:absolute; left:0; right:0; bottom:0; height:3px; background:#ffffff0f; }
+  .dr .floor::after {
+    content:""; position:absolute; left:50%; transform:translateX(-50%);
+    top:1px; width:34px; height:1px; background:#ffffff2b;
+  }
+
+  .dr .head { gap:8px; }
+  /* Count sits with the name, not at the far edge: across a 600px lane the two
+     stop reading as one heading. */
+  .dr .qcount { margin-left:0; }
+  /* Named once per lane when every issue in the queue carries it, so the rows
+     stop repeating one string — the same reason the ID drops its project
+     prefix. */
+  .dr .lane-epic {
+    margin-left:auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:9.5px; line-height:14px; color:#767d8a;
+  }
+  /* Hover underlines the row in its lane's hue, the same 2px mark the head
+     wears — so a hovered row rhymes with the column it belongs to instead of
+     growing an edge beside the priority glyph. */
+  .dr .row:hover { background:#ffffff0a; box-shadow:inset 0 -2px 0 var(--state), inset 0 1px 0 var(--line); }
+  .dr .row:first-child:hover { box-shadow:inset 0 -2px 0 var(--state); }
+  /* The next row drops its own hairline, or the hue reads as a doubled rule. */
+  .dr .row:hover + .row { box-shadow:none; }
+  /* At 660px a right-anchored age strands itself half a lane from the ID it
+     belongs to, so the sub line groups left at every width. */
+  /* Three columns rather than one run-on string. The middle track sizes to the
+     age and the outer two are equal fractions, so the age lands on the row's
+     true centre whether or not the row carries an epic — which makes the ages
+     a readable column down the lane instead of a value that moves with the
+     length of whatever precedes it. Explicit columns keep placement independent
+     of markup order, since a row may omit the epic entirely — and the row has
+     to be pinned too, or sparse auto-placement drops a trailing age onto a
+     second line whenever the epic was written before it. */
+  .dr .sub {
+    display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
+    align-items:center; gap:0;
+  }
+  .dr .id { grid-column:1; grid-row:1; justify-self:start; }
+  .dr .age { grid-column:2; grid-row:1; justify-self:center; margin-left:0; color:#6b7280; }
+  /* Spatial separation replaces the middots: nothing runs on any more. */
+  .dr .sub > * + *::before { content:none; }
+  /* The slack alone cannot guarantee a gap once a long name has eaten it, and
+     a name that meets the age reads as one string. */
+  .dr .epic { grid-column:3; grid-row:1; justify-self:end; margin-left:12px; }
+  .dr .void-note { padding-top:3px; }
+  .dr .void-note b { display:block; font:500 9.5px/15px var(--mono); color:#4f5663; font-weight:500; }
+
+  .dr .tab {
+    --state:var(--backlog); width:36px; display:flex; flex-direction:column; align-items:center;
+    cursor:pointer; position:relative;
+  }
+  .dr .tab.blocked { --state:var(--blocked); } .dr .tab.done { --state:var(--done); }
+  .dr .tab .bar { order:2; width:100%; height:2px; flex:none; background:var(--state); }
+  .dr .tab.void .bar { background:color-mix(in srgb,var(--state) 34%,transparent); }
+  .dr .tab .tcount {
+    order:1; height:17px; font:600 11px/17px var(--mono);
+    font-variant-numeric:tabular-nums; color:#cdd3dd; letter-spacing:.02em;
+  }
+  .dr .tab.void .tcount { color:#5c636f; }
+  /* Letterform spine, not rotated text: GPUI has no text transform, and one
+     glyph per line box is the only vertical label it can actually paint. */
+  .dr .tab .spine { order:3; margin:auto 0; display:flex; flex-direction:column; align-items:center; }
+  .dr .tab .spine i {
+    font:700 9.5px/10.5px var(--sans); font-style:normal; text-transform:uppercase;
+    color:color-mix(in srgb,var(--state) 40%,#c3c9d4); letter-spacing:.02em;
+  }
+  .dr .tab.void .spine i { color:#6b7280; }
+  .dr .tab .cue {
+    order:4; margin-bottom:7px; width:11px; height:11px; flex:none; border-radius:2px;
+    font:400 11px/11px var(--sans); font-style:normal; text-align:center; color:#5f6673;
+  }
+  .dr .tab:hover, .dr .tab.hot { background:#ffffff0d; }
+  .dr .tab.hot .cue { color:#e9ebf0; background:#ffffff1a; }
+  .dr .tab.hot .spine i { color:#e9ebf0; }
+  /* An open tab wears the hue down its inner edge, so the tab and the panel it
+     opened read as one object rather than two. */
+  .dr .tab.hot::after {
+    content:""; position:absolute; left:0; top:2px; bottom:0; width:1px; background:var(--state);
+  }
+  .dr .lane .unpin { margin-left:9px; font:400 13px/1 var(--sans); color:#6b7280; cursor:pointer; }
+  .dr .lane .unpin:hover { color:#dfe3ea; }
+
+  /* Hover opens over the lanes; it never reflows them. */
+  .dr .drawer {
+    position:absolute; top:5px; bottom:4px; right:96px; width:452px; z-index:4;
+    padding:0 13px; display:flex; flex-direction:column;
+    background:#191c22; border:1px solid #ffffff26; border-radius:3px;
+    box-shadow:-14px 0 30px #00000080;
+  }
+  .dr .drawer .bar { order:2; height:2px; flex:none; margin:0 -13px; background:var(--state); }
+  .dr .drawer.blocked { --state:var(--blocked); } .dr .drawer.done { --state:var(--done); }
+  .dr .drawer .head { order:1; height:17px; flex:none; display:flex; align-items:baseline; gap:8px; padding-top:0; }
+  .dr .drawer .qname { font:700 9.5px/1 var(--sans); letter-spacing:.13em; text-transform:uppercase; color:#aeb5c1; }
+  .dr .drawer .qcount { font:600 11px/17px var(--mono); letter-spacing:.02em; color:#cdd3dd; }
+  .dr .drawer .lane-epic { margin-left:2px; }
+  .dr .drawer .pinhint { margin-left:auto; font:500 9.5px/1 var(--mono); color:#5f6673; letter-spacing:.04em; }
+  .dr .drawer .rows { order:3; }
+
+  /* A drag in flight makes the collapsed Done tab a live drop target. */
+  .dr .tab.target { background:#68c98c26; }
+  .dr .tab.target .spine i, .dr .tab.target .tcount { color:#e4f3e9; }
+  .dr .tab.target .cue { color:#e4f3e9; }
+  .dr .ghost {
+    position:absolute; z-index:5; width:320px; height:36px; left:940px; top:110px;
+    padding:0 10px 0 8px; display:grid; grid-template-columns:20px minmax(0,1fr);
+    column-gap:6px; grid-template-rows:18px 14px; align-content:center;
+    background:#20242b; border:1px solid #ffffff2e; border-radius:3px; box-shadow:0 5px 16px #00000085;
+  }
+
+  /* =================================================================
+     A3 — FLOW : the same strip rendering the dependency graph the
+                 tracker actually stores, ranked by depth not status
+     ================================================================= */
+  .fl .band {
+    position:absolute; left:0; right:0; top:0; height:34px;
+    background:#ffffff09; border-bottom:1px solid var(--line-strong);
+    display:flex; align-items:center; gap:10px; padding:0 10px 0 14px;
+  }
+  .fl .epic { font:700 9.5px/1 var(--sans); letter-spacing:.13em; text-transform:uppercase; color:#e7eaf0; }
+  .fl .switch { font:400 10px/1 var(--sans); font-style:normal; color:#6b7280; cursor:pointer; }
+  .fl .tally { font:600 17px/1 var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.035em; color:#e9ebf0; }
+  .fl .tally small { font:500 9.5px/1 var(--mono); color:#69707d; }
+  /* Progress is the graph's own arithmetic, so it gets the graph's own bar. */
+  .fl .prog { width:150px; height:2px; background:#ffffff14; }
+  .fl .prog i { display:block; height:2px; background:var(--done); }
+  .fl .modes { margin-left:auto; display:flex; gap:1px; }
+  .fl .modes span {
+    font:600 9px/1 var(--sans); letter-spacing:.1em; text-transform:uppercase;
+    color:#6b7280; padding:5px 8px; cursor:pointer;
+  }
+  .fl .modes span.on { color:#e9ebf0; background:#ffffff12; }
+  /* ---- geometry -------------------------------------------------------
+     The 197px reservation, accounted in full:
+       band 34 + ruler 15 + graph 139 + hbar 2 + gap 4 + floor 3 = 197
+     The node is the most compact form still carrying dot, priority, title
+     and id, so the old sub line folds into the title line:
+       node       214 x 24
+       gutter      28        (a 14px stub either side of the dogleg)
+       RANK PITCH 242 = node width 214 + gutter 28
+       ROW PITCH   34 = node height 24 + row gap 10
+     Four rows therefore fit the 139px graph band (4x24 + 3x10 = 126). The
+     old 262x40 node on a 56px row pitch fitted two, which is what made a
+     wide rank overflow with nowhere to go.
+     -------------------------------------------------------------------- */
+  .fl .rank-ruler { position:absolute; left:0; right:0; top:34px; height:15px; overflow:hidden; }
+  .fl .rank-ruler .rr { position:absolute; inset:0; }
+  .fl .rank-ruler b {
+    position:absolute; font:500 9.5px/15px var(--mono); letter-spacing:.13em; color:#5b626f; font-weight:500;
+  }
+
+  /* The graph clips horizontally and never vertically: the layout is ranked
+     into the band's own height, so there is nothing below to scroll to. */
+  .fl .graph { position:absolute; left:0; right:0; top:49px; height:139px; overflow:hidden; }
+  .fl .canvas { position:absolute; inset:0; }
+
+  .fl .wires { position:absolute; inset:0; z-index:0; }
+  .fl .wires i { position:absolute; background:#ffffff38; }
+
+  .fl .node {
+    position:absolute; z-index:1; width:214px; height:24px; cursor:pointer;
+    display:flex; align-items:center; gap:6px; padding:0 6px;
+  }
+  .fl .node .dot { width:8px; height:8px; flex:none; border-radius:50%; }
+  .fl .node .pri { flex:none; font:700 9.5px/24px var(--mono); letter-spacing:.03em; color:var(--pri); }
+  .fl .node .title {
+    flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:12px; font-weight:600; line-height:24px; letter-spacing:-.008em; color:#e9ebf0;
+  }
+  .fl .node .id { flex:none; font:500 9.5px/24px var(--mono); color:#7a828f; }
+  .fl .node:hover { background:#ffffff08; }
+
+  /* Done recedes; it is context for the live node, not the point of the view. */
+  .fl .node.done .dot { background:var(--done); }
+  .fl .node.done .title { color:#949cA8; font-weight:550; }
+  .fl .node.done .pri { opacity:.6; }
+  /* Ready and blocked are hollow: the ring says the work has not started. */
+  .fl .node.ready .dot { background:transparent; box-shadow:inset 0 0 0 1.5px var(--ready); }
+  .fl .node.blocked .dot { background:transparent; box-shadow:inset 0 0 0 1.5px var(--blocked); }
+  .fl .node.blocked .title { color:#cdd3dd; }
+  /* The one node a machine is on right now. bd already records the assignee;
+     Scribe is the only surface that also knows the session is live in this
+     window, so the halo means running here, not merely assigned. */
+  .fl .node.live .dot {
+    background:var(--progress);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--progress) 20%,transparent);
+  }
+  .fl .node.live .title { color:#f4f6fa; font-weight:650; }
+  .fl .node .agent { flex:none; color:#9fb0ff; font:500 9.5px/24px var(--mono); }
+  .fl .node .agent::after {
+    content:""; display:inline-block; width:4px; height:4px; margin-left:5px;
+    border-radius:50%; background:var(--progress); vertical-align:1px;
+  }
+  /* Hovering a node traces its path: what it waited on, what it releases. */
+  .fl.trace .node { opacity:.24; }
+  .fl.trace .node.on { opacity:1; }
+  .fl.trace .wires i { background:#ffffff14; }
+  .fl.trace .wires i.on { background:#e9ebf0; }
+  .fl .node.cursor { background:#ffffff0f; box-shadow:inset 2px 0 0 #e9ebf0; }
+  .fl .back {
+    font:600 9px/1 var(--sans); letter-spacing:.1em; text-transform:uppercase;
+    color:#8d94a1; padding:5px 8px 5px 0; cursor:pointer;
+  }
+  .fl .opened-tag {
+    font:500 9.5px/1 var(--mono); color:#69707d; letter-spacing:.04em;
+  }
+  .fl .unlocks {
+    position:absolute; z-index:2; padding:3px 7px; border-radius:2px;
+    background:#20242b; border:1px solid #ffffff2b;
+    font:500 9.5px/13px var(--mono); color:#c9ced8; white-space:nowrap;
+  }
+  /* Edge treatment: the side that has graph behind it fades into the ground,
+     so a clipped rank reads as continuing rather than as ending. */
+  .fl .fade { position:absolute; top:49px; height:139px; width:48px; z-index:3; pointer-events:none; }
+  .fl .fade.l { left:0;  background:linear-gradient(90deg,var(--ground),#15171c00); }
+  .fl .fade.r { right:0; background:linear-gradient(270deg,var(--ground),#15171c00); }
+  /* Horizontal position only. The wheel scrolls x; there is deliberately no
+     vertical counterpart anywhere in this view. */
+  .fl .hbar { position:absolute; left:0; right:0; top:188px; height:2px; background:#ffffff0f; }
+  .fl .hbar i { position:absolute; top:0; height:2px; background:#ffffff33; }
+
+  .fl .floor { position:absolute; left:0; right:0; bottom:0; height:3px; background:#ffffff0f; }
+  .fl .floor::after {
+    content:""; position:absolute; left:50%; transform:translateX(-50%);
+    top:1px; width:34px; height:1px; background:#ffffff2b;
+  }
+</style>
+</head>
+<body>
+
+<h1>Beads board — direction A2</h1>
+<p class="lede">
+  Same reserved strip (<code>197px</code>), same live data, same GPUI vocabulary: flex rows, 1px rules,
+  two-stop gradients, rounded rects, theme + ANSI colour only. Shown against the <em>real</em> current
+  repository state (two in progress, four blocked, 559 done, two empty queues) and against a busy state,
+  because the sparse state is the one that reads worst today. Today's board and the ledger step it came
+  from are kept below as reference; the discarded card and panel directions are gone.
+</p>
+
+<!-- =============================== CURRENT =============================== -->
+<section class="case">
+  <h2>Current <span>— reference</span></h2>
+  <p>
+    Five equal columns; two of them spend a full column saying nothing. Colour runs three systems at once
+    (queue hue, priority heat, epic magenta), so nothing wins. Every card is the same grey rectangle at the
+    same weight whether it is a P0 blocker or the 559th closed issue.
+  </p>
+  <div class="frame">
+    <div class="board cur">
+      <i class="rail"></i>
+      <div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes">
+        <section class="lane backlog">
+          <header class="head"><i class="node"></i><div class="qline"><span class="qname">Backlog</span><span class="qcount">0</span></div></header>
+          <div class="empty">Empty</div>
+        </section>
+        <section class="lane ready">
+          <header class="head"><i class="node"></i><div class="qline"><span class="qname">Ready</span><span class="qcount">0</span></div></header>
+          <div class="empty">None ready</div>
+        </section>
+        <section class="lane progress">
+          <header class="head"><i class="node"></i><div class="qline"><span class="qname">In progress</span><span class="qcount">2</span></div></header>
+          <div class="card" style="--pri:var(--p1)"><div class="top"><span class="badge">P1</span><span class="title">Build the Pi lifecycle extension</span></div><div class="meta">2a8z.3<span class="epic">pi-ai-integration</span></div></div>
+          <div class="card" style="--pri:var(--p1)"><div class="top"><span class="badge">P1</span><span class="title">Promote Pi launch and restore to…</span></div><div class="meta">2a8z.2<span class="epic">pi-ai-integration</span></div></div>
+        </section>
+        <section class="lane blocked">
+          <header class="head"><i class="node"></i><div class="qline"><span class="qname">Blocked</span><span class="qcount">4</span></div></header>
+          <div class="card" style="--pri:var(--p1)"><div class="top"><span class="badge">P1</span><span class="title">Verify shared AI behavior for Pi</span></div><div class="meta">2a8z.5<span class="epic">pi-ai-integration</span></div></div>
+          <div class="card" style="--pri:var(--p1)"><div class="top"><span class="badge">P1</span><span class="title">Install and package the Pi extension</span></div><div class="meta">2a8z.4<span class="epic">pi-ai-integration</span></div></div>
+          <div class="card" style="--pri:var(--p2)"><div class="top"><span class="badge">P2</span><span class="title">Document Pi integration and com…</span></div><div class="meta">2a8z.7<span class="epic">pi-ai-integration</span></div></div>
+        </section>
+        <section class="lane done">
+          <header class="head"><i class="node"></i><div class="qline"><span class="qname">Done</span><span class="qcount">559</span></div></header>
+          <div class="card" style="--pri:var(--p0)"><div class="top"><span class="badge">P0</span><span class="title">Negotiate Pi provider compatibility</span></div><div class="meta">2a8z.1<span class="epic">pi-ai-integration</span></div></div>
+          <div class="card" style="--pri:var(--p0)"><div class="top"><span class="badge">P0</span><span class="title">Docker unit cache executes anoth…</span></div><div class="meta">szt6</div></div>
+          <div class="card" style="--pri:var(--p0)"><div class="top"><span class="badge">P0</span><span class="title">Replace private bd build with Scri…</span></div><div class="meta">af6s</div></div>
+        </section>
+      </div>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+</section>
+
+<!-- =============================== D1 LEDGER =============================== -->
+<section class="case">
+  <h2>A · Ledger <span>— stop imitating a kanban board</span></h2>
+  <p>
+    The card is deleted. Queue identity moves to a 2px hue bar over each column head; the count becomes the
+    largest type on the strip. Rows are ruled, not boxed, so four fit where three did, and hue survives in
+    exactly two places: the head bar and the priority glyph. Empty queues stop drawing a dashed rectangle
+    the size of real work — they dim their bar and say one line. Matches the settings surface's typeset grammar.
+  </p>
+
+  <div class="state">Real state</div>
+  <div class="frame">
+    <div class="board d1">
+      <div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes">
+        <section class="lane backlog void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">nothing waiting</div></div>
+        </section>
+        <section class="lane ready void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">none ready to start</div></div>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">2</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="sub"><span class="id">2a8z.3</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Promote Pi launch and restore</span><span class="sub"><span class="id">2a8z.2</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+        <section class="lane blocked">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Blocked</span><span class="qcount">4</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Verify shared AI behavior for Pi</span><span class="sub"><span class="id">2a8z.5</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Install and package the Pi extension</span><span class="sub"><span class="id">2a8z.4</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Document Pi integration</span><span class="sub"><span class="id">2a8z.7</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Prove Pi integration end to end</span><span class="sub"><span class="id">2a8z.6</span><span class="epic">pi-ai-integration</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+        <section class="lane done">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Done</span><span class="qcount">559</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p0)"><span class="pri">P0</span><span class="title">Negotiate Pi provider compatibility</span><span class="sub"><span class="id">2a8z.1</span><span class="epic">pi-ai-integration</span><span class="age">4h</span></span></div>
+            <div class="row" style="--pri:var(--p0)"><span class="pri">P0</span><span class="title">Docker unit cache executes another worktree</span><span class="sub"><span class="id">szt6</span><span class="age">1d</span></span></div>
+            <div class="row" style="--pri:var(--p0)"><span class="pri">P0</span><span class="title">Replace private bd build with write locks</span><span class="sub"><span class="id">af6s</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p0)"><span class="pri">P0</span><span class="title">Hot-reload loses all sessions</span><span class="sub"><span class="id">7sf</span><span class="age">3d</span></span></div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">Busy state</div>
+  <div class="frame">
+    <div class="board d1">
+      <div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes">
+        <section class="lane backlog">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">12</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Document cache policy</span><span class="sub"><span class="id">sc-70</span><span class="age">9d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Parse custom statuses</span><span class="sub"><span class="id">sc-81</span><span class="epic">beads-integration</span><span class="age">7d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Expose stale timestamp</span><span class="sub"><span class="id">sc-76</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p4)"><span class="pri">P4</span><span class="title">Polish empty queue copy</span><span class="sub"><span class="id">sc-64</span><span class="age">6d</span></span></div>
+          </div>
+        </section>
+        <section class="lane ready">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">4</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Add board protocol</span><span class="sub"><span class="id">sc-88</span><span class="epic">beads-integration</span><span class="age">3d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Cache stale state</span><span class="sub"><span class="id">sc-94</span><span class="age">3d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Wire workspace refresh</span><span class="sub"><span class="id">sc-32</span><span class="epic">workspace-intel</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Add unavailable state</span><span class="sub"><span class="id">sc-27</span><span class="age">1d</span></span></div>
+          </div>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">5</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Workspace Beads board</span><span class="sub"><span class="id">sc-1bf</span><span class="epic">workspace-intel</span><span class="age">5d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Render queue rail</span><span class="sub"><span class="id">sc-43</span><span class="age">4d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Pin board across tabs</span><span class="sub"><span class="id">sc-55</span><span class="epic">gpui-client</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Preserve lane scroll</span><span class="sub"><span class="id">sc-49</span><span class="age">1d</span></span></div>
+          </div>
+        </section>
+        <section class="lane blocked">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Blocked</span><span class="qcount">4</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Sync conflict handling</span><span class="sub"><span class="id">sc-91</span><span class="epic">beads-integration</span><span class="age">8d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Remote workspace reads</span><span class="sub"><span class="id">sc-58</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Restore cached snapshot</span><span class="sub"><span class="id">sc-36</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Resolve Dolt lock state</span><span class="sub"><span class="id">sc-18</span><span class="age">4d</span></span></div>
+          </div>
+        </section>
+        <section class="lane done">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Done</span><span class="qcount">559</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Fix maximize restore</span><span class="sub"><span class="id">sc-61</span><span class="epic">gpui-client</span><span class="age">4h</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Detect workspace root</span><span class="sub"><span class="id">sc-24</span><span class="age">1d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Cache bd availability</span><span class="sub"><span class="id">sc-16</span><span class="epic">beads-integration</span><span class="age">1d</span></span></div>
+            <div class="row" style="--pri:var(--p4)"><span class="pri">P4</span><span class="title">Tune titlebar spacing</span><span class="sub"><span class="id">sc-09</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+</section>
+
+<!-- =============================== A2 LEDGER + RAIL =============================== -->
+<section class="case">
+  <h2>A2 · Ledger + rail <span>— A, with Blocked and Done collapsed to hover tabs</span></h2>
+  <p>
+    Blocked and Done are the only two queues that never arm a card drag, so collapsing exactly those two
+    costs no gesture. They become 36px vertical tabs at the right edge. Hover opens a tab over the lanes;
+    click pins it and the lanes give up real width — the same hover-opens / click-pins grammar the
+    workspace bead already uses for the board itself. A tab holding work keeps its hue and count at full
+    strength, so “4 blocked” still registers while collapsed. The label is one glyph per line rather than
+    rotated text, because GPUI cannot transform a text element.
+  </p>
+  <p>
+    The head is a label row, not a bar. A filled 34px band spent a sixth of a 197px strip announcing five
+    words; now one hairline and five aligned seams do the grouping, each label takes its own queue's hue
+    pulled two thirds of the way to the chrome ink, the count drops to meta size and muted ink because the
+    label already carries the identity, and the text-size steppers are two borderless glyphs on that line. Every pixel reclaimed went to the rows, which run 51px — the
+    head is down to 12% of the strip and the work holds 78%. Each seam carries its hue at the lane's own
+    start and lets go across it, so the five read as a direction rather than as five equal slabs.
+  </p>
+  <p>
+    The rest is measure and repetition. An empty queue no longer holds a full working column; a queue whose
+    every issue shares one epic names it once in the head and drops it from the rows, the same reason the
+    ID already drops the project prefix every card repeats — the hover drawer obeys the same rule. The
+    sub line is three columns rather than one run-on string: ID left, age on the row's true centre, epic
+    right, so the ages read as a column down the lane whether or not a row carries an epic. The
+    count sits beside its name rather than at the far edge, an empty note starts where a title would, a
+    lane holding more than it shows carries the board's own <code>⌄</code> mark, and the strip terminates
+    in its own bar, which is the resize grip.
+  </p>
+
+  <div class="state">Collapsed — real state</div>
+  <div class="frame">
+    <div class="board d1 dr">
+      <i class="headband"></i><div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) 660px 36px 36px">
+        <section class="lane backlog void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">nothing waiting</div></div>
+        </section>
+        <section class="lane ready void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">none ready to start<b>4 blocked</b></div></div>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">2</span><span class="lane-epic">pi-ai-integration</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="sub"><span class="id">2a8z.3</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Promote Pi launch and restore to tracked AI</span><span class="sub"><span class="id">2a8z.2</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+        <aside class="tab blocked" title="Blocked — hover to open, click to pin">
+          <i class="bar"></i><span class="tcount">4</span>
+          <span class="spine"><i>B</i><i>L</i><i>O</i><i>C</i><i>K</i><i>E</i><i>D</i></span>
+          <i class="cue">‹</i>
+        </aside>
+        <aside class="tab done" title="Done — hover to open, click to pin">
+          <i class="bar"></i><span class="tcount">559</span>
+          <span class="spine"><i>D</i><i>O</i><i>N</i><i>E</i></span>
+          <i class="cue">‹</i>
+        </aside>
+      </div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">Hovering the Blocked tab — opens over the lanes, nothing reflows</div>
+  <div class="frame">
+    <div class="board d1 dr">
+      <i class="headband"></i><div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) 660px 36px 36px">
+        <section class="lane backlog void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">nothing waiting</div></div>
+        </section>
+        <section class="lane ready void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">none ready to start<b>4 blocked</b></div></div>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">2</span><span class="lane-epic">pi-ai-integration</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="sub"><span class="id">2a8z.3</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Promote Pi launch and restore to tracked AI</span><span class="sub"><span class="id">2a8z.2</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+        <aside class="tab blocked hot">
+          <i class="bar"></i><span class="tcount">4</span>
+          <span class="spine"><i>B</i><i>L</i><i>O</i><i>C</i><i>K</i><i>E</i><i>D</i></span>
+          <i class="cue">‹</i>
+        </aside>
+        <aside class="tab done">
+          <i class="bar"></i><span class="tcount">559</span>
+          <span class="spine"><i>D</i><i>O</i><i>N</i><i>E</i></span>
+          <i class="cue">‹</i>
+        </aside>
+      </div>
+      <div class="drawer blocked">
+        <i class="bar"></i>
+        <header class="head"><span class="qname">Blocked</span><span class="qcount">4</span><span class="lane-epic">pi-ai-integration</span><span class="pinhint">click to pin</span></header>
+        <div class="rows">
+          <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Verify shared AI behavior for Pi</span><span class="sub"><span class="id">2a8z.5</span><span class="age">2d</span></span></div>
+          <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Install and package the Pi extension</span><span class="sub"><span class="id">2a8z.4</span><span class="age">2d</span></span></div>
+          <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Document Pi integration and compatibility</span><span class="sub"><span class="id">2a8z.7</span><span class="age">2d</span></span></div>
+          <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Prove Pi integration end to end</span><span class="sub"><span class="id">2a8z.6</span><span class="age">2d</span></span></div>
+        </div><i class="chev">⌄</i>
+      </div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">Blocked pinned — busy state, Done still a tab</div>
+  <div class="frame">
+    <div class="board d1 dr">
+      <i class="headband"></i><div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes" style="grid-template-columns:repeat(3,minmax(0,1fr)) minmax(0,.85fr) 36px">
+        <section class="lane backlog">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">12</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Document cache policy</span><span class="sub"><span class="id">sc-70</span><span class="age">9d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Parse custom statuses</span><span class="sub"><span class="id">sc-81</span><span class="epic">beads-integration</span><span class="age">7d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Expose stale timestamp</span><span class="sub"><span class="id">sc-76</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p4)"><span class="pri">P4</span><span class="title">Polish empty queue copy</span><span class="sub"><span class="id">sc-64</span><span class="age">6d</span></span></div>
+          </div><i class="chev">⌄</i>
+        </section>
+        <section class="lane ready">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">4</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Cache stale state</span><span class="sub"><span class="id">sc-94</span><span class="age">3d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Add board protocol</span><span class="sub"><span class="id">sc-88</span><span class="epic">beads-integration</span><span class="age">3d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Wire workspace refresh</span><span class="sub"><span class="id">sc-32</span><span class="epic">workspace-intel</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Add unavailable state</span><span class="sub"><span class="id">sc-27</span><span class="age">1d</span></span></div>
+          </div><i class="chev">⌄</i>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">5</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Pin board across tabs</span><span class="sub"><span class="id">sc-55</span><span class="epic">gpui-client</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Workspace Beads board</span><span class="sub"><span class="id">sc-1bf</span><span class="epic">workspace-intel</span><span class="age">5d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Render queue rail</span><span class="sub"><span class="id">sc-43</span><span class="age">4d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Preserve lane scroll</span><span class="sub"><span class="id">sc-49</span><span class="age">1d</span></span></div>
+          </div><i class="chev">⌄</i>
+        </section>
+        <section class="lane blocked">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Blocked</span><span class="qcount">4</span><span class="unpin">×</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Sync conflict handling</span><span class="sub"><span class="id">sc-91</span><span class="epic">beads-integration</span><span class="age">8d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Remote workspace reads</span><span class="sub"><span class="id">sc-58</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p3)"><span class="pri">P3</span><span class="title">Restore cached snapshot</span><span class="sub"><span class="id">sc-36</span><span class="age">6d</span></span></div>
+            <div class="row" style="--pri:var(--p2)"><span class="pri">P2</span><span class="title">Resolve Dolt lock state</span><span class="sub"><span class="id">sc-18</span><span class="age">4d</span></span></div>
+          </div><i class="chev">⌄</i>
+        </section>
+        <aside class="tab done">
+          <i class="bar"></i><span class="tcount">559</span>
+          <span class="spine"><i>D</i><i>O</i><i>N</i><i>E</i></span>
+          <i class="cue">‹</i>
+        </aside>
+      </div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">Dragging a card — the collapsed Done tab is still the drop target that closes it</div>
+  <div class="frame">
+    <div class="board d1 dr">
+      <i class="headband"></i><div class="zoom"><i>+</i><i>−</i></div>
+      <div class="lanes" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) 660px 36px 36px">
+        <section class="lane backlog void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Backlog</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">nothing waiting</div></div>
+        </section>
+        <section class="lane ready void">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">Ready</span><span class="qcount">0</span></header>
+          <div class="rows"><div class="void-note">none ready to start<b>4 blocked</b></div></div>
+        </section>
+        <section class="lane progress">
+          <i class="bar"></i>
+          <header class="head"><span class="qname">In progress</span><span class="qcount">2</span><span class="lane-epic">pi-ai-integration</span></header>
+          <div class="rows">
+            <div class="row" style="--pri:var(--p1);opacity:.38"><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="sub"><span class="id">2a8z.3</span><span class="age">2d</span></span></div>
+            <div class="row" style="--pri:var(--p1)"><span class="pri">P1</span><span class="title">Promote Pi launch and restore to tracked AI</span><span class="sub"><span class="id">2a8z.2</span><span class="age">2d</span></span></div>
+          </div>
+        </section>
+        <aside class="tab blocked">
+          <i class="bar"></i><span class="tcount">4</span>
+          <span class="spine"><i>B</i><i>L</i><i>O</i><i>C</i><i>K</i><i>E</i><i>D</i></span>
+          <i class="cue">‹</i>
+        </aside>
+        <aside class="tab done target">
+          <i class="bar"></i><span class="tcount">559</span>
+          <span class="spine"><i>D</i><i>O</i><i>N</i><i>E</i></span>
+          <i class="cue">‹</i>
+        </aside>
+      </div>
+      <div class="ghost" style="--pri:var(--p1)">
+        <span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span>
+        <span class="sub" style="grid-column:2"><span class="id">2a8z.3</span><span class="epic">pi-ai-integration</span></span>
+      </div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+</section>
+
+<!-- =============================== A3 FLOW =============================== -->
+<section class="case">
+  <h2>A3 · Flow <span>— what opening a card lands on, and the graph the tracker actually stores</span></h2>
+  <p>
+    Every version above is a kanban: five buckets, and whatever order the rows happen to be in. But Beads
+    is not a bucket tracker — it is a dependency graph, <code>bd ready</code> literally means “no active
+    blockers,” and <code>BeadsBoardItem</code> already ships <code>blocker_ids</code> on the wire, which
+    the card throws away. This epic is a real DAG: <code>.1</code> forks into two branches that run in
+    parallel, reconverge on <code>.6</code>, and end at <code>.7</code>. Five columns cannot say that.
+    Flow ranks nodes by <em>depth in the graph</em> instead of by status, so “what is ready” stops being a
+    query and becomes a position, and “what happens after this” becomes visible for the first time.
+  </p>
+  <p>
+    The second half is something no tracker can render and no terminal can either. <code>bd</code> records
+    an issue's assignee, and Scribe knows which of its own panes is running that agent right now — so the
+    live node gets a halo that means <em>running here</em>, not merely assigned. The board stops reporting
+    what somebody remembered to set and starts reporting what the machine is doing.
+  </p>
+  <p>
+    <strong>Flow is where opening a card lands.</strong> Clicking a row in Lanes no longer just raises a
+    panel over the terminal — the strip itself becomes that card's epic, with the clicked issue marked as
+    the cursor. Answering “why can I not start this?” stops being a read of a blocker list and becomes a
+    position: the card sits one hop right of the node a machine is on. Lanes and Flow are two modes of one
+    board rather than two designs, so returning is the same control that got you here, and a card with no
+    epic keeps today's behaviour and opens the panel instead.
+  </p>
+
+  <p>
+    <strong>The node is sized by the budget, not the other way round.</strong> The strip is a fixed
+    <code>197px</code> and spends it exactly: <code>band 34 + ruler 15 + graph 139 + hbar 2 + gap 4 +
+    floor 3</code>. Everything else derives from a node compact enough to leave the graph room, which
+    means the old sub line folds into the title line and the node carries dot, priority, title and id on
+    one <code>214×24</code> row:
+  </p>
+  <p class="formula">
+    rank pitch&nbsp;&nbsp;&nbsp; = node width 214 + gutter 28 = <b>242px</b><br>
+    row pitch&nbsp;&nbsp;&nbsp;&nbsp; = node height 24 + row gap 10 = <b>34px</b><br>
+    rows per rank = floor((139 + 10) / 34) = <b>4</b>
+  </p>
+  <p>
+    The gutter is two 14px stubs either side of the dogleg, so every fork leaves its source and enters its
+    target on the same 1px rails at each rank. Four rows is the whole point of the exercise: the previous
+    <code>262×40</code> node on a 56px row pitch fitted <em>two</em>, so any rank wider than that had
+    nowhere to go. Depth costs width instead — eight ranks is <code>30 + 7×242 + 214 = 1938px</code>
+    against a 1552px strip — and width is the axis that can scroll. The wheel moves x, the clipped side
+    fades into the ground so a cut rank reads as continuing rather than ending, and a 2px bar reports
+    position. No state shows a vertical scrollbar and none is meant to: the graph is ranked into the
+    band's own height, so there is never anything below to scroll to.
+  </p>
+  <p>
+    Text scale moves the node but not the reservation, so the row budget is a
+    function of scale and worth stating rather than discovering:
+    <code>floor((139 + 10s) / 34s)</code> gives <strong>5</strong> rows at 0.8,
+    <strong>4</strong> at 1.0 and <strong>2</strong> at 1.6. Folding the sub line away is what keeps that
+    workable — a two-line node at 1.6 would leave a single row. A rank too wide for the budget at the
+    current scale is the layout engine's admission problem, not something to solve by growing the strip.
+  </p>
+
+  <div class="state">Opened “Document Pi integration” from the Blocked lane — the strip becomes its epic</div>
+  <div class="frame">
+    <div class="board fl">
+      <header class="band">
+        <span class="back">&larr; lanes</span>
+        <span class="epic">pi-ai-integration</span><i class="switch">&#8964;</i>
+        <span class="tally">5<small>/7</small></span>
+        <span class="prog"><i style="width:71%"></i></span>
+        <span class="opened-tag">opened 2a8z.7</span>
+        <span class="modes"><span>lanes</span><span class="on">flow</span></span>
+      </header>
+      <div class="rank-ruler"><div class="rr"><b style="left:30px">SHIPPED</b><b style="left:756px">NOW</b><b style="left:998px">NEXT</b></div></div>
+      <div class="graph"><div class="canvas">
+        <div class="wires">
+        <i style="left:244px;top:69px;width:14px;height:1px"></i>
+        <i style="left:258px;top:52px;width:1px;height:17px"></i>
+        <i style="left:258px;top:52px;width:14px;height:1px"></i>
+        <i style="left:258px;top:69px;width:1px;height:17px"></i>
+        <i style="left:258px;top:86px;width:14px;height:1px"></i>
+        <i style="left:486px;top:52px;width:28px;height:1px"></i>
+        <i style="left:486px;top:86px;width:28px;height:1px"></i>
+        <i style="left:728px;top:52px;width:14px;height:1px"></i>
+        <i style="left:742px;top:52px;width:1px;height:17px"></i>
+        <i style="left:742px;top:69px;width:14px;height:1px"></i>
+        <i style="left:728px;top:86px;width:14px;height:1px"></i>
+        <i style="left:742px;top:69px;width:1px;height:17px"></i>
+        <i style="left:970px;top:69px;width:28px;height:1px"></i>
+        </div>
+      <article class="node done" style="left:30px;top:57px;--pri:var(--p0)"><i class="dot"></i><span class="pri">P0</span><span class="title">Negotiate Pi provider compatibility</span><span class="id">2a8z.1</span></article>
+      <article class="node done" style="left:272px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Promote Pi launch and restore</span><span class="id">2a8z.2</span></article>
+      <article class="node done" style="left:272px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="id">2a8z.3</span></article>
+      <article class="node done" style="left:514px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Verify shared AI behavior</span><span class="id">2a8z.5</span></article>
+      <article class="node done" style="left:514px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Install and package extension</span><span class="id">2a8z.4</span></article>
+      <article class="node live" style="left:756px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Prove Pi integration end to end</span><span class="agent">codex</span><span class="id">2a8z.6</span></article>
+      <article class="node blocked cursor" style="left:998px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Document Pi integration</span><span class="id">2a8z.7</span></article>
+      </div></div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">Hovering a node traces its path — what it waited on, what it releases</div>
+  <div class="frame">
+    <div class="board fl trace">
+      <header class="band">
+        <span class="epic">pi-ai-integration</span><i class="switch">&#8964;</i>
+        <span class="tally">5<small>/7</small></span>
+        <span class="prog"><i style="width:71%"></i></span>
+        <span class="modes"><span>lanes</span><span class="on">flow</span></span>
+      </header>
+      <div class="rank-ruler"><div class="rr"><b style="left:30px">SHIPPED</b><b style="left:756px">NOW</b><b style="left:998px">NEXT</b></div></div>
+      <div class="graph"><div class="canvas">
+        <div class="wires">
+        <i class="on" style="left:244px;top:69px;width:14px;height:1px"></i>
+        <i style="left:258px;top:52px;width:1px;height:17px"></i>
+        <i style="left:258px;top:52px;width:14px;height:1px"></i>
+        <i class="on" style="left:258px;top:69px;width:1px;height:17px"></i>
+        <i class="on" style="left:258px;top:86px;width:14px;height:1px"></i>
+        <i style="left:486px;top:52px;width:28px;height:1px"></i>
+        <i class="on" style="left:486px;top:86px;width:28px;height:1px"></i>
+        <i style="left:728px;top:52px;width:14px;height:1px"></i>
+        <i style="left:742px;top:52px;width:1px;height:17px"></i>
+        <i class="on" style="left:742px;top:69px;width:14px;height:1px"></i>
+        <i class="on" style="left:728px;top:86px;width:14px;height:1px"></i>
+        <i class="on" style="left:742px;top:69px;width:1px;height:17px"></i>
+        <i class="on" style="left:970px;top:69px;width:28px;height:1px"></i>
+        </div>
+      <article class="node done on" style="left:30px;top:57px;--pri:var(--p0)"><i class="dot"></i><span class="pri">P0</span><span class="title">Negotiate Pi provider compatibility</span><span class="id">2a8z.1</span></article>
+      <article class="node done" style="left:272px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Promote Pi launch and restore</span><span class="id">2a8z.2</span></article>
+      <article class="node done on cursor" style="left:272px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Build the Pi lifecycle extension</span><span class="id">2a8z.3</span></article>
+      <article class="node done" style="left:514px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Verify shared AI behavior</span><span class="id">2a8z.5</span></article>
+      <article class="node done on" style="left:514px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Install and package extension</span><span class="id">2a8z.4</span></article>
+      <article class="node live on" style="left:756px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Prove Pi integration end to end</span><span class="agent">codex</span><span class="id">2a8z.6</span></article>
+      <article class="node blocked on" style="left:998px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Document Pi integration</span><span class="id">2a8z.7</span></article>
+        <span class="unlocks" style="left:286px;top:104px">releases 3 &middot; blocked by 1</span>
+      </div></div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">just check</span></div>
+  </div>
+
+  <div class="state">A deeper epic — the frontier rank is four rows deep, and the graph runs past the strip</div>
+  <div class="frame">
+    <div class="board fl">
+      <header class="band">
+        <span class="back">&larr; lanes</span>
+        <span class="epic">beads-flow-view</span><i class="switch">&#8964;</i>
+        <span class="tally">0<small>/17</small></span>
+        <span class="prog"><i style="width:0%"></i></span>
+        <span class="opened-tag">opened lpi2.2</span>
+        <span class="modes"><span>lanes</span><span class="on">flow</span></span>
+      </header>
+      <div class="rank-ruler"><div class="rr"><b style="left:30px">NOW</b><b style="left:272px">NEXT</b><b style="left:998px">LATER</b></div></div>
+      <div class="graph"><div class="canvas">
+        <div class="wires">
+        <i style="left:244px;top:18px;width:14px;height:1px"></i>
+        <i style="left:258px;top:18px;width:1px;height:34px"></i>
+        <i style="left:258px;top:52px;width:14px;height:1px"></i>
+        <i style="left:258px;top:18px;width:1px;height:68px"></i>
+        <i style="left:258px;top:86px;width:14px;height:1px"></i>
+        <i style="left:244px;top:18px;width:8px;height:1px"></i>
+        <i style="left:252px;top:18px;width:1px;height:17px"></i>
+        <i style="left:252px;top:35px;width:254px;height:1px"></i>
+        <i style="left:506px;top:35px;width:1px;height:51px"></i>
+        <i style="left:506px;top:86px;width:8px;height:1px"></i>
+        <i style="left:486px;top:86px;width:28px;height:1px"></i>
+        <i style="left:728px;top:86px;width:28px;height:1px"></i>
+        <i style="left:486px;top:52px;width:28px;height:1px"></i>
+        <i style="left:244px;top:86px;width:8px;height:1px"></i>
+        <i style="left:252px;top:69px;width:1px;height:17px"></i>
+        <i style="left:252px;top:69px;width:254px;height:1px"></i>
+        <i style="left:506px;top:52px;width:1px;height:17px"></i>
+        <i style="left:506px;top:52px;width:8px;height:1px"></i>
+        <i style="left:244px;top:52px;width:8px;height:1px"></i>
+        <i style="left:252px;top:35px;width:1px;height:17px"></i>
+        <i style="left:506px;top:35px;width:1px;height:17px"></i>
+        <i style="left:728px;top:52px;width:28px;height:1px"></i>
+        <i style="left:728px;top:86px;width:14px;height:1px"></i>
+        <i style="left:742px;top:52px;width:1px;height:34px"></i>
+        <i style="left:742px;top:52px;width:14px;height:1px"></i>
+        <i style="left:970px;top:52px;width:28px;height:1px"></i>
+        <i style="left:1212px;top:52px;width:28px;height:1px"></i>
+        <i style="left:252px;top:35px;width:738px;height:1px"></i>
+        <i style="left:990px;top:35px;width:1px;height:51px"></i>
+        <i style="left:990px;top:86px;width:8px;height:1px"></i>
+        <i style="left:970px;top:86px;width:28px;height:1px"></i>
+        <i style="left:1212px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1220px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1220px;top:69px;width:254px;height:1px"></i>
+        <i style="left:1474px;top:52px;width:1px;height:17px"></i>
+        <i style="left:1474px;top:52px;width:8px;height:1px"></i>
+        <i style="left:1454px;top:52px;width:28px;height:1px"></i>
+        <i style="left:1454px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1468px;top:52px;width:1px;height:34px"></i>
+        <i style="left:1468px;top:86px;width:14px;height:1px"></i>
+        <i style="left:244px;top:120px;width:8px;height:1px"></i>
+        <i style="left:252px;top:103px;width:1px;height:17px"></i>
+        <i style="left:252px;top:103px;width:1222px;height:1px"></i>
+        <i style="left:1474px;top:86px;width:1px;height:17px"></i>
+        <i style="left:1474px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1212px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1226px;top:52px;width:1px;height:34px"></i>
+        <i style="left:1226px;top:86px;width:14px;height:1px"></i>
+        <i style="left:252px;top:103px;width:980px;height:1px"></i>
+        <i style="left:1232px;top:86px;width:1px;height:17px"></i>
+        <i style="left:1232px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1696px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1710px;top:52px;width:1px;height:17px"></i>
+        <i style="left:1710px;top:69px;width:14px;height:1px"></i>
+        <i style="left:1696px;top:86px;width:14px;height:1px"></i>
+        <i style="left:1710px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1454px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1462px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1462px;top:69px;width:254px;height:1px"></i>
+        <i style="left:1716px;top:69px;width:1px;height:0px"></i>
+        <i style="left:1716px;top:69px;width:8px;height:1px"></i>
+        </div>
+      <article class="node ready" style="left:30px;top:6px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow protocol types</span><span class="id">lpi2.1</span></article>
+      <article class="node live" style="left:30px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Revise the Flow mock</span><span class="agent">codex</span><span class="id">lpi2.2</span></article>
+      <article class="node ready" style="left:30px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Board colour slots</span><span class="id">lpi2.4</span></article>
+      <article class="node ready" style="left:30px;top:108px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Multi-rank fixture</span><span class="id">lpi2.5</span></article>
+      <article class="node blocked" style="left:272px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow layout engine</span><span class="id">lpi2.3</span></article>
+      <article class="node blocked" style="left:272px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Retain parent id</span><span class="id">lpi2.6</span></article>
+      <article class="node blocked" style="left:514px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Render the Flow view</span><span class="id">lpi2.9</span></article>
+      <article class="node blocked" style="left:514px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Assemble + admit graph</span><span class="id">lpi2.7</span></article>
+      <article class="node blocked" style="left:756px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow mode and scroll</span><span class="id">lpi2.10</span></article>
+      <article class="node blocked" style="left:756px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Focused-issue registry</span><span class="id">lpi2.8</span></article>
+      <article class="node blocked" style="left:998px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Retarget the panel</span><span class="id">lpi2.11</span></article>
+      <article class="node blocked" style="left:998px;top:74px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">issue_focused hook</span><span class="id">lpi2.13</span></article>
+      <article class="node blocked" style="left:1240px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Hover path tracing</span><span class="id">lpi2.12</span></article>
+      <article class="node blocked" style="left:1240px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Functional contract</span><span class="id">lpi2.16</span></article>
+      <article class="node blocked" style="left:1482px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Live-agent halo</span><span class="id">lpi2.14</span></article>
+      <article class="node blocked" style="left:1482px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Visual contract</span><span class="id">lpi2.15</span></article>
+      <article class="node blocked" style="left:1724px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Synchronise lat.md</span><span class="id">lpi2.17</span></article>
+      </div></div>
+      <span class="fade r"></span>
+      <div class="hbar"><i style="left:0%;width:80.1%"></i></div>
+      <i class="floor"></i>
+    </div>
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">bd ready --mol</span></div>
+  </div>
+
+  <div class="state">Wheeled into the middle of the same graph — both edges fade, and there is still no vertical scrollbar</div>
+  <div class="frame">
+    <div class="board fl">
+      <header class="band">
+        <span class="back">&larr; lanes</span>
+        <span class="epic">beads-flow-view</span><i class="switch">&#8964;</i>
+        <span class="tally">0<small>/17</small></span>
+        <span class="prog"><i style="width:0%"></i></span>
+        <span class="opened-tag">opened lpi2.2</span>
+        <span class="modes"><span>lanes</span><span class="on">flow</span></span>
+      </header>
+      <div class="rank-ruler"><div class="rr" style="transform:translateX(-193px)"><b style="left:30px">NOW</b><b style="left:272px">NEXT</b><b style="left:998px">LATER</b></div></div>
+      <div class="graph"><div class="canvas" style="transform:translateX(-193px)">
+        <div class="wires">
+        <i style="left:244px;top:18px;width:14px;height:1px"></i>
+        <i style="left:258px;top:18px;width:1px;height:34px"></i>
+        <i style="left:258px;top:52px;width:14px;height:1px"></i>
+        <i style="left:258px;top:18px;width:1px;height:68px"></i>
+        <i style="left:258px;top:86px;width:14px;height:1px"></i>
+        <i style="left:244px;top:18px;width:8px;height:1px"></i>
+        <i style="left:252px;top:18px;width:1px;height:17px"></i>
+        <i style="left:252px;top:35px;width:254px;height:1px"></i>
+        <i style="left:506px;top:35px;width:1px;height:51px"></i>
+        <i style="left:506px;top:86px;width:8px;height:1px"></i>
+        <i style="left:486px;top:86px;width:28px;height:1px"></i>
+        <i style="left:728px;top:86px;width:28px;height:1px"></i>
+        <i style="left:486px;top:52px;width:28px;height:1px"></i>
+        <i style="left:244px;top:86px;width:8px;height:1px"></i>
+        <i style="left:252px;top:69px;width:1px;height:17px"></i>
+        <i style="left:252px;top:69px;width:254px;height:1px"></i>
+        <i style="left:506px;top:52px;width:1px;height:17px"></i>
+        <i style="left:506px;top:52px;width:8px;height:1px"></i>
+        <i style="left:244px;top:52px;width:8px;height:1px"></i>
+        <i style="left:252px;top:35px;width:1px;height:17px"></i>
+        <i style="left:506px;top:35px;width:1px;height:17px"></i>
+        <i style="left:728px;top:52px;width:28px;height:1px"></i>
+        <i style="left:728px;top:86px;width:14px;height:1px"></i>
+        <i style="left:742px;top:52px;width:1px;height:34px"></i>
+        <i style="left:742px;top:52px;width:14px;height:1px"></i>
+        <i style="left:970px;top:52px;width:28px;height:1px"></i>
+        <i style="left:1212px;top:52px;width:28px;height:1px"></i>
+        <i style="left:252px;top:35px;width:738px;height:1px"></i>
+        <i style="left:990px;top:35px;width:1px;height:51px"></i>
+        <i style="left:990px;top:86px;width:8px;height:1px"></i>
+        <i style="left:970px;top:86px;width:28px;height:1px"></i>
+        <i style="left:1212px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1220px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1220px;top:69px;width:254px;height:1px"></i>
+        <i style="left:1474px;top:52px;width:1px;height:17px"></i>
+        <i style="left:1474px;top:52px;width:8px;height:1px"></i>
+        <i style="left:1454px;top:52px;width:28px;height:1px"></i>
+        <i style="left:1454px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1468px;top:52px;width:1px;height:34px"></i>
+        <i style="left:1468px;top:86px;width:14px;height:1px"></i>
+        <i style="left:244px;top:120px;width:8px;height:1px"></i>
+        <i style="left:252px;top:103px;width:1px;height:17px"></i>
+        <i style="left:252px;top:103px;width:1222px;height:1px"></i>
+        <i style="left:1474px;top:86px;width:1px;height:17px"></i>
+        <i style="left:1474px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1212px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1226px;top:52px;width:1px;height:34px"></i>
+        <i style="left:1226px;top:86px;width:14px;height:1px"></i>
+        <i style="left:252px;top:103px;width:980px;height:1px"></i>
+        <i style="left:1232px;top:86px;width:1px;height:17px"></i>
+        <i style="left:1232px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1696px;top:52px;width:14px;height:1px"></i>
+        <i style="left:1710px;top:52px;width:1px;height:17px"></i>
+        <i style="left:1710px;top:69px;width:14px;height:1px"></i>
+        <i style="left:1696px;top:86px;width:14px;height:1px"></i>
+        <i style="left:1710px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1454px;top:86px;width:8px;height:1px"></i>
+        <i style="left:1462px;top:69px;width:1px;height:17px"></i>
+        <i style="left:1462px;top:69px;width:254px;height:1px"></i>
+        <i style="left:1716px;top:69px;width:1px;height:0px"></i>
+        <i style="left:1716px;top:69px;width:8px;height:1px"></i>
+        </div>
+      <article class="node ready" style="left:30px;top:6px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow protocol types</span><span class="id">lpi2.1</span></article>
+      <article class="node live" style="left:30px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Revise the Flow mock</span><span class="agent">codex</span><span class="id">lpi2.2</span></article>
+      <article class="node ready" style="left:30px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Board colour slots</span><span class="id">lpi2.4</span></article>
+      <article class="node ready" style="left:30px;top:108px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Multi-rank fixture</span><span class="id">lpi2.5</span></article>
+      <article class="node blocked" style="left:272px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow layout engine</span><span class="id">lpi2.3</span></article>
+      <article class="node blocked" style="left:272px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Retain parent id</span><span class="id">lpi2.6</span></article>
+      <article class="node blocked" style="left:514px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Render the Flow view</span><span class="id">lpi2.9</span></article>
+      <article class="node blocked" style="left:514px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Assemble + admit graph</span><span class="id">lpi2.7</span></article>
+      <article class="node blocked" style="left:756px;top:40px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Flow mode and scroll</span><span class="id">lpi2.10</span></article>
+      <article class="node blocked" style="left:756px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Focused-issue registry</span><span class="id">lpi2.8</span></article>
+      <article class="node blocked" style="left:998px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Retarget the panel</span><span class="id">lpi2.11</span></article>
+      <article class="node blocked" style="left:998px;top:74px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">issue_focused hook</span><span class="id">lpi2.13</span></article>
+      <article class="node blocked" style="left:1240px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Hover path tracing</span><span class="id">lpi2.12</span></article>
+      <article class="node blocked" style="left:1240px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Functional contract</span><span class="id">lpi2.16</span></article>
+      <article class="node blocked" style="left:1482px;top:40px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Live-agent halo</span><span class="id">lpi2.14</span></article>
+      <article class="node blocked" style="left:1482px;top:74px;--pri:var(--p1)"><i class="dot"></i><span class="pri">P1</span><span class="title">Visual contract</span><span class="id">lpi2.15</span></article>
+      <article class="node blocked" style="left:1724px;top:57px;--pri:var(--p2)"><i class="dot"></i><span class="pri">P2</span><span class="title">Synchronise lat.md</span><span class="id">lpi2.17</span></article>
+      </div></div>
+      <span class="fade l"></span>
+      <span class="fade r"></span>
+      <div class="hbar"><i style="left:10.0%;width:80.1%"></i></div>
+      <i class="floor"></i>
+    </div>
+
+    <div class="peek">~/work/scribe main › <span style="color:#c9ced8">bd ready --mol</span></div>
+  </div>
+</section>
+
+</body>
+</html>
