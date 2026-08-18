@@ -60,7 +60,9 @@ A launch-only [[protocol#Protocol#Client Messages#Session Lifecycle#Launch-only 
 
 [[crates/scribe-server/src/session_manager.rs#launch_exec_command]] is the only fork: structured AI intent yields the provider command with its resume arguments, a `shell_tool` yields `exec <binary>`, and neither yields `None` for the untouched plain-tab argv. Whatever it returns is a string, so [[crates/scribe-server/src/session_manager.rs#build_launch_shell]] and [[crates/scribe-server/src/session_manager.rs#tool_exec_args]] cannot tell an AI tab from a tool tab: a Pi tab is byte-for-byte the Claude tab's argv with the binary swapped, including the integration attachment, the zsh/fish restore-delta consumption, the Nushell `-i -c` form, and the PowerShell `-NoLogo -Command` fallback.
 
-[[crates/scribe-server/src/session_manager.rs#SessionLaunchRequest#normalize]] makes structured intent authoritative before shell detection: AI clears both `shell_tool` and legacy `command`, while `shell_tool` clears `command`. The resulting precedence is `ai_launch > shell_tool > command`, so an arbitrary simultaneous command cannot replace the host shell executable or receive structured exec arguments. The binary name comes from the [[crates/scribe-common/src/protocol.rs#ShellTool]] variant rather than the wire, so no client-supplied text reaches the shell command string. Nothing about a tool tab names an [[crates/scribe-common/src/ai_state.rs#AiProvider]], so the pane gets no AI chrome, hook channel, conversation id or resume mode.
+[[crates/scribe-server/src/session_manager.rs#SessionLaunchRequest#normalize]] makes structured intent authoritative before shell detection: AI clears both `shell_tool` and legacy `command`, while `shell_tool` clears `command`. The resulting precedence is `ai_launch > shell_tool > command`, so an arbitrary simultaneous command cannot replace the host shell executable or receive structured exec arguments. The binary name comes from the [[crates/scribe-common/src/protocol.rs#ShellTool]] variant rather than the wire, so no client-supplied text reaches the shell command string.
+
+The legacy shell-tool request itself still carries no conversation or resume mode, but Pi is now a user-visible [[crates/scribe-common/src/ai_state.rs#AiProvider]]. Ambient command detection recognizes the `pi` binary, structured Pi hook events can promote the live session into the shared AI-state pipeline, and Pi uses the same preserved-scrollback gate as the other visible providers. Its resume capability is explicitly false and its resume argument list empty, so server argv construction never adds a Pi resume command.
 
 After normalization, [[crates/scribe-server/src/session_manager.rs#ResolvedShell#for_request]] preserves legacy explicit commands and otherwise uses the host's env-first [[crates/scribe-common/src/shell.rs#default_shell_program|default shell resolver]], while [[crates/scribe-server/src/session_manager.rs#build_shell]] keeps bash `--rcfile`, zsh `ZDOTDIR`, fish/nushell vendor autoload, and PowerShell `-File` integration. Feature 018 briefly made AI tabs a second session class with their own login-shell resolution and script gates; unifying them back onto this one path deleted that resolver, the `SCRIBE_AI_TAB` mode in all three integration scripts, and the per-shell pre-exec preambles. Resident shells keep the prompt and env-capture hooks an exec-away tab never reaches, so nothing was lost by sharing the path — the AI or tool tab just stops running them.
 
@@ -548,7 +550,9 @@ Feature 013 (remote window control) added no handoff fields — the remote liste
 
 The child-identity token added for the PID check is exactly such an additive field and also stays at v6: a receiver that has never heard of it decodes the payload and ignores the key, and a receiver that expects it fills the missing value with `None`.
 
-Per-session terminal-image state is the one additive field that could not stay on the current version, because "the receiver ignores the key" is the failure: a pre-image server would restore every session's text with its images silently gone. `HANDOFF_VERSION` is therefore 7, but [[crates/scribe-server/src/handoff.rs#handoff_state_version|the payload declares 7 only when it actually carries image state]] and omits that key entirely otherwise, so a v6 receiver accepts the image-free named-map payload and ignores any unrelated additive keys. See [[terminal-images#Terminal Images#Image State Across Handoff]].
+Per-session terminal-image state is the one additive field that could not stay on the current version, because "the receiver ignores the key" is the failure: a pre-image server would restore every session's text with its images silently gone. An image-bearing pre-Pi payload declares v7; an image-free one still declares v6. See [[terminal-images#Terminal Images#Image State Across Handoff]].
+
+`AiProvider::Pi` requires the same fail-safe treatment for a different reason: an older receiver cannot deserialize the new enum value. [[crates/scribe-server/src/handoff.rs#handoff_state_version]] declares v8 whenever any session's live state or provider hint names Pi, ahead of the image check. A v8 receiver accepts v6, v7, and v8 senders so both image-free and image-bearing forward upgrades remain hot; v6/v7 receivers refuse v8 before acknowledging, leaving the current server and its Pi session running instead of silently losing or misreading state. See [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]].
 
 The sender uses `rmp_serde::to_vec_named` so `HandoffState` and `HandoffSession` serialize as MessagePack **maps** keyed by field name (since v6). Earlier versions used the default `rmp_serde::to_vec` which emitted MessagePack **arrays** — positional encoding where any field insertion in the middle of the struct silently mis-aligned every later field, breaking even "previous-version" hot-reloads despite `#[serde(default)]` annotations. Named encoding makes the invariant honest: as long as renames go through `#[serde(rename = "old_name")]` or `#[serde(alias = "old_name")]`, every additive struct change preserves backward compatibility. Cross-encoding handoff (v5 positional sender → v6 named receiver) is not supported; the old server remains active while the client asks for cold-restart approval.
 
@@ -660,7 +664,7 @@ The config also carries the feature-013 `[remote]` table; the same reload handle
 
 Structured IPC by which AI-tool hook subprocesses report state to the server, replacing the OSC-over-`/dev/tty` path that Claude Code v2.1.139 made unusable.
 
-CC v2.1.139 (2026-05-11) intentionally detached the controlling TTY from hook subprocesses, breaking every `printf > /dev/tty` Scribe hook. The replacement is a new `ClientMessage::HookEvent` variant carried on the existing IPC socket and consumed by . Claude Code, Codex, and the Claude statusline subprocess all route through it. See `specs/003-ai-hook-channel/`.
+CC v2.1.139 (2026-05-11) intentionally detached the controlling TTY from hook subprocesses, breaking every `printf > /dev/tty` Scribe hook. The replacement is a new `ClientMessage::HookEvent` variant carried on the existing IPC socket and consumed by . Claude Code, Codex, Pi, and the Claude statusline subprocess share its provider-neutral schema. See `specs/003-ai-hook-channel/`.
 
 ### Discovery
 
@@ -674,9 +678,116 @@ The injection site is : `SCRIBE_HOOK_SOCK` (absolute path to the existing server
 
 The shared  binary sends one `HookEvent` per invocation, waits for server EOF, then exits 0.
 
-CLI parsing via `clap`; both env vars read; payload built; `ClientMessage::HookEvent` length-prefix-msgpack-framed to the socket via the existing `framing::write_message`. After the write, the helper holds the connection open until the server consumes the transient frame and closes it. That EOF is a reply-free acknowledgement and prevents macOS `getpeereid` from returning `ENOTCONN` when an immediately exiting helper wins the race against the server's post-accept credential check. A 100 ms `tokio::time::timeout` bounds connect + write + server close (FR-012). Provider-specific adapters in `dist/ai-hook-{claude,codex,statusline}.sh` translate the AI tool's hook stdin JSON into the helper's argv.
+CLI parsing via `clap`; both env vars read; payload built; `ClientMessage::HookEvent` length-prefix-msgpack-framed to the socket via the existing `framing::write_message`. After the write, the helper holds the connection open until the server consumes the transient frame and closes it. That EOF is a reply-free acknowledgement and prevents macOS `getpeereid` from returning `ENOTCONN` when an immediately exiting helper wins the race against the server's post-accept credential check. A 100 ms `tokio::time::timeout` bounds connect + write + server close (FR-012). The helper accepts `--provider=pi` with the same generic event schema; current shell adapters remain in `dist/ai-hook-{claude,codex,statusline}.sh`.
 
 Claude Code and Codex `UserPromptSubmit` adapters both emit `StateChanged { Processing }` followed by `PromptReceived` when the hook payload contains prompt text, so the prompt bar is driven by the same structured hook event for both providers. Codex additionally derives a `TaskLabelChanged` event from the first non-empty non-slash prompt line and maps `PermissionRequest` to `PermissionPrompt`.
+
+### Pi Extension Adapter
+
+Pi has no hook-script mechanism, so its adapter is an in-process TypeScript
+extension that drives the same helper CLI the shell hooks drive. Transport,
+ingress, the stop classifier, and the schema are untouched.
+
+The full lifecycle, queue, shutdown, and silent-failure oracle is
+[[test#Test Harness#Pi Extension Harness]].
+
+[[dist/pi-extension.ts#scribePiExtension]] is the Scribe-owned adapter Pi loads
+from its user-scope extension directory. It shells out to
+`scribe-hook-helper --provider=pi --event=<name> --payload-stdin` and puts every
+value-bearing field in the JSON document on stdin, so a prompt carrying
+newlines, semicolons, or shell metacharacters lands in a payload rather than in
+an argv the process table would publish. The three selector arguments are the
+only argv the extension ever builds.
+
+The discovery gate is the same "not under Scribe" signal the helper itself
+uses: a missing `SCRIBE_HOOK_HELPER`, `SCRIBE_HOOK_SOCK`, or
+`SCRIBE_SESSION_ID` registers **zero** handlers and returns, so an installed
+extension is inert in a Pi run that Scribe did not spawn. `PI_SUBAGENT_CHILD=1`
+registers nothing for a different reason: a Pi subagent inherits the foreground
+pane's `SCRIBE_SESSION_ID` and would otherwise drive that pane's indicator from
+a child turn. A third-party launcher that exposes no child marker is outside
+what the extension can detect.
+
+A `Symbol.for("scribe.pi.lifecycle-extension")` slot on `globalThis` makes a
+second load a no-op rather than a second set of handlers, which is what keeps a
+duplicate registration from emitting every event twice. Shutdown releases the
+slot, so the successor load after a reload registers normally.
+
+Only documented Pi lifecycle events are used:
+
+- `session_start` → `task_label_cleared`, then `state_changed { idle_prompt }`.
+- `input` → `state_changed { processing }`, `prompt_received`, and a derived
+  `task_label_changed`, in that order. `source === "extension"` returns without
+  emitting, so a machine-injected turn never replaces the user's prompt bar or
+  tab label — the same outcome [[crates/scribe-server/src/hook_ingress.rs#is_machine_injected]]
+  produces for the shell adapters, decided one layer earlier.
+- `agent_start` → `state_changed { processing }` **only** when no captured input
+  already accounts for the run. A retry or command-triggered run still reports
+  processing; an ordinary prompt does not report it twice.
+- `message_end` retains the last assistant text and whether its stop reason was
+  an error, and emits nothing. `agent_settled` carries no message payload, so
+  the text has to be held from the message that produced it.
+  [[dist/pi-extension.ts#assistantText]] tolerates a malformed message by
+  returning nothing rather than throwing into Pi's event loop.
+- `agent_settled` → `state_changed { error }` for an error stop, otherwise
+  `session_stopped { last_message }` for the server's stop classifier to resolve
+  into `IdlePrompt` or `WaitingForInput`. [[dist/pi-extension.ts#contextPercent]]
+  then adds `context_changed` from `ctx.getContextUsage()`, rounded and clamped
+  to 0-100 so an out-of-range reading cannot paint an impossible gauge.
+- `session_shutdown` → a final `state_cleared` after the queue is retired.
+
+`PermissionPrompt` is never emitted. Pi exposes no documented permission event,
+and the recorded gap is that Pi panes show processing where Claude Code would
+show a permission prompt — a missing state, never a false one.
+
+[[dist/pi-extension.ts#taskLabel]] reproduces the Codex adapter's normalization
+— control characters to spaces, `;` to `,`, whitespace collapsed, 120 code
+points — with one deliberate difference: it *skips* slash-command lines and
+keeps reading, where Codex stops at the first non-empty line and yields nothing
+when that line is a slash command. A Pi turn that opens with `/reload` and then
+states the task still labels the tab. Slicing by code point rather than by
+UTF-16 unit keeps a multi-byte character from being cut in half.
+
+Emission is serial and bounded. One helper runs at a time, queued behind the
+active invocation; the queue holds at most 32 outstanding events and drops the
+rest, and each child is `SIGKILL`ed after 100 ms — the same budget the helper
+gives itself. Handlers return synchronously and never await an invocation, so a
+hung or missing helper cannot stall a Pi turn, and there is no polling timer at
+all. Every failure path resolves: a spawn that throws, a child that errors, a
+timeout, and a helper path that does not exist all end the same way, silently.
+
+`session_shutdown` is the one handler that returns a promise. It bumps a
+generation counter and discards every queued event from the previous
+generation, awaits only the in-flight child, then sends `state_cleared`. A
+reload therefore clears the pane in roughly one helper timeout instead of
+replaying a backlog Pi is no longer running.
+
+### Pi Extension Installation
+
+Scribe installs Pi integration once at user scope and repairs only extension content it owns.
+
+`dist/setup-pi-extension.sh` copies the marked packaged source atomically to
+`~/.pi/agent/extensions/scribe-ai-integration.ts` with mode 0644. Identical
+content is a no-op; stale marked content is replaced through a temporary file.
+An unmarked regular file, symlink, dangling symlink, directory, or other
+non-regular target is left untouched with a readable error. Setup never edits
+Pi's `settings.json`, never creates a project-local extension, and preserves
+unrelated sibling extensions, avoiding Pi's duplicate user/project load.
+
+[[crates/scribe-client/src/hook_setup.rs#repair_pi_extension_if_enabled]] finds
+the packaged source in the macOS app bundle or the active Linux flavor's share
+directory. Packaged startup and a settings false-to-true transition call the
+same repair path when `terminal.pi_integration` is enabled; failures remain a
+notice, never a blocked Scribe or Pi launch. New Pi processes load repaired
+content, while disabling integration leaves the flavor-neutral file installed
+so stable and development packages do not fight over ownership.
+
+Both Debian flavors ship the source and setup script from
+`crates/scribe-server/Cargo.toml`, and `postinst` installs for a known target
+user or defers safely until that user starts Scribe. The macOS bundle copies the
+same assets through `dist/macos/build-dmg.sh`. Rollback disables the provider
+first; removing the managed target is optional, and the next enabled packaged
+startup repairs it. See [[test#Test Harness#Pi Provider Compatibility#Installation, repair, and rollback]].
 
 ### Ingress
 
@@ -704,9 +815,15 @@ One provider-independent Rust function (with inline `#[cfg(test)]` rule tests) r
 
 ### Adding a Provider
 
-A new AI tool provider plugs in via one adapter script. No transport, server, or env-var changes.
+A new AI tool provider plugs in via one adapter, shell script or in-process extension. No transport, server, or env-var changes.
 
-Concretely: (1) add a variant to `AiProvider` in `crates/scribe-common/src/ai_state.rs` with `id`, `display_name`, and `binary_name`; (2) author `dist/ai-hook-<name>.sh` modeled on `ai-hook-claude.sh` and translate the AI tool's hook stdin JSON to `scribe-hook-helper --provider=<id> --event=…` invocations; (3) write a one-off `dist/setup-<name>-hooks.sh` that registers the adapter in that tool's settings file; (4) add the two new files to the deb-asset and DMG-build tables in `crates/scribe-server/Cargo.toml` and `dist/macos/build-dmg.sh`. The shared helper, env-var injection at `session_manager.rs:538`, server ingress at `hook_ingress.rs`, and the stop classifier require **no** changes. Events from a provider not yet recognized by the running build are dropped silently per FR-014.
+Concretely: (1) add a variant to `AiProvider` in `crates/scribe-common/src/ai_state.rs` with `id`, `display_name`, `binary_name`, and resume capability; (2) teach the provider's documented integration to invoke `scribe-hook-helper --provider=<id> --event=…`; (3) install that integration through the provider's supported user-scope mechanism; (4) package the integration and setup assets. Pi completes the shared Rust boundary first: `AiProvider::Pi`, config gating, helper parsing, IPC compatibility, and handoff safety exist before its provider-specific lifecycle adapter. Events from a provider not yet recognized by the running build are dropped silently per FR-014.
+
+Step (2) is a shell script only because Claude Code and Codex expose hook
+commands. A tool that instead exposes an in-process plugin API supplies the
+same helper invocations from there — see [[server#Server#Hook Channel#Pi Extension Adapter]],
+which replaces steps (2) and (3) with one TypeScript file and its installer
+while leaving step (1) and step (4) unchanged.
 
 ### Safety Contract
 

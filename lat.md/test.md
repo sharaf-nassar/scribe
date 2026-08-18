@@ -911,14 +911,15 @@ Old-to-new restore, new-to-old refusal, and the config downgrade that makes
 rollback something other than a cold restart are one connected mechanism, so
 they are measured together.
 
-The case requires an image-carrying payload to declare v7 and an image-free one
-to declare v6, and requires the image-free payload's bytes to omit the image key
-entirely rather than carry it as nil. It decodes the image-free payload into the
-current struct and requires an absent scene, decodes the image-carrying payload
-and requires its scene intact, requires a v6 receiver to refuse v7 and accept
-v6, and requires a current receiver to accept both. Finally it exports the same
-committed session with images disabled and requires that nothing at all was
-exported.
+The case requires an image-carrying pre-Pi payload to declare v7 and an
+image-free one to declare v6, and requires the image-free payload's bytes to
+omit the image key entirely rather than carry it as nil. It decodes the
+image-free payload into the current struct and requires an absent scene,
+decodes the image-carrying payload and requires its scene intact, requires a v6
+receiver to refuse v7 and accept v6, and requires an image-era v7 receiver to
+accept both. Finally it exports the same committed session with images disabled
+and requires that nothing at all was exported. Pi's v8 precedence is covered by
+[[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]].
 
 ### Docker Evidence Entry Point
 
@@ -1505,6 +1506,10 @@ hidden until `bd` is installed.
 
 Focused transport tests pin the short-lived helper's delivery contract without requiring an AI provider process.
 
+### Pi uses the generic hook schema
+
+`scribe-hook-helper --provider=pi --event=state_changed --state=processing` resolves the stable Pi provider id and builds the same typed `StateChanged` payload as the existing providers, without adding a Pi-specific transport or event variant.
+
 ### Sender lifetime protects macOS peer credentials
 
 The helper writes one complete hook frame but remains connected until the server closes, preventing macOS `getpeereid` from racing an already-exited sender while retaining the bounded no-reply protocol.
@@ -1512,6 +1517,159 @@ The helper writes one complete hook frame but remains connected until the server
 ### Packaged helper waits for server close
 
 The Docker functional harness drives the staged release helper against a stub Unix peer and proves the real process stays alive after its complete frame is read, exiting only after the peer closes.
+
+## Pi Provider Compatibility
+
+Unit and transport tests pin Pi's shared provider boundary and every mixed-version fallback before provider-specific lifecycle installation is involved.
+
+### Provider identity and config
+
+Pi's stable identity, no-resume contract, and independent default-on config gate are fixed across common types.
+
+Its id is `pi`, display name is `Pi`, binary is `pi`, and named-MessagePack serde identity is stable. Pi belongs to the user-visible provider list but has no resume capability or arguments. `terminal.pi_integration` can disable Pi alone and never enables the synthetic `System` provider.
+
+### Local capability negotiation
+
+Mixed local client/server generations never exchange a Pi enum the older peer cannot decode.
+
+Old `Hello` and `Welcome` maps default `pi_provider` to false, while old schemas ignore the new field. The compatibility helper selects structured fresh Pi metadata for a capable peer and `ShellTool::Pi` for an incapable one. The server withholds live Pi-only frames from an old client, downgrades `SessionList`, and resumes structured delivery once capability is enabled.
+
+### Remote and handoff version gates
+
+Remote protocol v8 returns the existing typed incompatibility refusal to a v7 peer. Handoff state carrying Pi AI state or a Pi provider hint declares v8; a v8 receiver accepts v6-v8 senders, while v6/v7 receivers reject v8 before acknowledging.
+
+### Fresh restore from legacy records
+
+Cold restore remains readable across the shell-tool-to-provider transition without implying Pi conversation resume.
+
+Fixtures retain legacy `ShellTool::Pi` snapshots and require
+[[crates/scribe-client/src/restore_replay.rs#promote_pi_replay_launches]] to
+upgrade them only after capability negotiation. The replay keeps launch identity
+and CWD but emits `AiResumeMode::New`, no conversation id, and exactly zero Pi
+resume arguments. A peer without Pi support leaves the legacy record unchanged.
+
+### Installation, repair, and rollback
+
+Package regressions prove Scribe can repair its own global Pi extension without clobbering user files.
+
+`tests/install/postinst-regressions.sh` covers fresh mode-0644 installation,
+identical-content no-op, atomic replacement of stale marked content, readable
+refusal of unmarked files and every symlink or non-regular collision, sibling
+preservation, target-user deferral, and stable/development package assets.
+Startup and settings tests require repair only while enabled and only once on a
+false-to-true transition; disabling leaves the installed file available for a
+later rollback reversal.
+
+### End-to-end Pi recipes
+
+Focused recipes compose the host extension oracle with disposable server and real GPUI surfaces.
+
+Run the complete Pi acceptance set with:
+
+```bash
+just e2e-func-ai-launch-smoke
+just e2e-func-pi-ai-lifecycle
+just e2e-visual-shared
+just e2e-visual-settings-entry
+just e2e-visual-multi-window-restore
+just test-install
+lat check
+```
+
+`tests/e2e/func/ai-launch-smoke.sh` proves zero argv, project-root CWD,
+helper discovery, negotiated tracked launch, legacy fallback, and tab exit.
+`tests/e2e/func/pi-ai-lifecycle.sh` drives the real helper path through
+Processing, prompt/task events, stop classification, Error, rounded context,
+clear, abrupt exit, and old-client filtering; its recipe first runs the
+extension harness below, which also proves no `PermissionPrompt` and child
+suppression. `tests/e2e/visual/ai-indicator.sh` proves shared enabled/disabled
+chrome, `tests/e2e/visual/settings-entry.sh` proves keyboard access, and
+`tests/e2e/visual/multi-window-restore.sh` proves fresh no-resume cold replay.
+
+## Pi Extension Harness
+
+`node tests/e2e/func/pi-extension-harness.mjs` drives the real
+[[server#Server#Hook Channel#Pi Extension Adapter|Pi adapter]] against a fake
+Pi API and a fake helper, proving the emission contract without Pi, Scribe, or
+a server.
+
+The harness imports `dist/pi-extension.ts` directly and hands it a stub
+`ExtensionAPI` that records handlers, so every assertion is against the shipped
+source rather than a copy. `SCRIBE_HOOK_HELPER` points at a script that appends
+a start and an end record — argv, stdin, pid, and timestamps — to a log, which
+is what makes ordering, serialization, and payload shape observable. It is a
+plain Node script rather than a Docker recipe because nothing in the contract
+needs a container, and it is deliberately absent from the `e2e-all-func`
+inventory, which maps executable `*.sh` only.
+
+Two assertions run across every event the whole run produced, not per case: the
+argv is always exactly `--provider=pi`, a lowercase `--event=` drawn from the
+seven known names, and `--payload-stdin` with parseable JSON behind it; and no
+payload ever carries `permission_prompt`, the state Pi cannot observe.
+
+### Startup and duplicate guard
+
+A second load of the extension registers no handlers, and the first load's
+`session_start` clears the task label before it announces `idle_prompt` — the
+order that leaves a reattached pane without a stale label.
+
+### Input sources and order
+
+Interactive and RPC input each emit processing, prompt, and task label in that
+order, while `source: "extension"` emits nothing at all.
+
+The prompt fixture leads with a blank line and a `/reload` line and carries a
+semicolon and a control character, so it also pins the label normalization the
+adapter shares with Codex.
+
+### Retry and settle behavior
+
+A duplicate `agent_start` after a captured input does not double the processing
+event, a settled turn reports the retained assistant text for the server's stop
+classifier, and an error stop reports `error` instead.
+
+The three context readings — 49.6, 100.6, and -4.8 — prove rounding and the
+0-100 clamp.
+
+### Malformed messages and no polling
+
+A null message and a message whose content array holds junk are both absorbed
+without throwing and without emitting; the settle that follows still reports,
+with empty text.
+
+The harness also counts `setInterval` calls and requires zero, since a polling
+adapter would keep waking a machine that is doing nothing.
+
+### Callbacks do not await the helper
+
+Against a helper that sleeps 500 ms, an ordinary callback returns `undefined` in
+under 25 ms and the helper still runs. A handler that awaited its own emission
+would add the helper's latency to every Pi turn.
+
+### Serial queue cap
+
+One hundred events queued at once produce exactly 32 helper invocations, and the
+log's strict start/end/start/end pid alternation proves the next child waits for
+the previous one to close.
+
+The cap is what stops a runaway event source from forking without bound.
+
+### Generation-cancelled shutdown and reload
+
+With forty events queued behind a slow helper, shutdown returns in under 250 ms
+having emitted only the in-flight event and `state_cleared` — the backlog is
+discarded by generation rather than drained.
+
+Loading the extension again then registers and emits normally, proving shutdown
+released the global slot.
+
+### Absent environment, child suppression, and missing helper
+
+No Scribe environment registers no handlers, and `PI_SUBAGENT_CHILD=1` registers
+none even with the environment present.
+
+A `SCRIBE_HOOK_HELPER` pointing at a path that does not exist still lets
+`session_start` return normally while emitting nothing.
 
 ## E2E Recipe Contract
 
@@ -1576,11 +1734,11 @@ It runs lint and unit tests only and never invokes the Scribe runtime, so it is 
 
 The functional harness can launch structured AI sessions and inspect the provider process without requiring a GPUI client.
 
-`scribe-test session create --ai-provider <claude|codex>` populates the production `AiLaunchSpec`; `--ai-resume-mode <new|resume>` defaults to `new`, and `--ai-conversation-id <id>` supplies the resume target. `--cwd <path>` names the PTY working directory, while `--env-envelope-id <id>` overrides the harness-minted launch id for restore-envelope scenarios. Omitting every new flag preserves plain-session behavior.
+`scribe-test session create --ai-provider <claude|codex|pi>` populates production launch metadata; `--ai-resume-mode <new|resume>` defaults to `new`, and `--ai-conversation-id <id>` supplies resumable providers' target. The daemon advertises no Pi capability by default, preserving the old-client fixture and selecting `ShellTool::Pi`; starting it with `SCRIBE_TEST_PI_PROVIDER=1` selects a fresh structured Pi launch. `--cwd <path>` names the PTY working directory, while `--env-envelope-id <id>` overrides the harness-minted launch id. Omitting every new flag preserves plain-session behavior.
 
-`tests/e2e/bin/claude` is the deterministic Claude stand-in already reachable through the functional container's `/tests/bin` PATH. It atomically writes `${SCRIBE_AI_STUB_OUT:-/tmp}/claude-invocation.txt`: argv one argument per line, an `--ENV--` delimiter, then locale-sorted environment entries. The stub writes only to the requested directory, never the read-only `/tests` mount.
+`tests/e2e/bin/claude` and `tests/e2e/bin/pi` are deterministic provider stand-ins on the functional container's `/tests/bin` PATH. Each writes argv one argument per line, an `--ENV--` delimiter, then locale-sorted environment entries outside the read-only `/tests` mount. Pi remains alive until signalled so the harness can prove provider exit closes the tab.
 
-`tests/e2e/func/ai-launch-smoke.sh` requests a resumed Claude launch with a quoted conversation id, explicit cwd, and envelope override. It asserts the stub's exact argv, `PWD`, and daemon-reported envelope id.
+`tests/e2e/func/ai-launch-smoke.sh` requests a resumed Claude launch, then creates Pi once through legacy metadata and once through negotiated structured metadata. It asserts exact argv, project-root `PWD`, hook discovery and session identity, capability-dependent chrome delivery, envelope preservation, and tab exit.
 
 ## E2E Functional Tests
 
@@ -2209,7 +2367,7 @@ A bare Backspace on a listening row must write an empty combo list for that acti
 
 `new_pi_tab` must record `ctrl+alt+p`, clear on Backspace, and take the chord back, four Tabs past `new_claude_tab`.
 
-Pi is [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|launch-only]] — no provider, no resume row beside it — so the one thing the settings page owes it is that it is an ordinary keybinding row and not a second surface. Three captures on that one row prove the write path routes the new key rather than dropping it, which an unrouted action would do silently.
+Pi is a first-class provider but [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|launch-only]] — there is no resume row beside it — so the settings page owes one ordinary keybinding row rather than a second resume surface. Three captures on that row prove the write path routes the new key instead of dropping it silently.
 
 The live half needs more than a tab appearing: the terminal window must produce a real `pi` invocation on the recorded chord and none on the `ctrl+alt+z` default it replaced, so the stub's own record — not the `opened a new tab` line — is the assertion.
 
@@ -2245,9 +2403,9 @@ That is what `exec pi` buys: the tool is the PTY's direct child, so quitting it 
 
 #### Typed Pi restore regressions
 
-Three focused unit regressions cover typed Pi continuity beyond the visual launch.
+Focused unit regressions cover the legacy Pi launch representation beyond the visual launch.
 
-A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`.
+A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`. Structured provider compatibility and the v8 handoff gate are covered separately by [[test#Test Harness#Pi Provider Compatibility]].
 
 ### Tab switching is live
 

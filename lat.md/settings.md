@@ -144,19 +144,21 @@ The frontend rule editor in  supports add, duplicate, remove, reorder, enable/di
 
 ### AI Keys
 
-AI page consolidates all AI integration settings including Prompt Bar, Scroll Pin, Preserve AI Scrollback, Indicator Height, and the AI Assistant States table.
+AI page consolidates shared AI integration settings including Prompt Bar, Scroll Pin, Preserve AI Scrollback, Indicator Height, and the AI Assistant States table.
 
 The Prompt Bar section title includes a "Customize colors" crosslink that switches to the Colors page and scrolls to the Prompt Bar color overrides.
 
 Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `preserve_ai_scrollback` now trims repeated AI redraw clears inside prompt/attention epochs, capturing the baseline after the first filtered redraw so real AI transcript history survives while duplicate repaint frames are still pruned. The client no longer collapses blank rows after render because that heuristic could move legitimate Codex prompt/layout rows upward. `scroll_pin` now defaults to false so AI history keeps the normal contiguous scrollback unless the user explicitly opts into split-scroll.
 
-AI tab shortcuts are configured through provider-specific keys: `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, and `new_codex_resume_tab`.
+AI tab shortcuts are configured through provider-specific keys: `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, and `new_codex_resume_tab`. Pi keeps the existing `new_pi_tab` action and has no resume action.
+
+The config model accepts `terminal.pi_integration`, defaulting to `true` like the Claude Code and Codex integration toggles. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled|ai_provider_enabled]] gates Pi independently while continuing to reject the synthetic `System` provider. The AI page exposes the same key as a keyboard-reachable Pi integration row. A false-to-true commit invokes [[crates/scribe-client/src/hook_setup.rs#repair_pi_extension_if_enabled|repair_pi_extension_if_enabled]] once and reports whether setup succeeded; packaged startup runs that repair too when the key is enabled. Disabling takes effect live but leaves the global extension file installed, and repaired extension code is loaded only by new Pi processes. See [[test#Test Harness#Pi Provider Compatibility#Installation, repair, and rollback]] and [[test#Test Harness#Pi Provider Compatibility#End-to-end Pi recipes]].
 
 AI tab working directory offers Active pane (`pane`, default), Project root (`project_root`, falling back through pane to home), and Home (`home`, sent as no cwd so the server uses its validated home fallback). The selected variant's fallback behavior appears directly under the settings row, and saving a new value affects the next fresh AI tab without restarting the client.
 
 Context threshold settings are persisted under `terminal.ai_context_thresholds` and control the warn/danger band boundaries and their display colors. `warn` (default 70) and `danger` (default 90) are integer percentages. `ok_color`, `warn_color`, and `danger_color` are `#rrggbb` hex strings (defaults `#5fa05f`, `#d4a017`, `#c83030`). These thresholds color both the prompt-bar AI context % indicator and the tab inline suffix; see  for band classification logic.
 
-Shared indicator settings cover Claude Code and Codex. The persisted key is now `ai_states`, while `claude_states` remains accepted as a config alias for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
+Shared indicator settings cover Claude Code, Codex, and Pi. The persisted key is now `ai_states`, while `claude_states` remains accepted as a config alias for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
 
 ### Keybinding Keys
 
@@ -164,7 +166,7 @@ All keybinding actions accept a string or array of strings (combo list, max 5 pe
 
 Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, Pi, close, next, prev, select 1-9), clipboard, scrolling, jump to previous prompt, jump to next prompt, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
 
-`new_pi_tab` is listed and rebound exactly like the AI rows even though Pi is not an [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|AI provider]] — [[crates/scribe-client/src/settings/model.rs#keybinding_actions]] is the single list the page renders from, so a launch-only action needs no second surface. Its label comes from the same word-mapping in [[crates/scribe-client/src/settings/model.rs#keybinding_label]] that capitalises Claude and Codex.
+`new_pi_tab` is listed and rebound beside the AI rows. Pi is a first-class provider, while the shortcut uses the [[client#Client#GPUI Client Spike#Tab Strip And Key Dispatch#A tool tab binds to its tool|negotiated launch path]] and deliberately has no resume partner. [[crates/scribe-client/src/settings/model.rs#keybinding_actions]] remains the single list the page renders from.
 
 The settings window writes these keys itself — see [[settings#Settings#GPUI Settings Window#Shortcut capture]] — so a rebind is a keystroke rather than a config-file edit. A captured combo replaces the action's whole list; alternates beyond the first stay a `config.toml` feature.
 

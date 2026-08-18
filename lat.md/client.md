@@ -200,13 +200,13 @@ The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send
 
 #### A tool tab binds to its tool
 
-`new_pi_tab` is a launch-only shortcut: it opens one tab in the focused workspace running Pi, and nothing about it is AI chrome.
+`new_pi_tab` is Pi's launch-only AI shortcut; capability negotiation chooses its wire representation without changing its working-directory policy.
 
-[[crates/scribe-client/src/main.rs#TerminalView#create_shell_tool_tab|create_shell_tool_tab]] goes through the same [[crates/scribe-client/src/main.rs#TerminalView#create_tab|create_tab]] every other tab shortcut uses, differing only in the [[crates/scribe-client/src/restore_replay.rs#SessionLaunchValues|SessionLaunchValues]] it carries — `shell_tool: Some(ShellTool::Pi)`, no argv and no `ai_launch`, so [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]] owns the argv. Unlike an AI tab it does not retarget to the workspace project root: Pi is not scoped to a project, so it starts in the focused pane's CWD exactly like a plain new tab.
+[[crates/scribe-client/src/main.rs#TerminalView#create_pi_tab|create_pi_tab]] applies the shared project-root-default AI CWD, then sends a fresh `AiLaunchSpec { provider: Pi }` when the server advertised Pi support. Otherwise [[crates/scribe-common/src/protocol.rs#pi_launch_metadata]] returns the legacy `ShellTool::Pi` shape and [[crates/scribe-client/src/main.rs#TerminalView#create_shell_tool_tab|create_shell_tool_tab]] uses the same CWD. In both cases the server owns the exact zero-argument `exec pi` command. See [[test#Test Harness#Pi Provider Compatibility#End-to-end Pi recipes]].
 
-Because Pi is untracked, no provider edge ever arrives for the pane, and [[crates/scribe-client/src/main.rs#update_retained_binding|update_retained_binding]] leaves an existing tool binding alone rather than demoting it — otherwise a later cold restart reopens a bare prompt instead of relaunching Pi.
+Each connection advertises `Hello.pi_provider = true`, resets its cached server capability before reconnect, and latches `Welcome.pi_provider`. Once Pi state arrives, the ordinary AI tracker renders it and AI metadata outranks retained shell-tool identity; an older server or downgraded session list still reconstructs `ShellTool::Pi`. Pi has no resume arguments, so promotion never adds a Pi resume CLI mode.
 
-Warm reconstruction retains the typed tool identity; see [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]].
+Warm reconstruction retains the best typed identity available; see [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]].
 
 `new_window` opens a second top-level window in the same process through , rather than re-spawning the binary the way the winit client's `spawn_client_process` had to — GPUI is multi-window, as the settings window already shows.  builds each window's own `Shared` state and its own IPC connection, and `main` calls it for the startup window too, so the two paths cannot drift. Independent state is what makes it a window rather than a mirror: the `Hello` on that second connection carries no window id, so the server registers a *new* window and gives it its own sessions, tab strip, and status line.
 
@@ -364,9 +364,9 @@ A retained provider, conversation id, and CWD build an AI resume binding, so the
 
 #### Retained shell-tool bindings stay structured
 
-Warm reconstruction recovers typed Pi identity from `SessionList` instead of guessing from the running process.
+Warm reconstruction recovers typed Pi identity from `SessionList` instead of guessing from the running process, including the compatibility shape sent to an old client.
 
-A fresh client process has no requested-binding queue for a server-retained Pi session. The server includes `SessionInfo.shell_tool`; [[crates/scribe-client/src/chrome_metadata.rs#SessionChrome]] retains it beside the launch id and CWD, and [[crates/scribe-client/src/main.rs#retained_session_binding]] chooses AI metadata first, then `ShellTool`, then a plain shell. Thus a warm reattach rewrites the snapshot with `LaunchKind::ShellTool` instead of silently converting Pi to bash, and the next cold replay launches Pi again.
+A fresh client process has no requested-binding queue for a server-retained Pi session. [[crates/scribe-client/src/chrome_metadata.rs#SessionChrome]] retains both AI metadata and `SessionInfo.shell_tool` beside the launch id and CWD, and [[crates/scribe-client/src/main.rs#retained_session_binding]] chooses AI metadata first, then `ShellTool`, then a plain shell. A capable connection therefore preserves structured Pi state when present; an incapable or pre-Pi peer receives `ShellTool::Pi` and still writes a legacy-readable `LaunchKind::ShellTool` snapshot instead of silently converting Pi to bash. On a capable cold replay, [[crates/scribe-client/src/restore_replay.rs#promote_pi_replay_launches]] upgrades that legacy record to `ReplayCommand::AiFresh`, retaining launch identity and CWD while sending `AiResumeMode::New` with no conversation id. See [[test#Test Harness#Pi Provider Compatibility#Fresh restore from legacy records]].
 
 #### Live AI metadata updates restore
 

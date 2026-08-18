@@ -120,6 +120,7 @@ scrollback_lines = 10000
 copy_on_select = true
 focus_follows_mouse = true
 claude_code_integration = true
+pi_integration = true
 keyboard_protocol_enhanced = true
 
 [terminal.images]
@@ -193,6 +194,7 @@ verbatim in a bug report.
 | Action | Default Shortcut |
 |--------|-----------------|
 | New tab | `Ctrl+Shift+T` |
+| New Pi tab | `Ctrl+Alt+Z` |
 | Close tab | `Ctrl+Shift+Q` |
 | Next/Previous tab | `Ctrl+PageDown/Up` |
 | Select tab 1-9 | `Ctrl+1-9` |
@@ -222,7 +224,38 @@ When a new server binary is available, the running server hands off all PTY file
 
 ### AI / LLM Process Awareness
 
-Scribe tracks AI coding sessions for Claude Code and Codex through structured hook events and shell pre-arm sentinels. It tracks idle/prompt, processing, waiting for input, waiting for permission, and error states. Metadata includes the active tool, agent name, model, context window usage percentage, and conversation ID. The prompt bar surfaces context fill in real time, giving developers instant visibility into their AI agent's state without switching windows.
+Scribe tracks Claude Code, Codex, and Pi through the same local structured hook
+channel. Shared chrome covers idle/prompt, processing, waiting for input, error,
+prompt/task labels, and context usage. Claude Code and Codex can also report
+permission waits; Pi exposes no permission lifecycle event, so Scribe never
+invents a Pi `PermissionPrompt`. The extension talks only to Scribe's local
+Unix socket and makes no network requests.
+
+### Pi integration
+
+`terminal.pi_integration` defaults to `true`. Packages install one marked,
+Scribe-owned extension at
+`~/.pi/agent/extensions/scribe-ai-integration.ts`; Scribe never edits Pi's
+`settings.json` or creates a project-local extension. Setup atomically refreshes
+that file when Scribe owns it and refuses regular-file, directory, or symlink
+collisions it does not own.
+
+Pi sessions started after installation load the extension automatically. After
+repairing the file or re-enabling the setting, open a new Pi tab; an already
+running Pi process does not reload extensions. Pi is launch-only: Scribe starts
+it in the focused workspace's project root when available, cold restore starts
+a fresh Pi process, and there is no resume action, conversation target, or
+resume argument.
+
+Disabling Pi integration hides and ignores Pi state but deliberately leaves the
+flavor-neutral extension file installed. To roll back completely, set
+`terminal.pi_integration = false`, close existing Pi tabs, then remove
+`~/.pi/agent/extensions/scribe-ai-integration.ts`. Re-enabling the setting
+repairs the managed file; packaged Scribe startup does the same whenever the
+setting is enabled. The extension is
+inert outside a root Pi process launched by Scribe and suppresses Pi subagents
+when `PI_SUBAGENT_CHILD=1`; third-party launchers without an equivalent child
+marker cannot be distinguished.
 
 ### Prompt Bar
 
