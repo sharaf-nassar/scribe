@@ -55,7 +55,7 @@ sample_board() {
     now=$(date +%s%3N)
     # The four-issue lanes the mock itself shows, so a capture here is
     # comparable to .impeccable/mocks/beads-compact-live-overview.html.
-    printf '%s' "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$workspace\",\"protocol_version\":1,\"state\":{\"Ready\":{\"snapshot\":{\"refreshed_at_epoch_ms\":$now,\"backlog\":[{\"id\":\"sc-70\",\"title\":\"Document cache policy\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-81\",\"title\":\"Parse custom statuses\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-76\",\"title\":\"Expose stale timestamp\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-64\",\"title\":\"Polish empty queue copy\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"ready\":[{\"id\":\"sc-88\",\"title\":\"$LONG_TITLE\",\"priority\":0,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-94\",\"title\":\"Cache stale state\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-32\",\"title\":\"Wire workspace refresh\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-27\",\"title\":\"Add unavailable state\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"in_progress\":[{\"id\":\"sc-1bf\",\"title\":\"Workspace Beads board\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-43\",\"title\":\"Render queue rail\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-55\",\"title\":\"Pin board across tabs\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-49\",\"title\":\"Preserve lane scroll\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"blocked\":[{\"id\":\"sc-91\",\"title\":\"Sync conflict handling\",\"priority\":1,\"blocker_ids\":[\"sc-12\",\"sc-19\"],\"parent_epic_name\":null},{\"id\":\"sc-58\",\"title\":\"Remote workspace reads\",\"priority\":2,\"blocker_ids\":[\"sc-22\"],\"parent_epic_name\":null},{\"id\":\"sc-36\",\"title\":\"Restore cached snapshot\",\"priority\":3,\"blocker_ids\":[\"sc-08\"],\"parent_epic_name\":null},{\"id\":\"sc-18\",\"title\":\"Resolve Dolt lock state\",\"priority\":2,\"blocker_ids\":[\"sc-07\"],\"parent_epic_name\":null}],\"done\":[{\"id\":\"sc-61\",\"title\":\"$LONG_TITLE\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-24\",\"title\":\"Detect workspace root\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-16\",\"title\":\"Cache bd availability\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-09\",\"title\":\"Tune titlebar spacing\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"backlog_total\":12,\"ready_total\":4,\"in_progress_total\":5,\"blocked_total\":4,\"done_total\":38},\"stale\":false,\"refresh_error\":null}}}"
+    printf '%s' "{\"type\":\"BeadsBoard\",\"workspace_id\":\"$workspace\",\"protocol_version\":1,\"state\":{\"Ready\":{\"snapshot\":{\"refreshed_at_epoch_ms\":$now,\"backlog\":[{\"id\":\"sc-70\",\"title\":\"Document cache policy\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-81\",\"title\":\"Parse custom statuses\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-76\",\"title\":\"Expose stale timestamp\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-64\",\"title\":\"Polish empty queue copy\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"ready\":[{\"id\":\"sc-88\",\"title\":\"$LONG_TITLE\",\"priority\":0,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-94\",\"title\":\"Cache stale state\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-32\",\"title\":\"Wire workspace refresh\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-27\",\"title\":\"Add unavailable state\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"in_progress\":[{\"id\":\"sc-1bf\",\"title\":\"$LONG_TITLE\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":\"Workspace intelligence and rooted boards\"},{\"id\":\"sc-43\",\"title\":\"Render queue rail\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-55\",\"title\":\"Pin board across tabs\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-49\",\"title\":\"Preserve lane scroll\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":null}],\"blocked\":[{\"id\":\"sc-91\",\"title\":\"Sync conflict handling\",\"priority\":1,\"blocker_ids\":[\"sc-12\",\"sc-19\"],\"parent_epic_name\":null},{\"id\":\"sc-58\",\"title\":\"Remote workspace reads\",\"priority\":2,\"blocker_ids\":[\"sc-22\"],\"parent_epic_name\":null},{\"id\":\"sc-36\",\"title\":\"Restore cached snapshot\",\"priority\":3,\"blocker_ids\":[\"sc-08\"],\"parent_epic_name\":null},{\"id\":\"sc-18\",\"title\":\"Resolve Dolt lock state\",\"priority\":2,\"blocker_ids\":[\"sc-07\"],\"parent_epic_name\":null}],\"done\":[{\"id\":\"sc-61\",\"title\":\"$LONG_TITLE\",\"priority\":1,\"blocker_ids\":[],\"parent_epic_name\":\"GPUI client rebuild\"},{\"id\":\"sc-24\",\"title\":\"Detect workspace root\",\"priority\":2,\"blocker_ids\":[],\"parent_epic_name\":null},{\"id\":\"sc-16\",\"title\":\"Cache bd availability\",\"priority\":3,\"blocker_ids\":[],\"parent_epic_name\":\"Beads integration\"},{\"id\":\"sc-09\",\"title\":\"Tune titlebar spacing\",\"priority\":4,\"blocker_ids\":[],\"parent_epic_name\":null}],\"backlog_total\":12,\"ready_total\":4,\"in_progress_total\":5,\"blocked_total\":4,\"done_total\":38},\"stale\":false,\"refresh_error\":null}}}"
 }
 
 # A board whose queues have all run dry, which is the state the lane heads would
@@ -214,22 +214,31 @@ assert_matching_badge_marks() {
 # threshold-crossing offset. ImageMagick reports the trimmed delta's `%X/%Y`.
 assert_drag_frame() {
     local current="$1" pointer_x="$2" pointer_y="$3" label="$4" target_border_x="${5:-}"
-    local expected_x expected_y crop_x crop_y border_crop_x bounds ghost_x ghost_y ghost_w ghost_h rows
-    local -a target_mask=()
+    local expected_x expected_y crop_x crop_y border_crop_x tip_center_x mask_draw bounds
+    local ghost_x ghost_y ghost_w ghost_h rows
     expected_x=$(( pointer_x - ARM_OFFSET_X ))
     expected_y=$(( pointer_y - PRESS_OFFSET_Y ))
     crop_x=$(( expected_x - 8 ))
     crop_y=$(( expected_y - 8 ))
+    # The base frame is captured mid-hover on the source card, before the drag
+    # arms and GPUI suppresses that tooltip, so a long-titled source's centred
+    # reveal can still be on screen there and gone by every later frame. Mask
+    # its full possible footprint -- centred on the source card, bounded by
+    # the tooltip's own proven 500px width and 100px height ceilings above it
+    # -- out of every waypoint rather than just the one its span happens to
+    # reach.
+    tip_center_x=$(( SOURCE_LEFT + CARD_W / 2 ))
+    mask_draw="rectangle $(( tip_center_x - 250 - crop_x )),$(( SOURCE_TOP - 104 - crop_y )) $(( tip_center_x + 250 - crop_x )),$(( SOURCE_TOP - crop_y ))"
     # Target borders are asserted independently at their waypoints. Remove
     # only that known two-pixel raster footprint from the ghost's delta.
     if [ -n "$target_border_x" ]; then
         border_crop_x=$(( target_border_x - crop_x ))
-        target_mask=(-fill black -draw "rectangle ${border_crop_x},0 $(( border_crop_x + 1 )),$(( CARD_H + 15 ))")
+        mask_draw="$mask_draw rectangle ${border_crop_x},0 $(( border_crop_x + 1 )),$(( CARD_H + 15 ))"
     fi
     bounds=$(convert /output/beads-board-drag-base.png "$current" \
         -compose difference -composite \
         -crop "$(( CARD_W + 16 ))x$(( CARD_H + 16 ))+${crop_x}+${crop_y}" +repage \
-        -colorspace Gray -threshold 12% "${target_mask[@]}" \
+        -colorspace Gray -threshold 12% -fill black -draw "$mask_draw" \
         -trim -format '%X,%Y,%w,%h' info:)
     if [[ "$bounds" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
         ghost_x=$(( crop_x + BASH_REMATCH[1] ))
@@ -457,6 +466,36 @@ TOOLTIP_BG=$(convert /output/beads-board-title-tooltip.png \
     -format "%[pixel:p{$(( TOOLTIP_X + 3 )),$(( TOOLTIP_Y + 3 ))}]" info:)
 [ "$TOOLTIP_BG" = "$BOARD_GROUND" ] \
     || fail "full-title tooltip background $TOOLTIP_BG is not the opaque theme ground $BOARD_GROUND"
+
+# The tooltip has to centre on its own card, not track the card's left edge.
+# Proven on the In Progress lane's first card, away from both viewport edges,
+# so nothing here can be explained by the snap-to-window clamp above: that
+# edge-clamp probe stays lane-4/left-anchored and unchanged.
+CENTER_CARD_LEFT=$(( 16 + 2 * LANE_W ))
+CENTER_CARD_TOP=70
+CENTER_CARD_W=$(( LANE_W - 20 ))
+CENTER_CARD_H=46
+CENTER_CARD_CENTER_X=$(( CENTER_CARD_LEFT + CENTER_CARD_W / 2 ))
+xdotool mousemove --sync --window "$WID" \
+    "$(( CENTER_CARD_LEFT + CENTER_CARD_W - 10 ))" \
+    "$(( CENTER_CARD_TOP + CENTER_CARD_H - 5 ))"
+sleep 0.1
+import -window "$WID" /output/beads-board-title-tooltip-center.png
+CENTER_TOOLTIP_BOUNDS=$(convert /output/beads-board-hover.png \
+    /output/beads-board-title-tooltip-center.png -compose difference -composite \
+    -colorspace Gray -threshold 8% -fill black \
+    -draw "rectangle 0,0 40,34 rectangle $(( CENTER_CARD_LEFT - 4 )),${CENTER_CARD_TOP} $(( CENTER_CARD_LEFT + CENTER_CARD_W + 12 )),$(( CENTER_CARD_TOP + CENTER_CARD_H )) rectangle 0,300 ${WIN_W},${WIN_H}" \
+    -trim -format '%X,%Y,%w,%h' info: 2>/dev/null || true)
+if [[ "$CENTER_TOOLTIP_BOUNDS" =~ ^\+([0-9]+),\+([0-9]+),([0-9]+),([0-9]+)$ ]]; then
+    CENTER_TOOLTIP_X=${BASH_REMATCH[1]}
+    CENTER_TOOLTIP_W=${BASH_REMATCH[3]}
+else
+    fail "middle-lane hover did not reveal the full-title tooltip (${CENTER_TOOLTIP_BOUNDS:-empty})"
+fi
+CENTER_TOOLTIP_CENTER_X=$(( CENTER_TOOLTIP_X + CENTER_TOOLTIP_W / 2 ))
+CENTER_DELTA=$(( CENTER_TOOLTIP_CENTER_X - CENTER_CARD_CENTER_X ))
+[ "$CENTER_DELTA" -ge -4 ] && [ "$CENTER_DELTA" -le 4 ] \
+    || fail "middle-lane tooltip centred at ${CENTER_TOOLTIP_CENTER_X}px, card centre is ${CENTER_CARD_CENTER_X}px (${CENTER_DELTA}px off)"
 
 # A card's id and epic are copy targets, which take the hover away from the
 # board. The board has to survive the pointer landing on one, past the grace

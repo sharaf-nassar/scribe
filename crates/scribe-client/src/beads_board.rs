@@ -1006,8 +1006,8 @@ struct BeadsCardTooltip {
 impl Render for BeadsCardTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         anchored()
-            .anchor(Anchor::BottomLeft)
-            .position(point(self.anchor.origin.x, self.anchor.origin.y - px(4.0)))
+            .anchor(Anchor::BottomCenter)
+            .position(point(self.anchor.center().x, self.anchor.origin.y - px(4.0)))
             .snap_to_window_with_margin(px(4.0))
             .child(
                 div()

@@ -1430,8 +1430,12 @@ they meet. [[crates/scribe-client/src/beads_board.rs#issue]] gives the whole
 normal card hitbox a zero-delay GPUI tooltip, so its title, metadata, and padding
 all reveal the same complete title. The card records its painted bounds and
 [[crates/scribe-client/src/beads_board.rs#BeadsCardTooltip]] anchors a
-480px-bounded wrapping view immediately above them, clamped inside the viewport.
-Its opaque background and ink come from the live board palette. The native drag
+480px-bounded wrapping view immediately above them, centred on the card's own
+width (`Anchor::BottomCenter` at the card bounds' horizontal centre) and
+clamped inside the viewport. A left-aligned popup over a card far narrower
+than its own reveal read as belonging to whichever neighbour it drifted
+over instead of the card it was hovering. Its opaque background and ink come
+from the live board palette. The native drag
 ghost renders separately, and GPUI suppresses the source tooltip while a drag is
 active, so lifting a card never creates a second reveal beside the ghost.
 The ID drops the project prefix that every card on one board repeats, keeping

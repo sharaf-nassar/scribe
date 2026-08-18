@@ -3871,12 +3871,22 @@ Undo deadline. [The visual script](../tests/e2e/visual/beads-board.sh) checks
 neutral lane ground in normal and pinned boards. Its exact long-title fixture
 hovers the normal card's bottom padding, captures the reveal after 100ms, and
 requires a wrapped bounded box above and horizontally overlapping that card,
-inside the right viewport edge with the board's opaque theme ground. The same
-run then copies the card ID and moves the long-titled source through the native
-drag waypoints, so title-only activation, a tooltip on the drag ghost, a broken
-nested copy target, or lost board hover fails the focused path. It checks
-compact borders for accepted and rejected targets
-independently, then measures the native ghost over a card, a rejected lane, and
+inside the right viewport edge with the board's opaque theme ground — the
+Done lane sits against that edge on purpose, so this proves the
+snap-to-window clamp specifically: an edge-driven box lands at the same `x`
+under either anchor, so overlap is all an edge site can distinguish. A second
+long-title fixture on the In Progress lane's own card, away from both
+viewport edges, isolates the anchor itself: the same reveal's measured centre
+must match that card's own centre within a few pixels, which only a
+card-centred anchor satisfies once the popup outgrows the card underneath it.
+The same run then copies the card ID and moves the long-titled source through
+the native drag waypoints, so title-only activation, a tooltip on the drag
+ghost, a broken nested copy target, or lost board hover fails the focused
+path; the ghost measurement also masks the source card's own pre-drag reveal
+out of every waypoint, since a card-centred popup on a long-titled source can
+reach into a neighbouring lane's crop before the drag itself suppresses it. It
+checks compact borders for accepted and rejected targets independently, then
+measures the native ghost over a card, a rejected lane, and
 outside the board while terminal rows remain fixed. The full path crops the
 text-size reversal to the grid band between the independently repainting
 titlebar and the status bar's live CPU/MEM sparkline, finds the
