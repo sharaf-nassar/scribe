@@ -79,6 +79,7 @@ pub async fn handle(server: &IpcServerState, event: HookEvent) {
         MetadataRuntime {
             workspace_manager: &server.workspace_manager,
             live_sessions: &server.live_sessions,
+            window_shares: &server.window_shares,
             git_ref_watcher: &server.git_ref_watcher,
         },
     )

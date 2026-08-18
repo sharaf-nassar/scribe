@@ -12583,6 +12583,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::BeadsBoard { .. } => "BeadsBoard",
         ServerMessage::BeadsIssueDetail { .. } => "BeadsIssueDetail",
         ServerMessage::BeadsEpicGraph { .. } => "BeadsEpicGraph",
+        ServerMessage::IssueFocused { .. } => "IssueFocused",
         ServerMessage::BeadsIssueWriteResult { .. } => "BeadsIssueWriteResult",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",

@@ -414,6 +414,27 @@ Flow. A write advances the cache generation before its authoritative refresh,
 so `graph_source` refuses to serve the preceding source generation during that
 interval.
 
+### Focused issue liveness
+
+A `LiveSession` keeps ephemeral `focused_issue` state, not an assignee-derived
+approximation.
+
+[[crates/scribe-server/src/ipc_server.rs#set_focused_issue]] is the sole
+registry seam for the forthcoming `issue_focused` hook: it silently drops an
+unknown session, writes the exact issue id for a live one, and emits
+[[crates/scribe-common/src/protocol.rs#ServerMessage]] `IssueFocused` only to
+the local owner of that session's unshared `SingleController` window. A session
+can have multiple output sinks while shared, so liveness deliberately resolves
+the window owner instead of fanning out through the session writer; remote and
+shared participants see neither set nor clear frames.
+
+`None` is the clear shape. The metadata pipeline sends it after
+`AiStateCleared`; clean session/window close, reader/child-exit finalization,
+and client disconnect clear the registry while the session is still live, so an
+attached owner cannot retain a halo for a dead or detached agent. The field is
+not serialized into handoff state: no process restart or reconnect revives a
+claim that was only observed locally.
+
 ## Beads issue writes
 
 The server admits one typed issue mutation, serializes Scribe writers per project root, and publishes only tracker-confirmed state.

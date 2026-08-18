@@ -282,6 +282,25 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 
 `TitleChanged` reports OSC 0/2 window titles; `IconTitleChanged` reports OSC 0/1 icon titles. Each source resets with an empty payload, and semicolons after the selector remain title text. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `TaskLabelChanged` and `TaskLabelCleared` report provider task-label channels used for tab naming, while legacy Codex task-label messages remain accepted for compatibility. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
 
+### Focused Beads issue
+
+`IssueFocused { session_id, issue_id }` reports a live agent's exact current
+Beads issue. `Some` binds it; `None` clears it.
+
+It is not an assignee lookup and carries no provider name, so every adapter can
+report the same relationship without coupling the wire to Pi, Claude Code, or
+Codex. The server emits it only to the local owner of an unshared
+`SingleController` window — the same boundary as Flow graph admission. Remote
+and shared participants receive neither the binding nor its clear, so liveness
+is local observation rather than shared session metadata. The client handler
+is intentionally deferred with the halo renderer; older clients ignore this
+additive variant during the current protocol-compatible release window.
+
+#### Named MessagePack round trip
+
+The protocol test preserves both `Some(issue_id)` and `None`, making set and
+clear one frame shape rather than two teardown paths.
+
 ### Connection
 
 `Welcome` responds to Hello with the assigned window ID and a list of other unconnected windows that have sessions. `WindowClosed` and `QuitRequested` are shutdown acknowledgments.

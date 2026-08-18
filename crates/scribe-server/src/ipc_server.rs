@@ -1198,6 +1198,7 @@ struct SessionRuntimeContext<'a> {
 pub struct MetadataRuntime<'a> {
     pub workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
     pub live_sessions: &'a LiveSessionRegistry,
+    pub window_shares: &'a WindowShares,
     pub git_ref_watcher: &'a Arc<GitRefWatcherControl>,
 }
 
@@ -1522,6 +1523,10 @@ pub struct LiveSession {
     /// still gets a prompt bar. Cleared with `ai_state`: the provider exiting
     /// ends the conversation the history belongs to.
     prompt_state: Option<scribe_common::protocol::SessionPromptState>,
+    /// The Beads issue the live agent is currently working on. This is
+    /// ephemeral session state: hook ingress owns writes, and teardown clears
+    /// it rather than persisting it through reconnect or handoff.
+    focused_issue: Option<String>,
     /// Latest known terminal cell size in pixels.
     cell_width: u16,
     cell_height: u16,
@@ -6283,6 +6288,14 @@ async fn detach_client_window(
 ) {
     server.github_ci_tracker.drop_detail_writer(Arc::clone(writer));
     let attached_ids = attached_snapshot(attached_ids).await;
+    clear_focused_issues_for_disconnect(
+        &server.live_sessions,
+        &server.window_shares,
+        window_id,
+        &attached_ids,
+        writer,
+    )
+    .await;
     // Detach only the sessions still routed to THIS connection. A feature-013
     // takeover may already have re-pointed them at the new controller, whose
     // output + clipboard-bridge routing (T016) must survive this old client's
@@ -6335,6 +6348,45 @@ async fn detach_client_window(
     info!(%window_id, still_owned, "client connection closed; window released if still owned");
     if last_client_disconnected {
         schedule_settings_shutdown_if_no_clients(Arc::clone(&server.window_shares));
+    }
+}
+
+/// Clear any liveness binding before its owning local controller disconnects.
+///
+/// `attached_ids` can contain sessions a displaced connection used to own, so
+/// prove this writer is still the local single-controller owner before clearing.
+/// A remote or shared connection fails that proof and sees no liveness frame.
+async fn clear_focused_issues_for_disconnect(
+    live_sessions: &LiveSessionRegistry,
+    window_shares: &WindowShares,
+    window_id: WindowId,
+    attached_ids: &HashSet<SessionId>,
+    writer: &SharedWriter,
+) {
+    let owns_flow = {
+        let shares = window_shares.read().await;
+        let Some(share) = shares.get(&window_id) else {
+            return;
+        };
+        share.local_participant().is_some_and(|local| Arc::ptr_eq(&local.writer, writer))
+            && beads_detail_connection_available(Some(share), writer, false)
+    };
+    if !owns_flow {
+        return;
+    }
+
+    let session_ids = {
+        let sessions = live_sessions.read().await;
+        attached_ids
+            .iter()
+            .copied()
+            .filter(|session_id| {
+                sessions.get(session_id).is_some_and(|session| session.env_window_id == window_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for session_id in session_ids {
+        set_focused_issue(session_id, None, live_sessions, window_shares).await;
     }
 }
 
@@ -6648,6 +6700,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
                 session_id,
                 &context.server.workspace_manager,
                 &context.server.live_sessions,
+                &context.server.window_shares,
                 context.attached_ids,
             )
             .await;
@@ -7026,6 +7079,53 @@ fn beads_detail_connection_available(
         })
 }
 
+/// Store one live agent's exact Beads issue binding and publish it only to the
+/// local single-controller owner of that session's window.
+///
+/// Hook ingress calls this seam for its future `issue_focused` event. A missing
+/// session is deliberately a no-op: helper processes can outlive their PTY.
+/// The local-owner gate matches Flow graph admission, so a remote or shared
+/// participant never learns which issue an agent is working on.
+pub async fn set_focused_issue(
+    session_id: SessionId,
+    issue_id: Option<String>,
+    live_sessions: &LiveSessionRegistry,
+    window_shares: &WindowShares,
+) {
+    let window_id = {
+        let mut sessions = live_sessions.write().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return;
+        };
+        if session.focused_issue == issue_id {
+            return;
+        }
+        session.focused_issue.clone_from(&issue_id);
+        session.env_window_id
+    };
+
+    let recipient = focused_issue_recipient(window_id, window_shares).await;
+    if let Some(writer) = recipient {
+        send_message(&writer, &ServerMessage::IssueFocused { session_id, issue_id }).await;
+    }
+}
+
+/// Return the one connection allowed to receive agent liveness for `window_id`.
+///
+/// Deliberately selects the registered local owner rather than a session sink:
+/// a session can temporarily have multiple sinks during sharing, but Flow's
+/// liveness contract is local-only and unshared.
+async fn focused_issue_recipient(
+    window_id: WindowId,
+    window_shares: &WindowShares,
+) -> Option<SharedWriter> {
+    let shares = window_shares.read().await;
+    let share = shares.get(&window_id)?;
+    let local = share.local_participant()?;
+    beads_detail_connection_available(Some(share), &local.writer, false)
+        .then(|| Arc::clone(&local.writer))
+}
+
 struct BeadsDetailRequest<'a> {
     window_id: WindowId,
     writer: &'a SharedWriter,
@@ -7350,7 +7450,7 @@ async fn start_session(
         image_sharing: Arc::clone(&shared.image_sharing), attachment: Arc::clone(&shared.attachment),
         workspace_id, shell_name, title, icon_title, task_label, cwd,
         last_cwd_report: None, git_branch_cache: GitBranchCache::default(),
-        context, ai_state, ai_provider_hint, shell_tool, prompt_state,
+        context, ai_state, ai_provider_hint, shell_tool, prompt_state, focused_issue: None,
         cell_width, cell_height, resize_pacer: std::sync::Mutex::default(),
         pty, handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
@@ -7586,6 +7686,7 @@ fn spawn_child_exit_watcher(
     // session would report an unknown status.
     handles.exit_gate.arm_watcher();
     let live_sessions = Arc::clone(runtime.live_sessions);
+    let window_shares = Arc::clone(runtime.window_shares);
     let workspace_manager = Arc::clone(runtime.workspace_manager);
     tokio::spawn(async move {
         let exit = watcher.exited().await;
@@ -7608,6 +7709,7 @@ fn spawn_child_exit_watcher(
                 client_writer: &handles.client_writer,
                 attachment: &handles.attachment,
                 live_sessions: &live_sessions,
+                window_shares: &window_shares,
                 workspace_manager: &workspace_manager,
             },
             exit,
@@ -7871,12 +7973,17 @@ async fn handle_close_session(
     session_id: SessionId,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
+    window_shares: &WindowShares,
     attached_ids: &AttachedSessionIds,
 ) {
     if !attached_contains(attached_ids, session_id).await {
         tracing::warn!(%session_id, "client sent CloseSession for unattached session");
         return;
     }
+
+    // Clear the ephemeral agent binding while the session remains in the
+    // registry, so its local owner receives the clear before SessionExited.
+    set_focused_issue(session_id, None, live_sessions, window_shares).await;
 
     // Step 1 — take: the registry write guard covers the removal and nothing
     // else, and holds across no `.await`.
@@ -7954,6 +8061,7 @@ async fn handle_close_session(
                 client_writer: &handles.client_writer,
                 attachment: &handles.attachment,
                 live_sessions,
+                window_shares,
                 workspace_manager,
             },
             ChildExit::UNKNOWN,
@@ -7987,6 +8095,18 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
     // registry guard below, so this never inverts the documented lock order.
     let session_ids = context.server.workspace_manager.read().await.sessions_for_window(window_id);
     info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
+
+    // Session removal below drops the registry field, but emitting the clear
+    // first prevents an attached owner from holding a stale live-agent halo.
+    for &session_id in &session_ids {
+        set_focused_issue(
+            session_id,
+            None,
+            &context.server.live_sessions,
+            &context.server.window_shares,
+        )
+        .await;
+    }
 
     // Step 1 — take: one registry write guard, holding nothing but the
     // removals. The session values leave with it so the per-session work below
@@ -8071,6 +8191,7 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
                 client_writer: &handles.client_writer,
                 attachment: &handles.attachment,
                 live_sessions: &context.server.live_sessions,
+                window_shares: &context.server.window_shares,
                 workspace_manager: &context.server.workspace_manager,
             },
             ChildExit::UNKNOWN,
@@ -10846,6 +10967,7 @@ async fn finalize_pty_reader(state: PtyReaderState, stop: ReaderStop) {
             client_writer: &state.client_writer,
             attachment: &state.attachment,
             live_sessions: &state.live_sessions,
+            window_shares: &state.window_shares,
             workspace_manager: &state.workspace_manager,
         },
         ChildExit::UNKNOWN,
@@ -10862,6 +10984,7 @@ struct SessionExitContext<'a> {
     client_writer: &'a ClientWriter,
     attachment: &'a SessionAttachment,
     live_sessions: &'a LiveSessionRegistry,
+    window_shares: &'a WindowShares,
     workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
 }
 
@@ -10899,6 +11022,10 @@ async fn finalize_session_exit(
         return;
     }
     gate.cancel();
+    // The reader/watch path owns the only session-end route where the entry is
+    // still live here. Clear first so the owner cannot retain a halo after the
+    // terminal that produced it is gone.
+    set_focused_issue(ctx.session_id, None, ctx.live_sessions, ctx.window_shares).await;
     let exit_msg = ServerMessage::SessionExited {
         session_id: ctx.session_id,
         exit_code: exit.exit_code,
@@ -11112,6 +11239,7 @@ async fn handle_session_event(
                 MetadataRuntime {
                     workspace_manager: &state.workspace_manager,
                     live_sessions: &state.live_sessions,
+                    window_shares: &state.window_shares,
                     git_ref_watcher: &state.git_ref_watcher,
                 },
             )
@@ -11894,6 +12022,7 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
         MetadataRuntime {
             workspace_manager: &state.workspace_manager,
             live_sessions: &state.live_sessions,
+            window_shares: &state.window_shares,
             git_ref_watcher: &state.git_ref_watcher,
         },
     )
@@ -11920,6 +12049,7 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
         MetadataRuntime {
             workspace_manager: &state.workspace_manager,
             live_sessions: &state.live_sessions,
+            window_shares: &state.window_shares,
             git_ref_watcher: &state.git_ref_watcher,
         },
     )
@@ -12321,7 +12451,8 @@ pub async fn send_metadata_event(
     client_writer: &ClientWriter,
     runtime: MetadataRuntime<'_>,
 ) {
-    let MetadataRuntime { workspace_manager, live_sessions, git_ref_watcher } = runtime;
+    let MetadataRuntime { workspace_manager, live_sessions, window_shares, git_ref_watcher } =
+        runtime;
     // Context-only refreshes patch the existing live state instead of
     // creating a new `AiStateChanged`. They never carry a state value, so
     // they cannot synthesize one — when no live state has been established
@@ -12362,14 +12493,19 @@ pub async fn send_metadata_event(
 
     merge_partial_ai_state(&mut server_msg, session_id, live_sessions).await;
 
+    let clears_focused_issue = matches!(&server_msg, ServerMessage::AiStateCleared { .. });
     persist_session_metadata(&server_msg, session_id, live_sessions).await;
 
     send_to_client(client_writer, None, &server_msg);
+    if clears_focused_issue {
+        set_focused_issue(session_id, None, live_sessions, window_shares).await;
+    }
 
     if synthesize_ai_cleared {
         let clear_msg = ServerMessage::AiStateCleared { session_id };
         persist_session_metadata(&clear_msg, session_id, live_sessions).await;
         send_to_client(client_writer, None, &clear_msg);
+        set_focused_issue(session_id, None, live_sessions, window_shares).await;
     }
 
     if let Some(cwd) = cwd_for_workspace {
@@ -13797,6 +13933,202 @@ mod tests {
         (session_id, live_sessions, vec![pty.slave])
     }
 
+    async fn install_flow_owner(
+        session_id: SessionId,
+        live_sessions: &LiveSessionRegistry,
+        writer: &SharedWriter,
+    ) -> WindowShares {
+        let window_id = WindowId::new();
+        live_sessions.write().await.get_mut(&session_id).expect("live session").env_window_id =
+            window_id;
+        let shares = new_window_shares();
+        shares.write().await.insert(
+            window_id,
+            WindowShare::new_single_controller(Participant::local(writer, false)),
+        );
+        shares
+    }
+
+    // @lat: [[server#Beads Flow source cache#Focused issue liveness]]
+    #[tokio::test]
+    async fn focused_issue_reaches_only_the_local_flow_owner_and_clears() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
+        let shares = install_flow_owner(session_id, &live_sessions, &writer).await;
+
+        set_focused_issue(session_id, Some(String::from("scribe-lpi2.8")), &live_sessions, &shares)
+            .await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::IssueFocused { session_id: id, issue_id: Some(issue) }
+                if id == session_id && issue == "scribe-lpi2.8"
+        ));
+
+        set_focused_issue(session_id, None, &live_sessions, &shares).await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::IssueFocused { session_id: id, issue_id: None } if id == session_id
+        ));
+        assert!(live_sessions.read().await[&session_id].focused_issue.is_none());
+    }
+
+    // @lat: [[server#Beads Flow source cache#Focused issue liveness]]
+    #[tokio::test]
+    async fn focused_issue_drops_unknown_and_withholds_remote_or_shared_delivery() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
+        let shares = install_flow_owner(session_id, &live_sessions, &writer).await;
+
+        set_focused_issue(
+            SessionId::new(),
+            Some(String::from("scribe-missing")),
+            &live_sessions,
+            &shares,
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                read_message::<ServerMessage, _>(&mut client_read)
+            )
+            .await
+            .is_err(),
+            "an unknown session must not receive a frame"
+        );
+
+        let window_id = live_sessions.read().await[&session_id].env_window_id;
+        shares.write().await.insert(
+            window_id,
+            WindowShare::new(
+                Participant::local(&writer, false),
+                scribe_config::SharingMode::FreeForAll,
+                scribe_config::ControlAcquisition::FreeClaim,
+                None,
+            ),
+        );
+        set_focused_issue(session_id, Some(String::from("scribe-lpi2.8")), &live_sessions, &shares)
+            .await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                read_message::<ServerMessage, _>(&mut client_read)
+            )
+            .await
+            .is_err(),
+            "a shared participant must not receive a liveness frame"
+        );
+
+        let remote = Participant::new(
+            &writer,
+            ControllerIdentity::Remote {
+                device_name: String::from("remote-device"),
+                login_name: String::from("remote-account"),
+            },
+            ParticipantTransport::Remote,
+            false,
+        );
+        shares.write().await.insert(window_id, WindowShare::new_single_controller(remote));
+        set_focused_issue(session_id, None, &live_sessions, &shares).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                read_message::<ServerMessage, _>(&mut client_read)
+            )
+            .await
+            .is_err(),
+            "a remote participant must not receive a liveness frame"
+        );
+    }
+
+    // @lat: [[server#Beads Flow source cache#Focused issue liveness]]
+    #[tokio::test]
+    async fn state_clear_and_session_exit_clear_the_focused_issue() {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(80, 24, &writer).await;
+        let shares = install_flow_owner(session_id, &live_sessions, &writer).await;
+        let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
+        let git_ref_watcher = Arc::new(GitRefWatcherControl::new(false));
+        let client_writer = Arc::clone(&live_sessions.read().await[&session_id].client_writer);
+
+        set_focused_issue(session_id, Some(String::from("scribe-lpi2.8")), &live_sessions, &shares)
+            .await;
+        let _ = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        send_metadata_event(
+            MetadataEvent::AiStateCleared,
+            session_id,
+            &client_writer,
+            MetadataRuntime {
+                workspace_manager: &workspace_manager,
+                live_sessions: &live_sessions,
+                window_shares: &shares,
+                git_ref_watcher: &git_ref_watcher,
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::AiStateCleared { session_id: id } if id == session_id
+        ));
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::IssueFocused { session_id: id, issue_id: None } if id == session_id
+        ));
+
+        set_focused_issue(session_id, Some(String::from("scribe-lpi2.8")), &live_sessions, &shares)
+            .await;
+        let _ = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        let window_id = live_sessions.read().await[&session_id].env_window_id;
+        let attached_ids = HashSet::from([session_id]);
+        clear_focused_issues_for_disconnect(
+            &live_sessions,
+            &shares,
+            window_id,
+            &attached_ids,
+            &writer,
+        )
+        .await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::IssueFocused { session_id: id, issue_id: None } if id == session_id
+        ));
+
+        set_focused_issue(session_id, Some(String::from("scribe-lpi2.8")), &live_sessions, &shares)
+            .await;
+        let _ = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        let handles = live_sessions.read().await[&session_id].exit_handles();
+        finalize_session_exit(
+            &handles.exit_gate,
+            SessionExitContext {
+                session_id,
+                client_writer: &handles.client_writer,
+                attachment: &handles.attachment,
+                live_sessions: &live_sessions,
+                window_shares: &shares,
+                workspace_manager: &workspace_manager,
+            },
+            ChildExit::UNKNOWN,
+        )
+        .await;
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::IssueFocused { session_id: id, issue_id: None } if id == session_id
+        ));
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
+            ServerMessage::SessionExited { session_id: id, .. } if id == session_id
+        ));
+        assert!(!live_sessions.read().await.contains_key(&session_id));
+    }
+
     // @lat: [[lat.md/server#Server#Sessions#Retained Prompt History#SessionEnd clears reattach chrome]]
     #[tokio::test]
     async fn state_cleared_drops_all_reattach_chrome_after_attention_dismissal() {
@@ -14796,6 +15128,7 @@ mod tests {
     async fn finalizing_a_session_exit_cancels_its_reader() {
         let gate = SessionExitGate::new();
         let live_sessions = new_live_session_registry();
+        let window_shares = new_window_shares();
         let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
         let client_writer = initial_client_writer(None).await;
         let attachment: SessionAttachment = Arc::new(Mutex::new(None));
@@ -14807,6 +15140,7 @@ mod tests {
                 client_writer: &client_writer,
                 attachment: &attachment,
                 live_sessions: &live_sessions,
+                window_shares: &window_shares,
                 workspace_manager: &workspace_manager,
             },
             ChildExit::UNKNOWN,

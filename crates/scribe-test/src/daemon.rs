@@ -676,8 +676,9 @@ async fn dispatch_server_message(
         }
         // Test daemon does not exercise env-persistence (feature 006), OSC 52
         // clipboard gating (spec 010), remote window control (feature 013), LAN
-        // remote control (feature 014), or the Beads epic graph (spec 026) yet.
-        // Those reach client/settings surfaces; a behavior-preserving no-op arm.
+        // remote control (feature 014), or the Beads Flow graph/liveness
+        // frames (spec 026) yet. Those reach client/settings surfaces; a
+        // behavior-preserving no-op arm.
         ServerMessage::EnvPreflightResult { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::ClipboardPromptRequest { .. }
@@ -701,6 +702,7 @@ async fn dispatch_server_message(
         | ServerMessage::TerminalImageCapabilityMismatch { .. }
         | ServerMessage::BeadsIssueDetail { .. }
         | ServerMessage::BeadsEpicGraph { .. }
+        | ServerMessage::IssueFocused { .. }
         | ServerMessage::ShareRoster { .. }
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }

@@ -26,7 +26,7 @@
 
 counts modules-total 75
 counts modules-wired 74
-counts server-messages-total 67
+counts server-messages-total 68
 counts server-messages-handled 61
 counts layout-actions-total 38
 counts layout-actions-handled 38
@@ -35,6 +35,8 @@ counts layout-actions-handled 38
 unwired-module beads_flow
 
 unhandled-server-message BeadsEpicGraph
+# scribe-lpi2.14 wires the Flow live-agent halo.
+unhandled-server-message IssueFocused
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message TrustedDeviceList

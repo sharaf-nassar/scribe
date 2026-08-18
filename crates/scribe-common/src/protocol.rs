@@ -1197,6 +1197,13 @@ pub enum ServerMessage {
         epic_id: String,
         outcome: BeadsEpicGraphOutcome,
     },
+    /// Current Beads issue a live agent session is working on. `None` clears
+    /// the binding when the agent leaves, its session ends, or its client
+    /// disconnects.
+    IssueFocused {
+        session_id: SessionId,
+        issue_id: Option<String>,
+    },
     /// Correlated outcome for one typed issue write.
     BeadsIssueWriteResult {
         workspace_id: WorkspaceId,
@@ -2986,6 +2993,23 @@ mod tests {
             panic!("expected a graph outcome");
         };
         assert_eq!(*decoded_graph, graph);
+    }
+
+    // @lat: [[protocol#Server Messages#Focused Beads issue#Named MessagePack round trip]]
+    #[test]
+    fn issue_focused_round_trips_set_and_clear() {
+        let session_id = SessionId::new();
+        for issue_id in [Some(String::from("scribe-lpi2.8")), None] {
+            let message = ServerMessage::IssueFocused { session_id, issue_id: issue_id.clone() };
+            let bytes = rmp_serde::to_vec_named(&message).expect("serialize focused issue");
+            let decoded: ServerMessage =
+                rmp_serde::from_slice(&bytes).expect("deserialize focused issue");
+            assert!(matches!(
+                decoded,
+                ServerMessage::IssueFocused { session_id: decoded_id, issue_id: decoded_issue }
+                    if decoded_id == session_id && decoded_issue == issue_id
+            ));
+        }
     }
 
     #[derive(Serialize)]
