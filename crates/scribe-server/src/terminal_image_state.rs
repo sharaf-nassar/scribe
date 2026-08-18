@@ -3296,6 +3296,14 @@ impl PtyTerminalImageState {
 /// Feed one read through the existing Alacritty processor and real `Term`,
 /// splitting only at completed image boundaries. Every input byte is consumed
 /// exactly once; split control strings do not synthesize observations.
+///
+/// A completed image inside a synchronized update is an observation checkpoint:
+/// VTE otherwise withholds its preceding cursor callbacks until `CSI ?2026l`,
+/// making the image boundary observe the cursor from before the update. The
+/// checkpoint flushes only the server's real `Term` through the existing VTE
+/// processor, then starts a new private sync interval for the remaining source
+/// bytes. Client delivery still carries the original unmodified frame as one
+/// atomic synchronized update.
 pub fn feed_terminal_observed<T: EventListener>(
     observer: &TerminalGridObserverHandle,
     term: &mut Term<T>,
@@ -3377,7 +3385,7 @@ where
         };
         let mut handler = ObservedTermHandler::new(term, &mut state, &observer.budget);
         ansi_processor.advance(&mut handler, span);
-        let finished = handler.finish();
+        let finished = finish_observed_image_cut(ansi_processor, handler);
         push_span(
             &observer.budget,
             &mut collected,
@@ -3402,6 +3410,25 @@ where
         }
     }
     collected
+}
+
+/// Snapshot a completed image at its source boundary without letting VTE's
+/// synchronized-update buffer delay its preceding cursor movement.
+///
+/// `Processor` exposes no partial sync drain. A nonempty sync buffer is thus
+/// flushed through the one production parser and real `Term`, and an internal
+/// BSU restarts buffering for later *source* bytes. The synthetic BSU is never
+/// delivered to a client; it only preserves VTE's server-side buffering after
+/// the checkpoint. Every byte from `bytes` still enters `ansi_processor` once.
+fn finish_observed_image_cut<T: EventListener>(
+    ansi_processor: &mut AnsiProcessor,
+    mut handler: ObservedTermHandler<'_, T>,
+) -> ObservedTerminalGridSpan {
+    if ansi_processor.sync_bytes_count() > 0 {
+        ansi_processor.stop_sync(&mut handler);
+        ansi_processor.advance(&mut handler, b"\x1b[?2026h");
+    }
+    handler.finish()
 }
 
 /// Reserve, then retain, one span observation and its effect ownership.

@@ -301,17 +301,24 @@ bytes to the client once. The seam returns typed `Raw` or sequenced `Image`
 boundaries in source order. Recognized Sixel modes also produce an image-side
 boundary. No image fanout or PTY reply write-back is connected yet.
 
-The existing Alacritty ANSI processor feeds every byte to the real production
-`Term` exactly once. It may split one `advance` call at completed graphics
-boundaries so later bytes in the same read cannot contaminate an image-time
-observation; ordered boundary ends are consumed and deduplicated linearly, and
-the normal no-image read remains one call. Split controls create no effects
-until Alacritty changes state or the framer completes a boundary. If image
-framing rejects a read, the same bytes still cross the delegating handler once
-as one full span because no committed image cuts exist. The live reader and
-Docker probe share one ingress orchestration seam, so client delivery, `Term`
-mutation, typed rejection, and payload-free logging each keep one production
-occurrence.
+The existing Alacritty ANSI processor feeds every source byte to the real
+production `Term` exactly once. It may split one `advance` call at completed
+graphics boundaries so later bytes in the same read cannot contaminate an
+image-time observation; ordered boundary ends are consumed and deduplicated
+linearly, and the normal no-image read remains one call. A boundary inside a
+VTE synchronized update is a checkpoint: VTE exposes no partial drain, so the
+server flushes its buffered callbacks through that same processor and `Term`,
+snapshots the placement cursor, then starts an internal sync interval for the
+remaining source bytes. The client receives only the original raw `CSI ?2026`
+frame, unchanged and as one delivery, so presentation remains atomic. This is
+not a replay parser and does not double-feed a source byte; a Pi fullscreen
+write with two classic Kitty PNG placements proves each keeps its own moved
+cursor. Split controls create no effects until Alacritty changes state or the
+framer completes a boundary. If image framing rejects a read, the same bytes
+still cross the delegating handler once as one full span because no committed
+image cuts exist. The live reader and Docker probe share one ingress
+orchestration seam, so client delivery, `Term` mutation, typed rejection, and
+payload-free logging each keep one production occurrence.
 
 One delegating `Handler` observes that same `Term`; no replay parser or
 image-only cursor engine exists. Payload-free snapshots retain active screen,

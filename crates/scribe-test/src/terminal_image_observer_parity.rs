@@ -179,6 +179,7 @@ pub fn run(evidence_path: &Path) -> Result<(), String> {
     verify_input_width_scroll_paths()?;
     verify_ordered_boundary_cuts()?;
     verify_image_error_observed_once()?;
+    verify_synchronized_kitty_image_cursors()?;
     verify_synchronized_update_timeout()?;
     verify_both_grid_resize()?;
 
@@ -202,6 +203,7 @@ pub fn run(evidence_path: &Path) -> Result<(), String> {
             ("same_read_chronology", "pass"),
             ("same_span_live_wrap_mode", "pass"),
             ("save_restore_per_grid", "pass"),
+            ("synchronized_kitty_image_cursors", "pass"),
             ("split_reads", "pass"),
             ("synchronized_update_timeout", "pass"),
             ("wrap_pending_and_image_move", "pass"),
@@ -217,6 +219,49 @@ pub fn run(evidence_path: &Path) -> Result<(), String> {
         .map_err(|error| format!("serialize observer evidence: {error}"))?;
     std::fs::write(evidence_path, bytes)
         .map_err(|error| format!("write observer evidence: {error}"))
+}
+
+/// Pi's fullscreen renderer emits this classic PNG form inside its synchronized
+/// redraw. `C=1` is deliberately retained: the image seam must snapshot the
+/// cursor before that placement's own cursor advancement can affect the next
+/// command.
+const PI_CLASSIC_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
+
+fn pi_classic_kitty_png(image_id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=T,f=100,C=1,i={image_id};{PI_CLASSIC_PNG}\x1b\\").into_bytes()
+}
+
+/// A single Pi fullscreen write must retain the cursor at each completed
+/// classic Kitty boundary even though VTE holds its callbacks until ESU.
+fn verify_synchronized_kitty_image_cursors() -> Result<(), String> {
+    let mut probe = Probe::new(40, 10);
+    let mut read = b"\x1b[?2026h\x1b[2;3H".to_vec();
+    read.extend(pi_classic_kitty_png(71));
+    read.extend(b"\x1b[6;8H");
+    read.extend(pi_classic_kitty_png(72));
+    read.extend(b"\x1b[?2026l");
+
+    let commit = probe.feed(&read)?;
+    if commit.grid_observations().len() != 3 {
+        return Err(format!(
+            "Pi synchronized read did not retain one observation per image plus ESU: {:?}",
+            commit.grid_observations()
+        ));
+    }
+    probe.images.commit_mutations(&commit).map_err(|error| error.to_string())?;
+    let anchors = probe
+        .images
+        .canonical_placements()
+        .into_iter()
+        .map(|(_, placement)| (placement.image_id.0, placement.anchor.row, placement.anchor.column))
+        .collect::<Vec<_>>();
+    let expected = vec![(71, 1, 2), (72, 5, 7)];
+    if anchors != expected {
+        return Err(format!(
+            "Pi synchronized classic Kitty anchors used a stale cursor: {anchors:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn verify_wrap_pending_and_image_move() -> Result<(), String> {
