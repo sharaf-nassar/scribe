@@ -47,6 +47,7 @@ pub enum ReplayCommand {
     Custom(Vec<String>),
     AiTargeted { provider: AiProvider, conversation_id: String },
     AiGeneric { provider: AiProvider },
+    AiFresh { provider: AiProvider },
     Tool(ShellTool),
 }
 
@@ -185,6 +186,42 @@ pub fn prepare_replay(snapshot: &WindowRestoreState) -> RebuiltWindow {
     rebuild_layout_from_snapshot(snapshot)
 }
 
+/// Promote a legacy persisted [`ShellTool::Pi`] launch to a fresh tracked
+/// [`AiProvider::Pi`] launch when the connected server has negotiated
+/// structured Pi support, so a cold replay relaunches Pi through the same
+/// server-owned AI path a live `new_pi_tab` chord uses instead of the legacy
+/// tool exec. There is no conversation to target either way — a legacy Pi
+/// record never carries one — so a promoted launch always requests
+/// [`AiResumeMode::New`] with no conversation id, never a resume. Without
+/// negotiated support (or for every other launch kind) the window is returned
+/// unchanged.
+#[must_use]
+pub fn promote_pi_replay_launches(mut rebuilt: RebuiltWindow, pi_provider: bool) -> RebuiltWindow {
+    if !pi_provider {
+        return rebuilt;
+    }
+    for pane in rebuilt.panes.values_mut() {
+        if matches!(pane.launch_binding.kind, LaunchKind::ShellTool { tool: ShellTool::Pi }) {
+            pane.launch_binding.kind = pi_ai_launch_kind();
+        }
+    }
+    for launch in &mut rebuilt.launches {
+        if matches!(launch.command, ReplayCommand::Tool(ShellTool::Pi)) {
+            launch.command = ReplayCommand::AiFresh { provider: AiProvider::Pi };
+            launch.session_launch = replay_launch_values(&launch.command);
+        }
+    }
+    rebuilt
+}
+
+fn pi_ai_launch_kind() -> LaunchKind {
+    LaunchKind::Ai {
+        provider: AiProvider::Pi,
+        resume_mode: AiResumeMode::New,
+        conversation_id: None,
+    }
+}
+
 /// Build structured AI intent for a fresh launch or cold-restart replay.
 #[must_use]
 pub fn ai_launch_values(
@@ -218,6 +255,7 @@ pub fn replay_launch_values(command: &ReplayCommand) -> SessionLaunchValues {
         ReplayCommand::AiGeneric { provider } => {
             ai_launch_values(*provider, AiResumeMode::Resume, None)
         }
+        ReplayCommand::AiFresh { provider } => ai_launch_values(*provider, AiResumeMode::New, None),
         ReplayCommand::Tool(tool) => shell_tool_launch_values(*tool),
     }
 }
@@ -652,13 +690,28 @@ fn snapshot_launches<S: BuildHasher>(
                 Some(LaunchRecord {
                     launch_id: pane.launch_binding.launch_id.clone(),
                     cwd: pane.cwd.clone().or_else(|| pane.launch_binding.fallback_cwd.clone()),
-                    kind: pane.launch_binding.kind.clone(),
+                    kind: legacy_persisted_kind(pane.launch_binding.kind.clone()),
                     prompts: pane.prompts.prompts.clone(),
                 })
             }));
         }
     }
     launches
+}
+
+/// Downgrade a live Pi AI binding to the legacy [`ShellTool::Pi`] shape before
+/// it is written to disk, so an older client (or an older build of this one)
+/// can still read the snapshot back. [`promote_pi_replay_launches`] is the
+/// other half: it upgrades the legacy shape back to a tracked AI launch when
+/// the snapshot is replayed with negotiated Pi support. Every other kind
+/// passes through unchanged.
+fn legacy_persisted_kind(kind: LaunchKind) -> LaunchKind {
+    match kind {
+        LaunchKind::Ai { provider: AiProvider::Pi, .. } => {
+            LaunchKind::ShellTool { tool: ShellTool::Pi }
+        }
+        other => other,
+    }
 }
 
 fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
@@ -900,5 +953,91 @@ mod tests {
                 conversation_id: Some("conv-42".to_owned()),
             })
         );
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Tool replay relaunches the tool]]
+    #[test]
+    fn pi_replay_stays_legacy_without_negotiated_support() {
+        let mut snapshot = single_pane_snapshot(WindowId::new(), WorkspaceId::new(), "launch-a");
+        snapshot.launches[0].kind = LaunchKind::ShellTool { tool: ShellTool::Pi };
+
+        let rebuilt = promote_pi_replay_launches(prepare_replay(&snapshot), false);
+
+        let pane = rebuilt.panes.values().next().expect("pane restored");
+        assert!(matches!(pane.launch_binding.kind, LaunchKind::ShellTool { tool: ShellTool::Pi }));
+        let launch = &rebuilt.launches[0];
+        assert!(matches!(launch.command, ReplayCommand::Tool(ShellTool::Pi)));
+        assert_eq!(launch.session_launch.shell_tool, Some(ShellTool::Pi));
+        assert!(launch.session_launch.ai_launch.is_none());
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]]
+    #[test]
+    fn pi_replay_promotes_to_a_fresh_tracked_launch_with_negotiated_support() {
+        let mut snapshot = single_pane_snapshot(WindowId::new(), WorkspaceId::new(), "launch-a");
+        snapshot.launches[0].kind = LaunchKind::ShellTool { tool: ShellTool::Pi };
+
+        let rebuilt = promote_pi_replay_launches(prepare_replay(&snapshot), true);
+
+        let pane = rebuilt.panes.values().next().expect("pane restored");
+        assert!(matches!(
+            pane.launch_binding.kind,
+            LaunchKind::Ai {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }
+        ));
+        // Promoted metadata never becomes a resume: there is no conversation
+        // to target, so the replay is a fresh launch either way.
+        let launch = &rebuilt.launches[0];
+        assert_eq!(launch.launch_id, "launch-a");
+        assert!(matches!(launch.command, ReplayCommand::AiFresh { provider: AiProvider::Pi }));
+        assert_eq!(
+            launch.session_launch.ai_launch,
+            Some(AiLaunchSpec {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            })
+        );
+        assert!(launch.session_launch.shell_tool.is_none());
+    }
+
+    #[test]
+    fn pi_promotion_leaves_every_other_launch_kind_untouched() {
+        let snapshot = single_pane_snapshot(WindowId::new(), WorkspaceId::new(), "launch-a");
+
+        let rebuilt = promote_pi_replay_launches(prepare_replay(&snapshot), true);
+
+        let pane = rebuilt.panes.values().next().expect("pane restored");
+        assert!(matches!(pane.launch_binding.kind, LaunchKind::Shell));
+        assert!(matches!(rebuilt.launches[0].command, ReplayCommand::Shell));
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Snapshot survives rebuild round trip]]
+    #[test]
+    fn snapshot_downgrades_a_live_pi_ai_binding_to_the_legacy_shell_tool_shape() {
+        let window_id = WindowId::new();
+        let workspace_id = WorkspaceId::new();
+        let snapshot = single_pane_snapshot(window_id, workspace_id, "launch-a");
+        let mut rebuilt = prepare_replay(&snapshot);
+        // Stand in for a live tracked Pi launch this process created: cold
+        // replay promotes a legacy record the same way, so persisting it
+        // again must round-trip back to the legacy shape, not leak the
+        // in-memory AI representation to an older reader.
+        let pane = rebuilt.panes.values_mut().next().expect("pane restored");
+        pane.launch_binding.kind = LaunchKind::Ai {
+            provider: AiProvider::Pi,
+            resume_mode: AiResumeMode::New,
+            conversation_id: None,
+        };
+
+        let reserialised = snapshot_window_restore(window_id, &rebuilt.layout, &rebuilt.panes);
+
+        assert!(matches!(
+            reserialised.launches[0].kind,
+            LaunchKind::ShellTool { tool: ShellTool::Pi }
+        ));
     }
 }

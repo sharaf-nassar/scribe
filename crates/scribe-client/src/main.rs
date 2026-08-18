@@ -160,7 +160,7 @@ use scribe_common::{
     protocol::{
         AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardSelection,
         PromptMarkKind, ServerMessage, SessionInfo, ShellTool, TerminalSize, UpdateProgressState,
-        WindowInfo, WorkspaceTreeNode,
+        WindowInfo, WorkspaceTreeNode, pi_launch_metadata,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -1008,6 +1008,21 @@ fn update_retained_binding(
 ) -> bool {
     let changed = update_binding_cwd(binding, cwd);
     let Some((provider, retained_conversation_id)) = ai else { return changed };
+    // A provider that never supports resume (Pi) has no conversation to
+    // target, so a retained edge for it must never promote the binding into
+    // a resume: it is always the same fresh launch `new_pi_tab` sends live.
+    if !provider.supports_resume() {
+        if matches!(
+            &binding.kind,
+            LaunchKind::Ai { provider: existing_provider, resume_mode: AiResumeMode::New, conversation_id: None }
+            if *existing_provider == provider
+        ) {
+            return changed;
+        }
+        binding.kind =
+            LaunchKind::Ai { provider, resume_mode: AiResumeMode::New, conversation_id: None };
+        return true;
+    }
     let effective_conversation_id = retained_conversation_id.map(str::to_owned).or_else(|| {
         if let LaunchKind::Ai { conversation_id: existing_conversation_id, .. } = &binding.kind {
             existing_conversation_id.clone()
@@ -1055,10 +1070,17 @@ fn retained_session_binding(
     launch_id: Option<String>,
 ) -> LaunchBinding {
     let kind = if let Some((provider, conversation_id)) = ai {
-        LaunchKind::Ai {
-            provider,
-            resume_mode: AiResumeMode::Resume,
-            conversation_id: conversation_id.map(str::to_owned),
+        if provider.supports_resume() {
+            LaunchKind::Ai {
+                provider,
+                resume_mode: AiResumeMode::Resume,
+                conversation_id: conversation_id.map(str::to_owned),
+            }
+        } else {
+            // Pi has no conversation to resume, so a server-retained Pi
+            // session always reconstructs as the same fresh launch
+            // `new_pi_tab` sends live — never a targeted or generic resume.
+            LaunchKind::Ai { provider, resume_mode: AiResumeMode::New, conversation_id: None }
         }
     } else if let Some(tool) = shell_tool {
         LaunchKind::ShellTool { tool }
@@ -2957,7 +2979,7 @@ impl TerminalView {
             LayoutAction::NewCodexResumeTab => {
                 self.create_ai_tab(AiProvider::CodexCode, AiResumeMode::Resume, cx);
             }
-            LayoutAction::NewPiTab => self.create_shell_tool_tab(ShellTool::Pi, cx),
+            LayoutAction::NewPiTab => self.create_pi_tab(cx),
             // Every tab shortcut acts on the region the user is in, which the
             // shell owns; the strip is asked for a tab of that region and can
             // no longer answer with a neighbouring region's.
@@ -4912,7 +4934,10 @@ impl TerminalView {
             return;
         }
         let Some(snapshot) = self.restore.pending.take() else { return };
-        let rebuilt = prepare_replay(&snapshot);
+        let rebuilt = restore_replay::promote_pi_replay_launches(
+            prepare_replay(&snapshot),
+            self.shared.pi_provider.load(Ordering::Acquire),
+        );
         let bindings: HashMap<PaneId, LaunchBinding> = rebuilt
             .panes
             .iter()
@@ -5287,18 +5312,31 @@ impl TerminalView {
         self.create_tab(workspace_id, launch, cwd);
     }
 
-    /// Ask for a launch-only tool tab.
-    ///
-    /// Unlike an AI tab this stays where the user is: the tool is not scoped to
-    /// a project, so it starts in the focused pane's CWD exactly like a plain
-    /// new tab and falls back to the server's `$HOME` guard when there is none.
-    fn create_shell_tool_tab(&mut self, tool: ShellTool, cx: &App) {
-        let cwd = self.focused_session_cwd();
+    /// Send a legacy launch-only tool request with the caller's chosen CWD.
+    fn create_shell_tool_tab(&mut self, tool: ShellTool, cwd: Option<PathBuf>, cx: &App) {
         self.create_tab(
             self.creating_workspace(cx),
             restore_replay::shell_tool_launch_values(tool),
             cwd,
         );
+    }
+
+    /// Launch Pi with the shared AI working-directory policy while preserving
+    /// legacy shell-tool metadata for older servers.
+    fn create_pi_tab(&mut self, cx: &App) {
+        let (ai_launch, shell_tool) =
+            pi_launch_metadata(self.shared.pi_provider.load(Ordering::Acquire));
+        let cwd =
+            self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd());
+        if let Some(tool) = shell_tool {
+            self.create_shell_tool_tab(tool, cwd, cx);
+        } else {
+            self.create_tab(
+                self.creating_workspace(cx),
+                SessionLaunchValues { command: None, ai_launch, shell_tool: None },
+                cwd,
+            );
+        }
     }
 
     /// Read the focused session's last server-reported OSC 7 directory.
@@ -15211,6 +15249,68 @@ mod tests {
         assert!(!update_retained_binding(
             &mut binding,
             Some((AiProvider::CodexCode, None)),
+            Some(Path::new("/tmp/cue")),
+        ));
+
+        // Only an explicit provider-exit edge demotes the binding.
+        assert!(clear_retained_binding(&mut binding, Some(Path::new("/tmp/cue"))));
+        assert_eq!(binding.launch_id, launch_id);
+        assert!(matches!(binding.kind, LaunchKind::Shell));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]]
+    #[test]
+    fn retained_pi_metadata_never_builds_a_resume_binding() {
+        let cwd = PathBuf::from("/tmp/paperclip");
+
+        // Even a stray conversation id (Pi never reports one) must not leak
+        // into a resume: the typed no-resume capability wins.
+        let binding = retained_session_binding(
+            Some((AiProvider::Pi, Some("should-never-resume"))),
+            None,
+            Some(cwd.clone()),
+            Some("launch-42".to_owned()),
+        );
+
+        assert_eq!(binding.launch_id, "launch-42");
+        assert_eq!(binding.fallback_cwd, Some(cwd));
+        assert!(matches!(
+            binding.kind,
+            LaunchKind::Ai {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }
+        ));
+    }
+
+    // @lat: [[client#Client#GPUI Client Spike#Hot Restart Reattach#Live AI metadata updates restore]]
+    #[test]
+    fn live_pi_metadata_updates_restore_without_ever_becoming_a_resume() {
+        let mut binding =
+            restore_replay::new_ai_binding(AiProvider::Pi, AiResumeMode::New, None, None);
+        let launch_id = binding.launch_id.clone();
+
+        assert!(update_retained_binding(
+            &mut binding,
+            Some((AiProvider::Pi, None)),
+            Some(Path::new("/tmp/cue")),
+        ));
+        assert_eq!(binding.launch_id, launch_id);
+        assert_eq!(binding.fallback_cwd.as_deref(), Some(Path::new("/tmp/cue")));
+        assert!(matches!(
+            binding.kind,
+            LaunchKind::Ai {
+                provider: AiProvider::Pi,
+                resume_mode: AiResumeMode::New,
+                conversation_id: None,
+            }
+        ));
+
+        // A repeat edge with nothing new to fold in reports no change.
+        assert!(!update_retained_binding(
+            &mut binding,
+            Some((AiProvider::Pi, None)),
             Some(Path::new("/tmp/cue")),
         ));
 

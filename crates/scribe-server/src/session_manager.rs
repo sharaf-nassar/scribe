@@ -1696,6 +1696,30 @@ mod tests {
         );
     }
 
+    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]]
+    #[test]
+    fn ai_argv_for_pi_execs_with_no_resume_args() {
+        // Pi is a first-class AI provider but never supports resume, so a
+        // structured launch is byte-for-byte the plain-tab argv plus an exec
+        // of `pi` — the same shape the legacy ShellTool::Pi path already
+        // produced (see `tool_argv_is_the_plain_tab_argv_plus_an_interactive_exec`
+        // below), and no resume flag exists to append even if one were asked for.
+        let launch = AiLaunchSpec {
+            provider: AiProvider::Pi,
+            resume_mode: AiResumeMode::New,
+            conversation_id: None,
+        };
+        assert_eq!(
+            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &launch),
+            ["--rcfile", "/s/scribe.bash", "-ic", "exec pi"]
+        );
+        assert_eq!(ai_argv(ShellKind::Nushell, None, &launch), ["-i", "-c", "exec pi"]);
+        assert_eq!(
+            ai_argv(ShellKind::PowerShell, Some("/s/scribe.ps1"), &launch),
+            ["-NoLogo", "-Command", "pi"]
+        );
+    }
+
     // @lat: [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]]
     #[test]
     fn tool_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
