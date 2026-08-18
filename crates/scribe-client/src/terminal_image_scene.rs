@@ -220,6 +220,7 @@ struct ReplayDeclaration {
     placements: u32,
     rgba_bytes: u64,
     active_screen: Option<TerminalScreenKind>,
+    rejection: Option<TerminalImageRejection>,
 }
 
 /// An off-screen snapshot being assembled from a generation-tagged replay.
@@ -436,6 +437,7 @@ impl LiveImageScene {
                 placement_count,
                 total_rgba_bytes,
                 active_screen,
+                rejection,
                 ..
             } => {
                 self.begin_replay(
@@ -445,6 +447,7 @@ impl LiveImageScene {
                         placements: placement_count,
                         rgba_bytes: total_rgba_bytes,
                         active_screen,
+                        rejection,
                     },
                 )?;
                 Ok(LiveSceneApply::Staged)
@@ -499,6 +502,7 @@ impl LiveImageScene {
         self.replay = None;
         let scene = CommittedImageScene {
             active_screen: declared.active_screen.unwrap_or(TerminalScreenKind::Primary),
+            last_rejection: declared.rejection,
             ..CommittedImageScene::default()
         };
         self.replay = Some(StagingReplay {
@@ -915,4 +919,55 @@ pub fn capability_mismatch_message(mismatch: TerminalImageCapabilityMismatch) ->
 /// Convenience for fixture builders that still construct bounded chunks.
 pub fn bounded_chunk(bytes: Vec<u8>) -> Result<BoundedImageBytes, ImageBoundError> {
     BoundedImageBytes::new(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scribe_common::terminal_images::{TerminalImageAction, TerminalImageRejectionReason};
+
+    #[test]
+    fn empty_replay_commits_its_typed_quota_notice() {
+        let generation = TerminalImageGeneration(4);
+        let sequence = TerminalOutputSequence(9);
+        let rejection = TerminalImageRejection {
+            reason: TerminalImageRejectionReason::QuotaExceeded,
+            protocol: None,
+            action: Some(TerminalImageAction::Replay),
+            width: None,
+            height: None,
+            observed: Some(17 * 1024 * 1024),
+            limit: None,
+        };
+        let mut scene = LiveImageScene::default();
+
+        assert!(matches!(
+            scene
+                .apply_replay(TerminalImageReplayMessage::Begin {
+                    generation,
+                    after_sequence: sequence,
+                    definition_count: 0,
+                    placement_count: 0,
+                    total_rgba_bytes: 0,
+                    active_screen: Some(TerminalScreenKind::Primary),
+                    rejection: Some(rejection),
+                })
+                .expect("begin accepted"),
+            LiveSceneApply::Staged
+        ));
+        let committed = scene
+            .apply_replay(TerminalImageReplayMessage::Commit {
+                generation,
+                through_sequence: sequence,
+            })
+            .expect("empty replay committed");
+        let LiveSceneApply::Committed(committed) = committed else {
+            panic!("commit stayed staged")
+        };
+
+        assert!(committed.definitions.is_empty());
+        assert!(committed.placements().is_empty());
+        assert_eq!(committed.last_rejection, Some(rejection));
+        assert_eq!(committed.diagnostic_notice(), Some("This session reached its image limit."));
+    }
 }

@@ -19,8 +19,9 @@
 //! can never complete.
 
 use scribe_common::terminal_images::{
-    BoundedImageBytes, ImageLimits, TerminalImageDataChunk, TerminalImageDefinition,
-    TerminalImageGeneration, TerminalImagePlacement, TerminalImageReplayMessage,
+    BoundedImageBytes, ImageLimits, TerminalImageAction, TerminalImageDataChunk,
+    TerminalImageDefinition, TerminalImageGeneration, TerminalImagePlacement,
+    TerminalImageRejection, TerminalImageRejectionReason, TerminalImageReplayMessage,
     TerminalOutputSequence, TerminalScreenKind,
 };
 
@@ -137,6 +138,7 @@ pub fn plan_replay(inputs: &ReplayInputs<'_>, payload: DefinitionPayload<'_>) ->
         placement_count: counters.placements,
         total_rgba_bytes: counters.total_rgba_bytes,
         active_screen: Some(inputs.active_screen),
+        rejection: None,
     });
     records.append(&mut body);
     records.push(TerminalImageReplayMessage::Commit {
@@ -144,6 +146,40 @@ pub fn plan_replay(inputs: &ReplayInputs<'_>, payload: DefinitionPayload<'_>) ->
         through_sequence: inputs.through_sequence,
     });
     ReplayPlan { records, counters }
+}
+
+/// Replace an unaffordable scene with the bounded empty-scene statement.
+///
+/// The rejection rides on `Begin`, so degradation keeps the same two-record
+/// atomic shape as every other empty replay and consumes no canonical output
+/// sequence for a per-sink flow-control decision.
+#[must_use]
+pub fn quota_exceeded_replay(
+    generation: TerminalImageGeneration,
+    through_sequence: TerminalOutputSequence,
+    active_screen: TerminalScreenKind,
+    observed_bytes: u64,
+) -> [TerminalImageReplayMessage; 2] {
+    [
+        TerminalImageReplayMessage::Begin {
+            generation,
+            after_sequence: through_sequence,
+            definition_count: 0,
+            placement_count: 0,
+            total_rgba_bytes: 0,
+            active_screen: Some(active_screen),
+            rejection: Some(TerminalImageRejection {
+                reason: TerminalImageRejectionReason::QuotaExceeded,
+                protocol: None,
+                action: Some(TerminalImageAction::Replay),
+                width: None,
+                height: None,
+                observed: Some(observed_bytes),
+                limit: None,
+            }),
+        },
+        TerminalImageReplayMessage::Commit { generation, through_sequence },
+    ]
 }
 
 /// Split one definition's canonical RGBA into wire-sized chunks.
@@ -357,6 +393,41 @@ mod tests {
             plan.counters,
             ReplayPlanCounters { max_chunk_bytes: 0, ..ReplayPlanCounters::default() }
         );
+    }
+
+    #[test]
+    fn quota_degradation_is_an_empty_two_record_replay_with_a_typed_rejection() {
+        let records = quota_exceeded_replay(
+            GENERATION,
+            TerminalOutputSequence(3),
+            TerminalScreenKind::Alternate,
+            17 * 1024 * 1024,
+        );
+
+        assert!(matches!(
+            &records[0],
+            TerminalImageReplayMessage::Begin {
+                generation: GENERATION,
+                after_sequence: TerminalOutputSequence(3),
+                definition_count: 0,
+                placement_count: 0,
+                total_rgba_bytes: 0,
+                active_screen: Some(TerminalScreenKind::Alternate),
+                rejection: Some(TerminalImageRejection {
+                    reason: TerminalImageRejectionReason::QuotaExceeded,
+                    action: Some(TerminalImageAction::Replay),
+                    observed: Some(17_825_792),
+                    ..
+                }),
+            }
+        ));
+        assert!(matches!(
+            records[1],
+            TerminalImageReplayMessage::Commit {
+                generation: GENERATION,
+                through_sequence: TerminalOutputSequence(3),
+            }
+        ));
     }
 
     #[test]

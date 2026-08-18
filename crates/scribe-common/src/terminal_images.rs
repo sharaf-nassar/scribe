@@ -950,6 +950,10 @@ pub enum TerminalImageReplayMessage {
         /// where the receiver keeps the primary screen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_screen: Option<TerminalScreenKind>,
+        /// Why the replay deliberately carries an empty scene. Omitted for a
+        /// normal replay, including every record produced by older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rejection: Option<TerminalImageRejection>,
     },
     Definition {
         generation: TerminalImageGeneration,

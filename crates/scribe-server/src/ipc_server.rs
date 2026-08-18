@@ -38,7 +38,10 @@ use scribe_common::protocol::{
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
-use scribe_common::terminal_images::{TerminalImageCapabilities, TerminalImagePlacementKind};
+use scribe_common::terminal_images::{
+    TerminalImageCapabilities, TerminalImagePlacementKind, TerminalImageReplayMessage,
+    TerminalScreenKind,
+};
 use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
@@ -395,24 +398,29 @@ impl AttachedSinks {
     /// Deliver one planned replay burst to every capable sink that owes one and
     /// clear its debt, returning how many received it.
     ///
-    /// Replay records are `Keep` frames: the burst is the recovery, so shedding
-    /// it under the policy that triggered the recovery would loop forever.
+    /// Replay records stay on the `Keep` lane, but only while the whole burst
+    /// fits that sink's remaining Keep budget. An oversized scene is replaced
+    /// atomically by the bounded empty-scene replay plus its typed rejection.
     // @lat: [[terminal-images#Terminal Images#Combined Image Replay]]
     fn fan_out_image_replay(
         &mut self,
         required: TerminalImageCapabilities,
         records: &[ServerMessage],
+        degraded: &[ServerMessage],
     ) -> usize {
         let mut delivered = 0;
         for sink in &mut self.sinks {
             if !sink.owes_image_replay || !sink.queue.image_capabilities().supports(required) {
                 continue;
             }
-            delivered += 1;
-            for msg in records {
-                deliver_frame(sink, None, msg);
+            let queued = match &mut sink.state {
+                SinkState::Live => sink.queue.enqueue_image_replay(records, degraded),
+                SinkState::Buffering(buffered) => buffer_image_replay(buffered, records),
+            };
+            if queued {
+                delivered += 1;
+                sink.owes_image_replay = false;
             }
-            sink.owes_image_replay = false;
         }
         delivered
     }
@@ -426,6 +434,17 @@ impl AttachedSinks {
         self.sinks.retain(|s| !Arc::ptr_eq(&s.writer, writer));
         self.sinks.len() != before
     }
+}
+
+/// Hold a replay burst for a sink still awaiting its attach replay, reporting
+/// whether the whole burst survived that buffer's own bound. An overflowed
+/// buffer is discarded wholesale, so the sink must keep owing the replay: the
+/// resync `finish_attach` asks for carries text, not the image scene.
+fn buffer_image_replay(buffered: &mut BufferedFrames, records: &[ServerMessage]) -> bool {
+    for msg in records {
+        buffered.push(None, msg);
+    }
+    !buffered.overflowed
 }
 
 /// Deliver one frame to a sink according to its attach state: straight into the
@@ -1952,10 +1971,9 @@ const OUTPUT_QUEUE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const OUTPUT_QUEUE_MAX_FRAMES: usize = 8192;
 
 /// Nominal byte cost charged to a queued control frame whose exact serialized
-/// size is not worth computing. The two high-volume streams are sized precisely
-/// (`PtyOutput` by payload length, `SessionReplay` by its compressed blob); every
-/// other frame is small, so a flat nominal keeps the total-byte accounting cheap
-/// while the frame-count ceiling backstops tiny-frame floods.
+/// size is not worth computing. High-volume streams and legacy per-cell
+/// `ScreenSnapshot` frames are sized precisely; every other frame is small, so a
+/// flat nominal keeps accounting cheap while the frame ceiling backstops floods.
 const OUTPUT_FRAME_NOMINAL_BYTES: usize = 256;
 
 /// Upper bound on how long a freshly accepted remote connection may take to send
@@ -2141,9 +2159,45 @@ struct OutputQueueInner {
 /// session-exit, workspace update, an attach or resync replay, …) is kept so it
 /// is never silently lost. Each variant carries its accounted byte size so both
 /// the droppable cap and the total-queue cap can be maintained in O(1) on pop.
+#[derive(Clone)]
 enum OutFrame {
     Session { session_id: SessionId, bytes: usize, msg: ServerMessage },
     Keep { bytes: usize, msg: ServerMessage },
+}
+
+fn keep_frames(messages: &[ServerMessage]) -> Vec<OutFrame> {
+    messages
+        .iter()
+        .map(|msg| OutFrame::Keep { bytes: out_frame_bytes(msg), msg: msg.clone() })
+        .collect()
+}
+
+fn keep_batch_cost(messages: &[ServerMessage]) -> usize {
+    messages.iter().fold(0usize, |total, msg| total.saturating_add(out_frame_bytes(msg)))
+}
+
+fn batch_can_ever_fit(bytes: usize, frames: usize) -> bool {
+    bytes <= OUTPUT_QUEUE_TOTAL_BYTES && frames <= OUTPUT_QUEUE_MAX_FRAMES
+}
+
+/// Make room for an already-bounded Keep batch by shedding only droppable
+/// backlog. Returns false without mutating the queue when existing Keep frames
+/// leave too little room even after that shed.
+fn make_keep_batch_fit(g: &mut OutputQueueInner, bytes: usize, frames: usize) -> bool {
+    let keep_frames =
+        g.frames.iter().filter(|frame| matches!(frame, OutFrame::Keep { .. })).count();
+    let keep_bytes = g.queued_total_bytes.saturating_sub(g.queued_pty_bytes);
+    if keep_bytes.saturating_add(bytes) > OUTPUT_QUEUE_TOTAL_BYTES
+        || keep_frames.saturating_add(frames) > OUTPUT_QUEUE_MAX_FRAMES
+    {
+        return false;
+    }
+    if g.queued_total_bytes.saturating_add(bytes) > OUTPUT_QUEUE_TOTAL_BYTES
+        || g.frames.len().saturating_add(frames) > OUTPUT_QUEUE_MAX_FRAMES
+    {
+        drop_pty_backlog(g);
+    }
+    true
 }
 
 impl OutputQueueInner {
@@ -2254,6 +2308,55 @@ impl OutputSink {
         true
     }
 
+    /// Atomically enqueue one combined image replay without ever exposing a
+    /// partial scene or letting an oversized `Keep` burst close the connection.
+    ///
+    /// A full replay that cannot fit alongside the sink's existing `Keep`
+    /// frames is replaced by `degraded`, the two-record empty scene carrying a
+    /// typed quota rejection. Droppable backlog does not consume Keep budget —
+    /// it is shed to make room before the batch is installed.
+    fn enqueue_image_replay(&self, records: &[ServerMessage], degraded: &[ServerMessage]) -> bool {
+        if records.is_empty() || degraded.is_empty() {
+            return false;
+        }
+        let full_cost = keep_batch_cost(records);
+        let degraded_cost = keep_batch_cost(degraded);
+        let full_admissible = batch_can_ever_fit(full_cost, records.len());
+        // Clone off the lock, as [`Self::enqueue`] does: both candidate batches
+        // are built here so the std mutex only ever does O(1) bookkeeping.
+        let mut full_frames = if full_admissible { keep_frames(records) } else { Vec::new() };
+        let mut degraded_frames = keep_frames(degraded);
+
+        let mut g = self.0.lock();
+        if g.closed {
+            return false;
+        }
+        let (frames, cost, was_degraded) =
+            if full_admissible && make_keep_batch_fit(&mut g, full_cost, records.len()) {
+                (std::mem::take(&mut full_frames), full_cost, false)
+            } else if make_keep_batch_fit(&mut g, degraded_cost, degraded.len()) {
+                (std::mem::take(&mut degraded_frames), degraded_cost, true)
+            } else {
+                return false;
+            };
+
+        g.queued_total_bytes = g.queued_total_bytes.saturating_add(cost);
+        g.frames.extend(frames);
+        enforce_queue_ceiling(&mut g);
+        debug_assert!(!g.closed, "a pre-budgeted replay batch must survive the queue ceiling");
+        drop(g);
+        self.0.notify.notify_one();
+
+        if was_degraded {
+            warn!(
+                replay_bytes = full_cost,
+                replay_frames = records.len(),
+                "terminal image replay exceeded the sink Keep budget; sent an empty scene"
+            );
+        }
+        true
+    }
+
     /// Enqueue one session-scoped droppable frame — raw `PtyOutput` or a live
     /// image record — reporting whether it is actually on its way.
     ///
@@ -2347,14 +2450,16 @@ fn drop_pty_backlog(g: &mut OutputQueueInner) {
     g.queued_pty_bytes = 0;
 }
 
-/// Byte cost charged to a queued frame. The two high-volume streams are sized
-/// precisely so the total-queue cap tracks real memory; every other (small)
-/// control frame is charged a flat [`OUTPUT_FRAME_NOMINAL_BYTES`], with the
-/// frame-count ceiling backstopping tiny-frame floods.
+/// Byte cost charged to a queued frame. High-volume payloads and the legacy
+/// per-cell snapshot are sized precisely so the total-queue cap sees their real
+/// footprint; small controls use [`OUTPUT_FRAME_NOMINAL_BYTES`].
 fn out_frame_bytes(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::PtyOutput { data, .. } => data.len(),
         ServerMessage::SessionReplay { replay, .. } => replay.replay_zstd.len(),
+        ServerMessage::ScreenSnapshot { .. } => {
+            rmp_serde::to_vec_named(msg).map_or(usize::MAX, |encoded| encoded.len())
+        }
         // Image records carry canonical RGBA in bounded chunks. Charging them a
         // flat nominal would let a large scene's replay outgrow the queue's
         // byte ceiling without the ceiling ever noticing.
@@ -8531,18 +8636,28 @@ async fn broadcast_post_resize_snapshot(
         return;
     }
 
-    // Cursor read under the `Term` lock alongside the snapshot, so a sink still
-    // awaiting its attach replay can tell whether that replay already carries
-    // this reflow.
-    let (snapshot, commit) = {
-        let term = term.lock().await;
-        (snapshot_term(&term), term_commit.get())
+    // The same compressed, self-resetting replay used for attach is the bounded
+    // repair frame here. A per-cell ScreenSnapshot can exceed MAX_MESSAGE_SIZE
+    // with the configured 10,000-row scrollback and never reach the pane.
+    let (replay, commit) = match crate::attach_flow::take_session_replay(
+        session_id,
+        &term,
+        &term_commit,
+        live_sessions,
+    )
+    .await
+    {
+        Ok(replay) => replay,
+        Err(error) => {
+            warn!(%session_id, %error, "post-resize replay build failed");
+            return;
+        }
     };
-    debug!(%session_id, cols = snapshot.cols, rows = snapshot.rows, "pushed post-resize snapshot");
+    debug!(%session_id, cols = replay.cols, rows = replay.rows, "pushed post-resize replay");
     send_to_client(
         &client_writer,
         Some(commit),
-        &ServerMessage::ScreenSnapshot { session_id, snapshot },
+        &ServerMessage::SessionReplay { session_id, replay },
     );
 }
 
@@ -8788,7 +8903,8 @@ async fn handle_subscribe(
     }
 }
 
-/// Handle `RequestSnapshot` — snapshot the terminal and send it to the client.
+/// Handle `RequestSnapshot` with the bounded whole-pane replay clients already
+/// use for attach and overflow repair.
 async fn handle_request_snapshot(
     session_id: SessionId,
     writer: &SharedWriter,
@@ -8801,19 +8917,33 @@ async fn handle_request_snapshot(
         return;
     }
 
-    let sessions = live_sessions.read().await;
-    let Some(session) = sessions.get(&session_id) else {
+    let handles = {
+        let sessions = live_sessions.read().await;
+        sessions
+            .get(&session_id)
+            .map(|session| (Arc::clone(&session.term), Arc::clone(&session.term_commit)))
+    };
+    let Some((term, term_commit)) = handles else {
         send_error(writer, &format!("RequestSnapshot for unknown session {session_id}")).await;
         return;
     };
 
-    let term = session.term.lock().await;
-    let snapshot = snapshot_term(&term);
-    drop(term);
-    drop(sessions);
-
-    let msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
-    send_message(writer, &msg).await;
+    let replay = match crate::attach_flow::take_session_replay(
+        session_id,
+        &term,
+        &term_commit,
+        live_sessions,
+    )
+    .await
+    {
+        Ok((replay, _)) => replay,
+        Err(error) => {
+            send_error(writer, &format!("RequestSnapshot repair failed for {session_id}: {error}"))
+                .await;
+            return;
+        }
+    };
+    send_message(writer, &ServerMessage::SessionReplay { session_id, replay }).await;
 }
 
 /// Handle `CreateWorkspace` — create a new workspace and send info to the client.
@@ -10150,7 +10280,28 @@ pub fn send_image_replay(
     required: TerminalImageCapabilities,
     records: &[ServerMessage],
 ) -> usize {
-    lock_sinks(client_writer).fan_out_image_replay(required, records)
+    let degraded = quota_exceeded_image_replay(records);
+    lock_sinks(client_writer).fan_out_image_replay(required, records, &degraded)
+}
+
+fn quota_exceeded_image_replay(records: &[ServerMessage]) -> Vec<ServerMessage> {
+    let Some(ServerMessage::TerminalImageReplay {
+        session_id,
+        message: TerminalImageReplayMessage::Begin { generation, after_sequence, active_screen, .. },
+    }) = records.first()
+    else {
+        return Vec::new();
+    };
+    let observed_bytes = u64::try_from(keep_batch_cost(records)).unwrap_or(u64::MAX);
+    terminal_image_replay::quota_exceeded_replay(
+        *generation,
+        *after_sequence,
+        active_screen.unwrap_or(TerminalScreenKind::Primary),
+        observed_bytes,
+    )
+    .into_iter()
+    .map(|message| ServerMessage::TerminalImageReplay { session_id: *session_id, message })
+    .collect()
 }
 
 /// Install an attaching connection's sink on a session in the buffering state,
@@ -10689,7 +10840,7 @@ fn record_image_application_evidence(
         return;
     }
     state.image_evidence = evidence;
-    info!(
+    debug!(
         session_id = %state.session_id,
         replies = evidence.replies,
         kitty_commands = evidence.kitty_commands,
@@ -12969,9 +13120,297 @@ fn resolve_window_assignment<V>(
 mod tests {
     use super::*;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-    use scribe_common::framing::read_message;
+    use scribe_common::framing::{MAX_MESSAGE_SIZE, read_message};
     use scribe_common::protocol::{CiRunState, CiRunStatus};
+    use scribe_common::terminal_images::{
+        BoundedImageBytes, TerminalImageDataChunk, TerminalImageGeneration,
+        TerminalImageRejectionReason, TerminalOutputSequence,
+    };
     use std::os::unix::net::UnixStream as StdUnixStream;
+
+    fn empty_output_queue() -> OutputQueueInner {
+        OutputQueueInner {
+            frames: VecDeque::new(),
+            queued_pty_bytes: 0,
+            queued_total_bytes: 0,
+            dirty: HashSet::new(),
+            closed: false,
+        }
+    }
+
+    fn bare_output_sink() -> OutputSink {
+        OutputSink(Arc::new(OutputQueueShared {
+            inner: std::sync::Mutex::new(empty_output_queue()),
+            notify: tokio::sync::Notify::new(),
+            image_capabilities: std::sync::atomic::AtomicU32::new(0),
+            pi_provider: AtomicBool::new(false),
+        }))
+    }
+
+    /// One planned replay burst carrying `chunks` maximum-sized definition
+    /// chunks, i.e. `chunks` MiB of canonical RGBA on the `Keep` lane.
+    fn image_replay_records(session_id: SessionId, chunks: usize) -> Vec<ServerMessage> {
+        let generation = TerminalImageGeneration(7);
+        let sequence = TerminalOutputSequence(11);
+        let chunk = BoundedImageBytes::new(vec![0; BoundedImageBytes::MAX_LEN])
+            .expect("maximum replay chunk");
+        let mut records = vec![ServerMessage::TerminalImageReplay {
+            session_id,
+            message: TerminalImageReplayMessage::Begin {
+                generation,
+                after_sequence: sequence,
+                definition_count: 1,
+                placement_count: 0,
+                total_rgba_bytes: (chunks * BoundedImageBytes::MAX_LEN) as u64,
+                active_screen: Some(TerminalScreenKind::Primary),
+                rejection: None,
+            },
+        }];
+        for index in 0..chunks {
+            records.push(ServerMessage::TerminalImageReplay {
+                session_id,
+                message: TerminalImageReplayMessage::DefinitionChunk {
+                    generation,
+                    chunk: TerminalImageDataChunk {
+                        id: scribe_common::terminal_images::TerminalImageId(1),
+                        generation,
+                        offset: (index * BoundedImageBytes::MAX_LEN) as u64,
+                        data: chunk.clone(),
+                        final_chunk: index + 1 == chunks,
+                    },
+                },
+            });
+        }
+        records.push(ServerMessage::TerminalImageReplay {
+            session_id,
+            message: TerminalImageReplayMessage::Commit { generation, through_sequence: sequence },
+        });
+        records
+    }
+
+    /// A live sink owing a combined replay, plus the queue it writes into.
+    fn sink_owing_a_replay(required: TerminalImageCapabilities) -> (OutputSink, ClientWriter) {
+        let queue = bare_output_sink();
+        queue.set_image_capabilities(required);
+        let client_writer = Arc::new(std::sync::Mutex::new(AttachedSinks {
+            sinks: vec![AttachedSink {
+                writer: test_writer(),
+                queue: queue.clone(),
+                state: SinkState::Live,
+                owes_image_replay: true,
+            }],
+        }));
+        (queue, client_writer)
+    }
+
+    #[test]
+    fn drop_pty_backlog_cannot_shrink_an_over_ceiling_keep_scene() {
+        let session_id = SessionId::new();
+        let mut queue = empty_output_queue();
+        queue.frames.push_back(OutFrame::Session {
+            session_id,
+            bytes: 8,
+            msg: ServerMessage::PtyOutput { session_id, data: vec![0; 8] },
+        });
+        queue.frames.push_back(OutFrame::Keep {
+            bytes: OUTPUT_QUEUE_TOTAL_BYTES + 1,
+            msg: ServerMessage::Error { message: String::from("oversized image replay") },
+        });
+        queue.queued_pty_bytes = 8;
+        queue.queued_total_bytes = OUTPUT_QUEUE_TOTAL_BYTES + 9;
+
+        drop_pty_backlog(&mut queue);
+
+        assert_eq!(queue.frames.len(), 1);
+        assert!(matches!(queue.frames.front(), Some(OutFrame::Keep { .. })));
+        assert_eq!(queue.queued_pty_bytes, 0);
+        assert_eq!(queue.queued_total_bytes, OUTPUT_QUEUE_TOTAL_BYTES + 1);
+        assert!(queue.dirty.contains(&session_id));
+    }
+
+    #[test]
+    fn enforce_queue_ceiling_closes_an_over_ceiling_keep_scene() {
+        let mut queue = empty_output_queue();
+        queue.frames.push_back(OutFrame::Keep {
+            bytes: OUTPUT_QUEUE_TOTAL_BYTES + 1,
+            msg: ServerMessage::Error { message: String::from("oversized image replay") },
+        });
+        queue.queued_total_bytes = OUTPUT_QUEUE_TOTAL_BYTES + 1;
+
+        enforce_queue_ceiling(&mut queue);
+
+        assert!(queue.closed, "the generic Keep policy cannot recover this shape");
+    }
+
+    #[test]
+    fn screen_snapshot_is_charged_its_encoded_size() {
+        let session_id = SessionId::new();
+        let snapshot = ScreenSnapshot {
+            cells: vec![ScreenCell {
+                c: 'x',
+                fg: scribe_common::screen::ScreenColor::Named(256),
+                bg: scribe_common::screen::ScreenColor::Named(257),
+                flags: scribe_common::screen::CellFlags::default(),
+            }],
+            cols: 1,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_style: scribe_common::screen::CursorStyle::Block,
+            cursor_visible: true,
+            alt_screen: false,
+            active_dec_modes: Vec::new(),
+            scrollback: Vec::new(),
+            scrollback_rows: 0,
+        };
+        let message = ServerMessage::ScreenSnapshot { session_id, snapshot };
+        let encoded = rmp_serde::to_vec_named(&message).expect("snapshot encodes");
+
+        assert_eq!(out_frame_bytes(&message), encoded.len());
+        assert_ne!(out_frame_bytes(&message), OUTPUT_FRAME_NOMINAL_BYTES);
+    }
+
+    #[tokio::test]
+    async fn full_scrollback_snapshot_repair_encodes_and_reaches_the_client() {
+        const COLS: u16 = 273;
+        const ROWS: u16 = 24;
+        const SCROLLBACK_ROWS: u32 = 10_000;
+        let cell = ScreenCell {
+            c: 'x',
+            fg: scribe_common::screen::ScreenColor::Named(256),
+            bg: scribe_common::screen::ScreenColor::Named(257),
+            flags: scribe_common::screen::CellFlags::default(),
+        };
+        let snapshot = ScreenSnapshot {
+            cells: vec![cell.clone(); usize::from(COLS) * usize::from(ROWS)],
+            cols: COLS,
+            rows: ROWS,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_style: scribe_common::screen::CursorStyle::Block,
+            cursor_visible: true,
+            alt_screen: false,
+            active_dec_modes: Vec::new(),
+            scrollback: vec![cell; usize::from(COLS) * SCROLLBACK_ROWS as usize],
+            scrollback_rows: SCROLLBACK_ROWS,
+        };
+        let session_id = SessionId::new();
+        let snapshot_message = ServerMessage::ScreenSnapshot { session_id, snapshot };
+        let snapshot_bytes = rmp_serde::to_vec_named(&snapshot_message)
+            .expect("full snapshot still serializes")
+            .len();
+        assert!(snapshot_bytes > MAX_MESSAGE_SIZE as usize, "fixture must reproduce the defect");
+        let ServerMessage::ScreenSnapshot { snapshot: oversized, .. } = snapshot_message else {
+            panic!("constructed snapshot message")
+        };
+
+        let replay = scribe_common::screen_replay::build_session_replay(&oversized)
+            .expect("repair replay builds");
+        let repair = ServerMessage::SessionReplay { session_id, replay };
+        let repair_bytes = rmp_serde::to_vec_named(&repair).expect("repair encodes").len();
+        assert!(repair_bytes <= MAX_MESSAGE_SIZE as usize);
+
+        let (mut server, mut client) = tokio::io::duplex(1024 * 1024);
+        assert!(write_queued_frame(&mut server, &repair).await);
+        let received: ServerMessage =
+            read_message(&mut client).await.expect("repair reached client");
+        assert!(
+            matches!(received, ServerMessage::SessionReplay { session_id: id, .. } if id == session_id)
+        );
+    }
+
+    /// The repair `RequestSnapshot` asks for must be the bounded whole-pane
+    /// replay, not the per-cell snapshot that outgrows `MAX_MESSAGE_SIZE` and is
+    /// dropped before a byte reaches the socket.
+    #[tokio::test]
+    async fn request_snapshot_is_answered_with_the_bounded_whole_pane_replay() {
+        let (server_sock, client_sock) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server_sock);
+        let (mut client_read, _client_write) = tokio::io::split(client_sock);
+        let writer = test_shared_writer(server_write);
+
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(120, 30, &writer).await;
+        let attached: AttachedSessionIds =
+            Arc::new(Mutex::new(std::iter::once(session_id).collect()));
+
+        handle_request_snapshot(session_id, &writer, &live_sessions, &attached).await;
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_message::<ServerMessage, _>(&mut client_read),
+        )
+        .await
+        .expect("the repair reached the client")
+        .expect("the repair decoded");
+        assert!(
+            matches!(received, ServerMessage::SessionReplay { session_id: id, .. } if id == session_id),
+            "RequestSnapshot must answer with a SessionReplay"
+        );
+    }
+
+    /// A scene that still fits the Keep budget once the droppable backlog the
+    /// queue may safely shed is ignored stays non-droppable and is queued whole.
+    #[tokio::test]
+    async fn a_fitting_replay_sheds_droppable_backlog_and_is_queued_whole() {
+        let session_id = SessionId::new();
+        let required = TerminalImageCapabilities::V1;
+        let (queue, client_writer) = sink_owing_a_replay(required);
+        queue.enqueue_session_frame(
+            session_id,
+            &ServerMessage::PtyOutput { session_id, data: vec![0; OUTPUT_QUEUE_PTY_BYTES] },
+        );
+        let records = image_replay_records(session_id, 13);
+        let cost = keep_batch_cost(&records);
+        assert!(cost <= OUTPUT_QUEUE_TOTAL_BYTES, "the scene must fit the Keep budget alone");
+        assert!(
+            cost + OUTPUT_QUEUE_PTY_BYTES > OUTPUT_QUEUE_TOTAL_BYTES,
+            "but not alongside the droppable backlog"
+        );
+
+        assert_eq!(send_image_replay(&client_writer, required, &records), 1);
+
+        let inner = queue.0.lock();
+        assert!(!inner.closed);
+        assert_eq!(inner.frames.len(), records.len(), "the whole scene is queued");
+        assert_eq!(inner.queued_pty_bytes, 0, "the droppable backlog made the room");
+        assert!(inner.dirty.contains(&session_id), "the shed session owes a text resync");
+    }
+
+    #[tokio::test]
+    async fn oversized_image_replay_degrades_without_closing_across_attach_cycles() {
+        let session_id = SessionId::new();
+        let required = TerminalImageCapabilities::V1;
+        let (queue, client_writer) = sink_owing_a_replay(required);
+        let records = image_replay_records(session_id, 17);
+        assert!(keep_batch_cost(&records) > OUTPUT_QUEUE_TOTAL_BYTES);
+
+        for _ in 0..3 {
+            assert_eq!(send_image_replay(&client_writer, required, &records), 1);
+            let mut inner = queue.0.lock();
+            assert!(!inner.closed);
+            assert!(inner.queued_total_bytes < OUTPUT_QUEUE_TOTAL_BYTES);
+            assert_eq!(inner.frames.len(), 2);
+            assert!(matches!(
+                inner.frames.front(),
+                Some(OutFrame::Keep {
+                    msg: ServerMessage::TerminalImageReplay {
+                        message: TerminalImageReplayMessage::Begin {
+                            definition_count: 0,
+                            placement_count: 0,
+                            rejection: Some(rejection),
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }) if rejection.reason == TerminalImageRejectionReason::QuotaExceeded
+            ));
+            let drained = std::iter::from_fn(|| inner.pop_message()).count();
+            assert_eq!(drained, 2, "the whole degraded burst reaches the drain task");
+            drop(inner);
+            lock_sinks(&client_writer).sinks[0].owes_image_replay = true;
+        }
+    }
 
     // @lat: [[test#Test Harness#Server lifecycle#Updater quit is a transient local action]]
     #[test]
@@ -14243,6 +14682,7 @@ mod tests {
     fn repainted_grid(msg: &ServerMessage) -> Option<(u16, u16)> {
         match msg {
             ServerMessage::ScreenSnapshot { snapshot, .. } => Some((snapshot.cols, snapshot.rows)),
+            ServerMessage::SessionReplay { replay, .. } => Some((replay.cols, replay.rows)),
             _ => None,
         }
     }
@@ -14263,7 +14703,7 @@ mod tests {
 
     /// [`next_repainted_grid`] under a deadline, so a server that pushes nothing
     /// fails the assertion instead of hanging the suite.
-    async fn await_screen_snapshot<R>(client_read: &mut R) -> Option<(u16, u16)>
+    async fn await_screen_repair<R>(client_read: &mut R) -> Option<(u16, u16)>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
@@ -14275,8 +14715,8 @@ mod tests {
     /// the client asks for the authoritative screen only when *it* changes size
     /// — so the trailing apply is the last thing that touches the grid and
     /// nobody asks about it afterwards. The server therefore owes the attached
-    /// client a `ScreenSnapshot` at the size the drag stopped on; without it the
-    /// pane renders the pre-reflow grid until the next drag.
+    /// client a bounded whole-pane replay at the size the drag stopped on;
+    /// without it the pane renders the pre-reflow grid until the next drag.
     // @lat: [[server#Sessions#Terminal Resize]]
     #[tokio::test]
     async fn a_coalesced_resize_burst_pushes_a_snapshot_at_the_size_it_settled_on() {
@@ -14296,7 +14736,7 @@ mod tests {
         handle_resize(session_id, report(90), &live_sessions, &attached).await;
         handle_resize(session_id, report(80), &live_sessions, &attached).await;
 
-        let grid = await_screen_snapshot(&mut client_read).await;
+        let grid = await_screen_repair(&mut client_read).await;
         assert_eq!(
             grid,
             Some((80, 30)),

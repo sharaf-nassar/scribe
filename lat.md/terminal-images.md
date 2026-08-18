@@ -912,7 +912,10 @@ screen, and `Commit`. Every record carries the same generation and the
 snapshot's output cursor, so a receiver stages the whole burst and swaps at
 `Commit`; a partial scene is never observable. An empty scene is still a
 truthful two-record burst, which is what converges a viewer holding stale
-placements.
+placements. `Begin` can also carry an optional payload-free typed rejection;
+normal and legacy records omit it, while a degraded replay commits it as the
+scene's diagnostic notice without adding a third record or consuming a shared
+output sequence for a per-sink decision.
 
 Chunks are capped at the frozen `max_replay_chunk_bytes`, so the largest scene
 v1 admits — 128 MiB of canonical RGBA — becomes 128 bounded records rather than
@@ -947,11 +950,16 @@ that joins afterwards.
 
 [[crates/scribe-server/src/ipc_server.rs#AttachedSinks#fan_out_image_replay]]
 delivers one planned burst to every sink that owes one and clears their debt
-together. Replay records are non-droppable: the burst *is* the recovery, so
-shedding it under the policy that triggered the recovery would loop. The plan is
-built once from canonical state however many sinks receive it, so the server
-never retains a per-sink copy of the scene and recovery cost does not grow with
-viewer count.
+together. Replay records are non-droppable only after the complete burst is
+chosen: the server first checks the plan against each sink's remaining Keep
+budget, ignoring droppable backlog that the queue can safely shed. A fitting
+scene is queued whole. An unaffordable scene is replaced whole by the same
+truthful two-record empty-scene `Begin`/`Commit`, with a `quota_exceeded` typed
+rejection on `Begin`; shedding the full burst would loop, while enqueuing it on
+the Keep lane would close the connection and make reconnect repeat the same
+failure. The plan is still built once from canonical state however many sinks
+receive it, so the server never retains a canonical per-sink scene and recovery
+cost does not grow with viewer count.
 
 ## Staged Client Image Replay
 
