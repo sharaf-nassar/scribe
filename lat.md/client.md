@@ -1608,6 +1608,18 @@ finally names a rooted workspace and requires the matching
 `RequestBeadsBoard` on the wire tap, so the trigger the injected snapshot
 bypasses stays covered.
 
+## Beads Flow Layout Engine
+
+The Flow strip's graph geometry is pure client logic: it accepts an already-admitted `BeadsEpicGraph`, returns typed layout data, and performs no GPUI rendering, I/O, or tracker access.
+
+[[crates/scribe-client/src/beads_flow.rs#longest_path_ranks]] validates the bounded graph while assigning every issue its maximum blocker distance from a root. Unknown endpoints, duplicate ids, empty or over-bound graphs, and an in-memory cycle fail as [[crates/scribe-client/src/beads_flow.rs#FlowLayoutError]] instead of leaking malformed geometry or looping. `bd` itself refuses cycles, but this boundary remains defensive because the ranking algorithm requires acyclicity.
+
+[[crates/scribe-client/src/beads_flow.rs#ExpandedGraph#add_edge]] inserts one virtual node in every intermediate rank crossed by a skip edge. [[crates/scribe-client/src/beads_flow.rs#ExpandedGraph#barycenter_pass]] then makes one downward pass, ordering each rank by the mean predecessor position with stable input order as the tie break. [[crates/scribe-client/src/beads_flow.rs#layout_flow]] places only real nodes after that ordering; dummies remain explicit metadata for crossing control rather than consuming visible cards.
+
+[[crates/scribe-client/src/beads_flow.rs#FlowMetrics]] derives rank pitch from node width plus gutter and row pitch from node height plus gap. The normative 214×24 node, 28px gutter, 10px row gap, and fixed 139px graph band yield row budgets of 5 at scale 0.8, 4 at 1.0, and 2 at 1.6. A real rank wider than the current budget returns `RankTooWide`; the strip never grows a vertical scroll axis.
+
+Wire routing follows the mock's orthogonal rails. Adjacent ranks use two half-gutter stubs around a vertical dogleg; skip edges use an 8px exit and entry around the nearest long-haul lane. [[crates/scribe-client/src/beads_flow.rs#union_wire_runs]] groups intervals by axis and offset, splits them at every endpoint, and applies `Traced` over `Base` over `Dimmed` on each atomic interval. Shared translucent rails therefore paint once, while a traced path can light only its half of a shared gutter.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

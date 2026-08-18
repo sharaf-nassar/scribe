@@ -59,6 +59,7 @@ pub mod ai_indicator;
 pub mod animation;
 pub mod app_shortcuts;
 pub mod beads_board;
+pub mod beads_flow;
 pub mod beads_panel;
 pub mod bell;
 pub mod box_drawing;

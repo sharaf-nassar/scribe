@@ -24,12 +24,15 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 74
+counts modules-total 75
 counts modules-wired 74
 counts server-messages-total 67
 counts server-messages-handled 61
 counts layout-actions-total 38
 counts layout-actions-handled 38
+
+# scribe-lpi2.9 wires the pure Flow layout module into the renderer.
+unwired-module beads_flow
 
 unhandled-server-message BeadsEpicGraph
 unhandled-server-message EnvPreflightResult
