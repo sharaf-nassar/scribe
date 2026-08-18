@@ -1303,7 +1303,32 @@ is wearing. Text and hairlines come from the chrome slots the tab bar already
 uses, and the queue states take the ANSI colours their meaning implies — ready
 cyan, in progress blue, blocked red, done green — which every theme defines.
 The palette is rebuilt from both a theme edit and an opacity edit, since those
-arrive as separate reload plans.
+arrive as separate reload plans. Opacity reaches the strip's own alpha and
+stops there, so a translucent board never bleeds its words into the desktop
+behind the window.
+
+The same palette carries the Flow view's slots — wires and their traced and
+dimmed states, the band, the progress track, the opened node's fill and
+keyline, the count chip and its hairline, the rank ruler's labels, and the
+agent line — so the renderer, the hover trace, and the live halo read one
+authoritative name each instead of three derivations of the same colour.
+`.impeccable/mocks/beads-board-directions.html` lays those surfaces down as
+white-alpha overlays, which only mean *lift* on a dark theme; each is
+therefore mixed toward whichever end the ground is not, the way a card border
+already is, because a fixed white tint paints nothing at all on a pale theme.
+Compositing at alpha `a` is the same arithmetic as mixing `a` of the way to a
+colour, so the mock's alphas carry over as mix amounts and reproduce its tones
+within a level or two. A wire stays structure rather than a mark and keeps the
+mock's faint ratio: lifting every wire to the floor a dot clears would make a
+dense graph read as a wiring diagram. The two marks that say which run the
+reader is on — a traced wire and the cursor's keyline — take the title's own
+ink instead, and the chip is the card surface again, since it floats over
+wires it has to cut. Only the words are lifted: the ruler's labels and the
+agent line clear the body-text floor on both the strip and a card, which is
+why the ruler paints brighter here than in the mock. Liveness stays in the
+in-progress hue's family rather than taking a hue of its own, carried toward
+the title far enough that the agent line cannot be mistaken for the dot it
+annotates.
 
 Where the mock lays its issues on the bare strip, an issue here is a **raised
 card**: a gradient fill lit from the top under a hairline border, rounded at

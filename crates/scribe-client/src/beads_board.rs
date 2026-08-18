@@ -666,6 +666,31 @@ pub struct BeadsBoardColors {
     pub done_state: Rgba,
     /// P0 through P4, hottest first.
     pub priorities: [Rgba; 5],
+    /// A wire between two nodes in the Flow view: structure rather than a
+    /// mark, so it stays faint enough that a dense graph reads as nodes with
+    /// connections instead of as a wiring diagram.
+    pub wire: Rgba,
+    /// A wire on the hovered node's path, which is the one the reader is
+    /// actually following, so it carries the title's own ink.
+    pub wire_traced: Rgba,
+    /// A wire off that path. Deliberately below any floor: being hard to read
+    /// is what the dimmed state is for.
+    pub wire_dimmed: Rgba,
+    /// The Flow band's fill, above the graph.
+    pub band: Rgba,
+    /// The unfilled part of the band's progress bar.
+    pub progress_track: Rgba,
+    /// The opened node's fill and the keyline down its leading edge.
+    pub cursor_fill: Rgba,
+    pub cursor_keyline: Rgba,
+    /// The floating count chip a traced node raises, and its hairline.
+    pub chip: Rgba,
+    pub chip_border: Rgba,
+    /// The rank ruler's labels.
+    pub rank_label: Rgba,
+    /// The agent line on a node a session is live on. Distinct from
+    /// `progress_state`, which the live dot itself keeps.
+    pub agent: Rgba,
 }
 
 impl BeadsBoardColors {
@@ -721,6 +746,13 @@ impl BeadsBoardColors {
         let high = mix(critical, caution, 0.45);
         let progress = slot(ansi[BRIGHT_BLUE]);
         let epic = anywhere(mix(slot(ansi[BRIGHT_MAGENTA]), muted, 0.45));
+        // Flow lays its surfaces on the strip as the mock's white-alpha
+        // overlays, which only read as a lift on a dark theme. A tint here
+        // therefore travels toward whichever end the ground is not, the same
+        // way a card border does, or a pale theme paints white on white. The
+        // amounts are the mock's own alphas: a colour composited at alpha `a`
+        // over the ground is that ground mixed `a` of the way to it.
+        let tint = |amount: f32| mix(ink, border_target, amount);
         Self {
             ground,
             card_top: mix(card, WHITE, 0.03),
@@ -767,6 +799,30 @@ impl BeadsBoardColors {
                 // back if that step took it through the floor.
                 anywhere(mix(muted, ground, 0.25)),
             ],
+            wire: tint(0.22),
+            // A traced wire and the cursor's keyline are the two marks that
+            // say which run the reader is on, so both take the title's ink
+            // rather than a tint: they are the only things in the graph that
+            // have to win against everything drawn near them.
+            wire_traced: text,
+            wire_dimmed: tint(0.078),
+            band: tint(0.035),
+            progress_track: tint(0.078),
+            cursor_fill: tint(0.059),
+            cursor_keyline: text,
+            // A chip floats above the graph the way a card sits above the
+            // strip, so it is the same raised surface with a stronger edge —
+            // it has wires running under it and needs to cut them.
+            chip: card,
+            chip_border: mix(card, border_target, 0.169),
+            // The ruler names ranks, not issues, so it steps further back than
+            // any card field before the floor lifts it again.
+            rank_label: anywhere(mix(muted, ground, 0.42)),
+            // Liveness is in-progress-ness observed rather than a separate
+            // meaning, so the agent line stays in the progress hue's family
+            // instead of taking a hue of its own. Carrying it toward the title
+            // is what keeps it apart from the dot it annotates.
+            agent: anywhere(mix(progress, text, 0.28)),
         }
     }
 
@@ -2498,6 +2554,8 @@ mod tests {
             ("P3", colors.priorities[3]),
             ("P4", colors.priorities[4]),
             ("epic", colors.epic),
+            ("rank label", colors.rank_label),
+            ("agent", colors.agent),
         ] {
             for (surface, under) in [(ink, "the board"), (colors.card, "a card")] {
                 let ratio = contrast(color, surface);
@@ -2532,6 +2590,116 @@ mod tests {
         // A theme that already reads well keeps its own tones untouched.
         let bright = Rgba { r: 0.9, g: 0.9, b: 0.9, a: 1.0 };
         assert_eq!(readable(bright, ink, BODY_CONTRAST), bright);
+    }
+
+    /// The Flow palette carries no colour of its own.
+    ///
+    /// Its surfaces are the mock's white-alpha overlays, which only say "lift"
+    /// on a dark theme, so the derivation follows the ground's polarity rather
+    /// than reproducing the mock's tones. Both polarities are checked because
+    /// a tint that lightens is invisible on a pale ground.
+    // @lat: [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]]
+    #[test]
+    fn flow_slots_track_the_theme_on_either_polarity() {
+        let themes = [
+            ("dark", [0.06, 0.08, 0.07, 1.0], [0.55, 0.57, 0.56, 1.0], [0.4, 0.45, 0.9, 1.0]),
+            ("light", [0.95, 0.94, 0.92, 1.0], [0.32, 0.34, 0.33, 1.0], [0.2, 0.25, 0.7, 1.0]),
+        ];
+        for (name, bg, fg, blue) in themes {
+            let mut ansi = [[0.5, 0.5, 0.5, 1.0]; 16];
+            ansi[BRIGHT_BLUE] = blue;
+            let chrome = ChromeColors {
+                tab_bar_bg: bg,
+                tab_text: fg,
+                tab_text_active: fg,
+                ..chrome_slots(bg)
+            };
+
+            let colors = BeadsBoardColors::from_theme(&chrome, &ansi, 1.0);
+
+            let ink = Rgba { a: 1.0, ..colors.ground };
+            // Words in the graph are read on the same two grounds every other
+            // word on the board is.
+            let words = [("rank label", colors.rank_label), ("agent", colors.agent)];
+            let grounds = [(ink, "the board"), (colors.card, "a card")];
+            let read_on = words.into_iter().flat_map(|word| grounds.map(|ground| (word, ground)));
+            for ((slot_name, color), (surface, under)) in read_on {
+                let ratio = contrast(color, surface);
+                assert!(
+                    ratio >= BODY_CONTRAST - 0.01,
+                    "{slot_name} reads at {ratio:.2}:1 on {under} in the {name} theme"
+                );
+            }
+
+            // Every surface has to travel away from the ground, whichever
+            // direction that is. A fixed white tint passes on a dark theme and
+            // paints nothing at all on a pale one.
+            let away = |color: Rgba| (luminance(color) - luminance(ink)).abs();
+            for (slot_name, color) in [
+                ("band", colors.band),
+                ("cursor fill", colors.cursor_fill),
+                ("wire", colors.wire),
+                ("dimmed wire", colors.wire_dimmed),
+                ("progress track", colors.progress_track),
+                ("chip border", colors.chip_border),
+            ] {
+                assert!(away(color) > 0.0, "{slot_name} is invisible on the {name} theme");
+            }
+            // The graph's own hierarchy, which the trace depends on: a live
+            // wire outranks the one it dims to, and the band under-runs both.
+            assert!(
+                away(colors.wire) > away(colors.wire_dimmed),
+                "a {name} traced wire does not out-read the dimmed one"
+            );
+            assert!(
+                away(colors.wire_dimmed) > away(colors.band),
+                "the {name} band competes with the wires over it"
+            );
+
+            // The two marks that say which run the reader is on take the
+            // title's ink, and a chip is the same raised surface as a card.
+            assert_eq!(colors.wire_traced, colors.title);
+            assert_eq!(colors.cursor_keyline, colors.title);
+            assert_eq!(colors.chip, colors.card);
+            // Liveness is not the in-progress dot it annotates.
+            assert_ne!(
+                colors.agent, colors.progress_state,
+                "the {name} agent line cannot be told from an in-progress node"
+            );
+        }
+    }
+
+    /// A theme edit and an opacity edit arrive as separate reload plans, and
+    /// the Flow slots have to answer both.
+    // @lat: [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]]
+    #[test]
+    fn flow_slots_rebuild_from_a_theme_edit_and_an_opacity_edit() {
+        let ansi = [[0.5, 0.5, 0.5, 1.0]; 16];
+        let dark = chrome_slots([0.06, 0.08, 0.07, 1.0]);
+        let light = ChromeColors {
+            tab_bar_bg: [0.95, 0.94, 0.92, 1.0],
+            tab_text: [0.3, 0.3, 0.3, 1.0],
+            tab_text_active: [0.1, 0.1, 0.1, 1.0],
+            ..chrome_slots([0.95, 0.94, 0.92, 1.0])
+        };
+
+        let base = BeadsBoardColors::from_theme(&dark, &ansi, 1.0);
+        let retheme = BeadsBoardColors::from_theme(&light, &ansi, 1.0);
+        for (name, before, after) in [
+            ("wire", base.wire, retheme.wire),
+            ("band", base.band, retheme.band),
+            ("chip", base.chip, retheme.chip),
+            ("rank label", base.rank_label, retheme.rank_label),
+        ] {
+            assert_ne!(before, after, "a theme edit left {name} where it was");
+        }
+
+        // Opacity reaches the strip's alpha and stops there: a translucent
+        // board must not bleed its graph into the desktop behind the window.
+        let faded = BeadsBoardColors::from_theme(&dark, &ansi, 0.5);
+        assert!(faded.ground.a < base.ground.a, "an opacity edit never reached the strip");
+        assert_eq!(faded.rank_label, base.rank_label);
+        assert_eq!(faded.wire, base.wire);
     }
 
     /// A card cannot reach the window's clipboard, so it parks the text and
