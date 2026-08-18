@@ -1,6 +1,6 @@
 //! Constellation workspace board: compact five-column Beads state for GPUI.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
@@ -9,12 +9,14 @@ use gpui::{
     point, prelude::*, px, uniform_list,
 };
 
+use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, layout_flow};
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
 use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::{
-    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueWriteResult,
+    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
+    BeadsIssueWriteResult,
 };
 
 /// One of the things whose hover keeps a board open. They overlap, so each is
@@ -68,6 +70,48 @@ pub struct BeadsBoards {
     /// Cards painted in their requested lane until a write result and the
     /// authoritative board snapshot settle that request.
     optimistic_drops: HashMap<(WorkspaceId, String), OptimisticDrop>,
+    /// Whether the server offered `beads_flow` on this connection. A board
+    /// never enters Flow without it, so losing the bit on reconnect drops
+    /// every open graph rather than leaving one nothing can refresh.
+    flow_enabled: bool,
+    /// The Flow strip each workspace is showing instead of its lanes.
+    flows: HashMap<WorkspaceId, FlowView>,
+    /// One in-flight epic-graph request per workspace, newest wins.
+    pending_flows: HashMap<WorkspaceId, PendingFlow>,
+    /// Monotonic per-window request epoch. Cleared fences never match again,
+    /// so a reply that outlived its request cannot reopen Flow.
+    flow_generation: u64,
+    /// Epic-graph requests the view drains on its next frame, mirroring how
+    /// the panel parks its detail requests.
+    flow_requests: VecDeque<(WorkspaceId, String)>,
+}
+
+/// One workspace's frozen Flow graph and the cursor it opened at.
+///
+/// The graph is captured once at open (Q5) and board polling never mutates
+/// it: a strip that re-ranked itself under the pointer would move the node a
+/// click was travelling towards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowView {
+    pub epic_id: String,
+    pub cursor_issue_id: String,
+    pub graph: BeadsEpicGraph,
+    pub layout: FlowLayout,
+    pub scroll_x: f32,
+}
+
+/// An epic-graph request waiting for its reply.
+///
+/// The cursor lives here as *latest intent* rather than being captured per
+/// request. Two clicks on one epic therefore collapse to the second: the
+/// reply carries graph content only, so honouring it against the newest
+/// cursor is what makes an out-of-order delivery land on the card the user
+/// actually asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFlow {
+    epic_id: String,
+    cursor_issue_id: String,
+    generation: u64,
 }
 
 /// One board's bottom bar, held by the pointer.
@@ -126,6 +170,164 @@ pub struct CardDragGhost {
 }
 
 impl BeadsBoards {
+    /// Latch the connection's `beads_flow` capability.
+    ///
+    /// Losing it drops every open graph: the board keeps painting lanes from
+    /// the snapshot it already polls, but nothing can refresh a Flow strip a
+    /// reconnected server will not answer for.
+    pub fn set_flow_enabled(&mut self, enabled: bool) {
+        self.flow_enabled = enabled;
+        if !enabled {
+            self.flows.clear();
+            self.pending_flows.clear();
+            self.flow_requests.clear();
+            self.flow_generation += 1;
+        }
+    }
+
+    /// Ask for `card`'s epic graph, if this board can enter Flow at all.
+    ///
+    /// The panel opens either way — this only decides whether the strip
+    /// follows. A card with no epic stays in Lanes without a request, which
+    /// is the Q3 rule the server's refusals also encode.
+    pub fn request_card_flow(&mut self, workspace_id: WorkspaceId, card: &BeadsBoardItem) {
+        if !self.flow_enabled {
+            return;
+        }
+        let Some(epic_id) = card.parent_epic_id.clone() else { return };
+        self.flow_generation += 1;
+        self.pending_flows.insert(
+            workspace_id,
+            PendingFlow {
+                epic_id: epic_id.clone(),
+                cursor_issue_id: card.id.clone(),
+                generation: self.flow_generation,
+            },
+        );
+        self.flow_requests.push_back((workspace_id, epic_id));
+    }
+
+    /// Drain one parked epic-graph request.
+    pub fn take_flow_request(&mut self) -> Option<(WorkspaceId, String)> {
+        self.flow_requests.pop_front()
+    }
+
+    /// Apply one epic-graph reply against the live fence.
+    ///
+    /// Returns whether the strip changed. A reply is honoured only while a
+    /// request for the same epic is still outstanding, and it opens at the
+    /// fence's *current* cursor so a superseded click cannot resurrect its
+    /// own target. Every refusal leaves the board in Lanes.
+    pub fn apply_epic_graph(
+        &mut self,
+        workspace_id: WorkspaceId,
+        epic_id: &str,
+        outcome: BeadsEpicGraphOutcome,
+    ) -> bool {
+        let Some(pending) = self.pending_flows.get(&workspace_id) else { return false };
+        if pending.epic_id != epic_id || pending.generation == 0 {
+            return false;
+        }
+        let BeadsEpicGraphOutcome::Graph(graph) = outcome else {
+            self.pending_flows.remove(&workspace_id);
+            return false;
+        };
+        let cursor_issue_id = pending.cursor_issue_id.clone();
+        self.pending_flows.remove(&workspace_id);
+        let Ok(layout) = layout_flow(&graph, self.text_scale()) else { return false };
+        if !graph.nodes.iter().any(|node| node.id == cursor_issue_id) {
+            return false;
+        }
+        self.flows.insert(
+            workspace_id,
+            FlowView {
+                epic_id: epic_id.to_owned(),
+                cursor_issue_id,
+                graph: *graph,
+                layout,
+                scroll_x: 0.0,
+            },
+        );
+        true
+    }
+
+    /// The Flow strip `workspace_id` is showing, if it is in Flow at all.
+    pub fn flow(&self, workspace_id: WorkspaceId) -> Option<&FlowView> {
+        self.flows.get(&workspace_id)
+    }
+
+    /// Leave Flow and return to lanes, discarding any request in flight.
+    pub fn exit_flow(&mut self, workspace_id: WorkspaceId) -> bool {
+        let left = self.flows.remove(&workspace_id).is_some();
+        let cancelled = self.pending_flows.remove(&workspace_id).is_some();
+        if left || cancelled {
+            self.flow_generation += 1;
+        }
+        left
+    }
+
+    /// Return the most recently opened Flow strip to lanes.
+    ///
+    /// Escape reaches this only after the detail panel has declined the key,
+    /// so a focused panel always dismisses before the strip changes mode.
+    pub fn exit_latest_flow(&mut self) -> bool {
+        let latest = self
+            .flows
+            .keys()
+            .copied()
+            .max_by_key(WorkspaceId::as_uuid)
+            .filter(|workspace_id| self.flows.contains_key(workspace_id));
+        latest.is_some_and(|workspace_id| self.exit_flow(workspace_id))
+    }
+
+    /// Move the Flow cursor to another node in the frozen graph.
+    ///
+    /// The graph and the epic are untouched: this is the board-state half of
+    /// a node activation. Retargeting the detail panel from the same seam is
+    /// a separate slice.
+    pub fn move_flow_cursor(&mut self, workspace_id: WorkspaceId, issue_id: &str) -> bool {
+        let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
+        if flow.cursor_issue_id == issue_id {
+            return false;
+        }
+        if !flow.graph.nodes.iter().any(|node| node.id == issue_id) {
+            return false;
+        }
+        issue_id.clone_into(&mut flow.cursor_issue_id);
+        true
+    }
+
+    /// Scroll a Flow strip along its one axis, clamped to the graph.
+    ///
+    /// Flow never grows a vertical axis — a rank that will not fit the row
+    /// budget fails layout instead — so a wheel anywhere over the strip moves
+    /// it horizontally regardless of which way the pointer scrolled.
+    pub fn scroll_flow(&mut self, workspace_id: WorkspaceId, delta_x: f32, board: Rect) -> bool {
+        let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
+        let span = (flow.layout.width - board.width).max(0.0);
+        let next = (flow.scroll_x + delta_x).clamp(0.0, span);
+        if (next - flow.scroll_x).abs() < f32::EPSILON {
+            return false;
+        }
+        flow.scroll_x = next;
+        true
+    }
+
+    /// Re-run layout for every open strip after a text-scale change.
+    ///
+    /// A strip whose graph no longer fits the row budget at the new scale
+    /// returns to lanes rather than clipping nodes out of sight.
+    fn relayout_flows(&mut self) {
+        let scale = self.text_scale();
+        self.flows.retain(|_, flow| {
+            let Ok(layout) = layout_flow(&flow.graph, scale) else { return false };
+            let span = (layout.width - flow.layout.width).min(0.0);
+            flow.scroll_x = (flow.scroll_x + span).max(0.0);
+            flow.layout = layout;
+            true
+        });
+    }
+
     /// Replace one server snapshot and report cards whose authoritative lane
     /// differed from both ends of an applied drop.
     pub fn update(
@@ -140,6 +342,7 @@ impl BeadsBoards {
             self.hovered.remove(&workspace_id);
             self.pinned.remove(&workspace_id);
             self.hover_expires.remove(&workspace_id);
+            self.exit_flow(workspace_id);
             if self.resize.is_some_and(|drag| drag.workspace_id == workspace_id) {
                 self.resize = None;
             }
@@ -255,6 +458,7 @@ impl BeadsBoards {
     pub fn adjust_text_scale(&mut self, steps: i8) {
         self.text_scale_steps =
             (self.text_scale_steps + steps).clamp(MIN_TEXT_SCALE_STEPS, MAX_TEXT_SCALE_STEPS);
+        self.relayout_flows();
     }
 
     /// How tall `workspace_id`'s board paints — and, while it is pinned, how
@@ -458,6 +662,9 @@ impl BeadsBoards {
         self.pinned.retain(|workspace_id| live.contains(workspace_id));
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
         self.optimistic_drops.retain(|(workspace_id, _), _| live.contains(workspace_id));
+        self.flows.retain(|workspace_id, _| live.contains(workspace_id));
+        self.pending_flows.retain(|workspace_id, _| live.contains(workspace_id));
+        self.flow_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
         if self.card_press.as_ref().is_some_and(|press| !live.contains(&press.workspace_id))
             || self.card_drag.as_ref().is_some_and(|drag| !live.contains(&drag.workspace_id))
         {
@@ -1009,6 +1216,11 @@ pub struct BeadsBoardRender {
     pub scale: f32,
     /// The live theme's board palette.
     pub colors: BeadsBoardColors,
+    /// Focus and activation for every node of this workspace's Flow graph.
+    ///
+    /// Held by the view across frames so a node keeps its Tab stop, and empty
+    /// whenever the board is painting lanes.
+    pub flow_controls: HashMap<String, FlowNodeControl>,
 }
 
 /// One queue's column, as the mock lays it out.
@@ -1130,6 +1342,7 @@ pub fn render(
         drag_target,
         scale,
         colors,
+        flow_controls,
     } = wiring;
     let colors = &colors;
     // The rect is the strip the region gave the board, already clamped to what
@@ -1167,6 +1380,24 @@ pub fn render(
             }
         })
         .child(text_size_controls(&hover_state, workspace_id, colors));
+    // Flow replaces the lanes inside the same strip: the reservation, the
+    // resize grip and the text-size controls all stay where the board put
+    // them, so returning to lanes cannot move the furniture around it.
+    if let Some(strip) = flow_strip(FlowStrip {
+        state: &hover_state,
+        workspace_id,
+        rect,
+        scale,
+        colors,
+        controls: &flow_controls,
+    }) {
+        let board = board.child(strip);
+        return if overlay {
+            board.shadow_lg().into_any_element()
+        } else {
+            board.into_any_element()
+        };
+    }
     let board = match snapshot {
         Some(snapshot) => board.child(lanes(
             snapshot,
@@ -1191,6 +1422,79 @@ pub fn render(
     // A hovered board floats over live panes and needs the lift to read as
     // separate; a pinned one sits in space the region gave up for it.
     if overlay { board.shadow_lg().into_any_element() } else { board.into_any_element() }
+}
+
+/// Paint the Flow strip when this workspace is in Flow, else nothing.
+///
+/// The wheel is claimed here rather than on the board root because only a
+/// Flow strip has an axis to move: in lanes the same gesture belongs to the
+/// lane bodies underneath.
+fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
+    let FlowStrip { state, workspace_id, rect, scale, colors, controls } = strip;
+    let guard = state.lock().ok()?;
+    let flow = guard.flow(workspace_id)?;
+    let graph = flow.graph.clone();
+    let layout = flow.layout.clone();
+    let cursor_issue_id = flow.cursor_issue_id.clone();
+    let scroll_x = flow.scroll_x;
+    drop(guard);
+    let painted = crate::beads_flow::render(&FlowRender {
+        rect,
+        graph: &graph,
+        layout: &layout,
+        cursor_issue_id: &cursor_issue_id,
+        scroll_x,
+        text_scale: scale,
+        colors: *colors,
+        node_controls: controls,
+        wire_classes: &[],
+    });
+    let painted = match painted {
+        Ok(painted) => painted,
+        Err(error) => {
+            tracing::debug!(%error, %workspace_id, "Beads Flow strip dropped");
+            return None;
+        }
+    };
+    let wheel_state = std::sync::Arc::clone(state);
+    Some(
+        div()
+            .flex_1()
+            .relative()
+            .overflow_hidden()
+            .on_scroll_wheel(move |event, window, app| {
+                let delta = event.delta.pixel_delta(px(FLOW_WHEEL_LINE));
+                // Either axis drives the one axis Flow has, so a plain
+                // vertical wheel still travels the graph.
+                let travel = if delta.x.abs() > delta.y.abs() {
+                    -f32::from(delta.x)
+                } else {
+                    -f32::from(delta.y)
+                };
+                if let Ok(mut boards) = wheel_state.lock()
+                    && boards.scroll_flow(workspace_id, travel, rect)
+                {
+                    window.refresh();
+                    app.stop_propagation();
+                }
+            })
+            .child(painted)
+            .into_any_element(),
+    )
+}
+
+/// One wheel line in pixels, used to turn a line-wise wheel into travel.
+const FLOW_WHEEL_LINE: f32 = 20.0;
+
+/// Everything the Flow strip needs from the board around it.
+#[derive(Clone, Copy)]
+struct FlowStrip<'a> {
+    state: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    workspace_id: WorkspaceId,
+    rect: Rect,
+    scale: f32,
+    colors: &'a BeadsBoardColors,
+    controls: &'a HashMap<String, FlowNodeControl>,
 }
 
 /// The board's own text-size control, parked in the strip's top right corner.
@@ -1600,6 +1904,7 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     let selected = item.clone();
     let dragged = item.clone();
     let arm_state = std::sync::Arc::clone(state);
+    let click_state = std::sync::Arc::clone(state);
     let start_state = std::sync::Arc::clone(state);
     let draggable = card_drag_source(lane);
     let drag_source = item.clone();
@@ -1618,24 +1923,7 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
         .relative()
         .overflow_hidden()
         .rounded(px(CARD_RADIUS))
-        .border_1()
-        .border_color(colors.card_border)
-        // Top light is the card's whole relief over the flat board ground.
-        .bg(linear_gradient(
-            180.0,
-            linear_color_stop(colors.card_top, 0.0),
-            linear_color_stop(colors.card, 1.0),
-        ))
-        .hover(|raised| {
-            raised
-                .bg(linear_gradient(
-                    180.0,
-                    linear_color_stop(colors.card_hover_top, 0.0),
-                    linear_color_stop(colors.card_hover, 1.0),
-                ))
-                .border_color(colors.card_border_hover)
-                .shadow_xs()
-        })
+        .map(|surface| card_relief(surface, colors))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |event, _window, app| {
             if let Ok(mut boards) = arm_state.lock() {
@@ -1645,8 +1933,13 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
             app.stop_propagation();
         })
         .on_click(move |_event, window, _app| {
+            // The panel opens exactly as it always has; the strip only follows
+            // when this card names an epic the server will serve a graph for.
             if let Ok(mut panels) = panels.lock() {
                 panels.open(workspace_id, selected.clone(), lane);
+            }
+            if let Ok(mut boards) = click_state.lock() {
+                boards.request_card_flow(workspace_id, &selected);
             }
             window.refresh();
         });
@@ -1676,6 +1969,33 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     )
     .child(card_contents(item, card, colors.priority_mark(item.priority)))
     .into_any_element()
+}
+
+/// A card's border and its lit top edge, at rest and under the pointer.
+///
+/// Top light is the card's whole relief over the flat board ground.
+fn card_relief(
+    surface: gpui::Stateful<gpui::Div>,
+    colors: &BeadsBoardColors,
+) -> gpui::Stateful<gpui::Div> {
+    surface
+        .border_1()
+        .border_color(colors.card_border)
+        .bg(linear_gradient(
+            180.0,
+            linear_color_stop(colors.card_top, 0.0),
+            linear_color_stop(colors.card, 1.0),
+        ))
+        .hover(|raised| {
+            raised
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(colors.card_hover_top, 0.0),
+                    linear_color_stop(colors.card_hover, 1.0),
+                ))
+                .border_color(colors.card_border_hover)
+                .shadow_xs()
+        })
 }
 
 fn with_card_title_tooltip(
@@ -2838,5 +3158,292 @@ mod tests {
         assert!(!boards.blocks_pty_mouse());
         assert!(boards.card_drag().is_none());
         assert_eq!(visible_sorted(&boards), [(neighbour, true)]);
+    }
+}
+
+#[cfg(test)]
+mod flow_mode_tests {
+    use scribe_common::protocol::{
+        BeadsEpicGraph, BeadsEpicGraphOutcome, BeadsEpicGraphRefusal, BeadsGraphEdge,
+        BeadsGraphNode, BeadsIssueQueue,
+    };
+
+    use super::*;
+
+    const EPIC: &str = "flow-epic";
+
+    fn card(id: &str, epic: Option<&str>) -> BeadsBoardItem {
+        BeadsBoardItem {
+            id: id.into(),
+            title: format!("Card {id}"),
+            priority: 1,
+            blocker_ids: Vec::new(),
+            parent_epic_name: epic.map(|_| "Flow epic".into()),
+            parent_epic_id: epic.map(str::to_owned),
+        }
+    }
+
+    fn node(id: &str) -> BeadsGraphNode {
+        BeadsGraphNode {
+            id: id.into(),
+            title: format!("Node {id}"),
+            priority: 1,
+            status: "open".into(),
+            queue: BeadsIssueQueue::Ready,
+            assignee: None,
+            updated_at: "2026-08-18T00:00:00Z".into(),
+        }
+    }
+
+    fn graph() -> BeadsEpicGraphOutcome {
+        BeadsEpicGraphOutcome::Graph(Box::new(BeadsEpicGraph {
+            epic_id: EPIC.into(),
+            epic_title: "Flow epic".into(),
+            closed: 0,
+            total: 3,
+            nodes: vec![node("a"), node("b"), node("c")],
+            edges: vec![
+                BeadsGraphEdge { from: "a".into(), to: "b".into() },
+                BeadsGraphEdge { from: "b".into(), to: "c".into() },
+            ],
+        }))
+    }
+
+    fn enabled() -> BeadsBoards {
+        let mut boards = BeadsBoards::default();
+        boards.set_flow_enabled(true);
+        boards
+    }
+
+    #[test]
+    fn a_card_naming_an_epic_asks_for_its_graph_and_opens_flow() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+
+        assert_eq!(boards.take_flow_request(), Some((workspace, EPIC.to_owned())));
+        assert!(boards.flow(workspace).is_none(), "no strip before the reply lands");
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        let flow = boards.flow(workspace).expect("flow open");
+        assert_eq!(flow.cursor_issue_id, "a");
+        assert_eq!(flow.epic_id, EPIC);
+        assert!((flow.scroll_x - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_card_with_no_epic_stays_in_lanes_without_a_request() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("loose", None));
+
+        assert_eq!(boards.take_flow_request(), None);
+        assert!(boards.flow(workspace).is_none());
+    }
+
+    #[test]
+    fn a_refused_epic_stays_in_lanes() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+
+        let refused = BeadsEpicGraphOutcome::NoGraph { reason: BeadsEpicGraphRefusal::Cycle };
+        assert!(!boards.apply_epic_graph(workspace, EPIC, refused));
+        assert!(boards.flow(workspace).is_none());
+        // The fence is spent, so the refusal cannot be retried by a late graph.
+        assert!(!boards.apply_epic_graph(workspace, EPIC, graph()));
+    }
+
+    #[test]
+    fn two_clicks_on_one_epic_land_on_the_second_however_replies_arrive() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        boards.request_card_flow(workspace, &card("c", Some(EPIC)));
+
+        // The reply carries graph content only, so the first one home opens at
+        // the latest click rather than resurrecting its own stale target.
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert_eq!(boards.flow(workspace).expect("flow open").cursor_issue_id, "c");
+
+        // Its twin is spent against the same fence and changes nothing.
+        assert!(!boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert_eq!(boards.flow(workspace).expect("flow open").cursor_issue_id, "c");
+    }
+
+    #[test]
+    fn a_reply_arriving_after_exit_is_discarded() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        boards.exit_flow(workspace);
+
+        assert!(!boards.apply_epic_graph(workspace, EPIC, graph()));
+        assert!(boards.flow(workspace).is_none());
+    }
+
+    #[test]
+    fn a_reply_for_another_epic_is_discarded() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+
+        assert!(!boards.apply_epic_graph(workspace, "other-epic", graph()));
+        assert!(boards.flow(workspace).is_none());
+    }
+
+    #[test]
+    fn flow_needs_the_capability_and_dies_when_it_is_lost() {
+        let workspace = WorkspaceId::new();
+        let mut ungated = BeadsBoards::default();
+        ungated.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert_eq!(ungated.take_flow_request(), None, "no capability, no request");
+
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        boards.set_flow_enabled(false);
+        assert!(boards.flow(workspace).is_none(), "a lost capability drops the strip");
+    }
+
+    #[test]
+    fn escape_returns_the_latest_strip_to_lanes() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        boards.apply_epic_graph(workspace, EPIC, graph());
+
+        assert!(boards.exit_latest_flow());
+        assert!(boards.flow(workspace).is_none());
+        assert!(!boards.exit_latest_flow(), "nothing left to leave");
+    }
+
+    #[test]
+    fn one_region_leaving_flow_leaves_its_neighbour_alone() {
+        let left = WorkspaceId::new();
+        let right = WorkspaceId::new();
+        let mut boards = enabled();
+        for workspace in [left, right] {
+            boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+            assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        }
+
+        boards.exit_flow(left);
+        assert!(boards.flow(left).is_none());
+        assert!(boards.flow(right).is_some(), "a board is its own region's furniture");
+    }
+
+    #[test]
+    fn losing_a_region_drops_its_strip_and_its_request() {
+        let left = WorkspaceId::new();
+        let right = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(left, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(left, EPIC, graph()));
+        boards.request_card_flow(right, &card("a", Some(EPIC)));
+
+        boards.retain_regions(&HashSet::new());
+        assert!(boards.flow(left).is_none());
+        assert!(!boards.apply_epic_graph(right, EPIC, graph()));
+        assert_eq!(boards.take_flow_request(), None);
+    }
+
+    #[test]
+    fn a_not_detected_snapshot_returns_the_board_to_lanes() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        boards.update(workspace, BeadsBoardState::NotDetected);
+        assert!(boards.flow(workspace).is_none());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_one_axis_and_clamps_at_both_ends() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        let narrow = Rect { x: 0.0, y: 0.0, width: 120.0, height: 197.0 };
+
+        assert!(boards.scroll_flow(workspace, 40.0, narrow));
+        assert!(boards.flow(workspace).expect("flow open").scroll_x > 0.0);
+
+        // Past either end the offset stops moving rather than running off.
+        while boards.scroll_flow(workspace, 500.0, narrow) {}
+        let span = boards.flow(workspace).expect("flow open").scroll_x;
+        assert!(!boards.scroll_flow(workspace, 500.0, narrow), "clamped at the far end");
+        assert!(span > 0.0);
+
+        while boards.scroll_flow(workspace, -500.0, narrow) {}
+        assert!((boards.flow(workspace).expect("flow open").scroll_x - 0.0).abs() < f32::EPSILON);
+        assert!(!boards.scroll_flow(workspace, -500.0, narrow), "clamped at the near end");
+    }
+
+    #[test]
+    fn a_graph_narrower_than_its_strip_never_scrolls() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        let wide = Rect { x: 0.0, y: 0.0, width: 4000.0, height: 197.0 };
+
+        assert!(!boards.scroll_flow(workspace, 200.0, wide));
+    }
+
+    #[test]
+    fn activating_a_node_moves_the_cursor_inside_the_frozen_graph() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        let opened = boards.flow(workspace).expect("flow open").graph.clone();
+
+        assert!(boards.move_flow_cursor(workspace, "c"));
+        let flow = boards.flow(workspace).expect("flow open");
+        assert_eq!(flow.cursor_issue_id, "c");
+        assert_eq!(flow.epic_id, EPIC, "the epic never swaps under a node click");
+        assert_eq!(flow.graph, opened, "the graph is frozen at open");
+
+        assert!(!boards.move_flow_cursor(workspace, "c"), "re-clicking the cursor is a no-op");
+        assert!(!boards.move_flow_cursor(workspace, "absent"));
+    }
+
+    #[test]
+    fn text_scale_survives_the_round_trip_and_relayouts_an_open_strip() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.adjust_text_scale(-2);
+        let scaled = boards.text_scale();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        let narrow = boards.flow(workspace).expect("flow open").layout.width;
+
+        boards.adjust_text_scale(2);
+        let widened = boards.flow(workspace).expect("flow open").layout.width;
+        assert!(widened > narrow, "a bigger text scale re-lays the open strip out");
+
+        boards.exit_flow(workspace);
+        boards.adjust_text_scale(-2);
+        assert!((boards.text_scale() - scaled).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pin_and_height_survive_the_round_trip() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.update(workspace, BeadsBoardState::Loading { cached: None });
+        boards.toggle_pin(workspace);
+        let pinned_height = boards.height(workspace);
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        assert!(boards.is_pinned(workspace), "Flow paints inside the strip the pin reserved");
+        assert!((boards.height(workspace) - pinned_height).abs() < f32::EPSILON);
+
+        boards.exit_flow(workspace);
+        assert!(boards.is_pinned(workspace));
+        assert!((boards.height(workspace) - pinned_height).abs() < f32::EPSILON);
     }
 }

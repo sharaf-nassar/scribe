@@ -1622,6 +1622,20 @@ Wire routing follows the mock's orthogonal rails. Adjacent ranks use two half-gu
 
 [[crates/scribe-client/src/beads_flow.rs#render]] lowers an admitted graph and its layout into the compact 197px strip: the 34px Flow band, rank ruler, 214×24 nodes, orthogonal one-pixel wire segments, horizontal position bar, and floor grip. It reads only named [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]] slots, so every Flow surface follows the live theme. `FlowRender` takes the cursor, horizontal offset, trace classes, and workspace-owned focus/action controls as explicit seams: mode entry and exit, scrolling, panel retargeting, trace selection, and liveness remain outside the renderer. A missing node control is a typed [[crates/scribe-client/src/beads_flow.rs#FlowRenderError]], preventing a painted node from silently losing its AccessKit button role, Tab stop, Enter/Space activation, or blockers/dependents description. The chevron and mode pair paint as inert text until their owning mode slice adds an action.
 
+### Flow mode entry, exit, and scrolling
+
+A board paints lanes or a Flow graph in the same strip, and the workspace owns which.
+
+Opening a card is unconditional for the panel and conditional for the strip. The card click still runs [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] exactly as it always has, then asks [[crates/scribe-client/src/beads_board.rs#BeadsBoards#request_card_flow]] for the epic graph. A card with no `parent_epic_id`, a board with no `beads_flow` capability, and every server refusal all leave the board in lanes with no notice — the panel already opened, so there is nothing to recover from. That is the Q3 rule: no graph, no Flow.
+
+[[crates/scribe-client/src/beads_board.rs#PendingFlow]] is the fence that makes a late reply safe. It holds the epic, a monotonic generation, and the cursor as *latest intent* rather than per request. Two clicks on one epic therefore collapse to the second: [[crates/scribe-common/src/protocol.rs#BeadsEpicGraph]] carries graph content and no cursor, so honouring whichever reply arrives first against the newest intent lands on the card the reader actually asked for, and its twin is spent against the same fence. The generation is what discards a reply after mode exit, workspace loss, `NotDetected`, and a reconnect that withdrew the capability, because each of those clears the fence and an epic match alone would wrongly re-enter Flow. Adding a request id to the wire would buy nothing: two replies for one epic cannot differ while the graph is frozen.
+
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#apply_epic_graph]] lays the graph out once and stores it in [[crates/scribe-client/src/beads_board.rs#FlowView]]. Board polling continues underneath and never touches it — a strip that re-ranked itself under the pointer would move the node a click was travelling towards. Only a text-scale change re-lays it out, through `relayout_flows`, and a graph that no longer fits the row budget returns to lanes rather than clipping nodes out of sight.
+
+Escape reaches [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_latest_flow]] only after the detail panel has declined the key, so a focused panel always dismisses before the strip changes mode and Escape never strands a reader in lanes with the panel they were reading still open. The wheel is claimed by the Flow strip alone: in lanes the same gesture belongs to the lane bodies underneath. Either wheel axis drives the one axis Flow has, clamped to the graph, because a rank too wide for the row budget fails layout instead of growing a vertical scrollbar.
+
+Pin, height, lanes scroll position, and text scale all live outside `FlowView`, so a round trip through Flow and back leaves the strip exactly as the reader left it. Flow state is per workspace and dies with the window: two regions side by side each enter and leave on their own.
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

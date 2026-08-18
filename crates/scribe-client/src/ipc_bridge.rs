@@ -1272,6 +1272,18 @@ impl IpcSink {
         self.enqueue(ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id })
     }
 
+    /// Ask for one epic-scoped Beads dependency graph.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver.
+    pub fn request_beads_epic_graph(
+        &self,
+        workspace_id: WorkspaceId,
+        epic_id: String,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::RequestBeadsEpicGraph { workspace_id, epic_id })
+    }
+
     /// Send one typed, guarded Beads issue mutation.
     pub fn write_beads_issue(
         &self,

@@ -34,6 +34,7 @@ use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
 };
+use scribe_client::beads_flow::FlowNodeControl;
 use scribe_client::beads_panel::{
     self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels, PanelWriteIntent,
 };
@@ -1709,6 +1710,11 @@ struct TerminalView {
     tooltip_demo: bool,
     /// Workspace board painted this frame and whether it is pinned.
     visible_beads_boards: Vec<(WorkspaceId, bool)>,
+    /// Focus and activation for every Flow node currently painted, held here
+    /// so a node keeps one focus handle across frames. Pinned GPUI registers
+    /// only mounted handles, so a per-frame handle would reset Tab order on
+    /// every repaint.
+    flow_node_controls: HashMap<WorkspaceId, HashMap<String, FlowNodeControl>>,
     /// CI snapshots matched to the regions that currently own their repository.
     visible_ci_runs: Vec<VisibleCiRun>,
     /// Client-local open panel identity; the server sees only interest changes.
@@ -2307,6 +2313,7 @@ impl TerminalView {
             pointer: PointerState::default(),
             tooltip_demo: false,
             visible_beads_boards: Vec::new(),
+            flow_node_controls: HashMap::new(),
             visible_ci_runs: Vec::new(),
             ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
@@ -8288,6 +8295,15 @@ impl TerminalView {
             cx.notify();
             return true;
         }
+        // Only once the panel has declined the key: a focused panel dismisses
+        // before the strip changes mode, so Escape never strands a reader in
+        // lanes with the panel they were reading still open.
+        if event.keystroke.key == "escape"
+            && self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.exit_latest_flow())
+        {
+            cx.notify();
+            return true;
+        }
         let overlay_free = self.dialog.is_none()
             && self.find_overlay.is_none()
             && !self.remote_connect.is_active();
@@ -9381,6 +9397,7 @@ impl TerminalView {
         let mut copied = None;
         let mut panel_copy = None;
         let mut detail_requests = Vec::new();
+        let mut graph_requests = Vec::new();
         let mut issue_writes = Vec::new();
         let panel_workspaces = self
             .shared
@@ -9407,6 +9424,9 @@ impl TerminalView {
             .map(|mut boards| {
                 boards.retain_regions(&live);
                 copied = boards.take_copy();
+                while let Some(request) = boards.take_flow_request() {
+                    graph_requests.push(request);
+                }
                 let mut visible = boards.visible();
                 include_open_panel_boards(&mut visible, &panel_workspaces, &boards);
                 strips = visible
@@ -9428,6 +9448,11 @@ impl TerminalView {
         for (workspace_id, issue_id) in detail_requests {
             if let Err(error) = self.sink.request_beads_issue_detail(workspace_id, issue_id) {
                 tracing::debug!(%error, "Beads issue detail request dropped");
+            }
+        }
+        for (workspace_id, epic_id) in graph_requests {
+            if let Err(error) = self.sink.request_beads_epic_graph(workspace_id, epic_id) {
+                tracing::debug!(%error, "Beads epic graph request dropped");
             }
         }
         for write in issue_writes {
@@ -9656,8 +9681,47 @@ impl TerminalView {
             .collect()
     }
 
+    /// Give every painted Flow node a focus handle that outlives the frame.
+    ///
+    /// Run before the render pass rather than inside it: the board guard and
+    /// the control cache are both needed, and building handles under the lock
+    /// would hold it across GPUI allocation.
+    fn sync_flow_node_controls(&mut self, cx: &App) {
+        let open: Vec<(WorkspaceId, Vec<String>)> = self
+            .shared
+            .beads_boards
+            .lock()
+            .map(|boards| {
+                self.visible_beads_boards
+                    .iter()
+                    .filter_map(|(workspace_id, _)| {
+                        let flow = boards.flow(*workspace_id)?;
+                        let ids =
+                            flow.graph.nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+                        Some((*workspace_id, ids))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let live: HashSet<WorkspaceId> =
+            open.iter().map(|(workspace_id, _)| *workspace_id).collect();
+        self.flow_node_controls.retain(|workspace_id, _| live.contains(workspace_id));
+        for (workspace_id, ids) in open {
+            let boards = Arc::clone(&self.shared.beads_boards);
+            let controls = self.flow_node_controls.entry(workspace_id).or_default();
+            controls.retain(|issue_id, _| ids.contains(issue_id));
+            let missing = ids.into_iter().filter(|issue_id| !controls.contains_key(issue_id));
+            for issue_id in missing.collect::<Vec<_>>() {
+                let control =
+                    flow_node_control(cx.focus_handle(), workspace_id, Arc::clone(&boards));
+                controls.insert(issue_id, control);
+            }
+        }
+    }
+
     // @lat: [[client#Client#Beads Board CLI Data Source]]
     fn render_beads_boards(&mut self, cx: &App) -> Vec<gpui::AnyElement> {
+        self.sync_flow_node_controls(cx);
         let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
         let scale = boards.text_scale();
         let colors = self.beads_colors;
@@ -9685,6 +9749,11 @@ impl TerminalView {
                             drag_target: boards.drag_target(*workspace_id),
                             scale,
                             colors,
+                            flow_controls: self
+                                .flow_node_controls
+                                .get(workspace_id)
+                                .cloned()
+                                .unwrap_or_default(),
                         },
                     ),
                     // The bar's grab band, carrying nothing but the pointer a
@@ -10888,6 +10957,27 @@ fn run_terminal_app(
     });
     if let Ok(mut slot) = restore_child_runtime.lock() {
         drop(slot.take());
+    }
+}
+
+/// One Flow node's focus handle and its activation seam.
+///
+/// Activation moves the frozen graph's cursor and nothing else: the epic and
+/// the layout are untouched, so the strip stays on the graph it opened with.
+fn flow_node_control(
+    focus: gpui::FocusHandle,
+    workspace_id: WorkspaceId,
+    boards: Arc<Mutex<BeadsBoards>>,
+) -> FlowNodeControl {
+    FlowNodeControl {
+        focus,
+        on_activate: Arc::new(move |issue_id, window, _app| {
+            if let Ok(mut boards) = boards.lock()
+                && boards.move_flow_cursor(workspace_id, &issue_id)
+            {
+                window.refresh();
+            }
+        }),
     }
 }
 
@@ -12890,6 +12980,16 @@ async fn dispatch_server_message(
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
+        ServerMessage::BeadsEpicGraph { workspace_id, epic_id, outcome } => {
+            // Every refusal, and every reply the fence has outlived, leaves
+            // the board in lanes without a notice: the panel already opened,
+            // so there is nothing for the reader to recover from.
+            if let Ok(mut boards) = ctx.beads_boards.lock()
+                && boards.apply_epic_graph(workspace_id, &epic_id, outcome)
+            {
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+        }
         ServerMessage::BeadsIssueWriteResult { workspace_id, issue_id, result } => {
             if let Ok(mut boards) = ctx.beads_boards.lock() {
                 boards.finish_card_drop(workspace_id, &issue_id, &result);
@@ -13868,6 +13968,7 @@ fn on_welcome(
         clipboard_gating,
         beads_detail,
         beads_write,
+        beads_flow,
         pi_provider,
         ..
     } = welcome
@@ -13895,6 +13996,9 @@ fn on_welcome(
         panels.set_enabled(beads_detail);
         panels.set_write_enabled(beads_write);
         panels.reconnected();
+    }
+    if let Ok(mut boards) = ctx.beads_boards.lock() {
+        boards.set_flow_enabled(beads_flow);
     }
     tracing::info!(
         adopted = ?registry.adopted_window(),
