@@ -29,12 +29,12 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState, BeadsIssueWrite,
-    BeadsIssueWriteGuards, BeadsIssueWriteResult, CiRunDelta, ClientMessage, ControllerInfo,
-    LanPeerInfo, LanRefusal, ParticipantInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
-    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, ShellTool,
-    TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo, WorkspaceListEntry,
-    WorkspaceTreeNode,
+    AiLaunchSpec, AutomationAction, BEADS_BOARD_PROTOCOL_VERSION, BeadsBoardState,
+    BeadsEpicGraphOutcome, BeadsIssueWrite, BeadsIssueWriteGuards, BeadsIssueWriteResult,
+    CiRunDelta, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, ParticipantInfo,
+    PromptMarkKind, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch,
+    ServerMessage, SessionInfo, ShellTool, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo,
+    WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -5564,9 +5564,9 @@ async fn handle_client_hello(
                 terminal_images: claim.terminal_images,
                 beads_detail,
                 beads_write,
-                // The epic-graph request is not served yet, so the Flow view
-                // stays unadvertised and every client keeps the Lanes board.
-                beads_flow: false,
+                // Flow has the identical local-owner/unshared admission as
+                // detail reads, so neither capability widens the trust boundary.
+                beads_flow: beads_detail,
                 pi_provider: true,
             };
             send_message(writer, &welcome).await;
@@ -6472,6 +6472,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::ListSessions
         | ClientMessage::RequestBeadsBoard { .. }
         | ClientMessage::RequestBeadsIssueDetail { .. }
+        | ClientMessage::RequestBeadsEpicGraph { .. }
         | ClientMessage::BeadsIssueWrite { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
@@ -6735,6 +6736,9 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
         ClientMessage::RequestBeadsIssueDetail { workspace_id, issue_id } => {
             handle_request_beads_issue_detail(workspace_id, issue_id, context).await;
         }
+        ClientMessage::RequestBeadsEpicGraph { workspace_id, epic_id } => {
+            handle_request_beads_epic_graph(workspace_id, epic_id, context).await;
+        }
         ClientMessage::BeadsIssueWrite { workspace_id, issue_id, verb, guards } => {
             handle_beads_issue_write(workspace_id, issue_id, verb, guards, context).await;
         }
@@ -6862,6 +6866,55 @@ async fn handle_request_beads_issue_detail(
             send_error(context.writer, &error).await;
         }
     }
+}
+
+async fn handle_request_beads_epic_graph(
+    workspace_id: WorkspaceId,
+    epic_id: String,
+    context: &ClientDispatchContext<'_>,
+) {
+    let Some(project_root) = beads_detail_request_root(
+        &context.server.workspace_manager,
+        &context.server.window_shares,
+        BeadsDetailRequest {
+            window_id: context.window_id,
+            writer: context.writer,
+            is_remote: context.is_remote,
+            workspace_id,
+        },
+    )
+    .await
+    else {
+        debug!(
+            window_id = %context.window_id,
+            %workspace_id,
+            "ignoring unauthorized Beads epic-graph request"
+        );
+        return;
+    };
+
+    let outcome = context.server.beads_boards.epic_graph(&project_root, &epic_id).await;
+    match &outcome {
+        BeadsEpicGraphOutcome::NoGraph { reason } => {
+            info!(
+                root = %project_root.display(),
+                %epic_id,
+                ?reason,
+                "Beads Flow graph refused"
+            );
+        }
+        BeadsEpicGraphOutcome::Unavailable { message } => {
+            warn!(
+                root = %project_root.display(),
+                %epic_id,
+                %message,
+                "Beads Flow graph unavailable"
+            );
+        }
+        BeadsEpicGraphOutcome::Graph(_) => {}
+    }
+    send_message(context.writer, &ServerMessage::BeadsEpicGraph { workspace_id, epic_id, outcome })
+        .await;
 }
 
 async fn handle_beads_issue_write(
@@ -13015,7 +13068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn beads_detail_rejects_remote_viewers_and_mismatched_workspaces() {
+    async fn beads_detail_and_flow_reject_remote_viewers_and_mismatched_workspaces() {
         let base = Path::new("/work");
         let repo = base.join("scribe");
         let window_id = WindowId::new();
@@ -13058,6 +13111,8 @@ mod tests {
         let manager = Arc::new(RwLock::new(manager));
 
         assert_eq!(
+            // Flow calls this exact helper, so the local-owner and workspace
+            // proof covers both request types without a second authorization path.
             beads_detail_request_root(
                 &manager,
                 &shares,

@@ -395,6 +395,25 @@ stays an opaque string because only the client presents relative time, so a
 tracker timestamp outside the expected ISO form cannot make the board
 unavailable.
 
+### Flow graph admission
+
+[[crates/scribe-server/src/ipc_server.rs#handle_request_beads_epic_graph]]
+reuses the exact local-owner, `SingleController`, and workspace-root gate from
+[[crates/scribe-server/src/ipc_server.rs#beads_detail_request_root]]. A remote,
+shared, displaced, or wrong-workspace requester receives no graph, and
+[[crates/scribe-server/src/ipc_server.rs#handle_client_hello]] advertises
+`Welcome.beads_flow` only to that same eligible owner.
+
+[[crates/scribe-server/src/beads_board.rs#BeadsBoardCache#epic_graph]] reads
+only the retained source. It refuses an absent or empty epic, more than 200
+members, more than 16 `blocks` edges from one member, external blockers,
+disconnected members, and dependency cycles; every refusal is logged and sent
+as typed `NoGraph`, never as a partial graph. The full retained list means a
+closed epic member falling past the board's 200-card Done paint cap remains in
+Flow. A write advances the cache generation before its authoritative refresh,
+so `graph_source` refuses to serve the preceding source generation during that
+interval.
+
 ## Beads issue writes
 
 The server admits one typed issue mutation, serializes Scribe writers per project root, and publishes only tracker-confirmed state.

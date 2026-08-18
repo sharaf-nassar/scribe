@@ -18,7 +18,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use scribe_common::protocol::{
-    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsIssueComment, BeadsIssueDetail,
+    BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
+    BeadsEpicGraphRefusal, BeadsGraphEdge, BeadsGraphNode, BeadsIssueComment, BeadsIssueDetail,
     BeadsIssueLink, BeadsIssueQueue, BeadsIssueQueueBasis, BeadsIssueWrite, BeadsIssueWriteGuards,
     BeadsIssueWriteResult,
 };
@@ -29,6 +30,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_ITEMS_PER_QUEUE: usize = 200;
+const MAX_FLOW_NODES: usize = 200;
+const MAX_FLOW_EDGES_PER_NODE: usize = 16;
 const MAX_BLOCKERS_PER_ITEM: usize = 16;
 const MAX_ID_CHARS: usize = 128;
 const MAX_TITLE_CHARS: usize = 512;
@@ -62,6 +65,10 @@ struct CacheEntry {
     last_error: Option<String>,
     in_flight: bool,
     generation: u64,
+    /// Generation that produced `last_good`'s retained list source. A write
+    /// advances `generation` before its authoritative refresh, fencing Flow
+    /// requests off the pre-write graph during that interval.
+    source_generation: Option<u64>,
 }
 
 pub struct BeadsIssueWriteOutcome {
@@ -123,9 +130,23 @@ impl BeadsBoardCache {
         let key = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
         let entries = self.entries.lock().await;
         let entry = entries.get(&key)?;
+        if entry.source_generation != Some(entry.generation) {
+            return None;
+        }
+        let board = entry.last_good.as_ref()?;
         let source =
-            entry.last_good.as_ref()?.issues.iter().map(BeadsGraphSourceIssue::from).collect();
+            board.issues.iter().map(|issue| graph_source_issue(issue, &board.ready_ids)).collect();
         Some((entry.generation, source))
+    }
+
+    /// Assemble one admitted Flow graph from the cached list, never another `bd` query.
+    pub async fn epic_graph(&self, project_root: &Path, epic_id: &str) -> BeadsEpicGraphOutcome {
+        let Some((_, source)) = self.graph_source(project_root).await else {
+            return BeadsEpicGraphOutcome::Unavailable {
+                message: "Beads board data is not available yet".into(),
+            };
+        };
+        assemble_epic_graph(&source, epic_id)
     }
 
     /// Report whether an official bd executable is installed for this process.
@@ -279,7 +300,11 @@ fn apply_refresh_if_current(
     if entry.generation != generation {
         return false;
     }
+    let refreshed_source = matches!(&result, Ok(LoadResult::Snapshot(_)));
     apply_refresh_result(entry, result, key);
+    if refreshed_source {
+        entry.source_generation = Some(generation);
+    }
     true
 }
 
@@ -290,10 +315,11 @@ fn apply_refresh_result(entry: &mut CacheEntry, result: Result<LoadResult, Strin
             entry.detected = Some(false);
             entry.last_good = None;
             entry.last_error = None;
+            entry.source_generation = None;
         }
         Ok(LoadResult::Snapshot(board)) => {
             entry.detected = Some(true);
-            entry.last_good = Some(board);
+            entry.last_good = Some(*board);
             entry.last_error = None;
         }
         Err(error) => {
@@ -332,7 +358,7 @@ impl CacheEntry {
 
 enum LoadResult {
     NotDetected,
-    Snapshot(CachedBoard),
+    Snapshot(Box<CachedBoard>),
 }
 
 /// One coherent board refresh: paintable queues plus every list issue needed
@@ -341,6 +367,7 @@ enum LoadResult {
 struct CachedBoard {
     snapshot: BeadsBoardSnapshot,
     issues: Vec<IssueJson>,
+    ready_ids: HashSet<String>,
 }
 
 /// Raw list data retained alongside a board snapshot for Flow assembly.
@@ -358,6 +385,8 @@ pub struct BeadsGraphSourceIssue {
     pub dependencies: Vec<BeadsGraphSourceDependency>,
     pub assignee: Option<String>,
     pub updated_at: String,
+    /// The same `bd ready` membership that classifies an unblocked open card.
+    pub ready: bool,
 }
 
 /// One typed dependency from the cached `bd list` issue record.
@@ -365,6 +394,187 @@ pub struct BeadsGraphSourceIssue {
 pub struct BeadsGraphSourceDependency {
     pub depends_on_id: String,
     pub dependency_type: String,
+}
+
+/// Assemble a complete epic graph from the retained list source.
+///
+/// The board's paint cap never participates here. A refusal is intentional and
+/// typed: Flow has no partial or degenerate rendering path.
+pub fn assemble_epic_graph(
+    issues: &[BeadsGraphSourceIssue],
+    epic_id: &str,
+) -> BeadsEpicGraphOutcome {
+    let Some(epic) = issues
+        .iter()
+        .find(|issue| issue.id == epic_id && issue.issue_type.as_deref() == Some("epic"))
+    else {
+        return refused_graph(BeadsEpicGraphRefusal::NoEpic);
+    };
+    let members = epic_members(issues, epic_id);
+    if members.is_empty() {
+        return refused_graph(BeadsEpicGraphRefusal::NoEpic);
+    }
+    if members.len() > MAX_FLOW_NODES {
+        return refused_graph(BeadsEpicGraphRefusal::TooLarge);
+    }
+
+    let member_ids = members.iter().map(|issue| issue.id.as_str()).collect::<HashSet<_>>();
+    let edges = match epic_edges(&members, &member_ids) {
+        Ok(edges) => edges,
+        Err(reason) => return refused_graph(reason),
+    };
+    if graph_has_cycle(&member_ids, &edges) {
+        return refused_graph(BeadsEpicGraphRefusal::Cycle);
+    }
+    if graph_is_disconnected(&member_ids, &edges) {
+        return refused_graph(BeadsEpicGraphRefusal::Disconnected);
+    }
+
+    let by_id = issues.iter().map(|issue| (issue.id.as_str(), issue)).collect::<HashMap<_, _>>();
+    BeadsEpicGraphOutcome::Graph(Box::new(BeadsEpicGraph {
+        epic_id: truncate(&epic.id, MAX_ID_CHARS),
+        epic_title: truncate(&epic.title, MAX_TITLE_CHARS),
+        closed: members
+            .iter()
+            .filter(|issue| issue.status == "closed")
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        total: members.len().try_into().unwrap_or(u32::MAX),
+        nodes: members.iter().map(|issue| graph_node(issue, &by_id)).collect(),
+        edges: edges
+            .into_iter()
+            .map(|edge| BeadsGraphEdge {
+                from: truncate(&edge.from, MAX_ID_CHARS),
+                to: truncate(&edge.to, MAX_ID_CHARS),
+            })
+            .collect(),
+    }))
+}
+
+fn refused_graph(reason: BeadsEpicGraphRefusal) -> BeadsEpicGraphOutcome {
+    BeadsEpicGraphOutcome::NoGraph { reason }
+}
+
+fn epic_members<'a>(
+    issues: &'a [BeadsGraphSourceIssue],
+    epic_id: &str,
+) -> Vec<&'a BeadsGraphSourceIssue> {
+    issues.iter().filter(|issue| is_epic_member(issue, epic_id)).collect()
+}
+
+fn is_epic_member(issue: &BeadsGraphSourceIssue, epic_id: &str) -> bool {
+    issue.parent.as_deref() == Some(epic_id)
+        || issue.dependencies.iter().any(|dependency| {
+            dependency.dependency_type == "parent-child" && dependency.depends_on_id == epic_id
+        })
+}
+
+fn epic_edges(
+    members: &[&BeadsGraphSourceIssue],
+    member_ids: &HashSet<&str>,
+) -> Result<Vec<BeadsGraphEdge>, BeadsEpicGraphRefusal> {
+    let mut edges = Vec::new();
+    let mut seen = HashSet::new();
+    for member in members {
+        let blockers = member
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.dependency_type == "blocks")
+            .collect::<Vec<_>>();
+        if blockers.len() > MAX_FLOW_EDGES_PER_NODE {
+            return Err(BeadsEpicGraphRefusal::TooLarge);
+        }
+        for blocker in blockers {
+            if !member_ids.contains(blocker.depends_on_id.as_str()) {
+                return Err(BeadsEpicGraphRefusal::ExternalBlocker);
+            }
+            if seen.insert((blocker.depends_on_id.as_str(), member.id.as_str())) {
+                edges.push(BeadsGraphEdge {
+                    from: blocker.depends_on_id.clone(),
+                    to: member.id.clone(),
+                });
+            }
+        }
+    }
+    Ok(edges)
+}
+
+fn graph_is_disconnected(member_ids: &HashSet<&str>, edges: &[BeadsGraphEdge]) -> bool {
+    let Some(first) = member_ids.iter().next().copied() else {
+        return true;
+    };
+    let mut connected = HashSet::from([first]);
+    let mut frontier = vec![first];
+    while let Some(id) = frontier.pop() {
+        for edge in edges {
+            let neighbor = if edge.from == id {
+                Some(edge.to.as_str())
+            } else if edge.to == id {
+                Some(edge.from.as_str())
+            } else {
+                None
+            };
+            if let Some(neighbor) = neighbor
+                && connected.insert(neighbor)
+            {
+                frontier.push(neighbor);
+            }
+        }
+    }
+    connected.len() != member_ids.len() || member_ids.len() < 2
+}
+
+fn graph_has_cycle(member_ids: &HashSet<&str>, edges: &[BeadsGraphEdge]) -> bool {
+    let mut indegree = member_ids.iter().map(|id| (*id, 0_usize)).collect::<HashMap<_, _>>();
+    for edge in edges {
+        if let Some(degree) = indegree.get_mut(edge.to.as_str()) {
+            *degree += 1;
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(&id, &degree)| (degree == 0).then_some(id))
+        .collect::<Vec<_>>();
+    let mut visited = 0_usize;
+    while let Some(id) = ready.pop() {
+        visited += 1;
+        for edge in edges.iter().filter(|edge| edge.from == id) {
+            let Some(degree) = indegree.get_mut(edge.to.as_str()) else {
+                return true;
+            };
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(edge.to.as_str());
+            }
+        }
+    }
+    visited != member_ids.len()
+}
+
+fn graph_node(
+    issue: &BeadsGraphSourceIssue,
+    by_id: &HashMap<&str, &BeadsGraphSourceIssue>,
+) -> BeadsGraphNode {
+    let has_open_blocker = issue.dependencies.iter().any(|dependency| {
+        dependency.dependency_type == "blocks"
+            && by_id
+                .get(dependency.depends_on_id.as_str())
+                .is_some_and(|blocker| blocker.status != "closed")
+    });
+    let (queue, _) = classify_issue(
+        &issue.status,
+        QueueSignals { has_open_blockers: has_open_blocker, ready: issue.ready },
+    );
+    BeadsGraphNode {
+        id: truncate(&issue.id, MAX_ID_CHARS),
+        title: truncate(&issue.title, MAX_TITLE_CHARS),
+        priority: issue.priority,
+        status: truncate(&issue.status, MAX_ID_CHARS),
+        queue,
+        assignee: issue.assignee.as_deref().map(|value| truncate(value, MAX_TITLE_CHARS)),
+        updated_at: truncate(&issue.updated_at, MAX_TITLE_CHARS),
+    }
 }
 
 async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
@@ -393,7 +603,7 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
     let blocked =
         Box::pin(run_bd(&bd, project_root, &["blocked"])).await.map_err(RunError::message)?;
 
-    parse_board_snapshot(&list, &ready, &blocked).map(LoadResult::Snapshot)
+    parse_board_snapshot(&list, &ready, &blocked).map(|board| LoadResult::Snapshot(Box::new(board)))
 }
 
 /// Result of a fresh issue-detail query. Missing issues stay distinct from
@@ -929,26 +1139,25 @@ struct DependencyJson {
     dependency_type: String,
 }
 
-impl From<&IssueJson> for BeadsGraphSourceIssue {
-    fn from(issue: &IssueJson) -> Self {
-        Self {
-            id: issue.id.clone(),
-            title: issue.title.clone(),
-            status: issue.status.clone(),
-            priority: issue.priority,
-            issue_type: issue.issue_type.clone(),
-            parent: issue.parent.clone(),
-            dependencies: issue
-                .dependencies
-                .iter()
-                .map(|dependency| BeadsGraphSourceDependency {
-                    depends_on_id: dependency.depends_on_id.clone(),
-                    dependency_type: dependency.dependency_type.clone(),
-                })
-                .collect(),
-            assignee: issue.assignee.clone(),
-            updated_at: issue.updated_at.clone(),
-        }
+fn graph_source_issue(issue: &IssueJson, ready_ids: &HashSet<String>) -> BeadsGraphSourceIssue {
+    BeadsGraphSourceIssue {
+        id: issue.id.clone(),
+        title: issue.title.clone(),
+        status: issue.status.clone(),
+        priority: issue.priority,
+        issue_type: issue.issue_type.clone(),
+        parent: issue.parent.clone(),
+        dependencies: issue
+            .dependencies
+            .iter()
+            .map(|dependency| BeadsGraphSourceDependency {
+                depends_on_id: dependency.depends_on_id.clone(),
+                dependency_type: dependency.dependency_type.clone(),
+            })
+            .collect(),
+        assignee: issue.assignee.clone(),
+        updated_at: issue.updated_at.clone(),
+        ready: ready_ids.contains(&issue.id),
     }
 }
 
@@ -1210,7 +1419,8 @@ fn parse_board_snapshot(
     let ready = parse_collection(ready_json, "ready")?;
     let blocked = parse_collection(blocked_json, "blocked")?;
     let snapshot = classify_issues(&issues, &ready, &blocked)?;
-    Ok(CachedBoard { snapshot, issues })
+    let ready_ids = ready.into_iter().map(|issue| issue.id).collect();
+    Ok(CachedBoard { snapshot, issues, ready_ids })
 }
 
 fn classify_issues(
@@ -1328,7 +1538,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use scribe_common::protocol::{BeadsIssueQueue, BeadsIssueQueueBasis};
+    use scribe_common::protocol::{
+        BeadsEpicGraphOutcome, BeadsEpicGraphRefusal, BeadsIssueQueue, BeadsIssueQueueBasis,
+    };
 
     use super::*;
 
@@ -1681,6 +1893,7 @@ mod tests {
             entry.last_good = Some(board);
             entry.detected = Some(true);
             entry.last_attempt = Some(Instant::now());
+            entry.source_generation = Some(entry.generation);
         }
         let (generation, source) = cache.graph_source(&scratch).await.expect("cached source");
         let child = source.iter().find(|issue| issue.id == "child").expect("child");
@@ -1713,6 +1926,67 @@ mod tests {
             ],
             [1, 1, 0, 0, 1]
         );
+        fs::remove_dir_all(scratch).expect("remove cache root");
+    }
+
+    fn cached_admitted_flow_board() -> CachedBoard {
+        let source_issue = |id: &str, status: &str, parent: Option<&str>, dependencies| IssueJson {
+            id: id.into(),
+            title: format!("{id} title"),
+            status: status.into(),
+            priority: 2,
+            issue_type: None,
+            parent: parent.map(str::to_owned),
+            dependencies,
+            blocked_by: vec![],
+            assignee: None,
+            updated_at: String::new(),
+        };
+        CachedBoard {
+            snapshot: BeadsBoardSnapshot::default(),
+            issues: vec![
+                IssueJson {
+                    issue_type: Some("epic".into()),
+                    ..source_issue("epic", "open", None, vec![])
+                },
+                source_issue("foundation", "closed", Some("epic"), vec![]),
+                source_issue(
+                    "ship",
+                    "open",
+                    Some("epic"),
+                    vec![DependencyJson {
+                        depends_on_id: "foundation".into(),
+                        dependency_type: "blocks".into(),
+                    }],
+                ),
+            ],
+            ready_ids: HashSet::from(["ship".into()]),
+        }
+    }
+
+    // @lat: [[server#Server#Beads Flow source cache#Flow graph admission]]
+    #[tokio::test]
+    async fn flow_source_generation_fences_the_pre_write_graph() {
+        let scratch = beads_test_scratch_path("flow-generation");
+        fs::create_dir_all(&scratch).expect("create cache root");
+        let cache = BeadsBoardCache::default();
+        let lookup = cache.lookup(&scratch).await;
+        {
+            let mut entries = cache.entries.lock().await;
+            let entry = entries.get_mut(&lookup.key).expect("cache entry");
+            entry.last_good = Some(cached_admitted_flow_board());
+            entry.detected = Some(true);
+            entry.source_generation = Some(entry.generation);
+        }
+        assert!(matches!(
+            cache.epic_graph(&scratch, "epic").await,
+            BeadsEpicGraphOutcome::Graph(_)
+        ));
+        cache.entries.lock().await.get_mut(&lookup.key).expect("cache entry").generation += 1;
+        assert!(matches!(
+            cache.epic_graph(&scratch, "epic").await,
+            BeadsEpicGraphOutcome::Unavailable { .. }
+        ));
         fs::remove_dir_all(scratch).expect("remove cache root");
     }
 
@@ -2085,17 +2359,29 @@ mod tests {
         assert!(!apply_refresh_if_current(
             &mut entry,
             1,
-            Ok(LoadResult::Snapshot(CachedBoard { snapshot: old, issues: vec![] })),
+            Ok(LoadResult::Snapshot(Box::new(CachedBoard {
+                snapshot: old,
+                issues: vec![],
+                ready_ids: HashSet::new()
+            }))),
             Path::new("/tmp/fenced"),
         ));
         assert!(entry.last_good.is_none());
+        assert_eq!(entry.source_generation, None);
         assert!(apply_refresh_if_current(
             &mut entry,
             2,
-            Ok(LoadResult::Snapshot(CachedBoard { snapshot: current.clone(), issues: vec![] })),
+            Ok(LoadResult::Snapshot(Box::new(CachedBoard {
+                snapshot: current.clone(),
+                issues: vec![],
+                ready_ids: HashSet::new()
+            }))),
             Path::new("/tmp/fenced"),
         ));
         assert_eq!(entry.last_good.as_ref().map(|board| &board.snapshot), Some(&current));
+        assert_eq!(entry.source_generation, Some(2));
+        entry.generation = 3;
+        assert_ne!(entry.source_generation, Some(entry.generation));
     }
 
     #[tokio::test]
@@ -2122,6 +2408,166 @@ mod tests {
         fs::remove_dir_all(scratch).expect("remove scratch root");
     }
 
+    fn flow_source_issue(
+        id: &str,
+        parent: Option<&str>,
+        status: &str,
+        blockers: &[&str],
+    ) -> BeadsGraphSourceIssue {
+        BeadsGraphSourceIssue {
+            id: id.into(),
+            title: format!("{id} title"),
+            status: status.into(),
+            priority: 2,
+            issue_type: None,
+            parent: parent.map(str::to_owned),
+            dependencies: blockers
+                .iter()
+                .map(|blocker_id| BeadsGraphSourceDependency {
+                    depends_on_id: (*blocker_id).into(),
+                    dependency_type: "blocks".into(),
+                })
+                .collect(),
+            assignee: None,
+            updated_at: "2026-08-18T00:00:00Z".into(),
+            ready: true,
+        }
+    }
+
+    fn flow_epic(id: &str) -> BeadsGraphSourceIssue {
+        BeadsGraphSourceIssue {
+            issue_type: Some("epic".into()),
+            parent: None,
+            dependencies: vec![],
+            ..flow_source_issue(id, None, "open", &[])
+        }
+    }
+
+    fn refusal(outcome: &BeadsEpicGraphOutcome) -> BeadsEpicGraphRefusal {
+        let BeadsEpicGraphOutcome::NoGraph { reason } = outcome else {
+            panic!("expected graph refusal");
+        };
+        *reason
+    }
+
+    // @lat: [[server#Server#Beads Flow source cache#Flow graph admission]]
+    #[test]
+    fn flow_admission_returns_a_complete_graph_or_a_typed_refusal() {
+        let admitted = vec![
+            flow_epic("epic"),
+            flow_source_issue("foundation", Some("epic"), "closed", &[]),
+            flow_source_issue("ship", Some("epic"), "open", &["foundation"]),
+        ];
+        let BeadsEpicGraphOutcome::Graph(graph) = assemble_epic_graph(&admitted, "epic") else {
+            panic!("expected admitted graph");
+        };
+        assert_eq!(graph.total, 2);
+        assert_eq!(graph.closed, 1);
+        assert_eq!(graph.edges, [BeadsGraphEdge { from: "foundation".into(), to: "ship".into() }]);
+        assert!(matches!(
+            graph.nodes.iter().find(|node| node.id == "ship").map(|node| node.queue),
+            Some(BeadsIssueQueue::Ready)
+        ));
+
+        let external = vec![
+            flow_epic("epic"),
+            flow_source_issue("inside", Some("epic"), "open", &["outside"]),
+        ];
+        assert_eq!(
+            refusal(&assemble_epic_graph(&external, "epic")),
+            BeadsEpicGraphRefusal::ExternalBlocker
+        );
+        let disconnected = vec![
+            flow_epic("epic"),
+            flow_source_issue("a", Some("epic"), "open", &[]),
+            flow_source_issue("b", Some("epic"), "open", &[]),
+        ];
+        assert_eq!(
+            refusal(&assemble_epic_graph(&disconnected, "epic")),
+            BeadsEpicGraphRefusal::Disconnected
+        );
+    }
+
+    // @lat: [[server#Server#Beads Flow source cache#Flow graph admission]]
+    #[test]
+    fn flow_graph_keeps_closed_members_past_the_board_done_cap() {
+        let mut issues = (0..MAX_ITEMS_PER_QUEUE)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("unrelated-{index}"),
+                    "title": "Unrelated closed",
+                    "status": "closed",
+                    "priority": 2,
+                })
+            })
+            .collect::<Vec<_>>();
+        issues.extend([
+            serde_json::json!({"id":"epic","title":"Epic","status":"open","priority":2,"issue_type":"epic"}),
+            serde_json::json!({"id":"foundation","title":"Foundation","status":"closed","priority":2,"parent":"epic"}),
+            serde_json::json!({"id":"ship","title":"Ship","status":"open","priority":2,"parent":"epic","dependencies":[{"type":"blocks","depends_on_id":"foundation"}]}),
+        ]);
+        let list = serde_json::to_vec(&serde_json::json!({
+            "data": {"issues": issues},
+            "schema_version": BD_JSON_SCHEMA_VERSION,
+        }))
+        .expect("serialize list");
+        let ready = br#"{"data":[{"id":"ship","title":"Ship","status":"open","priority":2}],"schema_version":1}"#;
+        let board = parse_board_snapshot(&list, ready, br#"{"data":[],"schema_version":1}"#)
+            .expect("parse board");
+        let source = board
+            .issues
+            .iter()
+            .map(|issue| graph_source_issue(issue, &board.ready_ids))
+            .collect::<Vec<_>>();
+
+        assert_eq!(board.snapshot.done.len(), MAX_ITEMS_PER_QUEUE);
+        assert!(board.snapshot.done.iter().all(|item| item.id != "foundation"));
+        let BeadsEpicGraphOutcome::Graph(graph) = assemble_epic_graph(&source, "epic") else {
+            panic!("expected graph after board cap");
+        };
+        assert_eq!(
+            graph.nodes.iter().map(|node| node.id.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["foundation", "ship"])
+        );
+    }
+
+    // bd refuses cycles, so this follows the actual admission boundary with an
+    // in-memory source rather than adding a test-only tracker corruption seam.
+    #[test]
+    fn flow_admission_rejects_cycles_and_independent_bounds() {
+        let cycle = vec![
+            flow_epic("epic"),
+            flow_source_issue("a", Some("epic"), "open", &["b"]),
+            flow_source_issue("b", Some("epic"), "open", &["a"]),
+        ];
+        assert_eq!(refusal(&assemble_epic_graph(&cycle, "epic")), BeadsEpicGraphRefusal::Cycle);
+
+        let mut too_large = vec![flow_epic("epic")];
+        too_large.extend(
+            (0..=MAX_FLOW_NODES).map(|index| {
+                flow_source_issue(&format!("node-{index}"), Some("epic"), "open", &[])
+            }),
+        );
+        assert_eq!(
+            refusal(&assemble_epic_graph(&too_large, "epic")),
+            BeadsEpicGraphRefusal::TooLarge
+        );
+
+        let mut edge_bound = vec![flow_epic("epic")];
+        edge_bound.extend((0..=MAX_FLOW_EDGES_PER_NODE).map(|index| {
+            flow_source_issue(&format!("blocker-{index}"), Some("epic"), "closed", &[])
+        }));
+        let blockers = (0..=MAX_FLOW_EDGES_PER_NODE)
+            .map(|index| format!("blocker-{index}"))
+            .collect::<Vec<_>>();
+        let blocker_refs = blockers.iter().map(String::as_str).collect::<Vec<_>>();
+        edge_bound.push(flow_source_issue("dependent", Some("epic"), "open", &blocker_refs));
+        assert_eq!(
+            refusal(&assemble_epic_graph(&edge_bound, "epic")),
+            BeadsEpicGraphRefusal::TooLarge
+        );
+    }
+
     // @lat: [[client#Client#Beads Board CLI Data Source]]
     #[tokio::test]
     async fn cache_deduplicates_refresh_and_retains_last_good_after_error() {
@@ -2138,7 +2584,12 @@ mod tests {
             let entry = entries.get_mut(&first.key).expect("cache entry");
             entry.in_flight = false;
             entry.detected = Some(true);
-            entry.last_good = Some(CachedBoard { snapshot: snapshot.clone(), issues: vec![] });
+            entry.last_good = Some(CachedBoard {
+                snapshot: snapshot.clone(),
+                issues: vec![],
+                ready_ids: HashSet::new(),
+            });
+            entry.source_generation = Some(entry.generation);
             entry.last_error = Some("bad JSON".into());
             entry.last_attempt = Some(Instant::now());
         }
