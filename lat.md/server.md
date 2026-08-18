@@ -373,6 +373,28 @@ Verifies an unnamed `Hello` adopts the same window and fans the rest out in the 
 
 The set is walked in window-id order, so two sets holding the same ids resolve identically, and `other_windows` follows in that same order rather than in a hash order that changed on every server process.
 
+## Beads Flow source cache
+
+The cache retains the full parsed list beside its paintable snapshot, so Flow
+needs no additional `bd` command.
+
+A successful `bd list --all --limit 0 --skip-labels --sort created` refresh
+produces one [[crates/scribe-server/src/beads_board.rs#CachedBoard]]: its
+paintable five-queue snapshot and the complete parsed list share the same cache
+generation. The source list retains the native `parent` id, every typed
+`blocks` dependency (including an edge whose blocker is already closed), and
+node metadata `assignee` plus `updated_at`. The board still derives open
+blocker lane placement from `bd blocked`; retaining historical closed edges does
+not alter classification or totals.
+
+This is deliberately one list result, not another `bd` command. Flow graph
+assembly can therefore operate within the existing cache's generation fence and
+cannot see a graph from a different tracker read than the board card that
+opened it. Missing assignee and timestamp fields default safely; `updated_at`
+stays an opaque string because only the client presents relative time, so a
+tracker timestamp outside the expected ISO form cannot make the board
+unavailable.
+
 ## Beads issue writes
 
 The server admits one typed issue mutation, serializes Scribe writers per project root, and publishes only tracker-confirmed state.

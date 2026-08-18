@@ -56,7 +56,7 @@ pub struct BeadsBoardCache {
 
 #[derive(Debug, Default)]
 struct CacheEntry {
-    last_good: Option<BeadsBoardSnapshot>,
+    last_good: Option<CachedBoard>,
     detected: Option<bool>,
     last_attempt: Option<Instant>,
     last_error: Option<String>,
@@ -112,6 +112,20 @@ impl BeadsBoardCache {
         entry.in_flight = false;
         apply_refresh_if_current(entry, generation, result, &key);
         entry.state(false)
+    }
+
+    /// Return the current cache generation and full parsed list for Flow graph
+    /// assembly. It is deliberately a cache read, never a second `bd` query.
+    pub async fn graph_source(
+        &self,
+        project_root: &Path,
+    ) -> Option<(u64, Vec<BeadsGraphSourceIssue>)> {
+        let key = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+        let entries = self.entries.lock().await;
+        let entry = entries.get(&key)?;
+        let source =
+            entry.last_good.as_ref()?.issues.iter().map(BeadsGraphSourceIssue::from).collect();
+        Some((entry.generation, source))
     }
 
     /// Report whether an official bd executable is installed for this process.
@@ -277,9 +291,9 @@ fn apply_refresh_result(entry: &mut CacheEntry, result: Result<LoadResult, Strin
             entry.last_good = None;
             entry.last_error = None;
         }
-        Ok(LoadResult::Snapshot(snapshot)) => {
+        Ok(LoadResult::Snapshot(board)) => {
             entry.detected = Some(true);
-            entry.last_good = Some(snapshot);
+            entry.last_good = Some(board);
             entry.last_error = None;
         }
         Err(error) => {
@@ -300,9 +314,9 @@ impl CacheEntry {
         if self.detected == Some(false) {
             return BeadsBoardState::NotDetected;
         }
-        if let Some(snapshot) = &self.last_good {
+        if let Some(board) = &self.last_good {
             return BeadsBoardState::Ready {
-                snapshot: snapshot.clone(),
+                snapshot: board.snapshot.clone(),
                 stale: stale || self.last_error.is_some(),
                 refresh_error: self.last_error.clone(),
             };
@@ -318,7 +332,39 @@ impl CacheEntry {
 
 enum LoadResult {
     NotDetected,
-    Snapshot(BeadsBoardSnapshot),
+    Snapshot(CachedBoard),
+}
+
+/// One coherent board refresh: paintable queues plus every list issue needed
+/// to assemble a Flow graph without another `bd` invocation.
+#[derive(Debug)]
+struct CachedBoard {
+    snapshot: BeadsBoardSnapshot,
+    issues: Vec<IssueJson>,
+}
+
+/// Raw list data retained alongside a board snapshot for Flow assembly.
+///
+/// This remains server-local rather than crossing the protocol; assembly applies
+/// its own graph bounds before producing the smaller `BeadsEpicGraph` wire type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeadsGraphSourceIssue {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub priority: u8,
+    pub issue_type: Option<String>,
+    pub parent: Option<String>,
+    pub dependencies: Vec<BeadsGraphSourceDependency>,
+    pub assignee: Option<String>,
+    pub updated_at: String,
+}
+
+/// One typed dependency from the cached `bd list` issue record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeadsGraphSourceDependency {
+    pub depends_on_id: String,
+    pub dependency_type: String,
 }
 
 async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
@@ -347,7 +393,7 @@ async fn load_board(project_root: &Path) -> Result<LoadResult, String> {
     let blocked =
         Box::pin(run_bd(&bd, project_root, &["blocked"])).await.map_err(RunError::message)?;
 
-    classify_snapshot(&list, &ready, &blocked).map(LoadResult::Snapshot)
+    parse_board_snapshot(&list, &ready, &blocked).map(LoadResult::Snapshot)
 }
 
 /// Result of a fresh issue-detail query. Missing issues stay distinct from
@@ -851,7 +897,7 @@ impl IssueCollection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct IssueJson {
     id: String,
     title: String,
@@ -861,18 +907,49 @@ struct IssueJson {
     issue_type: Option<String>,
     #[serde(default)]
     parent: Option<String>,
+    /// Typed list edges include already-satisfied `blocks` relations; Flow
+    /// must show dependency history, not only what `bd blocked` reports now.
     #[serde(default)]
     dependencies: Vec<DependencyJson>,
     #[serde(default)]
     blocked_by: Vec<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    /// Kept verbatim so a malformed tracker timestamp cannot break a board
+    /// refresh; the client owns relative-time presentation.
+    #[serde(default)]
+    updated_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DependencyJson {
     #[serde(default)]
     depends_on_id: String,
     #[serde(rename = "type", default)]
     dependency_type: String,
+}
+
+impl From<&IssueJson> for BeadsGraphSourceIssue {
+    fn from(issue: &IssueJson) -> Self {
+        Self {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status.clone(),
+            priority: issue.priority,
+            issue_type: issue.issue_type.clone(),
+            parent: issue.parent.clone(),
+            dependencies: issue
+                .dependencies
+                .iter()
+                .map(|dependency| BeadsGraphSourceDependency {
+                    depends_on_id: dependency.depends_on_id.clone(),
+                    dependency_type: dependency.dependency_type.clone(),
+                })
+                .collect(),
+            assignee: issue.assignee.clone(),
+            updated_at: issue.updated_at.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1115,14 +1192,32 @@ fn classify_issue(status: &str, signals: QueueSignals) -> (BeadsIssueQueue, Bead
     }
 }
 
+#[cfg(test)]
 fn classify_snapshot(
     list_json: &[u8],
     ready_json: &[u8],
     blocked_json: &[u8],
 ) -> Result<BeadsBoardSnapshot, String> {
+    parse_board_snapshot(list_json, ready_json, blocked_json).map(|board| board.snapshot)
+}
+
+fn parse_board_snapshot(
+    list_json: &[u8],
+    ready_json: &[u8],
+    blocked_json: &[u8],
+) -> Result<CachedBoard, String> {
     let issues = parse_collection(list_json, "list")?;
     let ready = parse_collection(ready_json, "ready")?;
     let blocked = parse_collection(blocked_json, "blocked")?;
+    let snapshot = classify_issues(&issues, &ready, &blocked)?;
+    Ok(CachedBoard { snapshot, issues })
+}
+
+fn classify_issues(
+    issues: &[IssueJson],
+    ready: &[IssueJson],
+    blocked: &[IssueJson],
+) -> Result<BeadsBoardSnapshot, String> {
     let ready_ids: HashSet<&str> = ready.iter().map(|issue| issue.id.as_str()).collect();
     let blocked_by_id: HashMap<&str, &[String]> =
         blocked.iter().map(|issue| (issue.id.as_str(), issue.blocked_by.as_slice())).collect();
@@ -1141,7 +1236,7 @@ fn classify_snapshot(
         ..BeadsBoardSnapshot::default()
     };
 
-    for issue in &issues {
+    for issue in issues {
         if issue.issue_type.as_deref() == Some("epic") {
             continue;
         }
@@ -1546,6 +1641,8 @@ mod tests {
         );
         assert_eq!(board.ready[0].id, "ready");
         assert_eq!(board.ready[0].parent_epic_name.as_deref(), Some("Board epic"));
+        assert_eq!(board.ready[0].parent_epic_id.as_deref(), Some("epic"));
+        assert_eq!(board.backlog[0].parent_epic_id, None);
         assert_eq!(board.in_progress[0].id, "doing");
         assert_eq!(board.blocked[0].id, "blocked");
         assert_eq!(board.blocked[0].blocker_ids, ["gate-1"]);
@@ -1560,6 +1657,63 @@ mod tests {
             ],
             [1, 1, 1, 1, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn retains_typed_list_edges_and_node_metadata_for_flow() {
+        let list = br#"{"data":{"issues":[
+          {"id":"epic","title":"Flow epic","status":"open","priority":2,"issue_type":"epic"},
+          {"id":"closed-gate","title":"Closed gate","status":"closed","priority":1},
+          {"id":"child","title":"Child","status":"open","priority":2,"parent":"epic","assignee":"agent-1","updated_at":"not-an-iso-timestamp","dependencies":[{"type":"blocks","depends_on_id":"closed-gate"},{"type":"parent-child","depends_on_id":"epic"}]},
+          {"id":"standalone","title":"Standalone","status":"open","priority":3,"assignee":null}
+        ]},"schema_version":1}"#;
+        let ready = br#"{"data":[{"id":"child","title":"Child","status":"open","priority":2}],"schema_version":1}"#;
+        let empty = br#"{"data":[],"schema_version":1}"#;
+
+        let board = parse_board_snapshot(list, ready, empty).expect("parse board");
+        let scratch = beads_test_scratch_path("flow-source");
+        fs::create_dir_all(&scratch).expect("create cache root");
+        let cache = BeadsBoardCache::default();
+        let lookup = cache.lookup(&scratch).await;
+        {
+            let mut entries = cache.entries.lock().await;
+            let entry = entries.get_mut(&lookup.key).expect("cache entry");
+            entry.last_good = Some(board);
+            entry.detected = Some(true);
+            entry.last_attempt = Some(Instant::now());
+        }
+        let (generation, source) = cache.graph_source(&scratch).await.expect("cached source");
+        let child = source.iter().find(|issue| issue.id == "child").expect("child");
+        let closed_edge = child
+            .dependencies
+            .iter()
+            .find(|edge| edge.dependency_type == "blocks")
+            .expect("closed blocks edge retained");
+        let standalone = source.iter().find(|issue| issue.id == "standalone").expect("standalone");
+        let BeadsBoardState::Ready { snapshot, .. } = cache.lookup(&scratch).await.state else {
+            panic!("cached board must remain paintable");
+        };
+
+        assert_eq!(generation, 0);
+        assert_eq!(closed_edge.depends_on_id, "closed-gate");
+        assert_eq!(child.assignee.as_deref(), Some("agent-1"));
+        assert_eq!(child.updated_at, "not-an-iso-timestamp");
+        assert_eq!(standalone.assignee, None);
+        assert!(standalone.updated_at.is_empty(), "absent timestamp defaults empty");
+        assert_eq!(snapshot.ready[0].parent_epic_id.as_deref(), Some("epic"));
+        assert_eq!(snapshot.backlog[0].parent_epic_id, None);
+        assert_eq!(snapshot.done[0].id, "closed-gate");
+        assert_eq!(
+            [
+                snapshot.backlog_total,
+                snapshot.ready_total,
+                snapshot.in_progress_total,
+                snapshot.blocked_total,
+                snapshot.done_total,
+            ],
+            [1, 1, 0, 0, 1]
+        );
+        fs::remove_dir_all(scratch).expect("remove cache root");
     }
 
     #[test]
@@ -1931,17 +2085,17 @@ mod tests {
         assert!(!apply_refresh_if_current(
             &mut entry,
             1,
-            Ok(LoadResult::Snapshot(old)),
+            Ok(LoadResult::Snapshot(CachedBoard { snapshot: old, issues: vec![] })),
             Path::new("/tmp/fenced"),
         ));
         assert!(entry.last_good.is_none());
         assert!(apply_refresh_if_current(
             &mut entry,
             2,
-            Ok(LoadResult::Snapshot(current.clone())),
+            Ok(LoadResult::Snapshot(CachedBoard { snapshot: current.clone(), issues: vec![] })),
             Path::new("/tmp/fenced"),
         ));
-        assert_eq!(entry.last_good, Some(current));
+        assert_eq!(entry.last_good.as_ref().map(|board| &board.snapshot), Some(&current));
     }
 
     #[tokio::test]
@@ -1984,7 +2138,7 @@ mod tests {
             let entry = entries.get_mut(&first.key).expect("cache entry");
             entry.in_flight = false;
             entry.detected = Some(true);
-            entry.last_good = Some(snapshot.clone());
+            entry.last_good = Some(CachedBoard { snapshot: snapshot.clone(), issues: vec![] });
             entry.last_error = Some("bad JSON".into());
             entry.last_attempt = Some(Instant::now());
         }
