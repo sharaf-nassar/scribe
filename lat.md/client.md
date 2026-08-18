@@ -1610,7 +1610,7 @@ bypasses stays covered.
 
 ## Beads Flow Layout Engine
 
-The Flow strip's graph geometry is pure client logic: it accepts an already-admitted `BeadsEpicGraph`, returns typed layout data, and performs no GPUI rendering, I/O, or tracker access.
+The Flow strip's graph geometry is pure client logic: it accepts an already-admitted `BeadsEpicGraph`, returns typed layout data, and performs no I/O or tracker access.
 
 [[crates/scribe-client/src/beads_flow.rs#longest_path_ranks]] validates the bounded graph while assigning every issue its maximum blocker distance from a root. Unknown endpoints, duplicate ids, empty or over-bound graphs, and an in-memory cycle fail as [[crates/scribe-client/src/beads_flow.rs#FlowLayoutError]] instead of leaking malformed geometry or looping. `bd` itself refuses cycles, but this boundary remains defensive because the ranking algorithm requires acyclicity.
 
@@ -1619,6 +1619,8 @@ The Flow strip's graph geometry is pure client logic: it accepts an already-admi
 [[crates/scribe-client/src/beads_flow.rs#FlowMetrics]] derives rank pitch from node width plus gutter and row pitch from node height plus gap. The normative 214×24 node, 28px gutter, 10px row gap, and fixed 139px graph band yield row budgets of 5 at scale 0.8, 4 at 1.0, and 2 at 1.6. A real rank wider than the current budget returns `RankTooWide`; the strip never grows a vertical scroll axis.
 
 Wire routing follows the mock's orthogonal rails. Adjacent ranks use two half-gutter stubs around a vertical dogleg; skip edges use an 8px exit and entry around the nearest long-haul lane. [[crates/scribe-client/src/beads_flow.rs#union_wire_runs]] groups intervals by axis and offset, splits them at every endpoint, and applies `Traced` over `Base` over `Dimmed` on each atomic interval. Shared translucent rails therefore paint once, while a traced path can light only its half of a shared gutter.
+
+[[crates/scribe-client/src/beads_flow.rs#render]] lowers an admitted graph and its layout into the compact 197px strip: the 34px Flow band, rank ruler, 214×24 nodes, orthogonal one-pixel wire segments, horizontal position bar, and floor grip. It reads only named [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]] slots, so every Flow surface follows the live theme. `FlowRender` takes the cursor, horizontal offset, trace classes, and workspace-owned focus/action controls as explicit seams: mode entry and exit, scrolling, panel retargeting, trace selection, and liveness remain outside the renderer. A missing node control is a typed [[crates/scribe-client/src/beads_flow.rs#FlowRenderError]], preventing a painted node from silently losing its AccessKit button role, Tab stop, Enter/Space activation, or blockers/dependents description. The chevron and mode pair paint as inert text until their owning mode slice adds an action.
 
 ## GPUI Titlebar
 

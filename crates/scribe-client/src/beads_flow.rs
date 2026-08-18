@@ -4,25 +4,37 @@
 //! keeps its fixed 139px reservation while node and gap dimensions scale.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
-use scribe_common::protocol::{BeadsEpicGraph, BeadsGraphEdge};
+use gpui::{
+    AnyElement, App, FocusHandle, KeyDownEvent, MouseButton, Role, SharedString, Window, div,
+    prelude::*, px,
+};
+use scribe_common::protocol::{BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue};
+
+use crate::beads_board::BeadsBoardColors;
+use crate::layout::Rect;
 
 const MAX_FLOW_NODES: usize = 200;
 
-fn scalar(value: usize) -> f64 {
-    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
+fn scalar(value: usize) -> f32 {
+    u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
+}
+
+fn count_to_f32(value: u32) -> f32 {
+    u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
 }
 
 /// Geometry copied from the normative A3 Flow mock as formulas, not pitches.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowMetrics {
-    pub node_width: f64,
-    pub node_height: f64,
-    pub gutter: f64,
-    pub row_gap: f64,
-    pub graph_height: f64,
-    pub left_padding: f64,
+    pub node_width: f32,
+    pub node_height: f32,
+    pub gutter: f32,
+    pub row_gap: f32,
+    pub graph_height: f32,
+    pub left_padding: f32,
 }
 
 impl FlowMetrics {
@@ -38,17 +50,17 @@ impl FlowMetrics {
     }
 
     #[must_use]
-    pub fn rank_pitch(self, text_scale: f64) -> f64 {
+    pub fn rank_pitch(self, text_scale: f32) -> f32 {
         (self.node_width + self.gutter) * text_scale
     }
 
     #[must_use]
-    pub fn row_pitch(self, text_scale: f64) -> f64 {
+    pub fn row_pitch(self, text_scale: f32) -> f32 {
         (self.node_height + self.row_gap) * text_scale
     }
 
     #[must_use]
-    pub fn rows_that_fit(self, text_scale: f64) -> Option<usize> {
+    pub fn rows_that_fit(self, text_scale: f32) -> Option<usize> {
         if !text_scale.is_finite() || text_scale <= 0.0 {
             return None;
         }
@@ -83,7 +95,7 @@ pub enum FlowLayoutError {
     #[error("Flow graph contains a dependency cycle")]
     Cycle,
     #[error("invalid Flow text scale: {0}")]
-    InvalidTextScale(f64),
+    InvalidTextScale(f32),
     #[error("Flow rank {rank} has {nodes} nodes but only {capacity} fit")]
     RankTooWide { rank: usize, nodes: usize, capacity: usize },
 }
@@ -94,10 +106,10 @@ pub struct FlowNodeLayout {
     pub issue_index: usize,
     pub rank: usize,
     pub order: usize,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Virtual node inserted into each intermediate rank crossed by a skip edge.
@@ -127,18 +139,18 @@ pub enum WireClass {
 pub struct EdgeWireRun {
     pub edge_index: usize,
     pub axis: WireAxis,
-    pub offset: f64,
-    pub start: f64,
-    pub end: f64,
+    pub offset: f32,
+    pub start: f32,
+    pub end: f32,
 }
 
 /// One non-overlapping paint interval keyed by rail and colour class.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WireSegment {
     pub axis: WireAxis,
-    pub offset: f64,
-    pub start: f64,
-    pub end: f64,
+    pub offset: f32,
+    pub start: f32,
+    pub end: f32,
     pub class: WireClass,
 }
 
@@ -148,8 +160,8 @@ pub struct FlowLayout {
     pub dummy_nodes: Vec<FlowDummyNode>,
     pub wire_runs: Vec<EdgeWireRun>,
     pub rank_count: usize,
-    pub width: f64,
-    pub height: f64,
+    pub width: f32,
+    pub height: f32,
 }
 
 impl FlowLayout {
@@ -347,7 +359,7 @@ impl ExpandedGraph {
 
 fn compare_expanded(
     nodes: &[ExpandedNode],
-    positions: &HashMap<usize, f64>,
+    positions: &HashMap<usize, f32>,
     left: usize,
     right: usize,
 ) -> Ordering {
@@ -359,7 +371,7 @@ fn compare_expanded(
         .then_with(|| left_node.stable_order.cmp(&right_node.stable_order))
 }
 
-fn barycenter(node: &ExpandedNode, positions: &HashMap<usize, f64>) -> f64 {
+fn barycenter(node: &ExpandedNode, positions: &HashMap<usize, f32>) -> f32 {
     let (sum, count) = node
         .predecessors
         .iter()
@@ -369,7 +381,7 @@ fn barycenter(node: &ExpandedNode, positions: &HashMap<usize, f64>) -> f64 {
 }
 
 /// Rank, order, place and route an admitted epic graph.
-pub fn layout_flow(graph: &BeadsEpicGraph, text_scale: f64) -> Result<FlowLayout, FlowLayoutError> {
+pub fn layout_flow(graph: &BeadsEpicGraph, text_scale: f32) -> Result<FlowLayout, FlowLayoutError> {
     let metrics = FlowMetrics::standard();
     let capacity =
         metrics.rows_that_fit(text_scale).ok_or(FlowLayoutError::InvalidTextScale(text_scale))?;
@@ -396,20 +408,20 @@ pub fn layout_flow(graph: &BeadsEpicGraph, text_scale: f64) -> Result<FlowLayout
 struct PlacedNodes {
     nodes: Vec<FlowNodeLayout>,
     dummies: Vec<FlowDummyNode>,
-    positions: Vec<(f64, f64)>,
+    positions: Vec<(f32, f32)>,
 }
 
 #[derive(Clone, Copy)]
 struct Placement {
     metrics: FlowMetrics,
-    text_scale: f64,
+    text_scale: f32,
     capacity: usize,
 }
 
 fn place_nodes(
     expanded: &ExpandedGraph,
     metrics: FlowMetrics,
-    text_scale: f64,
+    text_scale: f32,
     capacity: usize,
 ) -> Result<PlacedNodes, FlowLayoutError> {
     let issue_count =
@@ -478,7 +490,7 @@ fn place_rank(
     Ok(())
 }
 
-fn centered_row_tops(count: usize, metrics: FlowMetrics, text_scale: f64) -> Vec<f64> {
+fn centered_row_tops(count: usize, metrics: FlowMetrics, text_scale: f32) -> Vec<f32> {
     if count == 0 {
         return Vec::new();
     }
@@ -492,7 +504,7 @@ fn centered_row_tops(count: usize, metrics: FlowMetrics, text_scale: f64) -> Vec
 #[derive(Clone, Copy)]
 struct WireRouter {
     metrics: FlowMetrics,
-    text_scale: f64,
+    text_scale: f32,
 }
 
 impl WireRouter {
@@ -500,7 +512,7 @@ impl WireRouter {
         self,
         edges: &[(usize, usize)],
         ranks: &[usize],
-        positions: &[(f64, f64)],
+        positions: &[(f32, f32)],
     ) -> Vec<EdgeWireRun> {
         let mut runs = Vec::new();
         let node_width = self.metrics.node_width * self.text_scale;
@@ -527,8 +539,8 @@ impl WireRouter {
     fn emit_adjacent(
         self,
         edge_index: usize,
-        start: (f64, f64),
-        end: (f64, f64),
+        start: (f32, f32),
+        end: (f32, f32),
         runs: &mut Vec<EdgeWireRun>,
     ) {
         if start.1.to_bits() == end.1.to_bits() {
@@ -544,11 +556,11 @@ impl WireRouter {
     fn emit_skip(
         self,
         edge_index: usize,
-        start: (f64, f64),
-        end: (f64, f64),
+        start: (f32, f32),
+        end: (f32, f32),
         runs: &mut Vec<EdgeWireRun>,
     ) {
-        let lane = self.nearest_lane(f64::midpoint(start.1, end.1));
+        let lane = self.nearest_lane(f32::midpoint(start.1, end.1));
         let stub = 8.0 * self.text_scale;
         let left = start.0 + stub;
         let right = end.0 - stub;
@@ -559,7 +571,7 @@ impl WireRouter {
         push_horizontal(runs, edge_index, end.1, right, end.0);
     }
 
-    fn nearest_lane(self, target: f64) -> f64 {
+    fn nearest_lane(self, target: f32) -> f32 {
         let rows = self.metrics.rows_that_fit(self.text_scale).unwrap_or(1).max(1);
         let tops = centered_row_tops(rows, self.metrics, self.text_scale);
         let node_height = self.metrics.node_height * self.text_scale;
@@ -579,9 +591,9 @@ impl WireRouter {
 fn push_horizontal(
     runs: &mut Vec<EdgeWireRun>,
     edge_index: usize,
-    offset: f64,
-    start: f64,
-    end: f64,
+    offset: f32,
+    start: f32,
+    end: f32,
 ) {
     push_run(runs, EdgeWireRun { edge_index, axis: WireAxis::Horizontal, offset, start, end });
 }
@@ -589,9 +601,9 @@ fn push_horizontal(
 fn push_vertical(
     runs: &mut Vec<EdgeWireRun>,
     edge_index: usize,
-    offset: f64,
-    start: f64,
-    end: f64,
+    offset: f32,
+    start: f32,
+    end: f32,
 ) {
     push_run(runs, EdgeWireRun { edge_index, axis: WireAxis::Vertical, offset, start, end });
 }
@@ -600,7 +612,7 @@ fn push_run(runs: &mut Vec<EdgeWireRun>, mut run: EdgeWireRun) {
     if run.start > run.end {
         std::mem::swap(&mut run.start, &mut run.end);
     }
-    if run.end - run.start > f64::EPSILON {
+    if run.end - run.start > f32::EPSILON {
         runs.push(run);
     }
 }
@@ -655,7 +667,7 @@ fn union_track(
         return;
     };
     let mut boundaries = runs.iter().flat_map(|run| [run.start, run.end]).collect::<Vec<_>>();
-    boundaries.sort_by(f64::total_cmp);
+    boundaries.sort_by(f32::total_cmp);
     boundaries.dedup_by(|left, right| left.to_bits() == right.to_bits());
     for window in boundaries.windows(2) {
         let [start, end] = window else {
@@ -692,6 +704,694 @@ fn append_segment(output: &mut Vec<WireSegment>, segment: WireSegment) {
     } else {
         output.push(segment);
     }
+}
+
+/// One Flow-node activation owned by the mode and panel work items.
+///
+/// Rendering only delivers the issue id. It deliberately knows neither the
+/// panel nor the board mode, so retargeting remains the later interaction
+/// slice's responsibility.
+pub type FlowNodeActionHandler = Arc<dyn Fn(String, &mut Window, &mut App)>;
+
+/// Focus and activation supplied by the workspace-owned Flow state.
+#[derive(Clone)]
+pub struct FlowNodeControl {
+    pub focus: FocusHandle,
+    pub on_activate: FlowNodeActionHandler,
+}
+
+/// Inputs the workspace-owned mode state supplies to the pure Flow renderer.
+pub struct FlowRender<'a> {
+    pub rect: Rect,
+    pub graph: &'a BeadsEpicGraph,
+    pub layout: &'a FlowLayout,
+    pub cursor_issue_id: &'a str,
+    /// Current horizontal offset, owned and changed by the later mode slice.
+    pub scroll_x: f32,
+    pub text_scale: f32,
+    pub colors: BeadsBoardColors,
+    /// Must carry a focus and generic activation seam for every graph node.
+    pub node_controls: &'a HashMap<String, FlowNodeControl>,
+    /// Empty means the at-rest Base treatment. The hover-trace slice supplies
+    /// per-edge classes without rewriting graph geometry.
+    pub wire_classes: &'a [WireClass],
+}
+
+/// A boundary failure between an admitted graph, its layout, and GPUI chrome.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FlowRenderError {
+    #[error("Flow layout node {issue_index} is outside the graph")]
+    LayoutNodeOutsideGraph { issue_index: usize },
+    #[error("Flow layout contains issue {issue_index} more than once")]
+    DuplicateLayoutIssue { issue_index: usize },
+    #[error("Flow layout has {actual} nodes but graph has {expected}")]
+    IncompleteLayout { expected: usize, actual: usize },
+    #[error("Flow cursor issue is not in graph: {issue_id}")]
+    CursorNotInGraph { issue_id: String },
+    #[error("Flow node is missing its focus and activation seam: {issue_id}")]
+    MissingNodeControl { issue_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowNodeState {
+    Done,
+    Ready,
+    Blocked,
+    InProgress,
+    Backlog,
+}
+
+impl FlowNodeState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+            Self::InProgress => "in progress",
+            Self::Backlog => "backlog",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FlowNodePresentation {
+    id: String,
+    title: String,
+    priority: u8,
+    state: FlowNodeState,
+    description: String,
+    rank: usize,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    cursor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FlowRankLabel {
+    rank: usize,
+    x: f32,
+    text: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FlowPresentation {
+    nodes: Vec<FlowNodePresentation>,
+    wires: Vec<WireSegment>,
+    rank_labels: Vec<FlowRankLabel>,
+    width: f32,
+}
+
+const FLOW_BAND_HEIGHT: f32 = 34.0;
+const FLOW_RULER_HEIGHT: f32 = 15.0;
+const FLOW_GRAPH_HEIGHT: f32 = 139.0;
+const FLOW_GRAPH_TOP: f32 = FLOW_BAND_HEIGHT + FLOW_RULER_HEIGHT;
+const FLOW_HBAR_TOP: f32 = FLOW_GRAPH_TOP + FLOW_GRAPH_HEIGHT;
+const FLOW_HBAR_HEIGHT: f32 = 2.0;
+const FLOW_FLOOR_HEIGHT: f32 = 3.0;
+const FLOW_PROGRESS_WIDTH: f32 = 150.0;
+
+/// Lower an admitted graph and its layout into the Flow strip.
+///
+/// Mode transitions, wheel routing, node retargeting, trace state, and live
+/// sessions stay outside this function. Their state arrives through the
+/// explicit input seams instead of being recreated by the renderer.
+pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
+    let presentation =
+        present_flow(render.graph, render.layout, render.cursor_issue_id, render.wire_classes)?;
+    require_node_controls(&presentation, render.node_controls)?;
+    let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.rect.width);
+    let board_id = SharedString::from(format!("beads-flow-{}", render.graph.epic_id));
+    let contents = div()
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        .bg(render.colors.ground)
+        .child(flow_band(render.graph, render.cursor_issue_id, &render.colors, render.text_scale))
+        .child(rank_ruler(&presentation, scroll_x, &render.colors, render.text_scale))
+        .child(flow_graph(
+            &presentation,
+            render.node_controls,
+            scroll_x,
+            &render.colors,
+            render.text_scale,
+        ))
+        .child(scrollbar(&presentation, scroll_x, render.rect.width, &render.colors))
+        .child(floor(&render.colors));
+    Ok(div()
+        .id(board_id)
+        .absolute()
+        .left(px(render.rect.x))
+        .top(px(render.rect.y))
+        .w(px(render.rect.width))
+        .h(px(render.rect.height))
+        .child(contents)
+        .into_any_element())
+}
+
+fn present_flow(
+    graph: &BeadsEpicGraph,
+    layout: &FlowLayout,
+    cursor_issue_id: &str,
+    wire_classes: &[WireClass],
+) -> Result<FlowPresentation, FlowRenderError> {
+    let nodes = presentation_nodes(graph, layout, cursor_issue_id)?;
+    let rank_labels = rank_labels(&nodes);
+    let wires =
+        layout.wire_segments(|edge| wire_classes.get(edge).copied().unwrap_or(WireClass::Base));
+    Ok(FlowPresentation { nodes, wires, rank_labels, width: layout.width })
+}
+
+fn presentation_nodes(
+    graph: &BeadsEpicGraph,
+    layout: &FlowLayout,
+    cursor_issue_id: &str,
+) -> Result<Vec<FlowNodePresentation>, FlowRenderError> {
+    let mut seen = HashSet::with_capacity(layout.nodes.len());
+    let mut nodes = Vec::with_capacity(layout.nodes.len());
+    for positioned in &layout.nodes {
+        let Some(node) = graph.nodes.get(positioned.issue_index) else {
+            return Err(FlowRenderError::LayoutNodeOutsideGraph {
+                issue_index: positioned.issue_index,
+            });
+        };
+        if !seen.insert(positioned.issue_index) {
+            return Err(FlowRenderError::DuplicateLayoutIssue {
+                issue_index: positioned.issue_index,
+            });
+        }
+        nodes.push(node_presentation(node, positioned, graph, cursor_issue_id));
+    }
+    if nodes.len() != graph.nodes.len() {
+        return Err(FlowRenderError::IncompleteLayout {
+            expected: graph.nodes.len(),
+            actual: nodes.len(),
+        });
+    }
+    if !nodes.iter().any(|node| node.cursor) {
+        return Err(FlowRenderError::CursorNotInGraph { issue_id: cursor_issue_id.into() });
+    }
+    Ok(nodes)
+}
+
+fn node_presentation(
+    node: &BeadsGraphNode,
+    positioned: &FlowNodeLayout,
+    graph: &BeadsEpicGraph,
+    cursor_issue_id: &str,
+) -> FlowNodePresentation {
+    let state = node_state(node.queue);
+    FlowNodePresentation {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        priority: node.priority,
+        state,
+        description: relationship_description(graph, &node.id),
+        rank: positioned.rank,
+        x: positioned.x,
+        y: positioned.y,
+        width: positioned.width,
+        height: positioned.height,
+        cursor: node.id == cursor_issue_id,
+    }
+}
+
+const fn node_state(queue: BeadsIssueQueue) -> FlowNodeState {
+    match queue {
+        BeadsIssueQueue::Done => FlowNodeState::Done,
+        BeadsIssueQueue::Ready => FlowNodeState::Ready,
+        BeadsIssueQueue::Blocked => FlowNodeState::Blocked,
+        BeadsIssueQueue::InProgress => FlowNodeState::InProgress,
+        BeadsIssueQueue::Backlog => FlowNodeState::Backlog,
+    }
+}
+
+fn relationship_description(graph: &BeadsEpicGraph, issue_id: &str) -> String {
+    let blockers = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.to == issue_id)
+        .map(|edge| short_issue_id(&edge.from))
+        .collect::<Vec<_>>();
+    let dependents = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.from == issue_id)
+        .map(|edge| short_issue_id(&edge.to))
+        .collect::<Vec<_>>();
+    format!(
+        "Blockers: {}. Dependents: {}.",
+        relationship_list(&blockers),
+        relationship_list(&dependents),
+    )
+}
+
+fn relationship_list(ids: &[String]) -> String {
+    if ids.is_empty() { "none".into() } else { ids.join(", ") }
+}
+
+fn short_issue_id(id: &str) -> String {
+    id.strip_prefix("scribe-").unwrap_or(id).into()
+}
+
+fn rank_labels(nodes: &[FlowNodePresentation]) -> Vec<FlowRankLabel> {
+    let Some(cursor) = nodes.iter().find(|node| node.cursor) else { return Vec::new() };
+    let mut labels = Vec::new();
+    if rank_is_done(nodes, 0) {
+        push_rank_label(&mut labels, nodes, 0, "SHIPPED");
+    }
+    push_rank_label(&mut labels, nodes, cursor.rank, "NOW");
+    push_rank_label(&mut labels, nodes, cursor.rank + 1, "NEXT");
+    let last_rank = nodes.iter().map(|node| node.rank).max().unwrap_or_default();
+    if last_rank > cursor.rank + 1 {
+        push_rank_label(&mut labels, nodes, last_rank, "LATER");
+    }
+    labels
+}
+
+fn rank_is_done(nodes: &[FlowNodePresentation], rank: usize) -> bool {
+    let rank_nodes = nodes.iter().filter(|node| node.rank == rank).collect::<Vec<_>>();
+    !rank_nodes.is_empty() && rank_nodes.iter().all(|node| node.state == FlowNodeState::Done)
+}
+
+fn push_rank_label(
+    labels: &mut Vec<FlowRankLabel>,
+    nodes: &[FlowNodePresentation],
+    rank: usize,
+    text: &'static str,
+) {
+    if labels.iter().any(|label| label.rank == rank) {
+        return;
+    }
+    if let Some(node) = nodes.iter().find(|node| node.rank == rank) {
+        labels.push(FlowRankLabel { rank, x: node.x, text });
+    }
+}
+
+fn require_node_controls(
+    presentation: &FlowPresentation,
+    controls: &HashMap<String, FlowNodeControl>,
+) -> Result<(), FlowRenderError> {
+    for node in &presentation.nodes {
+        if !controls.contains_key(&node.id) {
+            return Err(FlowRenderError::MissingNodeControl { issue_id: node.id.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn clamped_scroll(requested: f32, graph_width: f32, viewport_width: f32) -> f32 {
+    let max = (graph_width - viewport_width).max(0.0);
+    requested.clamp(0.0, max)
+}
+
+fn flow_band(
+    graph: &BeadsEpicGraph,
+    cursor_issue_id: &str,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    let progress = progress_width(graph);
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top_0()
+        .h(px(FLOW_BAND_HEIGHT))
+        .px(px(14.0))
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .bg(colors.band)
+        .border_b_1()
+        .border_color(colors.hairline)
+        .child(back_label(colors, text_scale))
+        .child(epic_label(&graph.epic_title, colors, text_scale))
+        .child(div().text_size(px(10.0 * text_scale)).text_color(colors.chevron).child("⌄"))
+        .child(tally(graph, colors, text_scale))
+        .child(progress_bar(progress, colors))
+        .child(opened_tag(cursor_issue_id, colors, text_scale))
+        .child(mode_pair(colors, text_scale))
+        .into_any_element()
+}
+
+fn back_label(colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .pr(px(8.0))
+        .font_weight(gpui::FontWeight(600.0))
+        .text_size(px(9.0 * text_scale))
+        .text_color(colors.muted)
+        .child("← LANES")
+        .into_any_element()
+}
+
+fn epic_label(epic: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .min_w(px(0.0))
+        .truncate()
+        .font_weight(gpui::FontWeight(700.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(colors.title)
+        .child(epic.to_uppercase())
+        .into_any_element()
+}
+
+fn tally(graph: &BeadsEpicGraph, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_baseline()
+        .font_family("monospace")
+        .text_color(colors.title)
+        .child(
+            div()
+                .font_weight(gpui::FontWeight(600.0))
+                .text_size(px(17.0 * text_scale))
+                .child(graph.closed.to_string()),
+        )
+        .child(
+            div()
+                .font_weight(gpui::FontWeight(500.0))
+                .text_size(px(9.5 * text_scale))
+                .text_color(colors.muted)
+                .child(format!("/{}", graph.total)),
+        )
+        .into_any_element()
+}
+
+fn progress_width(graph: &BeadsEpicGraph) -> f32 {
+    let ratio =
+        if graph.total == 0 { 0.0 } else { count_to_f32(graph.closed) / count_to_f32(graph.total) };
+    FLOW_PROGRESS_WIDTH * ratio.clamp(0.0, 1.0)
+}
+
+fn progress_bar(done_width: f32, colors: &BeadsBoardColors) -> AnyElement {
+    div()
+        .relative()
+        .flex_none()
+        .w(px(FLOW_PROGRESS_WIDTH))
+        .h(px(2.0))
+        .bg(colors.progress_track)
+        .child(div().absolute().left_0().top_0().w(px(done_width)).h(px(2.0)).bg(colors.done_state))
+        .into_any_element()
+}
+
+fn opened_tag(cursor_issue_id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .font_family("monospace")
+        .font_weight(gpui::FontWeight(500.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(colors.muted)
+        .child(format!("opened {}", short_issue_id(cursor_issue_id)))
+        .into_any_element()
+}
+
+fn mode_pair(colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .ml_auto()
+        .flex()
+        .gap(px(1.0))
+        .child(mode_label("LANES", false, colors, text_scale))
+        .child(mode_label("FLOW", true, colors, text_scale))
+        .into_any_element()
+}
+
+fn mode_label(label: &str, active: bool, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    let element = div()
+        .px(px(8.0))
+        .py(px(5.0))
+        .font_weight(gpui::FontWeight(600.0))
+        .text_size(px(9.0 * text_scale))
+        .text_color(if active { colors.title } else { colors.muted })
+        .child(label.to_owned());
+    if active {
+        element.bg(colors.button_hover).into_any_element()
+    } else {
+        element.into_any_element()
+    }
+}
+
+fn rank_ruler(
+    presentation: &FlowPresentation,
+    scroll_x: f32,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(FLOW_BAND_HEIGHT))
+        .h(px(FLOW_RULER_HEIGHT))
+        .overflow_hidden()
+        .children(presentation.rank_labels.iter().map(|label| {
+            div()
+                .absolute()
+                .left(px(label.x - scroll_x))
+                .top_0()
+                .font_family("monospace")
+                .font_weight(gpui::FontWeight(500.0))
+                .text_size(px(9.5 * text_scale))
+                .text_color(colors.rank_label)
+                .child(label.text)
+        }))
+        .into_any_element()
+}
+
+fn flow_graph(
+    presentation: &FlowPresentation,
+    controls: &HashMap<String, FlowNodeControl>,
+    scroll_x: f32,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    let canvas = div()
+        .absolute()
+        .left(px(-scroll_x))
+        .top_0()
+        .w(px(presentation.width))
+        .h(px(FLOW_GRAPH_HEIGHT))
+        .child(wires(&presentation.wires, colors))
+        .children(presentation.nodes.iter().filter_map(|node| {
+            controls.get(&node.id).map(|control| flow_node(node, control, colors, text_scale))
+        }));
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(FLOW_GRAPH_TOP))
+        .h(px(FLOW_GRAPH_HEIGHT))
+        .overflow_hidden()
+        .child(canvas)
+        .into_any_element()
+}
+
+fn wires(segments: &[WireSegment], colors: &BeadsBoardColors) -> AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .children(segments.iter().map(|segment| wire(segment, colors)))
+        .into_any_element()
+}
+
+fn wire(segment: &WireSegment, colors: &BeadsBoardColors) -> AnyElement {
+    let color = match segment.class {
+        WireClass::Base => colors.wire,
+        WireClass::Traced => colors.wire_traced,
+        WireClass::Dimmed => colors.wire_dimmed,
+    };
+    let (left, top, width, height) = match segment.axis {
+        WireAxis::Horizontal => (segment.start, segment.offset, segment.end - segment.start, 1.0),
+        WireAxis::Vertical => (segment.offset, segment.start, 1.0, segment.end - segment.start),
+    };
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(height))
+        .bg(color)
+        .into_any_element()
+}
+
+fn flow_node(
+    node: &FlowNodePresentation,
+    control: &FlowNodeControl,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    let click_id = node.id.clone();
+    let key_id = node.id.clone();
+    let click_focus = control.focus.clone();
+    let click_activate = Arc::clone(&control.on_activate);
+    let key_activate = Arc::clone(&control.on_activate);
+    let hover = colors.button_hover;
+    let mut element = div()
+        .id(SharedString::from(format!("beads-flow-node-{}", node.id)))
+        .role(Role::Button)
+        .aria_label(format!("{} {}, {}", node.id, node.title, node.state.label()))
+        .aria_description(node.description.clone())
+        .track_focus(&control.focus)
+        .tab_stop(true)
+        .absolute()
+        .left(px(node.x))
+        .top(px(node.y))
+        .w(px(node.width))
+        .h(px(node.height))
+        .px(px(6.0 * text_scale))
+        .flex()
+        .items_center()
+        .gap(px(6.0 * text_scale))
+        .cursor_pointer()
+        .hover(move |element| element.bg(hover))
+        .on_mouse_down(MouseButton::Left, |_, _, app| app.stop_propagation())
+        .on_click(move |_, window, app| {
+            window.focus(&click_focus, app);
+            click_activate(click_id.clone(), window, app);
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, app| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                app.stop_propagation();
+                key_activate(key_id.clone(), window, app);
+            }
+        });
+    if node.cursor {
+        element = element.bg(colors.cursor_fill).child(
+            div().absolute().left_0().top_0().bottom_0().w(px(2.0)).bg(colors.cursor_keyline),
+        );
+    }
+    element.child(flow_node_contents(node, colors, text_scale)).into_any_element()
+}
+
+fn flow_node_contents(
+    node: &FlowNodePresentation,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .gap(px(6.0 * text_scale))
+        .child(node_dot(node.state, colors, text_scale))
+        .child(priority_text(node.priority, colors, text_scale))
+        .child(node_title(node, colors, text_scale))
+        .child(node_id(&node.id, colors, text_scale))
+        .into_any_element()
+}
+
+fn node_dot(state: FlowNodeState, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    let size = px(8.0 * text_scale);
+    let dot = div().flex_none().size(size).rounded_full();
+    match state {
+        FlowNodeState::Done => dot.bg(colors.done_state).into_any_element(),
+        FlowNodeState::Ready => dot.border_1().border_color(colors.ready_state).into_any_element(),
+        FlowNodeState::Blocked => {
+            dot.border_1().border_color(colors.blocked_state).into_any_element()
+        }
+        FlowNodeState::InProgress => dot.bg(colors.progress_state).into_any_element(),
+        FlowNodeState::Backlog => dot.bg(colors.muted).into_any_element(),
+    }
+}
+
+fn priority_text(priority: u8, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    let color =
+        colors.priorities.get(usize::from(priority.min(4))).copied().unwrap_or(colors.muted);
+    div()
+        .flex_none()
+        .font_family("monospace")
+        .font_weight(gpui::FontWeight(700.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(color)
+        .child(format!("P{priority}"))
+        .into_any_element()
+}
+
+fn node_title(
+    node: &FlowNodePresentation,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    let color = match node.state {
+        FlowNodeState::Done => colors.muted,
+        FlowNodeState::Blocked => colors.queue_name,
+        FlowNodeState::Ready | FlowNodeState::InProgress | FlowNodeState::Backlog => colors.title,
+    };
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .truncate()
+        .font_weight(gpui::FontWeight(if node.state == FlowNodeState::Done {
+            550.0
+        } else {
+            600.0
+        }))
+        .text_size(px(12.0 * text_scale))
+        .text_color(color)
+        .child(node.title.clone())
+        .into_any_element()
+}
+
+fn node_id(id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .flex_none()
+        .font_family("monospace")
+        .font_weight(gpui::FontWeight(500.0))
+        .text_size(px(9.5 * text_scale))
+        .text_color(colors.muted)
+        .child(short_issue_id(id))
+        .into_any_element()
+}
+
+fn scrollbar(
+    presentation: &FlowPresentation,
+    scroll_x: f32,
+    viewport_width: f32,
+    colors: &BeadsBoardColors,
+) -> AnyElement {
+    let graph_width = presentation.width;
+    if graph_width <= viewport_width {
+        return div().into_any_element();
+    }
+    let thumb_width = (viewport_width * viewport_width / graph_width).max(34.0);
+    let max_scroll = (graph_width - viewport_width).max(1.0);
+    let thumb_x = scroll_x / max_scroll * (viewport_width - thumb_width);
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(FLOW_HBAR_TOP))
+        .h(px(FLOW_HBAR_HEIGHT))
+        .bg(colors.progress_track)
+        .child(
+            div()
+                .absolute()
+                .left(px(thumb_x))
+                .top_0()
+                .w(px(thumb_width))
+                .h(px(2.0))
+                .bg(colors.hairline),
+        )
+        .into_any_element()
+}
+
+fn floor(colors: &BeadsBoardColors) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(FLOW_FLOOR_HEIGHT))
+        .flex()
+        .justify_center()
+        .bg(colors.progress_track)
+        .child(div().mt(px(1.0)).w(px(34.0)).h(px(1.0)).bg(colors.hairline))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -830,8 +1530,8 @@ mod tests {
     #[test]
     fn row_budget_matches_the_mock_at_scale_extremes() {
         let metrics = FlowMetrics::standard();
-        assert_eq!(metrics.rank_pitch(1.0).to_bits(), 242.0f64.to_bits());
-        assert_eq!(metrics.row_pitch(1.0).to_bits(), 34.0f64.to_bits());
+        assert_eq!(metrics.rank_pitch(1.0).to_bits(), 242.0f32.to_bits());
+        assert_eq!(metrics.row_pitch(1.0).to_bits(), 34.0f32.to_bits());
         assert_eq!(metrics.rows_that_fit(0.8), Some(5));
         assert_eq!(metrics.rows_that_fit(1.0), Some(4));
         assert_eq!(metrics.rows_that_fit(1.6), Some(2));
@@ -840,6 +1540,58 @@ mod tests {
             layout_flow(&graph(&["a", "b", "c"], &[]), 1.6),
             Err(FlowLayoutError::RankTooWide { rank: 0, nodes: 3, capacity: 2 })
         ));
+    }
+
+    #[test]
+    fn presentation_marks_exactly_one_cursor_and_describes_relationships() {
+        let mut graph = graph(
+            &["scribe-root", "scribe-ready", "scribe-blocked", "scribe-done", "scribe-next"],
+            &[
+                ("scribe-root", "scribe-ready"),
+                ("scribe-ready", "scribe-blocked"),
+                ("scribe-done", "scribe-blocked"),
+                ("scribe-blocked", "scribe-next"),
+            ],
+        );
+        graph.closed = 1;
+        graph.nodes[0].queue = BeadsIssueQueue::InProgress;
+        graph.nodes[2].queue = BeadsIssueQueue::Blocked;
+        graph.nodes[3].queue = BeadsIssueQueue::Done;
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        let presentation = present_flow(&graph, &layout, "scribe-blocked", &[]).unwrap();
+
+        assert_eq!(presentation.nodes.iter().filter(|node| node.cursor).count(), 1);
+        let blocked = presentation.nodes.iter().find(|node| node.cursor).unwrap();
+        assert_eq!(blocked.state, FlowNodeState::Blocked);
+        assert_eq!(blocked.description, "Blockers: ready, done. Dependents: next.");
+        assert_eq!(
+            presentation.nodes.iter().find(|node| node.id == "scribe-ready").unwrap().state,
+            FlowNodeState::Ready
+        );
+        assert_eq!(
+            presentation.nodes.iter().find(|node| node.id == "scribe-done").unwrap().state,
+            FlowNodeState::Done
+        );
+        assert!(presentation.wires.iter().all(|wire| wire.class == WireClass::Base));
+        assert!(presentation.rank_labels.iter().any(|label| label.text == "NOW"));
+        assert!(presentation.rank_labels.iter().any(|label| label.text == "NEXT"));
+    }
+
+    #[test]
+    fn presentation_rejects_a_cursor_missing_from_the_graph() {
+        let graph = graph(&["a", "b"], &[("a", "b")]);
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        assert_eq!(
+            present_flow(&graph, &layout, "not-here", &[]),
+            Err(FlowRenderError::CursorNotInGraph { issue_id: "not-here".into() })
+        );
+    }
+
+    #[test]
+    fn renderer_clamps_only_its_supplied_horizontal_offset() {
+        assert_eq!(clamped_scroll(-4.0, 500.0, 200.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(clamped_scroll(999.0, 500.0, 200.0).to_bits(), 300.0f32.to_bits());
+        assert_eq!(clamped_scroll(42.0, 200.0, 500.0).to_bits(), 0.0f32.to_bits());
     }
 
     #[test]
