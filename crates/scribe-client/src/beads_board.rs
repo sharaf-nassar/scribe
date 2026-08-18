@@ -3400,14 +3400,28 @@ mod flow_mode_tests {
         assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
         let opened = boards.flow(workspace).expect("flow open").graph.clone();
 
+        let laid_out = boards.flow(workspace).expect("flow open").layout.clone();
+        assert_eq!(boards.take_flow_request(), Some((workspace, EPIC.to_owned())));
+        assert_eq!(boards.take_flow_request(), None, "the opening request is spent");
+
         assert!(boards.move_flow_cursor(workspace, "c"));
         let flow = boards.flow(workspace).expect("flow open");
         assert_eq!(flow.cursor_issue_id, "c");
         assert_eq!(flow.epic_id, EPIC, "the epic never swaps under a node click");
         assert_eq!(flow.graph, opened, "the graph is frozen at open");
+        assert_eq!(flow.layout, laid_out, "every rank and wire survives the click");
+        assert_eq!(
+            boards.take_flow_request(),
+            None,
+            "moving the cursor must not ask for a second graph"
+        );
 
         assert!(!boards.move_flow_cursor(workspace, "c"), "re-clicking the cursor is a no-op");
         assert!(!boards.move_flow_cursor(workspace, "absent"));
+        assert_eq!(boards.take_flow_request(), None, "a refused activation sends nothing");
+        let settled = boards.flow(workspace).expect("flow open");
+        assert_eq!(settled.cursor_issue_id, "c", "a refused activation leaves the cursor put");
+        assert_eq!(settled.layout, laid_out);
     }
 
     #[test]

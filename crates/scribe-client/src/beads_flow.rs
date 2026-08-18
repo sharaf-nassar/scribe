@@ -1578,6 +1578,55 @@ mod tests {
     }
 
     #[test]
+    fn retargeting_the_cursor_repaints_nothing_but_the_cursor() {
+        let graph = graph(
+            &["scribe-root", "scribe-mid", "scribe-leaf"],
+            &[("scribe-root", "scribe-mid"), ("scribe-mid", "scribe-leaf")],
+        );
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        let opened = present_flow(&graph, &layout, "scribe-root", &[]).unwrap();
+        let retargeted = present_flow(&graph, &layout, "scribe-leaf", &[]).unwrap();
+
+        assert_eq!(retargeted.nodes.iter().filter(|node| node.cursor).count(), 1);
+        assert_eq!(
+            retargeted.nodes.iter().find(|node| node.cursor).unwrap().id,
+            "scribe-leaf",
+            "the cursor lands on the activated node"
+        );
+        assert_eq!(retargeted.wires, opened.wires, "every wire survives a retarget");
+        assert_eq!(retargeted.width.to_bits(), opened.width.to_bits());
+        let geometry = |presentation: &FlowPresentation| {
+            presentation
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.rank, node.x.to_bits(), node.y.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(geometry(&retargeted), geometry(&opened), "no node moves under a retarget");
+        let moved: Vec<_> = opened
+            .nodes
+            .iter()
+            .zip(&retargeted.nodes)
+            .filter(|(before, after)| before.cursor != after.cursor)
+            .map(|(before, _)| before.id.as_str())
+            .collect();
+        assert_eq!(moved, ["scribe-root", "scribe-leaf"], "only the two ends of the move change");
+
+        // The ruler is deliberately cursor-relative: NOW names the rank the
+        // reader is on, so it travels with the cursor while the graph under
+        // it stays put.
+        let now_rank = |presentation: &FlowPresentation| {
+            presentation
+                .rank_labels
+                .iter()
+                .find(|label| label.text == "NOW")
+                .map(|label| label.rank)
+        };
+        assert_eq!(now_rank(&opened), Some(0));
+        assert_eq!(now_rank(&retargeted), Some(2));
+    }
+
+    #[test]
     fn presentation_rejects_a_cursor_missing_from_the_graph() {
         let graph = graph(&["a", "b"], &[("a", "b")]);
         let layout = layout_flow(&graph, 1.0).unwrap();

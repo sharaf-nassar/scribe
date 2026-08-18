@@ -1062,7 +1062,14 @@ impl BeadsPanels {
         issue_id: &str,
         detail: Option<Box<BeadsIssueDetail>>,
     ) {
-        if self.pending_navigation.get(&workspace_id).is_some_and(|target| target == issue_id) {
+        // A pending navigation makes the target the only interesting reply.
+        // The issue the panel is still displaying has its own request in
+        // flight, and applying that late answer would repaint the pane the
+        // reader just navigated away from.
+        if let Some(target) = self.pending_navigation.get(&workspace_id) {
+            if target != issue_id {
+                return;
+            }
             self.pending_navigation.remove(&workspace_id);
             let Some(detail) = detail else {
                 self.close_missing(workspace_id, issue_id);
@@ -1598,6 +1605,20 @@ impl BeadsPanels {
             return false;
         };
         if !detail.dependents.iter().any(|dependent| dependent.id == issue_id) {
+            return false;
+        }
+        self.navigate_to_issue(workspace_id, issue_id)
+    }
+
+    /// Retarget an open panel at `issue_id`, whatever selected it.
+    ///
+    /// A Flow node click reaches an issue the open detail never listed, so
+    /// eligibility belongs to the caller: the board has already proved the
+    /// node is in its frozen graph. What is shared is the fence — the target
+    /// is recorded before the request leaves, so `update` can discard the
+    /// answer to the issue the reader navigated away from.
+    pub fn navigate_to_issue(&mut self, workspace_id: WorkspaceId, issue_id: &str) -> bool {
+        if !self.detail_enabled || !self.open.contains_key(&workspace_id) {
             return false;
         }
         self.pending_navigation.insert(workspace_id, issue_id.to_owned());
@@ -3583,6 +3604,67 @@ mod tests {
         assert_eq!(panel.card.title, "Dependent work");
         assert_eq!(panel.lane, 3);
         assert_eq!(panel.detail.as_deref().map(|detail| detail.id.as_str()), Some("next-1"));
+    }
+
+    #[test]
+    fn a_pending_navigation_discards_the_reply_for_the_issue_it_left() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+
+        // Retarget before the first request has been answered, so both are
+        // in flight and the slow one belongs to the issue just left.
+        assert!(panels.navigate_to_issue(workspace, "flow-node-2"));
+        assert_eq!(panels.take_request(), Some((workspace, "flow-node-2".into())));
+
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(full_detail())));
+        assert!(
+            panels.visible(workspace).is_some_and(|panel| panel.detail.is_none()),
+            "the answer to the issue the reader navigated away from must not paint"
+        );
+
+        let mut arrived = detail();
+        arrived.id = "flow-node-2".into();
+        arrived.title = "Second node".into();
+        panels.update(workspace, "flow-node-2", Some(Box::new(arrived)));
+        let panel = panels.visible(workspace).expect("the target's own reply lands");
+        assert_eq!(panel.card.id, "flow-node-2");
+        assert_eq!(panel.detail.as_deref().map(|detail| detail.id.as_str()), Some("flow-node-2"));
+    }
+
+    #[test]
+    fn retargeting_reaches_an_issue_the_open_detail_never_listed() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.open(workspace, item(), 1);
+        panels.update(workspace, "scribe-5wh1.4", Some(Box::new(full_detail())));
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+
+        // A Flow graph node is not necessarily a dependent of the open issue;
+        // the board's frozen graph is what proved it reachable.
+        assert!(!panels.navigate_to_dependent(workspace, "unrelated-node"));
+        assert_eq!(panels.take_request(), None, "a rejected dependent sends nothing");
+
+        assert!(panels.navigate_to_issue(workspace, "unrelated-node"));
+        assert_eq!(panels.take_request(), Some((workspace, "unrelated-node".into())));
+    }
+
+    #[test]
+    fn retargeting_needs_an_open_panel_and_the_detail_capability() {
+        let workspace = WorkspaceId::new();
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        assert!(!panels.navigate_to_issue(workspace, "flow-node-2"), "no panel to retarget");
+        assert_eq!(panels.take_request(), None);
+
+        panels.open(workspace, item(), 1);
+        assert_eq!(panels.take_request(), Some((workspace, "scribe-5wh1.4".into())));
+        panels.set_enabled(false);
+        assert!(!panels.navigate_to_issue(workspace, "flow-node-2"));
+        assert_eq!(panels.take_request(), None);
     }
 
     #[test]

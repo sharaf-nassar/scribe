@@ -9708,12 +9708,17 @@ impl TerminalView {
         self.flow_node_controls.retain(|workspace_id, _| live.contains(workspace_id));
         for (workspace_id, ids) in open {
             let boards = Arc::clone(&self.shared.beads_boards);
+            let panels = Arc::clone(&self.shared.beads_panels);
             let controls = self.flow_node_controls.entry(workspace_id).or_default();
             controls.retain(|issue_id, _| ids.contains(issue_id));
             let missing = ids.into_iter().filter(|issue_id| !controls.contains_key(issue_id));
             for issue_id in missing.collect::<Vec<_>>() {
-                let control =
-                    flow_node_control(cx.focus_handle(), workspace_id, Arc::clone(&boards));
+                let control = flow_node_control(
+                    cx.focus_handle(),
+                    workspace_id,
+                    Arc::clone(&boards),
+                    Arc::clone(&panels),
+                );
                 controls.insert(issue_id, control);
             }
         }
@@ -10962,21 +10967,32 @@ fn run_terminal_app(
 
 /// One Flow node's focus handle and its activation seam.
 ///
-/// Activation moves the frozen graph's cursor and nothing else: the epic and
-/// the layout are untouched, so the strip stays on the graph it opened with.
+/// Activation moves the frozen graph's cursor and retargets the open detail
+/// panel at the same issue. The epic and the layout are untouched, so the
+/// strip stays on the graph it opened with and only the panel follows.
+///
+/// The cursor move is the gate. It already refuses a re-click on the cursor
+/// and any id outside the frozen graph, so hanging the panel request off its
+/// result is what keeps a re-click free of a request rather than sending one
+/// that happens to produce the same view.
 fn flow_node_control(
     focus: gpui::FocusHandle,
     workspace_id: WorkspaceId,
     boards: Arc<Mutex<BeadsBoards>>,
+    panels: Arc<Mutex<BeadsPanels>>,
 ) -> FlowNodeControl {
     FlowNodeControl {
         focus,
         on_activate: Arc::new(move |issue_id, window, _app| {
-            if let Ok(mut boards) = boards.lock()
-                && boards.move_flow_cursor(workspace_id, &issue_id)
-            {
-                window.refresh();
+            let Ok(mut boards) = boards.lock() else { return };
+            if !boards.move_flow_cursor(workspace_id, &issue_id) {
+                return;
             }
+            drop(boards);
+            if let Ok(mut panels) = panels.lock() {
+                panels.navigate_to_issue(workspace_id, &issue_id);
+            }
+            window.refresh();
         }),
     }
 }

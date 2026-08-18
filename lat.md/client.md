@@ -1289,6 +1289,17 @@ line calls
 The source panel remains while the fresh request is in flight; only its
 matching reply swaps the card head, body, and queue lane.
 
+Retargeting itself is
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#navigate_to_issue]], and
+eligibility belongs to the caller. A dependent is checked against the open
+detail's own `dependents` list, but a Flow node click reaches an issue that
+detail never listed, so the board's frozen graph is what proves that one
+reachable. Both then share the fence: the target is recorded before the
+request leaves, and while it is outstanding `update` honours that target's
+reply alone. Discarding the rest is the point — the issue on screen has a
+request of its own in flight, and painting that late answer would repaint the
+pane the reader just navigated away from.
+
 [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures]] proves the
 mock-derived anatomy and lifecycle matrix. The independent
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh]] run proves
@@ -1635,6 +1646,16 @@ Opening a card is unconditional for the panel and conditional for the strip. The
 Escape reaches [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_latest_flow]] only after the detail panel has declined the key, so a focused panel always dismisses before the strip changes mode and Escape never strands a reader in lanes with the panel they were reading still open. The wheel is claimed by the Flow strip alone: in lanes the same gesture belongs to the lane bodies underneath. Either wheel axis drives the one axis Flow has, clamped to the graph, because a rank too wide for the row budget fails layout instead of growing a vertical scrollbar.
 
 Pin, height, lanes scroll position, and text scale all live outside `FlowView`, so a round trip through Flow and back leaves the strip exactly as the reader left it. Flow state is per workspace and dies with the window: two regions side by side each enter and leave on their own.
+
+### Retargeting the panel from a Flow node
+
+Activating a node moves the cursor and the panel follows; the strip stays on the graph it opened with.
+
+[[crates/scribe-client/src/main.rs#flow_node_control]] composes the two halves, and [[crates/scribe-client/src/beads_board.rs#BeadsBoards#move_flow_cursor]] is the gate rather than a first step: it already refuses a re-click on the cursor and any id outside the frozen graph, so hanging the panel request off its result is what keeps a re-click free of a request instead of sending one that happens to produce the same view. Only when it returns true does [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#navigate_to_issue]] retarget the open panel.
+
+No second graph is fetched and nothing is re-laid out. The epic, the ranks, and the wires are the ones the strip opened with, and the band's opened tag follows because it reads the cursor directly. The rank ruler is the deliberate exception: NOW names the rank the reader is on, so the ruler travels with the cursor while the graph beneath it stays fixed.
+
+A closed panel is not reopened. Clicking a node then moves the cursor alone, because the reader dismissed the panel and a graph click is not a request to bring it back.
 
 ## GPUI Titlebar
 
