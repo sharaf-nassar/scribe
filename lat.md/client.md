@@ -1647,6 +1647,8 @@ Escape reaches [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_latest
 
 Pin, height, lanes scroll position, and text scale all live outside `FlowView`, so a round trip through Flow and back leaves the strip exactly as the reader left it. Flow state is per workspace and dies with the window: two regions side by side each enter and leave on their own.
 
+Painting reads the graph as owned data, never through the store. [[crates/scribe-client/src/main.rs#TerminalView#render_beads_boards]] holds the board guard across the whole render pass, so [[crates/scribe-client/src/beads_board.rs#BeadsBoards#flow_snapshot]] copies the graph, layout, cursor, offset, trace, and live ids out under that guard and hands them to the strip on `BeadsBoardRender`. A strip that looked itself up would take the same non-reentrant `Mutex` a second time on the same thread and hang the board — and because the lookup would precede the is-this-Flow test, it would blank lanes too, not just Flow. Event closures still hold the `Arc` and still lock, which is correct: they run from callbacks after the render guard is dropped.
+
 ### Retargeting the panel from a Flow node
 
 Activating a node moves the cursor and the panel follows; the strip stays on the graph it opened with.

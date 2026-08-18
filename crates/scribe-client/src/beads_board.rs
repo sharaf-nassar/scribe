@@ -268,6 +268,28 @@ impl BeadsBoards {
         self.flows.get(&workspace_id)
     }
 
+    /// Copy out everything painting this workspace's Flow strip needs.
+    ///
+    /// Takes `&self` so the caller can read it through the guard it is already
+    /// holding for the rest of the render pass. The strip cannot look this up
+    /// for itself: painting happens inside that guard, and `Mutex` is not
+    /// reentrant, so a second lock would deadlock every board — lanes
+    /// included, since the lookup would precede the is-this-Flow test.
+    pub fn flow_snapshot(&self, workspace_id: WorkspaceId) -> Option<FlowStripSnapshot> {
+        let flow = self.flow(workspace_id)?;
+        Some(FlowStripSnapshot {
+            graph: flow.graph.clone(),
+            layout: flow.layout.clone(),
+            cursor_issue_id: flow.cursor_issue_id.clone(),
+            scroll_x: flow.scroll_x,
+            trace: flow
+                .hovered_issue_id
+                .as_deref()
+                .and_then(|hovered| FlowTrace::from_hover(&flow.graph, hovered)),
+            live_issue_ids: self.live_issue_ids(),
+        })
+    }
+
     /// Leave Flow and return to lanes, discarding any request in flight.
     pub fn exit_flow(&mut self, workspace_id: WorkspaceId) -> bool {
         let left = self.flows.remove(&workspace_id).is_some();
@@ -1307,6 +1329,13 @@ pub struct BeadsBoardRender {
     /// Held by the view across frames so a node keeps its Tab stop, and empty
     /// whenever the board is painting lanes.
     pub flow_controls: HashMap<String, FlowNodeControl>,
+    /// This workspace's Flow graph, already read out of the board store, or
+    /// `None` when the strip is painting lanes.
+    ///
+    /// Read by the caller under the guard it already holds rather than looked
+    /// up here: painting runs inside that guard, so a second lock on the same
+    /// non-reentrant mutex would deadlock the board rather than fail.
+    pub flow: Option<FlowStripSnapshot>,
 }
 
 /// One queue's column, as the mock lays it out.
@@ -1429,6 +1458,7 @@ pub fn render(
         scale,
         colors,
         flow_controls,
+        flow,
     } = wiring;
     let colors = &colors;
     // The rect is the strip the region gave the board, already clamped to what
@@ -1470,19 +1500,15 @@ pub fn render(
     // resize grip and the text-size controls all stay where the board put
     // them, so returning to lanes cannot move the furniture around it.
     if let Some(strip) = flow_strip(FlowStrip {
-        state: &hover_state,
+        wheel_state: &hover_state,
+        flow,
         workspace_id,
         rect,
         scale,
         colors,
         controls: &flow_controls,
     }) {
-        let board = board.child(strip);
-        return if overlay {
-            board.shadow_lg().into_any_element()
-        } else {
-            board.into_any_element()
-        };
+        return lift(board.child(strip), overlay);
     }
     let board = match snapshot {
         Some(snapshot) => board.child(lanes(
@@ -1505,8 +1531,12 @@ pub fn render(
                 .child(status),
         ),
     };
-    // A hovered board floats over live panes and needs the lift to read as
-    // separate; a pinned one sits in space the region gave up for it.
+    lift(board, overlay)
+}
+
+/// A hovered board floats over live panes and needs the lift to read as
+/// separate; a pinned one sits in space the region gave up for it.
+fn lift<E: Styled + IntoElement>(board: E, overlay: bool) -> AnyElement {
     if overlay { board.shadow_lg().into_any_element() } else { board.into_any_element() }
 }
 
@@ -1516,19 +1546,9 @@ pub fn render(
 /// Flow strip has an axis to move: in lanes the same gesture belongs to the
 /// lane bodies underneath.
 fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
-    let FlowStrip { state, workspace_id, rect, scale, colors, controls } = strip;
-    let guard = state.lock().ok()?;
-    let flow = guard.flow(workspace_id)?;
-    let graph = flow.graph.clone();
-    let layout = flow.layout.clone();
-    let cursor_issue_id = flow.cursor_issue_id.clone();
-    let scroll_x = flow.scroll_x;
-    let trace = flow
-        .hovered_issue_id
-        .as_deref()
-        .and_then(|hovered| FlowTrace::from_hover(&flow.graph, hovered));
-    let live_issue_ids = guard.live_issue_ids();
-    drop(guard);
+    let FlowStrip { wheel_state, flow, workspace_id, rect, scale, colors, controls } = strip;
+    let FlowStripSnapshot { graph, layout, cursor_issue_id, scroll_x, trace, live_issue_ids } =
+        flow?;
     let painted = crate::beads_flow::render(&FlowRender {
         rect,
         graph: &graph,
@@ -1548,7 +1568,7 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
             return None;
         }
     };
-    let wheel_state = std::sync::Arc::clone(state);
+    let wheel_state = std::sync::Arc::clone(wheel_state);
     Some(
         div()
             .flex_1()
@@ -1579,14 +1599,33 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
 const FLOW_WHEEL_LINE: f32 = 20.0;
 
 /// Everything the Flow strip needs from the board around it.
-#[derive(Clone, Copy)]
 struct FlowStrip<'a> {
-    state: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    /// Wheel target only. Event closures run after the caller's guard is
+    /// dropped, so locking there is safe; locking during paint is not.
+    wheel_state: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    /// `None` paints lanes. Owned rather than looked up here — see
+    /// [`BeadsBoards::flow_snapshot`].
+    flow: Option<FlowStripSnapshot>,
     workspace_id: WorkspaceId,
     rect: Rect,
     scale: f32,
     colors: &'a BeadsBoardColors,
     controls: &'a HashMap<String, FlowNodeControl>,
+}
+
+/// Everything painting a Flow strip needs, copied out of the board store.
+///
+/// The renderer is handed this instead of the store because `render` is
+/// called while the caller still holds the board guard. Owned data is what
+/// keeps the paint path off a mutex it cannot re-enter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowStripSnapshot {
+    pub graph: BeadsEpicGraph,
+    pub layout: FlowLayout,
+    pub cursor_issue_id: String,
+    pub scroll_x: f32,
+    pub trace: Option<FlowTrace>,
+    pub live_issue_ids: HashSet<String>,
 }
 
 /// The board's own text-size control, parked in the strip's top right corner.
@@ -3387,6 +3426,46 @@ mod flow_mode_tests {
         assert_eq!(flow.cursor_issue_id, "a");
         assert_eq!(flow.epic_id, EPIC);
         assert!((flow.scroll_x - 0.0).abs() < f32::EPSILON);
+    }
+
+    /// The regression guard for the deadlock that blanked the whole board.
+    ///
+    /// `render` is called with the board guard still held, so anything the
+    /// paint path needs must already be owned by the time it starts. This
+    /// pins that shape from inside a held guard: `try_lock` proving the mutex
+    /// is unavailable is the same condition the renderer runs under, and a
+    /// paint-time `lock()` there would not fail, it would hang forever.
+    #[test]
+    fn the_flow_paint_input_is_read_under_the_guard_the_renderer_runs_inside() {
+        let workspace = WorkspaceId::new();
+        let mut seeded = enabled();
+        seeded.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(seeded.apply_epic_graph(workspace, EPIC, graph()));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(seeded));
+
+        let guard = shared.lock().expect("render pass takes the board guard");
+        assert!(
+            shared.try_lock().is_err(),
+            "the renderer paints inside this guard, so any second lock deadlocks"
+        );
+        let snapshot = guard.flow_snapshot(workspace).expect("a strip in Flow paints a snapshot");
+        drop(guard);
+
+        assert_eq!(snapshot.cursor_issue_id, "a");
+        assert_eq!(snapshot.graph.nodes.len(), 3);
+        assert!(snapshot.trace.is_none(), "an untouched graph paints at rest");
+    }
+
+    /// Lanes paint through the same call, and the old lookup locked before it
+    /// tested for Flow — which is why a lanes-only board went blank too.
+    #[test]
+    fn a_board_in_lanes_needs_no_flow_snapshot_and_no_second_lock() {
+        let workspace = WorkspaceId::new();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(enabled()));
+
+        let guard = shared.lock().expect("render pass takes the board guard");
+        assert!(shared.try_lock().is_err());
+        assert!(guard.flow_snapshot(workspace).is_none(), "lanes carry no Flow snapshot");
     }
 
     #[test]

@@ -9759,6 +9759,10 @@ impl TerminalView {
                                 .get(workspace_id)
                                 .cloned()
                                 .unwrap_or_default(),
+                            // Read here, under the guard this pass already
+                            // holds. The strip painting inside it cannot take
+                            // the same non-reentrant lock for itself.
+                            flow: boards.flow_snapshot(*workspace_id),
                         },
                     ),
                     // The bar's grab band, carrying nothing but the pointer a
