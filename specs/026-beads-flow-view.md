@@ -703,7 +703,7 @@ Wire additions, all serde-defaulted so an older peer is unaffected:
 - `BeadsGraphNode { id, title, priority, status, queue, assignee: Option<String>, updated_at }`.
 - `BeadsGraphEdge { from, to }` — `blocks` edges only; `parent-child` defines
   membership, not adjacency.
-- `BeadsEpicGraph { epic_id, epic_title, closed, total, nodes, edges, truncated: bool }`.
+- `BeadsEpicGraph { epic_id, epic_title, closed, total, nodes, edges }`.
 
 Bounds mirror the board's: 200 nodes, 16 edges per node, `MAX_ID_CHARS` and
 `MAX_TITLE_CHARS` truncation. **There is no partial graph.** An epic exceeding
@@ -732,7 +732,7 @@ mutates `FlowView.graph` — the graph is frozen per Q5.
 ## API / Interface Changes
 
 - `ClientMessage::RequestBeadsEpicGraph { workspace_id, epic_id }`.
-- `ServerMessage::BeadsEpicGraph { workspace_id, epic_id, graph: Option<Box<BeadsEpicGraph>> }`
+- `ServerMessage::BeadsEpicGraph { workspace_id, epic_id, outcome: BeadsEpicGraphOutcome }`
   — `None` distinguishes a vanished epic from a failed read, matching
   [[protocol#Protocol#Client Messages#Beads issue detail]]'s shape.
 - `Welcome.beads_flow: bool`, defaulting false, independent of `beads_detail`
@@ -756,9 +756,9 @@ mutates `FlowView.graph` — the graph is frozen per Q5.
   `Welcome` defaults `beads_flow` false; an old client receives no epic-graph
   frames.
 - **Server** — epic assembly from a fixture `bd list` payload including a
-  *closed* blocker edge (the case `bd blocked` cannot supply), the 200-node
-  bound setting `truncated`, and the generation fence invalidating after an
-  applied write.
+  *closed* blocker edge (the case `bd blocked` cannot supply), each admission
+  refusal returning its own reason, and the generation fence invalidating after
+  an applied write.
 - **Visual E2E** — a new fixture epic with a real fan-out/fan-in and at least
   five ranks. Probes sited on rank 1 or 2 only, per the recorded
   viewport-edge learning: wire endpoints land on dot centres, cursor treatment
@@ -801,8 +801,10 @@ Principle 3.
 - **A wrong halo is worse than no halo.** Mitigation: the exact session-id join
   makes false positives structurally impossible; a missed claim degrades to no
   halo.
-- **Board caps could still surprise.** Mitigation: `truncated` is on the wire
-  and the band must show it rather than silently drawing a partial DAG.
+- **Board caps could still surprise.** Mitigation: the epic subgraph is
+  independently bounded rather than inheriting the per-queue cap, and an
+  over-bound epic is refused outright rather than silently drawing a partial
+  DAG.
 
 ## Sequencing
 
