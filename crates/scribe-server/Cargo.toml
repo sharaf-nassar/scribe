@@ -31,6 +31,11 @@ assets = [
     "755",
   ],
   [
+    "target/release/scribe-cli",
+    "usr/bin/scribe",
+    "755",
+  ],
+  [
     "../../dist/scribe-server.service",
     "usr/lib/systemd/user/",
     "644",
@@ -146,6 +151,11 @@ assets = [
   [
     "target/release/scribe-client",
     "usr/bin/scribe-dev",
+    "755",
+  ],
+  [
+    "target/release/scribe-cli",
+    "usr/bin/scribe-dev-cli",
     "755",
   ],
   [

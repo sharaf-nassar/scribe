@@ -471,9 +471,32 @@ else
 fi
 rm -rf "$pi_extension_fixture"
 
-# ── stable/dev Debian and macOS packages carry flavor-neutral Pi assets ─
+# ── stable/dev Debian and macOS packages carry the agent CLI ─────────────
 deb_manifest="$repo_root/crates/scribe-server/Cargo.toml"
 macos_builder="$repo_root/dist/macos/build-dmg.sh"
+macos_signer="$repo_root/dist/ci/sign-notarize-macos.sh"
+release_workflow="$repo_root/.github/workflows/release.yml"
+if [ "$(grep -Fc '"target/release/scribe-cli"' "$deb_manifest")" -ne 2 ] || \
+    ! grep -Fq '"usr/bin/scribe"' "$deb_manifest" || \
+    ! grep -Fq '"usr/bin/scribe-dev-cli"' "$deb_manifest"; then
+    echo "FAIL: stable/dev Debian asset manifests omit isolated agent CLIs"
+    failures=$((failures + 1))
+elif ! grep -Fq 'for bin in scribe-client scribe-server scribe-cli; do' "$macos_builder" || \
+    ! grep -Fq "cp \"\${BUILD_DIR}/scribe-cli\"      \"\${MACOS_DIR}/scribe\"" "$macos_builder" || \
+    ! grep -Fq "for executable in \"\${APP_BUNDLE}/Contents/MacOS/\"*; do" "$macos_signer"; then
+    echo "FAIL: macOS bundle does not stage and sign the agent CLI"
+    failures=$((failures + 1))
+elif ! grep -Fq "cp target/\${{ matrix.target }}/release/scribe-cli target/release/" "$release_workflow"; then
+    echo "FAIL: macOS release staging omits scribe-cli"
+    failures=$((failures + 1))
+elif grep -Eq 'SKILL\.md|/skills/' "$deb_manifest" "$macos_builder"; then
+    echo "FAIL: package assets include a generated skill file"
+    failures=$((failures + 1))
+else
+    echo "PASS: stable/dev Debian and macOS package definitions include only the agent CLI"
+fi
+
+# ── stable/dev Debian and macOS packages carry flavor-neutral Pi assets ─
 if [ "$(grep -Fc '"../../dist/pi-extension.ts"' "$deb_manifest")" -ne 2 ] || \
     ! grep -Fq '"usr/share/scribe/pi-extension.ts"' "$deb_manifest" || \
     ! grep -Fq '"usr/share/scribe-dev/pi-extension.ts"' "$deb_manifest" || \

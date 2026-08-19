@@ -856,7 +856,14 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     // covers every shell, including fish/nushell/powershell which have no
     // login-profile emulation in their integration scripts.
     #[cfg(target_os = "macos")]
-    env.insert("PATH".to_owned(), path_with_macos_baseline(std::env::var("PATH").ok().as_deref()));
+    {
+        let executable = std::env::current_exe().ok();
+        let bundle_bin = executable.as_deref().and_then(macos_bundle_bin_dir);
+        env.insert(
+            "PATH".to_owned(),
+            path_with_macos_bundle_bin(std::env::var("PATH").ok().as_deref(), bundle_bin),
+        );
+    }
     // Packaged layouts do not put `scribe-hook-helper` on `PATH`, so hand the
     // shells and the `ai-hook-*.sh` adapters an absolute path when we can
     // resolve one. Injected unconditionally: AI hooks run even with shell
@@ -932,6 +939,34 @@ fn path_with_macos_baseline(inherited: Option<&str>) -> String {
     entries.extend(&existing);
     entries.extend(SYSTEM_DIRS.iter().copied().filter(|dir| !existing.contains(dir)));
     entries.join(":")
+}
+
+/// Prepend the installed app bundle's executable directory to the normal macOS
+/// pane PATH so `scribe` is available inside Scribe panes.
+#[cfg(any(target_os = "macos", test))]
+fn path_with_macos_bundle_bin(inherited: Option<&str>, bundle_bin: Option<&Path>) -> String {
+    let baseline = path_with_macos_baseline(inherited);
+    let Some(bundle_bin) = bundle_bin.and_then(Path::to_str).filter(|entry| !entry.is_empty())
+    else {
+        return baseline;
+    };
+
+    std::iter::once(bundle_bin)
+        .chain(baseline.split(':').filter(|entry| *entry != bundle_bin))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_bundle_bin_dir(executable: &Path) -> Option<&Path> {
+    let macos_dir = executable.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    let app_dir = contents_dir.parent()?;
+
+    (macos_dir.file_name()?.to_str() == Some("MacOS")
+        && contents_dir.file_name()?.to_str() == Some("Contents")
+        && app_dir.extension().and_then(|extension| extension.to_str()) == Some("app"))
+    .then_some(macos_dir)
 }
 
 fn session_integration_script(kind: ShellKind, integration_enabled: bool) -> Option<String> {
@@ -1527,8 +1562,8 @@ mod tests {
     use super::{
         AiLaunchSpec, AiProvider, AiResumeMode, EnvLaunchContext, PtyOptionsBuild,
         SessionLaunchRequest, ShellTool, build_launch_shell, build_pty_options, build_shell,
-        codex_kitty_window_id, command_ai_provider_hint, launch_exec_command,
-        path_with_macos_baseline,
+        codex_kitty_window_id, command_ai_provider_hint, launch_exec_command, macos_bundle_bin_dir,
+        path_with_macos_baseline, path_with_macos_bundle_bin,
     };
     use crate::shell_integration::ShellKind;
 
@@ -1573,6 +1608,28 @@ mod tests {
         let once = path_with_macos_baseline(Some("/custom/bin:/usr/bin"));
         assert_eq!(path_with_macos_baseline(Some(&once)), once);
         assert_eq!(path_with_macos_baseline(Some(MACOS_BASELINE_PATH)), MACOS_BASELINE_PATH);
+    }
+
+    #[test]
+    fn macos_bundle_cli_precedes_inherited_path_entries() {
+        assert_eq!(
+            path_with_macos_bundle_bin(
+                Some("/custom/bin:/Applications/Scribe.app/Contents/MacOS:/usr/bin"),
+                Some(Path::new("/Applications/Scribe.app/Contents/MacOS")),
+            ),
+            "/Applications/Scribe.app/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:/custom/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+    }
+
+    #[test]
+    fn macos_bundle_path_identifies_the_staged_cli_directory() {
+        assert_eq!(
+            macos_bundle_bin_dir(Path::new(
+                "/Applications/Scribe.app/Contents/MacOS/scribe-server"
+            )),
+            Some(Path::new("/Applications/Scribe.app/Contents/MacOS"))
+        );
+        assert_eq!(macos_bundle_bin_dir(Path::new("/usr/local/bin/scribe-server")), None);
     }
 
     fn pty_env(kitty_window_id: bool) -> std::collections::HashMap<String, String> {

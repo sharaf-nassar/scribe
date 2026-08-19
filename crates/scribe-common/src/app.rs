@@ -34,7 +34,7 @@ impl AppIdentity {
     #[must_use]
     pub fn detect_from_path(path: &Path) -> Self {
         let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
-        if matches!(stem, "scribe-dev" | "scribe-dev-server")
+        if matches!(stem, "scribe-dev" | "scribe-dev-cli" | "scribe-dev-server")
             || path.ancestors().any(|ancestor| {
                 ancestor
                     .file_name()
@@ -181,4 +181,19 @@ pub fn current_config_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn current_state_dir() -> Option<PathBuf> {
     current_identity().state_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::AppIdentity;
+
+    #[test]
+    fn dev_cli_uses_the_dev_install_identity() {
+        assert_eq!(
+            AppIdentity::detect_from_path(Path::new("/usr/bin/scribe-dev-cli")),
+            AppIdentity::dev()
+        );
+    }
 }

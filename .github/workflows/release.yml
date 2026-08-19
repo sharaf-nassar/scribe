@@ -79,6 +79,7 @@ jobs:
           mkdir -p target/release
           cp target/${{ matrix.target }}/release/scribe-client target/release/
           cp target/${{ matrix.target }}/release/scribe-server target/release/
+          cp target/${{ matrix.target }}/release/scribe-cli target/release/
           cp target/${{ matrix.target }}/release/scribe-hook-helper target/release/
 
       - name: Assemble app bundle
