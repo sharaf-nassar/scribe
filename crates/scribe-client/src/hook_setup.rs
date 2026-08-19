@@ -5,8 +5,8 @@
 //! `postinst`, so Claude Code and Codex never pick up Scribe's hook adapters
 //! unless something explicitly runs `setup-{claude,codex}-hooks.sh`.
 //! Stable macOS launches therefore probe the user's AI-tool configs and invoke
-//! the bundled setup scripts when the current app bundle's hook paths are
-//! missing.
+//! the bundled setup scripts when the current app bundle's hook paths or the
+//! generated agent skill are missing.
 //!
 //! [`repair_pi_extension_if_enabled`] runs at packaged startup on every
 //! platform and after a settings-window `terminal.pi_integration` enable
@@ -82,6 +82,13 @@ fn bundled_resources_dir() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn claude_needs_setup(claude_dir: &Path, resources_dir: &Path) -> Result<bool, String> {
+    // The setup scripts also install the generated agent skill; a missing
+    // target means a fresh or pre-skill install that needs one run. A foreign
+    // (unmarked) file counts as present so the scripts are not rerun forever
+    // over a target they refuse to touch.
+    if !claude_dir.join("skills/scribe-terminal/SKILL.md").is_file() {
+        return Ok(true);
+    }
     let settings_path = claude_dir.join("settings.json");
     let expected_hook = resources_dir.join("ai-hook-claude.sh").to_string_lossy().into_owned();
     let expected_statusline =
@@ -99,6 +106,9 @@ fn claude_needs_setup(claude_dir: &Path, resources_dir: &Path) -> Result<bool, S
 
 #[cfg(target_os = "macos")]
 fn codex_needs_setup(codex_dir: &Path, resources_dir: &Path) -> Result<bool, String> {
+    if !codex_dir.join("skills/scribe-terminal/SKILL.md").is_file() {
+        return Ok(true);
+    }
     let expected_hook = resources_dir.join("ai-hook-codex.sh").to_string_lossy().into_owned();
     let config_path = codex_dir.join("config.toml");
     let hooks_path = codex_dir.join("hooks.json");

@@ -246,5 +246,117 @@ else:
 print("  Scribe Claude Code hooks now route via scribe-hook-helper IPC.")
 PYEOF
 
+# ── Step 3: Install the generated agent skill ───────────────────────
+# `scribe agent skill` renders provider guidance from the CLI's own command
+# tree and the live agent-API policy; no authored skill document exists.
+# The write is atomic, skipped when the rendered content is unchanged, and
+# refused (with a report) when the target exists without the Scribe
+# ownership marker. A missing or failing CLI skips the step so hook setup
+# never fails because of it.
+
+scribe_python << 'PYEOF'
+import os
+import shutil
+import subprocess
+import sys
+
+SKILL_MARKER = "SCRIBE-MANAGED-SKILL"
+skill_path = os.path.expanduser("~/.claude/skills/scribe-terminal/SKILL.md")
+
+
+def find_scribe_cli():
+    """Locate the packaged scribe CLI for this install's flavor."""
+    env = os.environ.get("SCRIBE_INSTALL_PREFIX")
+    if env and os.path.isdir(env):
+        prefixes = [env]
+    else:
+        prefixes = [
+            "/usr/share/scribe",
+            "/usr/share/scribe-dev",
+            "/usr/local/share/scribe",
+            "/usr/local/share/scribe-dev",
+            "/Applications/Scribe.app/Contents/Resources",
+            "/Applications/Scribe-Dev.app/Contents/Resources",
+        ]
+    candidates = []
+    for prefix in prefixes:
+        if not os.path.isdir(prefix):
+            continue
+        # macOS bundles stage the CLI as Contents/MacOS/scribe, next to the
+        # Resources directory that holds the hook assets.
+        candidates.append(os.path.join(os.path.dirname(prefix), "MacOS", "scribe"))
+        flavor = os.path.basename(os.path.normpath(prefix))
+        cli = "scribe-dev-cli" if flavor == "scribe-dev" else "scribe"
+        candidates.append(os.path.join("/usr/bin", cli))
+        candidates.append(os.path.join("/usr/local/bin", cli))
+    from_path = shutil.which("scribe")
+    if from_path:
+        candidates.append(from_path)
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def render_skill(cli):
+    result = subprocess.run(
+        [cli, "agent", "skill"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr.strip() or f"exit code {result.returncode}")
+    return result.stdout
+
+
+cli = find_scribe_cli()
+if cli is None:
+    print("  scribe CLI not found; skipping agent skill install.", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    body = render_skill(cli)
+except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+    print(
+        f"  scribe agent skill failed ({error}); skipping agent skill install.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+skill_text = (
+    "---\n"
+    "name: scribe-terminal\n"
+    'description: "Observe and control the Scribe terminal hosting this '
+    "session - list windows and sibling panes, read pane screen text, "
+    "dispatch window actions, and write pane input through the scribe "
+    "agent CLI. Use only inside a Scribe pane, when SCRIBE_SESSION_ID "
+    'is set; otherwise this skill does not apply."\n'
+    "---\n"
+    "\n"
+    f"<!-- {SKILL_MARKER} -->\n"
+    "\n" + body
+)
+
+current = read_text(skill_path)
+if current is None and os.path.lexists(skill_path):
+    print(f"  {skill_path} is not a regular file; leaving it untouched.", file=sys.stderr)
+    sys.exit(0)
+if current is not None and SKILL_MARKER not in current:
+    print(
+        f"  {skill_path} was not installed by Scribe; leaving it untouched. "
+        "Remove or rename it to let Scribe manage the agent skill.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+os.makedirs(os.path.dirname(skill_path), exist_ok=True)
+if write_text_if_changed(skill_path, skill_text, current):
+    print(f"  Updated {skill_path}")
+else:
+    print(f"  {skill_path} already up to date")
+PYEOF
+
 echo ""
 echo "  Done! Restart Claude Code for hooks to take effect."

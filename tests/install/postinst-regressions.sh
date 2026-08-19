@@ -317,6 +317,87 @@ else
     echo "SKIP: AI SessionEnd hook regressions require python3"
 fi
 
+# ── Agent skill install: fresh, idempotent, regenerating, foreign-safe ───
+if command -v python3 >/dev/null 2>&1; then
+    skill_fixture=$(mktemp -d)
+    skill_home="$skill_fixture/home"
+    # A macOS-bundle-shaped prefix makes CLI resolution hermetic: the setup
+    # scripts look for Contents/MacOS/scribe next to the Resources prefix
+    # before any machine-wide /usr/bin path.
+    skill_resources="$skill_fixture/Contents/Resources"
+    skill_macos="$skill_fixture/Contents/MacOS"
+    mkdir -p "$skill_home/.claude" "$skill_home/.codex" "$skill_resources" "$skill_macos"
+
+    cat > "$skill_macos/scribe" <<'EOF'
+#!/bin/sh
+if [ "$1" = "agent" ] && [ "$2" = "skill" ]; then
+    printf '# Scribe agent control\n\nbody %s\n' "${SCRIBE_FAKE_SKILL_REVISION:-r1}"
+    exit 0
+fi
+echo "unexpected argv: $*" >&2
+exit 2
+EOF
+    chmod +x "$skill_macos/scribe"
+
+    skill_failures=0
+    for provider in claude codex; do
+        setup_script="$repo_root/dist/setup-${provider}-hooks.sh"
+        target="$skill_home/.${provider}/skills/scribe-terminal/SKILL.md"
+
+        if ! HOME="$skill_home" SCRIBE_INSTALL_PREFIX="$skill_resources" \
+            bash "$setup_script" >/dev/null 2>&1; then
+            echo "FAIL: ${provider} setup with agent skill install failed"
+            skill_failures=$((skill_failures + 1))
+            continue
+        fi
+        if [ ! -f "$target" ] || \
+           ! grep -q "SCRIBE-MANAGED-SKILL" "$target" || \
+           ! grep -q "^name: scribe-terminal$" "$target" || \
+           ! grep -q "^body r1$" "$target"; then
+            echo "FAIL: ${provider} fresh install did not write the marked generated skill"
+            skill_failures=$((skill_failures + 1))
+            continue
+        fi
+
+        before=$(stat -c '%i %Y' "$target")
+        rerun_output=$(HOME="$skill_home" SCRIBE_INSTALL_PREFIX="$skill_resources" \
+            bash "$setup_script" 2>&1)
+        after=$(stat -c '%i %Y' "$target")
+        if [ "$before" != "$after" ] || \
+           ! printf '%s' "$rerun_output" | grep -q "skills/scribe-terminal/SKILL.md already up to date"; then
+            echo "FAIL: ${provider} rerun with unchanged output rewrote the skill file"
+            skill_failures=$((skill_failures + 1))
+            continue
+        fi
+
+        if ! HOME="$skill_home" SCRIBE_INSTALL_PREFIX="$skill_resources" \
+            SCRIBE_FAKE_SKILL_REVISION=r2 bash "$setup_script" >/dev/null 2>&1 || \
+           ! grep -q "^body r2$" "$target"; then
+            echo "FAIL: ${provider} changed CLI output was not regenerated"
+            skill_failures=$((skill_failures + 1))
+            continue
+        fi
+
+        printf 'my own skill\n' > "$target"
+        foreign_output=$(HOME="$skill_home" SCRIBE_INSTALL_PREFIX="$skill_resources" \
+            bash "$setup_script" 2>&1)
+        foreign_status=$?
+        if [ "$foreign_status" -ne 0 ] || \
+           [ "$(cat "$target")" != "my own skill" ] || \
+           ! printf '%s' "$foreign_output" | grep -q "was not installed by Scribe"; then
+            echo "FAIL: ${provider} foreign skill file was not reported and left untouched"
+            skill_failures=$((skill_failures + 1))
+            continue
+        fi
+
+        echo "PASS: ${provider} agent skill installs fresh, idempotently, and refuses foreign files"
+    done
+    failures=$((failures + skill_failures))
+    rm -rf "$skill_fixture"
+else
+    echo "SKIP: agent skill install regressions require python3"
+fi
+
 # ── pi_integration_enabled defaults on and only reads the [terminal] key ─
 pi_fixture=$(mktemp -d)
 pi_config="$pi_fixture/config.toml"

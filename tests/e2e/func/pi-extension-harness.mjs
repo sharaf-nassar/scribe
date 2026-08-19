@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -52,11 +52,17 @@ const { default: extensionFactory } = await import(
 
 class FakeExtensionAPI {
   handlers = new Map();
+  tools = new Map();
 
   on(name, handler) {
     const handlers = this.handlers.get(name) ?? [];
     handlers.push(handler);
     this.handlers.set(name, handlers);
+  }
+
+  registerTool(tool) {
+    assert.ok(!this.tools.has(tool.name), `duplicate tool registration: ${tool.name}`);
+    this.tools.set(tool.name, tool);
   }
 
   handler(name) {
@@ -445,6 +451,97 @@ async function testGenerationCancelledShutdownAndReload() {
   return starts(logPath);
 }
 
+// Agent API tools: registration shape, argv contract, and the session gate.
+async function testAgentToolContract() {
+  const logPath = join(tempDir, "agent-tools.jsonl");
+  setHarnessEnv(logPath);
+
+  const cliDir = join(tempDir, "fake-cli-bin");
+  const cliLog = join(tempDir, "agent-cli.jsonl");
+  await mkdir(cliDir, { recursive: true });
+  await writeFile(
+    join(cliDir, "scribe"),
+    `#!/usr/bin/env node
+require("node:fs").appendFileSync(
+  process.env.FAKE_AGENT_CLI_LOG,
+  JSON.stringify(process.argv.slice(2)) + "\\n",
+);
+process.stdout.write('{"v":1,"ok":true,"data":{}}\\n');
+`,
+  );
+  await chmod(join(cliDir, "scribe"), 0o755);
+
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${cliDir}:${priorPath}`;
+  process.env.FAKE_AGENT_CLI_LOG = cliLog;
+  try {
+    const api = new FakeExtensionAPI();
+    extensionFactory(api);
+
+    const expected = [
+      "scribe_agent_action",
+      "scribe_agent_capabilities",
+      "scribe_agent_read",
+      "scribe_agent_siblings",
+      "scribe_agent_world",
+      "scribe_agent_write",
+    ];
+    assert.deepEqual([...api.tools.keys()].sort(), expected, "typed agent tools must register");
+    for (const name of expected) {
+      const tool = api.tools.get(name);
+      assert.ok(tool.label, `${name} needs a label`);
+      assert.ok(tool.description, `${name} needs a description`);
+      assert.equal(tool.parameters.type, "object", `${name} parameters must be an object schema`);
+      assert.equal(typeof tool.execute, "function");
+    }
+    assert.deepEqual(api.tools.get("scribe_agent_read").parameters.required, ["session_id"]);
+    assert.deepEqual(api.tools.get("scribe_agent_write").parameters.required, [
+      "session_id",
+      "text",
+    ]);
+    const actionSchema = api.tools.get("scribe_agent_action").parameters;
+    assert.ok(
+      actionSchema.properties.action.enum.includes("focus-session"),
+      "action must be a typed enum",
+    );
+
+    // Execution shells to `scribe agent … --agent pi` and returns stdout.
+    const read = await api.tools
+      .get("scribe_agent_read")
+      .execute("t1", { session_id: "sess-1", scrollback: 12 }, undefined, undefined, {});
+    assert.deepEqual(read.content, [{ type: "text", text: '{"v":1,"ok":true,"data":{}}' }]);
+    const write = await api.tools
+      .get("scribe_agent_write")
+      .execute("t2", { session_id: "sess-1", text: "echo hi", submit: true }, undefined, undefined, {});
+    assert.deepEqual(write.content, [{ type: "text", text: '{"v":1,"ok":true,"data":{}}' }]);
+    const argvLog = (await readFile(cliLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(argvLog, [
+      ["agent", "read", "sess-1", "--scrollback", "12", "--agent", "pi"],
+      ["agent", "write", "sess-1", "--text", "echo hi", "--submit", "--agent", "pi"],
+    ]);
+
+    // A registered tool no-ops when SCRIBE_SESSION_ID is unset: no spawn,
+    // explanatory text instead.
+    delete process.env.SCRIBE_SESSION_ID;
+    const blocked = await api.tools
+      .get("scribe_agent_world")
+      .execute("t3", {}, undefined, undefined, {});
+    assert.match(blocked.content[0].text, /SCRIBE_SESSION_ID is unset/);
+    assert.equal(
+      (await readFile(cliLog, "utf8")).trim().split("\n").length,
+      2,
+      "a gated tool call must not spawn the CLI",
+    );
+
+    process.env.SCRIBE_SESSION_ID = randomUUID();
+    await shutdown(api);
+    return starts(logPath);
+  } finally {
+    process.env.PATH = priorPath;
+    delete process.env.FAKE_AGENT_CLI_LOG;
+  }
+}
+
 // @lat: [[test#Test Harness#Pi Extension Harness#Absent environment, child suppression, and missing helper]]
 async function testAbsentEnvironmentHelperAndChildSuppression() {
   const absentLog = join(tempDir, "absent.jsonl");
@@ -456,6 +553,7 @@ async function testAbsentEnvironmentHelperAndChildSuppression() {
   const absent = new FakeExtensionAPI();
   extensionFactory(absent);
   assert.equal(absent.handlers.size, 0, "absent Scribe environment must no-op");
+  assert.equal(absent.tools.size, 0, "absent Scribe environment must register no tools");
 
   const childLog = join(tempDir, "child.jsonl");
   setHarnessEnv(childLog);
@@ -463,6 +561,7 @@ async function testAbsentEnvironmentHelperAndChildSuppression() {
   const child = new FakeExtensionAPI();
   extensionFactory(child);
   assert.equal(child.handlers.size, 0, "Pi child process must no-op");
+  assert.equal(child.tools.size, 0, "Pi child process must register no tools");
   assert.equal((await starts(childLog)).length, 0);
 
   const missingLog = join(tempDir, "missing-helper.jsonl");
@@ -489,6 +588,7 @@ try {
   allStarts.push(...await testCallbacksDoNotAwaitHelper());
   allStarts.push(...await testSerialQueueCap());
   allStarts.push(...await testGenerationCancelledShutdownAndReload());
+  allStarts.push(...await testAgentToolContract());
   allStarts.push(...await testAbsentEnvironmentHelperAndChildSuppression());
   assertFixedArgv(allStarts);
   assertNoPermissionPrompt(allStarts);

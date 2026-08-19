@@ -756,7 +756,10 @@ fn run_profile_command(action: ProfileCommand) -> Result<(), ScribeError> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
-    fmt().with_env_filter(filter).init();
+    // Diagnostics go to stderr: stdout is reserved for data (agent commands
+    // emit versioned JSON there, and `agent skill` output is installed
+    // verbatim into skill files).
+    fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,

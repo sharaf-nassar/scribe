@@ -104,6 +104,227 @@ function contextPercent(ctx: { getContextUsage(): { percent: number | null } | u
   }
 }
 
+// ── Scribe agent API tools ──────────────────────────────────────────
+// Typed wrappers over the packaged `scribe agent` CLI (spec 027): Pi gets
+// tools instead of a prose skill file. Every call shells to the CLI, which
+// evaluates policy per request server-side, so a settings change applies to
+// the next call without reloading Pi. Registration sits behind the same
+// environment gate as the lifecycle handlers, and each execution re-checks
+// SCRIBE_SESSION_ID so a registered tool no-ops outside a Scribe pane.
+
+const AGENT_CLI_TIMEOUT_MS = 10_000;
+
+const AGENT_ACTION_NAMES = [
+  "open-settings",
+  "open-find",
+  "new-tab",
+  "new-claude-tab",
+  "resume-claude-tab",
+  "new-codex-tab",
+  "resume-codex-tab",
+  "split-vertical",
+  "split-horizontal",
+  "close-pane",
+  "close-tab",
+  "new-window",
+  "switch-profile",
+  "open-update-dialog",
+  "focus-session",
+];
+
+type AgentToolParams = Record<string, string | number | boolean | undefined>;
+
+type AgentToolSpec = {
+  name: string;
+  label: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  argv: (params: AgentToolParams) => string[];
+};
+
+function agentParameters(
+  properties: Record<string, Record<string, unknown>>,
+  required: string[] = [],
+): Record<string, unknown> {
+  return { type: "object", properties, required };
+}
+
+const AGENT_TOOLS: AgentToolSpec[] = [
+  {
+    name: "scribe_agent_world",
+    label: "Scribe world",
+    description:
+      "List every window, workspace, and terminal session in the hosting Scribe terminal, including ids, AI state, and which session is this agent's own pane. Returns versioned JSON.",
+    parameters: agentParameters({}),
+    argv: () => ["world"],
+  },
+  {
+    name: "scribe_agent_siblings",
+    label: "Scribe siblings",
+    description:
+      "List the terminal sessions sharing this pane's Scribe window — the fastest way to find the pane next to this one. Returns versioned JSON.",
+    parameters: agentParameters({}),
+    argv: () => ["siblings"],
+  },
+  {
+    name: "scribe_agent_read",
+    label: "Scribe read pane",
+    description:
+      "Read a Scribe terminal session's visible screen text, optionally with trailing scrollback lines. Returns versioned JSON.",
+    parameters: agentParameters(
+      {
+        session_id: {
+          type: "string",
+          description: "Full session id from scribe_agent_world or scribe_agent_siblings.",
+        },
+        scrollback: {
+          type: "integer",
+          description: "Scrollback lines to include above the visible screen.",
+        },
+      },
+      ["session_id"],
+    ),
+    argv: (params) => [
+      "read",
+      String(params.session_id),
+      ...(params.scrollback === undefined ? [] : ["--scrollback", String(params.scrollback)]),
+    ],
+  },
+  {
+    name: "scribe_agent_action",
+    label: "Scribe action",
+    description:
+      "Dispatch a window action in the hosting Scribe terminal. switch-profile takes name; focus-session takes session_id; close-pane, close-tab, and open-update-dialog are destructive and gated separately. Returns versioned JSON.",
+    parameters: agentParameters(
+      {
+        action: {
+          type: "string",
+          enum: AGENT_ACTION_NAMES,
+          description: "Action to dispatch.",
+        },
+        name: { type: "string", description: "Profile name; only for switch-profile." },
+        session_id: { type: "string", description: "Session to focus; only for focus-session." },
+        window: {
+          type: "string",
+          description: "Target window id; defaults to this pane's window.",
+        },
+      },
+      ["action"],
+    ),
+    argv: (params) => [
+      "action",
+      String(params.action),
+      ...(params.name === undefined ? [] : [String(params.name)]),
+      ...(params.session_id === undefined ? [] : [String(params.session_id)]),
+      ...(params.window === undefined ? [] : ["--window", String(params.window)]),
+    ],
+  },
+  {
+    name: "scribe_agent_write",
+    label: "Scribe write input",
+    description:
+      "Write text into a Scribe terminal session's input, optionally submitting it as a command. Returns versioned JSON.",
+    parameters: agentParameters(
+      {
+        session_id: { type: "string", description: "Full session id of the target pane." },
+        text: { type: "string", description: "Text to write into the pane's input." },
+        submit: { type: "boolean", description: "Press Enter after writing the text." },
+      },
+      ["session_id", "text"],
+    ),
+    argv: (params) => [
+      "write",
+      String(params.session_id),
+      "--text",
+      String(params.text),
+      ...(params.submit === true ? ["--submit"] : []),
+    ],
+  },
+  {
+    name: "scribe_agent_capabilities",
+    label: "Scribe capabilities",
+    description:
+      "Show which Scribe agent API capabilities the user's policy allows, prompts for, or denies right now. Returns versioned JSON.",
+    parameters: agentParameters({}),
+    argv: () => ["capabilities"],
+  },
+];
+
+/**
+ * Run `scribe agent <argv> --agent pi` and resolve with the text the model
+ * should see. Never rejects: a missing CLI, a failure envelope, and a killed
+ * child all resolve to explanatory text, because the CLI's JSON envelope is
+ * the contract and a thrown error would hide it.
+ */
+function runAgentCli(argv: string[], signal: AbortSignal | undefined): Promise<string> {
+  return new Promise((resolve) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+    const finish = (text: string) => {
+      if (settled) return;
+      settled = true;
+      resolve(text);
+    };
+
+    try {
+      const child = spawn("scribe", ["agent", ...argv, "--agent", "pi"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        signal,
+        timeout: AGENT_CLI_TIMEOUT_MS,
+      });
+      child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+      child.once("error", (error: Error) => {
+        finish(`failed to run the scribe CLI: ${error.message}`);
+      });
+      child.once("close", (code) => {
+        const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        const fallback =
+          code === null ? "scribe agent was terminated" : `scribe agent exited with code ${code}`;
+        finish(stdout || stderr || fallback);
+      });
+    } catch (error) {
+      finish(
+        `failed to run the scribe CLI: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
+}
+
+async function executeAgentCli(argv: string[], signal: AbortSignal | undefined) {
+  if (!process.env.SCRIBE_SESSION_ID) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "SCRIBE_SESSION_ID is unset: this process is not inside a Scribe pane, so scribe agent tools are unavailable.",
+        },
+      ],
+      details: undefined,
+    };
+  }
+  const text = await runAgentCli(argv, signal);
+  return { content: [{ type: "text" as const, text }], details: undefined };
+}
+
+function registerAgentTools(pi: ExtensionAPI) {
+  // Older Pi runtimes without registerTool keep lifecycle reporting only.
+  if (typeof pi.registerTool !== "function") return;
+  for (const tool of AGENT_TOOLS) {
+    pi.registerTool({
+      name: tool.name,
+      label: tool.label,
+      description: tool.description,
+      parameters: tool.parameters,
+      execute: (_toolCallId: string, params: unknown, signal: AbortSignal | undefined) =>
+        executeAgentCli(tool.argv((params ?? {}) as AgentToolParams), signal),
+    } as Parameters<ExtensionAPI["registerTool"]>[0]);
+  }
+}
+
 // @lat: [[server#Server#Hook Channel#Pi Extension Adapter]]
 export default function scribePiExtension(pi: ExtensionAPI) {
   const helper = process.env.SCRIBE_HOOK_HELPER;
@@ -255,4 +476,6 @@ export default function scribePiExtension(pi: ExtensionAPI) {
     })();
     return shutdownPromise;
   });
+
+  registerAgentTools(pi);
 }
