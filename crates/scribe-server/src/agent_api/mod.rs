@@ -3,6 +3,8 @@
 //! Capability handlers live in sibling modules. This foundational router keeps
 //! admission, policy ordering, and auditing in one place.
 
+pub mod policy;
+
 use std::sync::Arc;
 
 use scribe_common::agent::{
