@@ -28,7 +28,10 @@
 #      the grid paints highlights where the needle is;
 #   3. Enter moves the current match, which repaints a different cell run;
 #   4. Escape closes the overlay, every highlight is dropped, and the chord
-#      re-opens it — which it could not do if the overlay had swallowed it.
+#      re-opens it — which it could not do if the overlay had swallowed it;
+#   5. splitting the pane and focusing the LEFT one, opening find paints the
+#      box inside that pane's own grid slot rather than the window root — a
+#      regression guard for the overlay's mount point.
 #
 # Input is driven through XTEST (plain `xdotool key` / `type`, no `--window`):
 # GPUI reads keyboard through XInput2 and ignores the synthetic events that
@@ -290,6 +293,93 @@ sleep 0.5
 shot /output/05-reopened.png
 echo "PHASE 4 PASS: Escape cleared every highlight and released the keyboard"
 
+# ── Phase 5: the overlay mounts in the focused pane, not the window ──
+# Find only ever searches the focused pane's scrollback
+# (`send_search_request` targets `shared.active_session`), so splitting the
+# pane and opening find with the LEFT pane focused must paint the box inside
+# the LEFT half only. `half_ink`, ported from
+# tests/e2e/visual/pane-workspace-layout.sh:120, counts lit pixels in one
+# horizontal half of the grid area (title bar and status bar excluded).
+# Mounted on the window root instead of the pane, the overlay is still
+# right-anchored, so it paints over whichever pane sits under the window's
+# right edge regardless of which pane is actually focused — the right pane
+# here. This phase fails on that tree and passes once the box mounts inside
+# the focused pane's own grid slot.
+TITLEBAR_H=34
+BOTTOM_BANDS_H=24
+SPLIT_INK_MIN="${SPLIT_INK_MIN:-150}"
+SPLIT_INK_NOISE_MAX="${SPLIT_INK_NOISE_MAX:-150}"
+
+half_ink() {
+    local file="$1" half="$2"
+    local grid_h=$(( WIN_H - TITLEBAR_H - BOTTOM_BANDS_H ))
+    local half_w=$(( WIN_W / 2 ))
+    local off_x=$WIN_X
+    if [ "$half" = "right" ]; then
+        off_x=$(( WIN_X + half_w ))
+    fi
+    local off_y=$(( WIN_Y + TITLEBAR_H ))
+    local value
+    value=$(convert "$file" -crop "${half_w}x${grid_h}+${off_x}+${off_y}" +repage \
+        -colorspace Gray -threshold 35% -format "%[fx:mean*w*h]" info:)
+    printf '%s' "${value%.*}"
+}
+
+wait_for_log_growth() {
+    local pattern="$1" baseline="$2" timeout_secs="${3:-15}" started now
+    started=$(date +%s)
+    while true; do
+        now=$(count_log "$pattern")
+        if [ "$now" -gt "$baseline" ]; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
+# The overlay reopened at the end of phase 4 and owns every keystroke while
+# open, including the split chord below — close it first.
+send_keys Escape
+sleep 0.5
+
+SPLITS_BEFORE=$(count_log "split the focused pane")
+focus
+send_keys ctrl+shift+backslash
+wait_for_log_growth "split the focused pane" "$SPLITS_BEFORE" 15 \
+    || fail "PHASE 5: ctrl+shift+backslash never split the pane"
+sleep 1.0
+
+FOCUS_BEFORE=$(count_log "focused pane moved")
+focus
+send_keys shift+ctrl+alt+Left
+wait_for_log_growth "focused pane moved" "$FOCUS_BEFORE" 15 \
+    || fail "PHASE 5: shift+ctrl+alt+Left never focused the left pane"
+
+focus
+shot /output/06-split-before-find.png
+LEFT_BEFORE=$(half_ink /output/06-split-before-find.png left)
+RIGHT_BEFORE=$(half_ink /output/06-split-before-find.png right)
+
+OPENED_BEFORE=$(count_log "opened the find overlay")
+send_keys ctrl+shift+f
+wait_for_log_growth "opened the find overlay" "$OPENED_BEFORE" 15 \
+    || fail "PHASE 5: ctrl+shift+f did not reopen the overlay on the split pane"
+shot /output/07-split-find-open.png
+LEFT_AFTER=$(half_ink /output/07-split-find-open.png left)
+RIGHT_AFTER=$(half_ink /output/07-split-find-open.png right)
+LEFT_DELTA=$(( LEFT_AFTER - LEFT_BEFORE ))
+RIGHT_DELTA=$(( RIGHT_AFTER - RIGHT_BEFORE ))
+echo "PHASE 5: left half ${LEFT_BEFORE} -> ${LEFT_AFTER} (+${LEFT_DELTA}), right half ${RIGHT_BEFORE} -> ${RIGHT_AFTER} (+${RIGHT_DELTA})"
+
+[ "$LEFT_DELTA" -gt "$SPLIT_INK_MIN" ] \
+    || fail "PHASE 5: opening find on the left-focused pane added only $LEFT_DELTA px to the left half (min $SPLIT_INK_MIN) — the overlay is not painting inside the focused pane"
+[ "$RIGHT_DELTA" -lt "$SPLIT_INK_NOISE_MAX" ] \
+    || fail "PHASE 5: opening find on the left-focused pane added $RIGHT_DELTA px to the unfocused right pane (max $SPLIT_INK_NOISE_MAX) — the overlay is painting over the wrong pane"
+echo "PHASE 5 PASS: the find overlay mounted in the focused (left) pane, not the window (left +$LEFT_DELTA, right +$RIGHT_DELTA)"
+
 echo ""
 echo "PASS: visual find-overlay test"
 echo "  Inspect screenshots in test-output/:"
@@ -299,4 +389,6 @@ echo "    02-matches-highlighted.png — the query's matches painted on the grid
 echo "    03-next-match.png          — Enter moved the current match"
 echo "    04-overlay-closed.png      — Escape dropped every highlight"
 echo "    05-reopened.png            — the chord reopened the overlay"
+echo "    06-split-before-find.png   — split pane, left pane focused, before find"
+echo "    07-split-find-open.png     — find opened; the box stays in the left pane"
 echo "  Wire record: test-output/share-wire.jsonl"

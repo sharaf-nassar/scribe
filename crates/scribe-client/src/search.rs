@@ -565,9 +565,13 @@ impl Render for FindOverlayView {
             if query_empty { "Type to search scrollback".to_owned() } else { self.query.clone() };
         let query_color = if query_empty { colors.placeholder_fg } else { colors.query_fg };
 
-        // The box hugs the top-right corner exactly as the winit overlay did, so
-        // it never covers the prompt the user is searching from. The backdrop
-        // stays click-through except for its own dismiss handler.
+        // The overlay mounts inside the focused pane's `grid_slot`
+        // (`TerminalView::compose_pane_content`), which is the pane whose
+        // scrollback the query actually searches, so `inset_0` here resolves
+        // against that pane's rect rather than the window's. The box still
+        // hugs its top-right corner, but that corner is now the searched
+        // pane's, not the window's. The backdrop stays click-through except
+        // for its own dismiss handler.
         div()
             .track_focus(&self.focus_handle)
             .absolute()
@@ -575,7 +579,7 @@ impl Render for FindOverlayView {
             .flex()
             .justify_end()
             // `items_start` keeps the box at its own content height: the
-            // backdrop spans the window, and a stretched child would paint a
+            // backdrop spans the pane, and a stretched child would paint a
             // full-height panel down the right edge of the grid.
             .items_start()
             .on_mouse_down(
@@ -587,6 +591,12 @@ impl Render for FindOverlayView {
                     .mt(px(14.0))
                     .mr(px(14.0))
                     .w(px(360.0))
+                    .max_w(px(360.0))
+                    // ponytail: a pane narrower than this floor still clips
+                    // against grid_slot's overflow_hidden rather than
+                    // shrinking further; widen the floor or wrap the header
+                    // and query text if a narrower split turns out to matter.
+                    .min_w(px(200.0))
                     .flex()
                     .flex_col()
                     .bg(colors.bg)

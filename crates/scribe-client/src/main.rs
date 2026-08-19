@@ -6647,13 +6647,20 @@ impl TerminalView {
                 self.jump_button_accessibility(session_id, placement.rect.width, &content, cx)
             })
         });
+        // Find searches only the focused pane's scrollback
+        // (`send_search_request` targets `shared.active_session`), so the
+        // overlay mounts here rather than on the window root: `grid_slot` is
+        // the one rect that is both the searched pane's own bounds and
+        // already excludes the prompt strip.
+        let find_overlay = placement.focused.then(|| self.find_overlay.clone()).flatten();
         let grid_slot = div()
             .relative()
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
             .child(grid)
-            .children(jump_button);
+            .children(jump_button)
+            .children(find_overlay);
         let pane = pane.flex().flex_col();
         if self.prompt_bar.position == PromptBarPosition::Top {
             pane.children(strip).child(grid_slot)
@@ -10107,7 +10114,6 @@ impl Render for TerminalView {
             // the grid, taking the status surfaces off screen.
             .child(status_bar)
             .children(self.command_palette.clone())
-            .children(self.find_overlay.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
             .children(share)

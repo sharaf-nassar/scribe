@@ -4389,6 +4389,18 @@ its quiet baseline. That removes only cursor blink from the comparison; the
 full grid remains cropped and the 40-pixel ceiling still detects stale search
 highlights after Escape.
 
+A split-pane phase proves the overlay's mount point rather than just its wire
+round trip: the overlay searches only the focused pane
+([[crates/scribe-client/src/main.rs#TerminalView#send_search_request]] targets
+`shared.active_session`), so it must paint inside that pane and nowhere else.
+With the pane split and the LEFT pane focused, opening find must add lit
+pixels to the LEFT half of the grid and leave the RIGHT half flat within
+noise. `half_ink`, ported from `tests/e2e/visual/pane-workspace-layout.sh`,
+counts them per half; a box still mounted on the window root instead of
+[[crates/scribe-client/src/main.rs#TerminalView#compose_pane_content]]'s
+`grid_slot` paints over the RIGHT pane regardless of which one is focused,
+failing this phase.
+
 #### A typed query asks the server once
 
 Every request costs the server a full-scrollback scan, so the overlay debounces edits; this pins that a burst coalesces into one request for the settled text, that every kind of edit still re-asks, and that a no-op edit does not.
