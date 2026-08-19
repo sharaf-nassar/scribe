@@ -11,7 +11,9 @@ use crate::protocol::AutomationAction;
 
 /// One request made through the local agent API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+// `ClientMessage` already uses `type` as its outer tag. A distinct nested key
+// keeps `ClientMessage::AgentRequest(AgentRequest)` decodable on MessagePack.
+#[serde(tag = "request_type", rename_all = "snake_case")]
 pub enum AgentRequest {
     World {
         request_id: u64,

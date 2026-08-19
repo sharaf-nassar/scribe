@@ -26,15 +26,19 @@
 
 counts modules-total 75
 counts modules-wired 75
-counts server-messages-total 68
+counts server-messages-total 72
 counts server-messages-handled 63
 counts layout-actions-total 38
 counts layout-actions-handled 38
 
 # scribe-lpi2.9 wires the pure Flow layout module into the renderer.
 
+unhandled-server-message AgentActivity
+unhandled-server-message AgentPromptRequest
+unhandled-server-message AgentResponse
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
+unhandled-server-message RunActionCorrelated
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult

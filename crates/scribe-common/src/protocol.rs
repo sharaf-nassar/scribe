@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentActionOutcome, AgentCapability, AgentRequest, AgentResponse};
 use crate::ai_state::{AiProcessState, AiProvider, AiState};
 use crate::config::SharingMode;
 use crate::hook;
@@ -824,6 +825,10 @@ pub enum ClientMessage {
         /// legacy [`ShellTool::Pi`] launch and session metadata.
         #[serde(default)]
         pi_provider: bool,
+        /// Agent control-surface protocol support. Missing means this participant
+        /// must not receive agent activity or prompt frames.
+        #[serde(default)]
+        agent_api: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -865,6 +870,20 @@ pub enum ClientMessage {
     DispatchAction {
         window_id: Option<WindowId>,
         action: AutomationAction,
+    },
+    /// One-shot request through the local agent control surface.
+    AgentRequest(AgentRequest),
+    /// User resolution for a pending agent capability prompt.
+    AgentPromptResponse {
+        prompt_id: PromptId,
+        decision: ClipboardDecision,
+    },
+    /// Completion report for a correlated agent-dispatched action.
+    ActionCompleted {
+        correlation_id: u64,
+        outcome: AgentActionOutcome,
+        #[serde(default)]
+        created_session_id: Option<SessionId>,
     },
     /// Notify server of pane focus change so it can send CSI focus events
     /// to PTY applications that have enabled DECSET 1004 (`FOCUS_IN_OUT`).
@@ -1267,6 +1286,10 @@ pub enum ServerMessage {
         /// using legacy [`ShellTool::Pi`] metadata.
         #[serde(default)]
         pi_provider: bool,
+        /// Agent control-surface protocol support negotiated with the client.
+        /// Missing from older servers means unsupported.
+        #[serde(default)]
+        agent_api: bool,
     },
     /// One bounded live terminal-image record at an output boundary.
     TerminalImageLive {
@@ -1295,9 +1318,28 @@ pub enum ServerMessage {
     RunAction {
         action: AutomationAction,
     },
+    /// Correlated automation request originating from the agent API.
+    RunActionCorrelated {
+        correlation_id: u64,
+        action: AutomationAction,
+    },
     /// Confirms that a requested automation action was routed to a target window.
     ActionDispatched {
         window_id: WindowId,
+    },
+    /// Reply to a one-shot agent control-surface request.
+    AgentResponse(AgentResponse),
+    /// Prompt a capable client to approve an agent capability request.
+    AgentPromptRequest {
+        prompt_id: PromptId,
+        agent_label: String,
+        capability: AgentCapability,
+        target: String,
+    },
+    /// Shows agent activity for a session to capable participants.
+    AgentActivity {
+        session_id: SessionId,
+        active: bool,
     },
     /// Server requests this client to save state and close gracefully.
     /// Sent in response to a client's `QuitAll`, including the sender.
@@ -2104,6 +2146,7 @@ pub struct TrustedNetworkInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentPayload;
     use serde::de::IgnoredAny;
 
     #[derive(Serialize)]
@@ -2164,6 +2207,36 @@ mod tests {
             participant_id: Option<u64>,
             terminal_images: TerminalImageCapabilities,
             beads_detail: bool,
+        },
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum HelloWithoutAgentApi {
+        Hello {
+            window_id: Option<WindowId>,
+            clipboard_gating: bool,
+            takeover: bool,
+            join_window: bool,
+            terminal_images: TerminalImageCapabilities,
+            ci_run_bar: bool,
+            pi_provider: bool,
+        },
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "type")]
+    enum WelcomeWithoutAgentApi {
+        Welcome {
+            window_id: WindowId,
+            other_windows: Vec<WindowId>,
+            clipboard_gating: bool,
+            participant_id: Option<u64>,
+            terminal_images: TerminalImageCapabilities,
+            beads_detail: bool,
+            beads_write: bool,
+            beads_flow: bool,
+            pi_provider: bool,
         },
     }
 
@@ -2237,6 +2310,7 @@ mod tests {
             terminal_images: TerminalImageCapabilities::V1,
             ci_run_bar: true,
             pi_provider: true,
+            agent_api: true,
         };
         let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize new Hello");
         let _: HelloWithoutPiProvider =
@@ -2252,10 +2326,114 @@ mod tests {
             beads_write: true,
             beads_flow: true,
             pi_provider: true,
+            agent_api: true,
         };
         let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize new Welcome");
         let _: WelcomeWithoutPiProvider =
             rmp_serde::from_slice(&welcome_bytes).expect("old server schema decodes new Welcome");
+        let decoded_welcome: ServerMessage =
+            rmp_serde::from_slice(&welcome_bytes).expect("new server schema decodes Welcome");
+        assert!(matches!(decoded_welcome, ServerMessage::Welcome { agent_api: true, .. }));
+    }
+
+    // @lat: [[protocol#Protocol#Client Messages#Connection]]
+    #[test]
+    fn old_hello_and_welcome_default_agent_api_to_false() {
+        let hello = HelloWithoutAgentApi::Hello {
+            window_id: Some(WindowId::new()),
+            clipboard_gating: true,
+            takeover: false,
+            join_window: false,
+            terminal_images: TerminalImageCapabilities::V1,
+            ci_run_bar: true,
+            pi_provider: true,
+        };
+        let hello_bytes = rmp_serde::to_vec_named(&hello).expect("serialize old Hello");
+        let decoded_hello: ClientMessage =
+            rmp_serde::from_slice(&hello_bytes).expect("deserialize old Hello");
+        assert!(matches!(decoded_hello, ClientMessage::Hello { agent_api: false, .. }));
+
+        let welcome = WelcomeWithoutAgentApi::Welcome {
+            window_id: WindowId::new(),
+            other_windows: Vec::new(),
+            clipboard_gating: true,
+            participant_id: None,
+            terminal_images: TerminalImageCapabilities::V1,
+            beads_detail: true,
+            beads_write: true,
+            beads_flow: true,
+            pi_provider: true,
+        };
+        let welcome_bytes = rmp_serde::to_vec_named(&welcome).expect("serialize old Welcome");
+        let decoded_welcome: ServerMessage =
+            rmp_serde::from_slice(&welcome_bytes).expect("deserialize old Welcome");
+        assert!(matches!(decoded_welcome, ServerMessage::Welcome { agent_api: false, .. }));
+    }
+
+    #[test]
+    fn new_agent_wire_frames_round_trip() {
+        let request = ClientMessage::AgentRequest(AgentRequest::Capabilities {
+            request_id: 7,
+            agent_label: "test-agent".into(),
+            origin_session_id: None,
+        });
+        let request_bytes = rmp_serde::to_vec_named(&request).expect("serialize agent request");
+        let request_decoded: ClientMessage =
+            rmp_serde::from_slice(&request_bytes).expect("deserialize agent request");
+        assert!(matches!(
+            request_decoded,
+            ClientMessage::AgentRequest(AgentRequest::Capabilities { request_id: 7, .. })
+        ));
+
+        let response = ServerMessage::AgentResponse(AgentResponse {
+            request_id: 7,
+            result: Ok(AgentPayload::Capabilities {
+                capabilities: vec![AgentCapability::ReadMetadata],
+            }),
+        });
+        let response_bytes = rmp_serde::to_vec_named(&response).expect("serialize agent response");
+        let response_decoded: ServerMessage =
+            rmp_serde::from_slice(&response_bytes).expect("deserialize agent response");
+        assert!(matches!(
+            response_decoded,
+            ServerMessage::AgentResponse(AgentResponse { request_id: 7, .. })
+        ));
+
+        for message in [
+            ClientMessage::AgentPromptResponse {
+                prompt_id: PromptId(8),
+                decision: ClipboardDecision::AllowOnce,
+            },
+            ClientMessage::ActionCompleted {
+                correlation_id: 9,
+                outcome: AgentActionOutcome::Completed,
+                created_session_id: None,
+            },
+        ] {
+            let client_bytes =
+                rmp_serde::to_vec_named(&message).expect("serialize agent client frame");
+            let _: ClientMessage =
+                rmp_serde::from_slice(&client_bytes).expect("deserialize agent client frame");
+        }
+
+        for message in [
+            ServerMessage::AgentPromptRequest {
+                prompt_id: PromptId(10),
+                agent_label: "test-agent".into(),
+                capability: AgentCapability::ReadMetadata,
+                target: "server".into(),
+            },
+            ServerMessage::AgentActivity { session_id: SessionId::new(), active: true },
+            ServerMessage::RunActionCorrelated {
+                correlation_id: 11,
+                action: AutomationAction::OpenSettings,
+            },
+        ] {
+            let server_bytes =
+                rmp_serde::to_vec_named(&message).expect("serialize agent server frame");
+            let _: ServerMessage =
+                rmp_serde::from_slice(&server_bytes).expect("deserialize agent server frame");
+        }
     }
 
     #[test]
@@ -2802,6 +2980,7 @@ mod tests {
             beads_write: true,
             beads_flow: false,
             pi_provider: true,
+            agent_api: false,
         };
         let write_bytes = rmp_serde::to_vec_named(&message).expect("serialize write-only Welcome");
         let decoded_write: ServerMessage =
@@ -2848,6 +3027,7 @@ mod tests {
                 beads_write: write,
                 beads_flow: flow,
                 pi_provider: true,
+                agent_api: false,
             };
             let bytes = rmp_serde::to_vec_named(&message).expect("serialize Welcome");
             let decoded: ServerMessage =

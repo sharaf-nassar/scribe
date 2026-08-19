@@ -717,6 +717,18 @@ pub enum ParticipantTransport {
     Remote,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentApiCapability {
+    Unsupported,
+    Supported,
+}
+
+impl From<bool> for AgentApiCapability {
+    fn from(supported: bool) -> Self {
+        if supported { Self::Supported } else { Self::Unsupported }
+    }
+}
+
 /// Feature 015 (T006, D1): one attached machine's membership in a window share.
 /// Absorbs the per-connection state feature 013 spread across the three retired
 /// per-window maps plus the existing per-connection `OutputSink` queue (carried on
@@ -743,6 +755,8 @@ pub struct Participant {
     pub clipboard_gating: bool,
     /// Whether this participant can decode CI run-state server frames.
     pub ci_run_bar: bool,
+    /// Whether this participant can decode agent activity and prompt frames.
+    agent_api: AgentApiCapability,
 }
 
 impl Participant {
@@ -752,6 +766,7 @@ impl Participant {
         identity: ControllerIdentity,
         transport: ParticipantTransport,
         clipboard_gating: bool,
+        agent_api: AgentApiCapability,
     ) -> Self {
         Self {
             id: allocate_participant_id(),
@@ -761,12 +776,19 @@ impl Participant {
             viewport: TerminalSize::default(),
             clipboard_gating,
             ci_run_bar: false,
+            agent_api,
         }
     }
 
     /// The local owning-machine participant (Unix-socket client).
     fn local(writer: &SharedWriter, clipboard_gating: bool) -> Self {
-        Self::new(writer, ControllerIdentity::Local, ParticipantTransport::Local, clipboard_gating)
+        Self::new(
+            writer,
+            ControllerIdentity::Local,
+            ParticipantTransport::Local,
+            clipboard_gating,
+            AgentApiCapability::Unsupported,
+        )
     }
 
     /// Build the participant a `Hello` claim registers: its controller identity,
@@ -776,8 +798,13 @@ impl Participant {
             ControllerIdentity::Local => ParticipantTransport::Local,
             ControllerIdentity::Remote { .. } => ParticipantTransport::Remote,
         };
-        let mut participant =
-            Self::new(writer, claim.controller.clone(), transport, claim.clipboard_gating);
+        let mut participant = Self::new(
+            writer,
+            claim.controller.clone(),
+            transport,
+            claim.clipboard_gating,
+            claim.agent_api,
+        );
         participant.ci_run_bar = claim.ci_run_bar;
         participant
     }
@@ -979,6 +1006,16 @@ impl WindowShare {
         self.participants
             .values()
             .filter(|participant| participant.ci_run_bar)
+            .map(|participant| Arc::clone(&participant.writer))
+            .collect()
+    }
+
+    /// Writers that advertised support for agent activity and prompt frames.
+    #[cfg(test)]
+    fn agent_api_writers(&self) -> Vec<SharedWriter> {
+        self.participants
+            .values()
+            .filter(|participant| participant.agent_api == AgentApiCapability::Supported)
             .map(|participant| Arc::clone(&participant.writer))
             .collect()
     }
@@ -4945,6 +4982,7 @@ async fn claim_hello_window(
         terminal_images,
         ci_run_bar,
         pi_provider,
+        agent_api,
         ..
     } = hello
     else {
@@ -4970,6 +5008,7 @@ async fn claim_hello_window(
         controller,
         terminal_images: record_image_capabilities(conn.writer, terminal_images).await,
         ci_run_bar,
+        agent_api: agent_api.into(),
     };
     Some(handle_client_hello(claim, conn.server, conn.writer).await)
 }
@@ -5113,6 +5152,7 @@ fn is_transient_first_frame(msg: &ClientMessage) -> bool {
         ClientMessage::ListWindows
             | ClientMessage::QuitAll
             | ClientMessage::DispatchAction { .. }
+            | ClientMessage::AgentRequest(_)
             | ClientMessage::CheckForUpdates
             | ClientMessage::ListReleases
             | ClientMessage::TriggerUpdate
@@ -5176,6 +5216,10 @@ async fn establish_local_first_frame(
         ClientMessage::DispatchAction { window_id, action } => {
             handle_transient_dispatch_action(window_id, action, &server.window_shares, writer)
                 .await;
+            None
+        }
+        ClientMessage::AgentRequest(request) => {
+            debug!(?request, "agent request received before agent dispatcher is installed");
             None
         }
         ClientMessage::CheckForUpdates => {
@@ -5602,6 +5646,8 @@ struct HelloClaim<'a> {
     terminal_images: TerminalImageCapabilities,
     /// CI run-bar protocol support advertised by this connection.
     ci_run_bar: bool,
+    /// Agent control-surface protocol support advertised by this connection.
+    agent_api: AgentApiCapability,
     /// This connection's controller identity (local vs remote peer).
     controller: &'a ControllerIdentity,
 }
@@ -5653,7 +5699,7 @@ async fn handle_client_hello(
             }
             // Feature 015 self-id: tell the client its own registered participant id
             // so it can match itself in a `ShareRoster` exactly (its own `is_holder`).
-            let (participant_id, beads_detail) = {
+            let (participant_id, beads_detail, registered_agent_api) = {
                 let shares = server.window_shares.read().await;
                 let share = shares.get(&window_id);
                 (
@@ -5662,6 +5708,9 @@ async fn handle_client_hello(
                         share,
                         writer,
                         matches!(claim.controller, ControllerIdentity::Remote { .. }),
+                    ),
+                    share.and_then(|share| share.participant_for_writer(writer)).is_some_and(
+                        |participant| participant.agent_api == AgentApiCapability::Supported,
                     ),
                 )
             };
@@ -5678,10 +5727,16 @@ async fn handle_client_hello(
                 // detail reads, so neither capability widens the trust boundary.
                 beads_flow: beads_detail,
                 pi_provider: true,
+                agent_api: claim.agent_api == AgentApiCapability::Supported,
             };
             send_message(writer, &welcome).await;
 
-            info!(%window_id, client_clipboard_gating = claim.clipboard_gating, "client identified via Hello");
+            info!(
+                %window_id,
+                client_clipboard_gating = claim.clipboard_gating,
+                client_agent_api = registered_agent_api,
+                "client identified via Hello"
+            );
 
             announce_share_join(server, window_id, claim.controller, !displaced.is_empty()).await;
             window_id
@@ -5707,6 +5762,7 @@ async fn handle_client_hello(
                 beads_write: false,
                 beads_flow: false,
                 pi_provider: true,
+                agent_api: claim.agent_api == AgentApiCapability::Supported,
             };
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
@@ -6089,6 +6145,7 @@ async fn claim_window(
         controller: &local,
         terminal_images: TerminalImageCapabilities::default(),
         ci_run_bar: false,
+        agent_api: AgentApiCapability::Unsupported,
     };
     match resolve_and_register_claim(
         window_shares,
@@ -10232,6 +10289,27 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
     let _ = try_send_message(writer, msg).await;
 }
 
+/// Send an agent-only frame to participants that advertised `agent_api`.
+///
+/// Keeping the capability filter beside the participant registry makes every
+/// future agent activity/prompt broadcast fail closed for old clients.
+#[cfg(test)]
+async fn send_agent_api_message(
+    window_shares: &WindowShares,
+    window_id: WindowId,
+    msg: &ServerMessage,
+) {
+    let writers = window_shares
+        .read()
+        .await
+        .get(&window_id)
+        .map(WindowShare::agent_api_writers)
+        .unwrap_or_default();
+    for writer in writers {
+        send_message(&writer, msg).await;
+    }
+}
+
 /// Hand one `ServerMessage` to a connection's bounded output queue. Never blocks
 /// on the socket: overflow is absorbed inside the queue, so this returns `false`
 /// only when the connection is already closed.
@@ -13623,6 +13701,7 @@ mod tests {
             },
             ParticipantTransport::Remote,
             false,
+            AgentApiCapability::Unsupported,
         ));
         let shares = new_window_shares();
         shares.write().await.insert(window_id, share);
@@ -13666,6 +13745,7 @@ mod tests {
             },
             ParticipantTransport::Remote,
             false,
+            AgentApiCapability::Unsupported,
         ));
         let shares = new_window_shares();
         {
@@ -13811,6 +13891,21 @@ mod tests {
             intent: ClaimIntent::Plain,
             terminal_images: TerminalImageCapabilities::default(),
             ci_run_bar: capable,
+            agent_api: AgentApiCapability::Unsupported,
+            controller: &controller,
+        };
+        WindowShare::new_single_controller(Participant::from_claim(&claim, writer))
+    }
+
+    fn agent_share(writer: &SharedWriter, capable: bool) -> WindowShare {
+        let controller = ControllerIdentity::Local;
+        let claim = HelloClaim {
+            requested_window_id: None,
+            clipboard_gating: false,
+            intent: ClaimIntent::Plain,
+            terminal_images: TerminalImageCapabilities::default(),
+            ci_run_bar: false,
+            agent_api: capable.into(),
             controller: &controller,
         };
         WindowShare::new_single_controller(Participant::from_claim(&claim, writer))
@@ -13896,6 +13991,60 @@ mod tests {
             rollup: CiRunStatus::Queued,
             stale: false,
         }
+    }
+
+    #[tokio::test]
+    async fn agent_frames_reach_only_participants_that_advertise_agent_api() {
+        let capable_window = WindowId::new();
+        let incapable_window = WindowId::new();
+        let (capable_writer, mut capable_client) = ci_test_writer();
+        let (incapable_writer, mut incapable_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(capable_window, agent_share(&capable_writer, true));
+            shares.insert(incapable_window, agent_share(&incapable_writer, false));
+        }
+
+        let activity = ServerMessage::AgentActivity { session_id: SessionId::new(), active: true };
+        super::send_agent_api_message(&shares, capable_window, &activity).await;
+        super::send_agent_api_message(&shares, incapable_window, &activity).await;
+        assert!(matches!(
+            read_message(&mut capable_client).await.unwrap(),
+            ServerMessage::AgentActivity { active: true, .. }
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err()
+        );
+
+        let prompt = ServerMessage::AgentPromptRequest {
+            prompt_id: scribe_common::protocol::PromptId(9),
+            agent_label: "test-agent".into(),
+            capability: scribe_common::agent::AgentCapability::ReadMetadata,
+            target: "server".into(),
+        };
+        super::send_agent_api_message(&shares, capable_window, &prompt).await;
+        super::send_agent_api_message(&shares, incapable_window, &prompt).await;
+        assert!(matches!(
+            read_message(&mut capable_client).await.unwrap(),
+            ServerMessage::AgentPromptRequest {
+                prompt_id: scribe_common::protocol::PromptId(9),
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err()
+        );
     }
 
     // @lat: [[protocol#Server Messages#CI Run State#Capability and repository scoping]]
@@ -14471,6 +14620,7 @@ mod tests {
             },
             ParticipantTransport::Remote,
             false,
+            AgentApiCapability::Unsupported,
         );
         shares.write().await.insert(window_id, WindowShare::new_single_controller(remote));
         set_focused_issue(session_id, None, &live_sessions, &shares).await;

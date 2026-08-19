@@ -233,6 +233,46 @@ impl WaitNotifiers {
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
+struct MessageDispatch<'a> {
+    state: &'a SharedState,
+    notifiers: &'a Arc<WaitNotifiers>,
+}
+
+macro_rules! unused_server_message {
+    () => {
+        ServerMessage::EnvPreflightResult { .. }
+            | ServerMessage::EnvStatus { .. }
+            | ServerMessage::ClipboardPromptRequest { .. }
+            | ServerMessage::ClipboardBridgeWrite { .. }
+            | ServerMessage::ClipboardBridgeReadRequest { .. }
+            | ServerMessage::RemoteHandshakeReply { .. }
+            | ServerMessage::WindowTakenOver { .. }
+            | ServerMessage::RemoteDisconnect { .. }
+            | ServerMessage::RemotePeerList { .. }
+            | ServerMessage::RemoteEnv { .. }
+            | ServerMessage::LanApprovalPending
+            | ServerMessage::LanApprovalResult { .. }
+            | ServerMessage::LanApprovalRequest { .. }
+            | ServerMessage::LanPeerList { .. }
+            | ServerMessage::TrustedDeviceList { .. }
+            | ServerMessage::TrustedNetworkList { .. }
+            | ServerMessage::LanEnv { .. }
+            | ServerMessage::LanDialIdentity { .. }
+            | ServerMessage::TerminalImageLive { .. }
+            | ServerMessage::TerminalImageReplay { .. }
+            | ServerMessage::TerminalImageCapabilityMismatch { .. }
+            | ServerMessage::BeadsIssueDetail { .. }
+            | ServerMessage::IssueFocused { .. }
+            | ServerMessage::ShareRoster { .. }
+            | ServerMessage::ControlRequested { .. }
+            | ServerMessage::ControlDenied { .. }
+            | ServerMessage::ShareEnded { .. }
+            | ServerMessage::AgentResponse(_)
+            | ServerMessage::AgentPromptRequest { .. }
+            | ServerMessage::AgentActivity { .. }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Daemon lifecycle: start / run / stop
 // ---------------------------------------------------------------------------
@@ -373,6 +413,7 @@ pub async fn observe_ci_run(
             terminal_images: TerminalImageCapabilities::default(),
             ci_run_bar: true,
             pi_provider: false,
+            agent_api: false,
         },
     )
     .await?;
@@ -546,6 +587,7 @@ pub async fn run() -> Result<(), ScribeError> {
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
             pi_provider: pi_provider_capability(),
+            agent_api: false,
         },
     )
     .await?;
@@ -629,94 +671,71 @@ async fn server_reader_loop(
 }
 
 /// Dispatch a single `ServerMessage` to the appropriate session state.
+impl MessageDispatch<'_> {
+    async fn dispatch(&self, msg: ServerMessage) {
+        match msg {
+            msg @ (ServerMessage::PtyOutput { .. }
+            | ServerMessage::ScreenSnapshot { .. }
+            | ServerMessage::SessionReplay { .. }
+            | ServerMessage::CwdChanged { .. }
+            | ServerMessage::TitleChanged { .. }
+            | ServerMessage::IconTitleChanged { .. }
+            | ServerMessage::SessionCreated { .. }
+            | ServerMessage::SessionExited { .. }
+            | ServerMessage::SessionContextChanged { .. }
+            | ServerMessage::TrimScrollback { .. }
+            | ServerMessage::ScrollBottom { .. }
+            | ServerMessage::AiStateChanged { .. }
+            | ServerMessage::AiStateCleared { .. }) => {
+                dispatch_session_message(msg, self.state, self.notifiers).await;
+            }
+            msg @ (ServerMessage::WorkspaceInfo { .. }
+            | ServerMessage::WorkspaceNamed { .. }
+            | ServerMessage::Welcome { .. }
+            | ServerMessage::WindowClosed { .. }
+            | ServerMessage::QuitRequested
+            | ServerMessage::UpdateAvailable { .. }
+            | ServerMessage::UpdateProgress { .. }
+            | ServerMessage::UpdateCheckResult { .. }
+            | ServerMessage::ReleaseList { .. }
+            | ServerMessage::WindowList { .. }
+            | ServerMessage::RunAction { .. }
+            | ServerMessage::RunActionCorrelated { .. }
+            | ServerMessage::ActionDispatched { .. }
+            | ServerMessage::CiRunState { .. }
+            | ServerMessage::CiRunDetails { .. }) => {
+                dispatch_window_message(msg, self.state, self.notifiers).await;
+            }
+            msg @ (ServerMessage::CodexTaskLabelChanged { .. }
+            | ServerMessage::CodexTaskLabelCleared { .. }
+            | ServerMessage::TaskLabelChanged { .. }
+            | ServerMessage::TaskLabelCleared { .. }
+            | ServerMessage::GitBranch { .. }
+            | ServerMessage::Bell { .. }
+            | ServerMessage::Error { .. }
+            | ServerMessage::SessionList { .. }
+            | ServerMessage::SearchResults { .. }
+            | ServerMessage::PromptMark { .. }
+            | ServerMessage::PromptReceived { .. }) => {
+                dispatch_notice_message(msg);
+            }
+            msg @ (ServerMessage::BeadsBoard { .. }
+            | ServerMessage::BeadsIssueWriteResult { .. }
+            | ServerMessage::BeadsEpicGraph { .. }) => {
+                dispatch_beads_message(msg, self.state, self.notifiers).await;
+            }
+            // Keep ignored frames exhaustive so new variants force a routing decision.
+            unused_server_message!() => {}
+        }
+    }
+}
+
 async fn dispatch_server_message(
     msg: ServerMessage,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
 ) {
-    match msg {
-        msg @ (ServerMessage::PtyOutput { .. }
-        | ServerMessage::ScreenSnapshot { .. }
-        | ServerMessage::SessionReplay { .. }
-        | ServerMessage::CwdChanged { .. }
-        | ServerMessage::TitleChanged { .. }
-        | ServerMessage::IconTitleChanged { .. }
-        | ServerMessage::SessionCreated { .. }
-        | ServerMessage::SessionExited { .. }
-        | ServerMessage::SessionContextChanged { .. }
-        | ServerMessage::TrimScrollback { .. }
-        | ServerMessage::ScrollBottom { .. }
-        | ServerMessage::AiStateChanged { .. }
-        | ServerMessage::AiStateCleared { .. }) => {
-            dispatch_session_message(msg, state, notifiers).await;
-        }
-        msg @ (ServerMessage::WorkspaceInfo { .. }
-        | ServerMessage::WorkspaceNamed { .. }
-        | ServerMessage::Welcome { .. }
-        | ServerMessage::WindowClosed { .. }
-        | ServerMessage::QuitRequested
-        | ServerMessage::UpdateAvailable { .. }
-        | ServerMessage::UpdateProgress { .. }
-        | ServerMessage::UpdateCheckResult { .. }
-        | ServerMessage::ReleaseList { .. }
-        | ServerMessage::WindowList { .. }
-        | ServerMessage::RunAction { .. }
-        | ServerMessage::ActionDispatched { .. }
-        | ServerMessage::CiRunState { .. }
-        | ServerMessage::CiRunDetails { .. }) => {
-            dispatch_window_message(msg, state, notifiers).await;
-        }
-        msg @ (ServerMessage::CodexTaskLabelChanged { .. }
-        | ServerMessage::CodexTaskLabelCleared { .. }
-        | ServerMessage::TaskLabelChanged { .. }
-        | ServerMessage::TaskLabelCleared { .. }
-        | ServerMessage::GitBranch { .. }
-        | ServerMessage::Bell { .. }
-        | ServerMessage::Error { .. }
-        | ServerMessage::SessionList { .. }
-        | ServerMessage::SearchResults { .. }
-        | ServerMessage::PromptMark { .. }
-        | ServerMessage::PromptReceived { .. }) => {
-            dispatch_notice_message(msg);
-        }
-        // Test daemon does not exercise env-persistence (feature 006), OSC 52
-        // clipboard gating (spec 010), remote window control (feature 013), LAN
-        // remote control (feature 014), or the Beads Flow graph/liveness
-        // frames (spec 026) yet. Those reach client/settings surfaces; a
-        // behavior-preserving no-op arm.
-        ServerMessage::EnvPreflightResult { .. }
-        | ServerMessage::EnvStatus { .. }
-        | ServerMessage::ClipboardPromptRequest { .. }
-        | ServerMessage::ClipboardBridgeWrite { .. }
-        | ServerMessage::ClipboardBridgeReadRequest { .. }
-        | ServerMessage::RemoteHandshakeReply { .. }
-        | ServerMessage::WindowTakenOver { .. }
-        | ServerMessage::RemoteDisconnect { .. }
-        | ServerMessage::RemotePeerList { .. }
-        | ServerMessage::RemoteEnv { .. }
-        | ServerMessage::LanApprovalPending
-        | ServerMessage::LanApprovalResult { .. }
-        | ServerMessage::LanApprovalRequest { .. }
-        | ServerMessage::LanPeerList { .. }
-        | ServerMessage::TrustedDeviceList { .. }
-        | ServerMessage::TrustedNetworkList { .. }
-        | ServerMessage::LanEnv { .. }
-        | ServerMessage::LanDialIdentity { .. }
-        | ServerMessage::TerminalImageLive { .. }
-        | ServerMessage::TerminalImageReplay { .. }
-        | ServerMessage::TerminalImageCapabilityMismatch { .. }
-        | ServerMessage::BeadsIssueDetail { .. }
-        | ServerMessage::IssueFocused { .. }
-        | ServerMessage::ShareRoster { .. }
-        | ServerMessage::ControlRequested { .. }
-        | ServerMessage::ControlDenied { .. }
-        | ServerMessage::ShareEnded { .. } => {}
-        msg @ (ServerMessage::BeadsBoard { .. }
-        | ServerMessage::BeadsIssueWriteResult { .. }
-        | ServerMessage::BeadsEpicGraph { .. }) => {
-            dispatch_beads_message(msg, state, notifiers).await;
-        }
-    }
+    MessageDispatch { state, notifiers }.dispatch(msg).await;
 }
 
 /// Board snapshots and write results, the two Beads messages the test daemon
@@ -2631,6 +2650,7 @@ mod tests {
                 beads_write: false,
                 beads_flow: false,
                 pi_provider: false,
+                agent_api: false,
             },
         )
         .await

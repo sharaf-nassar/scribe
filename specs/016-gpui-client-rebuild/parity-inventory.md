@@ -91,7 +91,7 @@ upgrade. The `Bell` row was `manual` for the same reason and has since been
 upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
 window's `WM_HINTS` urgency flag, which a script can read directly.
 
-## Client messages (51 variants, 49 reachable)
+## Client messages (54 variants, 49 reachable)
 
 Every `ClientMessage` variant from `crates/scribe-common/src/protocol.rs` must
 remain serializable and be emitted by the corresponding GPUI interaction.
@@ -124,6 +124,9 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListWindows` | window management | scripted-E2E | `main.rs::TerminalView::poll_window_list` → `ipc_bridge::IpcSink::list_windows`, on the lifecycle tick while `remote.enabled` | required |
 | `DispatchAction` | remote automation | scripted-E2E | `main.rs::TerminalView::offer_action_to_controller` → `ipc_bridge::IpcSink::dispatch_action`, for a feature-015 viewer's window-mutating palette row | required |
+| `AgentRequest` | local agent control surface | unit | — (unwired; `scribe agent` CLI emission lands in `scribe-8uuf.15`) | required |
+| `AgentPromptResponse` | agent capability consent | unit | — (unwired; consent-dialog response routing lands in `scribe-8uuf.18`) | required |
+| `ActionCompleted` | correlated agent action completion | unit | — (unwired; client completion reporting lands in `scribe-8uuf.8`) | required |
 | `FocusChanged` | focus reporting | scripted-E2E | `main.rs::TerminalView::report_focus` → `ipc_bridge::IpcSink::focus_changed`, from the window activation observer and the pane-focus reconciliation | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
 | `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — settings-window row (in-app since bead .82) | required |
@@ -150,25 +153,26 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `BeadsIssueWrite` | workspace Beads issue detail edits | unit | — (unwired; protocol-only slice, editing pending a guard-capable bd) | required |
 | `RequestBeadsEpicGraph` | workspace Beads Flow epic dependency graph | unit | `beads_board.rs::BeadsBoards::request_card_flow` → `main.rs::TerminalView::sync_beads_board_strips` → `ipc_bridge.rs::IpcSink::request_beads_epic_graph` | required |
 
-**Reachability:** 49 of 51 rows name a live-path symbol; 2 are unwired and 0
+**Reachability:** 49 of 54 rows name a live-path symbol; 5 are unwired and 0
 are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
 rather than a client symbol, because the hook ingress is a separate binary by
 design; it is the only out-of-client row in the whole inventory.
 
-## Server messages (68 variants, 66 reachable)
+## Server messages (72 variants, 66 reachable)
 
 Every `ServerMessage` variant from `crates/scribe-common/src/protocol.rs` must
 be handled without loss, including additive sharing and LAN variants.
 
 The live reader's dispatcher `main.rs::dispatch_server_message` handles 60 of
-68 variants and routes the rest to `main.rs::unhandled_server_message`, which
+72 variants and routes the rest to `main.rs::unhandled_server_message`, which
 logs the variant name and increments a process counter rather than dropping it
 silently; the `_ => {}` catch-all the audit found is gone. Five variants —
 `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`, `TrustedDeviceList`,
 `TrustedNetworkList` — are consumed by the settings
 window's synchronous request/reply helper in `settings/server_action.rs`, and
-each of those rows says so. `BeadsIssueDetail` and `BeadsIssueWriteResult` are the
-remaining unwired replies; their protocol slices land before their panel
+each of those rows says so. `BeadsIssueDetail`, `BeadsIssueWriteResult`,
+`RunActionCorrelated`, `AgentResponse`, `AgentPromptRequest`, and `AgentActivity`
+are the remaining unwired replies; their protocol slices land before their
 consumers. `tools/check-parity-inventory.sh` enforces that:
 any variant the dispatcher does not handle must either carry a marker cell or
 be annotated a settings-window row, so this column cannot claim a reader arm
@@ -212,7 +216,11 @@ erase a replacement.
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
 | `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
+| `RunActionCorrelated` | correlated agent automation | unit | — (unwired; execution and completion routing lands in `scribe-8uuf.8`) | required |
 | `ActionDispatched` | remote automation | scripted-E2E | `main.rs::on_remote_message` arm — the routing ack for a dispatch this client sent | required |
+| `AgentResponse` | local agent request reply | unit | — (unwired; the CLI consumer lands in `scribe-8uuf.15`) | required |
+| `AgentPromptRequest` | agent capability consent | unit | — (unwired; the client consent dialog lands in `scribe-8uuf.18`) | required |
+| `AgentActivity` | visible agent session activity | unit | — (unwired; tab activity state lands in `scribe-8uuf.19`) | required |
 | `QuitRequested` | quit dialog | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_quit_requested` → the shell's lifecycle tick quits the app | required |
 | `UpdateAvailable` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_available` → `StatusBarData.update_available` | required |
 | `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
@@ -249,7 +257,7 @@ erase a replacement.
 | `BeadsEpicGraph` | workspace Beads Flow epic dependency graph reply | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::apply_epic_graph` → `beads_board.rs::flow_strip` | required |
 | `IssueFocused` | local unshared Flow live-agent issue binding | unit | `main.rs::dispatch_workspace_message` → `beads_board.rs::BeadsBoards::set_focused_issue` → `beads_flow.rs::node_dot` | required |
 
-**Reachability:** 66 of 68 rows name a live-path symbol; 2 are unwired and 0
+**Reachability:** 66 of 72 rows name a live-path symbol; 6 are unwired and 0
 are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
 unwired and 30 missing.)
 
@@ -472,19 +480,19 @@ with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 51 | 49 | 2 | 0 |
-| Server messages | 68 | 66 | 2 | 0 |
+| Client messages | 54 | 49 | 5 | 0 |
+| Server messages | 72 | 66 | 6 | 0 |
 | Input and keybinding actions | 56 | 56 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
 | Spec behaviour requirements | 28 | 28 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **218** | **214** | **4** | **0** |
+| **Total** | **225** | **214** | **11** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **209 rows, of which 205 are
-reachable (98%)** and 4 are not. **1 of those 209** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **216 rows, of which 205 are
+reachable (95%)** and 11 are not. **1 of those 216** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **204 of 209**.
+the in-client figure is **204 of 216**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

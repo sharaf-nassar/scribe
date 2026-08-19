@@ -11860,6 +11860,7 @@ where
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
             pi_provider: true,
+            agent_api: false,
         },
     )
     .await
@@ -12785,7 +12786,11 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::WindowClosed { .. } => "WindowClosed",
         ServerMessage::WindowList { .. } => "WindowList",
         ServerMessage::RunAction { .. } => "RunAction",
+        ServerMessage::RunActionCorrelated { .. } => "RunActionCorrelated",
         ServerMessage::ActionDispatched { .. } => "ActionDispatched",
+        ServerMessage::AgentResponse(_) => "AgentResponse",
+        ServerMessage::AgentPromptRequest { .. } => "AgentPromptRequest",
+        ServerMessage::AgentActivity { .. } => "AgentActivity",
         ServerMessage::QuitRequested => "QuitRequested",
         ServerMessage::UpdateAvailable { .. } => "UpdateAvailable",
         ServerMessage::UpdateProgress { .. } => "UpdateProgress",
