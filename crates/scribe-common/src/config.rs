@@ -3,6 +3,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentPolicyMode;
 use crate::ai_state::AiProvider;
 use crate::app::current_config_dir;
 use crate::error::ScribeError;
@@ -98,6 +99,10 @@ pub struct ScribeConfig {
     pub workspaces: WorkspacesConfig,
     #[serde(default)]
     pub github_ci: GithubCiConfig,
+    /// Policy and bounds for the local agent control surface. An absent table
+    /// keeps every capability denied and uses bounded defaults.
+    #[serde(default)]
+    pub agent_api: AgentApiConfig,
     #[serde(default)]
     pub update: UpdateConfig,
     #[serde(default)]
@@ -1952,6 +1957,158 @@ impl Default for NotificationsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Agent API (spec 027 — local agent control surface)
+// ---------------------------------------------------------------------------
+
+/// Maximum agent API response size (256 KiB).
+pub const AGENT_MAX_RESPONSE_BYTES_CEILING: u64 = 256 * 1024;
+/// Maximum agent API scrollback request (10,000 lines).
+pub const AGENT_MAX_SCROLLBACK_LINES_CEILING: u32 = 10_000;
+/// Maximum agent API input size (64 KiB).
+pub const AGENT_MAX_INPUT_BYTES_CEILING: u64 = 65_536;
+/// Maximum agent API prompt wait (5 minutes).
+pub const AGENT_PROMPT_TIMEOUT_MS_CEILING: u64 = 300_000;
+/// Maximum agent API burst reuse window (5 seconds).
+pub const AGENT_BURST_WINDOW_MS_CEILING: u64 = 5_000;
+/// Maximum agent API activity indicator dwell (10 seconds).
+pub const AGENT_ACTIVITY_DWELL_MS_CEILING: u64 = 10_000;
+
+fn default_agent_max_response_bytes() -> u64 {
+    AGENT_MAX_RESPONSE_BYTES_CEILING
+}
+
+fn default_agent_max_scrollback_lines() -> u32 {
+    1_000
+}
+
+fn default_agent_max_input_bytes() -> u64 {
+    4_096
+}
+
+fn default_agent_prompt_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_agent_burst_window_ms() -> u64 {
+    500
+}
+
+fn default_agent_activity_dwell_ms() -> u64 {
+    1_500
+}
+
+/// Default-safe policy and bounded limits for the local agent API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentApiConfig {
+    #[serde(default)]
+    pub read_metadata: AgentPolicyMode,
+    #[serde(default)]
+    pub read_content: AgentPolicyMode,
+    #[serde(default)]
+    pub dispatch_action: AgentPolicyMode,
+    #[serde(default)]
+    pub dispatch_destructive_action: AgentPolicyMode,
+    #[serde(default)]
+    pub write_input: AgentPolicyMode,
+    #[serde(default = "default_agent_max_response_bytes")]
+    pub max_response_bytes: u64,
+    #[serde(default = "default_agent_max_scrollback_lines")]
+    pub max_scrollback_lines: u32,
+    #[serde(default = "default_agent_max_input_bytes")]
+    pub max_input_bytes: u64,
+    #[serde(default = "default_agent_prompt_timeout_ms")]
+    pub prompt_timeout_ms: u64,
+    #[serde(default = "default_agent_burst_window_ms")]
+    pub burst_window_ms: u64,
+    #[serde(default = "default_agent_activity_dwell_ms")]
+    pub activity_dwell_ms: u64,
+}
+
+impl Default for AgentApiConfig {
+    fn default() -> Self {
+        Self {
+            read_metadata: AgentPolicyMode::Deny,
+            read_content: AgentPolicyMode::Deny,
+            dispatch_action: AgentPolicyMode::Deny,
+            dispatch_destructive_action: AgentPolicyMode::Deny,
+            write_input: AgentPolicyMode::Deny,
+            max_response_bytes: default_agent_max_response_bytes(),
+            max_scrollback_lines: default_agent_max_scrollback_lines(),
+            max_input_bytes: default_agent_max_input_bytes(),
+            prompt_timeout_ms: default_agent_prompt_timeout_ms(),
+            burst_window_ms: default_agent_burst_window_ms(),
+            activity_dwell_ms: default_agent_activity_dwell_ms(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentApiConfigRaw {
+    #[serde(default)]
+    read_metadata: Option<AgentPolicyMode>,
+    #[serde(default)]
+    read_content: Option<AgentPolicyMode>,
+    #[serde(default)]
+    dispatch_action: Option<AgentPolicyMode>,
+    #[serde(default)]
+    dispatch_destructive_action: Option<AgentPolicyMode>,
+    #[serde(default)]
+    write_input: Option<AgentPolicyMode>,
+    #[serde(default)]
+    max_response_bytes: Option<u64>,
+    #[serde(default)]
+    max_scrollback_lines: Option<u32>,
+    #[serde(default)]
+    max_input_bytes: Option<u64>,
+    #[serde(default)]
+    prompt_timeout_ms: Option<u64>,
+    #[serde(default)]
+    burst_window_ms: Option<u64>,
+    #[serde(default)]
+    activity_dwell_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for AgentApiConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = AgentApiConfigRaw::deserialize(deserializer)?;
+        let defaults = Self::default();
+        Ok(Self {
+            read_metadata: raw.read_metadata.unwrap_or(defaults.read_metadata),
+            read_content: raw.read_content.unwrap_or(defaults.read_content),
+            dispatch_action: raw.dispatch_action.unwrap_or(defaults.dispatch_action),
+            dispatch_destructive_action: raw
+                .dispatch_destructive_action
+                .unwrap_or(defaults.dispatch_destructive_action),
+            write_input: raw.write_input.unwrap_or(defaults.write_input),
+            max_response_bytes: raw
+                .max_response_bytes
+                .unwrap_or(defaults.max_response_bytes)
+                .min(AGENT_MAX_RESPONSE_BYTES_CEILING),
+            max_scrollback_lines: raw
+                .max_scrollback_lines
+                .unwrap_or(defaults.max_scrollback_lines)
+                .min(AGENT_MAX_SCROLLBACK_LINES_CEILING),
+            max_input_bytes: raw
+                .max_input_bytes
+                .unwrap_or(defaults.max_input_bytes)
+                .min(AGENT_MAX_INPUT_BYTES_CEILING),
+            prompt_timeout_ms: raw
+                .prompt_timeout_ms
+                .unwrap_or(defaults.prompt_timeout_ms)
+                .min(AGENT_PROMPT_TIMEOUT_MS_CEILING),
+            burst_window_ms: raw
+                .burst_window_ms
+                .unwrap_or(defaults.burst_window_ms)
+                .min(AGENT_BURST_WINDOW_MS_CEILING),
+            activity_dwell_ms: raw
+                .activity_dwell_ms
+                .unwrap_or(defaults.activity_dwell_ms)
+                .min(AGENT_ACTIVITY_DWELL_MS_CEILING),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Remote (feature 013 — remote window control over Tailscale)
 // ---------------------------------------------------------------------------
 
@@ -2317,6 +2474,7 @@ fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
 #[cfg(test)]
 mod tests {
     use super::{AiContextThresholds, AiIntegrationToggle, ContextBand, ScribeConfig};
+    use crate::agent::AgentPolicyMode;
     use crate::ai_state::AiProvider;
 
     // @lat: [[test#Test Harness#Pi Provider Compatibility#Provider identity and config]]
@@ -2359,6 +2517,42 @@ mod tests {
             parsed.get("github_ci").and_then(|v| v.get("enabled")).and_then(toml::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn agent_api_config_defaults_deny_and_absent_table_matches() {
+        let default = ScribeConfig::default().agent_api;
+        let parsed: ScribeConfig = toml::from_str("").expect("empty config should parse");
+        assert_eq!(parsed.agent_api, default);
+        assert_eq!(default.read_metadata, AgentPolicyMode::Deny);
+        assert_eq!(default.read_content, AgentPolicyMode::Deny);
+        assert_eq!(default.dispatch_action, AgentPolicyMode::Deny);
+        assert_eq!(default.dispatch_destructive_action, AgentPolicyMode::Deny);
+        assert_eq!(default.write_input, AgentPolicyMode::Deny);
+    }
+
+    #[test]
+    fn agent_api_config_clamps_limits_and_tolerates_unknown_keys() {
+        let parsed: ScribeConfig = toml::from_str(
+            "[agent_api]\n\
+             read_content = \"allow\"\n\
+             max_response_bytes = 262145\n\
+             max_scrollback_lines = 10001\n\
+             max_input_bytes = 65537\n\
+             prompt_timeout_ms = 300001\n\
+             burst_window_ms = 5001\n\
+             activity_dwell_ms = 10001\n\
+             future_limit = 42\n",
+        )
+        .expect("agent API config should parse");
+        let config = parsed.agent_api;
+        assert_eq!(config.read_content, AgentPolicyMode::Allow);
+        assert_eq!(config.max_response_bytes, 256 * 1024);
+        assert_eq!(config.max_scrollback_lines, 10_000);
+        assert_eq!(config.max_input_bytes, 65_536);
+        assert_eq!(config.prompt_timeout_ms, 300_000);
+        assert_eq!(config.burst_window_ms, 5_000);
+        assert_eq!(config.activity_dwell_ms, 10_000);
     }
 
     #[test]

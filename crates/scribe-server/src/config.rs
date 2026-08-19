@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use scribe_common::config::{ClipboardPolicyConfig, GithubCiConfig, RemoteConfig, UpdateConfig};
+use scribe_common::config::{
+    AgentApiConfig, ClipboardPolicyConfig, GithubCiConfig, RemoteConfig, UpdateConfig,
+};
 use scribe_common::error::ScribeError;
 
 /// Maximum allowed scrollback lines to prevent excessive memory use.
@@ -42,6 +44,8 @@ pub struct ScribeConfig {
     pub images_enabled: bool,
     /// Whether a qualifying local push may start GitHub CI tracking.
     pub github_ci: GithubCiConfig,
+    /// Live policy and bounds for the local agent control surface.
+    pub agent_api: AgentApiConfig,
 }
 
 impl Default for ScribeConfig {
@@ -56,13 +60,20 @@ impl Default for ScribeConfig {
             remote: RemoteConfig::default(),
             images_enabled: true,
             github_ci: GithubCiConfig::default(),
+            agent_api: AgentApiConfig::default(),
         }
     }
 }
 
 pub fn load_config() -> Result<ScribeConfig, ScribeError> {
-    let full = scribe_common::config::load_config()?;
+    Ok(project_config(scribe_common::config::load_config()?))
+}
 
+/// Project the shared config into the server-owned snapshot.
+///
+/// `load_config` is called at startup and on every `ConfigReloaded`, so this
+/// projection keeps the agent policy and limits live without a restart.
+fn project_config(full: scribe_common::config::ScribeConfig) -> ScribeConfig {
     let workspace_roots: Vec<PathBuf> = full
         .workspaces
         .roots
@@ -97,19 +108,9 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     let remote = full.remote;
     let images_enabled = full.terminal.images.enabled;
     let github_ci = full.github_ci;
+    let agent_api = full.agent_api;
 
-    info!(
-        roots = workspace_roots.len(),
-        scrollback_lines,
-        preserve_ai_scrollback = ai_terminal.preserve_ai_scrollback,
-        clipboard_read_mode = ?clipboard_policy.read_mode,
-        clipboard_write_mode = ?clipboard_policy.write_mode,
-        images_enabled,
-        github_ci_enabled = github_ci.enabled,
-        "server config loaded"
-    );
-
-    Ok(ScribeConfig {
+    let config = ScribeConfig {
         workspace_roots,
         scrollback_lines,
         shell_integration_enabled,
@@ -119,7 +120,23 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         remote,
         images_enabled,
         github_ci,
-    })
+        agent_api,
+    };
+
+    info!(
+        roots = config.workspace_roots.len(),
+        scrollback_lines = config.scrollback_lines,
+        preserve_ai_scrollback = config.ai_terminal.preserve_ai_scrollback,
+        clipboard_read_mode = ?config.clipboard_policy.read_mode,
+        clipboard_write_mode = ?config.clipboard_policy.write_mode,
+        images_enabled = config.images_enabled,
+        github_ci_enabled = config.github_ci.enabled,
+        agent_read_metadata = ?config.agent_api.read_metadata,
+        agent_read_content = ?config.agent_api.read_content,
+        "server config loaded"
+    );
+
+    config
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -127,4 +144,23 @@ fn expand_tilde(path: &str) -> PathBuf {
         || PathBuf::from(path),
         |rest| dirs::home_dir().map_or_else(|| PathBuf::from(path), |home| home.join(rest)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_config;
+    use scribe_common::agent::AgentPolicyMode;
+
+    #[test]
+    fn projects_agent_api_config_for_each_reload() {
+        let first: scribe_common::config::ScribeConfig =
+            toml::from_str("[agent_api]\nread_metadata = \"allow\"\n")
+                .expect("first config should parse");
+        let second: scribe_common::config::ScribeConfig =
+            toml::from_str("[agent_api]\nread_metadata = \"prompt\"\n")
+                .expect("second config should parse");
+
+        assert_eq!(project_config(first).agent_api.read_metadata, AgentPolicyMode::Allow);
+        assert_eq!(project_config(second).agent_api.read_metadata, AgentPolicyMode::Prompt);
+    }
 }
