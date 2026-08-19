@@ -62,8 +62,16 @@ focused pane's `grid_slot` in `TerminalView::compose_pane_content`, exactly
 where `jump_button` already goes; then scope the overlay's backdrop to the
 pane and clamp the fixed `w(px(360.0))` (`search.rs:588`) so a narrow split
 shrinks the box instead of clipping it under `grid_slot`'s
-`overflow_hidden`. Filed as `scribe-pty2`, unlanded as of this writing; the
-pointer controls and restyle are `scribe-1mpq`, blocked on it.
+`overflow_hidden`. Filed as `scribe-pty2`; the pointer controls and restyle are
+`scribe-1mpq`, blocked on it.
+
+Landed in `48f81e3` for `scribe-pty2`, as described. The regression phase is a
+proper negative control: with the split's LEFT pane focused it measured
+left +0 / right +342 before the fix and left +550 / right +0 after, so the
+assertion fails on the old mount point rather than merely passing on the new
+one. The 360px box is clamped with `max_w` plus a 200px `min_w` floor; a pane
+narrower than that floor still clips against `grid_slot`'s `overflow_hidden`,
+tracked as ponytail debt rather than solved.
 
 The reproduction that made it measurable: split the pane, focus LEFT, open
 find, and count lit pixels per window half with the `half_ink` helper from

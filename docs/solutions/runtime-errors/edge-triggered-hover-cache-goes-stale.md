@@ -99,8 +99,24 @@ already visits every scrollbar state, so this needs no second timer and no new
 state machine.
 
 Filed as `scribe-re54` (P2), with `scribe-jjbm` (P3) depending on it for the
-jump-chip cache that reuses the same refresh site. Both unlanded as of this
-writing; the description above is the approach, not a landed change.
+jump-chip cache that reuses the same refresh site.
+
+Landed in `b65b5c4` for `scribe-re54`, exactly as described above. Two details
+the approach did not anticipate, both worth knowing before attempting
+`scribe-jjbm` against the same site:
+
+- The regression phases had to be placed immediately after phase 1 of
+  `tests/e2e/visual/scrollbar.sh`, because that is the only point at which the
+  shared pane still has zero scrollback. The former phase 9 control lost that
+  shared tab as a result and now opens and fills its own. Phase numbers in that
+  script therefore no longer match source order, which is documented inline.
+- Adding the `on_mouse_exit` listener inline pushed `render_grid` to 81 lines
+  against this repo's 80-line clippy ceiling. The handler is a named
+  `forget_pointer_position` method for that reason, not for style. See
+  `docs/solutions/conventions/lint-suppression-allowlist-is-counted.md`.
+
+`scribe-jjbm` remains open and can reuse `PointerState::last_position` and the
+`on_mouse_exit` listener directly.
 
 ## Prevention
 
