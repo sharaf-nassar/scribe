@@ -1017,10 +1017,27 @@ click_card() {
 }
 
 # Wait for the seeded epic to reach the painted board before touching it.
-for _ in $(seq 1 50); do
-    issue_position e2e-flow-d >/dev/null 2>&1 && break
-    sleep 0.2
-done
+#
+# Two things gate that, and a fixed-duration sleep satisfies neither. The seed
+# went through the `bd` CLI, which the server never observes, so its board
+# cache only notices on the next expiry -- a full CACHE_TTL, not a poll. And
+# the client only asks for a board when the pointer actually moves: badge hover
+# is edge-triggered, so re-issuing `mousemove` to the coordinates the pointer
+# already occupies produces no event and therefore no request. Parking on the
+# badge waits forever. Move the pointer away and back each round so every cycle
+# is a real hover, and keep going long enough to outlast the cache.
+wait_for_seeded_card() {
+    local issue="$1" deadline=$(( SECONDS + 120 ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        issue_position "$issue" >/dev/null 2>&1 && return 0
+        xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( HEIGHT - 80 ))"
+        sleep 0.3
+        xdotool mousemove --sync --window "$WID" 13 17
+        sleep 1.7
+    done
+    fail "$issue never reached the painted board after seeding"
+}
+wait_for_seeded_card e2e-flow-d
 import -window "$WID" /output/beads-flow-lanes.png
 
 FLOW_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-d)

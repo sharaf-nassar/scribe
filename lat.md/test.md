@@ -1919,7 +1919,17 @@ swaps only the strip, and a node moves the panel without moving the epic.
 
 A small admissible epic is seeded into the painted workspace only after every
 lane, detail, and drag assertion has finished, so those keep the board they
-were written against. Clicking its deepest card must produce both a
+were written against.
+
+Waiting for those cards is not a poll. The seed goes through the `bd` CLI, so
+the server never observes it and its board cache only re-reads on
+`CACHE_TTL` expiry; and the client only requests a board when the pointer
+actually moves, because badge hover is edge-triggered, so re-issuing a move to
+the coordinates the pointer already holds produces no event and no request.
+Parking on the badge therefore waits forever. The run moves the pointer away
+and back each round and keeps going long enough to outlast the cache.
+
+Clicking its deepest card must produce both a
 `RequestBeadsIssueDetail` and a `RequestBeadsEpicGraph` on the client wire, an
 admitted graph from the server, and a repainted strip. Activating a node
 through its accessible Tab stop must request a different member's detail while
