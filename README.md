@@ -16,6 +16,7 @@
 - [Client-Server Architecture](#client-server-architecture)
 - [Zero-Downtime Upgrades](#zero-downtime-upgrades)
 - [AI / LLM Process Awareness](#ai--llm-process-awareness)
+- [Local Agent API](#local-agent-api)
 - [Prompt Bar](#prompt-bar)
 - [Clipboard Cleanup](#clipboard-cleanup)
 - [Cold Restart Restore](#cold-restart-restore)
@@ -257,6 +258,31 @@ inert outside a root Pi process launched by Scribe and suppresses Pi subagents
 when `PI_SUBAGENT_CHILD=1`; third-party launchers without an equivalent child
 marker cannot be distinguished.
 
+### Local Agent API
+
+A supported, default-off control surface that lets a local AI agent read and
+drive Scribe through the `scribe agent` CLI — list windows, workspaces, and
+sessions with their AI state (`world`, `siblings`), read another pane's screen
+text (`read`), dispatch automation actions (`action`), type into a session
+(`write`), and query what the build supports (`capabilities`). Every data
+command returns a versioned JSON envelope with typed error codes and documented
+exit codes, so agents integrate with no Scribe-specific adapter code, and
+`scribe agent skill` generates provider guidance directly from the binary and
+the live policy so instructions can never drift from the contract.
+
+Every capability is gated by its own Allow / Prompt / Deny policy and
+everything defaults to Deny — the API is inert until you opt in under
+Settings → Agent API (or `[agent_api]` in `config.toml`). While an agent uses a
+session through the API, that session's tab shows an agent indicator, and every
+call leaves a metadata-only audit record. Scribe opens no network connection
+for this feature: requests ride the existing local Unix socket. Granting a
+capability discloses data to the local agent only — but that agent may forward
+what it reads to its own model provider, so granting read access to a
+cloud-backed agent is an explicit egress opt-in. The policy constrains
+cooperative same-user callers; it is not a sandbox against arbitrary processes
+running as your user. Full contract, JSON schemas, policy keys, and trust
+notes: [docs/agent-api.md](docs/agent-api.md).
+
 ### Prompt Bar
 
 A per-pane bar that tracks AI prompts at the top or bottom of the terminal content. Shows the first and latest prompt with icons, and a prompt count. Click a prompt line to copy it; click the dismiss button to hide the bar until a new conversation starts. Font size, position, and colors are all configurable in settings.
@@ -345,7 +371,7 @@ crates/
 ├── scribe-pty        # PTY I/O, OSC interceptor, metadata parser
 ├── scribe-server     # Session/workspace management, IPC, handoff
 ├── scribe-client     # GPUI terminal and settings windows
-├── scribe-cli        # Headless test CLI: raw stdin/stdout over IPC
+├── scribe-cli        # `scribe` CLI: agent API, automation, headless IPC
 └── scribe-test       # E2E test harness with subcommands
 ```
 
