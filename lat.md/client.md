@@ -2529,6 +2529,15 @@ The wheel resolves from the pointed-at pane whether or not the window is active.
 
 A pane still waiting on `SessionCreated` gets no listener at all — there is nothing to scroll yet.
 
+The jump chip has the same edge-triggered failure mode: its hover predicate
+reads the pane's current `display_offset` and painted geometry, so
+[[crates/scribe-client/src/main.rs#TerminalView#update_jump_hover]] re-tests
+that level from [[crates/scribe-client/src/main.rs#TerminalView#poll_scrollbar_fades]]
+against `PointerState::last_position`, not only from
+[[crates/scribe-client/src/main.rs#TerminalView#move_over_grid]]. A pointer
+parked where the chip will appear therefore gets the hovered paint as soon as a
+scroll makes the control visible, without requiring another motion event.
+
 #### Per-Pane Painted Bounds
 
 Every pane records where it painted its grid into its own `GridBounds` sink, keyed by session in `TerminalView::pane_bounds`, so a hit test can never disagree with what paint drew.
@@ -3004,7 +3013,7 @@ Before converting pin rows into pixels,  checks the live view's `WRAPLINE` flags
 
 Rendering uses a dual-render approach in `build_all_instances`: the terminal is rendered at the current `display_offset` (scrollback) and the instances are filtered to the top portion's Y range; then `display_offset` is temporarily set to 0 (live), rendered again, the live cells are translated by `live_cell_y_translation`, filtered to the bottom portion, and the offset is restored. Selection highlighting is applied to each half before filtering, using the scrollback half's saved `display_offset` and the live half's zero offset, so selections remain visible while split-scroll is active. Chrome (divider + jump button) is rendered by .
 
-Typing while split-scrolled sends keystrokes without snapping to bottom. Pressing Enter (`\r`) snaps to bottom and clears `split_scroll`. Paste always snaps. Every pane with `display_offset > 0` shows the same 30px jump control, whether or not its provider enables split-scroll. It stays beyond the overlay scrollbar's widened hit zone, uses the terminal surface with a subtle border and accent arrow-to-baseline, brightens on hover and press, and hides when the canvas is too small. In a split it docks in the top portion; otherwise it docks in the pane's bottom-right. [[crates/scribe-client/src/main.rs#TerminalView#jump_button_accessibility]] places a native Button over that paint so pointer, keyboard, and assistive activation share [[crates/scribe-client/src/main.rs#TerminalView#activate_jump_button]]. A held press owns motion before the PTY reporter, and [[crates/scribe-client/src/main.rs#TerminalView#update_jump_hover]] repaints only on enter or leave. Scroll activation and deactivation is managed by the free functions `update_split_scroll` and `reconcile_split_scroll`, which check `display_offset`, `scroll_pin` config, AI provider detection, and alternate-screen mode.
+Typing while split-scrolled sends keystrokes without snapping to bottom. Pressing Enter (`\r`) snaps to bottom and clears `split_scroll`. Paste always snaps. Every pane with `display_offset > 0` shows the same 30px jump control, whether or not its provider enables split-scroll. It stays beyond the overlay scrollbar's widened hit zone, uses the terminal surface with a subtle border and accent arrow-to-baseline, brightens on hover and press, and hides when the canvas is too small. In a split it docks in the top portion; otherwise it docks in the pane's bottom-right. [[crates/scribe-client/src/main.rs#TerminalView#jump_button_accessibility]] places a native Button over that paint so pointer, keyboard, and assistive activation share [[crates/scribe-client/src/main.rs#TerminalView#activate_jump_button]]. A held press owns motion before the PTY reporter, and [[crates/scribe-client/src/main.rs#TerminalView#update_jump_hover]] rechecks the level-triggered hover on both motion and the existing idle tick, so its visual state cannot stay stale while scrolling or resizing under a resting pointer. Scroll activation and deactivation is managed by the free functions `update_split_scroll` and `reconcile_split_scroll`, which check `display_offset`, `scroll_pin` config, AI provider detection, and alternate-screen mode.
 
 ## Status Bar
 

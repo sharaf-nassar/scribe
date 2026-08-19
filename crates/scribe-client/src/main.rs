@@ -1492,8 +1492,8 @@ struct PointerState {
     jump_hover: Option<SessionId>,
     /// The last position `move_over_grid` saw, cleared on `MouseExitEvent`.
     ///
-    /// This is the level condition [`TerminalView::update_scrollbar_hover`]
-    /// samples from the idle tick: `None` means the pointer is outside every
+    /// This is the level condition the scrollbar and jump-chip hover passes
+    /// sample from the idle tick: `None` means the pointer is outside every
     /// hit zone (including "outside the window"), so a re-run against it
     /// clears hover even when the pointer left through a hit zone and no
     /// further motion ever fires.
@@ -7259,7 +7259,7 @@ impl TerminalView {
         }
         self.pointer.last_position = Some(event.position);
         self.update_scrollbar_hover(self.pointer.last_position, cx);
-        self.update_jump_hover(event.position, cx);
+        self.update_jump_hover(self.pointer.last_position, cx);
         if let Some(session_id) = hover_focus_target(
             self.config.config().config.terminal.focus.focus_follows_mouse,
             event.pressed_button,
@@ -7403,13 +7403,13 @@ impl TerminalView {
     /// while any is still on screen. Returning early when nothing is
     /// animating keeps a rested window from repainting sixty times a second.
     ///
-    /// Hover is re-evaluated here, ahead of the fade tick, because it is a
-    /// level condition over `metrics.history_size`, the pane's painted rect,
-    /// and `scrollbars.panes` membership — all three can change with the
-    /// pointer still, and this is the same 16 ms wake already visiting every
-    /// scrollbar state, so re-testing it here adds no new timer.
+    /// Hover is re-evaluated here, ahead of the fade tick, because both
+    /// controls depend on live pane state that can change with the pointer
+    /// still. This is the same 16 ms wake already visiting every scrollbar
+    /// state, so re-testing both level conditions here adds no new timer.
     fn poll_scrollbar_fades(&mut self, cx: &mut Context<Self>) {
         self.update_scrollbar_hover(self.pointer.last_position, cx);
+        self.update_jump_hover(self.pointer.last_position, cx);
         if self.tick_scrollbar_fades() {
             cx.notify();
         }
@@ -7499,11 +7499,16 @@ impl TerminalView {
     }
 
     /// Repaint only when the pointer enters or leaves a visible jump control.
-    fn update_jump_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let hovered = self.pane_at(position).and_then(|session_id| {
-            let bounds = self.pane_grid_bounds(session_id)?;
-            let content = self.pane_content(session_id)?;
-            hits_jump_chip(bounds, &self.font, &content, position).then_some(session_id)
+    ///
+    /// The control's visibility and geometry can change while the pointer is
+    /// still, so this level check runs from the idle tick as well as motion.
+    fn update_jump_hover(&mut self, position: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let hovered = position.and_then(|position| {
+            self.pane_at(position).and_then(|session_id| {
+                let bounds = self.pane_grid_bounds(session_id)?;
+                let content = self.pane_content(session_id)?;
+                hits_jump_chip(bounds, &self.font, &content, position).then_some(session_id)
+            })
         });
         if hovered != self.pointer.jump_hover {
             self.pointer.jump_hover = hovered;

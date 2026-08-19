@@ -4874,10 +4874,13 @@ portion; an ordinary pane uses its bottom-right canvas corner.
 
 At the live bottom and on a tiny pane it stays inert. The hover and pressed
 states brighten the terminal surface and border while preserving the accent
-icon. The visual mouse-reporting phase enables DECSET 1003, moves one pixel
-onto the control to prove all-motion reporting is live, snapshots the wire,
-then moves one pixel while the button is held and requires zero `KeyInput`
-growth before the control reaches offset zero.
+icon. The visual mouse-reporting phase first parks the pointer on the chip,
+returns to the live bottom, then scrolls back with keyboard input and compares
+the stationary-pointer paint to the idle paint after moving away; this catches
+the edge-triggered cache going stale until motion. It then enables DECSET 1003,
+moves one pixel onto the control to prove all-motion reporting is live,
+snapshots the wire, moves one pixel while the button is held, and requires zero
+`KeyInput` growth before the control reaches offset zero.
 
 ### Keyboard jump activation stays out of the PTY
 

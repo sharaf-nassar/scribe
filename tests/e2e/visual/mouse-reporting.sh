@@ -43,6 +43,9 @@ STATUS_BAR_INSET_PX="${STATUS_BAR_INSET_PX:-20}"
 # scrollback replaces every text row; a swallowed wheel event leaves consecutive
 # frames byte-identical (the image pins SCRIBE_DISABLE_ANIMATIONS=1).
 VIEWPORT_DIFF_MIN="${VIEWPORT_DIFF_MIN:-5000}"
+# Hovering brightens the 30px chip across its full crop. Keep this low enough
+# for compositor variance while still rejecting the idle paint.
+JUMP_HOVER_DIFF_MIN="${JUMP_HOVER_DIFF_MIN:-100}"
 
 POLL_TICKS="${POLL_TICKS:-20}"
 
@@ -50,6 +53,10 @@ WIN_X=0
 WIN_Y=0
 WIN_W=0
 WIN_H=0
+JUMP_CROP_X=0
+JUMP_CROP_Y=0
+JUMP_CROP_W=0
+JUMP_CROP_H=0
 
 fail() {
     echo "$1" >&2
@@ -160,6 +167,11 @@ click() {
     sleep 0.5
 }
 
+send_key() {
+    xdotool key --clearmodifiers "$1"
+    sleep 0.6
+}
+
 # Find and click a pane's painted 30px jump control. `$1` is the pane's right
 # edge relative to the client window, so this also covers the left side of a
 # split without a hard-coded status-bar or decoration offset.
@@ -177,12 +189,26 @@ point_at_jump_control() {
             split(geometry, part)
             if (part[1] >= 28 && part[1] <= 32 && part[2] >= 28 && part[2] <= 32)
                 print part[3], part[4], part[1], part[2]
-        }')
+        }' | sort -k3nr -k4nr | head -1)
     [ "${#controls[@]}" -eq 1 ] \
         || fail "FAIL: expected one 30px jump control, found ${#controls[@]} (${controls[*]:-none})"
     read -r x y w h <<<"${controls[0]}"
-    point_at "$(( pane_right - 80 + x + w / 2 ))" \
-        "$(( WIN_H - 110 + y + h / 2 ))"
+    JUMP_CROP_X=$(( pane_right - 80 + x ))
+    JUMP_CROP_Y=$(( WIN_H - 110 + y ))
+    JUMP_CROP_W="$w"
+    JUMP_CROP_H="$h"
+    point_at "$(( JUMP_CROP_X + w / 2 ))" "$(( JUMP_CROP_Y + h / 2 ))"
+}
+
+jump_chip_capture() {
+    convert "$1" -crop "${JUMP_CROP_W}x${JUMP_CROP_H}+${JUMP_CROP_X}+${JUMP_CROP_Y}" \
+        +repage "$2"
+}
+
+jump_chip_diff() {
+    local value
+    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
 }
 
 jump_to_bottom() {
@@ -371,6 +397,26 @@ if [ "${DIFF:-0}" -lt "$VIEWPORT_DIFF_MIN" ]; then
     fail "PHASE 2 FAIL: the wheel changed $DIFF px (min $VIEWPORT_DIFF_MIN); the viewport never moved"
 fi
 echo "PHASE 2 PASS: wheel-up paged into the scrollback (+$DIFF px) — $LINE"
+
+# @lat: [[test#GPUI Terminal Viewport#The jump chip follows every scrolled pane]]
+# ── Phase 2a: jump-chip hover survives a stationary pointer ───────
+# Park on the visible chip, return to the live bottom, then scroll back with
+# keyboard input while leaving the pointer untouched. The chip must paint its
+# hovered state immediately; a motion-only cache leaves it idle until the next
+# pointer event.
+point_at_jump_control "$WIN_W"
+send_key shift+End
+send_key shift+Prior
+capture /output/mouse-02a-stationary.png
+jump_chip_capture /output/mouse-02a-stationary.png /output/mouse-02a-stationary-chip.png
+point_at 200
+capture /output/mouse-02a-after-motion.png
+jump_chip_capture /output/mouse-02a-after-motion.png /output/mouse-02a-after-motion-chip.png
+DIFF=$(jump_chip_diff /output/mouse-02a-stationary-chip.png /output/mouse-02a-after-motion-chip.png)
+if [ "${DIFF:-0}" -lt "$JUMP_HOVER_DIFF_MIN" ]; then
+    fail "PHASE 2a FAIL: stationary-pointer jump chip changed only ${DIFF}px after hover motion (min $JUMP_HOVER_DIFF_MIN)"
+fi
+echo "PHASE 2a PASS: jump-chip hover was live under a stationary pointer (${DIFF}px diff)"
 
 # ── Phase 2b: jump control outranks mouse reporting ───────────────
 # The pane is still scrolled. Give its PTY SGR tracking, then click the terminal
