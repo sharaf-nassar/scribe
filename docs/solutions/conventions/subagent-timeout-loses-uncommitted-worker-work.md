@@ -61,6 +61,35 @@ Prefer a returned `status: "failed"` naming the needed decision over a blocking
 `contact_supervisor` call. A question that comes back in the result JSON costs
 one attempt; a detached child costs the whole attempt's output.
 
+## Recurrence: run `run-20260819T050710.ezoM1n`
+
+It happened again, to two workers in one wave, because the orchestrator
+dispatched without applying this file's lesson. `scribe-03wp` and
+`scribe-xevt` both returned:
+
+```text
+Subagent timed out after 1800000ms.
+```
+
+Both had real work uncommitted in their preserved worktrees (30 and 23
+insertions), both resumed successfully on attempt 2 with
+`timeoutMs: 14400000`, and both then passed. Cost: one wasted wave.
+
+The original trigger — "can touch Docker or a release build" — was too narrow.
+The sharper rule is about the acceptance criteria:
+
+> When acceptance demands repeated runs ("passes repeatedly", "ten consecutive
+> runs", N-1/N/N+1), the dispatch budget is repetition count times suite
+> runtime, never one run.
+
+`scribe-xevt` required ten consecutive `just e2e-func-beads-board` runs at up
+to 6m19s each: over sixty minutes of pure suite time against a thirty-minute
+budget, so the attempt was arithmetically impossible before it started.
+`scribe-03wp` needed an image build plus five shared-pane visual runs.
+
+Read acceptance criteria for a repetition count before choosing `timeoutMs`,
+and multiply.
+
 ## Prevention
 
 A worker's commit is the only durable artifact of its run. Treat "has it
