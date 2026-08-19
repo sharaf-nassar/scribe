@@ -1,15 +1,22 @@
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::str::FromStr;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tokio::io::{self, AsyncReadExt as _};
+use tokio::io::{self, AsyncRead, AsyncReadExt as _, AsyncWrite};
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 use tracing::info;
+
+use scribe_common::agent::{AgentError, AgentPayload, AgentRequest, AgentResponse};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{WindowId, WorkspaceId, new_launch_id};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::profiles;
 use scribe_common::protocol::{AutomationAction, ClientMessage, ServerMessage};
 use scribe_common::socket::server_socket_path;
@@ -34,6 +41,20 @@ enum CliCommand {
         #[command(subcommand)]
         action: ProfileCommand,
     },
+    /// One-shot local agent API commands. Data commands always emit JSON.
+    Agent {
+        /// Caller-supplied agent name displayed by the server.
+        #[arg(long, global = true, default_value = "scribe-cli")]
+        agent: String,
+        /// Optional caller-supplied model name displayed alongside the agent.
+        #[arg(long, global = true)]
+        model: Option<String>,
+        /// Request machine-readable output (agent commands are JSON by default).
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -57,6 +78,35 @@ enum ActionCommand {
     SwitchProfile {
         name: String,
     },
+    OpenUpdateDialog,
+    FocusSession {
+        session_id: SessionId,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    World,
+    Siblings,
+    Read {
+        session_id: SessionId,
+        #[arg(long)]
+        scrollback: Option<u32>,
+    },
+    Action {
+        #[command(subcommand)]
+        action: ActionCommand,
+        #[arg(long, global = true)]
+        window: Option<WindowId>,
+    },
+    Write {
+        session_id: SessionId,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        submit: bool,
+    },
+    Capabilities,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +144,11 @@ fn write_line(line: &str) {
     let mut buf = line.as_bytes().to_vec();
     buf.push(b'\n');
     write_stdout(&buf);
+}
+
+fn write_stderr_line(line: &str) {
+    let mut stderr = std::io::stderr().lock();
+    drop(writeln!(stderr, "{line}"));
 }
 
 /// Pump PTY output from the server to local stdout until the session exits or
@@ -166,6 +221,231 @@ async fn connect_server() -> Result<UnixStream, ScribeError> {
     let path = server_socket_path();
     info!(?path, "connecting to scribe-server");
     UnixStream::connect(&path).await.map_err(|e| ScribeError::Io { source: e })
+}
+
+const AGENT_API_DEADLINE: Duration = Duration::from_secs(3);
+const AGENT_REQUEST_ID: u64 = 1;
+const MAX_AGENT_LABEL_CHARS: usize = 64;
+
+#[derive(Debug)]
+enum AgentExchangeError {
+    Unreachable(ScribeError),
+    Unsupported(ScribeError),
+}
+
+fn agent_label(agent: &str, model: Option<String>) -> Result<String, &'static str> {
+    if agent.is_empty() {
+        return Err("--agent must not be empty");
+    }
+    if model.as_deref().is_some_and(str::is_empty) {
+        return Err("--model must not be empty");
+    }
+
+    let label = model.map_or_else(|| agent.to_owned(), |model| format!("{agent} [{model}]"));
+    if label.chars().count() > MAX_AGENT_LABEL_CHARS {
+        return Err("the composed agent label must be at most 64 characters");
+    }
+    Ok(label)
+}
+
+fn origin_session_id(value: Option<OsString>) -> Result<Option<SessionId>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let value = value.to_str().ok_or("SCRIBE_SESSION_ID must be valid Unicode when set")?;
+    SessionId::from_str(value)
+        .map(Some)
+        .map_err(|_| "SCRIBE_SESSION_ID must be a full valid session UUID when set")
+}
+
+fn agent_error_parts(error: &AgentError) -> (&'static str, &str) {
+    match error {
+        AgentError::Denied { message } => ("denied", message),
+        AgentError::PromptTimeout { message } => ("prompt_timeout", message),
+        AgentError::NotFound { message } => ("not_found", message),
+        AgentError::AmbiguousTarget { message } => ("ambiguous_target", message),
+        AgentError::Unsupported { message } => ("unsupported", message),
+        AgentError::TooLarge { message } => ("too_large", message),
+        AgentError::Busy { message } => ("busy", message),
+        AgentError::VersionMismatch { message } => ("version_mismatch", message),
+        AgentError::ActionFailed { message } => ("action_failed", message),
+        AgentError::Internal { message } => ("internal", message),
+    }
+}
+
+fn agent_failure_envelope(code: &str, message: &str) -> Result<String, serde_json::Error> {
+    let code = serde_json::to_string(code)?;
+    let message = serde_json::to_string(message)?;
+    Ok(format!(r#"{{"v":1,"ok":false,"error":{{"code":{code},"message":{message}}}}}"#))
+}
+
+fn agent_envelope(result: Result<AgentPayload, AgentError>) -> Result<String, serde_json::Error> {
+    match result {
+        Ok(data) => Ok(format!(r#"{{"v":1,"ok":true,"data":{}}}"#, serde_json::to_string(&data)?)),
+        Err(error) => {
+            let (code, message) = agent_error_parts(&error);
+            agent_failure_envelope(code, message)
+        }
+    }
+}
+
+fn print_agent_envelope(envelope: Result<String, serde_json::Error>) -> bool {
+    match envelope {
+        Ok(envelope) => {
+            write_line(&envelope);
+            true
+        }
+        Err(error) => {
+            write_stderr_line(&format!("failed to serialize agent response: {error}"));
+            write_line(
+                r#"{"v":1,"ok":false,"error":{"code":"internal","message":"Failed to serialize agent response."}}"#,
+            );
+            false
+        }
+    }
+}
+
+fn print_agent_failure(code: &str, message: &str) -> bool {
+    print_agent_envelope(agent_failure_envelope(code, message))
+}
+
+fn build_agent_request(
+    command: AgentCommand,
+    agent_label: String,
+    origin_session_id: Option<SessionId>,
+) -> AgentRequest {
+    match command {
+        AgentCommand::World => {
+            AgentRequest::World { request_id: AGENT_REQUEST_ID, agent_label, origin_session_id }
+        }
+        AgentCommand::Siblings => {
+            AgentRequest::Siblings { request_id: AGENT_REQUEST_ID, agent_label, origin_session_id }
+        }
+        AgentCommand::Read { session_id, scrollback } => AgentRequest::ReadScreen {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+            session_id,
+            scrollback_lines: scrollback,
+        },
+        AgentCommand::Action { action, window } => AgentRequest::DispatchAction {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+            action: to_automation_action(action),
+            window,
+        },
+        AgentCommand::Write { session_id, text, submit } => AgentRequest::WriteInput {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+            session_id,
+            text,
+            submit,
+        },
+        AgentCommand::Capabilities => AgentRequest::Capabilities {
+            request_id: AGENT_REQUEST_ID,
+            agent_label,
+            origin_session_id,
+        },
+    }
+}
+
+async fn exchange_agent_request(
+    request: &AgentRequest,
+) -> Result<AgentResponse, AgentExchangeError> {
+    let mut stream = UnixStream::connect(server_socket_path())
+        .await
+        .map_err(|source| AgentExchangeError::Unreachable(ScribeError::Io { source }))?;
+    exchange_agent_request_on(&mut stream, request).await
+}
+
+async fn exchange_agent_request_on<S>(
+    stream: &mut S,
+    request: &AgentRequest,
+) -> Result<AgentResponse, AgentExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_message(stream, &ClientMessage::AgentRequest(request.clone()))
+        .await
+        .map_err(AgentExchangeError::Unsupported)?;
+    let response: ServerMessage =
+        read_message(stream).await.map_err(AgentExchangeError::Unsupported)?;
+    let ServerMessage::AgentResponse(response) = response else {
+        return Err(AgentExchangeError::Unsupported(ScribeError::ProtocolError {
+            reason: String::from("server did not return an agent response"),
+        }));
+    };
+    Ok(response)
+}
+
+fn agent_response_exit(response: AgentResponse) -> ExitCode {
+    if response.request_id != AGENT_REQUEST_ID {
+        _ = print_agent_failure("internal", "Scribe server returned a mismatched agent response.");
+        return ExitCode::from(1);
+    }
+
+    let exit_code = match &response.result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(AgentError::Unsupported { .. }) => ExitCode::from(3),
+        Err(_) => ExitCode::from(1),
+    };
+    if print_agent_envelope(agent_envelope(response.result)) {
+        exit_code
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+async fn run_agent_command(
+    agent: String,
+    model: Option<String>,
+    command: AgentCommand,
+) -> ExitCode {
+    let agent_label = match agent_label(&agent, model) {
+        Ok(label) => label,
+        Err(message) => {
+            _ = print_agent_failure("usage", message);
+            return ExitCode::from(2);
+        }
+    };
+    let origin_session_id = match origin_session_id(std::env::var_os("SCRIBE_SESSION_ID")) {
+        Ok(session_id) => session_id,
+        Err(message) => {
+            _ = print_agent_failure("usage", message);
+            return ExitCode::from(2);
+        }
+    };
+    let request = build_agent_request(command, agent_label, origin_session_id);
+
+    match timeout(AGENT_API_DEADLINE, exchange_agent_request(&request)).await {
+        Ok(Ok(response)) => agent_response_exit(response),
+        Ok(Err(AgentExchangeError::Unreachable(error))) => {
+            write_stderr_line(&format!("agent API server is unreachable: {error}"));
+            _ = print_agent_failure("unreachable", "Scribe server is unreachable.");
+            ExitCode::from(3)
+        }
+        Ok(Err(AgentExchangeError::Unsupported(error))) => {
+            write_stderr_line(&format!("agent API is unsupported: {error}"));
+            _ = print_agent_failure(
+                "unsupported",
+                "The connected Scribe server does not support the agent API.",
+            );
+            ExitCode::from(3)
+        }
+        Err(_) => {
+            write_stderr_line("agent API deadline elapsed");
+            _ = print_agent_failure(
+                "unsupported",
+                "The connected Scribe server does not support the agent API.",
+            );
+            ExitCode::from(3)
+        }
+    }
 }
 
 async fn interactive_passthrough() -> Result<(), ScribeError> {
@@ -257,6 +537,8 @@ fn to_automation_action(action: ActionCommand) -> AutomationAction {
         ActionCommand::CloseTab => AutomationAction::CloseTab,
         ActionCommand::NewWindow => AutomationAction::NewWindow,
         ActionCommand::SwitchProfile { name } => AutomationAction::SwitchProfile { name },
+        ActionCommand::OpenUpdateDialog => AutomationAction::OpenUpdateDialog,
+        ActionCommand::FocusSession { session_id } => AutomationAction::FocusSession { session_id },
     }
 }
 
@@ -332,25 +614,53 @@ fn run_profile_command(action: ProfileCommand) -> Result<(), ScribeError> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), ScribeError> {
+async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
-
     fmt().with_env_filter(filter).init();
 
-    match Cli::parse().command {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code =
+                if error.exit_code() == 0 { ExitCode::SUCCESS } else { ExitCode::from(2) };
+            _ = error.print();
+            return exit_code;
+        }
+    };
+    let result = match cli.command {
         None => interactive_passthrough().await,
         Some(CliCommand::Windows) => run_windows_command().await,
         Some(CliCommand::Action { window, action }) => run_action_command(window, action).await,
         Some(CliCommand::Profile { action }) => run_profile_command(action),
+        Some(CliCommand::Agent { agent, model, json: _, command }) => {
+            return run_agent_command(agent, model, command).await;
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            write_stderr_line(&format!("Error: {error}"));
+            ExitCode::from(1)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_dispatch_response;
+    use std::ffi::OsString;
+
+    use super::{
+        agent_envelope, agent_label, exchange_agent_request_on, origin_session_id,
+        parse_dispatch_response,
+    };
+    use clap::Parser;
+    use scribe_common::agent::{AgentError, AgentPayload, AgentRequest, AgentResponse};
     use scribe_common::error::ScribeError;
+    use scribe_common::framing::{read_message, write_message};
     use scribe_common::ids::WindowId;
-    use scribe_common::protocol::ServerMessage;
+    use scribe_common::protocol::{ClientMessage, ServerMessage};
+
+    use crate::Cli;
 
     #[test]
     fn dispatch_response_accepts_success_ack() {
@@ -375,5 +685,127 @@ mod tests {
         let err = parse_dispatch_response(ServerMessage::QuitRequested).unwrap_err();
         assert!(matches!(err, ScribeError::ProtocolError { .. }));
         assert!(err.to_string().contains("unexpected response"));
+    }
+
+    #[test]
+    fn agent_command_tree_accepts_every_v1_command() {
+        let session_id = scribe_common::ids::SessionId::new().to_full_string();
+        let window_id = WindowId::new().to_full_string();
+        let commands = [
+            vec![
+                String::from("scribe"),
+                String::from("agent"),
+                String::from("world"),
+                String::from("--agent"),
+                String::from("runner"),
+                String::from("--model"),
+                String::from("model-x"),
+            ],
+            vec![String::from("scribe"), String::from("agent"), String::from("siblings")],
+            vec![
+                String::from("scribe"),
+                String::from("agent"),
+                String::from("read"),
+                session_id.clone(),
+                String::from("--scrollback"),
+                String::from("10"),
+            ],
+            vec![
+                String::from("scribe"),
+                String::from("agent"),
+                String::from("action"),
+                String::from("new-tab"),
+                String::from("--window"),
+                window_id,
+                String::from("--json"),
+            ],
+            vec![
+                String::from("scribe"),
+                String::from("agent"),
+                String::from("write"),
+                session_id,
+                String::from("--text"),
+                String::from("echo ok"),
+                String::from("--submit"),
+            ],
+            vec![String::from("scribe"), String::from("agent"), String::from("capabilities")],
+        ];
+        for command in commands {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+    }
+
+    #[test]
+    fn agent_label_composes_agent_and_model_within_the_wire_limit() {
+        assert_eq!(
+            agent_label("runner", Some(String::from("model-x"))).unwrap(),
+            "runner [model-x]"
+        );
+        assert!(agent_label("", None).is_err());
+        assert!(agent_label(&"x".repeat(65), None).is_err());
+    }
+
+    #[test]
+    fn origin_session_id_requires_a_valid_full_uuid_when_set() {
+        let session_id = scribe_common::ids::SessionId::new();
+        let parsed = origin_session_id(Some(session_id.to_full_string().into())).unwrap();
+        assert_eq!(parsed, Some(session_id));
+        assert!(origin_session_id(Some(String::from("not-a-session").into())).is_err());
+        assert_eq!(origin_session_id(Some(OsString::new())).unwrap(), None);
+        assert_eq!(origin_session_id(None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_exchange_uses_framed_one_shot_request_and_response() {
+        let session_id = scribe_common::ids::SessionId::new();
+        let request = AgentRequest::World {
+            request_id: 1,
+            agent_label: String::from("runner [model-x]"),
+            origin_session_id: Some(session_id),
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let message: ClientMessage = read_message(&mut server).await.unwrap();
+            assert!(matches!(
+                message,
+                ClientMessage::AgentRequest(AgentRequest::World {
+                    request_id: 1,
+                    agent_label,
+                    origin_session_id: Some(origin),
+                }) if agent_label == "runner [model-x]" && origin == session_id
+            ));
+            write_message(
+                &mut server,
+                &ServerMessage::AgentResponse(AgentResponse {
+                    request_id: 1,
+                    result: Ok(AgentPayload::WriteInput),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let response = exchange_agent_request_on(&mut client, &request).await.unwrap();
+        assert!(matches!(response.result, Ok(AgentPayload::WriteInput)));
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn agent_envelopes_are_versioned_json() {
+        let success: serde_json::Value =
+            serde_json::from_str(&agent_envelope(Ok(AgentPayload::WriteInput)).unwrap()).unwrap();
+        assert_eq!(
+            success,
+            serde_json::json!({"v": 1, "ok": true, "data": {"type": "write_input"}})
+        );
+
+        let error: serde_json::Value = serde_json::from_str(
+            &agent_envelope(Err(AgentError::Denied { message: String::from("denied") })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({"v": 1, "ok": false, "error": {"code": "denied", "message": "denied"}})
+        );
     }
 }
