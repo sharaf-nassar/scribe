@@ -4,6 +4,7 @@
 //! admission, policy ordering, and auditing in one place.
 
 pub mod policy;
+pub mod text;
 
 use std::{
     collections::HashMap,
