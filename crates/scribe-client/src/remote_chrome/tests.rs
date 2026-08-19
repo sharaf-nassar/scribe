@@ -7,7 +7,7 @@
 
 use scribe_common::protocol::{AutomationAction, RemotePeerInfo, RemoteRefusal};
 
-use super::{RemoteChrome, RemoteDialStatus, RemoteEnvSummary};
+use super::{QueuedAction, RemoteChrome, RemoteDialStatus, RemoteEnvSummary};
 use crate::lost_control::LostControlState;
 use crate::remote::RemoteConnectOutcome;
 
@@ -94,17 +94,45 @@ fn automation_queue_is_bounded_and_fifo() {
 
     remote.queue_action(AutomationAction::NewTab);
     remote.queue_action(AutomationAction::SplitVertical);
-    assert!(matches!(remote.take_action(), Some(AutomationAction::NewTab)));
-    assert!(matches!(remote.take_action(), Some(AutomationAction::SplitVertical)));
+    assert!(matches!(
+        remote.take_action(),
+        Some(QueuedAction { action: AutomationAction::NewTab, correlation_id: None })
+    ));
+    assert!(matches!(
+        remote.take_action(),
+        Some(QueuedAction { action: AutomationAction::SplitVertical, correlation_id: None })
+    ));
     assert!(remote.take_action().is_none());
 
-    // Overflow drops the OLDEST: the newest request is the one the user just
-    // typed, so a wedged window must not replay a minute of stale actions.
+    // Overflow drops the OLDEST uncorrelated request: the newest request is the
+    // one the user just typed, so a wedged window must not replay stale actions.
     for _ in 0..super::MAX_QUEUED_ACTIONS {
         remote.queue_action(AutomationAction::NewTab);
     }
     remote.queue_action(AutomationAction::CloseTab);
     let drained: Vec<_> = std::iter::from_fn(|| remote.take_action()).collect();
     assert_eq!(drained.len(), super::MAX_QUEUED_ACTIONS);
-    assert!(matches!(drained.last(), Some(AutomationAction::CloseTab)));
+    assert!(matches!(
+        drained.last(),
+        Some(QueuedAction { action: AutomationAction::CloseTab, correlation_id: None })
+    ));
+}
+
+#[test]
+fn correlated_action_reserves_capacity_without_dropping_older_work() {
+    let mut remote = RemoteChrome::new();
+    for correlation_id in 0..super::MAX_QUEUED_ACTIONS as u64 {
+        assert!(remote.queue_correlated_action(correlation_id, AutomationAction::NewTab));
+    }
+
+    assert!(!remote.queue_correlated_action(99, AutomationAction::CloseTab));
+    remote.queue_action(AutomationAction::OpenFind);
+
+    let drained: Vec<_> = std::iter::from_fn(|| remote.take_action()).collect();
+    assert_eq!(drained.len(), super::MAX_QUEUED_ACTIONS);
+    assert_eq!(
+        drained.iter().filter(|action| action.correlation_id.is_some()).count(),
+        drained.len()
+    );
+    assert_eq!(drained.first().and_then(|action| action.correlation_id), Some(0));
 }

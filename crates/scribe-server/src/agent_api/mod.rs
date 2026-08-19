@@ -5,13 +5,23 @@
 
 pub mod policy;
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use scribe_common::agent::{
-    AgentCapability, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
+    AgentActionOutcome, AgentActionResult, AgentCapability, AgentError, AgentPayload,
+    AgentPolicyMode, AgentRequest, AgentResponse,
 };
 use scribe_common::config::AgentApiConfig;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use scribe_common::protocol::{AutomationAction, ServerMessage};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// Maximum simultaneous agent API requests. The dispatch result retains its
 /// permit until the IPC reply is queued; future handlers retain it for their
@@ -23,12 +33,25 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 pub struct AgentApiState {
     policy: AgentApiConfig,
     in_flight: Arc<Semaphore>,
+    next_correlation_id: Arc<AtomicU64>,
+    pending_actions: Arc<Mutex<HashMap<u64, PendingAction>>>,
+}
+
+struct PendingAction {
+    writer_key: usize,
+    action: AutomationAction,
+    completion: oneshot::Sender<Result<AgentActionResult, AgentError>>,
 }
 
 impl AgentApiState {
     #[must_use]
     pub fn new(policy: AgentApiConfig) -> Self {
-        Self { policy, in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)) }
+        Self {
+            policy,
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
+            next_correlation_id: Arc::new(AtomicU64::new(1)),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AgentError> {
@@ -36,6 +59,136 @@ impl AgentApiState {
             .try_acquire_owned()
             .map_err(|_| AgentError::Busy { message: "agent request capacity reached".into() })
     }
+
+    /// Reserve a correlation before the caller queues `message()` to a client.
+    pub fn begin_correlated_action(
+        &self,
+        client_key: usize,
+        action: AutomationAction,
+    ) -> PendingCorrelatedAction {
+        let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let (completion, receiver) = oneshot::channel();
+        self.pending_actions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
+            correlation_id,
+            PendingAction { writer_key: client_key, action: action.clone(), completion },
+        );
+        PendingCorrelatedAction {
+            correlation_id,
+            message: ServerMessage::RunActionCorrelated { correlation_id, action },
+            receiver: Some(receiver),
+            pending_actions: Arc::clone(&self.pending_actions),
+        }
+    }
+
+    /// Send one action and wait for the target client's execution report.
+    pub async fn run_correlated_action<Send, Sent>(
+        &self,
+        client_key: usize,
+        action: AutomationAction,
+        timeout: Duration,
+        send: Send,
+    ) -> Result<AgentActionResult, AgentError>
+    where
+        Send: FnOnce(ServerMessage) -> Sent,
+        Sent: Future<Output = bool>,
+    {
+        let pending = self.begin_correlated_action(client_key, action);
+        if !send(pending.message().clone()).await {
+            return Err(action_failed("client disconnected before action dispatch"));
+        }
+        pending.wait(timeout).await
+    }
+
+    /// Resolve one action completion from the same client it was sent to.
+    pub fn complete_action(
+        &self,
+        client_key: usize,
+        correlation_id: u64,
+        outcome: AgentActionOutcome,
+        created_session_id: Option<scribe_common::ids::SessionId>,
+    ) -> bool {
+        let Some(pending) = self.take_action_for_writer(correlation_id, client_key) else {
+            return false;
+        };
+        pending
+            .completion
+            .send(Ok(AgentActionResult { action: pending.action, outcome, created_session_id }))
+            .is_ok()
+    }
+
+    /// Fail every action still awaiting this client during connection teardown.
+    pub fn fail_actions_for_client(&self, writer_key: usize) {
+        let pending = {
+            let mut actions =
+                self.pending_actions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ids = actions
+                .iter()
+                .filter_map(|(id, action)| (action.writer_key == writer_key).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter().filter_map(|id| actions.remove(&id)).collect::<Vec<_>>()
+        };
+        for action in pending {
+            drop(
+                action
+                    .completion
+                    .send(Err(action_failed("client disconnected before action completion"))),
+            );
+        }
+    }
+
+    fn take_action_for_writer(
+        &self,
+        correlation_id: u64,
+        writer_key: usize,
+    ) -> Option<PendingAction> {
+        let mut actions =
+            self.pending_actions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if actions.get(&correlation_id)?.writer_key != writer_key {
+            return None;
+        }
+        actions.remove(&correlation_id)
+    }
+}
+
+/// One registered correlation waiting for client foreground execution.
+pub struct PendingCorrelatedAction {
+    correlation_id: u64,
+    message: ServerMessage,
+    receiver: Option<oneshot::Receiver<Result<AgentActionResult, AgentError>>>,
+    pending_actions: Arc<Mutex<HashMap<u64, PendingAction>>>,
+}
+
+impl PendingCorrelatedAction {
+    #[must_use]
+    pub fn message(&self) -> &ServerMessage {
+        &self.message
+    }
+
+    pub async fn wait(mut self, timeout: Duration) -> Result<AgentActionResult, AgentError> {
+        let Some(receiver) = self.receiver.take() else {
+            return Err(AgentError::Internal {
+                message: "action completion receiver missing".into(),
+            });
+        };
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(action_failed("client disconnected before action completion")),
+            Err(_) => Err(action_failed("client did not complete the action before timeout")),
+        }
+    }
+}
+
+impl Drop for PendingCorrelatedAction {
+    fn drop(&mut self) {
+        self.pending_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.correlation_id);
+    }
+}
+
+fn action_failed(message: &str) -> AgentError {
+    AgentError::ActionFailed { message: message.into() }
 }
 
 impl Default for AgentApiState {
@@ -189,9 +342,11 @@ mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::sync::Arc;
 
-    use scribe_common::agent::{AgentError, AgentRequest};
+    use std::time::Duration;
+
+    use scribe_common::agent::{AgentActionOutcome, AgentError, AgentRequest};
     use scribe_common::framing::{read_message, write_message};
-    use scribe_common::protocol::{ClientMessage, ServerMessage};
+    use scribe_common::protocol::{AutomationAction, ClientMessage, ServerMessage};
     use tokio::sync::{Barrier, Semaphore};
 
     use super::{AgentApiState, MAX_IN_FLIGHT_REQUESTS, dispatch};
@@ -257,6 +412,56 @@ mod tests {
         let release_permit = release.acquire().await.expect("release remains open");
         drop(release_permit);
         dispatch
+    }
+
+    #[tokio::test]
+    async fn correlated_action_waits_for_client_completion() {
+        let state = AgentApiState::default();
+        let pending = state.begin_correlated_action(7, AutomationAction::NewTab);
+        let ServerMessage::RunActionCorrelated { correlation_id, action } = pending.message()
+        else {
+            panic!("expected correlated action");
+        };
+        assert!(matches!(action, AutomationAction::NewTab));
+        let correlation_id = *correlation_id;
+        let created_session_id = scribe_common::ids::SessionId::new();
+        assert!(state.complete_action(
+            7,
+            correlation_id,
+            AgentActionOutcome::Completed,
+            Some(created_session_id),
+        ));
+
+        let result = pending.wait(Duration::from_secs(1)).await.expect("completed action");
+        assert_eq!(result.created_session_id, Some(created_session_id));
+        assert_eq!(result.outcome, AgentActionOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn correlated_action_timeout_and_disconnect_are_action_failed() {
+        let state = AgentApiState::default();
+        let send_failed = state
+            .run_correlated_action(
+                6,
+                AutomationAction::OpenFind,
+                Duration::from_secs(1),
+                |_| async { false },
+            )
+            .await;
+        assert!(matches!(send_failed, Err(AgentError::ActionFailed { .. })));
+
+        let timed_out = state
+            .begin_correlated_action(7, AutomationAction::OpenFind)
+            .wait(Duration::from_millis(1))
+            .await;
+        assert!(matches!(timed_out, Err(AgentError::ActionFailed { .. })));
+
+        let pending = state.begin_correlated_action(8, AutomationAction::OpenSettings);
+        state.fail_actions_for_client(8);
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)).await,
+            Err(AgentError::ActionFailed { .. })
+        ));
     }
 
     #[tokio::test]

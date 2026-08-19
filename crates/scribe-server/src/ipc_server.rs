@@ -6451,6 +6451,7 @@ async fn detach_client_window(
     writer: &SharedWriter,
     severed: bool,
 ) {
+    server.agent_api.fail_actions_for_client(action_client_key(writer));
     server.github_ci_tracker.drop_detail_writer(Arc::clone(writer));
     let attached_ids = attached_snapshot(attached_ids).await;
     clear_focused_issues_for_disconnect(
@@ -6704,6 +6705,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::ListReleases
         | ClientMessage::ListWindows
         | ClientMessage::DispatchAction { .. }
+        | ClientMessage::ActionCompleted { .. }
         | ClientMessage::EnvPreflight) => {
             dispatch_window_message(msg, context).await;
         }
@@ -7373,6 +7375,16 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
                 context.writer,
             )
             .await;
+        }
+        ClientMessage::ActionCompleted { correlation_id, outcome, created_session_id } => {
+            if !context.server.agent_api.complete_action(
+                action_client_key(context.writer),
+                correlation_id,
+                outcome,
+                created_session_id,
+            ) {
+                debug!(correlation_id, "ignored unknown or stale action completion");
+            }
         }
         ClientMessage::EnvPreflight => {
             handle_env_preflight(context.writer).await;
@@ -10318,6 +10330,10 @@ async fn send_agent_api_message(
 /// only when the connection is already closed.
 async fn try_send_message(writer: &SharedWriter, msg: &ServerMessage) -> bool {
     writer.lock().await.0.enqueue(msg)
+}
+
+fn action_client_key(writer: &SharedWriter) -> usize {
+    Arc::as_ptr(writer).cast::<()>() as usize
 }
 
 /// Fan a `ServerMessage` out to every sink attached to a session (feature 015 T007,
@@ -15400,6 +15416,48 @@ mod tests {
         assert!(
             matches!(ack, ServerMessage::ActionDispatched { window_id: ack_id } if ack_id == window_id)
         );
+    }
+
+    async fn run_test_correlated_action(
+        state: crate::agent_api::AgentApiState,
+        target_writer: SharedWriter,
+    ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
+        state
+            .run_correlated_action(
+                action_client_key(&target_writer),
+                AutomationAction::NewTab,
+                std::time::Duration::from_secs(1),
+                |message| async move { try_send_message(&target_writer, &message).await },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn correlated_action_round_trip_reports_created_session() {
+        let state = crate::agent_api::AgentApiState::default();
+        let (target_server, mut target_client) = unix_stream_pair();
+        let (_target_read, target_write) = tokio::io::split(target_server);
+        let target_writer: SharedWriter = test_shared_writer(target_write);
+        let run =
+            tokio::spawn(run_test_correlated_action(state.clone(), Arc::clone(&target_writer)));
+
+        let ServerMessage::RunActionCorrelated { correlation_id, action } =
+            read_message(&mut target_client).await.unwrap()
+        else {
+            panic!("expected correlated action");
+        };
+        assert!(matches!(action, AutomationAction::NewTab));
+        let created_session_id = SessionId::new();
+        assert!(state.complete_action(
+            action_client_key(&target_writer),
+            correlation_id,
+            scribe_common::agent::AgentActionOutcome::Completed,
+            Some(created_session_id),
+        ));
+
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(result.created_session_id, Some(created_session_id));
+        assert_eq!(result.outcome, scribe_common::agent::AgentActionOutcome::Completed);
     }
 
     #[tokio::test]

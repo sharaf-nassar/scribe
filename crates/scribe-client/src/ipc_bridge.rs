@@ -41,10 +41,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -1084,6 +1081,39 @@ pub struct SessionLaunch {
     pub launch_id: String,
 }
 
+/// Ordered-writer handle for one correlated action completion report.
+#[derive(Debug, Clone)]
+pub struct ActionCompletion {
+    correlation_id: u64,
+    tx: OutboundSender,
+}
+
+impl ActionCompletion {
+    #[must_use]
+    pub fn correlation_id(&self) -> u64 {
+        self.correlation_id
+    }
+
+    pub fn report(
+        &self,
+        outcome: scribe_common::agent::AgentActionOutcome,
+        created_session_id: Option<SessionId>,
+    ) -> Result<(), SinkError> {
+        self.tx.send(ClientMessage::ActionCompleted {
+            correlation_id: self.correlation_id,
+            outcome,
+            created_session_id,
+        })
+    }
+}
+
+/// One `CreateSession` reply the IPC reader can claim from the ordered FIFO.
+#[derive(Debug, Clone)]
+pub enum PendingCreate {
+    Uncorrelated,
+    Correlated(ActionCompletion),
+}
+
 /// Outbound half of the bridge: the GPUI-side replacement for Zed's
 /// `write_to_pty`. Enqueues `ClientMessage::KeyInput` / `Resize` onto the shared
 /// IPC-writer channel, which is a single ordered FIFO drained by the writer
@@ -1096,16 +1126,16 @@ pub struct SessionLaunch {
 pub struct IpcSink {
     tx: OutboundSender,
     /// `CreateSession` frames this window has enqueued and not yet seen
-    /// answered. Shared by every clone, because the GPUI thread mints the
-    /// request and the IPC reader consumes the answer.
-    pending_creates: Arc<AtomicUsize>,
+    /// answered, in writer order. Shared by every clone because the GPUI thread
+    /// mints the request and the IPC reader consumes the answer.
+    pending_creates: Arc<Mutex<VecDeque<PendingCreate>>>,
 }
 
 impl IpcSink {
     /// Wraps the IPC-writer channel sender.
     #[must_use]
     pub fn new(tx: OutboundSender) -> Self {
-        Self { tx, pending_creates: Arc::new(AtomicUsize::new(0)) }
+        Self { tx, pending_creates: Arc::new(Mutex::new(VecDeque::new())) }
     }
 
     /// Enqueues encoded key bytes for `session_id`.
@@ -1169,7 +1199,25 @@ impl IpcSink {
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
     /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn create_session(&self, launch: SessionLaunch) -> Result<(), SinkError> {
-        self.pending_creates.fetch_add(1, Ordering::Release);
+        self.enqueue_create_session(launch, PendingCreate::Uncorrelated)
+    }
+
+    /// Enqueue a session creation whose reply completes a correlated action.
+    pub fn create_session_for_action(
+        &self,
+        launch: SessionLaunch,
+        completion: ActionCompletion,
+    ) -> Result<(), SinkError> {
+        self.enqueue_create_session(launch, PendingCreate::Correlated(completion))
+    }
+
+    fn enqueue_create_session(
+        &self,
+        launch: SessionLaunch,
+        pending_create: PendingCreate,
+    ) -> Result<(), SinkError> {
+        let mut pending = self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.push_back(pending_create);
         let result = self.enqueue(ClientMessage::CreateSession {
             workspace_id: launch.workspace_id,
             split_direction: None,
@@ -1181,13 +1229,12 @@ impl IpcSink {
             env_envelope_id: Some(launch.launch_id),
         });
         if result.is_err() {
-            self.claim_pending_create();
+            pending.pop_back();
         }
         result
     }
 
-    /// Claim the oldest unanswered [`Self::create_session`], returning whether
-    /// there was one.
+    /// Claim the oldest unanswered [`Self::create_session`].
     ///
     /// The server answers a `CreateSession` with a `SessionCreated` carrying no
     /// echo of the request, so the two are matched by the FIFO order the single
@@ -1200,10 +1247,8 @@ impl IpcSink {
     ///
     /// A `SessionCreated` with no claim outstanding is the server acknowledging
     /// an `AttachSessions`, which has to keep attaching.
-    pub fn claim_pending_create(&self) -> bool {
-        self.pending_creates
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_sub(1))
-            .is_ok()
+    pub fn claim_pending_create(&self) -> Option<PendingCreate> {
+        self.pending_creates.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
     }
 
     /// Attaches `session_ids` at `dimensions`, switching which sessions stream
@@ -1581,6 +1626,23 @@ impl IpcSink {
         action: AutomationAction,
     ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::DispatchAction { window_id, action })
+    }
+
+    /// Build a completion handle that may follow work onto another window's
+    /// backend while still reporting on this action's original connection.
+    #[must_use]
+    pub fn action_completion(&self, correlation_id: u64) -> ActionCompletion {
+        ActionCompletion { correlation_id, tx: self.tx.clone() }
+    }
+
+    /// Report the execution result for one correlated automation action.
+    pub fn action_completed(
+        &self,
+        correlation_id: u64,
+        outcome: scribe_common::agent::AgentActionOutcome,
+        created_session_id: Option<SessionId>,
+    ) -> Result<(), SinkError> {
+        self.action_completion(correlation_id).report(outcome, created_session_id)
     }
 
     /// Reports a pane focus transition so the server can relay CSI focus events
@@ -2037,15 +2099,18 @@ mod tests {
     fn create_session_answers_are_claimed_once_each() {
         let (out_tx, _out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
-        assert!(!sink.claim_pending_create(), "no create is outstanding yet");
+        assert!(sink.claim_pending_create().is_none(), "no create is outstanding yet");
 
         sink.create_session(sample_launch()).unwrap();
-        sink.create_session(sample_launch()).unwrap();
-        // A clone shares the counter: the reader holds one, the GPUI view another.
+        sink.create_session_for_action(sample_launch(), sink.action_completion(41)).unwrap();
+        // A clone shares the FIFO: the reader holds one, the GPUI view another.
         let reader = sink.clone();
-        assert!(reader.claim_pending_create());
-        assert!(reader.claim_pending_create());
-        assert!(!reader.claim_pending_create(), "an attach echo must not claim a create");
+        assert!(matches!(reader.claim_pending_create(), Some(PendingCreate::Uncorrelated)));
+        assert!(matches!(
+            reader.claim_pending_create(),
+            Some(PendingCreate::Correlated(completion)) if completion.correlation_id() == 41
+        ));
+        assert!(reader.claim_pending_create().is_none(), "an attach echo must not claim a create");
     }
 
     // @lat: [[test#GPUI IPC Bridge#Refused create leaves nothing to claim]]
@@ -2055,8 +2120,36 @@ mod tests {
         let sink = IpcSink::new(out_tx);
         drop(out_rx);
 
-        assert!(sink.create_session(sample_launch()).is_err());
-        assert!(!sink.claim_pending_create(), "a create that never went out is not outstanding");
+        assert!(
+            sink.create_session_for_action(sample_launch(), sink.action_completion(42)).is_err()
+        );
+        assert!(
+            sink.claim_pending_create().is_none(),
+            "a create that never went out is not outstanding"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_completion_carries_correlation_outcome_and_created_session() {
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        let session_id = SessionId::new();
+
+        sink.action_completed(
+            43,
+            scribe_common::agent::AgentActionOutcome::Completed,
+            Some(session_id),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(ClientMessage::ActionCompleted {
+                correlation_id: 43,
+                outcome: scribe_common::agent::AgentActionOutcome::Completed,
+                created_session_id: Some(created),
+            }) if created == session_id
+        ));
     }
 
     // @lat: [[test#GPUI IPC Bridge#Resize before key input]]

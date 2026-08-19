@@ -149,6 +149,7 @@ use scribe_client::{
         beads_graph_icon, title_columns,
     },
 };
+use scribe_common::agent::AgentActionOutcome;
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
@@ -178,9 +179,10 @@ use tokio::{
 
 use crate::{
     ipc_bridge::{
-        CoalescedBatch, InboundEvent, InboundReceiver, InboundSender, IpcSink,
-        OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, SessionLaunch, SinkError,
-        WriteOutcome, inbound_channel, outbound_channel, run_drain, write_or_tear,
+        ActionCompletion, CoalescedBatch, InboundEvent, InboundReceiver, InboundSender, IpcSink,
+        OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, PendingCreate,
+        SessionLaunch, SinkError, WriteOutcome, inbound_channel, outbound_channel, run_drain,
+        write_or_tear,
     },
     pane_shell::{ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
@@ -688,11 +690,22 @@ struct InitialSessionBootstrap {
     /// claims it once `SessionCreated` adds the new tab, preserving the launch
     /// id used by environment-envelope and cold-restart persistence.
     binding: Mutex<Option<LaunchBinding>>,
+    /// `NewWindow` completion returned through the originating window's sink
+    /// after this new backend's first `SessionCreated` arrives.
+    action_completion: Mutex<Option<ActionCompletion>>,
 }
 
 impl InitialSessionBootstrap {
-    fn new(armed: bool) -> Self {
-        Self { armed: AtomicBool::new(armed), binding: Mutex::new(None) }
+    fn new(armed: bool, action_completion: Option<ActionCompletion>) -> Self {
+        Self {
+            armed: AtomicBool::new(armed),
+            binding: Mutex::new(None),
+            action_completion: Mutex::new(action_completion),
+        }
+    }
+
+    fn take_action_completion(&self) -> Option<ActionCompletion> {
+        self.action_completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
     }
 
     /// Consume the one-shot decision on the first list for a connection.
@@ -2960,8 +2973,12 @@ impl TerminalView {
     /// stacks them.
     fn handle_layout_action(&mut self, action: LayoutAction, cx: &mut Context<Self>) {
         match action {
-            LayoutAction::SplitVertical => self.split_pane(SplitDirection::Horizontal, cx),
-            LayoutAction::SplitHorizontal => self.split_pane(SplitDirection::Vertical, cx),
+            LayoutAction::SplitVertical => {
+                self.split_pane(SplitDirection::Horizontal, None, cx);
+            }
+            LayoutAction::SplitHorizontal => {
+                self.split_pane(SplitDirection::Vertical, None, cx);
+            }
             LayoutAction::ClosePane => self.close_pane(cx),
             LayoutAction::FocusNext => self.focus_next_pane(cx),
             LayoutAction::FocusLeft => self.focus_pane(FocusDirection::Left, cx),
@@ -2981,7 +2998,12 @@ impl TerminalView {
             LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
             LayoutAction::NewTab => {
                 let cwd = self.focused_session_cwd();
-                self.create_tab(self.creating_workspace(cx), SessionLaunchValues::default(), cwd);
+                self.create_tab(
+                    self.creating_workspace(cx),
+                    SessionLaunchValues::default(),
+                    cwd,
+                    None,
+                );
             }
             LayoutAction::NewClaudeTab => {
                 self.create_ai_tab(AiProvider::ClaudeCode, AiResumeMode::New, cx);
@@ -3012,7 +3034,9 @@ impl TerminalView {
                 self.switch_tab(move |tabs| tabs.select(workspace_id, index), cx);
             }
             LayoutAction::CloseTab => self.close_active_tab(),
-            LayoutAction::NewWindow => self.open_new_window(cx),
+            LayoutAction::NewWindow => {
+                self.open_new_window(None, cx);
+            }
             LayoutAction::ScrollUp => self.scroll_terminal(Scroll::PageUp, cx),
             LayoutAction::ScrollDown => self.scroll_terminal(Scroll::PageDown, cx),
             LayoutAction::ScrollTop => self.scroll_terminal(Scroll::Top, cx),
@@ -3264,7 +3288,7 @@ impl TerminalView {
     fn execute_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
         match action {
             PaletteAction::Automation(automation) => {
-                self.execute_automation_action(automation, ActionOrigin::Local, cx);
+                self.execute_automation_action(automation, ActionOrigin::Local, None, cx);
             }
             PaletteAction::OpenRemoteConnect => self.open_remote_connect(cx),
         }
@@ -3460,8 +3484,14 @@ impl TerminalView {
         &mut self,
         action: AutomationAction,
         origin: ActionOrigin,
+        correlation_id: Option<u64>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(correlation_id) = correlation_id
+            && self.execute_correlated_session_action(&action, correlation_id, cx)
+        {
+            return;
+        }
         // A server-forwarded action has no visible pane focus to inherit. Keep
         // its cwd unset even when this window still remembers the last focused
         // session, so the server's home guard decides the launch directory.
@@ -3481,7 +3511,12 @@ impl TerminalView {
             _ => None,
         };
         if let Some((provider, resume_mode)) = automated_ai {
-            self.create_ai_tab_request(self.creating_workspace(cx), provider, resume_mode, None);
+            self.create_ai_tab_request(
+                self.creating_workspace(cx),
+                (provider, resume_mode),
+                None,
+                None,
+            );
             return;
         }
         if let Some(key_action) = key_action_for_automation(&action) {
@@ -3493,6 +3528,9 @@ impl TerminalView {
                 return;
             }
             self.dispatch_key_action(key_action, cx);
+            if let Some(correlation_id) = correlation_id {
+                self.report_action_completion(correlation_id, AgentActionOutcome::Completed, None);
+            }
             return;
         }
         match action {
@@ -3503,6 +3541,80 @@ impl TerminalView {
             AutomationAction::OpenUpdateDialog => self.open_update_dialog(cx),
             // Everything else was lowered onto a `KeyAction` above.
             other => unroutable_action(&format!("{other:?}"), "no automation handler"),
+        }
+        if let Some(correlation_id) = correlation_id {
+            self.report_action_completion(correlation_id, AgentActionOutcome::Completed, None);
+        }
+    }
+
+    fn execute_correlated_session_action(
+        &mut self,
+        action: &AutomationAction,
+        correlation_id: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let completion = self.sink.action_completion(correlation_id);
+        let enqueued = match action {
+            AutomationAction::NewTab => self.create_tab(
+                self.creating_workspace(cx),
+                SessionLaunchValues::default(),
+                None,
+                Some(completion.clone()),
+            ),
+            AutomationAction::NewClaudeTab => self.create_ai_tab_request(
+                self.creating_workspace(cx),
+                (AiProvider::ClaudeCode, AiResumeMode::New),
+                None,
+                Some(completion.clone()),
+            ),
+            AutomationAction::NewClaudeResumeTab => self.create_ai_tab_request(
+                self.creating_workspace(cx),
+                (AiProvider::ClaudeCode, AiResumeMode::Resume),
+                None,
+                Some(completion.clone()),
+            ),
+            AutomationAction::NewCodexTab => self.create_ai_tab_request(
+                self.creating_workspace(cx),
+                (AiProvider::CodexCode, AiResumeMode::New),
+                None,
+                Some(completion.clone()),
+            ),
+            AutomationAction::NewCodexResumeTab => self.create_ai_tab_request(
+                self.creating_workspace(cx),
+                (AiProvider::CodexCode, AiResumeMode::Resume),
+                None,
+                Some(completion.clone()),
+            ),
+            AutomationAction::SplitVertical => {
+                self.split_pane(SplitDirection::Horizontal, Some(completion.clone()), cx)
+            }
+            AutomationAction::SplitHorizontal => {
+                self.split_pane(SplitDirection::Vertical, Some(completion.clone()), cx)
+            }
+            AutomationAction::NewWindow => self.open_new_window(Some(completion), cx),
+            AutomationAction::OpenSettings
+            | AutomationAction::OpenFind
+            | AutomationAction::ClosePane
+            | AutomationAction::CloseTab
+            | AutomationAction::SwitchProfile { .. }
+            | AutomationAction::OpenUpdateDialog
+            | AutomationAction::FocusSession { .. } => return false,
+        };
+        if !enqueued {
+            self.report_action_completion(correlation_id, AgentActionOutcome::Failed, None);
+        }
+        true
+    }
+
+    fn report_action_completion(
+        &self,
+        correlation_id: u64,
+        outcome: AgentActionOutcome,
+        created_session_id: Option<SessionId>,
+    ) {
+        if let Err(error) = self.sink.action_completed(correlation_id, outcome, created_session_id)
+        {
+            tracing::warn!(%error, correlation_id, "action completion dropped: IPC writer closed");
         }
     }
 
@@ -3571,6 +3683,7 @@ impl TerminalView {
                         command: Some(shell_command_argv(&command)),
                         ..SessionLaunchValues::default()
                     },
+                    None,
                     None,
                 );
             }
@@ -4611,7 +4724,7 @@ impl TerminalView {
     /// behind it) is reconciled here, the window-list poll sends from the
     /// view's own sink, the OSC 52 clipboard work the reader parked runs
     /// here because arboard and the confirmation modal both belong to this
-    /// thread, and the automation actions a `RunAction` queued are executed here
+    /// thread, and the server-dispatched automation actions are executed here
     /// because the entities they drive are owned by this thread too.
     fn poll_window_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(mut ai) = self.shared.ai.lock()
@@ -5144,12 +5257,17 @@ impl TerminalView {
     /// just sent it.
     fn poll_remote_actions(&mut self, cx: &mut Context<Self>) {
         loop {
-            let Some(action) = self.shared.remote.lock().ok().and_then(|mut r| r.take_action())
+            let Some(queued) = self.shared.remote.lock().ok().and_then(|mut r| r.take_action())
             else {
                 return;
             };
-            tracing::info!(?action, "running a server-dispatched automation action");
-            self.execute_automation_action(action, ActionOrigin::Server, cx);
+            tracing::info!(action = ?queued.action, "running a server-dispatched automation action");
+            self.execute_automation_action(
+                queued.action,
+                ActionOrigin::Server,
+                queued.correlation_id,
+                cx,
+            );
         }
     }
 
@@ -5265,10 +5383,11 @@ impl TerminalView {
         workspace_id: Option<WorkspaceId>,
         launch: SessionLaunchValues,
         cwd: Option<PathBuf>,
-    ) {
+        action_completion: Option<ActionCompletion>,
+    ) -> bool {
         let Some(workspace_id) = workspace_id else {
             tracing::warn!("new tab ignored: no workspace is attached yet");
-            return;
+            return false;
         };
         // Queued before the request goes out so the answering `SessionCreated`
         // is bound to what this tab actually launched — a plain shell, or the
@@ -5279,7 +5398,7 @@ impl TerminalView {
         let binding = launch_binding_for(&launch, cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
-        let result = self.sink.create_session(SessionLaunch {
+        let session_launch = SessionLaunch {
             workspace_id,
             size: self.focused_pane_size,
             cwd,
@@ -5287,9 +5406,17 @@ impl TerminalView {
             ai_launch: launch.ai_launch,
             shell_tool: launch.shell_tool,
             launch_id,
-        });
-        if let Err(error) = result {
-            tracing::warn!(%error, "new tab dropped: IPC writer closed");
+        };
+        let result = match action_completion {
+            Some(completion) => self.sink.create_session_for_action(session_launch, completion),
+            None => self.sink.create_session(session_launch),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "new tab dropped: IPC writer closed");
+                false
+            }
         }
     }
 
@@ -5313,19 +5440,20 @@ impl TerminalView {
     fn create_ai_tab(&mut self, provider: AiProvider, resume_mode: AiResumeMode, cx: &App) {
         let cwd =
             self.shell.focused_workspace_project_root(cx).or_else(|| self.focused_session_cwd());
-        self.create_ai_tab_request(self.creating_workspace(cx), provider, resume_mode, cwd);
+        self.create_ai_tab_request(self.creating_workspace(cx), (provider, resume_mode), cwd, None);
     }
 
     /// Build one immutable structured AI create request.
     fn create_ai_tab_request(
         &mut self,
         workspace_id: Option<WorkspaceId>,
-        provider: AiProvider,
-        resume_mode: AiResumeMode,
+        ai: (AiProvider, AiResumeMode),
         cwd: Option<PathBuf>,
-    ) {
+        action_completion: Option<ActionCompletion>,
+    ) -> bool {
+        let (provider, resume_mode) = ai;
         let launch = restore_replay::ai_launch_values(provider, resume_mode, None);
-        self.create_tab(workspace_id, launch, cwd);
+        self.create_tab(workspace_id, launch, cwd, action_completion)
     }
 
     /// Send a legacy launch-only tool request with the caller's chosen CWD.
@@ -5334,6 +5462,7 @@ impl TerminalView {
             self.creating_workspace(cx),
             restore_replay::shell_tool_launch_values(tool),
             cwd,
+            None,
         );
     }
 
@@ -5351,6 +5480,7 @@ impl TerminalView {
                 self.creating_workspace(cx),
                 SessionLaunchValues { command: None, ai_launch, shell_tool: None },
                 cwd,
+                None,
             );
         }
     }
@@ -5538,7 +5668,11 @@ impl TerminalView {
     /// would open showing a window the user had before, and the real one would
     /// stay unopenable. A fresh UUID is by construction not a window the server
     /// knows, so it is assigned verbatim and the window is genuinely empty.
-    fn open_new_window(&mut self, cx: &mut Context<Self>) {
+    fn open_new_window(
+        &mut self,
+        action_completion: Option<ActionCompletion>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let terminal_size = self.terminal_size;
         let window_id = WindowId::new();
         let (shared, sink) = start_window_backend(
@@ -5547,13 +5681,18 @@ impl TerminalView {
                 claim: Some(window_id),
                 join_intent: LocalJoinIntent::Plain,
                 initial_session: true,
+                initial_action_completion: action_completion,
                 fan_out: false,
             },
         );
         // A deliberately opened window replays no snapshot and inherits no
         // geometry, then its backend creates its own first login shell.
-        open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(None));
-        tracing::info!(%window_id, "opened a new terminal window");
+        let opened =
+            open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(None)).is_some();
+        if opened {
+            tracing::info!(%window_id, "opened a new terminal window");
+        }
+        opened
     }
 
     /// Reopen a window the server still holds sessions for.
@@ -5572,6 +5711,7 @@ impl TerminalView {
                 claim: Some(window_id),
                 join_intent: LocalJoinIntent::Plain,
                 initial_session: false,
+                initial_action_completion: None,
                 fan_out: false,
             },
         );
@@ -5646,16 +5786,22 @@ impl TerminalView {
     }
 
     /// Split the focused pane and ask the server for the session it will host.
-    fn split_pane(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+    fn split_pane(
+        &mut self,
+        direction: SplitDirection,
+        action_completion: Option<ActionCompletion>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Capture before the split moves focus onto its unbound pending pane.
         let cwd = self.focused_session_cwd();
         if self.shell.split_focused_pane(direction, cx).is_none() {
             tracing::warn!(?direction, "split ignored: the window has no focused pane");
-            return;
+            return false;
         }
         tracing::info!(?direction, panes = self.shell.pane_count(cx), "split the focused pane");
-        self.request_pane_session(cwd, cx);
+        let requested = self.request_pane_session(cwd, action_completion, cx);
         self.after_layout_change(cx);
+        requested
     }
 
     /// Close the focused pane, falling back to closing the tab when the window
@@ -5765,7 +5911,7 @@ impl TerminalView {
         );
         // A new region is a fresh context, not a continuation of the source
         // pane, so it sends no CWD and the server's home fallback wins.
-        self.request_pane_session(None, cx);
+        self.request_pane_session(None, None, cx);
         self.after_layout_change(cx);
     }
 
@@ -5815,15 +5961,20 @@ impl TerminalView {
     /// The pane was queued by the split, so the reconcile pass hands it the
     /// session as soon as `SessionCreated` lands. `cwd` is captured from the
     /// source pane before the split moves focus to this pending pane.
-    fn request_pane_session(&mut self, cwd: Option<PathBuf>, cx: &App) {
+    fn request_pane_session(
+        &mut self,
+        cwd: Option<PathBuf>,
+        action_completion: Option<ActionCompletion>,
+        cx: &App,
+    ) -> bool {
         let Some(workspace_id) = self.creating_workspace(cx) else {
             tracing::warn!("pane session ignored: no workspace is attached yet");
-            return;
+            return false;
         };
         let binding = launch_binding_for(&SessionLaunchValues::default(), cwd.clone());
         let launch_id = binding.launch_id.clone();
         self.restore.requested.push_back(binding);
-        let result = self.sink.create_session(SessionLaunch {
+        let session_launch = SessionLaunch {
             workspace_id,
             size: self.focused_pane_size,
             cwd,
@@ -5831,9 +5982,17 @@ impl TerminalView {
             ai_launch: None,
             shell_tool: None,
             launch_id,
-        });
-        if let Err(error) = result {
-            tracing::warn!(%error, "pane session dropped: IPC writer closed");
+        };
+        let result = match action_completion {
+            Some(completion) => self.sink.create_session_for_action(session_launch, completion),
+            None => self.sink.create_session(session_launch),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "pane session dropped: IPC writer closed");
+                false
+            }
         }
     }
 
@@ -10362,7 +10521,7 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
 /// that names an existing window inherits its sessions and must not add a shell,
 /// and only the process bootstrap — the one window that stands for the whole
 /// client — speaks for the windows it did not open.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WindowBackend {
     /// The window this connection's `Hello` claims: the resumed window's id for
     /// the bootstrap, a freshly minted one for a deliberate new window, the id
@@ -10374,6 +10533,8 @@ struct WindowBackend {
     join_intent: LocalJoinIntent,
     /// Whether this window brings its own first login shell.
     initial_session: bool,
+    /// Completion for a `NewWindow` action, returned only after that shell is created.
+    initial_action_completion: Option<ActionCompletion>,
     /// Whether this connection may reopen the other windows `Welcome` reports.
     fan_out: bool,
 }
@@ -10395,7 +10556,8 @@ enum LocalJoinIntent {
 /// Called once from [`main`] for the startup window and again for every window
 /// this process opens afterwards, so the paths cannot drift.
 fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
-    let WindowBackend { claim, join_intent, initial_session, fan_out } = window;
+    let WindowBackend { claim, join_intent, initial_session, initial_action_completion, fan_out } =
+        window;
     let ci_owner_controls = matches!(join_intent, LocalJoinIntent::Plain)
         && lan_dial::target_from_env().is_none()
         && remote_handshake::target_from_env().is_none();
@@ -10414,7 +10576,10 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         connected: Arc::new(AtomicBool::new(false)),
         pi_provider: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
-        initial_session: Arc::new(InitialSessionBootstrap::new(initial_session)),
+        initial_session: Arc::new(InitialSessionBootstrap::new(
+            initial_session,
+            initial_action_completion,
+        )),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
@@ -11173,6 +11338,7 @@ fn main() -> std::process::ExitCode {
                 LocalJoinIntent::Plain
             },
             initial_session: bootstrap_initial_session,
+            initial_action_completion: None,
             // The bootstrap reopens the server's other windows; a
             // `--restore-child` is already the other half of the client-side
             // cold-restart fan-out.
@@ -13186,6 +13352,7 @@ async fn dispatch_server_message(
         | ServerMessage::RemoteDisconnect { .. }
         | ServerMessage::WindowTakenOver { .. }
         | ServerMessage::RunAction { .. }
+        | ServerMessage::RunActionCorrelated { .. }
         | ServerMessage::ActionDispatched { .. }) => on_remote_message(ctx, remote),
         other => unhandled_server_message(&other),
     }
@@ -13315,12 +13482,17 @@ fn request_initial_session(
     let launch_id = binding.launch_id.clone();
     let Ok(mut pending) = ctx.initial_session.binding.lock() else {
         ctx.initial_session.armed.store(true, Ordering::Release);
+        if let Some(completion) = ctx.initial_session.take_action_completion()
+            && let Err(error) = completion.report(AgentActionOutcome::Failed, None)
+        {
+            tracing::warn!(%error, "initial action failure report dropped");
+        }
         return Err("initial-session binding mutex poisoned".to_owned());
     };
     *pending = Some(binding);
     drop(pending);
 
-    if let Err(error) = ctx.sink.create_session(SessionLaunch {
+    let launch = SessionLaunch {
         workspace_id,
         size: reader_attach_size(ctx),
         cwd: None,
@@ -13328,10 +13500,21 @@ fn request_initial_session(
         ai_launch: None,
         shell_tool: None,
         launch_id,
-    }) {
+    };
+    let action_completion = ctx.initial_session.take_action_completion();
+    let result = match action_completion.as_ref() {
+        Some(completion) => ctx.sink.create_session_for_action(launch, completion.clone()),
+        None => ctx.sink.create_session(launch),
+    };
+    if let Err(error) = result {
         // The request never entered the ordered queue, so let the next
         // connection retry rather than leaving this fresh window empty.
         ctx.initial_session.armed.store(true, Ordering::Release);
+        if let Some(completion) = action_completion
+            && let Err(report_error) = completion.report(AgentActionOutcome::Failed, None)
+        {
+            tracing::warn!(%report_error, "initial action failure report dropped");
+        }
         return Err(error.to_string());
     }
     tracing::info!(%workspace_id, "requested initial shell session");
@@ -13952,14 +14135,14 @@ fn lan_approval_outcome(
 
 /// Fold one feature-013 tailnet answer into the shared [`RemoteChrome`].
 ///
-/// Seven variants, three jobs. The environment/peer pair is passive chrome. The
+/// Eight variants, three jobs. The environment/peer pair is passive chrome. The
 /// displacement pair is not: a `WindowTakenOver` freezes the window under the
 /// reclaim banner and a `RemoteDisconnect` records why the peer severed the
 /// link, and both must be visible before the user's next keystroke goes
-/// somewhere it no longer belongs. The automation pair is the `scribe action …`
-/// round trip: `RunAction` is queued for the foreground (the action it names may
-/// only run on the thread that owns the window) and `ActionDispatched`
-/// acknowledges a dispatch this client sent.
+/// somewhere it no longer belongs. Automation requests are queued for the
+/// foreground because their actions may only run on the owning thread;
+/// `ActionDispatched` keeps acknowledging legacy routing, while correlated
+/// actions report completion only after that foreground execution.
 ///
 /// Anything other than the remote family is a programming error in
 /// [`dispatch_server_message`]'s routing, not a protocol event, so it is counted
@@ -14033,6 +14216,19 @@ fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
             // own thread may touch. The lifecycle tick drains the queue.
             tracing::info!(?action, "automation action received");
             update_remote_chrome(ctx, |remote| remote.queue_action(action));
+        }
+        ServerMessage::RunActionCorrelated { correlation_id, action } => {
+            tracing::info!(correlation_id, ?action, "correlated automation action received");
+            let admitted = ctx
+                .remote
+                .lock()
+                .is_ok_and(|mut remote| remote.queue_correlated_action(correlation_id, action));
+            if !admitted
+                && let Err(error) =
+                    ctx.sink.action_completed(correlation_id, AgentActionOutcome::Failed, None)
+            {
+                tracing::warn!(%error, correlation_id, "queue refusal report dropped");
+            }
         }
         ServerMessage::ActionDispatched { window_id } => {
             // The ack for a `DispatchAction` this client sent. There is nothing
@@ -14289,10 +14485,21 @@ fn open_created_tab(
     let entry = TabEntry::new(session_id, workspace_id, shell_name);
     let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
     if added {
-        if ctx.sink.claim_pending_create() {
-            adopt_created_session(ctx, session_id)?;
-        } else {
-            attach_session(ctx, session_id)?;
+        match ctx.sink.claim_pending_create() {
+            Some(PendingCreate::Uncorrelated) => adopt_created_session(ctx, session_id)?,
+            Some(PendingCreate::Correlated(completion)) => {
+                adopt_created_session(ctx, session_id)?;
+                if let Err(error) =
+                    completion.report(AgentActionOutcome::Completed, Some(session_id))
+                {
+                    tracing::warn!(
+                        %error,
+                        correlation_id = completion.correlation_id(),
+                        "session action completion dropped: IPC writer closed"
+                    );
+                }
+            }
+            None => attach_session(ctx, session_id)?,
         }
         // The tab strip is pixels only; log the insert so a scripted E2E can
         // assert that an action really produced a session round trip.
@@ -15065,10 +15272,34 @@ mod tests {
     // @lat: [[lat.md/client#Client#GPUI Client Spike#Server Lifecycle Wiring]]
     #[test]
     fn fresh_window_bootstrap_is_claimed_exactly_once() {
-        let bootstrap = InitialSessionBootstrap::new(true);
+        let bootstrap = InitialSessionBootstrap::new(true, None);
 
         assert!(bootstrap.claim(true, 0));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[tokio::test]
+    async fn new_window_bootstrap_keeps_originating_action_completion() {
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        let bootstrap = InitialSessionBootstrap::new(true, Some(sink.action_completion(73)));
+        let session_id = SessionId::new();
+
+        assert!(bootstrap.claim(true, 0));
+        bootstrap
+            .take_action_completion()
+            .expect("new-window action completion")
+            .report(AgentActionOutcome::Completed, Some(session_id))
+            .unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(ClientMessage::ActionCompleted {
+                correlation_id: 73,
+                outcome: AgentActionOutcome::Completed,
+                created_session_id: Some(created),
+            }) if created == session_id
+        ));
     }
 
     // @lat: [[client#Client#GPUI Client Spike#Cold Restart Restore#An adopted window keeps its saved geometry]]
@@ -15689,7 +15920,7 @@ mod tests {
 
     #[test]
     fn existing_sessions_consume_fresh_window_bootstrap() {
-        let bootstrap = InitialSessionBootstrap::new(true);
+        let bootstrap = InitialSessionBootstrap::new(true, None);
 
         assert!(!bootstrap.claim(true, 1));
         assert!(!bootstrap.claim(true, 0));
@@ -15788,12 +16019,12 @@ mod tests {
         // A cold restore replays its own panes, and a window claimed from the
         // server (a share join, a restored sibling) already has its sessions —
         // both are constructed disarmed, and nothing can re-arm them.
-        let cold_restore = InitialSessionBootstrap::new(false);
+        let cold_restore = InitialSessionBootstrap::new(false, None);
         assert!(!cold_restore.claim(true, 0));
         assert!(!cold_restore.claim(true, 0));
 
         // A deliberate new window brings exactly one shell, once.
-        let fresh = InitialSessionBootstrap::new(true);
+        let fresh = InitialSessionBootstrap::new(true, None);
         assert!(fresh.claim(true, 0));
         assert!(!fresh.claim(true, 0));
     }

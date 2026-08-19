@@ -19,11 +19,9 @@
 //!   from it and suppresses every keystroke but the one-action reclaim. A
 //!   [`RemoteDisconnect`](scribe_common::protocol::ServerMessage::RemoteDisconnect)
 //!   records the typed reason the peer severed the link.
-//! * **Automation.** A
-//!   [`RunAction`](scribe_common::protocol::ServerMessage::RunAction) is queued
-//!   here for the foreground to execute, because the action it names (open a
-//!   tab, split a pane, focus a session) may only be run on the thread that owns
-//!   the window.
+//! * **Automation.** `RunAction` and `RunActionCorrelated` are queued here for
+//!   the foreground to execute, because the action they name (open a tab, split
+//!   a pane, focus a session) may only be run on the thread that owns the window.
 //!
 //! Everything here is display-independent: the state is a set of plain values
 //! plus one derived actionable [`RemoteChrome::status_line`], so the whole
@@ -40,14 +38,20 @@ use crate::lost_control::LostControlState;
 // (still unported) connect picker.
 pub use crate::remote::RemoteConnectOutcome;
 
-/// How many queued [`RunAction`](scribe_common::protocol::ServerMessage::RunAction)
-/// requests are held for the foreground before the oldest is dropped.
+/// How many automation requests are held for the foreground.
 ///
 /// Automation is a human-paced surface (`scribe action …` from a shell), and the
 /// foreground drains the queue every lifecycle tick, so a backlog this deep only
 /// happens when the window is wedged — at which point replaying a minute of
 /// stale actions would be worse than losing them.
 const MAX_QUEUED_ACTIONS: usize = 16;
+
+/// One foreground action, optionally tied to an agent completion report.
+#[derive(Debug, Clone)]
+pub struct QueuedAction {
+    pub action: AutomationAction,
+    pub correlation_id: Option<u64>,
+}
 
 /// Where a tailnet dial this client started has got to.
 ///
@@ -94,7 +98,7 @@ pub struct RemoteChrome {
     /// `RemoteDisconnect`.
     severed: Option<RemoteRefusal>,
     /// Automation actions taken off the wire and not yet run by the foreground.
-    actions: VecDeque<AutomationAction>,
+    actions: VecDeque<QueuedAction>,
 }
 
 impl RemoteChrome {
@@ -182,20 +186,46 @@ impl RemoteChrome {
         self.severed
     }
 
-    /// Queue one automation action for the foreground to execute.
+    /// Queue one legacy action for the foreground to execute.
     ///
-    /// The queue is bounded: past [`MAX_QUEUED_ACTIONS`] the OLDEST request is
-    /// dropped, because the newest one is the one the user just typed.
+    /// Legacy overflow keeps its newest-wins behavior, but may only evict an
+    /// older legacy action. A correlated action has already reserved its slot
+    /// and must survive until execution or an explicit failure report.
     pub fn queue_action(&mut self, action: AutomationAction) {
         if self.actions.len() >= MAX_QUEUED_ACTIONS {
-            let dropped = self.actions.pop_front();
+            let Some(index) =
+                self.actions.iter().position(|queued| queued.correlation_id.is_none())
+            else {
+                tracing::warn!(
+                    ?action,
+                    "automation queue full of correlated work; dropped RunAction"
+                );
+                return;
+            };
+            let dropped = self.actions.remove(index);
             tracing::warn!(?dropped, "automation queue full; dropped the oldest RunAction");
         }
-        self.actions.push_back(action);
+        self.actions.push_back(QueuedAction { action, correlation_id: None });
+    }
+
+    /// Reserve one queue slot for a correlated action.
+    ///
+    /// Returns `false` without disturbing older work when all 16 slots are in
+    /// use, so the reader can report a typed execution failure to the server.
+    pub fn queue_correlated_action(
+        &mut self,
+        correlation_id: u64,
+        action: AutomationAction,
+    ) -> bool {
+        if self.actions.len() >= MAX_QUEUED_ACTIONS {
+            return false;
+        }
+        self.actions.push_back(QueuedAction { action, correlation_id: Some(correlation_id) });
+        true
     }
 
     /// Take the next queued automation action, if any.
-    pub fn take_action(&mut self) -> Option<AutomationAction> {
+    pub fn take_action(&mut self) -> Option<QueuedAction> {
         self.actions.pop_front()
     }
 
