@@ -5,13 +5,16 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tokio::io::{self, AsyncRead, AsyncReadExt as _, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tracing::info;
 
-use scribe_common::agent::{AgentError, AgentPayload, AgentRequest, AgentResponse};
+use scribe_common::agent::{
+    AgentCapability, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
+};
+use scribe_common::config::{AgentApiConfig, load_config};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use scribe_common::error::ScribeError;
@@ -107,6 +110,8 @@ enum AgentCommand {
         submit: bool,
     },
     Capabilities,
+    /// Render provider guidance from this binary's commands and current policy.
+    Skill,
 }
 
 #[derive(Subcommand)]
@@ -312,12 +317,140 @@ fn print_agent_failure(code: &str, message: &str) -> bool {
     print_agent_envelope(agent_failure_envelope(code, message))
 }
 
+fn collect_agent_command_paths(
+    command: &clap::Command,
+    path: &mut Vec<String>,
+    paths: &mut Vec<Vec<String>>,
+) {
+    for subcommand in command.get_subcommands() {
+        path.push(subcommand.get_name().into());
+        paths.push(path.clone());
+        collect_agent_command_paths(subcommand, path, paths);
+        _ = path.pop();
+    }
+}
+
+fn agent_command_paths() -> Vec<Vec<String>> {
+    let command = Cli::command();
+    let mut paths = Vec::new();
+    for agent in command.get_subcommands().filter(|subcommand| subcommand.get_name() == "agent") {
+        collect_agent_command_paths(agent, &mut Vec::new(), &mut paths);
+    }
+    paths
+}
+
+fn agent_command_capability(path: &[String]) -> Option<AgentCapability> {
+    match path {
+        [command] if matches!(command.as_str(), "world" | "siblings" | "capabilities") => {
+            Some(AgentCapability::ReadMetadata)
+        }
+        [command] if command == "read" => Some(AgentCapability::ReadContent),
+        [command] if command == "write" => Some(AgentCapability::WriteInput),
+        [category, action] if category == "action" => match action.as_str() {
+            "close-pane" | "close-tab" | "open-update-dialog" => {
+                Some(AgentCapability::DispatchDestructiveAction)
+            }
+            "open-settings" | "open-find" | "new-tab" | "new-claude-tab" | "resume-claude-tab"
+            | "new-codex-tab" | "resume-codex-tab" | "new-ai-tab" | "resume-ai-tab"
+            | "split-vertical" | "split-horizontal" | "new-window" | "switch-profile"
+            | "focus-session" => Some(AgentCapability::DispatchAction),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn agent_policy_mode(policy: &AgentApiConfig, capability: AgentCapability) -> AgentPolicyMode {
+    match capability {
+        AgentCapability::ReadMetadata => policy.read_metadata,
+        AgentCapability::ReadContent => policy.read_content,
+        AgentCapability::DispatchAction => policy.dispatch_action,
+        AgentCapability::DispatchDestructiveAction => policy.dispatch_destructive_action,
+        AgentCapability::WriteInput => policy.write_input,
+    }
+}
+
+const fn agent_capability_settings_path(capability: AgentCapability) -> &'static str {
+    match capability {
+        AgentCapability::ReadMetadata => "agent_api.read_metadata",
+        AgentCapability::ReadContent => "agent_api.read_content",
+        AgentCapability::DispatchAction => "agent_api.dispatch_action",
+        AgentCapability::DispatchDestructiveAction => "agent_api.dispatch_destructive_action",
+        AgentCapability::WriteInput => "agent_api.write_input",
+    }
+}
+
+fn append_agent_command_policy(markdown: &mut String, policy: &AgentApiConfig, path: &[String]) {
+    let Some(capability) = agent_command_capability(path) else {
+        match path {
+            [command] if command == "skill" => markdown.push_str("renders this guidance."),
+            [command] if command == "action" => {
+                markdown.push_str("choose a subcommand below.");
+            }
+            _ => {
+                markdown.push_str("unavailable; no capability policy is defined for this command.");
+            }
+        }
+        return;
+    };
+
+    let settings_path = agent_capability_settings_path(capability);
+    match agent_policy_mode(policy, capability) {
+        AgentPolicyMode::Deny => {
+            markdown.push_str("unavailable; enable `");
+            markdown.push_str(settings_path);
+            markdown.push_str("` in Settings > Agent API.");
+        }
+        AgentPolicyMode::Prompt => {
+            markdown.push_str("available after confirmation (`");
+            markdown.push_str(settings_path);
+            markdown.push_str(" = prompt`).");
+        }
+        AgentPolicyMode::Allow => {
+            markdown.push_str("available (`");
+            markdown.push_str(settings_path);
+            markdown.push_str(" = allow`).");
+        }
+    }
+}
+
+fn render_agent_skill(policy: &AgentApiConfig) -> String {
+    let mut markdown = String::from(
+        "# Scribe agent control\n\n\
+         Use these commands only from a Scribe pane. If `SCRIBE_SESSION_ID` is unset, no-op: do not run `scribe agent` commands.\n\n\
+         Data commands write versioned JSON to stdout. Use `scribe agent <command> --help` for arguments.\n\n\
+         Set `--agent NAME` to identify the caller and optionally `--model MODEL`; the server displays `NAME [MODEL]` and the composed label is limited to 64 characters.\n\n\
+         ## Commands\n\n",
+    );
+    for path in agent_command_paths() {
+        markdown.push_str("- `scribe agent ");
+        markdown.push_str(&path.join(" "));
+        markdown.push_str("` — ");
+        append_agent_command_policy(&mut markdown, policy, &path);
+        markdown.push('\n');
+    }
+    markdown
+}
+
+fn run_agent_skill_command() -> ExitCode {
+    match load_config() {
+        Ok(config) => {
+            write_stdout(render_agent_skill(&config.agent_api).as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            write_stderr_line(&format!("failed to load agent API configuration: {error}"));
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn build_agent_request(
     command: AgentCommand,
     agent_label: String,
     origin_session_id: Option<SessionId>,
-) -> AgentRequest {
-    match command {
+) -> Option<AgentRequest> {
+    Some(match command {
         AgentCommand::World => {
             AgentRequest::World { request_id: AGENT_REQUEST_ID, agent_label, origin_session_id }
         }
@@ -351,7 +484,8 @@ fn build_agent_request(
             agent_label,
             origin_session_id,
         },
-    }
+        AgentCommand::Skill => return None,
+    })
 }
 
 async fn exchange_agent_request(
@@ -406,6 +540,10 @@ async fn run_agent_command(
     model: Option<String>,
     command: AgentCommand,
 ) -> ExitCode {
+    if matches!(&command, AgentCommand::Skill) {
+        return run_agent_skill_command();
+    }
+
     let agent_label = match agent_label(&agent, model) {
         Ok(label) => label,
         Err(message) => {
@@ -420,7 +558,9 @@ async fn run_agent_command(
             return ExitCode::from(2);
         }
     };
-    let request = build_agent_request(command, agent_label, origin_session_id);
+    let Some(request) = build_agent_request(command, agent_label, origin_session_id) else {
+        return run_agent_skill_command();
+    };
 
     match timeout(AGENT_API_DEADLINE, exchange_agent_request(&request)).await {
         Ok(Ok(response)) => agent_response_exit(response),
@@ -651,10 +791,11 @@ mod tests {
 
     use super::{
         agent_envelope, agent_label, exchange_agent_request_on, origin_session_id,
-        parse_dispatch_response,
+        parse_dispatch_response, render_agent_skill,
     };
-    use clap::Parser;
+    use clap::{Command, CommandFactory, Parser};
     use scribe_common::agent::{AgentError, AgentPayload, AgentRequest, AgentResponse};
+    use scribe_common::config::AgentApiConfig;
     use scribe_common::error::ScribeError;
     use scribe_common::framing::{read_message, write_message};
     use scribe_common::ids::WindowId;
@@ -685,6 +826,58 @@ mod tests {
         let err = parse_dispatch_response(ServerMessage::QuitRequested).unwrap_err();
         assert!(matches!(err, ScribeError::ProtocolError { .. }));
         assert!(err.to_string().contains("unexpected response"));
+    }
+
+    fn assert_agent_skill_covers_tree(command: &Command, path: &mut Vec<String>, skill: &str) {
+        for subcommand in command.get_subcommands() {
+            path.push(subcommand.get_name().into());
+            let rendered = format!("`scribe agent {}`", path.join(" "));
+            assert!(skill.contains(&rendered), "missing {rendered}");
+            assert_agent_skill_covers_tree(subcommand, path, skill);
+            _ = path.pop();
+        }
+    }
+
+    #[test]
+    fn agent_skill_names_every_clap_subcommand() {
+        let skill = render_agent_skill(&AgentApiConfig::default());
+        for agent in
+            Cli::command().get_subcommands().filter(|command| command.get_name() == "agent")
+        {
+            assert_agent_skill_covers_tree(agent, &mut Vec::new(), &skill);
+        }
+    }
+
+    #[test]
+    fn agent_skill_instructs_noop_and_marks_denied_capabilities_unavailable() {
+        let skill = render_agent_skill(&AgentApiConfig::default());
+        assert!(skill.contains("If `SCRIBE_SESSION_ID` is unset, no-op"));
+        for settings_path in [
+            "agent_api.read_metadata",
+            "agent_api.read_content",
+            "agent_api.dispatch_action",
+            "agent_api.dispatch_destructive_action",
+            "agent_api.write_input",
+        ] {
+            assert!(skill.contains(&format!("unavailable; enable `{settings_path}`")));
+        }
+    }
+
+    #[test]
+    fn agent_skill_reflects_allowed_and_prompted_policy() {
+        let policy = AgentApiConfig {
+            read_content: scribe_common::agent::AgentPolicyMode::Allow,
+            write_input: scribe_common::agent::AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        };
+        let skill = render_agent_skill(&policy);
+
+        assert!(
+            skill.contains("`scribe agent read` — available (`agent_api.read_content = allow`).")
+        );
+        assert!(skill.contains(
+            "`scribe agent write` — available after confirmation (`agent_api.write_input = prompt`)."
+        ));
     }
 
     #[test]
@@ -729,6 +922,7 @@ mod tests {
                 String::from("--submit"),
             ],
             vec![String::from("scribe"), String::from("agent"), String::from("capabilities")],
+            vec![String::from("scribe"), String::from("agent"), String::from("skill")],
         ];
         for command in commands {
             assert!(Cli::try_parse_from(command).is_ok());
