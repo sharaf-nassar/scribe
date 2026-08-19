@@ -17,12 +17,14 @@ use std::{
 };
 
 use scribe_common::agent::{
-    AgentActionOutcome, AgentActionResult, AgentCapability, AgentError, AgentPayload,
-    AgentPolicyMode, AgentRequest, AgentResponse,
+    AGENT_SURFACE_VERSION, AgentActionOutcome, AgentActionResult, AgentCapability,
+    AgentCapabilityStatus, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
 };
 use scribe_common::config::AgentApiConfig;
 use scribe_common::protocol::{AutomationAction, ServerMessage};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+
+use policy::{AgentPolicyEngine, mode_for};
 
 /// Maximum simultaneous agent API requests. The dispatch result retains its
 /// permit until the IPC reply is queued; future handlers retain it for their
@@ -32,7 +34,7 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 /// Server-owned admission state for one-shot agent requests.
 #[derive(Clone)]
 pub struct AgentApiState {
-    policy: AgentApiConfig,
+    policy: AgentPolicyEngine,
     in_flight: Arc<Semaphore>,
     next_correlation_id: Arc<AtomicU64>,
     pending_actions: Arc<Mutex<HashMap<u64, PendingAction>>>,
@@ -48,11 +50,19 @@ impl AgentApiState {
     #[must_use]
     pub fn new(policy: AgentApiConfig) -> Self {
         Self {
-            policy,
+            policy: AgentPolicyEngine::new(policy),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
             next_correlation_id: Arc::new(AtomicU64::new(1)),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the live policy in place. Every clone of this state and every
+    /// future dispatch reads the new config on its next call — a
+    /// `ConfigReloaded` edit takes effect with no server restart and no new
+    /// `AgentApiState`.
+    pub fn refresh_policy(&self, policy: AgentApiConfig) {
+        self.policy.refresh(policy);
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AgentError> {
@@ -265,20 +275,15 @@ impl<'a> From<&'a AgentRequest> for RequestMetadata<'a> {
 
 /// Dispatch one transient agent request and reply on the same connection.
 ///
-/// Policy evaluation deliberately precedes any target lookup. The policy and
-/// capability handlers land in follow-up modules; the foundational stub is
-/// default-safe and returns `Denied` without reading server state.
+/// Policy evaluation deliberately precedes any target lookup for every
+/// capability except `Capabilities` itself (see [`route_request`]). The
+/// remaining capability handlers land in follow-up modules; the foundational
+/// stub is default-safe and returns `Denied` without reading server state.
 pub fn dispatch(state: &AgentApiState, request: &AgentRequest) -> AgentDispatch {
     let metadata = RequestMetadata::from(request);
     let (result, permit) = match state.try_acquire() {
         Err(error) => (Err(error), None),
-        Ok(permit) => (
-            match authorize_before_lookup(&state.policy, metadata.capability) {
-                Err(error) => Err(error),
-                Ok(()) => route_authorized_request(request),
-            },
-            Some(permit),
-        ),
+        Ok(permit) => (route_request(state, request, metadata.capability), Some(permit)),
     };
 
     let decision = match &result {
@@ -293,24 +298,64 @@ pub fn dispatch(state: &AgentApiState, request: &AgentRequest) -> AgentDispatch 
     }
 }
 
-/// Policy seam. It must stay ahead of all future world/session/window lookup.
+/// Route one admitted request to its capability check and handler.
+///
+/// `Capabilities` is wired ahead of [`authorize_before_lookup`] rather than
+/// behind it: reporting what this build supports, and which mode each
+/// capability currently holds, must never itself require a grant —
+/// otherwise a caller could only discover the policy that blocks it by first
+/// being blocked. It reads `state`'s live policy directly, never a value
+/// captured at construction, so a `refresh_policy` call is reflected on the
+/// very next request.
+fn route_request(
+    state: &AgentApiState,
+    request: &AgentRequest,
+    capability: AgentCapability,
+) -> Result<AgentPayload, AgentError> {
+    let policy = state.policy.config();
+    if matches!(request, AgentRequest::Capabilities { .. }) {
+        return Ok(capabilities_payload(&policy));
+    }
+    authorize_before_lookup(&policy, capability)?;
+    route_authorized_request(request)
+}
+
+/// Policy seam for every capability except `Capabilities`. It must stay
+/// ahead of all future world/session/window lookup.
 fn authorize_before_lookup(
     policy: &AgentApiConfig,
     capability: AgentCapability,
 ) -> Result<(), AgentError> {
-    match policy_mode(policy, capability) {
+    match mode_for(policy, capability) {
         AgentPolicyMode::Deny => Err(denied()),
         AgentPolicyMode::Allow | AgentPolicyMode::Prompt => Ok(()),
     }
 }
 
-fn policy_mode(policy: &AgentApiConfig, capability: AgentCapability) -> AgentPolicyMode {
-    match capability {
-        AgentCapability::ReadMetadata => policy.read_metadata,
-        AgentCapability::ReadContent => policy.read_content,
-        AgentCapability::DispatchAction => policy.dispatch_action,
-        AgentCapability::DispatchDestructiveAction => policy.dispatch_destructive_action,
-        AgentCapability::WriteInput => policy.write_input,
+/// Every capability this build supports, in the order `Capabilities` reports
+/// them.
+const ALL_CAPABILITIES: [AgentCapability; 5] = [
+    AgentCapability::ReadMetadata,
+    AgentCapability::ReadContent,
+    AgentCapability::DispatchAction,
+    AgentCapability::DispatchDestructiveAction,
+    AgentCapability::WriteInput,
+];
+
+/// Surface version plus every supported capability's current policy mode.
+/// Always answerable, independent of any of those modes, so a caller learns
+/// what is available — and which setting unlocks it — instead of spending a
+/// turn on a refusal.
+fn capabilities_payload(policy: &AgentApiConfig) -> AgentPayload {
+    AgentPayload::Capabilities {
+        version: AGENT_SURFACE_VERSION,
+        capabilities: ALL_CAPABILITIES
+            .into_iter()
+            .map(|capability| AgentCapabilityStatus {
+                capability,
+                mode: mode_for(policy, capability),
+            })
+            .collect(),
     }
 }
 
@@ -345,17 +390,32 @@ mod tests {
 
     use std::time::Duration;
 
-    use scribe_common::agent::{AgentActionOutcome, AgentError, AgentRequest};
+    use scribe_common::agent::{
+        AGENT_SURFACE_VERSION, AgentActionOutcome, AgentCapability, AgentCapabilityStatus,
+        AgentError, AgentPayload, AgentPolicyMode, AgentRequest,
+    };
+    use scribe_common::config::AgentApiConfig;
     use scribe_common::framing::{read_message, write_message};
     use scribe_common::protocol::{AutomationAction, ClientMessage, ServerMessage};
     use tokio::sync::{Barrier, Semaphore};
 
-    use super::{AgentApiState, MAX_IN_FLIGHT_REQUESTS, dispatch};
+    use super::{ALL_CAPABILITIES, AgentApiState, MAX_IN_FLIGHT_REQUESTS, dispatch};
 
+    // `World` stands in for every capability handler still stubbed behind
+    // this dispatcher; `Capabilities` is the one variant with its own
+    // wiring below, so it is deliberately excluded from this generic helper.
     fn request(request_id: u64) -> AgentRequest {
-        AgentRequest::Capabilities {
+        AgentRequest::World {
             request_id,
             agent_label: "socket-test".into(),
+            origin_session_id: None,
+        }
+    }
+
+    fn capabilities_request(request_id: u64) -> AgentRequest {
+        AgentRequest::Capabilities {
+            request_id,
+            agent_label: "capability-test".into(),
             origin_session_id: None,
         }
     }
@@ -400,6 +460,62 @@ mod tests {
                 if reply_response.request_id == 7
                     && matches!(reply_response.result, Err(AgentError::Denied { .. }))
         ));
+    }
+
+    fn capability_mode(
+        capabilities: &[AgentCapabilityStatus],
+        capability: AgentCapability,
+    ) -> Option<AgentPolicyMode> {
+        capabilities.iter().find(|status| status.capability == capability).map(|status| status.mode)
+    }
+
+    #[test]
+    fn capabilities_reports_every_capability_and_mode_without_a_grant() {
+        // Default policy is all-`Deny`; `Capabilities` must still answer.
+        let state = AgentApiState::default();
+        let dispatched = dispatch(&state, &capabilities_request(1));
+
+        let Ok(AgentPayload::Capabilities { version, capabilities }) =
+            dispatched.response().result.clone()
+        else {
+            panic!("Capabilities must succeed under default (all-Deny) policy");
+        };
+        assert_eq!(version, AGENT_SURFACE_VERSION);
+        assert_eq!(capabilities.len(), ALL_CAPABILITIES.len());
+        for capability in ALL_CAPABILITIES {
+            assert_eq!(capability_mode(&capabilities, capability), Some(AgentPolicyMode::Deny));
+        }
+    }
+
+    #[test]
+    fn capabilities_reflects_a_live_policy_change_with_no_restart() {
+        let state = AgentApiState::default();
+        state.refresh_policy(AgentApiConfig {
+            read_content: AgentPolicyMode::Allow,
+            write_input: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+
+        let dispatched = dispatch(&state, &capabilities_request(2));
+        let Ok(AgentPayload::Capabilities { capabilities, .. }) =
+            dispatched.response().result.clone()
+        else {
+            panic!("Capabilities must succeed after a live policy refresh");
+        };
+        assert_eq!(
+            capability_mode(&capabilities, AgentCapability::ReadContent),
+            Some(AgentPolicyMode::Allow)
+        );
+        assert_eq!(
+            capability_mode(&capabilities, AgentCapability::WriteInput),
+            Some(AgentPolicyMode::Prompt)
+        );
+        // Untouched capabilities stay at their default, proving the refresh
+        // updates the live policy rather than replacing it wholesale.
+        assert_eq!(
+            capability_mode(&capabilities, AgentCapability::ReadMetadata),
+            Some(AgentPolicyMode::Deny)
+        );
     }
 
     async fn hold_dispatch(

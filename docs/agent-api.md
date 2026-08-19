@@ -311,9 +311,10 @@ scribe agent --agent my-agent write a4c2e8d0-9b1f-4c3a-8e5d-6f7a2b4c9e0d --text 
 
 ### `scribe agent capabilities`
 
-Capability: **read-metadata**. Reports which agent capabilities this build
-supports, so an agent can probe before spending calls. An operation the
-build does not know fails with `unsupported` rather than hanging.
+Requires no capability grant. Reports the surface version and every supported
+capability with its current live policy mode, so an agent can probe before
+spending calls. An operation the build does not know fails with `unsupported`
+rather than hanging.
 
 ```json
 {
@@ -321,8 +322,14 @@ build does not know fails with `unsupported` rather than hanging.
   "ok": true,
   "data": {
     "type": "capabilities",
-    "capabilities": ["read_metadata", "read_content", "dispatch_action",
-                     "dispatch_destructive_action", "write_input"]
+    "version": 1,
+    "capabilities": [
+      {"capability": "read_metadata", "mode": "deny"},
+      {"capability": "read_content", "mode": "allow"},
+      {"capability": "dispatch_action", "mode": "prompt"},
+      {"capability": "dispatch_destructive_action", "mode": "deny"},
+      {"capability": "write_input", "mode": "deny"}
+    ]
   }
 }
 ```
@@ -352,7 +359,7 @@ listener, task, or timer.
 
 | Capability | Config key | Gates |
 |---|---|---|
-| Read metadata | `agent_api.read_metadata` | `world`, `siblings`, `capabilities` |
+| Read metadata | `agent_api.read_metadata` | `world`, `siblings` |
 | Read content | `agent_api.read_content` | `read` |
 | Dispatch actions | `agent_api.dispatch_action` | non-destructive `action` commands |
 | Dispatch destructive actions | `agent_api.dispatch_destructive_action` | `close-pane`, `close-tab`, `open-update-dialog` |

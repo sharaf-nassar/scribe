@@ -2146,7 +2146,9 @@ pub struct TrustedNetworkInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentPayload;
+    use crate::agent::{
+        AGENT_SURFACE_VERSION, AgentCapabilityStatus, AgentPayload, AgentPolicyMode,
+    };
     use serde::de::IgnoredAny;
 
     #[derive(Serialize)]
@@ -2388,7 +2390,11 @@ mod tests {
         let response = ServerMessage::AgentResponse(AgentResponse {
             request_id: 7,
             result: Ok(AgentPayload::Capabilities {
-                capabilities: vec![AgentCapability::ReadMetadata],
+                version: AGENT_SURFACE_VERSION,
+                capabilities: vec![AgentCapabilityStatus {
+                    capability: AgentCapability::ReadMetadata,
+                    mode: AgentPolicyMode::Deny,
+                }],
             }),
         });
         let response_bytes = rmp_serde::to_vec_named(&response).expect("serialize agent response");

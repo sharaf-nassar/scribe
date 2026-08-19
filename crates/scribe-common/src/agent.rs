@@ -69,6 +69,11 @@ pub struct AgentResponse {
     pub result: Result<AgentPayload, AgentError>,
 }
 
+/// Version of the local agent control surface this build implements.
+/// Reported by [`AgentPayload::Capabilities`] so a caller can detect an
+/// unsupported build instead of guessing from a refusal.
+pub const AGENT_SURFACE_VERSION: u32 = 1;
+
 /// Successful payloads returned by the local agent API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -78,7 +83,7 @@ pub enum AgentPayload {
     ReadScreen { screen: AgentScreenText },
     DispatchAction { result: AgentActionResult },
     WriteInput,
-    Capabilities { capabilities: Vec<AgentCapability> },
+    Capabilities { version: u32, capabilities: Vec<AgentCapabilityStatus> },
 }
 
 /// Capability checked before an agent operation is serviced.
@@ -124,6 +129,14 @@ pub enum AgentPolicyMode {
     Deny,
     Allow,
     Prompt,
+}
+
+/// One capability's identity paired with its currently effective policy
+/// mode, as reported by [`AgentPayload::Capabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCapabilityStatus {
+    pub capability: AgentCapability,
+    pub mode: AgentPolicyMode,
 }
 
 /// Typed failure returned by the local agent API.
@@ -300,6 +313,16 @@ mod tests {
         }
     }
 
+    fn capabilities() -> AgentPayload {
+        AgentPayload::Capabilities {
+            version: AGENT_SURFACE_VERSION,
+            capabilities: vec![AgentCapabilityStatus {
+                capability: AgentCapability::ReadMetadata,
+                mode: AgentPolicyMode::Deny,
+            }],
+        }
+    }
+
     fn assert_redacted<T: Serialize>(value: &T) {
         let encoded = rmp_serde::to_vec_named(value);
         assert!(encoded.is_ok(), "agent DTO should serialize: {encoded:?}");
@@ -376,7 +399,7 @@ mod tests {
             AgentPayload::ReadScreen { screen: screen() },
             AgentPayload::DispatchAction { result: result() },
             AgentPayload::WriteInput,
-            AgentPayload::Capabilities { capabilities: vec![AgentCapability::ReadMetadata] },
+            capabilities(),
         ];
         for payload in &payloads {
             assert_redacted(payload);

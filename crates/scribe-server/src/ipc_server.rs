@@ -9850,6 +9850,8 @@ async fn handle_config_reloaded(server: &IpcServerState) {
         }
     };
 
+    server.agent_api.refresh_policy(cfg.agent_api.clone());
+
     let new_scrollback = usize::try_from(cfg.scrollback_lines).unwrap_or(usize::MAX);
     session_manager.set_scrollback_lines(new_scrollback);
 
