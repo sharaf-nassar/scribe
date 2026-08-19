@@ -103,14 +103,6 @@ pub struct FlowNodeLayout {
     pub height: f32,
 }
 
-/// Virtual node inserted into each intermediate rank crossed by a skip edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlowDummyNode {
-    pub edge_index: usize,
-    pub rank: usize,
-    pub order: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WireAxis {
     Horizontal,
@@ -148,7 +140,6 @@ pub struct WireSegment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlowLayout {
     pub nodes: Vec<FlowNodeLayout>,
-    pub dummy_nodes: Vec<FlowDummyNode>,
     pub wire_runs: Vec<EdgeWireRun>,
     pub rank_count: usize,
     pub width: f32,
@@ -265,13 +256,12 @@ fn release_successor(to: usize, indegree: &mut [usize], ready: &mut VecDeque<usi
 #[derive(Debug, Clone, Copy)]
 enum ExpandedKind {
     Issue(usize),
-    Dummy { edge_index: usize },
+    Dummy,
 }
 
 #[derive(Debug)]
 struct ExpandedNode {
     kind: ExpandedKind,
-    rank: usize,
     stable_order: usize,
     predecessors: Vec<usize>,
 }
@@ -292,7 +282,6 @@ impl ExpandedGraph {
             let index = expanded.nodes.len();
             expanded.nodes.push(ExpandedNode {
                 kind: ExpandedKind::Issue(issue_index),
-                rank,
                 stable_order: index,
                 predecessors: Vec::new(),
             });
@@ -300,22 +289,20 @@ impl ExpandedGraph {
                 bucket.push(index);
             }
         }
-        for (edge_index, &(from, to)) in indexed.edges.iter().enumerate() {
-            expanded.add_edge(edge_index, from, to, ranks);
+        for &(from, to) in &indexed.edges {
+            expanded.add_edge(from, to, ranks);
         }
         expanded
     }
 
-    fn add_edge(&mut self, edge_index: usize, from: usize, to: usize, ranks: &[usize]) {
+    fn add_edge(&mut self, from: usize, to: usize, ranks: &[usize]) {
         let from_rank = ranks.get(from).copied().unwrap_or_default();
         let to_rank = ranks.get(to).copied().unwrap_or(from_rank);
         let mut previous = from;
-        for (rank, bucket) in self.by_rank.iter_mut().enumerate().take(to_rank).skip(from_rank + 1)
-        {
+        for bucket in self.by_rank.iter_mut().take(to_rank).skip(from_rank + 1) {
             let index = self.nodes.len();
             self.nodes.push(ExpandedNode {
-                kind: ExpandedKind::Dummy { edge_index },
-                rank,
+                kind: ExpandedKind::Dummy,
                 stable_order: index,
                 predecessors: vec![previous],
             });
@@ -382,7 +369,6 @@ pub fn layout_flow(graph: &BeadsEpicGraph, text_scale: f32) -> Result<FlowLayout
     let rank_count = expanded.by_rank.len();
     Ok(FlowLayout {
         nodes: placed.nodes,
-        dummy_nodes: placed.dummies,
         wire_runs,
         rank_count,
         width: metrics.left_padding
@@ -394,7 +380,6 @@ pub fn layout_flow(graph: &BeadsEpicGraph, text_scale: f32) -> Result<FlowLayout
 
 struct PlacedNodes {
     nodes: Vec<FlowNodeLayout>,
-    dummies: Vec<FlowDummyNode>,
     positions: Vec<(f32, f32)>,
 }
 
@@ -415,7 +400,6 @@ fn place_nodes(
         expanded.nodes.iter().filter(|node| matches!(node.kind, ExpandedKind::Issue(_))).count();
     let mut placed = PlacedNodes {
         nodes: Vec::with_capacity(issue_count),
-        dummies: Vec::new(),
         positions: vec![(0.0, 0.0); issue_count],
     };
     let placement = Placement { metrics, text_scale, capacity };
@@ -465,14 +449,6 @@ fn place_rank(
             width: placement.metrics.node_width * placement.text_scale,
             height: placement.metrics.node_height * placement.text_scale,
         });
-    }
-    for (order, &index) in expanded_rank.iter().enumerate() {
-        let Some(node) = expanded.get(index) else {
-            continue;
-        };
-        if let ExpandedKind::Dummy { edge_index } = node.kind {
-            placed.dummies.push(FlowDummyNode { edge_index, rank: node.rank, order });
-        }
     }
     Ok(())
 }
@@ -1759,13 +1735,18 @@ mod tests {
     }
 
     #[test]
-    fn skip_edge_inserts_one_dummy_in_every_intermediate_rank() {
+    fn skip_edge_dummy_ordering_influences_real_node_order() {
         let graph = graph(
-            &["start", "middle", "end"],
-            &[("start", "middle"), ("middle", "end"), ("start", "end")],
+            &["root", "middle", "left-child", "right-child"],
+            &[
+                ("root", "middle"),
+                ("root", "left-child"),
+                ("middle", "left-child"),
+                ("middle", "right-child"),
+            ],
         );
         let layout = layout_flow(&graph, 1.0).unwrap();
-        assert_eq!(layout.dummy_nodes, vec![FlowDummyNode { edge_index: 2, rank: 1, order: 1 }]);
+        assert_eq!(ids_in_rank(&layout, &graph, 2), vec!["right-child", "left-child"]);
     }
 
     #[test]
