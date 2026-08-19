@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod ai_chrome;
 pub mod ai_state;
 pub mod app;
