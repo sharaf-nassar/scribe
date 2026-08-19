@@ -1253,9 +1253,10 @@ split or resize.
 The loading frame keeps the clicked card's priority, title, and epic over a
 placeholder while the detail request is outstanding. Loading and resolved
 content share that centered layout, so a reply cannot move the panel sideways.
-Opening lifts and widens from the source lane into the settled layout over 120ms
-through the shared animation policy, so reduced motion still lands on the
-identical final frame.
+Opening widens from the source lane into the settled layout over 120ms through
+the shared animation policy, but its frame and dismissal backdrop start below
+the board, leaving an open Flow strip readable and clickable. Reduced motion
+still lands on the identical final frame.
 [[crates/scribe-client/src/main.rs#dispatch_server_message]] correlates a reply
 through [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#update]] by both
 workspace and issue id. Its backdrop, close mark, and Esc all dismiss it. A
@@ -1633,7 +1634,7 @@ Already-admitted is the load-bearing word. [[server#Server#Beads Flow source cac
 
 Wire routing follows the mock's orthogonal rails. Adjacent ranks use two half-gutter stubs around a vertical dogleg; skip edges use an 8px exit and entry around the nearest long-haul lane. [[crates/scribe-client/src/beads_flow.rs#union_wire_runs]] groups intervals by axis and offset, splits them at every endpoint, and applies `Traced` over `Base` over `Dimmed` on each atomic interval. Shared translucent rails therefore paint once, while a traced path can light only its half of a shared gutter.
 
-[[crates/scribe-client/src/beads_flow.rs#render]] lowers an admitted graph and its layout into the compact 197px strip: the 34px Flow band, rank ruler, 214×24 nodes, orthogonal one-pixel wire segments, horizontal position bar, and floor grip. It reads only named [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]] slots, so every Flow surface follows the live theme. `FlowRender` takes the cursor, horizontal offset, trace classes, and workspace-owned focus/action controls as explicit seams: mode entry and exit, scrolling, panel retargeting, trace selection, and liveness remain outside the renderer. A missing node control is a typed [[crates/scribe-client/src/beads_flow.rs#FlowRenderError]], preventing a painted node from silently losing its AccessKit button role, Tab stop, Enter/Space activation, or blockers/dependents description. The chevron and mode pair paint as inert text until their owning mode slice adds an action.
+[[crates/scribe-client/src/beads_flow.rs#render]] lowers an admitted graph and its layout into the compact 197px strip: the 34px Flow band, rank ruler, 214×24 nodes, orthogonal one-pixel wire segments, horizontal position bar, and floor grip. It reads only named [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]] slots, so every Flow surface follows the live theme. `FlowRender` takes the cursor, horizontal offset, trace classes, and workspace-owned focus/action controls as explicit seams: mode entry and exit, scrolling, panel retargeting, trace selection, and liveness remain outside the renderer. A missing node control is a typed [[crates/scribe-client/src/beads_flow.rs#FlowRenderError]], preventing a painted node from silently losing its AccessKit button role, Tab stop, Enter/Space activation, or blockers/dependents description. [[crates/scribe-client/src/main.rs#flow_node_control]] marks each stable control handle as a tab stop, and the terminal focus repair recognises a focused node so the next repaint cannot return it to the PTY. The chevron and mode pair paint as inert text until their owning mode slice adds an action.
 
 ### Flow mode entry, exit, and scrolling
 

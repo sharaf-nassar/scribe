@@ -1931,11 +1931,13 @@ and back each round and keeps going long enough to outlast the cache.
 
 Clicking its deepest card must produce both a
 `RequestBeadsIssueDetail` and a `RequestBeadsEpicGraph` on the client wire, an
-admitted graph from the server, and a repainted strip. Activating a node
-through its accessible Tab stop must request a different member's detail while
-the epic-graph request count stays put, since the graph is frozen at open.
-Leaving Flow must return usable lanes: a card with no epic opens its panel and
-asks for no graph.
+admitted graph from the server, and a repainted strip. Its panel bounds must
+start below the strip. The run then clicks the clear rank-0 node, proving the
+real pointer reaches the handler despite the open panel, before Tab plus Enter
+activates its next node. Both requests must target different members while the
+epic-graph request count stays put, since the graph is frozen at open. Leaving
+Flow must return usable lanes: a card with no epic opens its panel and asks for
+no graph.
 
 #### Card drag writes and pointer isolation
 

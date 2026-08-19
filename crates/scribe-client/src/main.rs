@@ -1532,7 +1532,7 @@ struct TerminalFocus {
     cursor_blink: CursorBlink,
 }
 
-fn focus_is_unclaimed(claims: [bool; 5]) -> bool {
+fn focus_is_unclaimed(claims: [bool; 6]) -> bool {
     !claims.into_iter().any(std::convert::identity)
 }
 
@@ -8307,7 +8307,7 @@ impl TerminalView {
     ) -> bool {
         if self.window_displaced() || self.share_prompt_pending() {
             cx.stop_propagation();
-            self.handle_overlay_key(event, cx);
+            self.handle_overlay_key(event, window, cx);
             return true;
         }
         self.handle_beads_editor_key(event, window, cx)
@@ -8315,7 +8315,12 @@ impl TerminalView {
 
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
-    fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_overlay_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let mods = &event.keystroke.modifiers;
         // Feature 013 (T017): a displaced window is frozen. Checked before
         // everything else — including the share prompt and the shell chords —
@@ -8334,6 +8339,13 @@ impl TerminalView {
         // the holder (or the owner while control is unheld) answers it before
         // anything else reaches a binding, an overlay, or the PTY.
         if self.share_prompt_pending() && self.run_share_key(event, cx) {
+            return true;
+        }
+        if event.keystroke.key == "escape"
+            && self.flow_node_has_keyboard_focus(window)
+            && self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.exit_latest_flow())
+        {
+            cx.notify();
             return true;
         }
         if event.keystroke.key == "escape"
@@ -9931,6 +9943,12 @@ impl TerminalView {
         })
     }
 
+    fn flow_node_has_keyboard_focus(&self, window: &Window) -> bool {
+        self.flow_node_controls
+            .values()
+            .any(|controls| controls.values().any(|control| control.focus.is_focused(window)))
+    }
+
     /// Keep keyboard focus inside a modal, or restore it to terminal chrome
     /// when no modal owns the window.
     fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9954,6 +9972,7 @@ impl TerminalView {
                         .is_some_and(|content| content.display_offset > 0)
             }),
             self.beads_editor.read(cx).has_keyboard_focus(window, cx),
+            self.flow_node_has_keyboard_focus(window),
         ]);
         if focus_is_unclaimed {
             window.focus(&self.focus.root, cx);
@@ -10082,7 +10101,7 @@ impl Render for TerminalView {
                 // stop propagation in their own handlers). A focused terminal
                 // keeps Tab for the PTY; modified Tab chords continue to
                 // configured bindings below.
-                if view.handle_overlay_key(event, ctx) {
+                if view.handle_overlay_key(event, win, ctx) {
                     return;
                 }
                 if view.focus_next_titlebar_control(event, win, ctx) {
@@ -11034,7 +11053,7 @@ fn flow_node_control(
 ) -> FlowNodeControl {
     let hover_boards = Arc::clone(&boards);
     FlowNodeControl {
-        focus,
+        focus: focus.tab_stop(true),
         on_activate: Arc::new(move |issue_id, window, _app| {
             let Ok(mut boards) = boards.lock() else { return };
             if !boards.move_flow_cursor(workspace_id, &issue_id) {
@@ -14782,15 +14801,15 @@ mod tests {
     // @lat: [[test#Test Harness#GPUI CI Run Bar#CI controls retain keyboard focus]]
     #[test]
     fn ci_control_claim_prevents_terminal_focus_restore() {
-        assert!(!focus_is_unclaimed([false, false, false, true, false]));
-        assert!(focus_is_unclaimed([false; 5]));
+        assert!(!focus_is_unclaimed([false, false, false, true, false, false]));
+        assert!(focus_is_unclaimed([false; 6]));
     }
 
     // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Armed editor survives terminal focus repair]]
     #[test]
     fn beads_editor_claim_prevents_terminal_focus_restore() {
-        assert!(!focus_is_unclaimed([false, false, false, false, true]));
-        assert!(focus_is_unclaimed([false; 5]));
+        assert!(!focus_is_unclaimed([false, false, false, false, true, false]));
+        assert!(focus_is_unclaimed([false; 6]));
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]

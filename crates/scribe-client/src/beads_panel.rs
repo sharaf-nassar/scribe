@@ -228,7 +228,7 @@ fn panel_open_frame(
         .clamp(geometry.x, geometry.x + geometry.width - start_width);
     PanelOpenFrame {
         x: (geometry.x - start_x).mul_add(progress, start_x),
-        y: 8.0f32.mul_add(progress, geometry.y - 8.0),
+        y: geometry.y,
         width: (geometry.width - start_width).mul_add(progress, start_width),
         opacity: 0.25 + 0.75 * progress,
     }
@@ -1725,13 +1725,16 @@ pub fn render(panel: &BeadsPanel, wiring: &BeadsPanelRender<'_>) -> Vec<AnyEleme
     let close_state = std::sync::Arc::clone(&wiring.state);
     let close_editor = wiring.editor.clone();
     let close_focus = wiring.terminal_focus.clone();
+    // The panel starts below the board. Keeping its backdrop there leaves a
+    // Flow strip both visible and clickable while retaining outside-click
+    // dismissal for the panel's own part of the region.
     let backdrop = div()
         .id(SharedString::from(format!("beads-detail-backdrop-{workspace_id}")))
         .absolute()
         .left(px(wiring.region.x))
-        .top(px(wiring.region.y))
+        .top(px(layout.geometry.y))
         .w(px(wiring.region.width))
-        .h(px(wiring.region.height))
+        .h(px((wiring.region.y + wiring.region.height - layout.geometry.y).max(0.0)))
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
         .on_click(move |_event, window, app| {
             close_editor.update(app, BeadsEditor::commit);
@@ -3479,6 +3482,7 @@ mod tests {
 
         assert!(start.width < geometry.width);
         assert!(start.x >= board.x + 8.0);
+        assert!((start.y - geometry.y).abs() < f32::EPSILON, "opening never covers the board");
         assert_eq!(end, PanelOpenFrame { x: 22.0, y: 221.0, width: 560.0, opacity: 1.0 });
         assert_eq!(animation.duration, Duration::from_millis(120));
     }

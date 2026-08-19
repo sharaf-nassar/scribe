@@ -1452,6 +1452,7 @@ fn flow_node(
         .aria_description(node.description.clone())
         .track_focus(&control.focus)
         .tab_stop(true)
+        .focus_visible(move |style| style.border_1().border_color(colors.cursor_keyline))
         .absolute()
         .left(px(node.x))
         .top(px(node.y))

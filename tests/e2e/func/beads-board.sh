@@ -1071,21 +1071,47 @@ STRIP_DIFF=${STRIP_DIFF%%.*}
 [ "${STRIP_DIFF:-0}" -ge 5000 ] \
     || fail "the strip did not repaint into Flow (${STRIP_DIFF:-0}px)"
 
-# A node moves the opened card inside the frozen graph. The epic must not be
-# re-requested: the picture the reader is holding stays exactly as laid out.
-SIBLING_BEFORE=$(flow_sibling_requests e2e-flow-d)
+# The panel begins below the 34px titlebar plus Flow's fixed 197px strip.
+# Diffing with that strip masked isolates its real painted surface.
+read -r FLOW_PANEL_W FLOW_PANEL_H FLOW_PANEL_X FLOW_PANEL_Y \
+    <<<"$(panel_bounds /output/beads-flow-lanes.png /output/beads-flow-strip.png)"
+FLOW_PANEL_TOP=${FLOW_PANEL_Y#+}
+[ "${FLOW_PANEL_TOP:-0}" -ge 231 ] \
+    || fail "Flow detail panel overlaps the strip at y=${FLOW_PANEL_Y:-unknown}"
+
+# A real click on rank 0 must cross the panel layer and reach the node handler.
+# The 214px node starts at x=30; its one-row rank is vertically centred in the
+# 139px graph below the 34px titlebar, Flow band, and ruler.
+FLOW_ROOT_X=$((30 + 214 / 2))
+FLOW_ROOT_Y=$((34 + 34 + 15 + (139 - 24) / 2 + 24 / 2))
+ROOT_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-a)
 GRAPH_AFTER_OPEN=$(epic_graph_requests e2e-flow-epic)
+xdotool mousemove --sync --window "$WID" "$FLOW_ROOT_X" "$FLOW_ROOT_Y"
+xdotool click 1
+for _ in $(seq 1 50); do
+    [ "$(flow_detail_requests e2e-flow-a)" -gt "$ROOT_DETAIL_BEFORE" ] && break
+    sleep 0.2
+done
+[ "$(flow_detail_requests e2e-flow-a)" -gt "$ROOT_DETAIL_BEFORE" ] \
+    || fail "clicking a Flow node did not retarget the detail panel"
+[ "$(epic_graph_requests e2e-flow-epic)" -eq "$GRAPH_AFTER_OPEN" ] \
+    || fail "a Flow node click re-requested the epic graph"
+
+# The click focuses rank 0, so Tab reaches another node and Enter activates it.
+# This proves the rendered controls stay in the panel's focus cycle after the
+# retarget refresh rather than merely exposing an AccessKit role.
+TAB_DETAIL_BEFORE=$(flow_sibling_requests e2e-flow-a)
 xdotool key --clearmodifiers Tab
 sleep 0.2
 xdotool key --clearmodifiers Return
 for _ in $(seq 1 50); do
-    [ "$(flow_sibling_requests e2e-flow-d)" -gt "$SIBLING_BEFORE" ] && break
+    [ "$(flow_sibling_requests e2e-flow-a)" -gt "$TAB_DETAIL_BEFORE" ] && break
     sleep 0.2
 done
-[ "$(flow_sibling_requests e2e-flow-d)" -gt "$SIBLING_BEFORE" ] \
-    || fail "activating a Flow node did not retarget the detail panel"
+[ "$(flow_sibling_requests e2e-flow-a)" -gt "$TAB_DETAIL_BEFORE" ] \
+    || fail "Tab and Enter did not activate another Flow node"
 [ "$(epic_graph_requests e2e-flow-epic)" -eq "$GRAPH_AFTER_OPEN" ] \
-    || fail "a node activation re-requested the epic graph"
+    || fail "keyboard Flow activation re-requested the epic graph"
 
 # Leaving Flow returns the same board: lanes paint again and a card with no
 # epic opens its panel without ever asking for a graph.
