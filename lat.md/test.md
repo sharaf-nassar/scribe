@@ -4209,10 +4209,12 @@ one full-width region with the board pinned at its default height.
 The phase drives the shipped client rather than a fixture: a card carrying
 `parent_epic_id` is clicked, the epic graph is injected with no sleep because
 the pending fence the click opened is cleared by any non-`Graph` outcome, and
-the strip is asserted to swap while the panel opens underneath. Every geometry
-constant is written as the formula `beads_flow.rs` uses — rank pitch as node
-width plus gutter, row tops as the centred-row calculation — so a change to the
-node box fails here instead of silently re-siting each probe.
+the strip is asserted to swap while the panel opens underneath. Shared graph
+opening, pointer parking, and cursor-hover gestures are factored in the script;
+first entry stays split so its baseline capture precedes session-id discovery.
+Every geometry constant is written as the formula `beads_flow.rs` uses — rank
+pitch as node width plus gutter, row tops as the centred-row calculation — so a
+change to the node box fails here instead of silently re-siting each probe.
 
 Every probe sits on rank 1 or 2. The fixture gives both interior ranks two
 nodes on purpose: the cursor assertion checks that the sibling sharing rank 2

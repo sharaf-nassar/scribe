@@ -885,19 +885,27 @@ flow_dot_y() {
 
 FLOW_CARD_X=$((16 + LANE_W + 40))
 FLOW_CARD_Y=$((70 + 50 + 20))
+flow_open_graph() {
+    xdotool mousemove --sync --window "$WID" "$FLOW_CARD_X" "$FLOW_CARD_Y"
+    xdotool click 1
+    scribe-test share-inject --control "$CONTROL" "$(flow_epic_graph "$WORKSPACE")"
+    sleep 1.0
+}
+flow_park_pointer() {
+    xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
+    sleep "${1:-0.4}"
+}
+flow_hover_node() {
+    xdotool mousemove --sync --window "$WID" "$((FLOW_CURSOR_X + 90))" "$FLOW_R2_TOP"
+    sleep "${1:-0.6}"
+}
+# The first trace starts parked; later re-entry probes park before hovering.
 inject "$(flow_board "$WORKSPACE")"
 import -window "$WID" /output/beads-flow-lanes.png
 
-# Opening a card opens the panel and swaps the strip. The graph is injected
-# with no sleep between: the pending fence the click opened is cleared by any
-# non-Graph outcome, and the real bd-less server answers NotDetected on its
-# own schedule.
-xdotool mousemove --sync --window "$WID" "$FLOW_CARD_X" "$FLOW_CARD_Y"
-xdotool click 1
-scribe-test share-inject --control "$CONTROL" "$(flow_epic_graph "$WORKSPACE")"
-sleep 1.0
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.4
+# First entry stays split: capture its baseline before session-id discovery.
+flow_open_graph
+flow_park_pointer
 import -window "$WID" /output/beads-flow.png
 FLOW_ENTER_DIFF=$(compare -metric AE /output/beads-flow-lanes.png /output/beads-flow.png null: 2>&1 || true)
 FLOW_ENTER_DIFF=${FLOW_ENTER_DIFF%%.*}
@@ -1035,8 +1043,7 @@ FLOW_SIBLING_FILL=$(px_at /output/beads-flow.png "$FLOW_CURSOR_FILL_X" "$FLOW_R2
 # that reaches fl-b and dim the half that reaches fl-c. A router that emitted
 # whole edges instead of interval-unioned segments cannot produce that split,
 # which is the point of reading both halves of one run.
-xdotool mousemove --sync --window "$WID" "$((FLOW_CURSOR_X + 90))" "$FLOW_R2_TOP"
-sleep 0.6
+flow_hover_node
 import -window "$WID" /output/beads-flow-trace.png
 FLOW_TRACED=$(px_at /output/beads-flow-trace.png "$FLOW_GUTTER_X" "$((FLOW_R1_TOP + 6))")
 FLOW_DIMMED=$(px_at /output/beads-flow-trace.png "$FLOW_GUTTER_X" "$((FLOW_R1_BOT - 6))")
@@ -1061,8 +1068,7 @@ FLOW_CHIP_BOUNDS=$(convert /output/beads-flow.png /output/beads-flow-trace.png \
 FLOW_CHIP_W=${FLOW_CHIP_BOUNDS%%,*}
 [ "${FLOW_CHIP_W:-0}" -ge 80 ] ||
     fail "hovering the cursor node revealed no trace chip (${FLOW_CHIP_BOUNDS:-empty})"
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.5
+flow_park_pointer 0.5
 import -window "$WID" /output/beads-flow-restored.png
 FLOW_RESTORE_DIFF=$(strip_diff /output/beads-flow.png /output/beads-flow-restored.png)
 [ "${FLOW_RESTORE_DIFF:-9999}" -le 400 ] ||
@@ -1108,8 +1114,7 @@ import -window "$WID" /output/beads-flow-prechevron.png
 xdotool mousemove --sync --window "$WID" 138 "$((BOARD_TOP + 16))"
 xdotool click 1
 sleep 0.6
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.4
+flow_park_pointer
 import -window "$WID" /output/beads-flow-chevron.png
 FLOW_CHEVRON_DIFF=$(strip_diff /output/beads-flow-prechevron.png /output/beads-flow-chevron.png)
 [ "${FLOW_CHEVRON_DIFF:-9999}" -le 200 ] ||
@@ -1137,8 +1142,7 @@ xdotool click 4
 xdotool click 4
 xdotool click 4
 sleep 0.5
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.4
+flow_park_pointer
 
 # Every rendered Flow colour comes from the theme. This is the assertion the
 # board's colour rule actually needs: a hardcoded value survives every probe
@@ -1161,10 +1165,7 @@ flow_enter() {
         sleep 0.8
         inject "$(flow_board "$WORKSPACE")"
     fi
-    xdotool mousemove --sync --window "$WID" "$FLOW_CARD_X" "$FLOW_CARD_Y"
-    xdotool click 1
-    scribe-test share-inject --control "$CONTROL" "$(flow_epic_graph "$WORKSPACE")"
-    sleep 1.0
+    flow_open_graph
     scribe-test share-inject --control "$CONTROL" \
         "{\"type\":\"IssueFocused\",\"session_id\":\"$FLOW_LIVE_SESSION\",\"issue_id\":\"fl-c\"}"
     sleep 0.6
@@ -1185,10 +1186,8 @@ flow_slot_sites() {
         "agent_halo:$(($(flow_dot_x 1) - 6)):${FLOW_R1_BOT}"
 }
 flow_hover_cursor() {
-    xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-    sleep 0.3
-    xdotool mousemove --sync --window "$WID" "$((FLOW_CURSOR_X + 90))" "$FLOW_R2_TOP"
-    sleep 0.7
+    flow_park_pointer 0.3
+    flow_hover_node 0.7
 }
 flow_enter
 flow_hover_cursor
@@ -1229,8 +1228,7 @@ for _ in $(seq 1 40); do
 done
 sleep 1.0
 flow_enter
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.5
+flow_park_pointer 0.5
 import -window "$WID" /output/beads-flow-theme-restored.png
 FLOW_RESTORED_BAND=$(px_at /output/beads-flow-theme-restored.png 5 "$((BOARD_TOP + 16))")
 [ "$(px_delta "$FLOW_RESTORED_BAND" "$FLOW_BAND")" -le 10 ] ||
@@ -1255,8 +1253,7 @@ xdotool click 1
 sleep 0.5
 xdotool key --clearmodifiers Escape
 sleep 0.8
-xdotool mousemove --sync --window "$WID" "$((WIN_W / 2))" "$((WIN_H - 80))"
-sleep 0.4
+flow_park_pointer
 import -window "$WID" /output/beads-flow-back.png
 FLOW_BACK_DIFF=$(strip_diff /output/beads-flow-inflow.png /output/beads-flow-back.png)
 [ "${FLOW_BACK_DIFF:-0}" -ge 500 ] ||
