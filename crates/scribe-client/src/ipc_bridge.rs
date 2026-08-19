@@ -51,7 +51,7 @@ use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         AiLaunchSpec, AutomationAction, BeadsIssueWrite, BeadsIssueWriteGuards, ClientMessage,
-        PromptMarkKind, ShellTool, TerminalSize, WorkspaceTreeNode,
+        ClipboardDecision, PromptId, PromptMarkKind, ShellTool, TerminalSize, WorkspaceTreeNode,
     },
     terminal_images::{TerminalImageLiveMessage, TerminalImageReplayMessage, TerminalImageUpdate},
 };
@@ -1591,6 +1591,27 @@ impl IpcSink {
         self.enqueue(message)
     }
 
+    /// Answers a pending spec-027 agent capability prompt with the user's
+    /// decision, echoing the `prompt_id` the server's `AgentPromptRequest`
+    /// parked the agent's call behind.
+    ///
+    /// The reply is not optional: the server holds the agent request until this
+    /// `prompt_id` resolves or its timeout elapses, so a Deny — including the
+    /// Esc / backdrop default — is sent just as deliberately as an Allow. The
+    /// decision reuses the four-way clipboard enum because
+    /// `ClientMessage::AgentPromptResponse` carries exactly that type.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn agent_prompt_response(
+        &self,
+        prompt_id: PromptId,
+        decision: ClipboardDecision,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::AgentPromptResponse { prompt_id, decision })
+    }
+
     /// Asks the local server which same-account tailnet peers are online,
     /// answered with a single `RemotePeerList` (feature 013).
     ///
@@ -2149,6 +2170,22 @@ mod tests {
                 outcome: scribe_common::agent::AgentActionOutcome::Completed,
                 created_session_id: Some(created),
             }) if created == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_response_echoes_the_prompt_id_and_decision() {
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        sink.agent_prompt_response(PromptId(9), ClipboardDecision::AlwaysDeny).unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(ClientMessage::AgentPromptResponse {
+                prompt_id: PromptId(9),
+                decision: ClipboardDecision::AlwaysDeny,
+            })
         ));
     }
 

@@ -3,12 +3,13 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext};
-use scribe_common::protocol::{ClipboardOp, ClipboardSelection, PromptId};
+use scribe_common::agent::AgentCapability;
+use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
 use scribe_common::theme::minimal_dark;
 
 use super::{
-    AnyDialog, ButtonTone, ClipboardDialog, ClipboardDialogAction, CloseAction, CloseDialog,
-    DialogColors, DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction,
+    AgentConsentDialog, AnyDialog, ButtonTone, ClipboardDialog, ClipboardDialogAction, CloseAction,
+    CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction,
     DisallowedSchemeDialog, PasteConfirmationAction, PasteConfirmationDialog, UpdateAction,
     UpdateDialog, UpdateDialogKind,
 };
@@ -157,6 +158,99 @@ fn clipboard_dialog_four_button_policy_and_default_deny() {
     assert_eq!(read.spec().title, "Allow clipboard read?");
     assert!(read.spec().body.iter().all(|l| !l.contains("Payload preview")));
     assert!(read.spec().body.iter().any(|l| l.contains("primary selection")));
+}
+
+fn agent_consent(label: &str) -> AgentConsentDialog {
+    AgentConsentDialog::new(
+        PromptId(11),
+        label.to_owned(),
+        AgentCapability::WriteInput,
+        "session 7".to_owned(),
+    )
+}
+
+#[test]
+fn agent_consent_dialog_names_the_request_and_defaults_to_deny() {
+    let dialog = agent_consent("claude-code");
+    assert_eq!(dialog.prompt_id(), PromptId(11));
+    assert_eq!(dialog.capability(), AgentCapability::WriteInput);
+    let dialog = AnyDialog::AgentConsent(dialog);
+    let spec = dialog.spec();
+
+    assert_eq!(spec.title, "Allow agent request?");
+    // The capability, the target, and the caller-supplied name are all shown,
+    // and the name is labelled as unverified disclosure rather than identity.
+    assert!(spec.body.iter().any(|l| l.contains("Type into a session")));
+    assert!(spec.body.iter().any(|l| l.contains("Target: session 7")));
+    assert!(
+        spec.body.iter().any(|l| l.contains("claude-code") && l.contains("caller-supplied")),
+        "the agent label must be marked caller-supplied: {:?}",
+        spec.body
+    );
+
+    assert_eq!(labels(&dialog), vec!["Deny once", "Always deny", "Allow once", "Always allow"]);
+    assert_eq!(
+        tones(&dialog),
+        vec![ButtonTone::Normal, ButtonTone::Normal, ButtonTone::Danger, ButtonTone::Danger]
+    );
+    // Deny once (index 0) is the safe default focus, and Esc / backdrop denies.
+    assert_eq!(spec.focused, 0);
+    assert_eq!(dialog.confirm(), DialogOutcome::AgentConsent(ClipboardDecision::DenyOnce));
+    assert_eq!(dialog.cancel(), DialogOutcome::AgentConsent(ClipboardDecision::DenyOnce));
+    // Each index maps to the wire decision the response carries.
+    assert_eq!(
+        dialog.action_at(1),
+        Some(DialogOutcome::AgentConsent(ClipboardDecision::AlwaysDeny))
+    );
+    assert_eq!(
+        dialog.action_at(2),
+        Some(DialogOutcome::AgentConsent(ClipboardDecision::AllowOnce))
+    );
+    assert_eq!(
+        dialog.action_at(3),
+        Some(DialogOutcome::AgentConsent(ClipboardDecision::AlwaysAllow))
+    );
+    assert_eq!(dialog.action_at(4), None);
+}
+
+#[test]
+fn agent_consent_dialog_exposes_accessible_title_and_body() {
+    let spec = AnyDialog::AgentConsent(agent_consent("claude-code")).spec();
+    // The accessible name is the title; the description carries the body a
+    // sighted user reads, with the blank spacer rows dropped.
+    assert_eq!(spec.title, "Allow agent request?");
+    let described = spec.accessible_body();
+    assert!(described.contains("Type into a session"));
+    assert!(described.contains("session 7"));
+    assert!(described.contains("claude-code"));
+    assert!(described.contains("caller-supplied"));
+    assert!(!described.contains("  "), "blank body rows must not leak: {described}");
+}
+
+#[gpui::test]
+fn agent_consent_dialog_view_denies_on_escape(cx: &mut TestAppContext) {
+    let (view, log) = dialog_view(cx, AnyDialog::AgentConsent(agent_consent("claude-code")));
+    // Esc routes to `DialogView::dismiss`, which must answer the held request
+    // with a refusal rather than walking away from it.
+    view.update(cx, DialogView::dismiss);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &[DialogEvent::Chosen(DialogOutcome::AgentConsent(ClipboardDecision::DenyOnce))]
+    );
+}
+
+#[test]
+fn agent_consent_dialog_escapes_a_hostile_caller_supplied_label() {
+    // A caller controls its own label: newlines would forge extra body lines and
+    // a raw escape sequence would reach the renderer, so both are caret-escaped.
+    let hostile = format!("evil\x1b[31m\nAgent: trusted-{}", "a".repeat(90));
+    let dialog = AnyDialog::AgentConsent(agent_consent(&hostile));
+    let body = dialog.spec().body;
+    assert!(body.iter().all(|l| l.chars().all(|c| !c.is_control())));
+    let name_line = body.iter().find(|l| l.contains("evil")).expect("the label is shown");
+    assert!(name_line.contains("^[") && name_line.contains("^J"));
+    assert!(name_line.contains("..."), "an over-long label is truncated: {name_line}");
+    assert_eq!(body.iter().filter(|l| l.contains("caller-supplied")).count(), 1);
 }
 
 // @lat: [[client#GPUI Dialogs#Disallowed scheme dialog truncation]]

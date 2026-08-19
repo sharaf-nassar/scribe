@@ -56,9 +56,10 @@ use scribe_client::context_menu::{
     MenuItem,
 };
 use scribe_client::dialog::{
-    AnyDialog, ClipboardDialog, ClipboardDialogAction, CloseAction, CloseDialog, DialogColors,
-    DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction, DisallowedSchemeDialog,
-    PasteConfirmationAction, PasteConfirmationDialog, UpdateAction, UpdateDialogKind,
+    AgentConsentDialog, AnyDialog, ClipboardDialog, ClipboardDialogAction, CloseAction,
+    CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction,
+    DisallowedSchemeDialog, PasteConfirmationAction, PasteConfirmationDialog, UpdateAction,
+    UpdateDialogKind,
 };
 use scribe_client::divider::{self, DividerDrag};
 use scribe_client::drag_drop::dropped_path_insertion;
@@ -149,20 +150,21 @@ use scribe_client::{
         beads_graph_icon, title_columns,
     },
 };
-use scribe_common::agent::AgentActionOutcome;
+use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{
-        AiContextThresholds, PromptBarPosition, SmartSelectionActionKind, SmartSelectionConfig,
-        StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
+        AiContextThresholds, PromptBarPosition, ScribeConfig, SmartSelectionActionKind,
+        SmartSelectionConfig, StatusBarStatsConfig, TerminalPromptBarConfig, load_config,
+        save_config,
     },
     framing::{read_message, write_message},
     ids::{SessionId, WindowId, WorkspaceId, new_launch_id},
     protocol::{
-        AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardSelection,
-        PromptMarkKind, ServerMessage, SessionInfo, ShellTool, TerminalSize, UpdateProgressState,
-        WindowInfo, WorkspaceTreeNode, pi_launch_metadata,
+        AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardDecision,
+        ClipboardSelection, PromptId, PromptMarkKind, ServerMessage, SessionInfo, ShellTool,
+        TerminalSize, UpdateProgressState, WindowInfo, WorkspaceTreeNode, pi_launch_metadata,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -665,6 +667,12 @@ struct Shared {
     /// and performs the queued jobs, because arboard and the FR-019 focus gate
     /// both belong to the thread that owns the window.
     clipboard: Arc<Mutex<ClipboardBridge>>,
+    /// Spec-027 agent capability prompt parked by the IPC reader for the
+    /// foreground to raise, exactly as a LAN approval is: the modal is a GPUI
+    /// entity, so the reader only records the request and the lifecycle tick
+    /// opens it. At most one is outstanding — the server parks the rest behind
+    /// the same prompt id.
+    agent_prompt: Arc<Mutex<Option<AgentConsentDialog>>>,
     /// Feature-013 tailnet state. The IPC reader folds the peer-list,
     /// environment, dial-outcome, displacement and severance answers into it and
     /// queues inbound automation actions here; the view renders the displaced
@@ -1723,6 +1731,10 @@ struct TerminalView {
     /// the resolved choice can be correlated back to the held connection. The
     /// dialog owns its own copy for display; this is the reply copy.
     pending_lan_approval: Option<u64>,
+    /// The agent capability prompt the open modal is answering: the `prompt_id`
+    /// the response must echo and the capability an `Always*` choice persists.
+    /// The dialog owns its own copy for display; this is the reply copy.
+    pending_agent_prompt: Option<(PromptId, AgentCapability)>,
     /// Host clipboard handle, paste gate, and the OSC 52 prompt in flight.
     clipboard: ClipboardSurfaces,
     /// Click classification and drag state behind terminal text selection.
@@ -2331,6 +2343,7 @@ impl TerminalView {
             update_dialog_kind: None,
             pending_osc8_uri: None,
             pending_lan_approval: None,
+            pending_agent_prompt: None,
             clipboard: ClipboardSurfaces::new(gate),
             pointer: PointerState::default(),
             tooltip_demo: false,
@@ -3738,6 +3751,7 @@ impl TerminalView {
         let pending = self.pending_osc8_uri.take();
         let approval = self.pending_lan_approval.take();
         let clipboard_prompt = self.clipboard.pending_prompt.take();
+        let agent_prompt = self.pending_agent_prompt.take();
         match outcome {
             DialogOutcome::Update(action) => self.route_update_action(action),
             DialogOutcome::Close(action) => self.route_close_action(action),
@@ -3760,6 +3774,9 @@ impl TerminalView {
             }
             DialogOutcome::Clipboard(action) => {
                 self.answer_clipboard_prompt(clipboard_prompt, action);
+            }
+            DialogOutcome::AgentConsent(decision) => {
+                self.answer_agent_prompt(agent_prompt, decision);
             }
             DialogOutcome::DisallowedScheme(_) => {}
         }
@@ -4385,6 +4402,60 @@ impl TerminalView {
         self.open_dialog(AnyDialog::LanApproval(request), cx);
     }
 
+    /// Raise the agent capability prompt the IPC reader parked, if any.
+    ///
+    /// Runs on the foreground tick for the same reason the LAN approval does:
+    /// the modal is a GPUI entity. A modal already being up defers the prompt to
+    /// a later tick rather than stacking two — the server holds the agent's call
+    /// either way, and times it out as a deny if the user never gets to it.
+    fn poll_agent_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(prompt) =
+            self.shared.agent_prompt.lock().ok().and_then(|mut parked| parked.take())
+        else {
+            return;
+        };
+        let pending = (prompt.prompt_id(), prompt.capability());
+        tracing::info!(
+            prompt_id = pending.0.0,
+            capability = ?pending.1,
+            "raising the agent capability prompt",
+        );
+        self.pending_agent_prompt = Some(pending);
+        self.open_dialog(AnyDialog::AgentConsent(prompt), cx);
+    }
+
+    /// Answer a pending agent capability prompt on the wire.
+    ///
+    /// The reply is not optional: the server parked the agent's call behind this
+    /// `prompt_id`, so a Deny — including the Esc / backdrop default — is sent
+    /// just as deliberately as an Allow. An `Always*` choice also persists the
+    /// matching capability mode, so the answer outlives this session; the server
+    /// flips its own in-memory copy the moment the response lands, exactly as
+    /// the OSC 52 prompt does.
+    fn answer_agent_prompt(
+        &mut self,
+        pending: Option<(PromptId, AgentCapability)>,
+        decision: ClipboardDecision,
+    ) {
+        let Some((prompt_id, capability)) = pending else {
+            tracing::warn!("agent prompt answered with no pending request");
+            return;
+        };
+        tracing::info!(
+            prompt_id = prompt_id.0,
+            ?capability,
+            ?decision,
+            "answering the agent capability prompt",
+        );
+        persist_agent_capability_mode(capability, decision);
+        if let Err(error) = self.sink.agent_prompt_response(prompt_id, decision) {
+            tracing::warn!(%error, "agent prompt response dropped: IPC writer closed");
+        }
+    }
+
     /// Answer a pending LAN device approval on the wire.
     ///
     /// The reply is not optional: the server holds the peer's connection open —
@@ -4756,6 +4827,7 @@ impl TerminalView {
         self.poll_window_list();
         self.poll_beads_board(window);
         self.poll_lan_approval(cx);
+        self.poll_agent_prompt(cx);
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
         self.poll_restore(cx);
@@ -10600,6 +10672,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         workspaces: Arc::new(Mutex::new(Vec::new())),
         server_topology: Arc::new(Mutex::new(None)),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
+        agent_prompt: Arc::new(Mutex::new(None)),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
         beads_boards: Arc::new(Mutex::new(BeadsBoards::default())),
         beads_panels: Arc::new(Mutex::new(BeadsPanels::default())),
@@ -12026,7 +12099,11 @@ where
             terminal_images: scribe_common::terminal_images::advertised_capabilities(),
             ci_run_bar: true,
             pi_provider: true,
-            agent_api: false,
+            // Spec 027: this client owns the capability consent modal, so it
+            // opts into the agent control surface. With the bit clear the server
+            // takes the headless-deny path and never sends an agent frame, which
+            // would collapse every `prompt`-mode capability to a silent deny.
+            agent_api: true,
         },
     )
     .await
@@ -12086,6 +12163,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         workspaces: Arc::clone(&ctx.shared.workspaces),
         server_topology: Arc::clone(&ctx.shared.server_topology),
         clipboard: Arc::clone(&ctx.shared.clipboard),
+        agent_prompt: Arc::clone(&ctx.shared.agent_prompt),
         remote: Arc::clone(&ctx.shared.remote),
         beads_boards: Arc::clone(&ctx.shared.beads_boards),
         beads_panels: Arc::clone(&ctx.shared.beads_panels),
@@ -12582,6 +12660,8 @@ struct ReaderCtx {
     /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
+    /// Spec-027 agent capability prompt the reader parks for the foreground.
+    agent_prompt: Arc<Mutex<Option<AgentConsentDialog>>>,
     /// Feature-013 tailnet state the reader folds every remote answer onto and
     /// queues inbound automation actions in.
     remote: Arc<Mutex<RemoteChrome>>,
@@ -13337,6 +13417,13 @@ async fn dispatch_server_message(
         | ServerMessage::ClipboardBridgeWrite { .. }
         | ServerMessage::ClipboardBridgeReadRequest { .. }) => {
             on_clipboard_message(ctx, clipboard);
+        }
+        // Spec 027: the agent capability prompt. Naming it is what keeps the
+        // consent surface reachable — unnamed, the request reaches the drop
+        // counter and the agent's call is denied by timeout with no prompt ever
+        // shown to the user who could have allowed it.
+        ServerMessage::AgentPromptRequest { prompt_id, agent_label, capability, target } => {
+            on_agent_prompt_request(ctx, prompt_id, agent_label, capability, target);
         }
         // Feature 013: every tailnet answer — the dial preamble's reply, the
         // discovery/environment replies the startup probe asks for, the
@@ -14381,6 +14468,94 @@ fn on_clipboard_message(ctx: &ReaderCtx, message: ServerMessage) {
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
+/// Spec 027 — persist the capability mode an `Always*` consent choice settled.
+///
+/// `AllowOnce` / `DenyOnce` are a no-op: only the sticky choices write config.
+/// The server flips its own in-memory policy the moment the response lands, so
+/// this write is what makes the choice survive a restart — and the config
+/// watcher's `ConfigReloaded` round trip re-applies the identical value, which
+/// is why a failed save is a warning rather than an error. Mirrors
+/// [`clipboard::persist_policy_axis`], the same choice on the OSC 52 prompt.
+fn persist_agent_capability_mode(capability: AgentCapability, decision: ClipboardDecision) {
+    let Some(mode) = sticky_agent_mode(decision) else {
+        return;
+    };
+    let mut config = match load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "agent capability policy not persisted: config unreadable");
+            return;
+        }
+    };
+    apply_agent_capability_mode(&mut config, capability, mode);
+    if let Err(error) = save_config(&config) {
+        tracing::warn!(%error, "agent capability policy not persisted: config unwritable");
+    } else {
+        tracing::info!(?capability, ?mode, "persisted the agent capability policy");
+    }
+}
+
+/// The policy mode an `Always*` decision settles on; `None` for the two
+/// once-only choices, which resolve this request and nothing beyond it.
+const fn sticky_agent_mode(decision: ClipboardDecision) -> Option<AgentPolicyMode> {
+    match decision {
+        ClipboardDecision::AlwaysAllow => Some(AgentPolicyMode::Allow),
+        ClipboardDecision::AlwaysDeny => Some(AgentPolicyMode::Deny),
+        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => None,
+    }
+}
+
+/// Write `mode` onto the one `[agent_api]` axis `capability` gates, leaving
+/// every other capability at whatever the user configured.
+fn apply_agent_capability_mode(
+    config: &mut ScribeConfig,
+    capability: AgentCapability,
+    mode: AgentPolicyMode,
+) {
+    let axis = match capability {
+        AgentCapability::ReadMetadata => &mut config.agent_api.read_metadata,
+        AgentCapability::ReadContent => &mut config.agent_api.read_content,
+        AgentCapability::DispatchAction => &mut config.agent_api.dispatch_action,
+        AgentCapability::DispatchDestructiveAction => {
+            &mut config.agent_api.dispatch_destructive_action
+        }
+        AgentCapability::WriteInput => &mut config.agent_api.write_input,
+    };
+    *axis = mode;
+}
+
+/// Park one spec-027 agent capability prompt for the GPUI thread to raise.
+///
+/// Nothing is decided here: the modal is a GPUI entity, so the reader only
+/// records the request and [`TerminalView::poll_agent_prompt`] opens it on the
+/// next foreground tick. A prompt arriving while one is already parked replaces
+/// it — the server issues at most one per `(agent_label, capability, target)`
+/// key and parks the rest behind it, so the newest request is the live one and
+/// an abandoned prompt can never wedge the slot. Leaving one unanswered is not
+/// a hang either: the server times it out as a deny.
+fn on_agent_prompt_request(
+    ctx: &ReaderCtx,
+    prompt_id: PromptId,
+    agent_label: String,
+    capability: AgentCapability,
+    target: String,
+) {
+    tracing::info!(
+        prompt_id = prompt_id.0,
+        %agent_label,
+        ?capability,
+        %target,
+        "agent capability prompt requested",
+    );
+    let Ok(mut parked) = ctx.agent_prompt.lock() else {
+        tracing::warn!("agent prompt mutex poisoned; dropping the capability prompt");
+        return;
+    };
+    *parked = Some(AgentConsentDialog::new(prompt_id, agent_label, capability, target));
+    drop(parked);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
 /// Fold one window-lifecycle answer into the shared [`WindowLifecycle`].
 ///
 /// These three variants are the server's whole side of the window's own
@@ -14647,6 +14822,38 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn agent_consent_persists_only_the_sticky_choice_on_its_own_axis() {
+        assert_eq!(sticky_agent_mode(ClipboardDecision::AllowOnce), None);
+        assert_eq!(sticky_agent_mode(ClipboardDecision::DenyOnce), None);
+        assert_eq!(sticky_agent_mode(ClipboardDecision::AlwaysAllow), Some(AgentPolicyMode::Allow));
+        assert_eq!(sticky_agent_mode(ClipboardDecision::AlwaysDeny), Some(AgentPolicyMode::Deny));
+
+        // Each capability writes its own axis and only its own: allowing one
+        // must never widen another, so a mismapped arm fails here.
+        let capabilities = [
+            AgentCapability::ReadMetadata,
+            AgentCapability::ReadContent,
+            AgentCapability::DispatchAction,
+            AgentCapability::DispatchDestructiveAction,
+            AgentCapability::WriteInput,
+        ];
+        for (index, capability) in capabilities.into_iter().enumerate() {
+            let mut config = ScribeConfig::default();
+            apply_agent_capability_mode(&mut config, capability, AgentPolicyMode::Allow);
+            let mut expected = [AgentPolicyMode::Deny; 5];
+            expected[index] = AgentPolicyMode::Allow;
+            let axes = [
+                config.agent_api.read_metadata,
+                config.agent_api.read_content,
+                config.agent_api.dispatch_action,
+                config.agent_api.dispatch_destructive_action,
+                config.agent_api.write_input,
+            ];
+            assert_eq!(axes, expected, "{capability:?} wrote the wrong policy axis");
+        }
+    }
 
     #[test]
     fn hover_focus_requires_enabled_button_free_different_pane() {

@@ -14,7 +14,10 @@
 //! state lives in [`crate::lan_approval`] rather than here — the request's
 //! display fields and the Decline-default focus are ported from the winit
 //! overlay — and [`AnyDialog::LanApproval`] wraps it so it inherits this modal's
-//! backdrop, focus cycling, and click activation unchanged.
+//! backdrop, focus cycling, and click activation unchanged. The spec-027 agent
+//! capability prompt ([`AgentConsentDialog`]) is the seventh, and the first with
+//! no winit ancestor: it answers a `ServerMessage::AgentPromptRequest` with the
+//! same four-way policy choice the OSC 52 prompt uses.
 //!
 //! Each model keeps the winit dialog's parity-critical behaviour byte-for-byte:
 //! the button set and their labels, the **safe default focus** (Cancel / Deny /
@@ -26,7 +29,8 @@
 //! GPU quad painting and pixel hit-testing are dropped in favour of
 //! GPUI flex layout and `on_click` listeners.
 
-use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Rgba, div, prelude::*, px};
+use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, Rgba, Role, div, prelude::*, px};
+use scribe_common::agent::AgentCapability;
 use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
 use scribe_common::theme::ChromeColors;
 
@@ -174,6 +178,19 @@ pub struct DialogSpec {
     pub buttons: Vec<DialogButton>,
     /// Index of the keyboard-focused button within `buttons`.
     pub focused: usize,
+}
+
+impl DialogSpec {
+    /// The modal's accessible description: every body line a sighted user reads,
+    /// joined into one string with the blank spacer rows dropped.
+    ///
+    /// The title is the accessible *name*, so the two together say everything
+    /// the painted box does — which is what a screen-reader user needs before
+    /// answering a consent prompt.
+    #[must_use]
+    pub fn accessible_body(&self) -> String {
+        self.body.iter().filter(|line| !line.is_empty()).cloned().collect::<Vec<_>>().join(" ")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +549,100 @@ impl ClipboardDialog {
 }
 
 // ---------------------------------------------------------------------------
+// Agent consent dialog (spec 027 capability prompt).
+// ---------------------------------------------------------------------------
+
+/// Consent state for one `ServerMessage::AgentPromptRequest`.
+///
+/// The four choices are the wire [`ClipboardDecision`] itself rather than a
+/// dialog-local enum: `ClientMessage::AgentPromptResponse` carries that exact
+/// type, so there is no mapping to keep in step. `Deny once` is the default
+/// focus and the Esc / backdrop answer — the server holds the agent's request
+/// open until this prompt resolves, so walking away must refuse it.
+///
+/// `agent_label` is whatever the caller claimed to be. Spec 027 treats it as
+/// disclosure, not authentication, so the body labels it caller-supplied and
+/// caret-escapes it: a label carrying newlines would otherwise forge extra body
+/// lines, and one carrying an escape sequence would reach the renderer.
+pub struct AgentConsentDialog {
+    prompt_id: PromptId,
+    agent_label: String,
+    capability: AgentCapability,
+    target: String,
+    focused: usize,
+}
+
+impl AgentConsentDialog {
+    const ACTIONS: [ClipboardDecision; 4] = [
+        ClipboardDecision::DenyOnce,
+        ClipboardDecision::AlwaysDeny,
+        ClipboardDecision::AllowOnce,
+        ClipboardDecision::AlwaysAllow,
+    ];
+
+    /// Build the consent prompt for one agent capability request.
+    #[must_use]
+    pub fn new(
+        prompt_id: PromptId,
+        agent_label: String,
+        capability: AgentCapability,
+        target: String,
+    ) -> Self {
+        // Index 0 (`Deny once`) is the safe default focus.
+        Self { prompt_id, agent_label, capability, target, focused: 0 }
+    }
+
+    /// Correlation id the `AgentPromptResponse` must echo back to the server.
+    #[must_use]
+    pub fn prompt_id(&self) -> PromptId {
+        self.prompt_id
+    }
+
+    /// The capability being asked for — the axis an `Always*` choice persists.
+    #[must_use]
+    pub fn capability(&self) -> AgentCapability {
+        self.capability
+    }
+
+    fn spec(&self) -> DialogSpec {
+        DialogSpec {
+            title: String::from("Allow agent request?"),
+            body: vec![
+                format!("Capability: {}", capability_phrase(self.capability)),
+                format!("Target: {}", display_field(&self.target)),
+                format!("Agent: {} (caller-supplied)", display_field(&self.agent_label)),
+                String::new(),
+                String::from("Scribe cannot verify who is asking."),
+                String::from("Allow only if you expect this request."),
+            ],
+            buttons: vec![
+                DialogButton::new("Deny once", ButtonTone::Normal),
+                DialogButton::new("Always deny", ButtonTone::Normal),
+                DialogButton::new("Allow once", ButtonTone::Danger),
+                DialogButton::new("Always allow", ButtonTone::Danger),
+            ],
+            focused: self.focused,
+        }
+    }
+}
+
+/// Plain-language name for the capability a prompt is gating.
+fn capability_phrase(capability: AgentCapability) -> &'static str {
+    match capability {
+        AgentCapability::ReadMetadata => "Read session metadata",
+        AgentCapability::ReadContent => "Read screen contents",
+        AgentCapability::DispatchAction => "Run a window action",
+        AgentCapability::DispatchDestructiveAction => "Run a destructive window action",
+        AgentCapability::WriteInput => "Type into a session",
+    }
+}
+
+/// Render one server- or caller-supplied field as a single safe display line.
+fn display_field(value: &str) -> String {
+    truncate_for_display(&escape_line(value), MAX_PREVIEW_COLS)
+}
+
+// ---------------------------------------------------------------------------
 // Disallowed-scheme dialog (OSC 8 outside the allowlist).
 // ---------------------------------------------------------------------------
 
@@ -614,7 +725,7 @@ fn lan_approval_spec(dialog: &LanApprovalDialog) -> DialogSpec {
 }
 
 // ---------------------------------------------------------------------------
-// AnyDialog / DialogOutcome (uniform driver over the six models).
+// AnyDialog / DialogOutcome (uniform driver over the seven models).
 // ---------------------------------------------------------------------------
 
 /// The resolved choice from any modal, tagged by dialog so the shell routes it
@@ -633,9 +744,12 @@ pub enum DialogOutcome {
     DisallowedScheme(DisallowedSchemeAction),
     /// The feature-014 LAN device-approval prompt's choice.
     LanApproval(LanApprovalAction),
+    /// The spec-027 agent consent prompt's choice, already in the shape
+    /// `ClientMessage::AgentPromptResponse` carries.
+    AgentConsent(ClipboardDecision),
 }
 
-/// One of the six modal state models, wrapped so a single [`DialogView`] can
+/// One of the seven modal state models, wrapped so a single [`DialogView`] can
 /// drive focus, rendering, and activation uniformly.
 pub enum AnyDialog {
     /// Quit / kill / cancel.
@@ -650,6 +764,8 @@ pub enum AnyDialog {
     DisallowedScheme(DisallowedSchemeDialog),
     /// Feature-014 LAN device approval, pushed by this machine's own server.
     LanApproval(LanApprovalDialog),
+    /// Spec-027 agent capability consent.
+    AgentConsent(AgentConsentDialog),
 }
 
 impl AnyDialog {
@@ -663,6 +779,7 @@ impl AnyDialog {
             Self::Clipboard(d) => d.spec(),
             Self::DisallowedScheme(d) => d.spec(),
             Self::LanApproval(d) => lan_approval_spec(d),
+            Self::AgentConsent(d) => d.spec(),
         }
     }
 
@@ -674,6 +791,7 @@ impl AnyDialog {
             Self::Clipboard(d) => d.focused,
             Self::DisallowedScheme(d) => d.focused,
             Self::LanApproval(d) => d.focused_index(),
+            Self::AgentConsent(d) => d.focused,
         }
     }
 
@@ -685,6 +803,7 @@ impl AnyDialog {
             Self::Clipboard(_) => ClipboardDialog::ACTIONS.len(),
             Self::DisallowedScheme(_) => DisallowedSchemeDialog::ACTIONS.len(),
             Self::LanApproval(_) => LanApprovalDialog::ACTIONS.len(),
+            Self::AgentConsent(_) => AgentConsentDialog::ACTIONS.len(),
         }
     }
 
@@ -696,6 +815,7 @@ impl AnyDialog {
             Self::Clipboard(d) => d.focused = idx,
             Self::DisallowedScheme(d) => d.focused = idx,
             Self::LanApproval(d) => d.set_focused_index(idx),
+            Self::AgentConsent(d) => d.focused = idx,
         }
     }
 
@@ -730,6 +850,9 @@ impl AnyDialog {
             Self::LanApproval(_) => {
                 LanApprovalDialog::ACTIONS.get(idx).copied().map(DialogOutcome::LanApproval)
             }
+            Self::AgentConsent(_) => {
+                AgentConsentDialog::ACTIONS.get(idx).copied().map(DialogOutcome::AgentConsent)
+            }
         }
     }
 
@@ -757,6 +880,9 @@ impl AnyDialog {
             // dismissal: the connection is held open on the server until this
             // reply arrives, so walking away must reveal nothing (FR-004/006).
             Self::LanApproval(_) => DialogOutcome::LanApproval(LanApprovalAction::Decline),
+            // Same rule for an agent request: the server parks the call until
+            // this prompt resolves, so Esc denies rather than dismisses.
+            Self::AgentConsent(_) => DialogOutcome::AgentConsent(ClipboardDecision::DenyOnce),
         }
     }
 }
@@ -907,6 +1033,8 @@ impl DialogView {
         let (fg, bg) = button_colors(button.tone, active, &colors);
         div()
             .id(("dialog-button", index))
+            .role(Role::Button)
+            .aria_label(button.label.clone())
             .px_4()
             .py_1p5()
             .rounded_md()
@@ -978,6 +1106,14 @@ impl Render for DialogView {
             )
             .child(
                 div()
+                    // The modal's accessible identity: assistive technology sees
+                    // a dialog named by its title and described by its body,
+                    // which is what makes a consent prompt answerable without
+                    // reading the painted box (spec 027).
+                    .id("dialog-modal")
+                    .role(Role::Dialog)
+                    .aria_label(spec.title.clone())
+                    .aria_description(spec.accessible_body())
                     .min_w(px(420.0))
                     .max_w(px(640.0))
                     .flex()
