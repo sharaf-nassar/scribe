@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use scribe_common::config::UpdateConfig;
+use scribe_common::config::{AgentApiConfig, UpdateConfig};
 use scribe_common::error::ScribeError;
 use scribe_common::macos_launchd::{self, LaunchdSlot};
 use scribe_common::socket::server_socket_path;
@@ -33,6 +33,7 @@ mod stop_classifier;
 // where its `pub` peer-picker fields (unused by the binary's own call sites) trip
 // dead-code analysis. The library holds one fully-public copy, so this re-export
 // eliminates the double compile AND the dead-code warning — no lint suppression.
+use scribe_server::agent_api;
 use scribe_server::tailnet;
 // Feature 014: likewise, the per-transport LAN state in `mod ipc_server` reaches
 // the device-trust `DeviceId` type through `crate::lan`. Re-export the LIBRARY
@@ -229,7 +230,12 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
         session_manager,
         workspace_manager,
         (lock_guard, listener),
-        ServerLoopConfig { update: cfg.update, launchd_slot, restored_ci_windows: Vec::new() },
+        ServerLoopConfig {
+            update: cfg.update,
+            agent_api: cfg.agent_api,
+            launchd_slot,
+            restored_ci_windows: Vec::new(),
+        },
     )
     .await
 }
@@ -344,7 +350,12 @@ async fn run_upgrade_receiver(
         session_manager,
         workspace_manager,
         (lock_guard, listener),
-        ServerLoopConfig { update: cfg.update, launchd_slot, restored_ci_windows },
+        ServerLoopConfig {
+            update: cfg.update,
+            agent_api: cfg.agent_api,
+            launchd_slot,
+            restored_ci_windows,
+        },
     )
     .await
 }
@@ -359,6 +370,7 @@ async fn run_upgrade_receiver(
 /// flock.
 struct ServerLoopConfig {
     update: UpdateConfig,
+    agent_api: AgentApiConfig,
     launchd_slot: Option<LaunchdSlot>,
     restored_ci_windows: Vec<github_ci::HandoffCiWindow>,
 }
@@ -370,7 +382,7 @@ async fn run_server_loop(
     (_lock_guard, listener): (ipc_server::ServerLock, tokio::net::UnixListener),
     config: ServerLoopConfig,
 ) -> Result<(), ScribeError> {
-    let ServerLoopConfig { update, launchd_slot, restored_ci_windows } = config;
+    let ServerLoopConfig { update, agent_api, launchd_slot, restored_ci_windows } = config;
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
     let git_ref_watcher =
@@ -455,6 +467,7 @@ async fn run_server_loop(
         env_store: Arc::clone(&env_store),
         remote_control: Arc::clone(&remote_control),
         git_ref_watcher: Arc::clone(&git_ref_watcher),
+        agent_api: agent_api::AgentApiState::new(agent_api),
     };
 
     // Start the remote-control supervisor: it applies the current `[remote]`

@@ -1205,6 +1205,8 @@ pub struct IpcServerState {
     pub remote_control: Arc<RemoteControl>,
     /// Server-wide local-push detector, absent internally while its setting is off.
     pub git_ref_watcher: Arc<GitRefWatcherControl>,
+    /// Bounded one-shot request router for the local agent control surface.
+    pub agent_api: crate::agent_api::AgentApiState,
 }
 
 struct ClientDispatchContext<'a> {
@@ -5219,7 +5221,8 @@ async fn establish_local_first_frame(
             None
         }
         ClientMessage::AgentRequest(request) => {
-            debug!(?request, "agent request received before agent dispatcher is installed");
+            let dispatch = crate::agent_api::dispatch(&server.agent_api, &request);
+            send_message(writer, &ServerMessage::AgentResponse(dispatch.response().clone())).await;
             None
         }
         ClientMessage::CheckForUpdates => {
@@ -13492,8 +13495,15 @@ mod tests {
 
     // @lat: [[test#Test Harness#Server lifecycle#Updater quit is a transient local action]]
     #[test]
-    fn updater_quit_is_a_transient_local_action() {
+    fn updater_quit_and_agent_requests_are_transient_local_actions() {
         assert!(is_transient_first_frame(&ClientMessage::QuitAll));
+        assert!(is_transient_first_frame(&ClientMessage::AgentRequest(
+            scribe_common::agent::AgentRequest::Capabilities {
+                request_id: 1,
+                agent_label: "test".into(),
+                origin_session_id: None,
+            },
+        )));
     }
 
     // @lat: [[test#Test Harness#Pi Provider Compatibility#Remote and handoff version gates]]

@@ -5,6 +5,7 @@
 //! under `tests/` can link against the crate's internals without going
 //! through the binary.
 
+pub mod agent_api;
 pub mod attach_flow;
 pub mod beads_board;
 pub mod child_identity;
