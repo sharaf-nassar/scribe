@@ -300,13 +300,10 @@ impl BeadsBoards {
     /// Escape reaches this only after the detail panel has declined the key,
     /// so a focused panel always dismisses before the strip changes mode.
     pub fn exit_latest_flow(&mut self) -> bool {
-        let latest = self
-            .flow_open_order
-            .iter()
-            .rev()
-            .find(|workspace_id| self.flows.contains_key(workspace_id))
-            .copied();
-        latest.is_some_and(|workspace_id| self.exit_flow(workspace_id))
+        self.flow_open_order
+            .back()
+            .copied()
+            .is_some_and(|workspace_id| self.exit_flow(workspace_id))
     }
 
     /// Move the Flow cursor to another node in the frozen graph.

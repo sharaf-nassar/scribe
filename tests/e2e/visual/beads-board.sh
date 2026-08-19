@@ -1185,12 +1185,9 @@ flow_slot_sites() {
         "rank_label:$(flow_node_x 2):$((BOARD_TOP + FLOW_BAND_H + 4))" \
         "agent_halo:$(($(flow_dot_x 1) - 6)):${FLOW_R1_BOT}"
 }
-flow_hover_cursor() {
-    flow_park_pointer 0.3
-    flow_hover_node 0.7
-}
 flow_enter
-flow_hover_cursor
+flow_park_pointer 0.3
+flow_hover_node 0.7
 import -window "$WID" /output/beads-flow-theme-before.png
 FLOW_RELOADS_BEFORE=$(grep -cF "config hot-reloaded" "$CLIENT_LOG" 2>/dev/null || true)
 printf '[appearance]\ntheme = "dracula"\n' >"$FLOW_CONFIG_FILE"
@@ -1202,7 +1199,8 @@ done
     fail "the client never hot-reloaded the rewritten theme"
 sleep 1.0
 flow_enter
-flow_hover_cursor
+flow_park_pointer 0.3
+flow_hover_node 0.7
 import -window "$WID" /output/beads-flow-theme-after.png
 FLOW_STATIC_SLOTS=""
 while IFS=: read -r SLOT SX SY; do

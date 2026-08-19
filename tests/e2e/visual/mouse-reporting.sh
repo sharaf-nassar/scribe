@@ -205,12 +205,6 @@ jump_chip_capture() {
         +repage "$2"
 }
 
-jump_chip_diff() {
-    local value
-    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
-    printf '%s' "${value%%.*}"
-}
-
 jump_to_bottom() {
     point_at_jump_control "$1"
     xdotool mousedown 1
@@ -412,7 +406,7 @@ jump_chip_capture /output/mouse-02a-stationary.png /output/mouse-02a-stationary-
 point_at 200
 capture /output/mouse-02a-after-motion.png
 jump_chip_capture /output/mouse-02a-after-motion.png /output/mouse-02a-after-motion-chip.png
-DIFF=$(jump_chip_diff /output/mouse-02a-stationary-chip.png /output/mouse-02a-after-motion-chip.png)
+DIFF=$(window_diff /output/mouse-02a-stationary-chip.png /output/mouse-02a-after-motion-chip.png)
 if [ "${DIFF:-0}" -lt "$JUMP_HOVER_DIFF_MIN" ]; then
     fail "PHASE 2a FAIL: stationary-pointer jump chip changed only ${DIFF}px after hover motion (min $JUMP_HOVER_DIFF_MIN)"
 fi
