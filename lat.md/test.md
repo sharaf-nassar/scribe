@@ -2945,7 +2945,7 @@ Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHAR
 
 The client owns no PTY, so nothing local contradicts an over-reported width — the extra column is clipped by the pane's `overflow_hidden` box and the application wraps the line. Only pixels can tell. Phase 0 reads the published `cols` out of the client log and confirms the PTY runs at it. Phase 1 prints a line of exactly that many characters and asserts it paints the same number of ink rows as a line one character shorter. Phase 2 prints one character more and asserts the row count *rises* — the positive control, without which phase 1 would pass over a measurement that cannot see a wrap at all.
 
-The oracle is ink rows compared against themselves rather than a golden image or an absolute pixel budget, so it needs no per-font tuning. The script is UNVERIFIED: it was written alongside the fix and never executed, because the harness was held by another run.
+The oracle is ink rows compared against themselves rather than a golden image or an absolute pixel budget, so it needs no per-font tuning. It measures only the probe's two-row band, hides the DECTCEM cursor, and paints from row 6 instead of row 0, keeping cursor blink and autowrap scroll out of the result. N-1 and N must have the same nonzero ink-row count; N+1 must add a row, making the positive control mandatory.
 
 ## Sandbox limits
 

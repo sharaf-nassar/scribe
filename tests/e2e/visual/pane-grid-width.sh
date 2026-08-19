@@ -14,11 +14,16 @@ set -e
 # ("Passed" rendered as "Pa" + "ssed"). Nothing in the suite checked that the
 # published width and the painted width are the same number.
 #
-# Oracle: ink ROWS, measured from a screenshot, compared against themselves.
-# A line of exactly N characters must occupy one row; a line of N+1 must occupy
-# two. Running both in one pass with one threshold makes the check
-# self-calibrating — there is no absolute pixel budget to tune, and the N+1 case
-# is the positive control proving the measurement can see a wrap at all.
+# Oracle: ink ROWS, measured from the probe line's screenshot band and
+# compared against itself. A line of exactly N characters must occupy one row;
+# a line of N+1 must occupy two. Running both in one pass with one threshold
+# makes the check self-calibrating — there is no absolute pixel budget to tune,
+# and the N+1 case is the positive control proving the measurement can see a
+# wrap at all.
+#
+# The probe hides DECTCEM cursor paint, starts on row 6 rather than row 0, and
+# moves the shell prompt below its two-row crop. That keeps cursor blink,
+# autowrap scrolling, and prompt ink out of the measurement.
 #
 # Phases:
 #   0. read the cols the client published, and confirm the PTY agrees;
@@ -27,10 +32,6 @@ set -e
 #
 # Requires: the shared-pane visual rig, which exports SESSION —
 #   just e2e-visual-shared visual/pane-grid-width.sh
-#
-# UNVERIFIED: written alongside the fix for scribe-6uk but never executed; the
-# harness was held by another run. Treat a first failure as a script bug until
-# the phase-2 positive control is seen to pass.
 
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 POLL_TICKS="${POLL_TICKS:-20}"
@@ -38,7 +39,12 @@ POLL_TICKS="${POLL_TICKS:-20}"
 # The bottom status bar is lit whether or not a pane is attached, and the
 # titlebar carries the tab strip; both would read as ink rows.
 STATUS_BAR_INSET_PX="${STATUS_BAR_INSET_PX:-24}"
-TITLE_BAR_INSET_PX="${TITLE_BAR_INSET_PX:-40}"
+TITLE_BAR_INSET_PX="${TITLE_BAR_INSET_PX:-18}"
+CELL_HEIGHT_PX="${CELL_HEIGHT_PX:-19}"
+PROBE_ROW="${PROBE_ROW:-6}"
+PROBE_BAND_ROWS=2
+PROBE_BAND_H=$(( PROBE_BAND_ROWS * CELL_HEIGHT_PX ))
+PROBE_PROMPT_ROW=$(( PROBE_ROW + PROBE_BAND_ROWS + 2 ))
 
 WIN_X=0
 WIN_Y=0
@@ -88,27 +94,32 @@ capture_grid() {
         -crop "${WIN_W}x${band}+0+${TITLE_BAR_INSET_PX}" +repage "$out"
 }
 
-# Rows of the cropped band that hold any ink.
+# Rows of the probe line's cropped two-row band that hold any ink.
 #
 # Threshold to a 0/1 ink mask FIRST, then collapse each row to its mean and keep
 # the rows above a small floor: a single wrapped character is ~0.7% of a row, so
 # the floor sits well under that and well over the zero a clean row reads.
-ink_rows() {
-    local value
-    value=$(convert "$1" -colorspace Gray -threshold 35% \
+probe_rows() {
+    local image="$1" value
+    value=$(convert "$image" \
+        -crop "${WIN_W}x${PROBE_BAND_H}+0+$(( (PROBE_ROW - 1) * CELL_HEIGHT_PX ))" \
+        +repage -colorspace Gray -threshold 35% \
         -resize "1x!" -threshold 0.2% -format "%[fx:mean*h]" info:)
     printf '%s' "${value%.*}"
 }
 
-# Paint `$1` copies of '#' on an otherwise clean screen and count the ink rows
-# the line itself occupies. The prompt is cleared first and the shell is left at
-# a bare prompt afterwards, so the delta between two runs is the line alone.
+# Paint `$1` copies of '#' on an otherwise clean screen and count only the
+# probe's own two-row band. The cursor is hidden before and after clear; the
+# probe starts below the top row, and the shell prompt is moved below the crop.
 render_line_rows() {
     local count="$1" tag="$2" rows
-    scribe-test send "$SESSION" "clear; printf '%.0s#' \$(seq 1 $count); printf '\\\\n'\n"
+    local probe_line=$(( PROBE_ROW - 1 ))
+    local prompt_line=$(( PROBE_PROMPT_ROW - 1 ))
+    scribe-test send "$SESSION" \
+        "tput civis; clear; tput civis; tput cup $probe_line 0; printf '%.0s#' \$(seq 1 $count); tput cup $prompt_line 0\n"
     scribe-test wait-idle "$SESSION" --ms 800
     capture_grid "/output/pane-grid-${tag}.png"
-    rows=$(ink_rows "/output/pane-grid-${tag}.png")
+    rows=$(probe_rows "/output/pane-grid-${tag}.png")
     printf '%s' "$rows"
 }
 
@@ -130,8 +141,17 @@ done
 # never reach the server; a real measurement lands a column or two under it.
 echo "PHASE 0: the client published cols=$COLS"
 
-scribe-test send "$SESSION" 'printf "PTY_COLS=%s.\n" "$(tput cols)"\n'
-scribe-test wait-output "$SESSION" "PTY_COLS=${COLS}." \
+PTY_COLS_OK=0
+for _ in $(seq 1 5); do
+    scribe-test send "$SESSION" 'printf "PTY_COLS=%s.\n" "$(tput cols)"\n'
+    if scribe-test wait-output "$SESSION" "PTY_COLS=${COLS}." --timeout 5000 \
+        >/dev/null 2>&1; then
+        PTY_COLS_OK=1
+        break
+    fi
+    sleep 0.5
+done
+[ "$PTY_COLS_OK" -eq 1 ] \
     || fail "PHASE 0: the client published cols=$COLS but the PTY does not report it"
 echo "PHASE 0 PASS: the PTY runs at the published $COLS columns"
 
@@ -139,7 +159,7 @@ echo "PHASE 0 PASS: the PTY runs at the published $COLS columns"
 ROWS_SHORT=$(render_line_rows "$(( COLS - 1 ))" "short")
 ROWS_EXACT=$(render_line_rows "$COLS" "exact")
 echo "PHASE 1: $(( COLS - 1 )) chars -> $ROWS_SHORT ink row(s); $COLS chars -> $ROWS_EXACT"
-[ "$ROWS_SHORT" = "$ROWS_EXACT" ] \
+[ "$ROWS_SHORT" -gt 0 ] && [ "$ROWS_SHORT" = "$ROWS_EXACT" ] \
     || fail "PHASE 1: a line of exactly $COLS characters painted $ROWS_EXACT ink rows where $(( COLS - 1 )) painted $ROWS_SHORT — the client publishes more columns than it renders"
 echo "PHASE 1 PASS: a $COLS-character line occupies exactly one rendered row"
 
