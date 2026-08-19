@@ -76,6 +76,8 @@ pub struct BeadsBoards {
     flow_enabled: bool,
     /// The Flow strip each workspace is showing instead of its lanes.
     flows: HashMap<WorkspaceId, FlowView>,
+    /// Workspaces in the order their Flow strips opened, oldest first.
+    flow_open_order: VecDeque<WorkspaceId>,
     /// One in-flight epic-graph request per workspace, newest wins. Presence
     /// is the fence: mode exit, workspace loss and capability withdrawal all
     /// drop the entry, so a reply that outlived its request finds no match.
@@ -188,6 +190,7 @@ impl BeadsBoards {
         self.flow_enabled = enabled;
         if !enabled {
             self.flows.clear();
+            self.flow_open_order.clear();
             self.pending_flows.clear();
             self.flow_requests.clear();
         }
@@ -252,6 +255,8 @@ impl BeadsBoards {
                 hovered_issue_id: None,
             },
         );
+        self.flow_open_order.retain(|candidate| *candidate != workspace_id);
+        self.flow_open_order.push_back(workspace_id);
         true
     }
 
@@ -285,6 +290,7 @@ impl BeadsBoards {
     /// Leave Flow and return to lanes, discarding any request in flight.
     pub fn exit_flow(&mut self, workspace_id: WorkspaceId) -> bool {
         let left = self.flows.remove(&workspace_id).is_some();
+        self.flow_open_order.retain(|candidate| *candidate != workspace_id);
         self.pending_flows.remove(&workspace_id);
         left
     }
@@ -294,7 +300,12 @@ impl BeadsBoards {
     /// Escape reaches this only after the detail panel has declined the key,
     /// so a focused panel always dismisses before the strip changes mode.
     pub fn exit_latest_flow(&mut self) -> bool {
-        let latest = self.flows.keys().copied().max_by_key(WorkspaceId::as_uuid);
+        let latest = self
+            .flow_open_order
+            .iter()
+            .rev()
+            .find(|workspace_id| self.flows.contains_key(workspace_id))
+            .copied();
         latest.is_some_and(|workspace_id| self.exit_flow(workspace_id))
     }
 
@@ -404,6 +415,7 @@ impl BeadsBoards {
             flow.layout = layout;
             true
         });
+        self.flow_open_order.retain(|workspace_id| self.flows.contains_key(workspace_id));
     }
 
     /// Replace one server snapshot and report cards whose authoritative lane
@@ -741,6 +753,7 @@ impl BeadsBoards {
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
         self.optimistic_drops.retain(|(workspace_id, _), _| live.contains(workspace_id));
         self.flows.retain(|workspace_id, _| live.contains(workspace_id));
+        self.flow_open_order.retain(|workspace_id| live.contains(workspace_id));
         self.pending_flows.retain(|workspace_id, _| live.contains(workspace_id));
         self.flow_requests.retain(|(workspace_id, _)| live.contains(workspace_id));
         if self.card_press.as_ref().is_some_and(|press| !live.contains(&press.workspace_id))
@@ -3594,6 +3607,23 @@ mod flow_mode_tests {
         assert!(boards.exit_latest_flow());
         assert!(boards.flow(workspace).is_none());
         assert!(!boards.exit_latest_flow(), "nothing left to leave");
+    }
+
+    #[test]
+    fn escape_exits_the_most_recently_opened_strip_not_the_largest_uuid() {
+        let first = WorkspaceId::new();
+        let second = WorkspaceId::new();
+        let (largest_uuid, smallest_uuid) =
+            if first.as_uuid() > second.as_uuid() { (first, second) } else { (second, first) };
+        let mut boards = enabled();
+        for workspace in [largest_uuid, smallest_uuid] {
+            boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+            assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        }
+
+        assert!(boards.exit_latest_flow());
+        assert!(boards.flow(smallest_uuid).is_none(), "Escape did not exit the latest Flow");
+        assert!(boards.flow(largest_uuid).is_some(), "Escape selected by UUID instead");
     }
 
     #[test]
