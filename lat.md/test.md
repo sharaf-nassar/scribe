@@ -1949,7 +1949,9 @@ close and board-side Undo after its Applied result and a later board snapshot,
 defer clearing, classifier-won repaint, and zero writes for rejected or
 same-lane drops. It keeps the `SingleController` owner,
 proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
-during each gesture. The behavior belongs to
+during each gesture. The readiness probe waits for an actual SGR motion frame
+after DECSET crosses the PTY and client, rather than guessing with a sleep. The
+behavior belongs to
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
 #### Official Beads Write Contract

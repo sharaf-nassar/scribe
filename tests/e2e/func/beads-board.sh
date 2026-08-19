@@ -550,6 +550,20 @@ print(count)
 PY
 }
 
+wait_for_mouse_report() {
+    local before="$1"
+    # DECSET crosses the shell, PTY, server Term, and client Term asynchronously.
+    # A fixed sleep can send the probe before the client has parsed the modes;
+    # the first actual SGR report is the readiness signal instead.
+    for _ in $(seq 1 50); do
+        xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 - 40 ))" 400
+        xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 + 40 ))" 400
+        [ "$(mouse_report_count)" -gt "$before" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 drag_issue() {
     local issue="$1" target_lane="$2" position source_lane index
     local lane_width source_left press_x press_y target_x reports_before reports_after
@@ -819,16 +833,18 @@ sleep 0.5
 # into its owner-visible pane, then use the passive wire tap as the oracle.
 xdotool type --clearmodifiers --delay 1 "printf '\033[?1003h\033[?1006h'"
 xdotool key Return
-sleep 0.5
 PROBE_BEFORE=$(mouse_report_count)
+wait_for_mouse_report "$PROBE_BEFORE" \
+    || fail "owner-visible pane did not enable SGR mouse reporting"
+CLICK_BEFORE=$(mouse_report_count)
 xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" 400
 xdotool click 1
 for _ in $(seq 1 20); do
-    [ "$(mouse_report_count)" -ge "$(( PROBE_BEFORE + 2 ))" ] && break
+    [ "$(mouse_report_count)" -ge "$(( CLICK_BEFORE + 2 ))" ] && break
     sleep 0.2
 done
-[ "$(mouse_report_count)" -ge "$(( PROBE_BEFORE + 2 ))" ] \
-    || fail "owner-visible pane did not enable SGR mouse reporting"
+[ "$(mouse_report_count)" -ge "$(( CLICK_BEFORE + 2 ))" ] \
+    || fail "owner-visible pane click emitted no SGR mouse reports"
 xdotool mousemove --sync --window "$WID" 13 17
 sleep 0.5
 
