@@ -630,12 +630,26 @@ DETAIL_DIFF=$(compare -metric AE /output/beads-real-board.png \
 DETAIL_DIFF=${DETAIL_DIFF%%.*}
 [ "${DETAIL_DIFF:-0}" -ge 20000 ] || fail "real detail panel changed only ${DETAIL_DIFF:-0}px"
 
+# Bound the panel by differencing the pre-click board against the post-click
+# window, with the board strip masked out of that difference first.
+#
+# The mask is load-bearing. This probe once assumed the panel was the only
+# thing a card click changed, which stopped being true when Flow landed: a
+# click now opens the panel *and* swaps the strip into that card's epic graph,
+# so an unmasked difference spans strip plus panel and its bounding box is no
+# longer the panel's. It measured 561x553+223+47 — the strip's own left edge
+# one column further out, and 188px of extra height reaching up into the
+# strip — where the panel is still exactly the 560px surface it always was.
+# The strip is the 197px reservation directly under the 34px titlebar, which
+# is where this crop already starts, so blanking the crop's first 197 rows
+# leaves only what the panel itself changed.
 panel_bounds() {
     local before="$1" after="$2" content_height=$(( HEIGHT - 58 ))
     convert \
         \( "$before" -crop "${WIN_W}x${content_height}+0+34" \) \
         \( "$after" -crop "${WIN_W}x${content_height}+0+34" \) \
-        -compose difference -composite -threshold 10% -trim \
+        -compose difference -composite -threshold 10% \
+        -fill black -draw "rectangle 0,0 $(( WIN_W - 1 )),196" -trim \
         -format '%w %h %X %Y' info:
 }
 

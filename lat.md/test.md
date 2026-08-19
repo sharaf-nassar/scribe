@@ -2000,9 +2000,13 @@ has no Beads detail or write capability.
 
 The live functional proof derives its field coordinates from the painted detail surface and proves pointer activation commits one serialized title write without leaking keys to the terminal.
 
-The image-difference bound crops out the live title and status bands, accepts
-either the exact 560px panel surface or its 590px shadow-inclusive width, then
-normalizes to the surface before targeting the title. It moves the active caret
+The image-difference bound crops out the live title and status bands, blanks
+the board strip's 197px reservation out of the difference, accepts either the
+exact 560px panel surface or its 590px shadow-inclusive width, then normalizes
+to the surface before targeting the title. Masking the strip is what keeps the
+bound the panel's: since Flow landed a card click swaps the strip into that
+card's epic graph as well as opening the panel, so an unmasked difference
+spans strip plus panel and bounds both together. It moves the active caret
 and bounds the changed title pixels, then selects all
 and requires a larger highlight diff before typing. It submits with Enter,
 requires exactly one `set_title` wire verb and Applied result, and confirms the
