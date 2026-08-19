@@ -10,10 +10,8 @@
 //! namespace is represented, so the port stays 1:1 with the deleted surface
 //! without hand-transcribing 3000 lines of HTML.
 
-/// The eleven settings pages, in nav order. The first ten are the pages the old
-/// `settings.html` used; `Environment` splits the env-persistence surface out of
-/// the Terminal page because enabling it is gated on a live server round-trip
-/// (`EnvPreflight`) rather than a plain config write.
+/// The settings pages. `AgentApi` is appended so existing page-backed
+/// AccessKit element IDs remain stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     Appearance,
@@ -27,12 +25,13 @@ pub enum SettingsPage {
     Releases,
     Notifications,
     Remote,
+    AgentApi,
 }
 
 impl SettingsPage {
     /// Every page, in nav order.
     #[must_use]
-    pub fn all() -> [SettingsPage; 11] {
+    pub fn all() -> [SettingsPage; 12] {
         [
             SettingsPage::Appearance,
             SettingsPage::Colors,
@@ -45,6 +44,7 @@ impl SettingsPage {
             SettingsPage::Releases,
             SettingsPage::Notifications,
             SettingsPage::Remote,
+            SettingsPage::AgentApi,
         ]
     }
 
@@ -63,6 +63,7 @@ impl SettingsPage {
             SettingsPage::Releases => "Releases",
             SettingsPage::Notifications => "Notifications",
             SettingsPage::Remote => "Remote",
+            SettingsPage::AgentApi => "Agent API",
         }
     }
 }
@@ -249,6 +250,7 @@ pub fn page_controls(page: SettingsPage) -> Vec<Control> {
         SettingsPage::Releases => release_controls(),
         SettingsPage::Notifications => notification_controls(),
         SettingsPage::Remote => remote_controls(),
+        SettingsPage::AgentApi => agent_api_controls(),
     }
 }
 
@@ -448,6 +450,21 @@ pub fn workspace_badge_color_controls(count: usize) -> Vec<Control> {
         .collect()
 }
 
+fn agent_api_controls() -> Vec<Control> {
+    let modes = vec![("deny", "Deny"), ("prompt", "Prompt"), ("allow", "Allow")];
+    vec![
+        choice("agent_api.read_metadata", "Read metadata", modes.clone()),
+        choice("agent_api.read_content", "Read content", modes.clone()),
+        choice("agent_api.dispatch_action", "Dispatch actions", modes.clone()),
+        choice(
+            "agent_api.dispatch_destructive_action",
+            "Dispatch destructive actions",
+            modes.clone(),
+        ),
+        choice("agent_api.write_input", "Write input", modes),
+    ]
+}
+
 fn update_controls() -> Vec<Control> {
     vec![
         toggle("github_ci.enabled", "GitHub CI run status"),
@@ -537,5 +554,33 @@ mod tests {
 
         assert_eq!(control.label, "Focus follows mouse");
         assert!(matches!(control.kind, ControlKind::Toggle));
+    }
+
+    #[test]
+    fn agent_api_page_exposes_every_capability_policy() {
+        let controls = page_controls(SettingsPage::AgentApi);
+        let expected = [
+            "agent_api.read_metadata",
+            "agent_api.read_content",
+            "agent_api.dispatch_action",
+            "agent_api.dispatch_destructive_action",
+            "agent_api.write_input",
+        ];
+
+        assert_eq!(
+            controls.iter().map(|control| control.key.as_str()).collect::<Vec<_>>(),
+            expected
+        );
+        for control in controls {
+            assert!(matches!(
+                control.kind,
+                ControlKind::Choice(ref options)
+                    if options == &vec![
+                        ("deny", "Deny"),
+                        ("prompt", "Prompt"),
+                        ("allow", "Allow"),
+                    ]
+            ));
+        }
     }
 }

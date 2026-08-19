@@ -40,6 +40,9 @@ pub(crate) fn apply_config_key(
         "theme.preset" => {
             apply_theme_preset_key(config, value)?;
         }
+        key if key.starts_with("agent_api.") => {
+            apply_agent_api_key(config, key, value)?;
+        }
         key if key.starts_with("terminal.") => {
             apply_terminal_key(config, key, value)?;
         }
@@ -245,6 +248,31 @@ fn apply_theme_preset_key(
     config.appearance.theme = preset.replace('_', "-");
     if preset != "custom" {
         config.theme = None;
+    }
+    Ok(())
+}
+
+fn apply_agent_api_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let mode = match value.as_str() {
+        Some("deny") => scribe_common::agent::AgentPolicyMode::Deny,
+        Some("prompt") => scribe_common::agent::AgentPolicyMode::Prompt,
+        Some("allow") => scribe_common::agent::AgentPolicyMode::Allow,
+        Some(other) => return Err(format!("invalid agent API policy mode: {other}")),
+        None => return Err(format!("{key} must be a string")),
+    };
+    match key {
+        "agent_api.read_metadata" => config.agent_api.read_metadata = mode,
+        "agent_api.read_content" => config.agent_api.read_content = mode,
+        "agent_api.dispatch_action" => config.agent_api.dispatch_action = mode,
+        "agent_api.dispatch_destructive_action" => {
+            config.agent_api.dispatch_destructive_action = mode;
+        }
+        "agent_api.write_input" => config.agent_api.write_input = mode,
+        _ => return Err(format!("unhandled agent API key: {key}")),
     }
     Ok(())
 }
@@ -1031,6 +1059,26 @@ mod tests {
         .expect("focus-follows-mouse toggle should apply");
 
         assert!(!config.terminal.focus.focus_follows_mouse);
+    }
+
+    #[test]
+    fn agent_api_modes_round_trip_through_toml() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        for (key, mode) in [
+            ("agent_api.read_metadata", "allow"),
+            ("agent_api.read_content", "prompt"),
+            ("agent_api.dispatch_action", "deny"),
+            ("agent_api.dispatch_destructive_action", "allow"),
+            ("agent_api.write_input", "prompt"),
+        ] {
+            apply_config_key(&mut config, key, &serde_json::json!(mode))
+                .expect("agent API policy should apply");
+        }
+
+        let written = toml::to_string_pretty(&config).expect("agent API config serializes");
+        let parsed: scribe_common::config::ScribeConfig =
+            toml::from_str(&written).expect("agent API config parses");
+        assert_eq!(parsed.agent_api, config.agent_api);
     }
 
     #[test]

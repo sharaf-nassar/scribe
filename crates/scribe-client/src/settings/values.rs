@@ -26,6 +26,9 @@ pub fn current_value(config: &ScribeConfig, key: &str) -> Value {
     if let Some(v) = terminal_value(config, key) {
         return v;
     }
+    if let Some(v) = agent_api_value(config, key) {
+        return v;
+    }
     if let Some(v) = ai_value(config, key) {
         return v;
     }
@@ -164,6 +167,19 @@ fn terminal_value(config: &ScribeConfig, key: &str) -> Option<Value> {
     Some(v)
 }
 
+fn agent_api_value(config: &ScribeConfig, key: &str) -> Option<Value> {
+    let policy = &config.agent_api;
+    let mode = match key {
+        "agent_api.read_metadata" => &policy.read_metadata,
+        "agent_api.read_content" => &policy.read_content,
+        "agent_api.dispatch_action" => &policy.dispatch_action,
+        "agent_api.dispatch_destructive_action" => &policy.dispatch_destructive_action,
+        "agent_api.write_input" => &policy.write_input,
+        _ => return None,
+    };
+    Some(enum_str(mode))
+}
+
 fn ai_value(config: &ScribeConfig, key: &str) -> Option<Value> {
     let rest = key.strip_prefix("ai_states.").or_else(|| key.strip_prefix("claude_states."))?;
     let (state, field) = rest.split_once('.')?;
@@ -256,5 +272,18 @@ mod tests {
 
         config.terminal.focus.focus_follows_mouse = false;
         assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), false);
+    }
+
+    #[test]
+    fn reads_agent_api_policy_modes() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+        config.agent_api.read_metadata = scribe_common::agent::AgentPolicyMode::Allow;
+        config.agent_api.read_content = scribe_common::agent::AgentPolicyMode::Prompt;
+
+        assert_eq!(current_value(&config, "agent_api.read_metadata"), "allow");
+        assert_eq!(current_value(&config, "agent_api.read_content"), "prompt");
+        assert_eq!(current_value(&config, "agent_api.dispatch_action"), "deny");
+        assert_eq!(current_value(&config, "agent_api.dispatch_destructive_action"), "deny");
+        assert_eq!(current_value(&config, "agent_api.write_input"), "deny");
     }
 }

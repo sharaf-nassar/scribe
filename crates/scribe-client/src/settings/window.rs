@@ -1,6 +1,6 @@
 //! The GPUI settings window view.
 //!
-//! Renders the eleven-page [`crate::settings::model`] onto a GPUI view: a sidebar
+//! Renders the settings-page [`crate::settings::model`] onto a GPUI view: a sidebar
 //! nav plus a scrollable content pane whose controls read their current value
 //! from the loaded [`ScribeConfig`] via [`crate::settings::values`] and write
 //! edits back through the ported [`crate::settings::apply::apply_settings_change`]
@@ -6028,7 +6028,7 @@ fn stepper_button(
         .child(text)
 }
 
-fn settings_nav_pages() -> [SettingsPage; 11] {
+fn settings_nav_pages() -> [SettingsPage; 12] {
     [
         SettingsPage::Appearance,
         SettingsPage::Colors,
@@ -6041,6 +6041,7 @@ fn settings_nav_pages() -> [SettingsPage; 11] {
         SettingsPage::Releases,
         SettingsPage::Notifications,
         SettingsPage::Remote,
+        SettingsPage::AgentApi,
     ]
 }
 
@@ -6055,7 +6056,7 @@ fn settings_nav_groups() -> [(&'static str, &'static [SettingsPage]); 5] {
     const WORKFLOW: &[SettingsPage] = &[SettingsPage::Environment, SettingsPage::Workspaces];
     const SYSTEM: &[SettingsPage] =
         &[SettingsPage::Updates, SettingsPage::Releases, SettingsPage::Notifications];
-    const CONNECTIVITY: &[SettingsPage] = &[SettingsPage::Remote];
+    const CONNECTIVITY: &[SettingsPage] = &[SettingsPage::Remote, SettingsPage::AgentApi];
     [
         ("TERMINAL", TERMINAL),
         ("INTELLIGENCE", INTELLIGENCE),
@@ -6078,6 +6079,7 @@ fn page_icon(page: SettingsPage) -> &'static str {
         SettingsPage::Releases => "\u{f02b}",
         SettingsPage::Notifications => "\u{f0f3}",
         SettingsPage::Remote => "\u{f1eb}",
+        SettingsPage::AgentApi => "\u{f1e5}",
     }
 }
 
@@ -6094,6 +6096,7 @@ fn page_summary(page: SettingsPage) -> &'static str {
         SettingsPage::Releases => "Query available versions from the Scribe server",
         SettingsPage::Notifications => "Desktop delivery conditions and timeout behavior",
         SettingsPage::Remote => "Tailnet, local-network trust, and sharing policy",
+        SettingsPage::AgentApi => "Control local agent access to Scribe capabilities",
     }
 }
 
@@ -6116,6 +6119,7 @@ fn control_section(page: SettingsPage, key: &str) -> &'static str {
         SettingsPage::Releases => "Release service",
         SettingsPage::Notifications => notification_section(key),
         SettingsPage::Remote => remote_section(key),
+        SettingsPage::AgentApi => "Capability policy",
     }
 }
 
@@ -6404,14 +6408,14 @@ mod tests {
         ScrollMetrics, ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
         build_theme_preset_cache, canonical_combo, choice_menu_key_action,
         choice_options_from_cache, choice_scroll_offset, color_menu_left_offset, combo_for_capture,
-        commits_pi_integration_enable, conflicting_action, content_scroll_offset,
+        commits_pi_integration_enable, conflicting_action, content_scroll_offset, control_section,
         dismiss_choice_or_search, filter_choice_options, focus_targets_match, inline_commit_value,
         inline_placeholder, is_modifier_key, key_combo_text, move_choice_highlight,
         offset_from_drag, offset_from_track_click, palette_color_at, pi_integration_enable_status,
         prompt_bar_reset_change, prompt_bar_theme_swatch, push_control_focus_targets, px,
         release_inline_input, replace_pending_theme_preset, revert_inline_input,
-        search_display_text, take_pending_theme_preset, theme_preset_preview, utf16_range_to_utf8,
-        workspace_badge_color_controls, workspace_root_controls_match_query,
+        search_display_text, settings_nav_pages, take_pending_theme_preset, theme_preset_preview,
+        utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
         workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
         workspace_roots_match_query,
     };
@@ -6816,6 +6820,15 @@ mod tests {
         assert!(row_top >= viewport_top);
         assert!(
             row_top + super::CHOICE_OPTION_HEIGHT <= viewport_top + super::CHOICE_MENU_MAX_HEIGHT
+        );
+    }
+
+    #[test]
+    fn agent_api_page_is_appended_with_a_capability_policy_section() {
+        assert_eq!(settings_nav_pages().last(), Some(&SettingsPage::AgentApi));
+        assert_eq!(
+            control_section(SettingsPage::AgentApi, "agent_api.write_input"),
+            "Capability policy"
         );
     }
 
