@@ -180,6 +180,12 @@ Serializable per-cell terminal screen state used inside the server and for `Requ
 
 Carries cols/rows/scrollback-rows, cursor fields, alt-screen flag, and a zstd-compressed ANSI byte stream produced by  and compressed by . Both server hot-reload handoff and server → client reattach use this same encoding — receivers decompress via  and feed the bytes through `vte::ansi::Processor::advance`. `snapshot_to_ansi` starts with RIS, selects the captured screen, then re-emits enabled DEC private modes (mouse reporting, SGR/UTF-8 mouse, alternate scroll, bracketed paste, focus events, app-cursor, app-keypad), so dirty and fresh receivers converge without synthetic scrollback.
 
+### Control chars in cells replay as spaces
+
+A cell can hold a control character — alacritty's `put_tab` stores the literal `'\t'` in the cell it started on for selection-copy fidelity — and [[crates/scribe-common/src/screen_replay.rs#write_snapshot_row]] emits a space for any such cell rather than the raw byte.
+
+A replayed control char would be *executed* by the receiving parser: a tab re-advances the cursor to the next tab stop on top of the padding cells the row already carries, pushing the row past the right edge, so every tabbed row autowraps a spurious blank line under itself and the rows above scroll into history. This was visible in the field as `git status` output re-indenting and double-spacing on every tab switch or focus-driven re-attach. The advance the control char performed is already materialized in the cells that follow it, so a space reproduces the exact visual row; only the `'\t'` copy marker degrades. tmux and mosh serialize their grids the same way — redraw and state-sync streams carry printable cell content plus SGR, never stored control bytes.
+
 The declared cols/rows/scrollback-rows describe the grid for the receiver to rebuild; they are not a size bound on the payload. [[crates/scribe-common/src/screen_replay.rs#decompress_session_replay|decompress_session_replay]] streams the frame and enforces [[crates/scribe-common/src/screen_replay.rs#MAX_REPLAY_INFLATED_BYTES|its own 64 MiB ceiling]] instead, because both carrying paths accept payloads from an untrusted peer. See [[server#Server#Handoff#Session Replay Encoding|Session Replay Encoding]] for the reasoning.
 
 ## Socket Paths

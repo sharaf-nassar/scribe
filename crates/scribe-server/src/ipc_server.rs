@@ -1011,7 +1011,6 @@ impl WindowShare {
     }
 
     /// Writers that advertised support for agent activity and prompt frames.
-    #[cfg(test)]
     fn agent_api_writers(&self) -> Vec<SharedWriter> {
         self.participants
             .values()
@@ -10309,8 +10308,7 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
 /// Send an agent-only frame to participants that advertised `agent_api`.
 ///
 /// Keeping the capability filter beside the participant registry makes every
-/// future agent activity/prompt broadcast fail closed for old clients.
-#[cfg(test)]
+/// agent activity/prompt broadcast fail closed for old clients.
 async fn send_agent_api_message(
     window_shares: &WindowShares,
     window_id: WindowId,
@@ -13145,6 +13143,50 @@ async fn forward_env_status(
     );
 }
 
+/// Spawn the agent-activity indicator forwarder (spec 027).
+///
+/// Consumes the [`crate::agent_api::activity::AgentActivityTracker`]'s
+/// transition stream taken from the server's `agent_api` state and sends each
+/// one as [`ServerMessage::AgentActivity`] to the owning window's
+/// participants — capability-filtered, so a client that never advertised
+/// `agent_api` in `Hello` receives nothing. The task ends when the tracker's
+/// sender side (the `agent_api` state) is dropped at server shutdown.
+pub fn spawn_agent_activity_forwarder(server: &IpcServerState) {
+    let Some(mut transitions) = server.agent_api.take_activity_transitions() else {
+        return;
+    };
+    let workspace_manager = Arc::clone(&server.workspace_manager);
+    let window_shares = Arc::clone(&server.window_shares);
+    tokio::spawn(async move {
+        while let Some((session_id, active)) = transitions.recv().await {
+            forward_agent_activity(&workspace_manager, &window_shares, session_id, active).await;
+        }
+    });
+}
+
+/// Helper for the agent-activity forwarder loop: resolves the session's
+/// window and sends one transition to its `agent_api`-capable participants.
+async fn forward_agent_activity(
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    window_shares: &WindowShares,
+    session_id: SessionId,
+    active: bool,
+) {
+    let window_id = workspace_manager.read().await.window_for_session(session_id);
+    let Some(window_id) = window_id else {
+        // Session closed between the lease transition and our forward — drop
+        // silently, mirroring `forward_env_status`.
+        debug!(
+            target: "scribe_server::ipc_server",
+            ?session_id,
+            "AgentActivity transition for unknown session — dropped"
+        );
+        return;
+    };
+    let msg = ServerMessage::AgentActivity { session_id, active };
+    send_agent_api_message(window_shares, window_id, &msg).await;
+}
+
 /// Convert the server-internal [`crate::env_store::EnvStatusState`] to its
 /// wire-protocol counterpart for emission on
 /// [`ServerMessage::EnvStatus`]. Kept as a free function so the `env_store`
@@ -14072,6 +14114,51 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_activity_transitions_route_to_the_owning_windows_capable_participants() {
+        let capable_window = WindowId::new();
+        let incapable_window = WindowId::new();
+        let mut manager = WorkspaceManager::new(Vec::new());
+        let capable_session = SessionId::new();
+        let capable_workspace = manager.create_workspace();
+        manager.add_session(capable_workspace, capable_session, None);
+        manager.assign_session_to_window(capable_window, capable_session);
+        let incapable_session = SessionId::new();
+        let incapable_workspace = manager.create_workspace();
+        manager.add_session(incapable_workspace, incapable_session, None);
+        manager.assign_session_to_window(incapable_window, incapable_session);
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (capable_writer, mut capable_client) = ci_test_writer();
+        let (incapable_writer, mut incapable_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(capable_window, agent_share(&capable_writer, true));
+            shares.insert(incapable_window, agent_share(&incapable_writer, false));
+        }
+
+        // Unknown session: dropped without reaching any participant.
+        super::forward_agent_activity(&manager, &shares, SessionId::new(), true).await;
+        super::forward_agent_activity(&manager, &shares, capable_session, true).await;
+        super::forward_agent_activity(&manager, &shares, incapable_session, true).await;
+
+        assert!(matches!(
+            read_message(&mut capable_client).await.unwrap(),
+            ServerMessage::AgentActivity { session_id, active: true }
+                if session_id == capable_session
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut incapable_client),
+            )
+            .await
+            .is_err(),
+            "a participant without the agent_api bit received an AgentActivity frame"
         );
     }
 

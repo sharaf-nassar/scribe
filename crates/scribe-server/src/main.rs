@@ -470,6 +470,10 @@ async fn run_server_loop(
         agent_api: agent_api::AgentApiState::new(agent_api),
     };
 
+    // Spec 027: forward agent-activity lease transitions to each session's
+    // window as `AgentActivity`, gated on the participant's `agent_api` bit.
+    ipc_server::spawn_agent_activity_forwarder(&server_state);
+
     // Start the remote-control supervisor: it applies the current `[remote]`
     // config (a no-op when disabled — the default) and then rebinds/stops the
     // listener live on every `ConfigReloaded`. Spawned, not awaited, so a wedged

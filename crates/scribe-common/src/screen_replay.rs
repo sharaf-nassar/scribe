@@ -360,8 +360,16 @@ fn write_snapshot_row(
             sgr_state.update(cell);
         }
 
-        // Write the character (space for null/empty cells).
-        if cell.c == '\0' || cell.c == ' ' {
+        // Write the character. A space stands in for null cells and for any
+        // control character stored in a cell: alacritty's `put_tab` keeps the
+        // literal '\t' in the cell it started on (selection-copy fidelity),
+        // and replaying it verbatim would *execute* the tab — the cursor
+        // re-advances to the next tab stop on top of the padding cells that
+        // follow, pushing the row past the right edge and autowrapping a
+        // spurious blank line under every tabbed row. The advance a control
+        // char performed is already materialized in the cells after it, so a
+        // space reproduces the exact visual row.
+        if cell.c.is_control() {
             buf.push(' ');
         } else {
             buf.push(cell.c);

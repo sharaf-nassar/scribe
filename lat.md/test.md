@@ -1350,6 +1350,12 @@ Three CLI surfaces read it back:
 
 Raw replay into blank or dirty primary and alternate terminals reproduces exactly zero or N history rows without receiver trimming, resets stale margins and modes, and leaves omitted malformed cells blank.
 
+### Tab cells replay as content
+
+`roundtrip_tab_cells_are_not_reexecuted` in `crates/scribe-server/tests/replay_roundtrip.rs` proves tab-indented rows survive the replay round trip.
+
+It requires zero synthesized history, an unchanged visual grid (the stored `'\t'` marker degrading to the space it painted as), and no raw tab bytes in the encoded stream — the oracle for [[common#Common#Session Replay#Control chars in cells replay as spaces]].
+
 ## Terminal Client Singleton
 
 Unit checks cover terminal-client launch gating, authenticated restore-child focus transport, bounded cleanup, stale-owner recovery, and flavor-scoped paths without starting a Scribe runtime process.

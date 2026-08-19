@@ -3,6 +3,7 @@
 //! Capability handlers live in sibling modules. This foundational router keeps
 //! admission, policy ordering, and auditing in one place.
 
+pub mod activity;
 pub mod policy;
 pub mod text;
 
@@ -22,7 +23,9 @@ use scribe_common::agent::{
 };
 use scribe_common::config::AgentApiConfig;
 use scribe_common::protocol::{AutomationAction, ServerMessage};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+
+use self::activity::{ActivityTransition, AgentActivityTracker};
 
 use policy::{AgentPolicyEngine, mode_for};
 
@@ -38,6 +41,8 @@ pub struct AgentApiState {
     in_flight: Arc<Semaphore>,
     next_correlation_id: Arc<AtomicU64>,
     pending_actions: Arc<Mutex<HashMap<u64, PendingAction>>>,
+    activity: AgentActivityTracker,
+    activity_transitions: Arc<Mutex<Option<mpsc::UnboundedReceiver<ActivityTransition>>>>,
 }
 
 struct PendingAction {
@@ -49,20 +54,41 @@ struct PendingAction {
 impl AgentApiState {
     #[must_use]
     pub fn new(policy: AgentApiConfig) -> Self {
+        let (transitions, receiver) = mpsc::unbounded_channel();
+        let activity =
+            AgentActivityTracker::new(Duration::from_millis(policy.activity_dwell_ms), transitions);
         Self {
             policy: AgentPolicyEngine::new(policy),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
             next_correlation_id: Arc::new(AtomicU64::new(1)),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            activity,
+            activity_transitions: Arc::new(Mutex::new(Some(receiver))),
         }
     }
 
-    /// Replace the live policy in place. Every clone of this state and every
-    /// future dispatch reads the new config on its next call — a
-    /// `ConfigReloaded` edit takes effect with no server restart and no new
-    /// `AgentApiState`.
+    /// Replace live policy and release held activity when every capability is denied.
     pub fn refresh_policy(&self, policy: AgentApiConfig) {
+        let disabled = policy.read_metadata == AgentPolicyMode::Deny
+            && policy.read_content == AgentPolicyMode::Deny
+            && policy.dispatch_action == AgentPolicyMode::Deny
+            && policy.dispatch_destructive_action == AgentPolicyMode::Deny
+            && policy.write_input == AgentPolicyMode::Deny;
         self.policy.refresh(policy);
+        if disabled {
+            self.activity.release_all();
+        }
+    }
+
+    /// Per-session activity leases behind the tab agent indicator.
+    #[must_use]
+    pub fn activity(&self) -> &AgentActivityTracker {
+        &self.activity
+    }
+
+    /// Take the indicator transition stream. The server consumes it once at startup.
+    pub fn take_activity_transitions(&self) -> Option<mpsc::UnboundedReceiver<ActivityTransition>> {
+        self.activity_transitions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AgentError> {

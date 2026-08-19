@@ -228,6 +228,45 @@ fn replay_replaces_dirty_primary_and_alternate_destinations() {
     assert_eq!(rebuilt_alternate.cursor_col, alternate.cursor_col);
 }
 
+/// A cell holding a literal '\t' (alacritty's `put_tab` stores the tab in
+/// the cell it started on) must replay as content, never as a control char.
+/// An executed tab re-advances the cursor over the padding cells the row
+/// already carries, pushing it past the right edge, so every tabbed row
+/// autowraps a spurious blank line under itself and the screen above scrolls
+/// into history — the tab-switch corruption: `git status` output re-indented
+/// and double-spaced every time its pane was re-attached.
+#[test]
+fn roundtrip_tab_cells_are_not_reexecuted() {
+    let mut src = new_term(74, 20, 100);
+    feed(&mut src, b"\tmodified:   CLAUDE.md\r\n\tmodified:   proper-base/CLAUDE.md\r\nplain\r\n");
+    let snap = snapshot_term(&src);
+
+    let bytes = snapshot_to_ansi(&snap);
+    assert!(!bytes.contains(&b'\t'), "replay bytes must not carry raw cell control chars");
+
+    let mut dst = new_term(74, 20, 100);
+    feed(&mut dst, &bytes);
+    assert_eq!(dst.history_size(), 0, "a re-executed tab autowraps rows into history");
+
+    let rebuilt = snapshot_term(&dst);
+    // Identical visual grid; only the '\t' marker itself degrades to the
+    // space it painted as.
+    let normalized: Vec<_> = snap
+        .cells
+        .iter()
+        .cloned()
+        .map(|mut cell| {
+            if cell.c == '\t' {
+                cell.c = ' ';
+            }
+            cell
+        })
+        .collect();
+    assert_eq!(rebuilt.cells, normalized, "tabbed rows must keep their layout");
+    assert_eq!(rebuilt.cursor_row, snap.cursor_row);
+    assert_eq!(rebuilt.cursor_col, snap.cursor_col);
+}
+
 #[test]
 fn short_snapshot_clears_omitted_dirty_cells() {
     let mut src = new_term(10, 4, 20);

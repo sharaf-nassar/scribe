@@ -6233,7 +6233,18 @@ impl TerminalView {
         let split = placements.len() > 1;
         let live: HashSet<SessionId> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
-        self.pane_sizes.retain(|session, _| live.contains(session));
+        // Hidden-but-open tabs keep their last published size. That memory is
+        // what lets a switch back re-attach at the grid the session already
+        // has — so the server-side resize and the follow-up publish are both
+        // no-ops — instead of attaching at the outgoing tab's size and paying
+        // a corrective Resize + RequestSnapshot round trip (tmux applies the
+        // same rule at the PTY: resize only when the size actually changed).
+        // Only a session gone from the strip — closed or exited — drops out.
+        let open: HashSet<SessionId> = self.shared.tabs.lock().map_or_else(
+            |_| live.clone(),
+            |tabs| tabs.entries().map(|tab| tab.session_id).collect(),
+        );
+        self.pane_sizes.retain(|session, _| live.contains(session) || open.contains(session));
         for placement in placements {
             let size = self.grid_size_for(self.painted_pane_rect(&placement, split));
             if placement.focused {
@@ -14737,7 +14748,21 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
     // showing a live pane" is the readiness gate the visual E2E rig waits on
     // before it drives the window; a screenshot cannot tell an unattached
     // client from an idle one.
-    let size = reader_attach_size(ctx);
+    //
+    // The session usually streamed into a display grid before, and that grid
+    // — not the focused pane's — is the geometry it must come back at: the
+    // focused size describes the *outgoing* pane, whose prompt-bar chrome can
+    // differ, and attaching at it resizes the PTY off its real grid and back
+    // (one SIGWINCH storm and a doubled replay per switch). Same source
+    // [`reattach_visible_sessions`] uses; the focused size remains only for a
+    // session this window has never painted.
+    let focused = reader_attach_size(ctx);
+    let size = ctx
+        .panes
+        .lock()
+        .ok()
+        .and_then(|panes| pane_display_grid(&panes, session_id))
+        .map_or(focused, |grid| TerminalSize { cols: grid.cols, rows: grid.rows, ..focused });
     tracing::info!(%session_id, cols = size.cols, rows = size.rows, "attaching to session");
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
