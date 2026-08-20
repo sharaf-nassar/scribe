@@ -10314,15 +10314,15 @@ async fn handle_transient_dispatch_action(
     send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
 }
 
-struct AgentActionContext<'a> {
-    state: &'a crate::agent_api::AgentApiState,
+struct AgentActionContext {
+    state: crate::agent_api::AgentApiState,
     caller: usize,
-    window_shares: &'a WindowShares,
-    workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+    window_shares: WindowShares,
+    workspace_manager: Arc<RwLock<WorkspaceManager>>,
 }
 
 async fn run_agent_action(
-    context: AgentActionContext<'_>,
+    context: AgentActionContext,
     requested_window_id: Option<WindowId>,
     action: AutomationAction,
     origin_session_id: Option<SessionId>,
@@ -10484,10 +10484,10 @@ async fn handle_transient_agent_request(
             run_action: move |window_id, action| async move {
                 run_agent_action(
                     AgentActionContext {
-                        state: &agent_api,
+                        state: agent_api,
                         caller: action_caller,
-                        window_shares: &action_shares,
-                        workspace_manager: &action_workspaces,
+                        window_shares: action_shares,
+                        workspace_manager: action_workspaces,
                     },
                     window_id,
                     action,
@@ -15770,30 +15770,28 @@ mod tests {
         Arc::new(RwLock::new(manager))
     }
 
-    struct TestAgentActionContext {
-        state: crate::agent_api::AgentApiState,
+    /// One connected controller window wired to a live socket pair: the
+    /// window/share/socket/controller setup every correlated action-activity
+    /// test dispatches against before diverging on origin, workspace mapping,
+    /// and completion outcome.
+    struct TargetWindow {
         window_shares: WindowShares,
-        workspace_manager: Arc<RwLock<WorkspaceManager>>,
-        caller: usize,
+        window_id: WindowId,
+        writer: SharedWriter,
+        client: tokio::net::UnixStream,
     }
 
-    async fn run_test_agent_action(
-        context: TestAgentActionContext,
-        action: AutomationAction,
-        origin_session_id: Option<SessionId>,
-    ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
-        run_agent_action(
-            AgentActionContext {
-                state: &context.state,
-                caller: context.caller,
-                window_shares: &context.window_shares,
-                workspace_manager: &context.workspace_manager,
-            },
-            None,
-            action,
-            origin_session_id,
-        )
-        .await
+    async fn new_target_window() -> TargetWindow {
+        let window_shares = new_window_shares();
+        let window_id = WindowId::new();
+        let (target_server, client) = unix_stream_pair();
+        let (_target_read, target_write) = tokio::io::split(target_server);
+        let writer: SharedWriter = test_shared_writer(target_write);
+        window_shares.write().await.insert(
+            window_id,
+            WindowShare::new_single_controller(Participant::local(&writer, false)),
+        );
+        TargetWindow { window_shares, window_id, writer, client }
     }
 
     async fn read_correlated_action(
@@ -15815,24 +15813,22 @@ mod tests {
             ..scribe_common::config::AgentApiConfig::default()
         });
         let mut transitions = state.take_activity_transitions().unwrap();
-        let window_shares = new_window_shares();
-        let window_id = WindowId::new();
+        let TargetWindow {
+            window_shares,
+            window_id,
+            writer: target_writer,
+            client: mut target_client,
+        } = new_target_window().await;
         let origin = SessionId::new();
         let workspaces = action_workspaces(&[(window_id, origin)]);
-        let (target_server, mut target_client) = unix_stream_pair();
-        let (_target_read, target_write) = tokio::io::split(target_server);
-        let target_writer: SharedWriter = test_shared_writer(target_write);
-        window_shares.write().await.insert(
-            window_id,
-            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
-        );
-        let run = tokio::spawn(run_test_agent_action(
-            TestAgentActionContext {
+        let run = tokio::spawn(run_agent_action(
+            AgentActionContext {
                 state: state.clone(),
-                window_shares: Arc::clone(&window_shares),
-                workspace_manager: workspaces,
                 caller: 41,
+                window_shares,
+                workspace_manager: workspaces,
             },
+            None,
             AutomationAction::NewTab,
             Some(origin),
         ));
@@ -15870,28 +15866,23 @@ mod tests {
     async fn absent_stale_or_mismatched_action_origin_emits_no_activity() {
         let state = crate::agent_api::AgentApiState::default();
         let mut transitions = state.take_activity_transitions().unwrap();
-        let window_shares = new_window_shares();
-        let target_window = WindowId::new();
+        let TargetWindow {
+            window_shares, writer: target_writer, client: mut target_client, ..
+        } = new_target_window().await;
         let other_window = WindowId::new();
         let mismatched = SessionId::new();
         let stale_origin = SessionId::new();
         let workspaces = action_workspaces(&[(other_window, mismatched)]);
-        let (target_server, mut target_client) = unix_stream_pair();
-        let (_target_read, target_write) = tokio::io::split(target_server);
-        let target_writer: SharedWriter = test_shared_writer(target_write);
-        window_shares.write().await.insert(
-            target_window,
-            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
-        );
 
         for (caller, origin) in [(51, None), (52, Some(stale_origin)), (53, Some(mismatched))] {
-            let run = tokio::spawn(run_test_agent_action(
-                TestAgentActionContext {
+            let run = tokio::spawn(run_agent_action(
+                AgentActionContext {
                     state: state.clone(),
+                    caller,
                     window_shares: Arc::clone(&window_shares),
                     workspace_manager: Arc::clone(&workspaces),
-                    caller,
                 },
+                None,
                 AutomationAction::OpenFind,
                 origin,
             ));
@@ -15915,26 +15906,24 @@ mod tests {
     async fn focus_session_activity_uses_explicit_target_over_origin() {
         let state = crate::agent_api::AgentApiState::default();
         let mut transitions = state.take_activity_transitions().unwrap();
-        let window_shares = new_window_shares();
-        let target_window = WindowId::new();
+        let TargetWindow {
+            window_shares,
+            window_id: target_window,
+            writer: target_writer,
+            client: mut target_client,
+        } = new_target_window().await;
         let other_window = WindowId::new();
         let focused = SessionId::new();
         let mismatched = SessionId::new();
         let workspaces = action_workspaces(&[(target_window, focused), (other_window, mismatched)]);
-        let (target_server, mut target_client) = unix_stream_pair();
-        let (_target_read, target_write) = tokio::io::split(target_server);
-        let target_writer: SharedWriter = test_shared_writer(target_write);
-        window_shares.write().await.insert(
-            target_window,
-            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
-        );
-        let run = tokio::spawn(run_test_agent_action(
-            TestAgentActionContext {
+        let run = tokio::spawn(run_agent_action(
+            AgentActionContext {
                 state: state.clone(),
-                window_shares: Arc::clone(&window_shares),
-                workspace_manager: workspaces,
                 caller: 61,
+                window_shares,
+                workspace_manager: workspaces,
             },
+            None,
             AutomationAction::FocusSession { session_id: focused },
             Some(mismatched),
         ));
@@ -15961,10 +15950,10 @@ mod tests {
         assert!(matches!(
             run_agent_action(
                 AgentActionContext {
-                    state: &state,
+                    state: state.clone(),
                     caller: 1,
-                    window_shares: &window_shares,
-                    workspace_manager: &empty_workspaces,
+                    window_shares: Arc::clone(&window_shares),
+                    workspace_manager: empty_workspaces,
                 },
                 None,
                 AutomationAction::OpenFind,
@@ -15990,10 +15979,10 @@ mod tests {
         assert!(matches!(
             run_agent_action(
                 AgentActionContext {
-                    state: &state,
+                    state: state.clone(),
                     caller: 1,
-                    window_shares: &window_shares,
-                    workspace_manager: &mapped_workspaces,
+                    window_shares: Arc::clone(&window_shares),
+                    workspace_manager: mapped_workspaces,
                 },
                 None,
                 AutomationAction::OpenFind,
