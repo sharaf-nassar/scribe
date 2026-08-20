@@ -25,7 +25,7 @@ use scribe_common::agent::{
     AgentCapabilityStatus, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
     AgentScreenText,
 };
-use scribe_common::config::AgentApiConfig;
+use scribe_common::config::{AGENT_MAX_RESPONSE_BYTES_CEILING, AgentApiConfig};
 use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::protocol::{AutomationAction, ServerMessage};
 use scribe_pty::{async_fd::AsyncPtyFd, event_listener::ScribeEventListener};
@@ -387,7 +387,8 @@ where
         Err(AgentError::Busy { .. }) => "busy",
         Err(_) => "deny",
     };
-    let response = AgentResponse { request_id: metadata.request_id, result };
+    let mut response = AgentResponse { request_id: metadata.request_id, result };
+    enforce_serialized_response_ceiling(&mut response);
     emit_audit(&metadata, decision, serialized_response_bytes(&response));
     AgentDispatch { response, _permit: permit, _activity: activity }
 }
@@ -636,6 +637,33 @@ fn serialized_response_bytes(response: &AgentResponse) -> usize {
         .map_or(0, |reply| reply.len())
 }
 
+fn enforce_serialized_response_ceiling(response: &mut AgentResponse) {
+    let ceiling = usize::try_from(AGENT_MAX_RESPONSE_BYTES_CEILING).unwrap_or(usize::MAX);
+    loop {
+        let response_bytes = serialized_response_bytes(response);
+        if response_bytes <= ceiling {
+            break;
+        }
+        let overflow = response_bytes.saturating_sub(ceiling).max(1);
+        let Ok(AgentPayload::ReadScreen { screen }) = &mut response.result else {
+            break;
+        };
+        if screen.text.is_empty() {
+            response.result = Err(AgentError::TooLarge {
+                message: "agent screen response metadata exceeds maximum size".into(),
+            });
+            break;
+        }
+        let mut keep = screen.text.len().saturating_sub(overflow);
+        while keep > 0 && !screen.text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        screen.text.truncate(keep);
+        screen.lines = u32::try_from(screen.text.lines().count()).unwrap_or(u32::MAX);
+        screen.truncated = true;
+    }
+}
+
 fn not_found(session_id: SessionId) -> AgentError {
     AgentError::NotFound { message: format!("session {session_id} not found") }
 }
@@ -675,6 +703,7 @@ mod tests {
     use scribe_common::agent::{
         AGENT_SURFACE_VERSION, AgentActionOutcome, AgentActionResult, AgentCapability,
         AgentCapabilityStatus, AgentError, AgentPayload, AgentPolicyMode, AgentRequest,
+        AgentResponse, AgentScreenText,
     };
     use scribe_common::config::AgentApiConfig;
     use scribe_common::framing::{read_message, write_message};
@@ -690,8 +719,9 @@ mod tests {
     use vte::ansi::Processor as AnsiProcessor;
 
     use super::{
-        ALL_CAPABILITIES, AgentApiState, AgentSessionTarget, DispatchSources,
-        MAX_IN_FLIGHT_REQUESTS, RequestMetadata, authorize_before_lookup, dispatch, world,
+        AGENT_MAX_RESPONSE_BYTES_CEILING, ALL_CAPABILITIES, AgentApiState, AgentSessionTarget,
+        DispatchSources, MAX_IN_FLIGHT_REQUESTS, RequestMetadata, authorize_before_lookup,
+        dispatch, enforce_serialized_response_ceiling, serialized_response_bytes, world,
         write_agent_input,
     };
     use crate::ipc_server::{WindowShares, test_shared_writer};
@@ -1033,6 +1063,36 @@ mod tests {
         assert!(screen.text.len() <= 7);
         assert_eq!(screen.text, "hello\nw");
         assert!(screen.truncated);
+    }
+
+    #[test]
+    fn serialized_screen_response_stays_within_the_hard_ceiling() {
+        let mut response = AgentResponse {
+            request_id: 35,
+            result: Ok(AgentPayload::ReadScreen {
+                screen: AgentScreenText {
+                    session_id: SessionId::new(),
+                    title: Some("benchmark".into()),
+                    cwd: Some(PathBuf::from("/work/scribe")),
+                    text: "é".repeat(usize::try_from(AGENT_MAX_RESPONSE_BYTES_CEILING).unwrap()),
+                    lines: 1,
+                    truncated: false,
+                    captured_at: 1,
+                    snapshot_id: 1,
+                },
+            }),
+        };
+        enforce_serialized_response_ceiling(&mut response);
+        assert!(
+            serialized_response_bytes(&response)
+                <= usize::try_from(AGENT_MAX_RESPONSE_BYTES_CEILING).unwrap()
+        );
+        let Ok(AgentPayload::ReadScreen { screen }) = &response.result else {
+            panic!("expected read-screen payload");
+        };
+        assert!(screen.truncated);
+        assert!(screen.text.is_char_boundary(screen.text.len()));
+        assert_eq!(screen.lines, u32::try_from(screen.text.lines().count()).unwrap());
     }
 
     #[tokio::test]
