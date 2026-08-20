@@ -58,6 +58,14 @@ Prompted calls remain inside the same dispatcher invocation, so prompt resolutio
 
 Target kind is constrained to `server`, `window`, or `session`; no request body, reply body, error text, or terminal text is recorded. `response_bytes` is the named-MessagePack byte length of the `ServerMessage::AgentResponse` body that the socket writer serializes, excluding the 4-byte frame-length prefix described by [[protocol#Protocol#Transport#Frame Format]].
 
+### Action activity leases
+
+Authorized agent actions derive visibility only from explicit request semantics.
+
+After policy authorization and unambiguous target-window resolution, `FocusSession` uses its explicit session id; every other action uses `origin_session_id` only while that session still belongs to the target window. An absent, stale, or cross-window origin leaves the action sessionless rather than guessing from a multi-region window tree.
+
+[[crates/scribe-server/src/ipc_server.rs#run_agent_action]] acquires the shared per-session activity lease before queuing `RunActionCorrelated` and retains it through correlated completion, failure, disconnect, or timeout. Dropping it then follows the same configured dwell and overlapping refcount rules as screen reads and input writes. Policy-denied and ambiguous actions acquire no lease and emit no activity transition.
+
 ## Sessions
 
 Each PTY session is represented by a  during creation and a LiveSession during active operation.

@@ -1510,14 +1510,17 @@ mod tests {
         ));
     }
 
+    // @lat: [[test#Test Harness#Agent API action activity]]
     #[tokio::test]
-    async fn denied_and_prompt_denied_actions_never_reach_dispatch() {
+    async fn denied_and_prompt_denied_actions_never_reach_dispatch_or_activity() {
         let denied = action_request(15, AutomationAction::ClosePane, None);
+        let denied_state = AgentApiState::new(AgentApiConfig {
+            dispatch_action: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let mut denied_activity = denied_state.take_activity_transitions().unwrap();
         let denied_response = dispatch(
-            &AgentApiState::new(AgentApiConfig {
-                dispatch_action: AgentPolicyMode::Allow,
-                ..AgentApiConfig::default()
-            }),
+            &denied_state,
             0,
             &denied,
             DispatchSources {
@@ -1531,11 +1534,13 @@ mod tests {
         )
         .await;
         assert!(matches!(denied_response.response().result, Err(AgentError::Denied { .. })));
+        assert!(denied_activity.try_recv().is_err(), "denied action emitted activity");
 
         let state = AgentApiState::new(AgentApiConfig {
             dispatch_destructive_action: AgentPolicyMode::Prompt,
             ..AgentApiConfig::default()
         });
+        let mut prompt_activity = state.take_activity_transitions().unwrap();
         let resolver = state.clone();
         let prompt_response = dispatch(
             &state,
@@ -1552,6 +1557,7 @@ mod tests {
         )
         .await;
         assert!(matches!(prompt_response.response().result, Err(AgentError::Denied { .. })));
+        assert!(prompt_activity.try_recv().is_err(), "prompt-denied action emitted activity");
     }
 
     fn capability_mode(

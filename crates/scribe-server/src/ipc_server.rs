@@ -10314,14 +10314,21 @@ async fn handle_transient_dispatch_action(
     send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
 }
 
+struct AgentActionContext<'a> {
+    state: &'a crate::agent_api::AgentApiState,
+    caller: usize,
+    window_shares: &'a WindowShares,
+    workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+}
+
 async fn run_agent_action(
-    state: &crate::agent_api::AgentApiState,
+    context: AgentActionContext<'_>,
     requested_window_id: Option<WindowId>,
     action: AutomationAction,
-    window_shares: &WindowShares,
+    origin_session_id: Option<SessionId>,
 ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
-    let target_writer = {
-        let shares = window_shares.read().await;
+    let (target_window_id, target_writer) = {
+        let shares = context.window_shares.read().await;
         let target_window_id = if let Some(window_id) = requested_window_id {
             window_id
         } else {
@@ -10338,14 +10345,25 @@ async fn run_agent_action(
                 }
             }
         };
-        shares.get(&target_window_id).and_then(WindowShare::controller_writer).cloned().ok_or_else(
-            || scribe_common::agent::AgentError::NotFound {
+        let writer = shares
+            .get(&target_window_id)
+            .and_then(WindowShare::controller_writer)
+            .cloned()
+            .ok_or_else(|| scribe_common::agent::AgentError::NotFound {
                 message: format!("window {target_window_id} not connected"),
-            },
-        )?
+            })?;
+        (target_window_id, writer)
     };
 
-    state
+    let affected_session = {
+        let workspaces = context.workspace_manager.read().await;
+        affected_action_session(&workspaces, target_window_id, &action, origin_session_id)
+    };
+    let _activity = affected_session
+        .map(|session_id| context.state.activity().acquire(session_id, context.caller));
+
+    context
+        .state
         .run_correlated_action(
             action_client_key(&target_writer),
             action,
@@ -10353,6 +10371,20 @@ async fn run_agent_action(
             |message| async move { try_send_message(&target_writer, &message).await },
         )
         .await
+}
+
+fn affected_action_session(
+    workspace_manager: &WorkspaceManager,
+    target_window_id: WindowId,
+    action: &AutomationAction,
+    origin_session_id: Option<SessionId>,
+) -> Option<SessionId> {
+    let session_id = match action {
+        AutomationAction::FocusSession { session_id } => *session_id,
+        _ => origin_session_id?,
+    };
+    (workspace_manager.window_for_session(session_id) == Some(target_window_id))
+        .then_some(session_id)
 }
 
 /// Run the OS keystore preflight probe on behalf of the settings UI and
@@ -10415,9 +10447,17 @@ async fn handle_transient_agent_request(
     let world_workspaces = Arc::clone(&server.workspace_manager);
     let agent_api = server.agent_api.clone();
     let action_shares = Arc::clone(&server.window_shares);
+    let action_workspaces = Arc::clone(&server.workspace_manager);
+    let action_caller = action_client_key(writer);
+    let action_origin = match request {
+        scribe_common::agent::AgentRequest::DispatchAction { origin_session_id, .. } => {
+            *origin_session_id
+        }
+        _ => None,
+    };
     let dispatch = Box::pin(crate::agent_api::dispatch(
         &server.agent_api,
-        action_client_key(writer),
+        action_caller,
         request,
         crate::agent_api::DispatchSources {
             capture_world: move || async move {
@@ -10439,7 +10479,18 @@ async fn handle_transient_agent_request(
                 })
             },
             run_action: move |window_id, action| async move {
-                run_agent_action(&agent_api, window_id, action, &action_shares).await
+                run_agent_action(
+                    AgentActionContext {
+                        state: &agent_api,
+                        caller: action_caller,
+                        window_shares: &action_shares,
+                        workspace_manager: &action_workspaces,
+                    },
+                    window_id,
+                    action,
+                    action_origin,
+                )
+                .await
             },
         },
         prompt_writer.map(|prompt_client| {
@@ -15706,18 +15757,65 @@ mod tests {
         );
     }
 
-    async fn run_test_agent_action(
-        state: crate::agent_api::AgentApiState,
-        window_shares: WindowShares,
-    ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
-        run_agent_action(&state, None, AutomationAction::NewTab, &window_shares).await
+    fn action_workspaces(assignments: &[(WindowId, SessionId)]) -> Arc<RwLock<WorkspaceManager>> {
+        let mut manager = WorkspaceManager::new(Vec::new());
+        let workspace_id = manager.create_workspace();
+        for &(window_id, session_id) in assignments {
+            manager.add_session(workspace_id, session_id, None);
+            manager.assign_session_to_window(window_id, session_id);
+        }
+        Arc::new(RwLock::new(manager))
     }
 
-    #[tokio::test]
-    async fn agent_action_uses_the_only_window_and_reports_created_session() {
-        let state = crate::agent_api::AgentApiState::default();
+    struct TestAgentActionContext {
+        state: crate::agent_api::AgentApiState,
+        window_shares: WindowShares,
+        workspace_manager: Arc<RwLock<WorkspaceManager>>,
+        caller: usize,
+    }
+
+    async fn run_test_agent_action(
+        context: TestAgentActionContext,
+        action: AutomationAction,
+        origin_session_id: Option<SessionId>,
+    ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
+        run_agent_action(
+            AgentActionContext {
+                state: &context.state,
+                caller: context.caller,
+                window_shares: &context.window_shares,
+                workspace_manager: &context.workspace_manager,
+            },
+            None,
+            action,
+            origin_session_id,
+        )
+        .await
+    }
+
+    async fn read_correlated_action(
+        client: &mut tokio::net::UnixStream,
+    ) -> (u64, AutomationAction) {
+        match read_message(client).await.unwrap() {
+            ServerMessage::RunActionCorrelated { correlation_id, action } => {
+                (correlation_id, action)
+            }
+            message => panic!("expected correlated action, got {message:?}"),
+        }
+    }
+
+    // @lat: [[test#Test Harness#Agent API action activity]]
+    #[tokio::test(start_paused = true)]
+    async fn agent_action_activity_spans_correlated_completion_and_overlapping_leases() {
+        let state = crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+            activity_dwell_ms: 37,
+            ..scribe_common::config::AgentApiConfig::default()
+        });
+        let mut transitions = state.take_activity_transitions().unwrap();
         let window_shares = new_window_shares();
         let window_id = WindowId::new();
+        let origin = SessionId::new();
+        let workspaces = action_workspaces(&[(window_id, origin)]);
         let (target_server, mut target_client) = unix_stream_pair();
         let (_target_read, target_write) = tokio::io::split(target_server);
         let target_writer: SharedWriter = test_shared_writer(target_write);
@@ -15725,14 +15823,24 @@ mod tests {
             window_id,
             WindowShare::new_single_controller(Participant::local(&target_writer, false)),
         );
-        let run = tokio::spawn(run_test_agent_action(state.clone(), Arc::clone(&window_shares)));
+        let run = tokio::spawn(run_test_agent_action(
+            TestAgentActionContext {
+                state: state.clone(),
+                window_shares: Arc::clone(&window_shares),
+                workspace_manager: workspaces,
+                caller: 41,
+            },
+            AutomationAction::NewTab,
+            Some(origin),
+        ));
 
-        let ServerMessage::RunActionCorrelated { correlation_id, action } =
-            read_message(&mut target_client).await.unwrap()
-        else {
-            panic!("expected correlated action");
-        };
+        assert_eq!(transitions.recv().await, Some((origin, true)));
+        let (correlation_id, action) = read_correlated_action(&mut target_client).await;
         assert!(matches!(action, AutomationAction::NewTab));
+        assert!(!run.is_finished(), "activity must remain leased until completion");
+
+        let overlap = state.activity().acquire(origin, 42);
+        assert!(transitions.try_recv().is_err(), "overlap must not re-announce activity");
         let created_session_id = SessionId::new();
         assert!(state.complete_action(
             action_client_key(&target_writer),
@@ -15740,34 +15848,158 @@ mod tests {
             scribe_common::agent::AgentActionOutcome::Completed,
             Some(created_session_id),
         ));
-
         let result = run.await.unwrap().unwrap();
         assert_eq!(result.created_session_id, Some(created_session_id));
-        assert_eq!(result.outcome, scribe_common::agent::AgentActionOutcome::Completed);
+
+        tokio::time::advance(std::time::Duration::from_millis(37)).await;
+        tokio::task::yield_now().await;
+        assert!(transitions.try_recv().is_err(), "overlap keeps activity visible");
+        drop(overlap);
+        tokio::time::advance(std::time::Duration::from_millis(37)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(transitions.try_recv().ok(), Some((origin, false)));
     }
 
+    // @lat: [[test#Test Harness#Agent API action activity]]
     #[tokio::test]
-    async fn agent_action_without_exactly_one_window_is_ambiguous() {
+    async fn absent_stale_or_mismatched_action_origin_emits_no_activity() {
         let state = crate::agent_api::AgentApiState::default();
+        let mut transitions = state.take_activity_transitions().unwrap();
         let window_shares = new_window_shares();
+        let target_window = WindowId::new();
+        let other_window = WindowId::new();
+        let mismatched = SessionId::new();
+        let stale_origin = SessionId::new();
+        let workspaces = action_workspaces(&[(other_window, mismatched)]);
+        let (target_server, mut target_client) = unix_stream_pair();
+        let (_target_read, target_write) = tokio::io::split(target_server);
+        let target_writer: SharedWriter = test_shared_writer(target_write);
+        window_shares.write().await.insert(
+            target_window,
+            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
+        );
+
+        for (caller, origin) in [(51, None), (52, Some(stale_origin)), (53, Some(mismatched))] {
+            let run = tokio::spawn(run_test_agent_action(
+                TestAgentActionContext {
+                    state: state.clone(),
+                    window_shares: Arc::clone(&window_shares),
+                    workspace_manager: Arc::clone(&workspaces),
+                    caller,
+                },
+                AutomationAction::OpenFind,
+                origin,
+            ));
+            let (correlation_id, _) = read_correlated_action(&mut target_client).await;
+            assert!(state.complete_action(
+                action_client_key(&target_writer),
+                correlation_id,
+                scribe_common::agent::AgentActionOutcome::Completed,
+                None,
+            ));
+            run.await.unwrap().unwrap();
+            assert!(
+                transitions.try_recv().is_err(),
+                "absent, stale, or cross-window origin must not emit activity"
+            );
+        }
+    }
+
+    // @lat: [[test#Test Harness#Agent API action activity]]
+    #[tokio::test]
+    async fn focus_session_activity_uses_explicit_target_over_origin() {
+        let state = crate::agent_api::AgentApiState::default();
+        let mut transitions = state.take_activity_transitions().unwrap();
+        let window_shares = new_window_shares();
+        let target_window = WindowId::new();
+        let other_window = WindowId::new();
+        let focused = SessionId::new();
+        let mismatched = SessionId::new();
+        let workspaces = action_workspaces(&[(target_window, focused), (other_window, mismatched)]);
+        let (target_server, mut target_client) = unix_stream_pair();
+        let (_target_read, target_write) = tokio::io::split(target_server);
+        let target_writer: SharedWriter = test_shared_writer(target_write);
+        window_shares.write().await.insert(
+            target_window,
+            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
+        );
+        let run = tokio::spawn(run_test_agent_action(
+            TestAgentActionContext {
+                state: state.clone(),
+                window_shares: Arc::clone(&window_shares),
+                workspace_manager: workspaces,
+                caller: 61,
+            },
+            AutomationAction::FocusSession { session_id: focused },
+            Some(mismatched),
+        ));
+
+        assert_eq!(transitions.recv().await, Some((focused, true)));
+        let (correlation_id, _) = read_correlated_action(&mut target_client).await;
+        assert!(state.complete_action(
+            action_client_key(&target_writer),
+            correlation_id,
+            scribe_common::agent::AgentActionOutcome::Completed,
+            None,
+        ));
+        run.await.unwrap().unwrap();
+    }
+
+    // @lat: [[test#Test Harness#Agent API action activity]]
+    #[tokio::test]
+    async fn agent_action_without_exactly_one_window_is_ambiguous_without_activity() {
+        let state = crate::agent_api::AgentApiState::default();
+        let mut transitions = state.take_activity_transitions().unwrap();
+        let window_shares = new_window_shares();
+        let origin = SessionId::new();
+        let empty_workspaces = action_workspaces(&[]);
         assert!(matches!(
-            run_agent_action(&state, None, AutomationAction::OpenFind, &window_shares).await,
+            run_agent_action(
+                AgentActionContext {
+                    state: &state,
+                    caller: 1,
+                    window_shares: &window_shares,
+                    workspace_manager: &empty_workspaces,
+                },
+                None,
+                AutomationAction::OpenFind,
+                Some(origin),
+            )
+            .await,
             Err(scribe_common::agent::AgentError::AmbiguousTarget { .. })
         ));
 
+        let mut assignments = Vec::new();
         for _ in 0..2 {
             let (server, _client) = unix_stream_pair();
             let (_read, write) = tokio::io::split(server);
             let writer = test_shared_writer(write);
+            let window_id = WindowId::new();
             window_shares.write().await.insert(
-                WindowId::new(),
+                window_id,
                 WindowShare::new_single_controller(Participant::local(&writer, false)),
             );
+            assignments.push((window_id, origin));
         }
+        let mapped_workspaces = action_workspaces(&assignments[..1]);
         assert!(matches!(
-            run_agent_action(&state, None, AutomationAction::OpenFind, &window_shares).await,
+            run_agent_action(
+                AgentActionContext {
+                    state: &state,
+                    caller: 1,
+                    window_shares: &window_shares,
+                    workspace_manager: &mapped_workspaces,
+                },
+                None,
+                AutomationAction::OpenFind,
+                Some(origin),
+            )
+            .await,
             Err(scribe_common::agent::AgentError::AmbiguousTarget { .. })
         ));
+        assert!(transitions.try_recv().is_err(), "ambiguous actions must emit no activity");
     }
 
     #[tokio::test]

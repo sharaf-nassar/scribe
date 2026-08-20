@@ -122,6 +122,14 @@ Server unit tests capture dispatcher audit events as structured fields.
 
 A sentinel embedded in terminal content must be absent from the complete structured capture. `request_metadata_uses_only_supported_target_kinds` constrains every request variant's target kind to `server`, `window`, or `session`.
 
+## Agent API action activity
+
+Focused server tests cover action activity selection, lifetime, and refusal paths.
+
+An authorized action emits activity for a valid same-window origin before correlated execution, keeps its lease until completion, and cannot clear an overlapping read/write lease. Activity clears only after the final release plus configured dwell.
+
+Absent, stale, and cross-window origins emit no activity for window-targeted actions. `FocusSession` uses its explicit valid target instead of the origin. Direct and prompt denials never reach action dispatch or activity, and omitted targets with zero or multiple connected windows remain ambiguous without an activity transition.
+
 ## Architecture
 
 CLI binary (`scribe-test`) dispatches subcommands to a long-lived daemon that holds an open IPC connection to scribe-server and buffers per-session state.
