@@ -23,6 +23,9 @@ use tokio::sync::RwLock;
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
+type SessionRegistry<S> = Arc<RwLock<HashMap<SessionId, S>>>;
+type ShareRegistry<S> = Arc<RwLock<HashMap<WindowId, S>>>;
+
 /// Read-only view of one window share, implemented by `ipc_server`'s
 /// `WindowShare`. This is a nominal seam: the binary recompiles `ipc_server`
 /// as its own module tree while re-exporting THIS module from the library
@@ -122,9 +125,9 @@ impl Capture {
 /// transaction. The callback is defined by the transport owner so private
 /// `LiveSession` fields remain private to `ipc_server` while this module owns
 /// aggregation and DTO filtering.
-pub async fn capture<S, Share, Workspaces, CopySession, SessionState, ShareState>(
-    live_sessions: &Arc<RwLock<HashMap<SessionId, S, SessionState>>>,
-    window_shares: &Arc<RwLock<HashMap<WindowId, Share, ShareState>>>,
+pub async fn capture<S, Share, Workspaces, CopySession>(
+    live_sessions: &SessionRegistry<S>,
+    window_shares: &ShareRegistry<Share>,
     workspace_manager: &Arc<RwLock<Workspaces>>,
     copy_session: CopySession,
 ) -> Capture
@@ -132,8 +135,6 @@ where
     Share: ShareView,
     Workspaces: WorkspaceView,
     CopySession: Fn(SessionId, &S, Option<WindowId>) -> CapturedSession,
-    SessionState: std::hash::BuildHasher,
-    ShareState: std::hash::BuildHasher,
 {
     // Server order: live sessions before workspace manager. Window shares sit
     // between them so the final pair still matches ListWindows' shares ->

@@ -691,6 +691,7 @@ fn emit_audit(metadata: &RequestMetadata<'_>, decision: &'static str, response_b
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::future::{Ready, ready};
     use std::io::Read as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -934,6 +935,43 @@ mod tests {
         assert!(state.resolve_prompt(*prompt_id, ClipboardDecision::AllowOnce));
     }
 
+    type CaptureSource = fn() -> Ready<world::Capture>;
+    type LookupSource = fn(SessionId) -> Ready<Option<AgentSessionTarget>>;
+    type ActionSource =
+        fn(Option<WindowId>, AutomationAction) -> Ready<Result<AgentActionResult, AgentError>>;
+
+    fn session_sources<Lookup>(
+        lookup_session: Lookup,
+    ) -> DispatchSources<CaptureSource, Lookup, ActionSource> {
+        DispatchSources {
+            capture_world: || panic!("test request must not capture world registries"),
+            lookup_session,
+            run_action: |_, _| {
+                ready(Err(AgentError::Internal { message: "unexpected action".into() }))
+            },
+        }
+    }
+
+    fn action_sources<RunAction>(
+        run_action: RunAction,
+    ) -> DispatchSources<CaptureSource, LookupSource, RunAction> {
+        DispatchSources {
+            capture_world: || panic!("test request must not capture world registries"),
+            lookup_session: |_| ready(None),
+            run_action,
+        }
+    }
+
+    fn world_sources<CaptureWorld>(
+        capture_world: CaptureWorld,
+    ) -> DispatchSources<CaptureWorld, LookupSource, ActionSource> {
+        DispatchSources {
+            capture_world,
+            lookup_session: |_| panic!("test request must not look up terminal content"),
+            run_action: |_, _| panic!("test request must not run an action"),
+        }
+    }
+
     async fn dispatch_headless(
         state: &AgentApiState,
         request: &AgentRequest,
@@ -942,13 +980,7 @@ mod tests {
             state,
             0,
             request,
-            DispatchSources {
-                capture_world: || async { panic!("headless dispatch has no world registries") },
-                lookup_session: |_| async { None },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(|_| ready(None)),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await
@@ -1012,13 +1044,7 @@ mod tests {
             &state,
             0,
             &screen_request(8, session_id),
-            DispatchSources {
-                capture_world: || async { panic!("screen reads must not capture the world") },
-                lookup_session: move |_| async move { Some(target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(target) }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1048,13 +1074,7 @@ mod tests {
             &state,
             0,
             &screen_request(9, session_id),
-            DispatchSources {
-                capture_world: || async { panic!("screen reads must not capture the world") },
-                lookup_session: move |_| async move { Some(target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(target) }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1103,13 +1123,7 @@ mod tests {
             &AgentApiState::default(),
             0,
             &request,
-            DispatchSources {
-                capture_world: || async { panic!("denied read must not capture the world") },
-                lookup_session: |_| async {
-                    panic!("denied read must not look up terminal content")
-                },
-                run_action: |_, _| async { panic!("denied read must not run an action") },
-            },
+            world_sources(|| async { panic!("denied read must not capture world registries") }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1142,16 +1156,10 @@ mod tests {
             &state,
             0,
             &write_request(20, session_id, "éé", false),
-            DispatchSources {
-                capture_world: || async { panic!("writes must not capture the world") },
-                lookup_session: move |_| async move {
-                    lookup_called.store(true, Ordering::Relaxed);
-                    None
-                },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move {
+                lookup_called.store(true, Ordering::Relaxed);
+                None
+            }),
             Some(move |_| async move {
                 prompts.fetch_add(1, Ordering::Relaxed);
                 panic!("oversized input must not prompt");
@@ -1179,13 +1187,7 @@ mod tests {
             &state,
             0,
             &write_request(21, session_id, "hé", true),
-            DispatchSources {
-                capture_world: || async { panic!("writes must not capture the world") },
-                lookup_session: move |_| async move { Some(target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(target) }),
             Some(move |message| async move {
                 prompts.fetch_add(1, Ordering::Relaxed);
                 allow_prompt(&resolver, &message, AgentCapability::WriteInput);
@@ -1209,13 +1211,7 @@ mod tests {
             &state,
             0,
             &write_request(22, session_id, "plain", false),
-            DispatchSources {
-                capture_world: || async { panic!("writes must not capture the world") },
-                lookup_session: move |_| async move { Some(target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(target) }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1247,13 +1243,7 @@ mod tests {
             &state,
             0,
             &write_request(24, session_id, "fail", true),
-            DispatchSources {
-                capture_world: || async { panic!("writes must not capture the world") },
-                lookup_session: move |_| async move { Some(target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(target) }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1340,13 +1330,7 @@ mod tests {
                 &state,
                 0,
                 request,
-                DispatchSources {
-                    capture_world: || self.capture(),
-                    lookup_session: |_| async {
-                        panic!("world routing must not look up terminal content")
-                    },
-                    run_action: |_, _| async { panic!("world routing must not run an action") },
-                },
+                world_sources(|| self.capture()),
                 None::<fn(ServerMessage) -> std::future::Ready<()>>,
             )
             .await
@@ -1399,13 +1383,7 @@ mod tests {
             &AgentApiState::default(),
             0,
             &world_request(34, None),
-            DispatchSources {
-                capture_world: || async { panic!("denied world must not capture registries") },
-                lookup_session: |_| async {
-                    panic!("denied world must not look up terminal content")
-                },
-                run_action: |_, _| async { panic!("denied world must not run an action") },
-            },
+            world_sources(|| async { panic!("denied world must not capture registries") }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1486,19 +1464,15 @@ mod tests {
             &state,
             0,
             &request,
-            DispatchSources {
-                capture_world: || async { panic!("actions must not capture the world") },
-                lookup_session: |_| async { None },
-                run_action: move |target, action| async move {
-                    assert_eq!(target, Some(window_id));
-                    assert!(matches!(action, AutomationAction::NewTab));
-                    Ok(AgentActionResult {
-                        action,
-                        outcome: AgentActionOutcome::Completed,
-                        created_session_id: Some(created_session_id),
-                    })
-                },
-            },
+            action_sources(move |target, action| async move {
+                assert_eq!(target, Some(window_id));
+                assert!(matches!(action, AutomationAction::NewTab));
+                Ok(AgentActionResult {
+                    action,
+                    outcome: AgentActionOutcome::Completed,
+                    created_session_id: Some(created_session_id),
+                })
+            }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1524,13 +1498,9 @@ mod tests {
             &denied_state,
             0,
             &denied,
-            DispatchSources {
-                capture_world: || async { panic!("denied action must not capture the world") },
-                lookup_session: |_| async { None },
-                run_action: |_, _| async {
-                    panic!("destructive action used the benign capability")
-                },
-            },
+            action_sources(|_, _| async {
+                panic!("destructive action used the benign capability")
+            }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -1547,11 +1517,7 @@ mod tests {
             &state,
             0,
             &action_request(16, AutomationAction::OpenUpdateDialog, None),
-            DispatchSources {
-                capture_world: || async { panic!("denied action must not capture the world") },
-                lookup_session: |_| async { None },
-                run_action: |_, _| async { panic!("prompt-denied action reached dispatch") },
-            },
+            action_sources(|_, _| async { panic!("prompt-denied action reached dispatch") }),
             Some(move |message| async move {
                 deny_destructive_prompt(&resolver, &message);
             }),
@@ -1751,13 +1717,7 @@ mod tests {
             &state,
             0,
             &screen_request_for("prompted-agent", 22, session_id),
-            DispatchSources {
-                capture_world: || async { panic!("denied prompt must not capture the world") },
-                lookup_session: |_| async {
-                    panic!("denied prompt must not look up terminal content")
-                },
-                run_action: |_, _| async { panic!("denied prompt must not run an action") },
-            },
+            world_sources(|| async { panic!("denied prompt must not capture world registries") }),
             Some(move |message| {
                 deny_agent_prompt(&resolver, &message);
                 std::future::ready(())
@@ -1787,13 +1747,7 @@ mod tests {
             &allowed_state,
             0,
             &allowed_request,
-            DispatchSources {
-                capture_world: || async { panic!("screen reads must not capture the world") },
-                lookup_session: move |_| async move { Some(allowed_target) },
-                run_action: |_, _| async {
-                    Err(AgentError::Internal { message: "unexpected action".into() })
-                },
-            },
+            session_sources(move |_| async move { Some(allowed_target) }),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;

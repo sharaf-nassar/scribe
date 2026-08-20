@@ -10422,12 +10422,15 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
 /// Stable window ordering keeps concurrent callers from spraying the same
 /// prompt across several windows; the policy engine correlates the reply.
 async fn first_local_agent_api_writer(window_shares: &WindowShares) -> Option<SharedWriter> {
-    let shares = window_shares.read().await;
-    let mut windows = shares.keys().copied().collect::<Vec<_>>();
-    windows.sort_unstable_by_key(|window_id| window_id.to_full_string());
-    windows
-        .into_iter()
-        .find_map(|window_id| shares.get(&window_id).and_then(WindowShare::local_agent_api_writer))
+    window_shares
+        .read()
+        .await
+        .iter()
+        .filter_map(|(window_id, share)| {
+            share.local_agent_api_writer().map(|writer| (window_id, writer))
+        })
+        .min_by_key(|(window_id, _)| window_id.to_full_string())
+        .map(|(_, writer)| writer)
 }
 
 /// Spec 027 transient one-shot: route an `AgentRequest` through the agent

@@ -122,7 +122,8 @@ struct TabClose<'a> {
 
 struct TabChildren {
     display: String,
-    indicators: Vec<AnyElement>,
+    agent_indicator: Option<AnyElement>,
+    ai_indicator: Option<AnyElement>,
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
     underline: Option<AnyElement>,
@@ -608,15 +609,10 @@ impl TitlebarView {
         let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
         let available = title_columns(suffix_len, tab);
         let (display, _truncated) = tab_display_title(&tab.title, available);
-        let indicators = [
-            tab.agent_active.then(|| agent_active_glyph(self.colors.accent)),
-            tab.ai_indicator.map(|color| {
-                div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element()
-            }),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let agent_indicator = tab.agent_active.then(|| agent_active_glyph(self.colors.accent));
+        let ai_indicator = tab
+            .ai_indicator
+            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
@@ -646,7 +642,7 @@ impl TitlebarView {
                     .map_or(self.colors.accent, |accent| accent_tab_tone(accent, self.colors.bg)))
                 .into_any_element()
         });
-        TabChildren { display, indicators, suffix, close, underline }
+        TabChildren { display, agent_indicator, ai_indicator, suffix, close, underline }
     }
 
     fn render_tab(
@@ -656,8 +652,7 @@ impl TitlebarView {
         focused_window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_hovered = self.hovered_tab == Some(index);
-        let base_bg = self.tab_base_bg(tab, is_hovered);
+        let base_bg = self.tab_base_bg(tab, self.hovered_tab == Some(index));
         let bg = flash_blend(base_bg, self.colors.accent, tab.tab_flash);
         let fg = if tab.is_active { self.colors.active_text } else { self.colors.text };
         let tab_id = ElementId::from(tab.accessibility_id.clone());
@@ -708,7 +703,8 @@ impl TitlebarView {
             tab_el = tab_el.left(px(dx));
         }
         let tab_el = tab_el
-            .children(children.indicators)
+            .children(children.agent_indicator)
+            .children(children.ai_indicator)
             // `truncate` keeps the title a single clipped line; without it a
             // title that outgrows the flexed slot (the AI dot appearing, a
             // narrow group bar) wraps to a second line inside the fixed-height
@@ -1135,7 +1131,8 @@ mod tests {
                 },
                 cx,
             );
-            assert_eq!(children.indicators.len(), 2);
+            assert!(children.agent_indicator.is_some());
+            assert!(children.ai_indicator.is_some());
         });
     }
 
