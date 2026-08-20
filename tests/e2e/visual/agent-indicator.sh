@@ -3,34 +3,23 @@
 # @lat: [[test#Test Harness#Visual E2E Tests]]
 set -euo pipefail
 
-fail() {
-    echo "FAIL: $*" >&2
-    tail -40 "${SCRIBE_CLIENT_LOG:-/output/client.log}" 2>/dev/null >&2 || true
-    exit 1
-}
+# shellcheck source=tests/e2e/visual/agent-visual-common.bash
+. /tests/visual/agent-visual-common.bash
 
 [ "${SCRIBE_SHARED_PANE:-0}" = "1" ] \
     || fail "agent indicator requires the shared-pane visual harness"
 command -v scribe >/dev/null 2>&1 || fail "scribe CLI is absent from the visual harness"
 
-WID=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
-[ -n "$WID" ] || WID=$(xdotool search --name '[Ss]cribe' 2>/dev/null | tail -1)
+WID=$(find_scribe_window)
 [ -n "$WID" ] || fail "no Scribe window"
-xdotool windowactivate --sync "$WID" 2>/dev/null \
-    || xdotool windowfocus --sync "$WID" 2>/dev/null || true
+focus_scribe_window "$WID"
 sleep 1
 
 capture_tab() {
     local name="$1"
-    import -window "$WID" +repage "/output/agent-indicator-$name.png"
+    shot "/output/agent-indicator-$name.png"
     convert "/output/agent-indicator-$name.png" -crop 400x34+0+0 +repage \
         "/output/agent-indicator-tab-$name.png"
-}
-
-delta() {
-    local changed
-    changed=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
-    printf '%s' "${changed%%.*}"
 }
 
 capture_tab before

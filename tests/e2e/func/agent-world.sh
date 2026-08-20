@@ -3,26 +3,18 @@
 # @lat: [[test#Test Harness#E2E Functional Tests]]
 set -euo pipefail
 
-fail() {
-    echo "FAIL: $*" >&2
-    exit 1
-}
+# shellcheck source=tests/e2e/func/agent-common.bash
+. /tests/func/agent-common.bash
 
-scribe-test daemon stop >/dev/null 2>&1 || true
-scribe-test server stop >/dev/null 2>&1 || true
-cat >"$HOME/.config/scribe/config.toml" <<'TOML'
-[agent_api]
-read_metadata = "allow"
-TOML
-scribe-test server start
-scribe-test daemon start
+restart_with_agent_config '[agent_api]
+read_metadata = "allow"'
 
 CALLER=$(scribe-test session create)
 SIBLING=$(scribe-test session create)
 
 run_inside_caller() {
     local command="$1" output="$2" label="$3"
-    scribe-test send "$CALLER" "RUST_LOG=off scribe agent --agent agent-world-e2e $command > '$output' 2> '${output%.json}.stderr'; status=\$?; printf '$label:%s\\n' \"\$status\"\n"
+    send_agent_cli "$CALLER" agent-world-e2e "$command" "$output" "$label"
     scribe-test wait-output "$CALLER" "$label:0"
 }
 

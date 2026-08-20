@@ -3,12 +3,9 @@
 # @lat: [[test#Test Harness#E2E Functional Tests]]
 set -euo pipefail
 
-fail() {
-    echo "FAIL: $*" >&2
-    exit 1
-}
+# shellcheck source=tests/e2e/func/agent-common.bash
+. /tests/func/agent-common.bash
 
-CONFIG_FILE="$HOME/.config/scribe/config.toml"
 PAYLOAD_BYTES=65536
 READY=/output/agent-write-ready
 GATE=/output/agent-write-gate
@@ -17,15 +14,9 @@ ACK=/output/agent-write-ack.json
 STATUS=/output/agent-write-status
 rm -f "$READY" "$GATE" "$LANDED" "$ACK" "$STATUS"
 
-scribe-test daemon stop >/dev/null 2>&1 || true
-scribe-test server stop >/dev/null 2>&1 || true
-cat >"$CONFIG_FILE" <<TOML
-[agent_api]
-write_input = "allow"
-max_input_bytes = $PAYLOAD_BYTES
-TOML
-scribe-test server start
-scribe-test daemon start
+restart_with_agent_config "[agent_api]
+write_input = \"allow\"
+max_input_bytes = $PAYLOAD_BYTES"
 
 CALLER=$(scribe-test session create)
 TARGET=$(scribe-test session create)

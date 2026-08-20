@@ -3,24 +3,19 @@
 # @lat: [[test#Test Harness#Visual E2E Tests]]
 set -euo pipefail
 
-CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
-
-fail() {
-    echo "FAIL: $*" >&2
-    tail -50 "$CLIENT_LOG" 2>/dev/null >&2 || true
-    exit 1
-}
+# shellcheck source=tests/e2e/visual/agent-visual-common.bash
+. /tests/visual/agent-visual-common.bash
 
 [ "${SCRIBE_SHARED_PANE:-0}" = "1" ] \
     || fail "agent consent requires the shared-pane visual harness"
 command -v scribe >/dev/null 2>&1 || fail "scribe CLI is absent from the visual harness"
 
-WID=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
-[ -n "$WID" ] || WID=$(xdotool search --name '[Ss]cribe' 2>/dev/null | tail -1)
+WID=$(find_scribe_window)
 [ -n "$WID" ] || fail "no Scribe window"
-xdotool windowactivate --sync "$WID" 2>/dev/null \
-    || xdotool windowfocus --sync "$WID" 2>/dev/null || true
+focus_scribe_window "$WID"
 
+# The dialog paint can lag the just-raised window, so retry the capture
+# briefly instead of racing it with the shared plain shot.
 shot() {
     local path="$1"
     for _ in {1..20}; do
@@ -58,9 +53,7 @@ done
 DIALOG_DELTA=0
 for _ in {1..20}; do
     shot /output/agent-consent-dialog.png
-    DIALOG_DELTA=$(compare -metric AE \
-        /output/agent-consent-before.png /output/agent-consent-dialog.png null: 2>&1 || true)
-    DIALOG_DELTA=${DIALOG_DELTA%%.*}
+    DIALOG_DELTA=$(delta /output/agent-consent-before.png /output/agent-consent-dialog.png)
     [ "${DIALOG_DELTA:-0}" -ge 500 ] && break
     sleep 0.05
 done

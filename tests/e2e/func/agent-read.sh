@@ -3,28 +3,18 @@
 # @lat: [[test#Test Harness#E2E Functional Tests]]
 set -euo pipefail
 
-CONFIG_FILE="$HOME/.config/scribe/config.toml"
-
-fail() {
-    echo "FAIL: $*" >&2
-    exit 1
-}
+# shellcheck source=tests/e2e/func/agent-common.bash
+. /tests/func/agent-common.bash
 
 restart_with_read_policy() {
     local mode="$1"
-    scribe-test daemon stop >/dev/null 2>&1 || true
-    scribe-test server stop >/dev/null 2>&1 || true
-    cat >"$CONFIG_FILE" <<TOML
-[agent_api]
-read_content = "$mode"
-TOML
-    scribe-test server start
-    scribe-test daemon start
+    restart_with_agent_config "[agent_api]
+read_content = \"$mode\""
 }
 
 run_read_inside_pane() {
     local caller="$1" target="$2" output="$3" status_label="$4"
-    scribe-test send "$caller" "RUST_LOG=off scribe agent --agent agent-read-e2e read '$target' > '$output' 2> '${output%.json}.stderr'; status=\$?; printf '$status_label:%s\\n' \"\$status\"\n"
+    send_agent_cli "$caller" agent-read-e2e "read '$target'" "$output" "$status_label"
 }
 
 # Default-safe denial runs from a real Scribe pane and discloses no screen body.

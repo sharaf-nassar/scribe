@@ -9,33 +9,12 @@
 # Requires the shared-pane visual rig (`SCRIBE_SHARED_PANE=1`).
 set -e
 
+# shellcheck source=tests/e2e/visual/agent-visual-common.bash
+. /tests/visual/agent-visual-common.bash
+
 HOOK_SOCK="${SCRIBE_RUNTIME_DIR:-/run/user/$(id -u)/scribe}/server.sock"
 CONFIG_FILE="${XDG_CONFIG_HOME:?the entrypoint must export XDG_CONFIG_HOME}/scribe/config.toml"
-CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 DELTA_MIN="${AI_INDICATOR_DELTA_MIN:-60}"
-
-fail() {
-    echo "FAIL: $1" >&2
-    tail -40 "${SCRIBE_CLIENT_LOG:-/output/client.log}" 2>/dev/null >&2 || true
-    exit 1
-}
-
-find_window() {
-    local wid
-    wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
-    [ -z "$wid" ] && wid=$(xdotool search --name '[Ss]cribe' 2>/dev/null | tail -1)
-    printf '%s' "$wid"
-}
-
-shot() {
-    import -window "$WID" +repage "$1"
-}
-
-delta() {
-    local changed
-    changed=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
-    printf '%s' "${changed%%.*}"
-}
 
 magenta_pixels() {
     convert "$1" -alpha off \
@@ -43,10 +22,9 @@ magenta_pixels() {
         -format '%[fx:mean*w*h]' info: | tail -1
 }
 
-WID=$(find_window)
+WID=$(find_scribe_window)
 [ -n "$WID" ] || fail "no Scribe window"
-xdotool windowactivate --sync "$WID" 2>/dev/null \
-    || xdotool windowfocus --sync "$WID" 2>/dev/null || true
+focus_scribe_window "$WID"
 sleep 0.5
 
 shot /output/ai-indicator-00-before.png
