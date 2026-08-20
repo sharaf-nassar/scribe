@@ -31,9 +31,16 @@ Two independent causes with the same signature.
 
 `pi-subagents` applies a 30-minute default timeout when the spawn does not set
 `timeoutMs`. That is far below what this repo's visual acceptance criteria
-need: `just docker-visual` builds release binaries and bakes a ~4 GB image, and
-only then can `just e2e-visual-<name>` run. A worker whose bead requires a
-visual e2e cannot finish inside 30 minutes on a cold worktree.
+need *when the bead changes a binary*: `just docker-visual` builds release
+binaries and bakes a ~4 GB image, and only then can `just e2e-visual-<name>`
+run. A worker whose bead requires a visual e2e over changed binaries cannot
+finish inside 30 minutes on a cold worktree.
+
+That qualifier matters: the recipes bind-mount `tests/e2e`, so a bead that
+changes only shell under `tests/e2e` runs its real recipes against the existing
+images with no rebuild at all. See
+`../environment/e2e-recipes-mount-tests-so-shell-only-changes-skip-the-image-build.md`.
+Split the two cases before choosing a budget.
 
 Separately, a worker that blocks on `contact_supervisor` can be detached by the
 harness at the round-trip and never resumed, ending the run with the same
