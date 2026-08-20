@@ -25,7 +25,7 @@ use scribe_common::agent::{
     AgentScreenText,
 };
 use scribe_common::config::AgentApiConfig;
-use scribe_common::ids::SessionId;
+use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::protocol::{AutomationAction, ServerMessage};
 use scribe_pty::event_listener::ScribeEventListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -321,20 +321,23 @@ impl<'a> From<&'a AgentRequest> for RequestMetadata<'a> {
 /// Policy evaluation deliberately precedes target lookup. Prompt-mode calls
 /// park here until a capable local client answers, so no handler can
 /// accidentally treat `Prompt` as `Allow`.
-pub async fn dispatch<Lookup, LookupFuture, SendPrompt, PromptFuture>(
+pub async fn dispatch<Lookup, LookupFuture, RunAction, RunActionFuture, SendPrompt, PromptFuture>(
     state: &AgentApiState,
     caller: usize,
     request: &AgentRequest,
-    lookup_screen: Lookup,
+    handlers: (Lookup, RunAction),
     prompt_sender: Option<SendPrompt>,
 ) -> AgentDispatch
 where
     Lookup: FnOnce(SessionId) -> LookupFuture,
     LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    RunAction: FnOnce(Option<WindowId>, AutomationAction) -> RunActionFuture,
+    RunActionFuture: Future<Output = Result<AgentActionResult, AgentError>>,
     SendPrompt: FnOnce(ServerMessage) -> PromptFuture,
     PromptFuture: Future<Output = ()>,
 {
     let metadata = RequestMetadata::from(request);
+    let (lookup_screen, run_action) = handlers;
     let (result, permit, activity) = match state.try_acquire() {
         Err(error) => (Err(error), None, None),
         Ok(permit) => {
@@ -345,7 +348,7 @@ where
             {
                 (Err(error), None)
             } else {
-                route_authorized_request(state, caller, request, lookup_screen).await
+                route_authorized_request(state, caller, request, lookup_screen, run_action).await
             };
             (result, Some(permit), activity)
         }
@@ -437,24 +440,41 @@ pub struct ScreenReadTarget {
 }
 
 /// Handler-routing seam. Unimplemented capability variants stay default-safe.
-async fn route_authorized_request<Lookup, LookupFuture>(
+async fn route_authorized_request<Lookup, LookupFuture, RunAction, RunActionFuture>(
     state: &AgentApiState,
     caller: usize,
     request: &AgentRequest,
     lookup_screen: Lookup,
+    run_action: RunAction,
 ) -> (Result<AgentPayload, AgentError>, Option<AgentActivityLease>)
 where
     Lookup: FnOnce(SessionId) -> LookupFuture,
     LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    RunAction: FnOnce(Option<WindowId>, AutomationAction) -> RunActionFuture,
+    RunActionFuture: Future<Output = Result<AgentActionResult, AgentError>>,
 {
-    let AgentRequest::ReadScreen { session_id, scrollback_lines, .. } = request else {
-        return (Err(denied()), None);
-    };
-    match read_screen(state, caller, *session_id, scrollback_lines.unwrap_or(0), lookup_screen)
-        .await
-    {
-        Ok((payload, activity)) => (Ok(payload), Some(activity)),
-        Err(error) => (Err(error), None),
+    match request {
+        AgentRequest::ReadScreen { session_id, scrollback_lines, .. } => {
+            match read_screen(
+                state,
+                caller,
+                *session_id,
+                scrollback_lines.unwrap_or(0),
+                lookup_screen,
+            )
+            .await
+            {
+                Ok((payload, activity)) => (Ok(payload), Some(activity)),
+                Err(error) => (Err(error), None),
+            }
+        }
+        AgentRequest::DispatchAction { action, window, .. } => (
+            run_action(*window, action.clone())
+                .await
+                .map(|result| AgentPayload::DispatchAction { result }),
+            None,
+        ),
+        _ => (Err(denied()), None),
     }
 }
 
@@ -556,12 +576,12 @@ mod tests {
     use alacritty_terminal::Term;
     use alacritty_terminal::grid::Dimensions;
     use scribe_common::agent::{
-        AGENT_SURFACE_VERSION, AgentActionOutcome, AgentCapability, AgentCapabilityStatus,
-        AgentError, AgentPayload, AgentPolicyMode, AgentRequest,
+        AGENT_SURFACE_VERSION, AgentActionOutcome, AgentActionResult, AgentCapability,
+        AgentCapabilityStatus, AgentError, AgentPayload, AgentPolicyMode, AgentRequest,
     };
     use scribe_common::config::AgentApiConfig;
     use scribe_common::framing::{read_message, write_message};
-    use scribe_common::ids::SessionId;
+    use scribe_common::ids::{SessionId, WindowId};
     use scribe_common::protocol::{
         AutomationAction, ClientMessage, ClipboardDecision, ServerMessage,
     };
@@ -605,6 +625,28 @@ mod tests {
         }
     }
 
+    fn action_request(
+        request_id: u64,
+        action: AutomationAction,
+        window: Option<WindowId>,
+    ) -> AgentRequest {
+        AgentRequest::DispatchAction {
+            request_id,
+            agent_label: "action-test".into(),
+            origin_session_id: None,
+            action,
+            window,
+        }
+    }
+
+    fn deny_destructive_prompt(state: &AgentApiState, message: &ServerMessage) {
+        let ServerMessage::AgentPromptRequest { prompt_id, capability, .. } = message else {
+            panic!("expected agent prompt");
+        };
+        assert_eq!(*capability, AgentCapability::DispatchDestructiveAction);
+        assert!(state.resolve_prompt(*prompt_id, ClipboardDecision::DenyOnce));
+    }
+
     struct TestDims {
         cols: usize,
         rows: usize,
@@ -645,7 +687,10 @@ mod tests {
             state,
             0,
             request,
-            |_| async { None },
+            (
+                |_| async { None },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await
@@ -709,7 +754,10 @@ mod tests {
             &state,
             0,
             &screen_request(8, session_id),
-            move |_| async move { Some(target) },
+            (
+                move |_| async move { Some(target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -743,7 +791,10 @@ mod tests {
             &state,
             0,
             &screen_request(9, session_id),
-            move |_| async move { Some(target) },
+            (
+                move |_| async move { Some(target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -762,7 +813,10 @@ mod tests {
             &AgentApiState::default(),
             0,
             &request,
-            |_| async { panic!("denied read must not look up terminal content") },
+            (
+                |_| async { panic!("denied read must not look up terminal content") },
+                |_, _| async { panic!("denied read must not run an action") },
+            ),
             None::<fn(ServerMessage) -> std::future::Ready<()>>,
         )
         .await;
@@ -838,6 +892,80 @@ mod tests {
             .await,
             Err(AgentError::Denied { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn action_dispatch_returns_the_correlated_completion() {
+        let state = AgentApiState::new(AgentApiConfig {
+            dispatch_action: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let window_id = WindowId::new();
+        let created_session_id = SessionId::new();
+        let request = action_request(14, AutomationAction::NewTab, Some(window_id));
+        let dispatched = dispatch(
+            &state,
+            0,
+            &request,
+            (
+                |_| async { None },
+                move |target, action| async move {
+                    assert_eq!(target, Some(window_id));
+                    assert!(matches!(action, AutomationAction::NewTab));
+                    Ok(AgentActionResult {
+                        action,
+                        outcome: AgentActionOutcome::Completed,
+                        created_session_id: Some(created_session_id),
+                    })
+                },
+            ),
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+
+        assert!(matches!(
+            &dispatched.response().result,
+            Ok(AgentPayload::DispatchAction { result })
+                if result.created_session_id == Some(created_session_id)
+                    && result.outcome == AgentActionOutcome::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn denied_and_prompt_denied_actions_never_reach_dispatch() {
+        let denied = action_request(15, AutomationAction::ClosePane, None);
+        let denied_response = dispatch(
+            &AgentApiState::new(AgentApiConfig {
+                dispatch_action: AgentPolicyMode::Allow,
+                ..AgentApiConfig::default()
+            }),
+            0,
+            &denied,
+            (
+                |_| async { None },
+                |_, _| async { panic!("destructive action used the benign capability") },
+            ),
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        assert!(matches!(denied_response.response().result, Err(AgentError::Denied { .. })));
+
+        let state = AgentApiState::new(AgentApiConfig {
+            dispatch_destructive_action: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+        let resolver = state.clone();
+        let prompt_response = dispatch(
+            &state,
+            0,
+            &action_request(16, AutomationAction::OpenUpdateDialog, None),
+            (|_| async { None }, |_, _| async { panic!("prompt-denied action reached dispatch") }),
+            Some(move |message| async move {
+                deny_destructive_prompt(&resolver, &message);
+            }),
+        )
+        .await;
+        assert!(matches!(prompt_response.response().result, Err(AgentError::Denied { .. })));
     }
 
     fn capability_mode(

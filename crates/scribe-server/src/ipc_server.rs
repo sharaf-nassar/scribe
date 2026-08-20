@@ -130,6 +130,8 @@ const LOCAL_PENDING_CAP: usize = 64;
 /// the first frame stay untimed — an idle window is legitimate — and remote
 /// connections keep their own [`REMOTE_IDLE_READ_TIMEOUT`].
 const LOCAL_PRE_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound a one-shot agent call if the foreground client never reports action completion.
+const AGENT_ACTION_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Maximum number of session IDs in a single `Subscribe` message. Prevents
 /// a client from holding the workspace write-lock in a tight loop.
@@ -5233,18 +5235,27 @@ async fn establish_local_first_frame(
         ClientMessage::AgentRequest(request) => {
             let prompt_writer = first_local_agent_api_writer(&server.window_shares).await;
             let live_sessions = Arc::clone(&server.live_sessions);
+            let agent_api = server.agent_api.clone();
+            let window_shares = Arc::clone(&server.window_shares);
             let dispatch = Box::pin(crate::agent_api::dispatch(
                 &server.agent_api,
                 action_client_key(writer),
                 &request,
-                move |session_id| async move {
-                    let sessions = live_sessions.read().await;
-                    sessions.get(&session_id).map(|session| crate::agent_api::ScreenReadTarget {
-                        term: Arc::clone(&session.term),
-                        title: session.title.clone(),
-                        cwd: session.cwd.clone(),
-                    })
-                },
+                (
+                    move |session_id| async move {
+                        let sessions = live_sessions.read().await;
+                        sessions.get(&session_id).map(|session| {
+                            crate::agent_api::ScreenReadTarget {
+                                term: Arc::clone(&session.term),
+                                title: session.title.clone(),
+                                cwd: session.cwd.clone(),
+                            }
+                        })
+                    },
+                    move |window_id, action| async move {
+                        run_agent_action(&agent_api, window_id, action, &window_shares).await
+                    },
+                ),
                 prompt_writer.map(|prompt_client| {
                     move |message| async move { send_message(&prompt_client, &message).await }
                 }),
@@ -10315,6 +10326,47 @@ async fn handle_transient_dispatch_action(
     }
 
     send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
+}
+
+async fn run_agent_action(
+    state: &crate::agent_api::AgentApiState,
+    requested_window_id: Option<WindowId>,
+    action: AutomationAction,
+    window_shares: &WindowShares,
+) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
+    let target_writer = {
+        let shares = window_shares.read().await;
+        let target_window_id = if let Some(window_id) = requested_window_id {
+            window_id
+        } else {
+            let mut window_ids = shares.keys().copied();
+            match (window_ids.next(), window_ids.next()) {
+                (Some(window_id), None) => window_id,
+                _ => {
+                    return Err(scribe_common::agent::AgentError::AmbiguousTarget {
+                        message: format!(
+                            "action target omitted with {} connected windows",
+                            shares.len()
+                        ),
+                    });
+                }
+            }
+        };
+        shares.get(&target_window_id).and_then(WindowShare::controller_writer).cloned().ok_or_else(
+            || scribe_common::agent::AgentError::NotFound {
+                message: format!("window {target_window_id} not connected"),
+            },
+        )?
+    };
+
+    state
+        .run_correlated_action(
+            action_client_key(&target_writer),
+            action,
+            AGENT_ACTION_COMPLETION_TIMEOUT,
+            |message| async move { try_send_message(&target_writer, &message).await },
+        )
+        .await
 }
 
 /// Run the OS keystore preflight probe on behalf of the settings UI and
@@ -15594,28 +15646,26 @@ mod tests {
         );
     }
 
-    async fn run_test_correlated_action(
+    async fn run_test_agent_action(
         state: crate::agent_api::AgentApiState,
-        target_writer: SharedWriter,
+        window_shares: WindowShares,
     ) -> Result<scribe_common::agent::AgentActionResult, scribe_common::agent::AgentError> {
-        state
-            .run_correlated_action(
-                action_client_key(&target_writer),
-                AutomationAction::NewTab,
-                std::time::Duration::from_secs(1),
-                |message| async move { try_send_message(&target_writer, &message).await },
-            )
-            .await
+        run_agent_action(&state, None, AutomationAction::NewTab, &window_shares).await
     }
 
     #[tokio::test]
-    async fn correlated_action_round_trip_reports_created_session() {
+    async fn agent_action_uses_the_only_window_and_reports_created_session() {
         let state = crate::agent_api::AgentApiState::default();
+        let window_shares = new_window_shares();
+        let window_id = WindowId::new();
         let (target_server, mut target_client) = unix_stream_pair();
         let (_target_read, target_write) = tokio::io::split(target_server);
         let target_writer: SharedWriter = test_shared_writer(target_write);
-        let run =
-            tokio::spawn(run_test_correlated_action(state.clone(), Arc::clone(&target_writer)));
+        window_shares.write().await.insert(
+            window_id,
+            WindowShare::new_single_controller(Participant::local(&target_writer, false)),
+        );
+        let run = tokio::spawn(run_test_agent_action(state.clone(), Arc::clone(&window_shares)));
 
         let ServerMessage::RunActionCorrelated { correlation_id, action } =
             read_message(&mut target_client).await.unwrap()
@@ -15634,6 +15684,30 @@ mod tests {
         let result = run.await.unwrap().unwrap();
         assert_eq!(result.created_session_id, Some(created_session_id));
         assert_eq!(result.outcome, scribe_common::agent::AgentActionOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn agent_action_without_exactly_one_window_is_ambiguous() {
+        let state = crate::agent_api::AgentApiState::default();
+        let window_shares = new_window_shares();
+        assert!(matches!(
+            run_agent_action(&state, None, AutomationAction::OpenFind, &window_shares).await,
+            Err(scribe_common::agent::AgentError::AmbiguousTarget { .. })
+        ));
+
+        for _ in 0..2 {
+            let (server, _client) = unix_stream_pair();
+            let (_read, write) = tokio::io::split(server);
+            let writer = test_shared_writer(write);
+            window_shares.write().await.insert(
+                WindowId::new(),
+                WindowShare::new_single_controller(Participant::local(&writer, false)),
+            );
+        }
+        assert!(matches!(
+            run_agent_action(&state, None, AutomationAction::OpenFind, &window_shares).await,
+            Err(scribe_common::agent::AgentError::AmbiguousTarget { .. })
+        ));
     }
 
     #[tokio::test]
