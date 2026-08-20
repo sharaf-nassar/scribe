@@ -4549,6 +4549,14 @@ The find row's previous/next/close controls exist so a pointer-only user reaches
 
 The test opens a real headless GPUI window ( inside a fixed-size `.relative()` mount standing in for the pane's `grid_slot`), seeds a two-match query, and draws the window so the control row is actually laid out and hit-testable. It then computes each control's on-screen center from the same named layout constants  uses — border width, row padding, control size, and the gap between controls — so the click coordinates cannot drift from the production geometry, and asserts `simulate_click` at the next/previous/close centers drives `current_index()` and `match_count()` through the identical transitions `next_match`/`prev_match`/`dismiss` produce, plus the same `Dismissed` event Escape emits. Run against the old two-row, keyboard-only box the click on the next control's computed position lands on the header row's own click-swallowing handler instead of any button, so `current_index()` never leaves `0` and the assertion fails cleanly.
 
+#### A click on the overlay swallows the paired release
+
+The overlay's mouse-down stop kept a click from reaching the grid's press handler; nothing kept the matching mouse-up from bubbling there instead (scribe-uu2y), leaking a release to a mouse-tracking application that never saw the press.
+
+The overlay paints inside the pane's own `grid_slot`, so the leaked release still resolves to a real cell and reaches [[crates/scribe-client/src/main.rs#TerminalView#forward_mouse_release]], which cannot tell a leaked release from one whose press it actually forwarded — a mouse-tracking application (vim, htop, tmux) would see a button go up it was never told went down.
+
+The test wraps the same `grid_slot`-shaped probe [[test#GPUI Client Headless Suites#Find overlay#Pointer controls drive the same transitions as the key table]] uses in an outer container standing in for the workspace's own press/release gate, recording every press and release that reaches it. A click on the box's plain chrome and on each of the three controls reaches neither handler, while a press-move-release gesture that starts and ends clear of the overlay still records both — proving the fix does not swallow a real in-grid drag. The box's own stop covers the whole row, so it alone is enough to pass this assertion; the control-level stop added alongside it (search.rs's `find_control`) only becomes load-bearing if the box's is ever scoped down, which is why the fix keeps both rather than relying on either alone.
+
 #### Only on-screen matches are highlighted
 
 The server reports absolute grid rows including negative scrollback rows, while this client paints the active viewport only; clamping an off-screen match onto a visible row would highlight text that does not match.

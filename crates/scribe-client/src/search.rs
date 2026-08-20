@@ -651,6 +651,12 @@ impl Render for FindOverlayView {
                     .border_color(colors.border)
                     .rounded(px(4.0))
                     .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    // A press swallowed here has no PTY-visible counterpart, so
+                    // the matching release must be swallowed too (scribe-uu2y):
+                    // otherwise it bubbles to the workspace's `release_over_grid`,
+                    // which reports it to a mouse-tracking application as a
+                    // release with no press.
+                    .on_mouse_up(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
                     .child(div().flex_none().text_sm().text_color(colors.border).child("/"))
                     .child(
                         div()
@@ -730,6 +736,11 @@ fn find_control(
         .hover(move |style| style.bg(hover_bg).text_color(bright))
         .focus_visible(move |style| style.bg(focus_bg).text_color(contrast))
         .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+        // Same pairing as the box's own stop above: `on_click`'s
+        // `stop_propagation` below only reaches this control's synthesized
+        // click listeners, not the raw mouse-up bubble, so the release needs
+        // its own stop (scribe-uu2y).
+        .on_mouse_up(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
         .on_key_down(|event: &KeyDownEvent, _, ctx| {
             if !event.keystroke.modifiers.modified()
                 && matches!(event.keystroke.key.as_str(), "enter" | "space")
@@ -835,11 +846,13 @@ mod tests {
 
 #[cfg(test)]
 mod overlay_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use gpui::{
-        AppContext as _, Context, Entity, Modifiers, Pixels, Point, Render, TestAppContext,
-        VisualTestContext, WindowHandle, WindowOptions, div, point, prelude::*, px,
+        AppContext as _, Context, Entity, Modifiers, MouseButton, Pixels, Point, Render,
+        TestAppContext, VisualTestContext, WindowHandle, WindowOptions, div, point, prelude::*, px,
     };
     use scribe_common::protocol::SearchMatch as ServerMatch;
     use scribe_common::theme::minimal_dark;
@@ -1120,5 +1133,100 @@ mod overlay_tests {
             vec![FindOverlayEvent::Dismissed],
             "clicking the close control did not emit the same Dismissed event Escape does"
         );
+    }
+
+    type ReportLog = Rc<RefCell<Vec<&'static str>>>;
+
+    /// Stands in for the workspace container's own gesture handlers
+    /// (`press_grid` / `release_over_grid`, wired to `forward_mouse_press` /
+    /// `forward_mouse_release` in `main.rs`), which sit above every pane's
+    /// `grid_slot` and forward a press or release to a mouse-tracking
+    /// application whenever one reaches them. Recording unconditionally
+    /// stands in for a focused pane whose application has tracking on — the
+    /// condition under which a leaked release (scribe-uu2y) becomes a real PTY
+    /// write.
+    struct MouseReportProbe {
+        overlay: Entity<FindOverlayView>,
+        reports: ReportLog,
+    }
+
+    impl Render for MouseReportProbe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let press_reports = Rc::clone(&self.reports);
+            let release_reports = Rc::clone(&self.reports);
+            // Same `grid_slot` shape as `FindOverlayProbe`, with the ancestor
+            // report gate wrapped around it instead of left off.
+            div()
+                .relative()
+                .w(CONTAINER_WIDTH)
+                .h(CONTAINER_HEIGHT)
+                .on_mouse_down(MouseButton::Left, move |_, _win, _ctx| {
+                    press_reports.borrow_mut().push("press");
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _win, _ctx| {
+                    release_reports.borrow_mut().push("release");
+                })
+                .child(self.overlay.clone())
+        }
+    }
+
+    fn mouse_report_window(cx: &mut TestAppContext) -> (WindowHandle<MouseReportProbe>, ReportLog) {
+        let colors = FindOverlayColors::from(&minimal_dark().chrome);
+        let reports: ReportLog = Rc::new(RefCell::new(Vec::new()));
+        let probe_reports = Rc::clone(&reports);
+        let window = cx
+            .update(|app| {
+                app.open_window(WindowOptions::default(), move |_window, app| {
+                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, ctx));
+                    app.new(|_| MouseReportProbe { overlay, reports: probe_reports })
+                })
+            })
+            .expect("open mouse-report probe window");
+        (window, reports)
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#A click on the overlay swallows the paired release]]
+    #[gpui::test]
+    fn overlay_click_swallows_press_and_release(cx: &mut TestAppContext) {
+        let (window, reports) = mouse_report_window(cx);
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw the mouse-report probe");
+        let mut test_window = VisualTestContext::from_window(window.into(), cx);
+
+        // A point on the box's own chrome, left of every control: the box's
+        // stop covers the whole row (`FindOverlayView::render`), not just its
+        // three pointer controls.
+        let border = px(1.0);
+        let box_left = CONTAINER_WIDTH - BOX_MARGIN_RIGHT - BOX_WIDTH;
+        let row_center_y = BOX_MARGIN_TOP + border + ROW_PAD_Y + CONTROL_SIZE * 0.5;
+        let box_chrome = point(box_left + ROW_PAD_X, row_center_y);
+
+        for target in [
+            box_chrome,
+            control_center(CONTAINER_WIDTH, 0),
+            control_center(CONTAINER_WIDTH, 1),
+            control_center(CONTAINER_WIDTH, 2),
+        ] {
+            test_window.simulate_click(target, Modifiers::default());
+        }
+        assert!(
+            reports.borrow().is_empty(),
+            "a click on the overlay leaked a mouse report to the workspace: {:?}",
+            reports.borrow()
+        );
+
+        // A real drag that starts and ends on the grid, clear of the overlay,
+        // still reports both halves: the fix must not swallow a gesture the
+        // overlay was never part of.
+        let drag_start = point(px(10.0), px(10.0));
+        let drag_end = point(px(50.0), px(90.0));
+        test_window.simulate_mouse_down(drag_start, MouseButton::Left, Modifiers::default());
+        test_window.simulate_mouse_move(drag_end, MouseButton::Left, Modifiers::default());
+        test_window.simulate_mouse_up(drag_end, MouseButton::Left, Modifiers::default());
+        assert_eq!(*reports.borrow(), vec!["press", "release"]);
     }
 }
