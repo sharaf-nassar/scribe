@@ -1,0 +1,3 @@
+[agent_api]
+read_content = "prompt"
+prompt_timeout_ms = 60000

@@ -174,7 +174,7 @@ docker-visual profile="release":
         debug) image="scribe-test-visual-debug" ;;
         *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
     esac
-    tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper
+    tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper scribe-cli
     docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
 
 # Add the official bd release binary to the visual image for the real read-slice proof.
@@ -303,6 +303,18 @@ e2e-github-actions-api-fixture func_image="scribe-test-func" visual_image="scrib
 # talking about the same pane.
 e2e-visual-shared script="visual/ai-indicator.sh":
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/{{ script }}
+
+# Prove the server-owned agent lease paints and clears the tab indicator.
+e2e-visual-agent-indicator:
+    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-indicator-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/agent-indicator.sh
+
+# Prove Prompt raises the Scribe consent modal and Escape denies the call.
+e2e-visual-agent-consent:
+    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-consent-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/agent-consent-dialog.sh
+
+# Correlated actions need the real GPUI foreground client, not the headless daemon.
+e2e-visual-agent-action: docker-visual
+    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-action-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/func/agent-action.sh
 
 # Run the feature-015 sharing/control E2E through the wire tap
 e2e-visual-share:
@@ -631,6 +643,11 @@ e2e: build-release docker-func
     #!/usr/bin/env bash
     set -euo pipefail
     scripts=(
+        func/agent-action.sh
+        func/agent-affordance.sh
+        func/agent-read.sh
+        func/agent-world.sh
+        func/agent-write.sh
         func/ai-context-thresholds.sh
         func/ai-launch-smoke.sh
         func/ai-shell-env-bash.sh
@@ -670,7 +687,9 @@ e2e: build-release docker-func
         exit 2
     fi
     for script in "${scripts[@]}"; do
-        if [[ "$script" == func/beads-board.sh ]]; then
+        if [[ "$script" == func/agent-action.sh ]]; then
+            just e2e-visual-agent-action
+        elif [[ "$script" == func/beads-board.sh ]]; then
             just e2e-func-beads-board
         elif [[ "$script" == func/pi-ai-lifecycle.sh ]]; then
             just e2e-func-pi-ai-lifecycle
@@ -687,6 +706,8 @@ e2e-all-visual: build-release docker-visual
     #!/usr/bin/env bash
     set -uo pipefail
     mappings=(
+        'visual/agent-consent-dialog.sh|e2e-visual-agent-consent'
+        'visual/agent-indicator.sh|e2e-visual-agent-indicator'
         'visual/ai-indicator.sh|e2e-visual-shared'
         'visual/ai-task-label.sh|e2e-visual-ai-task-label'
         'visual/beads-board.sh|e2e-visual-beads-board'

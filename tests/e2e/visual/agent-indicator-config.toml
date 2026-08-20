@@ -1,0 +1,3 @@
+[agent_api]
+read_content = "allow"
+activity_dwell_ms = 1500

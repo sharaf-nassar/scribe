@@ -132,6 +132,8 @@ ARG BIN_DIR=target/e2e-stage/release
 COPY ${BIN_DIR}/scribe-server /usr/local/bin/scribe-server
 COPY ${BIN_DIR}/scribe-client /usr/local/bin/scribe-client
 COPY ${BIN_DIR}/scribe-test /usr/local/bin/scribe-test
+COPY ${BIN_DIR}/scribe-cli /usr/local/bin/scribe
+COPY ${BIN_DIR}/scribe-cli /usr/local/bin/scribe-cli
 # The AI hook channel is the only way a provider event (task label, state,
 # context %) reaches the server, so a visual test that needs one drives the real
 # helper instead of hand-forging a frame.
@@ -142,6 +144,8 @@ RUN chmod +x /entrypoint.sh \
     /usr/local/bin/scribe-server \
     /usr/local/bin/scribe-client \
     /usr/local/bin/scribe-test \
+    /usr/local/bin/scribe \
+    /usr/local/bin/scribe-cli \
     /usr/local/bin/scribe-hook-helper
 
 RUN mkdir -p /output
