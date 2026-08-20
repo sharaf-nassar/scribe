@@ -1,12 +1,9 @@
-use std::fmt::Write as _;
 use std::future;
 use std::hint::black_box;
 use std::io::{self, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::ExitCode;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -77,21 +74,10 @@ struct BenchmarkContext {
     deny_touches: Arc<AtomicUsize>,
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let mut stderr = io::stderr().lock();
-            drop(writeln!(stderr, "{error}"));
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), String> {
+fn main() -> Result<(), String> {
     let context = benchmark_context()?;
     let measurements = run_measurements(&context)?;
-    report(&measurements)?;
+    print_measurements(&measurements)?;
     validate(&context, &measurements)
 }
 
@@ -99,7 +85,7 @@ fn benchmark_context() -> Result<BenchmarkContext, String> {
     let scrollback = usize::try_from(SCROLLBACK_LINES).map_err(|error| error.to_string())?;
     Ok(BenchmarkContext {
         runtime: Runtime::new().map_err(|error| format!("failed to create runtime: {error}"))?,
-        world: world_fixture()?,
+        world: world_fixture(),
         viewport_term: term_fixture(0, VIEWPORT_ROWS, 200, 96)?,
         scrollback_term: term_fixture(scrollback, VIEWPORT_ROWS, 200, 96)?,
         ceiling_term: term_fixture(scrollback, VIEWPORT_ROWS, 300, 299)?,
@@ -111,7 +97,7 @@ fn benchmark_context() -> Result<BenchmarkContext, String> {
             request_id: 1,
             agent_label: "agent-api-bench".into(),
             origin_session_id: None,
-            session_id: fixed_id::<SessionId>(1)?,
+            session_id: SessionId::new(),
             scrollback_lines: None,
         },
         denied_state: AgentApiState::default(),
@@ -119,7 +105,7 @@ fn benchmark_context() -> Result<BenchmarkContext, String> {
             request_id: 2,
             agent_label: "agent-api-bench".into(),
             origin_session_id: None,
-            session_id: fixed_id::<SessionId>(2)?,
+            session_id: SessionId::new(),
             scrollback_lines: Some(SCROLLBACK_LINES),
         },
         deny_touches: Arc::new(AtomicUsize::new(0)),
@@ -325,7 +311,7 @@ fn term_fixture(
         return Err("fixture line width must leave one terminal column free".into());
     }
     let (sender, _receiver) = mpsc::unbounded_channel();
-    let listener = ScribeEventListener::new(fixed_id::<SessionId>(3)?, sender);
+    let listener = ScribeEventListener::new(SessionId::new(), sender);
     let mut term = Term::new(
         build_term_config(scrollback_lines),
         &TestDims { cols, rows: viewport_rows },
@@ -346,7 +332,7 @@ fn term_fixture(
     Ok(Arc::new(Mutex::new(term)))
 }
 
-fn world_fixture() -> Result<AgentWorldSnapshot, String> {
+fn world_fixture() -> AgentWorldSnapshot {
     const WINDOW_COUNT: usize = 8;
     const WORKSPACES_PER_WINDOW: usize = 2;
     const SESSIONS_PER_WORKSPACE: usize = 4;
@@ -356,17 +342,17 @@ fn world_fixture() -> Result<AgentWorldSnapshot, String> {
     let mut sessions =
         Vec::with_capacity(WINDOW_COUNT * WORKSPACES_PER_WINDOW * SESSIONS_PER_WORKSPACE);
     for window_index in 0..WINDOW_COUNT {
-        let window_id = fixed_id::<WindowId>(1_000 + window_index)?;
+        let window_id = WindowId::new();
         let mut workspace_names = Vec::with_capacity(WORKSPACES_PER_WINDOW);
         for workspace_offset in 0..WORKSPACES_PER_WINDOW {
             let workspace_index = window_index * WORKSPACES_PER_WINDOW + workspace_offset;
-            let workspace_id = fixed_id::<WorkspaceId>(2_000 + workspace_index)?;
+            let workspace_id = WorkspaceId::new();
             let workspace_name = format!("workspace-{workspace_index}");
             workspace_names.push(workspace_name.clone());
             let mut session_ids = Vec::with_capacity(SESSIONS_PER_WORKSPACE);
             for session_offset in 0..SESSIONS_PER_WORKSPACE {
                 let session_index = workspace_index * SESSIONS_PER_WORKSPACE + session_offset;
-                let session_id = fixed_id::<SessionId>(3_000 + session_index)?;
+                let session_id = SessionId::new();
                 session_ids.push(session_id);
                 sessions.push(AgentSession {
                     session_id,
@@ -397,46 +383,31 @@ fn world_fixture() -> Result<AgentWorldSnapshot, String> {
             participant_count: 1,
         });
     }
-    Ok(AgentWorldSnapshot {
-        windows,
-        workspaces,
-        sessions,
-        snapshot_id: 1,
-        captured_at: 1_777_777_777,
-    })
+    AgentWorldSnapshot { windows, workspaces, sessions, snapshot_id: 1, captured_at: 1_777_777_777 }
 }
 
-fn fixed_id<T>(value: usize) -> Result<T, String>
-where
-    T: FromStr,
-    T::Err: std::fmt::Display,
-{
-    let text = format!("00000000-0000-4000-8000-{value:012x}");
-    text.parse::<T>().map_err(|error| format!("invalid fixture id {text}: {error}"))
-}
-
-fn report(measurements: &[Measurement]) -> Result<(), String> {
-    let mut output = format!(
-        "agent_api benchmark: {WARMUP_ITERATIONS} warmup + {MEASURED_ITERATIONS} measured iterations\n"
-    );
+fn print_measurements(measurements: &[Measurement]) -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "agent_api benchmark: {WARMUP_ITERATIONS} warmup + {MEASURED_ITERATIONS} measured iterations"
+    )
+    .map_err(|error| format!("failed to write benchmark report: {error}"))?;
     for measurement in measurements {
         let budget = measurement
             .budget
             .map_or_else(|| "n/a".into(), |duration| format!("{} ms", duration.as_millis()));
         writeln!(
-            output,
+            stdout,
             "{}: p95={:.3} ms budget={} max_serialized={} bytes",
             measurement.name,
             duration_ms(measurement.p95),
             budget,
             measurement.max_serialized_bytes
         )
-        .map_err(|error| format!("failed to format benchmark report: {error}"))?;
+        .map_err(|error| format!("failed to write benchmark report: {error}"))?;
     }
-    io::stdout()
-        .lock()
-        .write_all(output.as_bytes())
-        .map_err(|error| format!("failed to write benchmark report: {error}"))
+    Ok(())
 }
 
 fn duration_ms(duration: Duration) -> f64 {
