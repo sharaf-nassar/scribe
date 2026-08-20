@@ -44,6 +44,20 @@ An upgrade server has no durable stdio of its own — Debian `postinst` redirect
 
 `upgrade.log` is the postinst watchdog's readiness channel and stays the successor's stdio for the rest of its life, so `postinst` truncates it at spawn instead of deleting it after the ready check. Deleting it left the new server appending to an unlinked tmpfs inode.
 
+## Agent API
+
+One-shot agent calls reuse the existing local transient socket path.
+
+[[crates/scribe-server/src/agent_api/mod.rs#dispatch]] owns admission, policy resolution, handler routing, response construction, and the call audit before the transient connection sends its single reply.
+
+### Metadata-only call audit
+
+Every completed call emits one named `agent_call` event on target `scribe::agent_api`.
+
+Prompted calls remain inside the same dispatcher invocation, so prompt resolution cannot create a second record. The event contains only `agent_label`, capability, target kind and id, decision, and `response_bytes`.
+
+Target kind is constrained to `server`, `window`, or `session`; no request body, reply body, error text, or terminal text is recorded. `response_bytes` is the named-MessagePack byte length of the `ServerMessage::AgentResponse` body that the socket writer serializes, excluding the 4-byte frame-length prefix described by [[protocol#Protocol#Transport#Frame Format]].
+
 ## Sessions
 
 Each PTY session is represented by a  during creation and a LiveSession during active operation.

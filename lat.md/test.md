@@ -114,6 +114,14 @@ A `ci_run_bar` participant may request jobs for a root visible in its window
 whether it owns or only views the window. Incapable clients and foreign roots
 are rejected, while close remains accepted after the root moves.
 
+## Agent API Audit
+
+Server unit tests capture dispatcher audit events as structured fields.
+
+`dispatcher_emits_one_complete_metadata_only_audit_for_every_outcome` exercises allowed screen content, direct denial, prompt denial, and busy admission. It requires one `agent_call` event per dispatch, the exact six-field schema, canonical target/name values, and `response_bytes` equal to the serialized `ServerMessage::AgentResponse`.
+
+A sentinel embedded in terminal content must be absent from the complete structured capture. `request_metadata_uses_only_supported_target_kinds` constrains every request variant's target kind to `server`, `window`, or `session`.
+
 ## Architecture
 
 CLI binary (`scribe-test`) dispatches subcommands to a long-lived daemon that holds an open IPC connection to scribe-server and buffers per-session state.

@@ -365,13 +365,9 @@ where
         Err(AgentError::Busy { .. }) => "busy",
         Err(_) => "deny",
     };
-    let response_bytes = response_content_bytes(&result);
-    emit_audit(&metadata, decision, response_bytes);
-    AgentDispatch {
-        response: AgentResponse { request_id: metadata.request_id, result },
-        _permit: permit,
-        _activity: activity,
-    }
+    let response = AgentResponse { request_id: metadata.request_id, result };
+    emit_audit(&metadata, decision, serialized_response_bytes(&response));
+    AgentDispatch { response, _permit: permit, _activity: activity }
 }
 
 /// Reject bounded requests before policy can raise a confirmation prompt.
@@ -589,11 +585,9 @@ async fn capture_rows(
     (rows, captured_at, snapshot_id)
 }
 
-fn response_content_bytes(result: &Result<AgentPayload, AgentError>) -> usize {
-    match result {
-        Ok(AgentPayload::ReadScreen { screen }) => screen.text.len(),
-        _ => 0,
-    }
+fn serialized_response_bytes(response: &AgentResponse) -> usize {
+    rmp_serde::to_vec_named(&ServerMessage::AgentResponse(response.clone()))
+        .map_or(0, |reply| reply.len())
 }
 
 fn not_found(session_id: SessionId) -> AgentError {
@@ -606,26 +600,28 @@ fn denied() -> AgentError {
 
 /// Emit exactly one metadata-only audit event per request.
 fn emit_audit(metadata: &RequestMetadata<'_>, decision: &'static str, response_bytes: usize) {
-    tracing::info!(
+    tracing::event!(
+        name: "agent_call",
         target: "scribe::agent_api",
+        tracing::Level::INFO,
         agent_label = metadata.agent_label,
         capability = ?metadata.capability,
         target_kind = metadata.target_kind,
         target_id = metadata.target_id,
         decision,
         response_bytes,
-        "agent_call"
     );
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Read as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
     use alacritty_terminal::Term;
@@ -643,6 +639,8 @@ mod tests {
     use scribe_pty::{async_fd::AsyncPtyFd, event_listener::ScribeEventListener};
     use tokio::io::AsyncReadExt;
     use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
     use vte::ansi::Processor as AnsiProcessor;
 
     use super::{
@@ -672,9 +670,17 @@ mod tests {
     }
 
     fn screen_request(request_id: u64, session_id: SessionId) -> AgentRequest {
+        screen_request_for("screen-test", request_id, session_id)
+    }
+
+    fn screen_request_for(
+        agent_label: &str,
+        request_id: u64,
+        session_id: SessionId,
+    ) -> AgentRequest {
         AgentRequest::ReadScreen {
             request_id,
-            agent_label: "screen-test".into(),
+            agent_label: agent_label.into(),
             origin_session_id: None,
             session_id,
             scrollback_lines: Some(1),
@@ -716,6 +722,60 @@ mod tests {
             session_id,
             text: text.into(),
             submit,
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        name: &'static str,
+        target: &'static str,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone)]
+    struct AuditCapture(Arc<StdMutex<Vec<CapturedEvent>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for AuditCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+            let metadata = event.metadata();
+            if metadata.name() != "agent_call" || metadata.target() != "scribe::agent_api" {
+                return;
+            }
+            let mut fields = FieldCapture::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(CapturedEvent {
+                name: metadata.name(),
+                target: metadata.target(),
+                fields: fields.0,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldCapture(BTreeMap<String, String>);
+
+    fn install_audit_capture() -> Arc<StdMutex<Vec<CapturedEvent>>> {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(AuditCapture(Arc::clone(&events)));
+        tracing::subscriber::set_global_default(subscriber).expect("install audit capture");
+        tracing::callsite::rebuild_interest_cache();
+        events
+    }
+
+    impl Visit for FieldCapture {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().into(), value.to_string());
         }
     }
 
@@ -1256,6 +1316,216 @@ mod tests {
             capability_mode(&capabilities, AgentCapability::ReadMetadata),
             Some(AgentPolicyMode::Deny)
         );
+    }
+
+    struct ExpectedAudit<'a> {
+        agent_label: &'a str,
+        capability: &'a str,
+        target_kind: &'a str,
+        target_id: String,
+        decision: &'a str,
+        response: &'a scribe_common::agent::AgentResponse,
+    }
+
+    fn assert_audit(event: &CapturedEvent, expected: &ExpectedAudit<'_>) {
+        assert_eq!(event.name, "agent_call");
+        assert_eq!(event.target, "scribe::agent_api");
+        assert_eq!(event.fields.len(), 6);
+        let expected_fields = [
+            ("agent_label", expected.agent_label.to_owned()),
+            ("capability", expected.capability.to_owned()),
+            ("target_kind", expected.target_kind.to_owned()),
+            ("target_id", expected.target_id.clone()),
+            ("decision", expected.decision.to_owned()),
+            (
+                "response_bytes",
+                rmp_serde::to_vec_named(&ServerMessage::AgentResponse(expected.response.clone()))
+                    .expect("serialize agent reply")
+                    .len()
+                    .to_string(),
+            ),
+        ];
+        for (field, value) in expected_fields {
+            assert_eq!(event.fields.get(field), Some(&value));
+        }
+    }
+
+    fn deny_agent_prompt(state: &AgentApiState, message: &ServerMessage) {
+        let ServerMessage::AgentPromptRequest { prompt_id, .. } = message else {
+            panic!("expected agent prompt");
+        };
+        assert!(state.resolve_prompt(*prompt_id, ClipboardDecision::DenyOnce));
+    }
+
+    #[test]
+    fn request_metadata_uses_only_supported_target_kinds() {
+        let session_id = SessionId::new();
+        let window_id = scribe_common::ids::WindowId::new();
+        let requests = [
+            request(1),
+            capabilities_request(2),
+            AgentRequest::Siblings {
+                request_id: 3,
+                agent_label: "target-test".into(),
+                origin_session_id: Some(session_id),
+            },
+            screen_request(4, session_id),
+            AgentRequest::DispatchAction {
+                request_id: 5,
+                agent_label: "target-test".into(),
+                origin_session_id: None,
+                action: AutomationAction::NewTab,
+                window: Some(window_id),
+            },
+            AgentRequest::WriteInput {
+                request_id: 6,
+                agent_label: "target-test".into(),
+                origin_session_id: None,
+                session_id,
+                text: String::new(),
+                submit: false,
+            },
+        ];
+        for request in &requests {
+            assert!(matches!(
+                RequestMetadata::from(request).target_kind,
+                "server" | "window" | "session"
+            ));
+        }
+    }
+
+    fn assert_dispatch_audits(
+        captured: &[CapturedEvent],
+        sessions: [SessionId; 3],
+        responses: [&super::AgentDispatch; 4],
+    ) {
+        let [allowed_session, denied_session, prompted_session] = sessions;
+        let [allowed, denied, prompted, busy] = responses;
+        let expected = [
+            ExpectedAudit {
+                agent_label: "allowed-agent",
+                capability: "ReadContent",
+                target_kind: "session",
+                target_id: allowed_session.to_string(),
+                decision: "allow",
+                response: allowed.response(),
+            },
+            ExpectedAudit {
+                agent_label: "denied-agent",
+                capability: "ReadContent",
+                target_kind: "session",
+                target_id: denied_session.to_string(),
+                decision: "deny",
+                response: denied.response(),
+            },
+            ExpectedAudit {
+                agent_label: "prompted-agent",
+                capability: "ReadContent",
+                target_kind: "session",
+                target_id: prompted_session.to_string(),
+                decision: "deny",
+                response: prompted.response(),
+            },
+            ExpectedAudit {
+                agent_label: "busy-agent",
+                capability: "ReadMetadata",
+                target_kind: "server",
+                target_id: "server".into(),
+                decision: "busy",
+                response: busy.response(),
+            },
+        ];
+        for (event, expected_audit) in captured.iter().zip(&expected) {
+            assert_audit(event, expected_audit);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatcher_emits_one_complete_metadata_only_audit_for_every_outcome() {
+        const TERMINAL_SECRET: &str = "terminal-secret-must-not-enter-audit";
+
+        let events = install_audit_capture();
+
+        let allowed_state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let allowed_session = SessionId::new();
+        let allowed_request = screen_request_for("allowed-agent", 20, allowed_session);
+        let (allowed_target, _peer) = session_target(
+            term_with_bytes(TERMINAL_SECRET.as_bytes(), 64, 1),
+            Some("sensitive pane".into()),
+            Some(PathBuf::from("/sensitive/worktree")),
+        );
+        let allowed = dispatch(
+            &allowed_state,
+            0,
+            &allowed_request,
+            (
+                move |_| async move { Some(allowed_target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+
+        let denied_session = SessionId::new();
+        let denied_request = screen_request_for("denied-agent", 21, denied_session);
+        let denied = dispatch_headless(&AgentApiState::default(), &denied_request).await;
+
+        let prompted_state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+        let prompted_session = SessionId::new();
+        let prompted_request = screen_request_for("prompted-agent", 22, prompted_session);
+        let prompt_resolver = prompted_state.clone();
+        let prompted = dispatch(
+            &prompted_state,
+            0,
+            &prompted_request,
+            (
+                |_| async { panic!("denied prompt must not look up terminal content") },
+                |_, _| async { panic!("denied prompt must not run an action") },
+            ),
+            Some(move |message| {
+                deny_agent_prompt(&prompt_resolver, &message);
+                std::future::ready(())
+            }),
+        )
+        .await;
+
+        let busy_state = AgentApiState::default();
+        let permits = (0..MAX_IN_FLIGHT_REQUESTS)
+            .map(|_| busy_state.try_acquire().expect("capacity available"))
+            .collect::<Vec<_>>();
+        let busy_request = AgentRequest::World {
+            request_id: 23,
+            agent_label: "busy-agent".into(),
+            origin_session_id: None,
+        };
+        let busy = dispatch_headless(&busy_state, &busy_request).await;
+        drop(permits);
+
+        let captured = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.fields.get("agent_label").map(String::as_str),
+                    Some("allowed-agent" | "denied-agent" | "prompted-agent" | "busy-agent")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(captured.len(), 4, "one audit event per dispatch outcome");
+        assert_dispatch_audits(
+            &captured,
+            [allowed_session, denied_session, prompted_session],
+            [&allowed, &denied, &prompted, &busy],
+        );
+        assert!(!format!("{captured:?}").contains(TERMINAL_SECRET));
     }
 
     async fn hold_dispatch(
