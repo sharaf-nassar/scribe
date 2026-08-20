@@ -1176,6 +1176,20 @@ impl WindowShare {
     }
 }
 
+/// Agent world-capture view (spec 027). Implemented against the library's
+/// trait via `crate::agent_api` in both compiles of this file — the binary
+/// re-exports the library's `agent_api`, so its recompiled `WindowShare`
+/// still satisfies the one nominal bound `agent_api::world::capture` uses.
+impl crate::agent_api::world::ShareView for WindowShare {
+    fn sharing_mode(&self) -> scribe_config::SharingMode {
+        self.mode
+    }
+
+    fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+}
+
 #[derive(Clone)]
 pub struct IpcServerState {
     pub session_manager: Arc<SessionManager>,
@@ -5233,36 +5247,7 @@ async fn establish_local_first_frame(
             None
         }
         ClientMessage::AgentRequest(request) => {
-            let prompt_writer = first_local_agent_api_writer(&server.window_shares).await;
-            let live_sessions = Arc::clone(&server.live_sessions);
-            let agent_api = server.agent_api.clone();
-            let window_shares = Arc::clone(&server.window_shares);
-            let dispatch = Box::pin(crate::agent_api::dispatch(
-                &server.agent_api,
-                action_client_key(writer),
-                &request,
-                (
-                    move |session_id| async move {
-                        let sessions = live_sessions.read().await;
-                        sessions.get(&session_id).map(|session| {
-                            crate::agent_api::AgentSessionTarget {
-                                term: Arc::clone(&session.term),
-                                pty_write: Arc::clone(&session.pty_write),
-                                title: session.title.clone(),
-                                cwd: session.cwd.clone(),
-                            }
-                        })
-                    },
-                    move |window_id, action| async move {
-                        run_agent_action(&agent_api, window_id, action, &window_shares).await
-                    },
-                ),
-                prompt_writer.map(|prompt_client| {
-                    move |message| async move { send_message(&prompt_client, &message).await }
-                }),
-            ))
-            .await;
-            send_message(writer, &ServerMessage::AgentResponse(dispatch.response().clone())).await;
+            handle_transient_agent_request(server, writer, &request).await;
             None
         }
         ClientMessage::CheckForUpdates => {
@@ -10411,6 +10396,80 @@ async fn first_local_agent_api_writer(window_shares: &WindowShares) -> Option<Sh
     windows
         .into_iter()
         .find_map(|window_id| shares.get(&window_id).and_then(WindowShare::local_agent_api_writer))
+}
+
+/// Spec 027 transient one-shot: route an `AgentRequest` through the agent
+/// dispatcher and reply on the same connection, which then closes without
+/// registering a window or attaching a session. The registry seams are
+/// closures over this server's live-session, share, and workspace state;
+/// they run only after the dispatcher's policy gate admits the request.
+async fn handle_transient_agent_request(
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    request: &scribe_common::agent::AgentRequest,
+) {
+    let prompt_writer = first_local_agent_api_writer(&server.window_shares).await;
+    let live_sessions = Arc::clone(&server.live_sessions);
+    let world_sessions = Arc::clone(&server.live_sessions);
+    let world_shares = Arc::clone(&server.window_shares);
+    let world_workspaces = Arc::clone(&server.workspace_manager);
+    let agent_api = server.agent_api.clone();
+    let action_shares = Arc::clone(&server.window_shares);
+    let dispatch = Box::pin(crate::agent_api::dispatch(
+        &server.agent_api,
+        action_client_key(writer),
+        request,
+        crate::agent_api::DispatchSources {
+            capture_world: move || async move {
+                crate::agent_api::world::capture(
+                    &world_sessions,
+                    &world_shares,
+                    &world_workspaces,
+                    copy_live_session_for_agent,
+                )
+                .await
+            },
+            lookup_session: move |session_id| async move {
+                let sessions = live_sessions.read().await;
+                sessions.get(&session_id).map(|session| crate::agent_api::AgentSessionTarget {
+                    term: Arc::clone(&session.term),
+                    pty_write: Arc::clone(&session.pty_write),
+                    title: session.title.clone(),
+                    cwd: session.cwd.clone(),
+                })
+            },
+            run_action: move |window_id, action| async move {
+                run_agent_action(&agent_api, window_id, action, &action_shares).await
+            },
+        },
+        prompt_writer.map(|prompt_client| {
+            move |message| async move { send_message(&prompt_client, &message).await }
+        }),
+    ))
+    .await;
+    send_message(writer, &ServerMessage::AgentResponse(dispatch.response().clone())).await;
+}
+
+/// Copy one live session's allowlisted metadata for an agent world capture.
+/// Defined here rather than in `agent_api::world` so `LiveSession`'s private
+/// fields — including retained prompt state — stay private to this module.
+/// The workspace-manager mapping names the session's window; a session not
+/// yet assigned there falls back to its stable creation-time owner.
+fn copy_live_session_for_agent(
+    session_id: SessionId,
+    session: &LiveSession,
+    window: Option<WindowId>,
+) -> crate::agent_api::world::CapturedSession {
+    crate::agent_api::world::CapturedSession {
+        session_id,
+        window_id: window.unwrap_or(session.env_window_id),
+        workspace_id: session.workspace_id,
+        title: session.title.clone(),
+        cwd: session.cwd.clone(),
+        ai_state: session.ai_state.clone(),
+        ai_provider_hint: session.ai_provider_hint,
+        task_label: session.task_label.clone(),
+    }
 }
 
 async fn connection_supports_agent_api(

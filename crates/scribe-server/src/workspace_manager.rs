@@ -715,6 +715,32 @@ impl WorkspaceManager {
     }
 }
 
+/// Agent world-capture view (spec 027). Implemented against the library's
+/// trait via `crate::agent_api` in both compiles of this file — the binary
+/// re-exports the library's `agent_api`, so its recompiled `WorkspaceManager`
+/// still satisfies the one nominal bound `agent_api::world::capture` uses.
+impl crate::agent_api::world::WorkspaceView for WorkspaceManager {
+    fn window_ids_with_sessions(&self) -> HashSet<WindowId> {
+        Self::window_ids_with_sessions(self)
+    }
+
+    fn workspace_names_for_window(&self, window_id: WindowId) -> Vec<String> {
+        Self::workspace_names_for_window(self, window_id)
+    }
+
+    fn window_session_count(&self, window_id: WindowId) -> usize {
+        self.sessions_for_window(window_id).len()
+    }
+
+    fn window_for_session(&self, session_id: SessionId) -> Option<WindowId> {
+        Self::window_for_session(self, session_id)
+    }
+
+    fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String> {
+        self.workspace_info(workspace_id).and_then(|(name, _, _, _)| name)
+    }
+}
+
 /// Every session a reported workspace tree names, in left-to-right region order
 /// and, within a region, in the client's own tab order.
 fn collect_tree_sessions(node: &WorkspaceTreeNode, out: &mut Vec<SessionId>) {
