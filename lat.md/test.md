@@ -4960,6 +4960,18 @@ Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion mov
 
  resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
 
+### A repaint clears a selection but not a live drag
+
+A line selection survives output that lands while a drag is still building it, then clears once the drag ends and a stale-content repaint lands over the same rows.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#begin_selection]] sets the drag guard; pi's `collapse` control produces the redraw as an unmodified click a mouse-tracking application claims before it reaches the client's own selection gestures. `selection_text()` returns `None` after the repaint rather than the new text now painted over the old range, which is also what proves the `copy` chord and context-menu Copy cannot hand back stale text.
+
+### A scrollback trim drops a selection it can no longer address
+
+A selection anchored on the oldest surviving scrollback line is dropped outright when a trim actually removes rows, rather than being shifted to track them.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#trim_history]] clears it because alacritty's `Line` addressing has no notion of a row that no longer exists — a selection left anchored above the new history floor would index past the ring buffer's surviving length on the next read.
+
 ### A parse in flight blocks neither the registry nor a paint
 
 Holding one pane's stream lock — standing in for a batch mid-parse — leaves the registry free for another pane's batch and leaves both panes' published projections readable, including the busy pane's.

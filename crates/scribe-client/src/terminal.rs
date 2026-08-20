@@ -267,6 +267,13 @@ pub struct DisplayOnlyTerminal {
     /// grid lines, so scrolling moves the highlight with the content rather
     /// than leaving it pinned to the screen.
     selection: SelectionState,
+    /// Set for the duration of a mouse-drag selection gesture. A repaint that
+    /// lands while this is set leaves the selection alone — it is the one the
+    /// drag itself is building — so [`Self::begin_selection`] sets it and
+    /// [`Self::end_selection_drag`] must be called unconditionally when the
+    /// gesture ends, even on a release a mouse-tracking application claimed
+    /// before `finish_selection` ever ran.
+    selection_dragging: bool,
     /// Atomically published CPU-only terminal-image state. GPU resources stay
     /// outside this model and land with the renderer bead.
     image_scene: LiveImageScene,
@@ -294,6 +301,7 @@ impl DisplayOnlyTerminal {
             scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
+            selection_dragging: false,
             image_scene: LiveImageScene::default(),
             urls: PaneUrlCache::new(),
         };
@@ -312,10 +320,21 @@ impl DisplayOnlyTerminal {
     /// overwritten before anything paints; rebuilding each one would spend the
     /// pane lock on screens no one ever sees. [`Self::publish_content`] does it
     /// once, for the state the burst actually leaves behind.
+    ///
+    /// A burst that actually changes visible state also drops the active
+    /// selection, unless [`Self::selection_dragging`] says the pointer is still
+    /// down building one. Selection ranges are absolute grid lines indexed
+    /// straight into the live `Term` ([`SelectionState::copy_text`]), so
+    /// nothing else notices when a redraw overwrites the cells they point at —
+    /// the highlight would otherwise keep painting whatever now occupies those
+    /// rows instead of disappearing with the content it described.
     pub fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
         self.output_processor.advance(&mut self.term, bytes);
         let needs_redraw = self.output_processor.sync_bytes_count() < bytes.len();
         self.content_stale |= needs_redraw;
+        if needs_redraw && !self.selection_dragging {
+            self.selection.clear();
+        }
         FeedOutputResult { needs_redraw, sync_pending: self.parser_sync_deadline().is_some() }
     }
 
@@ -542,6 +561,11 @@ impl DisplayOnlyTerminal {
     /// Shrinking and re-growing the ring is how alacritty exposes the drop, and
     /// it is the same two-step the server uses, so both ends land on the same
     /// surviving rows.
+    ///
+    /// Unconditionally drops the active selection when rows actually went:
+    /// alacritty's `Line` addressing has no notion of a row that used to exist,
+    /// so a selection anchored above the new history floor would index straight
+    /// past the ring buffer's surviving length on the next read.
     pub fn trim_history(&mut self, kept_rows: usize) -> usize {
         let dropped = self.trim_history_without_publish(kept_rows);
         if dropped > 0 {
@@ -559,7 +583,11 @@ impl DisplayOnlyTerminal {
         let grid = self.term.grid_mut();
         grid.update_history(kept_rows.min(max_rows));
         grid.update_history(max_rows);
-        before.saturating_sub(self.history_size())
+        let dropped = before.saturating_sub(self.history_size());
+        if dropped > 0 {
+            self.selection.clear();
+        }
+        dropped
     }
 
     /// The viewport measurements the overlay scrollbar sizes its thumb from.
@@ -749,6 +777,7 @@ impl DisplayOnlyTerminal {
             SelectionMode::Word => self.selection.start_word(&self.term, point),
             SelectionMode::Line => self.selection.start_line(&self.term, point),
         }
+        self.selection_dragging = true;
     }
 
     /// Extend the active selection to a viewport cell as the pointer drags,
@@ -757,6 +786,20 @@ impl DisplayOnlyTerminal {
     pub fn extend_selection(&mut self, at: ViewportPoint) {
         let point = self.selection_point(at);
         self.selection.drag_to(&self.term, point);
+    }
+
+    /// End the drag guard [`Self::begin_selection`] set, independent of
+    /// whether the gesture went on to settle through `finish_selection`.
+    ///
+    /// The caller must run this unconditionally at release, before any
+    /// early-return: a Shift-drag inside a mouse-tracking application can end
+    /// with the release itself forwarded to the application (Shift let go
+    /// before the button, or a bare release once tracking claims it), so a
+    /// guard cleared only on the settled path would stay stuck set and
+    /// permanently block a later repaint from ever dropping the selection
+    /// this gesture leaves behind.
+    pub fn end_selection_drag(&mut self) {
+        self.selection_dragging = false;
     }
 
     /// Drop the active selection. Returns `true` when there was one to drop, so
@@ -1499,6 +1542,60 @@ mod tests {
         assert!(
             terminal.smart_selection_actions(&rules, ViewportPoint { row: 2, col: 50 }).is_empty()
         );
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#A repaint clears a selection but not a live drag]]
+    #[gpui::test]
+    fn a_repaint_clears_a_selection_but_not_a_live_drag() {
+        let mut terminal = DisplayOnlyTerminal::new(40, 4);
+        terminal.feed_output(b"\x1b[?1049h\x1b[?1000h\x1b[H\x1b[2Jexpanded body text\r\ncollapse");
+        terminal.begin_selection(ViewportPoint { row: 0, col: 0 }, SelectionMode::Line);
+        terminal.extend_selection(ViewportPoint { row: 0, col: 17 });
+        assert_eq!(terminal.selection_text().as_deref(), Some("expanded body text"));
+
+        // A repaint landing while the pointer is still down must not erase the
+        // selection the drag itself is still building.
+        terminal.feed_output(b"\r\nmore output arrives while the drag is still live");
+        assert!(terminal.has_selection());
+
+        // Release: `TerminalView::release_over_grid` clears the drag guard
+        // unconditionally, even on a gesture whose release a mouse-tracking
+        // application claimed before `finish_selection` ever ran.
+        terminal.end_selection_drag();
+
+        // pi's `collapse` control takes an unmodified click, so
+        // `TerminalView::press_grid` forwards it to the mouse-tracking
+        // application instead of starting a new selection (Shift is required
+        // for that) — the completed selection above is still sitting over row
+        // 0 when pi's own redraw lands.
+        terminal.feed_output(
+            b"\x1b[H\x1b[2Jtool . bash . cd /somewhere\r\ntool . bash . cd /elsewhere",
+        );
+        assert!(!terminal.has_selection());
+        // The `copy` chord and context-menu Copy both read through
+        // `selection_text()`, so this also proves neither can hand back the old
+        // highlight's text after the repaint.
+        assert_eq!(terminal.selection_text(), None);
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#A scrollback trim drops a selection it can no longer address]]
+    #[gpui::test]
+    fn a_scrollback_trim_drops_a_selection_it_can_no_longer_address() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 12);
+        assert_eq!(terminal.history_size(), 9);
+
+        // Select the oldest surviving line, up in scrollback.
+        assert!(terminal.scroll_to_abs(0));
+        terminal.begin_selection(ViewportPoint { row: 0, col: 0 }, SelectionMode::Line);
+        terminal.end_selection_drag();
+        assert_eq!(terminal.selection_text().as_deref(), Some("l01"));
+
+        // The server-driven trim this mirrors (an AI session's suppressed ED 3)
+        // drops exactly the rows the selection is anchored in.
+        let dropped = terminal.trim_history(4);
+        assert_eq!(dropped, 5);
+        assert!(!terminal.has_selection());
+        assert_eq!(terminal.selection_text(), None);
     }
 
     // @lat: [[test#GPUI Sync Frame Queue#Split sync frame reaches terminal whole]]

@@ -36,13 +36,6 @@ pub struct SelectionPoint {
     pub col: usize,
 }
 
-impl SelectionPoint {
-    /// Adjust the row by `delta` grid lines (positive = down, negative = up).
-    pub fn shift_row(&mut self, delta: i32) {
-        self.row += delta;
-    }
-}
-
 impl PartialOrd for SelectionPoint {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -119,12 +112,6 @@ impl SelectionRange {
     /// Return `true` if the selection covers zero cells (start equals end).
     pub fn is_empty(&self) -> bool {
         self.start == self.end
-    }
-
-    /// Adjust both endpoints by `delta` grid lines.
-    pub fn shift_rows(&mut self, delta: i32) {
-        self.start.shift_row(delta);
-        self.end.shift_row(delta);
     }
 }
 
@@ -525,22 +512,6 @@ impl SelectionState {
         self.range = None;
         self.word_anchor = None;
         self.line_anchor = None;
-    }
-
-    /// Shift the active selection and anchors by `delta` grid lines, keeping the
-    /// selection pinned to content as scrollback is trimmed.
-    pub fn shift_rows(&mut self, delta: i32) {
-        if let Some(range) = self.range.as_mut() {
-            range.shift_rows(delta);
-        }
-        if let Some((start, end)) = self.word_anchor.as_mut() {
-            start.shift_row(delta);
-            end.shift_row(delta);
-        }
-        if let Some((start, end)) = self.line_anchor.as_mut() {
-            start.shift_row(delta);
-            end.shift_row(delta);
-        }
     }
 }
 

@@ -7595,6 +7595,14 @@ impl TerminalView {
     /// Resolve a left release over the grid band, ending whichever gesture the
     /// matching press started.
     fn release_over_grid(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        // Unconditional and first: a Shift-drag selection over a mouse-tracking
+        // application can end with this same release claimed by
+        // `forward_mouse_release` below (Shift let go before the button, or an
+        // unmodified release once tracking owns the pointer), so `finish_selection`
+        // never runs. Clearing the drag guard only there would leave it stuck set
+        // and permanently block a later repaint from dropping the selection this
+        // gesture leaves behind.
+        self.with_focused_grid(DisplayOnlyTerminal::end_selection_drag);
         if self.cancel_jump_button(cx) {
             return;
         }
