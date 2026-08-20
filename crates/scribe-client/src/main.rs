@@ -1444,6 +1444,20 @@ impl RestoreRuntime {
         self.geometry = Some(geometry);
     }
 
+    /// Whether the restore is still asserting a window state that owns the
+    /// window's *size* (maximized / fullscreen).
+    ///
+    /// On X11 such a record opens **windowed** at its restore rect —
+    /// [`x11_creation_bounds`] strips the state so GPUI emits no toggle — and
+    /// the real state is asserted after the map, so every bounds reading
+    /// taken while this holds describes a transient layout the assert exists
+    /// to replace. Both fields clear on a bounded schedule: the assert lands,
+    /// or [`STATE_ASSERT_ATTEMPTS`] gives up. Position, desktop, and minimize
+    /// restores do not move the window's size and are deliberately not here.
+    fn size_restore_in_flight(&self) -> bool {
+        self.pending_state.is_some() || self.state_target.is_some()
+    }
+
     /// Note that the persisted snapshot no longer matches the live layout.
     fn mark_layout_dirty(&mut self) {
         if self.layout_dirty_since.is_none() {
@@ -5682,6 +5696,26 @@ impl TerminalView {
         if let Ok(mut attached) = self.shared.attached.lock() {
             attached.insert(session_id);
         }
+        // While a restored window's maximize/fullscreen assert is in flight,
+        // every placement measures the pre-restore rect, so announce no grid
+        // at all: a zero `TerminalSize` makes the server skip its pre-snapshot
+        // PTY resize and replay the session at its current — last known,
+        // correct — size (the same contract the Codex reattach uses). The
+        // deferred entry makes the first settled publish announce the real
+        // grid even where the cache would have skipped it.
+        if self.restore.size_restore_in_flight() {
+            let result = self
+                .sink
+                .attach_sessions(vec![session_id], vec![TerminalSize::default()])
+                .and_then(|()| self.sink.subscribe(vec![session_id]));
+            if let Err(error) = result {
+                tracing::warn!(%error, "restore attach dropped: IPC writer closed");
+            }
+            if let Ok(mut deferred) = self.shared.deferred_grids.lock() {
+                deferred.push(session_id);
+            }
+            return;
+        }
         // The attach replay is the first frame the switched-to tab paints, so
         // size it from that session's current placement rather than the
         // outgoing focused pane. Prompt chrome is per tab and can change the
@@ -6224,6 +6258,17 @@ impl TerminalView {
         // Say nothing until the canvas has measured one: the probe defers back
         // here the moment it does.
         let Some(viewport) = self.measured_pane_viewport() else { return };
+        // A maximized or fullscreen restore measures the pre-assert rect for
+        // its first frames (see [`RestoreRuntime::size_restore_in_flight`]).
+        // Publishing that transient resized every PTY to it and asked for a
+        // full replay of each — then did both again when the real state
+        // landed: the multi-generation refresh storm a 9-pane restart showed
+        // on startup. Hold every announcement until the assert resolves; the
+        // render loop calls back each frame, so the first settled frame
+        // publishes the real grids exactly once.
+        if self.restore.size_restore_in_flight() {
+            return;
+        }
         let cell_width = self.font.cell_width();
         let line_height = self.font.line_height;
         if cell_width <= 0.0 || line_height <= 0.0 {
@@ -6263,11 +6308,16 @@ impl TerminalView {
                 continue;
             }
             self.pane_sizes.insert(session_id, size);
-            self.resize_pane_grid(session_id, size);
-            let result = self
-                .sink
-                .resize(session_id, size)
-                .and_then(|()| self.sink.request_snapshot(session_id));
+            // A grid already at exactly this size holds a rebuild applied at
+            // this size — the authoritative screen. Asking for another
+            // snapshot would pay a full replay for identical bytes; only the
+            // `Resize` still goes out so the server owns the size (a no-op
+            // there too when it matches, per the tmux rule).
+            let reshaped = self.resize_pane_grid(session_id, size);
+            let mut result = self.sink.resize(session_id, size);
+            if reshaped {
+                result = result.and_then(|()| self.sink.request_snapshot(session_id));
+            }
             if let Err(error) = result {
                 tracing::warn!(%error, "pane resize dropped: IPC writer closed");
             }
@@ -6297,16 +6347,23 @@ impl TerminalView {
         }
     }
 
-    /// Reshape one pane's display grid.
+    /// Reshape one pane's display grid, reporting whether the dimensions
+    /// actually changed.
     ///
     /// The pane is resolved out of the registry and the registry lock dropped
     /// before the reshape, so a resize waits on at most the batch being parsed
     /// into that one pane rather than on every pane at once.
-    fn resize_pane_grid(&self, session_id: SessionId, size: TerminalSize) {
-        let Some(pane) = self.pane_for(session_id) else { return };
+    fn resize_pane_grid(&self, session_id: SessionId, size: TerminalSize) -> bool {
+        let Some(pane) = self.pane_for(session_id) else { return false };
         pane.with_terminal(|terminal| {
-            terminal.resize(usize::from(size.cols), usize::from(size.rows));
-        });
+            let target = (usize::from(size.cols), usize::from(size.rows));
+            if terminal.dimensions() == target {
+                return false;
+            }
+            terminal.resize(target.0, target.1);
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Rebuild this window's regions, splits, and pane sessions from the
@@ -14793,24 +14850,35 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
     // focused size describes the *outgoing* pane, whose prompt-bar chrome can
     // differ, and attaching at it resizes the PTY off its real grid and back
     // (one SIGWINCH storm and a doubled replay per switch). Same source
-    // [`reattach_visible_sessions`] uses; the focused size remains only for a
-    // session this window has never painted.
-    let focused = reader_attach_size(ctx);
-    let size = ctx
-        .panes
-        .lock()
-        .ok()
-        .and_then(|panes| pane_display_grid(&panes, session_id))
-        .map_or(focused, |grid| TerminalSize { cols: grid.cols, rows: grid.rows, ..focused });
-    tracing::info!(%session_id, cols = size.cols, rows = size.rows, "attaching to session");
+    // [`reattach_visible_sessions`] uses. A session with no display grid yet —
+    // a fresh window's very first attach — announces no grid at all: the
+    // focused size at that point is the pre-restore seed, and pre-sizing the
+    // PTY to it crushes the session's real screen. A zero size makes the
+    // server replay at the session's current dimensions; the deferred entry
+    // makes the first measured publish announce the real grid.
+    let size =
+        ctx.panes.lock().ok().and_then(|panes| pane_display_grid(&panes, session_id)).map(|grid| {
+            TerminalSize { cols: grid.cols, rows: grid.rows, ..reader_attach_size(ctx) }
+        });
+    let announced = size.unwrap_or_default();
+    tracing::info!(
+        %session_id,
+        cols = announced.cols,
+        rows = announced.rows,
+        "attaching to session"
+    );
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
             session_ids: vec![session_id],
-            dimensions: vec![size],
+            dimensions: vec![announced],
         })
         .map_err(|error| error.to_string())?;
     // Announce the client size through the sink, ahead of any KeyInput.
-    ctx.sink.resize(session_id, size).map_err(|error| error.to_string())?;
+    if let Some(size) = size {
+        ctx.sink.resize(session_id, size).map_err(|error| error.to_string())?;
+    } else if let Ok(mut deferred) = ctx.deferred_grids.lock() {
+        deferred.push(session_id);
+    }
     ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
     adopt_attached_session(ctx, session_id);
     Ok(())
