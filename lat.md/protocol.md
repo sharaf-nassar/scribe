@@ -26,6 +26,34 @@ Every connection is verified by checking the peer UID via `SO_PEERCRED` on Linux
 
 Window and session operations are further scoped after handshake: a client cannot claim an already-connected window ID, attach another window's sessions, request snapshots for unattached sessions, or close a different window.
 
+## Agent Control Request Family
+
+The local agent control surface is an additive, one-shot request/reply family on the existing Unix socket, with explicit negotiation for the long-lived client frames it can trigger.
+
+### Requests, replies, and capability gates
+
+One `ClientMessage::AgentRequest(AgentRequest)` carries every control-surface operation and one `ServerMessage::AgentResponse(AgentResponse)` carries its correlated result.
+
+[[crates/scribe-common/src/agent.rs#AgentRequest]] defines `World`, `Siblings`, `ReadScreen`, `DispatchAction`, `WriteInput`, and `Capabilities`. Each request includes a client-generated `request_id`, a caller-supplied `agent_label`, and optional `origin_session_id`; the origin orients `Siblings` and `is_caller` only and is not authentication. `Capabilities` is always answerable and reports surface version 1 plus the live mode for every supported capability.
+
+The policy axes are read metadata, read content, dispatch action, dispatch destructive action, and write input. The action mapping is exhaustive, so a future `AutomationAction` cannot silently inherit the non-destructive gate. Typed errors use stable snake-case codes through the CLI: `denied`, `prompt_timeout`, `not_found`, `ambiguous_target`, `unsupported`, `too_large`, `busy`, `version_mismatch`, `action_failed`, and `internal`.
+
+### Prompt, activity, and action completion frames
+
+Three additive exchanges connect a one-shot caller to the long-lived GPUI client without turning the agent socket into a persistent session.
+
+`ServerMessage::AgentPromptRequest` names the prompt id, caller-supplied label, capability, and target. The capable local client answers with `ClientMessage::AgentPromptResponse` using the shared four-way `ClipboardDecision`, preserving allow/deny once and always semantics.
+
+`ServerMessage::AgentActivity { session_id, active }` carries server-owned lease edges for tab visibility. `ServerMessage::RunActionCorrelated` carries an action and correlation id; after foreground execution the target client sends `ClientMessage::ActionCompleted` with `Completed` or `Failed` plus an optional created session id. Existing `RunAction` and `ActionDispatched` semantics remain unchanged.
+
+### Negotiation and compatibility
+
+`Hello.agent_api` and `Welcome.agent_api` default to `false`, matching the existing capability-bit compatibility pattern.
+
+A new server sends prompt and activity frames only to participants that advertised the bit, so an older client's exhaustive `ServerMessage` match never sees an unknown top-level variant. An old Hello or Welcome decodes as incapable, while old schemas ignore the new named MessagePack field.
+
+`AgentRequest` is a local transient first frame: it registers no window and receives at most one reply. The remote handshake and authorization paths do not expose this request family. Same-UID socket admission remains the transport boundary; agent capability policy constrains cooperative use of this supported surface and is not a sandbox against other same-UID raw IPC callers.
+
 ## Client Messages
 
 Messages sent from the UI client to the server, defined in [[crates/scribe-common/src/protocol.rs#ClientMessage]].
@@ -92,9 +120,9 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID and a `clipboard_gating: bool` capability flag (spec 010 C7). The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating` and `agent_api`. The server responds with [[protocol#Server Messages]] `Welcome`.
 
-Both `Hello.clipboard_gating` and `Welcome.clipboard_gating` default to `false` for backward compatibility. When either side reports `false`, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes and the client defensively no-ops on receipt of the new clipboard variants.
+Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]].
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
@@ -311,7 +339,7 @@ clear one frame shape rather than two teardown paths.
 
 `Welcome` responds to Hello with the assigned window ID and a list of other unconnected windows that have sessions. `WindowClosed` and `QuitRequested` are shutdown acknowledgments.
 
-`Welcome.clipboard_gating: bool` advertises the server's OSC 52 gating capability (spec 010 C7 — see [[protocol#Client Messages#Connection]] for the matching client-side flag and negotiation semantics).
+`Welcome.clipboard_gating: bool` advertises the server's OSC 52 gating capability, while `Welcome.agent_api: bool` confirms support for agent prompt and activity frames. Both default to false when absent; see [[protocol#Client Messages#Connection]] and [[protocol#Agent Control Request Family#Negotiation and compatibility]].
 
 #### Beads detail capability defaults safely
 

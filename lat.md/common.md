@@ -34,6 +34,34 @@ Verifies  lights segments by `div_ceil` (any non-zero percentage fills at least 
 
 Verifies  returns the bare `NN%` suffix for every known percentage and `None` while a pulsing attention state owns the UX.
 
+## Agent Control Contract
+
+Shared agent types expose a narrow, versioned local contract without serializing the server's broader internal session and AI records.
+
+### Request and response DTOs
+
+[[crates/scribe-common/src/agent.rs#AgentRequest]] and [[crates/scribe-common/src/agent.rs#AgentPayload]] are tagged enums for world, sibling, screen, action, input, and capability operations.
+
+Every request carries `request_id`, a caller-supplied label, and optional origin session. [[crates/scribe-common/src/agent.rs#AgentResponse]] echoes the id and wraps either a successful payload or [[crates/scribe-common/src/agent.rs#AgentError]]. `AGENT_SURFACE_VERSION` is 1 and is reported by the capability payload.
+
+World DTOs expose window/workspace/session identity and status, with optional title, CWD, provider, AI state, task label, and context fill omitted when unavailable. They deliberately exclude launch ids, retained prompt state and text, conversation ids, model/tool/agent metadata, environment envelopes, controller identity, and participant identity. Screen replies identify the pane and include normalized text, line count, truncation, capture time, and snapshot id.
+
+### Capabilities, actions, and errors
+
+Five independent capabilities separate metadata, content, ordinary actions, destructive actions, and input injection.
+
+[[crates/scribe-common/src/agent.rs#AgentCapability#for_action]] maps close-pane, close-tab, and open-update-dialog to the destructive axis and exhaustively maps every other current automation action to the ordinary axis. `AgentPolicyMode` is `Deny`, `Allow`, or `Prompt`, defaulting to `Deny`. Capability status replies pair each axis with its current mode.
+
+`AgentError` carries typed failures for policy, timeout, lookup, ambiguity, compatibility, bounds, capacity, action completion, and internal faults. `AgentActionResult` reports the original action, completed/failed outcome, and optional created session id; there is no queued-success state.
+
+### Configuration
+
+`ScribeConfig.agent_api` is an additive top-level policy and bounds table whose absence is safe.
+
+[[crates/scribe-common/src/config.rs#AgentApiConfig]] defaults all five capabilities to `Deny`: all-Deny is the off state. Defaults are 256 KiB responses, 1,000 scrollback lines, 4,096 input bytes, 60,000 ms prompt timeout, 500 ms burst reuse, and 1,500 ms activity dwell. Deserialization clamps them respectively to 256 KiB, 10,000 lines, 65,536 bytes, 300,000 ms, 5,000 ms, and 10,000 ms, while unknown keys remain forward-compatible.
+
+The shared table is loaded at startup and on `ConfigReloaded`; the settings client and server projection both use the same type, so no translation vocabulary can drift from the wire capability names.
+
 ## Configuration
 
 Unified TOML config for server and client, deserialized from the active install
@@ -41,9 +69,9 @@ flavor's XDG config root into
 [[crates/scribe-common/src/config.rs#ScribeConfig]].
 
 Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads
-`~/.config/scribe-dev/config.toml`. `ScribeConfig` has nine top-level sections:
+`~/.config/scribe-dev/config.toml`. `ScribeConfig` has ten top-level sections:
 `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, `update`,
-`notifications`, `remote`, and `github_ci`.
+`notifications`, `remote`, `github_ci`, and `agent_api`.
 [[crates/scribe-common/src/config.rs#load_config]] returns
 `ScribeConfig::default()` when the file is absent. Prompt-bar configs still
 accept legacy `prompt_bar_bg` as an alias for `prompt_bar_second_row_bg`.

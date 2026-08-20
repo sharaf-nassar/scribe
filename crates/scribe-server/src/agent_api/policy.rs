@@ -73,6 +73,7 @@ impl Drop for PendingAuthorization {
     }
 }
 
+// @lat: [[server#Server#Agent API#Admission and capability policy]]
 /// Shared, in-memory policy and prompt state for the server process.
 #[derive(Clone)]
 pub struct AgentPolicyEngine {

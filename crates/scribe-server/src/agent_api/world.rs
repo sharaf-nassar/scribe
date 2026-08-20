@@ -117,6 +117,7 @@ impl Capture {
     }
 }
 
+// @lat: [[server#Server#Agent API#World and siblings]]
 /// Copy the three authoritative registries under one ordered, short-lived read
 /// transaction. The callback is defined by the transport owner so private
 /// `LiveSession` fields remain private to `ipc_server` while this module owns

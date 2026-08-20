@@ -41,6 +41,7 @@ use self::text::{copy_rows, format_rows};
 /// complete request lifetime.
 const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 
+// @lat: [[server#Server#Agent API]]
 /// Server-owned admission state for one-shot agent requests.
 #[derive(Clone)]
 pub struct AgentApiState {

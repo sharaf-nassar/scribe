@@ -52,6 +52,7 @@ pub struct ExtractedText {
     pub truncated: bool,
 }
 
+// @lat: [[server#Server#Agent API#Screen reads]]
 /// Phase 1 — call while holding the terminal lock.
 ///
 /// Copies the requested scrollback rows plus the viewport, oldest first, and

@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 /// One emitted indicator transition: the session and its new visible state.
 pub type ActivityTransition = (SessionId, bool);
 
+// @lat: [[server#Server#Agent API#Activity leases]]
 /// Shared lease registry for the server process.
 ///
 /// Leases are keyed per session *and* per caller connection, so a caller's

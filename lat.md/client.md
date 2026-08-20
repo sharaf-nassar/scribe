@@ -805,6 +805,46 @@ Two changes remove it from the critical path.  narrows `sysinfo` to exactly what
 
 The residual startup cost is no longer in client code, and the client now measures that directly:  times `cx.open_window` and  splits the first-frame span into `gpu_bringup_ms` and `scribe_startup_ms`. Measured on the reference host, first paint lands at 634–780 ms, of which 610–751 ms is wgpu adapter enumeration and driver bring-up inside `cx.open_window` and only 24–29 ms is Scribe's own work. That floor is why the absolute 500 ms budget was retired — see .
 
+## Agent Control Surface Consumers
+
+The CLI is the stable machine-facing consumer, while the GPUI client owns consent, correlated foreground execution, settings, and visible session activity.
+
+### CLI contract and generated discovery
+
+[[crates/scribe-cli/src/main.rs#AgentCommand]] exposes `world`, `siblings`, `read`, `action`, `write`, `capabilities`, and `skill` as one-shot commands over the existing local socket.
+
+Data commands reserve stdout for a versioned JSON envelope: `{"v":1,"ok":true,"data":…}` or `{"v":1,"ok":false,"error":{"code":…,"message":…}}`. Typed server failures exit 1 except `unsupported`; clap/label/environment usage failures exit 2; server-unreachable and unsupported/timeout paths exit 3. Diagnostics go to stderr. The CLI composes `--agent` and optional `--model` into one caller-supplied label capped at 64 characters and parses `SCRIBE_SESSION_ID` only as an optional full UUID orientation value.
+
+`scribe agent capabilities` bypasses capability policy so callers can discover the live modes and surface version before attempting work. `scribe agent siblings` supplies the pane-local one-call path by forwarding the inherited origin session id.
+
+[[crates/scribe-cli/src/main.rs#render_agent_skill]] walks the live clap tree and current `AgentApiConfig`, so generated guidance names every current command and marks each gated command as unavailable, promptable, or allowed with its exact settings key. Claude and Codex setup scripts wrap that output in an ownership-marked `scribe-terminal/SKILL.md`, update atomically only when content changes, and refuse non-regular or foreign files. Packaged startup repair reruns those scripts when the managed skill is missing.
+
+Pi receives six typed tools from [[dist/pi-extension.ts#registerAgentTools]] rather than a skill document. Each tool shells to the same CLI with `--agent pi`, returns its JSON text to the model, and rechecks `SCRIBE_SESSION_ID`; outside a Scribe pane the extension registers no handlers/tools or returns an explicit no-op response.
+
+### Consent and policy settings
+
+The GPUI connection advertises `Hello.agent_api = true`, parks `AgentPromptRequest` on the reader thread, and raises a modal on the foreground thread.
+
+[[crates/scribe-client/src/dialog.rs#AgentConsentDialog]] shows the capability, target, and caret-escaped caller label marked “caller-supplied,” plus the warning that Scribe cannot verify the caller. Deny once is the default focus; Escape and backdrop dismissal deliberately send `DenyOnce`. The four buttons reuse `ClipboardDecision`, so the wire carries allow/deny once and always without a second decision enum.
+
+[[crates/scribe-client/src/ipc_bridge.rs#IpcSink#agent_prompt_response]] sends the correlated answer on the ordered writer channel. `AlwaysAllow` and `AlwaysDeny` persist only the prompted capability's `[agent_api]` key through the normal config save path; once-only choices do not write config. The server updates its in-memory mode as soon as the response arrives, and the watcher reload makes the saved value durable.
+
+Settings appends an Agent API page without renumbering existing page identities. It exposes Deny/Prompt/Allow choices for read metadata, read content, ordinary actions, destructive actions, and write input; model, value, apply, TOML round-trip, navigation, and section tests all use the same `agent_api.*` keys.
+
+### Correlated action execution
+
+Agent-dispatched actions run through the same foreground handlers as keyboard, palette, and legacy automation actions, but reserve completion semantics.
+
+`RunActionCorrelated` is admitted into the client's 16-entry foreground action queue only when capacity is available; refusal immediately reports failed instead of evicting older work. Non-session-creating actions report completion after their ordinary handler runs. New tab, AI tab, split, and new-window paths carry an `ActionCompletion` until the resulting `SessionCreated` is known, then report the created session id. Queue refusal and send failure report `Failed` explicitly.
+
+### Session activity indicator
+
+The client mirrors server `AgentActivity` edges into a per-session set and derives tab data from it; it does not invent timers or clear activity locally.
+
+[[crates/scribe-client/src/titlebar.rs#agent_active_glyph]] renders a leading `◆` in the accent color before the existing AI dot. [[crates/scribe-client/src/titlebar.rs#title_columns]] reserves one column for the agent glyph and two for the AI dot so both remain visible without stealing unbudgeted title width. The same children are used in the top titlebar and lower split-region tab bars. [[crates/scribe-client/src/titlebar.rs#tab_accessible_label]] appends “agent active” to the AccessKit name.
+
+The visible edge follows the server's lease+dwell state. Duplicate active/inactive frames are no-ops; a changed set bumps the shared redraw generation. Server leases drive the indicator for screen reads, input writes, and correlated actions with a valid same-window origin or explicit focus target.
+
 ## GPUI Update Surfaces
 
 The terminal window learns about an available update from the server, renders it as the centred status-bar CTA, and sends the user's decision back — the `UpdateAvailable` / `UpdateProgress` / `TriggerUpdate` / `DismissUpdate` quartet, live.

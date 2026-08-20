@@ -114,13 +114,89 @@ A `ci_run_bar` participant may request jobs for a root visible in its window
 whether it owns or only views the window. Incapable clients and foreign roots
 are rejected, while close remains accepted after the root moves.
 
-## Agent API Audit
+## Agent Control Surface
+
+Checked-in suites cover the shared contract, server state machines and handlers, GPUI client surfaces, CLI discovery, installer-owned affordances, and the dedicated functional, visual, and performance harnesses.
+
+### Common contract and configuration
+
+Shared unit tests pin wire compatibility, DTO redaction, capability mapping, error envelopes, and safe config defaults.
+
+`crates/scribe-common/src/agent.rs` serializes every request, payload, response, world DTO, screen DTO, action result, capability, policy mode, and typed error, then rejects forbidden keys including launch id, prompt state/text, conversation id, model, tool, and agent metadata. The exhaustive automation-action test asserts every current action uses the ordinary or destructive capability intended for it.
+
+`crates/scribe-common/src/protocol.rs` round-trips the request, response, prompt, activity, correlated-action, and completion frames. Legacy Hello/Welcome schemas omit `agent_api` and must decode to false; newer fields remain ignorable by old named-MessagePack schemas.
+
+`crates/scribe-common/src/config.rs` proves an absent `[agent_api]` table leaves every axis at `Deny`, over-ceiling numerics clamp to their hard limits, and unknown keys are tolerated. Server config projection tests prove separate loads carry changed modes into the snapshot used by `ConfigReloaded`.
+
+### Server policy and handler units
+
+The server module tests each state machine independently and then exercises the shared dispatcher ordering.
+
+Policy tests cover direct allow/default deny, headless prompt deny, correlated prompt parking, configurable timeout, exact-key burst reuse and boundary expiry, the 64-waiter cap, sticky decisions affecting one capability only, and live refresh cancelling pending work.
+
+Activity tests use paused Tokio time to prove overlapping references cannot clear early, dwell is measured from final release, reacquisition cancels a stale clear, caller teardown releases only its leases, stale guard drops are harmless, and all-Deny refresh releases every lease.
+
+Text tests cover soft-wrap joining, hard breaks, blank-tail trimming, wide-character spacers, image markers, UTF-8-safe byte truncation, exact-fit behavior, OSC 8 label retention without URI, real-grid wrapping, scrollback bounds, and alternate-screen history exclusion.
+
+World tests assemble live-session, window-share, and workspace-manager fixtures, then assert one consistent snapshot, allowlisted AI fields, stable ordering, caller marking, same-window sibling filtering, and typed failure for absent or stale origins.
+
+Dispatcher tests cover a real framed socket request under default Deny; policy-before-lookup for world, screen, actions, and input; screen identity and truncation; prompt allow/deny; capability reporting and live refresh; benign/destructive action separation; correlated completion/timeout/disconnect; input byte ordering and full-write acknowledgement; and the four-request admission ceiling.
+
+### Audit contract
 
 Server unit tests capture dispatcher audit events as structured fields.
 
 `dispatcher_emits_one_complete_metadata_only_audit_for_every_outcome` exercises allowed screen content, direct denial, prompt denial, and busy admission. It requires one `agent_call` event per dispatch, the exact six-field schema, canonical target/name values, and `response_bytes` equal to the serialized `ServerMessage::AgentResponse`.
 
 A sentinel embedded in terminal content must be absent from the complete structured capture. `request_metadata_uses_only_supported_target_kinds` constrains every request variant's target kind to `server`, `window`, or `session`.
+
+### Client consent, indicator, action, and settings units
+
+GPUI headless tests verify the client can render, answer, execute, and configure the negotiated surface without a display server.
+
+Dialog tests require the capability, target, caller-supplied label warning, four decisions, Deny-on-Escape behavior, accessible title/body, and default Deny focus. IPC bridge tests pin prompt-id echo, correlated completion fields, create-session completion ownership, and failure when a completion-bearing create cannot enter the outbound queue.
+
+Client action tests preserve completion across the new-window bootstrap and report the created session id. Activity tests fold duplicate edges idempotently. Titlebar tests require the leading glyph and AI dot to coexist, reserve both width budgets, and add the non-visual state to the accessible tab label.
+
+Settings tests require all five `agent_api.*` controls on the appended Agent API page, read their modes from config, apply Deny/Prompt/Allow, and round-trip the result through the production TOML serializer.
+
+### CLI and generated affordance checks
+
+CLI unit tests walk the clap tree and require generated skill text to name every subcommand, report denied axes as unavailable with exact settings paths, and reflect Allow/Prompt changes.
+
+The same suite parses every v1 command, enforces the 64-character caller label and full origin UUID, performs a framed one-shot exchange over an in-memory duplex stream, and validates versioned success and typed-error JSON envelopes.
+
+`tests/e2e/func/pi-extension-harness.mjs` loads the packaged Pi extension, verifies six typed tool schemas, checks exact `scribe agent … --agent pi` argv, returns CLI JSON to the model, and proves an unset `SCRIBE_SESSION_ID` spawns nothing. `tests/install/postinst-regressions.sh` covers fresh Claude/Codex skill install, idempotent no-rewrite, regeneration after CLI output changes, and foreign-file refusal.
+
+### Socket gating and client compatibility
+
+Server IPC tests prove agent requests use the transient local pool, prompt and activity frames reach only participants advertising `agent_api`, activity resolves through the session's owning window, and unknown sessions emit no frame.
+
+The `scribe-test` daemon and IPC fixtures explicitly advertise `agent_api: false`; they tolerate the additive variants without claiming to implement an agent consumer. The dedicated recipes below instead drive the surface through the real `scribe` CLI inside live panes, so the harness itself never claims the capability.
+
+### Functional agent E2E scripts
+
+Container scripts exercise the real CLI-to-server control path from inside live sessions against a freshly configured server.
+
+`tests/e2e/func/agent-read.sh` restarts the server per policy phase: an in-pane read under `deny` returns the typed `denied` envelope without disclosing a sibling's secret marker, then a read under `allow` returns the sibling's session id, title, CWD, and marker text. `tests/e2e/func/agent-world.sh` proves `world` marks exactly one caller row, `siblings` resolves the caller's window purely through the inherited origin, and `capabilities` reports surface version 1 plus the live policy modes.
+
+`tests/e2e/func/agent-write.sh` holds the target PTY's raw-mode reader behind a file gate so a complete 64 KiB write cannot be acknowledged early, then proves the exact payload landed before the successful acknowledgement. `tests/e2e/func/agent-affordance.sh` runs the packaged Claude and Codex setup scripts through fresh install, idempotent no-rewrite, default-deny policy reflection, and foreign-file refusal.
+
+`tests/e2e/func/agent-action.sh` runs in the visual image (`just e2e-visual-agent-action`) because correlated completion needs a real GPUI window: a `new-tab` action targeted at the named client window completes and returns a created session id that a following `world` call must contain.
+
+### Visual consent and indicator recipes
+
+Shared-pane visual runs prove the consent dialog and the tab activity glyph as rendered pixels.
+
+`tests/e2e/visual/agent-consent-dialog.sh` parks a real in-pane read behind an `AgentPromptRequest`, requires the modal to change the window by at least 500 pixels, then sends Escape and requires the CLI to exit with the typed denial and no terminal content. `tests/e2e/visual/agent-indicator.sh` captures the tab strip before, during, and after an agent read, requiring the leading glyph to paint while the lease is held and to clear after the configured dwell.
+
+### Performance budgets and response ceiling
+
+`cargo bench -p scribe-server --bench agent_api` fails on budget or ceiling violations instead of only reporting numbers.
+
+Each case runs 20 warmup plus 200 measured iterations. p95 budgets are 50 ms for serializing a representative 8-window/64-session world snapshot DTO, 100 ms for a viewport read, and 250 ms for a 1,000-line scrollback read, both dispatched through the production seam against a real populated `Term`.
+
+Every serialized `ServerMessage::AgentResponse` must fit the 256 KiB `AGENT_MAX_RESPONSE_BYTES_CEILING`, including a deliberately over-ceiling screen fixture; the companion unit `serialized_screen_response_stays_within_the_hard_ceiling` proves the truncation lands on a UTF-8 boundary. A default-Deny read must complete without ever touching the session lookup, proven by a counting seam that stays at zero.
 
 ## Agent API action activity
 
@@ -139,12 +215,6 @@ The two-process model keeps the server connection alive across many short-lived 
 ### Error Model
 
 Two exit codes distinguish failure kinds.  has two variants: `TestFailure` (exit 1) for assertion mismatches, and `InfraError` (exit 2) for socket, spawn, or timeout problems.
-
-## Agent API write input
-
-Focused server tests cover agent input bounds, policy ordering, payload bytes, typed failures, and completion acknowledgement.
-
-An over-cap multibyte UTF-8 string returns `TooLarge` before prompt or target lookup. A prompted UTF-8 write plus submit raises exactly one `WriteInput` decision and emits only text plus carriage return; submit false emits text only. An approved missing target is `NotFound`, a closed writer is `ActionFailed`, and a one-byte-capacity duplex writer keeps the acknowledgement future pending until all payload bytes are consumed.
 
 ## Terminal Image Client Scene
 

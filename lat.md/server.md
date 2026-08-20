@@ -18,14 +18,6 @@ Splitting the pools is what makes a hook burst survivable. Hook events arrive as
 
 A local first frame is read under `LOCAL_PRE_HELLO_TIMEOUT` (5 s). Every local caller writes immediately after connecting, so a still-silent connection is an abandoned or half-open dialer sitting on a pending slot; reads after the first frame stay untimed, since an idle window is legitimate. Remote transports keep their own caps and their own idle timeout — see [[server#Remote Control#Accept Path]].
 
-### Agent write input
-
-Agent writes are bounded before prompting, authorized once, and acknowledged only after the complete PTY write.
-
-[[crates/scribe-server/src/agent_api/mod.rs#dispatch]] checks `max_input_bytes` against the UTF-8 string's byte length before entering the shared asynchronous policy/prompt seam. One `WriteInput` authorization therefore gates the complete text plus its explicit submit choice; target lookup happens only after approval.
-
-After lookup, [[crates/scribe-server/src/agent_api/mod.rs#write_agent_input]] builds one payload from the request text and appends exactly one carriage return only when `submit` is true. It awaits `write_all` on the live session's shared PTY writer before returning `AgentPayload::WriteInput`; write failure becomes typed `ActionFailed`, and an absent live session becomes typed `NotFound`. [[crates/scribe-server/src/ipc_server.rs#establish_local_first_frame]] sends the response only after that awaited dispatch completes.
-
 ### Frame Error Policy
 
 The server skips an undecodable MessagePack payload only after the framing layer has consumed that payload completely and preserved alignment.
@@ -46,9 +38,53 @@ An upgrade server has no durable stdio of its own — Debian `postinst` redirect
 
 ## Agent API
 
-One-shot agent calls reuse the existing local transient socket path.
+The server adapts its authoritative PTY, workspace, window-share, and automation state into one-shot local agent calls without adding a listener or registering an agent window.
 
-[[crates/scribe-server/src/agent_api/mod.rs#dispatch]] owns admission, policy resolution, handler routing, response construction, and the call audit before the transient connection sends its single reply.
+[[crates/scribe-server/src/ipc_server.rs#is_transient_first_frame]] classifies `AgentRequest` with the bounded transient pool. [[crates/scribe-server/src/ipc_server.rs#handle_transient_agent_request]] supplies registry and client seams to [[crates/scribe-server/src/agent_api/mod.rs#dispatch]], then sends exactly one `AgentResponse` before the socket closes. Agent traffic never attaches a session, claims a `WindowId`, resizes a PTY, or enters a remote transport.
+
+### Admission and capability policy
+
+Every request is admitted; every operation except `Capabilities` is policy-authorized before any target or registry lookup.
+
+[[crates/scribe-server/src/agent_api/mod.rs#AgentApiState]] admits four concurrent calls. `WriteInput` byte length is checked before admission can raise a prompt; excess requests return typed `Busy`, and oversized input returns `TooLarge` without touching a session or client.
+
+[[crates/scribe-server/src/agent_api/policy.rs#AgentPolicyEngine]] resolves `Deny`, `Allow`, or `Prompt` per capability. Prompt mode denies when no local `agent_api` client exists, otherwise issues one correlated prompt and parks up to 64 same-key requests behind it. The key is caller-supplied agent label, capability, and target. Decisions are reused for the configured burst window; timeout denies; `AlwaysAllow` and `AlwaysDeny` update only the matching in-memory axis.
+
+`ConfigReloaded` projects the fresh `[agent_api]` table through [[crates/scribe-server/src/config.rs#project_config]] and [[crates/scribe-server/src/agent_api/mod.rs#AgentApiState#refresh_policy]]. Refresh cancels pending prompts and takes effect on the next call without restarting the server. An all-`Deny` policy also releases held activity leases; it is the off state, not a separate master switch.
+
+### World and siblings
+
+Metadata reads copy one coherent, allowlisted view from the live-session, window-share, and workspace registries.
+
+[[crates/scribe-server/src/agent_api/world.rs#capture]] takes read guards in the order live sessions, window shares, workspace manager, stamps one `snapshot_id` and capture time, then releases the guards before DTO formatting. Windows reuse `ListWindows` workspace names, session counts, connection state, sharing mode, and participant count. Session copies include only identity, title, CWD, provider/state, task label, and context fill; retained prompts, conversation ids, model/tool/agent metadata, environment envelopes, and participant identities never enter the capture type.
+
+`World` returns every window, workspace, and live session server-wide. A matching `origin_session_id` marks exactly one session as `is_caller`; a missing or stale origin marks none. `Siblings` filters the same captured snapshot to the origin session's window and returns typed `NotFound` when the origin is absent or stale.
+
+### Screen reads
+
+Screen reads copy only the requested viewport and bounded trailing scrollback while holding the terminal lock, then normalize text after releasing it.
+
+[[crates/scribe-server/src/agent_api/text.rs#copy_rows]] excludes alternate-screen history and copies characters, spacer state, and soft-wrap state only. [[crates/scribe-server/src/agent_api/text.rs#format_rows]] joins soft wraps, preserves hard breaks, trims blank tails, skips wide-character spacers, keeps OSC 8 labels without URIs, replaces each image-placeholder run with `[image omitted]`, and cuts at a UTF-8 boundary under `max_response_bytes`, setting `truncated` when content is dropped.
+
+The reply includes session id, title, CWD, logical line count, capture time, and snapshot id. Policy is evaluated before the live-session lookup, so `Deny` returns no content bytes; an approved missing session returns `NotFound`.
+
+The configured `max_response_bytes` caps only the text field, so [[crates/scribe-server/src/agent_api/mod.rs#enforce_serialized_response_ceiling]] re-measures the complete serialized `ServerMessage::AgentResponse` and re-truncates screen text at UTF-8 boundaries until the whole reply fits the hard 256 KiB `AGENT_MAX_RESPONSE_BYTES_CEILING`, marking `truncated`. A screen reply whose metadata alone exceeds the cap becomes typed `TooLarge`.
+
+### Actions and input
+
+Mutation calls reuse existing window action handlers and live PTY writers, adding policy and completion semantics rather than a second implementation.
+
+`DispatchAction` maps every `AutomationAction` exhaustively to either `DispatchAction` or `DispatchDestructiveAction`; close-pane, close-tab, and update-dialog actions use the destructive gate. [[crates/scribe-server/src/ipc_server.rs#run_agent_action]] accepts an explicit connected window or the sole connected window, returns `AmbiguousTarget` when omission cannot select exactly one, and waits for `RunActionCorrelated` completion. Queue refusal, timeout, or client disconnect becomes `ActionFailed`; successful session-creating actions return the created session id.
+
+Agent writes are bounded before prompting, authorized once, and acknowledged only after the complete PTY write. [[crates/scribe-server/src/agent_api/mod.rs#write_agent_input]] appends exactly one carriage return only when `submit` is true and awaits `write_all`; an absent live session returns `NotFound` and write failure returns `ActionFailed`.
+
+### Activity leases
+
+Per-session activity uses reference-counted leases so overlapping calls cannot clear another call's visible state.
+
+[[crates/scribe-server/src/agent_api/activity.rs#AgentActivityTracker]] emits one active edge on the first lease and one inactive edge after the last release plus the configured dwell. Reacquisition during dwell cancels the pending clear; caller teardown can release only that caller's leases, while an all-`Deny` refresh releases all leases.
+
+`ReadScreen` and `WriteInput` hold leases for their named session, and authorized actions hold one under the origin rules in [[server#Server#Agent API#Action activity leases]]. [[crates/scribe-server/src/ipc_server.rs#spawn_agent_activity_forwarder]] resolves each transition to the session's window and sends `AgentActivity` only to participants that advertised the `agent_api` capability bit.
 
 ### Metadata-only call audit
 

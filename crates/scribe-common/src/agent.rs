@@ -9,6 +9,7 @@ use crate::config::SharingMode;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 use crate::protocol::AutomationAction;
 
+// @lat: [[common#Common#Agent Control Contract]]
 /// One request made through the local agent API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // `ClientMessage` already uses `type` as its outer tag. A distinct nested key
