@@ -177,8 +177,12 @@ type_text() {
     sleep 1.0
 }
 
-# Click at an absolute screen point through XTEST, mirroring
-# visual/overlay-actions.sh's click_at.
+# Click at an ABSOLUTE screen point through XTEST. Deliberately NOT the same
+# contract as the same-named helpers elsewhere in this directory: this one takes
+# absolute coordinates because control_center_x/y already add WIN_X/WIN_Y, while
+# overlay-actions.sh's takes window-relative coordinates plus a button, and
+# workspace-split.sh's and titlebar.sh's resolve the window themselves. Four
+# contracts sharing a name, not four copies to fold together.
 click_at() {
     xdotool mousemove "$1" "$2"
     sleep 0.3
