@@ -16,7 +16,10 @@ use alacritty_terminal_gpui::event::VoidListener;
 use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Boundary, Column, Direction, Point};
 use alacritty_terminal_gpui::term::search::{Match, RegexIter, RegexSearch};
-use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
+use gpui::{
+    ClickEvent, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, Pixels, Rgba, Role,
+    div, prelude::*, px,
+};
 use scribe_common::protocol::SearchMatch as ServerMatch;
 use scribe_common::theme::ChromeColors;
 
@@ -318,7 +321,7 @@ pub enum FindOverlayEvent {
     /// `SearchRequest` for a non-empty query and simply stops highlighting for
     /// an empty one.
     QueryChanged(String),
-    /// The overlay was dismissed (Escape or a backdrop click).
+    /// The overlay was dismissed (Escape or the close control).
     Dismissed,
 }
 
@@ -357,6 +360,28 @@ impl From<&ChromeColors> for FindOverlayColors {
     }
 }
 
+/// Fixed square size of each pointer control (previous/next/close). Explicit
+/// rather than content-fit, so the control cluster's on-screen position can be
+/// computed without depending on font metrics — see the click-driven
+/// regression tests in `overlay_tests` (scribe-1mpq).
+const CONTROL_SIZE: Pixels = px(22.0);
+/// Gap between every child in the control row, including between controls.
+const ROW_GAP: Pixels = px(6.0);
+/// Horizontal padding inside the control row, both sides.
+const ROW_PAD_X: Pixels = px(8.0);
+/// Vertical padding inside the control row, both sides.
+const ROW_PAD_Y: Pixels = px(6.0);
+/// Fixed width of the inline "n/m" counter, wide enough for
+/// `SEARCH_RESULT_LIMIT/SEARCH_RESULT_LIMIT` ("256/256") so the controls
+/// beside it never shift position as the digit count changes.
+const COUNTER_WIDTH: Pixels = px(50.0);
+/// The box's fixed (unclamped) width; the box's own `min_w` is the
+/// narrow-pane floor it shrinks to instead.
+const BOX_WIDTH: Pixels = px(360.0);
+/// The box's offset from the searched pane's top-right corner.
+const BOX_MARGIN_TOP: Pixels = px(14.0);
+const BOX_MARGIN_RIGHT: Pixels = px(14.0);
+
 /// The find-in-scrollback overlay: a query field, the server's match set, and
 /// the highlighted match index.
 ///
@@ -380,6 +405,12 @@ pub struct FindOverlayView {
     /// newer edit replaces it.
     pending: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
+    /// Focus targets for the row's three pointer controls, kept separate from
+    /// `focus_handle` so each control carries its own `focus_visible` ring
+    /// (`ci_bar::action_button`'s shape, copied verbatim: scribe-1mpq).
+    prev_focus: FocusHandle,
+    next_focus: FocusHandle,
+    close_focus: FocusHandle,
 }
 
 impl EventEmitter<FindOverlayEvent> for FindOverlayView {}
@@ -396,6 +427,9 @@ impl FindOverlayView {
             debounce: 0,
             pending: None,
             focus_handle: cx.focus_handle(),
+            prev_focus: cx.focus_handle(),
+            next_focus: cx.focus_handle(),
+            close_focus: cx.focus_handle(),
         }
     }
 
@@ -545,14 +579,18 @@ impl FindOverlayView {
         cx.emit(FindOverlayEvent::QueryChanged(self.query.clone()));
     }
 
-    /// The `Find  n/m` header text for the current state.
-    fn header(&self) -> String {
+    /// The inline "n/m" counter for the current state, folded from the old
+    /// two-row header's three states (scribe-1mpq): empty while the query
+    /// itself is empty, `0/0` once a non-empty query has no matches — never
+    /// prose, so the counter's fixed-width slot never has to reflow the
+    /// controls beside it — and `current/total` once there are matches.
+    fn counter_text(&self) -> String {
         if self.query.is_empty() {
-            "Find".to_owned()
+            String::new()
         } else if self.matches.is_empty() {
-            "Find  no matches".to_owned()
+            "0/0".to_owned()
         } else {
-            format!("Find  {}/{}", self.current + 1, self.matches.len())
+            format!("{}/{}", self.current + 1, self.matches.len())
         }
     }
 }
@@ -564,14 +602,21 @@ impl Render for FindOverlayView {
         let query_text =
             if query_empty { "Type to search scrollback".to_owned() } else { self.query.clone() };
         let query_color = if query_empty { colors.placeholder_fg } else { colors.query_fg };
+        let counter_text = self.counter_text();
 
         // The overlay mounts inside the focused pane's `grid_slot`
         // (`TerminalView::compose_pane_content`), which is the pane whose
         // scrollback the query actually searches, so `inset_0` here resolves
         // against that pane's rect rather than the window's. The box still
         // hugs its top-right corner, but that corner is now the searched
-        // pane's, not the window's. The backdrop stays click-through except
-        // for its own dismiss handler.
+        // pane's, not the window's.
+        //
+        // The backdrop no longer dismisses on click (scribe-1mpq): the row
+        // now carries a real close control and Escape still works, so
+        // swallowing every left click in the pane was only ever a cost — it
+        // turned a click meant to place a selection under find into a dismiss
+        // instead. Only the box itself still stops propagation, so a click on
+        // the control row doesn't also fall through to the grid underneath it.
         div()
             .track_focus(&self.focus_handle)
             .absolute()
@@ -582,54 +627,122 @@ impl Render for FindOverlayView {
             // backdrop spans the pane, and a stretched child would paint a
             // full-height panel down the right edge of the grid.
             .items_start()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _win, ctx| this.dismiss(ctx)),
-            )
             .child(
                 div()
-                    .mt(px(14.0))
-                    .mr(px(14.0))
-                    .w(px(360.0))
-                    .max_w(px(360.0))
+                    .mt(BOX_MARGIN_TOP)
+                    .mr(BOX_MARGIN_RIGHT)
+                    .w(BOX_WIDTH)
+                    .max_w(BOX_WIDTH)
                     // ponytail: a pane narrower than this floor still clips
                     // against grid_slot's overflow_hidden rather than
-                    // shrinking further; widen the floor or wrap the header
-                    // and query text if a narrower split turns out to matter.
+                    // shrinking further; widen the floor if a narrower split
+                    // turns out to matter. The counter and the three controls
+                    // are `flex_none` at a fixed size, so only the query text
+                    // truncates as the box narrows toward this floor — the
+                    // controls stay visible and clickable the whole way down.
                     .min_w(px(200.0))
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .px(ROW_PAD_X)
+                    .py(ROW_PAD_Y)
+                    .gap(ROW_GAP)
                     .bg(colors.bg)
                     .border_1()
                     .border_color(colors.border)
-                    .rounded_md()
-                    .shadow_lg()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    .rounded(px(4.0))
+                    .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    .child(div().flex_none().text_sm().text_color(colors.border).child("/"))
                     .child(
                         div()
-                            .px_2()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(colors.header_fg)
-                            .child(self.header()),
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .text_color(query_color)
+                            .child(query_text),
                     )
                     .child(
                         div()
-                            .mx_1()
-                            .mt_1()
-                            .mb_1()
-                            .px_2()
-                            .py_1()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .bg(colors.input_bg)
-                            .rounded_sm()
-                            .child(div().text_sm().text_color(colors.border).child("/"))
-                            .child(div().text_sm().text_color(query_color).child(query_text)),
-                    ),
+                            .flex_none()
+                            .w(COUNTER_WIDTH)
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_color(colors.header_fg)
+                            .child(counter_text),
+                    )
+                    .child(find_control(
+                        ("find-prev-match", "Previous match", "\u{2191}"),
+                        &colors,
+                        &self.prev_focus,
+                        cx.listener(|this, _event, _, ctx| this.prev_match(ctx)),
+                    ))
+                    .child(find_control(
+                        ("find-next-match", "Next match", "\u{2193}"),
+                        &colors,
+                        &self.next_focus,
+                        cx.listener(|this, _event, _, ctx| this.next_match(ctx)),
+                    ))
+                    .child(find_control(
+                        ("find-close", "Close find", "\u{2715}"),
+                        &colors,
+                        &self.close_focus,
+                        cx.listener(|this, _event, _, ctx| this.dismiss(ctx)),
+                    )),
             )
     }
+}
+
+/// One accessible pointer control in the find row — previous, next, or close.
+///
+/// Copies `ci_bar::action_button`'s shape (`crates/scribe-client/src/ci_bar.rs`)
+/// verbatim: `Role::Button`, an `aria_label` plus the same `aria_description`,
+/// `track_focus`, a pointer cursor, hover/`focus_visible` styling, and
+/// Enter/Space wired through `on_key_down` so GPUI's own
+/// Enter-Space-and-AccessKit-Click-to-`on_click` mapping reaches the same
+/// handler a pointer click does.
+fn find_control(
+    copy: (&'static str, &'static str, &'static str),
+    colors: &FindOverlayColors,
+    focus: &FocusHandle,
+    on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let (id, label, glyph) = copy;
+    let idle = colors.header_fg;
+    let bright = colors.query_fg;
+    let hover_bg = colors.input_bg;
+    let focus_bg = colors.border;
+    let contrast = colors.bg;
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .aria_description("Press Enter or Space to activate")
+        .track_focus(focus)
+        .flex_none()
+        .w(CONTROL_SIZE)
+        .h(CONTROL_SIZE)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(idle)
+        .hover(move |style| style.bg(hover_bg).text_color(bright))
+        .focus_visible(move |style| style.bg(focus_bg).text_color(contrast))
+        .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+        .on_key_down(|event: &KeyDownEvent, _, ctx| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                ctx.stop_propagation();
+            }
+        })
+        .on_click(move |event, window, ctx| {
+            ctx.stop_propagation();
+            on_click(event, window, ctx);
+        })
+        .child(glyph)
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -724,13 +837,17 @@ mod tests {
 mod overlay_tests {
     use std::sync::{Arc, Mutex};
 
-    use gpui::{AppContext as _, Entity, TestAppContext};
+    use gpui::{
+        AppContext as _, Context, Entity, Modifiers, Pixels, Point, Render, TestAppContext,
+        VisualTestContext, WindowHandle, WindowOptions, div, point, prelude::*, px,
+    };
     use scribe_common::protocol::SearchMatch as ServerMatch;
     use scribe_common::theme::minimal_dark;
 
     use super::{
-        FIND_QUERY_DEBOUNCE, FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults,
-        visible_highlights,
+        BOX_MARGIN_RIGHT, BOX_MARGIN_TOP, BOX_WIDTH, CONTROL_SIZE, FIND_QUERY_DEBOUNCE,
+        FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X,
+        ROW_PAD_Y, visible_highlights,
     };
 
     fn hit(row: i32, col_start: u16, col_end: u16) -> ServerMatch {
@@ -855,11 +972,12 @@ mod overlay_tests {
         assert_eq!(view.read_with(cx, |o, _| o.current_index()), 2);
         view.update(cx, FindOverlayView::next_match);
         assert_eq!(view.read_with(cx, |o, _| o.current_index()), 0);
-        assert_eq!(view.read_with(cx, |o, _| o.header()), "Find  1/3");
+        assert_eq!(view.read_with(cx, |o, _| o.counter_text()), "1/3");
 
-        // A query with no matches says so rather than pretending to be at 0/0.
+        // A query with no matches gets a compact `0/0` rather than prose that
+        // would have to reflow the counter's fixed-width slot.
         view.update(cx, |overlay, ctx| overlay.push_str("y", ctx));
-        assert_eq!(view.read_with(cx, |o, _| o.header()), "Find  no matches");
+        assert_eq!(view.read_with(cx, |o, _| o.counter_text()), "0/0");
         view.update(cx, FindOverlayView::next_match);
         assert_eq!(view.read_with(cx, |o, _| o.current_index()), 0);
     }
@@ -881,5 +999,126 @@ mod overlay_tests {
         // A degenerate grid highlights nothing rather than panicking on the
         // last-column arithmetic.
         assert!(visible_highlights(&matches, 0, 0, 0).is_empty());
+    }
+
+    /// Width of the probe's `.relative()` mount, standing in for the pane's
+    /// `grid_slot` in production. Comfortably wider than
+    /// `BOX_WIDTH + BOX_MARGIN_RIGHT` so the box renders at its unclamped
+    /// width rather than the narrow-pane floor.
+    const CONTAINER_WIDTH: Pixels = px(640.0);
+    const CONTAINER_HEIGHT: Pixels = px(120.0);
+
+    struct FindOverlayProbe {
+        overlay: Entity<FindOverlayView>,
+    }
+
+    impl Render for FindOverlayProbe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            // Mirrors `TerminalView::compose_pane_content`'s `grid_slot`: a
+            // `.relative()` box the overlay's own `.absolute().inset_0()`
+            // resolves against.
+            div().relative().w(CONTAINER_WIDTH).h(CONTAINER_HEIGHT).child(self.overlay.clone())
+        }
+    }
+
+    /// Open a headless window hosting the overlay inside a pane-shaped mount,
+    /// so `simulate_click` hit-tests the control row the same way a real
+    /// pointer click does.
+    fn overlay_window(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<FindOverlayProbe>, Entity<FindOverlayView>, EventLog) {
+        let colors = FindOverlayColors::from(&minimal_dark().chrome);
+        let window = cx
+            .update(|app| {
+                app.open_window(WindowOptions::default(), move |_window, app| {
+                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, ctx));
+                    app.new(|_| FindOverlayProbe { overlay })
+                })
+            })
+            .expect("open find overlay probe window");
+        let overlay =
+            window.update(cx, |probe, _, _| probe.overlay.clone()).expect("read overlay entity");
+
+        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        cx.update(|app| {
+            app.subscribe(&overlay, move |_, event: &FindOverlayEvent, _| record(&sink, event))
+                .detach();
+        });
+        (window, overlay, log)
+    }
+
+    /// The on-screen center of one control in the find row, counting from the
+    /// right: `0` = close, `1` = next, any other value = previous. Mirrors
+    /// `FindOverlayView::render`'s control row exactly — the border is
+    /// `.border_1()` (a fixed 1px, not the rem-based padding scale) and every
+    /// control at or right of the query field is `flex_none` at a fixed size,
+    /// so this position does not depend on font metrics. Only valid when the
+    /// mount is wide enough that the box renders at its unclamped
+    /// [`BOX_WIDTH`] (see [`CONTAINER_WIDTH`]).
+    fn control_center(container_width: Pixels, index_from_right: u8) -> Point<Pixels> {
+        let border = px(1.0);
+        let box_left = container_width - BOX_MARGIN_RIGHT - BOX_WIDTH;
+        let content_right = box_left + BOX_WIDTH - border - ROW_PAD_X;
+        let stride = CONTROL_SIZE + ROW_GAP;
+        let offset = match index_from_right {
+            0 => px(0.0),
+            1 => stride,
+            _ => stride + stride,
+        };
+        let center_x = content_right - offset - CONTROL_SIZE * 0.5;
+        let center_y = BOX_MARGIN_TOP + border + ROW_PAD_Y + CONTROL_SIZE * 0.5;
+        point(center_x, center_y)
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Pointer controls drive the same transitions as the key table]]
+    #[gpui::test]
+    fn pointer_controls_drive_the_same_transitions_as_the_key_table(cx: &mut TestAppContext) {
+        let (window, overlay, log) = overlay_window(cx);
+        overlay.update(cx, |view, ctx| view.push_str("err", ctx));
+        let mut results = FindResults::default();
+        results.accept("err".to_owned(), vec![hit(0, 0, 2), hit(1, 0, 2)]);
+        overlay.update(cx, |view, ctx| {
+            view.adopt_results(&results, ctx);
+        });
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw the seeded overlay");
+        let mut test_window = VisualTestContext::from_window(window.into(), cx);
+
+        assert_eq!(overlay.read_with(cx, |o, _| o.current_index()), 0);
+
+        // Clicking the next control drives the same transition Enter/Down do.
+        test_window.simulate_click(control_center(CONTAINER_WIDTH, 1), Modifiers::default());
+        assert_eq!(
+            overlay.read_with(cx, |o, _| o.current_index()),
+            1,
+            "clicking the next control did not advance the current match"
+        );
+
+        // Clicking the previous control drives the same transition Shift+Enter/Up do.
+        test_window.simulate_click(control_center(CONTAINER_WIDTH, 2), Modifiers::default());
+        assert_eq!(
+            overlay.read_with(cx, |o, _| o.current_index()),
+            0,
+            "clicking the previous control did not step the current match back"
+        );
+
+        // Clicking the close control drives the same transition Escape does.
+        test_window.simulate_click(control_center(CONTAINER_WIDTH, 0), Modifiers::default());
+        assert_eq!(
+            overlay.read_with(cx, |o, _| o.match_count()),
+            0,
+            "clicking the close control did not clear the match set"
+        );
+        assert_eq!(overlay.read_with(cx, |o, _| o.query().to_owned()), String::new());
+        assert_eq!(
+            drain(&log, cx),
+            vec![FindOverlayEvent::Dismissed],
+            "clicking the close control did not emit the same Dismissed event Escape does"
+        );
     }
 }

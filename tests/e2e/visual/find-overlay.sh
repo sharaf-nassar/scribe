@@ -29,6 +29,10 @@
 #   3. Enter moves the current match, which repaints a different cell run;
 #   4. Escape closes the overlay, every highlight is dropped, and the chord
 #      re-opens it — which it could not do if the overlay had swallowed it;
+#   6. clicking the row's next control (scribe-1mpq) moves the highlighted
+#      match, the same crop-diff assertion phase 3 uses for Enter;
+#   7. clicking the row's close control drops every highlight, the same
+#      assertion phase 4 uses for Escape;
 #   5. splitting the pane and focusing the LEFT one, opening find paints the
 #      box inside that pane's own grid slot rather than the window root — a
 #      regression guard for the overlay's mount point.
@@ -173,6 +177,39 @@ type_text() {
     sleep 1.0
 }
 
+# Click at an absolute screen point through XTEST, mirroring
+# visual/overlay-actions.sh's click_at.
+click_at() {
+    xdotool mousemove "$1" "$2"
+    sleep 0.3
+    xdotool click 1
+    sleep 0.5
+}
+
+# On-screen center of one find-row pointer control, counting from the right:
+# 0 = close, 1 = next, 2 = previous. Mirrors
+# crates/scribe-client/src/search.rs's control-row layout constants exactly
+# (BOX_MARGIN_RIGHT/TOP=14, a 1px border, ROW_PAD_X=8, ROW_PAD_Y=6,
+# CONTROL_SIZE=22, ROW_GAP=6), so these targets cannot drift from the
+# production geometry. The box's right margin — and therefore every
+# control's x — is independent of whether the box's own width is clamped by
+# the narrow-pane floor, since `mr()` positions against the pane regardless
+# of the box's resolved width. PANE_TOP_OFFSET is the pane content's offset
+# from the OS window top; phase 5's TITLEBAR_H is deliberately looser (it only
+# needs to exclude chrome bands from a broad ink count), so this is measured
+# directly off a captured frame instead: the box's own top border lands at
+# window-relative y=31 (WIN_Y+31) with SCRIBE_SHARED_PANE's single-tab chrome.
+PANE_TOP_OFFSET=17
+CONTROL_STRIDE=28
+control_center_x() {
+    echo $(( WIN_X + WIN_W - 34 - CONTROL_STRIDE * $1 ))
+}
+# PANE_TOP_OFFSET + BOX_MARGIN_TOP(14) + border(1) + ROW_PAD_Y(6) +
+# half a control(11) = the control row's vertical center.
+control_center_y() {
+    echo $(( WIN_Y + PANE_TOP_OFFSET + 14 + 1 + 6 + 11 ))
+}
+
 WIN_X=0
 WIN_Y=0
 WIN_W=0
@@ -293,6 +330,36 @@ sleep 0.5
 shot /output/05-reopened.png
 echo "PHASE 4 PASS: Escape cleared every highlight and released the keyboard"
 
+# ── Phase 6: clicking the next control moves the highlighted match ──
+# Pointer equivalent of phase 3: the same crop-diff assertion proves a click
+# on the next control reaches FindOverlayView::next_match, not just that
+# Enter does. The overlay reopened at the end of phase 4 with an empty query
+# (dismiss clears it), so it is re-seeded first.
+measure_window
+type_text "$NEEDLE"
+shot /output/06-reseeded.png
+crop_grid /output/06-reseeded.png /output/06-grid.png
+NEXT_X=$(control_center_x 1)
+NEXT_Y=$(control_center_y)
+click_at "$NEXT_X" "$NEXT_Y"
+shot /output/07-next-clicked.png
+crop_grid /output/07-next-clicked.png /output/07-grid.png
+NEXT_CLICK_DIFF=$(pixel_diff /output/06-grid.png /output/07-grid.png)
+[ "${NEXT_CLICK_DIFF:-0}" -gt "$DIFF_MIN" ] \
+    || fail "PHASE 6: clicking the next control did not move the highlighted match (diff $NEXT_CLICK_DIFF)"
+echo "PHASE 6 PASS: clicking the next control advanced the current match, $NEXT_CLICK_DIFF px repainted"
+
+# ── Phase 7: clicking the close control drops every highlight ──────
+CLOSE_X=$(control_center_x 0)
+CLOSE_Y=$(control_center_y)
+click_at "$CLOSE_X" "$CLOSE_Y"
+shot /output/08-close-clicked.png
+crop_grid /output/08-close-clicked.png /output/08-grid.png
+CLOSE_CLICK_DIFF=$(pixel_diff /output/00-grid.png /output/08-grid.png)
+[ "${CLOSE_CLICK_DIFF:-0}" -le "$DIFF_MAX" ] \
+    || fail "PHASE 7: clicking the close control left highlights behind (diff $CLOSE_CLICK_DIFF)"
+echo "PHASE 7 PASS: clicking the close control cleared every highlight"
+
 # ── Phase 5: the overlay mounts in the focused pane, not the window ──
 # Find only ever searches the focused pane's scrollback
 # (`send_search_request` targets `shared.active_session`), so splitting the
@@ -340,8 +407,9 @@ wait_for_log_growth() {
     done
 }
 
-# The overlay reopened at the end of phase 4 and owns every keystroke while
-# open, including the split chord below — close it first.
+# Phase 7 closed the overlay via the close control, but a still-open overlay
+# owns every keystroke including the split chord below, so this stays as a
+# defensive close.
 send_keys Escape
 sleep 0.5
 
@@ -359,17 +427,17 @@ wait_for_log_growth "focused pane moved" "$FOCUS_BEFORE" 15 \
     || fail "PHASE 5: shift+ctrl+alt+Left never focused the left pane"
 
 focus
-shot /output/06-split-before-find.png
-LEFT_BEFORE=$(half_ink /output/06-split-before-find.png left)
-RIGHT_BEFORE=$(half_ink /output/06-split-before-find.png right)
+shot /output/09-split-before-find.png
+LEFT_BEFORE=$(half_ink /output/09-split-before-find.png left)
+RIGHT_BEFORE=$(half_ink /output/09-split-before-find.png right)
 
 OPENED_BEFORE=$(count_log "opened the find overlay")
 send_keys ctrl+shift+f
 wait_for_log_growth "opened the find overlay" "$OPENED_BEFORE" 15 \
     || fail "PHASE 5: ctrl+shift+f did not reopen the overlay on the split pane"
-shot /output/07-split-find-open.png
-LEFT_AFTER=$(half_ink /output/07-split-find-open.png left)
-RIGHT_AFTER=$(half_ink /output/07-split-find-open.png right)
+shot /output/10-split-find-open.png
+LEFT_AFTER=$(half_ink /output/10-split-find-open.png left)
+RIGHT_AFTER=$(half_ink /output/10-split-find-open.png right)
 LEFT_DELTA=$(( LEFT_AFTER - LEFT_BEFORE ))
 RIGHT_DELTA=$(( RIGHT_AFTER - RIGHT_BEFORE ))
 echo "PHASE 5: left half ${LEFT_BEFORE} -> ${LEFT_AFTER} (+${LEFT_DELTA}), right half ${RIGHT_BEFORE} -> ${RIGHT_AFTER} (+${RIGHT_DELTA})"
@@ -389,6 +457,9 @@ echo "    02-matches-highlighted.png — the query's matches painted on the grid
 echo "    03-next-match.png          — Enter moved the current match"
 echo "    04-overlay-closed.png      — Escape dropped every highlight"
 echo "    05-reopened.png            — the chord reopened the overlay"
-echo "    06-split-before-find.png   — split pane, left pane focused, before find"
-echo "    07-split-find-open.png     — find opened; the box stays in the left pane"
+echo "    06-reseeded.png            — the reopened overlay re-seeded with the needle"
+echo "    07-next-clicked.png        — clicking the next control moved the current match"
+echo "    08-close-clicked.png       — clicking the close control dropped every highlight"
+echo "    09-split-before-find.png   — split pane, left pane focused, before find"
+echo "    10-split-find-open.png     — find opened; the box stays in the left pane"
 echo "  Wire record: test-output/share-wire.jsonl"

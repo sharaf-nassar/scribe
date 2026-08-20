@@ -4504,7 +4504,9 @@ Driving  followed by a `KeyInput` on the same ordered writer channel, the test a
 
 Covers the pure halves of : the query/reply state machine, the viewport projection of the server's absolute grid rows, and the recolouring that turns a match into painted cells.
 
-None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights.
+Scribe-1mpq added a fourth pure half: that the row's pointer controls drive the identical state transitions the key table does (see below).
+
+None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights, its highlighted match moving when the next control is clicked, and every highlight dropping when the close control is clicked.
 
 The visual fixture disables the terminal cursor with DECTCEM before capturing
 its quiet baseline. That removes only cursor blink from the comparison; the
@@ -4537,9 +4539,15 @@ A pause mid-word settles the query and sends it, so several replies can be in fl
 
 #### Cycling wraps and drives the counter
 
-The `n/m` header is the only feedback the overlay gives about where in the match list the user is, so the cycling and the counter have to stay in step.
+The inline `n/m` counter is the only feedback the overlay gives about where in the match list the user is, so the cycling and the counter have to stay in step.
 
-`next_match` and `prev_match` wrap in both directions, the header reads `Find  1/3` at the top of a three-match list, a query with no matches reads `Find  no matches` instead of a zeroed counter, and cycling an empty match set is a no-op.
+`next_match` and `prev_match` wrap in both directions, the counter reads `1/3` at the top of a three-match list, a query with no matches reads the compact `0/0` instead of prose (scribe-1mpq folded the old `Find  no matches` header into the counter's fixed-width slot, which never has to reflow the controls beside it), and cycling an empty match set is a no-op.
+
+#### Pointer controls drive the same transitions as the key table
+
+The find row's previous/next/close controls exist so a pointer-only user reaches the same transitions the key table already drives; the regression is a click landing on the box instead of an actual `on_click` handler.
+
+The test opens a real headless GPUI window ( inside a fixed-size `.relative()` mount standing in for the pane's `grid_slot`), seeds a two-match query, and draws the window so the control row is actually laid out and hit-testable. It then computes each control's on-screen center from the same named layout constants  uses — border width, row padding, control size, and the gap between controls — so the click coordinates cannot drift from the production geometry, and asserts `simulate_click` at the next/previous/close centers drives `current_index()` and `match_count()` through the identical transitions `next_match`/`prev_match`/`dismiss` produce, plus the same `Dismissed` event Escape emits. Run against the old two-row, keyboard-only box the click on the next control's computed position lands on the header row's own click-swallowing handler instead of any button, so `current_index()` never leaves `0` and the assertion fails cleanly.
 
 #### Only on-screen matches are highlighted
 
