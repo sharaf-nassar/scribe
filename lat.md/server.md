@@ -336,9 +336,9 @@ The run-list request uses `head_sha`, `event=push`, and `per_page=100`, retains 
 
 Up to 100 returned workflow runs contribute to the worst-status rollup. Queued or running remains non-terminal until every workflow completes; terminal precedence is failure, cancelled, then success. Each run records its first server observation and latest observation without a date-parsing dependency.
 
-The tracker retains the highest run id observed for each repository. A new window snapshots that value as its generation cutoff and ignores older or equal runs before rollup, publication, detail selection, and terminal-stop decisions. An old-only response remains in discovery.
+Each poll response is normalized to the newest run per workflow at the tracked head before rollup, publication, detail selection, and the terminal-stop decision: [[crates/scribe-server/src/github_ci.rs#newest_per_workflow|newest_per_workflow]] keeps only the highest-id run for each `workflow_id`, so a retag's superseded run cannot poison the rollup while distinct workflows running concurrently at the same head both survive together.
 
-A trusted same-OID generation replaces even an active window. Ordinary same-head events still merge repository roots without resetting polling, so duplicate watcher delivery cannot discard live state.
+A trusted same-OID generation at a window's unchanged head reopens it in place — observed state and roots carry forward and polling timers restart, but nothing is cleared or published as `Cleared`. Ordinary same-head events still merge repository roots without resetting polling. Only an actual head change clears the prior window and opens a fresh one, so duplicate watcher delivery cannot discard live state.
 
 Authentication or permission failure before observation logs once and hides the window without HTTP after failed `gh` auth. Offline failures retry with bounded backoff. Failures after observation publish the last state as stale; terminal state stops polling. Tracker updates route through [[crates/scribe-server/src/ipc_server.rs#publish_ci_run_delta]], which retains capability, repository, and dismissal gates.
 

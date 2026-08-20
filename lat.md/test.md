@@ -77,7 +77,11 @@ Multiple roots for one GitHub repository share one tracker, and a newer pushed h
 
 ### Active same-SHA generation
 
-A trusted same-OID generation replaces an active window, filters its observed run ids, ignores an old-only response, and publishes only the later run.
+A trusted same-OID generation at an unchanged head reopens the active window in place, so an already-observed workflow survives alongside a second workflow the next response adds, with one rollup and no `Cleared` delta.
+
+### Retag collapses to the newest run
+
+Two runs for one workflow at the same head — an earlier failed attempt and a retag's newer run — collapse to the newest run id, so the superseded failure cannot poison the rollup.
 
 ### Server-wide request budget
 

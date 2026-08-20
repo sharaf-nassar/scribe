@@ -322,11 +322,13 @@ The server tracker records each workflow's first and latest local observation
 times. This gives the bar a stable elapsed clock without adding a provider-date
 parser; a re-observed run keeps its first timestamp by run id.
 
-The tracker also retains the highest observed run id per repository. Each new
-window snapshots it as a generation cutoff. Older or equal runs never enter
-rollup, details, link selection, or terminal-stop decisions for that window.
-A trusted same-OID ref event replaces an active window too; ordinary same-head
-events keep merging roots without resetting the window.
+The tracker normalizes each poll response to the newest run per workflow at
+the pushed head, so a superseded run (a retag replacing an earlier attempt)
+never enters rollup, details, link selection, or terminal-stop decisions,
+while distinct workflows running concurrently at the same head both survive.
+A trusted same-OID ref event reopens an active window at an unchanged head in
+place, carrying its observed state and roots forward rather than clearing it;
+only an actual head change clears and opens a fresh window.
 
 Hot handoff carries active repository/head descriptors, remaining discovery
 time, roots, and last bounded run state. It never carries the GitHub token. The
