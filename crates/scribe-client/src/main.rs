@@ -1570,10 +1570,6 @@ struct TerminalFocus {
     cursor_blink: CursorBlink,
 }
 
-fn focus_is_unclaimed(claims: [bool; 6]) -> bool {
-    !claims.into_iter().any(std::convert::identity)
-}
-
 impl TerminalFocus {
     fn new(window_active: bool, cx: &mut Context<TerminalView>) -> Self {
         Self {
@@ -10271,7 +10267,7 @@ impl TerminalView {
     }
 
     /// Keep keyboard focus inside a modal, or restore it to terminal chrome
-    /// when no modal owns the window.
+    /// when no live rendered control holds it.
     fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(dialog) = self.dialog.as_ref() {
             let focus = dialog.focus_handle(cx);
@@ -10280,22 +10276,7 @@ impl TerminalView {
             }
             return;
         }
-        let focus_is_unclaimed = focus_is_unclaimed([
-            self.focus.root.is_focused(window),
-            self.titlebar.read(cx).has_keyboard_focus(window),
-            self.focus.update.is_focused(window),
-            self.ci_action_focus.values().any(|(toggle, open, dismiss)| {
-                toggle.is_focused(window) || open.is_focused(window) || dismiss.is_focused(window)
-            }) || self.jump_button_focus.iter().any(|(session_id, focus)| {
-                focus.is_focused(window)
-                    && self
-                        .pane_content(*session_id)
-                        .is_some_and(|content| content.display_offset > 0)
-            }),
-            self.beads_editor.read(cx).has_keyboard_focus(window, cx),
-            self.flow_node_has_keyboard_focus(window),
-        ]);
-        if focus_is_unclaimed {
+        if !self.focus.root.contains_focused(window, cx) {
             window.focus(&self.focus.root, cx);
         }
     }
@@ -15362,6 +15343,43 @@ mod tests {
         );
     }
 
+    struct UnclaimedFocusProbe {
+        root: FocusHandle,
+        control: FocusHandle,
+    }
+
+    impl Render for UnclaimedFocusProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if !self.root.contains_focused(window, cx) {
+                window.focus(&self.root, cx);
+            }
+            div().track_focus(&self.root).child(div().track_focus(&self.control))
+        }
+    }
+
+    // @lat: [[test#Test Harness#GPUI Terminal Viewport#An unclaimed control survives the focus-repair render]]
+    #[gpui::test]
+    fn unclaimed_control_survives_focus_repair_render(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|app| {
+            app.open_window(WindowOptions::default(), |_, app| {
+                app.new(|app| UnclaimedFocusProbe {
+                    root: app.focus_handle(),
+                    control: app.focus_handle(),
+                })
+            })
+            .unwrap()
+        });
+        let control = window
+            .update(cx, |probe, _, _| probe.control.clone())
+            .expect("read control focus handle");
+        focus_and_draw_probe(cx, window.into(), &control);
+
+        assert!(
+            cx.update_window(window.into(), |_, window, _| control.is_focused(window))
+                .expect("read control focus after repaint")
+        );
+    }
+
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
     #[test]
     fn ci_action_ids_are_scoped_to_workspace() {
@@ -15372,20 +15390,6 @@ mod tests {
 
         assert_ne!(first_open, second_open);
         assert_ne!(first_dismiss, second_dismiss);
-    }
-
-    // @lat: [[test#Test Harness#GPUI CI Run Bar#CI controls retain keyboard focus]]
-    #[test]
-    fn ci_control_claim_prevents_terminal_focus_restore() {
-        assert!(!focus_is_unclaimed([false, false, false, true, false, false]));
-        assert!(focus_is_unclaimed([false; 6]));
-    }
-
-    // @lat: [[test#Test Harness#GPUI Beads Inline Editing#Armed editor survives terminal focus repair]]
-    #[test]
-    fn beads_editor_claim_prevents_terminal_focus_restore() {
-        assert!(!focus_is_unclaimed([false, false, false, false, true, false]));
-        assert!(focus_is_unclaimed([false; 6]));
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Plain local launch owns the singleton]]

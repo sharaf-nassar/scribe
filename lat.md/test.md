@@ -5018,6 +5018,12 @@ A focused jump control survives the window's focus-repair render, then Space
 activates it exactly once without encoding a byte for the terminal root. The
 post-scroll render removes the control and restores terminal focus.
 
+### An unclaimed control survives the focus-repair render
+
+A control matching none of the retired six-slot claimants keeps focus across
+a repaint: `ensure_focus` now asks whether the rendered frame's root
+structurally contains the focused element, not a fixed claimant list.
+
 ## GPUI Mouse Reporting
 
 Golden byte-capture and decision tests for  — the X10 / SGR-1006 encoders against the captured legacy fixture, and the pure gates the live pointer path consults around them.
@@ -5207,11 +5213,6 @@ Visual Docker opens the collapsed band with a pointer, injects three timed job
 states, captures the expanded trace, then closes it with Space while asserting
 both interest edges on the wire.
 
-### CI controls retain keyboard focus
-
-Terminal repaint recognizes focused CI toggle, open, and dismiss controls as
-valid focus owners so it does not route their next keystroke into the PTY.
-
 ## GPUI Beads Editor Input Spike
 
 A headless GPUI window proves the proposed Beads editor can own native text
@@ -5325,14 +5326,6 @@ applying and reopening the server value.
 
 Escape drops the active draft without producing a write, leaving the next
 Escape available to close the panel.
-
-### Armed editor survives terminal focus repair
-
-The terminal repaint focus repair recognizes the Beads editor as an active focus owner instead of blurring and committing it back to the PTY.
-
-The claimed-focus decision includes the editor beside terminal, titlebar,
-update, and CI controls. This keeps the active edit alive across the repaint
-that its click requests, so subsequent native text stays on the editor path.
 
 ### Text fields map to typed writes
 

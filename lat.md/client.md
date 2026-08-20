@@ -1134,10 +1134,10 @@ their wrapped text rather than passing through a one-line shaping path.
 armed keys before overlays, bindings, vi mode, and PTY encoding. Printable
 keys stay unstopped so GPUI can deliver text; Enter, Escape, selection, and
 editing controls stay on the panel's key route.
-[[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] includes
-[[crates/scribe-client/src/beads_panel.rs#BeadsEditor#has_keyboard_focus]] in
-its claimed-focus decision. The shared handle contains focused inactive fields,
-so a repaint between Tab focus and activation cannot restore terminal focus.
+[[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] repairs focus
+only when the terminal root's rendered subtree does not structurally contain
+the focused element, so an inactive field the editor renders — Tab-focused but
+not yet activated — keeps a repaint from restoring terminal focus.
 
 #### Pickers, labels, comments, and status rail
 
@@ -1183,8 +1183,8 @@ issue; later snapshots cannot replay reconciliation.
 
 [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Write timeout convergence]]
 and [[test#Test Harness#Visual E2E Tests#Beads card-detail fixtures#Reconnect write reconciliation]]
-pin those unknown-outcome paths. The live focus regression is
-[[test#Test Harness#GPUI Beads Inline Editing#Armed editor survives terminal focus repair]].
+pin those unknown-outcome paths. The general focus-repair regression is
+[[test#Test Harness#GPUI Terminal Viewport#An unclaimed control survives the focus-repair render]].
 
 [[test#Test Harness#GPUI Beads Inline Editing]] pins editor semantics. The
 panel state matrix lives under
