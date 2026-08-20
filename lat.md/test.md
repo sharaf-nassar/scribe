@@ -47,6 +47,10 @@ Non-mutating access to an exact ref path may request a logical rescan but cannot
 
 A mutating event for an exact loose tag at a tracked branch-tip OID marks the emitted push gate as a new same-OID generation.
 
+#### Annotated tags mark same-OID generations
+
+An annotated tag's snapshot OID is peeled to its tagged commit, so it marks the same-OID generation gate exactly like a lightweight tag at the same head.
+
 #### Linked worktrees resolve indirection
 
 A real linked-worktree push resolves its private git dir and shared common dir through Git, then emits that worktree's canonical root and pushed branch-tip SHA.

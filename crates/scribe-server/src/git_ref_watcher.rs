@@ -135,7 +135,11 @@ fn logical_snapshot(repository: &Repository) -> Result<LogicalSnapshot, GitRefWa
     let local_tags = parse_refs(&git_output(
         &repository.root,
         "local tag snapshot",
-        ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/tags"],
+        [
+            "for-each-ref",
+            "--format=%(refname)%00%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)",
+            "refs/tags",
+        ],
     )?);
 
     let mut remote_refs = BTreeMap::new();
@@ -877,6 +881,23 @@ mod tests {
         let detected = detect_pushes(&repository, &snapshot, &snapshot, Some(&changed_paths));
 
         assert_eq!(detected.len(), 1);
+        assert!(detected[0].same_oid_generation);
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Git ref-state detection#Annotated tags mark same-OID generations]]
+    #[test]
+    fn annotated_tag_path_marks_a_same_oid_generation() {
+        let fixture = Fixture::new();
+        run(&fixture.work, ["tag", "-a", "v1.0.0", "-m", "release notes"]);
+        let repository = Repository::discover(&fixture.work)
+            .expect("discover repository")
+            .expect("fixture is a repository");
+        let snapshot = logical_snapshot(&repository).expect("logical snapshot");
+        let changed_paths = BTreeSet::from([repository.common_dir.join("refs/tags/v1.0.0")]);
+
+        let detected = detect_pushes(&repository, &snapshot, &snapshot, Some(&changed_paths));
+
+        assert_eq!(detected.len(), 1, "annotated tag at the pushed head inferred no generation");
         assert!(detected[0].same_oid_generation);
     }
 

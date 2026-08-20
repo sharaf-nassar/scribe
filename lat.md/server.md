@@ -314,7 +314,7 @@ Git resolves the worktree root, private git dir, and shared common dir, so a lin
 
 Each repository watches its git dirs and common dir non-recursively, `refs` recursively, and `reftable` non-recursively. Native `notify` events debounce for 250 ms. A watch error or rescan request replaces that repository's native watcher with a 2 s `PollWatcher`; the fallback reads only local ref paths.
 
-After a burst, Git plumbing reads local branch and tag tips plus every configured remote's tracking namespace. A changed remote-tracking OID qualifies only when it equals a local branch tip.
+After a burst, Git plumbing reads local branch and tag tips plus every configured remote's tracking namespace. Tag tips are peeled to their tagged commit, so annotated and lightweight tags at the same head read the same OID. A changed remote-tracking OID qualifies only when it equals a local branch tip.
 
 The debounce retains exact paths from mutating notify events. An exact loose remote-tracking ref or tag can qualify a repeated generation at the same OID when that OID is both a local branch tip and an existing tracked remote tip.
 
