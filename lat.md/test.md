@@ -124,6 +124,12 @@ The two-process model keeps the server connection alive across many short-lived 
 
 Two exit codes distinguish failure kinds.  has two variants: `TestFailure` (exit 1) for assertion mismatches, and `InfraError` (exit 2) for socket, spawn, or timeout problems.
 
+## Agent API write input
+
+Focused server tests cover agent input bounds, policy ordering, payload bytes, typed failures, and completion acknowledgement.
+
+An over-cap multibyte UTF-8 string returns `TooLarge` before prompt or target lookup. A prompted UTF-8 write plus submit raises exactly one `WriteInput` decision and emits only text plus carriage return; submit false emits text only. An approved missing target is `NotFound`, a closed writer is `ActionFailed`, and a one-byte-capacity duplex writer keeps the acknowledgement future pending until all payload bytes are consumed.
+
 ## Terminal Image Client Scene
 
 The functional harness applies owned fixtures directly to the production client CPU scene without touching a host Scribe process.

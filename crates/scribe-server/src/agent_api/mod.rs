@@ -27,7 +27,8 @@ use scribe_common::agent::{
 use scribe_common::config::AgentApiConfig;
 use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::protocol::{AutomationAction, ServerMessage};
-use scribe_pty::event_listener::ScribeEventListener;
+use scribe_pty::{async_fd::AsyncPtyFd, event_listener::ScribeEventListener};
+use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use self::activity::{ActivityTransition, AgentActivityLease, AgentActivityTracker};
@@ -330,27 +331,32 @@ pub async fn dispatch<Lookup, LookupFuture, RunAction, RunActionFuture, SendProm
 ) -> AgentDispatch
 where
     Lookup: FnOnce(SessionId) -> LookupFuture,
-    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    LookupFuture: Future<Output = Option<AgentSessionTarget>>,
     RunAction: FnOnce(Option<WindowId>, AutomationAction) -> RunActionFuture,
     RunActionFuture: Future<Output = Result<AgentActionResult, AgentError>>,
     SendPrompt: FnOnce(ServerMessage) -> PromptFuture,
     PromptFuture: Future<Output = ()>,
 {
     let metadata = RequestMetadata::from(request);
-    let (lookup_screen, run_action) = handlers;
-    let (result, permit, activity) = match state.try_acquire() {
-        Err(error) => (Err(error), None, None),
-        Ok(permit) => {
-            let (result, activity) = if matches!(request, AgentRequest::Capabilities { .. }) {
-                (Ok(capabilities_payload(&state.policy.config())), None)
-            } else if let Err(error) =
-                authorize_before_lookup(state, &metadata, prompt_sender).await
-            {
-                (Err(error), None)
-            } else {
-                route_authorized_request(state, caller, request, lookup_screen, run_action).await
-            };
-            (result, Some(permit), activity)
+    let (lookup_session, run_action) = handlers;
+    let (result, permit, activity) = if let Err(error) = validate_request_bounds(state, request) {
+        (Err(error), None, None)
+    } else {
+        match state.try_acquire() {
+            Err(error) => (Err(error), None, None),
+            Ok(permit) => {
+                let (result, activity) = if matches!(request, AgentRequest::Capabilities { .. }) {
+                    (Ok(capabilities_payload(&state.policy.config())), None)
+                } else if let Err(error) =
+                    authorize_before_lookup(state, &metadata, prompt_sender).await
+                {
+                    (Err(error), None)
+                } else {
+                    route_authorized_request(state, caller, request, lookup_session, run_action)
+                        .await
+                };
+                (result, Some(permit), activity)
+            }
         }
     };
 
@@ -366,6 +372,24 @@ where
         _permit: permit,
         _activity: activity,
     }
+}
+
+/// Reject bounded requests before policy can raise a confirmation prompt.
+fn validate_request_bounds(
+    state: &AgentApiState,
+    request: &AgentRequest,
+) -> Result<(), AgentError> {
+    let AgentRequest::WriteInput { text, .. } = request else {
+        return Ok(());
+    };
+    let max_bytes = state.policy.config().max_input_bytes;
+    let input_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if input_bytes > max_bytes {
+        return Err(AgentError::TooLarge {
+            message: format!("agent input is {input_bytes} bytes; maximum is {max_bytes}"),
+        });
+    }
+    Ok(())
 }
 
 /// Shared policy seam for capability handlers. Target lookup must happen only
@@ -433,8 +457,9 @@ fn capabilities_payload(policy: &AgentApiConfig) -> AgentPayload {
 
 /// Terminal handles and identifying metadata copied from the live-session
 /// registry only after policy authorizes the lookup.
-pub struct ScreenReadTarget {
+pub struct AgentSessionTarget {
     pub term: Arc<tokio::sync::Mutex<Term<ScribeEventListener>>>,
+    pub pty_write: Arc<tokio::sync::Mutex<WriteHalf<AsyncPtyFd>>>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
 }
@@ -444,12 +469,12 @@ async fn route_authorized_request<Lookup, LookupFuture, RunAction, RunActionFutu
     state: &AgentApiState,
     caller: usize,
     request: &AgentRequest,
-    lookup_screen: Lookup,
+    lookup_session: Lookup,
     run_action: RunAction,
 ) -> (Result<AgentPayload, AgentError>, Option<AgentActivityLease>)
 where
     Lookup: FnOnce(SessionId) -> LookupFuture,
-    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    LookupFuture: Future<Output = Option<AgentSessionTarget>>,
     RunAction: FnOnce(Option<WindowId>, AutomationAction) -> RunActionFuture,
     RunActionFuture: Future<Output = Result<AgentActionResult, AgentError>>,
 {
@@ -460,7 +485,7 @@ where
                 caller,
                 *session_id,
                 scrollback_lines.unwrap_or(0),
-                lookup_screen,
+                lookup_session,
             )
             .await
             {
@@ -474,6 +499,17 @@ where
                 .map(|result| AgentPayload::DispatchAction { result }),
             None,
         ),
+        AgentRequest::WriteInput { session_id, text, submit, .. } => {
+            let Some(target) = lookup_session(*session_id).await else {
+                return (Err(not_found(*session_id)), None);
+            };
+            let activity = state.activity.acquire(*session_id, caller);
+            let mut writer = target.pty_write.lock().await;
+            let result = write_agent_input(&mut *writer, *session_id, text, *submit)
+                .await
+                .map(|()| AgentPayload::WriteInput);
+            (result, Some(activity))
+        }
         _ => (Err(denied()), None),
     }
 }
@@ -487,7 +523,7 @@ async fn read_screen<Lookup, LookupFuture>(
 ) -> Result<(AgentPayload, AgentActivityLease), AgentError>
 where
     Lookup: FnOnce(SessionId) -> LookupFuture,
-    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    LookupFuture: Future<Output = Option<AgentSessionTarget>>,
 {
     let Some(target) = lookup_screen(session_id).await else {
         return Err(not_found(session_id));
@@ -502,7 +538,7 @@ where
 async fn screen_payload(
     state: &AgentApiState,
     session_id: SessionId,
-    target: ScreenReadTarget,
+    target: AgentSessionTarget,
     requested_scrollback: u32,
     policy: &AgentApiConfig,
 ) -> AgentPayload {
@@ -522,6 +558,22 @@ async fn screen_payload(
             snapshot_id,
         },
     }
+}
+
+async fn write_agent_input<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    session_id: SessionId,
+    text: &str,
+    submit: bool,
+) -> Result<(), AgentError> {
+    let mut payload = Vec::with_capacity(text.len() + usize::from(submit));
+    payload.extend_from_slice(text.as_bytes());
+    if submit {
+        payload.push(b'\r');
+    }
+    writer.write_all(&payload).await.map_err(|error| AgentError::ActionFailed {
+        message: format!("failed to write input to session {session_id}: {error}"),
+    })
 }
 
 async fn capture_rows(
@@ -568,9 +620,12 @@ fn emit_audit(metadata: &RequestMetadata<'_>, decision: &'static str, response_b
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use alacritty_terminal::Term;
@@ -585,13 +640,14 @@ mod tests {
     use scribe_common::protocol::{
         AutomationAction, ClientMessage, ClipboardDecision, ServerMessage,
     };
-    use scribe_pty::event_listener::ScribeEventListener;
+    use scribe_pty::{async_fd::AsyncPtyFd, event_listener::ScribeEventListener};
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
     use vte::ansi::Processor as AnsiProcessor;
 
     use super::{
-        ALL_CAPABILITIES, AgentApiState, MAX_IN_FLIGHT_REQUESTS, RequestMetadata, ScreenReadTarget,
-        authorize_before_lookup, dispatch,
+        ALL_CAPABILITIES, AgentApiState, AgentSessionTarget, MAX_IN_FLIGHT_REQUESTS,
+        RequestMetadata, authorize_before_lookup, dispatch, write_agent_input,
     };
     use crate::ipc_server::test_shared_writer;
     use crate::session_manager::build_term_config;
@@ -647,6 +703,22 @@ mod tests {
         assert!(state.resolve_prompt(*prompt_id, ClipboardDecision::DenyOnce));
     }
 
+    fn write_request(
+        request_id: u64,
+        session_id: SessionId,
+        text: impl Into<String>,
+        submit: bool,
+    ) -> AgentRequest {
+        AgentRequest::WriteInput {
+            request_id,
+            agent_label: "write-test".into(),
+            origin_session_id: None,
+            session_id,
+            text: text.into(),
+            submit,
+        }
+    }
+
     struct TestDims {
         cols: usize,
         rows: usize,
@@ -677,6 +749,33 @@ mod tests {
         let mut processor: AnsiProcessor = AnsiProcessor::new();
         processor.advance(&mut term, bytes);
         Arc::new(Mutex::new(term))
+    }
+
+    fn session_target(
+        term: Arc<Mutex<Term<ScribeEventListener>>>,
+        title: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> (AgentSessionTarget, StdUnixStream) {
+        let (writer, reader) = StdUnixStream::pair().expect("socket pair");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+        let writer: OwnedFd = writer.into();
+        let writer = AsyncPtyFd::new(writer).expect("register test writer");
+        let (_read, write) = tokio::io::split(writer);
+        (AgentSessionTarget { term, pty_write: Arc::new(Mutex::new(write)), title, cwd }, reader)
+    }
+
+    fn read_peer(mut peer: &StdUnixStream, expected: &[u8]) {
+        let mut received = vec![0; expected.len()];
+        peer.read_exact(&mut received).expect("read written input");
+        assert_eq!(received, expected);
+    }
+
+    fn allow_prompt(state: &AgentApiState, message: &ServerMessage, expected: AgentCapability) {
+        let ServerMessage::AgentPromptRequest { prompt_id, capability, .. } = message else {
+            panic!("expected agent prompt request");
+        };
+        assert_eq!(*capability, expected);
+        assert!(state.resolve_prompt(*prompt_id, ClipboardDecision::AllowOnce));
     }
 
     async fn dispatch_headless(
@@ -745,11 +844,11 @@ mod tests {
             ..AgentApiConfig::default()
         });
         let session_id = SessionId::new();
-        let target = ScreenReadTarget {
-            term: term_with_bytes(b"old\r\nview1\r\nview2", 8, 2),
-            title: Some("build".into()),
-            cwd: Some(PathBuf::from("/work/scribe")),
-        };
+        let (target, _peer) = session_target(
+            term_with_bytes(b"old\r\nview1\r\nview2", 8, 2),
+            Some("build".into()),
+            Some(PathBuf::from("/work/scribe")),
+        );
         let response = dispatch(
             &state,
             0,
@@ -782,11 +881,7 @@ mod tests {
             ..AgentApiConfig::default()
         });
         let session_id = SessionId::new();
-        let target = ScreenReadTarget {
-            term: term_with_bytes(b"hello\r\nworld", 8, 2),
-            title: None,
-            cwd: None,
-        };
+        let (target, _peer) = session_target(term_with_bytes(b"hello\r\nworld", 8, 2), None, None);
         let response = dispatch(
             &state,
             0,
@@ -831,6 +926,145 @@ mod tests {
         });
         let response = dispatch_headless(&state, &screen_request(11, SessionId::new())).await;
         assert!(matches!(response.response().result, Err(AgentError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn oversized_write_is_rejected_before_prompt_or_session_lookup() {
+        let state = AgentApiState::new(AgentApiConfig {
+            write_input: AgentPolicyMode::Prompt,
+            max_input_bytes: 3,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let looked_up = Arc::new(AtomicBool::new(false));
+        let lookup_called = Arc::clone(&looked_up);
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let prompts = Arc::clone(&prompt_count);
+        let response = dispatch(
+            &state,
+            0,
+            &write_request(20, session_id, "éé", false),
+            (
+                move |_| async move {
+                    lookup_called.store(true, Ordering::Relaxed);
+                    None
+                },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
+            Some(move |_| async move {
+                prompts.fetch_add(1, Ordering::Relaxed);
+                panic!("oversized input must not prompt");
+            }),
+        )
+        .await;
+        assert!(matches!(response.response().result, Err(AgentError::TooLarge { .. })));
+        assert!(!looked_up.load(Ordering::Relaxed));
+        assert_eq!(prompt_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn prompted_write_uses_one_decision_for_utf8_text_and_submit() {
+        let state = AgentApiState::new(AgentApiConfig {
+            write_input: AgentPolicyMode::Prompt,
+            max_input_bytes: 16,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let (target, peer) = session_target(term_with_bytes(b"", 8, 2), None, None);
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let prompts = Arc::clone(&prompt_count);
+        let resolver = state.clone();
+        let response = dispatch(
+            &state,
+            0,
+            &write_request(21, session_id, "hé", true),
+            (
+                move |_| async move { Some(target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
+            Some(move |message| async move {
+                prompts.fetch_add(1, Ordering::Relaxed);
+                allow_prompt(&resolver, &message, AgentCapability::WriteInput);
+            }),
+        )
+        .await;
+        assert!(matches!(response.response().result, Ok(AgentPayload::WriteInput)));
+        assert_eq!(prompt_count.load(Ordering::Relaxed), 1);
+        read_peer(&peer, b"h\xc3\xa9\r");
+    }
+
+    #[tokio::test]
+    async fn write_without_submit_injects_text_only() {
+        let state = AgentApiState::new(AgentApiConfig {
+            write_input: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let (target, peer) = session_target(term_with_bytes(b"", 8, 2), None, None);
+        let response = dispatch(
+            &state,
+            0,
+            &write_request(22, session_id, "plain", false),
+            (
+                move |_| async move { Some(target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        assert!(matches!(response.response().result, Ok(AgentPayload::WriteInput)));
+        read_peer(&peer, b"plain");
+    }
+
+    #[tokio::test]
+    async fn authorized_write_of_missing_session_returns_not_found() {
+        let state = AgentApiState::new(AgentApiConfig {
+            write_input: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let response =
+            dispatch_headless(&state, &write_request(23, SessionId::new(), "missing", false)).await;
+        assert!(matches!(response.response().result, Err(AgentError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn pty_write_failure_maps_to_action_failed() {
+        let state = AgentApiState::new(AgentApiConfig {
+            write_input: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let (target, peer) = session_target(term_with_bytes(b"", 8, 2), None, None);
+        drop(peer);
+        let response = dispatch(
+            &state,
+            0,
+            &write_request(24, session_id, "fail", true),
+            (
+                move |_| async move { Some(target) },
+                |_, _| async { Err(AgentError::Internal { message: "unexpected action".into() }) },
+            ),
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        assert!(matches!(response.response().result, Err(AgentError::ActionFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn write_acknowledgement_waits_for_the_full_payload() {
+        let session_id = SessionId::new();
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let write =
+            tokio::spawn(
+                async move { write_agent_input(&mut writer, session_id, "abc", true).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(!write.is_finished());
+
+        let mut payload = [0; 4];
+        reader.read_exact(&mut payload).await.expect("read full payload");
+        assert_eq!(&payload, b"abc\r");
+        assert!(write.await.expect("write task").is_ok());
     }
 
     async fn prompted_authorization(decision: ClipboardDecision) -> Result<(), AgentError> {

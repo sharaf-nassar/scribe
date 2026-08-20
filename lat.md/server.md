@@ -18,6 +18,14 @@ Splitting the pools is what makes a hook burst survivable. Hook events arrive as
 
 A local first frame is read under `LOCAL_PRE_HELLO_TIMEOUT` (5 s). Every local caller writes immediately after connecting, so a still-silent connection is an abandoned or half-open dialer sitting on a pending slot; reads after the first frame stay untimed, since an idle window is legitimate. Remote transports keep their own caps and their own idle timeout — see [[server#Remote Control#Accept Path]].
 
+### Agent write input
+
+Agent writes are bounded before prompting, authorized once, and acknowledged only after the complete PTY write.
+
+[[crates/scribe-server/src/agent_api/mod.rs#dispatch]] checks `max_input_bytes` against the UTF-8 string's byte length before entering the shared asynchronous policy/prompt seam. One `WriteInput` authorization therefore gates the complete text plus its explicit submit choice; target lookup happens only after approval.
+
+After lookup, [[crates/scribe-server/src/agent_api/mod.rs#write_agent_input]] builds one payload from the request text and appends exactly one carriage return only when `submit` is true. It awaits `write_all` on the live session's shared PTY writer before returning `AgentPayload::WriteInput`; write failure becomes typed `ActionFailed`, and an absent live session becomes typed `NotFound`. [[crates/scribe-server/src/ipc_server.rs#establish_local_first_frame]] sends the response only after that awaited dispatch completes.
+
 ### Frame Error Policy
 
 The server skips an undecodable MessagePack payload only after the framing layer has consumed that payload completely and preserved alignment.

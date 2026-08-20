@@ -5245,8 +5245,9 @@ async fn establish_local_first_frame(
                     move |session_id| async move {
                         let sessions = live_sessions.read().await;
                         sessions.get(&session_id).map(|session| {
-                            crate::agent_api::ScreenReadTarget {
+                            crate::agent_api::AgentSessionTarget {
                                 term: Arc::clone(&session.term),
+                                pty_write: Arc::clone(&session.pty_write),
                                 title: session.title.clone(),
                                 cwd: session.cwd.clone(),
                             }
