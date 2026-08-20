@@ -10,24 +10,29 @@ pub mod text;
 use std::{
     collections::HashMap,
     future::Future,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use alacritty_terminal::Term;
 use scribe_common::agent::{
     AGENT_SURFACE_VERSION, AgentActionOutcome, AgentActionResult, AgentCapability,
     AgentCapabilityStatus, AgentError, AgentPayload, AgentPolicyMode, AgentRequest, AgentResponse,
+    AgentScreenText,
 };
 use scribe_common::config::AgentApiConfig;
+use scribe_common::ids::SessionId;
 use scribe_common::protocol::{AutomationAction, ServerMessage};
+use scribe_pty::event_listener::ScribeEventListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-use self::activity::{ActivityTransition, AgentActivityTracker};
-
-use policy::{AgentPolicyEngine, mode_for};
+use self::activity::{ActivityTransition, AgentActivityLease, AgentActivityTracker};
+use self::policy::{AgentPolicyEngine, PolicyResolution, mode_for};
+use self::text::{copy_rows, format_rows};
 
 /// Maximum simultaneous agent API requests. The dispatch result retains its
 /// permit until the IPC reply is queued; future handlers retain it for their
@@ -40,6 +45,7 @@ pub struct AgentApiState {
     policy: AgentPolicyEngine,
     in_flight: Arc<Semaphore>,
     next_correlation_id: Arc<AtomicU64>,
+    next_snapshot_id: Arc<AtomicU64>,
     pending_actions: Arc<Mutex<HashMap<u64, PendingAction>>>,
     activity: AgentActivityTracker,
     activity_transitions: Arc<Mutex<Option<mpsc::UnboundedReceiver<ActivityTransition>>>>,
@@ -61,6 +67,7 @@ impl AgentApiState {
             policy: AgentPolicyEngine::new(policy),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
             next_correlation_id: Arc::new(AtomicU64::new(1)),
+            next_snapshot_id: Arc::new(AtomicU64::new(1)),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             activity,
             activity_transitions: Arc::new(Mutex::new(Some(receiver))),
@@ -89,6 +96,15 @@ impl AgentApiState {
     /// Take the indicator transition stream. The server consumes it once at startup.
     pub fn take_activity_transitions(&self) -> Option<mpsc::UnboundedReceiver<ActivityTransition>> {
         self.activity_transitions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+    }
+
+    /// Resolve a user decision for one pending capability prompt.
+    pub fn resolve_prompt(
+        &self,
+        prompt_id: scribe_common::protocol::PromptId,
+        decision: scribe_common::protocol::ClipboardDecision,
+    ) -> bool {
+        self.policy.resolve(prompt_id, decision)
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, AgentError> {
@@ -239,6 +255,7 @@ impl Default for AgentApiState {
 pub struct AgentDispatch {
     response: AgentResponse,
     _permit: Option<OwnedSemaphorePermit>,
+    _activity: Option<AgentActivityLease>,
 }
 
 impl AgentDispatch {
@@ -301,15 +318,37 @@ impl<'a> From<&'a AgentRequest> for RequestMetadata<'a> {
 
 /// Dispatch one transient agent request and reply on the same connection.
 ///
-/// Policy evaluation deliberately precedes any target lookup for every
-/// capability except `Capabilities` itself (see [`route_request`]). The
-/// remaining capability handlers land in follow-up modules; the foundational
-/// stub is default-safe and returns `Denied` without reading server state.
-pub fn dispatch(state: &AgentApiState, request: &AgentRequest) -> AgentDispatch {
+/// Policy evaluation deliberately precedes target lookup. Prompt-mode calls
+/// park here until a capable local client answers, so no handler can
+/// accidentally treat `Prompt` as `Allow`.
+pub async fn dispatch<Lookup, LookupFuture, SendPrompt, PromptFuture>(
+    state: &AgentApiState,
+    caller: usize,
+    request: &AgentRequest,
+    lookup_screen: Lookup,
+    prompt_sender: Option<SendPrompt>,
+) -> AgentDispatch
+where
+    Lookup: FnOnce(SessionId) -> LookupFuture,
+    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+    SendPrompt: FnOnce(ServerMessage) -> PromptFuture,
+    PromptFuture: Future<Output = ()>,
+{
     let metadata = RequestMetadata::from(request);
-    let (result, permit) = match state.try_acquire() {
-        Err(error) => (Err(error), None),
-        Ok(permit) => (route_request(state, request, metadata.capability), Some(permit)),
+    let (result, permit, activity) = match state.try_acquire() {
+        Err(error) => (Err(error), None, None),
+        Ok(permit) => {
+            let (result, activity) = if matches!(request, AgentRequest::Capabilities { .. }) {
+                (Ok(capabilities_payload(&state.policy.config())), None)
+            } else if let Err(error) =
+                authorize_before_lookup(state, &metadata, prompt_sender).await
+            {
+                (Err(error), None)
+            } else {
+                route_authorized_request(state, caller, request, lookup_screen).await
+            };
+            (result, Some(permit), activity)
+        }
     };
 
     let decision = match &result {
@@ -317,44 +356,48 @@ pub fn dispatch(state: &AgentApiState, request: &AgentRequest) -> AgentDispatch 
         Err(AgentError::Busy { .. }) => "busy",
         Err(_) => "deny",
     };
-    emit_audit(&metadata, decision, 0);
+    let response_bytes = response_content_bytes(&result);
+    emit_audit(&metadata, decision, response_bytes);
     AgentDispatch {
         response: AgentResponse { request_id: metadata.request_id, result },
         _permit: permit,
+        _activity: activity,
     }
 }
 
-/// Route one admitted request to its capability check and handler.
-///
-/// `Capabilities` is wired ahead of [`authorize_before_lookup`] rather than
-/// behind it: reporting what this build supports, and which mode each
-/// capability currently holds, must never itself require a grant —
-/// otherwise a caller could only discover the policy that blocks it by first
-/// being blocked. It reads `state`'s live policy directly, never a value
-/// captured at construction, so a `refresh_policy` call is reflected on the
-/// very next request.
-fn route_request(
+/// Shared policy seam for capability handlers. Target lookup must happen only
+/// after this future resolves successfully.
+async fn authorize_before_lookup<SendPrompt, PromptFuture>(
     state: &AgentApiState,
-    request: &AgentRequest,
-    capability: AgentCapability,
-) -> Result<AgentPayload, AgentError> {
-    let policy = state.policy.config();
-    if matches!(request, AgentRequest::Capabilities { .. }) {
-        return Ok(capabilities_payload(&policy));
-    }
-    authorize_before_lookup(&policy, capability)?;
-    route_authorized_request(request)
-}
-
-/// Policy seam for every capability except `Capabilities`. It must stay
-/// ahead of all future world/session/window lookup.
-fn authorize_before_lookup(
-    policy: &AgentApiConfig,
-    capability: AgentCapability,
-) -> Result<(), AgentError> {
-    match mode_for(policy, capability) {
-        AgentPolicyMode::Deny => Err(denied()),
-        AgentPolicyMode::Allow | AgentPolicyMode::Prompt => Ok(()),
+    metadata: &RequestMetadata<'_>,
+    prompt_sender: Option<SendPrompt>,
+) -> Result<(), AgentError>
+where
+    SendPrompt: FnOnce(ServerMessage) -> PromptFuture,
+    PromptFuture: Future<Output = ()>,
+{
+    match state.policy.authorize(
+        metadata.agent_label,
+        metadata.capability,
+        &metadata.target_id,
+        prompt_sender.is_some(),
+    ) {
+        PolicyResolution::Allow => Ok(()),
+        PolicyResolution::Deny => Err(denied()),
+        PolicyResolution::Prompt { prompt, pending } => {
+            let Some(send_prompt) = prompt_sender else {
+                return Err(denied());
+            };
+            send_prompt(ServerMessage::AgentPromptRequest {
+                prompt_id: prompt.prompt_id,
+                agent_label: prompt.agent_label,
+                capability: prompt.capability,
+                target: prompt.target,
+            })
+            .await;
+            pending.wait().await
+        }
+        PolicyResolution::Parked(pending) => pending.wait().await,
     }
 }
 
@@ -385,10 +428,104 @@ fn capabilities_payload(policy: &AgentApiConfig) -> AgentPayload {
     }
 }
 
-/// Handler-routing seam. Real capability handlers replace this default-safe
-/// stub in follow-up work.
-fn route_authorized_request(_request: &AgentRequest) -> Result<AgentPayload, AgentError> {
-    Err(denied())
+/// Terminal handles and identifying metadata copied from the live-session
+/// registry only after policy authorizes the lookup.
+pub struct ScreenReadTarget {
+    pub term: Arc<tokio::sync::Mutex<Term<ScribeEventListener>>>,
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// Handler-routing seam. Unimplemented capability variants stay default-safe.
+async fn route_authorized_request<Lookup, LookupFuture>(
+    state: &AgentApiState,
+    caller: usize,
+    request: &AgentRequest,
+    lookup_screen: Lookup,
+) -> (Result<AgentPayload, AgentError>, Option<AgentActivityLease>)
+where
+    Lookup: FnOnce(SessionId) -> LookupFuture,
+    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+{
+    let AgentRequest::ReadScreen { session_id, scrollback_lines, .. } = request else {
+        return (Err(denied()), None);
+    };
+    match read_screen(state, caller, *session_id, scrollback_lines.unwrap_or(0), lookup_screen)
+        .await
+    {
+        Ok((payload, activity)) => (Ok(payload), Some(activity)),
+        Err(error) => (Err(error), None),
+    }
+}
+
+async fn read_screen<Lookup, LookupFuture>(
+    state: &AgentApiState,
+    caller: usize,
+    session_id: SessionId,
+    requested_scrollback: u32,
+    lookup_screen: Lookup,
+) -> Result<(AgentPayload, AgentActivityLease), AgentError>
+where
+    Lookup: FnOnce(SessionId) -> LookupFuture,
+    LookupFuture: Future<Output = Option<ScreenReadTarget>>,
+{
+    let Some(target) = lookup_screen(session_id).await else {
+        return Err(not_found(session_id));
+    };
+    let activity = state.activity.acquire(session_id, caller);
+    let payload =
+        screen_payload(state, session_id, target, requested_scrollback, &state.policy.config())
+            .await;
+    Ok((payload, activity))
+}
+
+async fn screen_payload(
+    state: &AgentApiState,
+    session_id: SessionId,
+    target: ScreenReadTarget,
+    requested_scrollback: u32,
+    policy: &AgentApiConfig,
+) -> AgentPayload {
+    let (rows, captured_at, snapshot_id) =
+        capture_rows(state, &target.term, requested_scrollback, policy.max_scrollback_lines).await;
+    let max_bytes = usize::try_from(policy.max_response_bytes).unwrap_or(usize::MAX);
+    let extracted = format_rows(&rows, max_bytes);
+    AgentPayload::ReadScreen {
+        screen: AgentScreenText {
+            session_id,
+            title: target.title,
+            cwd: target.cwd,
+            text: extracted.text,
+            lines: extracted.lines,
+            truncated: extracted.truncated,
+            captured_at,
+            snapshot_id,
+        },
+    }
+}
+
+async fn capture_rows(
+    state: &AgentApiState,
+    term: &Arc<tokio::sync::Mutex<Term<ScribeEventListener>>>,
+    requested_scrollback: u32,
+    max_scrollback_lines: u32,
+) -> (Vec<text::CopiedRow>, u64, u64) {
+    let term = term.lock().await;
+    let rows = copy_rows(&term, requested_scrollback, max_scrollback_lines);
+    let captured_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let snapshot_id = state.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
+    (rows, captured_at, snapshot_id)
+}
+
+fn response_content_bytes(result: &Result<AgentPayload, AgentError>) -> usize {
+    match result {
+        Ok(AgentPayload::ReadScreen { screen }) => screen.text.len(),
+        _ => 0,
+    }
+}
+
+fn not_found(session_id: SessionId) -> AgentError {
+    AgentError::NotFound { message: format!("session {session_id} not found") }
 }
 
 fn denied() -> AgentError {
@@ -412,20 +549,32 @@ fn emit_audit(metadata: &RequestMetadata<'_>, decision: &'static str, response_b
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::path::PathBuf;
     use std::sync::Arc;
-
     use std::time::Duration;
 
+    use alacritty_terminal::Term;
+    use alacritty_terminal::grid::Dimensions;
     use scribe_common::agent::{
         AGENT_SURFACE_VERSION, AgentActionOutcome, AgentCapability, AgentCapabilityStatus,
         AgentError, AgentPayload, AgentPolicyMode, AgentRequest,
     };
     use scribe_common::config::AgentApiConfig;
     use scribe_common::framing::{read_message, write_message};
-    use scribe_common::protocol::{AutomationAction, ClientMessage, ServerMessage};
-    use tokio::sync::{Barrier, Semaphore};
+    use scribe_common::ids::SessionId;
+    use scribe_common::protocol::{
+        AutomationAction, ClientMessage, ClipboardDecision, ServerMessage,
+    };
+    use scribe_pty::event_listener::ScribeEventListener;
+    use tokio::sync::{Barrier, Mutex, Semaphore, mpsc};
+    use vte::ansi::Processor as AnsiProcessor;
 
-    use super::{ALL_CAPABILITIES, AgentApiState, MAX_IN_FLIGHT_REQUESTS, dispatch};
+    use super::{
+        ALL_CAPABILITIES, AgentApiState, MAX_IN_FLIGHT_REQUESTS, RequestMetadata, ScreenReadTarget,
+        authorize_before_lookup, dispatch,
+    };
+    use crate::ipc_server::test_shared_writer;
+    use crate::session_manager::build_term_config;
 
     // `World` stands in for every capability handler still stubbed behind
     // this dispatcher; `Capabilities` is the one variant with its own
@@ -444,6 +593,62 @@ mod tests {
             agent_label: "capability-test".into(),
             origin_session_id: None,
         }
+    }
+
+    fn screen_request(request_id: u64, session_id: SessionId) -> AgentRequest {
+        AgentRequest::ReadScreen {
+            request_id,
+            agent_label: "screen-test".into(),
+            origin_session_id: None,
+            session_id,
+            scrollback_lines: Some(1),
+        }
+    }
+
+    struct TestDims {
+        cols: usize,
+        rows: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn term_with_bytes(
+        bytes: &[u8],
+        cols: usize,
+        rows: usize,
+    ) -> Arc<Mutex<Term<ScribeEventListener>>> {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let listener = ScribeEventListener::new(SessionId::new(), sender);
+        let mut term = Term::new(build_term_config(100), &TestDims { cols, rows }, listener);
+        let mut processor: AnsiProcessor = AnsiProcessor::new();
+        processor.advance(&mut term, bytes);
+        Arc::new(Mutex::new(term))
+    }
+
+    async fn dispatch_headless(
+        state: &AgentApiState,
+        request: &AgentRequest,
+    ) -> super::AgentDispatch {
+        dispatch(
+            state,
+            0,
+            request,
+            |_| async { None },
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await
     }
 
     fn unix_stream_pair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
@@ -471,7 +676,7 @@ mod tests {
             panic!("expected agent request");
         };
 
-        let dispatch = dispatch(&AgentApiState::default(), &request);
+        let dispatch = dispatch_headless(&AgentApiState::default(), &request).await;
         write_message(
             &mut server_writer,
             &ServerMessage::AgentResponse(dispatch.response().clone()),
@@ -488,6 +693,153 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn read_screen_returns_viewport_scrollback_and_identity() {
+        let state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let target = ScreenReadTarget {
+            term: term_with_bytes(b"old\r\nview1\r\nview2", 8, 2),
+            title: Some("build".into()),
+            cwd: Some(PathBuf::from("/work/scribe")),
+        };
+        let response = dispatch(
+            &state,
+            0,
+            &screen_request(8, session_id),
+            move |_| async move { Some(target) },
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        let Ok(AgentPayload::ReadScreen { screen }) = response.response().result.clone() else {
+            panic!("expected read-screen payload");
+        };
+        assert_eq!(screen.session_id, session_id);
+        assert_eq!(screen.title.as_deref(), Some("build"));
+        assert_eq!(screen.cwd.as_deref(), Some(std::path::Path::new("/work/scribe")));
+        assert_eq!(screen.text, "old\nview1\nview2");
+        assert_eq!(screen.lines, 3);
+        assert!(!screen.truncated);
+        assert!(screen.captured_at > 0);
+        assert_eq!(screen.snapshot_id, 1);
+    }
+
+    #[tokio::test]
+    async fn read_screen_stays_within_content_cap_and_marks_truncation() {
+        let state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Allow,
+            max_response_bytes: 7,
+            ..AgentApiConfig::default()
+        });
+        let session_id = SessionId::new();
+        let target = ScreenReadTarget {
+            term: term_with_bytes(b"hello\r\nworld", 8, 2),
+            title: None,
+            cwd: None,
+        };
+        let response = dispatch(
+            &state,
+            0,
+            &screen_request(9, session_id),
+            move |_| async move { Some(target) },
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        let Ok(AgentPayload::ReadScreen { screen }) = response.response().result.clone() else {
+            panic!("expected read-screen payload");
+        };
+        assert!(screen.text.len() <= 7);
+        assert_eq!(screen.text, "hello\nw");
+        assert!(screen.truncated);
+    }
+
+    #[tokio::test]
+    async fn read_screen_deny_returns_no_content_before_session_lookup() {
+        let request = screen_request(10, SessionId::new());
+        let response = dispatch(
+            &AgentApiState::default(),
+            0,
+            &request,
+            |_| async { panic!("denied read must not look up terminal content") },
+            None::<fn(ServerMessage) -> std::future::Ready<()>>,
+        )
+        .await;
+        assert!(matches!(response.response().result, Err(AgentError::Denied { .. })));
+    }
+
+    #[tokio::test]
+    async fn authorized_read_of_missing_session_returns_not_found() {
+        let state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Allow,
+            ..AgentApiConfig::default()
+        });
+        let response = dispatch_headless(&state, &screen_request(11, SessionId::new())).await;
+        assert!(matches!(response.response().result, Err(AgentError::NotFound { .. })));
+    }
+
+    async fn prompted_authorization(decision: ClipboardDecision) -> Result<(), AgentError> {
+        let state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let prompt_writer = test_shared_writer(server_write);
+        let authorizer = state.clone();
+        let request = screen_request(12, SessionId::new());
+        let pending = tokio::spawn(async move {
+            let metadata = RequestMetadata::from(&request);
+            authorize_before_lookup(
+                &authorizer,
+                &metadata,
+                Some(move |message| async move {
+                    crate::ipc_server::send_message(&prompt_writer, &message).await;
+                }),
+            )
+            .await
+        });
+
+        let ServerMessage::AgentPromptRequest { prompt_id, capability, .. } =
+            read_message(&mut client_read).await.expect("read agent prompt")
+        else {
+            panic!("expected agent prompt request");
+        };
+        assert_eq!(capability, AgentCapability::ReadContent);
+        assert!(state.resolve_prompt(prompt_id, decision));
+        pending.await.expect("authorization task")
+    }
+
+    #[tokio::test]
+    async fn prompt_allow_and_deny_resolve_the_parked_read() {
+        assert!(prompted_authorization(ClipboardDecision::AllowOnce).await.is_ok());
+        assert!(matches!(
+            prompted_authorization(ClipboardDecision::DenyOnce).await,
+            Err(AgentError::Denied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompt_without_capable_client_denies_headlessly() {
+        let state = AgentApiState::new(AgentApiConfig {
+            read_content: AgentPolicyMode::Prompt,
+            ..AgentApiConfig::default()
+        });
+        let request = screen_request(13, SessionId::new());
+        let metadata = RequestMetadata::from(&request);
+        assert!(matches!(
+            authorize_before_lookup(
+                &state,
+                &metadata,
+                None::<fn(ServerMessage) -> std::future::Ready<()>>,
+            )
+            .await,
+            Err(AgentError::Denied { .. })
+        ));
+    }
+
     fn capability_mode(
         capabilities: &[AgentCapabilityStatus],
         capability: AgentCapability,
@@ -495,11 +847,11 @@ mod tests {
         capabilities.iter().find(|status| status.capability == capability).map(|status| status.mode)
     }
 
-    #[test]
-    fn capabilities_reports_every_capability_and_mode_without_a_grant() {
+    #[tokio::test]
+    async fn capabilities_reports_every_capability_and_mode_without_a_grant() {
         // Default policy is all-`Deny`; `Capabilities` must still answer.
         let state = AgentApiState::default();
-        let dispatched = dispatch(&state, &capabilities_request(1));
+        let dispatched = dispatch_headless(&state, &capabilities_request(1)).await;
 
         let Ok(AgentPayload::Capabilities { version, capabilities }) =
             dispatched.response().result.clone()
@@ -513,8 +865,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capabilities_reflects_a_live_policy_change_with_no_restart() {
+    #[tokio::test]
+    async fn capabilities_reflects_a_live_policy_change_with_no_restart() {
         let state = AgentApiState::default();
         state.refresh_policy(AgentApiConfig {
             read_content: AgentPolicyMode::Allow,
@@ -522,7 +874,7 @@ mod tests {
             ..AgentApiConfig::default()
         });
 
-        let dispatched = dispatch(&state, &capabilities_request(2));
+        let dispatched = dispatch_headless(&state, &capabilities_request(2)).await;
         let Ok(AgentPayload::Capabilities { capabilities, .. }) =
             dispatched.response().result.clone()
         else {
@@ -550,7 +902,7 @@ mod tests {
         ready: Arc<Barrier>,
         release: Arc<Semaphore>,
     ) -> super::AgentDispatch {
-        let dispatch = dispatch(&state, &request(request_id));
+        let dispatch = dispatch_headless(&state, &request(request_id)).await;
         ready.wait().await;
         let release_permit = release.acquire().await.expect("release remains open");
         drop(release_permit);
@@ -625,7 +977,7 @@ mod tests {
             .collect();
         ready.wait().await;
 
-        let response = dispatch(&state, &request(8));
+        let response = dispatch_headless(&state, &request(8)).await;
         assert!(matches!(
             response.response(),
             scribe_common::agent::AgentResponse {

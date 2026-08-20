@@ -1019,6 +1019,17 @@ impl WindowShare {
             .collect()
     }
 
+    /// Owning-machine client eligible to answer an agent capability prompt.
+    fn local_agent_api_writer(&self) -> Option<SharedWriter> {
+        self.participants
+            .values()
+            .find(|participant| {
+                participant.transport == ParticipantTransport::Local
+                    && participant.agent_api == AgentApiCapability::Supported
+            })
+            .map(|participant| Arc::clone(&participant.writer))
+    }
+
     /// The smallest-wins grid across attached participants that have reported a
     /// viewport (D3, FR-012): `min(rows) × min(cols)`. `None` until at least one
     /// participant has reported.
@@ -5090,12 +5101,12 @@ where
                 if !claim_local_slot(local.as_deref_mut(), kind) {
                     return None;
                 }
-                return establish_local_first_frame(
+                return Box::pin(establish_local_first_frame(
                     msg,
                     conn.server,
                     conn.writer,
                     conn.attached_ids,
-                )
+                ))
                 .await;
             }
             Err(ScribeError::Io { .. }) => {
@@ -5220,7 +5231,25 @@ async fn establish_local_first_frame(
             None
         }
         ClientMessage::AgentRequest(request) => {
-            let dispatch = crate::agent_api::dispatch(&server.agent_api, &request);
+            let prompt_writer = first_local_agent_api_writer(&server.window_shares).await;
+            let live_sessions = Arc::clone(&server.live_sessions);
+            let dispatch = Box::pin(crate::agent_api::dispatch(
+                &server.agent_api,
+                action_client_key(writer),
+                &request,
+                move |session_id| async move {
+                    let sessions = live_sessions.read().await;
+                    sessions.get(&session_id).map(|session| crate::agent_api::ScreenReadTarget {
+                        term: Arc::clone(&session.term),
+                        title: session.title.clone(),
+                        cwd: session.cwd.clone(),
+                    })
+                },
+                prompt_writer.map(|prompt_client| {
+                    move |message| async move { send_message(&prompt_client, &message).await }
+                }),
+            ))
+            .await;
             send_message(writer, &ServerMessage::AgentResponse(dispatch.response().clone())).await;
             None
         }
@@ -6705,22 +6734,13 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::ListWindows
         | ClientMessage::DispatchAction { .. }
         | ClientMessage::ActionCompleted { .. }
+        | ClientMessage::AgentPromptResponse { .. }
         | ClientMessage::EnvPreflight) => {
             dispatch_window_message(msg, context).await;
         }
-        ClientMessage::ClipboardPromptResponse { request_id, decision } => {
-            forward_clipboard_command_to_window(
-                context,
-                ClipboardCommand::PromptResponse { request_id, decision },
-            )
-            .await;
-        }
-        ClientMessage::ClipboardBridgeReadReply { request_id, payload } => {
-            forward_clipboard_command_to_window(
-                context,
-                ClipboardCommand::BridgeReadReply { request_id, payload },
-            )
-            .await;
+        msg @ (ClientMessage::ClipboardPromptResponse { .. }
+        | ClientMessage::ClipboardBridgeReadReply { .. }) => {
+            dispatch_clipboard_answer(msg, context).await;
         }
         ClientMessage::LanApprovalDecision { request_id, approve } => {
             handle_lan_approval_decision(context, request_id, approve);
@@ -6746,6 +6766,26 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
             handle_control_message(msg, context).await;
         }
         other => debug!(?other, "unhandled client message"),
+    }
+}
+
+async fn dispatch_clipboard_answer(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    match msg {
+        ClientMessage::ClipboardPromptResponse { request_id, decision } => {
+            forward_clipboard_command_to_window(
+                context,
+                ClipboardCommand::PromptResponse { request_id, decision },
+            )
+            .await;
+        }
+        ClientMessage::ClipboardBridgeReadReply { request_id, payload } => {
+            forward_clipboard_command_to_window(
+                context,
+                ClipboardCommand::BridgeReadReply { request_id, payload },
+            )
+            .await;
+        }
+        other => debug!(?other, "ignored non-clipboard answer"),
     }
 }
 
@@ -7384,6 +7424,9 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             ) {
                 debug!(correlation_id, "ignored unknown or stale action completion");
             }
+        }
+        ClientMessage::AgentPromptResponse { prompt_id, decision } => {
+            handle_agent_prompt_response(context, prompt_id, decision).await;
         }
         ClientMessage::EnvPreflight => {
             handle_env_preflight(context.writer).await;
@@ -10303,6 +10346,50 @@ async fn handle_env_preflight(writer: &SharedWriter) {
 /// Send a `ServerMessage` to the client, logging errors.
 pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
     let _ = try_send_message(writer, msg).await;
+}
+
+/// Select one owning-machine client that advertised agent prompt support.
+/// Stable window ordering keeps concurrent callers from spraying the same
+/// prompt across several windows; the policy engine correlates the reply.
+async fn first_local_agent_api_writer(window_shares: &WindowShares) -> Option<SharedWriter> {
+    let shares = window_shares.read().await;
+    let mut windows = shares.keys().copied().collect::<Vec<_>>();
+    windows.sort_unstable_by_key(|window_id| window_id.to_full_string());
+    windows
+        .into_iter()
+        .find_map(|window_id| shares.get(&window_id).and_then(WindowShare::local_agent_api_writer))
+}
+
+async fn connection_supports_agent_api(
+    window_shares: &WindowShares,
+    window_id: WindowId,
+    writer: &SharedWriter,
+) -> bool {
+    window_shares
+        .read()
+        .await
+        .get(&window_id)
+        .and_then(|share| share.participant_for_writer(writer))
+        .is_some_and(|participant| participant.agent_api == AgentApiCapability::Supported)
+}
+
+async fn handle_agent_prompt_response(
+    context: &ClientDispatchContext<'_>,
+    prompt_id: scribe_common::protocol::PromptId,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    if context.is_remote
+        || !connection_supports_agent_api(
+            &context.server.window_shares,
+            context.window_id,
+            context.writer,
+        )
+        .await
+    {
+        debug!(?prompt_id, "ignored agent prompt response from an incapable client");
+    } else if !context.server.agent_api.resolve_prompt(prompt_id, decision) {
+        debug!(?prompt_id, "ignored unknown or stale agent prompt response");
+    }
 }
 
 /// Send an agent-only frame to participants that advertised `agent_api`.
