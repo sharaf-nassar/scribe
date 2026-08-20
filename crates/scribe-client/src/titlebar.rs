@@ -30,6 +30,9 @@ const TAB_COLS: usize = 22;
 /// Approximate advance width of one label character.
 const CHAR_WIDTH: f32 = 8.0;
 
+/// Leading tab mark shown while the server holds an agent activity lease.
+const AGENT_ACTIVE_GLYPH: &str = "◆";
+
 /// Fixed width of one tab in pixels (`TAB_COLS * CHAR_WIDTH`). Matching the
 /// legacy fixed-column tab layout keeps the drag-reorder geometry deterministic.
 pub const TAB_WIDTH: f32 = 176.0;
@@ -119,7 +122,7 @@ struct TabClose<'a> {
 
 struct TabChildren {
     display: String,
-    ai_dot: Option<AnyElement>,
+    indicators: Vec<AnyElement>,
     suffix: Option<AnyElement>,
     close: Option<AnyElement>,
     underline: Option<AnyElement>,
@@ -461,16 +464,42 @@ pub fn beads_graph_icon(color: Rgba) -> AnyElement {
 }
 
 /// Label columns left for a tab title once padding and the close button
-/// (4 columns), the context-% suffix, and the AI dot (6px + margin ≈ 2
-/// columns) are reserved. Under-reserving here makes the title overflow its
-/// slot at full tab width, which used to wrap it onto a hidden second line.
+/// (4 columns), the context-% suffix, the leading agent glyph (1 column), and
+/// the AI dot (6px + margin ≈ 2 columns) are reserved. Under-reserving here
+/// makes the title overflow its slot at full tab width, which used to wrap it
+/// onto a hidden second line.
 ///
 /// Shared with the shell's lower-region bars: those tabs are the same width
-/// with the same chrome, so they must reserve the dot identically.
+/// with the same chrome, so they must reserve both indicators identically.
 #[must_use]
-pub fn title_columns(suffix_len: usize, has_ai_dot: bool) -> usize {
-    let dot_cols = if has_ai_dot { 2 } else { 0 };
-    TAB_COLS.saturating_sub(4).saturating_sub(suffix_len).saturating_sub(dot_cols)
+pub fn title_columns(suffix_len: usize, tab: &TabData) -> usize {
+    let agent_cols = usize::from(tab.agent_active);
+    let dot_cols = if tab.ai_indicator.is_some() { 2 } else { 0 };
+    TAB_COLS
+        .saturating_sub(4)
+        .saturating_sub(suffix_len)
+        .saturating_sub(agent_cols)
+        .saturating_sub(dot_cols)
+}
+
+/// One-column leading activity glyph shared by both tab-bar renderers.
+#[must_use]
+pub fn agent_active_glyph(color: Rgba) -> AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(CHAR_WIDTH))
+        .text_color(color)
+        .child(AGENT_ACTIVE_GLYPH)
+        .into_any_element()
+}
+
+/// AccessKit name for a tab, including the non-visual agent activity state.
+#[must_use]
+pub fn tab_accessible_label(tab: &TabData) -> String {
+    if tab.agent_active { format!("{}, agent active", tab.title) } else { tab.title.clone() }
 }
 
 /// Half-open tab ranges split at workspace-region boundaries.
@@ -577,11 +606,17 @@ impl TitlebarView {
     fn render_tab_children(&self, render: TabRender<'_>, cx: &mut Context<Self>) -> TabChildren {
         let TabRender { index, tab, foreground, id, focused, close_focused } = render;
         let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
-        let available = title_columns(suffix_len, tab.ai_indicator.is_some());
+        let available = title_columns(suffix_len, tab);
         let (display, _truncated) = tab_display_title(&tab.title, available);
-        let ai_dot = tab
-            .ai_indicator
-            .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
+        let indicators = [
+            tab.agent_active.then(|| agent_active_glyph(self.colors.accent)),
+            tab.ai_indicator.map(|color| {
+                div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element()
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let suffix = tab.context_suffix.as_ref().map(|suffix| {
             div().text_color(suffix.color).child(suffix.text.clone()).into_any_element()
         });
@@ -611,7 +646,7 @@ impl TitlebarView {
                     .map_or(self.colors.accent, |accent| accent_tab_tone(accent, self.colors.bg)))
                 .into_any_element()
         });
-        TabChildren { display, ai_dot, suffix, close, underline }
+        TabChildren { display, indicators, suffix, close, underline }
     }
 
     fn render_tab(
@@ -642,7 +677,7 @@ impl TitlebarView {
         let mut tab_el = div()
             .id(tab_id)
             .role(Role::Tab)
-            .aria_label(tab.title.clone())
+            .aria_label(tab_accessible_label(tab))
             .aria_selected(tab.is_active)
             .aria_position_in_set(index + 1)
             .aria_size_of_set(self.tabs.len())
@@ -672,9 +707,8 @@ impl TitlebarView {
         if let Some(dx) = slide {
             tab_el = tab_el.left(px(dx));
         }
-
         let tab_el = tab_el
-            .children(children.ai_dot)
+            .children(children.indicators)
             // `truncate` keeps the title a single clipped line; without it a
             // title that outgrows the flexed slot (the AI dot appearing, a
             // narrow group bar) wraps to a second line inside the fixed-height
@@ -1007,8 +1041,8 @@ mod tests {
     use scribe_common::theme::minimal_dark;
 
     use super::{
-        TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px, title_columns,
-        workspace_group_ranges,
+        TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px,
+        tab_accessible_label, title_columns, workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
@@ -1061,14 +1095,48 @@ mod tests {
 
     // @lat: [[client#GPUI Titlebar#Title budget reserves AI dot columns]]
     #[test]
-    fn title_budget_reserves_ai_dot_columns() {
-        // Without dot or suffix the title keeps every non-chrome column.
-        assert_eq!(title_columns(0, false), TAB_COLS - 4);
-        // The dot costs two columns, on top of any context suffix.
-        assert_eq!(title_columns(0, true), TAB_COLS - 6);
-        assert_eq!(title_columns(4, true), TAB_COLS - 10);
+    fn title_budget_reserves_agent_glyph_and_ai_dot_columns() {
+        let mut tab = TabData::new("build");
+        // Without indicators or suffix the title keeps every non-chrome column.
+        assert_eq!(title_columns(0, &tab), TAB_COLS - 4);
+        // Agent and AI indicators coexist: one leading glyph column plus two dot columns.
+        tab.agent_active = true;
+        tab.ai_indicator = Some(gpui::Rgba::default());
+        assert_eq!(title_columns(0, &tab), TAB_COLS - 7);
+        assert_eq!(title_columns(4, &tab), TAB_COLS - 11);
         // Degenerate budgets clamp to zero instead of underflowing.
-        assert_eq!(title_columns(TAB_COLS, true), 0);
+        assert_eq!(title_columns(TAB_COLS, &tab), 0);
+    }
+
+    #[test]
+    fn agent_active_is_included_in_the_accessible_tab_label() {
+        let mut tab = TabData::new("build");
+        assert_eq!(tab_accessible_label(&tab), "build");
+        tab.agent_active = true;
+        assert_eq!(tab_accessible_label(&tab), "build, agent active");
+    }
+
+    #[gpui::test]
+    fn agent_glyph_and_ai_dot_are_both_lowered_for_one_tab(cx: &mut TestAppContext) {
+        let (bar, _) = titlebar_with_tabs(1, cx);
+        bar.update(cx, |bar, cx| {
+            let mut tab = bar.tabs[0].clone();
+            tab.agent_active = true;
+            tab.ai_indicator = Some(bar.colors.accent);
+            let id = gpui::ElementId::from(tab.accessibility_id.clone());
+            let children = bar.render_tab_children(
+                super::TabRender {
+                    index: 0,
+                    tab: &tab,
+                    foreground: bar.colors.text,
+                    id: &id,
+                    focused: false,
+                    close_focused: false,
+                },
+                cx,
+            );
+            assert_eq!(children.indicators.len(), 2);
+        });
     }
 
     #[gpui::test]

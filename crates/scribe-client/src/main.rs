@@ -147,7 +147,7 @@ use scribe_client::{
     tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
         TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView,
-        beads_graph_icon, title_columns,
+        agent_active_glyph, beads_graph_icon, title_columns,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -590,6 +590,9 @@ struct Shared {
     initial_session: Arc<InitialSessionBootstrap>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
     ai: Arc<Mutex<AiChrome>>,
+    /// Sessions with a server-owned agent activity lease, driving the leading
+    /// tab indicator until the server sends its post-dwell clear transition.
+    agent_activity: Arc<Mutex<HashSet<SessionId>>>,
     /// Server-reported terminal chrome (CWD, git branch, session context, env
     /// health, workspace names) driving the status bar's metadata segments.
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
@@ -2933,6 +2936,11 @@ impl TerminalView {
         let mut data = self.rendered_tabs.to_tab_data();
         let terminal = &self.config.config().config.terminal;
         let ansi = &self.config.config().theme.ansi_colors;
+        if let Ok(agent_activity) = self.shared.agent_activity.lock() {
+            for (tab, slot) in data.iter_mut().zip(self.rendered_tabs.addresses()) {
+                tab.agent_active = agent_activity.contains(&slot.session_id);
+            }
+        }
         if let Ok(ai) = self.shared.ai.lock() {
             for (tab, slot) in data.iter_mut().zip(self.rendered_tabs.addresses()) {
                 tab.ai_indicator = ai
@@ -7217,8 +7225,8 @@ impl TerminalView {
             a: colors.bg.a,
         };
         let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
-        let (display, _truncated) =
-            tab_display_title(&tab.title, title_columns(suffix_len, tab.ai_indicator.is_some()));
+        let (display, _truncated) = tab_display_title(&tab.title, title_columns(suffix_len, tab));
+        let agent_glyph = tab.agent_active.then(|| agent_active_glyph(colors.accent));
         let ai_dot = tab
             .ai_indicator
             .map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_2().into_any_element());
@@ -7265,6 +7273,7 @@ impl TerminalView {
             .cursor_pointer()
             .when(!tab.is_active, |this| this.hover(move |s| s.bg(hover_bg)))
             .map(|tab| Self::region_tab_interactions(tab, session_id, slot, cx))
+            .children(agent_glyph)
             .children(ai_dot)
             // `truncate`, as in the titlebar: without it a title that outgrows
             // the flexed slot once the AI dot appears wraps onto a second line
@@ -10666,6 +10675,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
+        agent_activity: Arc::new(Mutex::new(HashSet::new())),
         chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
@@ -12156,6 +12166,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         active_session: Arc::clone(&ctx.shared.active_session),
         focused_size: Arc::clone(&ctx.shared.focused_size),
         ai: Arc::clone(&ctx.shared.ai),
+        agent_activity: Arc::clone(&ctx.shared.agent_activity),
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
         pi_provider: Arc::clone(&ctx.shared.pi_provider),
@@ -12625,6 +12636,8 @@ struct ReaderCtx {
     focused_size: Arc<Mutex<TerminalSize>>,
     /// AI state + prompt history the chrome renders from.
     ai: Arc<Mutex<AiChrome>>,
+    /// Server-owned agent activity leases the tab strip renders from.
+    agent_activity: Arc<Mutex<HashSet<SessionId>>>,
     /// Server-reported terminal chrome the status bar renders from.
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
@@ -12735,6 +12748,28 @@ fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
     mutate(&mut guard);
     drop(guard);
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply one server-owned activity transition to the active session set.
+fn apply_agent_activity(
+    active_sessions: &mut HashSet<SessionId>,
+    session_id: SessionId,
+    active: bool,
+) -> bool {
+    if active { active_sessions.insert(session_id) } else { active_sessions.remove(&session_id) }
+}
+
+/// Consume an `AgentActivity` edge and repaint the tab strip when it changes.
+fn on_agent_activity(ctx: &ReaderCtx, session_id: SessionId, active: bool) {
+    let Ok(mut active_sessions) = ctx.agent_activity.lock() else {
+        tracing::warn!("agent activity mutex poisoned; dropping update");
+        return;
+    };
+    let changed = apply_agent_activity(&mut active_sessions, session_id, active);
+    drop(active_sessions);
+    if changed {
+        ctx.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Fold one AI notice onto the shared [`AiChrome`].
@@ -13111,6 +13146,7 @@ fn on_session_exited(
 ) -> Result<(), String> {
     let existed = registry.on_session_exited(session_id);
     update_ai_chrome(ctx, |ai| ai.forget(session_id));
+    on_agent_activity(ctx, session_id, false);
     update_chrome_metadata(ctx, |metadata| metadata.forget_session(session_id));
     // A toast outliving the pane it points at is a click that can only land
     // nowhere, so the exit retires it on the same path that forgets the chrome.
@@ -13435,6 +13471,9 @@ async fn dispatch_server_message(
         // shown to the user who could have allowed it.
         ServerMessage::AgentPromptRequest { prompt_id, agent_label, capability, target } => {
             on_agent_prompt_request(ctx, prompt_id, agent_label, capability, target);
+        }
+        ServerMessage::AgentActivity { session_id, active } => {
+            on_agent_activity(ctx, session_id, active);
         }
         // Feature 013: every tailnet answer — the dial preamble's reply, the
         // discovery/environment replies the startup probe asks for, the
@@ -14847,6 +14886,18 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn agent_activity_transitions_follow_the_server_owned_dwell_state() {
+        let session_id = SessionId::new();
+        let mut active = HashSet::new();
+
+        assert!(apply_agent_activity(&mut active, session_id, true));
+        assert!(active.contains(&session_id));
+        assert!(!apply_agent_activity(&mut active, session_id, true));
+        assert!(apply_agent_activity(&mut active, session_id, false));
+        assert!(!active.contains(&session_id));
+    }
 
     #[test]
     fn agent_consent_persists_only_the_sticky_choice_on_its_own_axis() {

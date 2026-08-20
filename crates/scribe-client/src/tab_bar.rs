@@ -182,6 +182,8 @@ pub struct TabData {
     pub title: String,
     /// Whether this tab is the active/focused tab in its workspace.
     pub is_active: bool,
+    /// Whether the agent API currently holds an activity lease for this tab.
+    pub agent_active: bool,
     /// AI state indicator color. `None` when no active AI state.
     pub ai_indicator: Option<Rgba>,
     /// Colored context-% suffix appended to the label. `None` when not shown.
@@ -226,6 +228,7 @@ impl TabData {
             accessibility_id: format!("tab-{title}"),
             title,
             is_active: false,
+            agent_active: false,
             ai_indicator: None,
             context_suffix: None,
             tab_flash: None,
