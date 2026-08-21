@@ -10215,7 +10215,7 @@ impl TerminalView {
                             hover_state: Arc::clone(&self.shared.beads_boards),
                             panel_state: Arc::clone(&self.shared.beads_panels),
                             workspace_id: *workspace_id,
-                            drag_target: boards.drag_target(*workspace_id),
+                            card_drag: boards.card_drag_paint(*workspace_id),
                             rail,
                             blocked_tab_focus,
                             done_tab_focus,

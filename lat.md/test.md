@@ -4243,7 +4243,31 @@ Unit and Docker visual coverage pin the client drag contract at its state-machin
 Tests beside this section's code mention cover the strict threshold, source
 and target matrices, workspace hover and PTY ownership, guarded queue fences,
 generation-tagged overlays, rollback, classifier outcomes, and the five-second
-Undo deadline. [The visual script](../tests/e2e/visual/beads-board.sh) checks
+Undo deadline.
+
+Target resolution is pinned twice, because A2's tracks are adaptive. In
+[[crates/scribe-client/src/beads_board_a2.rs]] every track's own midpoint must
+hit its own queue across the collapsed, both-pinned, and sparse rail states,
+an open drawer must claim the pointer over the lanes it covers and give it
+back below its own bottom edge, and the gutter, inter-track gaps, right
+padding, and everything outside the strip must name no queue at all. Beside
+the board state itself, a lifted card is then dragged over a 1200px board
+whose track boundaries are written out from the same reservation arithmetic:
+each collapsed track takes the drop its own width covers, pinning Blocked
+moves the boundary a drop lands on while Done stays a 36px tab at the rail's
+right edge, and an open Done drawer takes a drop over In progress. Two of
+those drops run all the way through: the collapsed Done tab queues the
+guarded `CloseIssue`, moves the card optimistically, and exposes Undo on the
+applied result, while the collapsed Blocked tab queues nothing and leaves the
+card in its source lane. The ghost is asserted at the mock's 320x36 and at
+the scaled size a larger board text gives it. A drag move reported by another
+region's board is refused rather than allowed to retarget the gesture against
+its own rect, and the release stop the tabs and drawer hold at rest is
+asserted absent while a card is in flight, since that release is the drop's.
+
+The geometry constants both sides read are asserted against the generated
+`a2a3-contract.json` in `beads_board_a2`'s own `tests::manifest`, so the drag
+numbers cannot drift from the mock either. [The visual script](../tests/e2e/visual/beads-board.sh) checks
 neutral lane ground in normal and pinned boards. Its exact long-title fixture
 hovers the normal card's bottom padding, captures the reveal after 100ms, and
 requires a wrapped bounded box above and horizontally overlapping that card,

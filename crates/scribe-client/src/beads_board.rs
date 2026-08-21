@@ -225,6 +225,17 @@ pub struct CardDragGhost {
     pub height: f32,
 }
 
+/// What one board paints of the drag in flight (A2-S4): the lifted row, which
+/// dims where it still sits, the lane it came from, which never accepts its
+/// own card back, and the lane the pointer is over, which wears the accepted
+/// or rejected target treatment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDragPaint {
+    pub source_id: String,
+    pub source_lane: u8,
+    pub target_lane: Option<u8>,
+}
+
 impl BeadsBoards {
     /// Latch the connection's `beads_flow` capability.
     ///
@@ -650,17 +661,17 @@ impl BeadsBoards {
 
     /// Promote the armed press once GPUI's native `on_drag` fires.
     pub fn start_card_drag(&mut self, pointer: CardDragPoint, board: Rect) -> bool {
-        let Some(press) = self.card_press.as_ref() else { return false };
+        let Some(press) = self.card_press.clone() else { return false };
         let travel = (pointer.x - press.origin.x).hypot(pointer.y - press.origin.y);
         if travel <= CARD_DRAG_THRESHOLD {
             return false;
         }
         self.card_drag = Some(CardDragState {
+            hovered_lane: self.drag_lane_at(press.workspace_id, board, pointer),
             workspace_id: press.workspace_id,
-            source: press.source.clone(),
+            source: press.source,
             source_lane: press.source_lane,
             pointer,
-            hovered_lane: card_drag_lane(board, pointer),
         });
         self.card_press = None;
         true
@@ -668,28 +679,77 @@ impl BeadsBoards {
 
     /// Store one native drag move in constant work; no request or subprocess
     /// belongs on this path.
-    pub fn update_card_drag(&mut self, pointer: CardDragPoint, board: Rect) -> bool {
+    ///
+    /// GPUI delivers a drag move to every registered board, not only the one
+    /// under the pointer, so `workspace_id` names the board whose `board` rect
+    /// this report carries: a neighbouring region's board would otherwise
+    /// resolve the target against its own geometry and win by report order.
+    pub fn update_card_drag(
+        &mut self,
+        workspace_id: WorkspaceId,
+        pointer: CardDragPoint,
+        board: Rect,
+    ) -> bool {
+        if self.card_drag.as_ref().map(|drag| drag.workspace_id) != Some(workspace_id) {
+            return false;
+        }
+        let hovered_lane = self.drag_lane_at(workspace_id, board, pointer);
         let Some(drag) = self.card_drag.as_mut() else { return false };
         drag.pointer = pointer;
-        drag.hovered_lane = card_drag_lane(board, pointer);
+        drag.hovered_lane = hovered_lane;
         true
+    }
+
+    /// Which lane the pointer is over, resolved through the live A2
+    /// presentation this workspace is painting from
+    /// ([`beads_board_a2::queue_at`]) rather than a fixed five-equal-lanes
+    /// split: the rail's tracks move with occupancy, text scale, and which
+    /// collapsible lane is a 36px tab, an open drawer, or a pinned lane, and a
+    /// drop must write to the queue it visibly landed on (A2-I5, A2-BD6).
+    fn drag_lane_at(
+        &self,
+        workspace_id: WorkspaceId,
+        board: Rect,
+        pointer: CardDragPoint,
+    ) -> Option<u8> {
+        let snapshot = self.states.get(&workspace_id).and_then(state_snapshot)?;
+        let rail = RailState {
+            blocked: self.collapsed_lane_state(workspace_id, BeadsIssueQueue::Blocked)?,
+            done: self.collapsed_lane_state(workspace_id, BeadsIssueQueue::Done)?,
+        };
+        let queue = beads_board_a2::queue_at(
+            A2Input {
+                snapshot,
+                rail,
+                board_width: board.width,
+                board_height: board.height,
+                text_scale: self.text_scale(),
+            },
+            pointer.x - board.x,
+            pointer.y - board.y,
+        )?;
+        Some(lane_index(queue))
     }
 
     pub fn card_drag(&self) -> Option<&CardDragState> {
         self.card_drag.as_ref()
     }
 
-    /// Rejected-lane presentation for one board, read while its caller already
-    /// holds the shared store guard.
-    pub fn drag_target(&self, workspace_id: WorkspaceId) -> Option<u8> {
-        self.card_drag.as_ref().and_then(|drag| {
-            (drag.workspace_id == workspace_id).then_some(drag.hovered_lane).flatten()
+    /// How one board paints the drag in flight, read while its caller already
+    /// holds the shared store guard. Only the workspace whose card is lifted
+    /// dims a row or marks a target; every other board paints as usual.
+    pub fn card_drag_paint(&self, workspace_id: WorkspaceId) -> Option<CardDragPaint> {
+        let drag = self.card_drag.as_ref().filter(|drag| drag.workspace_id == workspace_id)?;
+        Some(CardDragPaint {
+            source_id: drag.source.id.clone(),
+            source_lane: drag.source_lane,
+            target_lane: drag.hovered_lane,
         })
     }
 
-    /// Describe the active drag's native ghost at the source card's size.
-    pub fn card_drag_ghost(&self, board: Rect, scale: f32) -> Option<CardDragGhost> {
-        self.card_drag.as_ref().map(|drag| CardDragGhost::new(drag.source.clone(), board, scale))
+    /// Describe the active drag's native ghost.
+    pub fn card_drag_ghost(&self, scale: f32) -> Option<CardDragGhost> {
+        self.card_drag.as_ref().map(|drag| CardDragGhost::new(drag.source.clone(), scale))
     }
 
     /// Whether the board owns pointer routing before it reaches the PTY.
@@ -1023,18 +1083,44 @@ impl BeadsBoards {
 }
 
 impl CardDragGhost {
-    fn new(source: BeadsBoardItem, board: Rect, scale: f32) -> Self {
-        let lane_width = (board.width - 2.0 * LANES_SIDE_PADDING) / 5.0;
+    /// The mock's compact 320x36 ghost (A2-S4), scaled with the board's text
+    /// the way every other repeating A2 unit is: it carries a row's own
+    /// grammar, so it has to grow with the rows it was lifted from.
+    fn new(source: BeadsBoardItem, scale: f32) -> Self {
         Self {
             source,
-            width: (lane_width - 2.0 * LANE_CARD_PADDING - LANE_BODY_RIGHT_PADDING).max(1.0),
-            height: (ISSUE_HEIGHT - CARD_GAP) * scale,
+            width: beads_board_a2::GHOST_W * scale,
+            height: beads_board_a2::GHOST_H * scale,
         }
+    }
+}
+
+impl CardDragPaint {
+    /// Whether a drop on `lane_index` would write (A2-BD6), so an accepted
+    /// target and a rejected one never wear the same treatment. The paint-side
+    /// twin of [`crate::beads_panel::BeadsPanels::queue_card_drop`]'s own
+    /// verb match: Backlog and Blocked never write, and the lane the card came
+    /// from is not a move.
+    fn accepts(&self, lane_index: u8) -> bool {
+        !matches!(lane_index, 0 | 3) && lane_index != self.source_lane
     }
 }
 
 fn card_drag_source(lane: u8) -> bool {
     lane <= 2
+}
+
+/// `queue`'s index in the five-lane order every drag, snapshot, and write
+/// path already speaks ([`lane_cards_mut`],
+/// [`crate::beads_panel::BeadsPanels::queue_card_drop`]).
+fn lane_index(queue: BeadsIssueQueue) -> u8 {
+    match queue {
+        BeadsIssueQueue::Backlog => 0,
+        BeadsIssueQueue::Ready => 1,
+        BeadsIssueQueue::InProgress => 2,
+        BeadsIssueQueue::Blocked => 3,
+        BeadsIssueQueue::Done => 4,
+    }
 }
 
 /// Whether `queue` is one of the two queues A2-I1/A2-I2 collapse to a rail
@@ -1043,6 +1129,14 @@ fn card_drag_source(lane: u8) -> bool {
 /// arm a drag.
 fn collapsible_queue(queue: BeadsIssueQueue) -> bool {
     matches!(queue, BeadsIssueQueue::Blocked | BeadsIssueQueue::Done)
+}
+
+fn state_snapshot(state: &BeadsBoardState) -> Option<&BeadsBoardSnapshot> {
+    match state {
+        BeadsBoardState::Loading { cached } => cached.as_ref(),
+        BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
+        BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+    }
 }
 
 fn state_snapshot_mut(state: &mut BeadsBoardState) -> Option<&mut BeadsBoardSnapshot> {
@@ -1109,31 +1203,6 @@ fn move_snapshot_card(
     })
 }
 
-fn card_drag_lane(board: Rect, pointer: CardDragPoint) -> Option<u8> {
-    let left = board.x + LANES_SIDE_PADDING;
-    let right = board.x + board.width - LANES_SIDE_PADDING;
-    if pointer.x < left
-        || pointer.x >= right
-        || pointer.y < board.y
-        || pointer.y >= board.y + board.height
-    {
-        return None;
-    }
-    let lane_width = (right - left) / 5.0;
-    let x = pointer.x - left;
-    Some(if x < lane_width {
-        0
-    } else if x < lane_width * 2.0 {
-        1
-    } else if x < lane_width * 3.0 {
-        2
-    } else if x < lane_width * 4.0 {
-        3
-    } else {
-        4
-    })
-}
-
 fn card_drag_point(position: Point<Pixels>) -> CardDragPoint {
     CardDragPoint { x: f32::from(position.x), y: f32::from(position.y) }
 }
@@ -1167,7 +1236,6 @@ pub struct BeadsBoardColors {
     /// gradient, and the second is the flat colour the card reads as.
     pub card_top: Rgba,
     pub card: Rgba,
-    pub card_hover_top: Rgba,
     pub card_hover: Rgba,
     pub card_border: Rgba,
     pub card_border_hover: Rgba,
@@ -1294,7 +1362,6 @@ impl BeadsBoardColors {
             ground,
             card_top: mix(card, WHITE, 0.03),
             card,
-            card_hover_top: mix(card_hover, WHITE, 0.03),
             card_hover,
             card_border: mix(card, border_target, 0.1),
             card_border_hover: mix(card, border_target, 0.22),
@@ -1384,43 +1451,6 @@ impl BeadsBoardColors {
     fn priority(&self, priority: u8) -> Rgba {
         self.priorities.get(usize::from(priority)).copied().unwrap_or(self.muted)
     }
-
-    /// The wash behind a priority and the ink that stays readable on it.
-    ///
-    /// The wash weakens as the rank falls, so the hierarchy survives a theme
-    /// whose reds are close: P0 is both the most saturated colour on the card
-    /// and the strongest mark, and neither depends on the other.
-    fn priority_mark(&self, priority: u8) -> PriorityMark {
-        let color = self.priority(priority);
-        let weight = PRIORITY_WEIGHTS
-            .get(usize::from(priority))
-            .copied()
-            .unwrap_or(PRIORITY_FAINTEST_WEIGHT);
-        let (floor, ceiling) = PRIORITY_TINT_RANGE;
-        let tint = (weight / reach(color, self.card).max(0.02)).clamp(floor, ceiling);
-        let fill = mix(self.card, color, (tint * BADGE_OF_WASH).clamp(0.2, 1.0));
-        // A filled badge is read the other way round from everything else on
-        // the card: the colour is the ground, so the digits take whichever end
-        // of the range that ground is not.
-        let on_fill = if luminance(fill) < 0.5 { WHITE } else { BLACK };
-        PriorityMark { ink: readable(on_fill, fill, BODY_CONTRAST), fill }
-    }
-}
-
-/// One priority's mark: the wash laid behind it, and the ink for its digits.
-#[derive(Clone, Copy)]
-struct PriorityMark {
-    /// The digits' colour, which is read on the badge rather than on the card.
-    ink: Rgba,
-    /// The badge's own fill, laid over the card at a strength solved from the
-    /// rank, so a hue near the card reads as strongly as one far from it.
-    fill: Rgba,
-}
-
-/// How far a colour sits from a ground, averaged over the channels: how much
-/// of itself a wash of it lays down.
-fn reach(color: Rgba, ground: Rgba) -> f32 {
-    ((color.r - ground.r).abs() + (color.g - ground.g).abs() + (color.b - ground.b).abs()) / 3.0
 }
 
 /// How saturated a colour is, which is what makes it read as urgent: a washed
@@ -1450,15 +1480,9 @@ const BRIGHT_CYAN: usize = 14;
 const WHITE: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
-/// The drag ghost's own geometry (`CardDragGhost::new`, `card_drag_lane`):
-/// the raised-card sizing scribe-zwtv.9 still owns until it redraws the
-/// ghost and drop targets for A2's unequal tracks.
-const LANES_SIDE_PADDING: f32 = 8.0;
-const LANE_CARD_PADDING: f32 = 8.0;
-const LANE_BODY_RIGHT_PADDING: f32 = 4.0;
-const ISSUE_HEIGHT: f32 = 50.0;
-const CARD_GAP: f32 = 4.0;
-const CARD_RADIUS: f32 = 4.0;
+/// How much of its queue's hue an accepted drop target washes its track with
+/// (A2-C7), the strength the mock's `#68c98c26` target tab carries.
+const DRAG_TARGET_WASH: f32 = 0.15;
 
 /// The borderless text-size steppers' own left-gutter geometry (A2-G2),
 /// mirrored from `a2a3-contract.json`'s `geometry.a2.zoom_*` block.
@@ -1495,28 +1519,6 @@ const FLOOR_GRIP_TOP: f32 = 1.0;
 /// title-aligned void copy): the priority column plus its gap to the title.
 const ROW_TITLE_INDENT: f32 = beads_board_a2::ROW_PRIORITY_W + beads_board_a2::ROW_PRIORITY_GAP;
 
-/// How much colour each rank's badge carries, as a mean channel distance from
-/// the card it sits on. P0 through P4.
-///
-/// The tint is solved for this rather than fixed, because a hue far from the
-/// card needs less of itself to make the same mark than one that sits near it:
-/// at one fixed tint a vivid yellow at P2 out-shouts a dulled red at P1, which
-/// is a ranking the reader can see and the ramp did not intend.
-const PRIORITY_WEIGHTS: [f32; 5] = [0.105, 0.078, 0.058, 0.042, 0.032];
-const PRIORITY_FAINTEST_WEIGHT: f32 = 0.032;
-/// What a solved tint may not go past: a colour sitting almost on the card
-/// would otherwise be asked for a wash stronger than itself.
-const PRIORITY_TINT_RANGE: (f32, f32) = (0.04, 0.5);
-/// How much more of a colour a badge carries than a broad wash of the same
-/// rank. Scaled so the hottest rank lands on the colour itself and the coolest
-/// keeps a fill it can still be read against.
-const BADGE_OF_WASH: f32 = 3.0;
-/// The card's own top padding.
-const CARD_PAD_TOP: f32 = 6.0;
-/// The title's line box, shared by the badge beside it so both sit on one
-/// line.
-const TITLE_LINE: f32 = 17.0;
-
 const TEXT_SCALE_STEP: f32 = 0.1;
 const MIN_TEXT_SCALE_STEPS: i8 = -2;
 const MAX_TEXT_SCALE_STEPS: i8 = 6;
@@ -1552,8 +1554,10 @@ pub struct BeadsBoardRender {
     pub hover_state: std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     pub panel_state: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     pub workspace_id: WorkspaceId,
-    /// Hovered lane copied from the caller's existing board-store guard.
-    pub drag_target: Option<u8>,
+    /// This board's drag in flight, copied from the caller's existing
+    /// board-store guard: the lifted row it dims and the lane the pointer is
+    /// over (A2-S4). `None` on every board but the one holding a card.
+    pub card_drag: Option<CardDragPaint>,
     /// Blocked and Done's collapsed-lane state, read under the caller's
     /// existing board-store guard: whether the A2 layout gives each a
     /// pinned lane's track or a plain rail tab (A2-S1, A2-S3).
@@ -1593,7 +1597,7 @@ struct BoardStores<'a> {
     boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     rect: Rect,
-    drag_target: Option<u8>,
+    drag: Option<&'a CardDragPaint>,
 }
 
 /// Marker registered with GPUI's native drag arm for eligible Beads cards.
@@ -1640,28 +1644,25 @@ impl Render for BeadsCardTooltip {
 impl Render for BeadsCardDragGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let item = &self.model.source;
-        let mark = self.colors.priority_mark(item.priority);
+        let metrics = self.metrics;
         div()
             .w(px(self.model.width))
             .h(px(self.model.height))
             .flex()
             .flex_col()
-            .gap(px(2.0))
+            .justify_center()
             .overflow_hidden()
-            .rounded(px(CARD_RADIUS))
+            .rounded(metrics.at(beads_board_a2::GHOST_RADIUS))
             .border_1()
             .border_color(self.colors.card_border_hover)
-            .bg(linear_gradient(
-                180.0,
-                linear_color_stop(self.colors.card_hover_top, 0.0),
-                linear_color_stop(self.colors.card_hover, 1.0),
-            ))
+            .bg(self.colors.card_hover)
             .shadow_lg()
-            .pt(px(CARD_PAD_TOP))
-            .px(px(8.0))
-            .pb(px(6.0))
-            .child(issue_title(item, mark, &self.colors, self.metrics))
-            .child(drag_ghost_meta(item, &self.colors, self.metrics))
+            .pl(metrics.at(beads_board_a2::GHOST_PAD_LEFT))
+            .pr(metrics.at(beads_board_a2::GHOST_PAD_RIGHT))
+            // The ghost is the row it was lifted from, not the raised card A2
+            // replaced: the same priority glyph, title, and sub line (A2-S4).
+            .child(row_title_line(item, self.colors.priority(item.priority), &self.colors, metrics))
+            .child(drag_ghost_meta(item, &self.colors, metrics))
     }
 }
 
@@ -1677,7 +1678,7 @@ pub fn render(
         hover_state,
         panel_state,
         workspace_id,
-        drag_target,
+        card_drag,
         rail,
         blocked_tab_focus,
         done_tab_focus,
@@ -1712,7 +1713,7 @@ pub fn render(
                 boards: &hover_state,
                 panels: &panel_state,
                 rect,
-                drag_target,
+                drag: card_drag.as_ref(),
             },
             colors,
             metrics,
@@ -1766,7 +1767,11 @@ fn board_shell(
         .border_color(colors.hairline)
         .on_drag_move(move |event: &DragMoveEvent<BeadsCardDrag>, window, _app| {
             if let Ok(mut boards) = drag_move.lock()
-                && boards.update_card_drag(card_drag_point(event.event.position), rect)
+                && boards.update_card_drag(
+                    workspace_id,
+                    card_drag_point(event.event.position),
+                    rect,
+                )
             {
                 window.refresh();
             }
@@ -2045,6 +2050,14 @@ impl<'a> LaneCtx<'a> {
     fn tab_focus(&self, queue: BeadsIssueQueue) -> &'a FocusHandle {
         if queue == BeadsIssueQueue::Done { self.done_tab_focus } else { self.blocked_tab_focus }
     }
+
+    /// Whether the drag in flight is over `lane_index`, and if so whether
+    /// dropping there would write (A2-S4, A2-BD6). `None` covers both no drag
+    /// and a drag over some other track, which paint the same: untouched.
+    fn drag_target(&self, lane_index: u8) -> Option<bool> {
+        let drag = self.stores.drag?;
+        (drag.target_lane == Some(lane_index)).then(|| drag.accepts(lane_index))
+    }
 }
 
 /// [`lanes`]'s own bundle of rail state plus the two stable Tab stops it
@@ -2131,27 +2144,14 @@ fn queue_column(
     state_color: Rgba,
     ctx: LaneCtx<'_>,
 ) -> AnyElement {
-    // A drag in flight marks its hovered lane's left edge: the queue's own
-    // hue for a lane that accepts the drop, muted for one that never writes
-    // (A2-BD6). The pointer-to-lane geometry behind `drag_target` is still
-    // the old five-equal-lanes math scribe-zwtv.9 owns updating for A2's
-    // unequal tracks; this only re-paints the edge the index already named.
-    let target_edge = (ctx.stores.drag_target == Some(lane_index))
-        .then(|| if accepts_drop(lane_index) { state_color } else { ctx.colors.muted });
+    let target = ctx.drag_target(lane_index);
     match collapsed {
-        Some(CollapsedLaneState::Tab) => collapsed_tab(lane, state_color, ctx, false, target_edge),
-        Some(CollapsedLaneState::Open) => collapsed_tab(lane, state_color, ctx, true, target_edge),
+        Some(CollapsedLaneState::Tab) => collapsed_tab(lane, state_color, ctx, false, target),
+        Some(CollapsedLaneState::Open) => collapsed_tab(lane, state_color, ctx, true, target),
         Some(CollapsedLaneState::Pinned) | None => {
-            ledger_lane(lane, lane_index, state_color, ctx, target_edge)
+            ledger_lane(lane, lane_index, state_color, ctx, target)
         }
     }
-}
-
-/// Whether `lane_index`'s queue ever accepts a card drop (A2-BD6): Backlog
-/// and Blocked never write, so their drag-target edge stays muted the way a
-/// rejected target does.
-fn accepts_drop(lane_index: u8) -> bool {
-    !matches!(lane_index, 0 | 3)
 }
 
 /// A full A2 lane: head, seam, and either whole rows or void copy, with the
@@ -2164,27 +2164,61 @@ fn ledger_lane(
     lane_index: u8,
     state_color: Rgba,
     ctx: LaneCtx<'_>,
-    target_edge: Option<Rgba>,
+    target: Option<bool>,
 ) -> AnyElement {
     div()
         .flex_none()
         .w(px(lane.width))
         .min_w(px(0.0))
         .relative()
+        .when_some(drag_target_ground(target, state_color, ctx.colors.ground), |el, wash| {
+            el.bg(wash)
+        })
         .flex()
         .flex_col()
         .child(lane_head(lane, state_color, ctx))
         .child(lane_seam(state_color, lane.void.is_some(), 0.0))
         .child(lane_body(lane, lane_index, state_color, ctx))
         .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
-        .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
+        .when_some(target, |el, accepted| {
+            el.child(drag_target_edge(if accepted { state_color } else { ctx.colors.muted }))
+        })
         .into_any_element()
 }
 
 /// The left-edge mark a lane or tab wears while it is the drag in flight's
-/// hovered target.
+/// hovered target: the queue's own hue where the drop writes, muted where it
+/// is refused (A2-BD6).
 fn drag_target_edge(color: Rgba) -> AnyElement {
     div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(color).into_any_element()
+}
+
+/// Whether a board control still swallows the release that pairs with the
+/// press it swallows -- scribe-uu2y's rule, so a mouse-tracking application in
+/// the pane below can never see an unmatched SGR release.
+///
+/// True at rest, and false for exactly as long as a card is in flight. That
+/// release is the drop: it belongs to `TerminalView::release_board`, the one
+/// path that queues the guarded write and clears the gesture, and that path is
+/// registered on the grid band every board is painted inside -- a control
+/// swallowing the release here would strand the drag instead of dropping it,
+/// on the collapsed Done tab above all. The pairing still holds while it is
+/// suspended: the press this release matches was swallowed by the row that
+/// armed the drag, not by this control, and `release_board` consumes the
+/// release before the terminal sees it (`forward_mouse_release` swallows it a
+/// second time for the same reason).
+fn swallows_release(drag: Option<&CardDragPaint>) -> bool {
+    drag.is_none()
+}
+
+/// The ground an accepted drop target wears over its whole track (A2-C7):
+/// its queue's hue washed into whatever that track normally sits on --
+/// the board's ground for a lane or tab, the raised band for the drawer.
+/// Applies to a full lane, a pinned lane, the drawer, and the collapsed tab
+/// the mock draws it on alike. A refused target keeps its own ground; only
+/// the muted edge says the pointer is there.
+fn drag_target_ground(target: Option<bool>, state_color: Rgba, ground: Rgba) -> Option<Rgba> {
+    (target == Some(true)).then(|| mix(ground, state_color, DRAG_TARGET_WASH))
 }
 
 /// The lane head: a queue-tinted uppercase label beside its muted count, a
@@ -2299,7 +2333,9 @@ fn unpin_control(lane: &QueueLane<'_>, ctx: LaneCtx<'_>, focus: &FocusHandle) ->
         .text_color(quiet)
         .hover(move |el| el.text_color(title))
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .when(swallows_release(ctx.stores.drag), |el| {
+            el.on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        })
         .on_click(move |_event, window, app| {
             window.focus(&click_focus, app);
             if let Ok(mut boards) = click_boards.lock() {
@@ -2359,6 +2395,7 @@ fn lane_body(
             RowMeta {
                 state_color,
                 show_separator: index < last,
+                lifted: ctx.stores.drag.is_some_and(|drag| drag.source_id == row.item.id),
                 row_height: ctx.row_height,
                 now_epoch_s: ctx.now_epoch_s,
             },
@@ -2414,34 +2451,37 @@ fn overflow_chevron(colors: &BeadsBoardColors) -> AnyElement {
 /// seam, and a one-glyph-per-line spine -- GPUI has no text-rotation
 /// primitive, so a stacked spine is the only vertical label it can paint --
 /// plus the cue that says a drawer lives here and the hot lift/inner-edge
-/// treatment while its drawer is open. Pointer/keyboard wiring (hover or
-/// focus opens the drawer, click or Enter/Space pins it) is
-/// [`tab_interactivity`]'s.
+/// treatment while its drawer is open. A drag in flight over the tab lifts
+/// the same three marks and washes the tab in its queue's hue, which is what
+/// keeps collapsed Done a visible close target rather than a strip of chrome
+/// (A2-S4, A2-C7). Pointer/keyboard wiring (hover or focus opens the drawer,
+/// click or Enter/Space pins it) is [`tab_interactivity`]'s.
 fn collapsed_tab(
     lane: &QueueLane<'_>,
     state_color: Rgba,
     ctx: LaneCtx<'_>,
     hot: bool,
-    target_edge: Option<Rgba>,
+    target: Option<bool>,
 ) -> AnyElement {
     let colors = ctx.colors;
     let void = lane.void.is_some();
     let title = colors.title;
-    let spine_color = if hot {
+    let lifted = hot || target == Some(true);
+    let spine_color = if lifted {
         title
     } else if void {
         colors.quiet
     } else {
         mix(state_color, title, 0.6)
     };
-    let count_color = if hot {
+    let count_color = if lifted {
         title
     } else if void {
         colors.quiet
     } else {
         colors.queue_name
     };
-    let cue_color = if hot { title } else { colors.quiet };
+    let cue_color = if lifted { title } else { colors.quiet };
     // A hot cue's chip reads roughly twice as strong as the tab's own hover
     // lift, the same ratio the mock's `#ffffff1a` chip over a `#ffffff0d` tab
     // carries (A2-C6).
@@ -2458,6 +2498,7 @@ fn collapsed_tab(
         lane,
         ctx,
         hot,
+        drag_target_ground(target, state_color, colors.ground),
     )
     .child(
         div()
@@ -2478,7 +2519,9 @@ fn collapsed_tab(
     .child(tab_spine(&spine, spine_color))
     .child(tab_cue(cue_color, hot, cue_hot_bg))
     .when(hot, |el| el.child(hot_inner_edge(state_color)))
-    .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
+    .when_some(target, |el, accepted| {
+        el.child(drag_target_edge(if accepted { state_color } else { colors.muted }))
+    })
     .into_any_element()
 }
 
@@ -2490,12 +2533,18 @@ fn collapsed_tab(
 /// across every paint state (tab, hot tab, and pinned via
 /// [`unpin_control`]), so Tab order never gains or loses a stop when it pins
 /// or unpins. The paired mouse-down/mouse-up stops are the rule scribe-uu2y
-/// established for every new click target.
+/// established for every new click target, held for as long as
+/// [`swallows_release`] says the release is this tab's to swallow.
+///
+/// `wash` is [`drag_target_ground`]'s accepted-target ground, taken here
+/// rather than set on `base` because it has to outrank the tab's own hover
+/// lift: a pointer dropping a card on this tab is necessarily hovering it.
 fn tab_interactivity(
     base: gpui::Div,
     lane: &QueueLane<'_>,
     ctx: LaneCtx<'_>,
     hot: bool,
+    wash: Option<Rgba>,
 ) -> gpui::Stateful<gpui::Div> {
     let queue = lane.queue;
     let workspace_id = ctx.stores.workspace_id;
@@ -2505,7 +2554,7 @@ fn tab_interactivity(
     let key_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_focus = focus.clone();
     let title = ctx.colors.title;
-    let button_hover = ctx.colors.button_hover;
+    let lift = wash.unwrap_or(ctx.colors.button_hover);
     base.id(SharedString::from(format!("beads-tab-{workspace_id}-{queue:?}")))
         .role(Role::Button)
         .aria_label(tab_accessible_label(lane))
@@ -2513,15 +2562,18 @@ fn tab_interactivity(
         .tab_stop(true)
         .focus_visible(move |style| style.border_1().border_color(title))
         .cursor_pointer()
-        .when(hot, |el| el.bg(button_hover))
-        .hover(move |el| el.bg(button_hover))
+        .when_some(wash, gpui::Styled::bg)
+        .when(hot, |el| el.bg(lift))
+        .hover(move |el| el.bg(lift))
         .on_hover(move |entered: &bool, _window, _app| {
             if let Ok(mut boards) = hover_boards.lock() {
                 boards.hover_lane(workspace_id, queue, LaneHoverSource::Tab, *entered);
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .when(swallows_release(ctx.stores.drag), |el| {
+            el.on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        })
         .on_click(move |_event, window, app| {
             window.focus(&click_focus, app);
             if let Ok(mut boards) = click_boards.lock() {
@@ -2633,6 +2685,12 @@ fn lane_drawer(
     let click_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_focus = ctx.tab_focus(queue).clone();
     let border = alpha(ctx.colors.title, 0.15);
+    // An open drawer is a drop target like the tab it came from: the drag hit
+    // test resolves the pointer to the queue the drawer previews, so the
+    // drawer has to say so too (A2-S4).
+    let target = ctx.drag_target(lane_index);
+    let ground =
+        drag_target_ground(target, state_color, ctx.colors.band).unwrap_or(ctx.colors.band);
     div()
         .id(SharedString::from(format!("beads-drawer-{workspace_id}-{queue:?}")))
         .role(Role::Group)
@@ -2647,7 +2705,7 @@ fn lane_drawer(
         .flex()
         .flex_col()
         .px(px(beads_board_a2::DRAWER_PAD_H))
-        .bg(ctx.colors.band)
+        .bg(ground)
         .border_1()
         .border_color(border)
         .rounded(px(beads_board_a2::DRAWER_RADIUS))
@@ -2658,7 +2716,9 @@ fn lane_drawer(
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
-        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .when(swallows_release(ctx.stores.drag), |el| {
+            el.on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        })
         .on_click(move |_event, window, app| {
             window.focus(&click_focus, app);
             if let Ok(mut boards) = click_boards.lock() {
@@ -2670,6 +2730,9 @@ fn lane_drawer(
         .child(lane_seam(state_color, lane.void.is_some(), beads_board_a2::DRAWER_PAD_H))
         .child(lane_body(lane, lane_index, state_color, ctx))
         .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
+        .when_some(target, |el, accepted| {
+            el.child(drag_target_edge(if accepted { state_color } else { ctx.colors.muted }))
+        })
         .into_any_element()
 }
 
@@ -2738,6 +2801,9 @@ struct RowMeta {
     /// underline regardless, so only the separator itself is conditional
     /// (A2-S7).
     show_separator: bool,
+    /// Whether this row's own card is the one currently in flight, in which
+    /// case it dims where it still sits until the drop settles (A2-S4).
+    lifted: bool,
     row_height: f32,
     now_epoch_s: i64,
 }
@@ -2746,7 +2812,7 @@ struct RowMeta {
 /// three-column sub line, opening the issue exactly as the raised card it
 /// replaces did (A2-G4, A2-G5, A2-C3).
 fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyElement {
-    let RowMeta { state_color, show_separator, row_height, now_epoch_s } = meta;
+    let RowMeta { state_color, show_separator, lifted, row_height, now_epoch_s } = meta;
     let CardContext { workspace_id, state, panels, lane, board_rect, colors, metrics } = card;
     let item = row.item;
     let panels = std::sync::Arc::clone(panels);
@@ -2776,6 +2842,7 @@ fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyEle
         .justify_center()
         .gap(metrics.at(beads_board_a2::ROW_INTERLINE_GAP))
         .cursor_pointer()
+        .when(lifted, |el| el.opacity(beads_board_a2::DRAG_SOURCE_OPACITY))
         .when(show_separator, |el| el.border_b_2().border_color(colors.hairline))
         .hover(|el| el.bg(colors.button_hover).border_b_2().border_color(state_color))
         .on_mouse_down(MouseButton::Left, move |event, _window, app| {
@@ -2802,11 +2869,9 @@ fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyEle
                 .lock()
                 .map_or(None, |mut boards| {
                     boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
-                    boards.card_drag_ghost(board_rect, metrics.scale)
+                    boards.card_drag_ghost(metrics.scale)
                 })
-                .unwrap_or_else(|| {
-                    CardDragGhost::new(drag_source.clone(), board_rect, metrics.scale)
-                });
+                .unwrap_or_else(|| CardDragGhost::new(drag_source.clone(), metrics.scale));
             window.refresh();
             app.new(move |_| BeadsCardDragGhost { model: ghost, colors: drag_colors, metrics })
         })
@@ -2951,53 +3016,16 @@ fn with_card_title_tooltip(
     .tooltip_show_delay(Duration::ZERO)
 }
 
-/// The priority badge and the title, which owns the rest of its line: the
-/// title is the only line a reader scans, so nothing else shares its row.
-fn issue_title(
-    item: &BeadsBoardItem,
-    mark: PriorityMark,
-    colors: &BeadsBoardColors,
-    metrics: Metrics,
-) -> gpui::Div {
-    div()
-        .h(metrics.at(TITLE_LINE))
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .child(
-            div()
-                .flex_none()
-                .rounded(px(3.0))
-                .px(px(4.0))
-                .bg(mark.fill)
-                .font_family("monospace")
-                .text_size(metrics.at(9.5))
-                .line_height(metrics.at(13.0))
-                .font_weight(FontWeight(700.0))
-                .text_color(mark.ink)
-                .child(format!("P{}", item.priority)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(metrics.at(12.0))
-                .line_height(metrics.at(TITLE_LINE))
-                .font_weight(FontWeight(650.0))
-                .text_color(colors.title)
-                .child(item.title.clone()),
-        )
-}
-
-/// The ghost's non-interactive metadata; its source card remains the only
-/// clipboard and panel target during the gesture.
+/// The ghost's own sub line: id and epic under the title, indented to the
+/// title column the way a row's sub line is (A2-G5). Non-interactive -- its
+/// source row remains the only clipboard and panel target during the gesture.
 fn drag_ghost_meta(
     item: &BeadsBoardItem,
     colors: &BeadsBoardColors,
     metrics: Metrics,
 ) -> AnyElement {
     div()
+        .pl(metrics.at(ROW_TITLE_INDENT))
         .h(metrics.at(12.0))
         .flex()
         .items_center()
@@ -3255,7 +3283,40 @@ mod tests {
     }
 
     fn drag_board() -> Rect {
-        Rect { x: 100.0, y: 50.0, width: 500.0, height: 200.0 }
+        Rect { x: 100.0, y: 50.0, width: 1200.0, height: BEADS_BOARD_HEIGHT }
+    }
+
+    /// A board wide enough to hold the mock's own rail, with every active
+    /// lane occupied so `rail_widths` splits it three ways. At 1200px and
+    /// scale 1.0 that reserves 44 + 10 gutter/padding, 4 x 16 track gaps and
+    /// two 36px tabs, leaving 1010 to divide equally: the tracks land at
+    /// board-relative [44, 380.67) Backlog, [396.67, 733.33) Ready,
+    /// [749.33, 1086) In progress, [1102, 1138) Blocked tab, and
+    /// [1154, 1190) Done tab. Every hit-test expectation below is that split
+    /// plus [`drag_board`]'s own 100px origin.
+    fn busy_board(source_lane: u8) -> BeadsBoardState {
+        let mut snapshot = BeadsBoardSnapshot {
+            backlog_total: 2,
+            ready_total: 2,
+            in_progress_total: 2,
+            blocked_total: 4,
+            done_total: 559,
+            ..Default::default()
+        };
+        if let Some(cards) = lane_cards_mut(&mut snapshot, source_lane) {
+            cards.push(drag_item());
+        }
+        BeadsBoardState::Ready { snapshot, stale: false, refresh_error: None }
+    }
+
+    /// Lift `source_lane`'s card on a busy 1200px board and report where the
+    /// pointer at `x` lands, in the workspace's current rail state.
+    fn lane_under(boards: &mut BeadsBoards, workspace: WorkspaceId, x: f32) -> Option<u8> {
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        assert!(boards.start_card_drag(drag_point(x, 100.0), drag_board()));
+        let lane = boards.card_drag().and_then(|drag| drag.hovered_lane);
+        boards.end_card_drag();
+        lane
     }
 
     fn drag_state(workspace_id: WorkspaceId, source_lane: u8, target_lane: u8) -> CardDragState {
@@ -3414,6 +3475,7 @@ mod tests {
     fn card_drag_tracks_source_pointer_and_lane_or_no_target() {
         let workspace = WorkspaceId::new();
         let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(0));
         let item = drag_item();
         boards.arm_card_drag(workspace, item.clone(), 0, drag_point(150.0, 100.0));
         assert!(boards.start_card_drag(drag_point(160.0, 100.0), drag_board()));
@@ -3425,46 +3487,186 @@ mod tests {
         assert_eq!(initial_drag.pointer, drag_point(160.0, 100.0));
         assert_eq!(initial_drag.hovered_lane, Some(0));
 
-        assert!(boards.update_card_drag(drag_point(210.0, 120.0), drag_board()));
+        assert!(boards.update_card_drag(workspace, drag_point(600.0, 120.0), drag_board()));
         let moved_drag = boards.card_drag().expect("updated card drag");
-        assert_eq!(moved_drag.pointer, drag_point(210.0, 120.0));
+        assert_eq!(moved_drag.pointer, drag_point(600.0, 120.0));
         assert_eq!(moved_drag.hovered_lane, Some(1));
 
-        assert!(boards.update_card_drag(drag_point(600.0, 120.0), drag_board()));
+        // GPUI reports a drag move to every board in the window; a neighbour
+        // reporting its own rect must not retarget this workspace's drag.
+        assert!(!boards.update_card_drag(
+            WorkspaceId::new(),
+            drag_point(200.0, 120.0),
+            Rect { x: 1400.0, y: 50.0, width: 1200.0, height: BEADS_BOARD_HEIGHT }
+        ));
+        assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), Some(1));
+
+        assert!(boards.update_card_drag(workspace, drag_point(1400.0, 120.0), drag_board()));
         assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), None);
-        assert!(boards.update_card_drag(drag_point(300.0, 250.0), drag_board()));
+        assert!(boards.update_card_drag(workspace, drag_point(300.0, 300.0), drag_board()));
         assert_eq!(boards.card_drag().and_then(|state| state.hovered_lane), None);
         assert!(boards.end_card_drag());
         assert!(boards.card_drag().is_none());
+    }
+
+    /// The whole point of routing the hit test through
+    /// [`beads_board_a2::queue_at`]: A2's tracks are not five equal columns,
+    /// so the pointer must resolve against the split the board is painting.
+    #[test]
+    fn every_collapsed_track_takes_the_drop_its_own_width_covers() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(1));
+
+        for (x, expected, what) in [
+            (200.0, Some(0), "Backlog"),
+            (600.0, Some(1), "Ready"),
+            (1000.0, Some(2), "In progress"),
+            (1220.0, Some(3), "the collapsed Blocked tab"),
+            (1272.0, Some(4), "the collapsed Done tab"),
+            (1194.0, None, "the gap between In progress and the Blocked tab"),
+            (120.0, None, "the left control gutter"),
+            (1295.0, None, "the right padding"),
+            (1400.0, None, "outside the board"),
+        ] {
+            assert_eq!(lane_under(&mut boards, workspace, x), expected, "{what} at x={x}");
+        }
+    }
+
+    #[test]
+    fn a_pinned_lane_and_an_open_drawer_take_the_drop_where_they_are_painted() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(1));
+        // Under two tabs this x is In progress; a pinned Blocked lane takes
+        // 0.85 of an active share out of the same rail and lands on it.
+        assert_eq!(lane_under(&mut boards, workspace, 1100.0), Some(2));
+
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+        assert_eq!(lane_under(&mut boards, workspace, 1100.0), Some(3));
+        assert_eq!(
+            lane_under(&mut boards, workspace, 1272.0),
+            Some(4),
+            "Done stays a 36px tab at the rail's right edge while Blocked is pinned"
+        );
+
+        boards.unpin_lane(workspace, BeadsIssueQueue::Blocked);
+        boards.hover_lane(workspace, BeadsIssueQueue::Done, LaneHoverSource::Tab, true);
+        // The drawer overlays the lanes without reflowing them, so a pointer
+        // inside it drops on Done rather than on the track it covers.
+        assert_eq!(lane_under(&mut boards, workspace, 900.0), Some(4));
+        assert_eq!(
+            lane_under(&mut boards, workspace, 700.0),
+            Some(1),
+            "a point left of the drawer still belongs to the lane it is over"
+        );
+    }
+
+    /// The reachability this bead exists for: a card dropped on the queue
+    /// A2 collapsed into a 36px tab still reaches the same guarded close and
+    /// its five-second Undo (A2-BD6). The verb matrix itself belongs to
+    /// [`BeadsPanels::queue_card_drop`]'s own tests; what is proved here is
+    /// that the tab's geometry reaches it at all.
+    #[test]
+    fn a_drop_on_the_collapsed_done_tab_queues_the_guarded_close_and_undo() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(1));
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.set_write_enabled(true);
+
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        assert!(boards.start_card_drag(drag_point(1272.0, 100.0), drag_board()));
+        let drag = boards.take_card_drag().expect("a lifted card");
+        assert_eq!(drag.hovered_lane, Some(4), "the collapsed Done tab is the drop target");
+
+        assert!(panels.queue_card_drop(&drag));
+        boards.apply_card_drop(drag.clone());
+        assert_eq!(board_card_lane(&boards, workspace), Some(4));
+        let write = panels.take_write().expect("a guarded write");
+        assert_eq!(write.verb, scribe_common::protocol::BeadsIssueWrite::CloseIssue);
+        assert_eq!(write.guards.if_status.as_deref(), Some("open"));
+
+        panels.finish_write(
+            workspace,
+            &drag.source.id,
+            BeadsIssueWriteResult::Applied { generation: 11 },
+        );
+        boards.finish_card_drop(
+            workspace,
+            &drag.source.id,
+            &BeadsIssueWriteResult::Applied { generation: 11 },
+        );
+        assert!(panels.undo_available(workspace), "an applied close exposes Undo");
+    }
+
+    /// The other half of A2-BD6 through the same geometry: the collapsed
+    /// Blocked tab is reachable but never writes.
+    #[test]
+    fn a_drop_on_the_collapsed_blocked_tab_writes_nothing() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(1));
+        let mut panels = BeadsPanels::default();
+        panels.set_enabled(true);
+        panels.set_write_enabled(true);
+
+        boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
+        assert!(boards.start_card_drag(drag_point(1220.0, 100.0), drag_board()));
+        let drag = boards.take_card_drag().expect("a lifted card");
+        assert_eq!(drag.hovered_lane, Some(3));
+
+        assert!(!panels.queue_card_drop(&drag));
+        assert_eq!(panels.take_write(), None);
+        assert_eq!(board_card_lane(&boards, workspace), Some(1), "the card stays in Ready");
     }
 
     #[test]
     fn card_drag_ghost_exists_only_for_the_active_gesture() {
         let workspace = WorkspaceId::new();
         let mut boards = BeadsBoards::default();
-        assert!(boards.card_drag_ghost(drag_board(), 1.0).is_none());
+        let _ = boards.update(workspace, busy_board(1));
+        assert!(boards.card_drag_ghost(1.0).is_none());
 
         boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
         boards.start_card_drag(drag_point(160.0, 100.0), drag_board());
-        let ghost = boards.card_drag_ghost(drag_board(), 1.0).expect("active ghost");
+        let ghost = boards.card_drag_ghost(1.0).expect("active ghost");
         assert_eq!(ghost.source.id, "scribe-drag.1");
-        assert!((ghost.width - 76.8).abs() < 0.001);
-        assert!((ghost.height - 46.0).abs() < 0.001);
+        assert!((ghost.width - beads_board_a2::GHOST_W).abs() < 0.001);
+        assert!((ghost.height - beads_board_a2::GHOST_H).abs() < 0.001);
+        let scaled = boards.card_drag_ghost(1.6).expect("active ghost");
+        assert!((scaled.height - beads_board_a2::GHOST_H * 1.6).abs() < 0.001);
 
         boards.end_card_drag();
-        assert!(boards.card_drag_ghost(drag_board(), 1.0).is_none());
+        assert!(boards.card_drag_ghost(1.0).is_none());
     }
 
     #[test]
-    fn drag_target_is_read_from_the_existing_board_guard_per_workspace() {
+    fn drag_paint_is_read_from_the_existing_board_guard_per_workspace() {
         let workspace = WorkspaceId::new();
         let other = WorkspaceId::new();
         let mut boards = BeadsBoards::default();
+        let _ = boards.update(workspace, busy_board(1));
         boards.arm_card_drag(workspace, drag_item(), 1, drag_point(150.0, 100.0));
-        boards.start_card_drag(drag_point(210.0, 100.0), drag_board());
+        boards.start_card_drag(drag_point(1272.0, 100.0), drag_board());
 
-        assert_eq!(boards.drag_target(workspace), Some(1));
-        assert_eq!(boards.drag_target(other), None);
+        let paint = boards.card_drag_paint(workspace).expect("the lifted board paints its drag");
+        assert_eq!(paint.source_id, "scribe-drag.1");
+        assert_eq!(paint.source_lane, 1);
+        assert_eq!(paint.target_lane, Some(4));
+        assert!(paint.accepts(4), "the collapsed Done tab closes the issue");
+        assert!(paint.accepts(2));
+        assert!(!paint.accepts(0) && !paint.accepts(3), "Backlog and Blocked never write");
+        assert!(!paint.accepts(1), "the source lane is not a move");
+        assert_eq!(boards.card_drag_paint(other), None);
+
+        // The tab, drawer, and unpin control swallow a click's release so it
+        // cannot reach a mouse-tracking application (scribe-uu2y), but the
+        // release that ends a drop belongs to `release_board` on the grid band
+        // underneath them.
+        assert!(swallows_release(None), "a swallowed press still swallows its own release");
+        assert!(!swallows_release(Some(&paint)), "a drop's release must reach release_board");
     }
 
     #[test]
@@ -3672,19 +3874,6 @@ mod tests {
         let hottest = vividness(colors.priorities[0]);
         let below = vividness(colors.priorities[1]);
         assert!(hottest > below, "P0 reads at {hottest:.2} saturation against P1 at {below:.2}");
-
-        // And the wash ranks every step, so a card says which of two issues is
-        // hotter before its digits are read. Measured as laid down rather than
-        // as a tint, since the tint is solved for exactly this: a hue further
-        // from the card makes the same mark with less of itself.
-        let laid = |priority: u8| reach(colors.priority_mark(priority).fill, colors.card);
-        for priority in 0..4u8 {
-            let (strong, weak) = (laid(priority), laid(priority + 1));
-            assert!(
-                strong > weak,
-                "the P{priority} badge carries {strong:.3} against the next rank's {weak:.3}"
-            );
-        }
     }
 
     /// A theme whose muted slot and ANSI red sit close to its background must

@@ -35,8 +35,9 @@ Manifest shape (top-level keys):
                        ({section, slug, trigger, evidence}).
   interactions_excluded -- controls deliberately NOT named as interactions,
                        with the closed decision that excludes them.
-  geometry.a2/.a3  -- flat numeric pixel facts, pre-parsed from the mock CSS
-                       and formula prose so consumers never parse CSS
+  geometry.a2/.a3  -- flat numeric facts (pixels, plus the drag state's own
+                       source-row opacity), pre-parsed from the mock CSS,
+                       markup and formula prose so consumers never parse CSS
                        shorthand themselves.
   typography.a2/.a3 -- per-role font metrics ({font_size, line_height, ...}),
                        keyed by a short descriptive role name.
@@ -399,7 +400,7 @@ def a3_geometry(rules: dict, a3_text: str) -> dict:
     }
 
 
-def a2_geometry(rules: dict) -> dict:
+def a2_geometry(rules: dict, a2_text: str) -> dict:
     lanes = css_of(rules, ".dr .lanes")
     zoom = css_of(rules, ".dr .zoom")
     zoom_i = css_of(rules, ".dr .zoom i")
@@ -414,6 +415,7 @@ def a2_geometry(rules: dict) -> dict:
     chev = css_of(rules, ".dr .chev")
     floor = css_of(rules, ".dr .floor")
     floor_after = css_of(rules, ".dr .floor::after")
+    ghost = css_of(rules, ".dr .ghost")
     epic = css_of(rules, ".dr .epic")
     lane_epic = css_of(rules, ".dr .lane-epic")
     qcount = merged(rules, ".d1 .qcount", ".dr .qcount")
@@ -429,6 +431,15 @@ def a2_geometry(rules: dict) -> dict:
         raise ContractError(f"A2 body height {body_h} is not a whole multiple of row height {row_h}")
     _, spine_lh = font_size_and_line_height(spine)
     drawer_pad = px_list(drawer["padding"])
+    ghost_pad = px_list(ghost["padding"])
+
+    # The lifted row's own dim is an inline style on the drag state's source
+    # row, not a CSS rule, so it is read from that section's markup.
+    lifted = re.findall(r"opacity:(\d*\.\d+|\d+)", a2_text)
+    if len(lifted) != 1:
+        raise ContractError(
+            f"expected exactly one dimmed A2 drag source row, found {len(lifted)}"
+        )
 
     return {
         "strip_h": px(board["height"]),
@@ -462,6 +473,12 @@ def a2_geometry(rules: dict) -> dict:
         "drawer_pad_h": drawer_pad[-1],
         "drawer_border_w": px(drawer["border"].split()[0]),
         "drawer_radius": px(drawer["border-radius"]),
+        "ghost_w": px(ghost["width"]),
+        "ghost_h": px(ghost["height"]),
+        "ghost_pad_right": ghost_pad[1],
+        "ghost_pad_left": ghost_pad[3],
+        "ghost_radius": px(ghost["border-radius"]),
+        "drag_source_opacity": float(lifted[0]),
         "chev_size": font_size_and_line_height(chev)[0],
         "chev_right": px(chev["right"]),
         "chev_bottom": px(chev["bottom"]),
@@ -553,7 +570,7 @@ def build_manifest(html_path: Path = MOCK_PATH, spec_path: Path = SPEC_PATH) -> 
         "interactions": interactions,
         "interactions_excluded": EXCLUDED_INTERACTIONS,
         "geometry": {
-            "a2": a2_geometry(rules),
+            "a2": a2_geometry(rules, sections["a2"][1]),
             "a3": a3_geometry(rules, sections["a3"][1]),
         },
         "typography": build_typography(rules),

@@ -54,6 +54,16 @@ pub const DRAWER_W: f32 = 452.0;
 pub const DRAWER_PAD_H: f32 = 13.0;
 pub const DRAWER_BORDER_W: f32 = 1.0;
 pub const DRAWER_RADIUS: f32 = 3.0;
+/// The native drag ghost's own box (A2-S4): a compact 320x36 card carrying
+/// the row grammar it was lifted from, not the raised card A2 replaced.
+pub const GHOST_W: f32 = 320.0;
+pub const GHOST_H: f32 = 36.0;
+pub const GHOST_PAD_LEFT: f32 = 8.0;
+pub const GHOST_PAD_RIGHT: f32 = 10.0;
+pub const GHOST_RADIUS: f32 = 3.0;
+/// What the lifted row itself fades to while its ghost is in flight
+/// (A2-S4's "source dims").
+pub const DRAG_SOURCE_OPACITY: f32 = 0.38;
 /// One lane head's own height (A2-G3).
 pub const HEAD_H: f32 = 17.0;
 /// A lane head's state seam (A2-G3).
@@ -349,6 +359,69 @@ pub struct RailWidths {
     pub in_progress: f32,
     pub blocked: f32,
     pub done: f32,
+}
+
+impl RailWidths {
+    /// Every track paired with its own width, in the rail's left-to-right
+    /// order -- the order [`layout`] returns its lanes in and the renderer
+    /// paints them in, so a caller walking the strip cannot pair a queue with
+    /// a neighbour's width.
+    pub fn tracks(self) -> [(BeadsIssueQueue, f32); 5] {
+        [
+            (BeadsIssueQueue::Backlog, self.backlog),
+            (BeadsIssueQueue::Ready, self.ready),
+            (BeadsIssueQueue::InProgress, self.in_progress),
+            (BeadsIssueQueue::Blocked, self.blocked),
+            (BeadsIssueQueue::Done, self.done),
+        ]
+    }
+}
+
+/// Which queue the board-relative point (`x`, `y`) lands on, or `None` for
+/// the left control gutter, an inter-track gap, the right padding, or a point
+/// outside the board entirely.
+///
+/// This is the drag hit test (A2-I5, A2-BD6), and it resolves the pointer
+/// through the same [`rail_widths`] split and drawer bounds the renderer
+/// paints from: an adaptive rail can move every track under the pointer
+/// between two frames, and the one thing that must never happen is a drop
+/// writing to a queue other than the one it visibly landed on. A track is hit
+/// over the strip's whole height, headband and floor included, since a
+/// pointer above or below a lane still names that lane and nothing else.
+pub fn queue_at(input: A2Input<'_>, x: f32, y: f32) -> Option<BeadsIssueQueue> {
+    let A2Input { snapshot, rail, board_width, board_height, text_scale } = input;
+    if !(0.0..board_width).contains(&x) || !(0.0..board_height).contains(&y) {
+        return None;
+    }
+    // An open drawer lies over the lanes without reflowing them (A2-G8,
+    // A2-I1), so inside its bounds it owns the pointer rather than the track
+    // it happens to cover.
+    if let Some(queue) = open_drawer(rail)
+        && (board_width - DRAWER_RIGHT - DRAWER_W..board_width - DRAWER_RIGHT).contains(&x)
+        && (DRAWER_TOP..board_height - DRAWER_BOTTOM).contains(&y)
+    {
+        return Some(queue);
+    }
+    let mut left = LANES_PADDING_LEFT;
+    for (queue, width) in rail_widths(snapshot, rail, board_width, text_scale).tracks() {
+        if (left..left + width).contains(&x) {
+            return Some(queue);
+        }
+        left += width + TRACK_GAP;
+    }
+    None
+}
+
+/// The one queue whose transient drawer is open, if either is (A2-I1 opens at
+/// most one per workspace).
+fn open_drawer(rail: RailState) -> Option<BeadsIssueQueue> {
+    if rail.blocked == CollapsedLaneState::Open {
+        Some(BeadsIssueQueue::Blocked)
+    } else if rail.done == CollapsedLaneState::Open {
+        Some(BeadsIssueQueue::Done)
+    } else {
+        None
+    }
 }
 
 pub fn rail_widths(
@@ -867,6 +940,106 @@ mod tests {
         );
     }
 
+    // ---- drag hit testing: the same tracks the renderer paints -----------
+
+    fn hit_input(snapshot: &BeadsBoardSnapshot, rail: RailState) -> A2Input<'_> {
+        A2Input {
+            snapshot,
+            rail,
+            board_width: 1200.0,
+            board_height: BEADS_BOARD_HEIGHT,
+            text_scale: 1.0,
+        }
+    }
+
+    /// Every track's own midpoint must hit its own queue, walking the rail
+    /// left to right exactly as the renderer lays it out.
+    fn assert_every_track_midpoint_hits_itself(snapshot: &BeadsBoardSnapshot, rail: RailState) {
+        let widths = rail_widths(snapshot, rail, 1200.0, 1.0);
+        let mut left = LANES_PADDING_LEFT;
+        for (queue, width) in widths.tracks() {
+            assert_eq!(
+                queue_at(hit_input(snapshot, rail), left + width / 2.0, 100.0),
+                Some(queue),
+                "{queue:?} track at {left}+{width} did not hit itself"
+            );
+            left += width + TRACK_GAP;
+        }
+    }
+
+    #[test]
+    fn every_track_hits_its_own_queue_in_every_rail_state() {
+        let snapshot = snapshot_with(12, 4, 5, 4, 559);
+        for rail in [
+            all_tabs(),
+            RailState { blocked: CollapsedLaneState::Pinned, done: CollapsedLaneState::Tab },
+            RailState { blocked: CollapsedLaneState::Tab, done: CollapsedLaneState::Pinned },
+        ] {
+            assert_every_track_midpoint_hits_itself(&snapshot, rail);
+        }
+        // The sparse real state moves every boundary again: an empty lane
+        // keeps only its header width, so a fixed five-equal-lanes split would
+        // put In progress where Ready actually is.
+        assert_every_track_midpoint_hits_itself(&snapshot_with(0, 0, 2, 4, 559), all_tabs());
+    }
+
+    #[test]
+    fn the_collapsed_done_tab_is_hit_at_its_own_thirty_six_pixels() {
+        let snapshot = snapshot_with(12, 4, 5, 4, 559);
+        let right_edge = 1200.0 - LANES_PADDING_RIGHT;
+        assert_eq!(
+            queue_at(hit_input(&snapshot, all_tabs()), right_edge - TAB_W / 2.0, 100.0),
+            Some(BeadsIssueQueue::Done)
+        );
+        assert_eq!(
+            queue_at(hit_input(&snapshot, all_tabs()), right_edge - TAB_W - TRACK_GAP / 2.0, 100.0),
+            None,
+            "the gap between the two tabs belongs to neither"
+        );
+    }
+
+    #[test]
+    fn an_open_drawer_owns_the_lanes_it_covers() {
+        let snapshot = snapshot_with(12, 4, 5, 4, 559);
+        let rail = RailState { blocked: CollapsedLaneState::Tab, done: CollapsedLaneState::Open };
+        let inside_x = 1200.0 - DRAWER_RIGHT - DRAWER_W / 2.0;
+
+        assert_eq!(
+            queue_at(hit_input(&snapshot, rail), inside_x, DRAWER_TOP + 1.0),
+            Some(BeadsIssueQueue::Done),
+            "a point inside the drawer targets the queue it previews"
+        );
+        // The drawer stops short of the strip's own floor, so the track it
+        // covers gets the pointer back there.
+        assert_eq!(
+            queue_at(hit_input(&snapshot, rail), inside_x, BEADS_BOARD_HEIGHT - 1.0),
+            Some(BeadsIssueQueue::InProgress)
+        );
+        assert_eq!(
+            queue_at(hit_input(&snapshot, all_tabs()), inside_x, DRAWER_TOP + 1.0),
+            Some(BeadsIssueQueue::InProgress),
+            "a closed drawer never claims the pointer"
+        );
+    }
+
+    #[test]
+    fn the_gutter_padding_and_everything_outside_the_board_hit_nothing() {
+        let snapshot = snapshot_with(12, 4, 5, 4, 559);
+        let input = hit_input(&snapshot, all_tabs());
+        for (x, y, what) in [
+            (LANES_PADDING_LEFT - 1.0, 100.0, "the left control gutter"),
+            (1200.0 - LANES_PADDING_RIGHT + 1.0, 100.0, "the right padding"),
+            (-1.0, 100.0, "left of the board"),
+            (1200.0, 100.0, "right of the board"),
+            (600.0, -1.0, "above the board"),
+            (600.0, BEADS_BOARD_HEIGHT, "below the board"),
+        ] {
+            assert_eq!(queue_at(input, x, y), None, "{what} must not name a queue");
+        }
+        // A track is hit over the strip's whole height, headband included.
+        assert_eq!(queue_at(input, LANES_PADDING_LEFT + 1.0, 0.0), Some(BeadsIssueQueue::Backlog));
+    }
+
     // ---- age formatting ----------------------------------------------------
 
     #[test]
@@ -903,8 +1076,9 @@ mod tests {
         use serde::Deserialize;
 
         use super::{
-            BEADS_BOARD_HEIGHT, DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H, DRAWER_RADIUS,
-            DRAWER_RIGHT, DRAWER_TOP, DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_H, HEAD_H, HEADBAND_H,
+            BEADS_BOARD_HEIGHT, DRAG_SOURCE_OPACITY, DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H,
+            DRAWER_RADIUS, DRAWER_RIGHT, DRAWER_TOP, DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_H,
+            GHOST_H, GHOST_PAD_LEFT, GHOST_PAD_RIGHT, GHOST_RADIUS, GHOST_W, HEAD_H, HEADBAND_H,
             LANES_PADDING_BOTTOM, LANES_PADDING_LEFT, LANES_PADDING_RIGHT, LANES_PADDING_TOP,
             ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP, ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H,
             SEAM_H, TAB_W, TRACK_GAP, visible_row_count,
@@ -950,6 +1124,12 @@ mod tests {
             drawer_pad_h: f32,
             drawer_border_w: f32,
             drawer_radius: f32,
+            ghost_w: f32,
+            ghost_h: f32,
+            ghost_pad_left: f32,
+            ghost_pad_right: f32,
+            ghost_radius: f32,
+            drag_source_opacity: f32,
         }
 
         /// `assert_eq!` on two `f32`s trips `clippy::float_cmp`; every field
@@ -994,6 +1174,12 @@ mod tests {
             assert_matches("drawer_pad_h", a2.drawer_pad_h, DRAWER_PAD_H);
             assert_matches("drawer_border_w", a2.drawer_border_w, DRAWER_BORDER_W);
             assert_matches("drawer_radius", a2.drawer_radius, DRAWER_RADIUS);
+            assert_matches("ghost_w", a2.ghost_w, GHOST_W);
+            assert_matches("ghost_h", a2.ghost_h, GHOST_H);
+            assert_matches("ghost_pad_left", a2.ghost_pad_left, GHOST_PAD_LEFT);
+            assert_matches("ghost_pad_right", a2.ghost_pad_right, GHOST_PAD_RIGHT);
+            assert_matches("ghost_radius", a2.ghost_radius, GHOST_RADIUS);
+            assert_matches("drag_source_opacity", a2.drag_source_opacity, DRAG_SOURCE_OPACITY);
             assert_eq!(a2.body_rows, 3);
             assert_eq!(
                 visible_row_count(a2.strip_h, 1.0),

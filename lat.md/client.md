@@ -1286,7 +1286,15 @@ dismiss. Every click target this adds pairs a mouse-down and mouse-up stop,
 the rule scribe-uu2y established so a swallowed press cannot leak an
 unmatched release to the terminal; the drawer additionally `occlude`s so a
 click on its own chrome cannot also land on the lane row it visually
-covers.
+covers. [[crates/scribe-client/src/beads_board.rs#swallows_release]] drops
+that release stop -- and only that one -- while a card is in flight: these
+same tabs are drop targets, and the release that lands one belongs to
+[[crates/scribe-client/src/main.rs#TerminalView#release_board]] on the grid
+band underneath them, which the deeper stop would preempt. Nothing leaks by
+it, because that release pairs with a press the dragged row already
+swallowed, and `release_board` and
+[[crates/scribe-client/src/main.rs#TerminalView#forward_mouse_release]] each
+consume it before the terminal can see it.
 [[test#Test Harness#GPUI Client Headless Suites#Beads collapsed-lane hover and pin]]
 pins every state transition above the paint layer; like
 `ledger_lane`/`lane_head`/`ledger_row` beside it, the paint layer itself has
@@ -1321,11 +1329,16 @@ horizontal scrollbar however narrow the board gets.
 `BeadsBoardItem.updated_at` into the row's compact age without a date
 library, parsing `bd`'s UTC timestamp through a from-scratch civil-calendar
 day count rather than trusting a malformed value into a panic.
+[[crates/scribe-client/src/beads_board_a2.rs#queue_at]] answers the drag's own
+question from those same widths -- which queue a board-relative point is over
+-- so hit-testing and painting can never disagree about where a track is.
 The module's own `tests::manifest` submodule `include_str!`s the generated
 a2a3-contract.json and asserts every geometry constant still matches it, the
 Rust-side consumer that generated contract was built for; a later bead
 reading A2 or A3 geometry from Rust should follow the same pattern instead of
-re-transcribing mock numbers.
+re-transcribing mock numbers. `gen-contract.py` grew the drag state's own
+numbers -- the ghost box and the lifted row's opacity -- for exactly that
+reason, rather than letting them be hand-copied out of the mock.
 
 The [Story 3 drag contract](../specs/024-beads-card-detail.md#story-3--move-a-card-between-queues-by-dragging)
 allows Backlog, Ready, and In-progress sources; Blocked and Done never register
@@ -1339,17 +1352,40 @@ inside 2px stays a card click.
 [[crates/scribe-client/src/beads_board.rs#ledger_row]] registers GPUI's `on_drag`
 and builds [[crates/scribe-client/src/beads_board.rs#BeadsCardDragGhost]] in the
 native window drag root. GPUI keeps the cursor offset captured on the
-threshold-crossing move, so the source-sized ghost follows beyond card and lane
-clipping without another pointer tracker.
+threshold-crossing move, so the ghost follows beyond row and lane clipping
+without another pointer tracker. The ghost is A2-S4's compact 320x36 card
+carrying the row grammar it was lifted from -- the same priority glyph, title,
+and indented sub line, scaled with the board's text
+([[crates/scribe-client/src/beads_board.rs#CardDragGhost]]) -- and the lifted
+row itself dims to `DRAG_SOURCE_OPACITY` where it still sits until the drop
+settles. Both numbers, like every other A2 measurement, are mirrored from
+`a2a3-contract.json` into [[crates/scribe-client/src/beads_board_a2.rs]] and
+asserted against it there.
+
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#update_card_drag]] stores
-the window pointer and target from
-[[crates/scribe-client/src/beads_board.rs#card_drag_lane]], whose five equal
-lanes share the board's 8px inset and exclude the right and bottom edges.
+the window pointer and the target
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#drag_lane_at]] resolves,
+after dropping the report outright unless it came from the board holding the
+card: GPUI delivers a drag move to every registered board rather than the one
+under the pointer, so a neighbouring region would otherwise resolve the target
+against its own rect and win by report order. It resolves
+through [[crates/scribe-client/src/beads_board_a2.rs#queue_at]]: the same
+[[crates/scribe-client/src/beads_board_a2.rs#rail_widths]] split and A2-G8
+drawer bounds the renderer paints from, walked left to right over
+[[crates/scribe-client/src/beads_board_a2.rs#RailWidths#tracks]], rather than a
+five-equal-lanes guess. A2's tracks move with occupancy, text scale, and
+whether each collapsible queue is a 36px tab, an open drawer, or a pinned lane,
+so hit-testing anything but the live presentation would write to a queue the
+pointer never landed on. An open drawer owns the pointer inside its own bounds
+(it overlays lanes without reflowing them, A2-I1); the left gutter, the
+inter-track gaps, the right padding, and everything outside the strip name no
+queue at all, while a track is hit over the strip's whole height.
 
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#expire_hover]] exempts the
 source workspace while its card is lifted, and
-[[crates/scribe-client/src/beads_board.rs#BeadsBoards#drag_target]] exposes a
-target only to that workspace. From the armed press through release,
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#card_drag_paint]] exposes
+the lifted row and its target only to that workspace. From the armed press
+through release,
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#blocks_pty_mouse]] makes
 [[crates/scribe-client/src/main.rs#TerminalView#card_drag_owns_pointer]] consume
 terminal press, motion, and release routing.
@@ -1382,7 +1418,7 @@ result. A third classifier lane returns an outcome through
 the five-second notice.
 
 [[test#Test Harness#GPUI Client Headless Suites#Beads card drag tracking]] pins
-the state and result transitions. The
+the state, geometry, and result transitions. The
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation|real-bd run]]
 proves the guarded verbs and PTY boundary, while the
 [Docker visual run](../tests/e2e/visual/beads-board.sh) checks the native ghost
@@ -1526,11 +1562,9 @@ through `P4` painted directly in `colors.priorities[]`, the row's only
 saturated ink (A2-C3). The heat-scale derivation those five colours come from
 — red at P0, a mixed amber at P1, yellow at P2, two neutral steps below it,
 each rank taking the more saturated of a theme's two matching ANSI slots — is
-unchanged; `priority_mark`'s further step of solving a badge fill's own tint
-against the card now backs only
-[[crates/scribe-client/src/beads_board.rs#BeadsCardDragGhost]]'s ghost, which
-still carries a badge until scribe-zwtv.9 redraws drag geometry for A2's
-unequal tracks.
+unchanged. The badge-fill solver that used to sit on top of it is gone with
+its last caller: A2's drag ghost carries the row's own glyph too, so nothing
+solves a fill tint against a card any more.
 
 A void lane says so in [[crates/scribe-client/src/beads_board.rs#void_copy]]
 instead of a dashed card outline: queue-specific headline copy indented to
@@ -1594,12 +1628,16 @@ Hover lifts a row's background and replaces its own lower hairline with a
 [[crates/scribe-client/src/beads_board.rs#ledger_row]] gives every row but a
 lane's last visible one that hairline as its own bottom edge rather than its
 neighbour's top one, there is no doubled rule to suppress on the row below a
-hover. A drag in flight still marks its hovered lane's left edge —
-[[crates/scribe-client/src/beads_board.rs#accepts_drop]] keeps Backlog and
-Blocked muted and every other queue in its own hue — through
-[[crates/scribe-client/src/beads_board.rs#drag_target_edge]], though the
-pointer-to-lane geometry behind it is still the five-equal-lanes math
-scribe-zwtv.9 owns updating for A2's unequal tracks.
+hover. A drag in flight marks its hovered track's left edge through
+[[crates/scribe-client/src/beads_board.rs#drag_target_edge]] and, where the
+drop would write, washes the whole track in its queue's hue over that track's
+own ground ([[crates/scribe-client/src/beads_board.rs#drag_target_ground]],
+A2-C7). [[crates/scribe-client/src/beads_board.rs#CardDragPaint#accepts]]
+decides which of the two treatments a track wears — Backlog, Blocked, and the
+lane the card was lifted from never write, so they stay muted — reading the
+same matrix
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#queue_card_drop]]
+writes from.
 
 The strip terminates in [[crates/scribe-client/src/beads_board.rs#floor]], a
 3px bar with a centred 34×1px grip (A2-G9) painted where the resize hitbox
