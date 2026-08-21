@@ -4272,6 +4272,36 @@ last so it cannot perturb those geometry proofs. The as-built rules and producti
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
 
+### Beads collapsed-lane hover and pin
+
+Unit coverage pins the A2-I1/A2-I2/A2-L1 state transitions
+`specs/028-beads-board-contract.md` requires for the Blocked and Done rail
+tabs, ahead of the pixel rendering a later bead adds.
+
+Tests beside the code they cover default a fresh workspace's Blocked and Done
+to a plain tab, open the same drawer by pointer hover or by keyboard focus,
+and carry it through the tab-to-drawer handoff without an early close: leaving
+the tab for the drawer it opened must not start the grace period, and only
+leaving both does, at the same 150ms the board's own hover grace uses.
+Entering a different queue while one is already open replaces it outright —
+A2-I1 opens at most one drawer per workspace — and the abandoned queue's
+stale leave is ignored rather than closing the drawer that replaced it.
+Pinning one queue unpins whichever was pinned before it, restoring a plain
+tab; a pin also drops a stale hover bit so an unpin cannot resurrect a drawer
+the pointer left long ago, and hover expiry can never clear a pin in the other
+direction. Escape closes only a transient drawer and never a pinned lane, and
+needs no grace to do it. A queue outside Blocked and Done is rejected at every
+entry point — pin, hover, unpin, close, and restore — rather than coerced into
+one that is allowed, and repeated hover, pin, and unpin events are idempotent.
+Separate workspaces pin and hover their own queues independently, and losing a
+region or a `NotDetected` reply clears only that workspace's lane pin and
+hover state, leaving a neighbour untouched. The lane pin survives a Flow
+round trip and a `beads_flow` capability change exactly like the board pin,
+and a restored lane pin waits for its region the same way a restored board
+pin does, including rejecting a persisted queue outside Blocked/Done rather
+than coercing it. The as-built rules and production links live in
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
+
 ### Flow layout and paint-path guard
 
 The Flow layout engine is pure, so its geometry, ordering and wire routing are

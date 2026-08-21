@@ -16,7 +16,7 @@ use crate::opacity::surface;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
-    BeadsIssueWriteResult,
+    BeadsIssueQueue, BeadsIssueWriteResult,
 };
 
 /// One of the things whose hover keeps a board open. They overlap, so each is
@@ -29,6 +29,32 @@ pub enum HoverSource {
     Board = 2,
     /// A control inside the board, which takes hover away from the board.
     Control = 4,
+}
+
+/// One of the things whose pointer hover or keyboard focus keeps a collapsed
+/// lane's drawer open. Tab and drawer overlap while the pointer crosses
+/// between them, so each is tracked on its own — the lane-level twin of
+/// `HoverSource`.
+#[derive(Clone, Copy)]
+pub enum LaneHoverSource {
+    /// The collapsed rail tab, by pointer hover.
+    Tab = 1,
+    /// The drawer the tab opened, by pointer hover.
+    Drawer = 2,
+    /// Keyboard focus on the tab, or inside the drawer it opened.
+    Focus = 4,
+}
+
+/// What a collapsed queue's lane looks like right now, for the rail and
+/// drawer a later bead paints from this state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollapsedLaneState {
+    /// A plain 36px tab: not pinned, not hovered or focused.
+    Tab,
+    /// Open as a transient, non-reflowing drawer by hover or focus.
+    Open,
+    /// Pinned open as a full lane.
+    Pinned,
 }
 
 /// Reader-owned snapshots plus GPUI-owned hover/pin intent.
@@ -49,6 +75,21 @@ pub struct BeadsBoards {
     /// pruning against the live layout would drop it before it could apply.
     pending_pins: HashSet<WorkspaceId>,
     hover_expires: HashMap<WorkspaceId, Instant>,
+    /// Which queue (Blocked or Done), if either, a workspace has pinned its
+    /// collapsed lane open. At most one: pinning one queue replaces the
+    /// other, the one-pinned-lane rule the mock draws.
+    lane_pinned: HashMap<WorkspaceId, BeadsIssueQueue>,
+    /// Lane pins read back from the window record, held until their region
+    /// shows up — the lane-level twin of `pending_pins`.
+    pending_lane_pins: HashMap<WorkspaceId, BeadsIssueQueue>,
+    /// The one collapsed-lane drawer a workspace has open by hover or focus,
+    /// and which of its sources still holds it open. Only one drawer is ever
+    /// open per workspace (A2-I1), so entering a different queue replaces
+    /// this outright rather than tracking Blocked and Done independently. An
+    /// entry whose sources are all gone is a drawer inside its grace period,
+    /// the same shape `hovered` gives the board itself.
+    lane_hovered: HashMap<WorkspaceId, (BeadsIssueQueue, u8)>,
+    lane_hover_expires: HashMap<WorkspaceId, Instant>,
     /// Text a card asked to put on the clipboard, drained by the view on the
     /// next frame. The board is built by a free function with no reach into
     /// the window's clipboard handle, so the request is parked here the way
@@ -429,6 +470,9 @@ impl BeadsBoards {
             self.hovered.remove(&workspace_id);
             self.pinned.remove(&workspace_id);
             self.hover_expires.remove(&workspace_id);
+            self.lane_pinned.remove(&workspace_id);
+            self.lane_hovered.remove(&workspace_id);
+            self.lane_hover_expires.remove(&workspace_id);
             self.exit_flow(workspace_id);
             if self.resize.is_some_and(|drag| drag.workspace_id == workspace_id) {
                 self.resize = None;
@@ -725,10 +769,82 @@ impl BeadsBoards {
         pinned
     }
 
+    /// Pin `queue`'s collapsed lane open for `workspace_id`, replacing
+    /// whichever queue was pinned before it — at most one of Blocked and Done
+    /// is ever pinned. Rejects a queue that is not Blocked or Done, and is a
+    /// no-op for a queue that is already the pinned one.
+    ///
+    /// Clears any transient hover/focus this queue was tracking: once pinned
+    /// it is a full lane, not a tab, and a stale bit left behind could not be
+    /// told apart from the pointer still resting on a tab that no longer
+    /// exists.
+    pub fn pin_lane(&mut self, workspace_id: WorkspaceId, queue: BeadsIssueQueue) -> bool {
+        if !collapsible_queue(queue) || self.lane_pinned.get(&workspace_id) == Some(&queue) {
+            return false;
+        }
+        self.lane_pinned.insert(workspace_id, queue);
+        if self.lane_hovered.get(&workspace_id).is_some_and(|(tracked, _)| *tracked == queue) {
+            self.lane_hovered.remove(&workspace_id);
+            self.lane_hover_expires.remove(&workspace_id);
+        }
+        true
+    }
+
+    /// Unpin `queue`'s collapsed lane, restoring it to a plain tab. A no-op
+    /// for a queue that is not the one currently pinned, including an
+    /// invalid one.
+    pub fn unpin_lane(&mut self, workspace_id: WorkspaceId, queue: BeadsIssueQueue) -> bool {
+        if !collapsible_queue(queue) || self.lane_pinned.get(&workspace_id) != Some(&queue) {
+            return false;
+        }
+        self.lane_pinned.remove(&workspace_id);
+        true
+    }
+
+    /// What `queue`'s collapsed lane looks like right now. `None` for a queue
+    /// that is not Blocked or Done — this state exists for only those two.
+    /// Pinned wins over a simultaneous hover, since a pinned queue is a full
+    /// lane rather than a tab with a drawer left to open.
+    pub fn collapsed_lane_state(
+        &self,
+        workspace_id: WorkspaceId,
+        queue: BeadsIssueQueue,
+    ) -> Option<CollapsedLaneState> {
+        if !collapsible_queue(queue) {
+            return None;
+        }
+        if self.lane_pinned.get(&workspace_id) == Some(&queue) {
+            return Some(CollapsedLaneState::Pinned);
+        }
+        let open =
+            self.lane_hovered.get(&workspace_id).is_some_and(|(tracked, _)| *tracked == queue);
+        Some(if open { CollapsedLaneState::Open } else { CollapsedLaneState::Tab })
+    }
+
+    /// Every pinned lane, in the same stable order `pinned()` gives the board
+    /// pins, for a caller comparing this against a persisted record.
+    pub fn lane_pinned(&self) -> Vec<(WorkspaceId, BeadsIssueQueue)> {
+        let mut pinned: Vec<_> =
+            self.lane_pinned.iter().map(|(workspace_id, queue)| (*workspace_id, *queue)).collect();
+        pinned.sort_by_key(|(workspace_id, _)| workspace_id.as_uuid());
+        pinned
+    }
+
     /// Take the pins a previous run of this window left behind. They apply as
     /// each named region appears.
     pub fn restore_pins(&mut self, pinned: impl IntoIterator<Item = WorkspaceId>) {
         self.pending_pins.extend(pinned);
+    }
+
+    /// Take the lane pins a previous run of this window left behind — the
+    /// lane-level twin of `restore_pins`. Rejects a queue that is not Blocked
+    /// or Done rather than coercing it into one that is.
+    pub fn restore_lane_pins(
+        &mut self,
+        pinned: impl IntoIterator<Item = (WorkspaceId, BeadsIssueQueue)>,
+    ) {
+        self.pending_lane_pins
+            .extend(pinned.into_iter().filter(|(_, queue)| collapsible_queue(*queue)));
     }
 
     /// Drop every workspace this window no longer shows a region for.
@@ -741,12 +857,18 @@ impl BeadsBoards {
             if self.pending_pins.remove(workspace_id) {
                 self.pinned.insert(*workspace_id);
             }
+            if let Some(queue) = self.pending_lane_pins.remove(workspace_id) {
+                self.lane_pinned.insert(*workspace_id, queue);
+            }
         }
         self.states.retain(|workspace_id, _| live.contains(workspace_id));
         self.retry_after.retain(|workspace_id, _| live.contains(workspace_id));
         self.hover_expires.retain(|workspace_id, _| live.contains(workspace_id));
         self.hovered.retain(|workspace_id, _| live.contains(workspace_id));
         self.pinned.retain(|workspace_id| live.contains(workspace_id));
+        self.lane_pinned.retain(|workspace_id, _| live.contains(workspace_id));
+        self.lane_hovered.retain(|workspace_id, _| live.contains(workspace_id));
+        self.lane_hover_expires.retain(|workspace_id, _| live.contains(workspace_id));
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
         self.optimistic_drops.retain(|(workspace_id, _), _| live.contains(workspace_id));
         self.flows.retain(|workspace_id, _| live.contains(workspace_id));
@@ -782,6 +904,63 @@ impl BeadsBoards {
         }
     }
 
+    /// Report the pointer or keyboard focus entering or leaving one of the
+    /// things that keep a collapsed lane's drawer open for `workspace_id`.
+    ///
+    /// A2-I1 opens at most one drawer per workspace, so entering a queue
+    /// other than the one already tracked replaces it outright instead of
+    /// tracking Blocked and Done independently — there is no grace period to
+    /// hand the old one, because the two were never open together. A leave
+    /// for a queue that is not the one tracked is stale and ignored, the same
+    /// filter `set_flow_hover` applies to an out-of-order leave. Rejects a
+    /// queue that is not Blocked or Done.
+    pub fn hover_lane(
+        &mut self,
+        workspace_id: WorkspaceId,
+        queue: BeadsIssueQueue,
+        source: LaneHoverSource,
+        entered: bool,
+    ) -> bool {
+        if !collapsible_queue(queue) {
+            return false;
+        }
+        let tracked = self.lane_hovered.get(&workspace_id).copied();
+        let next = match tracked {
+            Some((current, sources)) if current == queue => {
+                (queue, if entered { sources | source as u8 } else { sources & !(source as u8) })
+            }
+            _ if entered => (queue, source as u8),
+            _ => return false,
+        };
+        if tracked == Some(next) {
+            return false;
+        }
+        if next.1 == 0 {
+            self.lane_hover_expires
+                .insert(workspace_id, Instant::now() + Duration::from_millis(150));
+        } else {
+            self.lane_hover_expires.remove(&workspace_id);
+        }
+        self.lane_hovered.insert(workspace_id, next);
+        true
+    }
+
+    /// Force `workspace_id`'s open transient drawer closed for `queue`, the
+    /// way Escape does. A pinned lane is not a drawer, so Escape never
+    /// touches it, and a queue that is not the one currently tracked (or not
+    /// Blocked/Done at all) is a no-op.
+    pub fn close_lane_drawer(&mut self, workspace_id: WorkspaceId, queue: BeadsIssueQueue) -> bool {
+        if !collapsible_queue(queue) || self.lane_pinned.get(&workspace_id) == Some(&queue) {
+            return false;
+        }
+        if !self.lane_hovered.get(&workspace_id).is_some_and(|(tracked, _)| *tracked == queue) {
+            return false;
+        }
+        self.lane_hovered.remove(&workspace_id);
+        self.lane_hover_expires.remove(&workspace_id);
+        true
+    }
+
     pub fn expire_hover(&mut self) -> bool {
         let now = Instant::now();
         let held_resize = self.resizing();
@@ -801,7 +980,17 @@ impl BeadsBoards {
             self.hovered.remove(workspace_id);
             self.hover_expires.remove(workspace_id);
         }
-        !due.is_empty()
+        let lane_due: Vec<WorkspaceId> = self
+            .lane_hover_expires
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(workspace_id, _)| *workspace_id)
+            .collect();
+        for workspace_id in &lane_due {
+            self.lane_hovered.remove(workspace_id);
+            self.lane_hover_expires.remove(workspace_id);
+        }
+        !due.is_empty() || !lane_due.is_empty()
     }
 }
 
@@ -818,6 +1007,14 @@ impl CardDragGhost {
 
 fn card_drag_source(lane: u8) -> bool {
     lane <= 2
+}
+
+/// Whether `queue` is one of the two queues A2-I1/A2-I2 collapse to a rail
+/// tab. Backlog, Ready, and In progress are rejected rather than coerced into
+/// one of these two, the same way `card_drag_source` gates which lanes can
+/// arm a drag.
+fn collapsible_queue(queue: BeadsIssueQueue) -> bool {
+    matches!(queue, BeadsIssueQueue::Blocked | BeadsIssueQueue::Done)
 }
 
 fn state_snapshot_mut(state: &mut BeadsBoardState) -> Option<&mut BeadsBoardSnapshot> {
@@ -3774,5 +3971,432 @@ mod flow_mode_tests {
         boards.exit_flow(workspace);
         assert!(boards.is_pinned(workspace));
         assert!((boards.height(workspace) - pinned_height).abs() < f32::EPSILON);
+    }
+
+    /// A2-L2: the lane pin is board furniture, not Flow state, so it must
+    /// survive the strip's own round trip exactly like the board pin does.
+    #[test]
+    fn lane_pin_survives_the_flow_round_trip() {
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned),
+            "Flow paints over lanes, not over the lane pin itself"
+        );
+
+        boards.exit_flow(workspace);
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+    }
+}
+
+/// Unit coverage for the A2 collapsed-lane hover/pin state owned by
+/// `BeadsBoards` — scribe-zwtv.5. `specs/028-beads-board-contract.md` is
+/// normative; these tests pin its A2-I1, A2-I2, and A2-L1 rows, plus the
+/// closed pinned-lane, lifetime, and keyboard-equivalent decisions.
+#[cfg(test)]
+mod lane_tests {
+    use scribe_common::protocol::BeadsIssueQueue;
+
+    use super::*;
+
+    const NON_COLLAPSIBLE: [BeadsIssueQueue; 3] =
+        [BeadsIssueQueue::Backlog, BeadsIssueQueue::Ready, BeadsIssueQueue::InProgress];
+
+    #[test]
+    fn collapsed_lanes_default_to_a_tab() {
+        let workspace = WorkspaceId::new();
+        let boards = BeadsBoards::default();
+
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+    }
+
+    #[test]
+    fn only_blocked_and_done_are_collapsible_queues() {
+        let workspace = WorkspaceId::new();
+        for queue in NON_COLLAPSIBLE {
+            let mut boards = BeadsBoards::default();
+            assert_eq!(boards.collapsed_lane_state(workspace, queue), None);
+            assert!(!boards.pin_lane(workspace, queue));
+            assert!(!boards.hover_lane(workspace, queue, LaneHoverSource::Tab, true));
+            assert!(!boards.unpin_lane(workspace, queue));
+            assert!(!boards.close_lane_drawer(workspace, queue));
+            assert_eq!(
+                boards.collapsed_lane_state(workspace, queue),
+                None,
+                "a rejected queue must not be coerced into a real one"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_or_focus_opens_the_drawer() {
+        let workspace = WorkspaceId::new();
+
+        let mut hovered = BeadsBoards::default();
+        assert!(hovered.hover_lane(
+            workspace,
+            BeadsIssueQueue::Blocked,
+            LaneHoverSource::Tab,
+            true
+        ));
+        assert_eq!(
+            hovered.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Open)
+        );
+
+        let mut focused = BeadsBoards::default();
+        assert!(focused.hover_lane(workspace, BeadsIssueQueue::Done, LaneHoverSource::Focus, true));
+        assert_eq!(
+            focused.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Open)
+        );
+    }
+
+    #[test]
+    fn grace_period_transfers_from_tab_to_drawer() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true);
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Drawer, true);
+
+        // Leaving the tab for the drawer it opened must not start closing it.
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, false);
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Open)
+        );
+        assert!(!boards.expire_hover());
+
+        // Leaving the drawer too starts the same grace the board itself gets.
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Drawer, false);
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Open),
+            "still open inside its grace period"
+        );
+        assert!(!boards.expire_hover());
+
+        boards.lane_hover_expires.insert(
+            workspace,
+            Instant::now().checked_sub(Duration::from_millis(1)).expect("one millisecond fits"),
+        );
+        assert!(boards.expire_hover());
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+    }
+
+    #[test]
+    fn entering_a_different_queue_replaces_the_open_drawer() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true);
+
+        assert!(boards.hover_lane(workspace, BeadsIssueQueue::Done, LaneHoverSource::Tab, true));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab),
+            "only one drawer is ever open per workspace"
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Open)
+        );
+
+        // The abandoned queue's stale leave is ignored rather than closing
+        // the drawer that replaced it.
+        assert!(!boards.hover_lane(
+            workspace,
+            BeadsIssueQueue::Blocked,
+            LaneHoverSource::Tab,
+            false
+        ));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Open)
+        );
+    }
+
+    #[test]
+    fn pin_lane_replaces_whichever_queue_was_pinned() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        assert!(boards.pin_lane(workspace, BeadsIssueQueue::Blocked));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+
+        // Pinning Done unpins Blocked instead of both lanes staying pinned:
+        // A2 never shows a two-pinned layout.
+        assert!(boards.pin_lane(workspace, BeadsIssueQueue::Done));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Pinned)
+        );
+        assert_eq!(boards.lane_pinned(), [(workspace, BeadsIssueQueue::Done)]);
+    }
+
+    #[test]
+    fn unpin_lane_restores_the_tab() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+
+        assert!(!boards.unpin_lane(workspace, BeadsIssueQueue::Done), "Done was never pinned");
+        assert!(boards.unpin_lane(workspace, BeadsIssueQueue::Blocked));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert!(boards.lane_pinned().is_empty());
+        assert!(!boards.unpin_lane(workspace, BeadsIssueQueue::Blocked), "already unpinned");
+    }
+
+    #[test]
+    fn a_pinned_lane_ignores_its_own_stale_hover_state() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true);
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+
+        // Unpinning must not resurrect the tab-hover bit pinning left behind.
+        boards.unpin_lane(workspace, BeadsIssueQueue::Blocked);
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab),
+            "a stale hover bit leaked through the pin"
+        );
+    }
+
+    #[test]
+    fn hover_expiry_never_unpins_a_pinned_lane() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+        boards.lane_hovered.insert(workspace, (BeadsIssueQueue::Blocked, 0));
+        boards.lane_hover_expires.insert(
+            workspace,
+            Instant::now().checked_sub(Duration::from_millis(1)).expect("one millisecond fits"),
+        );
+
+        boards.expire_hover();
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned),
+            "hover expiry must never clear a pin"
+        );
+    }
+
+    #[test]
+    fn sibling_workspaces_pin_and_hover_their_own_queues() {
+        let left = WorkspaceId::new();
+        let right = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        boards.pin_lane(left, BeadsIssueQueue::Blocked);
+        boards.hover_lane(right, BeadsIssueQueue::Done, LaneHoverSource::Tab, true);
+
+        assert_eq!(
+            boards.collapsed_lane_state(left, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(left, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(right, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Open)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(right, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+    }
+
+    #[test]
+    fn losing_a_region_drops_its_lane_pin_and_hover() {
+        let missing = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(missing, BeadsIssueQueue::Blocked);
+        boards.hover_lane(neighbour, BeadsIssueQueue::Done, LaneHoverSource::Tab, true);
+
+        boards.retain_regions(&HashSet::from([neighbour]));
+
+        assert_eq!(
+            boards.collapsed_lane_state(missing, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert!(boards.lane_pinned().is_empty());
+        assert_eq!(
+            boards.collapsed_lane_state(neighbour, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Open),
+            "an unrelated region keeps its own state"
+        );
+    }
+
+    // @lat: [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]]
+    #[test]
+    fn not_detected_clears_only_that_workspaces_lane_state() {
+        let missing = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(missing, BeadsIssueQueue::Blocked);
+        boards.hover_lane(missing, BeadsIssueQueue::Done, LaneHoverSource::Tab, true);
+        boards.pin_lane(neighbour, BeadsIssueQueue::Done);
+
+        let _ = boards.update(missing, BeadsBoardState::NotDetected);
+
+        assert_eq!(
+            boards.collapsed_lane_state(missing, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(missing, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(neighbour, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Pinned),
+            "a neighbouring workspace's pin must survive"
+        );
+    }
+
+    #[test]
+    fn lane_pin_survives_a_flow_capability_change() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+
+        boards.set_flow_enabled(true);
+        boards.set_flow_enabled(false);
+
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned),
+            "losing beads_flow must not touch the lane pin"
+        );
+    }
+
+    /// A lane pin outlives the window it was made in, the same way a board
+    /// pin does: the record names a workspace the layout has not adopted
+    /// yet, so it waits rather than being pruned before the region appears.
+    #[test]
+    fn restored_lane_pins_wait_for_their_region_to_come_back() {
+        let restored = WorkspaceId::new();
+        let never_seen = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.restore_lane_pins([
+            (restored, BeadsIssueQueue::Blocked),
+            (never_seen, BeadsIssueQueue::Done),
+        ]);
+
+        // The layout is still empty on the first frames after a restart.
+        boards.retain_regions(&HashSet::new());
+        assert_eq!(
+            boards.collapsed_lane_state(restored, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab)
+        );
+
+        // The region arrives and takes its pin with it.
+        boards.retain_regions(&HashSet::from([restored]));
+        assert_eq!(
+            boards.collapsed_lane_state(restored, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+        assert_eq!(boards.lane_pinned(), [(restored, BeadsIssueQueue::Blocked)]);
+
+        // Pins are handed over once, so an explicit unpin is not undone next
+        // frame.
+        boards.unpin_lane(restored, BeadsIssueQueue::Blocked);
+        boards.retain_regions(&HashSet::from([restored]));
+        assert!(boards.lane_pinned().is_empty(), "a restored pin came back after being cleared");
+    }
+
+    #[test]
+    fn restore_lane_pins_rejects_a_persisted_non_collapsible_queue() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.restore_lane_pins([(workspace, BeadsIssueQueue::Ready)]);
+
+        boards.retain_regions(&HashSet::from([workspace]));
+
+        assert!(boards.lane_pinned().is_empty(), "an invalid persisted queue must not be coerced");
+    }
+
+    #[test]
+    fn repeated_hover_and_pin_events_are_idempotent() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        assert!(boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true));
+        assert!(!boards.hover_lane(
+            workspace,
+            BeadsIssueQueue::Blocked,
+            LaneHoverSource::Tab,
+            true
+        ));
+
+        assert!(boards.pin_lane(workspace, BeadsIssueQueue::Blocked));
+        assert!(!boards.pin_lane(workspace, BeadsIssueQueue::Blocked));
+
+        assert!(boards.unpin_lane(workspace, BeadsIssueQueue::Blocked));
+        assert!(!boards.unpin_lane(workspace, BeadsIssueQueue::Blocked));
+    }
+
+    #[test]
+    fn escape_closes_only_a_transient_drawer() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.pin_lane(workspace, BeadsIssueQueue::Blocked);
+        boards.hover_lane(workspace, BeadsIssueQueue::Done, LaneHoverSource::Focus, true);
+
+        assert!(
+            !boards.close_lane_drawer(workspace, BeadsIssueQueue::Blocked),
+            "Escape never touches a pin"
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned)
+        );
+
+        assert!(boards.close_lane_drawer(workspace, BeadsIssueQueue::Done));
+        assert_eq!(
+            boards.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert!(!boards.expire_hover(), "an explicit close needs no grace to expire");
     }
 }

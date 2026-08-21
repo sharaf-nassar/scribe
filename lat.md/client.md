@@ -1224,6 +1224,36 @@ a rooted `WorkspaceNamed`, requires its request, and checks that a
 and repins the board before proving the same request and cleanup after a
 rootless `WorkspaceNamed`.
 
+`specs/028-beads-board-contract.md` (A2-I1, A2-I2, A2-L1) is normative for A2's
+two collapsible queues, Blocked and Done. One state owner,
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#pin_lane]] and
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#unpin_lane]], hold at
+most one of the two pinned per workspace; pinning one unpins the other rather
+than letting both stay pinned.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#hover_lane]] reuses the
+board's own overlapping-source, 150ms-grace shape
+([[crates/scribe-client/src/beads_board.rs#LaneHoverSource]]) for pointer
+hover and keyboard focus on a collapsed tab or the drawer it opens, but tracks
+only one open drawer per workspace: entering a different queue replaces the
+tracked one outright rather than running Blocked and Done independently.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#close_lane_drawer]] is
+Escape's immediate, grace-free close and never touches a pinned lane.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#collapsed_lane_state]]
+resolves the
+[[crates/scribe-client/src/beads_board.rs#CollapsedLaneState]] a later
+rendering bead paints from: pinned always wins over a simultaneous or stale
+hover. A queue outside Blocked/Done is rejected at every entry point,
+including [[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pins]],
+rather than coerced into one that is allowed.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pins]] and
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#lane_pinned]] give the
+lane pin the board pin's own restart lifetime, and `update` and
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#retain_regions]] clear
+it on workspace loss and region removal the same way. Pixel rendering for the
+rail tabs and drawer is a later bead.
+[[test#Test Harness#GPUI Client Headless Suites#Beads collapsed-lane hover and pin]]
+pins every transition above.
+
 The [Story 3 drag contract](../specs/024-beads-card-detail.md#story-3--move-a-card-between-queues-by-dragging)
 allows Backlog, Ready, and In-progress sources; Blocked and Done never register
 the native arm. [[crates/scribe-client/src/beads_board.rs#BeadsBoards#arm_card_drag]]
