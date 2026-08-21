@@ -495,7 +495,11 @@ pub fn visible_row_count(board_height: f32, text_scale: f32) -> usize {
 /// A small integer as `f32`, saturating through `u16` rather than an `as`
 /// cast: every value this module counts (rows, lanes, characters) fits
 /// comfortably under `u16::MAX`, and the round trip is exact.
-fn count_to_f32(value: usize) -> f32 {
+///
+/// `pub(crate)` so the renderer can size a lane's fixed-height row box from
+/// the same `visible_rows` this module already computes, instead of
+/// re-deriving its own usize-to-f32 conversion.
+pub(crate) fn count_to_f32(value: usize) -> f32 {
     u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
 }
 

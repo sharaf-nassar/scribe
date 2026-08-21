@@ -1240,24 +1240,32 @@ tracked one outright rather than running Blocked and Done independently.
 Escape's immediate, grace-free close and never touches a pinned lane.
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#collapsed_lane_state]]
 resolves the
-[[crates/scribe-client/src/beads_board.rs#CollapsedLaneState]] a later
-rendering bead paints from: pinned always wins over a simultaneous or stale
-hover. A queue outside Blocked/Done is rejected at every entry point,
+[[crates/scribe-client/src/beads_board.rs#CollapsedLaneState]]
+[[crates/scribe-client/src/beads_board.rs#queue_column]] paints from: pinned
+always wins over a simultaneous or stale hover. A queue outside Blocked/Done
+is rejected at every entry point,
 including [[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pins]],
 rather than coerced into one that is allowed.
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pins]] and
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#lane_pinned]] give the
 lane pin the board pin's own restart lifetime, and `update` and
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#retain_regions]] clear
-it on workspace loss and region removal the same way. Pixel rendering for the
-rail tabs and drawer is a later bead.
+it on workspace loss and region removal the same way.
+[[crates/scribe-client/src/beads_board.rs#collapsed_tab]] paints an unpinned
+Blocked/Done's idle, full-strength count-and-spine state (A2-S1); a pinned
+one paints as an ordinary
+[[crates/scribe-client/src/beads_board.rs#ledger_lane]] instead, since
+[[crates/scribe-client/src/beads_board_a2.rs#QueueLane]] gives both the same
+shape. The hover-opens/click-pins drawer, its unpin control, and a hot tab's
+inner edge remain a later bead's (A2-G7, A2-G8, A2-C6, A2-C7).
 [[test#Test Harness#GPUI Client Headless Suites#Beads collapsed-lane hover and pin]]
 pins every transition above.
 
-[[crates/scribe-client/src/beads_board_a2.rs]] derives what that later
-rendering bead paints from one board snapshot, `RailState`, board width,
-height, and text scale, with zero GPUI types or paint calls so its geometry is
-a plain `#[test]` away from a window. It takes lane state as input from
+[[crates/scribe-client/src/beads_board_a2.rs]] derives what
+[[crates/scribe-client/src/beads_board.rs#lanes]] paints from one board
+snapshot, `RailState`, board width, height, and text scale, with zero GPUI
+types or paint calls so its geometry is a plain `#[test]` away from a window.
+It takes lane state as input from
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#collapsed_lane_state]]
 rather than owning a second copy of it.
 [[crates/scribe-client/src/beads_board_a2.rs#layout]] floor-clips every queue
@@ -1295,7 +1303,7 @@ captures the workspace, source card, lane, and press point in
 it only when Euclidean travel is strictly greater than 2px. A release at or
 inside 2px stays a card click.
 
-[[crates/scribe-client/src/beads_board.rs#issue]] registers GPUI's `on_drag`
+[[crates/scribe-client/src/beads_board.rs#ledger_row]] registers GPUI's `on_drag`
 and builds [[crates/scribe-client/src/beads_board.rs#BeadsCardDragGhost]] in the
 native window drag root. GPUI keeps the cursor offset captured on the
 threshold-crossing move, so the source-sized ghost follows beyond card and lane
@@ -1416,8 +1424,11 @@ mock-derived anatomy and lifecycle matrix. The independent
 the same request, response, painted fields, and copied identity against a real
 checksum-pinned `bd` repository.
 
-The board takes its structure, sizes, and weights from
-`.impeccable/mocks/beads-compact-live-overview.html` while
+The board takes its structure, sizes, and weights from A2's normative section
+of `.impeccable/mocks/beads-board-directions.html`
+(`specs/028-beads-board-contract.md`), read through the generated
+`.impeccable/mocks/a2a3-contract.json` manifest rather than re-transcribed by
+hand, while
 [[crates/scribe-client/src/beads_board.rs#BeadsBoardColors#from_theme]] reads
 its colours off the live theme, so a board wears whatever palette the terminal
 is wearing. Text and hairlines come from the chrome slots the tab bar already
@@ -1451,86 +1462,50 @@ in-progress hue's family rather than taking a hue of its own, carried toward
 the title far enough that the agent line cannot be mistaken for the dot it
 annotates.
 
-Where the mock lays its issues on the bare strip, an issue here is a **raised
-card**: a gradient fill lit from the top under a hairline border, rounded at
-4px. The pointer brightens the fill and the border and lifts the card on a
-small shadow. Elevation is light in every theme — the card is the ground
-carried toward white, which on a pale theme lands on the white a paper card
-would be and leaves the border and the shadow to carry the lift. The lane
-ground remains neutral. Queue colour stays on compact dots, the one-pixel rail,
-labels, counts, empty-lane borders, and priority badges. A drag target overlays
-a one-pixel lane border. It is semantic for an accepted target and muted for a
-rejected one, without tinting or moving the lane or card.
+A2 replaced that whole grammar with a ledger (`specs/028-beads-board-contract.md`;
+CURRENT and standalone A stay reference-only). There is no card fill, no
+priority badge, no dashed empty-lane outline, no per-lane equal-width track,
+and no top-right stepper pair left in
+[[crates/scribe-client/src/beads_board.rs#render]]'s tree.
+[[crates/scribe-client/src/beads_board.rs#headband]] paints one hairline
+across the whole strip in place of five floating heads, so five labels group
+into one row (A2-G3). Each of the five tracks gets
+[[crates/scribe-client/src/beads_board.rs#queue_column]]'s choice of
+[[crates/scribe-client/src/beads_board.rs#ledger_lane]] (Backlog, Ready, and
+In progress always; Blocked or Done once pinned) or
+[[crates/scribe-client/src/beads_board.rs#collapsed_tab]] (an unpinned
+Blocked or Done), at exactly the width
+[[crates/scribe-client/src/beads_board_a2.rs#rail_widths]] already worked
+out — paint code never recomputes a track's share.
 
-An issue's **priority is a filled badge** at the head of its title, and
-nothing else on the card carries it. Earlier passes spread the colour along the
-line — a tinted chip, a wash bled down it, a rule under the title, a bar across
-the card's head — and each either competed with the title for the line a reader
-actually scans or coloured more of the card than one field is worth. A badge is
-the one shape that stays where its own field is.
+A lane's own [[crates/scribe-client/src/beads_board.rs#lane_seam]] is the one
+place queue colour still runs a track's width: 2px carrying the hue at the
+lane's start and fading to 12% of it, or 34% fading to 9% when the lane is
+empty (A2-C5), in place of the wash bands the rail used to lay under every
+node. [[crates/scribe-client/src/beads_board.rs#lane_head]] mixes that same
+hue 40% toward the title ink for its uppercase label, or 32% toward muted
+when the lane is empty (A2-C2); its count is a separate, un-hued ink —
+`queue_name` normally, `muted` when the lane holds nothing — because the
+label alone now carries the queue's identity, not a coloured dot beside it.
 
-A badge is read the other way round from everything else on the card: the
-colour is the ground rather than the ink, so the digits take whichever end of
-the range that ground is not, then clear the floor against it like every other
-word. The fill is the wash's own solved tint tripled, which lands the hottest
-rank on the colour itself and leaves the coolest a fill its digits can still be
-read on.
+An issue's priority is a plain saturated glyph again, not a badge: `P0`
+through `P4` painted directly in `colors.priorities[]`, the row's only
+saturated ink (A2-C3). The heat-scale derivation those five colours come from
+— red at P0, a mixed amber at P1, yellow at P2, two neutral steps below it,
+each rank taking the more saturated of a theme's two matching ANSI slots — is
+unchanged; `priority_mark`'s further step of solving a badge fill's own tint
+against the card now backs only
+[[crates/scribe-client/src/beads_board.rs#BeadsCardDragGhost]]'s ghost, which
+still carries a badge until scribe-zwtv.9 redraws drag geometry for A2's
+unequal tracks.
 
-The mock's tint on the top edge of the blocked lane's first row is gone with
-the accents. Priority is the badge's alone now, and a red edge anywhere else on
-a card would be a second thing saying it.
-
-Priorities run a **heat scale**: red at P0, amber at P1, yellow at P2, then two
-neutral steps for the ranks that carry no heat. Every step is a different hue
-rather than one red at three strengths, because a badge this small is not much
-to tell apart and near-neighbours in the same family read as the same mark. No
-terminal palette carries an amber, so P1 is mixed from the theme's own red and
-yellow. Each of the three takes the more saturated of the two slots its hue
-gets — a washed-out pink says less than a deep red however light it is, and the
-ranking cannot be left to which slot a theme happened to fill.
-
-The rank a badge carries is then a solved tint, not a fixed one. What a reader
-sees is how much colour it lays over the card, which is the tint times the
-distance between that colour and the card: at one fixed tint a hue that sits
-far from the card carries more than a nearer one a rank above it, and the ramp
-says the opposite of what it means. So each rank names the amount of colour it
-is allowed and the tint is divided out of it, which ranks P0 through P4 in any
-theme's hues. The wash is one band per
-queue, running the full depth of the strip — past the padding the lanes hold at
-the bottom, so it stops on the board's own bottom bar — and running edge to
-edge so the five meet with no ground between them: the board reads as five
-columns of colour rather than as five headings over one shared ground. Each
-band is flat across its middle third and travels to meet its neighbours over
-the outer two, so a boundary is a crossing rather than a step. Both sides
-compute the same midpoint of the same two queues, which is what lets the two
-gradients meet without a seam of their own — nothing coordinates them at paint
-time, so the arithmetic has to agree by construction. The wash is laid
-translucent rather than mixed into a solid, because the rail is painted before
-the lanes and a solid wash would erase the length of it crossing that column.
-The strip keeps its own left and right margin unpainted, which frames the five
-and leaves the board's ground readable where a colour never lands. The rail is painted before the lanes, so a solid wash
-would erase the length of it running through that column, and the queue line
-that breaks the rail is filled in the wash's own colour rather than in bare
-ground, which would read as a hole in it. Every queue's node carries a halo;
-the lane the eye should land on carries more. The halo is painted after that
-patch and not before it: it reaches past the node, the patch begins at the
-node's edge, and whichever of the two goes down first comes up with a bite out
-of it. Painting last washes it over the node as well as around it, which a glow
-of the node's own colour is welcome to do — the dot keeps its colour and its
-rim picks the hue up.
-
-The mock's hairline between two lanes is gone with the cards that replaced its
-rows. It ran down the left of a lane, a hand's width from the card border and
-the priority rule beside it, and three parallel vertical lines said once what a
-column edge already said: where one queue's colour ends and the next begins is
-the boundary now.
-
-A queue holding nothing says so in the slot its first card would have taken —
-a dashed ghost of a card in the queue's colour, over a word written for that
-queue: nothing waiting, none ready, none picked up, nothing held back, nothing
-finished yet. An empty column under a floating heading reads as content that
-failed to arrive, and the outline is what says the queue itself is the empty
-thing.
+A void lane says so in [[crates/scribe-client/src/beads_board.rs#void_copy]]
+instead of a dashed card outline: queue-specific headline copy indented to
+where a row's title starts, in `quiet` ink; Ready adds its subordinate
+blocked-total hint as its own line beneath the headline (A2-S5).
+[[crates/scribe-client/src/beads_board.rs#BeadsBoardColors]]'s `quiet` field
+is A2's fourth and darkest named text step, one below `muted`, added for a
+row's age and a lane's void copy (A2-C1, A2-C4).
 
 Every colour carrying words is then lifted away from the ground it is read on
 until it clears WCAG AA, and every dot, chevron, and mark until it clears the
@@ -1549,42 +1524,73 @@ clearing its floor is returned untouched, so a theme with good contrast keeps
 its own tones exactly, and the mock's brightness steps are taken between the
 floor and the ground rather than below it.
 
-Five lanes sit under that rail, each headed by a coloured node, the queue's
-name, and its total — name and total sharing one 20px line box and centred on
-it, since baseline alignment left the smaller total sitting low. The head's own
-patch of ground breaks the rail behind those words, and it starts at the node
-rather than at the words: the gap between the two is the patch's padding, not a
-margin, or the rail shows through it and reads as a line joining a dot to a
-word. The rail stops a clear gap short of the text-size controls at the other
-end for the same reason — a line that runs under a button looks like it means
-something.
-Lanes scroll, showing three of their 50px issue rows at a time with a
-chevron marking the rest. A lane body is a virtualised `uniform_list`, so only
-the visible rows are built each frame: a full queue is 200 items and a window
-can hold several boards, and building every clipped card made the whole client
-drag as boards opened. The list's closure runs at layout time, after the build
-frame's borrow of the snapshot is gone, so it re-reads its queue from the
-shared board state and an index that outlives its snapshot resolves to
-nothing. A card gives its whole first line to P0-P4 and the
-title, since the title is the only line a reader scans; beneath it sit the
-issue's ID at the left and its parent epic at the right, pushed there by a
-grown spacer between them rather than by justify-content: a grown container
-fills its row and then has nothing left to justify, which reads as left
-aligned. A margin on the epic keeps a minimum gap the slack alone cannot
-guarantee once a long name has eaten it, since the two read as one string when
-they meet. [[crates/scribe-client/src/beads_board.rs#issue]] gives the whole
-normal card hitbox a zero-delay GPUI tooltip, so its title, metadata, and padding
-all reveal the same complete title. The card records its painted bounds and
+A lane's rows are exactly [[crates/scribe-client/src/beads_board_a2.rs#layout]]'s
+own `visible_rows` count, never more:
+[[crates/scribe-client/src/beads_board.rs#lane_body]] reserves a fixed box
+sized to that whole-row count regardless of how many rows this queue
+actually has, so every lane's floor lands on the same line whether it holds
+two rows or a full one, and a queue with more than it shows still carries the
+board's own overflow chevron
+([[crates/scribe-client/src/beads_board.rs#overflow_chevron]], A2-G9,
+A2-S6). Because the presentation model already floor-clips to that same count
+before a row is ever built,
+[[crates/scribe-client/src/beads_board.rs#lane_body]] maps directly over
+`QueueLane::rows` with no virtualised list underneath it: a full queue is
+capped server-side and the model only ever hands the paint path the handful
+of rows a strip can show, so there is nothing left for a `uniform_list` to
+defer.
+
+Each 51px row ([[crates/scribe-client/src/beads_board.rs#ledger_row]],
+A2-G4) is [[crates/scribe-client/src/beads_board.rs#row_title_line]] over
+[[crates/scribe-client/src/beads_board.rs#row_sub_line]], centred as a group
+in the row's own height rather than stretched to fill it. The sub line is
+three independent slots, not a run-on string: ID left and copyable exactly as
+before, age at the row's true centre from
+[[crates/scribe-client/src/beads_board_a2.rs#compact_relative_age]], and an
+optional epic right with at least a 12px gap from the age (A2-G5) — two equal
+flex spacers flanking the fixed-width age is what centres it regardless of
+whether the row carries an epic or how long its ID or epic text runs. A lane
+whose every visible row shares one epic hoists it once to
+[[crates/scribe-client/src/beads_board.rs#lane_head]] instead
+([[crates/scribe-client/src/beads_board_a2.rs#common_epic]], A2-S8); the
+hoisted and per-row epic both paint in `muted` ink now, the dedicated ANSI
+epic hue having moved to being the detail panel's own field alone.
+
+Hover lifts a row's background and replaces its own lower hairline with a
+2px lane-hue underline (A2-S7, A2-C5); because
+[[crates/scribe-client/src/beads_board.rs#ledger_row]] gives every row but a
+lane's last visible one that hairline as its own bottom edge rather than its
+neighbour's top one, there is no doubled rule to suppress on the row below a
+hover. A drag in flight still marks its hovered lane's left edge —
+[[crates/scribe-client/src/beads_board.rs#accepts_drop]] keeps Backlog and
+Blocked muted and every other queue in its own hue — through
+[[crates/scribe-client/src/beads_board.rs#drag_target_edge]], though the
+pointer-to-lane geometry behind it is still the five-equal-lanes math
+scribe-zwtv.9 owns updating for A2's unequal tracks.
+
+The strip terminates in [[crates/scribe-client/src/beads_board.rs#floor]], a
+3px bar with a centred 34×1px grip (A2-G9) painted where the resize hitbox
+[[crates/scribe-client/src/main.rs#TerminalView#render_beads_boards]] already
+overlays, so the grip a reader sees and the bar a drag actually grabs cannot
+drift apart. The text-size steppers moved off that top-right corner into the
+left gutter A2-R1's narrow-region policy already reserves
+([[crates/scribe-client/src/beads_board.rs#text_size_controls]], A2-G2):
+two borderless glyphs, quiet at rest and lifting to title ink on hover
+(A2-C8), rather than two bordered boxes.
+
+[[crates/scribe-client/src/beads_board.rs#ledger_row]] gives the whole
+normal row hitbox a zero-delay GPUI tooltip, so its title, metadata, and padding
+all reveal the same complete title. The row records its painted bounds and
 [[crates/scribe-client/src/beads_board.rs#BeadsCardTooltip]] anchors a
-480px-bounded wrapping view immediately above them, centred on the card's own
-width (`Anchor::BottomCenter` at the card bounds' horizontal centre) and
-clamped inside the viewport. A left-aligned popup over a card far narrower
+480px-bounded wrapping view immediately above them, centred on the row's own
+width (`Anchor::BottomCenter` at the row bounds' horizontal centre) and
+clamped inside the viewport. A left-aligned popup over a row far narrower
 than its own reveal read as belonging to whichever neighbour it drifted
-over instead of the card it was hovering. Its opaque background and ink come
+over instead of the row it was hovering. Its opaque background and ink come
 from the live board palette. The native drag
 ghost renders separately, and GPUI suppresses the source tooltip while a drag is
-active, so lifting a card never creates a second reveal beside the ghost.
-The ID drops the project prefix that every card on one board repeats, keeping
+active, so lifting a row never creates a second reveal beside the ghost.
+The ID drops the project prefix that every row on one board repeats, keeping
 the tail after the last `-` — or the whole ID when there is no tail to keep,
 half an ID being worse than a long one. The epic name is cut to 24 characters at a
 word boundary — space, hyphen, underscore, or slash, so a slug-style name
@@ -1592,22 +1598,21 @@ breaks as readably as a sentence one — and only when that boundary leaves at
 least half the budget, one near the start throwing away more than it saves. The
 cap was measured against every epic in the Beads projects on one machine: a
 median name is one word and 21 characters, so half are untouched while the cap
-trims a tail that runs to 72. The epic wears the one ANSI hue no queue or
-priority has claimed — which the heat scale moved, since taking yellow for P2
-left the epic and a priority wearing the same colour on one card — pulled most
-of the way to muted so it stays quiet beside the ID. It is plain text there:
-the mock's diamond, a tinted tag, and a rule beneath it were each tried in
-front of the name, and none of them said anything the hue was not already
-saying.
+trims a tail that runs to 72. `colors.epic` — the one ANSI hue no queue or
+priority has claimed, which the heat scale moved since taking yellow for P2
+would have left the epic and a priority sharing a colour, pulled most of the
+way to muted — is now the detail panel's own field alone: a board row's epic,
+hoisted or per-row, paints in `muted` instead (A2-C4), one tier brighter than
+the row's `quiet` age.
 
 Both are click-to-copy, and both copy in full — the ID with its prefix and the
-epic with everything past its cut — even though the card shows each shortened: what
+epic with everything past its cut — even though the row shows each shortened: what
 lands on the clipboard is what another tool would be given, and a shortened ID
 is not one anything else accepts. A
 board is built by a free function with no reach into the window's clipboard
 handle, so the click parks the text on the same shared state that already
 carries hover and pin intent, and the view lifts it on the next frame through
-the copy surface every other copy in the client goes through. Blockers are not listed: the lane the card sits in
+the copy surface every other copy in the client goes through. Blockers are not listed: the lane the row sits in
 already says the issue is blocked, and the line cost more than it carried. The
 board has no
 header of its own, so a stale or failed refresh no longer shows a status line
@@ -1621,13 +1626,12 @@ pending set rather than being pruned by the reconcile that runs before its
 region appears, and is handed over once so unpinning it is not undone on the
 next frame.
 
-Two small buttons in the strip's top right step the board's text size, plus on
-the left and minus on its right, in tenths between 0.8 and 1.6 of the designed
-size. The setting is one per window
-rather than per board, and lives only as long as the window. The strip's outer
-height never moves with it — a pinned board reserved exactly that much from its
-region — so larger text takes its space from the lane bodies and the terminal
-below is untouched.
+The text-size setting steps in tenths between 0.8 and 1.6 of the designed
+size, one per window rather than per board, and lives only as long as the
+window. The strip's outer height never moves with it — a pinned board
+reserved exactly that much from its region — so larger text takes its space
+from the row count [[crates/scribe-client/src/beads_board_a2.rs#visible_row_count]]
+fits and the terminal below is untouched.
 
 The one thing that does move that outer height is a drag of the board's bottom
 bar, which is a resize grip with a divider's four-pixel tolerance either side.

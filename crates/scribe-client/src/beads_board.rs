@@ -6,9 +6,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{
     Anchor, AnyElement, Bounds, Context, DragMoveEvent, FontWeight, MouseButton, Pixels, Point,
     Render, Rgba, Role, SharedString, Window, anchored, div, linear_color_stop, linear_gradient,
-    point, prelude::*, px, uniform_list,
+    point, prelude::*, px,
 };
 
+use crate::beads_board_a2::{
+    self, A2Input, QueueLane, RailState, RowView, VoidCopy, compact_relative_age, count_to_f32,
+    queue_name,
+};
 use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow};
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
@@ -744,9 +748,14 @@ impl BeadsBoards {
         }
     }
 
-    /// The shortest board that still shows a lane head with one issue under it.
+    /// The shortest board that still shows the headband with one whole row
+    /// under it (A2-G1, A2-G4).
     fn min_height(&self) -> f32 {
-        Metrics { scale: self.text_scale(), height: 0.0 }.min_height()
+        let scale = self.text_scale();
+        beads_board_a2::HEADBAND_H
+            + beads_board_a2::LANES_PADDING_BOTTOM
+            + beads_board_a2::FLOOR_H
+            + beads_board_a2::ROW_H * scale
     }
 
     /// Whether `workspace_id`'s board is pinned open.
@@ -1147,9 +1156,16 @@ pub struct BeadsBoardColors {
     pub queue_name: Rgba,
     pub queue_name_active: Rgba,
     pub muted: Rgba,
+    /// A2's darkest named text role (A2-C1): age, void copy, and an empty
+    /// tab's count sit here, one step below `muted`.
+    pub quiet: Rgba,
     pub hairline: Rgba,
     pub chevron: Rgba,
     pub button_hover: Rgba,
+    /// The A2 floor's own wash and its centred resize grip (A2-C8):
+    /// distinct from `band`'s "subtle lift" because the grip has to read a
+    /// step brighter than the floor it sits on.
+    pub grip: Rgba,
     pub epic: Rgba,
     pub backlog_state: Rgba,
     pub ready_state: Rgba,
@@ -1271,11 +1287,20 @@ impl BeadsBoardColors {
             queue_name: mix(text, muted, 0.35),
             queue_name_active: text,
             muted,
+            // A2's fourth, darkest step: age, void copy, and an empty
+            // tab's own count sit below `muted` the same way `muted` sits
+            // below `queue_name` (A2-C1, A2-C4).
+            quiet: anywhere(mix(muted, ground, 0.3)),
             hairline,
             // Marks rather than text, so they clear the lower floor a
             // non-text element needs.
             chevron: readable(muted, ink, MARK_CONTRAST),
             button_hover: alpha(text, 0.08),
+            // The floor's own resize grip has to read a step brighter than
+            // the floor wash it sits on, so it takes a stronger lift than
+            // `band`'s "subtle lift" while staying in the same family
+            // (A2-C8).
+            grip: tint(0.17),
             // An epic is a grouping label, not another muted field: it
             // takes the one ANSI hue no queue or priority has claimed, pulled
             // most of the way to muted so it stays quiet beside the id.
@@ -1330,13 +1355,6 @@ impl BeadsBoardColors {
             // dot's own glow instead of as another mark beside it.
             agent_halo: alpha(progress_state, 0.2),
         }
-    }
-
-    /// A queue's colour as words rather than as a mark: the totals sit on the
-    /// board's own ground, so they clear the floor a reader needs, not the
-    /// lower one a dot gets away with.
-    fn count_ink(&self, state: Rgba) -> Rgba {
-        readable(state, Rgba { a: 1.0, ..self.ground }, BODY_CONTRAST)
     }
 
     /// Lift a queue state from mark contrast to body-text contrast on a panel.
@@ -1413,27 +1431,40 @@ const BRIGHT_CYAN: usize = 14;
 const WHITE: Rgba = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
-const LANE_HEAD_HEIGHT: f32 = 36.0;
+/// The drag ghost's own geometry (`CardDragGhost::new`, `card_drag_lane`):
+/// the raised-card sizing scribe-zwtv.9 still owns until it redraws the
+/// ghost and drop targets for A2's unequal tracks.
 const LANES_SIDE_PADDING: f32 = 8.0;
 const LANE_CARD_PADDING: f32 = 8.0;
 const LANE_BODY_RIGHT_PADDING: f32 = 4.0;
-/// One issue's share of a lane: the card itself, then the gap that separates it
-/// from the next.
 const ISSUE_HEIGHT: f32 = 50.0;
 const CARD_GAP: f32 = 4.0;
 const CARD_RADIUS: f32 = 4.0;
-const RAIL_TOP: f32 = 17.0;
-/// Where the text-size controls sit in the strip's top right, and how wide
-/// they run: two square buttons with a gap between them.
-const SCALE_BUTTON: f32 = 15.0;
-const SCALE_CONTROLS_RIGHT: f32 = 6.0;
-const SCALE_CONTROLS_GAP: f32 = 3.0;
-/// The rail's own right inset. It stops a clear gap short of the controls
-/// rather than running under them, which is what the extra eight pixels are.
-const RAIL_RIGHT: f32 = SCALE_CONTROLS_RIGHT + 2.0 * SCALE_BUTTON + SCALE_CONTROLS_GAP + 8.0;
-const QUEUE_LINE_HEIGHT: f32 = 20.0;
-const LANES_BOTTOM_PAD: f32 = 7.0;
-const CHEVRON_GUTTER: f32 = 3.0;
+
+/// The borderless text-size steppers' own left-gutter geometry (A2-G2),
+/// mirrored from `a2a3-contract.json`'s `geometry.a2.zoom_*` block.
+const ZOOM_LEFT: f32 = 8.0;
+const ZOOM_TOP: f32 = 5.0;
+const ZOOM_GLYPH_W: f32 = 12.0;
+const ZOOM_GLYPH_H: f32 = 17.0;
+const ZOOM_GAP: f32 = 1.0;
+
+/// A lane's overflow cue (A2-G9: "Overflow chevron is 10px at right
+/// 1px/bottom 0").
+const CHEV_SIZE: f32 = 10.0;
+const CHEV_RIGHT: f32 = 1.0;
+const CHEV_BOTTOM: f32 = 0.0;
+
+/// The strip's own bottom resize grip (A2-G9: "Floor is 3px with a centred
+/// 34×1px grip at top 1px").
+const FLOOR_GRIP_W: f32 = 34.0;
+const FLOOR_GRIP_H: f32 = 1.0;
+const FLOOR_GRIP_TOP: f32 = 1.0;
+
+/// Where a row's sub line indents to under the title, and where the void
+/// copy that replaces an empty lane's rows starts too (A2-S5's
+/// title-aligned void copy): the priority column plus its gap to the title.
+const ROW_TITLE_INDENT: f32 = beads_board_a2::ROW_PRIORITY_W + beads_board_a2::ROW_PRIORITY_GAP;
 
 /// How much colour each rank's badge carries, as a mean channel distance from
 /// the card it sits on. P0 through P4.
@@ -1461,39 +1492,22 @@ const TEXT_SCALE_STEP: f32 = 0.1;
 const MIN_TEXT_SCALE_STEPS: i8 = -2;
 const MAX_TEXT_SCALE_STEPS: i8 = 6;
 
-/// Every board size at the current text scale, inside a strip of `height`.
+/// The text scale every board word and the drag ghost paint at.
 ///
-/// The strip's outer height moves only when the bottom bar is dragged — a
-/// pinned board reserved exactly that much from its region — so growing the
-/// text takes the space out of the lane bodies rather than out of the terminal
-/// below.
+/// A2's own row height and track widths come straight from
+/// [`beads_board_a2::layout`] instead: only the repeating row unit scales
+/// there (A2-G1, A2-G10), while the structural rail geometry this type still
+/// covers -- the ghost's card sizing, and the handful of small row-internal
+/// paddings paint code scales for legibility -- stays a plain factor on one
+/// designed pixel value.
 #[derive(Clone, Copy)]
 struct Metrics {
     scale: f32,
-    height: f32,
 }
 
 impl Metrics {
     fn at(self, designed: f32) -> gpui::Pixels {
         px(designed * self.scale)
-    }
-
-    fn head(self) -> f32 {
-        LANE_HEAD_HEIGHT * self.scale
-    }
-
-    fn body(self) -> f32 {
-        (self.height - self.head() - LANES_BOTTOM_PAD - 1.0).max(0.0)
-    }
-
-    /// The strip height at which the body is exactly one issue row, which is
-    /// as short as a resize may take the board.
-    fn min_height(self) -> f32 {
-        self.head() + ISSUE_HEIGHT * self.scale + CHEVRON_GUTTER + LANES_BOTTOM_PAD + 1.0
-    }
-
-    fn issues(self) -> f32 {
-        (self.body() - CHEVRON_GUTTER).max(0.0)
     }
 }
 
@@ -1511,6 +1525,10 @@ pub struct BeadsBoardRender {
     pub workspace_id: WorkspaceId,
     /// Hovered lane copied from the caller's existing board-store guard.
     pub drag_target: Option<u8>,
+    /// Blocked and Done's collapsed-lane state, read under the caller's
+    /// existing board-store guard: whether the A2 layout gives each a
+    /// pinned lane's track or a plain rail tab (A2-S1, A2-S3).
+    pub rail: RailState,
     /// Text scale shared by every board in this window.
     pub scale: f32,
     /// The live theme's board palette.
@@ -1529,29 +1547,10 @@ pub struct BeadsBoardRender {
     pub flow: Option<FlowStripSnapshot>,
 }
 
-/// One queue's column, as the mock lays it out.
-struct Lane<'a> {
-    index: u8,
-    name: &'static str,
-    /// What this queue says when it holds nothing. Written per queue because
-    /// an empty one means something different in each: no work waiting, none
-    /// picked up, nothing held back, nothing finished yet.
-    empty: &'static str,
-    total: u32,
-    items: &'a [BeadsBoardItem],
-    /// This queue's items off a later snapshot: the lane body is virtualised,
-    /// and its visible rows are built at layout time from the shared state
-    /// rather than from the borrow the build frame held.
-    queue: fn(&BeadsBoardSnapshot) -> &[BeadsBoardItem],
-    /// The queue's colour, worn by its node and the rail beneath it.
-    state: Rgba,
-    /// In progress is the lane the eye should land on.
-    accent: LaneAccent,
-}
-
-/// Shared stores lane builders need after the snapshot borrow ends.
+/// Shared stores lane and row builders need after the snapshot borrow ends.
 #[derive(Clone, Copy)]
 struct BoardStores<'a> {
+    workspace_id: WorkspaceId,
     boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     rect: Rect,
@@ -1627,12 +1626,6 @@ impl Render for BeadsCardDragGhost {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum LaneAccent {
-    None,
-    Progress,
-}
-
 /// Paint the compact live overview over the top of its own region.
 pub fn render(
     workspace_name: &str,
@@ -1646,19 +1639,74 @@ pub fn render(
         panel_state,
         workspace_id,
         drag_target,
+        rail,
         scale,
         colors,
         flow_controls,
         flow,
     } = wiring;
     let colors = &colors;
-    // The rect is the strip the region gave the board, already clamped to what
-    // that region has: painting to it rather than to a height of its own is
-    // what keeps a dragged board from hanging past its own terminal.
-    let metrics = Metrics { scale, height: rect.height };
+    let metrics = Metrics { scale };
     let (snapshot, status) = board_content(state);
-    let drag_move = std::sync::Arc::clone(&hover_state);
-    let board = div()
+    let board = board_shell(workspace_name, workspace_id, rect, colors, &hover_state);
+    // Flow replaces the lanes inside the same strip: the reservation, the
+    // resize grip and the text-size controls all stay where the board put
+    // them, so returning to lanes cannot move the furniture around it.
+    if let Some(strip) = flow_strip(FlowStrip {
+        wheel_state: &hover_state,
+        flow,
+        workspace_id,
+        rect,
+        scale,
+        colors,
+        controls: &flow_controls,
+    }) {
+        return lift(board.child(strip).child(floor(colors)), overlay);
+    }
+    let board = match snapshot {
+        Some(snapshot) => board.child(lanes(
+            snapshot,
+            BoardStores {
+                workspace_id,
+                boards: &hover_state,
+                panels: &panel_state,
+                rect,
+                drag_target,
+            },
+            colors,
+            metrics,
+            rail,
+        )),
+        // The mock draws no empty, loading, or unavailable state, so those keep
+        // the one line of copy the board has always shown for them.
+        None => board.child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(metrics.at(12.0))
+                .text_color(colors.muted)
+                .child(status),
+        ),
+    };
+    lift(board.child(floor(colors)), overlay)
+}
+
+/// The board's own root: positioned over the strip the region gave it --
+/// painting to that rect rather than to a height of its own is what keeps a
+/// dragged board from hanging past its own terminal -- with the headband and
+/// text-size steppers already on it, since both stay put whether the strip
+/// goes on to paint lanes or Flow.
+fn board_shell(
+    workspace_name: &str,
+    workspace_id: WorkspaceId,
+    rect: Rect,
+    colors: &BeadsBoardColors,
+    hover_state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+) -> gpui::Stateful<gpui::Div> {
+    let drag_move = std::sync::Arc::clone(hover_state);
+    div()
         .id(SharedString::from(format!("beads-board-{workspace_id}")))
         .aria_label(format!("{workspace_name} Beads overview"))
         .absolute()
@@ -1679,50 +1727,53 @@ pub fn render(
             }
         })
         .on_hover({
-            let hover_state = std::sync::Arc::clone(&hover_state);
+            let hover_state = std::sync::Arc::clone(hover_state);
             move |hovered: &bool, _window, _app| {
                 if let Ok(mut boards) = hover_state.lock() {
                     boards.hover(workspace_id, HoverSource::Board, *hovered);
                 }
             }
         })
-        .child(text_size_controls(&hover_state, workspace_id, colors));
-    // Flow replaces the lanes inside the same strip: the reservation, the
-    // resize grip and the text-size controls all stay where the board put
-    // them, so returning to lanes cannot move the furniture around it.
-    if let Some(strip) = flow_strip(FlowStrip {
-        wheel_state: &hover_state,
-        flow,
-        workspace_id,
-        rect,
-        scale,
-        colors,
-        controls: &flow_controls,
-    }) {
-        return lift(board.child(strip), overlay);
-    }
-    let board = match snapshot {
-        Some(snapshot) => board.child(lanes(
-            snapshot,
-            workspace_id,
-            BoardStores { boards: &hover_state, panels: &panel_state, rect, drag_target },
-            colors,
-            metrics,
-        )),
-        // The mock draws no empty, loading, or unavailable state, so those keep
-        // the one line of copy the board has always shown for them.
-        None => board.child(
+        // One hairline across the whole strip groups the five lane heads into
+        // a single row instead of five floating labels (A2-G3); each lane's
+        // own seam beneath it then carries that boundary's queue hue.
+        .child(headband(colors))
+        .child(text_size_controls(hover_state, workspace_id, colors))
+}
+
+/// The hairline that groups the five lane heads into one row (A2-G3).
+fn headband(colors: &BeadsBoardColors) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(beads_board_a2::HEADBAND_H))
+        .h(px(1.0))
+        .bg(colors.hairline)
+        .into_any_element()
+}
+
+/// The strip's own bottom resize grip: a 3px floor with a centred 34×1px
+/// grip mark (A2-G9).
+fn floor(colors: &BeadsBoardColors) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(beads_board_a2::FLOOR_H))
+        .flex()
+        .justify_center()
+        .bg(colors.band)
+        .child(
             div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(metrics.at(12.0))
-                .text_color(colors.muted)
-                .child(status),
-        ),
-    };
-    lift(board, overlay)
+                .mt(px(FLOOR_GRIP_TOP))
+                .flex_none()
+                .w(px(FLOOR_GRIP_W))
+                .h(px(FLOOR_GRIP_H))
+                .bg(colors.grip),
+        )
+        .into_any_element()
 }
 
 /// A hovered board floats over live panes and needs the lift to read as
@@ -1819,10 +1870,9 @@ pub struct FlowStripSnapshot {
     pub live_issue_ids: HashSet<String>,
 }
 
-/// The board's own text-size control, parked in the strip's top right corner.
-///
-/// Sized and coloured from the board's tokens rather than the chrome's, and
-/// opaque so it breaks the rail behind it the way a queue line does.
+/// The board's own text-size control, in the strip's left gutter (A2-G2):
+/// two borderless glyphs on the head's own line rather than two boxed
+/// buttons in the top right corner.
 fn text_size_controls(
     state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     workspace_id: WorkspaceId,
@@ -1830,11 +1880,10 @@ fn text_size_controls(
 ) -> AnyElement {
     div()
         .absolute()
-        .right(px(SCALE_CONTROLS_RIGHT))
-        .top(px(7.0))
+        .left(px(ZOOM_LEFT))
+        .top(px(ZOOM_TOP))
         .flex()
-        .gap(px(SCALE_CONTROLS_GAP))
-        .bg(colors.ground)
+        .gap(px(ZOOM_GAP))
         .child(scale_button(state, workspace_id, colors, ScaleStep::Larger))
         .child(scale_button(state, workspace_id, colors, ScaleStep::Smaller))
         .into_any_element()
@@ -1887,20 +1936,18 @@ fn scale_button(
         .id(SharedString::from(format!("beads-text-{}-{workspace_id}", step.key())))
         .role(Role::Button)
         .aria_label(step.label())
-        .size(px(SCALE_BUTTON))
+        .w(px(ZOOM_GLYPH_W))
+        .h(px(ZOOM_GLYPH_H))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(3.0))
-        .bg(colors.ground)
-        .border_1()
-        .border_color(colors.hairline)
-        .font_family("monospace")
-        .text_size(px(10.0))
-        .line_height(px(10.0))
-        .text_color(colors.muted)
+        .font_family("sans-serif")
+        .text_size(px(11.0))
+        .line_height(px(ZOOM_GLYPH_H))
+        // Quiet at rest, lifting to title ink on hover/focus (A2-C8).
+        .text_color(colors.quiet)
         .cursor_pointer()
-        .hover(|button| button.bg(colors.button_hover).text_color(colors.title))
+        .hover(|button| button.text_color(colors.title))
         .on_hover({
             let state = std::sync::Arc::clone(&state);
             move |hovered: &bool, _window, _app| {
@@ -1922,306 +1969,363 @@ fn scale_button(
         .into_any_element()
 }
 
+/// Everything a lane, tab, or row needs beyond its own [`QueueLane`]: where
+/// to paint (the board's shared stores and colours) and the two facts
+/// [`beads_board_a2::layout`] resolves once per strip -- the scaled row
+/// height, how many whole rows a lane's body reserves, and "now", for every
+/// row's relative age.
+#[derive(Clone, Copy)]
+struct LaneCtx<'a> {
+    stores: BoardStores<'a>,
+    colors: &'a BeadsBoardColors,
+    metrics: Metrics,
+    row_height: f32,
+    visible_rows: usize,
+    now_epoch_s: i64,
+}
+
+/// Paint A2: a unified hairline header (painted by the caller, see
+/// [`headband`]) over five adaptive queue tracks, ending in the shared
+/// floor. Reads every number from [`beads_board_a2::layout`] rather than
+/// recomputing geometry here.
 fn lanes(
     snapshot: &BeadsBoardSnapshot,
-    workspace_id: WorkspaceId,
     stores: BoardStores<'_>,
     colors: &BeadsBoardColors,
     metrics: Metrics,
+    rail: RailState,
 ) -> AnyElement {
-    let specs = [
-        Lane {
-            index: 0,
-            name: "Backlog",
-            empty: "Empty",
-            total: snapshot.backlog_total,
-            items: &snapshot.backlog,
-            queue: |board| &board.backlog,
-            state: colors.backlog_state,
-            accent: LaneAccent::None,
-        },
-        Lane {
-            index: 1,
-            name: "Ready",
-            empty: "None ready",
-            total: snapshot.ready_total,
-            items: &snapshot.ready,
-            queue: |board| &board.ready,
-            state: colors.ready_state,
-            accent: LaneAccent::None,
-        },
-        Lane {
-            index: 2,
-            name: "In progress",
-            empty: "Idle",
-            total: snapshot.in_progress_total,
-            items: &snapshot.in_progress,
-            queue: |board| &board.in_progress,
-            state: colors.progress_state,
-            accent: LaneAccent::Progress,
-        },
-        Lane {
-            index: 3,
-            name: "Blocked",
-            empty: "Clear",
-            total: snapshot.blocked_total,
-            items: &snapshot.blocked,
-            queue: |board| &board.blocked,
-            state: colors.blocked_state,
-            accent: LaneAccent::None,
-        },
-        Lane {
-            index: 4,
-            name: "Done",
-            empty: "None yet",
-            total: snapshot.done_total,
-            items: &snapshot.done,
-            queue: |board| &board.done,
-            state: colors.done_state,
-            accent: LaneAccent::None,
-        },
-    ];
+    let now_epoch_s = i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs()),
+    )
+    .unwrap_or(i64::MAX);
+    let layout = beads_board_a2::layout(A2Input {
+        snapshot,
+        rail,
+        board_width: stores.rect.width,
+        board_height: stores.rect.height,
+        text_scale: metrics.scale,
+    });
+    let ctx = LaneCtx {
+        stores,
+        colors,
+        metrics,
+        row_height: layout.row_height,
+        visible_rows: layout.visible_rows,
+        now_epoch_s,
+    };
     div()
         .relative()
         .h_full()
         .flex()
-        .px(px(LANES_SIDE_PADDING))
-        .pb(px(7.0))
-        .child(rail(colors, metrics))
-        .children(specs.iter().map(|spec| lane(spec, workspace_id, stores, colors, metrics)))
+        .pt(px(beads_board_a2::LANES_PADDING_TOP))
+        .pr(px(beads_board_a2::LANES_PADDING_RIGHT))
+        .pb(px(beads_board_a2::LANES_PADDING_BOTTOM))
+        .pl(px(beads_board_a2::LANES_PADDING_LEFT))
+        .gap(px(beads_board_a2::TRACK_GAP))
+        .child(queue_column(&layout.backlog, None, 0, colors.backlog_state, ctx))
+        .child(queue_column(&layout.ready, None, 1, colors.ready_state, ctx))
+        .child(queue_column(&layout.in_progress, None, 2, colors.progress_state, ctx))
+        .child(queue_column(&layout.blocked, Some(rail.blocked), 3, colors.blocked_state, ctx))
+        .child(queue_column(&layout.done, Some(rail.done), 4, colors.done_state, ctx))
         .into_any_element()
 }
 
-/// The thread running behind the queue nodes, tinted by the lanes it passes.
-///
-/// The mock's five-stop gradient becomes four two-stop segments because that is
-/// what [`gpui::linear_gradient`] carries; the stops land in the same places.
-fn rail(colors: &BeadsBoardColors, metrics: Metrics) -> AnyElement {
-    let cyan = colors.ready_state;
-    let indigo = colors.progress_state;
-    let coral = colors.blocked_state;
+/// One rail track: a full ledger lane for Backlog/Ready/In progress and for
+/// a pinned Blocked/Done, or a plain collapsed tab for an unpinned
+/// Blocked/Done (A2-S1). `collapsed` is `None` for the three queues that are
+/// never collapsible. The hover-drawer, pin control, and hot-tab styling a
+/// collapsed tab gains under pointer/keyboard attention are scribe-zwtv.8's;
+/// this is the tab's own full-strength idle state, which A2-S1 already makes
+/// normative here.
+fn queue_column(
+    lane: &QueueLane<'_>,
+    collapsed: Option<CollapsedLaneState>,
+    lane_index: u8,
+    state_color: Rgba,
+    ctx: LaneCtx<'_>,
+) -> AnyElement {
+    // A drag in flight marks its hovered lane's left edge: the queue's own
+    // hue for a lane that accepts the drop, muted for one that never writes
+    // (A2-BD6). The pointer-to-lane geometry behind `drag_target` is still
+    // the old five-equal-lanes math scribe-zwtv.9 owns updating for A2's
+    // unequal tracks; this only re-paints the edge the index already named.
+    let target_edge = (ctx.stores.drag_target == Some(lane_index))
+        .then(|| if accepts_drop(lane_index) { state_color } else { ctx.colors.muted });
+    if matches!(collapsed, Some(CollapsedLaneState::Tab | CollapsedLaneState::Open)) {
+        collapsed_tab(lane, state_color, ctx.colors, target_edge)
+    } else {
+        ledger_lane(lane, lane_index, state_color, ctx, target_edge)
+    }
+}
+
+/// Whether `lane_index`'s queue ever accepts a card drop (A2-BD6): Backlog
+/// and Blocked never write, so their drag-target edge stays muted the way a
+/// rejected target does.
+fn accepts_drop(lane_index: u8) -> bool {
+    !matches!(lane_index, 0 | 3)
+}
+
+/// A full A2 lane: head, seam, and either whole rows or void copy, with the
+/// board's own overflow cue when the queue holds more than it shows
+/// (A2-S1, A2-S5, A2-S6).
+fn ledger_lane(
+    lane: &QueueLane<'_>,
+    lane_index: u8,
+    state_color: Rgba,
+    ctx: LaneCtx<'_>,
+    target_edge: Option<Rgba>,
+) -> AnyElement {
     div()
-        .absolute()
-        .left(px(24.0))
-        .right(px(RAIL_RIGHT))
-        .top(metrics.at(RAIL_TOP))
-        .h(px(1.0))
-        .bg(colors.hairline)
+        .flex_none()
+        .w(px(lane.width))
+        .min_w(px(0.0))
+        .relative()
         .flex()
-        .child(rail_segment(fade(cyan), alpha(cyan, 0.41)))
-        .child(rail_segment(alpha(cyan, 0.41), alpha(indigo, 0.53)))
-        .child(rail_segment(alpha(indigo, 0.53), alpha(coral, 0.41)))
-        .child(rail_segment(alpha(coral, 0.41), fade(coral)))
+        .flex_col()
+        .child(lane_head(lane, state_color, ctx.colors))
+        .child(lane_seam(state_color, lane.void.is_some()))
+        .child(lane_body(lane, lane_index, state_color, ctx))
+        .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
+        .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
         .into_any_element()
 }
 
-fn rail_segment(from: Rgba, to: Rgba) -> AnyElement {
+/// The left-edge mark a lane or tab wears while it is the drag in flight's
+/// hovered target.
+fn drag_target_edge(color: Rgba) -> AnyElement {
+    div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(color).into_any_element()
+}
+
+/// The lane head: a queue-tinted uppercase label beside its muted count, and
+/// a common epic hoisted to the far right when every visible row shares one
+/// (A2-G6, A2-C2).
+fn lane_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColors) -> AnyElement {
+    let void = lane.void.is_some();
+    // Header labels mix 40% queue hue toward chrome ink; empty labels use the
+    // 32% muted treatment instead (A2-C2).
+    let name_color = if void {
+        mix(state_color, colors.muted, 0.68)
+    } else {
+        mix(state_color, colors.title, 0.6)
+    };
+    let count_color = if void { colors.muted } else { colors.queue_name };
     div()
-        .flex_1()
-        .h_full()
+        .flex_none()
+        .h(px(beads_board_a2::HEAD_H))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(9.5))
+                .line_height(px(beads_board_a2::HEAD_H))
+                .font_weight(FontWeight(700.0))
+                .text_color(name_color)
+                .child(queue_name(lane.queue).to_uppercase()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_family("monospace")
+                .text_size(px(11.0))
+                .line_height(px(beads_board_a2::HEAD_H))
+                .font_weight(FontWeight(600.0))
+                .text_color(count_color)
+                .child(lane.total.to_string()),
+        )
+        .children(lane.epic.as_deref().map(|name| {
+            div()
+                .ml_auto()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(9.5))
+                .line_height(px(14.0))
+                .text_color(colors.muted)
+                .child(name.to_owned())
+        }))
+        .into_any_element()
+}
+
+/// A lane's 2px state seam: full queue hue fading to 12% of itself, or 34%
+/// fading to 9% for an empty lane (A2-C5).
+fn lane_seam(state_color: Rgba, void: bool) -> AnyElement {
+    let (from, to) = if void {
+        (alpha(state_color, 0.34), alpha(state_color, 0.09))
+    } else {
+        (state_color, alpha(state_color, 0.12))
+    };
+    div()
+        .flex_none()
+        .h(px(beads_board_a2::SEAM_H))
         .bg(linear_gradient(90.0, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
         .into_any_element()
 }
 
-fn lane(
-    spec: &Lane<'_>,
-    workspace_id: WorkspaceId,
-    stores: BoardStores<'_>,
-    colors: &BeadsBoardColors,
-    metrics: Metrics,
-) -> AnyElement {
-    let target = stores.drag_target == Some(spec.index);
-    let target_border = if matches!(spec.index, 0 | 3) { colors.muted } else { spec.state };
-    div()
-        .flex_1()
-        .min_w(px(0.0))
-        .relative()
-        .px(px(LANE_CARD_PADDING))
-        .when(target, |lane| {
-            lane.child(div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(target_border))
-        })
-        .child(lane_head(spec, colors, metrics))
-        .child(lane_body(spec, workspace_id, stores, colors, metrics))
-        .into_any_element()
-}
-
-fn lane_head(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> AnyElement {
-    let name_color = if spec.accent == LaneAccent::Progress {
-        colors.queue_name_active
-    } else {
-        colors.queue_name
-    };
-    // The count wears its queue's own colour, lifted to carry words rather
-    // than to be a mark: it sits on the board's ground with nothing behind it.
-    let count_ink = colors.count_ink(spec.state);
-    div()
-        .relative()
-        .h(px(metrics.head()))
-        .flex()
-        .items_start()
-        .px(px(4.0))
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .size(metrics.at(9.0))
-                .mt(metrics.at(13.0))
-                .rounded_full()
-                .bg(spec.state)
-                .border_2()
-                .border_color(colors.ground)
-                .child(
-                    div()
-                        .absolute()
-                        .left(metrics.at(2.0))
-                        .top(metrics.at(7.0))
-                        .w(px(1.0))
-                        .h(metrics.at(14.0))
-                        .bg(alpha(spec.state, 0.45)),
-                ),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .mt(metrics.at(7.0))
-                // The gap to the node is padding, not margin: the patch has to
-                // start where the node ends, or the rail shows through between
-                // the two and reads as a line joining a dot to a word.
-                .pl(metrics.at(11.0))
-                .pr(px(6.0))
-                .flex()
-                // Both children share one line box and centre in it. Baseline
-                // alignment left the smaller count sitting low.
-                .items_center()
-                .gap(px(6.0))
-                // Opaque, so the queue line breaks the rail rather than
-                // sitting on top of it.
-                .bg(colors.ground)
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.at(12.0))
-                        .line_height(metrics.at(QUEUE_LINE_HEIGHT))
-                        .font_weight(FontWeight(650.0))
-                        .text_color(name_color)
-                        .child(spec.name),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family("monospace")
-                        .text_size(metrics.at(10.0))
-                        .line_height(metrics.at(13.0))
-                        .font_weight(FontWeight(600.0))
-                        .text_color(count_ink)
-                        .child(spec.total.to_string()),
-                ),
-        )
-        .into_any_element()
-}
-
+/// The lane's fixed-height row box (A2-G4, A2-G10): always tall enough for
+/// [`LaneCtx::visible_rows`] whole rows, whether this queue's own rows fill
+/// it or a shorter list leaves ground beneath, so every lane's floor lines
+/// up regardless of how many rows it actually holds.
 fn lane_body(
-    spec: &Lane<'_>,
-    workspace_id: WorkspaceId,
-    stores: BoardStores<'_>,
-    colors: &BeadsBoardColors,
-    metrics: Metrics,
+    lane: &QueueLane<'_>,
+    lane_index: u8,
+    state_color: Rgba,
+    ctx: LaneCtx<'_>,
 ) -> AnyElement {
-    if spec.items.is_empty() {
-        return div()
-            .relative()
-            .h(px(metrics.body()))
-            .child(empty_lane(spec, colors, metrics))
-            .into_any_element();
+    let height = ctx.row_height * count_to_f32(ctx.visible_rows);
+    let body = div().flex_none().h(px(height)).overflow_hidden().flex().flex_col();
+    if let Some(void) = &lane.void {
+        return body.child(void_copy(void, ctx.colors, ctx.metrics)).into_any_element();
     }
-    // Virtualised: a full queue is 200 rows and only ~3 are visible, so the
-    // closure builds cards for the range uniform_list asks for and no more.
-    // It runs at layout time, after the build frame's borrow of the snapshot
-    // is gone, so it re-reads this queue from the shared state; an index that
-    // outlives its snapshot resolves to nothing rather than to a stale card.
-    let queue = spec.queue;
-    let closure_state = std::sync::Arc::clone(stores.boards);
-    let closure_panels = std::sync::Arc::clone(stores.panels);
-    let closure_colors = *colors;
-    let lane_index = spec.index;
-    let board_rect = stores.rect;
-    div()
-        .relative()
-        .h(px(metrics.body()))
-        .child(
-            uniform_list(
-                SharedString::from(format!("beads-lane-{workspace_id}-{}", spec.name)),
-                spec.items.len(),
-                move |range, _window, _app| {
-                    let Ok(boards) = closure_state.lock() else { return Vec::new() };
-                    let (snapshot, _) = board_content(boards.state(workspace_id));
-                    let Some(snapshot) = snapshot else { return Vec::new() };
-                    let items = queue(snapshot);
-                    range
-                        .filter_map(|index| items.get(index))
-                        .map(|item| {
-                            // The row is the uniform unit, the card's gap and
-                            // all: uniform_list measures an item's taffy size,
-                            // which a margin is outside of, so the gap rides
-                            // inside a fixed-height row as padding instead.
-                            div().h(metrics.at(ISSUE_HEIGHT)).pb(metrics.at(CARD_GAP)).child(issue(
-                                item,
-                                CardContext {
-                                    workspace_id,
-                                    state: &closure_state,
-                                    panels: &closure_panels,
-                                    lane: lane_index,
-                                    board_rect,
-                                    colors: &closure_colors,
-                                    metrics,
-                                },
-                            ))
-                        })
-                        .collect()
-                },
-            )
-            .h(px(metrics.issues()))
-            .pr(px(LANE_BODY_RIGHT_PADDING)),
+    let last = lane.rows.len().saturating_sub(1);
+    body.children(lane.rows.iter().enumerate().map(|(index, row)| {
+        let card = CardContext {
+            workspace_id: ctx.stores.workspace_id,
+            state: ctx.stores.boards,
+            panels: ctx.stores.panels,
+            lane: lane_index,
+            board_rect: ctx.stores.rect,
+            colors: ctx.colors,
+            metrics: ctx.metrics,
+        };
+        ledger_row(
+            row,
+            RowMeta {
+                state_color,
+                show_separator: index < last,
+                row_height: ctx.row_height,
+                now_epoch_s: ctx.now_epoch_s,
+            },
+            card,
         )
+    }))
+    .into_any_element()
+}
+
+/// Queue-specific empty-lane copy, aligned under where a row's title would
+/// start; Ready's subordinate blocked-count hint prints as its own line
+/// beneath the headline (A2-S5).
+fn void_copy(void: &VoidCopy, colors: &BeadsBoardColors, metrics: Metrics) -> AnyElement {
+    div()
+        .pl(metrics.at(ROW_TITLE_INDENT))
+        .pt(metrics.at(3.0))
+        .flex()
+        .flex_col()
         .child(
             div()
-                .absolute()
-                .right(px(2.0))
-                .bottom(px(1.0))
-                .text_size(metrics.at(9.0))
-                .line_height(metrics.at(9.0))
-                .text_color(colors.chevron)
-                .child("⌄"),
+                .text_size(metrics.at(9.5))
+                .line_height(metrics.at(16.0))
+                .text_color(colors.quiet)
+                .child(void.headline),
         )
+        .children(void.subordinate.as_deref().map(|subordinate| {
+            div()
+                .font_family("monospace")
+                .text_size(metrics.at(9.5))
+                .line_height(metrics.at(15.0))
+                .font_weight(FontWeight(500.0))
+                .text_color(colors.quiet)
+                .child(subordinate.to_owned())
+        }))
         .into_any_element()
 }
 
-/// What an empty queue says, in the slot its first card would have taken.
-///
-/// A dashed ghost of a card rather than a bare word: an empty column with a
-/// heading floating over nothing reads as content that failed to arrive, and
-/// the outline is what says the queue itself is the empty thing.
-fn empty_lane(spec: &Lane<'_>, colors: &BeadsBoardColors, metrics: Metrics) -> AnyElement {
+/// The board's own `⌄` mark: a lane holds more rows than its fixed body
+/// shows (A2-G9, A2-S6).
+fn overflow_chevron(colors: &BeadsBoardColors) -> AnyElement {
     div()
-        .h(metrics.at(ISSUE_HEIGHT - CARD_GAP))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(CARD_RADIUS))
-        .border_1()
-        .border_dashed()
-        .border_color(alpha(spec.state, 0.3))
-        .text_size(metrics.at(9.5))
-        .line_height(metrics.at(12.0))
-        .text_color(colors.muted)
-        .child(spec.empty)
+        .absolute()
+        .right(px(CHEV_RIGHT))
+        .bottom(px(CHEV_BOTTOM))
+        .text_size(px(CHEV_SIZE))
+        .line_height(px(CHEV_SIZE))
+        .text_color(colors.quiet)
+        .child("⌄")
         .into_any_element()
 }
 
-/// One issue as a raised card: a gradient fill under a hairline, with the
-/// title's own line above its metadata.
-fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
+/// An unpinned Blocked/Done rail tab's idle, full-strength state (A2-S1): its
+/// count and one glyph per line -- GPUI has no text-rotation primitive, so a
+/// stacked spine is the only vertical label it can paint. The hover-opens/
+/// click-pins drawer and the hot inner edge scribe-zwtv.8 layers on this are
+/// not painted here.
+fn collapsed_tab(
+    lane: &QueueLane<'_>,
+    state_color: Rgba,
+    colors: &BeadsBoardColors,
+    target_edge: Option<Rgba>,
+) -> AnyElement {
+    let void = lane.void.is_some();
+    let spine_color = if void { colors.quiet } else { mix(state_color, colors.title, 0.6) };
+    let count_color = if void { colors.quiet } else { colors.queue_name };
+    let (seam_from, seam_to) = if void {
+        (alpha(state_color, 0.34), alpha(state_color, 0.09))
+    } else {
+        (state_color, alpha(state_color, 0.12))
+    };
+    let spine = queue_name(lane.queue).to_uppercase();
+    div()
+        .relative()
+        .flex_none()
+        .w(px(lane.width))
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(
+            div()
+                .flex_none()
+                .h(px(beads_board_a2::HEAD_H))
+                .flex()
+                .items_center()
+                .font_family("monospace")
+                .text_size(px(11.0))
+                .text_color(count_color)
+                .child(lane.total.to_string()),
+        )
+        .child(div().flex_none().w_full().h(px(beads_board_a2::SEAM_H)).bg(linear_gradient(
+            90.0,
+            linear_color_stop(seam_from, 0.0),
+            linear_color_stop(seam_to, 1.0),
+        )))
+        .child(
+            div().flex_1().flex().flex_col().items_center().justify_center().gap(px(1.0)).children(
+                spine.chars().map(move |glyph| {
+                    div()
+                        .text_size(px(9.5))
+                        .line_height(px(10.5))
+                        .font_weight(FontWeight(700.0))
+                        .text_color(spine_color)
+                        .child(glyph.to_string())
+                }),
+            ),
+        )
+        .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
+        .into_any_element()
+}
+
+/// One visible row's own paint facts, separate from [`CardContext`] because
+/// they come from the lane's [`QueueLane`]/position rather than the board's
+/// shared stores.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    state_color: Rgba,
+    /// Whether this row owns the hairline under it: every row but a lane's
+    /// last visible one. Hover replaces this same edge with a 2px lane-hue
+    /// underline regardless, so only the separator itself is conditional
+    /// (A2-S7).
+    show_separator: bool,
+    row_height: f32,
+    now_epoch_s: i64,
+}
+
+/// One 51px ledger row: a saturated priority glyph, the title, and a
+/// three-column sub line, opening the issue exactly as the raised card it
+/// replaces did (A2-G4, A2-G5, A2-C3).
+fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyElement {
+    let RowMeta { state_color, show_separator, row_height, now_epoch_s } = meta;
     let CardContext { workspace_id, state, panels, lane, board_rect, colors, metrics } = card;
+    let item = row.item;
     let panels = std::sync::Arc::clone(panels);
     let selected = item.clone();
     let dragged = item.clone();
@@ -2231,22 +2335,26 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
     let draggable = card_drag_source(lane);
     let drag_source = item.clone();
     let drag_colors = *colors;
+    let mark = colors.priority(item.priority);
     let tooltip_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
     let measured_tooltip_bounds = std::rc::Rc::clone(&tooltip_bounds);
-    let card_element = div()
+    let row_element = div()
         .on_children_prepainted(move |children, _window, _app| {
             measured_tooltip_bounds.set(children.first().copied());
         })
-        .id(SharedString::from(format!("beads-card-{workspace_id}-{}", item.id)))
+        .id(SharedString::from(format!("beads-row-{workspace_id}-{}", item.id)))
         .role(Role::Button)
         .aria_label(format!("Open issue {}", item.id))
-        .h(metrics.at(ISSUE_HEIGHT - CARD_GAP))
-        .flex_none()
         .relative()
-        .overflow_hidden()
-        .rounded(px(CARD_RADIUS))
-        .map(|surface| card_relief(surface, colors))
+        .flex_none()
+        .h(px(row_height))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(metrics.at(beads_board_a2::ROW_INTERLINE_GAP))
         .cursor_pointer()
+        .when(show_separator, |el| el.border_b_2().border_color(colors.hairline))
+        .hover(|el| el.bg(colors.button_hover).border_b_2().border_color(state_color))
         .on_mouse_down(MouseButton::Left, move |event, _window, app| {
             if let Ok(mut boards) = arm_state.lock() {
                 let pointer = card_drag_point(event.position);
@@ -2265,8 +2373,8 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
             }
             window.refresh();
         });
-    let card_element = if draggable {
-        card_element.on_drag(BeadsCardDrag, move |_, _, window, app| {
+    let row_element = if draggable {
+        row_element.on_drag(BeadsCardDrag, move |_, _, window, app| {
             let ghost = start_state
                 .lock()
                 .map_or(None, |mut boards| {
@@ -2280,44 +2388,129 @@ fn issue(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
             app.new(move |_| BeadsCardDragGhost { model: ghost, colors: drag_colors, metrics })
         })
     } else {
-        card_element
+        row_element
     };
     with_card_title_tooltip(
-        card_element,
+        row_element,
         item.title.clone(),
         tooltip_bounds,
         colors,
         metrics.at(12.0),
     )
-    .child(card_contents(item, card, colors.priority_mark(item.priority)))
+    .child(row_title_line(item, mark, colors, metrics))
+    .child(row_sub_line(row, now_epoch_s, card))
     .into_any_element()
 }
 
-/// A card's border and its lit top edge, at rest and under the pointer.
-///
-/// Top light is the card's whole relief over the flat board ground.
-fn card_relief(
-    surface: gpui::Stateful<gpui::Div>,
+/// The row's top line: a 20px saturated priority glyph -- the row's only
+/// saturated ink -- then the title (A2-G5, A2-C3).
+fn row_title_line(
+    item: &BeadsBoardItem,
+    mark: Rgba,
     colors: &BeadsBoardColors,
-) -> gpui::Stateful<gpui::Div> {
-    surface
-        .border_1()
-        .border_color(colors.card_border)
-        .bg(linear_gradient(
-            180.0,
-            linear_color_stop(colors.card_top, 0.0),
-            linear_color_stop(colors.card, 1.0),
-        ))
-        .hover(|raised| {
-            raised
-                .bg(linear_gradient(
-                    180.0,
-                    linear_color_stop(colors.card_hover_top, 0.0),
-                    linear_color_stop(colors.card_hover, 1.0),
-                ))
-                .border_color(colors.card_border_hover)
-                .shadow_xs()
-        })
+    metrics: Metrics,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .h(metrics.at(beads_board_a2::ROW_TITLE_H))
+        .flex()
+        .gap(metrics.at(beads_board_a2::ROW_PRIORITY_GAP))
+        .child(
+            div()
+                .flex_none()
+                .w(metrics.at(beads_board_a2::ROW_PRIORITY_W))
+                .font_family("monospace")
+                .text_size(metrics.at(9.5))
+                .line_height(metrics.at(beads_board_a2::ROW_TITLE_H))
+                .font_weight(FontWeight(700.0))
+                .text_color(mark)
+                .child(format!("P{}", item.priority)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(metrics.at(12.0))
+                .line_height(metrics.at(beads_board_a2::ROW_TITLE_H))
+                .font_weight(FontWeight(600.0))
+                .text_color(colors.title)
+                .child(item.title.clone()),
+        )
+        .into_any_element()
+}
+
+/// The row's sub line: ID left (copyable), age at the row's true centre, and
+/// an optional epic right with at least [`beads_board_a2::EPIC_SEPARATION_MIN`]
+/// clearance -- three independent slots, so the age never moves with
+/// whether a row carries an epic (A2-G5).
+fn row_sub_line(row: &RowView<'_>, now_epoch_s: i64, card: CardContext<'_>) -> AnyElement {
+    let CardContext { workspace_id, state, colors, metrics, .. } = card;
+    let item = row.item;
+    div()
+        .flex_none()
+        .h(metrics.at(beads_board_a2::ROW_SUB_H))
+        .pl(metrics.at(ROW_TITLE_INDENT))
+        .flex()
+        .items_center()
+        .child(
+            div().flex_1().min_w(px(0.0)).child(copyable(
+                CopyTarget {
+                    key: format!("beads-id-{workspace_id}-{}", item.id),
+                    label: format!("Copy issue {}", item.id),
+                    text: item.id.clone(),
+                    shown: short_id(&item.id).to_owned(),
+                    state,
+                },
+                div()
+                    .flex_none()
+                    .font_family("monospace")
+                    .text_size(metrics.at(9.5))
+                    .line_height(metrics.at(beads_board_a2::ROW_SUB_H))
+                    .font_weight(FontWeight(500.0))
+                    .text_color(colors.muted),
+                colors,
+            )),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_family("monospace")
+                .text_size(metrics.at(9.5))
+                .line_height(metrics.at(beads_board_a2::ROW_SUB_H))
+                .font_weight(FontWeight(500.0))
+                .text_color(colors.quiet)
+                .children(compact_relative_age(&item.updated_at, now_epoch_s)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .pl(metrics.at(beads_board_a2::EPIC_SEPARATION_MIN))
+                .flex()
+                .justify_end()
+                .children(row.epic.as_deref().zip(item.parent_epic_name.as_deref()).map(
+                    |(shown, full)| {
+                        copyable(
+                            CopyTarget {
+                                key: format!("beads-epic-{workspace_id}-{}", item.id),
+                                label: format!("Copy epic {full}"),
+                                text: full.to_owned(),
+                                shown: shown.to_owned(),
+                                state,
+                            },
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(metrics.at(9.5))
+                                .line_height(metrics.at(beads_board_a2::ROW_SUB_H))
+                                .text_color(colors.muted),
+                            colors,
+                        )
+                    },
+                )),
+        )
+        .into_any_element()
 }
 
 fn with_card_title_tooltip(
@@ -2333,19 +2526,6 @@ fn with_card_title_tooltip(
         cx.new(|_| BeadsCardTooltip { title: title.clone(), anchor, colors, text_size }).into()
     })
     .tooltip_show_delay(Duration::ZERO)
-}
-
-fn card_contents(item: &BeadsBoardItem, card: CardContext<'_>, mark: PriorityMark) -> gpui::Div {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .gap(px(2.0))
-        .pt(px(CARD_PAD_TOP))
-        .px(px(8.0))
-        .pb(px(6.0))
-        .child(issue_title(item, mark, card.colors, card.metrics))
-        .child(issue_meta(item, card))
 }
 
 /// The priority badge and the title, which owns the rest of its line: the
@@ -2422,40 +2602,6 @@ fn drag_ghost_meta(
                 .text_color(colors.epic)
                 .child(short_epic(name))
         }))
-        .into_any_element()
-}
-
-/// The id at the left of the card's second line and the epic at its right.
-fn issue_meta(item: &BeadsBoardItem, card: CardContext<'_>) -> AnyElement {
-    let CardContext { workspace_id, state, colors, metrics, .. } = card;
-    div()
-        .h(metrics.at(12.0))
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .overflow_hidden()
-        .child(copyable(
-            CopyTarget {
-                key: format!("beads-id-{workspace_id}-{}", item.id),
-                label: format!("Copy issue {}", item.id),
-                text: item.id.clone(),
-                shown: short_id(&item.id).to_owned(),
-                state,
-            },
-            div()
-                .flex_none()
-                .font_family("monospace")
-                .text_size(metrics.at(9.0))
-                .line_height(metrics.at(12.0))
-                .font_weight(FontWeight(500.0))
-                .text_color(colors.muted),
-            colors,
-        ))
-        // The slack sits here, between the two, rather than being left to
-        // justify-content: a grown container fills its row and then has
-        // nothing to justify, which reads as left-aligned.
-        .child(div().flex_1().min_w(px(0.0)))
-        .children(item.parent_epic_name.as_ref().map(|name| epic_label(name, &item.id, card)))
         .into_any_element()
 }
 
@@ -2548,44 +2694,6 @@ pub(crate) fn short_id(id: &str) -> &str {
     id.rsplit_once('-').map_or(id, |(_, tail)| if tail.is_empty() { id } else { tail })
 }
 
-/// The epic a card belongs to, on the right of the id's line.
-///
-/// Plain text in its own hue: the mock's diamond, a tinted tag, and a rule
-/// beneath it were each tried in front of the name, and none of them said
-/// anything the hue was not already saying.
-fn epic_label(name: &str, issue_id: &str, card: CardContext<'_>) -> AnyElement {
-    let CardContext { workspace_id, state, colors, metrics, .. } = card;
-    div()
-        // Sized by its own content, so the spacer before it decides where it
-        // sits: the row's right edge.
-        .min_w(px(0.0))
-        // Held off the id, which the slack alone cannot guarantee once a long
-        // name has eaten it: the two read as one string when they meet.
-        .ml(px(8.0))
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .child(copyable(
-            CopyTarget {
-                key: format!("beads-epic-{workspace_id}-{issue_id}"),
-                label: format!("Copy epic {name}"),
-                // Copied in full, shown as its topic: the whole name is
-                // what another tool would be given.
-                text: name.to_owned(),
-                shown: short_epic(name),
-                state,
-            },
-            div()
-                .truncate()
-                .text_right()
-                .text_size(metrics.at(9.0))
-                .line_height(metrics.at(12.0))
-                .text_color(colors.epic),
-            colors,
-        ))
-        .into_any_element()
-}
-
 fn board_content(state: Option<&BeadsBoardState>) -> (Option<&BeadsBoardSnapshot>, String) {
     match state {
         Some(BeadsBoardState::Ready { snapshot, .. }) => (Some(snapshot), String::new()),
@@ -2670,10 +2778,6 @@ fn slot(color: [f32; 4]) -> Rgba {
 
 fn alpha(color: Rgba, a: f32) -> Rgba {
     Rgba { a, ..color }
-}
-
-fn fade(color: Rgba) -> Rgba {
-    alpha(color, 0.0)
 }
 #[cfg(test)]
 mod tests {
@@ -3101,7 +3205,10 @@ mod tests {
         // caller says the region can spare.
         assert!(boards.resize_to(-1000.0, 600.0));
         let floor = boards.height(left);
-        assert!(floor > LANE_HEAD_HEIGHT && floor < BEADS_BOARD_HEIGHT, "collapsed to {floor}");
+        assert!(
+            floor > beads_board_a2::HEADBAND_H && floor < BEADS_BOARD_HEIGHT,
+            "collapsed to {floor}"
+        );
         boards.resize_to(4000.0, 240.0);
         assert!((boards.height(left) - 240.0).abs() < 0.001);
         // Even a region with nothing to spare keeps the board readable.
@@ -3195,6 +3302,7 @@ mod tests {
             ("queue name", colors.queue_name),
             ("queue name active", colors.queue_name_active),
             ("muted", colors.muted),
+            ("quiet", colors.quiet),
             ("P0", colors.priorities[0]),
             ("P1", colors.priorities[1]),
             ("P2", colors.priorities[2]),
@@ -3209,9 +3317,9 @@ mod tests {
                 assert!(ratio >= BODY_CONTRAST - 0.01, "{name} reads at {ratio:.2}:1 on {under}");
             }
         }
-        // A queue's colour is a mark on the rail and a word in the head, and
-        // the two floors are not the same: the total is lifted again for the
-        // one it has to clear as text.
+        // A2's lane label mixes a queue's colour 40% toward the title ink
+        // (A2-C2): a mark pulled that far toward text still has to read as
+        // text once it lands there.
         for (name, color) in [
             ("backlog", colors.backlog_state),
             ("ready", colors.ready_state),
@@ -3219,8 +3327,8 @@ mod tests {
             ("blocked", colors.blocked_state),
             ("done", colors.done_state),
         ] {
-            let ratio = contrast(colors.count_ink(color), ink);
-            assert!(ratio >= BODY_CONTRAST - 0.01, "the {name} total reads at {ratio:.2}:1");
+            let ratio = contrast(mix(color, colors.title, 0.6), ink);
+            assert!(ratio >= BODY_CONTRAST - 0.01, "the {name} lane label reads at {ratio:.2}:1");
         }
         for (name, color) in [
             ("chevron", colors.chevron),
@@ -3289,6 +3397,7 @@ mod tests {
                 ("dimmed wire", colors.wire_dimmed),
                 ("progress track", colors.progress_track),
                 ("chip border", colors.chip_border),
+                ("grip", colors.grip),
             ] {
                 assert!(away(color) > 0.0, "{slot_name} is invisible on the {name} theme");
             }

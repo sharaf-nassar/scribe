@@ -34,6 +34,7 @@ use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
     BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
 };
+use scribe_client::beads_board_a2::RailState;
 use scribe_client::beads_flow::FlowNodeControl;
 use scribe_client::beads_panel::{
     self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels, PanelWriteIntent,
@@ -10122,6 +10123,20 @@ impl TerminalView {
                     cx,
                 )?;
                 let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
+                let rail = RailState {
+                    blocked: boards
+                        .collapsed_lane_state(
+                            *workspace_id,
+                            scribe_common::protocol::BeadsIssueQueue::Blocked,
+                        )
+                        .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
+                    done: boards
+                        .collapsed_lane_state(
+                            *workspace_id,
+                            scribe_common::protocol::BeadsIssueQueue::Done,
+                        )
+                        .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
+                };
                 Some((
                     scribe_client::beads_board::render(
                         &name,
@@ -10133,6 +10148,7 @@ impl TerminalView {
                             panel_state: Arc::clone(&self.shared.beads_panels),
                             workspace_id: *workspace_id,
                             drag_target: boards.drag_target(*workspace_id),
+                            rail,
                             scale,
                             colors,
                             flow_controls: self
