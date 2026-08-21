@@ -1,8 +1,21 @@
 ---
 title: Find overlay opens at the window corner instead of the focused pane
 date: 2026-08-18
+last_updated: 2026-08-21
 component: scribe-client (search.rs, main.rs), GPUI layout
-tags: [gpui, overlay, absolute, positioning-ancestor, panes, find, mount-point]
+tags:
+  [
+    gpui,
+    overlay,
+    absolute,
+    positioning-ancestor,
+    panes,
+    find,
+    mount-point,
+    flexbox,
+    min-width,
+    overflow,
+  ]
 problem_type: bug
 ---
 
@@ -93,6 +106,57 @@ positioning it after the fact.
 A surface that resolves its *data* per pane (`active_session`,
 `placement.focused`) and its *geometry* per window is the smell. Those two
 should agree.
+
+## Follow-up: the narrow-pane floor left behind here was the wrong knob
+
+The `min_w(200)` floor above was filed as ponytail debt (`scribe-cu7f`) with
+the upgrade note "widen the floor if a narrower split turns out to matter".
+Triaging that debt on 2026-08-21 measured the geometry with
+`VisualTestContext::debug_bounds` and found the note points the wrong way.
+
+The box is `w(360) max_w(360) min_w(200)` under a `justify_end` parent
+(`crates/scribe-client/src/search.rs:629-638`). `min_w` is what blocks
+flex-shrink, so below a 214px pane (200 + the 14px right margin) the box's
+left edge goes negative:
+
+```
+pane 120 -> box left  -94.0  width 200.0
+pane 200 -> box left  -14.0  width 200.0
+pane 214 -> box left    0.0  width 200.0
+pane 374 -> box left    0.0  width 360.0
+```
+
+That is one gesture away, not a corner: `layout.rs:175` sets
+`MIN_RATIO = 0.1` with no pixel floor, so a divider dragged to the clamp on a
+1200px window leaves a 120px pane.
+
+Both obvious moves on the floor make things worse. Widening it pushes the left
+edge further negative. Setting it to `0` lets the box shrink correctly — but
+the row's `flex_none` children (the 50px counter plus three 22px controls plus
+gaps, roughly 170px that cannot shrink) then spill out the box's *right* side,
+so the controls get clipped instead of the query text. The floor was never the
+knob; the overflow *direction* is. What holds is `min_w(px(0.0))` plus
+`.overflow_hidden()` plus `.justify_end()` on the box, with `.min_w(px(0.0))`
+on the flexible query child — overflow then leaves from the start edge and the
+controls are the last thing to go. Measured good down to an 80px pane. Filed as
+`scribe-kx46`; unlanded as of this writing.
+
+Two things generalise. First, in flexbox a fixed `min-width` on a
+right-anchored box does not "floor" it gracefully — it converts a shrink into
+an overflow, and under a clipping ancestor an overflow is invisible rather
+than ugly, so it never shows up in the single-pane fixture. Second, a
+`ponytail:` note that names an upgrade path is a hypothesis, not a finding: it
+is written at land time by someone who did not measure the failure mode. Treat
+the trigger as real and the prescription as unverified, and measure before
+following it.
+
+For the geometry half, `debug_bounds` is the tool: tag the element with
+`.debug_selector(|| "…".to_owned())` (gpui compiles it to a no-op in release,
+`gpui/src/elements/div.rs:810-822`) and read the rect back in a headless
+`gpui::test`. A hit-test proxy is not a substitute — clicking a point near the
+pane's left edge cannot tell "box overflows past 0" from "box fits exactly at
+0", and that ambiguity sent this triage down a wrong path for one iteration
+before the bounds read settled it.
 
 For the fixture half of this, see
 `docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md`: a
