@@ -120,7 +120,7 @@ and `scribe-zwtv.18` performs the final independent audit.
 | A2-R2 | If a pinned lane would starve the three active lanes, it auto-collapses without deleting its persisted preference; it restores when the region again fits. | `scribe-zwtv.10` | Resize down/up and restart functional matrix. |
 | A2-R3 | Text scale remains 0.8–1.6 per window; track allocation and whole-row count recompute without changing the stored board height. | `scribe-zwtv.10` | Visual 0.8/1.0/1.6 matrix. |
 | A2-L1 | Hover/focus drawer state is per workspace and transient. Pinned collapsed lane is per workspace, persisted, exclusive, and cleared only by the lifetime rules above. | `scribe-zwtv.5` | State restore/cleanup tests. |
-| A2-L2 | Lane scroll, board pin, board height, and lane pin survive A2→A3→A2 unchanged; separate regions never share them. | `scribe-zwtv.10` | Two-region round-trip and restart functional run. |
+| A2-L2 | Board pin, board height, and lane pin survive A2→A3→A2 unchanged; separate regions never share them. | `scribe-zwtv.10` | Two-region round-trip and restart functional run. |
 
 ### A2 real-`bd` outcomes
 
@@ -188,7 +188,7 @@ and `scribe-zwtv.18` performs the final independent audit.
 | A3-L1 | Pending entry exists only until matching reply, exit, workspace loss, `NotDetected`, capability loss, or window close; late replies cannot reopen Flow. | `scribe-zwtv.14` | Out-of-order/reconnect functional tests. |
 | A3-L2 | Graph, layout, cursor, scroll, and trace live only for the current window/open. Exit clears them; reopening requests a fresh complete graph. | `scribe-zwtv.14` | Exit/reopen request-count oracle. |
 | A3-L3 | Liveness is session-scoped and window-local. It clears when focus changes, state clears, session ends, or owner disconnects; two live sessions on one issue keep the halo until both clear. | `scribe-zwtv.11` | Hook/session lifecycle unit and functional matrix. |
-| A3-L4 | Board pin, board height, A2 lane scroll, A2 lane pin, and text scale are outside Flow and survive its round trip. Flow mode itself does not survive window restart. | `scribe-zwtv.10` | Restart and A2→A3→A2 restore run. |
+| A3-L4 | Board pin, board height, A2 lane pin, and text scale are outside Flow and survive its round trip. Flow mode itself does not survive window restart. | `scribe-zwtv.10` | Restart and A2→A3→A2 restore run. |
 
 ### A3 real-`bd` and protocol outcomes
 
