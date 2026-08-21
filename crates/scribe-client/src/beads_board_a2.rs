@@ -43,6 +43,17 @@ pub const ROW_PRIORITY_GAP: f32 = 6.0;
 pub const EPIC_SEPARATION_MIN: f32 = 12.0;
 /// A collapsed Blocked/Done rail tab's fixed width (A2-G7).
 pub const TAB_W: f32 = 36.0;
+/// The hover/focus drawer's own bounds (A2-G8): an overlay laid over the
+/// lanes rather than a track that joins their flex row, so opening it never
+/// reflows them (A2-I1). `top`/`bottom` leave it short of the strip's own
+/// headband and floor; `right` clears the still-visible rail tabs beside it.
+pub const DRAWER_TOP: f32 = 5.0;
+pub const DRAWER_BOTTOM: f32 = 4.0;
+pub const DRAWER_RIGHT: f32 = 96.0;
+pub const DRAWER_W: f32 = 452.0;
+pub const DRAWER_PAD_H: f32 = 13.0;
+pub const DRAWER_BORDER_W: f32 = 1.0;
+pub const DRAWER_RADIUS: f32 = 3.0;
 /// One lane head's own height (A2-G3).
 pub const HEAD_H: f32 = 17.0;
 /// A lane head's state seam (A2-G3).
@@ -892,7 +903,8 @@ mod tests {
         use serde::Deserialize;
 
         use super::{
-            BEADS_BOARD_HEIGHT, EPIC_SEPARATION_MIN, FLOOR_H, HEAD_H, HEADBAND_H,
+            BEADS_BOARD_HEIGHT, DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H, DRAWER_RADIUS,
+            DRAWER_RIGHT, DRAWER_TOP, DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_H, HEAD_H, HEADBAND_H,
             LANES_PADDING_BOTTOM, LANES_PADDING_LEFT, LANES_PADDING_RIGHT, LANES_PADDING_TOP,
             ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP, ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H,
             SEAM_H, TAB_W, TRACK_GAP, visible_row_count,
@@ -931,6 +943,13 @@ mod tests {
             tab_w: f32,
             epic_separation_min: f32,
             floor_h: f32,
+            drawer_top: f32,
+            drawer_bottom: f32,
+            drawer_right: f32,
+            drawer_w: f32,
+            drawer_pad_h: f32,
+            drawer_border_w: f32,
+            drawer_radius: f32,
         }
 
         /// `assert_eq!` on two `f32`s trips `clippy::float_cmp`; every field
@@ -968,6 +987,13 @@ mod tests {
             assert_matches("tab_w", a2.tab_w, TAB_W);
             assert_matches("epic_separation_min", a2.epic_separation_min, EPIC_SEPARATION_MIN);
             assert_matches("floor_h", a2.floor_h, FLOOR_H);
+            assert_matches("drawer_top", a2.drawer_top, DRAWER_TOP);
+            assert_matches("drawer_bottom", a2.drawer_bottom, DRAWER_BOTTOM);
+            assert_matches("drawer_right", a2.drawer_right, DRAWER_RIGHT);
+            assert_matches("drawer_w", a2.drawer_w, DRAWER_W);
+            assert_matches("drawer_pad_h", a2.drawer_pad_h, DRAWER_PAD_H);
+            assert_matches("drawer_border_w", a2.drawer_border_w, DRAWER_BORDER_W);
+            assert_matches("drawer_radius", a2.drawer_radius, DRAWER_RADIUS);
             assert_eq!(a2.body_rows, 3);
             assert_eq!(
                 visible_row_count(a2.strip_h, 1.0),

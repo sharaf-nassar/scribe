@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Anchor, AnyElement, Bounds, Context, DragMoveEvent, FontWeight, MouseButton, Pixels, Point,
-    Render, Rgba, Role, SharedString, Window, anchored, div, linear_color_stop, linear_gradient,
-    point, prelude::*, px,
+    Anchor, AnyElement, Bounds, Context, DragMoveEvent, FocusHandle, FontWeight, KeyDownEvent,
+    MouseButton, Pixels, Point, Render, Rgba, Role, SharedString, Window, anchored, div,
+    linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 use crate::beads_board_a2::{
@@ -970,6 +970,25 @@ impl BeadsBoards {
         true
     }
 
+    /// Close every workspace's open transient collapsed-lane drawer, the way
+    /// a bare Escape does (specs/028's "Escape closes only a transient
+    /// drawer" closed decision) when no more specific target -- a workspace,
+    /// a queue -- is available to a window-wide keystroke. A pinned lane is
+    /// never in `lane_hovered`, so this can never unpin one. Returns whether
+    /// anything closed.
+    pub fn close_any_lane_drawer(&mut self) -> bool {
+        let open: Vec<(WorkspaceId, BeadsIssueQueue)> = self
+            .lane_hovered
+            .iter()
+            .map(|(workspace_id, (queue, _))| (*workspace_id, *queue))
+            .collect();
+        let mut closed = false;
+        for (workspace_id, queue) in open {
+            closed |= self.close_lane_drawer(workspace_id, queue);
+        }
+        closed
+    }
+
     pub fn expire_hover(&mut self) -> bool {
         let now = Instant::now();
         let held_resize = self.resizing();
@@ -1455,6 +1474,16 @@ const CHEV_SIZE: f32 = 10.0;
 const CHEV_RIGHT: f32 = 1.0;
 const CHEV_BOTTOM: f32 = 0.0;
 
+/// A collapsed tab's own `‹` cue (not the lane overflow `‹CHEV_*` marks
+/// above): 11x11px, a 7px gap off the tab's bottom edge, 2px corner radius
+/// for the chip its hot background paints. Not part of the generated machine
+/// contract, the same way `PINNED_LANE_SHARE` in `beads_board_a2` is not:
+/// `gen-contract.py` extracts no `.dr .tab .cue` box geometry, only the
+/// structural CSS it already asserts against.
+const TAB_CUE_SIZE: f32 = 11.0;
+const TAB_CUE_RADIUS: f32 = 2.0;
+const TAB_CUE_MARGIN_BOTTOM: f32 = 7.0;
+
 /// The strip's own bottom resize grip (A2-G9: "Floor is 3px with a centred
 /// 34×1px grip at top 1px").
 const FLOOR_GRIP_W: f32 = 34.0;
@@ -1529,6 +1558,16 @@ pub struct BeadsBoardRender {
     /// existing board-store guard: whether the A2 layout gives each a
     /// pinned lane's track or a plain rail tab (A2-S1, A2-S3).
     pub rail: RailState,
+    /// Stable Tab stops for Blocked's and Done's own collapsible-lane
+    /// control, held by the view across frames the same way
+    /// [`FlowNodeControl::focus`] is: a fresh handle every render would
+    /// reset keyboard focus and Tab order on every repaint. One handle per
+    /// queue serves the tab, its hover/focus-open drawer, *and* the pinned
+    /// lane's own unpin control, since those are one control across three
+    /// paint states rather than three controls (A2-I2's "activating the
+    /// pinned tab or its `×` control unpins it").
+    pub blocked_tab_focus: FocusHandle,
+    pub done_tab_focus: FocusHandle,
     /// Text scale shared by every board in this window.
     pub scale: f32,
     /// The live theme's board palette.
@@ -1640,6 +1679,8 @@ pub fn render(
         workspace_id,
         drag_target,
         rail,
+        blocked_tab_focus,
+        done_tab_focus,
         scale,
         colors,
         flow_controls,
@@ -1675,7 +1716,11 @@ pub fn render(
             },
             colors,
             metrics,
-            rail,
+            RailFocus {
+                rail,
+                blocked_tab_focus: &blocked_tab_focus,
+                done_tab_focus: &done_tab_focus,
+            },
         )),
         // The mock draws no empty, loading, or unavailable state, so those keep
         // the one line of copy the board has always shown for them.
@@ -1970,10 +2015,11 @@ fn scale_button(
 }
 
 /// Everything a lane, tab, or row needs beyond its own [`QueueLane`]: where
-/// to paint (the board's shared stores and colours) and the two facts
+/// to paint (the board's shared stores and colours), the two facts
 /// [`beads_board_a2::layout`] resolves once per strip -- the scaled row
 /// height, how many whole rows a lane's body reserves, and "now", for every
-/// row's relative age.
+/// row's relative age -- and Blocked's/Done's own stable Tab stops, shared
+/// by their tab, drawer, and pinned-lane unpin control alike.
 #[derive(Clone, Copy)]
 struct LaneCtx<'a> {
     stores: BoardStores<'a>,
@@ -1982,6 +2028,35 @@ struct LaneCtx<'a> {
     row_height: f32,
     visible_rows: usize,
     now_epoch_s: i64,
+    blocked_tab_focus: &'a FocusHandle,
+    done_tab_focus: &'a FocusHandle,
+}
+
+impl<'a> LaneCtx<'a> {
+    /// The one stable Tab stop `queue`'s collapsible-lane control keeps
+    /// across every paint state -- tab, hot tab, and pinned-lane unpin
+    /// (A2-I2's "activating the pinned tab or its `×` control unpins it").
+    /// Every caller reaches this through [`collapsible_queue`] or
+    /// [`queue_column`]'s own branch on a collapsed state, both of which
+    /// admit only Blocked or Done -- an equality check rather than an
+    /// exhaustive match so a third queue, though it never reaches here in
+    /// practice, still returns a real handle instead of panicking (the
+    /// workspace denies `clippy::unreachable`).
+    fn tab_focus(&self, queue: BeadsIssueQueue) -> &'a FocusHandle {
+        if queue == BeadsIssueQueue::Done { self.done_tab_focus } else { self.blocked_tab_focus }
+    }
+}
+
+/// [`lanes`]'s own bundle of rail state plus the two stable Tab stops it
+/// carries into [`LaneCtx`]: `RailState` alone cannot hold a GPUI
+/// `FocusHandle` -- `beads_board_a2` stays paint-free by design -- so this is
+/// where the two meet, and folding them into one parameter is what keeps
+/// `lanes` itself under the workspace's five-argument ceiling.
+#[derive(Clone, Copy)]
+struct RailFocus<'a> {
+    rail: RailState,
+    blocked_tab_focus: &'a FocusHandle,
+    done_tab_focus: &'a FocusHandle,
 }
 
 /// Paint A2: a unified hairline header (painted by the caller, see
@@ -1993,8 +2068,9 @@ fn lanes(
     stores: BoardStores<'_>,
     colors: &BeadsBoardColors,
     metrics: Metrics,
-    rail: RailState,
+    rail_focus: RailFocus<'_>,
 ) -> AnyElement {
+    let RailFocus { rail, blocked_tab_focus, done_tab_focus } = rail_focus;
     let now_epoch_s = i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs()),
     )
@@ -2013,6 +2089,18 @@ fn lanes(
         row_height: layout.row_height,
         visible_rows: layout.visible_rows,
         now_epoch_s,
+        blocked_tab_focus,
+        done_tab_focus,
+    };
+    // A2-I1 opens at most one drawer per workspace, so at most one of these
+    // is ever `Some`; the drawer paints after every track (see `lane_drawer`)
+    // so it lays over the lanes as an overlay instead of joining their row.
+    let open_drawer = if rail.blocked == CollapsedLaneState::Open {
+        Some(lane_drawer(&layout.blocked, 3, colors.blocked_state, ctx))
+    } else if rail.done == CollapsedLaneState::Open {
+        Some(lane_drawer(&layout.done, 4, colors.done_state, ctx))
+    } else {
+        None
     };
     div()
         .relative()
@@ -2028,16 +2116,14 @@ fn lanes(
         .child(queue_column(&layout.in_progress, None, 2, colors.progress_state, ctx))
         .child(queue_column(&layout.blocked, Some(rail.blocked), 3, colors.blocked_state, ctx))
         .child(queue_column(&layout.done, Some(rail.done), 4, colors.done_state, ctx))
+        .children(open_drawer)
         .into_any_element()
 }
 
 /// One rail track: a full ledger lane for Backlog/Ready/In progress and for
 /// a pinned Blocked/Done, or a plain collapsed tab for an unpinned
-/// Blocked/Done (A2-S1). `collapsed` is `None` for the three queues that are
-/// never collapsible. The hover-drawer, pin control, and hot-tab styling a
-/// collapsed tab gains under pointer/keyboard attention are scribe-zwtv.8's;
-/// this is the tab's own full-strength idle state, which A2-S1 already makes
-/// normative here.
+/// Blocked/Done (A2-S1, A2-S2). `collapsed` is `None` for the three queues
+/// that are never collapsible.
 fn queue_column(
     lane: &QueueLane<'_>,
     collapsed: Option<CollapsedLaneState>,
@@ -2052,10 +2138,12 @@ fn queue_column(
     // unequal tracks; this only re-paints the edge the index already named.
     let target_edge = (ctx.stores.drag_target == Some(lane_index))
         .then(|| if accepts_drop(lane_index) { state_color } else { ctx.colors.muted });
-    if matches!(collapsed, Some(CollapsedLaneState::Tab | CollapsedLaneState::Open)) {
-        collapsed_tab(lane, state_color, ctx.colors, target_edge)
-    } else {
-        ledger_lane(lane, lane_index, state_color, ctx, target_edge)
+    match collapsed {
+        Some(CollapsedLaneState::Tab) => collapsed_tab(lane, state_color, ctx, false, target_edge),
+        Some(CollapsedLaneState::Open) => collapsed_tab(lane, state_color, ctx, true, target_edge),
+        Some(CollapsedLaneState::Pinned) | None => {
+            ledger_lane(lane, lane_index, state_color, ctx, target_edge)
+        }
     }
 }
 
@@ -2068,7 +2156,9 @@ fn accepts_drop(lane_index: u8) -> bool {
 
 /// A full A2 lane: head, seam, and either whole rows or void copy, with the
 /// board's own overflow cue when the queue holds more than it shows
-/// (A2-S1, A2-S5, A2-S6).
+/// (A2-S1, A2-S3, A2-S5, A2-S6). [`queue_column`] only ever reaches this for
+/// Blocked/Done when that queue is pinned, so [`lane_head`] can infer the
+/// unpin control from `lane.queue` alone rather than a parameter here.
 fn ledger_lane(
     lane: &QueueLane<'_>,
     lane_index: u8,
@@ -2083,8 +2173,8 @@ fn ledger_lane(
         .relative()
         .flex()
         .flex_col()
-        .child(lane_head(lane, state_color, ctx.colors))
-        .child(lane_seam(state_color, lane.void.is_some()))
+        .child(lane_head(lane, state_color, ctx))
+        .child(lane_seam(state_color, lane.void.is_some(), 0.0))
         .child(lane_body(lane, lane_index, state_color, ctx))
         .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
         .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
@@ -2097,10 +2187,16 @@ fn drag_target_edge(color: Rgba) -> AnyElement {
     div().absolute().top_0().bottom_0().left_0().w(px(1.0)).bg(color).into_any_element()
 }
 
-/// The lane head: a queue-tinted uppercase label beside its muted count, and
-/// a common epic hoisted to the far right when every visible row shares one
-/// (A2-G6, A2-C2).
-fn lane_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColors) -> AnyElement {
+/// The lane head: a queue-tinted uppercase label beside its muted count, a
+/// common epic hoisted to the far right when every visible row shares one
+/// (A2-G6, A2-C2), and -- only for a pinned Blocked/Done lane -- the `×`
+/// unpin control that replaces the tab this lane came from (A2-S3). Whether
+/// that control appears is read straight off `lane.queue`: `ledger_lane`
+/// only ever renders Blocked/Done here while pinned, so a collapsible queue
+/// reaching this function is that invariant, not a flag threaded down for it.
+fn lane_head(lane: &QueueLane<'_>, state_color: Rgba, ctx: LaneCtx<'_>) -> AnyElement {
+    let colors = ctx.colors;
+    let unpin_focus = collapsible_queue(lane.queue).then(|| ctx.tab_focus(lane.queue));
     let void = lane.void.is_some();
     // Header labels mix 40% queue hue toward chrome ink; empty labels use the
     // 32% muted treatment instead (A2-C2).
@@ -2135,22 +2231,34 @@ fn lane_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColors)
                 .text_color(count_color)
                 .child(lane.total.to_string()),
         )
-        .children(lane.epic.as_deref().map(|name| {
+        .child(
             div()
                 .ml_auto()
                 .min_w(px(0.0))
-                .truncate()
-                .text_size(px(9.5))
-                .line_height(px(14.0))
-                .text_color(colors.muted)
-                .child(name.to_owned())
-        }))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .children(lane.epic.as_deref().map(|name| {
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(9.5))
+                        .line_height(px(14.0))
+                        .text_color(colors.muted)
+                        .child(name.to_owned())
+                }))
+                .when_some(unpin_focus, |el, focus| el.child(unpin_control(lane, ctx, focus))),
+        )
         .into_any_element()
 }
 
 /// A lane's 2px state seam: full queue hue fading to 12% of itself, or 34%
-/// fading to 9% for an empty lane (A2-C5).
-fn lane_seam(state_color: Rgba, void: bool) -> AnyElement {
+/// fading to 9% for an empty lane (A2-C5). `bleed` extends the seam past its
+/// own horizontal edges by that many pixels each side with a negative
+/// margin, which is how the drawer's seam reaches the drawer's own edges
+/// past its 13px padding (A2-G8) instead of stopping at the padded content
+/// width a plain lane's seam already fills exactly.
+fn lane_seam(state_color: Rgba, void: bool, bleed: f32) -> AnyElement {
     let (from, to) = if void {
         (alpha(state_color, 0.34), alpha(state_color, 0.09))
     } else {
@@ -2158,9 +2266,66 @@ fn lane_seam(state_color: Rgba, void: bool) -> AnyElement {
     };
     div()
         .flex_none()
+        .mx(px(-bleed))
         .h(px(beads_board_a2::SEAM_H))
         .bg(linear_gradient(90.0, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
         .into_any_element()
+}
+
+/// The pinned lane head's `×`: activating it unpins the same way
+/// reactivating the collapsed tab would (A2-I2). Shares `unpin_focus` --
+/// [`BeadsBoardRender::blocked_tab_focus`]/`done_tab_focus` -- with the tab
+/// this lane replaces, so Tab order does not gain or lose a stop when a
+/// lane pins or unpins.
+fn unpin_control(lane: &QueueLane<'_>, ctx: LaneCtx<'_>, focus: &FocusHandle) -> AnyElement {
+    let queue = lane.queue;
+    let workspace_id = ctx.stores.workspace_id;
+    let click_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let key_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let click_focus = focus.clone();
+    let quiet = ctx.colors.quiet;
+    let title = ctx.colors.title;
+    div()
+        .id(SharedString::from(format!("beads-unpin-{workspace_id}-{queue:?}")))
+        .role(Role::Button)
+        .aria_label(unpin_accessible_label(lane))
+        .track_focus(focus)
+        .tab_stop(true)
+        .focus_visible(move |style| style.border_1().border_color(title))
+        .flex_none()
+        .cursor_pointer()
+        .text_size(px(13.0))
+        .line_height(px(beads_board_a2::HEAD_H))
+        .text_color(quiet)
+        .hover(move |el| el.text_color(title))
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, app| {
+            window.focus(&click_focus, app);
+            if let Ok(mut boards) = click_boards.lock() {
+                boards.unpin_lane(workspace_id, queue);
+            }
+            window.refresh();
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, app| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                app.stop_propagation();
+                if let Ok(mut boards) = key_boards.lock() {
+                    boards.unpin_lane(workspace_id, queue);
+                }
+                window.refresh();
+            }
+        })
+        .child("×")
+        .into_any_element()
+}
+
+/// [`unpin_control`]'s accessible name (A2-I3): queue, count, pinned state,
+/// and the unpin action -- the pinned twin of [`tab_accessible_label`].
+fn unpin_accessible_label(lane: &QueueLane<'_>) -> String {
+    format!("Unpin {} lane, {} issues, pinned", queue_name(lane.queue), lane.total)
 }
 
 /// The lane's fixed-height row box (A2-G4, A2-G10): always tall enough for
@@ -2245,62 +2410,320 @@ fn overflow_chevron(colors: &BeadsBoardColors) -> AnyElement {
         .into_any_element()
 }
 
-/// An unpinned Blocked/Done rail tab's idle, full-strength state (A2-S1): its
-/// count and one glyph per line -- GPUI has no text-rotation primitive, so a
-/// stacked spine is the only vertical label it can paint. The hover-opens/
-/// click-pins drawer and the hot inner edge scribe-zwtv.8 layers on this are
-/// not painted here.
+/// A collapsed Blocked/Done rail tab (A2-S1, A2-S2): count, fading state
+/// seam, and a one-glyph-per-line spine -- GPUI has no text-rotation
+/// primitive, so a stacked spine is the only vertical label it can paint --
+/// plus the cue that says a drawer lives here and the hot lift/inner-edge
+/// treatment while its drawer is open. Pointer/keyboard wiring (hover or
+/// focus opens the drawer, click or Enter/Space pins it) is
+/// [`tab_interactivity`]'s.
 fn collapsed_tab(
     lane: &QueueLane<'_>,
     state_color: Rgba,
-    colors: &BeadsBoardColors,
+    ctx: LaneCtx<'_>,
+    hot: bool,
     target_edge: Option<Rgba>,
 ) -> AnyElement {
+    let colors = ctx.colors;
     let void = lane.void.is_some();
-    let spine_color = if void { colors.quiet } else { mix(state_color, colors.title, 0.6) };
-    let count_color = if void { colors.quiet } else { colors.queue_name };
+    let title = colors.title;
+    let spine_color = if hot {
+        title
+    } else if void {
+        colors.quiet
+    } else {
+        mix(state_color, title, 0.6)
+    };
+    let count_color = if hot {
+        title
+    } else if void {
+        colors.quiet
+    } else {
+        colors.queue_name
+    };
+    let cue_color = if hot { title } else { colors.quiet };
+    // A hot cue's chip reads roughly twice as strong as the tab's own hover
+    // lift, the same ratio the mock's `#ffffff1a` chip over a `#ffffff0d` tab
+    // carries (A2-C6).
+    let cue_hot_bg = alpha(title, 0.16);
     let (seam_from, seam_to) = if void {
         (alpha(state_color, 0.34), alpha(state_color, 0.09))
     } else {
         (state_color, alpha(state_color, 0.12))
     };
     let spine = queue_name(lane.queue).to_uppercase();
+
+    tab_interactivity(
+        div().relative().flex_none().w(px(lane.width)).flex().flex_col().items_center(),
+        lane,
+        ctx,
+        hot,
+    )
+    .child(
+        div()
+            .flex_none()
+            .h(px(beads_board_a2::HEAD_H))
+            .flex()
+            .items_center()
+            .font_family("monospace")
+            .text_size(px(11.0))
+            .text_color(count_color)
+            .child(lane.total.to_string()),
+    )
+    .child(div().flex_none().w_full().h(px(beads_board_a2::SEAM_H)).bg(linear_gradient(
+        90.0,
+        linear_color_stop(seam_from, 0.0),
+        linear_color_stop(seam_to, 1.0),
+    )))
+    .child(tab_spine(&spine, spine_color))
+    .child(tab_cue(cue_color, hot, cue_hot_bg))
+    .when(hot, |el| el.child(hot_inner_edge(state_color)))
+    .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
+    .into_any_element()
+}
+
+/// [`collapsed_tab`]'s pointer/keyboard wiring, split out to keep that
+/// function under the workspace's line ceiling: id, AccessKit role/name,
+/// Tab stop and its visible-focus ring, the hover/hot background lift, and
+/// hover-opens/click-or-Enter/Space-pins behaviour, all against the one
+/// stable `ctx.tab_focus` handle this queue's collapsible-lane control keeps
+/// across every paint state (tab, hot tab, and pinned via
+/// [`unpin_control`]), so Tab order never gains or loses a stop when it pins
+/// or unpins. The paired mouse-down/mouse-up stops are the rule scribe-uu2y
+/// established for every new click target.
+fn tab_interactivity(
+    base: gpui::Div,
+    lane: &QueueLane<'_>,
+    ctx: LaneCtx<'_>,
+    hot: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let queue = lane.queue;
+    let workspace_id = ctx.stores.workspace_id;
+    let focus = ctx.tab_focus(queue);
+    let hover_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let click_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let key_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let click_focus = focus.clone();
+    let title = ctx.colors.title;
+    let button_hover = ctx.colors.button_hover;
+    base.id(SharedString::from(format!("beads-tab-{workspace_id}-{queue:?}")))
+        .role(Role::Button)
+        .aria_label(tab_accessible_label(lane))
+        .track_focus(focus)
+        .tab_stop(true)
+        .focus_visible(move |style| style.border_1().border_color(title))
+        .cursor_pointer()
+        .when(hot, |el| el.bg(button_hover))
+        .hover(move |el| el.bg(button_hover))
+        .on_hover(move |entered: &bool, _window, _app| {
+            if let Ok(mut boards) = hover_boards.lock() {
+                boards.hover_lane(workspace_id, queue, LaneHoverSource::Tab, *entered);
+            }
+        })
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, app| {
+            window.focus(&click_focus, app);
+            if let Ok(mut boards) = click_boards.lock() {
+                boards.pin_lane(workspace_id, queue);
+            }
+            window.refresh();
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, app| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                app.stop_propagation();
+                if let Ok(mut boards) = key_boards.lock() {
+                    boards.pin_lane(workspace_id, queue);
+                }
+                window.refresh();
+            }
+        })
+}
+
+/// The tab's vertically centred letterform spine, one glyph per line box
+/// (A2-G7): GPUI has no text-rotation primitive, so this is the only
+/// vertical label it can paint. Each glyph `div` carries neither an id nor a
+/// role, so none is ever reported to AccessKit on its own -- the spine reads
+/// as the tab's one accessible name, never as separate letters.
+fn tab_spine(spine: &str, color: Rgba) -> AnyElement {
     div()
-        .relative()
-        .flex_none()
-        .w(px(lane.width))
+        .flex_1()
         .flex()
         .flex_col()
         .items_center()
+        .justify_center()
+        .gap(px(1.0))
+        .children(spine.chars().map(move |glyph| {
+            div()
+                .text_size(px(9.5))
+                .line_height(px(10.5))
+                .font_weight(FontWeight(700.0))
+                .text_color(color)
+                .child(glyph.to_string())
+        }))
+        .into_any_element()
+}
+
+/// The tab's own `‹` cue: always present, brightening to a lifted chip while
+/// the tab is hot (A2-G7, A2-C6).
+fn tab_cue(color: Rgba, hot: bool, hot_bg: Rgba) -> AnyElement {
+    div()
+        .flex_none()
+        .mb(px(TAB_CUE_MARGIN_BOTTOM))
+        .w(px(TAB_CUE_SIZE))
+        .h(px(TAB_CUE_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(TAB_CUE_RADIUS))
+        .when(hot, |el| el.bg(hot_bg))
+        .text_size(px(11.0))
+        .line_height(px(TAB_CUE_SIZE))
+        .text_color(color)
+        .child("\u{2039}")
+        .into_any_element()
+}
+
+/// A hot tab's 1px queue-hue inner edge (A2-C6): from just under the seam to
+/// the tab's own bottom, so an open tab and the drawer it opened read as one
+/// object rather than two.
+fn hot_inner_edge(color: Rgba) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(beads_board_a2::SEAM_H))
+        .bottom_0()
+        .w(px(1.0))
+        .bg(color)
+        .into_any_element()
+}
+
+/// [`collapsed_tab`]'s accessible name (A2-I3): queue, count, collapsed
+/// state, and what focus/activation do -- read as one queue label, never per
+/// spine glyph, since the individual spine letters carry neither an id nor a
+/// role and so are never reported to AccessKit on their own.
+fn tab_accessible_label(lane: &QueueLane<'_>) -> String {
+    format!(
+        "{} lane, {} issues, collapsed. Focus previews, activate pins",
+        queue_name(lane.queue),
+        lane.total
+    )
+}
+
+/// The transient, non-reflowing drawer a collapsed tab opens on hover or
+/// keyboard focus (A2-S2, A2-G8): the same row geometry a pinned lane uses,
+/// laid over the lanes as an absolute overlay -- painted after every track in
+/// [`lanes`] so it lays over them -- rather than joining their flex row, so
+/// opening it never reflows them (A2-I1). `occlude` keeps a click on the
+/// drawer's own chrome from also landing on whatever lane row it visually
+/// covers; the paired mouse-down/mouse-up stops keep that same click from
+/// reaching the terminal underneath, the rule scribe-uu2y established for
+/// every new click target.
+fn lane_drawer(
+    lane: &QueueLane<'_>,
+    lane_index: u8,
+    state_color: Rgba,
+    ctx: LaneCtx<'_>,
+) -> AnyElement {
+    let queue = lane.queue;
+    let workspace_id = ctx.stores.workspace_id;
+    let hover_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let click_boards = std::sync::Arc::clone(ctx.stores.boards);
+    let click_focus = ctx.tab_focus(queue).clone();
+    let border = alpha(ctx.colors.title, 0.15);
+    div()
+        .id(SharedString::from(format!("beads-drawer-{workspace_id}-{queue:?}")))
+        .role(Role::Group)
+        .aria_label(format!("{} preview, {} issues", queue_name(queue), lane.total))
+        .absolute()
+        .top(px(beads_board_a2::DRAWER_TOP))
+        .bottom(px(beads_board_a2::DRAWER_BOTTOM))
+        .right(px(beads_board_a2::DRAWER_RIGHT))
+        .w(px(beads_board_a2::DRAWER_W))
+        .relative()
+        .occlude()
+        .flex()
+        .flex_col()
+        .px(px(beads_board_a2::DRAWER_PAD_H))
+        .bg(ctx.colors.band)
+        .border_1()
+        .border_color(border)
+        .rounded(px(beads_board_a2::DRAWER_RADIUS))
+        .shadow_lg()
+        .on_hover(move |entered: &bool, _window, _app| {
+            if let Ok(mut boards) = hover_boards.lock() {
+                boards.hover_lane(workspace_id, queue, LaneHoverSource::Drawer, *entered);
+            }
+        })
+        .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
+        .on_click(move |_event, window, app| {
+            window.focus(&click_focus, app);
+            if let Ok(mut boards) = click_boards.lock() {
+                boards.pin_lane(workspace_id, queue);
+            }
+            window.refresh();
+        })
+        .child(drawer_head(lane, state_color, ctx.colors))
+        .child(lane_seam(state_color, lane.void.is_some(), beads_board_a2::DRAWER_PAD_H))
+        .child(lane_body(lane, lane_index, state_color, ctx))
+        .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
+        .into_any_element()
+}
+
+/// The drawer's own head: name and count always at full strength (unlike a
+/// void lane head, the drawer never dims them), an optional shared epic, and
+/// the `click to pin` hint the mock's `pinhint` carries.
+fn drawer_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColors) -> AnyElement {
+    let name_color = mix(state_color, colors.title, 0.6);
+    div()
+        .flex_none()
+        .h(px(beads_board_a2::HEAD_H))
+        .flex()
+        .items_baseline()
+        .gap(px(8.0))
         .child(
             div()
                 .flex_none()
-                .h(px(beads_board_a2::HEAD_H))
-                .flex()
-                .items_center()
+                .text_size(px(9.5))
+                .line_height(px(beads_board_a2::HEAD_H))
+                .font_weight(FontWeight(700.0))
+                .text_color(name_color)
+                .child(queue_name(lane.queue).to_uppercase()),
+        )
+        .child(
+            div()
+                .flex_none()
                 .font_family("monospace")
                 .text_size(px(11.0))
-                .text_color(count_color)
+                .line_height(px(beads_board_a2::HEAD_H))
+                .font_weight(FontWeight(600.0))
+                .text_color(colors.queue_name)
                 .child(lane.total.to_string()),
         )
-        .child(div().flex_none().w_full().h(px(beads_board_a2::SEAM_H)).bg(linear_gradient(
-            90.0,
-            linear_color_stop(seam_from, 0.0),
-            linear_color_stop(seam_to, 1.0),
-        )))
+        .children(lane.epic.as_deref().map(|name| {
+            div()
+                .ml(px(2.0))
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(9.5))
+                .line_height(px(14.0))
+                .text_color(colors.muted)
+                .child(name.to_owned())
+        }))
         .child(
-            div().flex_1().flex().flex_col().items_center().justify_center().gap(px(1.0)).children(
-                spine.chars().map(move |glyph| {
-                    div()
-                        .text_size(px(9.5))
-                        .line_height(px(10.5))
-                        .font_weight(FontWeight(700.0))
-                        .text_color(spine_color)
-                        .child(glyph.to_string())
-                }),
-            ),
+            div()
+                .ml_auto()
+                .flex_none()
+                .font_family("monospace")
+                .text_size(px(9.5))
+                .line_height(px(beads_board_a2::HEAD_H))
+                .font_weight(FontWeight(500.0))
+                .text_color(colors.quiet)
+                .child("click to pin"),
         )
-        .when_some(target_edge, |el, edge| el.child(drag_target_edge(edge)))
         .into_any_element()
 }
 
@@ -4511,5 +4934,34 @@ mod lane_tests {
             Some(CollapsedLaneState::Tab)
         );
         assert!(!boards.expire_hover(), "an explicit close needs no grace to expire");
+    }
+
+    #[test]
+    fn close_any_lane_drawer_closes_every_open_transient_drawer_but_not_a_pin() {
+        let left = WorkspaceId::new();
+        let right = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(!boards.close_any_lane_drawer(), "nothing open yet");
+
+        boards.pin_lane(left, BeadsIssueQueue::Blocked);
+        boards.hover_lane(left, BeadsIssueQueue::Done, LaneHoverSource::Focus, true);
+        boards.hover_lane(right, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true);
+
+        assert!(boards.close_any_lane_drawer());
+        assert_eq!(
+            boards.collapsed_lane_state(left, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Pinned),
+            "Escape never touches a pin"
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(left, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Tab)
+        );
+        assert_eq!(
+            boards.collapsed_lane_state(right, BeadsIssueQueue::Blocked),
+            Some(CollapsedLaneState::Tab),
+            "a second region's open drawer closes too"
+        );
+        assert!(!boards.close_any_lane_drawer(), "already closed");
     }
 }

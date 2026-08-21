@@ -1252,14 +1252,47 @@ lane pin the board pin's own restart lifetime, and `update` and
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#retain_regions]] clear
 it on workspace loss and region removal the same way.
 [[crates/scribe-client/src/beads_board.rs#collapsed_tab]] paints an unpinned
-Blocked/Done's idle, full-strength count-and-spine state (A2-S1); a pinned
-one paints as an ordinary
+Blocked/Done's count, fading seam, one-glyph-per-line spine (A2-G7), and
+`‹` cue; a pinned one paints as an ordinary
 [[crates/scribe-client/src/beads_board.rs#ledger_lane]] instead, since
 [[crates/scribe-client/src/beads_board_a2.rs#QueueLane]] gives both the same
-shape. The hover-opens/click-pins drawer, its unpin control, and a hot tab's
-inner edge remain a later bead's (A2-G7, A2-G8, A2-C6, A2-C7).
+shape.
+[[crates/scribe-client/src/beads_board.rs#tab_interactivity]] carries every
+tab's pointer/keyboard wiring: hover calls `hover_lane` with `Tab`, click or
+Enter/Space calls `pin_lane`, and `hot` (state `Open`) brightens the
+spine/cue and adds the 1px queue-hue inner edge
+([[crates/scribe-client/src/beads_board.rs#hot_inner_edge]], A2-C6). The
+same grammar reaches
+[[crates/scribe-client/src/beads_board.rs#lane_drawer]] -- A2-G8's absolute
+overlay, painted after every track in
+[[crates/scribe-client/src/beads_board.rs#lanes]] so opening it never
+reflows them, `on_hover`ing `Drawer` and `on_click`ing `pin_lane` the same
+way the tab does -- and
+[[crates/scribe-client/src/beads_board.rs#unpin_control]], the pinned head's
+`×`. All three share one `tab_focus` handle from
+[[crates/scribe-client/src/beads_board.rs#LaneCtx]] per queue, cached per
+workspace as `TerminalView`'s `lane_tab_focus` the same way
+`flow_node_controls` already is (a fresh handle every frame would drop
+GPUI's Tab-stop registration), so Tab order never gains or loses a stop
+across a queue's tab/drawer/pinned paint states. GPUI divs carry no
+focus-in/out element callback, so
+[[crates/scribe-client/src/main.rs#TerminalView#sync_lane_tab_focus]] polls
+`is_focused(window)` once per frame -- where `render` already holds
+`window` -- and reconciles it into `hover_lane`'s `Focus` source, A2-I1's
+keyboard equivalent to hovering the tab. Escape tries
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#close_any_lane_drawer]]
+(every open transient drawer, never a pin) before Flow exit or panel
+dismiss. Every click target this adds pairs a mouse-down and mouse-up stop,
+the rule scribe-uu2y established so a swallowed press cannot leak an
+unmatched release to the terminal; the drawer additionally `occlude`s so a
+click on its own chrome cannot also land on the lane row it visually
+covers.
 [[test#Test Harness#GPUI Client Headless Suites#Beads collapsed-lane hover and pin]]
-pins every transition above.
+pins every state transition above the paint layer; like
+`ledger_lane`/`lane_head`/`ledger_row` beside it, the paint layer itself has
+no GPUI window test in this file -- visual and functional proof are
+`tests/e2e/visual/beads-board.sh` (scribe-zwtv.13) and
+`tests/e2e/func/beads-board.sh` (scribe-zwtv.14).
 
 [[crates/scribe-client/src/beads_board_a2.rs]] derives what
 [[crates/scribe-client/src/beads_board.rs#lanes]] paints from one board

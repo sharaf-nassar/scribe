@@ -32,7 +32,7 @@ use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client::animation::AnimationSettings;
 use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
-    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource,
+    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource, LaneHoverSource,
 };
 use scribe_client::beads_board_a2::RailState;
 use scribe_client::beads_flow::FlowNodeControl;
@@ -1763,6 +1763,14 @@ struct TerminalView {
     /// only mounted handles, so a per-frame handle would reset Tab order on
     /// every repaint.
     flow_node_controls: HashMap<WorkspaceId, HashMap<String, FlowNodeControl>>,
+    /// Stable Tab stops for each visible workspace's Blocked/Done collapsed-
+    /// lane control -- (blocked, done) -- for the same reason
+    /// `flow_node_controls` is cached rather than rebuilt: GPUI drops an
+    /// unmounted handle's Tab-stop registration, so a fresh handle every
+    /// frame would reset focus and Tab order on every repaint. One handle
+    /// per queue serves that queue's tab, its hover/focus-open drawer, and
+    /// the pinned lane's own unpin control across all three paint states.
+    lane_tab_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
     /// CI snapshots matched to the regions that currently own their repository.
     visible_ci_runs: Vec<VisibleCiRun>,
     /// Client-local open panel identity; the server sees only interest changes.
@@ -2371,6 +2379,7 @@ impl TerminalView {
             tooltip_demo: false,
             visible_beads_boards: Vec::new(),
             flow_node_controls: HashMap::new(),
+            lane_tab_focus: HashMap::new(),
             visible_ci_runs: Vec::new(),
             ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
@@ -8635,6 +8644,12 @@ impl TerminalView {
         self.handle_beads_editor_key(event, window, cx)
     }
 
+    /// Whether Escape just closed a transient collapsed-lane drawer
+    /// somewhere in the window -- a hover/focus-open drawer, never a pin.
+    fn dismiss_lane_drawer(&self) -> bool {
+        self.shared.beads_boards.lock().is_ok_and(|mut boards| boards.close_any_lane_drawer())
+    }
+
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(
@@ -8661,6 +8676,15 @@ impl TerminalView {
         // the holder (or the owner while control is unheld) answers it before
         // anything else reaches a binding, an overlay, or the PTY.
         if self.share_prompt_pending() && self.run_share_key(event, cx) {
+            return true;
+        }
+        // A transient collapsed-lane drawer is the most local thing Escape
+        // can close, so it goes first (specs/028's "Escape closes only a
+        // transient drawer" closed decision): a pinned lane is never in
+        // this state, so this step can never cost the panel or Flow their
+        // own Escape.
+        if event.keystroke.key == "escape" && self.dismiss_lane_drawer() {
+            cx.notify();
             return true;
         }
         if event.keystroke.key == "escape"
@@ -9843,6 +9867,48 @@ impl TerminalView {
         self.shell.set_pinned_boards(strips);
     }
 
+    /// Ensure a stable Tab stop exists for each visible workspace's Blocked
+    /// and Done collapsed-lane control, and reconcile the window's actual
+    /// keyboard focus into `hover_lane`'s `LaneHoverSource::Focus` bit (A2-
+    /// I1's keyboard equivalent to hovering the tab).
+    ///
+    /// GPUI divs have no per-element focus-in/focus-out callback -- only
+    /// `Window::on_focus_in`/`on_focus_out` subscriptions, which need a
+    /// `&mut Window` no free-function board renderer ever has. Polling
+    /// `is_focused(window)` once per frame, here where `render` already
+    /// holds `window`, is what turns real keyboard focus into the same
+    /// drawer-opening state pointer hover already drives. `hover_lane`
+    /// itself is a no-op once nothing has changed, so calling it every frame
+    /// costs nothing once focus settles.
+    fn sync_lane_tab_focus(&mut self, window: &Window, cx: &App) {
+        let visible: HashSet<WorkspaceId> =
+            self.visible_beads_boards.iter().map(|(workspace_id, _)| *workspace_id).collect();
+        self.lane_tab_focus.retain(|workspace_id, _| visible.contains(workspace_id));
+        for workspace_id in &visible {
+            self.lane_tab_focus.entry(*workspace_id).or_insert_with(|| {
+                (cx.focus_handle().tab_stop(true), cx.focus_handle().tab_stop(true))
+            });
+        }
+        let Ok(mut boards) = self.shared.beads_boards.lock() else { return };
+        for workspace_id in visible {
+            let Some((blocked_focus, done_focus)) = self.lane_tab_focus.get(&workspace_id) else {
+                continue;
+            };
+            boards.hover_lane(
+                workspace_id,
+                scribe_common::protocol::BeadsIssueQueue::Blocked,
+                LaneHoverSource::Focus,
+                blocked_focus.is_focused(window),
+            );
+            boards.hover_lane(
+                workspace_id,
+                scribe_common::protocol::BeadsIssueQueue::Done,
+                LaneHoverSource::Focus,
+                done_focus.is_focused(window),
+            );
+        }
+    }
+
     fn send_beads_issue_write(&self, write: PanelWriteIntent) {
         let workspace_id = write.workspace_id;
         let issue_id = write.issue_id;
@@ -10123,6 +10189,8 @@ impl TerminalView {
                     cx,
                 )?;
                 let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
+                let (blocked_tab_focus, done_tab_focus) =
+                    self.lane_tab_focus.get(workspace_id).cloned()?;
                 let rail = RailState {
                     blocked: boards
                         .collapsed_lane_state(
@@ -10149,6 +10217,8 @@ impl TerminalView {
                             workspace_id: *workspace_id,
                             drag_target: boards.drag_target(*workspace_id),
                             rail,
+                            blocked_tab_focus,
+                            done_tab_focus,
                             scale,
                             colors,
                             flow_controls: self
@@ -10358,6 +10428,7 @@ impl Render for TerminalView {
         self.sync_equalize_visibility(cx);
         self.sync_ci_run_strips(cx);
         self.sync_beads_board_strips(cx);
+        self.sync_lane_tab_focus(window, cx);
         self.sync_grid_geometry(cx);
         // A prompt or CI state edge changes an internal strip without moving the
         // grid band, so the band probe never notices; republishing here keeps the
