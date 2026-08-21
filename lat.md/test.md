@@ -2023,9 +2023,12 @@ return `no_graph` with a reason, and a non-epic id returns `no_epic`.
 The painted run proves the clarified interaction: one click opens the panel and
 swaps only the strip, and a node moves the panel without moving the epic.
 
-A small admissible epic is seeded into the painted workspace only after every
-lane, detail, and drag assertion has finished, so those keep the board they
-were written against.
+A five-rank admissible epic is seeded into the painted workspace only after
+every lane, detail, and drag assertion has finished, so those keep the board
+they were written against. Five ranks is what makes the graph wider than the
+strip, so its wheel travel, clamps, and position bar are real rather than
+degenerate. Its deepest members are blocked, and Blocked is a collapsed tab
+with no rows to click, so the entry card is a member the board actually paints.
 
 Waiting for those cards is not a poll. The seed goes through the `bd` CLI, so
 the server never observes it and its board cache only re-reads on
@@ -2035,15 +2038,61 @@ the coordinates the pointer already holds produces no event and no request.
 Parking on the badge therefore waits forever. The run moves the pointer away
 and back each round and keeps going long enough to outlast the cache.
 
-Clicking its deepest card must produce both a
+Clicking that card must produce both a
 `RequestBeadsIssueDetail` and a `RequestBeadsEpicGraph` on the client wire, an
 admitted graph from the server, and a repainted strip. Its panel bounds must
 start below the strip. The run then clicks the clear rank-0 node, proving the
 real pointer reaches the handler despite the open panel, before Tab plus Enter
 activates its next node. Both requests must target different members while the
-epic-graph request count stays put, since the graph is frozen at open. Leaving
-Flow must return usable lanes: a card with no epic opens its panel and asks for
-no graph.
+epic-graph request count stays put, since the graph is frozen at open.
+
+Hover on a node must change the graph band and leaving must restore it in
+full: that is the trace, and its geometry comes from the contract's node box,
+rank pitch, and graph band rather than from a screenshot-specific offset.
+
+The wheel is asserted through the painted position bar. A wheel that travels
+moves the bar's own mark, moves the graph with it, and reaches neither the pane
+nor the mark past either end: further wheels at an end leave the mark exactly
+where it was, and wheeling back lands on the origin again. Both the travelling
+and the clamped clicks are bracketed by the SGR mouse-frame count, because a
+surface that handles a gesture owns it even when its own response is a no-op.
+
+Both exit controls are real: `← LANES` at the band's own left padding, and the
+mode pair's `LANES`, located from the selected `FLOW` chip's painted left edge
+rather than a guessed text width. Each must return a measurable A2 seam row.
+Reopening after an exit must request the graph again, since exit drops it.
+Leaving Flow must return usable lanes: a currently painted card with no epic
+opens its panel and asks for no graph.
+
+#### Painted A2 geometry
+
+The functional run resolves every board coordinate from the generated machine
+contract plus the pixels the client painted, never from lane arithmetic.
+
+`just e2e-func-beads-board` mounts `.impeccable/mocks/a2a3-contract.json` at
+`/mocks`, and the script reads its `geometry.a2` and `geometry.a3` blocks for
+the constants the mock fixes: the 44px left control gutter, 10px right padding,
+16px track gaps, 36px tab width, 24px headband, 51px row, three-row body, the
+drawer's own bounds, the text steppers, and A3's band, graph, node, rank-pitch,
+and position-bar numbers. Copying those numbers into the script instead would
+let the mock and the suite drift apart silently.
+
+Where the adaptive rail actually put its tracks is measured, not derived.
+[`beads-board-geometry.py`](../tests/e2e/func/beads-board-geometry.py) `rail`
+finds the one row where every visible track -- full lane, pinned lane, and
+collapsed tab alike -- paints its 2px state seam at `lanes_padding_top +
+head_h`, which yields both the strip's own top (the OS titlebar is the only
+offset no contract owns) and each track's left edge and width. Card and target
+coordinates come from that measurement plus the contract's row pitch, so a lane
+that collapsed to its legible header width, a pinned 0.85 share, and a 36px tab
+are all addressable by the same two helpers. Every gesture re-measures, because
+a card that changed lanes reflows the rail behind it. The same helper's `run`
+reports the widest painted run in a band of rows, which locates the drawer's
+top border, A3's position-bar thumb, and the selected `FLOW` chip.
+
+The measurement is also an assertion: the run requires exactly five tracks, the
+first at the contract's gutter, and both collapsible queues at 36px before it
+touches anything.
 
 #### Card drag writes and pointer isolation
 
@@ -2052,13 +2101,65 @@ The network-none real-bd GPUI run proves the production drag contract and termin
 [The script](../tests/e2e/func/beads-board.sh) checks native claim status,
 actor, and start time,
 close and board-side Undo after its Applied result and a later board snapshot,
-defer clearing, classifier-won repaint, and zero writes for rejected or
-same-lane drops. It keeps the `SingleController` owner,
+defer clearing, classifier-won repaint, and zero writes for rejected,
+same-lane, and collapsed-Blocked-tab drops. It keeps the `SingleController`
+owner,
 proves SGR 1003/1006 reporting is live, then requires zero mouse-frame growth
 during each gesture. The readiness probe waits for an actual SGR motion frame
 after DECSET crosses the PTY and client, rather than guessing with a sleep. The
+close target is the painted collapsed Done tab, which is the only Done target a
+default board has. The
 behavior belongs to
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
+
+#### Collapsed rail drawer, pin, and pinned drop
+
+The rail's own controls are proved by pointer and keyboard against the real
+board, with the drawer's contract bounds as the oracle.
+
+Hovering a collapsed tab must paint the drawer's top border at
+`width - drawer_right - drawer_w`, and the Backlog track measured through that
+same frame must be byte-identical to the idle one: the drawer overlays the
+lanes rather than joining their row. Crossing from the tab into the drawer
+keeps it open, Escape closes it, and a pinned lane is never a drawer -- which
+is why finding that border after an unpin also proves the unpin.
+
+Clicking a tab pins its lane wider than a tab while the other stays 36px, and
+pinning the second replaces the first. The click leaves that lane's control
+focused, and tab, drawer, and pinned `×` share one handle, so Enter unpins into
+a focus-opened drawer and Enter again pins it back: pointer and keyboard reach
+the same two states. A card dropped on the pinned Done lane closes through the
+same guarded `close_issue` verb the collapsed tab takes, and the pinned head's
+`×` returns the rail to two tabs.
+
+#### Keyboard card move
+
+A2-I6 runs through the shipped client with no pointer at all once the row has
+focus.
+
+A row click deliberately does not focus the row -- the row's own mouse-down
+stops propagation ahead of GPUI's focus transfer, and A2-I4 asks a click to
+open the detail, not to focus -- so the run reaches the keyboard path the way a
+keyboard user does. Clicking a rail tab focuses it, and the tab is painted
+immediately after the last In-progress row, so one Shift+Tab lands on that row;
+the run first asserts that lane holds exactly one card, so the step has a
+single target.
+
+Space grabs it, Right names the collapsed Blocked tab and Enter there writes
+nothing, Space and Left name Ready and Enter writes the same `set_status` verb
+the pointer drop sends for that target, and a third grab cancelled with Escape
+leaves the tracker untouched. No `KeyInput` frame reaches the pane across any
+of it.
+
+#### Board text scale
+
+The text steppers are in the strip's left control gutter, at the contract's own
+`zoom_left`/`zoom_top` offsets rather than the retired top-right corner.
+
+Two clicks on `+` must repaint the strip and two on `−` must return it to
+within a small residual, while the measured strip top does not move: text scale
+recomputes the rail and the whole-row count without touching the stored board
+height.
 
 #### Official Beads Write Contract
 

@@ -281,6 +281,123 @@ eval "$(xdotool getwindowgeometry --shell "$WID")"
 WIN_W=$WIDTH
 import -window "$WID" /output/beads-real-before.png
 
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Painted A2 geometry]]
+# Every coordinate below comes from exactly two sources: the generated machine
+# contract for the constants the mock fixes, and the pixels the shipped client
+# actually painted for where its adaptive rail put each track. The rail moves
+# with occupancy, text scale, and whether a collapsible queue is a 36px tab, an
+# open drawer, or a pinned lane, so no arithmetic over five equal lanes can name
+# a card or a drop target on this board.
+CONTRACT=${SCRIBE_A2A3_CONTRACT:-/mocks/a2a3-contract.json}
+[ -r "$CONTRACT" ] \
+    || fail "the generated A2/A3 contract manifest is not mounted at $CONTRACT"
+eval "$(python3 - "$CONTRACT" <<'PY'
+import json, sys
+
+geometry = json.load(open(sys.argv[1]))["geometry"]
+wanted = {
+    "a2": ("strip_h", "lanes_padding_top", "lanes_padding_left", "lanes_padding_right",
+           "track_gap", "tab_w", "head_h", "headband_h", "row_h", "body_rows", "floor_h",
+           "drawer_top", "drawer_bottom", "drawer_right", "drawer_w",
+           "zoom_left", "zoom_top", "zoom_glyph_w", "zoom_glyph_h", "zoom_gap"),
+    "a3": ("band_h", "band_pad_left", "graph_top", "graph_h", "node_w", "node_h",
+           "left_pad", "rank_pitch", "hbar_top", "hbar_h"),
+}
+for section, keys in wanted.items():
+    for key in keys:
+        print(f"{section.upper()}_{key.upper()}={int(geometry[section][key])}")
+PY
+)"
+
+# The one number no contract owns: the OS titlebar above the strip. It is
+# measured, never assumed -- `rail` reports the strip's own top from the row
+# where every track paints its state seam.
+STRIP_TOP=
+RAIL_TRACKS=
+
+rail_report() {
+    import -window "$WID" "$1"
+    python3 /tests/func/beads-board-geometry.py rail \
+        --contract "$CONTRACT" --shot "$1" --width "$WIN_W"
+}
+
+# Re-measure before every gesture: a card that changed lanes reflows the rail
+# behind it, so geometry resolved for the previous gesture is already stale.
+measure_rail() {
+    local report tracks
+    report=$(rail_report "${1:-/output/beads-rail.png}") \
+        || fail "the painted board exposed no A2 seam row to measure"
+    STRIP_TOP=$(printf '%s\n' "$report" | head -1)
+    RAIL_TRACKS=$(printf '%s\n' "$report" | tail -n +2)
+    tracks=$(printf '%s\n' "$RAIL_TRACKS" | wc -l)
+    [ "$tracks" -eq 5 ] || fail "the painted rail showed $tracks tracks, not five"
+}
+
+track_field() {
+    printf '%s\n' "$RAIL_TRACKS" | sed -n "$(( $1 + 1 ))p" | cut -d' ' -f"$2"
+}
+
+# A pointer x inside one painted track, whatever width that track currently
+# holds: the centre of a full lane, of a 36px rail tab, or of a pinned lane.
+lane_x() {
+    echo $(( $(track_field "$1" 1) + $(track_field "$1" 2) / 2 ))
+}
+
+# One whole painted row's centre. `row_h` and `headband_h` are contract
+# constants; the strip's own top is measured.
+row_y() {
+    echo $(( STRIP_TOP + A2_HEADBAND_H + $1 * A2_ROW_H + A2_ROW_H / 2 ))
+}
+
+# A lane head's own line, and the `×` a pinned Blocked/Done lane ends it with.
+head_y() {
+    echo $(( STRIP_TOP + A2_LANES_PADDING_TOP + A2_HEAD_H / 2 ))
+}
+
+lane_unpin_x() {
+    echo $(( $(track_field "$1" 1) + $(track_field "$1" 2) - 4 ))
+}
+
+# Pin one collapsible lane open by clicking its rail tab, so the rows it holds
+# are painted at all, and prove the pin landed.
+pin_lane() {
+    measure_rail
+    xdotool mousemove --sync --window "$WID" "$(lane_x "$1")" "$(row_y 1)"
+    sleep 0.3
+    xdotool click 1
+    sleep 0.6
+    measure_rail
+    [ "$(track_field "$1" 2)" -gt "$A2_TAB_W" ] \
+        || fail "clicking track $1's tab left it $(track_field "$1" 2)px wide"
+    xdotool mousemove --sync --window "$WID" 13 17
+    sleep 0.5
+}
+
+unpin_lane() {
+    measure_rail
+    xdotool mousemove --sync --window "$WID" "$(lane_unpin_x "$1")" "$(head_y)"
+    sleep 0.3
+    xdotool click 1
+    sleep 0.6
+}
+
+strip_crop() {
+    echo "${WIN_W}x${A2_STRIP_H}+0+${STRIP_TOP}"
+}
+
+# The centre of the collapsed drawer's own interior (A2-G8), for a hover that
+# has to land on the drawer rather than on the tab that opened it.
+drawer_center_x() {
+    echo $(( WIN_W - A2_DRAWER_RIGHT - A2_DRAWER_W / 2 ))
+}
+
+crop_diff() {
+    local diff
+    diff=$(compare -metric AE \
+        \( "$1" -crop "$3" +repage \) \( "$2" -crop "$3" +repage \) null: 2>&1 || true)
+    printf '%s\n' "${diff%%.*}"
+}
+
 flow_detail_requests() {
     python3 - "$RECORD" "$1" <<'PY'
 import json, sys
@@ -550,6 +667,28 @@ print(count)
 PY
 }
 
+# SGR frames whose button is a wheel notch (64/65), as opposed to the motion
+# and button frames `mouse_report_count` also counts: what a wheel over Flow
+# must never send the pane is a wheel.
+wheel_report_count() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+
+count = 0
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    message = row.get("message", {})
+    if row.get("dir") == "client" and message.get("type") == "KeyInput":
+        data = bytes(message.get("data") or [])
+        if data.startswith(b"\x1b[<") and data[-1:] in (b"M", b"m"):
+            count += data[3:].split(b";")[0] in (b"64", b"65")
+print(count)
+PY
+}
+
 wait_for_mouse_report() {
     local before="$1"
     # DECSET crosses the shell, PTY, server Term, and client Term asynchronously.
@@ -564,20 +703,24 @@ wait_for_mouse_report() {
     return 1
 }
 
+# Press one painted card and release it over one painted track. Both ends are
+# resolved from the live rail, so a collapsed 36px tab, a pinned lane, and a
+# full lane are all the same gesture with no target-specific arithmetic.
 drag_issue() {
     local issue="$1" target_lane="$2" position source_lane index
-    local lane_width source_left press_x press_y target_x reports_before reports_after
+    local press_x press_y target_x reports_before reports_after
     # A native release ends the hover overlay. Re-enter through the painted bead
     # target before resolving fresh card geometry for every gesture.
     xdotool mousemove --sync --window "$WID" 13 17
     sleep 0.5
     position=$(issue_position "$issue") || fail "$issue has no painted card"
     read -r source_lane index <<<"$position"
-    lane_width=$(( (WIN_W - 16) / 5 ))
-    source_left=$(( 16 + source_lane * lane_width ))
-    press_x=$(( source_left + 70 ))
-    press_y=$(( 70 + index * 50 + 14 ))
-    target_x=$(( 16 + target_lane * lane_width + 70 ))
+    [ "$index" -lt "$A2_BODY_ROWS" ] \
+        || fail "$issue sits past the last whole painted row of its lane"
+    measure_rail
+    press_x=$(lane_x "$source_lane")
+    press_y=$(row_y "$index")
+    target_x=$(lane_x "$target_lane")
     xdotool mousemove --sync --window "$WID" "$press_x" "$press_y"
     sleep 0.2
     reports_before=$(mouse_report_count)
@@ -609,11 +752,26 @@ done
 # The press and release stay at one coordinate, inside the future two-pixel
 # drag arm. Resolve the detail card from the authoritative lane order rather
 # than assuming priority order keeps it first.
+measure_rail
+# The rail this board actually painted: three ledger lanes and two collapsed
+# 36px tabs, the first lane starting at the contract's own left control gutter.
+[ "$(track_field 0 1)" -eq "$A2_LANES_PADDING_LEFT" ] \
+    || fail "the first lane started at $(track_field 0 1), not the ${A2_LANES_PADDING_LEFT}px gutter"
+[ "$(track_field 3 2)" -eq "$A2_TAB_W" ] && [ "$(track_field 4 2)" -eq "$A2_TAB_W" ] \
+    || fail "the collapsed rail is not two ${A2_TAB_W}px tabs: $RAIL_TRACKS"
+
 DETAIL_POSITION=$(issue_position e2e-detail) || fail "e2e-detail has no painted card"
 read -r DETAIL_LANE DETAIL_INDEX <<<"$DETAIL_POSITION"
-LANE_WIDTH=$(( (WIN_W - 16) / 5 ))
-DETAIL_X=$(( 16 + DETAIL_LANE * LANE_WIDTH + 70 ))
-DETAIL_Y=$(( 70 + DETAIL_INDEX * 50 + 14 ))
+# The detail fixture is blocked, and Blocked is a collapsed tab: pin that lane
+# so the row exists to click, which is also A2-I4 through a pinned lane.
+if [ "$DETAIL_LANE" -ge 3 ]; then
+    pin_lane "$DETAIL_LANE"
+    import -window "$WID" /output/beads-real-board.png
+fi
+[ "$DETAIL_INDEX" -lt "$A2_BODY_ROWS" ] \
+    || fail "e2e-detail sits past the last whole painted row of its lane"
+DETAIL_X=$(lane_x "$DETAIL_LANE")
+DETAIL_Y=$(row_y "$DETAIL_INDEX")
 REQUESTS_BEFORE=$(flow_detail_requests e2e-detail)
 xdotool mousemove --sync --window "$WID" "$DETAIL_X" "$DETAIL_Y"
 xdotool mousedown 1
@@ -636,6 +794,11 @@ python3 /tests/func/assert-beads-detail-wire.py \
     --issue e2e-detail \
     --output /output/beads-real-detail-evidence.json \
     || fail "painted detail response diverged from bd show"
+# Everything below this point works on the panel, and the drag matrix expects
+# the collapsed rail it measured above.
+if [ "$DETAIL_LANE" -ge 3 ]; then
+    unpin_lane "$DETAIL_LANE"
+fi
 xdotool mousemove --sync --window "$WID" 900 600
 sleep 0.5
 import -window "$WID" /output/beads-real-detail.png
@@ -654,16 +817,16 @@ DETAIL_DIFF=${DETAIL_DIFF%%.*}
 # longer the panel's. It measured 561x553+223+47 — the strip's own left edge
 # one column further out, and 188px of extra height reaching up into the
 # strip — where the panel is still exactly the 560px surface it always was.
-# The strip is the 197px reservation directly under the 34px titlebar, which
-# is where this crop already starts, so blanking the crop's first 197 rows
-# leaves only what the panel itself changed.
+# The strip is the contract's own `strip_h` reservation directly under the
+# measured strip top, which is where this crop already starts, so blanking the
+# crop's first `strip_h` rows leaves only what the panel itself changed.
 panel_bounds() {
-    local before="$1" after="$2" content_height=$(( HEIGHT - 58 ))
+    local before="$1" after="$2" content_height=$(( HEIGHT - STRIP_TOP - 24 ))
     convert \
-        \( "$before" -crop "${WIN_W}x${content_height}+0+34" \) \
-        \( "$after" -crop "${WIN_W}x${content_height}+0+34" \) \
+        \( "$before" -crop "${WIN_W}x${content_height}+0+${STRIP_TOP}" \) \
+        \( "$after" -crop "${WIN_W}x${content_height}+0+${STRIP_TOP}" \) \
         -compose difference -composite -threshold 10% \
-        -fill black -draw "rectangle 0,0 $(( WIN_W - 1 )),196" -trim \
+        -fill black -draw "rectangle 0,0 $(( WIN_W - 1 )),$(( A2_STRIP_H - 1 ))" -trim \
         -format '%w %h %X %Y' info:
 }
 
@@ -915,18 +1078,19 @@ CLASSIFIED=$(cd "$PROJECT" && bd show e2e-classifier --json)
 printf '%s\n' "$CLASSIFIED" | grep -Fq '"status": "open"' \
     || fail "classifier fixture did not stay open: $CLASSIFIED"
 import -window "$WID" /output/beads-drag-classifier-notice.png
-NOTICE_CHANGED=$(compare -metric AE \
-    \( /output/beads-drag-classifier-before.png -crop "${WIN_W}x40+0+245" +repage \) \
-    \( /output/beads-drag-classifier-notice.png -crop "${WIN_W}x40+0+245" +repage \) \
-    null: 2>&1 || true)
-NOTICE_CHANGED=${NOTICE_CHANGED%%.*}
+NOTICE_CHANGED=$(crop_diff /output/beads-drag-classifier-before.png \
+    /output/beads-drag-classifier-notice.png \
+    "${WIN_W}x40+0+$(( STRIP_TOP + A2_STRIP_H + 14 ))")
 [ "${NOTICE_CHANGED:-0}" -ge 1000 ] \
     || fail "classifier-won notice changed only ${NOTICE_CHANGED:-0}px"
 
-# Same-lane and derived-lane drops never enter the write queue or touch bd.
+# Same-lane, derived-lane, and collapsed-Blocked drops never enter the write
+# queue or touch bd. The Blocked arm is a drop on the painted 36px rail tab,
+# which is the only Blocked target this board has.
 REJECT_BEFORE=$(issue_write_count e2e-close)
 drag_issue e2e-close 1
 drag_issue e2e-close 0
+drag_issue e2e-close 3
 sleep 0.8
 [ "$(issue_write_count e2e-close)" -eq "$REJECT_BEFORE" ] \
     || fail "rejected or no-op drop queued an issue write"
@@ -937,6 +1101,292 @@ printf '%s\n' "$REJECTED" | grep -Fq '"status": "open"' \
 import -window "$WID" /output/beads-drag-functional.png
 echo 'PASS: real bd detail and card drags proved claim, close/Undo, clear-defer,' \
     'classifier notice, rejects, and PTY mouse isolation'
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Collapsed rail drawer, pin, and pinned drop]]
+# The rail is where A2 stopped being five equal lanes: Blocked and Done are
+# 36px tabs whose drawer, pin, and unpin are pointer and keyboard controls, and
+# a pinned lane is a real drop target. Every assertion below reads the painted
+# tracks back, so nothing here assumes which queue currently holds which width.
+measure_rail /output/beads-rail-idle.png
+IDLE_FIRST_TRACK=$(printf '%s\n' "$RAIL_TRACKS" | sed -n 1p)
+BLOCKED_TAB_X=$(lane_x 3)
+TAB_Y=$(row_y 1)
+
+# The drawer's own painted top border, at the bounds the contract fixes it to.
+# A pinned lane is never a drawer, so finding this border is also how an unpin
+# that leaves the tab focused proves itself.
+drawer_border() {
+    python3 /tests/func/beads-board-geometry.py run \
+        --shot "$1" --width "$WIN_W" --y "$(( STRIP_TOP + A2_DRAWER_TOP ))" --height 2 \
+        --min-width "$(( A2_DRAWER_W - 24 ))"
+}
+
+assert_drawer_open() {
+    local shot="$1" reason="$2" bounds left expected
+    import -window "$WID" "$shot"
+    bounds=$(drawer_border "$shot") || fail "$reason"
+    left=${bounds%% *}
+    expected=$(( WIN_W - A2_DRAWER_RIGHT - A2_DRAWER_W ))
+    [ "$left" -ge "$(( expected - 2 ))" ] && [ "$left" -le "$(( expected + 4 ))" ] \
+        || fail "$reason (a ${bounds} run is not the drawer's ${expected}px left edge)"
+}
+
+assert_drawer_closed() {
+    import -window "$WID" "$1"
+    if drawer_border "$1" >/dev/null 2>&1; then
+        fail "$2"
+    fi
+}
+
+assert_drawer_closed /output/beads-drawer-idle.png "an untouched rail already showed a drawer"
+
+# Hover opens the transient drawer over the lanes without moving them.
+xdotool mousemove --sync --window "$WID" "$BLOCKED_TAB_X" "$TAB_Y"
+sleep 0.6
+assert_drawer_open /output/beads-drawer-hover.png "hovering the Blocked tab opened no drawer"
+HOVER_REPORT=$(rail_report /output/beads-drawer-hover.png) \
+    || fail "the hovered rail lost its seam row"
+[ "$(printf '%s\n' "$HOVER_REPORT" | sed -n 2p)" = "$IDLE_FIRST_TRACK" ] \
+    || fail "the drawer reflowed the lanes it opened over"
+
+# Crossing from the tab into the drawer it opened keeps it open, and the board
+# under it stays painted: the drawer `occlude`s, so the board only knows the
+# pointer is still on it because the drawer says so.
+xdotool mousemove --sync --window "$WID" "$(drawer_center_x)" "$TAB_Y"
+sleep 0.6
+assert_drawer_open /output/beads-drawer-transfer.png \
+    "the drawer closed while the pointer crossed into it"
+rail_report /output/beads-drawer-inside.png >/dev/null \
+    || fail "the strip vanished under the pointer that entered its own drawer"
+
+# Back out to the tab and in again: one pointer move drives two hover sources,
+# and the grace period is what keeps that round trip from closing the drawer.
+xdotool mousemove --sync --window "$WID" "$BLOCKED_TAB_X" "$TAB_Y"
+sleep 0.6
+assert_drawer_open /output/beads-drawer-returned.png \
+    "returning to the tab closed the drawer it opened"
+
+# Escape closes a transient drawer and nothing else.
+xdotool key --clearmodifiers Escape
+sleep 0.6
+assert_drawer_closed /output/beads-drawer-escaped.png "Escape left the transient drawer open"
+
+# `click to pin` means inside the drawer too, which is only reachable because
+# crossing into it keeps both the drawer and the board alive. The target is the
+# drawer's own head, beside that hint: its rows are separate click targets that
+# open an issue, exactly as rows in a lane do.
+#
+# Escape left the pointer on the tab, and hover is edge-triggered: re-issuing a
+# move to the coordinates it already holds produces no event and reopens
+# nothing. Leave the tab first, then enter it again.
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+xdotool mousemove --sync --window "$WID" "$BLOCKED_TAB_X" "$TAB_Y"
+sleep 0.6
+assert_drawer_open /output/beads-drawer-reopened.png \
+    "re-entering the tab after Escape opened no drawer"
+xdotool mousemove --sync --window "$WID" \
+    "$(drawer_center_x)" "$(( STRIP_TOP + A2_DRAWER_TOP + A2_HEAD_H / 2 ))"
+sleep 0.6
+xdotool click 1
+sleep 0.6
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+measure_rail /output/beads-rail-pinned.png
+[ "$(track_field 3 2)" -gt "$A2_TAB_W" ] \
+    || fail "clicking inside the drawer did not pin its lane ($(track_field 3 2)px)"
+# Exactly one of Blocked and Done is ever pinned, so the other is still a tab.
+[ "$(track_field 4 2)" -eq "$A2_TAB_W" ] \
+    || fail "pinning Blocked also widened Done ($(track_field 4 2)px)"
+
+# Pinning the other replaces it rather than adding a second pinned lane.
+pin_lane 4
+[ "$(track_field 3 2)" -eq "$A2_TAB_W" ] \
+    || fail "a second pinned lane survived beside Done ($(track_field 3 2)px)"
+
+# That click left the pinned lane's control focused, and it is the same handle
+# the tab carries: Enter unpins, and the focus it leaves behind opens the very
+# drawer pointer hover opened above.
+xdotool key --clearmodifiers Return
+sleep 0.6
+assert_drawer_open /output/beads-drawer-focused.png \
+    "Enter on the pinned lane control did not unpin it into a focus-opened drawer"
+
+# Enter on that still-focused tab pins it again: the keyboard equivalent of the
+# click, and the state the pinned-lane drop below needs.
+xdotool key --clearmodifiers Return
+sleep 0.6
+measure_rail /output/beads-rail-key-pinned.png
+[ "$(track_field 4 2)" -gt "$A2_TAB_W" ] \
+    || fail "Enter on the focused tab did not pin it ($(track_field 4 2)px)"
+
+# A pinned lane is a real drop target: the same guarded close the collapsed tab
+# took above, through a track that did not exist two frames ago.
+PINNED_CLOSE_BEFORE=$(issue_write_count e2e-deferred close_issue)
+PINNED_APPLIED_BEFORE=$(issue_applied_count e2e-deferred)
+drag_issue e2e-deferred 4
+wait_for_write e2e-deferred close_issue "$PINNED_CLOSE_BEFORE"
+wait_for_applied e2e-deferred "$PINNED_APPLIED_BEFORE"
+PINNED_CLOSED=$(cd "$PROJECT" && bd show e2e-deferred --json)
+printf '%s\n' "$PINNED_CLOSED" | grep -Fq '"status": "closed"' \
+    || fail "a drop on the pinned Done lane did not close through bd: $PINNED_CLOSED"
+
+# The pinned head's own `×` unpins by pointer. Dropping keyboard focus
+# afterwards is what closes the drawer that focus would otherwise hold open.
+unpin_lane 4
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( HEIGHT - 80 ))"
+xdotool click 1
+sleep 0.4
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.8
+measure_rail /output/beads-rail-restored.png
+[ "$(track_field 3 2)" -eq "$A2_TAB_W" ] && [ "$(track_field 4 2)" -eq "$A2_TAB_W" ] \
+    || fail "the pinned lane's x did not return the rail to two collapsed tabs: $RAIL_TRACKS"
+echo 'PASS: the collapsed rail opened by hover and focus, pinned and unpinned by pointer' \
+    'and keyboard, kept one pinned lane, and closed a real card through it'
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Keyboard card move]]
+# A2-I6 through the shipped client: Space grabs an eligible row, Left/Right
+# step the named targets, Enter drops through the same guarded verb a pointer
+# drop uses, Enter on a rejected target writes nothing, and Escape cancels.
+# Nothing may reach the PTY while a move is armed.
+#
+# A row click deliberately does not take focus -- the row's own mouse-down
+# stops propagation before GPUI's focus transfer, and A2-I4 asks a click to
+# open the detail, not to focus. The rail tab does focus itself on click, and
+# it is painted immediately after the last In-progress row, so one Shift+Tab
+# from it is a deterministic way in for a keyboard-only user.
+lane_card_count() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+
+snapshot = None
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    message = row.get("message", {})
+    state = message.get("state", {})
+    if row.get("dir") == "server" and message.get("type") == "BeadsBoard":
+        ready = state.get("Ready") if isinstance(state, dict) else None
+        if isinstance(ready, dict):
+            snapshot = ready.get("snapshot")
+if not isinstance(snapshot, dict):
+    raise SystemExit(1)
+print(len(snapshot.get(sys.argv[2], [])))
+PY
+}
+
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+measure_rail /output/beads-key-move-lanes.png
+[ "$(issue_position e2e-ready)" = "2 0" ] \
+    || fail "the keyboard move expected e2e-ready first in In progress, got $(issue_position e2e-ready)"
+[ "$(lane_card_count in_progress)" -eq 1 ] \
+    || fail "In progress holds $(lane_card_count in_progress) rows, so Shift+Tab has no single target"
+pin_lane 3
+KEY_INPUT_BEFORE=$(key_input_count)
+xdotool key --clearmodifiers shift+Tab
+sleep 0.4
+
+# Right from In progress names Blocked, which refuses the move: the drop is
+# still made, and it must leave no write behind.
+REJECT_KEY_BEFORE=$(issue_write_count e2e-ready)
+xdotool key --clearmodifiers space
+sleep 0.3
+xdotool key --clearmodifiers Right
+sleep 0.3
+xdotool key --clearmodifiers Return
+sleep 0.8
+[ "$(issue_write_count e2e-ready)" -eq "$REJECT_KEY_BEFORE" ] \
+    || fail "a keyboard drop on the collapsed Blocked tab still wrote"
+
+# Left names Ready, which accepts through the same guarded verb the pointer
+# drop used for the same target.
+KEY_STATUS_BEFORE=$(issue_write_count e2e-ready set_status)
+KEY_APPLIED_BEFORE=$(issue_applied_count e2e-ready)
+xdotool key --clearmodifiers space
+sleep 0.3
+xdotool key --clearmodifiers Left
+sleep 0.3
+xdotool key --clearmodifiers Return
+wait_for_write e2e-ready set_status "$KEY_STATUS_BEFORE"
+wait_for_applied e2e-ready "$KEY_APPLIED_BEFORE"
+wait_for_lane e2e-ready 1
+KEY_MOVED=$(cd "$PROJECT" && bd show e2e-ready --json)
+printf '%s\n' "$KEY_MOVED" | grep -Fq '"status": "open"' \
+    || fail "the keyboard drop on Ready did not reopen through native bd: $KEY_MOVED"
+
+# Escape cancels the next move with no write at all.
+ESCAPE_BEFORE=$(issue_write_count e2e-ready)
+xdotool key --clearmodifiers space
+sleep 0.3
+xdotool key --clearmodifiers Right
+sleep 0.3
+xdotool key --clearmodifiers Escape
+sleep 0.8
+[ "$(issue_write_count e2e-ready)" -eq "$ESCAPE_BEFORE" ] \
+    || fail "Escape on an armed keyboard move still wrote"
+[ "$(key_input_count)" -eq "$KEY_INPUT_BEFORE" ] \
+    || fail "the keyboard move leaked keystrokes to the pane program"
+CANCELLED=$(cd "$PROJECT" && bd show e2e-ready --json)
+printf '%s\n' "$CANCELLED" | grep -Fq '"status": "open"' \
+    || fail "the cancelled keyboard move changed persisted state: $CANCELLED"
+
+# Leave the rail as the pointer phases found it: unpin, then drop focus so the
+# tab stops holding its drawer open.
+unpin_lane 3
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( HEIGHT - 80 ))"
+xdotool click 1
+sleep 0.4
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.8
+measure_rail /output/beads-key-move-restored.png
+[ "$(track_field 3 2)" -eq "$A2_TAB_W" ] \
+    || fail "the keyboard phase left Blocked pinned: $RAIL_TRACKS"
+echo 'PASS: the keyboard move stepped named targets, dropped through the guarded write path,' \
+    'refused Blocked, and cancelled clean with no keystroke reaching the pane'
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Board text scale]]
+# The steppers live in the strip's own left control gutter now. Scaling text
+# repaints every track and row without moving the strip the board reserved.
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+measure_rail /output/beads-scale-before.png
+SCALE_STRIP_TOP=$STRIP_TOP
+SCALE_CROP=$(strip_crop)
+LARGER_X=$(( A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2 ))
+SMALLER_X=$(( A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2 ))
+ZOOM_Y=$(( STRIP_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2 ))
+for _ in 1 2; do
+    xdotool mousemove --sync --window "$WID" "$LARGER_X" "$ZOOM_Y"
+    xdotool click 1
+    sleep 0.4
+done
+measure_rail /output/beads-scale-larger.png
+[ "$STRIP_TOP" -eq "$SCALE_STRIP_TOP" ] \
+    || fail "larger board text moved the strip from $SCALE_STRIP_TOP to $STRIP_TOP"
+SCALE_DIFF=$(crop_diff /output/beads-scale-before.png /output/beads-scale-larger.png "$SCALE_CROP")
+[ "${SCALE_DIFF:-0}" -ge 2000 ] \
+    || fail "the larger-text stepper changed only ${SCALE_DIFF:-0}px"
+for _ in 1 2; do
+    xdotool mousemove --sync --window "$WID" "$SMALLER_X" "$ZOOM_Y"
+    xdotool click 1
+    sleep 0.4
+done
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+measure_rail /output/beads-scale-restored.png
+[ "$STRIP_TOP" -eq "$SCALE_STRIP_TOP" ] \
+    || fail "restoring board text moved the strip from $SCALE_STRIP_TOP to $STRIP_TOP"
+RESTORED_DIFF=$(crop_diff /output/beads-scale-before.png /output/beads-scale-restored.png \
+    "$SCALE_CROP")
+[ "${RESTORED_DIFF:-9999}" -le 600 ] \
+    || fail "the smaller-text stepper left ${RESTORED_DIFF:-0}px of the larger scale behind"
+echo 'PASS: the board text steppers rescaled the rail and restored it without moving the strip'
 
 # @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow view entry and retarget]]
 # Everything above has finished with the single-region board it was written
@@ -950,10 +1400,12 @@ xdotool key --clearmodifiers Escape
 xdotool mousemove --sync --window "$WID" 13 17
 sleep 0.5
 
+# Five ranks, so the graph is wider than the strip and its wheel travel, edge
+# fades, and position bar are real rather than degenerate.
 (
     cd "$PROJECT"
     bd create 'Painted Flow epic' --id e2e-flow-epic --type epic --priority 2 >/dev/null
-    for issue_id in e2e-flow-a e2e-flow-b e2e-flow-c e2e-flow-d; do
+    for issue_id in e2e-flow-a e2e-flow-b e2e-flow-c e2e-flow-d e2e-flow-e e2e-flow-f; do
         bd create "Painted $issue_id" --id "$issue_id" --type task --priority 2 >/dev/null
         bd update "$issue_id" --parent e2e-flow-epic >/dev/null
     done
@@ -962,6 +1414,8 @@ sleep 0.5
     bd dep add e2e-flow-c e2e-flow-a >/dev/null
     bd dep add e2e-flow-d e2e-flow-b >/dev/null
     bd dep add e2e-flow-d e2e-flow-c >/dev/null
+    bd dep add e2e-flow-e e2e-flow-d >/dev/null
+    bd dep add e2e-flow-f e2e-flow-e >/dev/null
 )
 
 # Every detail request for a member of the painted epic other than $1, so a
@@ -969,7 +1423,9 @@ sleep 0.5
 flow_sibling_requests() {
     python3 - "$RECORD" "$1" <<'PY'
 import json, sys
-members = {"e2e-flow-a", "e2e-flow-b", "e2e-flow-c", "e2e-flow-d"} - {sys.argv[2]}
+members = {
+    "e2e-flow-a", "e2e-flow-b", "e2e-flow-c", "e2e-flow-d", "e2e-flow-e", "e2e-flow-f",
+} - {sys.argv[2]}
 count = 0
 for line in open(sys.argv[1]):
     try: row = json.loads(line)
@@ -1017,7 +1473,7 @@ PY
 }
 
 click_card() {
-    local issue="$1" position lane index lane_width
+    local issue="$1" position lane index
     for _ in $(seq 1 50); do
         position=$(issue_position "$issue" 2>/dev/null || true)
         [ -n "$position" ] && break
@@ -1025,9 +1481,10 @@ click_card() {
     done
     [ -n "${position:-}" ] || fail "$issue never painted a card"
     read -r lane index <<<"$position"
-    lane_width=$(( (WIN_W - 16) / 5 ))
-    xdotool mousemove --sync --window "$WID" \
-        "$(( 16 + lane * lane_width + 70 ))" "$(( 70 + index * 50 + 14 ))"
+    [ "$index" -lt "$A2_BODY_ROWS" ] \
+        || fail "$issue sits past the last whole painted row of its lane"
+    measure_rail
+    xdotool mousemove --sync --window "$WID" "$(lane_x "$lane")" "$(row_y "$index")"
     xdotool mousedown 1
     xdotool mouseup 1
 }
@@ -1053,21 +1510,23 @@ wait_for_seeded_card() {
     done
     fail "$issue never reached the painted board after seeding"
 }
-wait_for_seeded_card e2e-flow-d
-import -window "$WID" /output/beads-flow-lanes.png
+# The deepest members are blocked, and Blocked is a collapsed tab with no rows
+# to click: the entry card is the epic member the board actually paints.
+wait_for_seeded_card e2e-flow-b
+measure_rail /output/beads-flow-lanes.png
 
-FLOW_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-d)
+FLOW_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-b)
 FLOW_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
-click_card e2e-flow-d
+click_card e2e-flow-b
 for _ in $(seq 1 50); do
-    [ "$(flow_detail_requests e2e-flow-d)" -gt "$FLOW_DETAIL_BEFORE" ] \
+    [ "$(flow_detail_requests e2e-flow-b)" -gt "$FLOW_DETAIL_BEFORE" ] \
         && [ "$(epic_graph_requests e2e-flow-epic)" -gt "$FLOW_GRAPH_BEFORE" ] \
         && break
     sleep 0.2
 done
 # One click owes both: the panel is untouched by Flow and opens as it always
 # has, and only the strip follows the card into its epic.
-[ "$(flow_detail_requests e2e-flow-d)" -gt "$FLOW_DETAIL_BEFORE" ] \
+[ "$(flow_detail_requests e2e-flow-b)" -gt "$FLOW_DETAIL_BEFORE" ] \
     || fail "the card click did not open the detail panel"
 [ "$(epic_graph_requests e2e-flow-epic)" -gt "$FLOW_GRAPH_BEFORE" ] \
     || fail "the card click did not ask for its epic graph"
@@ -1079,27 +1538,27 @@ epic_graph_admitted e2e-flow-epic \
     || fail "the server never admitted the painted epic's graph"
 sleep 0.5
 import -window "$WID" /output/beads-flow-strip.png
-STRIP_DIFF=$(compare -metric AE \
-    \( /output/beads-flow-lanes.png -crop "${WIN_W}x197+0+34" +repage \) \
-    \( /output/beads-flow-strip.png -crop "${WIN_W}x197+0+34" +repage \) \
-    null: 2>&1 || true)
-STRIP_DIFF=${STRIP_DIFF%%.*}
+STRIP_DIFF=$(crop_diff /output/beads-flow-lanes.png /output/beads-flow-strip.png "$(strip_crop)")
 [ "${STRIP_DIFF:-0}" -ge 5000 ] \
     || fail "the strip did not repaint into Flow (${STRIP_DIFF:-0}px)"
 
-# The panel begins below the 34px titlebar plus Flow's fixed 197px strip.
+# The panel begins below the titlebar plus Flow's own strip reservation.
 # Diffing with that strip masked isolates its real painted surface.
 read -r FLOW_PANEL_W FLOW_PANEL_H FLOW_PANEL_X FLOW_PANEL_Y \
     <<<"$(panel_bounds /output/beads-flow-lanes.png /output/beads-flow-strip.png)"
 FLOW_PANEL_TOP=${FLOW_PANEL_Y#+}
-[ "${FLOW_PANEL_TOP:-0}" -ge 231 ] \
+[ "${FLOW_PANEL_TOP:-0}" -ge "$(( STRIP_TOP + A2_STRIP_H ))" ] \
     || fail "Flow detail panel overlaps the strip at y=${FLOW_PANEL_Y:-unknown}"
 
 # A real click on rank 0 must cross the panel layer and reach the node handler.
-# The 214px node starts at x=30; its one-row rank is vertically centred in the
-# 139px graph below the 34px titlebar, Flow band, and ruler.
-FLOW_ROOT_X=$((30 + 214 / 2))
-FLOW_ROOT_Y=$((34 + 34 + 15 + (139 - 24) / 2 + 24 / 2))
+# Its coordinates are the contract's own A3 formulas -- the node box at the
+# graph's left padding, its single-row rank centred in the fixed graph band
+# under the measured strip top, the Flow band, and the rank ruler.
+FLOW_ROOT_X=$(( A3_LEFT_PAD + A3_NODE_W / 2 ))
+FLOW_GRAPH_MID_Y=$(( STRIP_TOP + A3_GRAPH_TOP + A3_GRAPH_H / 2 ))
+FLOW_ROOT_Y=$FLOW_GRAPH_MID_Y
+FLOW_GUTTER_X=$(( A3_LEFT_PAD + A3_NODE_W + (A3_RANK_PITCH - A3_NODE_W) / 2 ))
+FLOW_GRAPH_CROP="${WIN_W}x${A3_GRAPH_H}+0+$(( STRIP_TOP + A3_GRAPH_TOP ))"
 ROOT_DETAIL_BEFORE=$(flow_detail_requests e2e-flow-a)
 GRAPH_AFTER_OPEN=$(epic_graph_requests e2e-flow-epic)
 xdotool mousemove --sync --window "$WID" "$FLOW_ROOT_X" "$FLOW_ROOT_Y"
@@ -1129,22 +1588,163 @@ done
 [ "$(epic_graph_requests e2e-flow-epic)" -eq "$GRAPH_AFTER_OPEN" ] \
     || fail "keyboard Flow activation re-requested the epic graph"
 
-# Leaving Flow returns the same board: lanes paint again and a card with no
-# epic opens its panel without ever asking for a graph.
-xdotool key --clearmodifiers Escape
+# Hover traces the path through the node under the pointer and dims the rest;
+# leaving restores every node and wire.
+xdotool mousemove --sync --window "$WID" "$FLOW_GUTTER_X" "$FLOW_GRAPH_MID_Y"
 sleep 0.5
-LOOSE_DETAIL_BEFORE=$(flow_detail_requests e2e-ready)
-LOOSE_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
-click_card e2e-ready
+import -window "$WID" /output/beads-flow-untraced.png
+xdotool mousemove --sync --window "$WID" "$FLOW_ROOT_X" "$FLOW_ROOT_Y"
+sleep 0.5
+import -window "$WID" /output/beads-flow-traced.png
+TRACE_DIFF=$(crop_diff /output/beads-flow-untraced.png /output/beads-flow-traced.png \
+    "$FLOW_GRAPH_CROP")
+[ "${TRACE_DIFF:-0}" -ge 1000 ] \
+    || fail "hovering a Flow node traced nothing (${TRACE_DIFF:-0}px)"
+xdotool mousemove --sync --window "$WID" "$FLOW_GUTTER_X" "$FLOW_GRAPH_MID_Y"
+sleep 0.5
+import -window "$WID" /output/beads-flow-untraced-again.png
+UNTRACE_DIFF=$(crop_diff /output/beads-flow-untraced.png /output/beads-flow-untraced-again.png \
+    "$FLOW_GRAPH_CROP")
+[ "${UNTRACE_DIFF:-0}" -le 400 ] \
+    || fail "leaving the node left ${UNTRACE_DIFF:-0}px of trace behind"
+
+# Five ranks are wider than this strip, so the position bar exists and the
+# wheel travels the graph. Its own painted mark is the oracle for travel and
+# for both clamps; the wheel is claimed by Flow, so the pane sees nothing.
+position_mark() {
+    import -window "$WID" "$1"
+    python3 /tests/func/beads-board-geometry.py run \
+        --shot "$1" --width "$WIN_W" --y "$(( STRIP_TOP + A3_HBAR_TOP ))" --height "$A3_HBAR_H" \
+        --min-width 20
+}
+
+wheel_flow() {
+    xdotool mousemove --sync --window "$WID" "$FLOW_GUTTER_X" "$FLOW_GRAPH_MID_Y"
+    # Let the client consume the move before the first wheel, and space the
+    # clicks: a wheel event is dispatched against the hit test the last
+    # processed pointer position produced, and a burst tighter than the
+    # client's frame arrives as one coalesced delta rather than the separate
+    # notches a reader actually turns.
+    sleep 0.4
+    xdotool click --repeat "$1" --delay 150 "$2"
+    sleep 0.5
+}
+
+MARK_START=$(position_mark /output/beads-flow-scroll-origin.png) \
+    || fail "an overflowing Flow graph painted no position bar"
+WHEEL_REPORTS_BEFORE=$(wheel_report_count)
+wheel_flow 5 5
+MARK_MOVED=$(position_mark /output/beads-flow-scrolled.png) \
+    || fail "the position bar vanished while scrolling"
+[ "${MARK_MOVED%% *}" -ne "${MARK_START%% *}" ] \
+    || fail "the wheel moved no position (${MARK_START} -> ${MARK_MOVED})"
+# A wheel over Flow is Flow's, travelling or clamped: it never reaches the
+# pane behind it. The clamped ends are bracketed too, below, because that is
+# the half that once handed the pane a wheel it had already handled.
+[ "$(wheel_report_count)" -eq "$WHEEL_REPORTS_BEFORE" ] \
+    || fail "a travelling wheel over Flow leaked wheel reports to the pane"
+SCROLL_DIFF=$(crop_diff /output/beads-flow-scroll-origin.png /output/beads-flow-scrolled.png \
+    "$FLOW_GRAPH_CROP")
+[ "${SCROLL_DIFF:-0}" -ge 2000 ] \
+    || fail "the wheel moved the position bar but not the graph (${SCROLL_DIFF:-0}px)"
+wheel_flow 10 5
+MARK_CLAMPED=$(position_mark /output/beads-flow-scroll-end.png) \
+    || fail "the position bar vanished at the far end"
+wheel_flow 3 5
+MARK_STILL_CLAMPED=$(position_mark /output/beads-flow-scroll-clamped.png) \
+    || fail "the position bar vanished past the far end"
+[ "${MARK_CLAMPED%% *}" -eq "${MARK_STILL_CLAMPED%% *}" ] \
+    || fail "scrolling past the end kept moving (${MARK_CLAMPED} -> ${MARK_STILL_CLAMPED})"
+wheel_flow 20 4
+MARK_HOME=$(position_mark /output/beads-flow-scroll-home.png) \
+    || fail "the position bar vanished back at the origin"
+[ "${MARK_HOME%% *}" -eq "${MARK_START%% *}" ] \
+    || fail "scrolling back did not clamp at the origin (${MARK_START} -> ${MARK_HOME})"
+[ "$(wheel_report_count)" -eq "$WHEEL_REPORTS_BEFORE" ] \
+    || fail "a clamped wheel over Flow leaked wheel reports to the pane"
+
+# `\u2190 LANES` is a real pointer control: it returns to the lanes, which the
+# measurable seam row proves outright.
+BACK_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
+xdotool mousemove --sync --window "$WID" \
+    "$(( A3_BAND_PAD_LEFT + 10 ))" "$(( STRIP_TOP + A3_BAND_H / 2 ))"
+sleep 0.3
+xdotool click 1
+sleep 0.8
+measure_rail /output/beads-flow-back-to-lanes.png
+
+# Reopening is the refresh action: the frozen graph is dropped on exit, so a
+# second entry asks the server for a complete one again.
+click_card e2e-flow-c
 for _ in $(seq 1 50); do
-    [ "$(flow_detail_requests e2e-ready)" -gt "$LOOSE_DETAIL_BEFORE" ] && break
+    [ "$(epic_graph_requests e2e-flow-epic)" -gt "$BACK_GRAPH_BEFORE" ] && break
     sleep 0.2
 done
-[ "$(flow_detail_requests e2e-ready)" -gt "$LOOSE_DETAIL_BEFORE" ] \
+[ "$(epic_graph_requests e2e-flow-epic)" -gt "$BACK_GRAPH_BEFORE" ] \
+    || fail "reopening Flow reused the graph it left instead of requesting a fresh one"
+sleep 0.8
+
+# The mode pair's `LANES` member is the second real exit. `FLOW` beside it is
+# the only selected-state chip in the band, so its painted left edge is what
+# locates `LANES` without guessing a text width.
+import -window "$WID" /output/beads-flow-reopened.png
+FLOW_CHIP=$(python3 /tests/func/beads-board-geometry.py run \
+    --shot /output/beads-flow-reopened.png --width "$WIN_W" \
+    --y "$(( STRIP_TOP + A3_BAND_H / 4 ))" --height 4 --min-width 20) \
+    || fail "the reopened Flow band painted no selected FLOW chip"
+xdotool mousemove --sync --window "$WID" \
+    "$(( ${FLOW_CHIP%% *} - 5 ))" "$(( STRIP_TOP + A3_BAND_H / 2 ))"
+sleep 0.3
+xdotool click 1
+sleep 0.8
+measure_rail /output/beads-flow-mode-exit.png
+
+# Leaving Flow returns the same board: lanes paint again and a card with no
+# epic opens its panel without ever asking for a graph. Select the current
+# snapshot's first epic-less whole-row card, not one fixture's old position:
+# Flow's two Ready cards may fill that lane before this closing check runs.
+loose_card() {
+    python3 - "$RECORD" "$A2_BODY_ROWS" <<'PY'
+import json, sys
+
+snapshot = None
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    message = row.get("message", {})
+    state = message.get("state", {})
+    if row.get("dir") == "server" and message.get("type") == "BeadsBoard":
+        ready = state.get("Ready") if isinstance(state, dict) else None
+        if isinstance(ready, dict):
+            snapshot = ready.get("snapshot")
+if not isinstance(snapshot, dict):
+    raise SystemExit(1)
+for lane in ("backlog", "ready", "in_progress"):
+    for card in snapshot.get(lane, [])[:int(sys.argv[2])]:
+        if card.get("parent_epic_id") is None:
+            print(card["id"])
+            raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+LOOSE_CARD=$(loose_card) \
+    || fail "no epic-less fixture is on a painted row for the return-to-lanes check"
+LOOSE_DETAIL_BEFORE=$(flow_detail_requests "$LOOSE_CARD")
+LOOSE_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
+click_card "$LOOSE_CARD"
+for _ in $(seq 1 50); do
+    [ "$(flow_detail_requests "$LOOSE_CARD")" -gt "$LOOSE_DETAIL_BEFORE" ] && break
+    sleep 0.2
+done
+[ "$(flow_detail_requests "$LOOSE_CARD")" -gt "$LOOSE_DETAIL_BEFORE" ] \
     || fail "lanes stopped opening the panel after a Flow round trip"
 [ "$(epic_graph_requests e2e-flow-epic)" -eq "$LOOSE_GRAPH_BEFORE" ] \
     || fail "a card with no epic asked for a graph"
 
 import -window "$WID" /output/beads-flow-functional.png
 echo 'PASS: a real card click opened the panel and swapped the strip into Flow, a node' \
-    'retargeted the panel inside the frozen epic, and lanes stayed usable on return'
+    'retargeted the panel inside the frozen epic, hover traced it, the wheel travelled and' \
+    'clamped it, both exit controls returned to lanes, and reopening asked for a fresh graph'

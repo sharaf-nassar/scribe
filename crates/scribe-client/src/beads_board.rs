@@ -2204,11 +2204,19 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
                 } else {
                     -f32::from(delta.y)
                 };
+                // A surface that handles a gesture owns it even when its own
+                // response is a no-op -- the rule scribe-uu2y established for
+                // the release half of a swallowed press. A wheel over Flow is
+                // Flow's whether or not the clamped offset moved (A3-I7
+                // claims the gesture and clamps the scroll as two separate
+                // clauses), or wheeling at either end of a graph scrolls the
+                // pane behind the board. Only the frame is conditional: a
+                // clamped wheel changes nothing to repaint.
+                app.stop_propagation();
                 if let Ok(mut boards) = wheel_state.lock()
                     && boards.scroll_flow(workspace_id, travel, rect)
                 {
                     window.refresh();
-                    app.stop_propagation();
                 }
             })
             .child(painted)
@@ -3096,12 +3104,15 @@ fn lane_drawer(
         .id(SharedString::from(format!("beads-drawer-{workspace_id}-{queue:?}")))
         .role(Role::Group)
         .aria_label(format!("{} preview, {} issues", queue_name(queue), lane.total))
+        // `absolute` has to be the last position this chain sets (A2-G8): a
+        // trailing `relative()` returns the drawer to the lanes' flex row,
+        // where `right` is an offset from its static position rather than the
+        // bounds `beads_board_a2::queue_at` hit-tests against.
         .absolute()
         .top(px(beads_board_a2::DRAWER_TOP))
         .bottom(px(beads_board_a2::DRAWER_BOTTOM))
         .right(px(beads_board_a2::DRAWER_RIGHT))
         .w(px(beads_board_a2::DRAWER_W))
-        .relative()
         .occlude()
         .flex()
         .flex_col()
@@ -3111,16 +3122,26 @@ fn lane_drawer(
         .border_color(border)
         .rounded(px(beads_board_a2::DRAWER_RADIUS))
         .shadow_lg()
-        // Same pairing as the tab's stop above: leaving the drawer starts the
+        // Same pairing as the tab's own hover: leaving the drawer starts the
         // grace timer, and that only becomes visible if this frame is drawn.
         .on_hover(move |entered: &bool, window, _app| {
-            let changed = hover_boards
-                .lock()
-                .is_ok_and(|mut boards| {
-                    boards.hover_lane(workspace_id, queue, LaneHoverSource::Drawer, *entered)
-                });
-            if changed {
-                window.refresh();
+            if let Ok(mut boards) = hover_boards.lock() {
+                let opened =
+                    boards.hover_lane(workspace_id, queue, LaneHoverSource::Drawer, *entered);
+                // The drawer is the board's own overlay, and it `occlude`s:
+                // GPUI's `BlockMouse` makes every hitbox behind it -- the
+                // board's own included -- report `is_hovered() == false`, so a
+                // hovered board would read the pointer entering its drawer as
+                // the pointer leaving the board and take the drawer down with
+                // it mid-transfer (A2-I1). `Control` is the source for exactly
+                // that, an element inside the board that takes hover away from
+                // it: `Board` would be cleared again by `board_shell`'s own
+                // leave, which GPUI dispatches after this one in the same
+                // pointer move.
+                boards.hover(workspace_id, HoverSource::Control, *entered);
+                if opened {
+                    window.refresh();
+                }
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
