@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Anchor, AnyElement, Bounds, Context, DragMoveEvent, FocusHandle, FontWeight, KeyDownEvent,
+    Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, FocusHandle, FontWeight, KeyDownEvent,
     MouseButton, Pixels, Point, Render, Rgba, Role, SharedString, Window, anchored, div,
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
@@ -118,6 +118,9 @@ pub struct BeadsBoards {
     card_press: Option<CardDragPress>,
     /// Card drag currently tracked by GPUI's native drag stream.
     card_drag: Option<CardDragState>,
+    /// Card move armed from the keyboard (Space on a focused eligible row),
+    /// the keyboard twin of `card_press`/`card_drag` (A2-I6).
+    card_key_move: Option<CardKeyMove>,
     /// Cards painted in their requested lane until a write result and the
     /// authoritative board snapshot settle that request.
     optimistic_drops: HashMap<(WorkspaceId, String), OptimisticDrop>,
@@ -214,6 +217,19 @@ pub struct CardDragState {
     pub source_lane: u8,
     pub pointer: CardDragPoint,
     pub hovered_lane: Option<u8>,
+}
+
+/// A card move armed from the keyboard (Space on a focused eligible row),
+/// the keyboard twin of `card_press`/`card_drag` (A2-I6). `target_lane` is
+/// never absent the way a pointer drag's `hovered_lane` can be: Left/Right
+/// always lands on one of the five named lanes, starting on the row's own --
+/// a reject, same as a pointer drag that has not left its source row yet.
+#[derive(Debug, Clone, PartialEq)]
+struct CardKeyMove {
+    workspace_id: WorkspaceId,
+    source: BeadsBoardItem,
+    source_lane: u8,
+    target_lane: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,6 +523,9 @@ impl BeadsBoards {
             {
                 self.end_card_drag();
             }
+            if self.card_key_move.as_ref().is_some_and(|mv| mv.workspace_id == workspace_id) {
+                self.card_key_move = None;
+            }
         }
         let snapshot = match &state {
             BeadsBoardState::Loading { cached } => cached.as_ref(),
@@ -683,6 +702,7 @@ impl BeadsBoards {
     ) -> bool {
         self.card_press = None;
         self.card_drag = None;
+        self.card_key_move = None;
         if !card_drag_source(source_lane) {
             return false;
         }
@@ -837,6 +857,124 @@ impl BeadsBoards {
         if let Some(snapshot) = self.states.get_mut(&workspace_id).and_then(state_snapshot_mut) {
             move_snapshot_card(snapshot, drop.target_lane, drop.source_lane, issue_id);
         }
+    }
+
+    /// `workspace_id`'s own armed keyboard move, if it has one (A2-I6).
+    fn key_move(&self, workspace_id: WorkspaceId) -> Option<&CardKeyMove> {
+        self.card_key_move.as_ref().filter(|mv| mv.workspace_id == workspace_id)
+    }
+
+    /// Arm one keyboard move on `workspace_id`'s focused `source` row
+    /// (A2-I6), the keyboard twin of `arm_card_drag`: Done and Blocked
+    /// reject through the same `card_drag_source` gate a pointer press
+    /// already uses. Starts targeting the row's own lane -- a reject, same
+    /// as a pointer drag that has not left its source row yet -- so
+    /// Left/Right is what actually picks a target. Also clears any pointer
+    /// press/drag: the two gestures are never in flight together.
+    pub fn arm_key_move(
+        &mut self,
+        workspace_id: WorkspaceId,
+        source: BeadsBoardItem,
+        source_lane: u8,
+    ) -> bool {
+        self.card_press = None;
+        self.card_drag = None;
+        self.card_key_move = None;
+        if !card_drag_source(source_lane) {
+            return false;
+        }
+        self.card_key_move =
+            Some(CardKeyMove { workspace_id, source, source_lane, target_lane: source_lane });
+        true
+    }
+
+    /// Whether `workspace_id` has `issue_id`'s keyboard move armed right
+    /// now -- what a row's own key handler reads to tell Space-to-arm apart
+    /// from Left/Right/Enter/Escape acting on a move already in flight.
+    pub fn key_move_armed(&self, workspace_id: WorkspaceId, issue_id: &str) -> bool {
+        self.key_move(workspace_id).is_some_and(|mv| mv.source.id == issue_id)
+    }
+
+    /// Step `workspace_id`'s armed move's target lane (`forward` is Right,
+    /// `!forward` is Left), clamped to the five named lanes (A2-I6). A
+    /// no-op off `workspace_id`'s own move or already at an end.
+    pub fn step_key_move(&mut self, workspace_id: WorkspaceId, forward: bool) -> bool {
+        let Some(mv) = self.card_key_move.as_mut().filter(|mv| mv.workspace_id == workspace_id)
+        else {
+            return false;
+        };
+        let next = if forward {
+            mv.target_lane.saturating_add(1).min(4)
+        } else {
+            mv.target_lane.saturating_sub(1)
+        };
+        if next == mv.target_lane {
+            return false;
+        }
+        mv.target_lane = next;
+        true
+    }
+
+    /// Cancel `workspace_id`'s armed move with no write (Escape). Reports
+    /// whether one was actually armed, so a row's key handler knows it
+    /// owned the key.
+    pub fn cancel_key_move(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.card_key_move.take_if(|mv| mv.workspace_id == workspace_id).is_some()
+    }
+
+    /// Take `workspace_id`'s armed move for a drop (Enter/Space), lowered to
+    /// the exact `CardDragState` shape `queue_card_drop` and
+    /// `apply_card_drop` already take -- so a keyboard drop runs through the
+    /// same guard and write functions as a pointer drop, never a second
+    /// path. `pointer` is dead weight for both calls: neither reads it, only
+    /// `hovered_lane` (A2-BD6's own guard match) and the id/lane fields they
+    /// already share.
+    pub fn take_key_move(&mut self, workspace_id: WorkspaceId) -> Option<CardDragState> {
+        let mv = self.card_key_move.take_if(|mv| mv.workspace_id == workspace_id)?;
+        Some(CardDragState {
+            workspace_id: mv.workspace_id,
+            source: mv.source,
+            source_lane: mv.source_lane,
+            pointer: CardDragPoint { x: 0.0, y: 0.0 },
+            hovered_lane: Some(mv.target_lane),
+        })
+    }
+
+    /// How one board paints its own keyboard-armed move (A2-I6), the
+    /// keyboard twin of `card_drag_paint`: read by `LaneCtx::drag_target`
+    /// and a row's own `lifted` dimming for the exact same wash/dim
+    /// treatment pointer drag already paints. Deliberately never folded
+    /// into `card_drag_paint` itself -- that value alone still gates
+    /// `swallows_release`, and a keyboard move must never change whether a
+    /// mouse release is some other control's to swallow (scribe-uu2y).
+    pub fn key_move_paint(&self, workspace_id: WorkspaceId) -> Option<CardDragPaint> {
+        let mv = self.key_move(workspace_id)?;
+        Some(CardDragPaint {
+            source_id: mv.source.id.clone(),
+            source_lane: mv.source_lane,
+            target_lane: Some(mv.target_lane),
+        })
+    }
+
+    /// Every Backlog/Ready/In-progress card id in `workspace_id`'s current
+    /// snapshot -- the rows A2-I6's keyboard move can grab, and so the ones
+    /// that need a stable Tab stop. Read off the raw snapshot rather than
+    /// `beads_board_a2::layout`'s windowed visible rows: an element that
+    /// gets no `track_focus` this frame is simply outside the Tab order, so
+    /// a handle for a row the fixed row-count window currently hides costs
+    /// nothing, and computing it here would be a second read of the same
+    /// layout paint already owns.
+    pub fn eligible_row_ids(&self, workspace_id: WorkspaceId) -> HashSet<String> {
+        let Some(snapshot) = self.state(workspace_id).and_then(state_snapshot) else {
+            return HashSet::new();
+        };
+        snapshot
+            .backlog
+            .iter()
+            .chain(&snapshot.ready)
+            .chain(&snapshot.in_progress)
+            .map(|item| item.id.clone())
+            .collect()
     }
 
     /// The shortest board that still shows one whole readable row after any
@@ -1180,6 +1318,19 @@ fn lane_index(queue: BeadsIssueQueue) -> u8 {
         BeadsIssueQueue::InProgress => 2,
         BeadsIssueQueue::Blocked => 3,
         BeadsIssueQueue::Done => 4,
+    }
+}
+
+/// The inverse of `lane_index`: `lane`'s queue, if it names one of the five
+/// (A2-I6's own row announces its keyboard-armed target by name).
+fn queue_for_lane(lane: u8) -> Option<BeadsIssueQueue> {
+    match lane {
+        0 => Some(BeadsIssueQueue::Backlog),
+        1 => Some(BeadsIssueQueue::Ready),
+        2 => Some(BeadsIssueQueue::InProgress),
+        3 => Some(BeadsIssueQueue::Blocked),
+        4 => Some(BeadsIssueQueue::Done),
+        _ => None,
     }
 }
 
@@ -1622,6 +1773,9 @@ pub struct BeadsBoardRender {
     /// board-store guard: the lifted row it dims and the lane the pointer is
     /// over (A2-S4). `None` on every board but the one holding a card.
     pub card_drag: Option<CardDragPaint>,
+    /// This board's own keyboard-armed move, the keyboard twin of
+    /// `card_drag` (A2-I6), read from `BeadsBoards::key_move_paint`.
+    pub key_move: Option<CardDragPaint>,
     /// Blocked and Done's collapsed-lane state, read under the caller's
     /// existing board-store guard: whether the A2 layout gives each a
     /// pinned lane's track or a plain rail tab (A2-S1, A2-S3).
@@ -1636,6 +1790,11 @@ pub struct BeadsBoardRender {
     /// pinned tab or its `×` control unpins it").
     pub blocked_tab_focus: FocusHandle,
     pub done_tab_focus: FocusHandle,
+    /// Stable Tab stops for every Backlog/Ready/In-progress row, keyed by
+    /// issue id and held by the view across frames the same way
+    /// `blocked_tab_focus`/`done_tab_focus` are, so Tab order and an armed
+    /// move's own focus survive a repaint (A2-I6).
+    pub row_focus: HashMap<String, FocusHandle>,
     /// Text scale shared by every board in this window.
     pub scale: f32,
     /// The live theme's board palette.
@@ -1662,6 +1821,14 @@ struct BoardStores<'a> {
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     rect: Rect,
     drag: Option<&'a CardDragPaint>,
+    /// This board's own keyboard-armed move, the keyboard twin of `drag`
+    /// (A2-I6). Kept separate from `drag` rather than merged into it: `drag`
+    /// alone gates `swallows_release`, and a keyboard move must never affect
+    /// whether a mouse release belongs to some other control (scribe-uu2y).
+    key_move: Option<&'a CardDragPaint>,
+    /// Stable Tab stops for every Backlog/Ready/In-progress row, keyed by
+    /// issue id (A2-I6).
+    row_focus: &'a HashMap<String, FocusHandle>,
 }
 
 /// Marker registered with GPUI's native drag arm for eligible Beads cards.
@@ -1743,9 +1910,11 @@ pub fn render(
         panel_state,
         workspace_id,
         card_drag,
+        key_move,
         rail,
         blocked_tab_focus,
         done_tab_focus,
+        row_focus,
         scale,
         colors,
         flow_controls,
@@ -1780,6 +1949,8 @@ pub fn render(
                 panels: &panel_state,
                 rect,
                 drag: card_drag.as_ref(),
+                key_move: key_move.as_ref(),
+                row_focus: &row_focus,
             },
             colors,
             metrics,
@@ -2122,12 +2293,18 @@ impl<'a> LaneCtx<'a> {
         if queue == BeadsIssueQueue::Done { self.done_tab_focus } else { self.blocked_tab_focus }
     }
 
-    /// Whether the drag in flight is over `lane_index`, and if so whether
-    /// dropping there would write (A2-S4, A2-BD6). `None` covers both no drag
-    /// and a drag over some other track, which paint the same: untouched.
+    /// Whether the drag or armed keyboard move in flight is over
+    /// `lane_index`, and if so whether dropping there would write (A2-S4,
+    /// A2-BD6, A2-I6). `None` covers no move in flight and a move over some
+    /// other track, which paint the same: untouched. A pointer drag and a
+    /// keyboard move are never both in flight, but checking the pointer
+    /// first costs nothing either way.
     fn drag_target(&self, lane_index: u8) -> Option<bool> {
-        let drag = self.stores.drag?;
-        (drag.target_lane == Some(lane_index)).then(|| drag.accepts(lane_index))
+        if let Some(drag) = self.stores.drag {
+            return (drag.target_lane == Some(lane_index)).then(|| drag.accepts(lane_index));
+        }
+        let key_move = self.stores.key_move?;
+        (key_move.target_lane == Some(lane_index)).then(|| key_move.accepts(lane_index))
     }
 }
 
@@ -2490,16 +2667,20 @@ fn lane_body(
             colors: ctx.colors,
             metrics: ctx.metrics,
         };
+        let key_move = ctx.stores.key_move.filter(|mv| mv.source_id == row.item.id).cloned();
         ledger_row(
             row,
             RowMeta {
                 state_color,
                 show_separator: index < last,
-                lifted: ctx.stores.drag.is_some_and(|drag| drag.source_id == row.item.id),
+                lifted: ctx.stores.drag.is_some_and(|drag| drag.source_id == row.item.id)
+                    || key_move.is_some(),
                 row_height: ctx.row_height,
                 now_epoch_s: ctx.now_epoch_s,
+                key_move,
             },
             card,
+            ctx.stores.row_focus.get(&row.item.id),
         )
     }))
     .into_any_element()
@@ -2916,7 +3097,7 @@ fn drawer_head(lane: &QueueLane<'_>, state_color: Rgba, colors: &BeadsBoardColor
 /// One visible row's own paint facts, separate from [`CardContext`] because
 /// they come from the lane's [`QueueLane`]/position rather than the board's
 /// shared stores.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RowMeta {
     state_color: Rgba,
     /// Whether this row owns the hairline under it: every row but a lane's
@@ -2924,30 +3105,43 @@ struct RowMeta {
     /// underline regardless, so only the separator itself is conditional
     /// (A2-S7).
     show_separator: bool,
-    /// Whether this row's own card is the one currently in flight, in which
-    /// case it dims where it still sits until the drop settles (A2-S4).
+    /// Whether this row's own card is the one currently in flight -- lifted
+    /// by a pointer drag or armed by a keyboard move alike -- in which case
+    /// it dims where it still sits until the drop or cancel settles (A2-S4,
+    /// A2-I6).
     lifted: bool,
     row_height: f32,
     now_epoch_s: i64,
+    /// This row's own keyboard move in flight, if it is the one armed
+    /// (A2-I6). Read only for its accessible name: the dim/wash treatment
+    /// `lifted` and the lane's own [`LaneCtx::drag_target`] already cover,
+    /// reused wholesale from the pointer matrix.
+    key_move: Option<CardDragPaint>,
 }
 
 /// One 51px ledger row: a saturated priority glyph, the title, and a
 /// three-column sub line, opening the issue exactly as the raised card it
-/// replaces did (A2-G4, A2-G5, A2-C3).
-fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyElement {
-    let RowMeta { state_color, show_separator, lifted, row_height, now_epoch_s } = meta;
-    let CardContext { workspace_id, state, panels, lane, board_rect, colors, metrics } = card;
+/// replaces did (A2-G4, A2-G5, A2-C3). `focus` is this row's own stable Tab
+/// stop when it is one of the eligible Backlog/Ready/In-progress rows
+/// A2-I6's keyboard move can grab, `None` for a Blocked/Done row shown by a
+/// pinned lane.
+fn ledger_row(
+    row: &RowView<'_>,
+    meta: RowMeta,
+    card: CardContext<'_>,
+    focus: Option<&FocusHandle>,
+) -> AnyElement {
+    let RowMeta { state_color, show_separator, lifted, row_height, now_epoch_s, key_move } = meta;
+    let CardContext { workspace_id, state, panels, lane, colors, metrics, .. } = card;
     let item = row.item;
     let panels = std::sync::Arc::clone(panels);
     let selected = item.clone();
     let dragged = item.clone();
     let arm_state = std::sync::Arc::clone(state);
     let click_state = std::sync::Arc::clone(state);
-    let start_state = std::sync::Arc::clone(state);
     let draggable = card_drag_source(lane);
-    let drag_source = item.clone();
-    let drag_colors = *colors;
     let mark = colors.priority(item.priority);
+    let title = colors.title;
     let tooltip_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
     let measured_tooltip_bounds = std::rc::Rc::clone(&tooltip_bounds);
     let row_element = div()
@@ -2956,7 +3150,7 @@ fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyEle
         })
         .id(SharedString::from(format!("beads-row-{workspace_id}-{}", item.id)))
         .role(Role::Button)
-        .aria_label(format!("Open issue {}", item.id))
+        .aria_label(row_accessible_label(item, key_move.as_ref(), draggable))
         .relative()
         .flex_none()
         .h(px(row_height))
@@ -2986,21 +3180,9 @@ fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyEle
             }
             window.refresh();
         });
-    let row_element = if draggable {
-        row_element.on_drag(BeadsCardDrag, move |_, _, window, app| {
-            let ghost = start_state
-                .lock()
-                .map_or(None, |mut boards| {
-                    boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
-                    boards.card_drag_ghost(metrics.scale)
-                })
-                .unwrap_or_else(|| CardDragGhost::new(drag_source.clone(), metrics.scale));
-            window.refresh();
-            app.new(move |_| BeadsCardDragGhost { model: ghost, colors: drag_colors, metrics })
-        })
-    } else {
-        row_element
-    };
+    let target = draggable.then_some(focus).flatten();
+    let row_element = row_key_move(row_element, target, title, card, item.clone());
+    let row_element = row_drag_ghost(row_element, draggable, card, item.clone());
     with_card_title_tooltip(
         row_element,
         item.title.clone(),
@@ -3011,6 +3193,163 @@ fn ledger_row(row: &RowView<'_>, meta: RowMeta, card: CardContext<'_>) -> AnyEle
     .child(row_title_line(item, mark, colors, metrics))
     .child(row_sub_line(row, now_epoch_s, card))
     .into_any_element()
+}
+
+/// [`ledger_row`]'s accessible name: the plain open-issue label at rest, a
+/// grab hint once dragging that row is a legal move, and the current
+/// keyboard-armed target plus accepted/rejected once one is grabbed
+/// (A2-I6's "accepted and rejected targets are announced" -- AccessKit
+/// clients read a focused node's name change as the announcement, the same
+/// mechanism [`tab_accessible_label`] already leans on for a tab's own
+/// state).
+fn row_accessible_label(
+    item: &BeadsBoardItem,
+    key_move: Option<&CardDragPaint>,
+    draggable: bool,
+) -> String {
+    if let Some(mv) = key_move.filter(|mv| mv.source_id == item.id)
+        && let Some(target_lane) = mv.target_lane
+    {
+        let target = queue_for_lane(target_lane).map_or("its lane", queue_name);
+        let verdict = if mv.accepts(target_lane) { "moves it there" } else { "no change" };
+        return format!(
+            "Grabbed issue {}, target {target}, {verdict}. Left or Right changes lane, Enter or \
+             Space moves, Escape cancels",
+            item.id
+        );
+    }
+    if draggable {
+        return format!("Open issue {}. Space grabs it to move lanes", item.id);
+    }
+    format!("Open issue {}", item.id)
+}
+
+/// Attach [`ledger_row`]'s Tab stop and keyboard-move wiring (A2-I6) when
+/// `focus` names this row's own stable handle -- `None` for a row this
+/// bead's move never grabs (a Blocked/Done row, or one not yet given a
+/// handle): `track_focus`, `tab_stop`, the same visible-focus ring
+/// [`tab_interactivity`] uses, and [`row_key_handler`]'s key wiring. Split
+/// out to keep [`ledger_row`] under the workspace's line ceiling. Reuses
+/// [`CardContext`] rather than a bespoke bundle: it already carries every
+/// store `row_key_handler` needs to arm, step, drop, or cancel this row's
+/// move.
+fn row_key_move(
+    el: gpui::Stateful<gpui::Div>,
+    focus: Option<&FocusHandle>,
+    title: Rgba,
+    card: CardContext<'_>,
+    source: BeadsBoardItem,
+) -> gpui::Stateful<gpui::Div> {
+    let Some(handle) = focus else { return el };
+    let key_handler = row_key_handler(card, source, handle.clone());
+    el.track_focus(handle)
+        .tab_stop(true)
+        .focus_visible(move |style| style.border_1().border_color(title))
+        .on_key_down(key_handler)
+}
+
+/// Queue and, if accepted, optimistically apply one completed keyboard move
+/// through the exact `queue_card_drop`/`apply_card_drop` pair
+/// `TerminalView::release_board` already calls for a pointer drop, so a
+/// keyboard drop is never a second write path.
+fn apply_drop(
+    boards: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    panels: &std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+    drag: CardDragState,
+) {
+    let accepted = panels.lock().is_ok_and(|mut panels| panels.queue_card_drop(&drag));
+    if !accepted {
+        return;
+    }
+    if let Ok(mut boards) = boards.lock() {
+        boards.apply_card_drop(drag);
+    }
+}
+
+/// [`row_key_move`]'s keyboard wiring for A2-I6: Space arms the move on
+/// this eligible row, Left/Right step its target lane, Enter or Space drop
+/// it through [`apply_drop`], and Escape cancels with no write and
+/// restores focus.
+///
+/// While armed this row owns every key, not only the five above -- the same
+/// blanket swallow the modal dialog and command palette already use for
+/// their own keys -- so no key reaches the PTY while the move is armed.
+fn row_key_handler(
+    card: CardContext<'_>,
+    source: BeadsBoardItem,
+    focus: FocusHandle,
+) -> impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static {
+    let CardContext { workspace_id, state, panels, lane, .. } = card;
+    let boards = std::sync::Arc::clone(state);
+    let panels = std::sync::Arc::clone(panels);
+    move |event: &KeyDownEvent, window, app| {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let Ok(mut guard) = boards.lock() else { return };
+        if !guard.key_move_armed(workspace_id, &source.id) {
+            if key == "space" {
+                guard.arm_key_move(workspace_id, source.clone(), lane);
+                drop(guard);
+                app.stop_propagation();
+                window.refresh();
+            }
+            return;
+        }
+        app.stop_propagation();
+        match key {
+            "left" => {
+                guard.step_key_move(workspace_id, false);
+            }
+            "right" => {
+                guard.step_key_move(workspace_id, true);
+            }
+            "enter" | "space" => {
+                let drag = guard.take_key_move(workspace_id);
+                drop(guard);
+                if let Some(drag) = drag {
+                    apply_drop(&boards, &panels, drag);
+                }
+            }
+            "escape" => {
+                guard.cancel_key_move(workspace_id);
+                drop(guard);
+                window.focus(&focus, app);
+            }
+            _ => {}
+        }
+        window.refresh();
+    }
+}
+
+/// Attach [`ledger_row`]'s native `on_drag` (A2-I5) when this row is
+/// draggable, a no-op otherwise. Split out to keep [`ledger_row`] under the
+/// workspace's line ceiling, the same reason [`row_key_move`] is; also
+/// reuses [`CardContext`] for the same reason that one does.
+fn row_drag_ghost(
+    el: gpui::Stateful<gpui::Div>,
+    draggable: bool,
+    card: CardContext<'_>,
+    source: BeadsBoardItem,
+) -> gpui::Stateful<gpui::Div> {
+    if !draggable {
+        return el;
+    }
+    let CardContext { state, board_rect, colors, metrics, .. } = card;
+    let state = std::sync::Arc::clone(state);
+    let colors = *colors;
+    el.on_drag(BeadsCardDrag, move |_, _, window, app| {
+        let ghost = state
+            .lock()
+            .map_or(None, |mut boards| {
+                boards.start_card_drag(card_drag_point(window.mouse_position()), board_rect);
+                boards.card_drag_ghost(metrics.scale)
+            })
+            .unwrap_or_else(|| CardDragGhost::new(source.clone(), metrics.scale));
+        window.refresh();
+        app.new(move |_| BeadsCardDragGhost { model: ghost, colors, metrics })
+    })
 }
 
 /// The row's top line: a 20px saturated priority glyph -- the row's only
@@ -3592,6 +3931,156 @@ mod tests {
             );
             boards.end_card_drag();
         }
+    }
+
+    #[test]
+    fn only_backlog_ready_and_in_progress_rows_can_arm_a_keyboard_move() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+
+        for lane in 0..=4 {
+            assert_eq!(
+                boards.arm_key_move(workspace, drag_item(), lane),
+                lane <= 2,
+                "lane {lane} source restriction"
+            );
+            boards.cancel_key_move(workspace);
+        }
+    }
+
+    #[test]
+    fn arming_a_keyboard_move_targets_its_own_lane_first() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.arm_key_move(workspace, drag_item(), 1));
+
+        let paint = boards.key_move_paint(workspace).expect("armed move paints");
+        assert_eq!(paint.source_lane, 1);
+        assert_eq!(paint.target_lane, Some(1));
+        assert!(!paint.accepts(1), "the source lane is never its own accepted target");
+    }
+
+    #[test]
+    fn a_keyboard_moves_target_lane_clamps_at_both_ends() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.arm_key_move(workspace, drag_item(), 0));
+
+        assert!(!boards.step_key_move(workspace, false), "left of Backlog stays put");
+        assert_eq!(boards.key_move_paint(workspace).and_then(|paint| paint.target_lane), Some(0));
+
+        for expected in 1..=4 {
+            assert!(boards.step_key_move(workspace, true));
+            assert_eq!(
+                boards.key_move_paint(workspace).and_then(|paint| paint.target_lane),
+                Some(expected)
+            );
+        }
+        assert!(!boards.step_key_move(workspace, true), "right of Done stays put");
+        assert_eq!(boards.key_move_paint(workspace).and_then(|paint| paint.target_lane), Some(4));
+    }
+
+    #[test]
+    fn escape_cancels_the_armed_move_with_no_write() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.arm_key_move(workspace, drag_item(), 1));
+        assert!(boards.step_key_move(workspace, true));
+
+        assert!(boards.cancel_key_move(workspace));
+        assert!(boards.key_move_paint(workspace).is_none());
+        assert!(boards.take_key_move(workspace).is_none(), "nothing left to drop");
+        assert!(!boards.cancel_key_move(workspace), "a second Escape finds nothing armed");
+    }
+
+    #[test]
+    fn take_key_move_lowers_to_the_pointer_drops_own_drag_state_shape() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let item = drag_item();
+        assert!(boards.arm_key_move(workspace, item.clone(), 0));
+        assert!(boards.step_key_move(workspace, true));
+
+        let drag = boards.take_key_move(workspace).expect("armed move");
+        assert_eq!(drag.workspace_id, workspace);
+        assert_eq!(drag.source, item);
+        assert_eq!(drag.source_lane, 0);
+        assert_eq!(drag.hovered_lane, Some(1));
+        assert!(boards.key_move_paint(workspace).is_none(), "taking clears the armed move");
+    }
+
+    #[test]
+    fn arming_a_keyboard_move_clears_an_armed_pointer_press() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.arm_card_drag(workspace, drag_item(), 0, drag_point(150.0, 100.0)));
+        assert!(boards.blocks_pty_mouse());
+
+        assert!(boards.arm_key_move(workspace, drag_item(), 1));
+        assert!(!boards.blocks_pty_mouse(), "the keyboard move replaced the pointer press");
+    }
+
+    #[test]
+    fn arming_a_pointer_press_clears_an_armed_keyboard_move() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        assert!(boards.arm_key_move(workspace, drag_item(), 1));
+
+        assert!(boards.arm_card_drag(workspace, drag_item(), 0, drag_point(150.0, 100.0)));
+        assert!(
+            boards.key_move_paint(workspace).is_none(),
+            "the pointer press replaced the keyboard move"
+        );
+    }
+
+    #[test]
+    fn a_keyboard_move_is_scoped_to_its_own_workspace() {
+        let workspace = WorkspaceId::new();
+        let other = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let item = drag_item();
+        assert!(boards.arm_key_move(workspace, item.clone(), 1));
+
+        assert!(boards.key_move_paint(workspace).is_some());
+        assert!(boards.key_move_paint(other).is_none());
+        assert!(boards.key_move_armed(workspace, &item.id));
+        assert!(!boards.key_move_armed(other, &item.id));
+        assert!(!boards.step_key_move(other, true), "stepping another workspace's move is a no-op");
+        assert!(!boards.cancel_key_move(other));
+        assert!(boards.take_key_move(other).is_none());
+    }
+
+    #[test]
+    fn eligible_row_ids_lists_only_backlog_ready_and_in_progress() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let mut snapshot = BeadsBoardSnapshot::default();
+        for (lane, id) in [(0, "b1"), (1, "r1"), (2, "p1"), (3, "x1"), (4, "d1")] {
+            if let Some(cards) = lane_cards_mut(&mut snapshot, lane) {
+                cards.push(BeadsBoardItem { id: id.into(), ..drag_item() });
+            }
+        }
+        let _ = boards.update(
+            workspace,
+            BeadsBoardState::Ready { snapshot, stale: false, refresh_error: None },
+        );
+
+        let ids = boards.eligible_row_ids(workspace);
+        assert_eq!(ids, ["b1", "r1", "p1"].into_iter().map(String::from).collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn not_detected_clears_an_armed_keyboard_move_for_that_workspace_only() {
+        let missing = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.arm_key_move(missing, drag_item(), 1);
+        boards.arm_card_drag(neighbour, drag_item(), 1, drag_point(150.0, 100.0));
+
+        let _ = boards.update(missing, BeadsBoardState::NotDetected);
+
+        assert!(boards.key_move_paint(missing).is_none());
+        assert!(boards.card_press.is_some(), "the neighbour's own pointer press is untouched");
     }
 
     #[test]

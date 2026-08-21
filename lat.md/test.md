@@ -4308,6 +4308,32 @@ last so it cannot perturb those geometry proofs. The as-built rules and producti
 the real-bd receipt is
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
 
+### Beads keyboard card move
+
+Unit coverage pins the A2-I6 keyboard equivalent of the drag above at its own
+state-machine boundary, beside the pointer tests it mirrors.
+
+Only Backlog, Ready, and In-progress rows arm, through the same source gate a
+pointer press uses; Blocked and Done never do. Arming targets the row's own
+lane first -- a reject, the same as a pointer drag that has not left its
+source row -- and Left/Right steps clamp rather than wrap at Backlog and
+Done. Escape cancels with no write, leaves nothing for a second Escape to
+find, and a stale take reports none. Taking an armed move for a drop lowers
+it to the identical `CardDragState` shape a pointer drop produces -- same
+workspace, source, source lane, and target lane -- which is what lets it drop
+through the exact same guarded write and optimistic-apply functions rather
+than a second path. Arming either gesture, pointer or keyboard, clears
+whatever the other one had armed, so the two are never in flight together.
+A keyboard move is scoped to its own workspace: stepping, cancelling, or
+taking another workspace's move is a no-op, and `NotDetected` on one
+workspace clears only that workspace's armed move, leaving a neighbour's own
+pointer press untouched. A pure `eligible_row_ids` fixture proves the set is
+exactly the union of Backlog, Ready, and In-progress card ids from the raw
+snapshot, not the windowed visible slice and not Blocked or Done.
+
+The as-built rules and production links live in
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
+
 ### Beads collapsed-lane hover and pin
 
 Unit coverage pins the A2-I1/A2-I2/A2-L1 state transitions

@@ -1436,6 +1436,63 @@ proves the guarded verbs and PTY boundary, while the
 [Docker visual run](../tests/e2e/visual/beads-board.sh) checks the native ghost
 within 3px of the pointer offset at each synchronized waypoint.
 
+A2-I6 gives every Backlog/Ready/In-progress row a keyboard equivalent of that
+same drag, through the identical guard and write functions rather than a
+second path.
+[[crates/scribe-client/src/main.rs#TerminalView#sync_row_focus]] keeps one
+stable `FocusHandle` per card id those three lanes currently hold --
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#eligible_row_ids]] names
+them straight off the snapshot rather than the windowed visible slice, since
+an element that gets no Tab stop this frame is simply outside the Tab order
+either way -- so Tab order and an armed move's own focus both survive a
+repaint. [[crates/scribe-client/src/beads_board.rs#row_key_move]] attaches
+that handle's `track_focus`/`tab_stop`/`focus_visible` ring to a draggable row
+only, then [[crates/scribe-client/src/beads_board.rs#row_key_handler]] arms
+the move on Space through
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#arm_key_move]] -- the
+same [[crates/scribe-client/src/beads_board.rs#card_drag_source]] gate a
+pointer press already uses, starting the target on the row's own lane, a
+reject the same way a pointer drag that has not left its source row is.
+Left/Right walk
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#step_key_move]] across
+the five named lanes, clamped rather than wrapped at Backlog and Done. Enter
+or Space call
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#take_key_move]], which
+lowers the armed move to the exact `CardDragState` shape a pointer drop
+produces -- its `pointer` field is dead weight neither
+[[crates/scribe-client/src/beads_panel.rs#BeadsPanels#queue_card_drop]] nor
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#apply_card_drop]] ever
+reads -- so `apply_drop` beside it calls those same two functions verbatim:
+the A2-BD6 write matrix, the optimistic overlay, rollback, and five-second
+Undo all behave exactly as they do for a pointer drop, because they are the
+same call. Escape calls
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#cancel_key_move]] with
+no write and restores focus to the row explicitly. While a move is armed the
+row's own key handler swallows every key, not only the five above, the same
+blanket capture the modal dialog and command palette already use for their
+own keys, so no key reaches the PTY while it is armed; stop_propagation on the
+focused row's own bubble-phase listener runs ahead of the window root's PTY
+encoder, the same mechanism [[crates/scribe-client/src/beads_board.rs#tab_interactivity]]
+already relies on for a collapsed tab's Enter/Space.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#key_move_paint]] is the
+keyboard twin of `card_drag_paint`, read by
+[[crates/scribe-client/src/beads_board.rs#LaneCtx<'a>#drag_target]] and a row's
+own lifted dimming so an armed keyboard move reuses the pointer matrix's
+dim/wash treatment wholesale -- but it is deliberately never folded into
+`card_drag_paint` itself, because that value alone still gates
+[[crates/scribe-client/src/beads_board.rs#swallows_release]], and a keyboard
+move must never change whether a mouse release belongs to some other control
+(scribe-uu2y).
+[[crates/scribe-client/src/beads_board.rs#row_accessible_label]] announces the
+armed row's current target lane and whether it is accepted or rejected
+through the row's own accessible name, the same name-change mechanism
+`tab_accessible_label` already leans on. Arming either gesture clears the
+other, so a pointer press and an armed keyboard move are never in flight
+together.
+[[test#Test Harness#GPUI Client Headless Suites#Beads card drag tracking]]
+covers the arm/step/cancel/take state machine and its workspace isolation
+beside the pointer drag tests it mirrors.
+
 When `Welcome.beads_detail` is enabled,
 [[crates/scribe-client/src/beads_panel.rs#BeadsPanels#open]] parks one
 workspace-scoped request as soon as a card is clicked.

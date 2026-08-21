@@ -1773,6 +1773,11 @@ struct TerminalView {
     /// per queue serves that queue's tab, its hover/focus-open drawer, and
     /// the pinned lane's own unpin control across all three paint states.
     lane_tab_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
+    /// Stable Tab stops for every Backlog/Ready/In-progress row, keyed by
+    /// issue id, for the same reason `lane_tab_focus` is cached rather than
+    /// rebuilt: a fresh handle every frame would reset Tab order and drop an
+    /// armed keyboard move's own focus on every repaint (A2-I6).
+    row_focus: HashMap<WorkspaceId, HashMap<String, FocusHandle>>,
     /// CI snapshots matched to the regions that currently own their repository.
     visible_ci_runs: Vec<VisibleCiRun>,
     /// Client-local open panel identity; the server sees only interest changes.
@@ -2382,6 +2387,7 @@ impl TerminalView {
             visible_beads_boards: Vec::new(),
             flow_node_controls: HashMap::new(),
             lane_tab_focus: HashMap::new(),
+            row_focus: HashMap::new(),
             visible_ci_runs: Vec::new(),
             ci_expanded: HashMap::new(),
             ci_action_focus: HashMap::new(),
@@ -9933,6 +9939,27 @@ impl TerminalView {
         }
     }
 
+    /// Ensure a stable Tab stop exists for every Backlog/Ready/In-progress
+    /// card -- the rows A2-I6's keyboard move can grab -- and prune one a
+    /// card no longer holds, the row-level twin of `sync_lane_tab_focus`.
+    fn sync_row_focus(&mut self, cx: &App) {
+        let Ok(boards) = self.shared.beads_boards.lock() else { return };
+        let live: HashMap<WorkspaceId, HashSet<String>> = self
+            .visible_beads_boards
+            .iter()
+            .map(|(workspace_id, _)| (*workspace_id, boards.eligible_row_ids(*workspace_id)))
+            .collect();
+        drop(boards);
+        self.row_focus.retain(|workspace_id, _| live.contains_key(workspace_id));
+        for (workspace_id, ids) in &live {
+            let handles = self.row_focus.entry(*workspace_id).or_default();
+            handles.retain(|issue_id, _| ids.contains(issue_id));
+            for issue_id in ids {
+                handles.entry(issue_id.clone()).or_insert_with(|| cx.focus_handle().tab_stop(true));
+            }
+        }
+    }
+
     fn send_beads_issue_write(&self, write: PanelWriteIntent) {
         let workspace_id = write.workspace_id;
         let issue_id = write.issue_id;
@@ -10239,9 +10266,15 @@ impl TerminalView {
                             panel_state: Arc::clone(&self.shared.beads_panels),
                             workspace_id: *workspace_id,
                             card_drag: boards.card_drag_paint(*workspace_id),
+                            key_move: boards.key_move_paint(*workspace_id),
                             rail,
                             blocked_tab_focus,
                             done_tab_focus,
+                            row_focus: self
+                                .row_focus
+                                .get(workspace_id)
+                                .cloned()
+                                .unwrap_or_default(),
                             scale,
                             colors,
                             flow_controls: self
@@ -10454,6 +10487,7 @@ impl Render for TerminalView {
         self.sync_ci_run_strips(cx);
         self.sync_beads_board_strips(cx);
         self.sync_lane_tab_focus(window, cx);
+        self.sync_row_focus(cx);
         self.sync_grid_geometry(cx);
         // A prompt or CI state edge changes an internal strip without moving the
         // grid band, so the band probe never notices; republishing here keeps the
