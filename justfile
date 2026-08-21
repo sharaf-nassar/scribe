@@ -571,15 +571,17 @@ e2e-visual-ci-run-bar:
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/ci-run-bar-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/ci-run-bar.sh
 
 # Run one real bd refresh through the GPUI client and functional server.
-# 900s, not the original 180s: the Flow phases added a real-bd epic seed, its
+# 1500s, not the original 180s: the Flow phases added a real-bd epic seed, its
 # admission proof, and a painted entry/retarget pass that has to outlast the
-# server's 30s board cache, and the A2 rail phases added drawer, pin, keyboard
-# move, and text-scale passes. The observed script takes a little over seven
-# minutes, and 900s leaves headroom for a loaded host.
+# server's 30s board cache; the A2 rail phases added drawer, pin, keyboard
+# move, and text-scale passes; and the lifetime phases added a hook-driven
+# liveness pass, a resize pass that seeds two more real cards behind that same
+# cache, and a two-region pass that waits the cache out again for a real
+# `NotDetected`. The budget leaves headroom for a loaded host.
 # The generated A2/A3 contract manifest is mounted because the script reads its
 # geometry from that machine contract rather than re-transcribing the mock.
 e2e-func-beads-board: docker-beads-read-e2e
-    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=900 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/mocks/a2a3-contract.json:ro {{ e2e_output }} scribe-test-beads-read-e2e /tests/func/beads-board.sh
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=1500 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/mocks/a2a3-contract.json:ro {{ e2e_output }} scribe-test-beads-read-e2e /tests/func/beads-board.sh
 
 # Prove the representative official bd write semantics Scribe relies on.
 e2e-func-beads-write-contract:

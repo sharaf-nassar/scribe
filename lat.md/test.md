@@ -2161,6 +2161,60 @@ within a small residual, while the measured strip top does not move: text scale
 recomputes the rail and the whole-row count without touching the stored board
 height.
 
+#### Flow liveness lifetime
+
+Real hook events drive A3-L3, not an injected paint. The run reads the
+`IssueFocused` frame for each binding off the client wire before it compares
+halos, and `state_cleared` is the real lifecycle hook that ends a claim.
+
+One `scribe-hook-helper issue_focused` on the primary session must change the
+graph band. A second tab is a second real session on the same issue, and
+clearing only the first must leave the halo standing; clearing the second
+removes it. The phase then exits Flow, closes the tab it opened, and waits for
+that session's `SessionExited`, so the next phase starts on the one-session
+board this one was handed.
+
+#### Board resize and text scale lifetime
+
+A2-R1, A2-R2, and A2-R3 through real controls, with the window geometry record
+as the oracle for what the board persisted and the painted rail as the oracle
+for what it allocated.
+
+A2-R2's threshold is each active lane's own measured legible header width, so a
+lane holding nothing is never starved and collapse can never be reached on a
+board whose Backlog and In-progress are empty -- which is what the phases above
+leave behind. This phase therefore seeds one real `bd` card into each and
+asserts all three active lanes hold work before it measures anything; a
+width-only assertion over that empty board would be about the fixture, not the
+contract.
+
+It then pins Blocked at full width, drags the real floor bar down by exactly
+one row, and steps text to the 1.6 ceiling: the strip top must not move and the
+stored height must not change, which is A2-R3's own claim. Narrowing to the
+derived `MIN_BOARD_W` floor starves the three active lanes at that scale, so
+the pin auto-collapses to a 36px tab while the record still names it, and the
+rail still ends inside the board's right padding because A2 answers a narrow
+region by reallocating rather than scrolling. Widening restores the lane with
+no second click. Teardown returns 1.0 text, the designed height, no lane pin,
+no board pin, and the window size the phase was handed.
+
+#### Two-region isolation and cleanup
+
+A3-R1 and A2-BD4 need a second real region, because at x=0 "anchored to its
+region" and "anchored to the window" look identical. Each region's rail is
+measured from a screenshot cropped to that region before the shared geometry
+helper sees it.
+
+A split region is a fresh context that sends no CWD of its own, so its own live
+terminal emits OSC 7 to put it on the fixture project before its board is read.
+A pointer Flow entry in the second region must leave the first one's persisted
+furniture, painted track geometry, and strip pixels untouched, and a real pin
+gesture in the first region must not exit the second one's Flow. A real `cd
+/tmp` then produces `NotDetected` for that workspace alone after the server's
+board cache expires: its board pin, board, and Flow all go, while the sibling's
+tuple and rail are unchanged. A2 has no lane-scroll lifetime because it has no
+A2 scroll axis.
+
 #### Official Beads Write Contract
 
 The network-none functional image proves the representative official CLI verbs Scribe invokes.

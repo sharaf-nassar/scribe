@@ -1682,12 +1682,20 @@ for _ in $(seq 1 50); do
 done
 [ "$(epic_graph_requests e2e-flow-epic)" -gt "$BACK_GRAPH_BEFORE" ] \
     || fail "reopening Flow reused the graph it left instead of requesting a fresh one"
-sleep 0.8
+
+# The strip swaps on the server's answer, not on the request, and that answer
+# is a fresh `bd` run: wait for the reopened graph's own position bar rather
+# than for a fixed interval that a loaded host outlasts.
+for _ in $(seq 1 60); do
+    position_mark /output/beads-flow-reopened.png >/dev/null 2>&1 && break
+    sleep 0.3
+done
+position_mark /output/beads-flow-reopened.png >/dev/null 2>&1 \
+    || fail "reopening Flow never painted its graph"
 
 # The mode pair's `LANES` member is the second real exit. `FLOW` beside it is
 # the only selected-state chip in the band, so its painted left edge is what
 # locates `LANES` without guessing a text width.
-import -window "$WID" /output/beads-flow-reopened.png
 FLOW_CHIP=$(python3 /tests/func/beads-board-geometry.py run \
     --shot /output/beads-flow-reopened.png --width "$WIN_W" \
     --y "$(( STRIP_TOP + A3_BAND_H / 4 ))" --height 4 --min-width 20) \
@@ -1748,3 +1756,691 @@ import -window "$WID" /output/beads-flow-functional.png
 echo 'PASS: a real card click opened the panel and swapped the strip into Flow, a node' \
     'retargeted the panel inside the frozen epic, hover traced it, the wheel travelled and' \
     'clamped it, both exit controls returned to lanes, and reopening asked for a fresh graph'
+
+# ---- Lifetime phases: liveness, board resize, two-region isolation ---------
+# These three read real controls, the hook wire, and the window geometry record
+# rather than the pixels the visual matrix owns. Each one sets up the board
+# state it needs and hands the board back the way it found it, so none of them
+# inherits a pin, a hook binding, or a focus from the phase before it.
+record_lines() {
+    wc -l <"$RECORD"
+}
+
+primary_workspace() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if row.get("dir") == "client" and message.get("type") == "CreateSession":
+        print(message["workspace_id"])
+        raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+session_after() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+workspace, after = sys.argv[2], int(sys.argv[3])
+for line_number, line in enumerate(open(sys.argv[1]), 1):
+    if line_number <= after:
+        continue
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server" and message.get("type") == "SessionCreated"
+            and message.get("workspace_id") == workspace):
+        print(message["session_id"])
+        raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+session_exited() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server" and message.get("type") == "SessionExited"
+            and message.get("session_id") == sys.argv[2]):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+other_workspace() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+primary = sys.argv[2]
+for line in reversed(open(sys.argv[1]).readlines()):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server" and message.get("type") == "WorkspaceInfo"
+            and message.get("workspace_id") != primary):
+        print(message["workspace_id"])
+        raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+
+focused_wire_count() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+session, issue = sys.argv[2:]
+count = 0
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if row.get("dir") != "server" or message.get("type") != "IssueFocused":
+        continue
+    if message.get("session_id") != session:
+        continue
+    if (issue == "null" and message.get("issue_id") is None) or message.get("issue_id") == issue:
+        count += 1
+print(count)
+PY
+}
+
+wait_focused_wire() {
+    local session="$1" issue="$2" expected="$3" label="$4" value
+    for _ in $(seq 1 80); do
+        value=$(focused_wire_count "$session" "$issue" 2>/dev/null || true)
+        [ "$value" = "$expected" ] && return 0
+        sleep 0.2
+    done
+    fail "$label (wanted $expected, saw ${value:-missing})"
+}
+
+send_issue_focus() {
+    printf '{"issue_id":"%s"}' "$2" | \
+        SCRIBE_HOOK_SOCK="$SCRIBE_RUNTIME_DIR/server.sock" SCRIBE_SESSION_ID="$1" \
+        scribe-hook-helper --provider=codex_code --event=issue_focused --payload-stdin
+}
+
+clear_issue_focus() {
+    SCRIBE_HOOK_SOCK="$SCRIBE_RUNTIME_DIR/server.sock" SCRIBE_SESSION_ID="$1" \
+        scribe-hook-helper --provider=codex_code --event=state_cleared
+}
+
+# Crop one live window region before running the shared pixel geometry helper.
+# `rail` deliberately sees one rail, so a split window must never feed it both;
+# a single-region phase passes the whole window as its one region.
+REGION_LEFT=0
+REGION_WIDTH=0
+REGION_IMAGE=
+REGION_TOP=
+REGION_TRACKS=
+
+region_capture() {
+    local left="$1" width="$2" shot="$3"
+    import -window "$WID" "$shot"
+    REGION_LEFT=$left
+    REGION_WIDTH=$width
+    REGION_IMAGE="${shot%.png}-region.png"
+    convert "$shot" -crop "${width}x${HEIGHT}+${left}+0" +repage "$REGION_IMAGE"
+}
+
+region_measure() {
+    local report tracks
+    region_capture "$1" "$2" "$3"
+    report=$(python3 /tests/func/beads-board-geometry.py rail \
+        --contract "$CONTRACT" --shot "$REGION_IMAGE" --width "$REGION_WIDTH") || return 1
+    REGION_TOP=$(printf '%s\n' "$report" | head -1)
+    REGION_TRACKS=$(printf '%s\n' "$report" | tail -n +2)
+    tracks=$(printf '%s\n' "$REGION_TRACKS" | wc -l)
+    [ "$tracks" -eq 5 ]
+}
+
+region_track_field() {
+    printf '%s\n' "$REGION_TRACKS" | sed -n "$(( $1 + 1 ))p" | cut -d' ' -f"$2"
+}
+
+region_lane_x() {
+    echo $(( REGION_LEFT + $(region_track_field "$1" 1) + $(region_track_field "$1" 2) / 2 ))
+}
+
+region_row_y() {
+    echo $(( REGION_TOP + A2_HEADBAND_H + $1 * A2_ROW_H + A2_ROW_H / 2 ))
+}
+
+
+# A3's own painted position bar, the mark that only exists while that region is
+# in Flow with a graph wider than its strip.
+region_flow_mark() {
+    python3 /tests/func/beads-board-geometry.py run \
+        --shot "$REGION_IMAGE" --width "$REGION_WIDTH" \
+        --y "$(( $1 + A3_HBAR_TOP ))" --height "$A3_HBAR_H" --min-width 20
+}
+
+wait_region_rail() {
+    local left="$1" width="$2" shot="$3"
+    for _ in $(seq 1 80); do
+        region_measure "$left" "$width" "$shot" && return 0
+        sleep 0.2
+    done
+    fail "region at x=$left did not paint an A2 rail"
+}
+
+wait_region_flow() {
+    local left="$1" width="$2" top="$3" shot="$4"
+    for _ in $(seq 1 80); do
+        region_capture "$left" "$width" "$shot"
+        region_flow_mark "$top" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    fail "region at x=$left did not paint an A3 position bar"
+}
+
+region_issue_position() {
+    python3 - "$RECORD" "$1" "$2" <<'PY'
+import json, sys
+workspace, issue = sys.argv[2:]
+snapshot = None
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    state = message.get("state", {})
+    if (row.get("dir") == "server" and message.get("type") == "BeadsBoard"
+            and message.get("workspace_id") == workspace):
+        ready = state.get("Ready") if isinstance(state, dict) else None
+        if isinstance(ready, dict):
+            snapshot = ready.get("snapshot")
+if not isinstance(snapshot, dict):
+    raise SystemExit(1)
+for lane, name in enumerate(("backlog", "ready", "in_progress", "blocked", "done")):
+    for index, card in enumerate(snapshot.get(name, [])):
+        if card.get("id") == issue:
+            print(lane, index)
+            raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+click_region_card() {
+    local workspace="$1" left="$2" width="$3" issue="$4" position lane index
+    for _ in $(seq 1 80); do
+        position=$(region_issue_position "$workspace" "$issue" 2>/dev/null || true)
+        [ -n "$position" ] && break
+        sleep 0.2
+    done
+    [ -n "${position:-}" ] || fail "$issue never reached region $workspace"
+    read -r lane index <<<"$position"
+    [ "$index" -lt "$A2_BODY_ROWS" ] || fail "$issue is not on a whole visible row in region $workspace"
+    wait_region_rail "$left" "$width" /output/beads-region-click.png
+    xdotool mousemove --sync --window "$WID" "$(region_lane_x "$lane")" "$(region_row_y "$index")"
+    xdotool click 1
+}
+
+# The board furniture the window geometry record owns, read back out of the
+# file the client actually writes rather than inferred from pixels.
+STATE_DIR="${XDG_STATE_HOME:?the entrypoint must export XDG_STATE_HOME}/scribe"
+geometry_field() {
+    python3 - "$STATE_DIR/windows" "$1" "$2" <<'PY'
+import pathlib, sys, tomllib
+root, field, workspace = sys.argv[1:]
+files = sorted(pathlib.Path(root).glob("*.toml"), key=lambda path: path.stat().st_mtime)
+if not files:
+    raise SystemExit(1)
+state = tomllib.loads(files[-1].read_text())
+if field == "pinned":
+    print(str(workspace in map(str, state.get("beads_pinned", []))).lower())
+elif field == "lane":
+    for row in state.get("beads_lane_pinned", []):
+        if len(row) == 2 and str(row[0]) == workspace:
+            print(row[1])
+            break
+    else:
+        print("none")
+elif field == "height":
+    for row in state.get("beads_heights", []):
+        if len(row) == 2 and str(row[0]) == workspace:
+            print(row[1])
+            break
+    else:
+        print("default")
+elif field == "scale":
+    print(state.get("beads_text_scale_steps", 0))
+else:
+    raise SystemExit(2)
+PY
+}
+
+wait_geometry() {
+    local field="$1" workspace="$2" expected="$3" value
+    for _ in $(seq 1 80); do
+        value=$(geometry_field "$field" "$workspace" 2>/dev/null || true)
+        [ "$value" = "$expected" ] && return 0
+        sleep 0.2
+    done
+    fail "persisted $field for $workspace was ${value:-missing}, not $expected"
+}
+
+geometry_tuple() {
+    printf '%s %s %s %s\n' \
+        "$(geometry_field pinned "$1")" \
+        "$(geometry_field lane "$1")" \
+        "$(geometry_field height "$1")" \
+        "$(geometry_field scale "$1")"
+}
+
+refresh_window() {
+    eval "$(xdotool getwindowgeometry --shell "$WID")"
+    WIN_W=$WIDTH
+}
+
+toggle_board_pin() {
+    xdotool mousemove --sync --window "$WID" "$(( $1 + 13 ))" 17
+    sleep 0.4
+    xdotool click 1
+    sleep 0.6
+}
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Flow liveness lifetime]]
+# A real hook owns A3-L3's liveness state. Both session bindings arrive on the
+# wire before their halos are compared, so nothing here is an injected
+# paint-only capture, and `state_cleared` is the real lifecycle hook that ends
+# a session's claim on an issue.
+PRIMARY_WORKSPACE=$(primary_workspace) || fail "client wire carried no primary workspace"
+FIRST_SESSION=$(session_after "$PRIMARY_WORKSPACE" 0) || fail "client wire carried no primary session"
+
+LIVE_GRAPH_BEFORE=$(epic_graph_requests e2e-flow-epic)
+click_card e2e-flow-b
+for _ in $(seq 1 50); do
+    [ "$(epic_graph_requests e2e-flow-epic)" -gt "$LIVE_GRAPH_BEFORE" ] && break
+    sleep 0.2
+done
+[ "$(epic_graph_requests e2e-flow-epic)" -gt "$LIVE_GRAPH_BEFORE" ] \
+    || fail "the liveness phase did not reopen Flow"
+# The halo baseline has to be a painted graph, not the lanes the strip is still
+# showing while the server runs `bd` for the reopened epic.
+for _ in $(seq 1 60); do
+    position_mark /output/beads-live-clear.png >/dev/null 2>&1 && break
+    sleep 0.3
+done
+position_mark /output/beads-live-clear.png >/dev/null 2>&1 \
+    || fail "the liveness phase never painted its Flow graph"
+sleep 0.4
+import -window "$WID" /output/beads-live-clear.png
+send_issue_focus "$FIRST_SESSION" e2e-flow-b
+wait_focused_wire "$FIRST_SESSION" e2e-flow-b 1 "first hook focus never reached the client"
+sleep 0.4
+import -window "$WID" /output/beads-live-one.png
+LIVE_ONE_DIFF=$(crop_diff /output/beads-live-clear.png /output/beads-live-one.png "$FLOW_GRAPH_CROP")
+[ "${LIVE_ONE_DIFF:-0}" -ge 80 ] \
+    || fail "hook-driven live issue changed only ${LIVE_ONE_DIFF:-0}px"
+
+# A second real session on the same issue. The tab inherits the focused
+# session's cwd, so the workspace keeps the very board this run has measured
+# all along.
+SECOND_START=$(record_lines)
+xdotool key --clearmodifiers ctrl+shift+t
+for _ in $(seq 1 80); do
+    LIVE_SECOND_SESSION=$(session_after "$PRIMARY_WORKSPACE" "$SECOND_START" 2>/dev/null || true)
+    [ -n "${LIVE_SECOND_SESSION:-}" ] && break
+    sleep 0.2
+done
+[ -n "${LIVE_SECOND_SESSION:-}" ] || fail "opening a second live tab created no session"
+send_issue_focus "$LIVE_SECOND_SESSION" e2e-flow-b
+wait_focused_wire "$LIVE_SECOND_SESSION" e2e-flow-b 1 "second hook focus never reached the client"
+sleep 0.4
+import -window "$WID" /output/beads-live-two.png
+clear_issue_focus "$FIRST_SESSION"
+wait_focused_wire "$FIRST_SESSION" null 1 "state-cleared hook left the first live binding behind"
+sleep 0.4
+import -window "$WID" /output/beads-live-one-cleared.png
+LIVE_RETAINED_DIFF=$(crop_diff /output/beads-live-two.png /output/beads-live-one-cleared.png \
+    "$FLOW_GRAPH_CROP")
+[ "${LIVE_RETAINED_DIFF:-9999}" -le 80 ] \
+    || fail "clearing one of two live sessions erased ${LIVE_RETAINED_DIFF:-0}px of halo"
+clear_issue_focus "$LIVE_SECOND_SESSION"
+wait_focused_wire "$LIVE_SECOND_SESSION" null 1 "state-cleared hook left the second live binding behind"
+sleep 0.4
+import -window "$WID" /output/beads-live-all-cleared.png
+LIVE_CLEAR_DIFF=$(crop_diff /output/beads-live-two.png /output/beads-live-all-cleared.png \
+    "$FLOW_GRAPH_CROP")
+[ "${LIVE_CLEAR_DIFF:-0}" -ge 80 ] \
+    || fail "clearing both live sessions removed only ${LIVE_CLEAR_DIFF:-0}px"
+echo 'PASS: two hook-backed sessions kept the Flow halo live until both state-cleared hooks ran'
+
+# Hand the board back the way this phase found it: in lanes, on one session.
+# The tab strip lives inside the fixed-height titlebar, so closing the tab
+# leaves the strip top where the exit control was just measured.
+xdotool mousemove --sync --window "$WID" \
+    "$(( A3_BAND_PAD_LEFT + 10 ))" "$(( STRIP_TOP + A3_BAND_H / 2 ))"
+xdotool click 1
+sleep 0.8
+measure_rail /output/beads-live-back-to-lanes.png
+xdotool key --clearmodifiers ctrl+shift+q
+for _ in $(seq 1 80); do
+    session_exited "$LIVE_SECOND_SESSION" && break
+    sleep 0.2
+done
+session_exited "$LIVE_SECOND_SESSION" || fail "the liveness phase's second tab never closed"
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.8
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Board resize and text scale lifetime]]
+# A2-R1/A2-R2/A2-R3 through the shipped client, with the window geometry record
+# as the oracle for what the board persisted and the painted rail as the oracle
+# for what it allocated.
+#
+# A2-R2's threshold is each active lane's own measured legible header width, so
+# a lane holding nothing is never starved and an empty Backlog or In-progress
+# board can never reach the auto-collapse rule at all. The phases above leave
+# both of those lanes empty, so this one seeds its own card into each: without
+# that, a stored pin correctly stays an expanded lane at every width this
+# window can take, and "the pin collapsed" would be an assertion about the
+# fixture rather than about the contract.
+xdotool key --clearmodifiers Escape
+sleep 0.3
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+(
+    cd "$PROJECT"
+    bd create 'Resize backlog fixture' --id e2e-resize-backlog --type task --priority 2 \
+        --defer '2030-05-01' >/dev/null
+    bd create 'Resize active fixture' --id e2e-resize-active --type task --priority 2 >/dev/null
+    bd update e2e-resize-active --claim >/dev/null
+)
+wait_for_seeded_card e2e-resize-backlog
+wait_for_seeded_card e2e-resize-active
+for lane in backlog ready in_progress; do
+    [ "$(lane_card_count "$lane")" -gt 0 ] \
+        || fail "A2-R2 needs work in every active lane; $lane is empty"
+done
+
+RESIZE_ENTRY_W=$WIN_W
+RESIZE_ENTRY_H=$HEIGHT
+# `MIN_BOARD_W` is the contract's own derived narrow floor (44 + 452 + 96), not
+# a breakpoint invented here; the wide width is the mock's A3 viewport.
+RESIZE_WIDE_W=1008
+RESIZE_NARROW_W=592
+xdotool windowsize --sync "$WID" "$RESIZE_WIDE_W" 739
+sleep 0.8
+refresh_window
+[ "$(geometry_field pinned "$PRIMARY_WORKSPACE" 2>/dev/null || true)" = true ] \
+    || toggle_board_pin 0
+wait_geometry pinned "$PRIMARY_WORKSPACE" true
+
+# A stored pin at full width is a real lane, and only one of Blocked and Done
+# ever is.
+pin_lane 3
+wait_geometry lane "$PRIMARY_WORKSPACE" blocked
+wait_region_rail 0 "$WIN_W" /output/beads-resize-wide-pinned.png
+RESIZE_STRIP_TOP=$REGION_TOP
+[ "$(region_track_field 3 2)" -gt "$A2_TAB_W" ] \
+    || fail "the stored Blocked pin was not a lane at ${WIN_W}px ($(region_track_field 3 2)px)"
+
+# A2-R3: text scale recomputes the rail without touching the stored height, so
+# the height has to be a non-default one the record actually carries. Drag the
+# real floor bar down by exactly one row and read what the client wrote.
+RESIZE_HEIGHT=$(( A2_STRIP_H + A2_ROW_H ))
+RESIZE_FLOOR_Y=$(( RESIZE_STRIP_TOP + A2_STRIP_H - 1 ))
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$RESIZE_FLOOR_Y"
+xdotool mousedown 1
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( RESIZE_FLOOR_Y + A2_ROW_H ))"
+xdotool mouseup 1
+wait_geometry height "$PRIMARY_WORKSPACE" "$RESIZE_HEIGHT"
+
+# Six `+` steps is the 1.6 ceiling A2-R3 fixes. The zoom glyphs keep the
+# contract's own fixed gutter geometry at every scale, so one coordinate drives
+# all six clicks.
+RESIZE_LARGER_X=$(( A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2 ))
+RESIZE_SMALLER_X=$(( A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2 ))
+RESIZE_ZOOM_Y=$(( RESIZE_STRIP_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2 ))
+for _ in 1 2 3 4 5 6; do
+    xdotool mousemove --sync --window "$WID" "$RESIZE_LARGER_X" "$RESIZE_ZOOM_Y"
+    xdotool click 1
+    sleep 0.25
+done
+wait_geometry scale "$PRIMARY_WORKSPACE" 6
+wait_region_rail 0 "$WIN_W" /output/beads-resize-wide-scaled.png
+[ "$REGION_TOP" -eq "$RESIZE_STRIP_TOP" ] \
+    || fail "the 1.6 text scale moved the strip from $RESIZE_STRIP_TOP to $REGION_TOP"
+[ "$(geometry_field height "$PRIMARY_WORKSPACE")" = "$RESIZE_HEIGHT" ] \
+    || fail "text scale rewrote the stored board height to $(geometry_field height "$PRIMARY_WORKSPACE")"
+[ "$(region_track_field 3 2)" -gt "$A2_TAB_W" ] \
+    || fail "${WIN_W}px still fits the pinned lane at 1.6, but it collapsed"
+
+# A2-R2 down: at the narrow floor the same 1.6 rail cannot give all three
+# active lanes their header width beside a pinned lane, so the pin auto-
+# collapses -- and the preference it collapsed from stays in the record.
+xdotool windowsize --sync "$WID" "$RESIZE_NARROW_W" 739
+sleep 0.8
+refresh_window
+[ "$WIN_W" -le "$(( RESIZE_NARROW_W + 16 ))" ] \
+    || fail "the window manager refused the narrow width and left ${WIN_W}px"
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( HEIGHT - 80 ))"
+wait_region_rail 0 "$WIN_W" /output/beads-resize-narrow.png
+[ "$(region_track_field 3 2)" -eq "$A2_TAB_W" ] \
+    || fail "the starved pin stayed a $(region_track_field 3 2)px lane at ${WIN_W}px"
+wait_geometry lane "$PRIMARY_WORKSPACE" blocked
+# A2-R1: the tabs keep their fixed geometry and the rail still ends inside the
+# board, because A2 answers a narrow region by reallocating, never by scrolling.
+[ "$(( $(region_track_field 4 1) + A2_TAB_W ))" -le "$(( WIN_W - A2_LANES_PADDING_RIGHT ))" ] \
+    || fail "the narrow rail ran past the board's own right padding: $REGION_TRACKS"
+
+# A2-R2 up: widening restores the lane from the untouched preference, with no
+# second click anywhere.
+xdotool windowsize --sync "$WID" "$RESIZE_WIDE_W" 739
+sleep 0.8
+refresh_window
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( HEIGHT - 80 ))"
+wait_region_rail 0 "$WIN_W" /output/beads-resize-restored.png
+[ "$(region_track_field 3 2)" -gt "$A2_TAB_W" ] \
+    || fail "widening back to ${WIN_W}px left the pin collapsed"
+wait_geometry height "$PRIMARY_WORKSPACE" "$RESIZE_HEIGHT"
+echo 'PASS: the stored lane pin auto-collapsed at the narrow floor and restored on widening,' \
+    'while text scale recomputed the rail without moving the strip or the stored height'
+
+# Hand back the default board: 1.0 text, the designed height, no lane pin, no
+# board pin, and the window size this phase was handed.
+for _ in 1 2 3 4 5 6; do
+    xdotool mousemove --sync --window "$WID" "$RESIZE_SMALLER_X" "$RESIZE_ZOOM_Y"
+    xdotool click 1
+    sleep 0.25
+done
+wait_geometry scale "$PRIMARY_WORKSPACE" 0
+wait_region_rail 0 "$WIN_W" /output/beads-resize-teardown.png
+RESIZE_FLOOR_Y=$(( REGION_TOP + RESIZE_HEIGHT - 1 ))
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$RESIZE_FLOOR_Y"
+xdotool mousedown 1
+xdotool mousemove --sync --window "$WID" "$(( WIN_W / 2 ))" "$(( RESIZE_FLOOR_Y - A2_ROW_H ))"
+xdotool mouseup 1
+wait_geometry height "$PRIMARY_WORKSPACE" default
+unpin_lane 3
+wait_geometry lane "$PRIMARY_WORKSPACE" none
+toggle_board_pin 0
+wait_geometry pinned "$PRIMARY_WORKSPACE" false
+xdotool windowsize --sync "$WID" "$RESIZE_ENTRY_W" "$RESIZE_ENTRY_H"
+sleep 0.8
+refresh_window
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Two-region isolation and cleanup]]
+# A3-R1 and A2-BD4 need a second real region, which is the only fixture that
+# can tell "anchored to its region" from "anchored to the window": at x=0 both
+# answers look the same.
+region_session() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+workspace = sys.argv[2]
+for line in reversed(open(sys.argv[1]).readlines()):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "client" and message.get("type") == "MoveSession"
+            and message.get("target_workspace") == workspace):
+        print(message["session_id"])
+        raise SystemExit
+    if (row.get("dir") == "server" and message.get("type") == "SessionCreated"
+            and message.get("workspace_id") == workspace):
+        print(message["session_id"])
+        raise SystemExit
+raise SystemExit(1)
+PY
+}
+
+not_detected_seen() {
+    python3 - "$RECORD" "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server" and message.get("type") == "BeadsBoard"
+            and message.get("workspace_id") == sys.argv[2]
+            and message.get("state") == "NotDetected"):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+wait_region_cwd() {
+    local session="$1" path="$2"
+    for _ in $(seq 1 80); do
+        python3 - "$RECORD" "$session" "$path" <<'PY' && return 0
+import json, sys
+for line in open(sys.argv[1]):
+    try: row = json.loads(line)
+    except ValueError: continue
+    message = row.get("message", {})
+    if (row.get("dir") == "server" and message.get("type") == "CwdChanged"
+            and message.get("session_id") == sys.argv[2]
+            and str(message.get("cwd")) == sys.argv[3]):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+        sleep 0.2
+    done
+    return 1
+}
+
+# A split region is a fresh context with no CWD request of its own, so the
+# server's home fallback wins and its board would never be the fixture's. The
+# image has no shell integration either, so the region's own live terminal
+# emits the OSC 7 the server reads instead.
+REGION_CWD_PROBE=/tmp/scribe-region-cwd.sh
+cat >"$REGION_CWD_PROBE" <<'SH'
+cd "$1" || exit 1
+printf '\033]7;file://%s%s\033\\' "${HOSTNAME}" "$PWD"
+SH
+
+set_region_cwd() {
+    local session="$1" left="$2" path="$3"
+    for _ in 1 2 3; do
+        # The terminal's exposed lower-left corner, clear of its own board.
+        xdotool mousemove --sync --window "$WID" "$(( left + 12 ))" "$(( HEIGHT - 80 ))"
+        xdotool click 1
+        sleep 1.5
+        xdotool type --clearmodifiers --delay 1 -- ". $REGION_CWD_PROBE $path"
+        xdotool key --clearmodifiers Return
+        wait_region_cwd "$session" "$path" && return 0
+    done
+    fail "region session $session never changed CWD to $path"
+}
+
+xdotool windowsize --sync "$WID" 1008 739
+sleep 0.8
+refresh_window
+HALF=$(( WIN_W / 2 ))
+xdotool key --clearmodifiers ctrl+alt+backslash
+for _ in $(seq 1 80); do
+    SECOND_WORKSPACE=$(other_workspace "$PRIMARY_WORKSPACE" 2>/dev/null || true)
+    [ -n "${SECOND_WORKSPACE:-}" ] && break
+    sleep 0.2
+done
+[ -n "${SECOND_WORKSPACE:-}" ] || fail "workspace split created no second region"
+for _ in $(seq 1 80); do
+    SECOND_SESSION=$(region_session "$SECOND_WORKSPACE" 2>/dev/null || true)
+    [ -n "${SECOND_SESSION:-}" ] && break
+    sleep 0.2
+done
+[ -n "${SECOND_SESSION:-}" ] || fail "the second region adopted no session"
+set_region_cwd "$SECOND_SESSION" "$HALF" "$PROJECT"
+
+# Both regions pin their own board, so each rail paints without a hover that
+# would itself be cross-region state.
+[ "$(geometry_field pinned "$PRIMARY_WORKSPACE" 2>/dev/null || true)" = true ] \
+    || toggle_board_pin 0
+wait_geometry pinned "$PRIMARY_WORKSPACE" true
+[ "$(geometry_field pinned "$SECOND_WORKSPACE" 2>/dev/null || true)" = true ] \
+    || toggle_board_pin "$HALF"
+wait_geometry pinned "$SECOND_WORKSPACE" true
+wait_region_rail "$HALF" "$HALF" /output/beads-isolation-right.png
+RIGHT_TOP=$REGION_TOP
+
+# A pointer Flow entry in the right region changes nothing about the left one:
+# not its persisted furniture, and not one pixel of its painted strip. Park the
+# pointer off the left board first, so its own row hover is not the difference.
+xdotool mousemove --sync --window "$WID" "$(( HALF / 2 ))" "$(( HEIGHT - 80 ))"
+sleep 0.6
+wait_region_rail 0 "$HALF" /output/beads-isolation-left-before.png
+LEFT_TOP=$REGION_TOP
+LEFT_TRACKS=$REGION_TRACKS
+LEFT_STRIP_CROP="${HALF}x${A2_STRIP_H}+0+${LEFT_TOP}"
+LEFT_BEFORE_FLOW=$(geometry_tuple "$PRIMARY_WORKSPACE")
+click_region_card "$SECOND_WORKSPACE" "$HALF" "$HALF" e2e-flow-b
+wait_region_flow "$HALF" "$HALF" "$RIGHT_TOP" /output/beads-isolation-right-flow.png
+LEFT_AFTER_FLOW=$(geometry_tuple "$PRIMARY_WORKSPACE")
+[ "$LEFT_AFTER_FLOW" = "$LEFT_BEFORE_FLOW" ] \
+    || fail "right-region Flow changed left board state ($LEFT_BEFORE_FLOW -> $LEFT_AFTER_FLOW)"
+xdotool mousemove --sync --window "$WID" "$(( HALF / 2 ))" "$(( HEIGHT - 80 ))"
+sleep 0.6
+wait_region_rail 0 "$HALF" /output/beads-isolation-left-after.png
+[ "$REGION_TRACKS" = "$LEFT_TRACKS" ] \
+    || fail "right-region Flow reflowed the left rail: $LEFT_TRACKS -> $REGION_TRACKS"
+LEFT_FLOW_DIFF=$(crop_diff /output/beads-isolation-left-before.png \
+    /output/beads-isolation-left-after.png "$LEFT_STRIP_CROP")
+[ "${LEFT_FLOW_DIFF:-9999}" -le 400 ] \
+    || fail "right-region Flow repainted ${LEFT_FLOW_DIFF:-0}px of the left region's strip"
+
+# The reverse direction: a real pin gesture in the left region is that region's
+# alone and never exits the other one's Flow.
+xdotool mousemove --sync --window "$WID" "$(region_lane_x 3)" "$(region_row_y 1)"
+sleep 0.4
+xdotool click 1
+sleep 0.6
+wait_geometry lane "$PRIMARY_WORKSPACE" blocked
+region_capture "$HALF" "$HALF" /output/beads-isolation-right-after-left-pointer.png
+region_flow_mark "$RIGHT_TOP" >/dev/null \
+    || fail "a left-region pointer gesture exited the other region's Flow"
+
+# A2-BD4: a real CWD loss removes only its own region's board, drawer, lane
+# pin, and Flow. The active A3 region is deliberately the one that loses it.
+PRIMARY_BEFORE_NOT_DETECTED=$(geometry_tuple "$PRIMARY_WORKSPACE")
+set_region_cwd "$SECOND_SESSION" "$HALF" /tmp
+# The server's board cache is 30s. Re-enter the region badge after that window
+# so a real CWD change, not a fixture injection, produces NotDetected.
+sleep 31
+for _ in $(seq 1 40); do
+    xdotool mousemove --sync --window "$WID" "$(( HALF / 2 ))" "$(( HEIGHT - 80 ))"
+    xdotool mousemove --sync --window "$WID" "$(( HALF + 13 ))" 17
+    not_detected_seen "$SECOND_WORKSPACE" && break
+    sleep 0.5
+done
+not_detected_seen "$SECOND_WORKSPACE" \
+    || fail "the real /tmp workspace never returned BeadsBoard NotDetected"
+wait_geometry pinned "$SECOND_WORKSPACE" false
+[ "$(geometry_tuple "$PRIMARY_WORKSPACE")" = "$PRIMARY_BEFORE_NOT_DETECTED" ] \
+    || fail "NotDetected in one region changed its sibling's board state"
+xdotool mousemove --sync --window "$WID" "$(( HALF / 2 ))" "$(( HEIGHT - 80 ))"
+sleep 1.2
+region_capture "$HALF" "$HALF" /output/beads-not-detected-right.png
+region_flow_mark "$RIGHT_TOP" >/dev/null 2>&1 \
+    && fail "NotDetected left Flow alive in the removed region"
+if region_measure "$HALF" "$HALF" /output/beads-not-detected-right-rail.png; then
+    fail "NotDetected left the removed region's board painted"
+fi
+wait_region_rail 0 "$HALF" /output/beads-not-detected-left.png
+[ "$(region_track_field 3 2)" -eq "$A2_TAB_W" ] \
+    || fail "the left region's starved pin stopped being a tab: $REGION_TRACKS"
+echo 'PASS: two regions isolated real pointer, Flow, and NotDetected state while the sibling' \
+    'board kept its own pins, height, and text scale'
