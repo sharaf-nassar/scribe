@@ -309,6 +309,12 @@ pub struct BeadsBoardItem {
     /// eligibility client-side: no parent epic means no graph to open.
     #[serde(default)]
     pub parent_epic_id: Option<String>,
+    /// ISO-8601 timestamp from `bd`, kept verbatim; the client derives the A2
+    /// relative-age column from it without a date library. Additive and
+    /// `#[serde(default)]` so a payload from an older server still
+    /// deserializes, with age left blank rather than the read refused.
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 /// A complete, mutually-exclusive five-queue board snapshot.
@@ -2744,6 +2750,7 @@ mod tests {
             blocker_ids: vec!["scribe-blocker".into()],
             parent_epic_name: Some("Workspace board".into()),
             parent_epic_id: Some("scribe-1bf".into()),
+            updated_at: "2026-08-19T09:00:00Z".into(),
         };
         let response = ServerMessage::BeadsBoard {
             workspace_id,
@@ -3076,6 +3083,35 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("deserialize pre-flow board item");
         assert_eq!(decoded.parent_epic_id, None);
         assert_eq!(decoded.parent_epic_name.as_deref(), Some("Workspace board"));
+    }
+
+    // @lat: [[protocol#Client Messages#Beads epic graph#Board item age defaults safely]]
+    #[test]
+    fn board_item_without_updated_at_defaults_to_empty() {
+        #[derive(Serialize)]
+        struct BoardItemWithoutUpdatedAt {
+            id: String,
+            title: String,
+            priority: u8,
+            blocker_ids: Vec<String>,
+            parent_epic_name: Option<String>,
+            parent_epic_id: Option<String>,
+        }
+
+        let bytes = rmp_serde::to_vec_named(&BoardItemWithoutUpdatedAt {
+            id: "scribe-1bf.2".into(),
+            title: "Add board cache".into(),
+            priority: 2,
+            blocker_ids: Vec::new(),
+            parent_epic_name: Some("Workspace board".into()),
+            parent_epic_id: Some("scribe-1bf".into()),
+        })
+        .expect("serialize pre-age board item");
+
+        let decoded: BeadsBoardItem =
+            rmp_serde::from_slice(&bytes).expect("deserialize pre-age board item");
+        assert_eq!(decoded.updated_at, "");
+        assert_eq!(decoded.parent_epic_id.as_deref(), Some("scribe-1bf"));
     }
 
     fn sample_beads_epic_graph() -> BeadsEpicGraph {

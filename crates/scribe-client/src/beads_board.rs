@@ -2518,6 +2518,7 @@ mod tests {
             blocker_ids: Vec::new(),
             parent_epic_name: Some("Beads card detail".into()),
             parent_epic_id: Some("scribe-5wh1".into()),
+            updated_at: String::new(),
         }
     }
 
@@ -3371,6 +3372,7 @@ mod flow_mode_tests {
             blocker_ids: Vec::new(),
             parent_epic_name: epic.map(|_| "Flow epic".into()),
             parent_epic_id: epic.map(str::to_owned),
+            updated_at: String::new(),
         }
     }
 

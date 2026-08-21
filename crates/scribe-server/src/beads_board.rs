@@ -1473,6 +1473,7 @@ fn classify_issues(
                 .and_then(|id| epic_names.get(id).copied())
                 .map(|name| truncate(name, MAX_TITLE_CHARS)),
             parent_epic_id: parent_id.map(|id| truncate(id, MAX_ID_CHARS)),
+            updated_at: truncate(&issue.updated_at, MAX_TITLE_CHARS),
         };
 
         let (queue, total) = match classify_issue(
@@ -1836,10 +1837,10 @@ mod tests {
         let list = br#"{"data":{"issues":[
           {"id":"epic","title":"Board epic","status":"open","priority":2,"issue_type":"epic"},
           {"id":"backlog","title":"Backlog","status":"deferred","priority":4},
-          {"id":"ready","title":"Ready","status":"open","priority":1,"parent":"epic"},
+          {"id":"ready","title":"Ready","status":"open","priority":1,"parent":"epic","updated_at":"2026-08-19T09:00:00Z"},
           {"id":"doing","title":"Doing","status":"in_progress","priority":0},
           {"id":"blocked","title":"Blocked","status":"in_progress","priority":2},
-          {"id":"done","title":"Done","status":"closed","priority":3}
+          {"id":"done","title":"Done","status":"closed","priority":3,"updated_at":"2026-08-19T10:00:00Z"}
         ]},"schema_version":1}"#;
         let ready = br#"{"data":[{"id":"ready","title":"Ready","status":"open","priority":1},{"id":"doing","title":"Doing","status":"in_progress","priority":0}],"schema_version":1}"#;
         let blocked = br#"{"data":[{"id":"blocked","title":"Blocked","status":"in_progress","priority":2,"blocked_by":["gate-1"]},{"id":"done","title":"Done","status":"closed","priority":3,"blocked_by":["old"]}],"schema_version":1}"#;
@@ -1853,11 +1854,17 @@ mod tests {
         assert_eq!(board.ready[0].id, "ready");
         assert_eq!(board.ready[0].parent_epic_name.as_deref(), Some("Board epic"));
         assert_eq!(board.ready[0].parent_epic_id.as_deref(), Some("epic"));
+        assert_eq!(board.ready[0].updated_at, "2026-08-19T09:00:00Z", "open issue carries its age");
         assert_eq!(board.backlog[0].parent_epic_id, None);
+        assert!(board.backlog[0].updated_at.is_empty(), "absent timestamp defaults empty");
         assert_eq!(board.in_progress[0].id, "doing");
         assert_eq!(board.blocked[0].id, "blocked");
         assert_eq!(board.blocked[0].blocker_ids, ["gate-1"]);
         assert_eq!(board.done[0].id, "done");
+        assert_eq!(
+            board.done[0].updated_at, "2026-08-19T10:00:00Z",
+            "closed issue carries its age"
+        );
         assert_eq!(
             [
                 board.backlog_total,

@@ -1001,9 +1001,14 @@ Blocked, and Done queues. Classification precedence is Done, Blocked, In
 Progress, Ready, then Backlog, so an issue appears in only one queue. Each lane
 preserves the authoritative list order, and its 200-card cap therefore retains
 the newest 200 items instead of the highest-priority 200. Priorities stay as
-Beads P0-P4 values; blocker IDs and parent-epic names travel with each item.
-Epic records supply those parent names but never enter a queue, its total, or
-its display cap.
+Beads P0-P4 values; blocker IDs, parent-epic names, and each issue's verbatim
+`bd` `updated_at` timestamp travel with each item, the last of those left an
+empty string when `bd` omitted it. Epic records supply those parent names but
+never enter a queue, its total, or its display cap.
+
+See [[protocol#Client Messages#Beads epic graph#Board item age defaults safely]] for why that timestamp stays an opaque string: only the client turns
+it into the A2 relative-age column, so a malformed tracker timestamp cannot
+make the board unavailable.
 
 One in-memory snapshot is cached per canonical project root for 30 seconds.
 The first request returns Loading immediately and refreshes off-thread; later

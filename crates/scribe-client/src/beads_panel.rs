@@ -1674,6 +1674,7 @@ fn card_from_detail(detail: &BeadsIssueDetail) -> BeadsBoardItem {
         // card synthesized here cannot state Flow eligibility. Read it from the
         // board snapshot's card instead.
         parent_epic_id: None,
+        updated_at: detail.updated_at.clone(),
     }
 }
 
@@ -3235,6 +3236,7 @@ mod tests {
             blocker_ids: Vec::new(),
             parent_epic_name: Some("Beads card detail".into()),
             parent_epic_id: Some("scribe-5wh1".into()),
+            updated_at: String::new(),
         }
     }
 

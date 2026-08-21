@@ -236,6 +236,22 @@ response resolves the parent epic to a title and never carries its id, so
 `card_from_detail` leaves the field `None` and eligibility is read from the
 board snapshot's own card.
 
+#### Board item age defaults safely
+
+`BeadsBoardItem.updated_at` carries the same `bd`-supplied ISO-8601 timestamp
+the Flow graph node already carries, kept verbatim.
+
+The server parses it only as a JSON string field, never into a structured
+time, so a malformed tracker timestamp cannot make the board unavailable. The
+client owns turning it into the A2 relative-age column, without a date
+library.
+
+An older snapshot omitting the field decodes it as an empty string, which
+reads as no known age rather than refusing the read. `card_from_detail`
+populates it from the freshly read `BeadsIssueDetail.updated_at`, so a card
+resynthesized mid-navigation keeps a real age instead of blanking it until the
+next board refresh.
+
 ### Beads issue writes
 
 `BeadsIssueWrite` carries one workspace-scoped, issue-scoped mutation without exposing `bd` arguments to the client.
