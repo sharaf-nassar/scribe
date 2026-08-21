@@ -13,7 +13,9 @@ use crate::beads_board_a2::{
     self, A2Input, QueueLane, RailState, RowView, VoidCopy, compact_relative_age, count_to_f32,
     queue_name,
 };
-use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow};
+use crate::beads_flow::{
+    FlowBandControl, FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow,
+};
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
@@ -48,6 +50,18 @@ pub enum LaneHoverSource {
     Drawer = 2,
     /// Keyboard focus on the tab, or inside the drawer it opened.
     Focus = 4,
+}
+
+/// One of the things holding a Flow node's hover/trace open (A3-I3: "hover
+/// and keyboard focus apply the same path trace"). The Flow-node twin of
+/// `LaneHoverSource`: a pointer and a keyboard focus can each name a
+/// *different* node at once, so each needs its own bit rather than one
+/// boolean, or a stale pointer-leave poll would erase a trace keyboard focus
+/// still holds open (and vice versa).
+#[derive(Clone, Copy)]
+pub enum FlowHoverSource {
+    Pointer = 1,
+    Focus = 2,
 }
 
 /// What a collapsed queue's lane looks like right now, for the rail and
@@ -161,9 +175,13 @@ pub struct FlowView {
     pub graph: BeadsEpicGraph,
     pub layout: FlowLayout,
     pub scroll_x: f32,
-    /// Node the pointer is over, or `None` at rest. Hover is transient view
-    /// state, so it never survives a mode exit or a re-opened graph.
+    /// Node the pointer is over or keyboard focus is on, or `None` at rest
+    /// (A3-I3). Hover is transient view state, so it never survives a mode
+    /// exit or a re-opened graph.
     pub hovered_issue_id: Option<String>,
+    /// Which of `FlowHoverSource`'s bits currently hold `hovered_issue_id`
+    /// open, the Flow twin of `lane_hovered`'s per-queue bitmask.
+    hover_sources: u8,
 }
 
 /// An epic-graph request waiting for its reply.
@@ -331,6 +349,7 @@ impl BeadsBoards {
                 layout,
                 scroll_x: 0.0,
                 hovered_issue_id: None,
+                hover_sources: 0,
             },
         );
         self.flow_open_order.retain(|candidate| *candidate != workspace_id);
@@ -430,35 +449,49 @@ impl BeadsBoards {
         self.live_issues.values().cloned().collect()
     }
 
-    /// Record which node the pointer is over, or clear it on leave.
-    ///
-    /// Returns whether anything changed, so a pointer crossing a node it is
-    /// already tracing does not schedule a repaint. A leave is honoured only
-    /// for the node that owns the current trace: pointers cross node borders
-    /// in an arbitrary order, so an unfiltered leave from the node just
-    /// departed would erase the trace the newly entered node had set.
+    /// Report the pointer or keyboard focus entering or leaving a Flow
+    /// node's trace (A3-I3: hover and keyboard focus raise the identical
+    /// trace). The Flow twin of `hover_lane`: only one node is ever traced
+    /// at once, so entering a *different* node than the one currently
+    /// tracked replaces it outright — sources merge only while both name the
+    /// same node — and a leave for a stale node (or a stale source on the
+    /// tracked node) is ignored. Returns whether anything changed, so a
+    /// pointer or focus crossing a node it already holds schedules no
+    /// repaint.
     pub fn set_flow_hover(
         &mut self,
         workspace_id: WorkspaceId,
         issue_id: &str,
+        source: FlowHoverSource,
         entered: bool,
     ) -> bool {
         let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
-        let next = if entered {
-            if !flow.graph.nodes.iter().any(|node| node.id == issue_id) {
-                return false;
+        let tracked = flow.hovered_issue_id.as_deref();
+        let sources = match tracked {
+            Some(current) if current == issue_id => {
+                if entered {
+                    flow.hover_sources | source as u8
+                } else {
+                    flow.hover_sources & !(source as u8)
+                }
             }
-            Some(issue_id.to_owned())
-        } else if flow.hovered_issue_id.as_deref() == Some(issue_id) {
-            None
-        } else {
-            return false;
+            _ if entered => {
+                if !flow.graph.nodes.iter().any(|node| node.id == issue_id) {
+                    return false;
+                }
+                source as u8
+            }
+            _ => return false,
         };
-        if flow.hovered_issue_id == next {
-            return false;
-        }
+        let next = (sources != 0).then(|| issue_id.to_owned());
+        // A second source joining or leaving an already-traced node changes
+        // `hover_sources` but never `hovered_issue_id`, and the renderer
+        // reads only the latter, so that alone decides whether a repaint is
+        // owed.
+        let changed = flow.hovered_issue_id != next;
         flow.hovered_issue_id = next;
-        true
+        flow.hover_sources = sources;
+        changed
     }
 
     /// Scroll a Flow strip along its one axis, clamped to the graph.
@@ -470,6 +503,42 @@ impl BeadsBoards {
         let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
         let span = (flow.layout.width - board.width).max(0.0);
         let next = (flow.scroll_x + delta_x).clamp(0.0, span);
+        if (next - flow.scroll_x).abs() < f32::EPSILON {
+            return false;
+        }
+        flow.scroll_x = next;
+        true
+    }
+
+    /// Move a Flow strip's offset just far enough that `issue_id`'s node is
+    /// fully inside `viewport_width`, the way Tab/Shift+Tab landing keyboard
+    /// focus on it has to (A3-I6). A node already fully visible leaves the
+    /// offset untouched; one already clipped on the left is brought flush
+    /// with the left edge, one clipped on the right flush with the right.
+    pub fn scroll_flow_node_into_view(
+        &mut self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        viewport_width: f32,
+    ) -> bool {
+        let Some(flow) = self.flows.get_mut(&workspace_id) else { return false };
+        let Some(issue_index) = flow.graph.nodes.iter().position(|node| node.id == issue_id) else {
+            return false;
+        };
+        let Some(node) = flow.layout.nodes.iter().find(|node| node.issue_index == issue_index)
+        else {
+            return false;
+        };
+        let (left, right) = (node.x, node.x + node.width);
+        let max_scroll = (flow.layout.width - viewport_width).max(0.0);
+        let next = if left < flow.scroll_x {
+            left
+        } else if right > flow.scroll_x + viewport_width {
+            right - viewport_width
+        } else {
+            return false;
+        };
+        let next = next.clamp(0.0, max_scroll);
         if (next - flow.scroll_x).abs() < f32::EPSILON {
             return false;
         }
@@ -1458,6 +1527,11 @@ pub struct BeadsBoardColors {
     /// tab's count sit here, one step below `muted`.
     pub quiet: Rgba,
     pub hairline: Rgba,
+    /// A louder structural rule than `hairline` (A2-C1's "hairline and
+    /// strong hairline are the theme-derived structural rules"): the Flow
+    /// band's own lower edge, which has to separate the band from a graph
+    /// rather than merely rule off one row from the next.
+    pub hairline_strong: Rgba,
     pub chevron: Rgba,
     pub button_hover: Rgba,
     /// The A2 floor's own wash and its centred resize grip (A2-C8):
@@ -1537,6 +1611,10 @@ impl BeadsBoardColors {
         let text = anywhere(slot(chrome.tab_text_active));
         let muted = anywhere(slot(chrome.tab_text));
         let hairline = slot(chrome.tab_separator);
+        // A2-C1's "strong hairline": the same structural rule pulled further
+        // toward whichever end the ground is not, so it reads apart from the
+        // ordinary hairline the way the Flow band's lower edge has to (A3-C1).
+        let hairline_strong = mix(hairline, border_target, 0.4);
         let blocked = anywhere(slot(ansi[BRIGHT_RED]));
         // P0 takes the more saturated of the theme's two reds, and P1 is that
         // same red pulled toward the neutral. Derived from each other rather
@@ -1589,6 +1667,7 @@ impl BeadsBoardColors {
             // below `queue_name` (A2-C1, A2-C4).
             quiet: anywhere(mix(muted, ground, 0.3)),
             hairline,
+            hairline_strong,
             // Marks rather than text, so they clear the lower floor a
             // non-text element needs.
             chevron: readable(muted, ink, MARK_CONTRAST),
@@ -1804,6 +1883,11 @@ pub struct BeadsBoardRender {
     /// Held by the view across frames so a node keeps its Tab stop, and empty
     /// whenever the board is painting lanes.
     pub flow_controls: HashMap<String, FlowNodeControl>,
+    /// Focus and activation for the band's `← LANES`/`LANES` exit controls.
+    /// Held by the view across frames the same way `flow_controls` is;
+    /// unused (but always present, since one `BeadsBoardRender` shape serves
+    /// both modes) while the board is painting lanes.
+    pub flow_band: FlowBandControl,
     /// This workspace's Flow graph, already read out of the board store, or
     /// `None` when the strip is painting lanes.
     ///
@@ -1918,6 +2002,7 @@ pub fn render(
         scale,
         colors,
         flow_controls,
+        flow_band,
         flow,
     } = wiring;
     let colors = &colors;
@@ -1936,6 +2021,7 @@ pub fn render(
             scale,
             colors,
             controls: &flow_controls,
+            band: &flow_band,
         })
     {
         return lift(board.child(strip).child(floor(colors)), overlay);
@@ -2080,7 +2166,7 @@ fn flow_fits_board(height: f32) -> bool {
 /// Flow strip has an axis to move: in lanes the same gesture belongs to the
 /// lane bodies underneath.
 fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
-    let FlowStrip { wheel_state, flow, workspace_id, rect, scale, colors, controls } = strip;
+    let FlowStrip { wheel_state, flow, workspace_id, rect, scale, colors, controls, band } = strip;
     let FlowStripSnapshot { graph, layout, cursor_issue_id, scroll_x, trace, live_issue_ids } =
         flow?;
     let painted = crate::beads_flow::render(&FlowRender {
@@ -2094,6 +2180,7 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
         node_controls: controls,
         trace: trace.as_ref(),
         live_issue_ids: &live_issue_ids,
+        band,
     });
     let painted = match painted {
         Ok(painted) => painted,
@@ -2145,6 +2232,7 @@ struct FlowStrip<'a> {
     scale: f32,
     colors: &'a BeadsBoardColors,
     controls: &'a HashMap<String, FlowNodeControl>,
+    band: &'a FlowBandControl,
 }
 
 /// Everything painting a Flow strip needs, copied out of the board store.
@@ -3689,7 +3777,7 @@ fn slot(color: [f32; 4]) -> Rgba {
     Rgba { r: color[0], g: color[1], b: color[2], a: color[3] }
 }
 
-fn alpha(color: Rgba, a: f32) -> Rgba {
+pub(crate) fn alpha(color: Rgba, a: f32) -> Rgba {
     Rgba { a, ..color }
 }
 #[cfg(test)]
@@ -4656,6 +4744,7 @@ mod tests {
                 ("progress track", colors.progress_track),
                 ("chip border", colors.chip_border),
                 ("grip", colors.grip),
+                ("hairline strong", colors.hairline_strong),
             ] {
                 assert!(away(color) > 0.0, "{slot_name} is invisible on the {name} theme");
             }
@@ -5082,12 +5171,12 @@ mod flow_mode_tests {
         boards.request_card_flow(workspace, &card("a", Some(EPIC)));
         assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
 
-        assert!(boards.set_flow_hover(workspace, "b", true));
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, true));
         assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
         // Re-entering the node already traced repaints nothing.
-        assert!(!boards.set_flow_hover(workspace, "b", true));
+        assert!(!boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, true));
 
-        assert!(boards.set_flow_hover(workspace, "b", false));
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, false));
         assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
     }
 
@@ -5100,9 +5189,57 @@ mod flow_mode_tests {
 
         // Pointers cross borders in an arbitrary order: the enter for the new
         // node can land before the leave for the old one.
-        assert!(boards.set_flow_hover(workspace, "a", true));
-        assert!(boards.set_flow_hover(workspace, "b", true));
-        assert!(!boards.set_flow_hover(workspace, "a", false));
+        assert!(boards.set_flow_hover(workspace, "a", FlowHoverSource::Pointer, true));
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, true));
+        assert!(!boards.set_flow_hover(workspace, "a", FlowHoverSource::Pointer, false));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn keyboard_focus_and_pointer_hover_hold_the_same_trace_independently() {
+        // A3-I3: hover and keyboard focus raise the identical trace, and
+        // either can outlive the other -- Tab landing on the pointer-hovered
+        // node must not make a later pointer leave erase the trace focus
+        // still holds, and the reverse.
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, true));
+        // Focus joining a node the pointer already traces changes no visible
+        // state, so it repaints nothing -- the same "re-entering repaints
+        // nothing" rule a single source already gets.
+        assert!(!boards.set_flow_hover(workspace, "b", FlowHoverSource::Focus, true));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+
+        // The pointer moves off while focus is still on "b": the trace stays.
+        assert!(!boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, false));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+
+        // Focus leaves too: only now does the trace clear.
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Focus, false));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
+    }
+
+    #[test]
+    fn keyboard_focus_on_a_new_node_overrides_a_pointer_hover_elsewhere() {
+        // Tab can land on a node the pointer is not over. Only one node is
+        // ever traced at once, so the newly focused node takes over outright
+        // -- the same "latest entered wins" rule `hover_lane` applies across
+        // queues.
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+
+        assert!(boards.set_flow_hover(workspace, "a", FlowHoverSource::Pointer, true));
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Focus, true));
+        assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
+
+        // The pointer's stale leave against "a" is a no-op: "a" is no longer
+        // tracked at all, so nothing about "b"'s trace can be disturbed by it.
+        assert!(!boards.set_flow_hover(workspace, "a", FlowHoverSource::Pointer, false));
         assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id.as_deref(), Some("b"));
     }
 
@@ -5110,11 +5247,14 @@ mod flow_mode_tests {
     fn hover_is_refused_outside_the_graph_and_outside_flow() {
         let workspace = WorkspaceId::new();
         let mut boards = enabled();
-        assert!(!boards.set_flow_hover(workspace, "a", true), "no flow open");
+        assert!(
+            !boards.set_flow_hover(workspace, "a", FlowHoverSource::Pointer, true),
+            "no flow open"
+        );
 
         boards.request_card_flow(workspace, &card("a", Some(EPIC)));
         assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
-        assert!(!boards.set_flow_hover(workspace, "not-in-graph", true));
+        assert!(!boards.set_flow_hover(workspace, "not-in-graph", FlowHoverSource::Pointer, true));
         assert_eq!(boards.flow(workspace).unwrap().hovered_issue_id, None);
     }
 
@@ -5124,7 +5264,7 @@ mod flow_mode_tests {
         let mut boards = enabled();
         boards.request_card_flow(workspace, &card("a", Some(EPIC)));
         assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
-        assert!(boards.set_flow_hover(workspace, "b", true));
+        assert!(boards.set_flow_hover(workspace, "b", FlowHoverSource::Pointer, true));
 
         boards.exit_flow(workspace);
         boards.request_card_flow(workspace, &card("a", Some(EPIC)));
@@ -5257,6 +5397,43 @@ mod flow_mode_tests {
         while boards.scroll_flow(workspace, -500.0, narrow) {}
         assert!((boards.flow(workspace).expect("flow open").scroll_x - 0.0).abs() < f32::EPSILON);
         assert!(!boards.scroll_flow(workspace, -500.0, narrow), "clamped at the near end");
+    }
+
+    #[test]
+    fn scroll_flow_node_into_view_moves_only_as_far_as_the_clip_needs() {
+        // A3-I6: Tab/Shift+Tab auto-scrolls the focused node into view. The
+        // fixture's a -> b -> c chain ranks at x 30..244, 272..486, 514..728,
+        // so a 300px viewport can hold exactly one end at a time.
+        let workspace = WorkspaceId::new();
+        let mut boards = enabled();
+        boards.request_card_flow(workspace, &card("a", Some(EPIC)));
+        assert!(boards.apply_epic_graph(workspace, EPIC, graph()));
+        let viewport_width = 300.0;
+
+        // "a" is already fully visible at rest.
+        assert!(!boards.scroll_flow_node_into_view(workspace, "a", viewport_width));
+        assert!((boards.flow(workspace).unwrap().scroll_x - 0.0).abs() < f32::EPSILON);
+
+        // "c" is clipped on the right; the offset moves exactly far enough to
+        // bring its right edge flush with the viewport, not all the way to
+        // the graph's own far end.
+        assert!(boards.scroll_flow_node_into_view(workspace, "c", viewport_width));
+        assert!(
+            (boards.flow(workspace).unwrap().scroll_x - (728.0 - viewport_width)).abs()
+                < f32::EPSILON
+        );
+
+        // Landing back on "a" is now clipped on the left; the offset moves
+        // flush with its own left edge rather than all the way back to zero.
+        assert!(boards.scroll_flow_node_into_view(workspace, "a", viewport_width));
+        assert!((boards.flow(workspace).unwrap().scroll_x - 30.0).abs() < f32::EPSILON);
+
+        // Already fully visible again repaints nothing.
+        assert!(!boards.scroll_flow_node_into_view(workspace, "a", viewport_width));
+
+        // An id outside the graph, or a workspace outside Flow, is a no-op.
+        assert!(!boards.scroll_flow_node_into_view(workspace, "not-in-graph", viewport_width));
+        assert!(!boards.scroll_flow_node_into_view(WorkspaceId::new(), "a", viewport_width));
     }
 
     #[test]

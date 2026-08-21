@@ -32,10 +32,11 @@ use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client::animation::AnimationSettings;
 use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
-    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, HoverSource, LaneHoverSource,
+    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, FlowHoverSource,
+    HoverSource, LaneHoverSource,
 };
 use scribe_client::beads_board_a2::RailState;
-use scribe_client::beads_flow::FlowNodeControl;
+use scribe_client::beads_flow::{FlowBandControl, FlowNodeControl};
 use scribe_client::beads_panel::{
     self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels, PanelWriteIntent,
 };
@@ -1773,6 +1774,14 @@ struct TerminalView {
     /// per queue serves that queue's tab, its hover/focus-open drawer, and
     /// the pinned lane's own unpin control across all three paint states.
     lane_tab_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
+    /// Stable Tab stops for each visible Flow strip's `← LANES`/`LANES` exit
+    /// controls -- (back, lanes) -- for the same reason `lane_tab_focus` is
+    /// cached rather than rebuilt.
+    flow_band_focus: HashMap<WorkspaceId, (FocusHandle, FocusHandle)>,
+    /// The Flow node that held keyboard focus as of the last frame, per
+    /// workspace, so `sync_flow_focus` can tell a still-focused node from a
+    /// newly focused one and scroll only on the transition (A3-I6).
+    flow_focused_node: HashMap<WorkspaceId, String>,
     /// Stable Tab stops for every Backlog/Ready/In-progress row, keyed by
     /// issue id, for the same reason `lane_tab_focus` is cached rather than
     /// rebuilt: a fresh handle every frame would reset Tab order and drop an
@@ -2387,6 +2396,8 @@ impl TerminalView {
             visible_beads_boards: Vec::new(),
             flow_node_controls: HashMap::new(),
             lane_tab_focus: HashMap::new(),
+            flow_band_focus: HashMap::new(),
+            flow_focused_node: HashMap::new(),
             row_focus: HashMap::new(),
             visible_ci_runs: Vec::new(),
             ci_expanded: HashMap::new(),
@@ -9960,6 +9971,85 @@ impl TerminalView {
         }
     }
 
+    /// Ensure a stable Tab stop exists for each visible Flow strip's
+    /// `← LANES`/`LANES` exit controls, and fold keyboard focus on a Flow
+    /// node into the same hovered-node trace pointer hover already drives
+    /// (A3-I3: "hover and keyboard focus apply the same path trace"). Polled
+    /// here for the reason `sync_lane_tab_focus` documents: GPUI has no
+    /// per-element focus-in/out callback, only `Window::on_focus_in/out`
+    /// subscriptions a free-function board renderer cannot register.
+    fn sync_flow_focus(&mut self, window: &Window, cx: &App) {
+        let in_flow: HashSet<WorkspaceId> = {
+            let Ok(boards) = self.shared.beads_boards.lock() else { return };
+            self.visible_beads_boards
+                .iter()
+                .filter_map(|(workspace_id, _)| {
+                    boards.flow(*workspace_id).is_some().then_some(*workspace_id)
+                })
+                .collect()
+        };
+        self.flow_band_focus.retain(|workspace_id, _| in_flow.contains(workspace_id));
+        for workspace_id in &in_flow {
+            self.flow_band_focus.entry(*workspace_id).or_insert_with(|| {
+                (cx.focus_handle().tab_stop(true), cx.focus_handle().tab_stop(true))
+            });
+        }
+        let Ok(mut boards) = self.shared.beads_boards.lock() else { return };
+        let focused_this_frame = self.poll_flow_node_focus(window, &mut boards);
+        // Scroll only on the rising edge -- a node that already had focus
+        // last frame must not fight a wheel scroll the reader took since
+        // (A3-I6: Tab/Shift+Tab auto-scrolls the focused node into view,
+        // nothing else moves the strip on its own).
+        for (workspace_id, issue_id) in &focused_this_frame {
+            if self.flow_focused_node.get(workspace_id) != Some(issue_id) {
+                self.scroll_flow_focus_into_view(*workspace_id, issue_id, &mut boards, cx);
+            }
+        }
+        drop(boards);
+        self.flow_focused_node = focused_this_frame;
+    }
+
+    /// Feed every visible Flow node's live keyboard focus into the shared
+    /// hover trace (A3-I3), and report which node (if any) holds focus per
+    /// workspace this frame.
+    fn poll_flow_node_focus(
+        &self,
+        window: &Window,
+        boards: &mut BeadsBoards,
+    ) -> HashMap<WorkspaceId, String> {
+        let entries = self.flow_node_controls.iter().flat_map(|(workspace_id, controls)| {
+            controls.iter().map(move |(issue_id, control)| (*workspace_id, issue_id, control))
+        });
+        let mut focused = HashMap::new();
+        for (workspace_id, issue_id, control) in entries {
+            let is_focused = control.focus.is_focused(window);
+            boards.set_flow_hover(workspace_id, issue_id, FlowHoverSource::Focus, is_focused);
+            if is_focused {
+                focused.insert(workspace_id, issue_id.clone());
+            }
+        }
+        focused
+    }
+
+    /// A3-I6's scroll step for one workspace's newly focused node.
+    fn scroll_flow_focus_into_view(
+        &self,
+        workspace_id: WorkspaceId,
+        issue_id: &str,
+        boards: &mut BeadsBoards,
+        cx: &App,
+    ) {
+        let Some(rect) = self.beads_board_rect(
+            workspace_id,
+            boards.is_pinned(workspace_id),
+            boards.height(workspace_id),
+            cx,
+        ) else {
+            return;
+        };
+        boards.scroll_flow_node_into_view(workspace_id, issue_id, rect.width);
+    }
+
     fn send_beads_issue_write(&self, write: PanelWriteIntent) {
         let workspace_id = write.workspace_id;
         let issue_id = write.issue_id;
@@ -10224,6 +10314,26 @@ impl TerminalView {
     }
 
     // @lat: [[client#Client#Beads Board CLI Data Source]]
+    /// The Flow band's exit-control focus and callback for `workspace_id`.
+    ///
+    /// Stable cached handles while this strip is actually in Flow; a
+    /// lanes-mode board still needs a value here (one `BeadsBoardRender`
+    /// shape serves both modes) but never mounts it, so a fresh throwaway
+    /// pair costs nothing.
+    fn flow_band_for(&self, workspace_id: WorkspaceId, cx: &App) -> FlowBandControl {
+        let (back_focus, lanes_focus) = self
+            .flow_band_focus
+            .get(&workspace_id)
+            .cloned()
+            .unwrap_or_else(|| (cx.focus_handle(), cx.focus_handle()));
+        flow_band_control(
+            back_focus,
+            lanes_focus,
+            workspace_id,
+            Arc::clone(&self.shared.beads_boards),
+        )
+    }
+
     fn render_beads_boards(&mut self, cx: &App) -> Vec<gpui::AnyElement> {
         self.sync_flow_node_controls(cx);
         let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
@@ -10241,6 +10351,7 @@ impl TerminalView {
                 let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
                 let (blocked_tab_focus, done_tab_focus) =
                     self.lane_tab_focus.get(workspace_id).cloned()?;
+                let flow_band = self.flow_band_for(*workspace_id, cx);
                 let rail = RailState {
                     blocked: boards
                         .collapsed_lane_state(
@@ -10282,6 +10393,7 @@ impl TerminalView {
                                 .get(workspace_id)
                                 .cloned()
                                 .unwrap_or_default(),
+                            flow_band,
                             // Read here, under the guard this pass already
                             // holds. The strip painting inside it cannot take
                             // the same non-reentrant lock for itself.
@@ -10488,6 +10600,7 @@ impl Render for TerminalView {
         self.sync_beads_board_strips(cx);
         self.sync_lane_tab_focus(window, cx);
         self.sync_row_focus(cx);
+        self.sync_flow_focus(window, cx);
         self.sync_grid_geometry(cx);
         // A prompt or CI state edge changes an internal strip without moving the
         // grid band, so the band probe never notices; republishing here keeps the
@@ -11527,13 +11640,34 @@ fn flow_node_control(
         }),
         on_hover: Arc::new(move |issue_id, entered, window, _app| {
             let Ok(mut hovered) = hover_boards.lock() else { return };
-            if !hovered.set_flow_hover(workspace_id, &issue_id, entered) {
+            if !hovered.set_flow_hover(workspace_id, &issue_id, FlowHoverSource::Pointer, entered) {
                 return;
             }
             drop(hovered);
             // One refresh per real change repaints every node and wire
             // together, so entering and leaving each land in a single frame.
             window.refresh();
+        }),
+    }
+}
+
+/// The Flow band's `← LANES`/`LANES` exit controls: real pointer, keyboard,
+/// and AccessKit Buttons that return to A2 (specs/028's Flow return
+/// controls). Both share this one callback -- the destination is identical.
+fn flow_band_control(
+    back_focus: gpui::FocusHandle,
+    lanes_focus: gpui::FocusHandle,
+    workspace_id: WorkspaceId,
+    boards: Arc<Mutex<BeadsBoards>>,
+) -> FlowBandControl {
+    FlowBandControl {
+        back_focus: back_focus.tab_stop(true),
+        lanes_focus: lanes_focus.tab_stop(true),
+        on_exit: Arc::new(move |window, _app| {
+            let Ok(mut boards) = boards.lock() else { return };
+            if boards.exit_flow(workspace_id) {
+                window.refresh();
+            }
         }),
     }
 }

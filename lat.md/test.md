@@ -4401,6 +4401,24 @@ A benchmark holds ranking plus layout under two milliseconds for a 200-node
 epic, which is the admission bound, so the worst graph the server will serve
 stays inside the frame budget.
 
+One test opens a real headless GPUI window instead of asserting pure
+geometry, because a track_focus/on_click claim is not evidence that the
+control actually keeps focus after a draw or that Enter/Space actually
+reaches its callback -- [focus-allowlist-revokes-new-overlay-controls](../docs/solutions/conventions/focus-allowlist-revokes-new-overlay-controls.md)
+records two prior controls that compiled, passed every pointer-only oracle,
+and still could not be focused or did not survive a repaint. It renders one
+real FlowRender (a one-node graph, a real FlowBandControl) inside a probe
+entity, focuses the band's back-control handle, forces a draw, and asserts
+the handle is still focused afterward; then it dispatches a real Space
+key-down and key-up and asserts the exit callback fired exactly once. That
+exact-once count is also a regression guard on its own: GPUI turns a
+focused element's Enter/Space key-up into a synthesized click by itself
+(div.rs's own note that pressing enter or space triggers a click when the
+element is focused), so a control whose own on_key_down also calls the
+action directly fires it twice per activation -- caught here specifically
+because [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_flow]]
+happens to be idempotent enough not to show up any other way.
+
 Two tests guard the paint path instead of the geometry, and they exist because
 the Flow strip once deadlocked every board render. They take the board guard the
 way the render pass does, assert a second lock would fail, and then require the
@@ -4513,11 +4531,21 @@ later phase reads a colour.
 Two facts shape the phase's structure. The real bd-less server answers
 `NotDetected` on its own schedule and that reply legitimately clears the pin
 and leaves Flow, so anything that has to wait — both theme reloads — rebuilds
-the whole state afterwards instead of assuming it survived. And the exit is
-Escape, not the band's `← LANES` text: that label, the mode pair and the epic
-chevron are plain divs, and the only pointer handler in the renderer is on a
-node. The chevron's inertness is asserted directly, scoped to the strip because
-the detail panel beneath it repaints on its own.
+the whole state afterwards instead of assuming it survived. And the exit this
+phase drives is Escape, not a click on the band's own `← LANES`/`LANES`
+controls: both are real pointer/keyboard/AccessKit Buttons (specs/028's Flow
+return controls), but proving a real on-screen click needs a measured, not
+guessed, pixel offset
+([e2e-click-targets-need-measured-not-ink-counting-offsets](../docs/solutions/conventions/e2e-click-targets-need-measured-not-ink-counting-offsets.md)),
+so that property is proven headlessly instead by
+[[test#Test Harness#GPUI Client Headless Suites#Flow layout and paint-path guard|beads_flow's band-control focus/activation test]].
+What this phase proves that the headless test cannot is panel-focus
+precedence: a node is clicked first so focus sits in the strip, because Esc
+yields to the detail panel when the panel holds it. The epic chevron stays a
+plain div -- no id, role, or handler, so no pointer cursor, focus stop, or
+AccessKit action reaches it by construction -- and its inertness is asserted
+directly, scoped to the strip because the detail panel beneath it repaints on
+its own.
 
 ### Region reports every tab and which is active
 

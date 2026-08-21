@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, FocusHandle, KeyDownEvent, MouseButton, Role, SharedString, Window, div,
-    prelude::*, px,
+    linear_color_stop, linear_gradient, prelude::*, px,
 };
 use scribe_common::protocol::{
     BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue, MAX_FLOW_NODES,
 };
 
-use crate::beads_board::{BeadsBoardColors, short_id};
+use crate::beads_board::{BeadsBoardColors, alpha, short_id};
 use crate::layout::Rect;
 
 fn scalar(value: usize) -> f32 {
@@ -780,6 +780,21 @@ pub struct FlowNodeControl {
     pub on_hover: FlowNodeHoverHandler,
 }
 
+/// Leaving Flow for A2, owned by the workspace-owned mode state.
+pub type FlowExitHandler = Arc<dyn Fn(&mut Window, &mut App)>;
+
+/// Focus and activation for the band's exit controls: `← LANES` and the
+/// `LANES` member of the mode pair (specs/028's Flow return controls). Both
+/// return to A2 through the same callback -- the destination is identical --
+/// but each keeps its own [`FocusHandle`], since Tab has to reach them as two
+/// separate stops.
+#[derive(Clone)]
+pub struct FlowBandControl {
+    pub back_focus: FocusHandle,
+    pub lanes_focus: FocusHandle,
+    pub on_exit: FlowExitHandler,
+}
+
 /// Inputs the workspace-owned mode state supplies to the pure Flow renderer.
 pub struct FlowRender<'a> {
     pub rect: Rect,
@@ -801,6 +816,8 @@ pub struct FlowRender<'a> {
     /// but never implies it is running: bd records who claimed an issue, and
     /// a claim outlives the process that made it.
     pub live_issue_ids: &'a HashSet<String>,
+    /// Focus and activation for the band's `← LANES`/`LANES` exit controls.
+    pub band: &'a FlowBandControl,
 }
 
 /// A boundary failure between an admitted graph, its layout, and GPUI chrome.
@@ -916,8 +933,9 @@ const FLOW_GRAPH_HEIGHT: f32 = 139.0;
 const FLOW_GRAPH_TOP: f32 = FLOW_BAND_HEIGHT + FLOW_RULER_HEIGHT;
 const FLOW_HBAR_TOP: f32 = FLOW_GRAPH_TOP + FLOW_GRAPH_HEIGHT;
 const FLOW_HBAR_HEIGHT: f32 = 2.0;
-const FLOW_FLOOR_HEIGHT: f32 = 3.0;
 const FLOW_PROGRESS_WIDTH: f32 = 150.0;
+/// Clipped-edge continuation fade width (A3-G8).
+const FLOW_FADE_WIDTH: f32 = 48.0;
 /// Chip offset from the hovered node's own box, read off the mock's
 /// `left:286px;top:104px` chip against its `left:272px;top:74px` node.
 const FLOW_CHIP_OFFSET_X: f32 = 14.0;
@@ -941,13 +959,20 @@ pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
     )?;
     require_node_controls(&presentation, render.node_controls)?;
     let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.rect.width);
+    let max_scroll = (presentation.width - render.rect.width).max(0.0);
     let board_id = SharedString::from(format!("beads-flow-{}", render.graph.epic_id));
     let contents = div()
         .relative()
         .size_full()
         .overflow_hidden()
         .bg(render.colors.ground)
-        .child(flow_band(render.graph, render.cursor_issue_id, &render.colors, render.text_scale))
+        .child(flow_band(
+            render.graph,
+            render.cursor_issue_id,
+            render.band,
+            &render.colors,
+            render.text_scale,
+        ))
         .child(rank_ruler(&presentation, scroll_x, &render.colors, render.text_scale))
         .child(flow_graph(
             &presentation,
@@ -956,8 +981,8 @@ pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
             &render.colors,
             render.text_scale,
         ))
-        .child(scrollbar(&presentation, scroll_x, render.rect.width, &render.colors))
-        .child(floor(&render.colors));
+        .children(edge_fades(scroll_x, max_scroll, &render.colors))
+        .child(scrollbar(&presentation, scroll_x, render.rect.width, &render.colors));
     Ok(div()
         .id(board_id)
         .absolute()
@@ -1178,6 +1203,7 @@ fn clamped_scroll(requested: f32, graph_width: f32, viewport_width: f32) -> f32 
 fn flow_band(
     graph: &BeadsEpicGraph,
     cursor_issue_id: &str,
+    band: &FlowBandControl,
     colors: &BeadsBoardColors,
     text_scale: f32,
 ) -> AnyElement {
@@ -1194,24 +1220,59 @@ fn flow_band(
         .gap(px(10.0))
         .bg(colors.band)
         .border_b_1()
-        .border_color(colors.hairline)
-        .child(back_label(colors, text_scale))
+        .border_color(colors.hairline_strong)
+        .child(back_label(band, colors, text_scale))
         .child(epic_label(&graph.epic_title, colors, text_scale))
         .child(div().text_size(px(10.0 * text_scale)).text_color(colors.chevron).child("⌄"))
         .child(tally(graph, colors, text_scale))
         .child(progress_bar(progress, colors))
         .child(opened_tag(cursor_issue_id, colors, text_scale))
-        .child(mode_pair(colors, text_scale))
+        .child(mode_pair(band, colors, text_scale))
         .into_any_element()
 }
 
-fn back_label(colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+/// `← LANES`: a real pointer, keyboard, and AccessKit control that returns
+/// to A2 (specs/028's Flow return controls). Shares its destination with
+/// [`lanes_mode_label`] but keeps its own focus handle, since Tab reaches
+/// them as two separate stops.
+fn back_label(band: &FlowBandControl, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    let hover_bg = colors.button_hover;
+    let hover_ink = colors.title;
+    let click_focus = band.back_focus.clone();
+    let click_exit = Arc::clone(&band.on_exit);
     div()
+        .id("beads-flow-back")
+        .role(Role::Button)
+        .aria_label("Back to Lanes")
+        .aria_description("Press Enter or Space to return to Lanes")
+        .track_focus(&band.back_focus)
+        .tab_stop(true)
         .flex_none()
-        .pr(px(8.0))
+        .px(px(8.0))
+        .py(px(5.0))
+        .cursor_pointer()
         .font_weight(gpui::FontWeight(600.0))
         .text_size(px(9.0 * text_scale))
         .text_color(colors.muted)
+        .hover(move |style| style.bg(hover_bg).text_color(hover_ink))
+        .focus_visible(move |style| style.bg(hover_bg).text_color(hover_ink))
+        .on_mouse_down(MouseButton::Left, |_, _, app| app.stop_propagation())
+        .on_click(move |_, window, app| {
+            window.focus(&click_focus, app);
+            click_exit(window, app);
+        })
+        // GPUI already turns Enter/Space on a focused, `on_click`-bearing
+        // element into a synthesized click (`div.rs`'s "Press enter, space
+        // to trigger click, when the element is focused"), so this only
+        // has to keep the keystroke off the PTY -- calling `on_exit` again
+        // here would double-fire it, the way `ci_bar::action_button` avoids.
+        .on_key_down(|event: &KeyDownEvent, _, app| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                app.stop_propagation();
+            }
+        })
         .child("← LANES")
         .into_any_element()
 }
@@ -1278,29 +1339,79 @@ fn opened_tag(cursor_issue_id: &str, colors: &BeadsBoardColors, text_scale: f32)
         .into_any_element()
 }
 
-fn mode_pair(colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+fn mode_pair(band: &FlowBandControl, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
     div()
         .ml_auto()
         .flex()
         .gap(px(1.0))
-        .child(mode_label("LANES", false, colors, text_scale))
-        .child(mode_label("FLOW", true, colors, text_scale))
+        .child(lanes_mode_label(band, colors, text_scale))
+        .child(flow_mode_label(colors, text_scale))
         .into_any_element()
 }
 
-fn mode_label(label: &str, active: bool, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
-    let element = div()
+/// `LANES`: the mode pair's actionable member, a real Button that returns to
+/// A2 -- the same destination [`back_label`] leaves by (specs/028's Flow
+/// return controls: "the `LANES` member of the mode pair").
+fn lanes_mode_label(
+    band: &FlowBandControl,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
+    let hover_bg = colors.button_hover;
+    let hover_ink = colors.title;
+    let click_focus = band.lanes_focus.clone();
+    let click_exit = Arc::clone(&band.on_exit);
+    div()
+        .id("beads-flow-mode-lanes")
+        .role(Role::Button)
+        .aria_label("Lanes")
+        .aria_description("Press Enter or Space to return to Lanes")
+        .track_focus(&band.lanes_focus)
+        .tab_stop(true)
+        .cursor_pointer()
         .px(px(8.0))
         .py(px(5.0))
         .font_weight(gpui::FontWeight(600.0))
         .text_size(px(9.0 * text_scale))
-        .text_color(if active { colors.title } else { colors.muted })
-        .child(label.to_owned());
-    if active {
-        element.bg(colors.button_hover).into_any_element()
-    } else {
-        element.into_any_element()
-    }
+        .text_color(colors.muted)
+        .hover(move |style| style.bg(hover_bg).text_color(hover_ink))
+        .focus_visible(move |style| style.bg(hover_bg).text_color(hover_ink))
+        .on_mouse_down(MouseButton::Left, |_, _, app| app.stop_propagation())
+        .on_click(move |_, window, app| {
+            window.focus(&click_focus, app);
+            click_exit(window, app);
+        })
+        // See `back_label`: GPUI's own focused Enter/Space already
+        // synthesizes the click above, so this only clears the keystroke.
+        .on_key_down(|event: &KeyDownEvent, _, app| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                app.stop_propagation();
+            }
+        })
+        .child("LANES")
+        .into_any_element()
+}
+
+/// `FLOW`: a selected-state indicator, not a control (specs/028's "The
+/// active `FLOW` member is a selected-state indicator and a no-op"). Carries
+/// no focus handle or click/key handler, so it is unreachable by pointer or
+/// keyboard, and exposes only its selected state to AccessKit.
+fn flow_mode_label(colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+    div()
+        .id("beads-flow-mode-flow")
+        .role(Role::Tab)
+        .aria_label("Flow")
+        .aria_selected(true)
+        .px(px(8.0))
+        .py(px(5.0))
+        .font_weight(gpui::FontWeight(600.0))
+        .text_size(px(9.0 * text_scale))
+        .text_color(colors.title)
+        .bg(colors.button_hover)
+        .child("FLOW")
+        .into_any_element()
 }
 
 fn rank_ruler(
@@ -1607,6 +1718,50 @@ fn node_id(id: &str, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
         .into_any_element()
 }
 
+/// The clipped-edge continuation fades (A3-G8): the side that still has
+/// graph behind it fades into the ground, so a cut rank reads as continuing
+/// rather than ending. Present only on the side content is actually clipped,
+/// so a graph that fits shows neither and one scrolled to an end shows only
+/// the other -- the near/far/middle states are exactly this predicate
+/// against the clamped offset.
+fn edge_fades(scroll_x: f32, max_scroll: f32, colors: &BeadsBoardColors) -> Vec<AnyElement> {
+    let mut fades = Vec::with_capacity(2);
+    if scroll_x > f32::EPSILON {
+        fades.push(fade(FadeSide::Left, colors));
+    }
+    if scroll_x < max_scroll - f32::EPSILON {
+        fades.push(fade(FadeSide::Right, colors));
+    }
+    fades
+}
+
+#[derive(Clone, Copy)]
+enum FadeSide {
+    Left,
+    Right,
+}
+
+fn fade(side: FadeSide, colors: &BeadsBoardColors) -> AnyElement {
+    let angle = match side {
+        FadeSide::Left => 90.0,
+        FadeSide::Right => 270.0,
+    };
+    let transparent = alpha(colors.ground, 0.0);
+    let gradient = linear_gradient(
+        angle,
+        linear_color_stop(colors.ground, 0.0),
+        linear_color_stop(transparent, 1.0),
+    );
+    let element =
+        div().absolute().top(px(FLOW_GRAPH_TOP)).h(px(FLOW_GRAPH_HEIGHT)).w(px(FLOW_FADE_WIDTH));
+    match side {
+        FadeSide::Left => element.left_0(),
+        FadeSide::Right => element.right_0(),
+    }
+    .bg(gradient)
+    .into_any_element()
+}
+
 fn scrollbar(
     presentation: &FlowPresentation,
     scroll_x: f32,
@@ -1620,13 +1775,18 @@ fn scrollbar(
     let thumb_width = (viewport_width * viewport_width / graph_width).max(34.0);
     let max_scroll = (graph_width - viewport_width).max(1.0);
     let thumb_x = scroll_x / max_scroll * (viewport_width - thumb_width);
+    // The board's own floor (painted outside this function, over the whole
+    // strip) already carries the subtle-lift/grip pairing A2's floor uses;
+    // the hbar is that same pairing applied to a position mark instead of a
+    // resize grip, so it reuses the roles rather than the tally progress
+    // bar's `progress_track` or a structural `hairline`.
     div()
         .absolute()
         .left_0()
         .right_0()
         .top(px(FLOW_HBAR_TOP))
         .h(px(FLOW_HBAR_HEIGHT))
-        .bg(colors.progress_track)
+        .bg(colors.band)
         .child(
             div()
                 .absolute()
@@ -1634,22 +1794,8 @@ fn scrollbar(
                 .top_0()
                 .w(px(thumb_width))
                 .h(px(2.0))
-                .bg(colors.hairline),
+                .bg(colors.grip),
         )
-        .into_any_element()
-}
-
-fn floor(colors: &BeadsBoardColors) -> AnyElement {
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .h(px(FLOW_FLOOR_HEIGHT))
-        .flex()
-        .justify_center()
-        .bg(colors.progress_track)
-        .child(div().mt(px(1.0)).w(px(34.0)).h(px(1.0)).bg(colors.hairline))
         .into_any_element()
 }
 
@@ -2259,5 +2405,142 @@ mod tests {
         let live = nodes.iter().find(|node| node.id == "flow-2").unwrap();
         assert!(live.liveness.is_running());
         assert_eq!(live.state, FlowNodeState::Done, "the queue state is unchanged");
+    }
+
+    fn test_colors() -> BeadsBoardColors {
+        let fill = [0.1, 0.11, 0.12, 1.0];
+        let chrome = scribe_common::theme::ChromeColors {
+            tab_bar_bg: fill,
+            tab_bar_active_bg: fill,
+            tab_text: fill,
+            tab_text_active: fill,
+            tab_separator: fill,
+            status_bar_bg: fill,
+            status_bar_text: fill,
+            divider: fill,
+            accent: fill,
+            scrollbar: fill,
+            tab_bar_gradient_top: fill,
+            status_bar_separator: fill,
+            prompt_bar_first_row_bg: fill,
+            prompt_bar_second_row_bg: fill,
+            prompt_bar_text: fill,
+            prompt_bar_icon_first: fill,
+            prompt_bar_icon_latest: fill,
+        };
+        let ansi = [[0.5, 0.5, 0.5, 1.0]; 16];
+        BeadsBoardColors::from_theme(&chrome, &ansi, 1.0)
+    }
+
+    /// Renders one Flow strip so a real GPUI window can paint it.
+    struct FlowBandFocusProbe {
+        rect: Rect,
+        graph: BeadsEpicGraph,
+        layout: FlowLayout,
+        node_controls: HashMap<String, FlowNodeControl>,
+        band: FlowBandControl,
+        colors: BeadsBoardColors,
+    }
+
+    impl Render for FlowBandFocusProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            render(&FlowRender {
+                rect: self.rect,
+                graph: &self.graph,
+                layout: &self.layout,
+                cursor_issue_id: "solo",
+                scroll_x: 0.0,
+                text_scale: 1.0,
+                colors: self.colors,
+                node_controls: &self.node_controls,
+                trace: None,
+                live_issue_ids: &HashSet::new(),
+                band: &self.band,
+            })
+            .expect("a one-node graph always renders")
+        }
+    }
+
+    /// specs/028's Flow return controls: `← LANES` and `LANES` are real
+    /// Buttons with visible focus and Enter/Space activation (A3-I4). Per
+    /// docs/solutions/conventions/focus-allowlist-revokes-new-overlay-controls.md's
+    /// prevention note, a `track_focus`/`focus_visible` claim needs a test
+    /// proving the handle is still focused after a real draw, not just that
+    /// the builder chain compiles -- and this one also proves the activation
+    /// path reaches the exit callback.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Flow layout and paint-path guard]]
+    #[gpui::test]
+    fn flow_band_back_control_survives_a_draw_and_activates_on_space(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+
+        let graph = graph(&["solo"], &[]);
+        let layout = layout_flow(&graph, 1.0).unwrap();
+        let colors = test_colors();
+        let exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exit_count = Arc::clone(&exits);
+
+        let window = cx.update(|app| {
+            app.open_window(gpui::WindowOptions::default(), |_, app| {
+                app.new(|app| {
+                    let mut node_controls = HashMap::new();
+                    node_controls.insert(
+                        "solo".to_owned(),
+                        FlowNodeControl {
+                            focus: app.focus_handle(),
+                            on_activate: Arc::new(|_, _, _| {}),
+                            on_hover: Arc::new(|_, _, _, _| {}),
+                        },
+                    );
+                    FlowBandFocusProbe {
+                        rect: Rect { x: 0.0, y: 0.0, width: 1200.0, height: 197.0 },
+                        graph,
+                        layout,
+                        node_controls,
+                        band: FlowBandControl {
+                            back_focus: app.focus_handle().tab_stop(true),
+                            lanes_focus: app.focus_handle().tab_stop(true),
+                            on_exit: Arc::new(move |_, _| {
+                                exit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }),
+                        },
+                        colors,
+                    }
+                })
+            })
+            .unwrap()
+        });
+        let back_focus =
+            window.update(cx, |probe, _, _| probe.band.back_focus.clone()).expect("probe entity");
+        cx.update_window(window.into(), |_, window, app| {
+            window.focus(&back_focus, app);
+            window.draw(app).clear();
+        })
+        .unwrap();
+        assert!(
+            cx.update_window(window.into(), |_, window, _| back_focus.is_focused(window)).unwrap(),
+            "the back control loses focus after a draw"
+        );
+
+        let keystroke = gpui::Keystroke::parse("space").expect("parse Space");
+        cx.update_window(window.into(), |_, window, app| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(gpui::KeyUpEvent { keystroke }.to_platform_input(), app);
+        })
+        .unwrap();
+        assert_eq!(
+            exits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Space on the focused back control did not exit Flow"
+        );
     }
 }

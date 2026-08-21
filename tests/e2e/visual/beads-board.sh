@@ -1235,12 +1235,15 @@ FLOW_RESTORED_BAND=$(px_at /output/beads-flow-theme-restored.png 5 "$((BOARD_TOP
 # Back to lanes, and the strip is a board again. The pin survives the round
 # trip: Flow borrows the reservation, it does not own it.
 #
-# Esc is the exit, not the band's "← LANES" text: that label is a plain div
-# with no click handler, as are the mode pair and the chevron — the only
-# pointer handler in beads_flow.rs is on a node. Asserting a click on the label
-# would pin behaviour the renderer does not have. A node is clicked first so
-# focus sits in the strip, because Esc yields to the detail panel when the
-# panel holds it.
+# This phase exits through Escape rather than a click on the band's own
+# "← LANES"/"LANES" controls: both are real pointer/keyboard/AccessKit Buttons
+# now (specs/028's Flow return controls), proven headlessly by
+# beads_flow::tests::flow_band_back_control_survives_a_draw_and_activates_on_space
+# (a real-pixel click site needs a measured, not guessed, offset --
+# docs/solutions/conventions/e2e-click-targets-need-measured-not-ink-counting-offsets.md).
+# What this phase proves instead is panel-focus precedence: a node is clicked
+# first so focus sits in the strip, because Esc yields to the detail panel
+# when the panel holds it, and only then reaches Flow's own exit.
 flow_enter
 import -window "$WID" /output/beads-flow-inflow.png
 [ "$(strip_diff /output/beads-flow-lanes.png /output/beads-flow-inflow.png)" -ge 500 ] ||
