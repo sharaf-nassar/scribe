@@ -40,6 +40,17 @@ parity-inventory:
 parity-gate:
     tools/check-parity-inventory.sh --gate
 
+# Regenerate the A2/A3 machine contract manifest from the approved Beads
+# board mock (.impeccable/mocks/beads-board-directions.html).
+beads-board-contract-gen:
+    python3 .impeccable/mocks/gen-contract.py
+
+# Check the mock's A2/A3 sections against that generated contract: catches
+# stale evidence, changed normative geometry, and missing named states or
+# interactions. Not part of `just ready`; CI wiring is a separate gate.
+beads-board-contract:
+    python3 .impeccable/mocks/check-contract.py
+
 # Lint (strict clippy config)
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings

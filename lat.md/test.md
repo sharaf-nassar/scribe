@@ -4307,6 +4307,49 @@ boards too. The invariant they encode is
 [[client#Client#Beads Flow Layout Engine#Flow mode entry, exit, and scrolling]]'s:
 nothing reachable from the paint path may lock the board store.
 
+### Beads board A2/A3 machine contract
+
+`gen-contract.py` reads the approved Beads board mock's normative A2/A3 CSS
+and markup into a committed JSON manifest of geometry, typography, color
+roles, named states, and interactions, so nothing re-transcribes mock numbers
+by hand.
+
+[specs/028-beads-board-contract.md](../specs/028-beads-board-contract.md) is
+the canonical prose contract; only its A2 (Ledger + rail) and A3 (Flow)
+sections of the mock are normative; the page scaffolding, CURRENT, and
+standalone A are reference-only.
+[gen-contract.py](../.impeccable/mocks/gen-contract.py) is the machine oracle
+that keeps the two from drifting: it parses the mock's own `<style>` block and
+A2/A3 markup -- never a second, hand-copied set of numbers -- into
+[a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json), a small
+committed manifest covering named states (collapsed/hover/pinned/drag for A2,
+opened/traced/deep/scrolled for A3) and named interactions.
+`just beads-board-contract-gen` regenerates it.
+
+Section scope is enforced by construction: extraction only ever reads bytes
+between the mock's own `A2 LEDGER + RAIL` / `A3 FLOW` comment markers, and
+both the marker set and each section's required state slugs are asserted
+against a hardcoded allowlist, so a renamed, added, or removed section fails
+generation instead of silently mis-scoping. A `font` shorthand is expanded to
+longhand `font-size`/`line-height`/`font-weight` at parse time so a later rule
+overriding only one longhand (`.dr .pri`'s `line-height` over `.d1 .pri`'s
+shorthand) merges correctly instead of losing to the shorthand it partially
+overrides. Rank/row pitch and the 197px strip budget are cross-checked against
+the mock's own `<p class="formula">` prose, the same proof
+[check-flow.py](../.impeccable/mocks/check-flow.py) already made for A3 alone.
+
+[check-contract.py](../.impeccable/mocks/check-contract.py)
+(`just beads-board-contract`) re-runs the generator fresh and fails on any of:
+the committed manifest no longer matching byte-for-byte (stale evidence,
+which also catches any changed normative geometry); a missing required named
+state or interaction; a reference-only section leaking into the normative
+set; a broken rank/row-pitch or strip-budget formula; or a regression in
+`check-flow.py`'s own suite, which it shells out to and requires green so
+that contract's existing guarantees stay represented rather than replaced.
+Rust unit tests and the E2E shell/Python suites below are the intended
+consumers: they read named geometry/typography/color fields out of the
+committed JSON instead of re-transcribing mock numbers.
+
 ### Beads Flow visual contract
 
 The Flow view is the strip's second rendering, and

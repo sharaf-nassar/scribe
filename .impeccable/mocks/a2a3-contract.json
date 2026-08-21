@@ -1,0 +1,343 @@
+{
+  "colors": {
+    "backlog": "#727b88",
+    "blocked": "#ef6f6b",
+    "card": "#1f2229",
+    "card-hover": "#252932",
+    "card-hover-top": "#2d323b",
+    "card-top": "#262a31",
+    "done": "#68c98c",
+    "epic": "#b8737f",
+    "ground": "#15171c",
+    "line": "#ffffff12",
+    "line-strong": "#ffffff1f",
+    "muted": "#8d94a1",
+    "p0": "#e2555f",
+    "p1": "#d68d38",
+    "p2": "#c4ae3c",
+    "p3": "#8f96a2",
+    "p4": "#6d7480",
+    "page": "#08090c",
+    "progress": "#8296ff",
+    "quiet": "#666d7a",
+    "ready": "#4cc7d6",
+    "terminal": "#0b0d11",
+    "text": "#e9ebf0"
+  },
+  "fonts": {
+    "mono": "\"JetBrains Mono\",\"Noto Sans Mono\",monospace",
+    "sans": "\"Noto Sans Display\",\"Noto Sans\",sans-serif"
+  },
+  "generated_by": "gen-contract.py",
+  "geometry": {
+    "a2": {
+      "body_h": 153,
+      "body_rows": 3,
+      "chev_bottom": 0,
+      "chev_right": 1,
+      "chev_size": 10,
+      "drawer_border_w": 1,
+      "drawer_bottom": 4,
+      "drawer_pad_h": 13,
+      "drawer_radius": 3,
+      "drawer_right": 96,
+      "drawer_top": 5,
+      "drawer_w": 452,
+      "epic_separation_min": 12,
+      "floor_grip_h": 1,
+      "floor_grip_top": 1,
+      "floor_grip_w": 34,
+      "floor_h": 3,
+      "head_h": 17,
+      "headband_h": 24,
+      "lane_epic_margin_left": "auto",
+      "lanes_padding_bottom": 7,
+      "lanes_padding_left": 44,
+      "lanes_padding_right": 10,
+      "lanes_padding_top": 5,
+      "qcount_margin_left": "0",
+      "row_h": 51,
+      "row_interline_gap": 4,
+      "row_priority_gap": 6,
+      "row_priority_w": 20,
+      "row_sub_h": 15,
+      "row_title_h": 19,
+      "seam_h": 2,
+      "strip_h": 197,
+      "sub_columns": "minmax(0,1fr) auto minmax(0,1fr)",
+      "tab_spine_line_h": 10.5,
+      "tab_w": 36,
+      "track_gap": 16,
+      "zoom_gap": 1,
+      "zoom_glyph_h": 17,
+      "zoom_glyph_w": 12,
+      "zoom_left": 8,
+      "zoom_top": 5
+    },
+    "a3": {
+      "band_gap": 10,
+      "band_h": 34,
+      "band_pad_left": 14,
+      "band_pad_right": 10,
+      "chip_pad_h": 7,
+      "chip_pad_v": 3,
+      "chip_radius": 2,
+      "dot_size": 8,
+      "fade_w": 48,
+      "floor_grip_h": 1,
+      "floor_grip_top": 1,
+      "floor_grip_w": 34,
+      "floor_h": 3,
+      "gap": 4,
+      "graph_h": 139,
+      "graph_top": 49,
+      "gutter": 28,
+      "hbar_h": 2,
+      "hbar_top": 188,
+      "left_pad": 30,
+      "node_h": 24,
+      "node_w": 214,
+      "progress_h": 2,
+      "progress_w": 150,
+      "rank_pitch": 242,
+      "row_capacity": {
+        "0.8": 5,
+        "1.0": 4,
+        "1.6": 2
+      },
+      "row_gap": 10,
+      "row_pitch": 34,
+      "ruler_h": 15,
+      "strip_h": 197
+    }
+  },
+  "interactions": [
+    {
+      "evidence": "hover to open, click to pin",
+      "section": "A2",
+      "slug": "hover-drawer",
+      "trigger": "pointer-hover|keyboard-focus"
+    },
+    {
+      "evidence": "click to pin",
+      "section": "A2",
+      "slug": "pin-drawer",
+      "trigger": "click|enter|space"
+    },
+    {
+      "evidence": "class=\"unpin\"",
+      "section": "A2",
+      "slug": "unpin-drawer",
+      "trigger": "click"
+    },
+    {
+      "evidence": "class=\"ghost\"",
+      "section": "A2",
+      "slug": "drag-card",
+      "trigger": "pointer-drag"
+    },
+    {
+      "evidence": "Clicking a row in Lanes",
+      "section": "A3",
+      "slug": "open-epic",
+      "trigger": "click|enter|space"
+    },
+    {
+      "evidence": "class=\"board fl trace\"",
+      "section": "A3",
+      "slug": "trace-node",
+      "trigger": "pointer-hover|keyboard-focus"
+    },
+    {
+      "evidence": "transform:translateX(-193px)",
+      "section": "A3",
+      "slug": "wheel-scroll",
+      "trigger": "wheel"
+    }
+  ],
+  "interactions_excluded": [
+    {
+      "reason": "closed decision: epic chevron is inert chrome -- no pointer cursor, hover, focus stop, or action -- despite cursor:pointer in the mock CSS",
+      "section": "A3",
+      "selector": ".fl .switch"
+    }
+  ],
+  "provenance": {
+    "contract_spec": "specs/028-beads-board-contract.md",
+    "quill_session": "01a01227-1e60-78a5-ac9d-58a63aef7ead"
+  },
+  "schema_version": 1,
+  "sections": {
+    "normative": [
+      "A2 · Ledger + rail",
+      "A3 · Flow"
+    ],
+    "reference_only": [
+      "Current",
+      "A · Ledger"
+    ]
+  },
+  "source": {
+    "path": ".impeccable/mocks/beads-board-directions.html",
+    "sha256": "67f1af1e918c47018a9c21e312a5321eb343c0116f8131116a561f26992124ae"
+  },
+  "states": [
+    {
+      "label": "Collapsed — real state",
+      "section": "A2",
+      "slug": "collapsed"
+    },
+    {
+      "label": "Hovering the Blocked tab — opens over the lanes, nothing reflows",
+      "section": "A2",
+      "slug": "hover"
+    },
+    {
+      "label": "Blocked pinned — busy state, Done still a tab",
+      "section": "A2",
+      "slug": "pinned"
+    },
+    {
+      "label": "Dragging a card — the collapsed Done tab is still the drop target that closes it",
+      "section": "A2",
+      "slug": "drag"
+    },
+    {
+      "label": "Opened “Document Pi integration” from the Blocked lane — the strip becomes its epic",
+      "section": "A3",
+      "slug": "opened"
+    },
+    {
+      "label": "Hovering a node traces its path — what it waited on, what it releases",
+      "section": "A3",
+      "slug": "traced"
+    },
+    {
+      "label": "A deeper epic — the frontier rank is four rows deep, and the graph runs past the strip",
+      "section": "A3",
+      "slug": "deep"
+    },
+    {
+      "label": "Wheeled into the middle of the same graph — both edges fade, and there is still no vertical scrollbar",
+      "section": "A3",
+      "slug": "scrolled"
+    }
+  ],
+  "typography": {
+    "a2": {
+      "qcount": {
+        "font_size": 11,
+        "font_weight": 600,
+        "letter_spacing": ".02em",
+        "line_height": 17
+      },
+      "qname": {
+        "font_size": 9.5,
+        "font_weight": 700,
+        "letter_spacing": ".13em",
+        "text_transform": "uppercase"
+      },
+      "row_age": {
+        "font_size": 9.5,
+        "font_weight": 500,
+        "line_height": 14
+      },
+      "row_epic": {
+        "font_size": 9.5,
+        "line_height": 14
+      },
+      "row_id": {
+        "font_size": 9.5,
+        "font_weight": 500,
+        "line_height": 14
+      },
+      "row_pri": {
+        "font_size": 9.5,
+        "font_weight": 700,
+        "letter_spacing": ".03em",
+        "line_height": 19
+      },
+      "row_title": {
+        "font_size": 12,
+        "font_weight": 600,
+        "letter_spacing": "-.008em",
+        "line_height": 19
+      },
+      "tab_count": {
+        "font_size": 11,
+        "font_weight": 600,
+        "letter_spacing": ".02em",
+        "line_height": 17
+      },
+      "tab_spine": {
+        "font_size": 9.5,
+        "font_weight": 700,
+        "letter_spacing": ".02em",
+        "line_height": 10.5,
+        "text_transform": "uppercase"
+      },
+      "zoom_glyph": {
+        "font_size": 11,
+        "font_weight": 400,
+        "line_height": 17
+      }
+    },
+    "a3": {
+      "back": {
+        "font_size": 9,
+        "font_weight": 600,
+        "letter_spacing": ".1em",
+        "text_transform": "uppercase"
+      },
+      "chip": {
+        "font_size": 9.5,
+        "font_weight": 500,
+        "line_height": 13
+      },
+      "epic": {
+        "font_size": 9.5,
+        "font_weight": 700,
+        "letter_spacing": ".13em",
+        "text_transform": "uppercase"
+      },
+      "epic_chevron": {
+        "font_size": 10,
+        "font_weight": 400
+      },
+      "modes": {
+        "font_size": 9,
+        "font_weight": 600,
+        "letter_spacing": ".1em",
+        "text_transform": "uppercase"
+      },
+      "node_id": {
+        "font_size": 9.5,
+        "font_weight": 500,
+        "line_height": 24
+      },
+      "node_pri": {
+        "font_size": 9.5,
+        "font_weight": 700,
+        "letter_spacing": ".03em",
+        "line_height": 24
+      },
+      "node_title": {
+        "font_size": 12,
+        "font_weight": 600,
+        "letter_spacing": "-.008em",
+        "line_height": 24
+      },
+      "rank_label": {
+        "font_size": 9.5,
+        "font_weight": 500,
+        "letter_spacing": ".13em",
+        "line_height": 15
+      },
+      "tally": {
+        "font_size": 17,
+        "font_weight": 600,
+        "letter_spacing": "-.035em"
+      }
+    }
+  }
+}
