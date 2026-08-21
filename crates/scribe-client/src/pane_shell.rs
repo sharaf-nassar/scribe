@@ -166,6 +166,14 @@ fn apply_slot_metadata(name: Option<String>, accent: [f32; 4]) -> impl FnOnce(&m
     }
 }
 
+/// Requested pinned-board height plus the terminal space that must remain
+/// below it in the same region.
+#[derive(Clone, Copy)]
+pub struct BoardReservation {
+    pub height: f32,
+    pub terminal: f32,
+}
+
 /// The window's live pane/workspace layout.
 pub struct PaneShell {
     /// Window-level split into workspace regions.
@@ -519,6 +527,33 @@ impl PaneShell {
             .find(|(id, _)| *id == workspace_id)
             .map(|(_, rect)| Self::content_rect(rect, self.ci_strip(workspace_id), 0.0))
             .map(|content| Rect { height: height.min(content.height), ..content })
+    }
+
+    /// A pinned board rect capped before `terminal_reservation`, so stored
+    /// height remains a preference while a short stacked region still keeps
+    /// its terminal recoverable.
+    pub fn reserved_board_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        reservation: BoardReservation,
+        viewport: Rect,
+        cx: &App,
+    ) -> Option<Rect> {
+        let content = self.board_rect(workspace_id, f32::MAX, viewport, cx)?;
+        Some(Rect {
+            height: Self::reserved_board_height(
+                content.height,
+                reservation.height,
+                reservation.terminal,
+            ),
+            ..content
+        })
+    }
+
+    fn reserved_board_height(content: f32, requested: f32, terminal_reservation: f32) -> f32 {
+        let reservation =
+            if terminal_reservation.is_finite() { terminal_reservation.max(0.0) } else { 0.0 };
+        requested.min((content - reservation).max(0.0))
     }
 
     /// Full region bounds used to clamp workspace-owned overlays.
@@ -1631,6 +1666,12 @@ mod tests {
 
         let shallow = PaneShell::content_rect(Rect { height: 100.0, ..top }, 0.0, board);
         assert!(shallow.height >= 0.0, "a region shorter than the board clamps to zero");
+
+        assert!((PaneShell::reserved_board_height(600.0, board, 60.0) - board).abs() < 0.001);
+        assert!(
+            (PaneShell::reserved_board_height(180.0, board, 60.0) - 120.0).abs() < 0.001,
+            "a short stacked region keeps its terminal reservation"
+        );
     }
 
     /// The hot-reconnect adoption lowering preserves split orientation: a

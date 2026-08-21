@@ -17,6 +17,7 @@ use crate::beads_flow::{FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layo
 use crate::beads_panel::BeadsPanels;
 use crate::layout::Rect;
 use crate::opacity::surface;
+use crate::restore_replay::round_positive_f32_to_u16;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
@@ -106,6 +107,11 @@ pub struct BeadsBoards {
     /// not per window like the text size, because the strip a pinned board
     /// takes comes out of that region's terminal and no other's.
     heights: HashMap<WorkspaceId, f32>,
+    /// Board heights read from the window record, held until their regions
+    /// appear -- the height twin of `pending_pins`.
+    pending_heights: HashMap<WorkspaceId, f32>,
+    // A2 deliberately has no lane scroll state: A2-R1 keeps whole rows,
+    // ellipsizes text, and exposes an overflow cue rather than a scroll axis.
     /// The bottom-bar drag in flight, if any.
     resize: Option<BoardResize>,
     /// Eligible card press waiting for GPUI's native drag arm.
@@ -488,6 +494,10 @@ impl BeadsBoards {
             self.lane_pinned.remove(&workspace_id);
             self.lane_hovered.remove(&workspace_id);
             self.lane_hover_expires.remove(&workspace_id);
+            self.heights.remove(&workspace_id);
+            self.pending_heights.remove(&workspace_id);
+            self.pending_pins.remove(&workspace_id);
+            self.pending_lane_pins.remove(&workspace_id);
             self.exit_flow(workspace_id);
             if self.resize.is_some_and(|drag| drag.workspace_id == workspace_id) {
                 self.resize = None;
@@ -599,11 +609,22 @@ impl BeadsBoards {
         1.0 + f32::from(self.text_scale_steps) * TEXT_SCALE_STEP
     }
 
-    /// Nudge every board's text size, clamped to what the fixed-height strip
-    /// can still show a readable row in.
+    /// Nudge every board's text size, clamped to the canonical 0.8–1.6 range.
     pub fn adjust_text_scale(&mut self, steps: i8) {
         self.text_scale_steps =
             (self.text_scale_steps + steps).clamp(MIN_TEXT_SCALE_STEPS, MAX_TEXT_SCALE_STEPS);
+        self.relayout_flows();
+    }
+
+    /// Persistable text-scale step for this window.
+    pub const fn text_scale_steps(&self) -> i8 {
+        self.text_scale_steps
+    }
+
+    /// Restore a window's board text scale, rejecting out-of-range file data
+    /// by clamping through the same bounds the controls use.
+    pub fn restore_text_scale_steps(&mut self, steps: i8) {
+        self.text_scale_steps = steps.clamp(MIN_TEXT_SCALE_STEPS, MAX_TEXT_SCALE_STEPS);
         self.relayout_flows();
     }
 
@@ -629,10 +650,20 @@ impl BeadsBoards {
     /// and `max`. Reports whether the height actually moved.
     pub fn resize_to(&mut self, y: f32, max: f32) -> bool {
         let Some(drag) = self.resize else { return false };
-        let floor = self.min_height();
-        let height = (drag.from_height + y - drag.press_y).clamp(floor, max.max(floor));
+        let floor = Self::min_height();
+        let ceiling = if max.is_finite() { max.max(0.0) } else { floor };
+        let requested = drag.from_height + y - drag.press_y;
+        // Keep a readable stored preference even when the current region is
+        // shorter: PaneShell caps the painted/reserved strip before its three
+        // terminal lines, and widening restores this untouched preference.
+        let height = requested.clamp(floor, ceiling.max(floor));
+        let height = f32::from(round_positive_f32_to_u16(height));
         let moved = (height - self.height(drag.workspace_id)).abs() > f32::EPSILON;
-        self.heights.insert(drag.workspace_id, height);
+        if (height - BEADS_BOARD_HEIGHT).abs() < f32::EPSILON {
+            self.heights.remove(&drag.workspace_id);
+        } else {
+            self.heights.insert(drag.workspace_id, height);
+        }
         moved
     }
 
@@ -808,14 +839,14 @@ impl BeadsBoards {
         }
     }
 
-    /// The shortest board that still shows the headband with one whole row
-    /// under it (A2-G1, A2-G4).
-    fn min_height(&self) -> f32 {
-        let scale = self.text_scale();
+    /// The shortest board that still shows one whole readable row after any
+    /// later text-scale change. Using the 1.6 maximum keeps A2-R3's stored
+    /// height unchanged while the same board moves through 0.8–1.6.
+    fn min_height() -> f32 {
         beads_board_a2::HEADBAND_H
             + beads_board_a2::LANES_PADDING_BOTTOM
             + beads_board_a2::FLOOR_H
-            + beads_board_a2::ROW_H * scale
+            + beads_board_a2::ROW_H * max_text_scale()
     }
 
     /// Whether `workspace_id`'s board is pinned open.
@@ -905,6 +936,30 @@ impl BeadsBoards {
         self.pending_pins.extend(pinned);
     }
 
+    /// Every non-default board height in stable workspace order, rounded to
+    /// the same whole logical pixels the resize path stores.
+    pub fn heights(&self) -> Vec<(WorkspaceId, u16)> {
+        let mut heights: Vec<_> = self
+            .heights
+            .iter()
+            .map(|(workspace_id, height)| (*workspace_id, round_positive_f32_to_u16(*height)))
+            .collect();
+        heights.sort_by_key(|(workspace_id, _)| workspace_id.as_uuid());
+        heights
+    }
+
+    /// Take board heights from a previous run. They wait for their named
+    /// region and clamp to the max-scale one-row floor, so a scale restored
+    /// later in the same record cannot make the first row unreadable.
+    pub fn restore_heights(&mut self, heights: impl IntoIterator<Item = (WorkspaceId, u16)>) {
+        let floor = Self::min_height();
+        self.pending_heights.extend(
+            heights
+                .into_iter()
+                .map(|(workspace_id, height)| (workspace_id, f32::from(height).max(floor))),
+        );
+    }
+
     /// Take the lane pins a previous run of this window left behind — the
     /// lane-level twin of `restore_pins`. Rejects a queue that is not Blocked
     /// or Done rather than coercing it into one that is.
@@ -928,6 +983,11 @@ impl BeadsBoards {
             }
             if let Some(queue) = self.pending_lane_pins.remove(workspace_id) {
                 self.lane_pinned.insert(*workspace_id, queue);
+            }
+            if let Some(height) = self.pending_heights.remove(workspace_id)
+                && (height - BEADS_BOARD_HEIGHT).abs() >= f32::EPSILON
+            {
+                self.heights.insert(*workspace_id, height);
             }
         }
         self.states.retain(|workspace_id, _| live.contains(workspace_id));
@@ -1523,6 +1583,10 @@ const TEXT_SCALE_STEP: f32 = 0.1;
 const MIN_TEXT_SCALE_STEPS: i8 = -2;
 const MAX_TEXT_SCALE_STEPS: i8 = 6;
 
+fn max_text_scale() -> f32 {
+    1.0 + f32::from(MAX_TEXT_SCALE_STEPS) * TEXT_SCALE_STEP
+}
+
 /// The text scale every board word and the drag ghost paint at.
 ///
 /// A2's own row height and track widths come straight from
@@ -1694,15 +1758,17 @@ pub fn render(
     // Flow replaces the lanes inside the same strip: the reservation, the
     // resize grip and the text-size controls all stay where the board put
     // them, so returning to lanes cannot move the furniture around it.
-    if let Some(strip) = flow_strip(FlowStrip {
-        wheel_state: &hover_state,
-        flow,
-        workspace_id,
-        rect,
-        scale,
-        colors,
-        controls: &flow_controls,
-    }) {
+    if flow_fits_board(rect.height)
+        && let Some(strip) = flow_strip(FlowStrip {
+            wheel_state: &hover_state,
+            flow,
+            workspace_id,
+            rect,
+            scale,
+            colors,
+            controls: &flow_controls,
+        })
+    {
         return lift(board.child(strip).child(floor(colors)), overlay);
     }
     let board = match snapshot {
@@ -1760,6 +1826,7 @@ fn board_shell(
         .top(px(rect.y))
         .w(px(rect.width))
         .h(px(rect.height))
+        .overflow_hidden()
         .flex()
         .flex_col()
         .bg(colors.ground)
@@ -1830,6 +1897,10 @@ fn floor(colors: &BeadsBoardColors) -> AnyElement {
 /// separate; a pinned one sits in space the region gave up for it.
 fn lift<E: Styled + IntoElement>(board: E, overlay: bool) -> AnyElement {
     if overlay { board.shadow_lg().into_any_element() } else { board.into_any_element() }
+}
+
+fn flow_fits_board(height: f32) -> bool {
+    height.is_finite() && height >= BEADS_BOARD_HEIGHT
 }
 
 /// Paint the Flow strip when this workspace is in Flow, else nothing.
@@ -2072,6 +2143,24 @@ struct RailFocus<'a> {
     done_tab_focus: &'a FocusHandle,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabMode {
+    Idle,
+    Open,
+    AutoCollapsed,
+}
+
+fn tab_mode(requested: CollapsedLaneState, effective: CollapsedLaneState) -> Option<TabMode> {
+    match effective {
+        CollapsedLaneState::Pinned => None,
+        CollapsedLaneState::Open => Some(TabMode::Open),
+        CollapsedLaneState::Tab if requested == CollapsedLaneState::Pinned => {
+            Some(TabMode::AutoCollapsed)
+        }
+        CollapsedLaneState::Tab => Some(TabMode::Idle),
+    }
+}
+
 /// Paint A2: a unified hairline header (painted by the caller, see
 /// [`headband`]) over five adaptive queue tracks, ending in the shared
 /// floor. Reads every number from [`beads_board_a2::layout`] rather than
@@ -2095,6 +2184,7 @@ fn lanes(
         board_height: stores.rect.height,
         text_scale: metrics.scale,
     });
+    let effective_rail = layout.rail;
     let ctx = LaneCtx {
         stores,
         colors,
@@ -2108,9 +2198,9 @@ fn lanes(
     // A2-I1 opens at most one drawer per workspace, so at most one of these
     // is ever `Some`; the drawer paints after every track (see `lane_drawer`)
     // so it lays over the lanes as an overlay instead of joining their row.
-    let open_drawer = if rail.blocked == CollapsedLaneState::Open {
+    let open_drawer = if effective_rail.blocked == CollapsedLaneState::Open {
         Some(lane_drawer(&layout.blocked, 3, colors.blocked_state, ctx))
-    } else if rail.done == CollapsedLaneState::Open {
+    } else if effective_rail.done == CollapsedLaneState::Open {
         Some(lane_drawer(&layout.done, 4, colors.done_state, ctx))
     } else {
         None
@@ -2127,8 +2217,20 @@ fn lanes(
         .child(queue_column(&layout.backlog, None, 0, colors.backlog_state, ctx))
         .child(queue_column(&layout.ready, None, 1, colors.ready_state, ctx))
         .child(queue_column(&layout.in_progress, None, 2, colors.progress_state, ctx))
-        .child(queue_column(&layout.blocked, Some(rail.blocked), 3, colors.blocked_state, ctx))
-        .child(queue_column(&layout.done, Some(rail.done), 4, colors.done_state, ctx))
+        .child(queue_column(
+            &layout.blocked,
+            tab_mode(rail.blocked, effective_rail.blocked),
+            3,
+            colors.blocked_state,
+            ctx,
+        ))
+        .child(queue_column(
+            &layout.done,
+            tab_mode(rail.done, effective_rail.done),
+            4,
+            colors.done_state,
+            ctx,
+        ))
         .children(open_drawer)
         .into_any_element()
 }
@@ -2139,19 +2241,16 @@ fn lanes(
 /// that are never collapsible.
 fn queue_column(
     lane: &QueueLane<'_>,
-    collapsed: Option<CollapsedLaneState>,
+    tab: Option<TabMode>,
     lane_index: u8,
     state_color: Rgba,
     ctx: LaneCtx<'_>,
 ) -> AnyElement {
     let target = ctx.drag_target(lane_index);
-    match collapsed {
-        Some(CollapsedLaneState::Tab) => collapsed_tab(lane, state_color, ctx, false, target),
-        Some(CollapsedLaneState::Open) => collapsed_tab(lane, state_color, ctx, true, target),
-        Some(CollapsedLaneState::Pinned) | None => {
-            ledger_lane(lane, lane_index, state_color, ctx, target)
-        }
-    }
+    tab.map_or_else(
+        || ledger_lane(lane, lane_index, state_color, ctx, target),
+        |mode| collapsed_tab(lane, state_color, ctx, mode, target),
+    )
 }
 
 /// A full A2 lane: head, seam, and either whole rows or void copy, with the
@@ -2170,6 +2269,7 @@ fn ledger_lane(
         .flex_none()
         .w(px(lane.width))
         .min_w(px(0.0))
+        .overflow_hidden()
         .relative()
         .when_some(drag_target_ground(target, state_color, ctx.colors.ground), |el, wash| {
             el.bg(wash)
@@ -2460,10 +2560,11 @@ fn collapsed_tab(
     lane: &QueueLane<'_>,
     state_color: Rgba,
     ctx: LaneCtx<'_>,
-    hot: bool,
+    mode: TabMode,
     target: Option<bool>,
 ) -> AnyElement {
     let colors = ctx.colors;
+    let hot = mode == TabMode::Open;
     let void = lane.void.is_some();
     let title = colors.title;
     let lifted = hot || target == Some(true);
@@ -2497,7 +2598,7 @@ fn collapsed_tab(
         div().relative().flex_none().w(px(lane.width)).flex().flex_col().items_center(),
         lane,
         ctx,
-        hot,
+        mode,
         drag_target_ground(target, state_color, colors.ground),
     )
     .child(
@@ -2543,7 +2644,7 @@ fn tab_interactivity(
     base: gpui::Div,
     lane: &QueueLane<'_>,
     ctx: LaneCtx<'_>,
-    hot: bool,
+    mode: TabMode,
     wash: Option<Rgba>,
 ) -> gpui::Stateful<gpui::Div> {
     let queue = lane.queue;
@@ -2554,10 +2655,11 @@ fn tab_interactivity(
     let key_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_focus = focus.clone();
     let title = ctx.colors.title;
+    let hot = mode == TabMode::Open;
     let lift = wash.unwrap_or(ctx.colors.button_hover);
     base.id(SharedString::from(format!("beads-tab-{workspace_id}-{queue:?}")))
         .role(Role::Button)
-        .aria_label(tab_accessible_label(lane))
+        .aria_label(tab_accessible_label(lane, mode))
         .track_focus(focus)
         .tab_stop(true)
         .focus_visible(move |style| style.border_1().border_color(title))
@@ -2577,7 +2679,7 @@ fn tab_interactivity(
         .on_click(move |_event, window, app| {
             window.focus(&click_focus, app);
             if let Ok(mut boards) = click_boards.lock() {
-                boards.pin_lane(workspace_id, queue);
+                activate_tab(&mut boards, workspace_id, queue, mode);
             }
             window.refresh();
         })
@@ -2587,7 +2689,7 @@ fn tab_interactivity(
             {
                 app.stop_propagation();
                 if let Ok(mut boards) = key_boards.lock() {
-                    boards.pin_lane(workspace_id, queue);
+                    activate_tab(&mut boards, workspace_id, queue, mode);
                 }
                 window.refresh();
             }
@@ -2656,12 +2758,33 @@ fn hot_inner_edge(color: Rgba) -> AnyElement {
 /// state, and what focus/activation do -- read as one queue label, never per
 /// spine glyph, since the individual spine letters carry neither an id nor a
 /// role and so are never reported to AccessKit on their own.
-fn tab_accessible_label(lane: &QueueLane<'_>) -> String {
-    format!(
-        "{} lane, {} issues, collapsed. Focus previews, activate pins",
-        queue_name(lane.queue),
-        lane.total
-    )
+fn activate_tab(
+    boards: &mut BeadsBoards,
+    workspace_id: WorkspaceId,
+    queue: BeadsIssueQueue,
+    mode: TabMode,
+) {
+    if mode == TabMode::AutoCollapsed {
+        boards.unpin_lane(workspace_id, queue);
+    } else {
+        boards.pin_lane(workspace_id, queue);
+    }
+}
+
+fn tab_accessible_label(lane: &QueueLane<'_>, mode: TabMode) -> String {
+    if mode == TabMode::AutoCollapsed {
+        format!(
+            "{} lane, {} issues, pinned and temporarily collapsed. Activate unpins",
+            queue_name(lane.queue),
+            lane.total
+        )
+    } else {
+        format!(
+            "{} lane, {} issues, collapsed. Focus previews, activate pins",
+            queue_name(lane.queue),
+            lane.total
+        )
+    }
 }
 
 /// The transient, non-reflowing drawer a collapsed tab opens on hover or
@@ -3796,6 +3919,33 @@ mod tests {
         assert_eq!(boards.pinned(), ids);
     }
 
+    #[test]
+    fn cold_restart_restores_board_pin_lane_pin_height_and_text_scale() {
+        let workspace = WorkspaceId::new();
+        let mut before = BeadsBoards::default();
+        before.toggle_pin(workspace);
+        before.pin_lane(workspace, BeadsIssueQueue::Done);
+        before.start_resize(workspace, 100.0);
+        before.resize_to(163.0, 600.0);
+        before.adjust_text_scale(6);
+        let height = before.height(workspace);
+
+        let mut restored = BeadsBoards::default();
+        restored.restore_pins(before.pinned());
+        restored.restore_lane_pins(before.lane_pinned());
+        restored.restore_heights(before.heights());
+        restored.restore_text_scale_steps(before.text_scale_steps());
+        restored.retain_regions(&HashSet::from([workspace]));
+
+        assert!(restored.is_pinned(workspace));
+        assert_eq!(
+            restored.collapsed_lane_state(workspace, BeadsIssueQueue::Done),
+            Some(CollapsedLaneState::Pinned)
+        );
+        assert!((restored.height(workspace) - height).abs() < f32::EPSILON);
+        assert!((restored.text_scale() - 1.6).abs() < f32::EPSILON);
+    }
+
     /// Dragging one board's bottom bar resizes that board and no other, stays
     /// inside what its region can give, and holds the board open while the
     /// pointer is off it.
@@ -3834,11 +3984,18 @@ mod tests {
             floor > beads_board_a2::HEADBAND_H && floor < BEADS_BOARD_HEIGHT,
             "collapsed to {floor}"
         );
+        for scale in [0.8_f32, 1.0, 1.6] {
+            assert!(
+                beads_board_a2::visible_row_count(floor, scale) >= 1,
+                "the resize floor lost its row at scale {scale}"
+            );
+        }
         boards.resize_to(4000.0, 240.0);
         assert!((boards.height(left) - 240.0).abs() < 0.001);
-        // Even a region with nothing to spare keeps the board readable.
+        // A region too short for the floor keeps the readable preference;
+        // PaneShell caps the actual strip before its terminal reservation.
         boards.resize_to(4000.0, 0.0);
-        assert!((boards.height(left) - floor).abs() < 0.001);
+        assert!((boards.height(left) - floor).abs() < f32::EPSILON);
 
         assert!(boards.end_resize());
         assert!(!boards.end_resize());
@@ -4250,11 +4407,14 @@ mod tests {
         boards.toggle_pin(neighbour);
         boards.hover(neighbour, HoverSource::Board, true);
         boards.start_resize(missing, 100.0);
+        boards.resize_to(160.0, 600.0);
+        assert!((boards.height(missing) - BEADS_BOARD_HEIGHT).abs() > f32::EPSILON);
         boards.arm_card_drag(missing, drag_item(), 1, drag_point(150.0, 100.0));
 
         let _ = boards.update(missing, BeadsBoardState::NotDetected);
 
         assert_eq!(visible_sorted(&boards), [(neighbour, true)]);
+        assert!((boards.height(missing) - BEADS_BOARD_HEIGHT).abs() < f32::EPSILON);
         assert!(!boards.hover_expires.contains_key(&missing));
         assert_eq!(boards.resizing(), None);
         assert!(!boards.blocks_pty_mouse());
@@ -4651,6 +4811,13 @@ mod flow_mode_tests {
         let settled = boards.flow(workspace).expect("flow open");
         assert_eq!(settled.cursor_issue_id, "c", "a refused activation leaves the cursor put");
         assert_eq!(settled.layout, laid_out);
+    }
+
+    #[test]
+    fn flow_uses_a2_below_its_fixed_197px_module_height() {
+        assert!(!flow_fits_board(BEADS_BOARD_HEIGHT - 0.01));
+        assert!(flow_fits_board(BEADS_BOARD_HEIGHT));
+        assert!(flow_fits_board(600.0));
     }
 
     #[test]

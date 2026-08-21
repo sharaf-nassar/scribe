@@ -3472,6 +3472,16 @@ mod tests {
         let width =
             panel_layout(floor, floor_board, 0, 1.0).expect("400px panel floor").geometry.width;
         assert!((width - 400.0).abs() < f32::EPSILON);
+
+        let narrow = Rect { width: crate::beads_board_a2::MIN_BOARD_W, ..region };
+        for (height, scale) in [(116.0, 0.8_f32), (116.0, 1.6), (520.0, 1.6)] {
+            let board = Rect { height, ..narrow };
+            let layout = panel_layout(narrow, board, 4, scale).expect("narrow panel layout");
+            assert!(layout.geometry.x >= narrow.x);
+            assert!(layout.geometry.x + layout.geometry.width <= narrow.x + narrow.width);
+            assert!(layout.geometry.y >= board.y + board.height);
+            assert!(layout.geometry.y + layout.geometry.max_height <= narrow.y + narrow.height);
+        }
     }
 
     #[test]

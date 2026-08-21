@@ -1248,9 +1248,13 @@ including [[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pin
 rather than coerced into one that is allowed.
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#restore_lane_pins]] and
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#lane_pinned]] give the
-lane pin the board pin's own restart lifetime, and `update` and
+lane pin the board pin's own restart lifetime. The same window record now
+carries non-default per-workspace heights through `restore_heights`/`heights`
+and the window-wide 0.1 text-scale step through
+`restore_text_scale_steps`/`text_scale_steps`; all wait for their named region
+where needed, while `update` and
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#retain_regions]] clear
-it on workspace loss and region removal the same way.
+workspace-owned pin/height state on workspace loss and region removal.
 [[crates/scribe-client/src/beads_board.rs#collapsed_tab]] paints an unpinned
 Blocked/Done's count, fading seam, one-glyph-per-line spine (A2-G7), and
 `‹` cue; a pinned one paints as an ordinary
@@ -1323,8 +1327,16 @@ the fixed left gutter, right padding, inter-track gaps, and each unpinned rail
 tab reserve first; an empty active lane gets only its own legible header
 width; the rest splits equally among nonempty Backlog/Ready/In-progress lanes,
 with a pinned Blocked or Done lane counted as a fixed share of one such split.
-Every track clamps to zero rather than going negative, so A2 never gains a
-horizontal scrollbar however narrow the board gets.
+`rail_allocation` uses those same measured legible-header widths as A2-R2's
+starvation threshold: a requested pin becomes an effective tab before any
+active lane crosses its header width, but the persisted preference stays in
+`BeadsBoards` and reappears automatically when width or scale fits. The
+renderer and `queue_at` consume that same effective rail, including the
+auto-collapsed tab's unpin action and accessible name. `MIN_BOARD_W` derives
+the all-state narrow floor (`44 + 452 + 96 = 592`) from the fixed control
+gutter and drawer bounds, not a duplicate breakpoint. Track widths never go
+negative and the board root clips its owning region, so A2 gains no horizontal
+scroll axis or cross-region paint.
 [[crates/scribe-client/src/beads_board_a2.rs#compact_relative_age]] turns
 `BeadsBoardItem.updated_at` into the row's compact age without a date
 library, parsing `bd`'s UTC timestamp through a from-scratch civil-calendar
@@ -1832,7 +1844,7 @@ Opening a card is unconditional for the panel and conditional for the strip. The
 
 Escape reaches [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_latest_flow]] only after the detail panel has declined the key, so a focused panel always dismisses before the strip changes mode. It exits the queue's tail — the genuinely most recently opened Flow, not the numerically largest workspace UUID — and Escape never strands a reader in lanes with the panel they were reading still open. The wheel is claimed by the Flow strip alone: in lanes the same gesture belongs to the lane bodies underneath. Either wheel axis drives the one axis Flow has, clamped to the graph, because a rank too wide for the row budget fails layout instead of growing a vertical scrollbar.
 
-Pin, height, lanes scroll position, and text scale all live outside `FlowView`, so a round trip through Flow and back leaves the strip exactly as the reader left it. Flow state is per workspace and dies with the window: two regions side by side each enter and leave on their own.
+Pin, height, lane pin, and text scale all live outside `FlowView`, so a round trip through Flow and back leaves the strip exactly as the reader left it. A2 has no scroll state or axis: whole-row clipping, ellipsis, and the overflow cue are its A2-R1 overflow contract. Below the fixed 197px Flow module height the same workspace paints A2; growing the stored board height back restores the still-frozen Flow. Board pins, lane pins, non-default heights, and text scale also round-trip through the window geometry record, while transient drawers and Flow state die with the window. Two regions side by side each enter, leave, pin, and resize on their own; text scale is intentionally window-wide.
 
 Painting reads the graph as owned data, never through the store. [[crates/scribe-client/src/main.rs#TerminalView#render_beads_boards]] holds the board guard across the whole render pass, so [[crates/scribe-client/src/beads_board.rs#BeadsBoards#flow_snapshot]] copies the graph, layout, cursor, offset, trace, and live ids out under that guard and hands them to the strip on `BeadsBoardRender`. A strip that looked itself up would take the same non-reentrant `Mutex` a second time on the same thread and hang the board — and because the lookup would precede the is-this-Flow test, it would blank lanes too, not just Flow. Event closures still hold the `Arc` and still lock, which is correct: they run from callbacks after the render guard is dropped.
 

@@ -177,6 +177,16 @@ pub struct WindowGeometry {
     /// → none, for records written before this field existed.
     #[serde(default)]
     pub beads_lane_pinned: Vec<(WorkspaceId, BeadsIssueQueue)>,
+    /// Non-default per-workspace Beads board heights in whole logical pixels.
+    /// Stored beside board/lane pins because all four values are board
+    /// furniture that survives a cold restart. `serde(default)` keeps older
+    /// records at the canonical 197px height.
+    #[serde(default)]
+    pub beads_heights: Vec<(WorkspaceId, u16)>,
+    /// Window-wide Beads text scale as 0.1 steps from 1.0 (`-2..=6`). The
+    /// board store clamps hand-edited values on restore.
+    #[serde(default)]
+    pub beads_text_scale_steps: i8,
     /// Legacy `maximized = true|false`, read from pre-[`WindowState`] records
     /// and folded into `state` by [`adopt_legacy_state`]. Never written back.
     #[serde(default, rename = "maximized", skip_serializing)]
@@ -203,6 +213,8 @@ impl Default for WindowGeometry {
             zoom: 0,
             beads_pinned: Vec::new(),
             beads_lane_pinned: Vec::new(),
+            beads_heights: Vec::new(),
+            beads_text_scale_steps: 0,
             legacy_maximized: None,
             restore_rect: None,
         }
@@ -268,6 +280,18 @@ impl WindowGeometry {
     #[must_use]
     pub fn with_pinned_lanes(self, beads_lane_pinned: Vec<(WorkspaceId, BeadsIssueQueue)>) -> Self {
         Self { beads_lane_pinned, ..self }
+    }
+
+    /// The same record with non-default per-workspace board heights.
+    #[must_use]
+    pub fn with_board_heights(self, beads_heights: Vec<(WorkspaceId, u16)>) -> Self {
+        Self { beads_heights, ..self }
+    }
+
+    /// The same record with the window-wide board text scale step.
+    #[must_use]
+    pub fn at_board_text_scale(self, beads_text_scale_steps: i8) -> Self {
+        Self { beads_text_scale_steps, ..self }
     }
 
     /// The origin a restore re-asserts, or `None` when none was captured.
@@ -569,6 +593,10 @@ pub fn geometry_from_bounds(
         beads_pinned: Vec::new(),
         // And with [`WindowGeometry::with_pinned_lanes`].
         beads_lane_pinned: Vec::new(),
+        // Filled in by [`WindowGeometry::with_board_heights`].
+        beads_heights: Vec::new(),
+        // Filled in by [`WindowGeometry::at_board_text_scale`].
+        beads_text_scale_steps: 0,
         legacy_maximized: None,
         restore_rect,
     }
@@ -1188,6 +1216,32 @@ titlebar_normalized = true
         let legacy: WindowGeometry =
             toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
         assert!(legacy.beads_lane_pinned.is_empty());
+    }
+
+    // @lat: [[test#Window geometry compat#Beads height and text scale round-trip]]
+    #[test]
+    fn beads_height_and_text_scale_round_trip() {
+        let captured = capture(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&WindowGeometry {
+                restore_rect: Some(SavedRect { x: Some(10), y: Some(20), width: 800, height: 600 }),
+                state: WindowState::Maximized,
+                ..WindowGeometry::default()
+            }),
+        );
+        let heights = vec![(WorkspaceId::new(), 116), (WorkspaceId::new(), 420)];
+        let geom = captured.with_board_heights(heights.clone()).at_board_text_scale(6);
+        let text = toml::to_string_pretty(&geom).expect("serialize");
+        assert_eq!(toml::from_str::<WindowGeometry>(&text).expect("round-trip"), geom, "{text}");
+        assert_eq!(geom.beads_heights, heights);
+        assert_eq!(geom.beads_text_scale_steps, 6);
+
+        let legacy: WindowGeometry =
+            toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
+        assert!(legacy.beads_heights.is_empty());
+        assert_eq!(legacy.beads_text_scale_steps, 0);
     }
 
     // @lat: [[test#Window geometry compat#A window off the layout is clamped back onto it]]

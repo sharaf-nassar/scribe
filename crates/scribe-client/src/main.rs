@@ -187,7 +187,9 @@ use crate::{
         SessionLaunch, SinkError, WriteOutcome, inbound_channel, outbound_channel, run_drain,
         write_or_tear,
     },
-    pane_shell::{ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
+    pane_shell::{
+        BoardReservation, ClosedPane, PanePlacement, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome,
+    },
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::present_next_burst,
     terminal::{
@@ -2211,6 +2213,14 @@ impl TerminalView {
         // later X11 start in the screen corner; the record stores no origin at
         // all instead, and restore falls back to the default placement.
         let bounds = window.bounds();
+        let (board_pins, lane_pins, board_heights, board_text_scale) = self
+            .shared
+            .beads_boards
+            .lock()
+            .map(|boards| {
+                (boards.pinned(), boards.lane_pinned(), boards.heights(), boards.text_scale_steps())
+            })
+            .unwrap_or_default();
         let geometry = geometry_from_bounds(
             monitor::window_origin_is_exposed(window).then_some(bounds.origin),
             bounds.size,
@@ -2230,9 +2240,12 @@ impl TerminalView {
         // Pinned boards ride the same capture as the zoom level: a pin is
         // per-window state the user chose, and the record is the only place it
         // survives a quit.
-        .with_pinned_boards(self.pinned_board_ids())
-        // Pinned lanes ride the same capture, for the same reason.
-        .with_pinned_lanes(self.pinned_lane_ids());
+        .with_pinned_boards(board_pins)
+        // Pinned lanes, non-default heights, and text scale ride the same
+        // capture: all are board furniture restored with this window.
+        .with_pinned_lanes(lane_pins)
+        .with_board_heights(board_heights)
+        .at_board_text_scale(board_text_scale);
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -2248,17 +2261,6 @@ impl TerminalView {
         if self.restore.geometry_dirty_since.is_none() {
             self.restore.geometry_dirty_since = Some(Instant::now());
         }
-    }
-
-    /// Workspaces whose boards are pinned open, in the order the record keeps.
-    fn pinned_board_ids(&self) -> Vec<WorkspaceId> {
-        self.shared.beads_boards.lock().map(|boards| boards.pinned()).unwrap_or_default()
-    }
-
-    /// Workspaces whose collapsed lane is pinned open, and which queue, in the
-    /// order the record keeps.
-    fn pinned_lane_ids(&self) -> Vec<(WorkspaceId, scribe_common::protocol::BeadsIssueQueue)> {
-        self.shared.beads_boards.lock().map(|boards| boards.lane_pinned()).unwrap_or_default()
     }
 
     /// The zoom level a window opens at, and the grid font that level yields.
@@ -5027,6 +5029,8 @@ impl TerminalView {
         if let Ok(mut boards) = self.shared.beads_boards.lock() {
             boards.restore_pins(geometry.beads_pinned.iter().copied());
             boards.restore_lane_pins(geometry.beads_lane_pinned.iter().copied());
+            boards.restore_heights(geometry.beads_heights.iter().copied());
+            boards.restore_text_scale_steps(geometry.beads_text_scale_steps);
         }
         self.restore.adopt_geometry_record(geometry);
         // This process built its font before it knew which window it was
@@ -7395,6 +7399,28 @@ impl TerminalView {
         ))
     }
 
+    /// Resolve one board against its own region. Pinned boards keep three
+    /// terminal lines; hovered boards overlay without changing PTY geometry.
+    fn beads_board_rect(
+        &self,
+        workspace_id: WorkspaceId,
+        pinned: bool,
+        height: f32,
+        cx: &App,
+    ) -> Option<Rect> {
+        let viewport = self.pane_viewport();
+        if pinned {
+            self.shell.reserved_board_rect(
+                workspace_id,
+                BoardReservation { height, terminal: self.font.line_height * 3.0 },
+                viewport,
+                cx,
+            )
+        } else {
+            self.shell.board_rect(workspace_id, height, viewport, cx)
+        }
+    }
+
     /// Start a resize when the pointer lands on an open board's bottom bar.
     ///
     /// Resolved here rather than by a listener inside the board so the press is
@@ -7406,11 +7432,9 @@ impl TerminalView {
             return false;
         }
         let Some((x, y)) = self.grid_local_position(position) else { return false };
-        let viewport = self.pane_viewport();
         let Ok(mut boards) = self.shared.beads_boards.lock() else { return false };
-        let grabbed = self.visible_beads_boards.iter().find(|(workspace_id, _)| {
-            self.shell
-                .board_rect(*workspace_id, boards.height(*workspace_id), viewport, cx)
+        let grabbed = self.visible_beads_boards.iter().find(|(workspace_id, pinned)| {
+            self.beads_board_rect(*workspace_id, *pinned, boards.height(*workspace_id), cx)
                 .is_some_and(|rect| {
                     x >= rect.x
                         && x < rect.x + rect.width
@@ -7431,14 +7455,11 @@ impl TerminalView {
         let Ok(mut boards) = self.shared.beads_boards.lock() else { return false };
         let Some(workspace_id) = boards.resizing() else { return false };
         let Some((_, y)) = self.grid_local_position(position) else { return true };
-        // A board may take its region up to the last few lines of terminal.
-        // Growing past that is what the user asked for right up until the
-        // terminal disappears, and there is no gesture to get it back.
-        let viewport = self.pane_viewport();
+        // A board may take its region up to the last three terminal lines;
+        // those stay reserved so the resize gesture can always recover.
         let max = self
-            .shell
-            .board_rect(workspace_id, f32::MAX, viewport, cx)
-            .map_or(0.0, |content| content.height - self.font.line_height * 3.0);
+            .beads_board_rect(workspace_id, true, f32::MAX, cx)
+            .map_or(0.0, |content| content.height);
         if boards.resize_to(y, max) {
             drop(boards);
             cx.notify();
@@ -9838,7 +9859,10 @@ impl TerminalView {
                 strips = visible
                     .iter()
                     .filter(|(_, pinned)| *pinned)
-                    .map(|(workspace_id, _)| (*workspace_id, boards.height(*workspace_id)))
+                    .filter_map(|(workspace_id, _)| {
+                        self.beads_board_rect(*workspace_id, true, boards.height(*workspace_id), cx)
+                            .map(|rect| (*workspace_id, rect.height))
+                    })
                     .collect();
                 visible
             })
@@ -10178,14 +10202,13 @@ impl TerminalView {
         let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
         let scale = boards.text_scale();
         let colors = self.beads_colors;
-        let viewport = self.pane_viewport();
         self.visible_beads_boards
             .iter()
             .filter_map(|(workspace_id, pinned)| {
-                let rect = self.shell.board_rect(
+                let rect = self.beads_board_rect(
                     *workspace_id,
+                    *pinned,
                     boards.height(*workspace_id),
-                    viewport,
                     cx,
                 )?;
                 let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
@@ -10280,11 +10303,13 @@ impl TerminalView {
                 let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
                     return Vec::new();
                 };
-                let Some(board) =
-                    self.shell.board_rect(workspace_id, boards.height(workspace_id), viewport, cx)
-                else {
-                    return Vec::new();
-                };
+                let board = self.beads_board_rect(
+                    workspace_id,
+                    boards.is_pinned(workspace_id),
+                    boards.height(workspace_id),
+                    cx,
+                );
+                let Some(board) = board else { return Vec::new() };
                 let wiring = BeadsPanelRender {
                     region,
                     board,
@@ -11680,6 +11705,8 @@ fn open_window(
     {
         boards.restore_pins(geometry.beads_pinned.iter().copied());
         boards.restore_lane_pins(geometry.beads_lane_pinned.iter().copied());
+        boards.restore_heights(geometry.beads_heights.iter().copied());
+        boards.restore_text_scale_steps(geometry.beads_text_scale_steps);
     }
     // Restored geometry wins over the grid-derived startup size. Non-X11
     // platforms receive its bounds and state in GPUI's creation options; X11

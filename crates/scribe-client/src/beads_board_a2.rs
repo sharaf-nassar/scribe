@@ -80,6 +80,11 @@ pub const LANES_PADDING_BOTTOM: f32 = 7.0;
 pub const LANES_PADDING_LEFT: f32 = 44.0;
 /// Gap between adjacent lane/tab tracks (A2-G1, A2-R1).
 pub const TRACK_GAP: f32 = 16.0;
+/// Narrowest region that keeps the fixed drawer to the right of the fixed
+/// text-control gutter: `44 + 452 + 96` (A2-G2, A2-G8). Tests use this
+/// derived floor for the all-state narrow matrix rather than inventing a
+/// breakpoint-specific renderer.
+pub const MIN_BOARD_W: f32 = LANES_PADDING_LEFT + DRAWER_W + DRAWER_RIGHT;
 /// A pinned Blocked/Done lane's share of an active lane's width, from
 /// `specs/028-beads-board-contract.md`'s "Narrow-region allocation" closed
 /// decision (corroborated by the mock's own `.85fr` pinned-state track). Not
@@ -192,6 +197,11 @@ pub struct QueueLane<'a> {
 /// queue's lane, in `BeadsBoardSnapshot`'s own field order.
 #[derive(Debug)]
 pub struct A2Layout<'a> {
+    /// Effective rail state at this width. A persisted pin may temporarily be
+    /// a `Tab` here when its 0.85 share would starve an active lane (A2-R2);
+    /// the caller's stored [`RailState`] remains untouched, so widening the
+    /// same region restores it automatically.
+    pub rail: RailState,
     /// A row's height at the input's text scale.
     pub row_height: f32,
     /// Whole rows every lane's `rows` is clipped to (A2-G10).
@@ -210,11 +220,13 @@ pub struct A2Layout<'a> {
 pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
     let A2Input { snapshot, rail, board_width, board_height, text_scale } = input;
     let visible_rows = visible_row_count(board_height, text_scale);
-    let widths = rail_widths(snapshot, rail, board_width, text_scale);
+    let allocation = rail_allocation(snapshot, rail, board_width, text_scale);
+    let widths = allocation.widths;
     let blocked_total = snapshot.blocked_total;
 
     A2Layout {
-        row_height: ROW_H * text_scale,
+        rail: allocation.rail,
+        row_height: ROW_H * valid_text_scale(text_scale),
         visible_rows,
         backlog: queue_lane(QueueLaneArgs {
             queue: BeadsIssueQueue::Backlog,
@@ -393,17 +405,18 @@ pub fn queue_at(input: A2Input<'_>, x: f32, y: f32) -> Option<BeadsIssueQueue> {
     if !(0.0..board_width).contains(&x) || !(0.0..board_height).contains(&y) {
         return None;
     }
+    let allocation = rail_allocation(snapshot, rail, board_width, text_scale);
     // An open drawer lies over the lanes without reflowing them (A2-G8,
     // A2-I1), so inside its bounds it owns the pointer rather than the track
     // it happens to cover.
-    if let Some(queue) = open_drawer(rail)
+    if let Some(queue) = open_drawer(allocation.rail)
         && (board_width - DRAWER_RIGHT - DRAWER_W..board_width - DRAWER_RIGHT).contains(&x)
         && (DRAWER_TOP..board_height - DRAWER_BOTTOM).contains(&y)
     {
         return Some(queue);
     }
     let mut left = LANES_PADDING_LEFT;
-    for (queue, width) in rail_widths(snapshot, rail, board_width, text_scale).tracks() {
+    for (queue, width) in allocation.widths.tracks() {
         if (left..left + width).contains(&x) {
             return Some(queue);
         }
@@ -430,6 +443,60 @@ pub fn rail_widths(
     board_width: f32,
     text_scale: f32,
 ) -> RailWidths {
+    rail_allocation(snapshot, rail, board_width, text_scale).widths
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RailAllocation {
+    rail: RailState,
+    widths: RailWidths,
+}
+
+/// Allocate the requested rail, temporarily replacing a persisted pin with a
+/// tab when its share would make any of the three always-present active lanes
+/// narrower than that lane's existing measured legible-header width. The
+/// threshold therefore comes from the contract's own allocation primitive,
+/// not from a second breakpoint number (A2-R2).
+fn rail_allocation(
+    snapshot: &BeadsBoardSnapshot,
+    requested: RailState,
+    board_width: f32,
+    text_scale: f32,
+) -> RailAllocation {
+    let widths = requested_rail_widths(snapshot, requested, board_width, text_scale);
+    let has_pin = requested.blocked == CollapsedLaneState::Pinned
+        || requested.done == CollapsedLaneState::Pinned;
+    if !has_pin || !active_lanes_starved(widths, text_scale) {
+        return RailAllocation { rail: requested, widths };
+    }
+
+    let rail =
+        RailState { blocked: collapse_pin(requested.blocked), done: collapse_pin(requested.done) };
+    RailAllocation { rail, widths: requested_rail_widths(snapshot, rail, board_width, text_scale) }
+}
+
+fn collapse_pin(state: CollapsedLaneState) -> CollapsedLaneState {
+    if state == CollapsedLaneState::Pinned { CollapsedLaneState::Tab } else { state }
+}
+
+fn active_lanes_starved(widths: RailWidths, text_scale: f32) -> bool {
+    [
+        (widths.backlog, queue_name(BeadsIssueQueue::Backlog)),
+        (widths.ready, queue_name(BeadsIssueQueue::Ready)),
+        (widths.in_progress, queue_name(BeadsIssueQueue::InProgress)),
+    ]
+    .into_iter()
+    .any(|(width, name)| width + 0.01 < legible_header_width(name, text_scale))
+}
+
+fn requested_rail_widths(
+    snapshot: &BeadsBoardSnapshot,
+    rail: RailState,
+    board_width: f32,
+    text_scale: f32,
+) -> RailWidths {
+    let text_scale = valid_text_scale(text_scale);
+    let board_width = if board_width.is_finite() { board_width.max(0.0) } else { 0.0 };
     let blocked_pinned = rail.blocked == CollapsedLaneState::Pinned;
     let done_pinned = rail.done == CollapsedLaneState::Pinned;
     let pinned_count = usize::from(blocked_pinned) + usize::from(done_pinned);
@@ -560,7 +627,11 @@ fn active_lane_widths(wants: ActiveLaneWants) -> (f32, f32, f32, f32) {
 fn legible_header_width(name: &str, text_scale: f32) -> f32 {
     const CHAR_WIDTH: f32 = 7.0;
     const BASE: f32 = 24.0;
-    (BASE + count_to_f32(name.chars().count()) * CHAR_WIDTH) * text_scale
+    (BASE + count_to_f32(name.chars().count()) * CHAR_WIDTH) * valid_text_scale(text_scale)
+}
+
+fn valid_text_scale(text_scale: f32) -> f32 {
+    if text_scale.is_finite() && text_scale > 0.0 { text_scale } else { 0.0 }
 }
 
 /// How many whole rows fit in `board_height` at `text_scale` (A2-G10):
@@ -843,6 +914,19 @@ mod tests {
     }
 
     #[test]
+    fn max_scale_resize_floor_keeps_one_whole_row_at_every_supported_scale() {
+        let floor = VERTICAL_CHROME + ROW_H * 1.6;
+        for scale in [0.8_f32, 1.0, 1.6] {
+            assert!(visible_row_count(floor, scale) >= 1, "scale {scale} lost its readable row");
+            let rows = visible_row_count(floor, scale);
+            assert!(
+                count_to_f32(rows) * ROW_H * scale <= floor - VERTICAL_CHROME + 0.01,
+                "scale {scale} exposed a partial row"
+            );
+        }
+    }
+
+    #[test]
     fn no_partial_final_row_across_a_height_sweep() {
         let mut height = 0.0_f32;
         while height <= 600.0 {
@@ -880,7 +964,7 @@ mod tests {
             RailState { blocked: CollapsedLaneState::Open, done: CollapsedLaneState::Tab },
         ];
 
-        let mut width = 0.0_f32;
+        let mut width = MIN_BOARD_W;
         while width <= 2000.0 {
             assert_rail_widths_fit_every_scale_and_state(&occupancies, &rails, width);
             width += 41.0;
@@ -903,9 +987,8 @@ mod tests {
         }
     }
 
-    /// One matrix cell: every track is non-negative, and -- once `width` is
-    /// at least the rail's own fixed floor of tabs/padding/gaps, which never
-    /// shrink (A2-R1) -- the five tracks exactly fill the rest with no
+    /// One matrix cell at or above the all-state narrow floor: every track is
+    /// non-negative and the five tracks stay inside the board with no
     /// scrollbar.
     fn assert_rail_widths_fit(
         snapshot: &BeadsBoardSnapshot,
@@ -918,14 +1001,6 @@ mod tests {
             assert!(value.is_finite() && value >= 0.0, "negative/NaN width at board_width={width}");
         }
 
-        let pinned = usize::from(rail.blocked == CollapsedLaneState::Pinned)
-            + usize::from(rail.done == CollapsedLaneState::Pinned);
-        let tabs = 2_usize.saturating_sub(pinned);
-        let floor =
-            LANES_PADDING_LEFT + LANES_PADDING_RIGHT + RAIL_GAPS + TAB_W * count_to_f32(tabs);
-        if width < floor {
-            return;
-        }
         let reserved = w.backlog
             + w.ready
             + w.in_progress
@@ -938,6 +1013,90 @@ mod tests {
             reserved <= width + 0.5,
             "scrollbar risk: reserved={reserved} exceeds board_width={width}"
         );
+    }
+
+    #[test]
+    fn the_all_state_narrow_floor_keeps_the_drawer_clear_of_text_controls() {
+        assert!(close(MIN_BOARD_W, 592.0));
+        let drawer_left = MIN_BOARD_W - DRAWER_RIGHT - DRAWER_W;
+        assert!(close(drawer_left, LANES_PADDING_LEFT));
+    }
+
+    #[test]
+    fn a_starved_pin_auto_collapses_without_mutating_its_preference() {
+        let snapshot = snapshot_with(12, 4, 5, 4, 559);
+        let requested =
+            RailState { blocked: CollapsedLaneState::Pinned, done: CollapsedLaneState::Tab };
+        let narrow = layout(A2Input {
+            snapshot: &snapshot,
+            rail: requested,
+            board_width: MIN_BOARD_W,
+            board_height: BEADS_BOARD_HEIGHT,
+            text_scale: 1.6,
+        });
+        assert_eq!(narrow.rail.blocked, CollapsedLaneState::Tab);
+        assert_eq!(narrow.rail.done, CollapsedLaneState::Tab);
+        assert_eq!(requested.blocked, CollapsedLaneState::Pinned, "the preference is input state");
+
+        let restored = layout(A2Input {
+            snapshot: &snapshot,
+            rail: requested,
+            board_width: 1200.0,
+            board_height: BEADS_BOARD_HEIGHT,
+            text_scale: 1.6,
+        });
+        assert_eq!(restored.rail, requested, "widening restores the persisted pin");
+    }
+
+    #[test]
+    fn every_named_a2_state_stays_inside_the_extreme_layout_matrix() {
+        let empty = snapshot_with(0, 0, 0, 0, 0);
+        let sparse = snapshot_with(0, 0, 2, 4, 559);
+        let busy = snapshot_with(12, 4, 5, 4, 559);
+        let states = [
+            ("collapsed empty", &empty, all_tabs()),
+            ("collapsed sparse", &sparse, all_tabs()),
+            (
+                "drawer",
+                &sparse,
+                RailState { blocked: CollapsedLaneState::Open, done: CollapsedLaneState::Tab },
+            ),
+            (
+                "pinned busy",
+                &busy,
+                RailState { blocked: CollapsedLaneState::Pinned, done: CollapsedLaneState::Tab },
+            ),
+            ("drag geometry", &busy, all_tabs()),
+        ];
+        let heights = [VERTICAL_CHROME + ROW_H * 1.6, 600.0];
+        let extremes: Vec<_> = [MIN_BOARD_W, 1200.0]
+            .into_iter()
+            .flat_map(|width| {
+                heights.into_iter().flat_map(move |height| {
+                    [0.8_f32, 1.0, 1.6].into_iter().map(move |scale| (width, height, scale))
+                })
+            })
+            .collect();
+
+        for (name, snapshot, rail) in states {
+            for &(width, height, scale) in &extremes {
+                let out = layout(A2Input {
+                    snapshot,
+                    rail,
+                    board_width: width,
+                    board_height: height,
+                    text_scale: scale,
+                });
+                assert_rail_widths_fit(snapshot, rail, width, scale);
+                assert!(out.visible_rows >= 1, "{name} lost every row at {height}x{scale}");
+                assert!(
+                    [&out.backlog, &out.ready, &out.in_progress, &out.blocked, &out.done]
+                        .into_iter()
+                        .all(|lane| lane.rows.len() <= out.visible_rows),
+                    "{name} exposed a partial row"
+                );
+            }
+        }
     }
 
     // ---- drag hit testing: the same tracks the renderer paints -----------

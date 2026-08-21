@@ -3597,6 +3597,12 @@ A capture pins no lane itself, leaving the workspace/queue pairs to the caller's
 
 The round trip is taken with `restore_rect` present for the same reason the board pins' is: the array is a bare key, and one emitted after a table would be read back as part of it. Two distinct workspaces each carry their own queue, so a collapse into one entry would show up in the round trip. A record written before the field existed restores with no lane pinned.
 
+### Beads height and text scale round-trip
+
+Beads board height and text scale survive the window record alongside board and lane pins.
+
+The non-default per-workspace heights and window-wide text-scale step occupy bare keys before `restore_rect`. Two distinct heights and scale step 6 survive TOML exactly; a pre-field record restores 197px and default scale through `serde(default)`.
+
 ### A placement move restates the window's size
 
 The `_NET_MOVERESIZE_WINDOW` payload marks x, y, width and height all present, carries `StaticGravity`, and repeats the window's current size in its size words instead of zeroing them.
@@ -4232,7 +4238,7 @@ Every pane-geometry consumer (`placements`, `dividers`, directional focus) share
 
 Unit coverage for the second reservation the region content rect carries: a pinned Beads board takes its strip from the top of its own region, stacking below a lower region's tab bar.
 
-The strip keeps its region's x and width, and clamps rather than going negative in a region shorter than the board.
+The strip keeps its region's x and width, and clamps rather than going negative in a region shorter than the board. Its reserved-height helper subtracts three terminal lines before clamping a stored height, so a tall restored board in a short stacked region cannot starve the PTY; widening the region restores the untouched height preference.
 
 Pinning it here is what keeps the board a region citizen. The band it replaced spanned the window, so pinning a board in one region pushed every other region's panes down and shrank PTYs that had nothing to do with it.
 
@@ -4308,6 +4314,17 @@ Unit coverage pins the A2-I1/A2-I2/A2-L1 state transitions
 `specs/028-beads-board-contract.md` requires for the Blocked and Done rail
 tabs, ahead of the pixel rendering a later bead adds.
 
+The pure A2 matrix sweeps collapsed-empty, sparse, drawer, pinned-busy, and
+drag states across the derived 592px all-state narrow floor and 1200px width,
+0.8/1.0/1.6 text scale, and max-scale one-row/minimum plus 600px heights. Every
+cell asserts non-negative contained tracks, at least one readable whole row,
+and no row slice beyond the shared row budget. The existing panel layout matrix
+adds the same 592px region at minimum/maximum board height and 0.8/1.6 scale,
+asserting every edge remains inside its owner. Separate tests derive
+the narrow floor from fixed gutter/drawer geometry and prove a starved pin
+auto-collapses at 1.6 without mutating its preference, then restores at a width
+that fits.
+
 Tests beside the code they cover default a fresh workspace's Blocked and Done
 to a plain tab, open the same drawer by pointer hover or by keyboard focus,
 and carry it through the tab-to-drawer handoff without an early close: leaving
@@ -4324,12 +4341,13 @@ needs no grace to do it. A queue outside Blocked and Done is rejected at every
 entry point — pin, hover, unpin, close, and restore — rather than coerced into
 one that is allowed, and repeated hover, pin, and unpin events are idempotent.
 Separate workspaces pin and hover their own queues independently, and losing a
-region or a `NotDetected` reply clears only that workspace's lane pin and
-hover state, leaving a neighbour untouched. The lane pin survives a Flow
-round trip and a `beads_flow` capability change exactly like the board pin,
-and a restored lane pin waits for its region the same way a restored board
-pin does, including rejecting a persisted queue outside Blocked/Done rather
-than coercing it. The as-built rules and production links live in
+region or a `NotDetected` reply clears only that workspace's lane pin, height,
+and hover state, leaving a neighbour untouched. The lane pin, board pin,
+non-default height, and text scale survive a Flow round trip. A cold-restart
+fixture restores all four together from the window record, with heights waiting
+for their named region like pins do and invalid persisted queues still rejected.
+The max-scale resize floor keeps one whole row at every supported scale, while a
+ceiling below that floor gives terminal reservation priority. The as-built rules and production links live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
 ### Flow layout and paint-path guard
