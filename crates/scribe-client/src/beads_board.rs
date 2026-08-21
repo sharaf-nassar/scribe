@@ -1961,9 +1961,23 @@ impl gpui::Render for BoardStrip {
         _window: &mut gpui::Window,
         _cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
+        // The band-spanning container is load-bearing, not decoration.
+        // `Entity::cached` lays a view out through `layout_as_root`, and taffy
+        // pins a root node's location to the origin: the `absolute()` origin
+        // `board_shell` puts on its own root is dropped without a word when
+        // that root is the layout root, and every region's strip lands on the
+        // band's top-left corner instead of over its own region. Nesting the
+        // board one level down makes it an ordinary absolutely-positioned
+        // child again, which is the only arrangement in which `rect` means
+        // what the rest of this module reads it as.
+        //
         // `render` consumes its wiring; the clone is paid only on the frames
         // the diff already decided must rebuild.
-        render(&self.name, self.state.as_ref(), self.wiring.clone())
+        div().relative().size_full().child(render(
+            &self.name,
+            self.state.as_ref(),
+            self.wiring.clone(),
+        ))
     }
 }
 
@@ -6576,5 +6590,99 @@ mod strip_cache_tests {
                 "a rebuilt handler is a different control"
             );
         });
+    }
+
+    /// Two regions' strips embedded exactly the way the root embeds them: one
+    /// cached entity each, wrapped at the full grid band.
+    struct CachedStripsProbe {
+        strips: Vec<gpui::Entity<BoardStrip>>,
+    }
+
+    impl Render for CachedStripsProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().children(
+                self.strips
+                    .iter()
+                    .map(|strip| {
+                        strip
+                            .clone()
+                            .cached(gpui::StyleRefinement::default().absolute().inset_0())
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    fn region_strip(
+        app: &mut gpui::App,
+        shared: &Arc<std::sync::Mutex<BeadsBoards>>,
+        workspace_id: WorkspaceId,
+        x: f32,
+        width: f32,
+    ) -> gpui::Entity<BoardStrip> {
+        let mut wiring = wiring(app, workspace_id);
+        wiring.rect = Rect { x, y: 0.0, width, height: BEADS_BOARD_HEIGHT };
+        wiring.hover_state = Arc::clone(shared);
+        app.new(|_| BoardStrip { name: "probe".into(), state: Some(ready_state(1_000)), wiring })
+    }
+
+    /// A cached strip paints inside the region that owns it.
+    ///
+    /// `Entity::cached` lays its view out through `layout_as_root`, and taffy
+    /// pins a root node's location to the origin, so an `absolute()` inset on
+    /// the rendered root is dropped without a word. Sited on two regions on
+    /// purpose: at x=0 "positioned in its region" and "positioned in the
+    /// window" are the same answer. The board root's own hover hitbox is the
+    /// probe, and it separates a strip that was never built from one built
+    /// over the wrong region.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Cached view placement]]
+    #[gpui::test]
+    fn each_region_paints_its_cached_strip_inside_its_own_bounds(cx: &mut gpui::TestAppContext) {
+        let half = 504.0;
+        let shared = Arc::new(std::sync::Mutex::new(BeadsBoards::default()));
+        let (left, right) = (WorkspaceId::new(), WorkspaceId::new());
+        let window = cx
+            .update(|app| {
+                let strips = vec![
+                    region_strip(app, &shared, left, 0.0, half),
+                    region_strip(app, &shared, right, half, half),
+                ];
+                app.open_window(
+                    gpui::WindowOptions {
+                        window_bounds: Some(gpui::WindowBounds::Windowed(Bounds {
+                            origin: point(px(0.0), px(0.0)),
+                            size: gpui::size(px(2.0 * half), px(739.0)),
+                        })),
+                        ..Default::default()
+                    },
+                    |_, app| app.new(|_| CachedStripsProbe { strips }),
+                )
+            })
+            .expect("open the two-region cached-strip probe");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw both cached strips");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        let hovered = |workspace_id| {
+            shared.lock().expect("probe store").hovered.get(&workspace_id).copied().unwrap_or(0)
+                & HoverSource::Board as u8
+                != 0
+        };
+
+        test_window.simulate_mouse_move(
+            point(px(half + 10.0), px(10.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert!(hovered(right), "the second region's cached strip never covered its own region");
+        assert!(!hovered(left), "the first region's cached strip reached into the second region");
+
+        test_window.simulate_mouse_move(
+            point(px(10.0), px(10.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert!(hovered(left), "the origin region's cached strip never covered its own region");
+        assert!(!hovered(right), "the second region's cached strip painted over the first region");
     }
 }

@@ -5282,4 +5282,114 @@ mod panel_cache_tests {
         zoomed.scale = 1.1;
         assert!(!layer.same_inputs(&zoomed), "scale");
     }
+
+    /// Two regions' overlays embedded exactly the way the root embeds them:
+    /// one cached entity each, wrapped at the full grid band.
+    struct CachedLayersProbe {
+        layers: Vec<gpui::Entity<PanelLayer>>,
+    }
+
+    impl Render for CachedLayersProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div().relative().size_full().children(
+                self.layers
+                    .iter()
+                    .map(|layer| {
+                        layer
+                            .clone()
+                            .cached(gpui::StyleRefinement::default().absolute().inset_0())
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    /// The `BoardStrip` twin of the placement probe: a cached overlay reaches
+    /// only into the region that opened it.
+    ///
+    /// `PanelLayer::render` roots a band-spanning container and hangs every
+    /// absolutely-positioned overlay child off it, so taffy pinning a layout
+    /// root to the origin costs the panel nothing -- but only measurement
+    /// tells that apart from the strip's arrangement, which lost its origin
+    /// exactly that way. The backdrop's own dismiss hitbox is the probe.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Cached view placement]]
+    #[gpui::test]
+    fn each_region_reaches_only_its_own_cached_overlay(cx: &mut gpui::TestAppContext) {
+        let (left, right) = (WorkspaceId::new(), WorkspaceId::new());
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        panels.lock().expect("probe store").set_enabled(true);
+        for workspace_id in [left, right] {
+            panels.lock().expect("probe store").open(workspace_id, panel().card, panel().lane);
+        }
+        let window = cx
+            .update(|app| {
+                app.open_window(
+                    gpui::WindowOptions {
+                        window_bounds: Some(gpui::WindowBounds::Windowed(Bounds {
+                            origin: gpui::point(px(0.0), px(0.0)),
+                            size: gpui::size(px(2.0 * REGION_WIDTH), px(REGION_HEIGHT)),
+                        })),
+                        ..Default::default()
+                    },
+                    |window, app| {
+                        let editor = app.new(|editor_cx| {
+                            BeadsEditor::new(Arc::clone(&panels), window, editor_cx)
+                        });
+                        let layers = [(left, 0.0), (right, REGION_WIDTH)]
+                            .map(|(workspace_id, x)| {
+                                region_layer(app, &panels, &editor, workspace_id, x)
+                            })
+                            .to_vec();
+                        app.new(|_| CachedLayersProbe { layers })
+                    },
+                )
+            })
+            .expect("open the two-region cached-overlay probe");
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw both cached overlays");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Inside the second region's backdrop and clear of its centred body,
+        // which starts one panel margin in.
+        test_window.simulate_click(
+            gpui::point(px(REGION_WIDTH + PANEL_MARGIN / 2.0), px(300.0)),
+            gpui::Modifiers::default(),
+        );
+        let store = panels.lock().expect("probe store");
+        assert!(
+            store.visible(right).is_none(),
+            "the second region's cached overlay never took the click its own backdrop painted"
+        );
+        assert!(store.visible(left).is_some(), "dismissing one region dismissed the other");
+    }
+
+    const REGION_WIDTH: f32 = 504.0;
+    const REGION_HEIGHT: f32 = 739.0;
+
+    fn region_layer(
+        app: &mut gpui::App,
+        panels: &Arc<Mutex<BeadsPanels>>,
+        editor: &gpui::Entity<BeadsEditor>,
+        workspace_id: WorkspaceId,
+        x: f32,
+    ) -> gpui::Entity<PanelLayer> {
+        let focus = app.focus_handle();
+        app.new(|_| PanelLayer {
+            inputs: PanelLayerInputs {
+                region: Rect { x, y: 0.0, width: REGION_WIDTH, height: REGION_HEIGHT },
+                board: Rect { x, y: 0.0, width: REGION_WIDTH, height: 197.0 },
+                workspace_id,
+                state: Arc::clone(panels),
+                editor: editor.clone(),
+                terminal_focus: focus,
+                write_enabled: true,
+                scale: 1.0,
+                colors: colors(),
+                animations: AnimationSettings::resolve_with_env(false, None),
+                panel: Some(panel()),
+                notice: None,
+            },
+        })
+    }
 }

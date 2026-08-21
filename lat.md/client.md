@@ -1214,6 +1214,22 @@ band through a full-band `absolute().inset_0()` cached style, which keeps
 the strip's own rect-positioned root in exactly the coordinate space it
 always painted in while giving GPUI the definite bounds caching requires.
 
+A cached view's rendered root is a *layout root*, and that costs one rule:
+`Entity::cached` lays the subtree out through gpui's `layout_as_root`, and
+taffy's `compute_root_layout` pins a root node's location to the origin, so
+an `absolute()` inset on the rendered root is discarded in silence. The
+band-positioned board therefore hangs one level below the container
+[[crates/scribe-client/src/beads_board.rs#BoardStrip#render]] roots, exactly
+as the overlay children hang below the one
+[[crates/scribe-client/src/beads_panel.rs#PanelLayer#render]] roots. Rooting
+the positioned element directly is what put every region's strip on the grid
+band's top-left corner and left a second region blank — and `rect` cannot be
+deleted the way the Flow renderer's was, because
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#drag_lane_at]] resolves
+card drags against those same band coordinates. The nesting is measured, not
+asserted from source, by
+[[test#Test Harness#GPUI Client Headless Suites#Cached view placement]].
+
 Invalidation has two edges, and both were already load-bearing conventions.
 Interactions inside the strip — wheel scroll, flow hover and activation,
 scale steppers, drags, lane and row focus — all call `window.refresh()` at

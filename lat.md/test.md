@@ -4589,6 +4589,37 @@ boards too. The invariant they encode is
 [[client#Client#Beads Flow Layout Engine#Flow mode entry, exit, and scrolling]]'s:
 nothing reachable from the paint path may lock the board store.
 
+### Cached view placement
+
+Two real-window probes measure where a `Entity::cached` board strip and issue
+overlay actually land once each region owns one, because caching moved both
+subtrees onto a layout root and a layout root loses its own `absolute()`
+origin without a word.
+
+The strip probe builds one
+[[crates/scribe-client/src/beads_board.rs#BoardStrip]] per region at the rects
+two regions would give them, embeds each through the same full-band cached
+style the root uses, and moves a real pointer into each region in turn. The
+board root's own hover hitbox
+([[crates/scribe-client/src/beads_board.rs#BeadsBoards#hover]],
+`HoverSource::Board`) is the readback, and probing both regions is what makes
+it evidence rather than a smoke test: a strip that was never built reports no
+hover anywhere, while a strip built over the wrong region reports its hover at
+the *other* region's coordinates. That second reading is the one this suite was
+written for — both strips answered at x=10 and neither at x=514, which is a
+second region's board painted on top of the first. The overlay probe is its
+twin over [[crates/scribe-client/src/beads_panel.rs#PanelLayer]], clicking one
+region's dismiss backdrop and requiring the other region's panel to survive;
+it passes unchanged, which is how the panel's arrangement is known to be sound
+rather than merely untested.
+
+Both are sited on two regions for the reason
+[viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md)
+states, and both measure instead of asserting existence for the reason
+[gpui-layout-chains-fail-silently-and-only-measurement-catches-them](../docs/solutions/conventions/gpui-layout-chains-fail-silently-and-only-measurement-catches-them.md)
+states. The design they pin is
+[[client#Client#Beads Board CLI Data Source#Cached strip painting]].
+
 ### Beads board A2/A3 machine contract
 
 `gen-contract.py` reads the approved Beads board mock's normative A2/A3 CSS
