@@ -3591,6 +3591,12 @@ A capture pins nothing itself, leaving the workspaces to the caller's [[crates/s
 
 The round trip is taken with `restore_rect` present for the same reason the zoom's is: the pinned list is an array, which TOML writes as a bare key, and one emitted after a table would be read back as part of it. A record written before the field existed restores with no board pinned.
 
+### Pinned lanes round-trip
+
+A capture pins no lane itself, leaving the workspace/queue pairs to the caller's [[crates/scribe-client/src/window_state.rs#WindowGeometry#with_pinned_lanes]] exactly as it leaves the board pins, and the filled-in record survives a TOML round trip.
+
+The round trip is taken with `restore_rect` present for the same reason the board pins' is: the array is a bare key, and one emitted after a table would be read back as part of it. Two distinct workspaces each carry their own queue, so a collapse into one entry would show up in the round trip. A record written before the field existed restores with no lane pinned.
+
 ### A placement move restates the window's size
 
 The `_NET_MOVERESIZE_WINDOW` payload marks x, y, width and height all present, carries `StaticGravity`, and repeats the window's current size in its size words instead of zeroing them.

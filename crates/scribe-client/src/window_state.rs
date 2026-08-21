@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use gpui::{Bounds, Pixels, Point, Size, WindowBounds, point, px, size};
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::{WindowId, WorkspaceId};
+use scribe_common::protocol::BeadsIssueQueue;
 use serde::{Deserialize, Serialize};
 
 use crate::restore_replay::round_positive_f32_to_u16;
@@ -168,6 +169,14 @@ pub struct WindowGeometry {
     /// field existed.
     #[serde(default)]
     pub beads_pinned: Vec<WorkspaceId>,
+    /// Workspaces whose collapsed Blocked/Done lane was pinned open, and which
+    /// queue — the lane-level twin of `beads_pinned`, fed and drained the same
+    /// way by [`crate::beads_board::BeadsBoards::lane_pinned`] and
+    /// [`crate::beads_board::BeadsBoards::restore_lane_pins`]. Declared before
+    /// `restore_rect` for the same reason `beads_pinned` is. `serde(default)`
+    /// → none, for records written before this field existed.
+    #[serde(default)]
+    pub beads_lane_pinned: Vec<(WorkspaceId, BeadsIssueQueue)>,
     /// Legacy `maximized = true|false`, read from pre-[`WindowState`] records
     /// and folded into `state` by [`adopt_legacy_state`]. Never written back.
     #[serde(default, rename = "maximized", skip_serializing)]
@@ -193,6 +202,7 @@ impl Default for WindowGeometry {
             titlebar_normalized: true,
             zoom: 0,
             beads_pinned: Vec::new(),
+            beads_lane_pinned: Vec::new(),
             legacy_maximized: None,
             restore_rect: None,
         }
@@ -246,6 +256,18 @@ impl WindowGeometry {
     #[must_use]
     pub fn with_pinned_boards(self, beads_pinned: Vec<WorkspaceId>) -> Self {
         Self { beads_pinned, ..self }
+    }
+
+    /// The same record with the workspaces whose collapsed lane is pinned
+    /// open, and which queue.
+    ///
+    /// A sibling of [`Self::with_pinned_boards`], captured the same way and for
+    /// the same reason: it rides the frame's equality check, so a lane pin
+    /// arms the debounce exactly as a board pin does and there is no second
+    /// write path.
+    #[must_use]
+    pub fn with_pinned_lanes(self, beads_lane_pinned: Vec<(WorkspaceId, BeadsIssueQueue)>) -> Self {
+        Self { beads_lane_pinned, ..self }
     }
 
     /// The origin a restore re-asserts, or `None` when none was captured.
@@ -545,6 +567,8 @@ pub fn geometry_from_bounds(
         // Likewise filled in by the caller, with
         // [`WindowGeometry::with_pinned_boards`].
         beads_pinned: Vec::new(),
+        // And with [`WindowGeometry::with_pinned_lanes`].
+        beads_lane_pinned: Vec::new(),
         legacy_maximized: None,
         restore_rect,
     }
@@ -1129,6 +1153,41 @@ titlebar_normalized = true
         let legacy: WindowGeometry =
             toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
         assert!(legacy.beads_pinned.is_empty());
+    }
+
+    // @lat: [[test#Window geometry compat#Pinned lanes round-trip]]
+    #[test]
+    fn pinned_lanes_round_trip() {
+        let captured = capture(
+            test_bounds(120.0, 64.0, 1440.0, 900.0),
+            ObservedWindowState::from_wm_state(false, WindowState::Maximized),
+            None,
+            Some(&WindowGeometry {
+                restore_rect: Some(SavedRect { x: Some(10), y: Some(20), width: 800, height: 600 }),
+                state: WindowState::Maximized,
+                ..WindowGeometry::default()
+            }),
+        );
+        assert!(captured.beads_lane_pinned.is_empty(), "the bounds conversion pins no lane itself");
+
+        // Taken with `restore_rect` present: an array is a bare key, and one
+        // written after a table would be read back as part of it. Two distinct
+        // workspaces, each with its own queue, so a collapse into one entry
+        // would show up in the round trip.
+        let pinned = vec![
+            (WorkspaceId::new(), BeadsIssueQueue::Blocked),
+            (WorkspaceId::new(), BeadsIssueQueue::Done),
+        ];
+        let geom = captured.with_pinned_lanes(pinned.clone());
+        assert!(geom.restore_rect.is_some(), "the round trip needs the table present");
+        let text = toml::to_string_pretty(&geom).expect("serialize");
+        assert_eq!(toml::from_str::<WindowGeometry>(&text).expect("round-trip"), geom, "{text}");
+        assert_eq!(geom.beads_lane_pinned, pinned);
+
+        // A record written before the field existed restores with no lane pinned.
+        let legacy: WindowGeometry =
+            toml::from_str("width = 800\nheight = 600\n").expect("parse legacy toml");
+        assert!(legacy.beads_lane_pinned.is_empty());
     }
 
     // @lat: [[test#Window geometry compat#A window off the layout is clamped back onto it]]

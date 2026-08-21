@@ -2221,7 +2221,9 @@ impl TerminalView {
         // Pinned boards ride the same capture as the zoom level: a pin is
         // per-window state the user chose, and the record is the only place it
         // survives a quit.
-        .with_pinned_boards(self.pinned_board_ids());
+        .with_pinned_boards(self.pinned_board_ids())
+        // Pinned lanes ride the same capture, for the same reason.
+        .with_pinned_lanes(self.pinned_lane_ids());
         if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
             return;
         }
@@ -2242,6 +2244,12 @@ impl TerminalView {
     /// Workspaces whose boards are pinned open, in the order the record keeps.
     fn pinned_board_ids(&self) -> Vec<WorkspaceId> {
         self.shared.beads_boards.lock().map(|boards| boards.pinned()).unwrap_or_default()
+    }
+
+    /// Workspaces whose collapsed lane is pinned open, and which queue, in the
+    /// order the record keeps.
+    fn pinned_lane_ids(&self) -> Vec<(WorkspaceId, scribe_common::protocol::BeadsIssueQueue)> {
+        self.shared.beads_boards.lock().map(|boards| boards.lane_pinned()).unwrap_or_default()
     }
 
     /// The zoom level a window opens at, and the grid font that level yields.
@@ -5008,6 +5016,7 @@ impl TerminalView {
         let level = geometry.zoom;
         if let Ok(mut boards) = self.shared.beads_boards.lock() {
             boards.restore_pins(geometry.beads_pinned.iter().copied());
+            boards.restore_lane_pins(geometry.beads_lane_pinned.iter().copied());
         }
         self.restore.adopt_geometry_record(geometry);
         // This process built its font before it knew which window it was
@@ -11583,6 +11592,7 @@ fn open_window(
         && let Ok(mut boards) = shared.beads_boards.lock()
     {
         boards.restore_pins(geometry.beads_pinned.iter().copied());
+        boards.restore_lane_pins(geometry.beads_lane_pinned.iter().copied());
     }
     // Restored geometry wins over the grid-derived startup size. Non-X11
     // platforms receive its bounds and state in GPUI's creation options; X11
