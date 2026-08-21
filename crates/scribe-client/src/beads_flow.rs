@@ -16,7 +16,6 @@ use scribe_common::protocol::{
 };
 
 use crate::beads_board::{BeadsBoardColors, alpha, short_id};
-use crate::layout::Rect;
 
 fn scalar(value: usize) -> f32 {
     u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
@@ -797,7 +796,12 @@ pub struct FlowBandControl {
 
 /// Inputs the workspace-owned mode state supplies to the pure Flow renderer.
 pub struct FlowRender<'a> {
-    pub rect: Rect,
+    /// The strip slot's width, for clamping the scroll and sizing the position
+    /// bar. Deliberately a width and not the board's `Rect`: the strip is
+    /// mounted inside the board, which has already positioned itself over its
+    /// region, so a renderer that knew its own origin would apply that offset a
+    /// second time and paint outside the region it belongs to.
+    pub viewport_width: f32,
     pub graph: &'a BeadsEpicGraph,
     pub layout: &'a FlowLayout,
     pub cursor_issue_id: &'a str,
@@ -958,8 +962,8 @@ pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
         render.live_issue_ids,
     )?;
     require_node_controls(&presentation, render.node_controls)?;
-    let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.rect.width);
-    let max_scroll = (presentation.width - render.rect.width).max(0.0);
+    let scroll_x = clamped_scroll(render.scroll_x, presentation.width, render.viewport_width);
+    let max_scroll = (presentation.width - render.viewport_width).max(0.0);
     let board_id = SharedString::from(format!("beads-flow-{}", render.graph.epic_id));
     let contents = div()
         .relative()
@@ -982,16 +986,8 @@ pub fn render(render: &FlowRender<'_>) -> Result<AnyElement, FlowRenderError> {
             render.text_scale,
         ))
         .children(edge_fades(scroll_x, max_scroll, &render.colors))
-        .child(scrollbar(&presentation, scroll_x, render.rect.width, &render.colors));
-    Ok(div()
-        .id(board_id)
-        .absolute()
-        .left(px(render.rect.x))
-        .top(px(render.rect.y))
-        .w(px(render.rect.width))
-        .h(px(render.rect.height))
-        .child(contents)
-        .into_any_element())
+        .child(scrollbar(&presentation, scroll_x, render.viewport_width, &render.colors));
+    Ok(div().id(board_id).size_full().child(contents).into_any_element())
 }
 
 fn present_flow(
@@ -2434,7 +2430,7 @@ mod tests {
 
     /// Renders one Flow strip so a real GPUI window can paint it.
     struct FlowBandFocusProbe {
-        rect: Rect,
+        viewport_width: f32,
         graph: BeadsEpicGraph,
         layout: FlowLayout,
         node_controls: HashMap<String, FlowNodeControl>,
@@ -2445,7 +2441,7 @@ mod tests {
     impl Render for FlowBandFocusProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             render(&FlowRender {
-                rect: self.rect,
+                viewport_width: self.viewport_width,
                 graph: &self.graph,
                 layout: &self.layout,
                 cursor_issue_id: "solo",
@@ -2494,7 +2490,7 @@ mod tests {
                         },
                     );
                     FlowBandFocusProbe {
-                        rect: Rect { x: 0.0, y: 0.0, width: 1200.0, height: 197.0 },
+                        viewport_width: 1200.0,
                         graph,
                         layout,
                         node_controls,

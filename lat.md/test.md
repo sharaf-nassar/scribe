@@ -4513,6 +4513,18 @@ action directly fires it twice per activation -- caught here specifically
 because [[crates/scribe-client/src/beads_board.rs#BeadsBoards#exit_flow]]
 happens to be idempotent enough not to show up any other way.
 
+A second real-window test paints two boards side by side, each in Flow, at the
+rects two regions would give them, and clicks each band's `← LANES` at that
+region's own coordinates. It exists because the strip once re-applied its
+board's absolute offset: an origin-region probe cannot see that at all, since
+both offsets are zero there, and the second region's whole strip landed outside
+the board's clip -- built, and unreachable. Each click must exit only its own
+region's Flow, which pins the geometry and A3-R1's per-region mode in the same
+gesture. The two-region siting is the rule
+[viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md)
+states: a fixture with one region cannot tell "anchored to its region" from
+"anchored to the window".
+
 Two tests guard the paint path instead of the geometry, and they exist because
 the Flow strip once deadlocked every board render. They take the board guard the
 way the render pass does, assert a second lock would fail, and then require the

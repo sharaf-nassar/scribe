@@ -2170,7 +2170,10 @@ fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
     let FlowStripSnapshot { graph, layout, cursor_issue_id, scroll_x, trace, live_issue_ids } =
         flow?;
     let painted = crate::beads_flow::render(&FlowRender {
-        rect,
+        // The strip fills the slot this board already positioned over its own
+        // region, so the renderer gets the width it clamps against and no
+        // origin of its own.
+        viewport_width: rect.width,
         graph: &graph,
         layout: &layout,
         cursor_issue_id: &cursor_issue_id,
@@ -5588,6 +5591,231 @@ mod flow_mode_tests {
         assert_eq!(
             boards.collapsed_lane_state(workspace, BeadsIssueQueue::Blocked),
             Some(CollapsedLaneState::Pinned)
+        );
+    }
+
+    /// Two boards side by side, each painted from the rect its own region
+    /// gave it, so a Flow strip's geometry is measurable against the region it
+    /// belongs to rather than against the window.
+    struct RegionBoardsProbe {
+        boards: std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+        panels: std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
+        regions: Vec<RegionBoard>,
+        controls: HashMap<String, FlowNodeControl>,
+        lane_tabs: (FocusHandle, FocusHandle),
+        colors: BeadsBoardColors,
+    }
+
+    /// One region's board: the workspace it shows, the rect the region gave
+    /// it, and its own band controls, the way `flow_band_for` hands out one
+    /// pair per workspace.
+    struct RegionBoard {
+        workspace_id: WorkspaceId,
+        rect: Rect,
+        band: FlowBandControl,
+    }
+
+    impl Render for RegionBoardsProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let painted = self
+                .regions
+                .iter()
+                .map(|region| {
+                    let flow = self
+                        .boards
+                        .lock()
+                        .ok()
+                        .and_then(|boards| boards.flow_snapshot(region.workspace_id));
+                    render(
+                        "probe",
+                        Some(&BeadsBoardState::Ready {
+                            snapshot: BeadsBoardSnapshot::default(),
+                            stale: false,
+                            refresh_error: None,
+                        }),
+                        BeadsBoardRender {
+                            rect: region.rect,
+                            overlay: false,
+                            hover_state: std::sync::Arc::clone(&self.boards),
+                            panel_state: std::sync::Arc::clone(&self.panels),
+                            workspace_id: region.workspace_id,
+                            card_drag: None,
+                            key_move: None,
+                            rail: RailState {
+                                blocked: CollapsedLaneState::Tab,
+                                done: CollapsedLaneState::Tab,
+                            },
+                            blocked_tab_focus: self.lane_tabs.0.clone(),
+                            done_tab_focus: self.lane_tabs.1.clone(),
+                            row_focus: HashMap::new(),
+                            scale: 1.0,
+                            colors: self.colors,
+                            flow_controls: self.controls.clone(),
+                            flow_band: region.band.clone(),
+                            flow,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            div().relative().size_full().children(painted)
+        }
+    }
+
+    /// Both regions' boards in one window, each in Flow, each holding its own
+    /// band controls the way `flow_band_for` hands out one pair per workspace.
+    fn region_boards_window(
+        cx: &mut gpui::TestAppContext,
+        shared: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+        origins: [f32; 2],
+        half: f32,
+    ) -> gpui::WindowHandle<RegionBoardsProbe> {
+        let workspaces: Vec<WorkspaceId> = {
+            let mut store = shared.lock().expect("probe store");
+            store.set_flow_enabled(true);
+            origins
+                .iter()
+                .map(|_| {
+                    let workspace = WorkspaceId::new();
+                    store.request_card_flow(workspace, &card("a", Some(EPIC)));
+                    assert!(store.apply_epic_graph(workspace, EPIC, graph()));
+                    workspace
+                })
+                .collect()
+        };
+        let theme = scribe_common::theme::Theme::from_colors(&scribe_common::theme::ThemeColors {
+            name: std::borrow::Cow::Borrowed("probe"),
+            foreground: [0.9, 0.9, 0.9, 1.0],
+            background: [0.1, 0.11, 0.12, 1.0],
+            cursor: [0.9, 0.9, 0.9, 1.0],
+            cursor_accent: [0.1, 0.1, 0.1, 1.0],
+            selection: [0.2, 0.3, 0.4, 1.0],
+            selection_foreground: [0.9, 0.9, 0.9, 1.0],
+            ansi_colors: [[0.5, 0.5, 0.5, 1.0]; 16],
+        });
+        let colors = BeadsBoardColors::from_theme(&theme.chrome, &theme.ansi_colors, 1.0);
+        let shared = std::sync::Arc::clone(shared);
+        cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: gpui::size(px(2.0 * half), px(739.0)),
+                    })),
+                    ..Default::default()
+                },
+                |_, app| {
+                    app.new(|app| RegionBoardsProbe {
+                        regions: region_boards(&workspaces, origins, half, &shared, app),
+                        controls: node_controls(app),
+                        panels: std::sync::Arc::new(std::sync::Mutex::new(BeadsPanels::default())),
+                        lane_tabs: (app.focus_handle(), app.focus_handle()),
+                        colors,
+                        boards: std::sync::Arc::clone(&shared),
+                    })
+                },
+            )
+            .expect("open the two-region probe window")
+        })
+    }
+
+    fn node_controls(app: &mut App) -> HashMap<String, FlowNodeControl> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    FlowNodeControl {
+                        focus: app.focus_handle(),
+                        on_activate: std::sync::Arc::new(|_, _, _| {}),
+                        on_hover: std::sync::Arc::new(|_, _, _, _| {}),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn region_boards(
+        workspaces: &[WorkspaceId],
+        origins: [f32; 2],
+        width: f32,
+        shared: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+        app: &mut App,
+    ) -> Vec<RegionBoard> {
+        workspaces
+            .iter()
+            .zip(origins)
+            .map(|(workspace_id, x)| region_board(*workspace_id, x, width, shared, app))
+            .collect()
+    }
+
+    fn region_board(
+        workspace_id: WorkspaceId,
+        x: f32,
+        width: f32,
+        shared: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+        app: &mut App,
+    ) -> RegionBoard {
+        let exit_store = std::sync::Arc::clone(shared);
+        RegionBoard {
+            workspace_id,
+            rect: Rect { x, y: 0.0, width, height: BEADS_BOARD_HEIGHT },
+            band: FlowBandControl {
+                back_focus: app.focus_handle().tab_stop(true),
+                lanes_focus: app.focus_handle().tab_stop(true),
+                on_exit: std::sync::Arc::new(move |_, _| {
+                    if let Ok(mut store) = exit_store.lock() {
+                        store.exit_flow(workspace_id);
+                    }
+                }),
+            },
+        }
+    }
+
+    /// A3-R1: each region's Flow strip paints inside that region's own bounds,
+    /// so the `← LANES` control a reader sees there is the one a click at those
+    /// coordinates reaches, and it exits that region's Flow alone.
+    ///
+    /// Sited on two regions on purpose. An origin-only probe collapses
+    /// "positioned in the region" onto "positioned in the window" -- the
+    /// degenerate-fixture trap
+    /// `docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md`
+    /// documents -- and a strip that re-applied its board's own rect offset
+    /// passed every origin-region check while painting the second region's
+    /// strip clean outside the window.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Flow layout and paint-path guard]]
+    #[gpui::test]
+    fn each_region_paints_its_flow_strip_inside_its_own_bounds(cx: &mut gpui::TestAppContext) {
+        let half = 504.0;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(BeadsBoards::default()));
+        let window = region_boards_window(cx, &shared, [0.0, half], half);
+        let regions = window
+            .update(cx, |probe, _, _| {
+                probe.regions.iter().map(|region| region.workspace_id).collect::<Vec<_>>()
+            })
+            .expect("probe entity");
+        let (left, right) = (regions[0], regions[1]);
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw both regions");
+        let mut test_window = gpui::VisualTestContext::from_window(window.into(), cx);
+        // `← LANES` sits at the band's own left padding, the same fixed offset
+        // into whichever region painted the strip (A3 `band_pad_left`), on the
+        // band's own row (A3 `band_h`).
+        let back_label = |region_x: f32| point(px(region_x + 20.0), px(17.0));
+
+        test_window.simulate_click(back_label(half), gpui::Modifiers::default());
+        {
+            let store = shared.lock().expect("probe store");
+            assert!(
+                store.flow(right).is_none(),
+                "the second region's `← LANES` never took the click its own band painted"
+            );
+            assert!(store.flow(left).is_some(), "exiting one region left the other in Lanes");
+        }
+
+        test_window.simulate_click(back_label(0.0), gpui::Modifiers::default());
+        assert!(
+            shared.lock().expect("probe store").flow(left).is_none(),
+            "the origin region's `← LANES` never took its own click"
         );
     }
 }
