@@ -2936,9 +2936,18 @@ fn tab_interactivity(
         .when_some(wash, gpui::Styled::bg)
         .when(hot, |el| el.bg(lift))
         .hover(move |el| el.bg(lift))
-        .on_hover(move |entered: &bool, _window, _app| {
-            if let Ok(mut boards) = hover_boards.lock() {
-                boards.hover_lane(workspace_id, queue, LaneHoverSource::Tab, *entered);
+        // Opening the drawer is a paint change, so the hover that causes it
+        // has to ask for the frame the way this element's own `on_click`
+        // already does. Without it the tab goes hot (pure CSS hover) while
+        // the drawer waits for some unrelated repaint.
+        .on_hover(move |entered: &bool, window, _app| {
+            let changed = hover_boards
+                .lock()
+                .is_ok_and(|mut boards| {
+                    boards.hover_lane(workspace_id, queue, LaneHoverSource::Tab, *entered)
+                });
+            if changed {
+                window.refresh();
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
@@ -3102,9 +3111,16 @@ fn lane_drawer(
         .border_color(border)
         .rounded(px(beads_board_a2::DRAWER_RADIUS))
         .shadow_lg()
-        .on_hover(move |entered: &bool, _window, _app| {
-            if let Ok(mut boards) = hover_boards.lock() {
-                boards.hover_lane(workspace_id, queue, LaneHoverSource::Drawer, *entered);
+        // Same pairing as the tab's stop above: leaving the drawer starts the
+        // grace timer, and that only becomes visible if this frame is drawn.
+        .on_hover(move |entered: &bool, window, _app| {
+            let changed = hover_boards
+                .lock()
+                .is_ok_and(|mut boards| {
+                    boards.hover_lane(workspace_id, queue, LaneHoverSource::Drawer, *entered)
+                });
+            if changed {
+                window.refresh();
             }
         })
         .on_mouse_down(MouseButton::Left, |_, _window, app| app.stop_propagation())
