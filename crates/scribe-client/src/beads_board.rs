@@ -1508,7 +1508,7 @@ pub const BEADS_BOARD_GRIP: f32 = 4.0;
 /// Where the mock lays its issues on the bare ground, an issue here is a raised
 /// card, so the palette carries two grounds: the strip's, which the lane heads
 /// sit on, and the card's, which every word inside an issue sits on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BeadsBoardColors {
     /// The strip's ground, already composited with the window's opacity.
     pub ground: Rgba,
@@ -1836,6 +1836,7 @@ impl Metrics {
     }
 }
 
+#[derive(Clone)]
 pub struct BeadsBoardRender {
     /// The strip at the top of this workspace's region, in grid-band
     /// coordinates. The board is a region citizen, never a window-wide band:
@@ -1895,6 +1896,109 @@ pub struct BeadsBoardRender {
     /// up here: painting runs inside that guard, so a second lock on the same
     /// non-reentrant mutex would deadlock the board rather than fail.
     pub flow: Option<FlowStripSnapshot>,
+}
+
+/// One workspace's board strip as a cached GPUI view.
+///
+/// The window redraw pump notifies the root view at up to 60 fps while any
+/// AI pulse or PTY burst is live, and the root used to rebuild every open
+/// board's element tree on each of those frames. Wrapping the strip in its
+/// own entity embedded with [`gpui::Entity::cached`] lets GPUI replay the
+/// recorded prepaint/paint ranges instead, so a board only pays for a
+/// rebuild when its own inputs change.
+///
+/// Invalidation has exactly two edges. Interactions inside the strip (wheel
+/// scroll, flow hover/activate, scale steppers, drags, focus moves) already
+/// call `window.refresh()` at event time, which bypasses every view cache
+/// for that one frame and re-records this strip with fresh visuals; gpui's
+/// own hover styling notifies the strip entity directly because it is the
+/// `current_view` its hitbox listeners were recorded under. Everything else
+/// — server-pushed snapshots, flow graphs, geometry, palette, focus-handle
+/// churn — flows through the root's per-frame [`BoardStrip::same_inputs`]
+/// diff, which notifies this entity only on a real change.
+pub struct BoardStrip {
+    pub name: String,
+    pub state: Option<BeadsBoardState>,
+    pub wiring: BeadsBoardRender,
+}
+
+impl BoardStrip {
+    /// True when a fresh render would paint exactly what the cached subtree
+    /// already shows, so the root can skip notifying this entity.
+    ///
+    /// Focus handles compare by identity and the flow-control closures by
+    /// `Arc` pointer: the root caches both across frames precisely so they
+    /// stay stable, and a rebuilt handle must repaint the strip anyway to
+    /// re-record the listeners that capture it. The shared store handles
+    /// (`hover_state`, `panel_state`) are process-lifetime constants and
+    /// carry no paint state of their own, so they stay out of the diff.
+    pub fn same_inputs(
+        &self,
+        name: &str,
+        state: Option<&BeadsBoardState>,
+        wiring: &BeadsBoardRender,
+    ) -> bool {
+        let ours = &self.wiring;
+        self.name == name
+            && self.state.as_ref() == state
+            && ours.rect == wiring.rect
+            && ours.overlay == wiring.overlay
+            && ours.workspace_id == wiring.workspace_id
+            && ours.card_drag == wiring.card_drag
+            && ours.key_move == wiring.key_move
+            && ours.rail == wiring.rail
+            && ours.blocked_tab_focus == wiring.blocked_tab_focus
+            && ours.done_tab_focus == wiring.done_tab_focus
+            && ours.row_focus == wiring.row_focus
+            // Exact-bits is the right cache test: any scale change repaints,
+            // and equal bits paint equal strips.
+            && ours.scale.to_bits() == wiring.scale.to_bits()
+            && ours.colors == wiring.colors
+            && same_flow_controls(&ours.flow_controls, &wiring.flow_controls)
+            && same_flow_band(ours, wiring)
+            && ours.flow == wiring.flow
+    }
+}
+
+/// Compare the band's exit controls, but only while the strip paints Flow.
+///
+/// A lanes-mode board never mounts the band, and `flow_band_for` hands such
+/// a board a fresh throwaway pair every call — diffing those would bust the
+/// cache on every frame for exactly the boards that change least. In Flow
+/// the handles come from the root's retained per-workspace map, so identity
+/// is meaningful. `on_exit` is rebuilt every call and stays out of the diff:
+/// its behaviour is fixed by the workspace id and store handle, both stable.
+fn same_flow_band(ours: &BeadsBoardRender, theirs: &BeadsBoardRender) -> bool {
+    theirs.flow.is_none()
+        || (ours.flow_band.back_focus == theirs.flow_band.back_focus
+            && ours.flow_band.lanes_focus == theirs.flow_band.lanes_focus)
+}
+
+impl gpui::Render for BoardStrip {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        // `render` consumes its wiring; the clone is paid only on the frames
+        // the diff already decided must rebuild.
+        render(&self.name, self.state.as_ref(), self.wiring.clone())
+    }
+}
+
+/// Compare flow-control maps by focus identity and handler pointer.
+fn same_flow_controls(
+    ours: &HashMap<String, FlowNodeControl>,
+    theirs: &HashMap<String, FlowNodeControl>,
+) -> bool {
+    ours.len() == theirs.len()
+        && ours.iter().all(|(id, control)| {
+            theirs.get(id).is_some_and(|other| {
+                control.focus == other.focus
+                    && std::sync::Arc::ptr_eq(&control.on_activate, &other.on_activate)
+                    && std::sync::Arc::ptr_eq(&control.on_hover, &other.on_hover)
+            })
+        })
 }
 
 /// Shared stores lane and row builders need after the snapshot borrow ends.
@@ -6250,5 +6354,246 @@ mod lane_tests {
             "a second region's open drawer closes too"
         );
         assert!(!boards.close_any_lane_drawer(), "already closed");
+    }
+}
+
+#[cfg(test)]
+mod strip_cache_tests {
+    use std::sync::Arc;
+
+    use scribe_common::protocol::{BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState};
+
+    use super::*;
+    use crate::beads_board_a2::RailState;
+
+    fn item(id: &str) -> BeadsBoardItem {
+        BeadsBoardItem {
+            id: id.into(),
+            title: format!("Issue {id}"),
+            priority: 2,
+            blocker_ids: Vec::new(),
+            parent_epic_name: None,
+            parent_epic_id: None,
+            updated_at: String::new(),
+        }
+    }
+
+    fn ready_state(refreshed_at_epoch_ms: u64) -> BeadsBoardState {
+        BeadsBoardState::Ready {
+            snapshot: BeadsBoardSnapshot {
+                refreshed_at_epoch_ms,
+                backlog_total: 1,
+                ready_total: 0,
+                in_progress_total: 0,
+                blocked_total: 0,
+                done_total: 0,
+                backlog: vec![item("scribe-cache.1")],
+                ready: Vec::new(),
+                in_progress: Vec::new(),
+                blocked: Vec::new(),
+                done: Vec::new(),
+            },
+            stale: false,
+            refresh_error: None,
+        }
+    }
+
+    fn colors() -> BeadsBoardColors {
+        let fill = [0.15, 0.16, 0.17, 1.0];
+        let chrome = scribe_common::theme::ChromeColors {
+            tab_bar_bg: fill,
+            tab_bar_active_bg: fill,
+            tab_text: fill,
+            tab_text_active: fill,
+            tab_separator: fill,
+            status_bar_bg: fill,
+            status_bar_text: fill,
+            divider: fill,
+            accent: fill,
+            scrollbar: fill,
+            tab_bar_gradient_top: fill,
+            status_bar_separator: fill,
+            prompt_bar_first_row_bg: fill,
+            prompt_bar_second_row_bg: fill,
+            prompt_bar_text: fill,
+            prompt_bar_icon_first: fill,
+            prompt_bar_icon_latest: fill,
+        };
+        BeadsBoardColors::from_theme(&chrome, &[[0.5, 0.5, 0.5, 1.0]; 16], 1.0)
+    }
+
+    fn wiring(app: &mut gpui::App, workspace_id: WorkspaceId) -> BeadsBoardRender {
+        BeadsBoardRender {
+            rect: Rect { x: 0.0, y: 0.0, width: 1200.0, height: 160.0 },
+            overlay: false,
+            hover_state: Arc::new(std::sync::Mutex::new(BeadsBoards::default())),
+            panel_state: Arc::new(std::sync::Mutex::new(BeadsPanels::default())),
+            workspace_id,
+            card_drag: None,
+            key_move: None,
+            rail: RailState { blocked: CollapsedLaneState::Tab, done: CollapsedLaneState::Tab },
+            blocked_tab_focus: app.focus_handle(),
+            done_tab_focus: app.focus_handle(),
+            row_focus: HashMap::from([("scribe-cache.1".to_string(), app.focus_handle())]),
+            scale: 1.0,
+            colors: colors(),
+            flow_controls: HashMap::new(),
+            flow_band: FlowBandControl {
+                back_focus: app.focus_handle(),
+                lanes_focus: app.focus_handle(),
+                on_exit: Arc::new(|_, _| {}),
+            },
+            flow: None,
+        }
+    }
+
+    fn strip(app: &mut gpui::App) -> (BoardStrip, BeadsBoardRender) {
+        let wiring = wiring(app, WorkspaceId::new());
+        let strip = BoardStrip {
+            name: "ws".into(),
+            state: Some(ready_state(1_000)),
+            wiring: wiring.clone(),
+        };
+        (strip, wiring)
+    }
+
+    #[gpui::test]
+    fn identical_inputs_leave_the_cache_alone(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            let (strip, wiring) = strip(app);
+            assert!(strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring));
+        });
+    }
+
+    #[gpui::test]
+    fn every_painted_input_invalidates(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            let (strip, wiring) = strip(app);
+
+            assert!(!strip.same_inputs("renamed", Some(&ready_state(1_000)), &wiring), "name");
+            assert!(
+                !strip.same_inputs("ws", Some(&ready_state(2_000)), &wiring),
+                "server-pushed snapshot"
+            );
+            assert!(!strip.same_inputs("ws", None, &wiring), "state cleared");
+
+            let mut moved = wiring.clone();
+            moved.rect.y += 40.0;
+            assert!(!strip.same_inputs("ws", Some(&ready_state(1_000)), &moved), "rect");
+
+            let mut floated = wiring.clone();
+            floated.overlay = true;
+            assert!(!strip.same_inputs("ws", Some(&ready_state(1_000)), &floated), "overlay");
+
+            let mut dragging = wiring.clone();
+            dragging.card_drag = Some(CardDragPaint {
+                source_id: "scribe-cache.1".into(),
+                source_lane: 0,
+                target_lane: Some(1),
+            });
+            assert!(!strip.same_inputs("ws", Some(&ready_state(1_000)), &dragging), "card drag");
+
+            let mut pinned = wiring.clone();
+            pinned.rail.done = CollapsedLaneState::Pinned;
+            assert!(!strip.same_inputs("ws", Some(&ready_state(1_000)), &pinned), "rail");
+
+            let mut zoomed = wiring.clone();
+            zoomed.scale = 1.2;
+            assert!(!strip.same_inputs("ws", Some(&ready_state(1_000)), &zoomed), "scale");
+
+            let mut rebuilt_focus = wiring.clone();
+            rebuilt_focus.row_focus =
+                HashMap::from([("scribe-cache.1".to_string(), app.focus_handle())]);
+            assert!(
+                !strip.same_inputs("ws", Some(&ready_state(1_000)), &rebuilt_focus),
+                "a rebuilt focus handle must re-record the listeners that capture it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn flow_band_diffs_only_in_flow_mode(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            let (mut strip, mut wiring) = strip(app);
+            let throwaway = |handles: &mut gpui::App| FlowBandControl {
+                back_focus: handles.focus_handle(),
+                lanes_focus: handles.focus_handle(),
+                on_exit: Arc::new(|_, _| {}),
+            };
+            // Lanes mode: `flow_band_for` mints a fresh pair every call for a
+            // board with no retained entry; that pair must not bust the cache.
+            wiring.flow_band = throwaway(app);
+            assert!(
+                strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring),
+                "lanes mode ignores throwaway band handles"
+            );
+
+            // Flow mode: the handles are the retained per-workspace pair, so
+            // a rebuilt handle is a real change that must repaint.
+            let graph = scribe_common::protocol::BeadsEpicGraph {
+                epic_id: "flow-epic".into(),
+                epic_title: "Flow epic".into(),
+                closed: 0,
+                total: 1,
+                nodes: vec![scribe_common::protocol::BeadsGraphNode {
+                    id: "a".into(),
+                    title: "Node a".into(),
+                    priority: 1,
+                    status: "open".into(),
+                    queue: scribe_common::protocol::BeadsIssueQueue::Ready,
+                    assignee: None,
+                    updated_at: String::new(),
+                }],
+                edges: Vec::new(),
+            };
+            let flow = FlowStripSnapshot {
+                layout: layout_flow(&graph, 1.0).expect("one-node graph lays out"),
+                graph,
+                cursor_issue_id: "a".into(),
+                scroll_x: 0.0,
+                trace: None,
+                live_issue_ids: HashSet::new(),
+            };
+            let band = throwaway(app);
+            strip.wiring.flow = Some(flow.clone());
+            strip.wiring.flow_band = band.clone();
+            wiring.flow = Some(flow);
+            wiring.flow_band = band;
+            assert!(
+                strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring),
+                "flow mode with the shared retained pair caches"
+            );
+            wiring.flow_band.back_focus = app.focus_handle();
+            assert!(
+                !strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring),
+                "a rebuilt band handle must re-record the band's listeners"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn flow_controls_compare_by_handler_identity(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            let (mut strip, mut wiring) = strip(app);
+            let control = FlowNodeControl {
+                focus: app.focus_handle(),
+                on_activate: Arc::new(|_, _, _| {}),
+                on_hover: Arc::new(|_, _, _, _| {}),
+            };
+            strip.wiring.flow_controls =
+                HashMap::from([("scribe-cache.1".to_string(), control.clone())]);
+            wiring.flow_controls = HashMap::from([("scribe-cache.1".to_string(), control)]);
+            assert!(
+                strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring),
+                "cloned controls share their handlers"
+            );
+
+            wiring.flow_controls.get_mut("scribe-cache.1").unwrap().on_activate =
+                Arc::new(|_, _, _| {});
+            assert!(
+                !strip.same_inputs("ws", Some(&ready_state(1_000)), &wiring),
+                "a rebuilt handler is a different control"
+            );
+        });
     }
 }

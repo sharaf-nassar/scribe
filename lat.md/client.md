@@ -1197,6 +1197,65 @@ panel state matrix lives under
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Server Beads Issue Writes]]
 proves the complete protocol, server, GPUI, and real-`bd` path.
 
+### Cached strip painting
+
+Each visible board and each open issue panel is its own GPUI view embedded with `Entity::cached`, so the redraw pump's pulse and PTY frames replay recorded subtrees instead of rebuilding their element trees at up to 60 fps apiece.
+
+The cost this removes was measured, not guessed: while any agent pane is
+live, [[crates/scribe-client/src/main.rs#drive_redraws]] notifies the root
+view every 16 ms (PTY bursts bump the generation; between bursts
+[[crates/scribe-client/src/main.rs#TerminalView#tick_ai_animation]] keeps the
+pulse alive), and the root render used to rebuild every open board's full
+element tree on each of those frames. With several agents streaming and
+several boards open, that multiplied into a saturated render thread and a
+laggy window. [[crates/scribe-client/src/beads_board.rs#BoardStrip]] wraps
+one workspace's strip inputs as a view; the root embeds it inside the grid
+band through a full-band `absolute().inset_0()` cached style, which keeps
+the strip's own rect-positioned root in exactly the coordinate space it
+always painted in while giving GPUI the definite bounds caching requires.
+
+Invalidation has two edges, and both were already load-bearing conventions.
+Interactions inside the strip — wheel scroll, flow hover and activation,
+scale steppers, drags, lane and row focus — all call `window.refresh()` at
+event time, which bypasses every view cache for that one frame and
+re-records the strip with fresh visuals; GPUI's own hover styling notifies
+the strip entity directly because the strip is the `current_view` its hitbox
+listeners were recorded under, and focus moves force a window refresh from
+inside GPUI itself. Everything else — server-pushed snapshots and flow
+graphs, board geometry, palette and text-scale changes, focus-handle churn —
+reaches the strip only through
+[[crates/scribe-client/src/main.rs#TerminalView#sync_strip_view]], which
+diffs freshly assembled inputs against the strip's stored copy with
+[[crates/scribe-client/src/beads_board.rs#BoardStrip#same_inputs]] and
+notifies the entity only on a real change. The diff compares focus handles
+by identity and flow-control handlers by `Arc` pointer: the root caches both
+across frames precisely so they stay stable, and a rebuilt handle must
+repaint the strip anyway to re-record the listeners that capture it. The
+resize grip stays an ordinary per-frame element — it is one quad, and its
+press geometry must never diverge from the rect the root just computed.
+The band's exit controls are diffed only while the strip paints Flow: a
+lanes-mode board is handed a fresh throwaway pair every call by
+[[crates/scribe-client/src/main.rs#TerminalView#flow_band_for]], and diffing
+those would bust the cache on every frame for exactly the boards that
+change least.
+
+The issue panel gets the same treatment through
+[[crates/scribe-client/src/beads_panel.rs#PanelLayer]] and
+[[crates/scribe-client/src/main.rs#TerminalView#sync_panel_view]], with one
+deliberate asymmetry: the live text editor stays out of
+[[crates/scribe-client/src/beads_panel.rs#PanelLayer#same_inputs]] entirely.
+Every editor mutation path forces its own uncached frame — text input and
+IME through `replace_text_in_range`/`unmark_text`, caret and selection keys
+through the router's `Consumed` arm in
+[[crates/scribe-client/src/main.rs#TerminalView#handle_beads_editor_key]]
+(which gained its `window.refresh()` for exactly this reason), and closing
+the editor through the focus move GPUI itself refreshes for — so the diff
+carries only the panel's owned data: layer content, notices, geometry,
+palette, scale, and the write gate. An entity that is merely *read* during
+a cached render does not invalidate that cache when notified, which is why
+the refresh convention, not the editor's own `cx.notify`, is the load-bearing
+edge here.
+
 ### Board interaction and issue detail
 
 Board gestures, detail loading, and read-only panel rendering share the Beads state but do not weaken the guarded write boundary above.
@@ -2111,6 +2170,10 @@ Verifies titlebar tabs keep unique session-backed accessibility IDs when drag re
 The GPUI rebuild ports the winit client's per-session AI state machine so pulsing pane borders, tab indicators, and the context store behave identically across the cutover. The state machine is pure and covered by `#[gpui::test]`.
 
  is a byte-for-byte port of the winit  tracker. It keeps the Layer-1 pulse envelope (attention states pulse for a bounded window from entry; `Processing` pulses only while alive, re-armed by state edges and PTY output via ) so a hung AI stops pinning the redraw loop (), the Layer-2 wall-clock  that removes a dead `Processing` state entirely, the keystroke-driven , and the workspace-level priority aggregation (, `PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing`).
+A live agent legitimately re-arms the pulse for as long as it works, so the
+redraw loop staying hot is by design; what keeps those frames affordable is
+that the expensive chrome they would otherwise rebuild is cached — see
+[[client#Beads Board CLI Data Source#Cached strip painting]].
 
 The context-window percent is stored independently of the visible state () so it survives every state-pruning path; the pulse-suppression predicate () is the `pulsing` argument for the tab suffix banding that now lives in . The pulsing border geometry is , which excludes the tab bar and reuses the shared  strip math; the GPUI paint path fills those rects with the aggregated colour. `AiStateChanged`/`AiStateCleared` are verified by the visual-E2E harness.
 

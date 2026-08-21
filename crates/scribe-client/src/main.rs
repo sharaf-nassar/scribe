@@ -23,22 +23,22 @@ use std::{
 use gpui::{
     App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId, Entity, FocusHandle,
     Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription,
-    Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StyleRefinement,
+    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client::animation::AnimationSettings;
 use scribe_client::app_shortcuts::{self, CloseWindow, Quit};
 use scribe_client::beads_board::{
-    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, FlowHoverSource,
+    BEADS_BOARD_GRIP, BeadsBoardColors, BeadsBoardRender, BeadsBoards, BoardStrip, FlowHoverSource,
     HoverSource, LaneHoverSource,
 };
 use scribe_client::beads_board_a2::RailState;
 use scribe_client::beads_flow::{FlowBandControl, FlowNodeControl};
 use scribe_client::beads_panel::{
-    self, BeadsEditor, BeadsEditorKeyRoute, BeadsPanelRender, BeadsPanels, PanelWriteIntent,
+    BeadsEditor, BeadsEditorKeyRoute, BeadsPanels, PanelLayer, PanelLayerInputs, PanelWriteIntent,
 };
 use scribe_client::bell::{BellController, BellEvent};
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
@@ -1761,6 +1761,14 @@ struct TerminalView {
     tooltip_demo: bool,
     /// Workspace board painted this frame and whether it is pinned.
     visible_beads_boards: Vec<(WorkspaceId, bool)>,
+    /// One cached strip view per visible workspace board. The entity is what
+    /// lets GPUI reuse a board's recorded subtree across the redraw pump's
+    /// pulse and PTY frames; `render_beads_boards` diffs fresh inputs against
+    /// each strip and notifies it only when something it paints changed.
+    beads_strip_views: HashMap<WorkspaceId, Entity<BoardStrip>>,
+    /// The issue-detail twin of `beads_strip_views`: one cached overlay view
+    /// per workspace with an open panel, diffed and notified the same way.
+    beads_panel_views: HashMap<WorkspaceId, Entity<PanelLayer>>,
     /// Focus and activation for every Flow node currently painted, held here
     /// so a node keeps one focus handle across frames. Pinned GPUI registers
     /// only mounted handles, so a per-frame handle would reset Tab order on
@@ -2394,6 +2402,8 @@ impl TerminalView {
             pointer: PointerState::default(),
             tooltip_demo: false,
             visible_beads_boards: Vec::new(),
+            beads_strip_views: HashMap::new(),
+            beads_panel_views: HashMap::new(),
             flow_node_controls: HashMap::new(),
             lane_tab_focus: HashMap::new(),
             flow_band_focus: HashMap::new(),
@@ -8656,6 +8666,10 @@ impl TerminalView {
             BeadsEditorKeyRoute::Consumed => {
                 cx.stop_propagation();
                 cx.notify();
+                // Caret and selection moves change what the editor paints but
+                // notify no view the cached panel checks; refresh re-records
+                // it the way every other editor mutation path already does.
+                window.refresh();
                 true
             }
             BeadsEditorKeyRoute::Finished => {
@@ -10334,91 +10348,171 @@ impl TerminalView {
         )
     }
 
-    fn render_beads_boards(&mut self, cx: &App) -> Vec<gpui::AnyElement> {
-        self.sync_flow_node_controls(cx);
-        let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
-        let scale = boards.text_scale();
-        let colors = self.beads_colors;
-        self.visible_beads_boards
-            .iter()
-            .filter_map(|(workspace_id, pinned)| {
-                let rect = self.beads_board_rect(
-                    *workspace_id,
-                    *pinned,
-                    boards.height(*workspace_id),
-                    cx,
-                )?;
-                let name = self.workspace_name(*workspace_id).unwrap_or_else(|| "workspace".into());
-                let (blocked_tab_focus, done_tab_focus) =
-                    self.lane_tab_focus.get(workspace_id).cloned()?;
-                let flow_band = self.flow_band_for(*workspace_id, cx);
-                let rail = RailState {
-                    blocked: boards
-                        .collapsed_lane_state(
-                            *workspace_id,
-                            scribe_common::protocol::BeadsIssueQueue::Blocked,
-                        )
-                        .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
-                    done: boards
-                        .collapsed_lane_state(
-                            *workspace_id,
-                            scribe_common::protocol::BeadsIssueQueue::Done,
-                        )
-                        .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
-                };
-                Some((
-                    scribe_client::beads_board::render(
-                        &name,
-                        boards.state(*workspace_id),
-                        BeadsBoardRender {
-                            rect,
-                            overlay: !pinned,
-                            hover_state: Arc::clone(&self.shared.beads_boards),
-                            panel_state: Arc::clone(&self.shared.beads_panels),
-                            workspace_id: *workspace_id,
-                            card_drag: boards.card_drag_paint(*workspace_id),
-                            key_move: boards.key_move_paint(*workspace_id),
-                            rail,
-                            blocked_tab_focus,
-                            done_tab_focus,
-                            row_focus: self
-                                .row_focus
-                                .get(workspace_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                            scale,
-                            colors,
-                            flow_controls: self
-                                .flow_node_controls
-                                .get(workspace_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                            flow_band,
-                            // Read here, under the guard this pass already
-                            // holds. The strip painting inside it cannot take
-                            // the same non-reentrant lock for itself.
-                            flow: boards.flow_snapshot(*workspace_id),
-                        },
-                    ),
-                    // The bar's grab band, carrying nothing but the pointer a
-                    // divider's does — the press itself is resolved against the
-                    // same rect over in `press_board_edge`, so the two cannot
-                    // disagree about where the bar is.
-                    div()
-                        .absolute()
-                        .left(px(rect.x))
-                        .top(px(rect.y + rect.height - BEADS_BOARD_GRIP))
-                        .w(px(rect.width))
-                        .h(px(BEADS_BOARD_GRIP * 2.0))
-                        .cursor(gpui::CursorStyle::ResizeUpDown)
-                        .into_any_element(),
-                ))
-            })
-            .flat_map(|(board, grip)| [board, grip])
-            .collect()
+    /// Get-or-create the workspace's cached strip view, notifying it when
+    /// the freshly assembled inputs differ from what its cache last painted.
+    ///
+    /// Server-pushed data (snapshots, flow graphs) and root-side geometry
+    /// reach the strip only through this diff: interactions inside the strip
+    /// already force their own uncached frame via `window.refresh()`, but an
+    /// IPC refresh only notifies the root. Without the notify here, a cached
+    /// strip would keep replaying its old subtree forever.
+    fn sync_strip_view(
+        &mut self,
+        boards: std::sync::MutexGuard<'_, BeadsBoards>,
+        name: String,
+        wiring: BeadsBoardRender,
+        cx: &mut Context<Self>,
+    ) -> Entity<BoardStrip> {
+        let workspace_id = wiring.workspace_id;
+        if let Some(view) = self.beads_strip_views.get(&workspace_id) {
+            if view.read(cx).same_inputs(&name, boards.state(workspace_id), &wiring) {
+                return view.clone();
+            }
+            let state = boards.state(workspace_id).cloned();
+            let view = view.clone();
+            drop(boards);
+            view.update(cx, |strip, cx| {
+                strip.name = name;
+                strip.state = state;
+                strip.wiring = wiring;
+                cx.notify();
+            });
+            return view;
+        }
+        let state = boards.state(workspace_id).cloned();
+        drop(boards);
+        let view = cx.new(|_| BoardStrip { name, state, wiring });
+        self.beads_strip_views.insert(workspace_id, view.clone());
+        view
     }
 
-    fn render_beads_panels(&self, cx: &App) -> Vec<gpui::AnyElement> {
+    fn render_beads_boards(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        self.sync_flow_node_controls(cx);
+        let visible = self.visible_beads_boards.clone();
+        let live: HashSet<WorkspaceId> = visible.iter().map(|(id, _)| *id).collect();
+        self.beads_strip_views.retain(|workspace_id, _| live.contains(workspace_id));
+        let colors = self.beads_colors;
+        let mut out = Vec::with_capacity(visible.len() * 2);
+        for (workspace_id, pinned) in visible {
+            // Locked through a local handle rather than `self.shared` so the
+            // guard can ride into `sync_strip_view` alongside `&mut self`.
+            let boards_store = Arc::clone(&self.shared.beads_boards);
+            let Ok(boards) = boards_store.lock() else { break };
+            let scale = boards.text_scale();
+            let Some(rect) =
+                self.beads_board_rect(workspace_id, pinned, boards.height(workspace_id), cx)
+            else {
+                continue;
+            };
+            let name = self.workspace_name(workspace_id).unwrap_or_else(|| "workspace".into());
+            let Some((blocked_tab_focus, done_tab_focus)) =
+                self.lane_tab_focus.get(&workspace_id).cloned()
+            else {
+                continue;
+            };
+            let rail = RailState {
+                blocked: boards
+                    .collapsed_lane_state(
+                        workspace_id,
+                        scribe_common::protocol::BeadsIssueQueue::Blocked,
+                    )
+                    .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
+                done: boards
+                    .collapsed_lane_state(
+                        workspace_id,
+                        scribe_common::protocol::BeadsIssueQueue::Done,
+                    )
+                    .unwrap_or(scribe_client::beads_board::CollapsedLaneState::Tab),
+            };
+            let flow_band = self.flow_band_for(workspace_id, cx);
+            let wiring = BeadsBoardRender {
+                rect,
+                overlay: !pinned,
+                hover_state: Arc::clone(&self.shared.beads_boards),
+                panel_state: Arc::clone(&self.shared.beads_panels),
+                workspace_id,
+                card_drag: boards.card_drag_paint(workspace_id),
+                key_move: boards.key_move_paint(workspace_id),
+                rail,
+                blocked_tab_focus,
+                done_tab_focus,
+                row_focus: self.row_focus.get(&workspace_id).cloned().unwrap_or_default(),
+                scale,
+                colors,
+                flow_controls: self
+                    .flow_node_controls
+                    .get(&workspace_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                flow_band,
+                // Read here, under the guard this pass already holds. The
+                // strip painting inside it cannot take the same non-reentrant
+                // lock for itself.
+                flow: boards.flow_snapshot(workspace_id),
+            };
+            let strip = self.sync_strip_view(boards, name, wiring, cx);
+            // The cached wrapper spans the whole grid band so the strip's own
+            // absolutely-positioned root keeps today's coordinate space; the
+            // band is definite, which is what `cached` needs, and an
+            // unstyled wrapper intercepts no events of its own.
+            out.push(
+                strip.cached(StyleRefinement::default().absolute().inset_0()).into_any_element(),
+            );
+            // The bar's grab band, carrying nothing but the pointer a
+            // divider's does — the press itself is resolved against the
+            // same rect over in `press_board_edge`, so the two cannot
+            // disagree about where the bar is.
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(rect.x))
+                    .top(px(rect.y + rect.height - BEADS_BOARD_GRIP))
+                    .w(px(rect.width))
+                    .h(px(BEADS_BOARD_GRIP * 2.0))
+                    .cursor(gpui::CursorStyle::ResizeUpDown)
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The panel twin of `sync_strip_view`: get-or-create the workspace's
+    /// cached overlay view and notify it when the owned inputs changed.
+    ///
+    /// The live editor stays out of the diff on purpose — every editor
+    /// mutation path forces its own uncached frame via `window.refresh()`,
+    /// so this diff only carries the panel's owned data: layer content,
+    /// notices, geometry, palette, scale, and the write gate.
+    fn sync_panel_view(
+        &mut self,
+        inputs: PanelLayerInputs,
+        cx: &mut Context<Self>,
+    ) -> Entity<PanelLayer> {
+        let workspace_id = inputs.workspace_id;
+        if let Some(view) = self.beads_panel_views.get(&workspace_id) {
+            let view = view.clone();
+            if view.read(cx).same_inputs(&inputs) {
+                return view;
+            }
+            view.update(cx, |layer, cx| {
+                layer.inputs = inputs;
+                cx.notify();
+            });
+            return view;
+        }
+        let view = cx.new(|_| PanelLayer { inputs });
+        self.beads_panel_views.insert(workspace_id, view.clone());
+        view
+    }
+
+    /// One board-store read for the values a panel overlay needs: the pin,
+    /// the strip height, and the shared text scale.
+    fn board_geometry(&self, workspace_id: WorkspaceId) -> Option<(bool, f32, f32)> {
+        let boards = self.shared.beads_boards.lock().ok()?;
+        Some((boards.is_pinned(workspace_id), boards.height(workspace_id), boards.text_scale()))
+    }
+
+    fn render_beads_panels(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let (layers, write_enabled) = self
             .shared
             .beads_panels
@@ -10439,46 +10533,42 @@ impl TerminalView {
                 (open, panels.write_enabled())
             })
             .unwrap_or_default();
-        let Ok(boards) = self.shared.beads_boards.lock() else { return Vec::new() };
+        let live: HashSet<WorkspaceId> = layers.iter().map(|(id, ..)| *id).collect();
+        self.beads_panel_views.retain(|workspace_id, _| live.contains(workspace_id));
         let viewport = self.pane_viewport();
         let animations = AnimationSettings::from_config(&self.config.config().config);
-        layers
-            .into_iter()
-            .flat_map(|(workspace_id, panel, notice, notice_lane)| {
-                let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
-                    return Vec::new();
-                };
-                let board = self.beads_board_rect(
-                    workspace_id,
-                    boards.is_pinned(workspace_id),
-                    boards.height(workspace_id),
-                    cx,
-                );
-                let Some(board) = board else { return Vec::new() };
-                let wiring = BeadsPanelRender {
-                    region,
-                    board,
-                    workspace_id,
-                    state: Arc::clone(&self.shared.beads_panels),
-                    editor: self.beads_editor.clone(),
-                    terminal_focus: self.focus.root.clone(),
-                    app: cx,
-                    write_enabled,
-                    scale: boards.text_scale(),
-                    colors: self.beads_colors,
-                    animations,
-                };
-                let mut elements = panel
-                    .as_ref()
-                    .map_or_else(Vec::new, |panel| beads_panel::render(panel, &wiring));
-                if let (Some(text), Some(lane)) = (notice, notice_lane)
-                    && let Some(notice_element) = beads_panel::render_notice(&text, lane, &wiring)
-                {
-                    elements.push(notice_element);
-                }
-                elements
-            })
-            .collect()
+        let mut out = Vec::with_capacity(layers.len());
+        for (workspace_id, panel, notice, notice_lane) in layers {
+            let Some(region) = self.shell.workspace_rect(workspace_id, viewport, cx) else {
+                continue;
+            };
+            let Some((pinned, height, scale)) = self.board_geometry(workspace_id) else { break };
+            let Some(board) = self.beads_board_rect(workspace_id, pinned, height, cx) else {
+                continue;
+            };
+            let inputs = PanelLayerInputs {
+                region,
+                board,
+                workspace_id,
+                state: Arc::clone(&self.shared.beads_panels),
+                editor: self.beads_editor.clone(),
+                terminal_focus: self.focus.root.clone(),
+                write_enabled,
+                scale,
+                colors: self.beads_colors,
+                animations,
+                panel,
+                notice: notice.zip(notice_lane),
+            };
+            let layer = self.sync_panel_view(inputs, cx);
+            // Same full-band cached wrapper as the board strips: definite
+            // bounds for the cache, unchanged band coordinates for the
+            // absolutely-positioned overlay children.
+            out.push(
+                layer.cached(StyleRefinement::default().absolute().inset_0()).into_any_element(),
+            );
+        }
+        out
     }
 
     /// Lower the live share state onto the overlay layer: the presence roster,

@@ -238,7 +238,7 @@ fn panel_open_animation(settings: AnimationSettings) -> Animation {
     settings.transition(PANEL_OPEN_DURATION)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BeadsPanel {
     pub card: BeadsBoardItem,
     pub lane: u8,
@@ -1694,6 +1694,91 @@ pub struct BeadsPanelRender<'a> {
     pub scale: f32,
     pub colors: BeadsBoardColors,
     pub animations: AnimationSettings,
+}
+
+/// One workspace's issue-detail overlay as a cached GPUI view, the panel
+/// twin of `beads_board::BoardStrip`.
+///
+/// The wrapped subtree replays until this entity is notified. Every editor
+/// mutation path already forces its own uncached frame — text input and IME
+/// go through `replace_text_in_range`/`unmark_text` which call
+/// `window.refresh()`, caret and selection keys land in the editor key
+/// router's `Consumed` arm which does the same, and closing the editor moves
+/// focus, which refreshes from inside GPUI — so the live editor never
+/// depends on this cache invalidating. Everything else the panel paints is
+/// owned data diffed by [`PanelLayer::same_inputs`] on the root's frame.
+pub struct PanelLayer {
+    pub inputs: PanelLayerInputs,
+}
+
+/// The owned inputs one panel overlay paints from, stored on [`PanelLayer`]
+/// and rebuilt into a borrowed [`BeadsPanelRender`] each real render.
+pub struct PanelLayerInputs {
+    pub region: Rect,
+    pub board: Rect,
+    pub workspace_id: WorkspaceId,
+    pub state: Arc<Mutex<BeadsPanels>>,
+    pub editor: Entity<BeadsEditor>,
+    pub terminal_focus: FocusHandle,
+    pub write_enabled: bool,
+    pub scale: f32,
+    pub colors: BeadsBoardColors,
+    pub animations: AnimationSettings,
+    pub panel: Option<BeadsPanel>,
+    pub notice: Option<(String, u8)>,
+}
+
+impl PanelLayer {
+    /// True when a fresh render would paint exactly what the cached subtree
+    /// already shows. The editor entity and shared stores are deliberately
+    /// absent: their identities are process-stable and their visual changes
+    /// arrive through `window.refresh()`, never through this diff.
+    pub fn same_inputs(&self, inputs: &PanelLayerInputs) -> bool {
+        let ours = &self.inputs;
+        ours.region == inputs.region
+            && ours.board == inputs.board
+            && ours.workspace_id == inputs.workspace_id
+            && ours.terminal_focus == inputs.terminal_focus
+            && ours.write_enabled == inputs.write_enabled
+            // Exact-bits, as in `BoardStrip::same_inputs`: any change
+            // repaints, equal bits paint equal panels.
+            && ours.scale.to_bits() == inputs.scale.to_bits()
+            && ours.colors == inputs.colors
+            && ours.animations == inputs.animations
+            && ours.panel == inputs.panel
+            && ours.notice == inputs.notice
+    }
+}
+
+impl gpui::Render for PanelLayer {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let app: &App = cx;
+        let inputs = &self.inputs;
+        let wiring = BeadsPanelRender {
+            region: inputs.region,
+            board: inputs.board,
+            workspace_id: inputs.workspace_id,
+            state: Arc::clone(&inputs.state),
+            editor: inputs.editor.clone(),
+            terminal_focus: inputs.terminal_focus.clone(),
+            app,
+            write_enabled: inputs.write_enabled,
+            scale: inputs.scale,
+            colors: inputs.colors,
+            animations: inputs.animations,
+        };
+        let mut layers =
+            inputs.panel.as_ref().map_or_else(Vec::new, |panel| render(panel, &wiring));
+        if let Some((text, lane)) = &inputs.notice
+            && let Some(notice) = render_notice(text, *lane, &wiring)
+        {
+            layers.push(notice);
+        }
+        // The overlay children position themselves absolutely in band
+        // coordinates; the wrapper spans the band so those coordinates keep
+        // meaning what they meant when the root painted them inline.
+        gpui::div().absolute().inset_0().children(layers)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5066,5 +5151,135 @@ mod tests {
             let ratio = contrast(color, colors.card);
             assert!(ratio >= BODY_CONTRAST - 0.01, "panel text reads at {ratio:.2}:1");
         }
+    }
+}
+
+#[cfg(test)]
+mod panel_cache_tests {
+    use scribe_common::ids::WorkspaceId;
+    use scribe_common::protocol::BeadsBoardItem;
+
+    use super::*;
+    use crate::beads_board::BeadsBoardColors;
+
+    fn colors() -> BeadsBoardColors {
+        let fill = [0.15, 0.16, 0.17, 1.0];
+        let chrome = scribe_common::theme::ChromeColors {
+            tab_bar_bg: fill,
+            tab_bar_active_bg: fill,
+            tab_text: fill,
+            tab_text_active: fill,
+            tab_separator: fill,
+            status_bar_bg: fill,
+            status_bar_text: fill,
+            divider: fill,
+            accent: fill,
+            scrollbar: fill,
+            tab_bar_gradient_top: fill,
+            status_bar_separator: fill,
+            prompt_bar_first_row_bg: fill,
+            prompt_bar_second_row_bg: fill,
+            prompt_bar_text: fill,
+            prompt_bar_icon_first: fill,
+            prompt_bar_icon_latest: fill,
+        };
+        BeadsBoardColors::from_theme(&chrome, &[[0.5, 0.5, 0.5, 1.0]; 16], 1.0)
+    }
+
+    fn panel() -> BeadsPanel {
+        BeadsPanel {
+            card: BeadsBoardItem {
+                id: "scribe-panel.1".into(),
+                title: "Panel issue".into(),
+                priority: 2,
+                blocker_ids: Vec::new(),
+                parent_epic_name: None,
+                parent_epic_id: None,
+                updated_at: String::new(),
+            },
+            lane: 1,
+            detail: None,
+        }
+    }
+
+    fn layer(cx: &mut gpui::TestAppContext) -> PanelLayer {
+        let window = cx.add_empty_window();
+        let panels = Arc::new(Mutex::new(BeadsPanels::default()));
+        let editor = window.update(|window, app| {
+            app.new(|editor_cx| BeadsEditor::new(Arc::clone(&panels), window, editor_cx))
+        });
+        cx.update(|app| PanelLayer {
+            inputs: PanelLayerInputs {
+                region: Rect { x: 0.0, y: 0.0, width: 1600.0, height: 900.0 },
+                board: Rect { x: 0.0, y: 0.0, width: 1600.0, height: 160.0 },
+                workspace_id: WorkspaceId::new(),
+                state: panels,
+                editor,
+                terminal_focus: app.focus_handle(),
+                write_enabled: true,
+                scale: 1.0,
+                colors: colors(),
+                animations: AnimationSettings::resolve_with_env(false, None),
+                panel: Some(panel()),
+                notice: None,
+            },
+        })
+    }
+
+    fn clone_inputs(layer: &PanelLayer) -> PanelLayerInputs {
+        let inputs = &layer.inputs;
+        PanelLayerInputs {
+            region: inputs.region,
+            board: inputs.board,
+            workspace_id: inputs.workspace_id,
+            state: Arc::clone(&inputs.state),
+            editor: inputs.editor.clone(),
+            terminal_focus: inputs.terminal_focus.clone(),
+            write_enabled: inputs.write_enabled,
+            scale: inputs.scale,
+            colors: inputs.colors,
+            animations: inputs.animations,
+            panel: inputs.panel.clone(),
+            notice: inputs.notice.clone(),
+        }
+    }
+
+    #[gpui::test]
+    fn identical_inputs_leave_the_cache_alone(cx: &mut gpui::TestAppContext) {
+        let layer = layer(cx);
+        assert!(layer.same_inputs(&clone_inputs(&layer)));
+    }
+
+    #[gpui::test]
+    fn every_owned_input_invalidates(cx: &mut gpui::TestAppContext) {
+        let layer = layer(cx);
+
+        let mut moved = clone_inputs(&layer);
+        moved.board.height += 40.0;
+        assert!(!layer.same_inputs(&moved), "board rect");
+
+        let mut resized = clone_inputs(&layer);
+        resized.region.width -= 200.0;
+        assert!(!layer.same_inputs(&resized), "region rect");
+
+        let mut gated = clone_inputs(&layer);
+        gated.write_enabled = false;
+        assert!(!layer.same_inputs(&gated), "write gate");
+
+        let mut retitled = clone_inputs(&layer);
+        retitled.panel.as_mut().unwrap().card.title = "Renamed".into();
+        assert!(!layer.same_inputs(&retitled), "server-pushed panel content");
+
+        let mut closed = clone_inputs(&layer);
+        closed.panel = None;
+        assert!(!layer.same_inputs(&closed), "panel closed");
+
+        let mut noticed = clone_inputs(&layer);
+        noticed.notice = Some(("Issue closed".into(), 1));
+        assert!(!layer.same_inputs(&noticed), "notice");
+
+        let mut zoomed = clone_inputs(&layer);
+        zoomed.scale = 1.1;
+        assert!(!layer.same_inputs(&zoomed), "scale");
     }
 }

@@ -61,7 +61,7 @@ pub enum SplitDirection {
 }
 
 /// Axis-aligned rectangle in pixel coordinates.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
