@@ -119,6 +119,18 @@ def main() -> int:
     a2 = fresh["geometry"]["a2"]
     report(a2["body_h"] == a2["row_h"] * a2["body_rows"], "A2 body height = row height * row count", failures)
     report(a2["body_rows"] == 3, "A2 default body is exactly three rows", failures)
+    report(a2["pinned_lane_share"] == 0.85, "A2 pinned lane uses the mock's 0.85 share", failures)
+    report(a3["viewport_w"] == 1552, "A3 mock viewport is the 1552px strip", failures)
+    report(
+        a3["node_pad_h"] == 6 and a3["node_gap"] == 6,
+        "A3 node horizontal padding and gap are 6px",
+        failures,
+    )
+    report(
+        a3["chip_offset_x"] == 14 and a3["chip_gap_y"] == 6,
+        "A3 trace chip keeps its 14px/6px node anchor",
+        failures,
+    )
 
     print("existing check-flow.py suite")
     result = subprocess.run(

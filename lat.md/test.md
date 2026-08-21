@@ -4271,41 +4271,34 @@ region's board is refused rather than allowed to retarget the gesture against
 its own rect, and the release stop the tabs and drawer hold at rest is
 asserted absent while a card is in flight, since that release is the drop's.
 
-The geometry constants both sides read are asserted against the generated
-`a2a3-contract.json` in `beads_board_a2`'s own `tests::manifest`, so the drag
-numbers cannot drift from the mock either. [The visual script](../tests/e2e/visual/beads-board.sh) checks
-neutral lane ground in normal and pinned boards. Its exact long-title fixture
-hovers the normal card's bottom padding, captures the reveal after 100ms, and
-requires a wrapped bounded box above and horizontally overlapping that card,
-inside the right viewport edge with the board's opaque theme ground — the
-Done lane sits against that edge on purpose, so this proves the
-snap-to-window clamp specifically: an edge-driven box lands at the same `x`
-under either anchor, so overlap is all an edge site can distinguish. A second
-long-title fixture on the In Progress lane's own card, away from both
-viewport edges, isolates the anchor itself: the same reveal's measured centre
-must match that card's own centre within a few pixels, which only a
-card-centred anchor satisfies once the popup outgrows the card underneath it.
-The same run then copies the card ID and moves the long-titled source through
-the native drag waypoints, so title-only activation, a tooltip on the drag
-ghost, a broken nested copy target, or lost board hover fails the focused
-path; the ghost measurement also masks the source card's own pre-drag reveal
-out of every waypoint, since a card-centred popup on a long-titled source can
-reach into a neighbouring lane's crop before the drag itself suppresses it. It
-checks compact borders for accepted and rejected targets independently, then
-measures the native ghost over a card, a rejected lane, and
-outside the board while terminal rows remain fixed. The full path crops the
-text-size reversal to the grid band between the independently repainting
-titlebar and the status bar's live CPU/MEM sparkline, finds the
-pinned edge from the last long live-height run of board ground, and completes
-single-region pin/resize before changing topology. Its side-by-side fixture
-polls the share-tap wire record, scoped to frames at or after the split, for
-the real (bd-less) test server's own `NotDetected` reply before re-arming the
-pinned region and focusing its neighbour — real and injected messages share one
-ordered relay channel, so a reply already on the wire record is guaranteed to
-reach the client before a later injection. Lower-region badge coverage runs
-last so it cannot perturb those geometry proofs. The as-built rules and production links live in
+The Docker visual contract is now the A2/A3 mock contract rather than the
+retired raised-card/five-equal-lane design.
+[beads-board.sh](../tests/e2e/visual/beads-board.sh) mounts the generated
+[a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json), and
+[beads-board-oracle.py](../tests/e2e/visual/beads-board-oracle.py) reads every
+box, pitch, padding, share, and semantic color role from it before examining
+running-client RGBA captures. No Flow or rail geometry is copied into the
+harness.
+
+A2's named captures cover sparse and busy collapsed rails, both hover drawers,
+both exclusive pinned lanes, and the native drag state. Extended captures pin
+empty copy, overflow without a partial fourth row, 51px hover and focus boxes,
+left/center/right metadata columns, the 0.8/1.0/1.6 scale matrix, whole-row
+resize remainder, theme movement, a narrow full region, and two independent
+split-region boards. Seam runs prove the fixed gutter/right padding, 16px gaps,
+36px tabs, equal busy shares, sparse slack transfer, and the generated 0.85
+pinned share. The floor oracle measures its 3px band and centered 34x1 grip;
+the drag oracle measures the 320x36 ghost, dimmed source, accepted Done wash,
+and rejected Blocked edge.
+
+The keeper only prevents the bd-less visual server's periodic `NotDetected`
+from erasing long-running fixtures. It is paused for the Blocked/Done hover
+regression: each tab must paint its exact generated drawer on the hover's own
+next frame, with no injected frame, then remove it after the existing grace.
+This is the running-client regression layer for scribe-zwtv.22. A2 never gains
+a scroll assertion or substitute scroll fixture. The as-built rules live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
-the real-bd receipt is
+real tracker writes remain
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
 
 ### Beads keyboard card move
@@ -4445,7 +4438,9 @@ that keeps the two from drifting: it parses the mock's own `<style>` block and
 A2/A3 markup -- never a second, hand-copied set of numbers -- into
 [a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json), a small
 committed manifest covering named states (collapsed/hover/pinned/drag for A2,
-opened/traced/deep/scrolled for A3) and named interactions.
+opened/traced/deep/scrolled for A3) and named interactions. Visual consumers
+also receive the mock-derived 0.85 pinned share, A3 node padding/gap, and trace
+chip offsets instead of copying those inline-state values.
 `just beads-board-contract-gen` regenerates it.
 
 Section scope is enforced by construction: extraction only ever reads bytes
@@ -4478,74 +4473,42 @@ regenerated without updating those constants fails loudly instead of drifting.
 
 ### Beads Flow visual contract
 
-The Flow view is the strip's second rendering, and
-[the visual script](../tests/e2e/visual/beads-board.sh) pins it in the same run
-as the lanes contract, sited before the split so every coordinate is read from
-one full-width region with the board pinned at its default height.
+The generated-contract visual run opens a real epic-backed row and captures
+all named A3 states: opened, traced, deep, and scrolled.
 
-The phase drives the shipped client rather than a fixture: a card carrying
-`parent_epic_id` is clicked, the epic graph is injected with no sleep because
-the pending fence the click opened is cleared by any non-`Graph` outcome, and
-the strip is asserted to swap while the panel opens underneath. Shared graph
-opening, pointer parking, and cursor-hover gestures are factored in the script;
-first entry stays split so its baseline capture precedes session-id discovery.
-Every geometry constant is written as the formula `beads_flow.rs` uses — rank
-pitch as node width plus gutter, row tops as the centred-row calculation — so a
-change to the node box fails here instead of silently re-siting each probe.
+A standard five-rank graph keeps opened geometry un-clipped at the mock width
+and carries one sibling for every queue treatment. The oracle reads node
+size/padding/gap, dot size, rank and row pitch, graph/band/ruler/floor bounds,
+progress width, and trace-chip anchor from the manifest. Filled and hollow
+state dots are sampled at center and rim; cursor fill/keyline, wire endpoints,
+on-path brightening, off-path 0.24 dimming, and the generated 14px/6px chip
+anchor are separate failures. `IssueFocused` then proves the ready ring becomes
+a filled progress dot with a halo while its idle twin remains hollow.
 
-Every probe sits on rank 1 or 2. The fixture gives both interior ranks two
-nodes on purpose: the cursor assertion checks that the sibling sharing rank 2
-carries neither the keyline nor the fill, because a rank holding one node
-cannot distinguish "styled" from "the only one" — the degenerate-fixture trap
-recorded in
-[viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md).
-State treatments are read at two points per dot, centre and rim, since a filled
-state paints its hue at the centre while a ring leaves the ground there; the
-blocked and ready rims are also compared against each other so two ring states
-cannot collapse into one assertion.
+Pointer trace and retained node focus are captured independently. The band's
+`← LANES` and mode-pair `LANES` controls are focused through the real GPUI Tab
+order, measured as visible band changes, then activated through pointer and
+Enter respectively. Returning captures A2 again instead of accepting a closed
+or unchanged strip. A far-node Tab walk proves focus auto-scroll reaches the
+far clamp.
 
-Wire endpoints are asserted at dot centres and nowhere else: each probe reads
-the wire at the centre and again six pixels above it, so a run that drifts off
-the dot fails even though it is still painted. Tracing the cursor node lights
-one half of the vertical gutter fl-a's two out-edges share and dims the other,
-which only an interval-unioned router can produce — a router emitting whole
-edges paints both halves alike. The chip is proven present by difference
-against the untraced capture; its counts are the ancestor and descendant
-closure, deliberately not a direct-neighbour query.
+A second eight-rank graph puts four nodes in rank zero and exceeds the 1552px
+strip. Origin, middle, and far captures assert the four-row frontier, 2px
+position thumb, no vertical bar, and exact fade predicates: right only, both,
+then left only. The fixture deliberately places cursor fills under the sampled
+fade edges so the screenshot can distinguish a gradient from empty ground.
+The ruler and canvas move under the same scroll offset; the hbar thumb advances
+from zero through an interior position to the far edge.
 
-Liveness is injected as the `IssueFocused` frame the server sends, which is the
-exact issue-to-session join the halo answers to. The assertions are symmetric:
-the focused node gains a filled core and a halo outside its dot, the same node
-carries no halo before the frame, and a node that is not focused never gains
-one.
-
-The theme assertion is the one the board's colour rule needs, because a
-hardcoded value survives every other probe and fails only here. Eight rendered
-slots are sampled under hover with the halo lit — wire, traced wire, band,
-progress track, cursor fill, cursor keyline, rank label and agent halo — the
-theme is rewritten, and every slot must move. The original theme is written
-back by name rather than by deleting the file, since a removed config leaves
-the client on the last one it parsed, and the restoration is proven before any
-later phase reads a colour.
-
-Two facts shape the phase's structure. The real bd-less server answers
-`NotDetected` on its own schedule and that reply legitimately clears the pin
-and leaves Flow, so anything that has to wait — both theme reloads — rebuilds
-the whole state afterwards instead of assuming it survived. And the exit this
-phase drives is Escape, not a click on the band's own `← LANES`/`LANES`
-controls: both are real pointer/keyboard/AccessKit Buttons (specs/028's Flow
-return controls), but proving a real on-screen click needs a measured, not
-guessed, pixel offset
-([e2e-click-targets-need-measured-not-ink-counting-offsets](../docs/solutions/conventions/e2e-click-targets-need-measured-not-ink-counting-offsets.md)),
-so that property is proven headlessly instead by
-[[test#Test Harness#GPUI Client Headless Suites#Flow layout and paint-path guard|beads_flow's band-control focus/activation test]].
-What this phase proves that the headless test cannot is panel-focus
-precedence: a node is clicked first so focus sits in the strip, because Esc
-yields to the detail panel when the panel holds it. The epic chevron stays a
-plain div -- no id, role, or handler, so no pointer cursor, focus stop, or
-AccessKit action reaches it by construction -- and its inertness is asserted
-directly, scoped to the strip because the detail panel beneath it repaints on
-its own.
+Theme coverage repeats both A2 and A3 under Dracula and requires every sampled
+semantic region to move without moving geometry. Queue and priority samples
+are compared to the approved mock role vectors relative to live ground rather
+than literal theme hex values. The container's forced
+`SCRIBE_DISABLE_ANIMATIONS=1` plus `animations = false` makes the complete run
+the reduced-motion oracle; trace, focus, scroll, and return semantics must land
+on the same final frames. `/output/beads-a2a3-contract-evidence.json` records
+the manifest digest and every named/extended capture, and inventory validation
+fails if a generated state slug lacks a running-client image.
 
 ### Region reports every tab and which is active
 

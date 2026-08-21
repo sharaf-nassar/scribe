@@ -360,14 +360,35 @@ def a3_geometry(rules: dict, a3_text: str) -> dict:
     if not left_lefts:
         raise ContractError("no A3 node left offsets found to derive graph left padding")
     left_pad = min(left_lefts)
+    viewport = re.search(r"against a (\d+)px strip", a3_text)
+    if not viewport:
+        raise ContractError("A3 normative strip width not found")
 
     row_capacity = {}
     for scale in (0.8, 1.0, 1.6):
         row_capacity[str(scale)] = int((graph_h + row_gap * scale) // (node_h * scale + row_gap * scale))
 
     band_padding = px_list(band["padding"])
+    node_padding = px_list(node["padding"])
+
+    trace_board = re.search(r'<div class="board fl trace">(.*?)<i class="floor">', a3_text, re.S)
+    if not trace_board:
+        raise ContractError("A3 trace board not found")
+    hovered = re.search(
+        r'class="node[^"]*cursor[^"]*" style="left:(\d+)px;top:(\d+)px',
+        trace_board.group(1),
+    )
+    chip_markup = re.search(
+        r'class="unlocks" style="left:(\d+)px;top:(\d+)px', trace_board.group(1)
+    )
+    if not hovered or not chip_markup:
+        raise ContractError("A3 trace node/chip offsets not found")
+    node_left, node_top = (int(value) for value in hovered.groups())
+    chip_left, chip_top = (int(value) for value in chip_markup.groups())
+
     return {
         "strip_h": strip_h,
+        "viewport_w": int(viewport.group(1)),
         "band_h": band_h,
         "ruler_h": ruler_h,
         "graph_h": graph_h,
@@ -376,6 +397,8 @@ def a3_geometry(rules: dict, a3_text: str) -> dict:
         "floor_h": floor_h,
         "node_w": node_w,
         "node_h": node_h,
+        "node_pad_h": node_padding[-1],
+        "node_gap": px(node["gap"]),
         "dot_size": px(dot["width"]),
         "gutter": gutter,
         "row_gap": row_gap,
@@ -392,6 +415,8 @@ def a3_geometry(rules: dict, a3_text: str) -> dict:
         "chip_pad_v": px_list(chip["padding"])[0],
         "chip_pad_h": px_list(chip["padding"])[1],
         "chip_radius": px(chip["border-radius"]),
+        "chip_offset_x": chip_left - node_left,
+        "chip_gap_y": chip_top - node_top - node_h,
         "band_pad_left": band_padding[3],
         "band_pad_right": band_padding[1],
         "band_gap": px(band["gap"]),
@@ -440,6 +465,14 @@ def a2_geometry(rules: dict, a2_text: str) -> dict:
         raise ContractError(
             f"expected exactly one dimmed A2 drag source row, found {len(lifted)}"
         )
+    pinned_shares = re.findall(
+        r"grid-template-columns:repeat\(3,minmax\(0,1fr\)\) minmax\(0,(\.\d+)fr\) 36px",
+        a2_text,
+    )
+    if len(pinned_shares) != 1:
+        raise ContractError(
+            f"expected exactly one A2 pinned-lane share, found {len(pinned_shares)}"
+        )
 
     return {
         "strip_h": px(board["height"]),
@@ -465,6 +498,7 @@ def a2_geometry(rules: dict, a2_text: str) -> dict:
         "zoom_glyph_w": px(zoom_i["width"]),
         "zoom_glyph_h": px(zoom_i["height"]),
         "tab_w": px(tab["width"]),
+        "pinned_lane_share": float(pinned_shares[0]),
         "tab_spine_line_h": spine_lh,
         "drawer_top": px(drawer["top"]),
         "drawer_bottom": px(drawer["bottom"]),

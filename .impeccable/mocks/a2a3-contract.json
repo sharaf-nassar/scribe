@@ -61,6 +61,7 @@
       "lanes_padding_left": 44,
       "lanes_padding_right": 10,
       "lanes_padding_top": 5,
+      "pinned_lane_share": 0.85,
       "qcount_margin_left": "0",
       "row_h": 51,
       "row_interline_gap": 4,
@@ -85,6 +86,8 @@
       "band_h": 34,
       "band_pad_left": 14,
       "band_pad_right": 10,
+      "chip_gap_y": 6,
+      "chip_offset_x": 14,
       "chip_pad_h": 7,
       "chip_pad_v": 3,
       "chip_radius": 2,
@@ -101,7 +104,9 @@
       "hbar_h": 2,
       "hbar_top": 188,
       "left_pad": 30,
+      "node_gap": 6,
       "node_h": 24,
+      "node_pad_h": 6,
       "node_w": 214,
       "progress_h": 2,
       "progress_w": 150,
@@ -114,7 +119,8 @@
       "row_gap": 10,
       "row_pitch": 34,
       "ruler_h": 15,
-      "strip_h": 197
+      "strip_h": 197,
+      "viewport_w": 1552
     }
   },
   "interactions": [
