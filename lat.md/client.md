@@ -1254,6 +1254,38 @@ rail tabs and drawer is a later bead.
 [[test#Test Harness#GPUI Client Headless Suites#Beads collapsed-lane hover and pin]]
 pins every transition above.
 
+[[crates/scribe-client/src/beads_board_a2.rs]] derives what that later
+rendering bead paints from one board snapshot, `RailState`, board width,
+height, and text scale, with zero GPUI types or paint calls so its geometry is
+a plain `#[test]` away from a window. It takes lane state as input from
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#collapsed_lane_state]]
+rather than owning a second copy of it.
+[[crates/scribe-client/src/beads_board_a2.rs#layout]] floor-clips every queue
+to [[crates/scribe-client/src/beads_board_a2.rs#visible_row_count]]'s whole
+rows (A2-G10, A2-S6) and hoists a lane's shared epic to its head via
+[[crates/scribe-client/src/beads_board_a2.rs#common_epic]] when every item the
+snapshot carries for that queue -- not only the visible slice -- names the
+same parent-epic id (A2-S8); a mixed lane keeps per-row epic text instead.
+Empty-queue copy is queue-specific, and an empty Ready lane's void copy adds
+the blocked-total subordinate hint the mock shows.
+[[crates/scribe-client/src/beads_board_a2.rs#rail_widths]] implements the
+closed "Narrow-region allocation" decision in `specs/028-beads-board-contract.md`:
+the fixed left gutter, right padding, inter-track gaps, and each unpinned rail
+tab reserve first; an empty active lane gets only its own legible header
+width; the rest splits equally among nonempty Backlog/Ready/In-progress lanes,
+with a pinned Blocked or Done lane counted as a fixed share of one such split.
+Every track clamps to zero rather than going negative, so A2 never gains a
+horizontal scrollbar however narrow the board gets.
+[[crates/scribe-client/src/beads_board_a2.rs#compact_relative_age]] turns
+`BeadsBoardItem.updated_at` into the row's compact age without a date
+library, parsing `bd`'s UTC timestamp through a from-scratch civil-calendar
+day count rather than trusting a malformed value into a panic.
+The module's own `tests::manifest` submodule `include_str!`s the generated
+a2a3-contract.json and asserts every geometry constant still matches it, the
+Rust-side consumer that generated contract was built for; a later bead
+reading A2 or A3 geometry from Rust should follow the same pattern instead of
+re-transcribing mock numbers.
+
 The [Story 3 drag contract](../specs/024-beads-card-detail.md#story-3--move-a-card-between-queues-by-dragging)
 allows Backlog, Ready, and In-progress sources; Blocked and Done never register
 the native arm. [[crates/scribe-client/src/beads_board.rs#BeadsBoards#arm_card_drag]]

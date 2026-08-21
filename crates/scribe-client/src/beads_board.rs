@@ -2517,7 +2517,11 @@ const EPIC_MAX_CHARS: usize = 24;
 /// slug-style name breaks as readably as a sentence one — and only when that
 /// boundary leaves at least half the budget; otherwise the cut is hard, since
 /// a boundary near the start would throw away more than it saves.
-fn short_epic(name: &str) -> String {
+///
+/// `pub(crate)` so the A2 presentation model
+/// ([`crate::beads_board_a2`]) can reuse the same truncation for a lane's
+/// hoisted and per-row epic text instead of re-deriving it.
+pub(crate) fn short_epic(name: &str) -> String {
     let mut head: String = name.chars().take(EPIC_MAX_CHARS).collect();
     if head.chars().count() == name.chars().count() {
         return head;
