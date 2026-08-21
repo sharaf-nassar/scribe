@@ -4622,6 +4622,12 @@ The find row's previous/next/close controls exist so a pointer-only user reaches
 
 The test opens a real headless GPUI window ( inside a fixed-size `.relative()` mount standing in for the pane's `grid_slot`), seeds a two-match query, and draws the window so the control row is actually laid out and hit-testable. It then computes each control's on-screen center from the same named layout constants  uses — border width, row padding, control size, and the gap between controls — so the click coordinates cannot drift from the production geometry, and asserts `simulate_click` at the next/previous/close centers drives `current_index()` and `match_count()` through the identical transitions `next_match`/`prev_match`/`dismiss` produce, plus the same `Dismissed` event Escape emits. Run against the old two-row, keyboard-only box the click on the next control's computed position lands on the header row's own click-swallowing handler instead of any button, so `current_index()` never leaves `0` and the assertion fails cleanly.
 
+#### Clicking a control parks focus in the query field
+
+The row's three controls dropped `track_focus` (scribe-2yw1); a click still has to leave the keyboard somewhere reachable, or the fix trades one dead affordance for another.
+
+Reusing the [[test#GPUI Client Headless Suites#Find overlay#Pointer controls drive the same transitions as the key table]] probe, the test drives `simulate_click` at the next control's centre and asserts the overlay's own `focus_handle` — not a per-control handle, which no longer exists — is focused, then that a further typed character still extends the query. The first assertion is the regression: before the fix, `find_control`'s `on_click` never called `window.focus`, so a click focused nothing at all. The second guards against a fix that parks focus somewhere the overlay can no longer take input from.
+
 #### A click on the overlay swallows the paired release
 
 The overlay's mouse-down stop kept a click from reaching the grid's press handler; nothing kept the matching mouse-up from bubbling there instead (scribe-uu2y), leaking a release to a mouse-tracking application that never saw the press.

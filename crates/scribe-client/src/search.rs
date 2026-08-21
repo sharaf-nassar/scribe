@@ -17,8 +17,8 @@ use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Boundary, Column, Direction, Point};
 use alacritty_terminal_gpui::term::search::{Match, RegexIter, RegexSearch};
 use gpui::{
-    ClickEvent, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, Pixels, Rgba, Role,
-    div, prelude::*, px,
+    ClickEvent, Context, EventEmitter, FocusHandle, MouseButton, Pixels, Rgba, Role, div,
+    prelude::*, px,
 };
 use scribe_common::protocol::SearchMatch as ServerMatch;
 use scribe_common::theme::ChromeColors;
@@ -404,13 +404,11 @@ pub struct FindOverlayView {
     /// The scheduled request. Dropped — and therefore cancelled — whenever a
     /// newer edit replaces it.
     pending: Option<gpui::Task<()>>,
+    /// Where a pointer click on any of the row's three controls parks the
+    /// keyboard — the query-field equivalent Zed's own find bar focuses on a
+    /// button click (`search_bar.rs:56-58`). The controls themselves are
+    /// deliberately not tab stops; see [`find_control`] (scribe-2yw1).
     focus_handle: FocusHandle,
-    /// Focus targets for the row's three pointer controls, kept separate from
-    /// `focus_handle` so each control carries its own `focus_visible` ring
-    /// (`ci_bar::action_button`'s shape, copied verbatim: scribe-1mpq).
-    prev_focus: FocusHandle,
-    next_focus: FocusHandle,
-    close_focus: FocusHandle,
 }
 
 impl EventEmitter<FindOverlayEvent> for FindOverlayView {}
@@ -427,9 +425,6 @@ impl FindOverlayView {
             debounce: 0,
             pending: None,
             focus_handle: cx.focus_handle(),
-            prev_focus: cx.focus_handle(),
-            next_focus: cx.focus_handle(),
-            close_focus: cx.focus_handle(),
         }
     }
 
@@ -676,21 +671,26 @@ impl Render for FindOverlayView {
                             .child(counter_text),
                     )
                     .child(find_control(
-                        ("find-prev-match", "Previous match", "\u{2191}"),
+                        (
+                            "find-prev-match",
+                            "Previous match",
+                            "\u{2191}",
+                            "Previous match - Shift+Enter",
+                        ),
                         &colors,
-                        &self.prev_focus,
+                        &self.focus_handle,
                         cx.listener(|this, _event, _, ctx| this.prev_match(ctx)),
                     ))
                     .child(find_control(
-                        ("find-next-match", "Next match", "\u{2193}"),
+                        ("find-next-match", "Next match", "\u{2193}", "Next match - Enter"),
                         &colors,
-                        &self.next_focus,
+                        &self.focus_handle,
                         cx.listener(|this, _event, _, ctx| this.next_match(ctx)),
                     ))
                     .child(find_control(
-                        ("find-close", "Close find", "\u{2715}"),
+                        ("find-close", "Close find", "\u{2715}", "Close - Esc"),
                         &colors,
-                        &self.close_focus,
+                        &self.focus_handle,
                         cx.listener(|this, _event, _, ctx| this.dismiss(ctx)),
                     )),
             )
@@ -699,30 +699,38 @@ impl Render for FindOverlayView {
 
 /// One accessible pointer control in the find row — previous, next, or close.
 ///
-/// Copies `ci_bar::action_button`'s shape (`crates/scribe-client/src/ci_bar.rs`)
-/// verbatim: `Role::Button`, an `aria_label` plus the same `aria_description`,
-/// `track_focus`, a pointer cursor, hover/`focus_visible` styling, and
-/// Enter/Space wired through `on_key_down` so GPUI's own
-/// Enter-Space-and-AccessKit-Click-to-`on_click` mapping reaches the same
-/// handler a pointer click does.
+/// Keeps `ci_bar::action_button`'s `Role::Button`, `aria_label`,
+/// `aria_description`, pointer cursor, and hover styling, but deliberately
+/// drops `track_focus`, `focus_visible`, and the Enter/Space `on_key_down`:
+/// scribe-1mpq shipped all three as dead code (click never focused the
+/// control, it was never a tab stop, and `handle_find_overlay_key` consumes
+/// every key including Tab while find is up, so nothing could ever reach
+/// them). Zed's own find bar (`search/src/search_bar.rs:40-67`, the same
+/// vendored rev this repo pins) is the reference for what to do instead:
+/// focus the query field on click rather than the button, and name the
+/// keystroke in a tooltip rather than making the button a second tab stop.
+/// AccessKit's `Action::Click` still activates the control for assistive
+/// tech regardless of tab order (`on_click` auto-registers it) — WCAG 2.1.1
+/// only requires an equivalent keyboard path to exist, not that every
+/// pointer target be focusable, and Escape/Enter/Shift+Enter/Up/Down already
+/// cover every one of these three actions (scribe-2yw1).
 fn find_control(
-    copy: (&'static str, &'static str, &'static str),
+    copy: (&'static str, &'static str, &'static str, &'static str),
     colors: &FindOverlayColors,
-    focus: &FocusHandle,
+    focus_handle: &FocusHandle,
     on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
-    let (id, label, glyph) = copy;
+    let (id, label, glyph, tooltip) = copy;
     let idle = colors.header_fg;
     let bright = colors.query_fg;
     let hover_bg = colors.input_bg;
-    let focus_bg = colors.border;
-    let contrast = colors.bg;
+    let click_focus = focus_handle.clone();
+    let tooltip_colors = *colors;
     div()
         .id(id)
         .role(Role::Button)
         .aria_label(label)
         .aria_description("Press Enter or Space to activate")
-        .track_focus(focus)
         .flex_none()
         .w(CONTROL_SIZE)
         .h(CONTROL_SIZE)
@@ -734,26 +742,47 @@ fn find_control(
         .text_sm()
         .text_color(idle)
         .hover(move |style| style.bg(hover_bg).text_color(bright))
-        .focus_visible(move |style| style.bg(focus_bg).text_color(contrast))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| FindControlTooltip { text: tooltip, colors: tooltip_colors }).into()
+        })
         .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
         // Same pairing as the box's own stop above: `on_click`'s
         // `stop_propagation` below only reaches this control's synthesized
         // click listeners, not the raw mouse-up bubble, so the release needs
         // its own stop (scribe-uu2y).
         .on_mouse_up(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-        .on_key_down(|event: &KeyDownEvent, _, ctx| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                ctx.stop_propagation();
-            }
-        })
         .on_click(move |event, window, ctx| {
             ctx.stop_propagation();
+            // The pointer path's query-field equivalent (Zed's
+            // `render_action_button`, `search_bar.rs:56-58`): a click leaves
+            // the keyboard parked where typing continues to work, rather
+            // than on a control that no key ever reaches (scribe-2yw1).
+            window.focus(&click_focus, ctx);
             on_click(event, window, ctx);
         })
         .child(glyph)
         .into_any_element()
+}
+
+/// The hover reveal for a find-row control, naming the keystroke that does
+/// the same thing now that Tab no longer reaches the button itself.
+struct FindControlTooltip {
+    text: &'static str,
+    colors: FindOverlayColors,
+}
+
+impl Render for FindControlTooltip {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .bg(self.colors.bg)
+            .border_1()
+            .border_color(self.colors.border)
+            .text_xs()
+            .text_color(self.colors.header_fg)
+            .child(self.text)
+    }
 }
 
 #[cfg(test)]
@@ -1132,6 +1161,44 @@ mod overlay_tests {
             drain(&log, cx),
             vec![FindOverlayEvent::Dismissed],
             "clicking the close control did not emit the same Dismissed event Escape does"
+        );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Clicking a control parks focus in the query field]]
+    #[gpui::test]
+    fn clicking_a_control_parks_focus_in_the_query_field(cx: &mut TestAppContext) {
+        let (window, overlay, _log) = overlay_window(cx);
+        overlay.update(cx, |view, ctx| view.push_str("err", ctx));
+        let mut results = FindResults::default();
+        results.accept("err".to_owned(), vec![hit(0, 0, 2), hit(1, 0, 2)]);
+        overlay.update(cx, |view, ctx| {
+            view.adopt_results(&results, ctx);
+        });
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw the seeded overlay");
+        let mut test_window = VisualTestContext::from_window(window.into(), cx);
+
+        // Before this fix, `find_control`'s `on_click` never called
+        // `window.focus`, so a click focused nothing at all.
+        test_window.simulate_click(control_center(CONTAINER_WIDTH, 1), Modifiers::default());
+        let focused = cx
+            .update_window(window.into(), |_, window, app| {
+                overlay.read(app).focus_handle.is_focused(window)
+            })
+            .expect("read the overlay's focus state");
+        assert!(
+            focused,
+            "clicking the next control did not park keyboard focus on the overlay's own handle"
+        );
+
+        // The click must leave the query field able to keep taking input —
+        // parking focus is only useful if typing still works afterwards.
+        let before = overlay.read_with(cx, |o, _| o.query().to_owned());
+        overlay.update(cx, |view, ctx| view.push_char('x', ctx));
+        assert_eq!(
+            overlay.read_with(cx, |o, _| o.query().to_owned()),
+            format!("{before}x"),
+            "the query field stopped accepting input after the click"
         );
     }
 

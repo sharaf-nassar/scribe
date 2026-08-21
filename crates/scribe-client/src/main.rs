@@ -8078,11 +8078,6 @@ impl TerminalView {
                 }
             }
         }
-        // The match highlights are painted by *this* view, not by the overlay
-        // entity, so cycling the current match has to dirty the grid too — a
-        // notify on the overlay alone would move the `n/m` counter while the
-        // accent stayed on the previous match until the next server frame.
-        cx.notify();
     }
 
     /// Open the right-click context menu at `position` with a representative item
