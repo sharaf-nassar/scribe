@@ -10,8 +10,9 @@ use gpui::{
 };
 
 use crate::beads_board_a2::{
-    self, A2Input, QueueLane, RailState, RowView, VoidCopy, compact_relative_age, count_to_f32,
-    queue_name,
+    self, A2Input, CHEV_BOTTOM, CHEV_RIGHT, CHEV_SIZE, FLOOR_GRIP_H, FLOOR_GRIP_TOP, FLOOR_GRIP_W,
+    QueueLane, RailState, RowView, VoidCopy, ZOOM_GAP, ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT,
+    ZOOM_TOP, compact_relative_age, count_to_f32, queue_name,
 };
 use crate::beads_flow::{
     FlowBandControl, FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow,
@@ -1774,20 +1775,6 @@ const BLACK: Rgba = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 /// (A2-C7), the strength the mock's `#68c98c26` target tab carries.
 const DRAG_TARGET_WASH: f32 = 0.15;
 
-/// The borderless text-size steppers' own left-gutter geometry (A2-G2),
-/// mirrored from `a2a3-contract.json`'s `geometry.a2.zoom_*` block.
-const ZOOM_LEFT: f32 = 8.0;
-const ZOOM_TOP: f32 = 5.0;
-const ZOOM_GLYPH_W: f32 = 12.0;
-const ZOOM_GLYPH_H: f32 = 17.0;
-const ZOOM_GAP: f32 = 1.0;
-
-/// A lane's overflow cue (A2-G9: "Overflow chevron is 10px at right
-/// 1px/bottom 0").
-const CHEV_SIZE: f32 = 10.0;
-const CHEV_RIGHT: f32 = 1.0;
-const CHEV_BOTTOM: f32 = 0.0;
-
 /// A collapsed tab's own `‹` cue (not the lane overflow `‹CHEV_*` marks
 /// above): 11x11px, a 7px gap off the tab's bottom edge, 2px corner radius
 /// for the chip its hot background paints. Not part of the generated machine
@@ -1797,12 +1784,6 @@ const CHEV_BOTTOM: f32 = 0.0;
 const TAB_CUE_SIZE: f32 = 11.0;
 const TAB_CUE_RADIUS: f32 = 2.0;
 const TAB_CUE_MARGIN_BOTTOM: f32 = 7.0;
-
-/// The strip's own bottom resize grip (A2-G9: "Floor is 3px with a centred
-/// 34×1px grip at top 1px").
-const FLOOR_GRIP_W: f32 = 34.0;
-const FLOOR_GRIP_H: f32 = 1.0;
-const FLOOR_GRIP_TOP: f32 = 1.0;
 
 /// Where a row's sub line indents to under the title, and where the void
 /// copy that replaces an empty lane's rows starts too (A2-S5's

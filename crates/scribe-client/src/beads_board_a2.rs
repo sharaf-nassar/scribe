@@ -80,6 +80,31 @@ pub const LANES_PADDING_BOTTOM: f32 = 7.0;
 pub const LANES_PADDING_LEFT: f32 = 44.0;
 /// Gap between adjacent lane/tab tracks (A2-G1, A2-R1).
 pub const TRACK_GAP: f32 = 16.0;
+/// Borderless text-size stepper geometry (A2-G2).
+pub const ZOOM_LEFT: f32 = 8.0;
+pub const ZOOM_TOP: f32 = 5.0;
+pub const ZOOM_GLYPH_W: f32 = 12.0;
+pub const ZOOM_GLYPH_H: f32 = 17.0;
+pub const ZOOM_GAP: f32 = 1.0;
+/// Overflow-chevron geometry (A2-G9).
+pub const CHEV_SIZE: f32 = 10.0;
+pub const CHEV_RIGHT: f32 = 1.0;
+pub const CHEV_BOTTOM: f32 = 0.0;
+/// Centered floor-grip geometry (A2-G9).
+pub const FLOOR_GRIP_W: f32 = 34.0;
+pub const FLOOR_GRIP_H: f32 = 1.0;
+pub const FLOOR_GRIP_TOP: f32 = 1.0;
+/// Flow paint geometry (A3-G1, A3-G8).
+pub const FLOW_BAND_HEIGHT: f32 = 34.0;
+pub const FLOW_RULER_HEIGHT: f32 = 15.0;
+pub const FLOW_GRAPH_HEIGHT: f32 = 139.0;
+pub const FLOW_GRAPH_TOP: f32 = 49.0;
+pub const FLOW_HBAR_TOP: f32 = 188.0;
+pub const FLOW_HBAR_HEIGHT: f32 = 2.0;
+pub const FLOW_PROGRESS_WIDTH: f32 = 150.0;
+pub const FLOW_FADE_WIDTH: f32 = 48.0;
+pub const FLOW_CHIP_OFFSET_X: f32 = 14.0;
+pub const FLOW_CHIP_GAP_Y: f32 = 6.0;
 /// Narrowest region that keeps the fixed drawer to the right of the fixed
 /// text-control gutter: `44 + 452 + 96` (A2-G2, A2-G8). Tests use this
 /// derived floor for the all-state narrow matrix rather than inventing a
@@ -1235,12 +1260,16 @@ mod tests {
         use serde::Deserialize;
 
         use super::{
-            BEADS_BOARD_HEIGHT, DRAG_SOURCE_OPACITY, DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H,
-            DRAWER_RADIUS, DRAWER_RIGHT, DRAWER_TOP, DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_H,
-            GHOST_H, GHOST_PAD_LEFT, GHOST_PAD_RIGHT, GHOST_RADIUS, GHOST_W, HEAD_H, HEADBAND_H,
-            LANES_PADDING_BOTTOM, LANES_PADDING_LEFT, LANES_PADDING_RIGHT, LANES_PADDING_TOP,
-            ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP, ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H,
-            SEAM_H, TAB_W, TRACK_GAP, visible_row_count,
+            BEADS_BOARD_HEIGHT, CHEV_BOTTOM, CHEV_RIGHT, CHEV_SIZE, DRAG_SOURCE_OPACITY,
+            DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H, DRAWER_RADIUS, DRAWER_RIGHT, DRAWER_TOP,
+            DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_GRIP_H, FLOOR_GRIP_TOP, FLOOR_GRIP_W, FLOOR_H,
+            FLOW_BAND_HEIGHT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X, FLOW_FADE_WIDTH,
+            FLOW_GRAPH_HEIGHT, FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP,
+            FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT, GHOST_H, GHOST_PAD_LEFT, GHOST_PAD_RIGHT,
+            GHOST_RADIUS, GHOST_W, HEAD_H, HEADBAND_H, LANES_PADDING_BOTTOM, LANES_PADDING_LEFT,
+            LANES_PADDING_RIGHT, LANES_PADDING_TOP, ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP,
+            ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H, SEAM_H, TAB_W, TRACK_GAP, ZOOM_GAP,
+            ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT, ZOOM_TOP, visible_row_count,
         };
 
         const MANIFEST_JSON: &str = include_str!("../../../.impeccable/mocks/a2a3-contract.json");
@@ -1253,6 +1282,7 @@ mod tests {
         #[derive(Deserialize)]
         struct Geometry {
             a2: A2Geometry,
+            a3: A3Geometry,
         }
 
         #[derive(Deserialize)]
@@ -1289,6 +1319,31 @@ mod tests {
             ghost_pad_right: f32,
             ghost_radius: f32,
             drag_source_opacity: f32,
+            zoom_left: f32,
+            zoom_top: f32,
+            zoom_glyph_w: f32,
+            zoom_glyph_h: f32,
+            zoom_gap: f32,
+            chev_size: f32,
+            chev_right: f32,
+            chev_bottom: f32,
+            floor_grip_w: f32,
+            floor_grip_h: f32,
+            floor_grip_top: f32,
+        }
+
+        #[derive(Deserialize)]
+        struct A3Geometry {
+            band_h: f32,
+            ruler_h: f32,
+            graph_h: f32,
+            graph_top: f32,
+            hbar_top: f32,
+            hbar_h: f32,
+            progress_w: f32,
+            fade_w: f32,
+            chip_offset_x: f32,
+            chip_gap_y: f32,
         }
 
         /// `assert_eq!` on two `f32`s trips `clippy::float_cmp`; every field
@@ -1303,10 +1358,11 @@ mod tests {
         }
 
         #[test]
-        fn constants_match_the_generated_a2_contract() {
+        fn constants_match_the_generated_contract() {
             let manifest: Manifest =
                 serde_json::from_str(MANIFEST_JSON).expect("valid a2a3-contract.json");
             let a2 = manifest.geometry.a2;
+            let a3 = manifest.geometry.a3;
 
             assert_matches("strip_h", a2.strip_h, BEADS_BOARD_HEIGHT);
             assert_matches("lanes_padding_top", a2.lanes_padding_top, LANES_PADDING_TOP);
@@ -1339,6 +1395,27 @@ mod tests {
             assert_matches("ghost_pad_right", a2.ghost_pad_right, GHOST_PAD_RIGHT);
             assert_matches("ghost_radius", a2.ghost_radius, GHOST_RADIUS);
             assert_matches("drag_source_opacity", a2.drag_source_opacity, DRAG_SOURCE_OPACITY);
+            assert_matches("zoom_left", a2.zoom_left, ZOOM_LEFT);
+            assert_matches("zoom_top", a2.zoom_top, ZOOM_TOP);
+            assert_matches("zoom_glyph_w", a2.zoom_glyph_w, ZOOM_GLYPH_W);
+            assert_matches("zoom_glyph_h", a2.zoom_glyph_h, ZOOM_GLYPH_H);
+            assert_matches("zoom_gap", a2.zoom_gap, ZOOM_GAP);
+            assert_matches("chev_size", a2.chev_size, CHEV_SIZE);
+            assert_matches("chev_right", a2.chev_right, CHEV_RIGHT);
+            assert_matches("chev_bottom", a2.chev_bottom, CHEV_BOTTOM);
+            assert_matches("floor_grip_w", a2.floor_grip_w, FLOOR_GRIP_W);
+            assert_matches("floor_grip_h", a2.floor_grip_h, FLOOR_GRIP_H);
+            assert_matches("floor_grip_top", a2.floor_grip_top, FLOOR_GRIP_TOP);
+            assert_matches("a3.band_h", a3.band_h, FLOW_BAND_HEIGHT);
+            assert_matches("a3.ruler_h", a3.ruler_h, FLOW_RULER_HEIGHT);
+            assert_matches("a3.graph_h", a3.graph_h, FLOW_GRAPH_HEIGHT);
+            assert_matches("a3.graph_top", a3.graph_top, FLOW_GRAPH_TOP);
+            assert_matches("a3.hbar_top", a3.hbar_top, FLOW_HBAR_TOP);
+            assert_matches("a3.hbar_h", a3.hbar_h, FLOW_HBAR_HEIGHT);
+            assert_matches("a3.progress_w", a3.progress_w, FLOW_PROGRESS_WIDTH);
+            assert_matches("a3.fade_w", a3.fade_w, FLOW_FADE_WIDTH);
+            assert_matches("a3.chip_offset_x", a3.chip_offset_x, FLOW_CHIP_OFFSET_X);
+            assert_matches("a3.chip_gap_y", a3.chip_gap_y, FLOW_CHIP_GAP_Y);
             assert_eq!(a2.body_rows, 3);
             assert_eq!(
                 visible_row_count(a2.strip_h, 1.0),

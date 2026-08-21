@@ -4634,9 +4634,10 @@ Rust unit tests and the E2E shell/Python suites below are the intended
 consumers: they read named geometry/typography/color fields out of the
 committed JSON instead of re-transcribing mock numbers.
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail|beads_board_a2's `tests::manifest`]]
-is the first: it `include_str!`s the committed JSON and asserts every A2
-geometry constant the pure layout model uses still matches it, so a mock edit
-regenerated without updating those constants fails loudly instead of drifting.
+is the consumer seam: it `include_str!`s the committed JSON and asserts every
+exported A2 layout/paint and A3 paint geometry constant matches it.
+`beads_board.rs` and `beads_flow.rs` consume those exports, so a regenerated
+mock mismatch fails loudly instead of drifting.
 
 ### Beads Flow visual contract
 

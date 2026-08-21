@@ -16,6 +16,10 @@ use scribe_common::protocol::{
 };
 
 use crate::beads_board::{BeadsBoardColors, alpha, short_id};
+use crate::beads_board_a2::{
+    FLOW_BAND_HEIGHT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X, FLOW_FADE_WIDTH, FLOW_GRAPH_HEIGHT,
+    FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP, FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT,
+};
 
 fn scalar(value: usize) -> f32 {
     u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
@@ -931,19 +935,6 @@ struct FlowPresentation {
     width: f32,
 }
 
-const FLOW_BAND_HEIGHT: f32 = 34.0;
-const FLOW_RULER_HEIGHT: f32 = 15.0;
-const FLOW_GRAPH_HEIGHT: f32 = 139.0;
-const FLOW_GRAPH_TOP: f32 = FLOW_BAND_HEIGHT + FLOW_RULER_HEIGHT;
-const FLOW_HBAR_TOP: f32 = FLOW_GRAPH_TOP + FLOW_GRAPH_HEIGHT;
-const FLOW_HBAR_HEIGHT: f32 = 2.0;
-const FLOW_PROGRESS_WIDTH: f32 = 150.0;
-/// Clipped-edge continuation fade width (A3-G8).
-const FLOW_FADE_WIDTH: f32 = 48.0;
-/// Chip offset from the hovered node's own box, read off the mock's
-/// `left:286px;top:104px` chip against its `left:272px;top:74px` node.
-const FLOW_CHIP_OFFSET_X: f32 = 14.0;
-const FLOW_CHIP_GAP_Y: f32 = 6.0;
 /// The mock's `.fl.trace .node { opacity:.24 }`.
 const FLOW_TRACE_DIM: f32 = 0.24;
 
