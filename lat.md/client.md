@@ -1499,9 +1499,9 @@ against its own rect and win by report order. It resolves
 through [[crates/scribe-client/src/beads_board_a2.rs#queue_at]]: the same
 [[crates/scribe-client/src/beads_board_a2.rs#rail_widths]] split and A2-G8
 drawer bounds the renderer paints from, walked left to right over
-[[crates/scribe-client/src/beads_board_a2.rs#RailWidths#tracks]], rather than a
-five-equal-lanes guess. A2's tracks move with occupancy, text scale, and
-whether each collapsible queue is a 36px tab, an open drawer, or a pinned lane,
+[[crates/scribe-client/src/beads_board_a2.rs#RailWidths#tracks]], from the
+live presentation. A2's tracks move with occupancy, text scale, and whether
+each collapsible queue is a 36px tab, an open drawer, or a pinned lane,
 so hit-testing anything but the live presentation would write to a queue the
 pointer never landed on. An open drawer owns the pointer inside its own bounds
 (it overlays lanes without reflowing them, A2-I1); the left gutter, the
@@ -1715,14 +1715,10 @@ in-progress hue's family rather than taking a hue of its own, carried toward
 the title far enough that the agent line cannot be mistaken for the dot it
 annotates.
 
-A2 replaced that whole grammar with a ledger (`specs/028-beads-board-contract.md`;
-CURRENT and standalone A stay reference-only). There is no card fill, no
-priority badge, no dashed empty-lane outline, no per-lane equal-width track,
-and no top-right stepper pair left in
-[[crates/scribe-client/src/beads_board.rs#render]]'s tree.
-[[crates/scribe-client/src/beads_board.rs#headband]] paints one hairline
-across the whole strip in place of five floating heads, so five labels group
-into one row (A2-G3). Each of the five tracks gets
+A2 is the ledger defined by `specs/028-beads-board-contract.md`; CURRENT and
+standalone A stay reference-only. [[crates/scribe-client/src/beads_board.rs#headband]]
+paints one hairline across the strip so five labels group into one row (A2-G3).
+Each of the five tracks gets
 [[crates/scribe-client/src/beads_board.rs#queue_column]]'s choice of
 [[crates/scribe-client/src/beads_board.rs#ledger_lane]] (Backlog, Ready, and
 In progress always; Blocked or Done once pinned) or

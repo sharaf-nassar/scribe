@@ -1816,6 +1816,12 @@ Docker E2E recipes default to portable software rendering and keep test sources 
 
 Each E2E image carries a label hashing its Rust, Cargo, Docker, and packaged-script inputs. Generic and specialized recipes validate that label before running, so a changed binary input fails with a rebuild instruction rather than testing a stale image. `tests/e2e` is bind-mounted and deliberately excluded from the hash: shell-only edits keep the no-rebuild fast path. The `e2e-func-*` wrappers route through the guarded functional entrypoint, except `e2e-func-beads-board`, which rebuilds its derived image; visual wrappers either validate the default visual image or rebuild it (`e2e-visual-agent-action`).
 
+`just test-install` is the package-level Beads acceptance: it proves postinst
+searches the target user's `PATH` and standard install locations without
+executing `bd`, and that an absent executable is a nonfatal hidden-board
+warning. It does not run the A2/A3 Docker contracts against an installed
+package; those remain the source-build CI evidence.
+
 ### Hardened Runtime Profile
 
 The hardened Docker runtime profile checks both E2E images under network, filesystem, and capability restrictions without changing their release or debug binary profile.
@@ -1853,7 +1859,7 @@ GitHub Actions runs a blocking pull-request smoke gate and an informational nigh
 
 `.github/workflows/e2e.yml` runs the smoke job for every `pull_request`. A manual `workflow_dispatch` choice can also select `smoke` or `nightly`; the daily schedule and manual `nightly` choice are the only triggers for the nightly job, so no trigger can start both jobs.
 
-The blocking smoke job has a 40-minute timeout and a warm-runtime target of at most 25 minutes. It builds release binaries and both Docker images, then runs `func/smoke.sh`, `func/session-exit-status.sh`, `func/cli-smoke.sh`, and `visual/titlebar.sh` through the Docker-only just recipes. Two local runs on 2026-08-02 passed in 119.86 seconds cold and 18.47 seconds warm.
+The blocking smoke job has a 70-minute timeout and a warm-runtime target of at most 25 minutes. It builds release binaries and both Docker images, then runs `func/smoke.sh`, `func/session-exit-status.sh`, `func/cli-smoke.sh`, `visual/titlebar.sh`, `e2e-func-beads-board`, and `e2e-visual-beads-board` through Docker-only just recipes. The two board contracts are the real-`bd` interaction/lifetime matrix and running-client A2/A3 visual inventory; neither reuses a static mock capture. Two local runs on 2026-08-02 passed in 119.86 seconds cold and 18.47 seconds warm.
 
 The informational nightly job has a four-hour timeout and runs the complete `just e2e` and `just e2e-all-visual` aggregates described above. Each aggregate runs even if the other fails, and the job reports a failing outcome without failing the workflow. It never retries; repeated flakes follow the quarantine-bead contract above.
 
@@ -4474,8 +4480,8 @@ region's board is refused rather than allowed to retarget the gesture against
 its own rect, and the release stop the tabs and drawer hold at rest is
 asserted absent while a card is in flight, since that release is the drop's.
 
-The Docker visual contract is now the A2/A3 mock contract rather than the
-retired raised-card/five-equal-lane design.
+The Docker visual contract takes its baseline only from the A2/A3 mock
+contract.
 [beads-board.sh](../tests/e2e/visual/beads-board.sh) mounts the generated
 [a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json). The shared
 [beads_board_image_oracle.py](../tests/e2e/beads_board_image_oracle.py) reads
@@ -4748,12 +4754,14 @@ The same checker parses the coverage table in
 [specs/028-beads-board-contract.md](../specs/028-beads-board-contract.md),
 the only ownership inventory: every normative row needs one owner bead and
 one oracle; the manifest's named states must retain visual coverage and its
-interactions must retain interaction coverage. `just ready`, the matching
-pre-commit hook, and Quality run this Docker-free check. It also rejects raw
-A2/A3 shell assignments and Flow/board geometry restatements outside the
-manifest-backed Rust bridge. Its legacy scan is deliberately visual: it rejects
-a board-width `/ 5` allocation or raised ledger-card paint marker, not the
-legitimate five named server queues and their status handling.
+interactions must retain interaction coverage. This is SCOPE-3's
+Speckit-facing materialization gate: there is no second coverage manifest to
+update or omit. `just ready`, the matching pre-commit hook, and Quality run
+this Docker-free check. It also rejects raw A2/A3 shell assignments and
+Flow/board geometry restatements outside the manifest-backed Rust bridge. Its
+legacy scan is deliberately visual: it rejects a board-width `/ 5` allocation
+or a retired ledger paint marker, not the legitimate five named server queues
+and their status handling.
 
 The required PR E2E job runs `just e2e-func-beads-board` and
 `just e2e-visual-beads-board`; those Docker runs respectively retain the

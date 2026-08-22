@@ -42,8 +42,8 @@ same named roles from the live theme and preserves WCAG contrast.
 | Epic chevron | Remains inert. It is visual punctuation only: no pointer cursor, hover state, focus stop, AccessKit action, picker, or epic switching. | `scribe-zwtv.11` | Inert-chrome visual and AccessKit assertion. |
 | Graph overflow | Width scrolls; height does not. Either wheel axis over A3 moves horizontal position, clamped to content. Keyboard focus auto-scrolls the focused node into view. Edge fades and the 2px position bar appear only when content is clipped. | `scribe-zwtv.11` | Origin/middle overflow visual matrix. |
 | Rank overflow | If a rank exceeds the row budget at current text scale, Flow is not painted (or exits on relayout) and A2 remains usable. The board height is never grown to rescue the graph. | `scribe-zwtv.10` | Scale and rank-overflow functional matrix. |
-| Cycles and malformed graphs | Never park cycle members. Cycle, disconnected membership, external blockers, and over-bound graphs are typed admission refusals. The renderer accepts only complete admitted DAGs. | `scribe-zwtv.14` | Server/layout refusal tests. |
-| Flow result shape | Outcomes are mandatory and typed: complete `Graph`, `NoGraph` with `NoEpic`, `Cycle`, `Disconnected`, `ExternalBlocker`, or `TooLarge`, and `Unavailable { message }`. No optional graph and no `truncated` flag exist. | `scribe-zwtv.14` | Protocol round trip and real-`bd` outcome matrix. |
+| Cycles and malformed graphs | Cycle, disconnected membership, external blockers, and over-bound graphs are typed admission refusals. The renderer accepts only complete admitted DAGs. | `scribe-zwtv.14` | Server/layout refusal tests. |
+| Flow result shape | Every result is exactly complete `Graph`, `NoGraph` with `NoEpic`, `Cycle`, `Disconnected`, `ExternalBlocker`, or `TooLarge`, or `Unavailable { message }`; no `truncated` flag exists. | `scribe-zwtv.14` | Protocol round trip and real-`bd` outcome matrix. |
 
 ## Coverage map
 
@@ -62,7 +62,7 @@ and `scribe-zwtv.18` performs the final independent audit.
 | SCOPE-2 | Session `01a01227-1e60-78a5-ac9d-58a63aef7ead` is recorded as provenance; no fabricated dialogue is quoted. | `scribe-zwtv.2` | Machine metadata check. |
 | SCOPE-3 | Every normative mock selector/state must map to an implementation, visual/functional oracle, and owner before materialization. | `scribe-zwtv.6` | Speckit materialization rejection fixture. |
 | SCOPE-4 | Literal hex values are mock-theme references; production uses live-theme roles and contrast solving, never hardcoded board colors. | `scribe-zwtv.13` | Visual theme rewrite moves every sampled role. |
-| SCOPE-5 | Final specs and `lat.md/` describe landed A2/A3 behavior without retaining the legacy five-lane contract. | `scribe-zwtv.16` | `lat check` plus stale-contract grep. |
+| SCOPE-5 | Final specs and `lat.md/` describe landed A2/A3 behavior. | `scribe-zwtv.16` | `lat check` plus stale-contract grep. |
 
 ### A2 named states
 
@@ -169,7 +169,7 @@ and `scribe-zwtv.18` performs the final independent audit.
 | A3-C5 | Non-live In progress uses filled progress dot; Backlog uses filled backlog/muted dot. Both retain ordinary title and never show an agent line or halo from assignment alone. | `scribe-zwtv.11` | Visual undefined-state regression fixture. |
 | A3-C6 | Live uses filled progress dot, 3px 20%-strength progress halo, lifted 650 title, agent ink, and 4px progress status dot. Missing assignee suppresses only the agent text. | `scribe-zwtv.11` | IssueFocused positive/negative visual matrix. |
 | A3-C7 | Cursor uses subtle fill plus 2px title-ink left keyline. Trace dims off-path nodes to 0.24 without altering geometry. | `scribe-zwtv.11` | Cursor uniqueness and trace screenshot diff. |
-| A3-C8 | Chip uses raised-card ground, strong hairline, and body ink. Edge fade resolves into live ground; hbar track/thumb and floor/grip use distinct lift roles. | `scribe-zwtv.11` | Theme rewrite and overflow samples. |
+| A3-C8 | Chip uses lifted ground, strong hairline, and body ink. Edge fade resolves into live ground; hbar track/thumb and floor/grip use distinct lift roles. | `scribe-zwtv.11` | Theme rewrite and overflow samples. |
 | A3-C9 | Text and marks meet the same 4.5:1 / 3:1 floors as A2 across live themes. | `scribe-zwtv.13` | Dark/light/custom contrast matrix. |
 
 ### A3 interaction, accessibility, responsive behavior, and lifetime
@@ -197,8 +197,8 @@ and `scribe-zwtv.18` performs the final independent audit.
 | A3-BD1 | `Graph` is complete and epic-scoped, includes closed members omitted by capped Done lanes, and includes satisfied `blocks` edges omitted by `bd blocked`. | `scribe-zwtv.14` | Real-`bd` seven-node/eight-edge comparison. |
 | A3-BD2 | `NoEpic` (non-epic id, vanished epic, or wrong workspace root) leaves A2 and panel usable and paints no empty Flow frame. | `scribe-zwtv.14` | Real-`bd` non-epic and cross-root requests. |
 | A3-BD3 | `Disconnected` and `ExternalBlocker` are real-`bd` refusal fixtures; both remain A2 and are logged diagnostically. | `scribe-zwtv.14` | Real-`bd` refusal fixture. |
-| A3-BD4 | `Cycle` is a typed refusal proven in memory because official `bd` rejects cycle creation; it is never a parked layout or fake E2E fixture. | `scribe-zwtv.14` | Server/layout unit tests. |
-| A3-BD5 | `TooLarge` refuses the whole graph. No partial nodes, optional graph, or `truncated` flag are allowed. | `scribe-zwtv.14` | Bound unit tests and protocol round trip. |
+| A3-BD4 | `Cycle` is a typed refusal proven in memory because official `bd` rejects cycle creation; it has no renderer layout or fake E2E fixture. | `scribe-zwtv.14` | Server/layout unit tests. |
+| A3-BD5 | `TooLarge` returns only its whole-graph refusal; it never exposes nodes or a `truncated` flag. | `scribe-zwtv.14` | Bound unit tests and protocol round trip. |
 | A3-BD6 | `Unavailable { message }` leaves A2 usable, clears the pending entry, and may be retried by reopening; it never replaces a frozen graph already on screen. | `scribe-zwtv.14` | Forced graph-read failure/retry functional run. |
 | A3-BD7 | Missing/false `beads_flow`, remote/shared ownership, protocol mismatch, or capability loss never enters Flow and never weakens A2/detail gating. | `scribe-zwtv.14` | Capability/share/reconnect matrix. |
 | A3-BD8 | Graph assembly reuses the server-owned full board read and generation fence; it adds no client `bd` process and no second tracker invocation. | `scribe-zwtv.14` | Exact argv/count server tests. |
@@ -208,8 +208,7 @@ and `scribe-zwtv.18` performs the final independent audit.
 The contract is complete only when:
 
 1. `scribe-zwtv.2` machine-checks the A2/A3 section boundary and geometry.
-2. `scribe-zwtv.13` replaces the obsolete five-lane visual baseline with every
-   named A2/A3 state above.
+2. `scribe-zwtv.13` captures every named A2/A3 state above.
 3. `scribe-zwtv.14` proves every interaction and real-`bd` outcome above.
 4. `scribe-zwtv.15` makes the machine, visual, functional, and coverage checks
    permanent CI gates.
