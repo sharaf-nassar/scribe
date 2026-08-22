@@ -2081,17 +2081,18 @@ and position-bar numbers. Copying those numbers into the script instead would
 let the mock and the suite drift apart silently.
 
 Where the adaptive rail actually put its tracks is measured, not derived.
-[`beads-board-geometry.py`](../tests/e2e/func/beads-board-geometry.py) `rail`
-finds the one row where every visible track -- full lane, pinned lane, and
-collapsed tab alike -- paints its 2px state seam at `lanes_padding_top +
-head_h`, which yields both the strip's own top (the OS titlebar is the only
-offset no contract owns) and each track's left edge and width. Card and target
-coordinates come from that measurement plus the contract's row pitch, so a lane
-that collapsed to its legible header width, a pinned 0.85 share, and a 36px tab
-are all addressable by the same two helpers. Every gesture re-measures, because
-a card that changed lanes reflows the rail behind it. The same helper's `run`
-reports the widest painted run in a band of rows, which locates the drawer's
-top border, A3's position-bar thumb, and the selected `FLOW` chip.
+The shared [`beads_board_image_oracle.py`](../tests/e2e/beads_board_image_oracle.py)
+`rail-search` finds the one row where every visible track -- full lane, pinned
+lane, and collapsed tab alike -- paints its 2px state seam at
+`lanes_padding_top + head_h`, which yields both the strip's own top (the OS
+titlebar is the only offset no contract owns) and each track's left edge and
+width. Card and target coordinates come from that measurement plus the
+contract's row pitch, so a lane that collapsed to its legible header width, a
+pinned 0.85 share, and a 36px tab are all addressable by the same two helpers.
+Every gesture re-measures, because a card that changed lanes reflows the rail
+behind it. The same `widest-run` probe locates the drawer's top border, A3's
+position-bar thumb, and the selected `FLOW` chip; `contract-env` exports the
+same generated contract fields to both suites.
 
 The measurement is also an assertion: the run requires exactly five tracks, the
 first at the contract's gutter, and both collapsible queues at 36px before it
@@ -4476,11 +4477,12 @@ asserted absent while a card is in flight, since that release is the drop's.
 The Docker visual contract is now the A2/A3 mock contract rather than the
 retired raised-card/five-equal-lane design.
 [beads-board.sh](../tests/e2e/visual/beads-board.sh) mounts the generated
-[a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json), and
-[beads-board-oracle.py](../tests/e2e/visual/beads-board-oracle.py) reads every
-box, pitch, padding, share, and semantic color role from it before examining
-running-client RGBA captures. No Flow or rail geometry is copied into the
-harness.
+[a2a3-contract.json](../.impeccable/mocks/a2a3-contract.json). The shared
+[beads_board_image_oracle.py](../tests/e2e/beads_board_image_oracle.py) reads
+its contract environment and running-client RGBA pixels, detects runs, and
+scans A2 tracks; [beads-board-oracle.py](../tests/e2e/visual/beads-board-oracle.py)
+layers the visual assertions over those measurements. No Flow or rail geometry
+is copied into the harness.
 
 A2's named captures cover sparse and busy collapsed rails, both hover drawers,
 both exclusive pinned lanes, and the native drag state. Extended captures pin

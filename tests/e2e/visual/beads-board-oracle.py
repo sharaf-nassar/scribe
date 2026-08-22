@@ -10,29 +10,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from beads_board_image_oracle import Image, close, contract, delta, runs, seam_tracks
+
 
 class Failure(Exception):
     pass
-
-
-class Image:
-    def __init__(self, path: str):
-        self.path = path
-        size = subprocess.check_output(
-            ["identify", "-format", "%w %h", path], text=True
-        ).split()
-        self.width, self.height = (int(value) for value in size)
-        self.data = subprocess.check_output(["convert", path, "rgba:-"])
-
-    def pixel(self, x: float, y: float) -> tuple[int, int, int]:
-        x = min(self.width - 1, max(0, round(x)))
-        y = min(self.height - 1, max(0, round(y)))
-        offset = 4 * (y * self.width + x)
-        return tuple(self.data[offset : offset + 3])
-
-
-def delta(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
-    return sum(abs(x - y) for x, y in zip(a, b))
 
 
 def rgb(value: str) -> tuple[int, int, int]:
@@ -40,30 +23,11 @@ def rgb(value: str) -> tuple[int, int, int]:
     return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
 
 
-def contract(path: str) -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def runs(flags: list[bool], minimum: int = 1) -> list[tuple[int, int]]:
-    found: list[tuple[int, int]] = []
-    start = None
-    for index, enabled in enumerate(flags + [False]):
-        if enabled and start is None:
-            start = index
-        elif not enabled and start is not None:
-            if index - start >= minimum:
-                found.append((start, index - start))
-            start = None
-    return found
-
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise Failure(message)
 
-
-def close(actual: float, expected: float, tolerance: float = 1.1) -> bool:
-    return abs(actual - expected) <= tolerance
 
 
 def role_similarity(sample: tuple[int, int, int], ground: tuple[int, int, int], role: str, data: dict) -> float:
@@ -81,26 +45,6 @@ def assert_role(sample: tuple[int, int, int], ground: tuple[int, int, int], role
     similarity = role_similarity(sample, ground, role, data)
     require(similarity >= 0.70, f"{role} sample {sample} points away from mock role (cos={similarity:.2f})")
 
-
-def seam_tracks(image: Image, board_top: int, data: dict, left: int = 0, width: int | None = None) -> list[tuple[int, int]]:
-    geometry = data["geometry"]["a2"]
-    width = width or image.width
-    seam_y = board_top + geometry["lanes_padding_top"] + geometry["head_h"]
-    ground = image.pixel(left + 2, board_top + geometry["headband_h"] + 8)
-    flags = [delta(image.pixel(x, seam_y), ground) > 8 for x in range(left, left + width)]
-    found = [(left + start, length) for start, length in runs(flags, 3)]
-    tail = 2 * geometry["tab_w"] + geometry["track_gap"]
-    expected_tail_x = left + width - geometry["lanes_padding_right"] - tail
-    if (
-        len(found) == 4
-        and close(found[-1][0], expected_tail_x)
-        and tail <= found[-1][1] <= tail + geometry["lanes_padding_right"] + 2
-    ):
-        found[-1:] = [
-            (round(expected_tail_x), round(geometry["tab_w"])),
-            (round(expected_tail_x + geometry["tab_w"] + geometry["track_gap"]), round(geometry["tab_w"])),
-        ]
-    return found
 
 
 def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dict) -> None:
@@ -131,16 +75,6 @@ def assert_board_chrome(image: Image, top: int, left: int, width: int, data: dic
     expected_x = left + (width - geometry["floor_grip_w"]) / 2
     require(close(grip_x, expected_x), f"A2 grip starts at {grip_x}, expected centered x={expected_x}")
 
-
-def command_env(args: argparse.Namespace) -> None:
-    data = contract(args.contract)
-    for section in ("a2", "a3"):
-        for key, value in data["geometry"][section].items():
-            if isinstance(value, (int, float)):
-                print(f"{section.upper()}_{key.upper()}={value}")
-    slugs = [f"{entry['section'].lower()}:{entry['slug']}" for entry in data["states"]]
-    print("CONTRACT_STATE_SLUGS=" + ",".join(slugs))
-    print("CONTRACT_SOURCE_SHA=" + data["source"]["sha256"])
 
 
 def command_board_top(args: argparse.Namespace) -> None:
@@ -718,10 +652,6 @@ def command_inventory(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     sub = root.add_subparsers(dest="command", required=True)
-
-    env = sub.add_parser("env")
-    env.add_argument("contract")
-    env.set_defaults(func=command_env)
 
     board_top = sub.add_parser("board-top")
     board_top.add_argument("contract")

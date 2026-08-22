@@ -289,35 +289,20 @@ import -window "$WID" /output/beads-real-before.png
 # open drawer, or a pinned lane, so no arithmetic over five equal lanes can name
 # a card or a drop target on this board.
 CONTRACT=${SCRIBE_A2A3_CONTRACT:-/mocks/a2a3-contract.json}
+IMAGE_ORACLE=/tests/beads_board_image_oracle.py
 [ -r "$CONTRACT" ] \
     || fail "the generated A2/A3 contract manifest is not mounted at $CONTRACT"
-eval "$(python3 - "$CONTRACT" <<'PY'
-import json, sys
-
-geometry = json.load(open(sys.argv[1]))["geometry"]
-wanted = {
-    "a2": ("strip_h", "lanes_padding_top", "lanes_padding_left", "lanes_padding_right",
-           "track_gap", "tab_w", "head_h", "headband_h", "row_h", "body_rows", "floor_h",
-           "drawer_top", "drawer_bottom", "drawer_right", "drawer_w",
-           "zoom_left", "zoom_top", "zoom_glyph_w", "zoom_glyph_h", "zoom_gap"),
-    "a3": ("band_h", "band_pad_left", "graph_top", "graph_h", "node_w", "node_h",
-           "left_pad", "rank_pitch", "hbar_top", "hbar_h"),
-}
-for section, keys in wanted.items():
-    for key in keys:
-        print(f"{section.upper()}_{key.upper()}={int(geometry[section][key])}")
-PY
-)"
+eval "$(python3 "$IMAGE_ORACLE" contract-env "$CONTRACT")"
 
 # The one number no contract owns: the OS titlebar above the strip. It is
-# measured, never assumed -- `rail` reports the strip's own top from the row
+# measured, never assumed -- `rail-search` reports the strip's own top from the row
 # where every track paints its state seam.
 STRIP_TOP=
 RAIL_TRACKS=
 
 rail_report() {
     import -window "$WID" "$1"
-    python3 /tests/func/beads-board-geometry.py rail \
+    python3 "$IMAGE_ORACLE" rail-search \
         --contract "$CONTRACT" --shot "$1" --width "$WIN_W"
 }
 
@@ -1116,7 +1101,7 @@ TAB_Y=$(row_y 1)
 # A pinned lane is never a drawer, so finding this border is also how an unpin
 # that leaves the tab focused proves itself.
 drawer_border() {
-    python3 /tests/func/beads-board-geometry.py run \
+    python3 "$IMAGE_ORACLE" widest-run \
         --shot "$1" --width "$WIN_W" --y "$(( STRIP_TOP + A2_DRAWER_TOP ))" --height 2 \
         --min-width "$(( A2_DRAWER_W - 24 ))"
 }
@@ -1631,7 +1616,7 @@ UNTRACE_DIFF=$(crop_diff /output/beads-flow-untraced.png /output/beads-flow-untr
 # for both clamps; the wheel is claimed by Flow, so the pane sees nothing.
 position_mark() {
     import -window "$WID" "$1"
-    python3 /tests/func/beads-board-geometry.py run \
+    python3 "$IMAGE_ORACLE" widest-run \
         --shot "$1" --width "$WIN_W" --y "$(( STRIP_TOP + A3_HBAR_TOP ))" --height "$A3_HBAR_H" \
         --min-width 20
 }
@@ -1714,7 +1699,7 @@ position_mark /output/beads-flow-reopened.png >/dev/null 2>&1 \
 # The mode pair's `LANES` member is the second real exit. `FLOW` beside it is
 # the only selected-state chip in the band, so its painted left edge is what
 # locates `LANES` without guessing a text width.
-FLOW_CHIP=$(python3 /tests/func/beads-board-geometry.py run \
+FLOW_CHIP=$(python3 "$IMAGE_ORACLE" widest-run \
     --shot /output/beads-flow-reopened.png --width "$WIN_W" \
     --y "$(( STRIP_TOP + A3_BAND_H / 4 ))" --height 4 --min-width 20) \
     || fail "the reopened Flow band painted no selected FLOW chip"
@@ -1888,7 +1873,7 @@ clear_issue_focus() {
 }
 
 # Crop one live window region before running the shared pixel geometry helper.
-# `rail` deliberately sees one rail, so a split window must never feed it both;
+# `rail-search` deliberately sees one rail, so a split window must never feed it both;
 # a single-region phase passes the whole window as its one region.
 REGION_LEFT=0
 REGION_WIDTH=0
@@ -1908,7 +1893,7 @@ region_capture() {
 region_measure() {
     local report tracks
     region_capture "$1" "$2" "$3"
-    report=$(python3 /tests/func/beads-board-geometry.py rail \
+    report=$(python3 "$IMAGE_ORACLE" rail-search \
         --contract "$CONTRACT" --shot "$REGION_IMAGE" --width "$REGION_WIDTH") || return 1
     REGION_TOP=$(printf '%s\n' "$report" | head -1)
     REGION_TRACKS=$(printf '%s\n' "$report" | tail -n +2)
@@ -1932,7 +1917,7 @@ region_row_y() {
 # A3's own painted position bar, the mark that only exists while that region is
 # in Flow with a graph wider than its strip.
 region_flow_mark() {
-    python3 /tests/func/beads-board-geometry.py run \
+    python3 "$IMAGE_ORACLE" widest-run \
         --shot "$REGION_IMAGE" --width "$REGION_WIDTH" \
         --y "$(( $1 + A3_HBAR_TOP ))" --height "$A3_HBAR_H" --min-width 20
 }

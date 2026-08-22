@@ -10,6 +10,7 @@ CONTROL="${SHARE_TAP_CONTROL:-$XDG_RUNTIME_DIR/scribe/share-tap.sock}"
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 CONTRACT="${SCRIBE_A2A3_CONTRACT:-/contract/a2a3-contract.json}"
+IMAGE_ORACLE=/tests/beads_board_image_oracle.py
 ORACLE=/tests/visual/beads-board-oracle.py
 
 fail() {
@@ -416,7 +417,7 @@ strip_diff() {
 
 [ -r "$CONTRACT" ] || fail "generated A2/A3 contract is not mounted"
 [ "${SCRIBE_DISABLE_ANIMATIONS:-0}" = "1" ] || fail "visual contract must run with reduced motion"
-eval "$(python3 "$ORACLE" env "$CONTRACT")"
+eval "$(python3 "$IMAGE_ORACLE" contract-env "$CONTRACT")"
 
 sleep 2
 focus
