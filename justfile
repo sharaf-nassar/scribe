@@ -100,6 +100,11 @@ deb:
 deb-dev:
     cargo build --release
     cargo deb -p scribe-server --no-build --variant dev
+    bash tests/install/dev-package-smoke.sh --package-only
+
+# Compare the installed dev package with the current release build.
+package-smoke-dev:
+    bash tests/install/dev-package-smoke.sh
 
 # Exercise Debian maintainer-script guards without touching a live install.
 test-install:

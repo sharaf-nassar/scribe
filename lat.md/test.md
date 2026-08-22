@@ -1816,11 +1816,18 @@ Docker E2E recipes default to portable software rendering and keep test sources 
 
 Each E2E image carries a label hashing its Rust, Cargo, Docker, and packaged-script inputs. Generic and specialized recipes validate that label before running, so a changed binary input fails with a rebuild instruction rather than testing a stale image. `tests/e2e` is bind-mounted and deliberately excluded from the hash: shell-only edits keep the no-rebuild fast path. The `e2e-func-*` wrappers route through the guarded functional entrypoint, except `e2e-func-beads-board`, which rebuilds its derived image; visual wrappers either validate the default visual image or rebuild it (`e2e-visual-agent-action`).
 
-`just test-install` is the package-level Beads acceptance: it proves postinst
-searches the target user's `PATH` and standard install locations without
-executing `bd`, and that an absent executable is a nonfatal hidden-board
-warning. It does not run the A2/A3 Docker contracts against an installed
-package; those remain the source-build CI evidence.
+`just deb-dev` ends with `tests/install/dev-package-smoke.sh --package-only`,
+which extracts the built `scribe-dev` package and byte-compares every renamed
+binary and dev asset plus maintainer script against its source. It also requires
+the board snapshot and Flow named MessagePack fields in both packaged binaries.
+After an operator installs that package, `just package-smoke-dev` repeats those
+checks against `/usr`, so a stale client/server or source-versus-installed
+A2/A3 visual binary mismatch fails before launch. The Docker A2/A3 contracts
+remain the running-client behavior evidence.
+
+`just test-install` separately proves postinst searches the target user's
+`PATH` and standard install locations without executing `bd`, and that an
+absent executable is a nonfatal hidden-board warning.
 
 ### Hardened Runtime Profile
 
