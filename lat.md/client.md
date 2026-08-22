@@ -1255,10 +1255,40 @@ lanes-mode board is handed a fresh throwaway pair every call by
 those would bust the cache on every frame for exactly the boards that
 change least.
 
+That diff's verdict, not `cx.notify`, is what busts the cache, and the
+distinction is the whole of `scribe-sa1d`. Both sync functions run inside the
+root's own render, and GPUI's `WindowInvalidator::invalidate_view` files a
+notify raised during a draw against the *next* draw's `dirty_views` while
+setting no dirty flag and requesting no frame. Notifying a cached child from
+there therefore applies a frame late to a frame nobody asked for: the child
+replays its recorded subtree, and only an unrelated repaint ever corrects it.
+Refresh-driven interactions self-heal for exactly that reason, which is why
+the defect surfaced on the one path with no input behind it — collapsed-lane
+hover-grace expiry, where
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#expire_hover]] notifies
+the root once from
+[[crates/scribe-client/src/main.rs#TerminalView#poll_window_lifecycle]] and
+the drawer never repainted away. So the two sync functions return their
+verdict and [[crates/scribe-client/src/main.rs#mount_synced_view]] takes the
+decision the root already holds: unchanged inputs mount `Entity::cached`,
+changed inputs mount the entity live under the identical full-band wrapper,
+which rebuilds the subtree in the same frame. Both arms place the child in
+the same box — `cached` lays its view out through `layout_as_root` at the
+wrapper style's bounds, and a full-band `absolute().inset_0()` div gives the
+live arm those same bounds — so nothing about the placement rule above
+changes. The steady state the caching exists for is untouched: a frame that
+changes no input is still a pure replay. The rule is pinned by
+[[test#Test Harness#GPUI Client Headless Suites#Root-synced child invalidation]].
+
 The issue panel gets the same treatment through
 [[crates/scribe-client/src/beads_panel.rs#PanelLayer]] and
-[[crates/scribe-client/src/main.rs#TerminalView#sync_panel_view]], with one
-deliberate asymmetry: the live text editor stays out of
+[[crates/scribe-client/src/main.rs#TerminalView#sync_panel_view]] — including
+the mount rule above, which it needed for a hole of its own: a write notice
+that times out in
+[[crates/scribe-client/src/main.rs#TerminalView#poll_beads_writes]] notifies
+only the root and earns exactly one frame, the same no-follow-up shape as
+hover-grace expiry. There is one deliberate asymmetry: the live text editor
+stays out of
 [[crates/scribe-client/src/beads_panel.rs#PanelLayer#same_inputs]] entirely.
 Every editor mutation path forces its own uncached frame — text input and
 IME through `replace_text_in_range`/`unmark_text`, caret and selection keys

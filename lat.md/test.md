@@ -2124,6 +2124,20 @@ lanes rather than joining their row. Crossing from the tab into the drawer
 keeps it open, Escape closes it, and a pinned lane is never a drawer -- which
 is why finding that border after an unpin also proves the unpin.
 
+Leaving the rail closes it too, on the hover grace's own expiry, and that
+phase carries a load the others do not: the pointer park is the last event
+the client receives, so the frame that has to erase the drawer is the expiry
+timer's and nothing else's. Every other transition here is driven by an input
+that requests its own repaint, which is precisely why a strip whose cached
+subtree applies new inputs a frame late passed all of them and left the
+drawer painted on this one (`scribe-sa1d`; the mechanism and its headless
+gate are
+[[client#Client#Beads Board CLI Data Source#Cached strip painting]] and
+[[test#Test Harness#GPUI Client Headless Suites#Root-synced child invalidation]]).
+Re-entering the tab afterwards restores the state Escape's phase expects, and
+doubles as the proof that the expiry left the rail hoverable rather than
+wedged.
+
 Clicking a tab pins its lane wider than a tab while the other stays 36px, and
 pinning the second replaces the first. The click leaves that lane's control
 focused, and tab, drawer, and pinned `×` share one handle, so Enter unpins into
@@ -4618,6 +4632,31 @@ Both are sited on two regions for the reason
 states, and both measure instead of asserting existence for the reason
 [gpui-layout-chains-fail-silently-and-only-measurement-catches-them](../docs/solutions/conventions/gpui-layout-chains-fail-silently-and-only-measurement-catches-them.md)
 states. The design they pin is
+[[client#Client#Beads Board CLI Data Source#Cached strip painting]].
+
+### Root-synced child invalidation
+
+One probe pair holds the rule that placement cannot: a child view the root
+syncs during its own render has to repaint in *that* frame, because on the
+path this was found on no second frame is coming.
+
+A two-entity probe embeds a child view exactly as
+[[crates/scribe-client/src/main.rs#TerminalView#render_beads_boards]] and
+[[crates/scribe-client/src/main.rs#TerminalView#render_beads_panels]] embed
+theirs -- diff during the root's render, push the changed inputs into the
+child, mount through
+[[crates/scribe-client/src/main.rs#mount_synced_view]] -- and the child
+records the input it last actually painted, which is the only way to tell a
+rebuilt subtree from a replayed one. The test then reproduces the single
+shape hover-grace expiry has: state changes outside any draw, the root is
+notified once, and the one frame that notify earns is the only frame there
+will ever be.
+
+The frame count is asserted alongside the paint, and that assertion is the
+point. GPUI files a `cx.notify` raised during a draw against the *next*
+draw's `dirty_views` and requests no frame to carry it, so any second draw
+from any source repaints the child and makes a still-broken mount look
+fixed. A probe that lets one in proves nothing. The design it pins is
 [[client#Client#Beads Board CLI Data Source#Cached strip painting]].
 
 ### Beads board A2/A3 machine contract

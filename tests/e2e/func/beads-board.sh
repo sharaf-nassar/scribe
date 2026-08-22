@@ -1166,6 +1166,24 @@ sleep 0.6
 assert_drawer_open /output/beads-drawer-returned.png \
     "returning to the tab closed the drawer it opened"
 
+# Leaving the rail closes the drawer when the grace expires, and this is the
+# one drawer transition with no input behind the frame that has to show it:
+# the park below is the last event the client sees, so everything after it is
+# the expiry timer's own single frame. A cached strip that waits for some
+# later repaint to apply its new inputs leaves the drawer painted here
+# (scribe-sa1d) and nowhere else in this suite.
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.6
+assert_drawer_closed /output/beads-drawer-grace-expired.png \
+    "the drawer outlived the hover grace with no input left to repaint it"
+
+# Re-enter the tab so the Escape phase below starts where it expects to. That
+# leave is also what makes this move an entry again: hover is edge-triggered.
+xdotool mousemove --sync --window "$WID" "$BLOCKED_TAB_X" "$TAB_Y"
+sleep 0.6
+assert_drawer_open /output/beads-drawer-regraced.png \
+    "re-entering the tab after the grace expiry opened no drawer"
+
 # Escape closes a transient drawer and nothing else.
 xdotool key --clearmodifiers Escape
 sleep 0.6

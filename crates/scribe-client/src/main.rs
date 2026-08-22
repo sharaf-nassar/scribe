@@ -1764,10 +1764,11 @@ struct TerminalView {
     /// One cached strip view per visible workspace board. The entity is what
     /// lets GPUI reuse a board's recorded subtree across the redraw pump's
     /// pulse and PTY frames; `render_beads_boards` diffs fresh inputs against
-    /// each strip and notifies it only when something it paints changed.
+    /// each strip and reuses that subtree only while nothing it paints
+    /// changed (see `mount_synced_view`).
     beads_strip_views: HashMap<WorkspaceId, Entity<BoardStrip>>,
     /// The issue-detail twin of `beads_strip_views`: one cached overlay view
-    /// per workspace with an open panel, diffed and notified the same way.
+    /// per workspace with an open panel, diffed and mounted the same way.
     beads_panel_views: HashMap<WorkspaceId, Entity<PanelLayer>>,
     /// Focus and activation for every Flow node currently painted, held here
     /// so a node keeps one focus handle across frames. Pinned GPUI registers
@@ -10348,25 +10349,30 @@ impl TerminalView {
         )
     }
 
-    /// Get-or-create the workspace's cached strip view, notifying it when
-    /// the freshly assembled inputs differ from what its cache last painted.
+    /// Get-or-create the workspace's cached strip view, updating it when the
+    /// freshly assembled inputs differ from what its cache last painted.
     ///
     /// Server-pushed data (snapshots, flow graphs) and root-side geometry
     /// reach the strip only through this diff: interactions inside the strip
     /// already force their own uncached frame via `window.refresh()`, but an
-    /// IPC refresh only notifies the root. Without the notify here, a cached
+    /// IPC refresh only notifies the root. Without the diff here, a cached
     /// strip would keep replaying its old subtree forever.
+    ///
+    /// The returned flag is that diff's verdict: `true` means the strip's
+    /// recorded subtree is stale as of this frame, which is what
+    /// [`mount_synced_view`] needs and what `cx.notify` cannot deliver from
+    /// inside the root's own render.
     fn sync_strip_view(
         &mut self,
         boards: std::sync::MutexGuard<'_, BeadsBoards>,
         name: String,
         wiring: BeadsBoardRender,
         cx: &mut Context<Self>,
-    ) -> Entity<BoardStrip> {
+    ) -> (Entity<BoardStrip>, bool) {
         let workspace_id = wiring.workspace_id;
         if let Some(view) = self.beads_strip_views.get(&workspace_id) {
             if view.read(cx).same_inputs(&name, boards.state(workspace_id), &wiring) {
-                return view.clone();
+                return (view.clone(), false);
             }
             let state = boards.state(workspace_id).cloned();
             let view = view.clone();
@@ -10377,13 +10383,13 @@ impl TerminalView {
                 strip.wiring = wiring;
                 cx.notify();
             });
-            return view;
+            return (view, true);
         }
         let state = boards.state(workspace_id).cloned();
         drop(boards);
         let view = cx.new(|_| BoardStrip { name, state, wiring });
         self.beads_strip_views.insert(workspace_id, view.clone());
-        view
+        (view, false)
     }
 
     fn render_beads_boards(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -10450,14 +10456,12 @@ impl TerminalView {
                 // lock for itself.
                 flow: boards.flow_snapshot(workspace_id),
             };
-            let strip = self.sync_strip_view(boards, name, wiring, cx);
-            // The cached wrapper spans the whole grid band so the strip's own
+            let (strip, changed) = self.sync_strip_view(boards, name, wiring, cx);
+            // The wrapper spans the whole grid band so the strip's own
             // absolutely-positioned root keeps today's coordinate space; the
             // band is definite, which is what `cached` needs, and an
             // unstyled wrapper intercepts no events of its own.
-            out.push(
-                strip.cached(StyleRefinement::default().absolute().inset_0()).into_any_element(),
-            );
+            out.push(mount_synced_view(strip, changed));
             // The bar's grab band, carrying nothing but the pointer a
             // divider's does — the press itself is resolved against the
             // same rect over in `press_board_edge`, so the two cannot
@@ -10477,7 +10481,8 @@ impl TerminalView {
     }
 
     /// The panel twin of `sync_strip_view`: get-or-create the workspace's
-    /// cached overlay view and notify it when the owned inputs changed.
+    /// cached overlay view and update it when the owned inputs changed,
+    /// reporting staleness to [`mount_synced_view`] the same way.
     ///
     /// The live editor stays out of the diff on purpose — every editor
     /// mutation path forces its own uncached frame via `window.refresh()`,
@@ -10487,22 +10492,22 @@ impl TerminalView {
         &mut self,
         inputs: PanelLayerInputs,
         cx: &mut Context<Self>,
-    ) -> Entity<PanelLayer> {
+    ) -> (Entity<PanelLayer>, bool) {
         let workspace_id = inputs.workspace_id;
         if let Some(view) = self.beads_panel_views.get(&workspace_id) {
             let view = view.clone();
             if view.read(cx).same_inputs(&inputs) {
-                return view;
+                return (view, false);
             }
             view.update(cx, |layer, cx| {
                 layer.inputs = inputs;
                 cx.notify();
             });
-            return view;
+            return (view, true);
         }
         let view = cx.new(|_| PanelLayer { inputs });
         self.beads_panel_views.insert(workspace_id, view.clone());
-        view
+        (view, false)
     }
 
     /// One board-store read for the values a panel overlay needs: the pin,
@@ -10560,13 +10565,11 @@ impl TerminalView {
                 panel,
                 notice: notice.zip(notice_lane),
             };
-            let layer = self.sync_panel_view(inputs, cx);
-            // Same full-band cached wrapper as the board strips: definite
-            // bounds for the cache, unchanged band coordinates for the
+            let (layer, changed) = self.sync_panel_view(inputs, cx);
+            // Same full-band wrapper as the board strips: definite bounds
+            // for the cache, unchanged band coordinates for the
             // absolutely-positioned overlay children.
-            out.push(
-                layer.cached(StyleRefinement::default().absolute().inset_0()).into_any_element(),
-            );
+            out.push(mount_synced_view(layer, changed));
         }
         out
     }
@@ -10663,6 +10666,33 @@ impl TerminalView {
             window.focus_next(cx);
         }
         true
+    }
+}
+
+/// Embed a root-synced child view in the grid band, cached only while its
+/// recorded subtree is still valid.
+///
+/// `Context::notify` is GPUI's cache-busting contract for a cached view, and
+/// it cannot be honoured from where the root feeds these children: the sync
+/// runs inside the root's OWN render, and `WindowInvalidator::invalidate_view`
+/// only files the entity for the *next* draw's `dirty_views` while a draw is
+/// in progress -- it sets no dirty flag and requests no frame. So a cached
+/// wrapper replays the stale subtree, and on any path that earns exactly one
+/// frame nothing ever asks for the frame that would correct it. Hover-grace
+/// expiry is that path: no input follows it, so a drawer left open by a stale
+/// replay stays open until something unrelated repaints.
+///
+/// The decision belongs here because the root already holds the answer -- it
+/// has just diffed the freshly assembled inputs -- rather than in a notify
+/// that cannot land in time. Both arms place the child in the same box:
+/// `cached` lays its view out through `layout_as_root` at the wrapper style's
+/// bounds, which for a full-band `absolute().inset_0()` is exactly what the
+/// live arm's wrapper gives it.
+fn mount_synced_view<V: Render>(view: Entity<V>, changed: bool) -> gpui::AnyElement {
+    if changed {
+        div().absolute().inset_0().child(view).into_any_element()
+    } else {
+        view.cached(StyleRefinement::default().absolute().inset_0()).into_any_element()
     }
 }
 
@@ -15755,6 +15785,97 @@ mod tests {
             cx.update_window(window.into(), |_, window, _| control.is_focused(window))
                 .expect("read control focus after repaint")
         );
+    }
+
+    /// The child half of the root-synced pair: it records the input it last
+    /// actually painted, which is the only way to tell a rebuilt subtree from
+    /// a replayed one.
+    struct SyncedChildProbe {
+        input: u32,
+        painted: u32,
+    }
+
+    impl Render for SyncedChildProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.painted = self.input;
+            div().relative().size_full()
+        }
+    }
+
+    /// The root half, embedding the child exactly the way `render_beads_boards`
+    /// and `render_beads_panels` embed theirs: diff the inputs during the
+    /// root's own render, push the changed ones into the child, and mount the
+    /// result through [`mount_synced_view`].
+    struct SyncedRootProbe {
+        child: Entity<SyncedChildProbe>,
+        input: u32,
+        frames: u32,
+    }
+
+    impl SyncedRootProbe {
+        /// The `sync_strip_view` shape with the board taken out: diff, push a
+        /// real change into the child, report whether one happened.
+        fn sync_child(&mut self, cx: &mut Context<Self>) -> bool {
+            let input = self.input;
+            if self.child.read(cx).input == input {
+                return false;
+            }
+            self.child.update(cx, |child, cx| {
+                child.input = input;
+                cx.notify();
+            });
+            true
+        }
+    }
+
+    impl Render for SyncedRootProbe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.frames += 1;
+            let changed = self.sync_child(cx);
+            div().relative().size_full().child(mount_synced_view(self.child.clone(), changed))
+        }
+    }
+
+    /// A child synced from inside the root's own render repaints in that same
+    /// frame, with no second frame behind it.
+    ///
+    /// This is the shape hover-grace expiry has and nothing else does: the
+    /// state changes outside any draw, the root is notified once, and the one
+    /// frame that notify earns is the only frame that will ever come. GPUI
+    /// files a `cx.notify` raised during a draw against the *next* draw's
+    /// `dirty_views` and requests no frame for it, so a cached child replays
+    /// its recorded subtree here and stays stale forever. Asserting the frame
+    /// count is what keeps the test honest: pass it a second draw and a
+    /// still-broken mount would look fixed.
+    // @lat: [[test#Test Harness#GPUI Client Headless Suites#Root-synced child invalidation]]
+    #[gpui::test]
+    fn a_root_synced_child_repaints_in_the_frame_that_changed_it(cx: &mut gpui::TestAppContext) {
+        let window = cx.update(|app| {
+            app.open_window(WindowOptions::default(), |_, app| {
+                let child = app.new(|_| SyncedChildProbe { input: 0, painted: u32::MAX });
+                app.new(|_| SyncedRootProbe { child, input: 0, frames: 0 })
+            })
+            .expect("open the root-synced child probe")
+        });
+        let child = window.update(cx, |probe, _, _| probe.child.clone()).expect("read the child");
+        cx.update(|app| assert_eq!(child.read(app).painted, 0, "opening a window draws once"));
+
+        window
+            .update(cx, |probe, _, cx| {
+                probe.input = 1;
+                cx.notify();
+            })
+            .expect("stage new inputs outside any draw");
+
+        let frames = window.update(cx, |probe, _, _| probe.frames).expect("read the frame count");
+        assert_eq!(frames, 2, "the notify must earn exactly one frame, and only one");
+        cx.update(|app| {
+            assert_eq!(
+                child.read(app).painted,
+                1,
+                "the child replayed its recorded subtree, and no later frame is coming to fix it"
+            );
+        });
     }
 
     // @lat: [[test#Test Harness#GPUI CI Run Bar#Owner action identities are region-scoped]]
