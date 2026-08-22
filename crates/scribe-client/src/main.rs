@@ -6597,7 +6597,9 @@ impl TerminalView {
     /// the root region's workspace ID before the first `SessionList`, a pane
     /// whose session exited, and a freshly created session that has no pane
     /// yet — and each is settled here rather than from the reader, which must
-    /// never touch GPUI entities.
+    /// never touch GPUI entities. During a cold-restart replay, only
+    /// `fill_pending_panes` consumes pending panes: the active session is the
+    /// newest arrival while replay panes and launches are FIFO.
     fn reconcile_panes(&mut self, cx: &mut Context<Self>) {
         // The server's persisted split tree is folded in first: on a fresh
         // (re)connect it rebuilds regions and splits that everything below —
@@ -6651,8 +6653,11 @@ impl TerminalView {
             changed |= retired.changed;
         }
         let active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
-        if let Some(session_id) =
-            active.filter(|session| !self.shell.shown_sessions().contains(session))
+        // A replay queues every pane and `active` is the newest `SessionCreated`.
+        // Let `fill_pending_panes` pair the FIFO launches and panes instead.
+        if !self.restore.replaying
+            && let Some(session_id) =
+                active.filter(|session| !self.shell.shown_sessions().contains(session))
         {
             // A split queued the pane that asked for this session; anything
             // else (a new tab, a reattach, a refocus after an exit) belongs in

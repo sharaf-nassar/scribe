@@ -20,15 +20,15 @@
 #     under which a snapshot may be replayed.
 #
 # Phases:
-#   0. hand the client a live pane, then split it so the snapshot has a real
-#      pane tree to rebuild;
+#   0. hand the client a live pane, split it, then split the window into a
+#      second workspace region so the snapshot has a multi-region pane tree;
 #   1. the restore store and the window geometry record appear on disk;
 #   2. a resize is persisted into the geometry record;
 #   3. crash the client and cold-restart the server;
 #   4. the relaunched client claims the snapshot and replays it: one
 #      `CreateSession` per saved pane, each carrying its `env_envelope_id`;
-#   5. the relaunched window came back at the persisted geometry, and both
-#      restored panes are on screen.
+#   5. the relaunched window came back at the persisted geometry, its panes
+#      adopted their own launch-order sessions, and no session crossed regions.
 #
 # The wire tap is deliberately NOT used: it renames the server socket out from
 # under `scribe-test server stop/start`, and this test has to restart the real
@@ -148,7 +148,7 @@ geometry_field() {
     sed -n "s/^$1 = \\(.*\\)$/\\1/p" "$file" | head -1
 }
 
-# ── Phase 0: a live pane, then a real pane tree to save ───────────
+# ── Phase 0: a live pane, then a multi-region pane tree to save ───
 # Same preamble as window-lifecycle.sh: the entrypoint creates $SESSION through
 # `scribe-test` after launching the client, and the server hides another
 # window's sessions, so the running client never learns it exists. Releasing the
@@ -172,15 +172,24 @@ sleep 1.0
 launch_client
 focus
 SPLITS_BEFORE=$(count_log "split the focused pane")
+ADOPTS_BEFORE=$(count_log "pane adopted a session")
 send_keys ctrl+shift+backslash
 wait_for_log_growth "split the focused pane" "$SPLITS_BEFORE" 15 \
     || fail "PHASE 0: ctrl+shift+backslash never split the pane"
 # The split's session has to actually land in the new pane, or the snapshot
-# would prune it and the replay would come back with one pane instead of two.
-wait_for_log_growth "pane adopted a session" 1 20 \
+# would prune it and the replay would lose the original in-region split.
+wait_for_log_growth "pane adopted a session" "$ADOPTS_BEFORE" 20 \
     || fail "PHASE 0: the split pane never adopted a session"
-shot /output/00-two-panes.png
-echo "PHASE 0 PASS: the client owns a split window with two live panes"
+WORKSPACE_SPLITS_BEFORE=$(count_log "split the window into a new workspace region")
+ADOPTS_BEFORE=$(count_log "pane adopted a session")
+send_keys ctrl+alt+backslash
+wait_for_log_growth "split the window into a new workspace region" \
+    "$WORKSPACE_SPLITS_BEFORE" 15 \
+    || fail "PHASE 0: ctrl+alt+backslash never split the workspace"
+wait_for_log_growth "pane adopted a session" "$ADOPTS_BEFORE" 20 \
+    || fail "PHASE 0: the new workspace never adopted its pane session"
+shot /output/00-three-panes-two-regions.png
+echo "PHASE 0 PASS: the client owns three live panes across two workspace regions"
 
 # ── Phase 1: the snapshot and the geometry record reach disk ──────
 # Both are debounced, so give the tick time to flush before looking.
@@ -190,14 +199,15 @@ SNAPSHOTS=$(find "$RESTORE_DIR/windows" -maxdepth 1 -name '*.toml' 2>/dev/null |
 [ "$SNAPSHOTS" -eq 1 ] || fail "PHASE 1: expected exactly one window snapshot, found $SNAPSHOTS"
 SNAPSHOT_FILE=$(find "$RESTORE_DIR/windows" -maxdepth 1 -name '*.toml' | head -1)
 LAUNCHES=$(grep -c '^\[\[launches\]\]' "$SNAPSHOT_FILE" || true)
-[ "$LAUNCHES" -eq 2 ] \
-    || fail "PHASE 1: the snapshot recorded $LAUNCHES launches, expected 2 (one per pane)"
-grep -q '^\[\[workspaces\]\]' "$SNAPSHOT_FILE" \
-    || fail "PHASE 1: the snapshot recorded no workspace"
+[ "$LAUNCHES" -eq 3 ] \
+    || fail "PHASE 1: the snapshot recorded $LAUNCHES launches, expected 3 (one per pane)"
+WORKSPACES=$(grep -c '^\[\[workspaces\]\]' "$SNAPSHOT_FILE" || true)
+[ "$WORKSPACES" -eq 2 ] \
+    || fail "PHASE 1: the snapshot recorded $WORKSPACES workspaces, expected 2"
 LIVE_WINDOW=$(basename "$SNAPSHOT_FILE" .toml)
 [ -f "$(geometry_file)" ] \
     || fail "PHASE 1: no geometry record was written for window $LIVE_WINDOW"
-echo "PHASE 1 PASS: a two-launch snapshot and a geometry record are on disk for $LIVE_WINDOW"
+echo "PHASE 1 PASS: a three-launch, two-region snapshot and geometry are on disk for $LIVE_WINDOW"
 
 # ── Phase 2: a resize is persisted ────────────────────────────────
 WID=$(find_window)
@@ -246,32 +256,40 @@ echo "PHASE 3 PASS: the client was killed and the server cold-restarted"
 CLAIMS_BEFORE=$(count_log "claimed a cold-restart snapshot")
 REPLAYS_BEFORE=$(count_log "replaying a cold-restart snapshot")
 REQUESTS_BEFORE=$(count_log "requested a restored session")
+CREATED_BEFORE=$(count_log "opened a new tab")
+MOVES_BEFORE_REPLAY=$(count_log "moved a session into another workspace region")
 launch_client
 wait_for_log_growth "claimed a cold-restart snapshot" "$CLAIMS_BEFORE" 20 \
     || fail "PHASE 4: the relaunched client never claimed the snapshot"
 wait_for_log_growth "replaying a cold-restart snapshot" "$REPLAYS_BEFORE" 25 \
     || fail "PHASE 4: the claimed snapshot was never replayed"
 REPLAY_PANES=$(last_log_field "replaying a cold-restart snapshot" panes)
-[ "$REPLAY_PANES" = "2" ] \
-    || fail "PHASE 4: the replay rebuilt $REPLAY_PANES panes, expected 2"
+[ "$REPLAY_PANES" = "3" ] \
+    || fail "PHASE 4: the replay rebuilt $REPLAY_PANES panes, expected 3"
 started=$(date +%s)
-while [ "$(count_log "requested a restored session")" -lt $(( REQUESTS_BEFORE + 2 )) ]; do
+while [ "$(count_log "requested a restored session")" -lt $(( REQUESTS_BEFORE + 3 )) ]; do
     if [ $(( "$(date +%s)" - started )) -ge 25 ]; then
-        fail "PHASE 4: the replay requested fewer than two restored sessions"
+        fail "PHASE 4: the replay requested fewer than three restored sessions"
     fi
     sleep 0.3
 done
-# The server's own account of the same event: two brand-new PTYs after the
+while [ "$(count_log "opened a new tab")" -lt $(( CREATED_BEFORE + 3 )) ]; do
+    if [ $(( "$(date +%s)" - started )) -ge 25 ]; then
+        fail "PHASE 4: the replay created fewer than three sessions"
+    fi
+    sleep 0.3
+done
+# The server's own account of the same event: three brand-new PTYs after the
 # restart, which is the replay actually reaching it rather than the client
 # merely logging its intent.
 started=$(date +%s)
-while [ "$(count_server_log "created new PTY session")" -lt $(( PTYS_BEFORE + 2 )) ]; do
+while [ "$(count_server_log "created new PTY session")" -lt $(( PTYS_BEFORE + 3 )) ]; do
     if [ $(( "$(date +%s)" - started )) -ge 25 ]; then
-        fail "PHASE 4: the cold-restarted server spawned fewer than two PTYs"
+        fail "PHASE 4: the cold-restarted server spawned fewer than three PTYs"
     fi
     sleep 0.3
 done
-echo "PHASE 4 PASS: the snapshot was claimed and both saved panes were relaunched"
+echo "PHASE 4 PASS: the snapshot was claimed and all three saved panes were relaunched"
 
 # ── Phase 5: geometry and pane tree came back ─────────────────────
 focus
@@ -282,11 +300,33 @@ eval "$(xdotool getwindowgeometry --shell "$(find_window)")"
     || fail "PHASE 5: the restored window is ${HEIGHT}px tall, expected about $RESIZE_H"
 wait_for_log_growth "cold-restart replay filled every restored pane" 0 20 \
     || fail "PHASE 5: not every restored pane adopted a session"
-# A vertical split gives two equal halves, so the two restored sessions must
-# have been requested at the same, less-than-full width. A replay that lost the
-# pane tree would have asked for one full-width session instead.
+MOVES_AFTER_REPLAY=$(count_log "moved a session into another workspace region")
+[ "$MOVES_AFTER_REPLAY" -eq "$MOVES_BEFORE_REPLAY" ] \
+    || fail "PHASE 5: replay moved a session into another workspace region"
+# The ordered replay requests, created sessions, and pane adoptions must agree:
+# each restored pane takes the session its own launch created, in launch order.
+mapfile -t REQUESTED_PANES < <(plain_log | grep "requested a restored session" \
+    | tail -n "$REPLAY_PANES" | sed -n 's/.*pane=\([0-9]*\).*/\1/p')
+mapfile -t CREATED_SESSIONS < <(plain_log | grep "opened a new tab" \
+    | tail -n "$REPLAY_PANES" | sed -n 's/.*session=\([^ ]*\).*/\1/p')
+mapfile -t ADOPTED_PAIRS < <(plain_log | grep "pane adopted a session" \
+    | tail -n "$REPLAY_PANES" \
+    | sed -n 's/.*session_id=\([^ ]*\).*pane=\([0-9]*\).*/\1 \2/p')
+[ "${#REQUESTED_PANES[@]}" -eq "$REPLAY_PANES" ] \
+    && [ "${#CREATED_SESSIONS[@]}" -eq "$REPLAY_PANES" ] \
+    && [ "${#ADOPTED_PAIRS[@]}" -eq "$REPLAY_PANES" ] \
+    || fail "PHASE 5: replay logs did not expose every request, creation, and adoption"
+for (( index = 0; index < REPLAY_PANES; index++ )); do
+    read -r adopted_session adopted_pane <<<"${ADOPTED_PAIRS[$index]}"
+    [ "$adopted_pane" = "${REQUESTED_PANES[$index]}" ] \
+        && [ "$adopted_session" = "${CREATED_SESSIONS[$index]}" ] \
+        || fail "PHASE 5: replay launch $index adopted $adopted_session into pane $adopted_pane"
+done
+# The original in-region vertical split still gives its first two restored
+# sessions equal, less-than-full widths. A replay that lost that pane tree
+# would have asked for one full-width session instead.
 REQUESTED_COLS=$(plain_log | grep "requested a restored session" \
-    | sed -n 's/.*cols=\([0-9]*\).*/\1/p' | tail -2)
+    | sed -n 's/.*cols=\([0-9]*\).*/\1/p' | tail -n "$REPLAY_PANES" | head -2)
 LEFT_COLS=$(echo "$REQUESTED_COLS" | head -1)
 RIGHT_COLS=$(echo "$REQUESTED_COLS" | tail -1)
 [ -n "$LEFT_COLS" ] && [ "$LEFT_COLS" = "$RIGHT_COLS" ] \
@@ -298,12 +338,12 @@ FULL_COLS=$(plain_log | grep "published a pane's grid size" | head -1 \
 [ "$LEFT_COLS" -lt "$FULL_COLS" ] \
     || fail "PHASE 5: each restored pane asked for $LEFT_COLS of $FULL_COLS columns"
 shot /output/02-restored.png
-echo "PHASE 5 PASS: the window reopened at ${WIDTH}x${HEIGHT} with both panes restored"
+echo "PHASE 5 PASS: the window reopened at ${WIDTH}x${HEIGHT} with three panes restored"
 
 echo ""
 echo "PASS: visual cold-restart restore test"
 echo "  Inspect screenshots in test-output/:"
-echo "    00-two-panes.png — the split window whose layout was saved"
-echo "    01-resized.png   — the window at the geometry that had to persist"
-echo "    02-restored.png  — the window rebuilt from the snapshot after the crash"
+echo "    00-three-panes-two-regions.png — the saved multi-region split window"
+echo "    01-resized.png                  — the geometry that had to persist"
+echo "    02-restored.png                 — the window rebuilt after the crash"
 echo "  Logs: test-output/client.log, test-output/server.log"
