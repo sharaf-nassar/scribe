@@ -375,8 +375,7 @@ const ROW_PAD_Y: Pixels = px(6.0);
 /// `SEARCH_RESULT_LIMIT/SEARCH_RESULT_LIMIT` ("256/256") so the controls
 /// beside it never shift position as the digit count changes.
 const COUNTER_WIDTH: Pixels = px(50.0);
-/// The box's fixed (unclamped) width; the box's own `min_w` is the
-/// narrow-pane floor it shrinks to instead.
+/// The box's preferred width; narrow panes shrink it to their available width.
 const BOX_WIDTH: Pixels = px(360.0);
 /// The box's offset from the searched pane's top-right corner.
 const BOX_MARGIN_TOP: Pixels = px(14.0);
@@ -624,19 +623,18 @@ impl Render for FindOverlayView {
             .items_start()
             .child(
                 div()
+                    .debug_selector(|| "find-overlay-box".to_owned())
                     .mt(BOX_MARGIN_TOP)
                     .mr(BOX_MARGIN_RIGHT)
                     .w(BOX_WIDTH)
                     .max_w(BOX_WIDTH)
-                    // ponytail: a pane narrower than this floor still clips
-                    // against grid_slot's overflow_hidden rather than
-                    // shrinking further; widen the floor if a narrower split
-                    // turns out to matter. The counter and the three controls
-                    // are `flex_none` at a fixed size, so only the query text
-                    // truncates as the box narrows toward this floor — the
-                    // controls stay visible and clickable the whole way down.
-                    .min_w(px(200.0))
+                    // The box may shrink to the pane's available width. Its
+                    // clipped, right-aligned contents sacrifice query text
+                    // before the fixed counter and pointer controls.
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .flex()
+                    .justify_end()
                     .items_center()
                     .px(ROW_PAD_X)
                     .py(ROW_PAD_Y)
@@ -656,6 +654,7 @@ impl Render for FindOverlayView {
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .truncate()
                             .text_sm()
                             .text_color(query_color)
@@ -1052,6 +1051,7 @@ mod overlay_tests {
 
     struct FindOverlayProbe {
         overlay: Entity<FindOverlayView>,
+        container_width: Pixels,
     }
 
     impl Render for FindOverlayProbe {
@@ -1063,7 +1063,7 @@ mod overlay_tests {
             // Mirrors `TerminalView::compose_pane_content`'s `grid_slot`: a
             // `.relative()` box the overlay's own `.absolute().inset_0()`
             // resolves against.
-            div().relative().w(CONTAINER_WIDTH).h(CONTAINER_HEIGHT).child(self.overlay.clone())
+            div().relative().w(self.container_width).h(CONTAINER_HEIGHT).child(self.overlay.clone())
         }
     }
 
@@ -1073,12 +1073,19 @@ mod overlay_tests {
     fn overlay_window(
         cx: &mut TestAppContext,
     ) -> (WindowHandle<FindOverlayProbe>, Entity<FindOverlayView>, EventLog) {
+        overlay_window_with_width(cx, CONTAINER_WIDTH)
+    }
+
+    fn overlay_window_with_width(
+        cx: &mut TestAppContext,
+        container_width: Pixels,
+    ) -> (WindowHandle<FindOverlayProbe>, Entity<FindOverlayView>, EventLog) {
         let colors = FindOverlayColors::from(&minimal_dark().chrome);
         let window = cx
             .update(|app| {
                 app.open_window(WindowOptions::default(), move |_window, app| {
                     let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, ctx));
-                    app.new(|_| FindOverlayProbe { overlay })
+                    app.new(|_| FindOverlayProbe { overlay, container_width })
                 })
             })
             .expect("open find overlay probe window");
@@ -1115,6 +1122,33 @@ mod overlay_tests {
         let center_x = content_right - offset - CONTROL_SIZE * 0.5;
         let center_y = BOX_MARGIN_TOP + border + ROW_PAD_Y + CONTROL_SIZE * 0.5;
         point(center_x, center_y)
+    }
+
+    #[gpui::test]
+    fn find_overlay_shrinks_and_keeps_controls_clickable_in_a_narrow_pane(cx: &mut TestAppContext) {
+        let narrow_width = px(120.0);
+        let (window, overlay, _log) = overlay_window_with_width(cx, narrow_width);
+        overlay.update(cx, |view, ctx| view.push_str("err", ctx));
+        let mut results = FindResults::default();
+        results.accept("err".to_owned(), vec![hit(0, 0, 2), hit(1, 0, 2)]);
+        overlay.update(cx, |view, ctx| {
+            view.adopt_results(&results, ctx);
+        });
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw the narrow overlay");
+        let mut test_window = VisualTestContext::from_window(window.into(), cx);
+
+        let bounds =
+            test_window.debug_bounds("find-overlay-box").expect("find overlay box should render");
+        assert_eq!(bounds.origin.x, px(0.0), "find overlay should not overhang the pane");
+        assert_eq!(bounds.size.width, narrow_width - BOX_MARGIN_RIGHT);
+
+        test_window.simulate_click(control_center(narrow_width, 1), Modifiers::default());
+        assert_eq!(overlay.read_with(cx, |o, _| o.current_index()), 1);
+        test_window.simulate_click(control_center(narrow_width, 2), Modifiers::default());
+        assert_eq!(overlay.read_with(cx, |o, _| o.current_index()), 0);
+        test_window.simulate_click(control_center(narrow_width, 0), Modifiers::default());
+        assert!(overlay.read_with(cx, |o, _| o.query().is_empty()));
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#Pointer controls drive the same transitions as the key table]]
