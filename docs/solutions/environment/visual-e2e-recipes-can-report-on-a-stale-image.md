@@ -6,9 +6,24 @@ tags: [e2e, docker, justfile, stale-image, false-green, attribution]
 problem_type: environment
 ---
 
+## Update (2026-08-22): the gap described here is now guarded
+
+`e2e-image-current` (`justfile:200-211`) compares the image's
+`scribe.e2e.inputs` label against the working tree's hash and hard-fails when
+they differ, and every `e2e-visual-*` recipe now depends on it — including
+`e2e-visual-beads-board` (`justfile:592`). A casual run can no longer answer
+about an older image; it refuses to run at all. The counter-pressure below was
+resolved the way it asks for: the guard compares inputs rather than forcing a
+rebuild, so bind-mounted `tests/e2e` edits still need no image bake.
+
+The reasoning below is kept because the failure mode it describes is what the
+guard exists to prevent, and because deliberately running a fresh script
+against a stale image is now a *technique* rather than an accident — see
+`fail-before-proof-runs-the-new-script-on-the-old-image.md` in this directory.
+
 ## Problem
 
-`just e2e-visual-beads-board` has no `docker-visual` dependency. It runs against
+`just e2e-visual-beads-board` had no `docker-visual` dependency. It runs against
 whatever `scribe-test-visual` image already exists, which may have been built
 from an unrelated tree. The suite then reports a confident pass or fail about a
 binary that has nothing to do with your working copy.
