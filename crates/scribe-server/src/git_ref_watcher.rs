@@ -783,9 +783,10 @@ mod tests {
         fn new() -> Self {
             let base = std::env::temp_dir()
                 .join(format!("scribe-git-ref-watcher-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&base).expect("create fixture root");
+            let base = base.canonicalize().expect("canonical fixture root");
             let work = base.join("work");
             let remote = base.join("remote.git");
-            fs::create_dir_all(&base).expect("create fixture root");
             run(&base, ["init", "--bare", remote.to_str().expect("utf-8 temp path")]);
             run(&base, ["init", work.to_str().expect("utf-8 temp path")]);
             run(&work, ["config", "user.email", "scribe@example.com"]);

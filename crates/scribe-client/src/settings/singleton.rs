@@ -393,16 +393,19 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> Result<UnixStream, Fo
     let fd = nix::sys::socket::socket(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
-        nix::sys::socket::SockFlag::SOCK_CLOEXEC | nix::sys::socket::SockFlag::SOCK_NONBLOCK,
+        nix::sys::socket::SockFlag::empty(),
         None,
     )
     .map_err(std::io::Error::from)?;
+    nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
+        .map_err(std::io::Error::from)?;
+    let stream = UnixStream::from(fd);
+    stream.set_nonblocking(true)?;
     let address = nix::sys::socket::UnixAddr::new(path).map_err(std::io::Error::from)?;
     let deadline = Instant::now() + timeout;
     loop {
-        match nix::sys::socket::connect(fd.as_raw_fd(), &address) {
+        match nix::sys::socket::connect(stream.as_raw_fd(), &address) {
             Ok(()) | Err(nix::errno::Errno::EISCONN) => {
-                let stream = UnixStream::from(fd);
                 stream.set_nonblocking(false)?;
                 return Ok(stream);
             }
@@ -825,8 +828,8 @@ mod tests {
     }
 
     fn test_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "scribe-focus-{label}-{}-{}",
+        PathBuf::from("/tmp").join(format!(
+            "sf-{label}-{}-{}",
             std::process::id(),
             ClientFocusGeneration::new().socket_tag()
         ))
@@ -1075,6 +1078,30 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(matches!(read_focus_endpoint_result(&reader), Err(FocusTransportError::Timeout)));
         assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    // @lat: [[test#Test Harness#Terminal Client Singleton#Timed focus connects preserve descriptor flags]]
+    #[test]
+    fn timed_focus_connects_are_cloexec_and_return_blocking() {
+        let dir = test_dir("connect-flags");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("focus.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let stream = connect_with_timeout(&path, FOCUS_IO_TIMEOUT).unwrap();
+        let descriptor_flags = nix::fcntl::fcntl(&stream, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_truncate(descriptor_flags)
+                .contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        let status_flags = nix::fcntl::fcntl(&stream, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        assert!(
+            !nix::fcntl::OFlag::from_bits_truncate(status_flags)
+                .contains(nix::fcntl::OFlag::O_NONBLOCK)
+        );
+
+        drop(stream);
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     // @lat: [[test#Test Harness#Terminal Client Singleton#Crash debris cleanup is bounded and conservative]]

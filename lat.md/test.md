@@ -11,6 +11,8 @@ Server unit fixtures verify the local push gate before any GitHub polling or cli
 
 Tests exercise real loose, packed, and linked-worktree layouts plus native delivery and a synthetic reftable watch path.
 
+Real Git fixtures canonicalize their temporary root before deriving expected worktree paths, matching Git's `/var` to `/private/var` resolution on macOS.
+
 #### Disabled construction creates no watcher
 
 Starting with the feature off returns no detector, receiver, worker thread, or filesystem watcher.
@@ -1460,6 +1462,8 @@ It requires zero synthesized history, an unchanged visual grid (the stored `'\t'
 
 Unit checks cover terminal-client launch gating, authenticated restore-child focus transport, bounded cleanup, stale-owner recovery, and flavor-scoped paths without starting a Scribe runtime process.
 
+Socket fixtures use short `/tmp/sf-*` paths so they stay below macOS's `sun_path` limit regardless of the runner's configured temporary directory.
+
 ### Plain local launch owns the singleton
 
 Only a plain local launch acquires the terminal singleton; restore children, explicit joins, and remote or LAN dial launches bypass it.
@@ -1527,6 +1531,10 @@ Binding a restore-child endpoint leaves its parent directory at 0700 and its soc
 ### Focus endpoint reads time out
 
 A connected endpoint that sends no result returns a typed timeout at the 100 ms transport bound.
+
+### Timed focus connects preserve descriptor flags
+
+The bounded connector sets `FD_CLOEXEC` without platform-specific socket creation flags, uses nonblocking mode only during the connect, and returns a blocking stream.
 
 ### Crash debris cleanup is bounded and conservative
 

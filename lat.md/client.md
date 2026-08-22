@@ -608,6 +608,29 @@ Building that snapshot is the expensive half, and it is charged per presented bu
 
 Two orderings hold the design together. Nothing on the paint path takes a pane's stream lock: a frame that had to queue behind a parse is a dropped frame. And the prompt-mark store is always taken *inside* a pane lock, the order the drain takes them in when it anchors a mark against the grid it just advanced — [[crates/scribe-client/src/main.rs#TerminalView#jump_to_mark]] follows the same order for exactly that reason, because the inversion is the one that could deadlock a jump against a firehosed pane.
 
+#### Pane-grid cached-view decision
+
+Pane grids remain uncached. Bead `scribe-goa4.1` closed the investigation as **do not implement now** because a faithful caching-on measurement variant is indistinguishable from building the feature.
+
+Unlike the retained board and panel views, each pane is currently assembled directly inside [[crates/scribe-client/src/main.rs#TerminalView#render_panes]]. A real variant needs a retained per-session `Entity`, complete input diffing for the content snapshot, font and palette, find/selection/link overlays, cursor blink, scrollbar, IME, image scene/cache, bounds sink, and pane lifecycle, plus the live-versus-cached mount rule required when a root render changes child inputs. Omitting any of those is not the proposed cache and can silently paint stale state. No caching-on binary was fabricated, no production code changed, and no probe counter was added.
+
+The measurable control used commit `18db2d5ac5532962feec34ebc7b5b4cde23129a7` and the same caching-off `target/release/scribe-client` for both sequential rig arms. This preserves the current board/panel caching from `e42757e` and measures only same-commit run-to-run variation:
+
+```bash
+PS4='+TRACE:${LINENO}: ' bash -x tools/perf-ab-rig/run-perf-ab.sh \
+  --live --scroll-only \
+  --new-client target/release/scribe-client \
+  --old-client target/release/scribe-client \
+  --scribe-test target/release/scribe-test \
+  --out test-output/scribe-goa4.1/perf-control.md
+```
+
+The unpaced `seq 1 100000000` scroll produced 470 `frames` and 0 `dropped_frames` over 7845.041 ms (59.910 fps) in the first arm, then 471 `frames` and 0 `dropped_frames` over 7847.748 ms (60.017 fps) in the repeat. The fps spread was 0.18%, below the rig's documented 10% run-to-run noise allowance. This is caching-off control evidence only, not an A/B result; therefore there is no measured improvement that can clear the greater-than-10% implementation threshold.
+
+Host load was recorded around the run on a 64-logical-CPU host: load average `23.43, 19.67, 17.05` at `2026-08-22T20:26:51Z` and `18.11, 18.73, 16.82` at `2026-08-22T20:27:22Z`. Top consumers included `containerd` at 97.8%, `dockerd` at 88.4%, and the stable `/usr/bin/scribe-client` at 83.0%; no `rustc` build was active. The rig staged only the isolated `scribe-dev` identity, the pointer was parked at `(0,0)` after the run, and `/proc/13871/exe` plus `/proc/687754/exe` remained `/usr/bin/scribe-server` and `/usr/bin/scribe-client`.
+
+Pulse-only frames remain unmeasurable with the current probe. [[crates/scribe-common/src/perf_probe.rs#missed_frames]] deliberately scores gaps longer than its 250 ms idle threshold as zero dropped frames, so idle pulse gaps do not form the drop-accounting signal this hypothesis needs; the report also has no cause label that could separate a pulse repaint from other frames. Since measuring the cache requires building it and the output-heavy control already sustains the frame target with zero drops, no pulse counter is warranted.
+
  runs after any layout change: each pane's rect yields a cell count, which is reshaped locally through  and announced to the server as `Resize` followed by `RequestSnapshot` — the client owns no PTY and never reflows locally, so the authoritative grid has to come back from the server. Unchanged panes are skipped, so a redraw storm never becomes a `RequestSnapshot` storm.
 
 The cell count divides real pixels by the live cell box, which is why the viewport above is measured rather than derived from the font: a rect stated in the font's own cells moves its numerator and denominator together, so every font size yields the same `cols`x`rows` and a zoom step would leave the freed pixels dead while telling the server nothing new.  closes the other half of that loop — it compares the measured area against the last published size and republishes exactly once when a window resize or a chrome band moved the grid's boundaries.
@@ -887,7 +910,7 @@ The owner accepts same-UID `focus` commands and routes them through [[crates/scr
 
 Each eligible restore child starts one [[crates/scribe-client/src/main.rs#start_restore_child_focus]] endpoint after GPUI starts. Every terminal window in that process updates the same `RECENT_TERMINAL_WINDOW`; the endpoint acknowledges activation only after GPUI updates that handle and accepts `activate_window()`.
 
-[[crates/scribe-client/src/main.rs#route_terminal_focus]] uses the existing bounded transport for an external winner. A missing, stale, timed-out, rejected, or unavailable child is pruned and the owner's recent terminal receives the same handoff. A replacement owner constructs a fresh broker, so external recency resets.
+[[crates/scribe-client/src/main.rs#route_terminal_focus]] uses the existing bounded transport for an external winner. [[crates/scribe-client/src/settings/singleton.rs#connect_with_timeout]] creates a plain Unix socket, then sets `FD_CLOEXEC` and nonblocking mode through portable descriptor operations before connecting; this avoids Linux-only `SOCK_CLOEXEC` and `SOCK_NONBLOCK` creation flags while returning a blocking stream to the framing layer. A missing, stale, timed-out, rejected, or unavailable child is pruned and the owner's recent terminal receives the same handoff. A replacement owner constructs a fresh broker, so external recency resets.
 
 Explicit joins and remote or LAN dial clients neither own the singleton nor publish restore-child recency. The duplicate plain-launch return remains before cold-start resolution, backend attachment, restore claims, GPUI startup, and session creation.
 
