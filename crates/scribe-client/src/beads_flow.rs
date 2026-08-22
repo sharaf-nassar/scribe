@@ -17,8 +17,11 @@ use scribe_common::protocol::{
 
 use crate::beads_board::{BeadsBoardColors, alpha, short_id};
 use crate::beads_board_a2::{
-    FLOW_BAND_HEIGHT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X, FLOW_FADE_WIDTH, FLOW_GRAPH_HEIGHT,
-    FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP, FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT,
+    FLOW_BAND_GAP, FLOW_BAND_HEIGHT, FLOW_BAND_PAD_LEFT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X,
+    FLOW_CHIP_PAD_H, FLOW_CHIP_PAD_V, FLOW_CHIP_RADIUS, FLOW_DOT_SIZE, FLOW_FADE_WIDTH,
+    FLOW_GRAPH_HEIGHT, FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP, FLOW_NODE_GAP,
+    FLOW_NODE_GUTTER, FLOW_NODE_HEIGHT, FLOW_NODE_LEFT_PAD, FLOW_NODE_PAD_H, FLOW_NODE_ROW_GAP,
+    FLOW_NODE_WIDTH, FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT,
 };
 
 fn scalar(value: usize) -> f32 {
@@ -43,12 +46,12 @@ struct FlowMetrics {
 impl FlowMetrics {
     const fn standard() -> Self {
         Self {
-            node_width: 214.0,
-            node_height: 24.0,
-            gutter: 28.0,
-            row_gap: 10.0,
-            graph_height: 139.0,
-            left_padding: 30.0,
+            node_width: FLOW_NODE_WIDTH,
+            node_height: FLOW_NODE_HEIGHT,
+            gutter: FLOW_NODE_GUTTER,
+            row_gap: FLOW_NODE_ROW_GAP,
+            graph_height: FLOW_GRAPH_HEIGHT,
+            left_padding: FLOW_NODE_LEFT_PAD,
         }
     }
 
@@ -1201,10 +1204,10 @@ fn flow_band(
         .right_0()
         .top_0()
         .h(px(FLOW_BAND_HEIGHT))
-        .px(px(14.0))
+        .px(px(FLOW_BAND_PAD_LEFT))
         .flex()
         .items_center()
-        .gap(px(10.0))
+        .gap(px(FLOW_BAND_GAP))
         .bg(colors.band)
         .border_b_1()
         .border_color(colors.hairline_strong)
@@ -1477,9 +1480,9 @@ fn trace_chip(chip: &FlowChip, colors: &BeadsBoardColors, text_scale: f32) -> An
         .absolute()
         .left(px(chip.x))
         .top(px(chip.y))
-        .px(px(7.0))
-        .py(px(3.0))
-        .rounded(px(2.0))
+        .px(px(FLOW_CHIP_PAD_H))
+        .py(px(FLOW_CHIP_PAD_V))
+        .rounded(px(FLOW_CHIP_RADIUS))
         .bg(colors.chip)
         .border_1()
         .border_color(colors.chip_border)
@@ -1518,10 +1521,10 @@ fn flow_node(
         .top(px(node.y))
         .w(px(node.width))
         .h(px(node.height))
-        .px(px(6.0 * text_scale))
+        .px(px(FLOW_NODE_PAD_H * text_scale))
         .flex()
         .items_center()
-        .gap(px(6.0 * text_scale))
+        .gap(px(FLOW_NODE_GAP * text_scale))
         .cursor_pointer()
         .hover(move |element| element.bg(hover))
         .on_hover(move |entered, window, app| on_hover(hover_id.clone(), *entered, window, app))
@@ -1570,7 +1573,7 @@ fn flow_node_contents(
         .size_full()
         .flex()
         .items_center()
-        .gap(px(6.0 * text_scale))
+        .gap(px(FLOW_NODE_GAP * text_scale))
         .child(node_dot(node, colors, text_scale))
         .child(priority_text(node.priority, colors, text_scale))
         .child(node_title(node, colors, text_scale))
@@ -1581,7 +1584,7 @@ fn flow_node_contents(
 
 // @lat: [[client#Client#Beads Flow Layout Engine#Reading liveness from a node]]
 fn node_dot(node: &FlowNodePresentation, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
-    let size = px(8.0 * text_scale);
+    let size = px(FLOW_DOT_SIZE * text_scale);
     let dot = div().flex_none().size(size).rounded_full();
     // A live node's dot outranks its queue treatment: the ring says a machine
     // is on this issue now, which is the one fact a reader is scanning for.
@@ -1925,8 +1928,14 @@ mod tests {
     #[test]
     fn row_budget_matches_the_mock_at_scale_extremes() {
         let metrics = FlowMetrics::standard();
-        assert_eq!(metrics.rank_pitch(1.0).to_bits(), 242.0f32.to_bits());
-        assert_eq!(metrics.row_pitch(1.0).to_bits(), 34.0f32.to_bits());
+        assert_eq!(
+            metrics.rank_pitch(1.0).to_bits(),
+            (FLOW_NODE_WIDTH + FLOW_NODE_GUTTER).to_bits()
+        );
+        assert_eq!(
+            metrics.row_pitch(1.0).to_bits(),
+            (FLOW_NODE_HEIGHT + FLOW_NODE_ROW_GAP).to_bits()
+        );
         assert_eq!(metrics.rows_that_fit(0.8), Some(5));
         assert_eq!(metrics.rows_that_fit(1.0), Some(4));
         assert_eq!(metrics.rows_that_fit(1.6), Some(2));
@@ -2203,8 +2212,8 @@ mod tests {
         let hovered = shown.nodes.iter().find(|node| node.id == "2a8z.3").unwrap();
         let chip = shown.chip.clone().unwrap();
         assert_eq!(chip.text, "releases 3 · blocked by 1");
-        assert!((chip.x - (hovered.x + 14.0)).abs() < f32::EPSILON);
-        assert!((chip.y - (hovered.y + hovered.height + 6.0)).abs() < f32::EPSILON);
+        assert!((chip.x - (hovered.x + FLOW_CHIP_OFFSET_X)).abs() < f32::EPSILON);
+        assert!((chip.y - (hovered.y + hovered.height + FLOW_CHIP_GAP_Y)).abs() < f32::EPSILON);
     }
 
     #[test]

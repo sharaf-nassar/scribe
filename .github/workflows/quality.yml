@@ -52,6 +52,9 @@ jobs:
           tools/check-parity-inventory.sh \
             --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
 
+      - name: Check A2/A3 contract and coverage ownership
+        run: python3 .impeccable/mocks/check-contract.py
+
   # Until this job existed no workflow ran clippy or the unit tests at all:
   # the suppression guards above are repo hygiene, and e2e.yml only builds
   # binaries for the Docker suites. The workspace denies clippy::pedantic

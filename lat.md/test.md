@@ -4744,6 +4744,21 @@ exported A2 layout/paint and A3 paint geometry constant matches it.
 `beads_board.rs` and `beads_flow.rs` consume those exports, so a regenerated
 mock mismatch fails loudly instead of drifting.
 
+The same checker parses the coverage table in
+[specs/028-beads-board-contract.md](../specs/028-beads-board-contract.md),
+the only ownership inventory: every normative row needs one owner bead and
+one oracle; the manifest's named states must retain visual coverage and its
+interactions must retain interaction coverage. `just ready`, the matching
+pre-commit hook, and Quality run this Docker-free check. It also rejects raw
+A2/A3 shell assignments and Flow/board geometry restatements outside the
+manifest-backed Rust bridge. Its legacy scan is deliberately visual: it rejects
+a board-width `/ 5` allocation or raised ledger-card paint marker, not the
+legitimate five named server queues and their status handling.
+
+The required PR E2E job runs `just e2e-func-beads-board` and
+`just e2e-visual-beads-board`; those Docker runs respectively retain the
+interaction matrix and validate the running-client visual capture inventory.
+
 ### Beads Flow visual contract
 
 The generated-contract visual run opens a real epic-backed row and captures

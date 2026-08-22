@@ -45,9 +45,7 @@ parity-gate:
 beads-board-contract-gen:
     python3 .impeccable/mocks/gen-contract.py
 
-# Check the mock's A2/A3 sections against that generated contract: catches
-# stale evidence, changed normative geometry, and missing named states or
-# interactions. Not part of `just ready`; CI wiring is a separate gate.
+# Check the mock's A2/A3 contract, coverage ownership, and production drift.
 beads-board-contract:
     python3 .impeccable/mocks/check-contract.py
 
@@ -68,6 +66,7 @@ ready:
     just lint-suppressions
     just reachability
     just parity-inventory
+    just beads-board-contract
     just fmt
     just clippy
     just test

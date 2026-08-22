@@ -37,6 +37,13 @@ repos:
         files: ^(specs/016-gpui-client-rebuild/(parity-inventory|spec)\.md|crates/scribe-client/src/(main|input)\.rs|crates/scribe-common/src/protocol\.rs|tools/check-parity-inventory\.sh)$
         pass_filenames: false
 
+      - id: beads-board-contract
+        name: A2/A3 contract and coverage
+        entry: python3 .impeccable/mocks/check-contract.py
+        language: system
+        files: ^(\.impeccable/mocks/(a2a3-contract\.json|beads-board-directions\.html|check-contract\.py|check-flow\.py|gen-contract\.py)|specs/028-beads-board-contract\.md|crates/scribe-client/src/beads_(board|board_a2|flow)\.rs|tests/e2e/(beads_board_image_oracle\.py|func/beads-board\.sh|visual/beads-board(\.sh|-oracle\.py))|justfile)$
+        pass_filenames: false
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all -- --check

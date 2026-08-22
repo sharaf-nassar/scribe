@@ -9,6 +9,7 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
+pub use crate::beads_board_a2::BEADS_BOARD_HEIGHT;
 use crate::beads_board_a2::{
     self, A2Input, CHEV_BOTTOM, CHEV_RIGHT, CHEV_SIZE, FLOOR_GRIP_H, FLOOR_GRIP_TOP, FLOOR_GRIP_W,
     QueueLane, RailState, RowView, VoidCopy, ZOOM_GAP, ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT,
@@ -1501,11 +1502,6 @@ fn move_snapshot_card(
 fn card_drag_point(position: Point<Pixels>) -> CardDragPoint {
     CardDragPoint { x: f32::from(position.x), y: f32::from(position.y) }
 }
-
-/// Height a board opens at, shared by the paint and by the region reservation
-/// a pinned board makes, so the two cannot disagree. A drag of the bottom bar
-/// moves it for that one workspace.
-pub const BEADS_BOARD_HEIGHT: f32 = 197.0;
 
 /// How far either side of the bottom bar counts as grabbing it, matching the
 /// tolerance a pane divider gives its own one-pixel line.

@@ -29,6 +29,8 @@ use crate::beads_board::{CollapsedLaneState, short_epic};
 
 // ---- Geometry, mirrored from `a2a3-contract.json`'s `geometry.a2` block ----
 
+/// Height shared by the A2 ledger and A3 Flow modules.
+pub const BEADS_BOARD_HEIGHT: f32 = 197.0;
 /// A row's total height: 19px title line + 15px subline + 4px interline gap,
 /// plus centring slack the row's own `align-content` absorbs (A2-G4).
 pub const ROW_H: f32 = 51.0;
@@ -105,6 +107,19 @@ pub const FLOW_PROGRESS_WIDTH: f32 = 150.0;
 pub const FLOW_FADE_WIDTH: f32 = 48.0;
 pub const FLOW_CHIP_OFFSET_X: f32 = 14.0;
 pub const FLOW_CHIP_GAP_Y: f32 = 6.0;
+pub const FLOW_NODE_WIDTH: f32 = 214.0;
+pub const FLOW_NODE_HEIGHT: f32 = 24.0;
+pub const FLOW_NODE_GUTTER: f32 = 28.0;
+pub const FLOW_NODE_ROW_GAP: f32 = 10.0;
+pub const FLOW_NODE_LEFT_PAD: f32 = 30.0;
+pub const FLOW_NODE_PAD_H: f32 = 6.0;
+pub const FLOW_NODE_GAP: f32 = 6.0;
+pub const FLOW_DOT_SIZE: f32 = 8.0;
+pub const FLOW_CHIP_PAD_V: f32 = 3.0;
+pub const FLOW_CHIP_PAD_H: f32 = 7.0;
+pub const FLOW_CHIP_RADIUS: f32 = 2.0;
+pub const FLOW_BAND_PAD_LEFT: f32 = 14.0;
+pub const FLOW_BAND_GAP: f32 = 10.0;
 /// Narrowest region that keeps the fixed drawer to the right of the fixed
 /// text-control gutter: `44 + 452 + 96` (A2-G2, A2-G8). Tests use this
 /// derived floor for the all-state narrow matrix rather than inventing a
@@ -1263,13 +1278,16 @@ mod tests {
             BEADS_BOARD_HEIGHT, CHEV_BOTTOM, CHEV_RIGHT, CHEV_SIZE, DRAG_SOURCE_OPACITY,
             DRAWER_BORDER_W, DRAWER_BOTTOM, DRAWER_PAD_H, DRAWER_RADIUS, DRAWER_RIGHT, DRAWER_TOP,
             DRAWER_W, EPIC_SEPARATION_MIN, FLOOR_GRIP_H, FLOOR_GRIP_TOP, FLOOR_GRIP_W, FLOOR_H,
-            FLOW_BAND_HEIGHT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X, FLOW_FADE_WIDTH,
-            FLOW_GRAPH_HEIGHT, FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP,
-            FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT, GHOST_H, GHOST_PAD_LEFT, GHOST_PAD_RIGHT,
-            GHOST_RADIUS, GHOST_W, HEAD_H, HEADBAND_H, LANES_PADDING_BOTTOM, LANES_PADDING_LEFT,
-            LANES_PADDING_RIGHT, LANES_PADDING_TOP, ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP,
-            ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H, SEAM_H, TAB_W, TRACK_GAP, ZOOM_GAP,
-            ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT, ZOOM_TOP, visible_row_count,
+            FLOW_BAND_GAP, FLOW_BAND_HEIGHT, FLOW_BAND_PAD_LEFT, FLOW_CHIP_GAP_Y,
+            FLOW_CHIP_OFFSET_X, FLOW_CHIP_PAD_H, FLOW_CHIP_PAD_V, FLOW_CHIP_RADIUS, FLOW_DOT_SIZE,
+            FLOW_FADE_WIDTH, FLOW_GRAPH_HEIGHT, FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP,
+            FLOW_NODE_GAP, FLOW_NODE_GUTTER, FLOW_NODE_HEIGHT, FLOW_NODE_LEFT_PAD, FLOW_NODE_PAD_H,
+            FLOW_NODE_ROW_GAP, FLOW_NODE_WIDTH, FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT, GHOST_H,
+            GHOST_PAD_LEFT, GHOST_PAD_RIGHT, GHOST_RADIUS, GHOST_W, HEAD_H, HEADBAND_H,
+            LANES_PADDING_BOTTOM, LANES_PADDING_LEFT, LANES_PADDING_RIGHT, LANES_PADDING_TOP,
+            ROW_H, ROW_INTERLINE_GAP, ROW_PRIORITY_GAP, ROW_PRIORITY_W, ROW_SUB_H, ROW_TITLE_H,
+            SEAM_H, TAB_W, TRACK_GAP, ZOOM_GAP, ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT, ZOOM_TOP,
+            visible_row_count,
         };
 
         const MANIFEST_JSON: &str = include_str!("../../../.impeccable/mocks/a2a3-contract.json");
@@ -1344,6 +1362,19 @@ mod tests {
             fade_w: f32,
             chip_offset_x: f32,
             chip_gap_y: f32,
+            node_w: f32,
+            node_h: f32,
+            gutter: f32,
+            row_gap: f32,
+            left_pad: f32,
+            node_pad_h: f32,
+            node_gap: f32,
+            dot_size: f32,
+            chip_pad_v: f32,
+            chip_pad_h: f32,
+            chip_radius: f32,
+            band_pad_left: f32,
+            band_gap: f32,
         }
 
         /// `assert_eq!` on two `f32`s trips `clippy::float_cmp`; every field
@@ -1416,6 +1447,19 @@ mod tests {
             assert_matches("a3.fade_w", a3.fade_w, FLOW_FADE_WIDTH);
             assert_matches("a3.chip_offset_x", a3.chip_offset_x, FLOW_CHIP_OFFSET_X);
             assert_matches("a3.chip_gap_y", a3.chip_gap_y, FLOW_CHIP_GAP_Y);
+            assert_matches("a3.node_w", a3.node_w, FLOW_NODE_WIDTH);
+            assert_matches("a3.node_h", a3.node_h, FLOW_NODE_HEIGHT);
+            assert_matches("a3.gutter", a3.gutter, FLOW_NODE_GUTTER);
+            assert_matches("a3.row_gap", a3.row_gap, FLOW_NODE_ROW_GAP);
+            assert_matches("a3.left_pad", a3.left_pad, FLOW_NODE_LEFT_PAD);
+            assert_matches("a3.node_pad_h", a3.node_pad_h, FLOW_NODE_PAD_H);
+            assert_matches("a3.node_gap", a3.node_gap, FLOW_NODE_GAP);
+            assert_matches("a3.dot_size", a3.dot_size, FLOW_DOT_SIZE);
+            assert_matches("a3.chip_pad_v", a3.chip_pad_v, FLOW_CHIP_PAD_V);
+            assert_matches("a3.chip_pad_h", a3.chip_pad_h, FLOW_CHIP_PAD_H);
+            assert_matches("a3.chip_radius", a3.chip_radius, FLOW_CHIP_RADIUS);
+            assert_matches("a3.band_pad_left", a3.band_pad_left, FLOW_BAND_PAD_LEFT);
+            assert_matches("a3.band_gap", a3.band_gap, FLOW_BAND_GAP);
             assert_eq!(a2.body_rows, 3);
             assert_eq!(
                 visible_row_count(a2.strip_h, 1.0),
