@@ -24,7 +24,7 @@ use crate::restore_replay::round_positive_f32_to_u16;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{
     BeadsBoardItem, BeadsBoardSnapshot, BeadsBoardState, BeadsEpicGraph, BeadsEpicGraphOutcome,
-    BeadsIssueQueue, BeadsIssueWriteResult,
+    BeadsIssueQueue, BeadsIssueWrite, BeadsIssueWriteResult,
 };
 
 /// One of the things whose hover keeps a board open. They overlap, so each is
@@ -1365,12 +1365,26 @@ impl CardDragGhost {
 
 impl CardDragPaint {
     /// Whether a drop on `lane_index` would write (A2-BD6), so an accepted
-    /// target and a rejected one never wear the same treatment. The paint-side
-    /// twin of [`crate::beads_panel::BeadsPanels::queue_card_drop`]'s own
-    /// verb match: Backlog and Blocked never write, and the lane the card came
-    /// from is not a move.
+    /// target and a rejected one never wear the same treatment as the guarded
+    /// write queue.
     fn accepts(&self, lane_index: u8) -> bool {
-        !matches!(lane_index, 0 | 3) && lane_index != self.source_lane
+        card_drop_verb(self.source_lane, lane_index).is_some()
+    }
+}
+
+/// The only A2-BD6 card-drop matrix: native lanes can move to Ready, claim in
+/// In progress, or close in Done. Paint and guarded writes both derive from it.
+pub(crate) fn card_drop_verb(source_lane: u8, target_lane: u8) -> Option<BeadsIssueWrite> {
+    if source_lane > 2 {
+        return None;
+    }
+    match target_lane {
+        1 if source_lane != 1 => {
+            Some(BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: true })
+        }
+        2 if source_lane != 2 => Some(BeadsIssueWrite::Claim),
+        4 => Some(BeadsIssueWrite::CloseIssue),
+        _ => None,
     }
 }
 
@@ -4479,6 +4493,35 @@ mod tests {
 
         boards.end_card_drag();
         assert!(boards.card_drag_ghost(1.0).is_none());
+    }
+
+    #[test]
+    fn card_drop_paint_and_queue_agree_for_every_lane_pair() {
+        for source_lane in 0..=4 {
+            for target_lane in 0..=4 {
+                let mut panels = BeadsPanels::default();
+                panels.set_enabled(true);
+                panels.set_write_enabled(true);
+                let drag = CardDragState {
+                    workspace_id: WorkspaceId::new(),
+                    source: drag_item(),
+                    source_lane,
+                    pointer: drag_point(0.0, 0.0),
+                    hovered_lane: Some(target_lane),
+                };
+                let paint = CardDragPaint {
+                    source_id: drag.source.id.clone(),
+                    source_lane,
+                    target_lane: Some(target_lane),
+                };
+
+                assert_eq!(
+                    paint.accepts(target_lane),
+                    panels.queue_card_drop(&drag),
+                    "source {source_lane} -> target {target_lane}"
+                );
+            }
+        }
     }
 
     #[test]

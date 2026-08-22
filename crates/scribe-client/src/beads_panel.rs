@@ -22,7 +22,8 @@ use scribe_common::protocol::{
 };
 
 use crate::animation::AnimationSettings;
-use crate::beads_board::{BeadsBoardColors, CardDragState};
+use crate::beads_board::{BeadsBoardColors, CardDragState, card_drop_verb};
+use crate::beads_board_a2::queue_name;
 use crate::layout::Rect;
 use crate::settings::window::{utf8_range_to_utf16, utf16_range_to_utf8};
 use unicode_segmentation::UnicodeSegmentation;
@@ -1220,20 +1221,13 @@ impl BeadsPanels {
     }
 
     /// Translate one completed board gesture into the existing guarded write
-    /// queue. Derived lanes and same-lane drops never enter the queue.
+    /// queue. Rejected targets never enter the queue.
     pub fn queue_card_drop(&mut self, drag: &CardDragState) -> bool {
-        if !self.write_enabled || drag.source_lane > 2 {
+        if !self.write_enabled {
             return false;
         }
         let Some(target_lane) = drag.hovered_lane else { return false };
-        let verb = match target_lane {
-            1 if drag.source_lane != 1 => {
-                BeadsIssueWrite::SetStatus { status: "open".into(), clear_defer: true }
-            }
-            2 if drag.source_lane != 2 => BeadsIssueWrite::Claim,
-            4 => BeadsIssueWrite::CloseIssue,
-            _ => return false,
-        };
+        let Some(verb) = card_drop_verb(drag.source_lane, target_lane) else { return false };
         let detail = self.open.get(&drag.workspace_id).and_then(|panel| {
             (panel.card.id == drag.source.id).then_some(panel.detail.as_deref()).flatten()
         });
@@ -3214,16 +3208,6 @@ fn queue_basis(presentation: &PanelPresentation) -> String {
     }
 }
 
-fn queue_name(queue: BeadsIssueQueue) -> &'static str {
-    match queue {
-        BeadsIssueQueue::Backlog => "Backlog",
-        BeadsIssueQueue::Ready => "Ready",
-        BeadsIssueQueue::InProgress => "In progress",
-        BeadsIssueQueue::Blocked => "Blocked",
-        BeadsIssueQueue::Done => "Done",
-    }
-}
-
 fn queue_color(colors: &BeadsBoardColors, queue: BeadsIssueQueue) -> Rgba {
     match queue {
         BeadsIssueQueue::Backlog => colors.backlog_state,
@@ -4261,7 +4245,7 @@ mod tests {
     }
 
     #[test]
-    fn card_drop_matrix_queues_only_native_writable_targets() {
+    fn card_drop_queue_carries_shared_verbs_and_guards() {
         for source_lane in 0..=2 {
             let source_status = match source_lane {
                 1 => Some("open"),
@@ -4274,15 +4258,7 @@ mod tests {
                 panels.set_enabled(true);
                 panels.set_write_enabled(true);
 
-                let expected = match target_lane {
-                    1 if source_lane != 1 => Some(BeadsIssueWrite::SetStatus {
-                        status: "open".into(),
-                        clear_defer: true,
-                    }),
-                    2 if source_lane != 2 => Some(BeadsIssueWrite::Claim),
-                    4 => Some(BeadsIssueWrite::CloseIssue),
-                    _ => None,
-                };
+                let expected = card_drop_verb(source_lane, target_lane);
                 assert_eq!(
                     panels.queue_card_drop(&drag),
                     expected.is_some(),

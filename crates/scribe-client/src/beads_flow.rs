@@ -1208,7 +1208,17 @@ fn flow_band(
         .bg(colors.band)
         .border_b_1()
         .border_color(colors.hairline_strong)
-        .child(back_label(band, colors, text_scale))
+        .child(flow_exit_control(
+            FlowExitControl {
+                id: "beads-flow-back",
+                label: "← LANES",
+                accessible_label: "Back to Lanes",
+                focus: &band.back_focus,
+                on_exit: &band.on_exit,
+            },
+            colors,
+            text_scale,
+        ))
         .child(epic_label(&graph.epic_title, colors, text_scale))
         .child(div().text_size(px(10.0 * text_scale)).text_color(colors.chevron).child("⌄"))
         .child(tally(graph, colors, text_scale))
@@ -1218,21 +1228,32 @@ fn flow_band(
         .into_any_element()
 }
 
-/// `← LANES`: a real pointer, keyboard, and AccessKit control that returns
-/// to A2 (specs/028's Flow return controls). Shares its destination with
-/// [`lanes_mode_label`] but keeps its own focus handle, since Tab reaches
-/// them as two separate stops.
-fn back_label(band: &FlowBandControl, colors: &BeadsBoardColors, text_scale: f32) -> AnyElement {
+#[derive(Clone, Copy)]
+struct FlowExitControl<'a> {
+    id: &'static str,
+    label: &'static str,
+    accessible_label: &'static str,
+    focus: &'a FocusHandle,
+    on_exit: &'a FlowExitHandler,
+}
+
+/// One Flow exit control. Each call keeps its distinct id, accessible label,
+/// and focus handle while sharing the one destination callback.
+fn flow_exit_control(
+    control: FlowExitControl<'_>,
+    colors: &BeadsBoardColors,
+    text_scale: f32,
+) -> AnyElement {
     let hover_bg = colors.button_hover;
     let hover_ink = colors.title;
-    let click_focus = band.back_focus.clone();
-    let click_exit = Arc::clone(&band.on_exit);
+    let click_focus = control.focus.clone();
+    let click_exit = Arc::clone(control.on_exit);
     div()
-        .id("beads-flow-back")
+        .id(control.id)
         .role(Role::Button)
-        .aria_label("Back to Lanes")
+        .aria_label(control.accessible_label)
         .aria_description("Press Enter or Space to return to Lanes")
-        .track_focus(&band.back_focus)
+        .track_focus(control.focus)
         .tab_stop(true)
         .flex_none()
         .px(px(8.0))
@@ -1260,7 +1281,7 @@ fn back_label(band: &FlowBandControl, colors: &BeadsBoardColors, text_scale: f32
                 app.stop_propagation();
             }
         })
-        .child("← LANES")
+        .child(control.label)
         .into_any_element()
 }
 
@@ -1331,53 +1352,18 @@ fn mode_pair(band: &FlowBandControl, colors: &BeadsBoardColors, text_scale: f32)
         .ml_auto()
         .flex()
         .gap(px(1.0))
-        .child(lanes_mode_label(band, colors, text_scale))
+        .child(flow_exit_control(
+            FlowExitControl {
+                id: "beads-flow-mode-lanes",
+                label: "LANES",
+                accessible_label: "Lanes",
+                focus: &band.lanes_focus,
+                on_exit: &band.on_exit,
+            },
+            colors,
+            text_scale,
+        ))
         .child(flow_mode_label(colors, text_scale))
-        .into_any_element()
-}
-
-/// `LANES`: the mode pair's actionable member, a real Button that returns to
-/// A2 -- the same destination [`back_label`] leaves by (specs/028's Flow
-/// return controls: "the `LANES` member of the mode pair").
-fn lanes_mode_label(
-    band: &FlowBandControl,
-    colors: &BeadsBoardColors,
-    text_scale: f32,
-) -> AnyElement {
-    let hover_bg = colors.button_hover;
-    let hover_ink = colors.title;
-    let click_focus = band.lanes_focus.clone();
-    let click_exit = Arc::clone(&band.on_exit);
-    div()
-        .id("beads-flow-mode-lanes")
-        .role(Role::Button)
-        .aria_label("Lanes")
-        .aria_description("Press Enter or Space to return to Lanes")
-        .track_focus(&band.lanes_focus)
-        .tab_stop(true)
-        .cursor_pointer()
-        .px(px(8.0))
-        .py(px(5.0))
-        .font_weight(gpui::FontWeight(600.0))
-        .text_size(px(9.0 * text_scale))
-        .text_color(colors.muted)
-        .hover(move |style| style.bg(hover_bg).text_color(hover_ink))
-        .focus_visible(move |style| style.bg(hover_bg).text_color(hover_ink))
-        .on_mouse_down(MouseButton::Left, |_, _, app| app.stop_propagation())
-        .on_click(move |_, window, app| {
-            window.focus(&click_focus, app);
-            click_exit(window, app);
-        })
-        // See `back_label`: GPUI's own focused Enter/Space already
-        // synthesizes the click above, so this only clears the keystroke.
-        .on_key_down(|event: &KeyDownEvent, _, app| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                app.stop_propagation();
-            }
-        })
-        .child("LANES")
         .into_any_element()
 }
 
