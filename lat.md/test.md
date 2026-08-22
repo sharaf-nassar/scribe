@@ -3981,6 +3981,12 @@ Zombie process states count as exited because their tasks are already gone and c
 
 The recovery wrapper invokes the replacement client even when the destructive server restart returns an error, so approval cannot leave every UI process closed with no recovery surface.
 
+### Shutdown frame is held until the server consumes it
+
+The relay's shutdown sender does not return until the peer has read the frame and closed the connection.
+
+Dropping the stream right after the write raced the server's accept-time `peer_cred()` check, which fails with ENOTCONN for an already-gone peer and rejects the `QuitAll` unread — the 0.1.8 macOS update left the old clients running because of exactly that.
+
 ## Server handoff
 
 Unit coverage for the socket takeover an upgrade receiver performs against the still-serving old server, proving the mechanism over a real bound socket without a live handoff peer.

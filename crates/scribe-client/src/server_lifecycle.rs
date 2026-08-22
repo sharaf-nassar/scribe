@@ -637,21 +637,41 @@ fn wait_for_replacement_server(
 
 #[cfg(target_os = "macos")]
 fn request_graceful_client_shutdown() -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut stream = std::os::unix::net::UnixStream::connect(server_socket_path())
+    let stream = std::os::unix::net::UnixStream::connect(server_socket_path())
         .map_err(|error| format!("cannot connect for graceful client shutdown: {error}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("cannot bound graceful client shutdown write: {error}"))?;
     let payload = rmp_serde::to_vec_named(&scribe_common::protocol::ClientMessage::QuitAll)
         .map_err(|error| format!("cannot encode graceful client shutdown: {error}"))?;
     let length = u32::try_from(payload.len())
         .map_err(|_| String::from("graceful client shutdown frame is too large"))?;
-    stream
-        .write_all(&length.to_be_bytes())
-        .and_then(|()| stream.write_all(&payload))
+    let mut frame = length.to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    send_frame_and_await_close(stream, &frame)
         .map_err(|error| format!("cannot send graceful client shutdown: {error}"))
+}
+
+/// Write one frame, then hold the connection open until the peer closes it.
+///
+/// Dropping the stream immediately after the write races the server's
+/// accept-time credential check: `peer_cred()` on a peer that already
+/// disconnected fails with ENOTCONN and the frame is rejected unread (seen
+/// on macOS during the 0.1.8 update — the quit request never reached the
+/// server and the pre-update clients were left running). Waiting for the
+/// peer's EOF proves the frame was accepted, not just buffered.
+#[cfg(any(target_os = "macos", test))]
+fn send_frame_and_await_close(
+    mut stream: std::os::unix::net::UnixStream,
+    frame: &[u8],
+) -> Result<(), std::io::Error> {
+    use std::io::{Read as _, Write as _};
+
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(frame)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut scratch = [0u8; 512];
+    // Ok(0) is the peer's EOF; any error (including the read timeout) ends
+    // the bounded wait without failing the send that already went through.
+    while matches!(stream.read(&mut scratch), Ok(read) if read > 0) {}
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -716,9 +736,20 @@ pub fn finish_client_relaunch(
     request_graceful_client_shutdown()?;
     let graceful_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut survivors = targets;
+    let mut next_resend = std::time::Instant::now() + Duration::from_secs(1);
     while !survivors.is_empty() && std::time::Instant::now() < graceful_deadline {
         std::thread::sleep(SERVER_RETRY_INTERVAL);
         survivors.retain(|client| process_is_alive(client.pid));
+        // A quit broadcast only reaches windows registered at that instant.
+        // Pre-update clients are still reconnecting to the replacement
+        // server during the first seconds after the handoff, so a single
+        // request can land in an empty room (seen with the 0.1.8 update).
+        // Repeat it until the survivors are gone or the deadline passes.
+        if !survivors.is_empty() && std::time::Instant::now() >= next_resend {
+            drop(request_settings_shutdown());
+            drop(request_graceful_client_shutdown());
+            next_resend = std::time::Instant::now() + Duration::from_secs(1);
+        }
     }
 
     if !survivors.is_empty() {
@@ -1483,6 +1514,35 @@ mod tests {
         assert!(process_state_is_zombie(" Z (zombie)"));
         assert!(process_state_is_zombie("Z+"));
         assert!(!process_state_is_zombie("S (sleeping)"));
+    }
+
+    // @lat: [[test#Test Harness#Server lifecycle#Shutdown frame is held until the server consumes it]]
+    #[test]
+    fn shutdown_frame_is_held_until_the_server_consumes_it() {
+        use std::io::Read as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let consumed = Arc::new(AtomicBool::new(false));
+        let server_side = Arc::clone(&consumed);
+        let server = std::thread::spawn(move || {
+            let mut theirs = theirs;
+            let mut frame = [0u8; 4];
+            theirs.read_exact(&mut frame).expect("frame arrives");
+            // Linger before closing: a fire-and-forget sender would have
+            // returned long before this flag is set.
+            std::thread::sleep(Duration::from_millis(100));
+            server_side.store(true, Ordering::SeqCst);
+        });
+
+        send_frame_and_await_close(ours, b"ping").expect("send succeeds");
+
+        assert!(
+            consumed.load(Ordering::SeqCst),
+            "the sender must not return before the peer consumed the frame and closed"
+        );
+        server.join().expect("server thread");
     }
 
     // @lat: [[test#Test Harness#Server lifecycle#Restart failure still relaunches the client]]
