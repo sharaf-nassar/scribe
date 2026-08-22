@@ -138,6 +138,9 @@ setup-codex:
 
 gpu_flags := if env("SCRIBE_E2E_GPUS", "") == "" { "" } else { "--gpus " + env("SCRIBE_E2E_GPUS") }
 hardened_e2e_flags := "--network none --read-only --cap-drop ALL"
+# Hash every source or Docker input baked into an E2E image, excluding the
+# bind-mounted tests/e2e scripts so shell-only edits retain their fast path.
+e2e_image_inputs_hash := `git ls-files -co --exclude-standard -z -- Cargo.lock Cargo.toml crates third_party docker dist rust-toolchain.toml | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1`
 
 # Bind-mount ./test-output and hand it back to the invoking user. The default
 # profile runs the container as root, so without HOST_UID/HOST_GID the
@@ -162,7 +165,7 @@ docker-func profile="release":
         *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
     esac
     tools/e2e-stage.sh "$profile" scribe-server scribe-test scribe-hook-helper scribe-cli
-    docker build --target func-runtime --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.func -t "$image" .
+    docker build --label "scribe.e2e.inputs={{ e2e_image_inputs_hash }}" --target func-runtime --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.func -t "$image" .
 
 # Compile and run Beads-board server unit tests inside the functional image.
 docker-unit-beads-write:
@@ -186,7 +189,29 @@ docker-visual profile="release":
         *) printf 'ERROR: invalid profile %q; expected release or debug.\n' "$requested" >&2; exit 2 ;;
     esac
     tools/e2e-stage.sh "$profile" scribe-server scribe-client scribe-test scribe-hook-helper scribe-cli
-    docker build --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
+    docker build --label "scribe.e2e.inputs={{ e2e_image_inputs_hash }}" --build-arg "BIN_DIR=target/e2e-stage/$profile" -f docker/Dockerfile.visual -t "$image" .
+
+# Fail before an E2E test runs against an image built from different Rust or
+# Docker inputs. The test scripts themselves are bind-mounted, not hashed.
+e2e-image-current image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    image="{{ image }}"
+    expected="{{ e2e_image_inputs_hash }}"
+    actual="$(docker image inspect "$image" 2>/dev/null | sed -n 's/.*"scribe.e2e.inputs": "\([^"]*\)".*/\1/p' | head -n 1)"
+    if [[ "$actual" != "$expected" ]]; then
+        printf 'ERROR: E2E image %q does not match this working tree.\n' "$image" >&2
+        printf 'Rebuild it with the matching `just docker-*` recipe, then retry.\n' >&2
+        printf 'Edits only under tests/e2e are bind-mounted and need no rebuild.\n' >&2
+        exit 2
+    fi
+
+# Check the default image used by each direct specialized recipe.
+e2e-func-image-current:
+    just e2e-image-current scribe-test-func
+
+e2e-visual-image-current:
+    just e2e-image-current scribe-test-visual
 
 # Add the official bd release binary to the visual image for the real read-slice proof.
 docker-beads-read-e2e: docker-visual
@@ -218,6 +243,7 @@ e2e-func script image="scribe-test-func" runtime_profile="default":
             ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
+    just e2e-image-current "$image"
     docker run --rm "${runtime_flags[@]}" -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -e SCRIBE_GITHUB_API_URL -v ./tests/e2e:/tests:ro {{ e2e_output }} "$image" /tests/{{ script }}
 
 # Run a functional E2E test under the hardened Docker runtime profile.
@@ -252,7 +278,7 @@ e2e-func-pi-ai-lifecycle:
 # green `just e2e` and the terminal-image visual suites rather than replace
 # them. The criterion count is re-derived from the spec on every invocation, so
 # a new acceptance criterion fails the gate until it is mapped to evidence.
-e2e-release-gate:
+e2e-release-gate: e2e-func-image-current
     #!/usr/bin/env bash
     set -euo pipefail
     candidate=$(git rev-parse HEAD)
@@ -295,6 +321,7 @@ e2e-visual script image="scribe-test-visual" runtime_profile="default":
             ;;
         *) printf 'ERROR: invalid runtime profile %q; expected default or hardened.\n' "$requested" >&2; exit 2 ;;
     esac
+    just e2e-image-current "$image"
     docker run --rm "${runtime_flags[@]}" {{ gpu_flags }} -e TEST_TIMEOUT -e RUST_LOG -e SCRIBE_KEYRING -e SCRIBE_GITHUB_API_URL -v ./tests/e2e:/tests:ro {{ e2e_output }} "$image" "/tests/$script"
 
 # Run a visual E2E test under the hardened Docker runtime profile.
@@ -312,15 +339,15 @@ e2e-github-actions-api-fixture func_image="scribe-test-func" visual_image="scrib
 # window's share additively instead of opening an empty window of its own — the
 # only arrangement in which a pixel assertion and `scribe-test wait-output` are
 # talking about the same pane.
-e2e-visual-shared script="visual/ai-indicator.sh":
+e2e-visual-shared script="visual/ai-indicator.sh": e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/{{ script }}
 
 # Prove the server-owned agent lease paints and clears the tab indicator.
-e2e-visual-agent-indicator:
+e2e-visual-agent-indicator: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-indicator-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/agent-indicator.sh
 
 # Prove Prompt raises the Scribe consent modal and Escape denies the call.
-e2e-visual-agent-consent:
+e2e-visual-agent-consent: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-consent-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/agent-consent-dialog.sh
 
 # Correlated actions need the real GPUI foreground client, not the headless daemon.
@@ -328,15 +355,15 @@ e2e-visual-agent-action: docker-visual
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/agent-action-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/func/agent-action.sh
 
 # Run the feature-015 sharing/control E2E through the wire tap
-e2e-visual-share:
+e2e-visual-share: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/share-control.sh
 
 # Run the CI job-detail trace against the protocol wire tap.
-e2e-visual-ci-details:
+e2e-visual-ci-details: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/ci-run-details.sh
 
 # Run the Subscribe / RequestSnapshot session-tooling E2E through the wire tap
-e2e-visual-session-tooling:
+e2e-visual-session-tooling: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/session-tooling.sh
 
 # Run the feature-014 settings trust/preflight E2E. Drives the real settings
@@ -346,7 +373,7 @@ e2e-visual-session-tooling:
 # the container's own netns so the production network-fingerprint gate has a
 # real default gateway to read; NET_ADMIN is namespaced and `--network none`
 # still holds, so the host's routing and iptables state is never touched.
-e2e-visual-settings-trust:
+e2e-visual-settings-trust: e2e-visual-image-current
     docker run --rm --network none --cap-add NET_ADMIN {{ gpu_flags }} -e SCRIBE_VISUAL_APP=settings -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SEED_TRUST=1 -e SCRIBE_SEED_LAN_IFACE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/settings-trust.sh
 
 # Run the in-app settings entry-point E2E. Drives the running terminal window
@@ -358,15 +385,15 @@ e2e-visual-settings-trust:
 # running client re-parses its bindings so the terminal answers the NEW chord.
 # Default visual app (the client): the script opens the settings window itself
 # and fails phase 0 if one is already up.
-e2e-visual-settings-keybindings:
+e2e-visual-settings-keybindings: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/settings-keybindings.sh
 
-e2e-visual-settings-entry:
+e2e-visual-settings-entry: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_FILE_CHOOSER=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/settings-entry.sh
 
 # Run the Colors theme-picker E2E through the live client so one preset apply
 # can be matched to one config-watcher hot reload.
-e2e-visual-settings-theme-picker:
+e2e-visual-settings-theme-picker: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/settings-theme-picker.sh
 
 # Run the settings-scrollbar E2E: the content pane's overlay scrollbar answers
@@ -377,104 +404,104 @@ e2e-visual-settings-theme-picker:
 # SCRIBE_DISABLE_ANIMATIONS=0 deliberately unpins the image default: that switch
 # flips GPUI reduce-motion, which pins the thumb opaque and stops the width
 # lerp, and the fade and the widen are the behaviour under test.
-e2e-visual-settings-scrollbar:
+e2e-visual-settings-scrollbar: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_VISUAL_APP=settings -e SCRIBE_DISABLE_ANIMATIONS=0 -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/settings-scrollbar.sh
 
 # Run the live tab-switching E2E through the shared-pane rig and the wire tap.
 # The client creates its own second tab, then keyboard and titlebar selection
 # changes are asserted on the recorded `AttachSessions` frames.
-e2e-visual-tab-switching:
+e2e-visual-tab-switching: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=360 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/tab-switching-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-switching.sh
 
 # Run the maximized-restore E2E. It stops the client with SIGTERM the way the
 # package upgrade does and relaunches it, so it needs room for two client
 # starts.
-e2e-visual-maximized-restore:
+e2e-visual-maximized-restore: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/maximized-restore.sh
 
 # Run the Ctrl+click link E2E. It installs a stand-in `xdg-open` inside the
 # container to observe what the client asked the OS to open, and drives a real
 # shell for the CWD phase, so it needs more than the default budget.
-e2e-visual-terminal-links:
+e2e-visual-terminal-links: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-links-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/terminal-links.sh
 
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll
 # on, and the run relaunches the client twice so it needs a longer budget.
-e2e-visual-window-lifecycle:
+e2e-visual-window-lifecycle: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/window-lifecycle.sh
 
 # Run the cold-restart restore E2E against the real client. No wire tap: the run
 # restarts the real server, and the tap renames the socket `scribe-test server`
 # addresses. It kills the client, cold-restarts the server, and relaunches, so
 # it needs a longer budget.
-e2e-visual-cold-restart:
+e2e-visual-cold-restart: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/cold-restart.sh
 
 # Run the layout-restore E2E: tab order, active tab, and window position across
 # a restart. Needs the wire tap, because the whole tab list only exists as a
 # `ReportWorkspaceTree` frame — a screenshot shows the visible tab and no more.
-e2e-visual-layout-restore:
+e2e-visual-layout-restore: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/layout-restore.sh
 
 # Run the geometry capture probe: unlike layout-restore's move-only coverage,
 # this resizes the window and asserts the record-to-window offset stays
 # constant, then that a restart still lands exact. Guards against the capture
 # reading a parent-relative ConfigureNotify.
-e2e-visual-geometry-capture-probe:
+e2e-visual-geometry-capture-probe: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=120 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/geometry-capture-probe.sh
 
 # Run the tab drag-reorder E2E: a real pointer drag inside one region. Needs the
 # wire tap, because tab order only exists as a `ReportWorkspaceTree` frame — the
 # tabs themselves are identical shells on screen.
-e2e-visual-tab-drag-reorder:
+e2e-visual-tab-drag-reorder: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/tab-drag-reorder.sh
 
 # Run the warm multi-window restore E2E against the real client. No wire tap:
 # it quits and relaunches the client several times, which the tap's renamed
 # socket does not survive. It opens a second window, quits, relaunches, and
 # opens a third, so it needs a longer budget.
-e2e-visual-multi-window-restore:
+e2e-visual-multi-window-restore: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/multi-window-restore.sh
 
 # Run the plain relaunch focus-handoff E2E through the window-list wire tap.
-e2e-visual-relaunch-focus:
+e2e-visual-relaunch-focus: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=120 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/relaunch-focus.sh
 
 # Prove X11 focus recency across one owner and one cold-restore child. This
 # purpose-built case restarts the disposable server, so it must not use the tap.
-e2e-visual-restore-child-focus-recency:
+e2e-visual-restore-child-focus-recency: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e RUST_LOG=scribe_server=info,scribe_client=debug -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/restore-child-focus-recency.sh
 
 # Run the refused stale-claim E2E. The script removes only the disposable
 # container's client singleton socket so one plain bootstrap reaches the server.
-e2e-visual-refused-claim:
+e2e-visual-refused-claim: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/refused-claim.sh
 
 # Run the find-overlay E2E. It needs the shared pane (so the harness can put
 # the searched text on the real PTY the client renders) AND the wire tap (so
 # SearchRequest leaving the client and SearchResults coming back can both be
 # asserted as real frames).
-e2e-visual-find:
+e2e-visual-find: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/find-overlay.sh
 
 # Run the feature-014 LAN approval + dial visual E2E. The wire tap records the
 # Unix socket (the approval decision leaves on it) and SCRIBE_KEYRING=1 starts a
 # session keyring so the server can seal a LAN device identity for the dial half.
-e2e-visual-lan-approval:
+e2e-visual-lan-approval: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_KEYRING=1 -e SCRIBE_SEED_TRUST=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/lan-approval-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/lan-approval.sh
 
 # Run the feature-013 tailnet remote-control visual E2E. The wire tap records
 # the Unix socket (the startup remote probe and the reclaim leave on it) and
 # injects the takeover / severance notices a second machine would have caused;
 # `scribe-test remote-peer` terminates the TCP dial for the handshake half.
-e2e-visual-remote-control:
+e2e-visual-remote-control: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/remote-control-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/remote-control.sh
 
 # Run either update-surface visual E2E, or both when no script is named. The
 # optional selector lets the aggregate report each script independently while
 # this recipe remains the source of truth for their shared environment.
-e2e-visual-update script="":
+e2e-visual-update script="": e2e-visual-image-current
     #!/usr/bin/env bash
     set -euo pipefail
     requested="{{ script }}"
@@ -492,21 +519,21 @@ e2e-visual-update script="":
 # terminal grid, and the prompt/status bands all on screen. Uses the shared-pane
 # rig so `scribe-test send` fills the very pane being measured, and the AI hook
 # channel to raise a real prompt strip.
-e2e-visual-chrome-bands:
+e2e-visual-chrome-bands: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/window-chrome-bands.sh
 
 # Run the terminal-viewport E2E: scrollback paging, zoom, vi mode, split-scroll,
 # and the smart-selection context menu, all against the real window. Needs the
 # shared-pane rig (so `scribe-test` and the client see one pane), the
 # `scroll_pin` opt-in, and a longer budget than the default 60 s for its phases.
-e2e-visual-terminal-viewport:
+e2e-visual-terminal-viewport: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-viewport-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/terminal-viewport.sh
 
 # Run the terminal-zoom E2E: the three zoom chords against the real window, with
 # the wire tap recording the `Resize` each font rescale republishes. Needs the
 # shared-pane rig (so `scribe-test` seeds the very pane being measured) and
 # SCRIBE_SHARE_TAP=1 for the on-the-wire half.
-e2e-visual-terminal-zoom:
+e2e-visual-terminal-zoom: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/terminal-zoom.sh
 
 # Run the window-resize E2E: the window manager resizes the real window and the
@@ -516,7 +543,7 @@ e2e-visual-terminal-zoom:
 # across a stepped drag, so a pane that publishes perfect geometry and renders
 # nothing still fails. Needs the shared-pane rig (so `scribe-test` owns the very
 # pane being measured) and SCRIBE_SHARE_TAP=1.
-e2e-visual-window-resize:
+e2e-visual-window-resize: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/window-resize.sh
 
 # Run the mouse-reporting E2E: the wheel over the grid, and the X10 / SGR-1006
@@ -524,7 +551,7 @@ e2e-visual-window-resize:
 # real `cat -v` behind the DEC modes echoes the reports back), the wire tap
 # (the recorded `KeyInput` bytes are the byte-identical oracle), and a longer
 # budget than the default 60 s for its ten phases.
-e2e-visual-mouse-reporting:
+e2e-visual-mouse-reporting: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/mouse-reporting.sh
 
 # Run the prompt-mark E2E: OSC 133 ingestion plus prompt_jump_up /
@@ -532,7 +559,7 @@ e2e-visual-mouse-reporting:
 # all against the real window. Needs the shared-pane rig (so `scribe-test`
 # writes the OSC 133 bytes into the very pane the client renders) and a longer
 # budget than the default 60 s for its six phases.
-e2e-visual-prompt-marks:
+e2e-visual-prompt-marks: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/prompt-marks.sh
 
 # Run the command-mark scrollbar E2E: the overlay thumb, its success/failure
@@ -540,13 +567,13 @@ e2e-visual-prompt-marks:
 # asserted as pixels in the pane's right-edge strip. Needs the shared-pane rig
 # (so `scribe-test` writes the OSC 133 bytes into the very pane the client
 # paints) and a longer budget than the default 60 s for its six phases.
-e2e-visual-scrollbar:
+e2e-visual-scrollbar: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/scrollbar.sh
 
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.
-e2e-visual-ai-task-label:
+e2e-visual-ai-task-label: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/ai-task-label.sh
 
 # Run the workspace-IPC visual E2E: CreateWorkspace / ReportWorkspaceTree /
@@ -554,20 +581,20 @@ e2e-visual-ai-task-label:
 # WorkspaceInfo repainting the status bar. Needs the wire tap (frames are the
 # evidence) and a longer budget than the default 60 s because it relaunches the
 # client to adopt the harness session first.
-e2e-visual-workspace-ipc:
+e2e-visual-workspace-ipc: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-ipc.sh
 
 # Run the workspace Beads board visual contract against the generated mock manifest.
-e2e-visual-beads-board:
+e2e-visual-beads-board: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/contract/a2a3-contract.json:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
 
 # Decode the complete card-detail fixture matrix through the visual wire tap.
-e2e-visual-beads-detail-fixtures:
+e2e-visual-beads-detail-fixtures: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=90 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/beads-card-detail.html:/mocks/beads-card-detail.html:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-card-detail-fixtures.sh
 
 # Run the approved collapsed GitHub CI trace through a watched local push and
 # the loopback Actions fixture. The container has no route beyond loopback.
-e2e-visual-ci-run-bar:
+e2e-visual-ci-run-bar: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_GITHUB_API_URL=http://127.0.0.1:8098 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/ci-run-bar-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/ci-run-bar.sh
 
 # Run one real bd refresh through the GPUI client and functional server.
@@ -595,64 +622,64 @@ e2e-func-beads-issue-write:
 # puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run
 # relaunches the client to adopt the harness session, so it needs a longer
 # budget than the default 60 s.
-e2e-visual-clipboard:
+e2e-visual-clipboard: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/clipboard-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/clipboard-osc52.sh
 
 # Run the terminal-bell visual E2E. It needs the shared-pane rig so a real shell
 # can write the BEL byte into the very pane the client renders, and it minimizes
 # and restores the window between phases, so it needs more than the default 60 s.
-e2e-visual-bell:
+e2e-visual-bell: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/bell.sh
 
 # Run the desktop-notification visual E2E. SCRIBE_NOTIFY=1 stands a real
 # `org.freedesktop.Notifications` service on a session bus so the client's zbus
 # dispatcher has something to deliver to and something to be clicked from; the
 # shared-pane rig is what makes the AI hook events reach the client's own window.
-e2e-visual-notifications:
+e2e-visual-notifications: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_NOTIFY=1 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/notifications.sh
 
 # Run the drag-and-drop visual E2E. A real XDND drag source on the same X server
 # hands the client a file; the shared-pane rig is what lets `scribe-test` read
 # the quoted path back off the very PTY the client typed it into.
-e2e-visual-drag-drop:
+e2e-visual-drag-drop: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/drag-drop.sh
 
 # Run the server-lifecycle visual E2E: a stale socket diagnosed by name, and an
 # autostart that ends in a live initial shell. The run stops the server and
 # relaunches the client twice, so it needs a longer budget than the default 60 s.
-e2e-visual-server-lifecycle:
+e2e-visual-server-lifecycle: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/server-lifecycle.sh
 
 # Run the live server-upgrade reattach oracle. It keeps the original GPUI
 # process alive through `scribe-server --upgrade` and asserts that it rebuilds
 # its session topology before accepting post-handoff output.
-e2e-visual-server-upgrade-reattach:
+e2e-visual-server-upgrade-reattach: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/server-upgrade-reattach.sh
 
 # Run the Codex reattach oracle: the same live handoff, over a pane the hook
 # channel has told the server is a codex_code session, asserting the attach
 # announces no grid and the real one follows as an ordinary resize.
-e2e-visual-codex-reattach:
+e2e-visual-codex-reattach: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/codex-reattach-size.sh
 
 # Run the targeted Codex resume oracle through server upgrade, warm client
 # reattach, and cold replay. A blocking stub records exact provider argv.
-e2e-visual-codex-targeted-resume:
+e2e-visual-codex-targeted-resume: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_AI_STUB_RECORD=/output/codex-targeted-resume.invocations -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/codex-targeted-resume.sh
 
 # Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
 # and exports XMODIFIERS before the client launches, so a real input method
 # owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the
 # raw composition keys never reached the PTY.
-e2e-visual-ime:
+e2e-visual-ime: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_IME=1 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/ime-preedit.sh
 
 # Run the pane/workspace layout E2E with its openbox-safe keybinding.
-e2e-visual-pane-workspace-layout:
+e2e-visual-pane-workspace-layout: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/pane-workspace-layout-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/pane-workspace-layout.sh
 
 # Run paste confirmation with its opt-in policy enabled.
-e2e-visual-paste-confirmation:
+e2e-visual-paste-confirmation: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/paste-confirmation-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/paste-confirmation.sh
 
 # Full functional E2E suite: build, containerise, run all tests

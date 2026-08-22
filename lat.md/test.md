@@ -1814,6 +1814,8 @@ Docker E2E recipes default to portable software rendering and keep test sources 
 
 `just e2e-func <script> image=<tag>` and `just e2e-visual <script> image=<tag>` select a prebuilt release or debug image. Both recipes pass through `TEST_TIMEOUT`, `RUST_LOG`, and `SCRIBE_KEYRING` from the host environment.
 
+Each E2E image carries a label hashing its Rust, Cargo, Docker, and packaged-script inputs. Generic and specialized recipes validate that label before running, so a changed binary input fails with a rebuild instruction rather than testing a stale image. `tests/e2e` is bind-mounted and deliberately excluded from the hash: shell-only edits keep the no-rebuild fast path. The `e2e-func-*` wrappers route through the guarded functional entrypoint, except `e2e-func-beads-board`, which rebuilds its derived image; visual wrappers either validate the default visual image or rebuild it (`e2e-visual-agent-action`).
+
 ### Hardened Runtime Profile
 
 The hardened Docker runtime profile checks both E2E images under network, filesystem, and capability restrictions without changing their release or debug binary profile.
@@ -1891,10 +1893,11 @@ and retain the `scribe-test-func` and `scribe-test-visual` tags. Run
 stage `target/debug` binaries under the separate `scribe-test-func-debug` or
 `scribe-test-visual-debug` tags. No other profile is accepted.
 
-The staging helper rejects a required binary that is missing or older than
-the newest commit touching `crates/`. Rebuild with `just build-release` for
-release images or `just build` for debug images before retrying the Docker
-recipe.
+The staging helper lets Cargo rebuild only stale binaries before staging. Each
+Docker build labels the image with a hash of its binary and Docker inputs; E2E
+recipes reject a missing, unlabeled, or mismatched image with a rebuild
+instruction. `tests/e2e` remains outside that hash because it is mounted at
+runtime, so shell-only edits do not rebuild an otherwise current image.
 
 ### Debug Image Smoke and Diagnosis
 
