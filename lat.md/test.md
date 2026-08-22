@@ -2232,6 +2232,36 @@ board cache expires: its board pin, board, and Flow all go, while the sibling's
 tuple and rail are unchanged. A2 has no lane-scroll lifetime because it has no
 A2 scroll axis.
 
+#### Restart and restore lifetime
+
+The final phase restores non-default board furniture while Flow expires.
+
+It recreates the right region's real Flow board after isolation deliberately
+removes it, then independently writes its board pin, Blocked lane preference,
+non-default height, and text scale. It opens Flow, restarts the client, and
+requires A2 plus the exact persisted tuple on the restored region while the A3
+position bar is absent. Widening that same restored region makes the saved
+Blocked preference visibly expand; one more floor drag and text-scale step prove
+the fresh client consumed the values rather than merely retaining the file.
+
+The original `persisted lane ... was blocked, not none` failure was a test bug,
+not a renderer defect. Its `36px` assertion measured the right region after
+`wait_region_rail "$HALF"` while claiming the left stored pin, and it encoded
+width-triggered collapse. A2-R2 instead collapses only when the three active
+lanes would starve; the draft fixture had empty Backlog and In-progress, so a
+504px pinned Blocked lane correctly stayed expanded. The subsequent click then
+landed on that expanded lane body rather than a collapsed tab and could not
+unpin, leaving `blocked` in the record. The restart phase therefore checks the
+persisted preference directly and widens an explicit region to observe its
+restoration, never asserting that narrow width alone produces a tab.
+
+The widen moves the window to the screen origin before it resizes. A centred
+window is granted only the width left between its own x and the screen edge, so
+the request was clipped while the client still split at half the width it asked
+for, and the right region's crop ran off the captured window. The phase asserts
+the granted width so a clipped widen names itself instead of surfacing as a
+region that painted no rail.
+
 #### Official Beads Write Contract
 
 The network-none functional image proves the representative official CLI verbs Scribe invokes.

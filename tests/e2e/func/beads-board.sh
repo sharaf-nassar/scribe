@@ -2054,6 +2054,35 @@ refresh_window() {
     WIN_W=$WIDTH
 }
 
+wait_for_client_exit() {
+    local timeout_secs="$1" started
+    started=$(date +%s)
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+    return 0
+}
+
+launch_client() {
+    scribe-client >>"${SCRIBE_CLIENT_LOG:-/output/client.log}" 2>&1 &
+    xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
+    sleep 2
+}
+
+restart_client() {
+    pkill -TERM -f 'scribe-client' 2>/dev/null || fail "no client process to restart"
+    wait_for_client_exit 20 || fail "client did not exit for restore"
+    : >"$RECORD"
+    launch_client
+    WID=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
+    [ -n "${WID:-}" ] || fail "restored client opened no Scribe window"
+    xdotool windowactivate --sync "$WID" 2>/dev/null || xdotool windowfocus --sync "$WID"
+    refresh_window
+}
+
 toggle_board_pin() {
     xdotool mousemove --sync --window "$WID" "$(( $1 + 13 ))" 17
     sleep 0.4
@@ -2462,3 +2491,160 @@ wait_region_rail 0 "$HALF" /output/beads-not-detected-left.png
     || fail "the left region's starved pin stopped being a tab: $REGION_TRACKS"
 echo 'PASS: two regions isolated real pointer, Flow, and NotDetected state while the sibling' \
     'board kept its own pins, height, and text scale'
+
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Restart and restore lifetime]]
+# The isolation phase deliberately leaves the right region NotDetected, so this
+# phase recreates its own board before changing any furniture. The old draft
+# treated a narrow region as an unconditional collapse and then clicked an
+# expanded pinned lane body; its "blocked, not none" failure was test state,
+# not a renderer defect. A2-R2 collapses only when active lanes starve.
+set_region_cwd "$SECOND_SESSION" "$HALF" "$PROJECT"
+for _ in $(seq 1 80); do
+    xdotool mousemove --sync --window "$WID" "$(( HALF + 12 ))" "$(( HEIGHT - 80 ))"
+    sleep 0.2
+    xdotool mousemove --sync --window "$WID" "$(( HALF + 13 ))" 17
+    sleep 0.6
+    region_measure "$HALF" "$HALF" /output/beads-restart-ready.png && break
+    sleep 0.2
+done
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-ready.png
+
+# Start from this phase's own persisted furniture rather than the isolation
+# phase's state. NotDetected cleared the right region, but normalize every
+# field explicitly so this stays valid if an earlier phase changes.
+[ "$(geometry_field pinned "$SECOND_WORKSPACE" 2>/dev/null || true)" = true ] \
+    || toggle_board_pin "$HALF"
+wait_geometry pinned "$SECOND_WORKSPACE" true
+case "$(geometry_field lane "$SECOND_WORKSPACE")" in
+    blocked) ;;
+    done)
+        xdotool mousemove --sync --window "$WID" \
+            "$(( HALF + $(region_track_field 4 1) + $(region_track_field 4 2) - 4 ))" \
+            "$(( REGION_TOP + A2_LANES_PADDING_TOP + A2_HEAD_H / 2 ))"
+        xdotool click 1
+        wait_geometry lane "$SECOND_WORKSPACE" none
+        ;;
+    none) ;;
+    *) fail "unexpected persisted lane $(geometry_field lane "$SECOND_WORKSPACE")" ;;
+esac
+if [ "$(geometry_field lane "$SECOND_WORKSPACE")" = none ]; then
+    wait_region_rail "$HALF" "$HALF" /output/beads-restart-lane-tab.png
+    xdotool mousemove --sync --window "$WID" "$(region_lane_x 3)" "$(region_row_y 1)"
+    xdotool click 1
+fi
+wait_geometry lane "$SECOND_WORKSPACE" blocked
+
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-before-height.png
+RESTART_OLD_HEIGHT=$(geometry_field height "$SECOND_WORKSPACE")
+[ "$RESTART_OLD_HEIGHT" = default ] && RESTART_OLD_HEIGHT=$A2_STRIP_H
+RESTART_HEIGHT=$(( RESTART_OLD_HEIGHT + 12 ))
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + RESTART_OLD_HEIGHT - 1 ))"
+xdotool mousedown 1
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + RESTART_HEIGHT - 1 ))"
+xdotool mouseup 1
+wait_geometry height "$SECOND_WORKSPACE" "$RESTART_HEIGHT"
+
+# Pick an exact non-default scale regardless of what a preceding phase left.
+RESTART_PLUS_X=$(( HALF + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2 ))
+RESTART_MINUS_X=$(( HALF + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2 ))
+RESTART_ZOOM_Y=$(( REGION_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2 ))
+RESTART_SCALE=$(geometry_field scale "$SECOND_WORKSPACE")
+while [ "$RESTART_SCALE" -lt 2 ]; do
+    RESTART_SCALE=$(( RESTART_SCALE + 1 ))
+    xdotool mousemove --sync --window "$WID" "$RESTART_PLUS_X" "$RESTART_ZOOM_Y"
+    xdotool click 1
+    wait_geometry scale "$SECOND_WORKSPACE" "$RESTART_SCALE"
+done
+while [ "$RESTART_SCALE" -gt 2 ]; do
+    RESTART_SCALE=$(( RESTART_SCALE - 1 ))
+    xdotool mousemove --sync --window "$WID" "$RESTART_MINUS_X" "$RESTART_ZOOM_Y"
+    xdotool click 1
+    wait_geometry scale "$SECOND_WORKSPACE" "$RESTART_SCALE"
+done
+RESTART_TUPLE=$(geometry_tuple "$SECOND_WORKSPACE")
+[ "$RESTART_TUPLE" = "true blocked $RESTART_HEIGHT 2" ] \
+    || fail "restart setup wrote $RESTART_TUPLE, not true blocked $RESTART_HEIGHT 2"
+
+# A real Flow entry makes its post-restart absence an observable A3-L4 claim.
+click_region_card "$SECOND_WORKSPACE" "$HALF" "$HALF" e2e-flow-b
+RESTART_FLOW_TOP=$REGION_TOP
+wait_region_flow "$HALF" "$HALF" "$RESTART_FLOW_TOP" /output/beads-restart-flow.png
+xdotool mousemove --sync --window "$WID" "$(( HALF + 12 ))" "$(( HEIGHT - 80 ))"
+restart_client
+HALF=$(( WIN_W / 2 ))
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-restored.png
+RESTORE_TOP=$REGION_TOP
+if region_flow_mark "$RESTORE_TOP" >/dev/null 2>&1; then
+    fail "Flow mode survived the client restart"
+fi
+[ "$(geometry_tuple "$SECOND_WORKSPACE")" = "$RESTART_TUPLE" ] \
+    || fail "restart changed board furniture ($(geometry_tuple "$SECOND_WORKSPACE"), expected $RESTART_TUPLE)"
+
+# At the split width, A2-R2 may show the restored preference as either a lane
+# or an auto-collapsed tab. Widen the exact right region to make that preference
+# visible; this deliberately avoids the old draft's unconditional 36px claim.
+#
+# The restored window is centred by the window manager, so a widen it cannot fit
+# between its own x and the screen edge is granted clipped: 1600 became 1463
+# while the client still laid the split out at 800, and the right region's crop
+# then ran off the captured window. Park the window at the origin first so the
+# requested width is the width both the client and `import` see.
+xdotool windowmove --sync "$WID" 0 0
+xdotool windowsize --sync "$WID" 1600 739
+sleep 0.8
+refresh_window
+[ "$WIN_W" -eq 1600 ] || fail "the widened restore window is ${WIN_W}px, not the requested 1600"
+HALF=$(( WIN_W / 2 ))
+xdotool mousemove --sync --window "$WID" "$(( HALF + 12 ))" "$(( HEIGHT - 80 ))"
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-wide.png
+[ "$(region_track_field 3 2)" -gt "$A2_TAB_W" ] \
+    || fail "widening the restored region did not reopen its stored Blocked lane"
+
+# Mutating each restored live control proves the fresh client consumed the
+# record rather than leaving its old file untouched.
+RESTART_PLUS_X=$(( HALF + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2 ))
+RESTART_MINUS_X=$(( HALF + A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GLYPH_W / 2 + A2_ZOOM_GAP ))
+RESTORED_HEIGHT=$RESTART_HEIGHT
+RESTORED_HEIGHT_AFTER=$(( RESTORED_HEIGHT + 12 ))
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + RESTORED_HEIGHT - 1 ))"
+xdotool mousedown 1
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + RESTORED_HEIGHT_AFTER - 1 ))"
+xdotool mouseup 1
+wait_geometry height "$SECOND_WORKSPACE" "$RESTORED_HEIGHT_AFTER"
+RESTART_ZOOM_Y=$(( REGION_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2 ))
+xdotool mousemove --sync --window "$WID" "$RESTART_PLUS_X" "$RESTART_ZOOM_Y"
+xdotool click 1
+wait_geometry scale "$SECOND_WORKSPACE" 3
+
+# Teardown returns only this phase's furniture to defaults for any later phase.
+RESTART_SCALE=3
+while [ "$RESTART_SCALE" -gt 0 ]; do
+    RESTART_SCALE=$(( RESTART_SCALE - 1 ))
+    xdotool mousemove --sync --window "$WID" "$RESTART_MINUS_X" "$RESTART_ZOOM_Y"
+    xdotool click 1
+    wait_geometry scale "$SECOND_WORKSPACE" "$RESTART_SCALE"
+done
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-teardown.png
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + RESTORED_HEIGHT_AFTER - 1 ))"
+xdotool mousedown 1
+xdotool mousemove --sync --window "$WID" "$(( HALF + HALF / 2 ))" \
+    "$(( REGION_TOP + A2_STRIP_H - 1 ))"
+xdotool mouseup 1
+wait_geometry height "$SECOND_WORKSPACE" default
+wait_region_rail "$HALF" "$HALF" /output/beads-restart-unpin.png
+xdotool mousemove --sync --window "$WID" \
+    "$(( HALF + $(region_track_field 3 1) + $(region_track_field 3 2) - 4 ))" \
+    "$(( REGION_TOP + A2_LANES_PADDING_TOP + A2_HEAD_H / 2 ))"
+xdotool click 1
+wait_geometry lane "$SECOND_WORKSPACE" none
+toggle_board_pin "$HALF"
+wait_geometry pinned "$SECOND_WORKSPACE" false
+xdotool windowsize --sync "$WID" 1008 739
+sleep 0.8
+refresh_window
+echo 'PASS: restart restored board pin, height, lane pin, and text scale while Flow expired'
