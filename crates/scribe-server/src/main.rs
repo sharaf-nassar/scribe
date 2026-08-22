@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,17 +89,71 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Size cap for the state-dir server log. On overflow at startup the file is
 /// rotated once to `server.log.1`, so disk use stays bounded at ~2x the cap.
 const SERVER_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SERVER_USAGE: &str = "Usage: scribe-server [--upgrade] [--launchd-slot=primary|alternate]";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServerAction {
+    RunServer { upgrade: bool, launchd_slot: Option<LaunchdSlot> },
+    Help,
+    Version,
+    Unknown(String),
+}
+
+/// Decide the startup mode before environment, logging, or runtime setup.
+fn parse_args<'a>(arguments: impl IntoIterator<Item = &'a str>) -> ServerAction {
+    let args = arguments.into_iter().collect::<Vec<_>>();
+    if args.contains(&"--help") {
+        return ServerAction::Help;
+    }
+    if args.contains(&"--version") {
+        return ServerAction::Version;
+    }
+
+    let launchd_slot = LaunchdSlot::from_args(args.iter().copied());
+    if let Some(argument) = args.iter().find(|argument| {
+        **argument != "--upgrade" && LaunchdSlot::from_argument(argument).is_none()
+    }) {
+        return ServerAction::Unknown((*argument).to_owned());
+    }
+
+    ServerAction::RunServer { upgrade: args.contains(&"--upgrade"), launchd_slot }
+}
+
+fn write_stdout(message: &str) {
+    let mut stdout = std::io::stdout().lock();
+    drop(stdout.write_all(message.as_bytes()));
+    drop(stdout.write_all(b"\n"));
+}
+
+fn write_stderr(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    drop(stderr.write_all(message.as_bytes()));
+    drop(stderr.write_all(b"\n"));
+}
 
 /// Entry point. Calls `setup_env()` before spawning the tokio runtime so that
 /// `env::set_var("TERM", …)` runs while the process is still single-threaded.
 /// `env::set_var` is unsound in multi-threaded contexts (Rust 1.81+).
 fn main() -> Result<(), ScribeError> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let (upgrade_mode, launchd_slot) = match parse_args(args.iter().map(String::as_str)) {
+        ServerAction::RunServer { upgrade, launchd_slot } => (upgrade, launchd_slot),
+        ServerAction::Help => {
+            write_stdout(SERVER_USAGE);
+            return Ok(());
+        }
+        ServerAction::Version => {
+            write_stdout(&format!("scribe-server {}", env!("CARGO_PKG_VERSION")));
+            return Ok(());
+        }
+        ServerAction::Unknown(argument) => {
+            write_stderr(&format!("error: unrecognized argument '{argument}'\n\n{SERVER_USAGE}"));
+            return Err(ScribeError::IpcError { reason: String::from("invalid command line") });
+        }
+    };
+
     // Set TERM/COLORTERM before any threads are spawned.
     alacritty_terminal::tty::setup_env();
-
-    let args = std::env::args().collect::<Vec<_>>();
-    let upgrade_mode = args.iter().any(|argument| argument == "--upgrade");
-    let launchd_slot = LaunchdSlot::from_args(args.iter().map(String::as_str));
     #[cfg(target_os = "macos")]
     let _launchd_slot_guard = launchd_slot
         .map(|slot| {
@@ -593,7 +648,21 @@ fn load_env_persistence_seed() -> bool {
 
 #[cfg(test)]
 mod server_log_tests {
-    use super::rotate_if_oversized;
+    use scribe_common::macos_launchd::LaunchdSlot;
+
+    use super::{ServerAction, parse_args, rotate_if_oversized};
+
+    #[test]
+    fn parser_stops_non_startup_arguments_before_server_setup() {
+        assert_eq!(parse_args(["--help"]), ServerAction::Help);
+        assert_eq!(parse_args(["--version"]), ServerAction::Version);
+        assert_eq!(parse_args(["--upgrde"]), ServerAction::Unknown("--upgrde".to_owned()));
+        assert_eq!(parse_args([]), ServerAction::RunServer { upgrade: false, launchd_slot: None });
+        assert_eq!(
+            parse_args(["--upgrade", "--launchd-slot=alternate"]),
+            ServerAction::RunServer { upgrade: true, launchd_slot: Some(LaunchdSlot::Alternate) }
+        );
+    }
 
     #[test]
     fn rotates_only_when_over_cap() {

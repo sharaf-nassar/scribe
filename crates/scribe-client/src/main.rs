@@ -11,6 +11,7 @@ mod terminal_image_renderer_probe;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
+    io::Write as _,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -202,6 +203,81 @@ use crate::{
         TerminalImagesPaint, cell_at, hits_jump_chip, record_grid_area,
     },
 };
+
+const CLIENT_USAGE: &str = "Usage: scribe-client [--settings]";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientAction {
+    Run,
+    Help,
+    Version,
+    Unknown(String),
+}
+
+fn parse_client_args<'a>(input: impl IntoIterator<Item = &'a str>) -> ClientAction {
+    let items = input.into_iter().collect::<Vec<_>>();
+    if items.contains(&"--help") {
+        return ClientAction::Help;
+    }
+    if items.contains(&"--version") {
+        return ClientAction::Version;
+    }
+
+    for flag in &items {
+        if !is_known_client_argument(flag) {
+            return ClientAction::Unknown((*flag).to_owned());
+        }
+    }
+    ClientAction::Run
+}
+
+fn is_known_client_argument(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--settings"
+            | "--vulkan-probe"
+            | "--gpui-image-spike"
+            | "--terminal-image-renderer-probe"
+            | restore_replay::RESTORE_CHILD_ARG
+            | server_lifecycle::FINISH_UPDATE_RESTART_ARG
+    ) || scribe_common::macos_launchd::LaunchdSlot::registration_from_args([flag]).is_some()
+        || scribe_common::macos_launchd::LaunchdSlot::inactive_unregistration_from_args([flag])
+            .is_some()
+        || server_lifecycle::client_relaunch_request([flag]).is_some()
+}
+
+fn write_client_stdout(message: &str) {
+    let mut stdout = std::io::stdout().lock();
+    drop(stdout.write_all(message.as_bytes()));
+    drop(stdout.write_all(b"\n"));
+}
+
+fn write_client_stderr(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    drop(stderr.write_all(message.as_bytes()));
+    drop(stderr.write_all(b"\n"));
+}
+
+fn client_argument_exit() -> Option<std::process::ExitCode> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match parse_client_args(args.iter().map(String::as_str)) {
+        ClientAction::Run => None,
+        ClientAction::Help => {
+            write_client_stdout(CLIENT_USAGE);
+            Some(std::process::ExitCode::SUCCESS)
+        }
+        ClientAction::Version => {
+            write_client_stdout(&format!("scribe-client {}", env!("CARGO_PKG_VERSION")));
+            Some(std::process::ExitCode::SUCCESS)
+        }
+        ClientAction::Unknown(argument) => {
+            write_client_stderr(&format!(
+                "error: unrecognized argument '{argument}'\n\n{CLIENT_USAGE}"
+            ));
+            Some(std::process::ExitCode::from(2))
+        }
+    }
+}
 
 /// Wall-clock origin captured at the very top of `main`, used to time
 /// startup-to-first-frame for the perf A/B rig (`tools/perf-ab-rig`).
@@ -11793,6 +11869,10 @@ fn flow_band_control(
 }
 
 fn main() -> std::process::ExitCode {
+    if let Some(exit) = client_argument_exit() {
+        return exit;
+    }
+
     PROCESS_START.get_or_init(Instant::now);
     init_tracing();
     if let Some(exit) = launchd_command_exit() {
@@ -15350,6 +15430,23 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn client_parser_stops_non_startup_arguments_before_client_setup() {
+        assert_eq!(parse_client_args(["--help"]), ClientAction::Help);
+        assert_eq!(parse_client_args(["--version"]), ClientAction::Version);
+        assert_eq!(parse_client_args(["--setings"]), ClientAction::Unknown("--setings".to_owned()));
+        for arguments in [
+            &["--settings"][..],
+            &[restore_replay::RESTORE_CHILD_ARG][..],
+            &[server_lifecycle::FINISH_UPDATE_RESTART_ARG][..],
+            &["--register-launchd-replacement-for=alternate"][..],
+            &["--unregister-launchd-inactive-for=primary"][..],
+            &["--relaunch-clients-after-server=unchanged:7@70"][..],
+        ] {
+            assert_eq!(parse_client_args(arguments.iter().copied()), ClientAction::Run);
+        }
+    }
 
     #[test]
     fn agent_activity_transitions_follow_the_server_owned_dwell_state() {

@@ -62,7 +62,7 @@ fn runtime_dir() -> PathBuf {
     platform_runtime_dir(current_identity(), geteuid().as_raw())
 }
 
-/// Linux: use the standard XDG runtime directory.
+/// Linux: use the per-user runtime directory under `/run/user/{uid}`.
 #[cfg(target_os = "linux")]
 fn platform_runtime_dir(identity: AppIdentity, uid: u32) -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}/{}", identity.runtime_dir_name()))

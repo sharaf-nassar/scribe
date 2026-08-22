@@ -4,9 +4,11 @@ The scribe-server is a long-running daemon that owns PTY sessions, manages works
 
 ## Startup
 
-The server initializes in  by loading config, creating a SessionManager and WorkspaceManager, then acquiring a singleton lock and binding the IPC socket.
+[[crates/scribe-server/src/main.rs#parse_args]] handles `--help`, `--version`, and invalid arguments before server setup.
 
-It acquires the singleton lock via flock on `server.lock`. The main loop uses `tokio::select!` over the IPC accept loop, handoff listener, and Ctrl+C signal.
+Those paths return before environment, logging, runtime, lock, socket, or PTY setup. Valid `--upgrade` and `--launchd-slot=primary|alternate` arguments keep their existing handoff and launchd startup modes.
+
+The server then initializes by loading config, creating a SessionManager and WorkspaceManager, then acquiring a singleton lock and binding the IPC socket. It acquires the singleton lock via flock on `server.lock`. The main loop uses `tokio::select!` over the IPC accept loop, handoff listener, and Ctrl+C signal.
 
 ### Local Admission
 

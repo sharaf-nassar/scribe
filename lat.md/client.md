@@ -3,9 +3,9 @@
 The scribe-client is the GPUI terminal frontend, preserving the established
 IPC, binary, and session-continuity contracts after the client cutover.
 
- opens GPUI windows over the unchanged
-local IPC protocol. `--settings` opens the integrated settings window and
-`--vulkan-probe` verifies hardware or lavapipe before package relaunches.
+[[crates/scribe-client/src/main.rs#parse_client_args]] handles `--help`, `--version`, and invalid arguments before tracing or GPUI setup, so probes cannot create a window, socket, or session. Valid special modes preserve their existing behavior.
+
+The regular client opens GPUI windows over the unchanged local IPC protocol. `--settings` opens the integrated settings window and `--vulkan-probe` verifies hardware or lavapipe before package relaunches.
 
 The GPUI rebuild keeps `appearance.opacity`:  proves that the pinned GPUI revision opens a transparent Wayland/X11 surface and repaints root alpha live. The decision is recorded in `specs/016-gpui-client-rebuild/spikes/window-opacity-wayland-x11.md`, and  documents how the client paints it.
 
