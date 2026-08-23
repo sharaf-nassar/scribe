@@ -1787,8 +1787,30 @@ done
 SCROLL_LANE_X=$(lane_x "$SCROLL_LANE")
 SCROLL_LANE_Y=$(row_y 1)
 # The lane's own row box: its measured track, from the first row's top to the
-# last whole row's bottom. Only rows land in it, so a diff here is travel.
-SCROLL_CROP="$(track_field "$SCROLL_LANE" 2)x${A2_BODY_H}+$(track_field "$SCROLL_LANE" 1)+$(( STRIP_TOP + A2_HEADBAND_H ))"
+# last whole row's bottom. The compact relative-age label is the sole clock-
+# driven ink in it, so omit its centre column while retaining the row identity,
+# status, edges, and positions on either side.
+SCROLL_LANE_W=$(track_field "$SCROLL_LANE" 2)
+SCROLL_LANE_LEFT=$(track_field "$SCROLL_LANE" 1)
+SCROLL_BODY_TOP=$(( STRIP_TOP + A2_HEADBAND_H ))
+SCROLL_AGE_HALF_W=24
+SCROLL_STABLE_LEFT_CROP="$(( SCROLL_LANE_W / 2 - SCROLL_AGE_HALF_W ))x${A2_BODY_H}+${SCROLL_LANE_LEFT}+${SCROLL_BODY_TOP}"
+SCROLL_STABLE_RIGHT_CROP="$(( SCROLL_LANE_W / 2 - SCROLL_AGE_HALF_W ))x${A2_BODY_H}+$(( SCROLL_LANE_LEFT + SCROLL_LANE_W / 2 + SCROLL_AGE_HALF_W ))+${SCROLL_BODY_TOP}"
+
+lane_scroll_diff() {
+    local left right
+    left=$(crop_diff "$1" "$2" "$SCROLL_STABLE_LEFT_CROP")
+    right=$(crop_diff "$1" "$2" "$SCROLL_STABLE_RIGHT_CROP")
+    echo $(( left + right ))
+}
+
+# Captures must not hold a row tooltip open: a scroll changes which row sits
+# beneath the pointer, while this phase compares rows rather than tooltip state.
+capture_lane_scroll() {
+    xdotool mousemove --sync --window "$WID" 13 17
+    sleep 0.4
+    import -window "$WID" "$1"
+}
 
 wheel_lane() {
     # A wheel is dispatched against the hit test the last processed pointer
@@ -1800,29 +1822,25 @@ wheel_lane() {
     sleep 0.5
 }
 
-# Park on the row first: the hover lift and underline it paints belong in the
-# baseline, not in the travel measurement.
-xdotool mousemove --sync --window "$WID" "$SCROLL_LANE_X" "$SCROLL_LANE_Y"
-sleep 0.8
-import -window "$WID" /output/beads-lane-scroll-origin.png
+capture_lane_scroll /output/beads-lane-scroll-origin.png
 LANE_WHEEL_REPORTS_BEFORE=$(wheel_report_count)
 wheel_lane 3 5
-import -window "$WID" /output/beads-lane-scrolled.png
-LANE_SCROLL_DIFF=$(crop_diff /output/beads-lane-scroll-origin.png \
-    /output/beads-lane-scrolled.png "$SCROLL_CROP")
+capture_lane_scroll /output/beads-lane-scrolled.png
+LANE_SCROLL_DIFF=$(lane_scroll_diff /output/beads-lane-scroll-origin.png \
+    /output/beads-lane-scrolled.png)
 [ "${LANE_SCROLL_DIFF:-0}" -ge 1500 ] \
-    || fail "the wheel moved no rows in the lane under it (${LANE_SCROLL_DIFF:-0}px)"
+    || fail "the wheel moved no stable rows in the lane under it (${LANE_SCROLL_DIFF:-0}px)"
 [ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \
     || fail "a travelling wheel over a lane leaked wheel reports to the pane"
 
 # Past the last row the lane stops rather than running off, and the wheel that
 # changes nothing is still the board's.
 wheel_lane 12 5
-import -window "$WID" /output/beads-lane-scroll-end.png
+capture_lane_scroll /output/beads-lane-scroll-end.png
 wheel_lane 4 5
-import -window "$WID" /output/beads-lane-scroll-clamped.png
-LANE_CLAMP_DIFF=$(crop_diff /output/beads-lane-scroll-end.png \
-    /output/beads-lane-scroll-clamped.png "$SCROLL_CROP")
+capture_lane_scroll /output/beads-lane-scroll-clamped.png
+LANE_CLAMP_DIFF=$(lane_scroll_diff /output/beads-lane-scroll-end.png \
+    /output/beads-lane-scroll-clamped.png)
 [ "${LANE_CLAMP_DIFF:-0}" -le 200 ] \
     || fail "scrolling past the last row kept moving (${LANE_CLAMP_DIFF:-0}px)"
 [ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \
@@ -1831,9 +1849,9 @@ LANE_CLAMP_DIFF=$(crop_diff /output/beads-lane-scroll-end.png \
 # And back: the same clamp at the first row, which is also how this phase
 # hands the board back to the row geometry every later phase reads.
 wheel_lane 20 4
-import -window "$WID" /output/beads-lane-scroll-home.png
-LANE_HOME_DIFF=$(crop_diff /output/beads-lane-scroll-origin.png \
-    /output/beads-lane-scroll-home.png "$SCROLL_CROP")
+capture_lane_scroll /output/beads-lane-scroll-home.png
+LANE_HOME_DIFF=$(lane_scroll_diff /output/beads-lane-scroll-origin.png \
+    /output/beads-lane-scroll-home.png)
 [ "${LANE_HOME_DIFF:-0}" -le 200 ] \
     || fail "scrolling back did not clamp at the first row (${LANE_HOME_DIFF:-0}px)"
 [ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \

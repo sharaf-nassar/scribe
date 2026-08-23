@@ -2119,10 +2119,11 @@ behind the strip receives nothing.
 The target lane is resolved from the live board rather than named: A2 paints
 three whole rows at the default strip, so the run takes whichever of Backlog,
 Ready, and In progress the snapshot currently overfills -- which lane that is
-depends on every drag and keyboard move the phases above landed. Its crop is
-the measured track's own row box, so a diff there is rows moving and nothing
-else, and the pointer is parked on the row before the baseline shot so the
-hover lift it paints belongs to the baseline instead of the measurement.
+depends on every drag and keyboard move the phases above landed. Its comparison
+uses the measured track's own row box except its central relative-age column:
+that clock-driven label can tick during the run, while the title, status, row
+edges, and positions on both sides still make a shifted row differ. Captures
+move the pointer out of the lane so a row tooltip cannot enter that oracle.
 
 Three notches down must move that box; twelve more must reach the last row and
 four past it must change nothing; twenty back must land on the baseline again.
