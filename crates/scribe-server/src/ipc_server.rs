@@ -5696,6 +5696,28 @@ struct HelloClaim<'a> {
     controller: &'a ControllerIdentity,
 }
 
+fn welcome_message(
+    (window_id, other_windows, participant_id): (WindowId, Vec<WindowId>, Option<u64>),
+    terminal_images: TerminalImageCapabilities,
+    (beads_detail, beads_write, beads_flow): (bool, bool, bool),
+    agent_api: bool,
+) -> ServerMessage {
+    ServerMessage::Welcome {
+        window_id,
+        other_windows,
+        clipboard_gating: true,
+        participant_id,
+        terminal_images,
+        beads_detail,
+        beads_write,
+        beads_flow,
+        pi_provider: true,
+        agent_api,
+        // This protocol-only slice has no server transfer transaction yet.
+        workspace_transfer: false,
+    }
+}
+
 async fn handle_client_hello(
     claim: HelloClaim<'_>,
     server: &IpcServerState,
@@ -5710,7 +5732,6 @@ async fn handle_client_hello(
         let wm = server.workspace_manager.read().await;
         wm.window_ids_with_sessions()
     };
-
     let outcome = resolve_and_register_claim(
         &server.window_shares,
         &claim,
@@ -5725,12 +5746,10 @@ async fn handle_client_hello(
             // Feature 013/015: a takeover swapped out the live controller(s) — notify
             // each so it freezes its last frame and offers reclaim (FR-007/FR-003).
             // In a shared mode EVERY attached participant is displaced (T010). This
-            // is the only takeover side effect left outside the claim lock: the
-            // capability bit and controller identity were already re-bound to this
-            // claimant atomically under the lock (see `resolve_and_register_claim`),
-            // so no stale clipboard-gating or policy state can survive the swap
-            // (FR-014), and the transition itself is traced there. The
-            // clipboard-bridge routing then follows automatically — the new
+            // is the only takeover side effect outside the claim lock; capability bits
+            // and controller identity rebound atomically in `resolve_and_register_claim`.
+            // so no stale clipboard-gating or policy state can survive the swap.
+            // The clipboard-bridge routing then follows automatically — the new
             // controller's AttachSessions re-points each session's client writer,
             // and the displaced clients' later disconnect can no longer detach them
             // (see `detach_sessions`' ptr-eq guard).
@@ -5759,22 +5778,13 @@ async fn handle_client_hello(
                 )
             };
             let beads_write = beads_detail && BeadsBoardCache::write_available();
-            let welcome = ServerMessage::Welcome {
-                window_id,
-                other_windows,
-                clipboard_gating: true,
-                participant_id,
-                terminal_images: claim.terminal_images,
-                beads_detail,
-                beads_write,
-                // Flow has the identical local-owner/unshared admission as
-                // detail reads, so neither capability widens the trust boundary.
-                beads_flow: beads_detail,
-                pi_provider: true,
-                agent_api: claim.agent_api == AgentApiCapability::Supported,
-            };
+            let welcome = welcome_message(
+                (window_id, other_windows, participant_id),
+                claim.terminal_images,
+                (beads_detail, beads_write, beads_detail),
+                claim.agent_api == AgentApiCapability::Supported,
+            );
             send_message(writer, &welcome).await;
-
             info!(
                 %window_id,
                 client_clipboard_gating = claim.clipboard_gating,
@@ -5795,19 +5805,12 @@ async fn handle_client_hello(
             // lost-control state and offers explicit reclaim (FR-011). The
             // connection is intentionally NOT registered, so its later teardown
             // leaves the current controller's writer + state untouched.
-            let welcome = ServerMessage::Welcome {
-                window_id,
-                other_windows: Vec::new(),
-                clipboard_gating: true,
-                // A lost-control landing registers no participant.
-                participant_id: None,
-                terminal_images: claim.terminal_images,
-                beads_detail: false,
-                beads_write: false,
-                beads_flow: false,
-                pi_provider: true,
-                agent_api: claim.agent_api == AgentApiCapability::Supported,
-            };
+            let welcome = welcome_message(
+                (window_id, Vec::new(), None),
+                claim.terminal_images,
+                (false, false, false),
+                claim.agent_api == AgentApiCapability::Supported,
+            );
             send_message(writer, &welcome).await;
             send_message(writer, &current.window_taken_over()).await;
             info!(%window_id, "remote reconnect landed on a controlled window; sent lost-control");

@@ -12688,6 +12688,7 @@ where
             // takes the headless-deny path and never sends an agent frame, which
             // would collapse every `prompt`-mode capability to a silent deny.
             agent_api: true,
+            workspace_transfer: false,
         },
     )
     .await
@@ -13633,6 +13634,7 @@ fn server_message_variant(message: &ServerMessage) -> &'static str {
         ServerMessage::BeadsEpicGraph { .. } => "BeadsEpicGraph",
         ServerMessage::IssueFocused { .. } => "IssueFocused",
         ServerMessage::BeadsIssueWriteResult { .. } => "BeadsIssueWriteResult",
+        ServerMessage::WorkspaceTransferResult { .. } => "WorkspaceTransferResult",
         ServerMessage::SearchResults { .. } => "SearchResults",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::TerminalImageLive { .. } => "TerminalImageLive",

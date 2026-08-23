@@ -263,6 +263,7 @@ macro_rules! unused_server_message {
             | ServerMessage::TerminalImageCapabilityMismatch { .. }
             | ServerMessage::BeadsIssueDetail { .. }
             | ServerMessage::IssueFocused { .. }
+            | ServerMessage::WorkspaceTransferResult { .. }
             | ServerMessage::ShareRoster { .. }
             | ServerMessage::ControlRequested { .. }
             | ServerMessage::ControlDenied { .. }
@@ -414,6 +415,7 @@ pub async fn observe_ci_run(
             ci_run_bar: true,
             pi_provider: false,
             agent_api: false,
+            workspace_transfer: false,
         },
     )
     .await?;
@@ -588,6 +590,7 @@ pub async fn run() -> Result<(), ScribeError> {
             ci_run_bar: true,
             pi_provider: pi_provider_capability(),
             agent_api: false,
+            workspace_transfer: false,
         },
     )
     .await?;
@@ -2651,6 +2654,7 @@ mod tests {
                 beads_flow: false,
                 pi_provider: false,
                 agent_api: false,
+                workspace_transfer: false,
             },
         )
         .await

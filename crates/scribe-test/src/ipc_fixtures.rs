@@ -215,6 +215,7 @@ fn insert_local_fixtures(
             ci_run_bar: false,
             pi_provider: false,
             agent_api: false,
+            workspace_transfer: false,
         },
     )?;
     insert_named(
@@ -249,6 +250,7 @@ fn insert_local_fixtures(
             beads_flow: false,
             pi_provider: false,
             agent_api: false,
+            workspace_transfer: false,
         },
     )
 }
@@ -412,7 +414,10 @@ fn decode_fixtures(fixtures: &BTreeMap<String, String>) -> Result<(), String> {
 fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     let message: ClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("decode {name}: {error}"))?;
-    let ClientMessage::Hello { join_window, terminal_images, ci_run_bar, .. } = message else {
+    let ClientMessage::Hello {
+        join_window, terminal_images, ci_run_bar, workspace_transfer, ..
+    } = message
+    else {
         return Err(format!("{name} decoded as wrong client message"));
     };
     if name.ends_with("old") && terminal_images != TerminalImageCapabilities::default() {
@@ -423,6 +428,9 @@ fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     }
     if name.ends_with("old") && ci_run_bar {
         return Err("old Hello did not default CI capability".to_owned());
+    }
+    if name.ends_with("old") && workspace_transfer {
+        return Err("old Hello did not default workspace-transfer capability".to_owned());
     }
     let _: LegacyClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("legacy decode {name}: {error}"))?;
@@ -455,11 +463,14 @@ fn decode_server_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn verify_old_welcome(message: &ServerMessage) -> Result<(), String> {
-    let ServerMessage::Welcome { terminal_images, .. } = message else {
+    let ServerMessage::Welcome { terminal_images, workspace_transfer, .. } = message else {
         return Err("old Welcome decoded as wrong message".to_owned());
     };
     if *terminal_images != TerminalImageCapabilities::default() {
         return Err("old Welcome did not default image capabilities".to_owned());
+    }
+    if *workspace_transfer {
+        return Err("old Welcome did not default workspace-transfer capability".to_owned());
     }
     Ok(())
 }

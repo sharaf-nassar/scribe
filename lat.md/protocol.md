@@ -112,6 +112,18 @@ The reported tree's [[crates/scribe-common/src/protocol.rs#WorkspaceTreeNode]] `
 
 `WorkspaceTreeNode` also owns pure structural operations shared by later client and server callers: `extract_workspace` and `insert_workspace_at_edge` re-equalize split ratios by descendant leaf count, while `swap_workspaces` exchanges leaves without changing any ratio or tree shape. Extracting the sole leaf returns the typed `WorkspaceTreeError::SoleWorkspace` refusal.
 
+### Workspace transfer
+
+`TransferWorkspace { transfer_id, workspace_id, target_window_id }` requests
+one atomic transfer using ids only. `transfer_id` is client-minted and the
+matching [[protocol#Server Messages#Workspace transfer]] reply repeats it; the
+server derives all tree changes from authoritative state.
+
+The exchange is capability-gated by `Hello.workspace_transfer` and
+`Welcome.workspace_transfer`. Both fields serde-default to `false`, so old
+local peers neither offer nor accept the additive frames. A client must wait
+for a true `Welcome` bit before sending a transfer request.
+
 ### Automation
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
@@ -122,9 +134,9 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating` and `agent_api`. The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID plus additive capability fields including `clipboard_gating`, `agent_api`, and `workspace_transfer`. The server responds with [[protocol#Server Messages]] `Welcome`.
 
-Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]].
+Both sides default missing capability fields to `false`. When either clipboard field is false, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes. When `agent_api` is false, the server sends no agent prompt or activity frame to that participant; see [[protocol#Agent Control Request Family#Negotiation and compatibility]]. When `workspace_transfer` is false, no workspace-transfer frame is sent.
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
@@ -393,6 +405,19 @@ rather than only the pairs. A server omitting the field leaves the client in the
 Lanes rendering, so an older peer never negotiates a view it cannot ask for.
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
+
+### Workspace transfer
+
+`WorkspaceTransferResult { transfer_id, result }` acknowledges a
+`TransferWorkspace` request as either `Transferred` or `Refused { reason }`.
+
+`WorkspaceTransferRefusal` distinguishes unknown workspaces, a source-window
+ownership mismatch, missing window control, absent capability, a sole
+workspace, target-window-id collision, and a handoff already in progress.
+
+The named-MessagePack protocol test round-trips the request, success, and
+every refusal. Its old-peer schemas omit `workspace_transfer` and decode as
+false; those schemas also decode new messages while ignoring the added field.
 
 ### Clipboard Variants
 
