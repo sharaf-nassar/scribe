@@ -1702,6 +1702,240 @@ pub enum WorkspaceTreeNode {
     },
 }
 
+/// An edge of a workspace region where another workspace can be inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTreeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Failure while structurally editing a [`WorkspaceTreeNode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceTreeError {
+    #[error("workspace {workspace_id} is not in the tree")]
+    WorkspaceNotFound { workspace_id: WorkspaceId },
+    #[error("cannot extract the sole workspace {workspace_id}")]
+    SoleWorkspace { workspace_id: WorkspaceId },
+    #[error("inserted workspace must be a leaf")]
+    InsertedWorkspaceMustBeLeaf,
+    #[error("workspace {workspace_id} is already in the tree")]
+    WorkspaceAlreadyPresent { workspace_id: WorkspaceId },
+}
+
+impl WorkspaceTreeNode {
+    /// Remove a workspace leaf and return it, promoting its sibling.
+    ///
+    /// All surviving split ratios are re-equalized so each leaf receives an
+    /// equal share of its parent region. A tree cannot be emptied.
+    pub fn extract_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<WorkspaceTreeNode, WorkspaceTreeError> {
+        if !workspace_tree_contains(self, workspace_id) {
+            return Err(WorkspaceTreeError::WorkspaceNotFound { workspace_id });
+        }
+        if workspace_tree_leaf_count(self) == 1 {
+            return Err(WorkspaceTreeError::SoleWorkspace { workspace_id });
+        }
+
+        let extracted = extract_workspace_node(self, workspace_id)
+            .ok_or(WorkspaceTreeError::WorkspaceNotFound { workspace_id })?;
+        equalize_workspace_tree_ratios(self);
+        Ok(extracted)
+    }
+
+    /// Split `target_workspace_id` at `edge`, inserting a detached workspace leaf.
+    ///
+    /// Structural insertion re-equalizes every split ratio. `workspace` must
+    /// be an extracted leaf and must not already occur in this tree.
+    pub fn insert_workspace_at_edge(
+        &mut self,
+        target_workspace_id: WorkspaceId,
+        edge: WorkspaceTreeEdge,
+        workspace: WorkspaceTreeNode,
+    ) -> Result<(), WorkspaceTreeError> {
+        let WorkspaceTreeNode::Leaf { workspace_id, .. } = &workspace else {
+            return Err(WorkspaceTreeError::InsertedWorkspaceMustBeLeaf);
+        };
+        if !workspace_tree_contains(self, target_workspace_id) {
+            return Err(WorkspaceTreeError::WorkspaceNotFound {
+                workspace_id: target_workspace_id,
+            });
+        }
+        if workspace_tree_contains(self, *workspace_id) {
+            return Err(WorkspaceTreeError::WorkspaceAlreadyPresent {
+                workspace_id: *workspace_id,
+            });
+        }
+
+        insert_workspace_node(self, target_workspace_id, edge, workspace);
+        equalize_workspace_tree_ratios(self);
+        Ok(())
+    }
+
+    /// Exchange two workspace leaves without changing tree shape or ratios.
+    pub fn swap_workspaces(
+        &mut self,
+        first_workspace_id: WorkspaceId,
+        second_workspace_id: WorkspaceId,
+    ) -> Result<(), WorkspaceTreeError> {
+        if first_workspace_id == second_workspace_id {
+            return workspace_tree_contains(self, first_workspace_id)
+                .then_some(())
+                .ok_or(WorkspaceTreeError::WorkspaceNotFound { workspace_id: first_workspace_id });
+        }
+
+        let first = workspace_tree_leaf(self, first_workspace_id)
+            .cloned()
+            .ok_or(WorkspaceTreeError::WorkspaceNotFound { workspace_id: first_workspace_id })?;
+        let second = workspace_tree_leaf(self, second_workspace_id)
+            .cloned()
+            .ok_or(WorkspaceTreeError::WorkspaceNotFound { workspace_id: second_workspace_id })?;
+        swap_workspace_nodes(self, first_workspace_id, second_workspace_id, &first, &second);
+        Ok(())
+    }
+}
+
+fn workspace_tree_contains(node: &WorkspaceTreeNode, workspace_id: WorkspaceId) -> bool {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id: id, .. } => *id == workspace_id,
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            workspace_tree_contains(first, workspace_id)
+                || workspace_tree_contains(second, workspace_id)
+        }
+    }
+}
+
+fn workspace_tree_leaf_count(node: &WorkspaceTreeNode) -> u32 {
+    match node {
+        WorkspaceTreeNode::Leaf { .. } => 1,
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            workspace_tree_leaf_count(first) + workspace_tree_leaf_count(second)
+        }
+    }
+}
+
+fn workspace_tree_leaf(
+    node: &WorkspaceTreeNode,
+    workspace_id: WorkspaceId,
+) -> Option<&WorkspaceTreeNode> {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id: id, .. } if *id == workspace_id => Some(node),
+        WorkspaceTreeNode::Leaf { .. } => None,
+        WorkspaceTreeNode::Split { first, second, .. } => workspace_tree_leaf(first, workspace_id)
+            .or_else(|| workspace_tree_leaf(second, workspace_id)),
+    }
+}
+
+fn extract_workspace_node(
+    node: &mut WorkspaceTreeNode,
+    workspace_id: WorkspaceId,
+) -> Option<WorkspaceTreeNode> {
+    let WorkspaceTreeNode::Split { first, second, .. } = node else {
+        return None;
+    };
+
+    if matches!(first.as_ref(), WorkspaceTreeNode::Leaf { workspace_id: id, .. } if *id == workspace_id)
+    {
+        let extracted = first.as_ref().clone();
+        *node = second.as_ref().clone();
+        return Some(extracted);
+    }
+    if matches!(second.as_ref(), WorkspaceTreeNode::Leaf { workspace_id: id, .. } if *id == workspace_id)
+    {
+        let extracted = second.as_ref().clone();
+        *node = first.as_ref().clone();
+        return Some(extracted);
+    }
+
+    if workspace_tree_contains(first, workspace_id) {
+        extract_workspace_node(first, workspace_id)
+    } else {
+        extract_workspace_node(second, workspace_id)
+    }
+}
+
+fn insert_workspace_node(
+    node: &mut WorkspaceTreeNode,
+    target_workspace_id: WorkspaceId,
+    edge: WorkspaceTreeEdge,
+    workspace: WorkspaceTreeNode,
+) {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id, .. } if *workspace_id == target_workspace_id => {
+            let target = node.clone();
+            let (direction, first, second) = match edge {
+                WorkspaceTreeEdge::Left => (LayoutDirection::Horizontal, workspace, target),
+                WorkspaceTreeEdge::Right => (LayoutDirection::Horizontal, target, workspace),
+                WorkspaceTreeEdge::Top => (LayoutDirection::Vertical, workspace, target),
+                WorkspaceTreeEdge::Bottom => (LayoutDirection::Vertical, target, workspace),
+            };
+            *node = WorkspaceTreeNode::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(first),
+                second: Box::new(second),
+            };
+        }
+        WorkspaceTreeNode::Leaf { .. } => {}
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            if workspace_tree_contains(first, target_workspace_id) {
+                insert_workspace_node(first, target_workspace_id, edge, workspace);
+            } else {
+                insert_workspace_node(second, target_workspace_id, edge, workspace);
+            }
+        }
+    }
+}
+
+fn swap_workspace_nodes(
+    node: &mut WorkspaceTreeNode,
+    first_workspace_id: WorkspaceId,
+    second_workspace_id: WorkspaceId,
+    first: &WorkspaceTreeNode,
+    second: &WorkspaceTreeNode,
+) {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id, .. } if *workspace_id == first_workspace_id => {
+            *node = second.clone();
+        }
+        WorkspaceTreeNode::Leaf { workspace_id, .. } if *workspace_id == second_workspace_id => {
+            *node = first.clone();
+        }
+        WorkspaceTreeNode::Leaf { .. } => {}
+        WorkspaceTreeNode::Split { first: child_first, second: child_second, .. } => {
+            swap_workspace_nodes(
+                child_first,
+                first_workspace_id,
+                second_workspace_id,
+                first,
+                second,
+            );
+            swap_workspace_nodes(
+                child_second,
+                first_workspace_id,
+                second_workspace_id,
+                first,
+                second,
+            );
+        }
+    }
+}
+
+fn equalize_workspace_tree_ratios(node: &mut WorkspaceTreeNode) {
+    if let WorkspaceTreeNode::Split { ratio, first, second, .. } = node {
+        let first_leaves = workspace_tree_leaf_count(first);
+        let total_leaves = first_leaves + workspace_tree_leaf_count(second);
+        let first_ratio = f32::from(u16::try_from(first_leaves).unwrap_or(u16::MAX));
+        let total_ratio = f32::from(u16::try_from(total_leaves).unwrap_or(u16::MAX));
+        *ratio = first_ratio / total_ratio;
+        equalize_workspace_tree_ratios(first);
+        equalize_workspace_tree_ratios(second);
+    }
+}
+
 /// Serialisable pane split tree within a single tab.
 ///
 /// Each leaf holds the session ID of the pane's PTY session. Split nodes
@@ -3556,5 +3790,152 @@ mod tests {
             }
             other => panic!("unexpected variant after round-trip: {other:?}"),
         }
+    }
+
+    fn workspace_leaf(workspace_id: WorkspaceId, session_id: SessionId) -> WorkspaceTreeNode {
+        WorkspaceTreeNode::Leaf {
+            workspace_id,
+            session_ids: vec![session_id],
+            pane_trees: vec![None],
+            active_tab_index: 0,
+        }
+    }
+
+    fn workspace_split(
+        direction: LayoutDirection,
+        ratio: f32,
+        first: WorkspaceTreeNode,
+        second: WorkspaceTreeNode,
+    ) -> WorkspaceTreeNode {
+        WorkspaceTreeNode::Split {
+            direction,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn extract_workspace_collapses_nested_split_and_equalizes_ratios() {
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let workspace_c = WorkspaceId::new();
+        let workspace_d = WorkspaceId::new();
+        let leaf_a = workspace_leaf(workspace_a, SessionId::new());
+        let leaf_b = workspace_leaf(workspace_b, SessionId::new());
+        let leaf_c = workspace_leaf(workspace_c, SessionId::new());
+        let leaf_d = workspace_leaf(workspace_d, SessionId::new());
+        let mut tree = workspace_split(
+            LayoutDirection::Vertical,
+            0.2,
+            workspace_split(
+                LayoutDirection::Horizontal,
+                0.1,
+                leaf_a.clone(),
+                workspace_split(LayoutDirection::Vertical, 0.9, leaf_b.clone(), leaf_c.clone()),
+            ),
+            leaf_d.clone(),
+        );
+
+        assert_eq!(tree.extract_workspace(workspace_b), Ok(leaf_b));
+        assert_eq!(
+            tree,
+            workspace_split(
+                LayoutDirection::Vertical,
+                2.0 / 3.0,
+                workspace_split(LayoutDirection::Horizontal, 0.5, leaf_a, leaf_c),
+                leaf_d,
+            )
+        );
+    }
+
+    #[test]
+    fn insert_workspace_at_each_edge_splits_nested_target_and_equalizes_ratios() {
+        for (edge, direction, inserted_first) in [
+            (WorkspaceTreeEdge::Left, LayoutDirection::Horizontal, true),
+            (WorkspaceTreeEdge::Right, LayoutDirection::Horizontal, false),
+            (WorkspaceTreeEdge::Top, LayoutDirection::Vertical, true),
+            (WorkspaceTreeEdge::Bottom, LayoutDirection::Vertical, false),
+        ] {
+            let workspace_a = WorkspaceId::new();
+            let workspace_b = WorkspaceId::new();
+            let workspace_c = WorkspaceId::new();
+            let workspace_d = WorkspaceId::new();
+            let leaf_a = workspace_leaf(workspace_a, SessionId::new());
+            let leaf_b = workspace_leaf(workspace_b, SessionId::new());
+            let leaf_c = workspace_leaf(workspace_c, SessionId::new());
+            let leaf_d = workspace_leaf(workspace_d, SessionId::new());
+            let mut tree = workspace_split(
+                LayoutDirection::Vertical,
+                0.8,
+                leaf_a.clone(),
+                workspace_split(LayoutDirection::Horizontal, 0.3, leaf_b.clone(), leaf_d.clone()),
+            );
+
+            assert!(tree.insert_workspace_at_edge(workspace_b, edge, leaf_c.clone()).is_ok());
+
+            let (first, second) = if inserted_first {
+                (leaf_c.clone(), leaf_b.clone())
+            } else {
+                (leaf_b.clone(), leaf_c.clone())
+            };
+            assert_eq!(
+                tree,
+                workspace_split(
+                    LayoutDirection::Vertical,
+                    0.25,
+                    leaf_a,
+                    workspace_split(
+                        LayoutDirection::Horizontal,
+                        2.0 / 3.0,
+                        workspace_split(direction, 0.5, first, second),
+                        leaf_d,
+                    ),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn swap_workspaces_preserves_nested_shape_ratios_and_leaf_payloads() {
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let workspace_c = WorkspaceId::new();
+        let workspace_d = WorkspaceId::new();
+        let leaf_a = workspace_leaf(workspace_a, SessionId::new());
+        let leaf_b = workspace_leaf(workspace_b, SessionId::new());
+        let leaf_c = workspace_leaf(workspace_c, SessionId::new());
+        let leaf_d = workspace_leaf(workspace_d, SessionId::new());
+        let mut tree = workspace_split(
+            LayoutDirection::Vertical,
+            0.37,
+            workspace_split(LayoutDirection::Horizontal, 0.22, leaf_a.clone(), leaf_b.clone()),
+            workspace_split(LayoutDirection::Vertical, 0.71, leaf_c.clone(), leaf_d.clone()),
+        );
+
+        assert_eq!(tree.swap_workspaces(workspace_a, workspace_d), Ok(()));
+        assert_eq!(
+            tree,
+            workspace_split(
+                LayoutDirection::Vertical,
+                0.37,
+                workspace_split(LayoutDirection::Horizontal, 0.22, leaf_d, leaf_b),
+                workspace_split(LayoutDirection::Vertical, 0.71, leaf_c, leaf_a),
+            )
+        );
+    }
+
+    #[test]
+    fn sole_workspace_extraction_is_typed_and_leaves_tree_unchanged() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = workspace_leaf(workspace_id, SessionId::new());
+        let original = tree.clone();
+
+        assert_eq!(
+            tree.extract_workspace(workspace_id),
+            Err(WorkspaceTreeError::SoleWorkspace { workspace_id })
+        );
+        assert_eq!(tree, original);
+        assert_eq!(tree.swap_workspaces(workspace_id, workspace_id), Ok(()));
     }
 }

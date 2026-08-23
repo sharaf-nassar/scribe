@@ -110,6 +110,8 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 The reported tree's [[crates/scribe-common/src/protocol.rs#WorkspaceTreeNode]] `Leaf` carries per-workspace tab ordering (`session_ids`), per-tab pane layouts (`pane_trees`), and the per-workspace active tab index (`active_tab_index`). Accent colors and names still travel separately in `WorkspaceListEntry` / `WorkspaceNamed`. The active tab index is `#[serde(default)]` so a pre-active-tab-aware handoff envelope degrades to 0 (last-active-tab is then re-asserted on the next client report).
 
+`WorkspaceTreeNode` also owns pure structural operations shared by later client and server callers: `extract_workspace` and `insert_workspace_at_edge` re-equalize split ratios by descendant leaf count, while `swap_workspaces` exchanges leaves without changing any ratio or tree shape. Extracting the sole leaf returns the typed `WorkspaceTreeError::SoleWorkspace` refusal.
+
 ### Automation
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
