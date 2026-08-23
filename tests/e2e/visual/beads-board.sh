@@ -582,9 +582,10 @@ PLUS_X=$((A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W / 2))
 MINUS_X=$((A2_ZOOM_LEFT + A2_ZOOM_GLYPH_W + A2_ZOOM_GAP + A2_ZOOM_GLYPH_W / 2))
 ZOOM_Y=$((BOARD_TOP + A2_ZOOM_TOP + A2_ZOOM_GLYPH_H / 2))
 scale_steps() {
-    local x=$1 count=$2
+    local x=$1 count=$2 fixture=${3:-busy}
     for _ in $(seq 1 "$count"); do
-        show_board busy
+        show_board "$fixture"
+        park_pointer 0.08
         xdotool mousemove --sync --window "$WID" "$x" "$ZOOM_Y"
         xdotool click 1
         sleep 0.06
@@ -776,6 +777,16 @@ inject "$(board_message "$WORKSPACE" busy)"
 park_pointer 0.2
 shot a2-narrow.png
 python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow.png "$BOARD_TOP" pinned-blocked --width "$WIN_W"
+
+# Sparse active lanes at the narrow 0.8 scale retain each header inside its
+# painted seam track, including the persisted Blocked pin and Done tab.
+scale_steps "$MINUS_X" 2 sparse
+show_board sparse
+park_pointer 0.2
+shot a2-narrow-sparse-scale-0.8.png
+python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" sparse-pinned-blocked --width "$WIN_W" --scale 0.8
+python3 "$ORACLE" a2-header-ink "$CONTRACT" /output/a2-narrow-sparse-scale-0.8.png "$BOARD_TOP" --width "$WIN_W"
+scale_steps "$PLUS_X" 2 sparse
 xdotool windowsize --sync "$WID" 1008 739
 sleep 0.5
 focus
@@ -811,6 +822,6 @@ python3 "$ORACLE" a2-layout "$CONTRACT" /output/a2-narrow-split.png "$BOARD_TOP"
 python3 "$ORACLE" inventory "$CONTRACT" /output /output/beads-a2a3-contract-evidence.json
 
 echo "PASS: generated A2/A3 contract $CONTRACT_SOURCE_SHA; states=$CONTRACT_STATE_SLUGS;" \
-    "A2 sparse/busy/drawers/pins/empty/overflow/drag/scales/resize/theme/narrow-split;" \
+    "A2 sparse/busy/drawers/pins/empty/overflow/drag/scales/resize/theme/narrow/narrow-sparse-scale/split;" \
     "A3 opened/trace/live/controls/deep/near-middle-far/fades/hbar/focus/theme;" \
     "reduced-motion=true rows=$UNPINNED_ROWS->$PINNED_ROWS"

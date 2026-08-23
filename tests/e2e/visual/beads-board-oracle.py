@@ -137,8 +137,11 @@ def command_a2_layout(args: argparse.Namespace) -> None:
         require(close(widths[3], geometry["tab_w"]) and close(widths[4], geometry["tab_w"]), f"rail tabs are {widths[3:]}, expected {geometry['tab_w']}px")
     if args.mode in {"busy", "collapsed"}:
         require(max(widths[:3]) - min(widths[:3]) <= 2, f"busy active tracks are not equal: {widths[:3]}")
-    if args.mode == "sparse":
+    if args.mode in {"sparse", "sparse-pinned-blocked"}:
         require(widths[2] > widths[0] * 2 and widths[2] > widths[1] * 2, f"sparse work lane did not receive slack: {widths[:3]}")
+    if args.mode == "sparse-pinned-blocked":
+        require(close(widths[4], geometry["tab_w"]), f"Done tab is {widths[4]}px")
+        require(abs(widths[3] / widths[2] - geometry["pinned_lane_share"]) <= 0.02, f"Blocked pin share is {widths[3] / widths[2]:.3f}")
     if args.mode == "pinned-blocked":
         require(close(widths[4], geometry["tab_w"]), f"Done tab is {widths[4]}px")
         require(max(widths[:3]) - min(widths[:3]) <= 2, f"pinned active tracks are not equal: {widths[:3]}")
@@ -157,6 +160,42 @@ def command_a2_layout(args: argparse.Namespace) -> None:
     if args.mode == "busy" and args.left == 0 and abs(args.scale - 1.0) < 0.01:
         assert_priorities(image, args.top, tracks, data, args.scale)
     print("tracks=" + ",".join(str(width) for width in widths))
+
+
+def header_ink_extent(image: Image, ground: tuple[int, int, int], left: int, right: int, top: int, bottom: int) -> tuple[int, int]:
+    flags = [
+        any(delta(image.pixel(x, y), ground) > 8 for y in range(top, bottom))
+        for x in range(left, right)
+    ]
+    found = runs(flags, merge=8)
+    require(found, f"no foreground ink in header band x={left}..{right - 1}")
+    start, width = found[0]
+    return left + start, left + start + width - 1
+
+
+def command_a2_header_ink(args: argparse.Namespace) -> None:
+    image = Image(args.image)
+    data = contract(args.contract)
+    geometry = data["geometry"]["a2"]
+    tracks = seam_tracks(image, args.top, data, args.left, args.width)
+    require(len(tracks) == 5, f"found {len(tracks)} A2 tracks, expected five: {tracks}")
+    ground = image.pixel(args.left + 2, args.top + geometry["headband_h"] + 8)
+    header_top = args.top + geometry["lanes_padding_top"]
+    header_bottom = header_top + geometry["head_h"]
+    lanes = ("Backlog", "Ready", "In progress", "Blocked", "Done")
+    extents = []
+    for lane, (left, width) in zip(lanes, tracks):
+        right = left + width
+        try:
+            ink_left, ink_right = header_ink_extent(image, ground, left, right, header_top, header_bottom)
+        except Failure as error:
+            raise Failure(f"{lane} header ink extent missing; track={left}..{right - 1}: {error}") from error
+        require(
+            left <= ink_left and ink_right < right,
+            f"{lane} header ink extent {ink_left}..{ink_right}; track={left}..{right - 1}",
+        )
+        extents.append(f"{lane}={ink_left}..{ink_right}")
+    print("header-ink " + " ".join(extents))
 
 
 def command_a2_drawer(args: argparse.Namespace) -> None:
@@ -628,6 +667,7 @@ def command_inventory(args: argparse.Namespace) -> None:
         "a2-theme-before.png",
         "a2-theme-after.png",
         "a2-narrow.png",
+        "a2-narrow-sparse-scale-0.8.png",
         "a2-narrow-split.png",
         "a3-live.png",
         "a3-back-focus.png",
@@ -671,11 +711,19 @@ def parser() -> argparse.ArgumentParser:
     layout.add_argument("contract")
     layout.add_argument("image")
     layout.add_argument("top", type=int)
-    layout.add_argument("mode", choices=["busy", "collapsed", "sparse", "pinned-blocked", "pinned-done", "auto-collapsed"])
+    layout.add_argument("mode", choices=["busy", "collapsed", "sparse", "sparse-pinned-blocked", "pinned-blocked", "pinned-done", "auto-collapsed"])
     layout.add_argument("--left", type=int, default=0)
     layout.add_argument("--width", type=int, required=True)
     layout.add_argument("--scale", type=float, default=1.0)
     layout.set_defaults(func=command_a2_layout)
+
+    header_ink = sub.add_parser("a2-header-ink")
+    header_ink.add_argument("contract")
+    header_ink.add_argument("image")
+    header_ink.add_argument("top", type=int)
+    header_ink.add_argument("--left", type=int, default=0)
+    header_ink.add_argument("--width", type=int, required=True)
+    header_ink.set_defaults(func=command_a2_header_ink)
 
     drawer = sub.add_parser("a2-drawer")
     drawer.add_argument("contract")
