@@ -3,6 +3,28 @@
 Scribe tests combine server-focused functional checks with GPUI headless and
 visual end-to-end coverage for the rebuilt client.
 
+## Workspace Transfer Server Transaction
+
+Focused server tests construct real live-session entries over PTY pairs and a
+two-leaf authoritative window tree.
+
+Success coverage asserts both trees, session ownership, env coordinates,
+controller and viewer severance, source refresh, and destination activity-lease
+rebroadcast.
+
+Refusal tests serialize the workspace manager and env coordinates before and
+after capability, handoff, ownership, sole-workspace, target-collision, and
+env-staging failures; equality is the byte-identical-state oracle. The bounded
+ledger is tested both before handoff and after a named-MessagePack handoff
+round-trip. A concurrent handoff snapshot is parked behind the transfer gate,
+then asserted to contain the whole post-transfer source and target windows;
+the separately-taken pre snapshot contains the whole old tree.
+
+Pure env-store tests cover successful sealed-byte staging and failed copy
+cleanup with no partial target. Protocol tests round-trip
+`EnvironmentRebindFailed` alongside every other refusal and retain the
+old-peer default-false capability behavior.
+
 ## GitHub CI Tracking
 
 Server unit fixtures verify the local push gate before any GitHub polling or client protocol is involved.

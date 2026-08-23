@@ -44,6 +44,7 @@ use crate::github_ci::GithubCiTrackerHandle;
 use crate::handoff::{self, HandoffState};
 use crate::ipc_server::LiveSessionRegistry;
 use crate::workspace_manager::WorkspaceManager;
+use crate::workspace_transfer::TransferGate;
 
 /// How often the dump task samples the dirty generation.
 ///
@@ -106,12 +107,18 @@ pub async fn dump_now(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     github_ci_tracker: &GithubCiTrackerHandle,
+    workspace_transfers: &TransferGate,
 ) -> bool {
     let Some(path) = dump_path() else {
         return false;
     };
-    let (state, _fds) =
-        handoff::serialize_state(live_sessions, workspace_manager, github_ci_tracker).await;
+    let (state, _fds) = handoff::serialize_state(
+        live_sessions,
+        workspace_manager,
+        github_ci_tracker,
+        workspace_transfers,
+    )
+    .await;
     if state.sessions.is_empty() {
         if DUMPED_LIVE_SESSIONS.load(Ordering::Relaxed) {
             remove_dump_file(&path);
@@ -162,6 +169,7 @@ pub fn spawn_dump_task(
     live_sessions: LiveSessionRegistry,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     github_ci_tracker: GithubCiTrackerHandle,
+    workspace_transfers: TransferGate,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // One behind whatever the current generation is, so a server that
@@ -176,7 +184,14 @@ pub fn spawn_dump_task(
             if generation == dumped_generation {
                 continue;
             }
-            if dump_now(&live_sessions, &workspace_manager, &github_ci_tracker).await {
+            if dump_now(
+                &live_sessions,
+                &workspace_manager,
+                &github_ci_tracker,
+                &workspace_transfers,
+            )
+            .await
+            {
                 dumped_generation = generation;
             }
         }
@@ -385,6 +400,7 @@ mod tests {
             workspace_tree: None,
             windows: Vec::new(),
             ci_windows: Vec::new(),
+            transfer_ledger: Vec::new(),
         }
     }
 

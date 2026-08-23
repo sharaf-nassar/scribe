@@ -694,6 +694,7 @@ fn encode_state(sessions: Vec<HandoffSession>, version: u32) -> Result<Vec<u8>, 
         workspace_tree: None,
         windows: Vec::new(),
         ci_windows: Vec::new(),
+        transfer_ledger: Vec::new(),
     };
     rmp_serde::to_vec_named(&state).map_err(|error| format!("encode handoff state: {error}"))
 }

@@ -441,6 +441,70 @@ Verifies an unnamed `Hello` adopts the same window and fans the rest out in the 
 
 The set is walked in window-id order, so two sets holding the same ids resolve identically, and `other_windows` follows in that same order rather than in a hash order that changed on every server process.
 
+## Workspace Transfer
+
+[[crates/scribe-server/src/ipc_server.rs#run_workspace_transfer]] owns the
+capability-gated, idempotent `TransferWorkspace` transaction.
+
+It holds the [[crates/scribe-server/src/workspace_transfer.rs#TransferGate]]
+across validation, env staging, commit, viewer refresh, and ledger write. The
+handoff/state-dump snapshotter and agent world capture take the same gate, so
+those readers see strictly old or new state.
+
+### Transfer gate and ledger
+
+The gate retains the most recent 64 `transfer_id → result` entries in recording
+order.
+
+Every success and typed refusal is recorded; retrying an id returns it without
+re-running validation. Handoff state carries the ledger with
+`#[serde(default)]`, so a lost-ACK retry against the successor still returns
+`Transferred`. A latched handoff refuses new transfers; failure clears the latch.
+
+### In-gate commit
+
+The request carries ids only; the server derives and commits both post-move
+trees plus session ownership.
+
+[[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#transfer_workspace]]
+extracts the authoritative leaf through the shared tree operation. Registries
+are acquired live sessions → window shares → workspace manager; env owner
+coordinates and source sinks change before any guard releases.
+
+### Typed refusals leave state byte-identical
+
+Every pre-commit failure returns a typed `WorkspaceTransferResult::Refused` and
+leaves authoritative source state unchanged.
+
+Reasons cover unknown or foreign workspace, missing control or capability,
+sole workspace, target collision, handoff, and env staging. Commit-time
+revalidation failure discards staged target env copies before refusing.
+
+### Staged env re-bind
+
+[[crates/scribe-server/src/env_store/store.rs#stage_envelope_transfer]] stages
+existing DEK and sealed bytes at target coordinates before commit.
+
+Source coordinates remain untouched until commit. Keystore or filesystem
+failure becomes `EnvironmentRebindFailed`, never a generic error. After commit,
+old copies are deleted best-effort and persist schedulers restart on the target.
+
+### Viewer severance and authoritative ownership
+
+Commit severs every source participant's moved-session sinks and attached-id
+entries, then refreshes each over existing `SessionList` frames.
+
+Session-addressed key, resize, and close mutations re-check authoritative
+session→window ownership. Active agent leases are re-announced after commit and
+resolve to the destination window.
+
+### Strict pre/post snapshots
+
+[[crates/scribe-server/src/handoff.rs#serialize_state]] and the transient agent
+world capture take the transfer gate before their existing ordered registry
+reads. A snapshot that begins before a transfer owns the gate completes as
+pre-state; one arriving during the transfer waits and captures post-state.
+
 ## Beads Flow source cache
 
 The cache retains the full parsed list beside its paintable snapshot, so Flow

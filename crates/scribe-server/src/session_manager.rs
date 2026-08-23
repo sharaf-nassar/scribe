@@ -1463,6 +1463,7 @@ mod tests_session_cap {
             workspace_tree: None,
             windows: vec![],
             ci_windows: vec![],
+            transfer_ledger: vec![],
         };
         (state, masters, slaves)
     }

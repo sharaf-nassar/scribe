@@ -16,7 +16,9 @@ use vte::ansi::Processor as AnsiProcessor;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{SessionContext, ShellTool};
+use scribe_common::protocol::{
+    LayoutDirection, SessionContext, ShellTool, WorkspaceTransferResult, WorkspaceTreeNode,
+};
 use scribe_common::screen::{
     CellFlags, CursorStyle, DecPrivateMode, ScreenCell, ScreenColor, ScreenSnapshot,
 };
@@ -30,6 +32,7 @@ use crate::handoff::{
 use crate::ipc_server::{self, LiveSessionRegistry};
 use crate::session_manager::{SessionManager, build_term_config, snapshot_term};
 use crate::workspace_manager::WorkspaceManager;
+use crate::workspace_transfer::{new_transfer_gate, restored_transfer_gate};
 
 #[derive(Clone, Copy)]
 struct TestDims {
@@ -101,6 +104,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         workspace_tree: None,
         windows: vec![],
         ci_windows: vec![],
+        transfer_ledger: vec![],
     };
 
     (state, vec![pty.master], vec![pty.slave])
@@ -185,6 +189,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
         workspace_tree: None,
         windows: vec![],
         ci_windows: vec![],
+        transfer_ledger: vec![],
     };
 
     (state, masters, slaves)
@@ -204,6 +209,99 @@ async fn wait_registry_count(registry: &LiveSessionRegistry, expected: usize) {
 }
 
 // ── Tests ───────────────────────────────────────────────────────
+
+fn transfer_leaf(workspace_id: WorkspaceId, session_ids: Vec<SessionId>) -> WorkspaceTreeNode {
+    let pane_trees = session_ids.iter().map(|_| None).collect();
+    WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, active_tab_index: 0 }
+}
+
+// @lat: [[server#Workspace Transfer#Transfer gate and ledger]]
+#[tokio::test]
+async fn transfer_ledger_retries_survive_handoff_serialization() {
+    let gate = new_transfer_gate();
+    gate.lock().await.record(77, WorkspaceTransferResult::Transferred);
+    let live = ipc_server::new_live_session_registry();
+    let workspaces = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
+    let ci = crate::github_ci::GithubCiTrackerHandle::default();
+
+    let (state, _fds) = crate::handoff::serialize_state(&live, &workspaces, &ci, &gate).await;
+    let bytes = rmp_serde::to_vec_named(&state).expect("serialize handoff state");
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).expect("deserialize handoff state");
+    let restored = restored_transfer_gate(decoded.transfer_ledger);
+
+    assert_eq!(restored.lock().await.recorded(77), Some(WorkspaceTransferResult::Transferred));
+}
+
+// @lat: [[server#Workspace Transfer#Strict pre/post snapshots]]
+#[tokio::test]
+async fn handoff_snapshot_waits_for_the_transfer_gate_and_is_strictly_post_commit() {
+    let source = WindowId::new();
+    let target = WindowId::new();
+    let left = WorkspaceId::new();
+    let right = WorkspaceId::new();
+    let left_session = SessionId::new();
+    let right_session = SessionId::new();
+    let mut manager = WorkspaceManager::new(vec![]);
+    for (workspace, session) in [(left, left_session), (right, right_session)] {
+        manager.add_session(workspace, session, None);
+        manager.assign_session_to_window(source, session);
+    }
+    manager.set_window_tree(
+        source,
+        WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(transfer_leaf(left, vec![left_session])),
+            second: Box::new(transfer_leaf(right, vec![right_session])),
+        },
+    );
+    let workspaces = Arc::new(RwLock::new(manager));
+    let live = ipc_server::new_live_session_registry();
+    let gate = new_transfer_gate();
+    let ci = crate::github_ci::GithubCiTrackerHandle::default();
+
+    // A pre-transfer snapshot is wholly pre-state.
+    let (pre, _) = crate::handoff::serialize_state(&live, &workspaces, &ci, &gate).await;
+    assert!(pre.windows.iter().any(|window| {
+        window.window_id == source
+            && window.session_ids == vec![left_session, right_session]
+            && matches!(window.workspace_tree, Some(WorkspaceTreeNode::Split { .. }))
+    }));
+
+    // Emulate the transaction owning the gate. A concurrent snapshot cannot
+    // read between the source-tree and ownership mutations; it remains parked
+    // until the transaction releases, then captures only post-state.
+    let transfer = gate.lock().await;
+    let snapshot = {
+        let live = Arc::clone(&live);
+        let workspaces = Arc::clone(&workspaces);
+        let gate = Arc::clone(&gate);
+        let ci = ci.clone();
+        tokio::spawn(async move {
+            crate::handoff::serialize_state(&live, &workspaces, &ci, &gate).await.0
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(!snapshot.is_finished(), "snapshot must wait behind the transfer gate");
+    workspaces
+        .write()
+        .await
+        .transfer_workspace(source, left, target)
+        .expect("commit transfer under the gate");
+    drop(transfer);
+
+    let post = snapshot.await.expect("snapshot task");
+    assert!(post.windows.iter().any(|window| {
+        window.window_id == source
+            && window.session_ids == vec![right_session]
+            && window.workspace_tree == Some(transfer_leaf(right, vec![right_session]))
+    }));
+    assert!(post.windows.iter().any(|window| {
+        window.window_id == target
+            && window.session_ids == vec![left_session]
+            && window.workspace_tree == Some(transfer_leaf(left, vec![left_session]))
+    }));
+}
 
 #[tokio::test]
 async fn restore_from_handoff_populates_session_manager() {

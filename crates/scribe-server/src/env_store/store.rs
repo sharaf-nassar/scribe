@@ -164,6 +164,57 @@ pub async fn write_envelope(
     .map_err(|e| StoreError::Io(io::Error::other(format!("blocking panic: {e}"))))?
 }
 
+/// Stage one envelope's workspace-transfer re-bind: copy its DEK and sealed
+/// file from `source_window`'s coordinates to `target_window`'s, without
+/// decrypting and without touching the source. Returns whether a file was
+/// staged.
+///
+/// The file gates everything — a session that never persisted has nothing to
+/// re-bind and costs zero keystore I/O. A file whose DEK is already missing
+/// is copied alone: restore at the new coordinates fails exactly as it would
+/// have at the old ones. Any real keystore or filesystem failure propagates
+/// so the transfer can refuse with `EnvironmentRebindFailed`; the staged
+/// target copy is then collectable garbage (`delete_envelope` on the target
+/// coordinates), never a broken restore.
+pub async fn stage_envelope_transfer(
+    source_window: WindowId,
+    target_window: WindowId,
+    launch_id: &str,
+) -> Result<bool, StoreError> {
+    let source_path = envelope_path(source_window, launch_id)?;
+    let sealed = match tokio::fs::read(&source_path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StoreError::Io(e)),
+    };
+
+    match keystore::get_dek(source_window, launch_id).await {
+        Ok(dek) => keystore::set_dek(target_window, launch_id, &dek).await?,
+        Err(KeystoreError::NotFound) => {}
+        Err(e) => return Err(StoreError::Keystore(e)),
+    }
+
+    let target_dir = ensure_env_dir(target_window).await?;
+    let target_path = target_dir.join(format!("{launch_id}.envz"));
+    tokio::task::spawn_blocking(move || copy_sealed_envelope_bytes(&sealed, &target_path))
+        .await
+        .map_err(|e| StoreError::Io(io::Error::other(format!("blocking panic: {e}"))))??;
+    Ok(true)
+}
+
+/// Write already-sealed envelope bytes at `target_path` through the private
+/// temp-file + rename dance. Pure over its paths so tests can drive it
+/// against a scratch directory without a keystore.
+fn copy_sealed_envelope_bytes(sealed: &[u8], target_path: &Path) -> Result<(), StoreError> {
+    let tmp = write_private_temp_file(target_path, sealed)?;
+    if let Err(e) = std::fs::rename(&tmp, target_path) {
+        drop(std::fs::remove_file(&tmp));
+        return Err(StoreError::Io(e));
+    }
+    set_private_file_perms(target_path)?;
+    Ok(())
+}
+
 /// Delete an envelope + its DEK. Idempotent; missing entries are not errors.
 pub async fn delete_envelope(window_id: WindowId, launch_id: &str) -> Result<(), StoreError> {
     let path = envelope_path(window_id, launch_id)?;
@@ -279,4 +330,46 @@ fn write_private_temp_file(final_path: &Path, content: &[u8]) -> io::Result<Path
         }
     }
     Err(io::Error::other("could not create private temp file after 16 attempts"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-env-transfer-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    // @lat: [[server#Workspace Transfer#Staged env re-bind]]
+    #[test]
+    fn sealed_envelope_bytes_copy_atomically_and_leave_no_temp() {
+        let dir = scratch_dir("copy");
+        let target = dir.join("launch-a.envz");
+        copy_sealed_envelope_bytes(b"sealed-bytes", &target).expect("copy");
+        assert_eq!(std::fs::read(&target).expect("read staged copy"), b"sealed-bytes");
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != target)
+            .count();
+        assert_eq!(leftovers, 0, "no temp file survives a successful copy");
+    }
+
+    // @lat: [[server#Workspace Transfer#Staged env re-bind]]
+    #[test]
+    fn sealed_envelope_copy_failure_leaves_no_partial_target() {
+        let dir = scratch_dir("fail");
+        // The rename target's parent does not exist, so the copy must fail
+        // after the temp write and clean the temp up.
+        let target = dir.join("missing-subdir").join("launch-a.envz");
+        assert!(copy_sealed_envelope_bytes(b"sealed-bytes", &target).is_err());
+        assert!(!target.exists(), "no partial file at the target coordinates");
+    }
 }

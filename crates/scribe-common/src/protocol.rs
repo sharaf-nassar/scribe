@@ -675,6 +675,10 @@ pub enum WorkspaceTransferRefusal {
     SoleWorkspace,
     TargetWindowIdCollision,
     HandoffInProgress,
+    /// The pre-commit env DEK/envelope re-bind to the target window's
+    /// coordinates failed; the source window is byte-identical and staged
+    /// copies were discarded, so cold restore stays intact.
+    EnvironmentRebindFailed,
 }
 
 // ── UI → Server ──────────────────────────────────────────────────
@@ -2797,6 +2801,9 @@ mod tests {
             },
             WorkspaceTransferResult::Refused {
                 reason: WorkspaceTransferRefusal::HandoffInProgress,
+            },
+            WorkspaceTransferResult::Refused {
+                reason: WorkspaceTransferRefusal::EnvironmentRebindFailed,
             },
         ];
         for result in results {

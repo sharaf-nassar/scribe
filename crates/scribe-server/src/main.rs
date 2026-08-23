@@ -71,6 +71,10 @@ use scribe_server::terminal_image_handoff;
 // `pub` items dead there.
 use scribe_server::beads_board;
 use scribe_server::child_watch;
+// The transfer gate + ledger is one small all-`pub` leaf shared by `mod
+// handoff`, `mod state_dump`, and `mod ipc_server`; re-export the library's
+// copy for the same single-compile reason as `tailnet`/`lan`.
+use scribe_server::workspace_transfer;
 mod github_ci;
 mod updater;
 mod workspace_manager;
@@ -307,6 +311,7 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
             launchd_slot,
             restored_ci_windows: Vec::new(),
             recovered_sessions,
+            restored_transfer_ledger: Vec::new(),
         },
     ))
     .await
@@ -412,6 +417,7 @@ async fn run_upgrade_receiver(
             &live_sessions,
         )));
     let restored_ci_windows = state.ci_windows.clone();
+    let restored_transfer_ledger = state.transfer_ledger.clone();
 
     // Record completion only after restoration succeeds. A receiver that ACKed
     // but could not rebuild the handed-off state must not announce success.
@@ -435,6 +441,7 @@ async fn run_upgrade_receiver(
             // and a client reattaching to a surviving server replays nothing
             // that could consume an entry anyway.
             recovered_sessions: std::collections::HashMap::new(),
+            restored_transfer_ledger,
         },
     ))
     .await
@@ -457,6 +464,9 @@ struct ServerLoopConfig {
     /// dump; consumed by cold-restart `CreateSession` replays.
     recovered_sessions:
         std::collections::HashMap<String, scribe_common::screen_replay::SessionReplay>,
+    /// Workspace-transfer results carried across a handoff so a lost-ACK
+    /// retry deduplicates on the successor; empty on cold start.
+    restored_transfer_ledger: Vec<workspace_transfer::TransferLedgerEntry>,
 }
 
 #[allow(clippy::too_many_lines, reason = "server setup remains one ordered startup transaction")]
@@ -472,8 +482,10 @@ async fn run_server_loop(
         launchd_slot,
         restored_ci_windows,
         recovered_sessions,
+        restored_transfer_ledger,
     } = config;
     let live_sessions = ipc_server::new_live_session_registry();
+    let workspace_transfers = workspace_transfer::restored_transfer_gate(restored_transfer_ledger);
     let window_shares = ipc_server::new_window_shares();
     let git_ref_watcher =
         Arc::new(git_ref_watcher::GitRefWatcherControl::new(github_ci::github_ci_enabled()));
@@ -559,6 +571,7 @@ async fn run_server_loop(
         git_ref_watcher: Arc::clone(&git_ref_watcher),
         agent_api: agent_api::AgentApiState::new(agent_api),
         recovered_sessions: Arc::new(std::sync::Mutex::new(recovered_sessions)),
+        workspace_transfers: Arc::clone(&workspace_transfers),
     };
 
     // Crash-recovery dump: checkpoint the live state on a dirty-gated interval
@@ -567,6 +580,7 @@ async fn run_server_loop(
         Arc::clone(&live_sessions),
         Arc::clone(&workspace_manager),
         github_ci_tracker.clone(),
+        Arc::clone(&workspace_transfers),
     );
     // The handoff-listener arm consumes `github_ci_tracker`; the final dump
     // below runs after the select and needs its own handle.
@@ -609,6 +623,7 @@ async fn run_server_loop(
             Arc::clone(&workspace_manager),
             Arc::clone(&live_sessions),
             github_ci_tracker,
+            Arc::clone(&workspace_transfers),
         ) => {
             match result {
                 Ok(()) => {
@@ -649,7 +664,13 @@ async fn run_server_loop(
         // The sessions die with this process, so checkpoint them first: this
         // is what makes an ordinary service stop or reboot content-preserving
         // for the next cold start's replay.
-        state_dump::dump_now(&live_sessions, &workspace_manager, &shutdown_ci_tracker).await;
+        state_dump::dump_now(
+            &live_sessions,
+            &workspace_manager,
+            &shutdown_ci_tracker,
+            &workspace_transfers,
+        )
+        .await;
         // Stop the readers before the runtime unwinds, under the same bounded
         // join the close paths use, so shutdown is not the one exit path that
         // abandons a task parked on a PTY read (spec 017 US1-3).

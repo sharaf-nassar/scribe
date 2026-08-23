@@ -123,6 +123,11 @@ Produced by the CLI itself:
 Policy is evaluated before target lookup, so a call denied by policy returns
 `denied` without disclosing whether the target exists.
 
+Window ids are snapshot facts, not permanent workspace identities. Moving a
+workspace to a new window mints a fresh `window_id`; `world` and `siblings`
+show the ownership change atomically, so agents should refresh a snapshot
+rather than cache a session's or workspace's window id across operations.
+
 ## Commands
 
 Session, window, and workspace ids are full UUIDs, exactly as returned by

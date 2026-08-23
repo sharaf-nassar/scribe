@@ -413,7 +413,10 @@ Only the bootstrap client (launched without `--window-id`) spawns child processe
 
 `WorkspaceTransferRefusal` distinguishes unknown workspaces, a source-window
 ownership mismatch, missing window control, absent capability, a sole
-workspace, target-window-id collision, and a handoff already in progress.
+workspace, target-window-id collision, a handoff already in progress, and
+`EnvironmentRebindFailed` when the pre-commit env DEK/envelope staging cannot
+complete. Env failure is never reported as generic `ServerMessage::Error`; it
+is a typed refusal and the source state stays byte-identical.
 
 The named-MessagePack protocol test round-trips the request, success, and
 every refusal. Its old-peer schemas omit `workspace_transfer` and decode as

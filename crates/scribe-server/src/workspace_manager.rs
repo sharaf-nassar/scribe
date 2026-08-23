@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{LayoutDirection, ServerMessage, WorkspaceTreeNode};
+use scribe_common::protocol::{
+    LayoutDirection, ServerMessage, WorkspaceTransferRefusal, WorkspaceTreeError, WorkspaceTreeNode,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,7 @@ const ACCENT_COLORS: &[&str] =
     &["#a78bfa", "#38bdf8", "#6ee7b7", "#fb7185", "#fbbf24", "#a3e635", "#f472b6", "#22d3ee"];
 
 type WorkspaceInfoSummary = (Option<String>, String, Option<LayoutDirection>, Option<PathBuf>);
+type WorkspaceTransferTrees = (WorkspaceTreeNode, WorkspaceTreeNode);
 
 /// Manages workspace ↔ session relationships, window ↔ session ownership,
 /// and auto-names workspaces based on configured root directories.
@@ -342,6 +345,106 @@ impl WorkspaceManager {
         self.window_trees.insert(window_id, tree);
     }
 
+    // ── Workspace transfer (spec 029) ────────────────────────────────
+
+    /// Validate a workspace transfer without mutating anything.
+    ///
+    /// Returns the sessions that would move (the workspace's authoritative
+    /// membership) or the typed refusal the requester gets. Both post-move
+    /// trees are derivable exactly when this returns `Ok`: the source
+    /// window's stored tree contains the workspace and at least one other
+    /// leaf.
+    pub fn validate_workspace_transfer(
+        &self,
+        source_window: WindowId,
+        workspace_id: WorkspaceId,
+        target_window: WindowId,
+    ) -> Result<Vec<SessionId>, WorkspaceTransferRefusal> {
+        self.check_workspace_transfer(source_window, workspace_id, target_window)
+            .map(|(moved, _)| moved)
+    }
+
+    /// Atomically commit a workspace transfer: derive both post-move trees
+    /// through the shared `WorkspaceTreeNode` operations, re-key every moved
+    /// session's window mapping, and store the target window's tree. Refusal
+    /// leaves every map byte-identical — validation runs before the first
+    /// mutation and the tree edit happens on a clone.
+    pub fn transfer_workspace(
+        &mut self,
+        source_window: WindowId,
+        workspace_id: WorkspaceId,
+        target_window: WindowId,
+    ) -> Result<Vec<SessionId>, WorkspaceTransferRefusal> {
+        let (moved, (source_tree, target_tree)) =
+            self.check_workspace_transfer(source_window, workspace_id, target_window)?;
+
+        crate::state_dump::mark_dirty();
+        self.window_trees.insert(source_window, source_tree);
+        self.window_trees.insert(target_window, target_tree);
+        for &session_id in &moved {
+            self.session_to_window.insert(session_id, target_window);
+        }
+        info!(
+            %workspace_id,
+            %source_window,
+            %target_window,
+            sessions = moved.len(),
+            "transferred workspace to a new window"
+        );
+        Ok(moved)
+    }
+
+    /// Shared validation + tree derivation for the two entry points above.
+    /// Pure: derives the post-move `(source, target)` trees on clones.
+    fn check_workspace_transfer(
+        &self,
+        source_window: WindowId,
+        workspace_id: WorkspaceId,
+        target_window: WindowId,
+    ) -> Result<(Vec<SessionId>, WorkspaceTransferTrees), WorkspaceTransferRefusal> {
+        if target_window == source_window
+            || self.window_trees.contains_key(&target_window)
+            || self.session_to_window.values().any(|&window| window == target_window)
+        {
+            return Err(WorkspaceTransferRefusal::TargetWindowIdCollision);
+        }
+        let Some(workspace) = self.workspaces.get(&workspace_id) else {
+            return Err(WorkspaceTransferRefusal::UnknownWorkspace);
+        };
+        let moved = workspace.sessions.clone();
+        if !moved.iter().all(|session| self.session_to_window.get(session) == Some(&source_window))
+        {
+            return Err(WorkspaceTransferRefusal::NotWorkspaceOwner);
+        }
+        let Some(tree) = self.window_trees.get(&source_window) else {
+            // No reported layout to derive from. A window whose sessions all
+            // belong to this workspace is a single-region window (nothing
+            // would remain); anything else cannot prove region ownership.
+            let window_sessions = self.sessions_for_window(source_window);
+            let all_here = !window_sessions.is_empty()
+                && window_sessions
+                    .iter()
+                    .all(|session| self.session_to_workspace.get(session) == Some(&workspace_id));
+            return Err(if all_here {
+                WorkspaceTransferRefusal::SoleWorkspace
+            } else {
+                WorkspaceTransferRefusal::NotWorkspaceOwner
+            });
+        };
+
+        let mut source_tree = tree.clone();
+        let extracted =
+            source_tree.extract_workspace(workspace_id).map_err(|error| match error {
+                WorkspaceTreeError::SoleWorkspace { .. } => WorkspaceTransferRefusal::SoleWorkspace,
+                WorkspaceTreeError::WorkspaceNotFound { .. }
+                | WorkspaceTreeError::InsertedWorkspaceMustBeLeaf
+                | WorkspaceTreeError::WorkspaceAlreadyPresent { .. } => {
+                    WorkspaceTransferRefusal::NotWorkspaceOwner
+                }
+            })?;
+        Ok((moved, (source_tree, extracted)))
+    }
+
     // ── Window tracking ──────────────────────────────────────────────
 
     /// Assign a session to a window.
@@ -405,6 +508,23 @@ impl WorkspaceManager {
         self.sessions_for_window(window_id)
             .iter()
             .any(|session_id| self.session_to_workspace.get(session_id) == Some(&workspace_id))
+    }
+
+    /// Whether every session named by a reported tree is authoritatively owned
+    /// by `window_id`. Empty leaves are allowed (they carry no stale session
+    /// authority); a pre-transfer source report that still names moved tabs is
+    /// rejected by this check instead of restoring the detached workspace.
+    #[must_use]
+    pub fn reported_tree_belongs_to_window(
+        &self,
+        window_id: WindowId,
+        tree: &WorkspaceTreeNode,
+    ) -> bool {
+        let mut session_ids = Vec::new();
+        collect_tree_sessions(tree, &mut session_ids);
+        session_ids
+            .into_iter()
+            .all(|session_id| self.window_for_session(session_id) == Some(window_id))
     }
 
     /// Connected-window identities containing a workspace rooted at `project_root`.
@@ -1129,6 +1249,158 @@ mod tests {
         mgr.assign_session_to_window(other_window, theirs);
         assert_eq!(mgr.sessions_for_window(window), vec![r1, l2, l1, fresh]);
         assert_eq!(mgr.sessions_for_window(other_window), vec![theirs]);
+    }
+
+    fn leaf(workspace_id: WorkspaceId, session_ids: Vec<SessionId>) -> WorkspaceTreeNode {
+        let pane_trees = session_ids.iter().map(|_| None).collect();
+        WorkspaceTreeNode::Leaf { workspace_id, session_ids, pane_trees, active_tab_index: 0 }
+    }
+
+    /// One window holding two workspaces side by side, ready to transfer.
+    fn transfer_fixture() -> (WorkspaceManager, WindowId, WorkspaceId, WorkspaceId, Vec<SessionId>)
+    {
+        let mut mgr = manager_with_roots(vec![]);
+        let window = WindowId::new();
+        let left = mgr.create_workspace();
+        let right = mgr.create_workspace();
+        let (l1, l2, r1) = (SessionId::new(), SessionId::new(), SessionId::new());
+        for (workspace, session) in [(left, l1), (left, l2), (right, r1)] {
+            mgr.add_session(workspace, session, None);
+            mgr.assign_session_to_window(window, session);
+        }
+        mgr.set_window_tree(
+            window,
+            WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leaf(left, vec![l1, l2])),
+                second: Box::new(leaf(right, vec![r1])),
+            },
+        );
+        (mgr, window, left, right, vec![l1, l2, r1])
+    }
+
+    // @lat: [[server#Workspace Transfer#In-gate commit]]
+    #[test]
+    fn transfer_moves_sessions_and_derives_both_trees() {
+        let (mut mgr, window, left, right, sessions) = transfer_fixture();
+        let (l1, l2, r1) = (sessions[0], sessions[1], sessions[2]);
+        let target = WindowId::new();
+
+        let stale_source_tree = mgr.window_tree(window).cloned().expect("source tree");
+        let moved = mgr.transfer_workspace(window, left, target).expect("transfer commits");
+        assert_eq!(moved, vec![l1, l2]);
+
+        // Every moved session's window mapping re-keys; the rest stay.
+        assert_eq!(mgr.window_for_session(l1), Some(target));
+        assert_eq!(mgr.window_for_session(l2), Some(target));
+        assert_eq!(mgr.window_for_session(r1), Some(window));
+        // Workspace identity is untouched by the move.
+        assert_eq!(mgr.workspace_for_session(l1), Some(left));
+
+        // The source tree collapsed to the remaining leaf; the target tree is
+        // exactly the extracted leaf, both derived via the shared tree ops.
+        assert_eq!(mgr.window_tree(window), Some(&leaf(right, vec![r1])));
+        assert_eq!(mgr.window_tree(target), Some(&leaf(left, vec![l1, l2])));
+        assert_eq!(mgr.sessions_for_window(target), vec![l1, l2]);
+        assert_eq!(mgr.sessions_for_window(window), vec![r1]);
+        assert!(
+            !mgr.reported_tree_belongs_to_window(window, &stale_source_tree),
+            "a pre-transfer source report cannot restore moved sessions"
+        );
+        assert!(mgr.reported_tree_belongs_to_window(target, &leaf(left, vec![l1, l2])));
+    }
+
+    // @lat: [[server#Workspace Transfer#Typed refusals leave state byte-identical]]
+    #[test]
+    fn transfer_refusals_are_typed_and_leave_state_byte_identical() {
+        let (mut manager, source_window, left, _right, sessions) = transfer_fixture();
+        let foreign_window = WindowId::new();
+        let foreign_session = SessionId::new();
+        let foreign_workspace = manager.create_workspace();
+        manager.add_session(foreign_workspace, foreign_session, None);
+        manager.assign_session_to_window(foreign_window, foreign_session);
+        manager.set_window_tree(foreign_window, leaf(foreign_workspace, vec![foreign_session]));
+
+        let snapshot = |state: &WorkspaceManager| {
+            let (workspaces, tree, mut windows) = state.serialize_for_handoff();
+            windows.sort_by_key(|entry| entry.window_id.to_full_string());
+            (
+                rmp_serde::to_vec_named(&workspaces).expect("workspaces"),
+                rmp_serde::to_vec_named(&tree).expect("tree"),
+                rmp_serde::to_vec_named(&windows).expect("windows"),
+            )
+        };
+        let before = snapshot(&manager);
+
+        let cases = [
+            // Unknown workspace id.
+            (
+                source_window,
+                WorkspaceId::new(),
+                WindowId::new(),
+                WorkspaceTransferRefusal::UnknownWorkspace,
+            ),
+            // Another window's workspace is not this connection's to move.
+            (
+                source_window,
+                foreign_workspace,
+                WindowId::new(),
+                WorkspaceTransferRefusal::NotWorkspaceOwner,
+            ),
+            // The target id collides with the source window itself…
+            (source_window, left, source_window, WorkspaceTransferRefusal::TargetWindowIdCollision),
+            // …or with any window the registries already know.
+            (
+                source_window,
+                left,
+                foreign_window,
+                WorkspaceTransferRefusal::TargetWindowIdCollision,
+            ),
+            // A window's only workspace cannot tear out.
+            (
+                foreign_window,
+                foreign_workspace,
+                WindowId::new(),
+                WorkspaceTransferRefusal::SoleWorkspace,
+            ),
+        ];
+        for (source, workspace, target, expected) in cases {
+            assert_eq!(
+                manager.validate_workspace_transfer(source, workspace, target),
+                Err(expected)
+            );
+            assert_eq!(manager.transfer_workspace(source, workspace, target), Err(expected));
+        }
+        assert_eq!(snapshot(&manager), before, "refused transfers mutate nothing");
+        drop(sessions);
+    }
+
+    #[test]
+    fn transfer_without_a_reported_tree_refuses_honestly() {
+        // Sole-workspace window that never reported a tree: nothing would
+        // remain after the move, so the refusal is SoleWorkspace.
+        let mut mgr = manager_with_roots(vec![]);
+        let window = WindowId::new();
+        let only = mgr.create_workspace();
+        let session = SessionId::new();
+        mgr.add_session(only, session, None);
+        mgr.assign_session_to_window(window, session);
+        assert_eq!(
+            mgr.transfer_workspace(window, only, WindowId::new()),
+            Err(WorkspaceTransferRefusal::SoleWorkspace)
+        );
+
+        // Multi-workspace window without a tree: region ownership cannot be
+        // derived, so the transfer refuses rather than inventing a layout.
+        let second = mgr.create_workspace();
+        let second_session = SessionId::new();
+        mgr.add_session(second, second_session, None);
+        mgr.assign_session_to_window(window, second_session);
+        assert_eq!(
+            mgr.transfer_workspace(window, only, WindowId::new()),
+            Err(WorkspaceTransferRefusal::NotWorkspaceOwner)
+        );
     }
 
     #[test]

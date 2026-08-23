@@ -101,6 +101,20 @@ impl AgentActivityTracker {
         self.release_where(|holder| holder == caller);
     }
 
+    /// Re-announce the active indicator for each of `session_ids` that
+    /// currently shows one (spec 029): a workspace transfer re-homes the
+    /// sessions, and the forwarder resolves each transition's window at send
+    /// time, so replaying the `true` edge routes the in-flight lease state to
+    /// the destination window. Sessions with no live indicator emit nothing.
+    pub fn rebroadcast_active(&self, session_ids: &[SessionId]) {
+        let state = self.lock();
+        for &session_id in session_ids {
+            if state.sessions.contains_key(&session_id) {
+                self.transitions.send((session_id, true)).ok();
+            }
+        }
+    }
+
     /// Release every lease held by anyone (policy disable). Each cleared
     /// session's indicator still waits out the dwell before turning off.
     pub fn release_all(&self) {

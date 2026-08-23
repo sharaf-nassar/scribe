@@ -38,3 +38,4 @@ pub mod terminal_image_sharing;
 pub mod terminal_image_state;
 pub mod updater;
 pub mod workspace_manager;
+pub mod workspace_transfer;

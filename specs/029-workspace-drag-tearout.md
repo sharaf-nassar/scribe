@@ -632,7 +632,9 @@ Alternatives considered and rejected:
     a typed refusal enum: unknown workspace, not owner / not this
     connection's window, no window control, capability absent,
     sole workspace, target window id already exists (collision with any
-    session/tree/share registry), mid-handoff.
+    session/tree/share registry), mid-handoff, or pre-commit environment
+    DEK/envelope re-bind failure (`EnvironmentRebindFailed`; never generic
+    `ServerMessage::Error`).
   - `Hello`/`Welcome` gain `workspace_transfer: bool` (serde-default
     false).
 - **Server state**: `window_trees` and `session_to_window` mutate inside

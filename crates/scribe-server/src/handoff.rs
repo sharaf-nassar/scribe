@@ -62,6 +62,7 @@ pub use crate::workspace_manager::HandoffWindowState;
 
 use crate::ipc_server::LiveSessionRegistry;
 use crate::workspace_manager::WorkspaceManager;
+use crate::workspace_transfer::{TransferGate, TransferLedgerEntry};
 
 // ── Wire types ──────────────────────────────────────────────────────
 
@@ -189,6 +190,11 @@ pub struct HandoffState {
     /// Active GitHub CI windows contain no credential and re-poll on takeover.
     #[serde(default)]
     pub ci_windows: Vec<crate::github_ci::HandoffCiWindow>,
+    /// Bounded workspace-transfer result ledger (spec 029), so a transfer ACK
+    /// lost across an upgrade still deduplicates the client's retry. Additive
+    /// `#[serde(default)]` — an older peer simply starts with an empty ledger.
+    #[serde(default)]
+    pub transfer_ledger: Vec<TransferLedgerEntry>,
 }
 
 /// Per-session state transferred during handoff.
@@ -302,6 +308,14 @@ struct HandoffPayload {
     fds: Vec<Arc<OwnedFd>>,
 }
 
+#[derive(Clone, Copy)]
+struct HandoffSources<'a> {
+    live_sessions: &'a LiveSessionRegistry,
+    workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+    github_ci_tracker: &'a crate::github_ci::GithubCiTrackerHandle,
+    workspace_transfers: &'a TransferGate,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PeerIdentity {
     uid: u32,
@@ -318,15 +332,19 @@ pub async fn run_handoff_listener(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
     github_ci_tracker: crate::github_ci::GithubCiTrackerHandle,
+    workspace_transfers: TransferGate,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
     let listen_async = prepare_handoff_listener(&path)?;
     wait_for_successful_handoff(
         &listen_async,
         &path,
-        &live_sessions,
-        &workspace_manager,
-        &github_ci_tracker,
+        HandoffSources {
+            live_sessions: &live_sessions,
+            workspace_manager: &workspace_manager,
+            github_ci_tracker: &github_ci_tracker,
+            workspace_transfers: &workspace_transfers,
+        },
     )
     .await
 }
@@ -334,20 +352,20 @@ pub async fn run_handoff_listener(
 async fn wait_for_successful_handoff(
     listen_async: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
     path: &PathBuf,
-    live_sessions: &LiveSessionRegistry,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
+    sources: HandoffSources<'_>,
 ) -> Result<(), ScribeError> {
     // Loop so the old server survives a failed handoff (e.g. version
     // mismatch) and keeps serving until a compatible upgrade arrives or
     // postinst cold-restarts via systemctl.
     loop {
         let peer_fd = accept_handoff_peer(listen_async).await?;
-        if process_handoff_peer(&peer_fd, path, live_sessions, workspace_manager, github_ci_tracker)
-            .await
-        {
+        let done = process_handoff_peer(&peer_fd, path, sources).await;
+        if done {
             return Ok(());
         }
+        // Failed handoff: this server keeps serving, so transfers may run
+        // again — the state snapshotted above is stale and discarded.
+        sources.workspace_transfers.lock().await.abort_handoff();
     }
 }
 
@@ -406,23 +424,26 @@ async fn accept_handoff_peer(
 async fn process_handoff_peer(
     peer_fd: &std::os::fd::OwnedFd,
     path: &PathBuf,
-    live_sessions: &LiveSessionRegistry,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
+    sources: HandoffSources<'_>,
 ) -> bool {
     if let Err(e) = receive_upgrade_request(peer_fd) {
         warn!("handoff upgrade request failed: {e}");
         return false;
     }
 
-    let payload =
-        match prepare_handoff_payload(live_sessions, workspace_manager, github_ci_tracker).await {
-            Ok(payload) => payload,
-            Err(e) => {
-                warn!("handoff serialization failed: {e}");
-                return false;
-            }
-        };
+    // Latch the transfer refusal BEFORE the snapshot: a transfer committed
+    // after serialization would mutate state the payload no longer carries,
+    // so from here until this handoff succeeds (process exit) or fails (the
+    // caller clears the latch) every transfer gets `HandoffInProgress`.
+    sources.workspace_transfers.lock().await.begin_handoff();
+
+    let payload = match prepare_handoff_payload(sources).await {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!("handoff serialization failed: {e}");
+            return false;
+        }
+    };
 
     if let Err(e) = send_handoff_payload(peer_fd, &payload) {
         warn!("handoff transfer failed: {e}");
@@ -446,11 +467,15 @@ fn receive_upgrade_request(peer_fd: &OwnedFd) -> Result<(), ScribeError> {
 }
 
 async fn prepare_handoff_payload(
-    live_sessions: &LiveSessionRegistry,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
+    sources: HandoffSources<'_>,
 ) -> Result<HandoffPayload, ScribeError> {
-    let (state, fds) = serialize_state(live_sessions, workspace_manager, github_ci_tracker).await;
+    let (state, fds) = serialize_state(
+        sources.live_sessions,
+        sources.workspace_manager,
+        sources.github_ci_tracker,
+        sources.workspace_transfers,
+    )
+    .await;
     // Named-map encoding (since v6) so additive `#[serde(default)]` fields on
     // the receiver are tolerated regardless of insertion position. Positional
     // `to_vec` would force append-only discipline that the codebase has not
@@ -692,7 +717,14 @@ pub async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,
+    workspace_transfers: &TransferGate,
 ) -> (HandoffState, Vec<Arc<OwnedFd>>) {
+    // Hold the transfer gate across the whole capture (spec 029 C4): a
+    // transfer transaction mutates the live-session and workspace registries
+    // under separate guards, so a snapshot taken between them would carry a
+    // half-moved workspace. Under the gate this snapshot is strictly pre- or
+    // post-transfer state, and the ledger it serializes matches.
+    let transfers = workspace_transfers.lock().await;
     let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
@@ -705,6 +737,7 @@ pub async fn serialize_state(
         workspace_tree,
         windows,
         ci_windows: github_ci_tracker.handoff_windows(),
+        transfer_ledger: transfers.entries(),
     };
 
     (state, fds)
