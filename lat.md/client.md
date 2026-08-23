@@ -365,6 +365,8 @@ The claim is carried on [[crates/scribe-client/src/main.rs#WindowBackend]], one 
 
 `other_windows` is what makes a restart bring *all* the windows back rather than one. [[crates/scribe-client/src/main.rs#on_welcome]] parks the ids and [[crates/scribe-client/src/main.rs#TerminalView#poll_sibling_windows]] reopens one window per id on the foreground, each claiming its own id and creating no first shell, so each adopts its own sessions instead of racing the others for them. Only the process bootstrap's first handshake may fan out: the flag is consumed there, so a redial cannot reopen a window whose own process is mid-reconnect, and a reopened window cannot fan out again.
 
+[[crates/scribe-client/src/main.rs#open_claimed_window]] is also the target bootstrap for workspace tear-out. It prepares the named backend with `initial_session: false`, opens GPUI at the requested size and placement, and launches the IPC thread only after the platform window succeeds. A failed open therefore never claims the committed target; the server continues offering that `WindowId` through the same restored-window path on the next client bootstrap.
+
 The two fan-outs are mutually exclusive by construction. `other_windows` restores windows the server still holds sessions for; the `--restore-child` processes restore snapshots after the server itself died. Whichever one fires zeroes the other's count, so no window is ever opened twice.
 
 ### Hot Restart Reattach
@@ -2983,6 +2985,10 @@ Mouse events are processed for text selection, scrollbar interaction, divider dr
 Selection modes are click-drag for cell, double-click for word or configured Smart Selection, triple-click for line, and quad-click for Smart Selection when configured that way. Scrollbar supports click-to-jump and drag-to-scroll. Divider drag resizes splits with 4px hit tolerance. Tab drag reorders with visual offset.
 
 Once GPUI engages a workspace drag, [[crates/scribe-client/src/main.rs#TerminalView#workspace_drag_shield]] mounts a full-window occluding input surface ahead of the terminal. It claims motion and both release paths, while the root claims Escape, so no drag event or cancel key can become PTY mouse reporting or input. Window deactivation and source disappearance explicitly call `stop_active_drag`; all three tested backends retained an active GPUI drag until that application hook ran.
+
+[[crates/scribe-client/src/workspace_transfer.rs#WorkspaceTransfers]] owns the correlated client half of [[protocol#Client Messages#Workspace transfer]]. Tear arming clears the in-window preview and re-entry restores targeting; arming stays disabled until `Welcome.workspace_transfer` is true. Release mints the target `WindowId` and transfer id but leaves the source layout untouched, and a sole workspace or absent capability sends nothing. Timeout or disconnect retains the same ids and retries after a live capable connection; one matching success parks one target open, every typed refusal becomes status feedback, and late or duplicate results have no side effect.
+
+[[crates/scribe-client/src/main.rs#TerminalView#open_transferred_window]] claims that target with `initial_session: false` and the source window's current size. X11 and macOS use the release cursor as the target top-left; Wayland passes the inherited size while leaving placement to the compositor. Open failure reports committed-but-recoverable state instead of rolling the server transaction back.
 
 Click sequencing is tracked by , which records each press time and position to classify the event as  (Single, Double, Triple, or Quadruple). Multi-click is recognized when a press arrives within 400 ms and 5 px of the previous one. The derived  (Cell, Word, or Line) follows directly from the click kind. Auto-scrolling during drag is triggered by `edge_scroll_delta` when the cursor enters the 20 px edge zone at the top or bottom of the content area.
 

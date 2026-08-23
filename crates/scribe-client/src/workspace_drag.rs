@@ -91,6 +91,8 @@ pub struct WorkspaceDragUpdate<'a> {
     pub layout_pointer: DragPoint,
     pub regions: &'a [(WorkspaceId, Rect)],
     pub divider_blocked: bool,
+    /// Whether `Welcome` negotiated the atomic transfer operation.
+    pub tear_enabled: bool,
 }
 
 /// Complete client-local workspace drag state.
@@ -125,6 +127,7 @@ impl WorkspaceDrag {
             layout_pointer,
             regions,
             divider_blocked,
+            tear_enabled,
         } = update;
         let Some(source_workspace_id) = self.source_workspace_id() else { return };
         if matches!(self.phase, WorkspaceDragPhase::Committing { .. }) {
@@ -132,8 +135,9 @@ impl WorkspaceDrag {
         }
 
         let tear_armed = matches!(self.phase, WorkspaceDragPhase::TearArmed { .. });
-        if should_arm_tear(window_pointer, window_bounds)
-            || (tear_armed && !should_disarm_tear(window_pointer, window_bounds))
+        if tear_enabled
+            && (tear_candidate_at(window_pointer, window_bounds)
+                || (tear_armed && !should_disarm_tear(window_pointer, window_bounds)))
         {
             self.phase =
                 WorkspaceDragPhase::TearArmed { source_workspace_id, pointer: window_pointer };
@@ -352,7 +356,9 @@ fn drop_target_at(
     })
 }
 
-fn should_arm_tear(point: DragPoint, bounds: Rect) -> bool {
+/// Whether a release is in the universal edge band or beyond the window.
+#[must_use]
+pub fn tear_candidate_at(point: DragPoint, bounds: Rect) -> bool {
     point.x <= bounds.x + TEAR_ARM_DISTANCE
         || point.x >= bounds.x + bounds.width - TEAR_ARM_DISTANCE
         || point.y <= bounds.y + TEAR_ARM_DISTANCE
@@ -404,6 +410,7 @@ mod tests {
             layout_pointer: point,
             regions,
             divider_blocked,
+            tear_enabled: true,
         });
     }
 
@@ -491,6 +498,41 @@ mod tests {
 
         update_drag(&mut drag, DragPoint { x: -1.0, y: 100.0 }, &[], false);
         assert!(drag.is_tear_armed(), "out-of-bounds delivery also arms");
+    }
+
+    #[test]
+    fn tear_arm_clears_preview_and_reentry_restores_targeting() {
+        let source = WorkspaceId::new();
+        let target = WorkspaceId::new();
+        let regions = [(target, rect())];
+        let mut drag = WorkspaceDrag::default();
+        drag.arm(source);
+        update_drag(&mut drag, DragPoint { x: 150.0, y: 150.0 }, &regions, false);
+        assert!(drag.preview().is_some());
+
+        update_drag(&mut drag, DragPoint { x: 4.0, y: 150.0 }, &regions, false);
+        assert!(drag.is_tear_armed());
+        assert_eq!(drag.preview(), None);
+
+        update_drag(&mut drag, DragPoint { x: 25.0, y: 150.0 }, &regions, false);
+        assert!(!drag.is_tear_armed());
+        assert!(drag.preview().is_some());
+    }
+
+    #[test]
+    fn absent_capability_never_arms_tear_out() {
+        let source = WorkspaceId::new();
+        let mut drag = WorkspaceDrag::default();
+        drag.arm(source);
+        drag.update(WorkspaceDragUpdate {
+            window_pointer: DragPoint { x: 4.0, y: 100.0 },
+            window_bounds: window(),
+            layout_pointer: DragPoint { x: 4.0, y: 100.0 },
+            regions: &[],
+            divider_blocked: false,
+            tear_enabled: false,
+        });
+        assert!(!drag.is_tear_armed());
     }
 
     #[test]

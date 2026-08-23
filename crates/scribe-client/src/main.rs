@@ -26,7 +26,7 @@ use gpui::{
     Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StyleRefinement,
     Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
+    WindowBounds, WindowHandle, WindowOptions, canvas, div, point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -140,9 +140,14 @@ use scribe_client::window_state::{
 };
 use scribe_client::workspace_drag::{
     DragPoint, EmptyWorkspaceDragGhost, WorkspaceDrag, WorkspaceDragCancel, WorkspaceDragMarker,
-    WorkspaceDragUpdate, zone_preview_rect,
+    WorkspaceDragUpdate, tear_candidate_at, zone_preview_rect,
 };
 use scribe_client::workspace_layout::{self, WorkspaceDividerDrag};
+use scribe_client::workspace_transfer::{
+    TransferWindowSpec, TransferredWindow, WorkspaceTransferConnection, WorkspaceTransferFeedback,
+    WorkspaceTransferOutcome, WorkspaceTransferRequest, WorkspaceTransferResultDisposition,
+    WorkspaceTransfers,
+};
 use scribe_client::x11_focus::{X11FocusGuard, should_reconcile_window_activation};
 use scribe_client::zoom::ZoomState;
 use scribe_client::{
@@ -172,7 +177,8 @@ use scribe_common::{
     protocol::{
         AutomationAction, CiRunDetails, CiRunState, ClientMessage, ClipboardDecision,
         ClipboardSelection, PromptId, PromptMarkKind, ServerMessage, SessionInfo, ShellTool,
-        TerminalSize, UpdateProgressState, WindowInfo, WorkspaceTreeNode, pi_launch_metadata,
+        TerminalSize, UpdateProgressState, WindowInfo, WorkspaceTransferResult, WorkspaceTreeNode,
+        pi_launch_metadata,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -687,6 +693,8 @@ struct Shared {
     /// Whether the server accepted this client's workspace-transfer support.
     /// False until each connection's `Welcome` confirms support.
     workspace_transfer: Arc<AtomicBool>,
+    /// Correlated tear-out request, retry, and foreground-open state.
+    workspace_transfers: Arc<Mutex<WorkspaceTransfers>>,
     /// Set by the IPC reader once the server has answered this connection's
     /// first `ListSessions`. Cold-restart replay waits on it: only an *answered*
     /// and empty session list proves the server lost everything, which is the
@@ -993,6 +1001,8 @@ struct ColdStart {
     /// The geometry persisted for the claimed snapshot's window, normalized and
     /// range-checked.
     geometry: Option<WindowGeometry>,
+    /// One-shot creation bounds for a newly transferred window.
+    initial_bounds: Option<Bounds<Pixels>>,
     /// Snapshots still unclaimed in the restore index after this process took
     /// one. Fanned out as `--restore-child` processes only if the server turns
     /// out to have lost its sessions — see
@@ -1007,7 +1017,17 @@ impl ColdStart {
     /// server named in `other_windows`. Nothing to replay and no siblings to fan
     /// out; only the geometry the named window was last seen at.
     fn for_window(window_id: Option<WindowId>) -> Self {
-        Self { snapshot: None, geometry: window_id.and_then(saved_geometry_for), siblings: 0 }
+        Self {
+            snapshot: None,
+            geometry: window_id.and_then(saved_geometry_for),
+            initial_bounds: None,
+            siblings: 0,
+        }
+    }
+
+    fn with_initial_bounds(mut self, bounds: Option<Bounds<Pixels>>) -> Self {
+        self.initial_bounds = bounds;
+        self
     }
 
     /// Claim one restore entry and load the claimed window's geometry.
@@ -1034,7 +1054,7 @@ impl ColdStart {
         // reaches a fresh server that has not named this window yet, and by the
         // time `Welcome` does the window is already on screen.
         let geometry = saved_geometry_for(snapshot.window_id);
-        Self { snapshot: Some(snapshot), geometry, siblings }
+        Self { snapshot: Some(snapshot), geometry, initial_bounds: None, siblings }
     }
 }
 
@@ -1812,6 +1832,9 @@ struct TerminalView {
     region_chrome: RegionChrome,
     /// Client-local workspace pill drag lifecycle and actionable preview.
     workspace_drag: WorkspaceDrag,
+    /// Source bounds sampled with the last drag update, used by release paths
+    /// whose titlebar event no longer carries a `Window` reference.
+    workspace_drag_bounds: Option<Bounds<Pixels>>,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
     terminal_colors: GridPalette,
@@ -2492,6 +2515,7 @@ impl TerminalView {
             titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
             workspace_drag: WorkspaceDrag::default(),
+            workspace_drag_bounds: None,
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -5082,6 +5106,7 @@ impl TerminalView {
         }
         self.report_focus();
         self.poll_sibling_windows(cx);
+        self.poll_workspace_transfers(cx);
         self.poll_window_list();
         self.poll_beads_board(window);
         self.poll_lan_approval(cx);
@@ -5162,7 +5187,87 @@ impl TerminalView {
         // would open every one of them twice.
         self.restore.siblings = 0;
         for window_id in siblings {
-            self.open_restored_window(window_id, cx);
+            if !self.open_restored_window(window_id, cx) {
+                set_status(
+                    &self.shared.status,
+                    &self.shared.generation,
+                    "A restored window could not open; restart Scribe to retry".to_owned(),
+                );
+            }
+        }
+    }
+
+    fn poll_workspace_transfers(&mut self, cx: &mut Context<Self>) {
+        let connection = match (
+            self.shared.connected.load(Ordering::Acquire),
+            self.shared.workspace_transfer.load(Ordering::Acquire),
+        ) {
+            (false, _) => WorkspaceTransferConnection::Disconnected,
+            (true, false) => WorkspaceTransferConnection::ConnectedWithoutCapability,
+            (true, true) => WorkspaceTransferConnection::Connected,
+        };
+        let retry = self
+            .shared
+            .workspace_transfers
+            .lock()
+            .ok()
+            .and_then(|mut transfers| transfers.retry_if_due(Instant::now(), connection));
+        if let Some(request) = retry {
+            self.send_workspace_transfer_request(request, "retry");
+        }
+        self.apply_workspace_transfer_outcomes(cx);
+    }
+
+    fn apply_workspace_transfer_outcomes(&mut self, cx: &mut Context<Self>) {
+        let outcomes = self
+            .shared
+            .workspace_transfers
+            .lock()
+            .map(|mut transfers| transfers.take_outcomes())
+            .unwrap_or_default();
+        for outcome in outcomes {
+            match outcome {
+                WorkspaceTransferOutcome::Feedback(feedback) => {
+                    self.show_workspace_transfer_feedback(feedback);
+                }
+                WorkspaceTransferOutcome::Open(target) => {
+                    let opened = self.open_transferred_window(target, cx);
+                    set_status(
+                        &self.shared.status,
+                        &self.shared.generation,
+                        transferred_window_status(opened).to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn show_workspace_transfer_feedback(&self, feedback: WorkspaceTransferFeedback) {
+        set_status(&self.shared.status, &self.shared.generation, feedback.message().to_owned());
+    }
+
+    fn send_workspace_transfer_request(
+        &self,
+        request: WorkspaceTransferRequest,
+        context: &'static str,
+    ) {
+        let sent = self.sink.transfer_workspace(
+            request.correlation,
+            request.workspace,
+            request.target_window,
+        );
+        let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
+            tracing::warn!(context, "workspace transfer state mutex poisoned");
+            return;
+        };
+        match sent {
+            Ok(()) => {
+                transfers.mark_sent(request.correlation, Instant::now());
+            }
+            Err(error) => {
+                tracing::warn!(%error, context, "workspace transfer request dropped");
+                transfers.send_failed(request.correlation);
+            }
         }
     }
 
@@ -6061,20 +6166,37 @@ impl TerminalView {
     /// id — so it adopts *its own* sessions rather than racing the other
     /// restored windows for them — creates no first shell, and opens at the
     /// geometry that window was last seen at.
-    fn open_restored_window(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
-        let terminal_size = self.terminal_size;
-        let (shared, sink) = start_window_backend(
-            terminal_size,
-            WindowBackend {
-                claim: Some(window_id),
-                join_intent: LocalJoinIntent::Plain,
-                initial_session: false,
-                initial_action_completion: None,
-                fan_out: false,
-            },
+    fn open_restored_window(&mut self, window_id: WindowId, cx: &mut Context<Self>) -> bool {
+        let opened = open_claimed_window(
+            cx,
+            self.terminal_size,
+            window_id,
+            ColdStart::for_window(Some(window_id)),
+            None,
         );
-        open_window(cx, &shared, &sink, terminal_size, ColdStart::for_window(Some(window_id)));
-        tracing::info!(%window_id, "reopened a window the server kept sessions for");
+        if opened {
+            tracing::info!(%window_id, "reopened a window the server kept sessions for");
+        }
+        opened
+    }
+
+    fn open_transferred_window(
+        &mut self,
+        target: TransferredWindow,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let bounds = transferred_window_bounds(target.spec);
+        let opened = open_claimed_window(
+            cx,
+            self.terminal_size,
+            target.window_id,
+            ColdStart::for_window(None),
+            Some(bounds),
+        );
+        if opened {
+            tracing::info!(window_id = %target.window_id, "opened transferred workspace window");
+        }
+        opened
     }
 
     /// The grid area every pane rect is resolved against, in real pixels.
@@ -7293,6 +7415,7 @@ impl TerminalView {
             return;
         }
         self.workspace_drag.arm(workspace_id);
+        self.workspace_drag_bounds = None;
         cx.notify();
     }
 
@@ -7323,6 +7446,7 @@ impl TerminalView {
         )
         .is_some();
         let bounds = window.bounds();
+        self.workspace_drag_bounds = Some(bounds);
         self.workspace_drag.update(WorkspaceDragUpdate {
             window_pointer: pointer,
             window_bounds: Rect {
@@ -7334,6 +7458,7 @@ impl TerminalView {
             layout_pointer,
             regions: &regions,
             divider_blocked,
+            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire),
         });
     }
 
@@ -7358,6 +7483,7 @@ impl TerminalView {
         )
         .is_some();
         let bounds = window.bounds();
+        self.workspace_drag_bounds = Some(bounds);
         self.workspace_drag.update(WorkspaceDragUpdate {
             window_pointer: pointer,
             window_bounds: Rect {
@@ -7369,6 +7495,7 @@ impl TerminalView {
             layout_pointer,
             regions: &regions,
             divider_blocked,
+            tear_enabled: self.shared.workspace_transfer.load(Ordering::Acquire),
         });
         cx.notify();
     }
@@ -7378,8 +7505,25 @@ impl TerminalView {
         if !self.workspace_drag.is_active() {
             return false;
         }
+        let capable = self.shared.workspace_transfer.load(Ordering::Acquire);
+        let release_point = self.workspace_drag.pointer();
+        let source_bounds = self.workspace_drag_bounds.take();
+        let tear = self
+            .workspace_drag
+            .is_tear_armed()
+            .then(|| {
+                Some((self.workspace_drag.source_workspace_id()?, release_point?, source_bounds?))
+            })
+            .flatten();
+        let blocked_tear = !capable
+            && release_point.zip(source_bounds).is_some_and(|(point, bounds)| {
+                tear_candidate_at(point, rect_from_window_bounds(bounds))
+            });
         let commit = self.workspace_drag.release();
-        if let Some(commit) = commit {
+
+        if let Some((workspace_id, tear_point, tear_bounds)) = tear {
+            self.begin_workspace_transfer(workspace_id, tear_point, tear_bounds, cx);
+        } else if let Some(commit) = commit {
             match self.shell.rearrange_workspace(
                 commit.source_workspace_id,
                 commit.target.workspace_id,
@@ -7396,9 +7540,46 @@ impl TerminalView {
                 Err(error) => tracing::warn!(%error, "workspace drag commit refused"),
             }
             self.workspace_drag.complete_commit();
+        } else if blocked_tear {
+            self.show_workspace_transfer_feedback(WorkspaceTransferFeedback::CapabilityAbsent);
         }
         cx.notify();
         true
+    }
+
+    fn begin_workspace_transfer(
+        &mut self,
+        workspace_id: WorkspaceId,
+        pointer: DragPoint,
+        source_bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let target_window_id = WindowId::new();
+        let request = WorkspaceTransferRequest {
+            correlation: workspace_transfer_id(target_window_id),
+            workspace: workspace_id,
+            target_window: target_window_id,
+        };
+        let spec =
+            transfer_window_spec(source_bounds, pointer, cursor_anchored_transfer_placement());
+        let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
+            tracing::warn!("workspace transfer state mutex poisoned");
+            return;
+        };
+        let begin = transfers.begin(
+            self.shared.workspace_transfer.load(Ordering::Acquire),
+            self.shell.region_count(cx),
+            request,
+            spec,
+        );
+        drop(transfers);
+        match begin {
+            Ok(accepted) => {
+                self.send_workspace_transfer_request(accepted, "initial send");
+                self.apply_workspace_transfer_outcomes(cx);
+            }
+            Err(feedback) => self.show_workspace_transfer_feedback(feedback),
+        }
     }
 
     fn cancel_workspace_drag(
@@ -7411,6 +7592,7 @@ impl TerminalView {
             return false;
         }
         self.workspace_drag.cancel(reason);
+        self.workspace_drag_bounds = None;
         cx.stop_active_drag(window);
         cx.notify();
         true
@@ -7522,6 +7704,7 @@ impl TerminalView {
         };
         if !self.shell.has_region(source_workspace_id) {
             self.workspace_drag.cancel(WorkspaceDragCancel::SourceDisappeared);
+            self.workspace_drag_bounds = None;
             cx.stop_active_drag(window);
             return Vec::new();
         }
@@ -11529,6 +11712,66 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
     size(px(wanted.width), px(wanted.height))
 }
 
+fn rect_from_window_bounds(bounds: Bounds<Pixels>) -> Rect {
+    Rect {
+        x: 0.0,
+        y: 0.0,
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+    }
+}
+
+fn workspace_transfer_id(target_window_id: WindowId) -> u64 {
+    let (high, low) = target_window_id.as_uuid().as_u64_pair();
+    (high ^ low).max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_anchored_transfer_placement() -> bool {
+    gpui::guess_compositor() == "X11"
+}
+
+#[cfg(target_os = "macos")]
+const fn cursor_anchored_transfer_placement() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn cursor_anchored_transfer_placement() -> bool {
+    false
+}
+
+fn transfer_window_spec(
+    source_bounds: Bounds<Pixels>,
+    pointer: DragPoint,
+    cursor_anchored: bool,
+) -> TransferWindowSpec {
+    let origin = cursor_anchored.then(|| {
+        (
+            f32::from(source_bounds.origin.x) + pointer.x,
+            f32::from(source_bounds.origin.y) + pointer.y,
+        )
+    });
+    TransferWindowSpec {
+        width: f32::from(source_bounds.size.width),
+        height: f32::from(source_bounds.size.height),
+        origin,
+    }
+}
+
+fn transferred_window_bounds(spec: TransferWindowSpec) -> Bounds<Pixels> {
+    let (x, y) = spec.origin.unwrap_or((0.0, 0.0));
+    Bounds::new(point(px(x), px(y)), size(px(spec.width), px(spec.height)))
+}
+
+const fn transferred_window_status(opened: bool) -> &'static str {
+    if opened {
+        "Workspace moved to a new window"
+    } else {
+        "Workspace moved, but its window could not open; restart Scribe to recover it"
+    }
+}
+
 /// Which window a backend is being started for.
 ///
 /// The three answers travel together because they are one decision: a window
@@ -11553,14 +11796,41 @@ struct WindowBackend {
     fan_out: bool,
 }
 
+impl WindowBackend {
+    fn claimed(window_id: WindowId) -> Self {
+        Self {
+            claim: Some(window_id),
+            join_intent: LocalJoinIntent::Plain,
+            initial_session: false,
+            initial_action_completion: None,
+            fan_out: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LocalJoinIntent {
     Plain,
     Join,
 }
 
-/// Build one terminal window's backend: fresh shared state plus its own IPC
-/// connection to the server, with the reader/writer thread already running.
+struct PreparedWindowBackend {
+    shared: Shared,
+    sink: IpcSink,
+    ipc: IpcThread,
+}
+
+impl PreparedWindowBackend {
+    fn launch(self) {
+        start_ipc_thread(self.ipc);
+    }
+}
+
+/// Build one terminal window's backend without claiming it yet.
+///
+/// Dynamic claimed windows launch this IPC thread only after GPUI opens the
+/// platform window, so an open failure leaves the server window unconnected and
+/// recoverable through the existing restored-window offer.
 ///
 /// Every window owns an independent [`Shared`] — its own grid, status line, tab
 /// strip, and chrome — because a window is a separate client from the server's
@@ -11569,7 +11839,10 @@ enum LocalJoinIntent {
 ///
 /// Called once from [`main`] for the startup window and again for every window
 /// this process opens afterwards, so the paths cannot drift.
-fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
+fn prepare_window_backend(
+    terminal_size: TerminalSize,
+    window: WindowBackend,
+) -> PreparedWindowBackend {
     let WindowBackend { claim, join_intent, initial_session, initial_action_completion, fan_out } =
         window;
     let ci_owner_controls = matches!(join_intent, LocalJoinIntent::Plain)
@@ -11590,6 +11863,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         connected: Arc::new(AtomicBool::new(false)),
         pi_provider: Arc::new(AtomicBool::new(false)),
         workspace_transfer: Arc::new(AtomicBool::new(false)),
+        workspace_transfers: Arc::new(Mutex::new(WorkspaceTransfers::default())),
         session_list_seen: Arc::new(AtomicBool::new(false)),
         initial_session: Arc::new(InitialSessionBootstrap::new(
             initial_session,
@@ -11625,7 +11899,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
     let (in_tx, in_rx) = inbound_channel();
     let sink = IpcSink::new(out_tx.clone());
 
-    start_ipc_thread(IpcThread {
+    let ipc = IpcThread {
         shared: shared.clone(),
         sink: sink.clone(),
         out_tx,
@@ -11635,9 +11909,16 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         claim,
         join_intent,
         fan_out,
-    });
+    };
 
-    (shared, sink)
+    PreparedWindowBackend { shared, sink, ipc }
+}
+
+fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (Shared, IpcSink) {
+    let prepared = prepare_window_backend(terminal_size, window);
+    let handles = (prepared.shared.clone(), prepared.sink.clone());
+    prepared.launch();
+    handles
 }
 
 fn launchd_command_exit() -> Option<std::process::ExitCode> {
@@ -12475,6 +12756,28 @@ fn run_settings() {
     drop(listener);
 }
 
+fn open_claimed_window(
+    cx: &mut App,
+    terminal_size: TerminalSize,
+    window_id: WindowId,
+    cold_start: ColdStart,
+    initial_bounds: Option<Bounds<Pixels>>,
+) -> bool {
+    let prepared = prepare_window_backend(terminal_size, WindowBackend::claimed(window_id));
+    let opened = open_window(
+        cx,
+        &prepared.shared,
+        &prepared.sink,
+        terminal_size,
+        cold_start.with_initial_bounds(initial_bounds),
+    )
+    .is_some();
+    if opened {
+        prepared.launch();
+    }
+    opened
+}
+
 fn open_window(
     cx: &mut App,
     shared: &Shared,
@@ -12482,7 +12785,9 @@ fn open_window(
     terminal_size: TerminalSize,
     cold_start: ColdStart,
 ) -> Option<WindowHandle<TerminalView>> {
-    let bounds = Bounds::centered(None, startup_window_size(cx), cx);
+    let bounds = cold_start
+        .initial_bounds
+        .unwrap_or_else(|| Bounds::centered(None, startup_window_size(cx), cx));
     // A cold-restart window knows its record before it opens, so its pinned
     // boards are seeded here; a window the server assigns an id to instead
     // picks them up in `adopt_assigned_geometry`.
@@ -12706,6 +13011,14 @@ async fn supervise_connection(mut ctx: IpcThread) {
         // every new outage starts at the short initial retry interval.
         if ctx.shared.connected.swap(false, Ordering::AcqRel) {
             reconnect_delay = INITIAL_RECONNECT_DELAY;
+            if ctx
+                .shared
+                .workspace_transfers
+                .lock()
+                .is_ok_and(|mut transfers| transfers.disconnected())
+            {
+                ctx.shared.generation.fetch_add(1, Ordering::Release);
+            }
         }
 
         match result {
@@ -13126,6 +13439,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         tabs: Arc::clone(&ctx.shared.tabs),
         pi_provider: Arc::clone(&ctx.shared.pi_provider),
         workspace_transfer: Arc::clone(&ctx.shared.workspace_transfer),
+        workspace_transfers: Arc::clone(&ctx.shared.workspace_transfers),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
         initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
@@ -13600,6 +13914,8 @@ struct ReaderCtx {
     tabs: Arc<Mutex<TabSessions>>,
     /// Negotiated workspace-transfer support for this connection.
     workspace_transfer: Arc<AtomicBool>,
+    /// Correlated tear-out state shared with the foreground window.
+    workspace_transfers: Arc<Mutex<WorkspaceTransfers>>,
     /// Negotiated structured Pi provider support for this connection.
     pi_provider: Arc<AtomicBool>,
     /// Latched by the first `SessionList`; see the `session_list_seen` field of
@@ -14369,6 +14685,9 @@ async fn dispatch_server_message(
                 ctx.generation.fetch_add(1, Ordering::Release);
             }
         }
+        ServerMessage::WorkspaceTransferResult { transfer_id, result } => {
+            on_workspace_transfer_result(ctx, transfer_id, result);
+        }
         // The four provider task-label notices all land in the tab strip's
         // label column, so they are named here and routed as one to
         // [`on_task_label_message`]. Naming them is what keeps an AI tab's
@@ -14769,6 +15088,31 @@ fn on_search_results(
     results.accept(query, matches);
     drop(results);
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+fn on_workspace_transfer_result(
+    ctx: &ReaderCtx,
+    transfer_id: u64,
+    result: WorkspaceTransferResult,
+) {
+    let disposition = ctx
+        .workspace_transfers
+        .lock()
+        .map_or(WorkspaceTransferResultDisposition::Late, |mut transfers| {
+            transfers.receive_result(transfer_id, result)
+        });
+    match disposition {
+        WorkspaceTransferResultDisposition::Accepted => {
+            tracing::info!(transfer_id, ?result, "workspace transfer result accepted");
+            ctx.generation.fetch_add(1, Ordering::Release);
+        }
+        WorkspaceTransferResultDisposition::Duplicate => {
+            tracing::debug!(transfer_id, "duplicate workspace transfer result ignored");
+        }
+        WorkspaceTransferResultDisposition::Late => {
+            tracing::debug!(transfer_id, "late workspace transfer result ignored");
+        }
+    }
 }
 
 /// Surface one server rejection on the status line.
@@ -17312,6 +17656,32 @@ mod tests {
 
         assert!(!bootstrap.claim(true, 1));
         assert!(!bootstrap.claim(true, 0));
+    }
+
+    #[test]
+    fn claimed_target_bootstrap_creates_no_initial_session_and_reports_open_status() {
+        let backend = WindowBackend::claimed(WindowId::new());
+        assert!(!backend.initial_session);
+        assert!(backend.initial_action_completion.is_none());
+        assert!(transferred_window_status(false).contains("restart Scribe to recover"));
+    }
+
+    #[test]
+    fn transfer_window_inherits_size_and_uses_platform_placement_rule() {
+        let source = Bounds::new(point(px(20.0), px(30.0)), size(px(800.0), px(600.0)));
+        let pointer = DragPoint { x: 790.0, y: 250.0 };
+
+        let anchored = transfer_window_spec(source, pointer, true);
+        assert_eq!(anchored.width.to_bits(), 800.0f32.to_bits());
+        assert_eq!(anchored.height.to_bits(), 600.0f32.to_bits());
+        assert_eq!(anchored.origin, Some((810.0, 280.0)));
+        assert_eq!(transferred_window_bounds(anchored).origin, point(px(810.0), px(280.0)));
+
+        let compositor = transfer_window_spec(source, pointer, false);
+        assert_eq!(compositor.origin, None);
+        let bounds = transferred_window_bounds(compositor);
+        assert_eq!(bounds.origin, point(px(0.0), px(0.0)));
+        assert_eq!(bounds.size, source.size);
     }
 
     #[test]

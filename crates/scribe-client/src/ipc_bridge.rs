@@ -26,7 +26,7 @@
 //! `ListWindows` / `FocusChanged`), the feature-014 LAN frames the approval
 //! prompt and the startup LAN probe raise (`LanApprovalDecision` /
 //! `ListLanPeers`), the workspace frames the window's split shell raises
-//! (`CreateWorkspace` / `CloseWorkspace` / `MoveSession` /
+//! (`CreateWorkspace` / `CloseWorkspace` / `TransferWorkspace` / `MoveSession` /
 //! `ReportWorkspaceTree`), and the feature-013 tailnet frames the startup
 //! remote probe and the automation fallback raise (`ListRemotePeers` /
 //! `DispatchAction`), onto the ordered IPC-writer channel. That channel is
@@ -1412,6 +1412,24 @@ impl IpcSink {
         self.enqueue(ClientMessage::CloseWorkspace { workspace_id })
     }
 
+    /// Ask the server to atomically transfer one workspace to a fresh window.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn transfer_workspace(
+        &self,
+        transfer_id: u64,
+        workspace_id: WorkspaceId,
+        target_window_id: WindowId,
+    ) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::TransferWorkspace {
+            transfer_id,
+            workspace_id,
+            target_window_id,
+        })
+    }
+
     /// Reports that `session_id` now lives in `target_workspace`.
     ///
     /// A session and a region are independent axes: a split seeds its session
@@ -2217,6 +2235,25 @@ mod tests {
 
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::ConfigReloaded));
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn workspace_transfer_preserves_all_correlated_ids() {
+        let workspace_id = WorkspaceId::new();
+        let target_window_id = WindowId::new();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        sink.transfer_workspace(77, workspace_id, target_window_id).unwrap();
+
+        assert!(matches!(
+            out_rx.recv().await.unwrap(),
+            ClientMessage::TransferWorkspace {
+                transfer_id: 77,
+                workspace_id: sent_workspace,
+                target_window_id: sent_window,
+            } if sent_workspace == workspace_id && sent_window == target_window_id
+        ));
     }
 
     // @lat: [[test#GPUI IPC Bridge#Beads issue write reaches the wire]]

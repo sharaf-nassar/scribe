@@ -129,6 +129,7 @@ pub mod window_lifecycle;
 pub mod window_state;
 pub mod workspace_drag;
 pub mod workspace_layout;
+pub mod workspace_transfer;
 pub mod workspace_tree;
 pub mod x11_focus;
 pub mod zoom;
