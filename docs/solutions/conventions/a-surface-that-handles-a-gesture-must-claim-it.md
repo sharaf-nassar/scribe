@@ -1,8 +1,9 @@
 ---
 title: A surface that handles a gesture must claim it even when it does nothing
 date: 2026-08-21
-component: scribe-client (search.rs find overlay, beads_board.rs Flow strip, main.rs grid pointer path)
-tags: [gpui, stop_propagation, mouse-reporting, pty, sgr, wheel, overlay, pointer]
+last_updated: 2026-08-23
+component: scribe-client (search.rs find overlay, beads_board.rs Flow strip and A2 lanes, main.rs grid pointer path)
+tags: [gpui, stop_propagation, mouse-reporting, pty, sgr, wheel, overlay, pointer, hit-test]
 problem_type: bug
 ---
 
@@ -28,6 +29,10 @@ The three:
 3. The link path had the same hazard and was already guarded, which is what
    makes the pattern legible — see `main.rs:7665`, where a release belonging to
    a completed link gesture is dropped rather than forwarded.
+4. (Found 2026-08-23.) The A2 lanes never registered a wheel handler at all,
+   so every wheel over an open Beads board fell through to the pane behind it.
+   Filed as `scribe-2c6p`; the lost scroll axis behind it is its own learning,
+   `docs/solutions/runtime-errors/ui-rewrite-drops-a-scroll-axis-that-lived-in-the-element-type.md`.
 
 ## Root cause
 
@@ -40,10 +45,10 @@ Both fixes are one line, and both look like nothing:
 
 - `search.rs:654` and `search.rs:753` — an `on_mouse_up` stop sits next to each
   existing `on_mouse_down` stop, so the pairing is visible at the call site.
-- `beads_board.rs:2218` — `app.stop_propagation()` moved out of the
-  `if ... scroll_flow(...)` condition. `window.refresh()` stays inside it,
-  because a repaint genuinely is conditional on something having changed. The
-  comment at `beads_board.rs:2210` states the rule.
+- `beads_board.rs:2327` (`2218` when this was written) —
+  `app.stop_propagation()` moved out of the `if ... scroll_flow(...)`
+  condition. `window.refresh()` stays inside it, because a repaint genuinely is
+  conditional on something having changed. The comment above it states the rule.
 
 ## The rule
 
@@ -66,6 +71,33 @@ Do not fix this downstream by teaching the grid's release path to recognise
 overlays. That was considered and rejected: it creates a second place that has
 to know about every overlay, which is exactly the bookkeeping that produced the
 bug. The rule stays local to the element that ate the first half.
+
+## Why a non-occluding overlay leaks wheels but not clicks
+
+GPUI hit-tests scroll and every other mouse event differently, and the asymmetry
+is easy to miss because the click half looks correct.
+
+`Window::hit_test` (`crates/gpui/src/window.rs:938`) walks painted hitboxes
+front to back, pushes every one containing the pointer into `hit_test.ids`, and
+only `break`s on a hitbox with `HitboxBehavior::BlockMouse` —
+`InteractiveElement::occlude()`. Then:
+
+- `HitboxId::is_hovered` (`window.rs:629`) reads only the first
+  `hover_hitbox_count` ids, so an overlay in front hides the elements behind it
+  from hover styling, clicks, and moves.
+- `HitboxId::should_handle_scroll` (`window.rs:666`) is a bare
+  `ids.contains(&self)` — **every** hitbox under the pointer, occluders aside.
+  This is deliberate upstream: a scroll should find the nearest scrollable
+  ancestor even through non-interactive overlays.
+
+So an overlay that does not `.occlude()` will correctly swallow a press it
+handles and still hand the same pointer's wheel to whatever is painted
+underneath. Over the terminal grid that means `scroll_pane` (`main.rs:4508`)
+moves scrollback or encodes an SGR wheel report for a cell the user was never
+pointing at. `stop_propagation()` in the overlay's own wheel handler is the fix;
+`.occlude()` also works but changes hover semantics for everything behind, which
+is why `lane_drawer` (`beads_board.rs:3197`) uses it and `board_shell`
+(`beads_board.rs:2179`) does not.
 
 ## Why it stays invisible
 
