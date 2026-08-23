@@ -679,6 +679,9 @@ struct Shared {
     /// Whether the connected server negotiated structured Pi provider metadata.
     /// False until each connection's `Welcome` confirms support.
     pi_provider: Arc<AtomicBool>,
+    /// Whether the server accepted this client's workspace-transfer support.
+    /// False until each connection's `Welcome` confirms support.
+    workspace_transfer: Arc<AtomicBool>,
     /// Set by the IPC reader once the server has answered this connection's
     /// first `ListSessions`. Cold-restart replay waits on it: only an *answered*
     /// and empty session list proves the server lost everything, which is the
@@ -11202,6 +11205,7 @@ fn start_window_backend(terminal_size: TerminalSize, window: WindowBackend) -> (
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
         pi_provider: Arc::new(AtomicBool::new(false)),
+        workspace_transfer: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
         initial_session: Arc::new(InitialSessionBootstrap::new(
             initial_session,
@@ -12654,9 +12658,10 @@ where
     // windows, and no later handshake on this or any other connection does.
     let fan_out_other_windows = std::mem::take(&mut ctx.fan_out);
     // Capabilities belong to this connection. Reset before `Hello` so a queued
-    // Pi launch cannot reuse a newer server's answer while reconnecting to an
-    // older one.
+    // Pi launch or future workspace tear-out cannot reuse a newer server's answer
+    // while reconnecting to an older one.
     ctx.shared.pi_provider.store(false, Ordering::Release);
+    ctx.shared.workspace_transfer.store(false, Ordering::Release);
 
     // Write the connection handshake directly before draining the shared
     // outbound queue. A reconnect may have queued UI work while no stream was
@@ -12688,7 +12693,9 @@ where
             // takes the headless-deny path and never sends an agent frame, which
             // would collapse every `prompt`-mode capability to a silent deny.
             agent_api: true,
-            workspace_transfer: false,
+            // Tear-out UI remains disabled until `Welcome` confirms the server
+            // can complete the matching transfer transaction.
+            workspace_transfer: true,
         },
     )
     .await
@@ -12734,6 +12741,7 @@ fn reader_ctx(ctx: &IpcThread, fan_out_other_windows: bool) -> ReaderCtx {
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
         pi_provider: Arc::clone(&ctx.shared.pi_provider),
+        workspace_transfer: Arc::clone(&ctx.shared.workspace_transfer),
         session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
         initial_session: Arc::clone(&ctx.shared.initial_session),
         share: Arc::clone(&ctx.shared.share),
@@ -13206,6 +13214,8 @@ struct ReaderCtx {
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
     tabs: Arc<Mutex<TabSessions>>,
+    /// Negotiated workspace-transfer support for this connection.
+    workspace_transfer: Arc<AtomicBool>,
     /// Negotiated structured Pi provider support for this connection.
     pi_provider: Arc<AtomicBool>,
     /// Latched by the first `SessionList`; see the `session_list_seen` field of
@@ -14986,6 +14996,7 @@ fn on_welcome(
         beads_write,
         beads_flow,
         pi_provider,
+        workspace_transfer,
         ..
     } = welcome
     else {
@@ -14993,6 +15004,7 @@ fn on_welcome(
     };
     registry.adopt_window(window_id);
     ctx.pi_provider.store(pi_provider, Ordering::Release);
+    ctx.workspace_transfer.store(workspace_transfer, Ordering::Release);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
     if ctx.fan_out_other_windows && !other_windows.is_empty() {
         tracing::info!(
@@ -15021,6 +15033,7 @@ fn on_welcome(
         ?participant_id,
         clipboard_gating,
         pi_provider,
+        workspace_transfer,
         "welcome: adopted window"
     );
 }

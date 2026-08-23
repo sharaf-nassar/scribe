@@ -206,6 +206,8 @@ The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send
 
 Each connection advertises `Hello.pi_provider = true`, resets its cached server capability before reconnect, and latches `Welcome.pi_provider`. Once Pi state arrives, the ordinary AI tracker renders it and AI metadata outranks retained shell-tool identity; an older server or downgraded session list still reconstructs `ShellTool::Pi`. Pi has no resume arguments, so promotion never adds a Pi resume CLI mode.
 
+Each connection likewise advertises `Hello.workspace_transfer = true`, clears its cached server bit before reconnect, and latches `Welcome.workspace_transfer`. Future tear-out UI must remain disabled until that bit is true, so an old server cannot receive a transfer request it cannot handle.
+
 Warm reconstruction retains the best typed identity available; see [[client#Client#GPUI Client Spike#Hot Restart Reattach#Retained shell-tool bindings stay structured]].
 
 `new_window` opens a second top-level window in the same process through , rather than re-spawning the binary the way the winit client's `spawn_client_process` had to — GPUI is multi-window, as the settings window already shows.  builds each window's own `Shared` state and its own IPC connection, and `main` calls it for the startup window too, so the two paths cannot drift. Independent state is what makes it a window rather than a mirror: the `Hello` on that second connection carries no window id, so the server registers a *new* window and gives it its own sessions, tab strip, and status line.

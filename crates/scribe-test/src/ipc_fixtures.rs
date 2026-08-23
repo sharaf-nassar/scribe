@@ -215,7 +215,7 @@ fn insert_local_fixtures(
             ci_run_bar: false,
             pi_provider: false,
             agent_api: false,
-            workspace_transfer: false,
+            workspace_transfer: true,
         },
     )?;
     insert_named(
@@ -250,7 +250,7 @@ fn insert_local_fixtures(
             beads_flow: false,
             pi_provider: false,
             agent_api: false,
-            workspace_transfer: false,
+            workspace_transfer: true,
         },
     )
 }
@@ -432,6 +432,9 @@ fn decode_client_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
     if name.ends_with("old") && workspace_transfer {
         return Err("old Hello did not default workspace-transfer capability".to_owned());
     }
+    if name.ends_with("new") && !workspace_transfer {
+        return Err("new Hello did not advertise workspace-transfer capability".to_owned());
+    }
     let _: LegacyClientMessage =
         rmp_serde::from_slice(bytes).map_err(|error| format!("legacy decode {name}: {error}"))?;
     Ok(())
@@ -456,6 +459,12 @@ fn decode_server_fixture(name: &str, bytes: &[u8]) -> Result<(), String> {
         message.validate().map_err(|error| format!("validate {name}: {error}"))?;
     }
     if name == "local_welcome_new" {
+        let ServerMessage::Welcome { workspace_transfer, .. } = &message else {
+            return Err("new Welcome decoded as wrong message".to_owned());
+        };
+        if !workspace_transfer {
+            return Err("new Welcome did not advertise workspace-transfer capability".to_owned());
+        }
         let _: LegacyServerMessage = rmp_serde::from_slice(bytes)
             .map_err(|error| format!("legacy decode {name}: {error}"))?;
     }
