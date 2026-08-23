@@ -144,13 +144,13 @@ use scribe_client::zoom::ZoomState;
 use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{
-        GroupBadge, TabBarColors, TabData, accent_tab_tone, badge_label, context_suffix,
-        flash_blend, px_units, reorder_target_index, tab_display_title,
+        GroupBadge, TabBarColors, TabData, accent_tab_tone, context_suffix, flash_blend, px_units,
+        reorder_target_index, tab_display_title, workspace_pill_label,
     },
     tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
-        TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent, TitlebarView,
-        agent_active_glyph, beads_graph_icon, title_columns,
+        StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent,
+        TitlebarView, agent_active_glyph, beads_graph_icon, title_columns,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -2025,7 +2025,7 @@ struct RegionBarData {
     workspace_id: WorkspaceId,
     /// Region accent, tinting the bar's hairline and active underline.
     accent: [f32; 4],
-    /// Badge pill, present only when the server named the workspace.
+    /// Named or neutral fallback pill for this multi-region workspace.
     badge: Option<GroupBadge>,
     /// The bar's tabs in strip order, each naming the session it selects.
     tabs: Vec<(SessionId, TabData)>,
@@ -2769,28 +2769,23 @@ impl TerminalView {
                 else {
                     return;
                 };
-                let refresh = this.shared.beads_boards.lock().is_ok_and(|mut boards| {
-                    boards.hover(workspace_id, HoverSource::Bead, *hovered);
-                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
-                });
-                if *hovered && refresh {
-                    request_beads_board_or_log(&this.sink, workspace_id, "hover refresh");
-                }
-                ctx.notify();
+                this.hover_beads_board(workspace_id, *hovered, ctx);
             }
             TitlebarEvent::ToggleBeadsBoard { index } => {
                 let Some(workspace_id) = this.titlebar_slot(*index).map(|slot| slot.workspace_id)
                 else {
                     return;
                 };
-                let refresh = this.shared.beads_boards.lock().is_ok_and(|mut boards| {
-                    boards.toggle_pin(workspace_id);
-                    boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
-                });
-                if refresh {
-                    request_beads_board_or_log(&this.sink, workspace_id, "pin refresh");
-                }
-                ctx.notify();
+                this.toggle_beads_board(workspace_id, ctx);
+            }
+            TitlebarEvent::FocusWorkspace(workspace_id) => {
+                this.focus_workspace_region(*workspace_id, ctx);
+            }
+            TitlebarEvent::StandaloneBeadsHover { workspace_id, hovered } => {
+                this.hover_beads_board(*workspace_id, *hovered, ctx);
+            }
+            TitlebarEvent::ToggleStandaloneBeadsBoard(workspace_id) => {
+                this.toggle_beads_board(*workspace_id, ctx);
             }
         })
         .detach();
@@ -2948,6 +2943,33 @@ impl TerminalView {
         self.titlebar.update(cx, |bar, ctx| bar.set_colors(colors, ctx));
     }
 
+    fn hover_beads_board(
+        &mut self,
+        workspace_id: WorkspaceId,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let refresh = self.shared.beads_boards.lock().is_ok_and(|mut boards| {
+            boards.hover(workspace_id, HoverSource::Bead, hovered);
+            boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+        });
+        if hovered && refresh {
+            request_beads_board_or_log(&self.sink, workspace_id, "hover refresh");
+        }
+        cx.notify();
+    }
+
+    fn toggle_beads_board(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
+        let refresh = self.shared.beads_boards.lock().is_ok_and(|mut boards| {
+            boards.toggle_pin(workspace_id);
+            boards.needs_refresh(workspace_id, BEADS_HOVER_REFRESH_AGE)
+        });
+        if refresh {
+            request_beads_board_or_log(&self.sink, workspace_id, "pin refresh");
+        }
+        cx.notify();
+    }
+
     /// The configured badge colour for a real server-provided workspace name.
     // @lat: [[lat.md/common#Common#Configuration#Workspaces]]
     fn workspace_badge_accent(name: &str, palette: &[String], fallback: [f32; 4]) -> gpui::Rgba {
@@ -2968,11 +2990,15 @@ impl TerminalView {
         workspace_name: Option<&str>,
         palette: &[String],
         fallback: [f32; 4],
-        beads: bool,
+        muted_accent: gpui::Rgba,
+        multi_region: bool,
     ) -> Option<GroupBadge> {
-        let label = badge_label(workspace_name, true)?;
-        let accent = Self::workspace_badge_accent(label, palette, fallback);
-        Some(GroupBadge { label: label.to_owned(), accent, beads })
+        let label = workspace_pill_label(workspace_name, multi_region)?;
+        let accent = workspace_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or(muted_accent, |name| Self::workspace_badge_accent(name, palette, fallback));
+        Some(GroupBadge { label: label.to_owned(), accent, beads: false })
     }
 
     fn workspace_name(&self, workspace_id: WorkspaceId) -> Option<String> {
@@ -2983,8 +3009,8 @@ impl TerminalView {
             .and_then(|store| store.workspace_name(workspace_id).map(ToOwned::to_owned))
     }
 
-    /// Mark each multi-workspace titlebar run with its region edge and accent,
-    /// plus a badge only when the server provides a real workspace name.
+    /// Mark each titlebar run with its region edge and accent, adding a named
+    /// pill or the neutral multi-region fallback.
     ///
     /// `slots` names, for each titlebar position, the tab it renders — the
     /// titlebar hosts only top-row regions' tabs, whose left edges are distinct
@@ -3001,18 +3027,56 @@ impl TerminalView {
                 tab.group_region_x = (!single_region)
                     .then(|| region_x.get(&slot.workspace_id).copied().unwrap_or(0.0));
                 let workspace_name = self.workspace_name(slot.workspace_id);
+                let beads = self
+                    .shared
+                    .beads_boards
+                    .lock()
+                    .is_ok_and(|boards| boards.detected(slot.workspace_id));
                 tab.badge = Self::workspace_group_badge(
                     workspace_name.as_deref(),
                     &self.config.config().config.workspaces.badge_colors,
                     accent,
-                    self.shared
-                        .beads_boards
-                        .lock()
-                        .is_ok_and(|boards| boards.detected(slot.workspace_id)),
-                );
+                    opaque_slot(self.chrome.tab_separator),
+                    !single_region,
+                )
+                .map(|badge| GroupBadge { beads, ..badge });
             }
             previous = Some(slot.workspace_id);
         }
+    }
+
+    /// Build pills for top-row regions that have no tab to carry one.
+    fn titlebar_standalone_badges(&self, slots: &[TabAddress], cx: &App) -> Vec<StandaloneBadge> {
+        if self.shell.region_count(cx) <= 1 {
+            return Vec::new();
+        }
+        let tabbed: HashSet<WorkspaceId> = slots.iter().map(|slot| slot.workspace_id).collect();
+        let palette = &self.config.config().config.workspaces.badge_colors;
+        let muted_accent = opaque_slot(self.chrome.tab_separator);
+        self.shell
+            .top_region_left_edges(self.pane_viewport(), cx)
+            .into_iter()
+            .filter(|(workspace_id, _)| !tabbed.contains(workspace_id))
+            .filter_map(|(workspace_id, region_x)| {
+                let accent = self.shell.workspace_accent(workspace_id, cx);
+                let beads = self
+                    .shared
+                    .beads_boards
+                    .lock()
+                    .is_ok_and(|boards| boards.detected(workspace_id));
+                Self::workspace_group_badge(
+                    self.workspace_name(workspace_id).as_deref(),
+                    palette,
+                    accent,
+                    muted_accent,
+                    true,
+                )
+                .map(|mut badge| {
+                    badge.beads = beads;
+                    StandaloneBadge { workspace_id, region_x, badge }
+                })
+            })
+            .collect()
     }
 
     /// Split the decorated strip between the titlebar and the lower regions'
@@ -3046,11 +3110,17 @@ impl TerminalView {
                         self.workspace_name(workspace_id).as_deref(),
                         badge_palette,
                         accent,
-                        self.shared
+                        opaque_slot(self.chrome.tab_separator),
+                        true,
+                    )
+                    .map(|mut badge| {
+                        badge.beads = self
+                            .shared
                             .beads_boards
                             .lock()
-                            .is_ok_and(|boards| boards.detected(workspace_id)),
-                    ),
+                            .is_ok_and(|boards| boards.detected(workspace_id));
+                        badge
+                    }),
                     tabs: Vec::new(),
                 }
             })
@@ -3110,11 +3180,13 @@ impl TerminalView {
         }
         let (mut titlebar_data, titlebar_slots) = self.partition_tab_strip(data, cx);
         self.apply_group_badges(&mut titlebar_data, &titlebar_slots, cx);
+        let standalone_badges = self.titlebar_standalone_badges(&titlebar_slots, cx);
         self.titlebar_slots = titlebar_slots;
         self.titlebar.update(cx, |bar, ctx| {
             if bar.tabs() != titlebar_data {
                 bar.set_tabs(titlebar_data, ctx);
             }
+            bar.set_standalone_badges(standalone_badges, ctx);
         });
     }
 
@@ -7194,9 +7266,9 @@ impl TerminalView {
             .collect()
     }
 
-    /// One lower region's bar: badge pill, then its tabs, over a hairline in
-    /// the region's tab tone — the same shape the titlebar draws for a
-    /// top-row region's group.
+    /// One lower region's bar: named or neutral workspace pill, then its tabs,
+    /// over a hairline in the region's tab tone — the same shape the titlebar
+    /// draws for a top-row region's group.
     /// Advance a region bar's tab drag to `cursor_x`, swapping slots as the
     /// dragged tab's centre crosses into a neighbour's.
     ///
@@ -7294,11 +7366,10 @@ impl TerminalView {
             // reserved strip never flashes terminal background.
             return row.into_any_element();
         };
-        // The workspace pill opening this bar: clicking it selects the bar's
-        // first tab, which focuses the region. A badge with no tabs yet has
-        // nothing to select, so it waits for the seed session.
+        // The workspace pill opening this bar selects its first tab, or focuses
+        // the region itself while its seed session is still in flight.
         let first_session = bar.tabs.first().map(|(session_id, _)| *session_id);
-        if let Some((badge, first)) = bar.badge.as_ref().zip(first_session) {
+        if let Some(badge) = bar.badge.as_ref() {
             let label = div()
                 .id(ElementId::from(format!("region-badge-{workspace_id}")))
                 .flex()
@@ -7310,7 +7381,11 @@ impl TerminalView {
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
                 .on_click(cx.listener(move |view, _, _window, ctx| {
-                    view.select_session_tab(first, ctx);
+                    if let Some(session_id) = first_session {
+                        view.select_session_tab(session_id, ctx);
+                    } else {
+                        view.focus_workspace_region(workspace_id, ctx);
+                    }
                 }))
                 .child(badge.label.clone());
             let mut pill = div().flex().flex_none().items_center().h_full().bg(tone);
@@ -7496,6 +7571,13 @@ impl TerminalView {
             .children(close)
             .children(underline)
             .into_any_element()
+    }
+
+    /// Focus an empty region through its retained pane.
+    fn focus_workspace_region(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
+        let Some(pane) = self.shell.region_focused_pane(workspace_id) else { return };
+        self.shell.focus_pane(workspace_id, pane, cx);
+        self.focus_pane_session(cx);
     }
 
     /// Focus the tab attached to `session_id`, wherever it sits in the strip.
@@ -15472,6 +15554,7 @@ mod tests {
     use std::ops::Range;
 
     use gpui::{ElementInputHandler, EntityInputHandler, InputEvent, UTF16Selection};
+    use scribe_client::tab_bar::UNNAMED_WORKSPACE_LABEL;
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
@@ -16966,14 +17049,39 @@ mod tests {
     }
 
     #[test]
-    fn workspace_group_badge_requires_a_real_name() {
+    fn lower_region_badge_data_keeps_named_and_unnamed_pills() {
         let fallback = [0.25, 0.5, 0.75, 1.0];
-        let badge = TerminalView::workspace_group_badge(Some(" scribe "), &[], fallback, false)
-            .expect("named workspace has a badge");
+        let muted = gpui::Rgba { r: 0.4, g: 0.4, b: 0.4, a: 1.0 };
+        let named =
+            TerminalView::workspace_group_badge(Some(" scribe "), &[], fallback, muted, true)
+                .expect("named workspace has a badge");
+        let unnamed = TerminalView::workspace_group_badge(None, &[], fallback, muted, true)
+            .expect("multi-region workspace has a fallback pill");
 
-        assert_eq!(badge.label, "scribe");
-        assert!(TerminalView::workspace_group_badge(None, &[], fallback, false).is_none());
-        assert!(TerminalView::workspace_group_badge(Some("  "), &[], fallback, false).is_none());
+        assert_eq!(named.label, "scribe");
+        assert_eq!(named.accent, opaque_slot(fallback));
+        assert_eq!(unnamed.label, UNNAMED_WORKSPACE_LABEL);
+        assert_eq!(unnamed.accent, muted);
+        assert!(TerminalView::workspace_group_badge(None, &[], fallback, muted, false).is_none());
+    }
+
+    #[test]
+    fn zero_tab_lower_region_keeps_badge_data() {
+        let workspace_id = WorkspaceId::new();
+        let badge = GroupBadge {
+            label: UNNAMED_WORKSPACE_LABEL.to_owned(),
+            accent: gpui::Rgba { r: 0.4, g: 0.4, b: 0.4, a: 1.0 },
+            beads: false,
+        };
+        let bar = RegionBarData {
+            workspace_id,
+            accent: [0.25, 0.5, 0.75, 1.0],
+            badge: Some(badge),
+            tabs: Vec::new(),
+        };
+
+        assert!(bar.tabs.is_empty());
+        assert_eq!(bar.badge.as_ref().map(|pill| pill.label.as_str()), Some("workspace"));
     }
 
     /// Build a plain key-down event for `key` with `modifiers` held.

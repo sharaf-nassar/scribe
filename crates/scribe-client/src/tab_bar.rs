@@ -205,12 +205,13 @@ pub struct TabData {
     pub group_accent: Option<Rgba>,
 }
 
-/// Workspace pill prefixed to a group's first tab in a multi-workspace strip.
+/// Workspace pill prefixed to a group's first tab or rendered on its own for
+/// an otherwise empty multi-workspace region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupBadge {
-    /// Server-provided workspace name.
+    /// Server-provided workspace name or the neutral fallback label.
     pub label: String,
-    /// The workspace's region accent, tinting the pill.
+    /// The workspace's region accent, or the muted fallback accent.
     pub accent: Rgba,
     /// Whether this workspace has a detected Beads project.
     pub beads: bool,
@@ -261,16 +262,28 @@ pub fn tab_display_title(title: &str, available: usize) -> (String, bool) {
     (truncated, true)
 }
 
-/// Whether a workspace badge pill should be shown, and its label.
+/// Neutral label for an unnamed workspace in a multi-region window.
+pub const UNNAMED_WORKSPACE_LABEL: &str = "workspace";
+
+/// Return a trimmed server-provided workspace name when available.
 ///
-/// Named workspaces in a multi-workspace window show a badge; a single workspace
-/// or an unnamed one shows none.
+/// [`workspace_pill_label`] adds the neutral multi-region fallback; keeping the
+/// name-only path separate preserves existing single-workspace chrome.
 #[must_use]
 pub fn badge_label(ws_name: Option<&str>, multi_workspace: bool) -> Option<&str> {
     match (multi_workspace, ws_name) {
         (true, Some(name)) if !name.trim().is_empty() => Some(name.trim()),
         _ => None,
     }
+}
+
+/// Resolve the label for a workspace pill.
+///
+/// Named workspaces keep their label in every window. Unnamed workspaces gain
+/// the neutral fallback only when the window has multiple regions.
+#[must_use]
+pub fn workspace_pill_label(ws_name: Option<&str>, multi_workspace: bool) -> Option<&str> {
+    badge_label(ws_name, true).or_else(|| multi_workspace.then_some(UNNAMED_WORKSPACE_LABEL))
 }
 
 /// Convert a small index/column count to `f32` without a lint-tripping `as`
@@ -326,8 +339,8 @@ pub fn accent_tab_tone(accent: Rgba, bg: Rgba) -> Rgba {
 mod tests {
     use super::{
         CONTEXT_DANGER_COLOR, CONTEXT_OK_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors,
-        badge_label, context_suffix, flash_blend, px_units, reorder_target_index,
-        tab_display_title, tab_flash_intensity,
+        UNNAMED_WORKSPACE_LABEL, badge_label, context_suffix, flash_blend, px_units,
+        reorder_target_index, tab_display_title, tab_flash_intensity, workspace_pill_label,
     };
     use gpui::Rgba;
 
@@ -400,15 +413,15 @@ mod tests {
         assert_eq!(context_suffix(50, 70, 90, true), None, "pulsing suppresses");
     }
 
-    // @lat: [[client#GPUI Titlebar#Badge shown only for named multi-workspace]]
+    // @lat: [[client#GPUI Titlebar#Multi-workspace pills cover unnamed and zero-tab regions]]
     #[test]
-    fn badge_label_requires_named_multi_workspace() {
+    fn workspace_pill_label_keeps_named_labels_and_falls_back_in_multi_region_windows() {
         assert_eq!(badge_label(Some("work"), true), Some("work"));
         assert_eq!(badge_label(Some("work"), false), None);
-        assert_eq!(badge_label(None, true), None);
-        assert_eq!(badge_label(Some(""), true), None);
-        assert_eq!(badge_label(Some("  "), true), None);
-        assert_eq!(badge_label(Some(" work "), true), Some("work"));
+        assert_eq!(workspace_pill_label(Some(" work "), false), Some("work"));
+        assert_eq!(workspace_pill_label(None, false), None);
+        assert_eq!(workspace_pill_label(Some("  "), true), Some(UNNAMED_WORKSPACE_LABEL));
+        assert_eq!(workspace_pill_label(None, true), Some(UNNAMED_WORKSPACE_LABEL));
     }
 
     // @lat: [[client#GPUI Titlebar#Drag reorder resolves the target slot]]

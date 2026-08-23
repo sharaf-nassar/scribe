@@ -15,6 +15,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, Role, Window,
     WindowControlArea, deferred, div, prelude::*, px,
 };
+use scribe_common::ids::WorkspaceId;
 
 use crate::tab_bar::{
     GroupBadge, TabBarColors, TabData, accent_tab_tone, flash_blend, px_units,
@@ -70,6 +71,12 @@ pub enum TitlebarEvent {
     BeadsHover { index: usize, hovered: bool },
     /// A detected workspace's Beads icon was clicked.
     ToggleBeadsBoard { index: usize },
+    /// A pill without a tab was clicked; focus its empty workspace region.
+    FocusWorkspace(WorkspaceId),
+    /// Pointer entered or left a standalone pill's Beads icon.
+    StandaloneBeadsHover { workspace_id: WorkspaceId, hovered: bool },
+    /// A standalone pill's Beads icon was clicked.
+    ToggleStandaloneBeadsBoard(WorkspaceId),
 }
 
 /// Marker value handed to GPUI's native drag system when a tab press turns
@@ -139,10 +146,22 @@ struct TabRender<'a> {
     close_focused: bool,
 }
 
+/// A workspace pill whose region currently has no terminal tabs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StandaloneBadge {
+    /// Workspace region the pill focuses or opens through Beads.
+    pub workspace_id: WorkspaceId,
+    /// Window-relative left edge of the workspace region.
+    pub region_x: f32,
+    /// Existing pill data, independent of any terminal tab.
+    pub badge: GroupBadge,
+}
+
 /// The custom titlebar view.
 pub struct TitlebarView {
     colors: TabBarColors,
     tabs: Vec<TabData>,
+    standalone_badges: Vec<StandaloneBadge>,
     show_equalize: bool,
     hovered_tab: Option<usize>,
     drag: Option<DragState>,
@@ -156,6 +175,7 @@ pub struct TitlebarView {
     tab_close_focus_handles: Vec<FocusHandle>,
     equalize_focus_handle: FocusHandle,
     beads_focus_handles: Vec<FocusHandle>,
+    standalone_beads_focus_handles: Vec<FocusHandle>,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -166,6 +186,7 @@ impl TitlebarView {
         Self {
             colors,
             tabs: Vec::new(),
+            standalone_badges: Vec::new(),
             show_equalize: false,
             hovered_tab: None,
             drag: None,
@@ -175,6 +196,7 @@ impl TitlebarView {
             tab_close_focus_handles: Vec::new(),
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
             beads_focus_handles: Vec::new(),
+            standalone_beads_focus_handles: Vec::new(),
         }
     }
 
@@ -206,6 +228,19 @@ impl TitlebarView {
     /// Borrow the current tabs.
     pub fn tabs(&self) -> &[TabData] {
         &self.tabs
+    }
+
+    /// Replace the standalone pills for top-row regions without tabs.
+    pub fn set_standalone_badges(&mut self, badges: Vec<StandaloneBadge>, cx: &mut Context<Self>) {
+        if self.standalone_badges == badges {
+            return;
+        }
+        self.standalone_badges = badges;
+        while self.standalone_beads_focus_handles.len() < self.standalone_badges.len() {
+            self.standalone_beads_focus_handles.push(cx.focus_handle().tab_index(0).tab_stop(true));
+        }
+        self.standalone_beads_focus_handles.truncate(self.standalone_badges.len());
+        cx.notify();
     }
 
     /// Toggle the equalize icon (shown only when the active tab has 2+ panes).
@@ -364,6 +399,7 @@ impl TitlebarView {
             || self.tab_close_focus_handles.iter().any(|handle| handle.is_focused(window))
             || self.equalize_focus_handle.is_focused(window)
             || self.beads_focus_handles.iter().any(|handle| handle.is_focused(window))
+            || self.standalone_beads_focus_handles.iter().any(|handle| handle.is_focused(window))
     }
 
     fn focus_next_or_previous(
@@ -788,6 +824,19 @@ impl TitlebarView {
             .into_any_element()
     }
 
+    /// Sorted left edges of every top-row workspace group, including empty
+    /// regions that render only a standalone pill.
+    fn workspace_region_edges(&self) -> Vec<f32> {
+        let mut edges: Vec<f32> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.group_region_x)
+            .chain(self.standalone_badges.iter().map(|badge| badge.region_x))
+            .collect();
+        edges.sort_by(f32::total_cmp);
+        edges
+    }
+
     /// Lower the strip into workspace-group elements.
     ///
     /// When every group has a region edge and those edges strictly
@@ -807,8 +856,7 @@ impl TitlebarView {
         // group order in the strip does not matter, since each group anchors
         // at its own edge independently. Stacked regions share an edge, so
         // duplicates fall back to one flowed row.
-        let mut sorted_edges: Vec<f32> = edges.iter().copied().flatten().collect();
-        sorted_edges.sort_by(f32::total_cmp);
+        let sorted_edges = self.workspace_region_edges();
         let aligned = edges.iter().all(Option::is_some)
             && sorted_edges.windows(2).all(|pair| matches!(pair, [a, b] if b > a));
         groups
@@ -907,6 +955,94 @@ impl TitlebarView {
         row.child(label).into_any_element()
     }
 
+    /// Render pills for top-row workspace regions that have no tabs yet.
+    fn render_standalone_badges(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let edges = self.workspace_region_edges();
+        self.standalone_badges
+            .iter()
+            .enumerate()
+            .map(|(index, badge)| {
+                let next = edges.iter().copied().find(|edge| *edge > badge.region_x);
+                self.render_standalone_badge(index, badge, next, cx)
+            })
+            .collect()
+    }
+
+    fn render_standalone_badge(
+        &self,
+        index: usize,
+        standalone: &StandaloneBadge,
+        next_region_x: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tag_bg = accent_tab_tone(standalone.badge.accent, self.colors.bg);
+        let workspace_id = standalone.workspace_id;
+        let label = div()
+            .id(ElementId::from(format!("standalone-workspace-badge-{index}")))
+            .flex()
+            .items_center()
+            .px_2()
+            .h_full()
+            .text_color(self.colors.active_text)
+            .text_xs()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .on_click(cx.listener(move |_this, _, _window, ctx| {
+                ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
+            }))
+            .child(standalone.badge.label.clone());
+        let mut pill = div().flex().flex_none().items_center().h_full().bg(tag_bg);
+        if standalone.badge.beads {
+            let focus = self
+                .standalone_beads_focus_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| self.focus_handle.clone());
+            pill = pill.child(
+                div()
+                    .id(ElementId::from(format!("standalone-workspace-beads-{index}")))
+                    .role(Role::Button)
+                    .aria_label(format!("Open {} Beads board", standalone.badge.label))
+                    .track_focus(&focus)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(26.0))
+                    .h_full()
+                    .text_color(self.colors.accent)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(self.colors.gradient_top))
+                    .on_hover(cx.listener(move |_this, hovered: &bool, _window, ctx| {
+                        ctx.emit(TitlebarEvent::StandaloneBeadsHover {
+                            workspace_id,
+                            hovered: *hovered,
+                        });
+                    }))
+                    .on_mouse_down(MouseButton::Left, |_, _window, ctx| {
+                        ctx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |_this, _, window, ctx| {
+                        window.focus(&focus, ctx);
+                        ctx.emit(TitlebarEvent::ToggleStandaloneBeadsBoard(workspace_id));
+                    }))
+                    .child(beads_graph_icon(self.colors.accent)),
+            );
+        }
+        let row = div()
+            .absolute()
+            .top_0()
+            .left(px(standalone.region_x))
+            .h_full()
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(tag_bg);
+        let row = match next_region_x {
+            Some(next) => row.w(px((next - standalone.region_x).max(0.0))),
+            None => row.right_0(),
+        };
+        row.child(pill.child(label)).into_any_element()
+    }
+
     fn render_equalize_button(
         &self,
         window: &Window,
@@ -935,6 +1071,7 @@ impl Render for TitlebarView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tabs = self.render_tabs(focused_window, cx);
+        let standalone_badges = self.render_standalone_badges(cx);
         let equalize = self.render_equalize_button(focused_window, cx);
 
         div()
@@ -1020,7 +1157,8 @@ impl Render for TitlebarView {
                             .inset_0()
                             .window_control_area(WindowControlArea::Drag),
                     )
-                    .children(tabs),
+                    .children(tabs)
+                    .children(standalone_badges),
             )
             .children(equalize)
     }
@@ -1034,11 +1172,11 @@ mod tests {
     };
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use scribe_common::theme::minimal_dark;
+    use scribe_common::{ids::WorkspaceId, theme::minimal_dark};
 
     use super::{
-        TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px,
-        tab_accessible_label, title_columns, workspace_group_ranges,
+        StandaloneBadge, TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView,
+        badge_width_px, tab_accessible_label, title_columns, workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
@@ -1087,6 +1225,54 @@ mod tests {
             tabs.iter().map(|tab| tab.title.as_str()).collect::<Vec<_>>(),
             ["one", "two", "three"]
         );
+    }
+
+    #[gpui::test]
+    fn top_region_badge_data_keeps_named_and_unnamed_pills(cx: &mut TestAppContext) {
+        let colors = TabBarColors::from(&minimal_dark().chrome);
+        let named = StandaloneBadge {
+            workspace_id: WorkspaceId::new(),
+            region_x: 0.0,
+            badge: GroupBadge { label: "scribe".to_owned(), accent: colors.accent, beads: true },
+        };
+        let unnamed = StandaloneBadge {
+            workspace_id: WorkspaceId::new(),
+            region_x: 320.0,
+            badge: GroupBadge {
+                label: "workspace".to_owned(),
+                accent: colors.separator,
+                beads: false,
+            },
+        };
+        let bar = cx.new(|cx| TitlebarView::new(colors, cx));
+
+        bar.update(cx, |bar, cx| {
+            bar.set_standalone_badges(vec![named.clone(), unnamed.clone()], cx);
+        });
+        bar.read_with(cx, |bar, _| {
+            assert_eq!(bar.standalone_badges, vec![named, unnamed]);
+        });
+    }
+
+    #[gpui::test]
+    fn zero_tab_top_region_keeps_standalone_badge(cx: &mut TestAppContext) {
+        let colors = TabBarColors::from(&minimal_dark().chrome);
+        let badge = StandaloneBadge {
+            workspace_id: WorkspaceId::new(),
+            region_x: 0.0,
+            badge: GroupBadge {
+                label: "workspace".to_owned(),
+                accent: colors.separator,
+                beads: false,
+            },
+        };
+        let bar = cx.new(|cx| TitlebarView::new(colors, cx));
+
+        bar.update(cx, |bar, cx| bar.set_standalone_badges(vec![badge.clone()], cx));
+        bar.read_with(cx, |bar, _| {
+            assert!(bar.tabs.is_empty());
+            assert_eq!(bar.standalone_badges, vec![badge]);
+        });
     }
 
     // @lat: [[client#GPUI Titlebar#Title budget reserves AI dot columns]]

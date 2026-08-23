@@ -453,6 +453,18 @@ impl PaneShell {
             .collect()
     }
 
+    /// Top-row regions and their left edges, including regions with no tabs.
+    pub fn top_region_left_edges(&self, viewport: Rect, cx: &App) -> Vec<(WorkspaceId, f32)> {
+        self.workspace
+            .read(cx)
+            .layout()
+            .compute_workspace_rects(viewport)
+            .into_iter()
+            .filter(|(_, rect)| !Self::is_lower_region(*rect))
+            .map(|(workspace_id, rect)| (workspace_id, rect.x))
+            .collect()
+    }
+
     /// Whether `rect` hangs below the window's top row of regions, and so
     /// carries its own tab bar instead of a titlebar group.
     fn is_lower_region(rect: Rect) -> bool {
