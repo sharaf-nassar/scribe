@@ -5,15 +5,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, FocusHandle, FontWeight, KeyDownEvent,
-    MouseButton, Pixels, Point, Render, Rgba, Role, SharedString, Window, anchored, div,
-    linear_color_stop, linear_gradient, point, prelude::*, px,
+    MouseButton, Pixels, Point, Render, Rgba, Role, ScrollWheelEvent, SharedString, Window,
+    anchored, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 
 pub use crate::beads_board_a2::BEADS_BOARD_HEIGHT;
 use crate::beads_board_a2::{
     self, A2Input, CHEV_BOTTOM, CHEV_RIGHT, CHEV_SIZE, FLOOR_GRIP_H, FLOOR_GRIP_TOP, FLOOR_GRIP_W,
-    QueueLane, RailState, RowView, VoidCopy, ZOOM_GAP, ZOOM_GLYPH_H, ZOOM_GLYPH_W, ZOOM_LEFT,
-    ZOOM_TOP, compact_relative_age, count_to_f32, queue_name,
+    LANE_FADE_H, LaneScroll, QueueLane, RailState, RowView, VoidCopy, ZOOM_GAP, ZOOM_GLYPH_H,
+    ZOOM_GLYPH_W, ZOOM_LEFT, ZOOM_TOP, compact_relative_age, count_to_f32, queue_name,
 };
 use crate::beads_flow::{
     FlowBandControl, FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow,
@@ -126,8 +126,13 @@ pub struct BeadsBoards {
     /// Board heights read from the window record, held until their regions
     /// appear -- the height twin of `pending_pins`.
     pending_heights: HashMap<WorkspaceId, f32>,
-    // A2 deliberately has no lane scroll state: A2-R1 keeps whole rows,
-    // ellipsizes text, and exposes an overflow cue rather than a scroll axis.
+    /// How far each of a workspace's five lanes is wheeled down its own rows,
+    /// in pixels (A2-I7). Per workspace and per lane, like every other board
+    /// gesture: two regions scroll their own Ready lanes independently. Live
+    /// view state, never a preference -- it is cleared with the workspace and
+    /// reset when a queue's membership changes, and no window record restores
+    /// it.
+    lane_scroll: HashMap<WorkspaceId, LaneScroll>,
     /// The bottom-bar drag in flight, if any.
     resize: Option<BoardResize>,
     /// Eligible card press waiting for GPUI's native drag arm.
@@ -512,6 +517,69 @@ impl BeadsBoards {
         true
     }
 
+    /// Every lane's scroll offset for `workspace_id`, for the frame painting
+    /// it (A2-I7). Read through the guard the render pass already holds, the
+    /// way `flow_snapshot` is.
+    #[must_use]
+    pub fn lane_scroll(&self, workspace_id: WorkspaceId) -> LaneScroll {
+        self.lane_scroll.get(&workspace_id).copied().unwrap_or_default()
+    }
+
+    /// Scroll whichever lane, tab, or drawer the pointer is over, clamped to
+    /// that queue's own rows (A2-I7).
+    ///
+    /// The pointer resolves through [`beads_board_a2::queue_at`] -- the same
+    /// live rail split the drag hit test and the renderer use -- so a wheel
+    /// moves the lane it visibly landed on, whatever width that track
+    /// currently holds. Returns whether the offset actually moved: claiming
+    /// the gesture is the caller's unconditional job, and only the repaint is
+    /// conditional on travel.
+    pub fn scroll_lane_at(
+        &mut self,
+        workspace_id: WorkspaceId,
+        board: Rect,
+        pointer: CardDragPoint,
+        travel: f32,
+    ) -> bool {
+        if !travel.is_finite() {
+            return false;
+        }
+        let Some((queue, span)) = self.wheeled_lane(workspace_id, board, pointer) else {
+            return false;
+        };
+        let offset = self.lane_scroll.entry(workspace_id).or_default().at_mut(queue);
+        let next = (*offset + travel).clamp(0.0, span);
+        if (next - *offset).abs() < f32::EPSILON {
+            return false;
+        }
+        *offset = next;
+        true
+    }
+
+    /// The queue a board-relative pointer is over and how far its lane can
+    /// scroll, or `None` for a board with no snapshot and for the gutter,
+    /// gaps, and padding that name no queue at all.
+    fn wheeled_lane(
+        &self,
+        workspace_id: WorkspaceId,
+        board: Rect,
+        pointer: CardDragPoint,
+    ) -> Option<(BeadsIssueQueue, f32)> {
+        let snapshot = self.states.get(&workspace_id).and_then(state_snapshot)?;
+        let input = A2Input {
+            snapshot,
+            rail: RailState {
+                blocked: self.collapsed_lane_state(workspace_id, BeadsIssueQueue::Blocked)?,
+                done: self.collapsed_lane_state(workspace_id, BeadsIssueQueue::Done)?,
+            },
+            board_width: board.width,
+            board_height: board.height,
+            text_scale: self.text_scale(),
+        };
+        let queue = beads_board_a2::queue_at(input, pointer.x - board.x, pointer.y - board.y)?;
+        Some((queue, beads_board_a2::lane_scroll_span(input, queue)))
+    }
+
     /// Move a Flow strip's offset just far enough that `issue_id`'s node is
     /// fully inside `viewport_width`, the way Tab/Shift+Tab landing keyboard
     /// focus on it has to (A3-I6). A node already fully visible leaves the
@@ -585,6 +653,7 @@ impl BeadsBoards {
             self.pending_heights.remove(&workspace_id);
             self.pending_pins.remove(&workspace_id);
             self.pending_lane_pins.remove(&workspace_id);
+            self.lane_scroll.remove(&workspace_id);
             self.exit_flow(workspace_id);
             if self.resize.is_some_and(|drag| drag.workspace_id == workspace_id) {
                 self.resize = None;
@@ -603,6 +672,7 @@ impl BeadsBoards {
             BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
             BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
         };
+        self.reset_moved_lane_scroll(workspace_id, snapshot);
         let settled: Vec<_> = self
             .optimistic_drops
             .keys()
@@ -623,6 +693,35 @@ impl BeadsBoards {
         }
         self.states.insert(workspace_id, state);
         classifier_won
+    }
+
+    /// Return every lane whose membership this snapshot changed to its own
+    /// first row (A2-I7).
+    ///
+    /// A scroll offset is an index into rows that no longer exist once the
+    /// queue holding them is re-ordered, drained, or refilled, so it is reset
+    /// per queue rather than per board: a card leaving Ready must not move
+    /// Backlog under a pointer that is reading it. Membership, not the whole
+    /// snapshot, is the test -- every 60-second poll carries fresh ages, and
+    /// resetting on those would undo a scroll nobody touched.
+    fn reset_moved_lane_scroll(
+        &mut self,
+        workspace_id: WorkspaceId,
+        snapshot: Option<&BeadsBoardSnapshot>,
+    ) {
+        let Some(offsets) = self.lane_scroll.get_mut(&workspace_id) else { return };
+        let previous = self.states.get(&workspace_id).and_then(state_snapshot);
+        for queue in [
+            BeadsIssueQueue::Backlog,
+            BeadsIssueQueue::Ready,
+            BeadsIssueQueue::InProgress,
+            BeadsIssueQueue::Blocked,
+            BeadsIssueQueue::Done,
+        ] {
+            if !same_queue_membership(previous, snapshot, queue) {
+                *offsets.at_mut(queue) = 0.0;
+            }
+        }
     }
 
     pub fn detected(&self, workspace_id: WorkspaceId) -> bool {
@@ -1208,6 +1307,7 @@ impl BeadsBoards {
         self.lane_hovered.retain(|workspace_id, _| live.contains(workspace_id));
         self.lane_hover_expires.retain(|workspace_id, _| live.contains(workspace_id));
         self.heights.retain(|workspace_id, _| live.contains(workspace_id));
+        self.lane_scroll.retain(|workspace_id, _| live.contains(workspace_id));
         self.optimistic_drops.retain(|(workspace_id, _), _| live.contains(workspace_id));
         self.flows.retain(|workspace_id, _| live.contains(workspace_id));
         self.flow_open_order.retain(|workspace_id| live.contains(workspace_id));
@@ -1440,6 +1540,27 @@ fn state_snapshot_mut(state: &mut BeadsBoardState) -> Option<&mut BeadsBoardSnap
         BeadsBoardState::Loading { cached } => cached.as_mut(),
         BeadsBoardState::Ready { snapshot, .. } => Some(snapshot),
         BeadsBoardState::NotDetected | BeadsBoardState::Unavailable { .. } => None,
+    }
+}
+
+/// Whether both snapshots list exactly the same issues, in the same order,
+/// for `queue`. Two absent snapshots match; one absent never does.
+fn same_queue_membership(
+    before: Option<&BeadsBoardSnapshot>,
+    after: Option<&BeadsBoardSnapshot>,
+    queue: BeadsIssueQueue,
+) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let (before, after) = (
+                beads_board_a2::queue_items(before, queue),
+                beads_board_a2::queue_items(after, queue),
+            );
+            before.len() == after.len()
+                && before.iter().zip(after).all(|(held, arrived)| held.id == arrived.id)
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1851,6 +1972,11 @@ pub struct BeadsBoardRender {
     /// existing board-store guard: whether the A2 layout gives each a
     /// pinned lane's track or a plain rail tab (A2-S1, A2-S3).
     pub rail: RailState,
+    /// How far each of this board's five lanes is wheeled down its own rows
+    /// (A2-I7), read under that same guard. An input rather than a paint-time
+    /// lookup for the same reason `rail` and `flow` are: the strip paints
+    /// inside the guard and cannot retake a non-reentrant lock.
+    pub lane_scroll: LaneScroll,
     /// Stable Tab stops for Blocked's and Done's own collapsible-lane
     /// control, held by the view across frames the same way
     /// [`FlowNodeControl::focus`] is: a fresh handle every render would
@@ -1938,6 +2064,7 @@ impl BoardStrip {
             && ours.card_drag == wiring.card_drag
             && ours.key_move == wiring.key_move
             && ours.rail == wiring.rail
+            && ours.lane_scroll == wiring.lane_scroll
             && ours.blocked_tab_focus == wiring.blocked_tab_focus
             && ours.done_tab_focus == wiring.done_tab_focus
             && ours.row_focus == wiring.row_focus
@@ -2013,6 +2140,9 @@ struct BoardStores<'a> {
     boards: &'a std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
     panels: &'a std::sync::Arc<std::sync::Mutex<BeadsPanels>>,
     rect: Rect,
+    /// How far each lane is wheeled down its own rows (A2-I7), read from the
+    /// board store under the caller's guard the way `rail` and `flow` are.
+    scroll: LaneScroll,
     drag: Option<&'a CardDragPaint>,
     /// This board's own keyboard-armed move, the keyboard twin of `drag`
     /// (A2-I6). Kept separate from `drag` rather than merged into it: `drag`
@@ -2105,6 +2235,7 @@ pub fn render(
         card_drag,
         key_move,
         rail,
+        lane_scroll,
         blocked_tab_focus,
         done_tab_focus,
         row_focus,
@@ -2143,6 +2274,7 @@ pub fn render(
                 boards: &hover_state,
                 panels: &panel_state,
                 rect,
+                scroll: lane_scroll,
                 drag: card_drag.as_ref(),
                 key_move: key_move.as_ref(),
                 row_focus: &row_focus,
@@ -2271,9 +2403,10 @@ fn flow_fits_board(height: f32) -> bool {
 
 /// Paint the Flow strip when this workspace is in Flow, else nothing.
 ///
-/// The wheel is claimed here rather than on the board root because only a
-/// Flow strip has an axis to move: in lanes the same gesture belongs to the
-/// lane bodies underneath.
+/// The wheel is claimed here rather than on the board root because each mode
+/// has its own axis and its own clamp: in lanes the same gesture belongs to
+/// the rail underneath, which claims it in [`lanes`] and moves the one lane
+/// the pointer is over.
 fn flow_strip(strip: FlowStrip<'_>) -> Option<AnyElement> {
     let FlowStrip { wheel_state, flow, workspace_id, rect, scale, colors, controls, band } = strip;
     let FlowStripSnapshot { graph, layout, cursor_issue_id, scroll_x, trace, live_issue_ids } =
@@ -2562,13 +2695,16 @@ fn lanes(
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs()),
     )
     .unwrap_or(i64::MAX);
-    let layout = beads_board_a2::layout(A2Input {
-        snapshot,
-        rail,
-        board_width: stores.rect.width,
-        board_height: stores.rect.height,
-        text_scale: metrics.scale,
-    });
+    let layout = beads_board_a2::layout(
+        A2Input {
+            snapshot,
+            rail,
+            board_width: stores.rect.width,
+            board_height: stores.rect.height,
+            text_scale: metrics.scale,
+        },
+        stores.scroll,
+    );
     let effective_rail = layout.rail;
     let ctx = LaneCtx {
         stores,
@@ -2599,6 +2735,14 @@ fn lanes(
         .pb(px(beads_board_a2::LANES_PADDING_BOTTOM))
         .pl(px(beads_board_a2::LANES_PADDING_LEFT))
         .gap(px(beads_board_a2::TRACK_GAP))
+        // The wheel is claimed for the whole rail here rather than per lane
+        // body: this element covers every track, head, gap and the floor
+        // between them, so no part of a lanes-mode strip hands a wheel to the
+        // pane behind it, and `queue_at` resolves which lane the pointer was
+        // actually over. An open drawer `occlude`s, which takes this hitbox
+        // out of the scroll hit test, so it claims its own (see
+        // `lane_drawer`).
+        .on_scroll_wheel(lane_wheel(stores.boards, stores.workspace_id, stores.rect))
         .child(queue_column(&layout.backlog, None, 0, colors.backlog_state, ctx))
         .child(queue_column(&layout.ready, None, 1, colors.ready_state, ctx))
         .child(queue_column(&layout.in_progress, None, 2, colors.progress_state, ctx))
@@ -2618,6 +2762,36 @@ fn lanes(
         ))
         .children(open_drawer)
         .into_any_element()
+}
+
+/// One wheel line in pixels for a lane, the vertical twin of
+/// [`FLOW_WHEEL_LINE`].
+const LANE_WHEEL_LINE: f32 = 20.0;
+
+/// The wheel handler a lanes-mode surface claims its gestures with (A2-I7).
+///
+/// Claiming is unconditional and only the repaint is conditional: a surface
+/// that handles a gesture owns it even when its own response is a no-op
+/// (scribe-uu2y), or a lane already resting at either end hands the pane
+/// behind the board a wheel that was never the pane's. A2 has no horizontal
+/// axis (A2-R1), so only the vertical delta travels -- the sideways half of a
+/// trackpad swipe is swallowed with the rest of the gesture rather than
+/// passed down to be encoded as one.
+fn lane_wheel(
+    state: &std::sync::Arc<std::sync::Mutex<BeadsBoards>>,
+    workspace_id: WorkspaceId,
+    rect: Rect,
+) -> impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + use<> {
+    let state = std::sync::Arc::clone(state);
+    move |event, window, app| {
+        app.stop_propagation();
+        let travel = -f32::from(event.delta.pixel_delta(px(LANE_WHEEL_LINE)).y);
+        if let Ok(mut boards) = state.lock()
+            && boards.scroll_lane_at(workspace_id, rect, card_drag_point(event.position), travel)
+        {
+            window.refresh();
+        }
+    }
 }
 
 /// One rail track: a full ledger lane for Backlog/Ready/In progress and for
@@ -2663,7 +2837,13 @@ fn ledger_lane(
         .flex_col()
         .child(lane_head(lane, state_color, ctx))
         .child(lane_seam(state_color, lane.void.is_some(), 0.0))
-        .child(lane_body(lane, lane_index, state_color, ctx))
+        .child(lane_body(
+            lane,
+            lane_index,
+            state_color,
+            ctx,
+            drag_target_ground(target, state_color, ctx.colors.ground).unwrap_or(ctx.colors.ground),
+        ))
         .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
         .when_some(target, |el, accepted| {
             el.child(drag_target_edge(if accepted { state_color } else { ctx.colors.muted }))
@@ -2853,44 +3033,100 @@ fn unpin_accessible_label(lane: &QueueLane<'_>) -> String {
 /// [`LaneCtx::visible_rows`] whole rows, whether this queue's own rows fill
 /// it or a shorter list leaves ground beneath, so every lane's floor lines
 /// up regardless of how many rows it actually holds.
+///
+/// The rows inside it are the window `beads_board_a2` resolved for this
+/// lane's scroll offset, hung from the body's top edge by that offset's
+/// sub-row remainder (A2-I7). `ground` is what the body actually sits on --
+/// the board's ground, the drawer's raised band, or either washed by an
+/// accepted drop -- because the edge fades that mask a clipped row have to
+/// fade into it.
 fn lane_body(
     lane: &QueueLane<'_>,
     lane_index: u8,
     state_color: Rgba,
     ctx: LaneCtx<'_>,
+    ground: Rgba,
 ) -> AnyElement {
     let height = ctx.row_height * count_to_f32(ctx.visible_rows);
-    let body = div().flex_none().h(px(height)).overflow_hidden().flex().flex_col();
+    let body = div().flex_none().h(px(height)).relative().overflow_hidden().flex().flex_col();
     if let Some(void) = &lane.void {
         return body.child(void_copy(void, ctx.colors, ctx.metrics)).into_any_element();
     }
     let last = lane.rows.len().saturating_sub(1);
-    body.children(lane.rows.iter().enumerate().map(|(index, row)| {
-        let card = CardContext {
-            workspace_id: ctx.stores.workspace_id,
-            state: ctx.stores.boards,
-            panels: ctx.stores.panels,
-            lane: lane_index,
-            board_rect: ctx.stores.rect,
-            colors: ctx.colors,
-            metrics: ctx.metrics,
-        };
-        let key_move = ctx.stores.key_move.filter(|mv| mv.source_id == row.item.id).cloned();
-        ledger_row(
-            row,
-            RowMeta {
-                state_color,
-                show_separator: index < last,
-                lifted: ctx.stores.drag.is_some_and(|drag| drag.source_id == row.item.id)
-                    || key_move.is_some(),
-                row_height: ctx.row_height,
-                now_epoch_s: ctx.now_epoch_s,
-                key_move,
-            },
-            card,
-            ctx.stores.row_focus.get(&row.item.id),
-        )
-    }))
+    let rows =
+        div().absolute().top(px(-lane.row_offset)).left_0().right_0().flex().flex_col().children(
+            lane.rows.iter().enumerate().map(|(index, row)| {
+                let card = CardContext {
+                    workspace_id: ctx.stores.workspace_id,
+                    state: ctx.stores.boards,
+                    panels: ctx.stores.panels,
+                    lane: lane_index,
+                    board_rect: ctx.stores.rect,
+                    colors: ctx.colors,
+                    metrics: ctx.metrics,
+                };
+                let key_move =
+                    ctx.stores.key_move.filter(|mv| mv.source_id == row.item.id).cloned();
+                ledger_row(
+                    row,
+                    RowMeta {
+                        state_color,
+                        show_separator: index < last,
+                        lifted: ctx.stores.drag.is_some_and(|drag| drag.source_id == row.item.id)
+                            || key_move.is_some(),
+                        row_height: ctx.row_height,
+                        now_epoch_s: ctx.now_epoch_s,
+                        key_move,
+                    },
+                    card,
+                    ctx.stores.row_focus.get(&row.item.id),
+                )
+            }),
+        );
+    body.child(rows).children(lane_edge_fades(lane, ground, ctx.metrics)).into_any_element()
+}
+
+/// The masks a scrolled lane wears where its body cuts a row (A2-I7, A2-S6):
+/// the partial row at a clipped edge fades into the ground it sits on, so it
+/// reads as a row continuing past the edge rather than as a short whole row.
+/// The vertical twin of the Flow strip's own `edge_fades` (A3-G8), and like
+/// it, present only on the side that is actually clipped -- a lane resting at
+/// the top wears no top fade, and one scrolled to its end wears no bottom
+/// fade, which is the same predicate the `⌄` cue reads.
+fn lane_edge_fades(lane: &QueueLane<'_>, ground: Rgba, metrics: Metrics) -> Vec<AnyElement> {
+    let mut fades = Vec::with_capacity(2);
+    if lane.clipped_above {
+        fades.push(lane_fade(LaneEdge::Top, ground, metrics));
+    }
+    if lane.overflow {
+        fades.push(lane_fade(LaneEdge::Bottom, ground, metrics));
+    }
+    fades
+}
+
+/// Which edge of a lane body a fade masks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaneEdge {
+    Top,
+    Bottom,
+}
+
+fn lane_fade(edge: LaneEdge, ground: Rgba, metrics: Metrics) -> AnyElement {
+    // 180 degrees runs a gradient top to bottom and 0 bottom to top, so each
+    // fade starts opaque on its own edge.
+    let angle = match edge {
+        LaneEdge::Top => 180.0,
+        LaneEdge::Bottom => 0.0,
+    };
+    let fade = div().absolute().left_0().right_0().h(metrics.at(LANE_FADE_H)).bg(linear_gradient(
+        angle,
+        linear_color_stop(ground, 0.0),
+        linear_color_stop(alpha(ground, 0.0), 1.0),
+    ));
+    match edge {
+        LaneEdge::Top => fade.top_0(),
+        LaneEdge::Bottom => fade.bottom_0(),
+    }
     .into_any_element()
 }
 
@@ -3260,6 +3496,12 @@ fn lane_drawer(
         .when(swallows_release(ctx.stores.drag), |el| {
             el.on_mouse_up(MouseButton::Left, |_, _window, app| app.stop_propagation())
         })
+        // The drawer `occlude`s, and GPUI stops its scroll hit test at the
+        // first occluding hitbox, so the rail's own wheel claim behind this
+        // one never sees a wheel inside these bounds. It claims the identical
+        // gesture, and `queue_at` resolves the same drawer bounds back to the
+        // queue it previews.
+        .on_scroll_wheel(lane_wheel(ctx.stores.boards, workspace_id, ctx.stores.rect))
         .on_click(move |_event, window, app| {
             window.focus(&click_focus, app);
             if let Ok(mut boards) = click_boards.lock() {
@@ -3269,7 +3511,7 @@ fn lane_drawer(
         })
         .child(drawer_head(lane, state_color, ctx.colors))
         .child(lane_seam(state_color, lane.void.is_some(), beads_board_a2::DRAWER_PAD_H))
-        .child(lane_body(lane, lane_index, state_color, ctx))
+        .child(lane_body(lane, lane_index, state_color, ctx, ground))
         .when(lane.overflow, |el| el.child(overflow_chevron(ctx.colors)))
         .when_some(target, |el, accepted| {
             el.child(drag_target_edge(if accepted { state_color } else { ctx.colors.muted }))
@@ -4582,6 +4824,139 @@ mod tests {
         assert!(boards.visible().is_empty());
     }
 
+    /// A board whose three active lanes each hold `rows` cards, so
+    /// [`busy_board`]'s own equal three-way split of the 1200px rail applies.
+    /// At 197px and scale 1.0 three rows are visible, so anything past the
+    /// third is only reachable by wheel.
+    fn scrollable_board(rows: usize) -> BeadsBoardState {
+        let cards: Vec<BeadsBoardItem> = (0..rows)
+            .map(|index| BeadsBoardItem { id: format!("scribe-row.{index}"), ..drag_item() })
+            .collect();
+        let total = u32::try_from(rows).expect("row count fits");
+        BeadsBoardState::Ready {
+            snapshot: BeadsBoardSnapshot {
+                backlog_total: total,
+                ready_total: total,
+                in_progress_total: total,
+                backlog: cards.clone(),
+                ready: cards.clone(),
+                in_progress: cards,
+                ..Default::default()
+            },
+            stale: false,
+            refresh_error: None,
+        }
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Beads lane scroll]]
+    #[test]
+    fn the_wheel_scrolls_the_lane_under_it_and_clamps_at_both_ends() {
+        let workspace = WorkspaceId::new();
+        let neighbour = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.update(workspace, scrollable_board(8));
+        boards.update(neighbour, scrollable_board(8));
+        let board = drag_board();
+        // Board-relative 200 and 500: Backlog's and Ready's own tracks in the
+        // split [`busy_board`] writes out, offset by this board's origin.
+        let backlog = drag_point(board.x + 200.0, board.y + 100.0);
+        let ready = drag_point(board.x + 500.0, board.y + 100.0);
+
+        assert!(boards.scroll_lane_at(workspace, board, ready, 40.0));
+        assert!((boards.lane_scroll(workspace).ready - 40.0).abs() < f32::EPSILON);
+        assert!(
+            (boards.lane_scroll(workspace).backlog - 0.0).abs() < f32::EPSILON,
+            "the wheel moved a lane the pointer was not over"
+        );
+        assert_eq!(boards.lane_scroll(neighbour), LaneScroll::default(), "other workspace moved");
+
+        // Five rows past the three-row body, so the last row rests on the
+        // floor rather than the offset running off the end.
+        while boards.scroll_lane_at(workspace, board, ready, 500.0) {}
+        let span = boards.lane_scroll(workspace).ready;
+        assert!((span - beads_board_a2::ROW_H * 5.0).abs() < 0.01, "clamped short of {span}");
+        assert!(
+            !boards.scroll_lane_at(workspace, board, ready, 500.0),
+            "a lane at its end reports no travel, which is what leaves the frame unpainted"
+        );
+
+        while boards.scroll_lane_at(workspace, board, ready, -500.0) {}
+        assert!((boards.lane_scroll(workspace).ready - 0.0).abs() < f32::EPSILON);
+        assert!(!boards.scroll_lane_at(workspace, board, ready, -500.0), "clamped at the top");
+
+        // A lane shorter than its body has no axis at all, and the gutter,
+        // gaps and padding name no lane to move.
+        boards.update(workspace, scrollable_board(2));
+        assert!(!boards.scroll_lane_at(workspace, board, backlog, 500.0));
+        boards.update(workspace, scrollable_board(8));
+        let gutter = drag_point(board.x + 10.0, board.y + 100.0);
+        assert!(!boards.scroll_lane_at(workspace, board, gutter, 40.0));
+        assert!(!boards.scroll_lane_at(WorkspaceId::new(), board, ready, 40.0), "no board");
+        assert!(!boards.scroll_lane_at(workspace, board, ready, f32::NAN), "non-finite wheel");
+    }
+
+    #[test]
+    fn a_drawers_wheel_resolves_to_the_queue_it_previews() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        let mut state = scrollable_board(8);
+        if let BeadsBoardState::Ready { snapshot, .. } = &mut state {
+            snapshot.blocked_total = 8;
+            snapshot.blocked = snapshot.backlog.clone();
+        }
+        boards.update(workspace, state);
+        assert!(boards.hover_lane(workspace, BeadsIssueQueue::Blocked, LaneHoverSource::Tab, true));
+        let board = drag_board();
+        let drawer = drag_point(
+            board.x + board.width - beads_board_a2::DRAWER_RIGHT - beads_board_a2::DRAWER_W / 2.0,
+            board.y + 100.0,
+        );
+
+        assert!(boards.scroll_lane_at(workspace, board, drawer, 40.0));
+        assert!((boards.lane_scroll(workspace).blocked - 40.0).abs() < f32::EPSILON);
+        assert!(
+            (boards.lane_scroll(workspace).in_progress - 0.0).abs() < f32::EPSILON,
+            "the drawer wheel moved the lane it covers instead of its preview"
+        );
+    }
+
+    #[test]
+    fn a_lanes_scroll_resets_when_its_own_rows_change_and_dies_with_its_region() {
+        let workspace = WorkspaceId::new();
+        let mut boards = BeadsBoards::default();
+        boards.update(workspace, scrollable_board(8));
+        let board = drag_board();
+        let backlog = drag_point(board.x + 200.0, board.y + 100.0);
+        let ready = drag_point(board.x + 500.0, board.y + 100.0);
+        assert!(boards.scroll_lane_at(workspace, board, backlog, 40.0));
+        assert!(boards.scroll_lane_at(workspace, board, ready, 40.0));
+
+        // The same rows again -- every 60-second poll -- leave both offsets
+        // where the reader put them.
+        boards.update(workspace, scrollable_board(8));
+        assert!((boards.lane_scroll(workspace).ready - 40.0).abs() < f32::EPSILON);
+        assert!((boards.lane_scroll(workspace).backlog - 40.0).abs() < f32::EPSILON);
+
+        // A card leaving Ready resets Ready alone: Backlog's offset still
+        // indexes rows that did not move.
+        let mut moved = scrollable_board(8);
+        if let BeadsBoardState::Ready { snapshot, .. } = &mut moved {
+            snapshot.ready.remove(0);
+            snapshot.ready_total = 7;
+        }
+        boards.update(workspace, moved);
+        assert!((boards.lane_scroll(workspace).ready - 0.0).abs() < f32::EPSILON);
+        assert!((boards.lane_scroll(workspace).backlog - 40.0).abs() < f32::EPSILON);
+
+        // Losing the workspace takes the rest with it, both ways it is lost.
+        boards.update(workspace, BeadsBoardState::NotDetected);
+        assert!((boards.lane_scroll(workspace).backlog - 0.0).abs() < f32::EPSILON);
+        boards.update(workspace, scrollable_board(8));
+        assert!(boards.scroll_lane_at(workspace, board, backlog, 40.0));
+        boards.retain_regions(&HashSet::new());
+        assert!((boards.lane_scroll(workspace).backlog - 0.0).abs() < f32::EPSILON);
+    }
+
     // @lat: [[client#Client#Beads Board CLI Data Source]]
     #[test]
     fn every_region_pins_hovers_and_closes_its_own_board() {
@@ -5779,6 +6154,7 @@ mod flow_mode_tests {
                             workspace_id: region.workspace_id,
                             card_drag: None,
                             key_move: None,
+                            lane_scroll: LaneScroll::default(),
                             rail: RailState {
                                 blocked: CollapsedLaneState::Tab,
                                 done: CollapsedLaneState::Tab,
@@ -6466,6 +6842,7 @@ mod strip_cache_tests {
             card_drag: None,
             key_move: None,
             rail: RailState { blocked: CollapsedLaneState::Tab, done: CollapsedLaneState::Tab },
+            lane_scroll: LaneScroll::default(),
             blocked_tab_focus: app.focus_handle(),
             done_tab_focus: app.focus_handle(),
             row_focus: HashMap::from([("scribe-cache.1".to_string(), app.focus_handle())]),

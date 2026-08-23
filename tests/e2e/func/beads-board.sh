@@ -1760,6 +1760,89 @@ echo 'PASS: a real card click opened the panel and swapped the strip into Flow, 
     'retargeted the panel inside the frozen epic, hover traced it, the wheel travelled and' \
     'clamped it, both exit controls returned to lanes, and reopening asked for a fresh graph'
 
+# @lat: [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Lane wheel scrolling and pointer isolation]]
+# A2-I7 through the shipped client: a wheel over a lane moves that lane's own
+# rows and clamps at both ends, and the pane behind the strip -- which still
+# has SGR mouse reporting on from the drag phase above -- never sees a wheel.
+# The board's own painted rows are the oracle for travel; `wheel_report_count`
+# is the oracle for the half that once handed the pane a gesture the board had
+# already handled.
+xdotool key --clearmodifiers Escape
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.6
+measure_rail /output/beads-lane-scroll-idle.png
+
+# Whichever active lane this board actually overfills: A2 paints three whole
+# rows at the default strip, so a lane needs a fourth card to have an axis at
+# all, and which lane holds one depends on every drag and move above.
+SCROLL_LANE=
+for candidate in 0:backlog 1:ready 2:in_progress; do
+    if [ "$(lane_card_count "${candidate#*:}")" -gt "$A2_BODY_ROWS" ]; then
+        SCROLL_LANE=${candidate%%:*}
+        break
+    fi
+done
+[ -n "$SCROLL_LANE" ] \
+    || fail "no active lane holds more than the $A2_BODY_ROWS painted rows, so nothing can scroll"
+SCROLL_LANE_X=$(lane_x "$SCROLL_LANE")
+SCROLL_LANE_Y=$(row_y 1)
+# The lane's own row box: its measured track, from the first row's top to the
+# last whole row's bottom. Only rows land in it, so a diff here is travel.
+SCROLL_CROP="$(track_field "$SCROLL_LANE" 2)x${A2_BODY_H}+$(track_field "$SCROLL_LANE" 1)+$(( STRIP_TOP + A2_HEADBAND_H ))"
+
+wheel_lane() {
+    # A wheel is dispatched against the hit test the last processed pointer
+    # position produced, and a burst tighter than the client's frame arrives
+    # coalesced -- the same pacing the Flow wheel above needs.
+    xdotool mousemove --sync --window "$WID" "$SCROLL_LANE_X" "$SCROLL_LANE_Y"
+    sleep 0.4
+    xdotool click --repeat "$1" --delay 150 "$2"
+    sleep 0.5
+}
+
+# Park on the row first: the hover lift and underline it paints belong in the
+# baseline, not in the travel measurement.
+xdotool mousemove --sync --window "$WID" "$SCROLL_LANE_X" "$SCROLL_LANE_Y"
+sleep 0.8
+import -window "$WID" /output/beads-lane-scroll-origin.png
+LANE_WHEEL_REPORTS_BEFORE=$(wheel_report_count)
+wheel_lane 3 5
+import -window "$WID" /output/beads-lane-scrolled.png
+LANE_SCROLL_DIFF=$(crop_diff /output/beads-lane-scroll-origin.png \
+    /output/beads-lane-scrolled.png "$SCROLL_CROP")
+[ "${LANE_SCROLL_DIFF:-0}" -ge 1500 ] \
+    || fail "the wheel moved no rows in the lane under it (${LANE_SCROLL_DIFF:-0}px)"
+[ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \
+    || fail "a travelling wheel over a lane leaked wheel reports to the pane"
+
+# Past the last row the lane stops rather than running off, and the wheel that
+# changes nothing is still the board's.
+wheel_lane 12 5
+import -window "$WID" /output/beads-lane-scroll-end.png
+wheel_lane 4 5
+import -window "$WID" /output/beads-lane-scroll-clamped.png
+LANE_CLAMP_DIFF=$(crop_diff /output/beads-lane-scroll-end.png \
+    /output/beads-lane-scroll-clamped.png "$SCROLL_CROP")
+[ "${LANE_CLAMP_DIFF:-0}" -le 200 ] \
+    || fail "scrolling past the last row kept moving (${LANE_CLAMP_DIFF:-0}px)"
+[ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \
+    || fail "a wheel clamped at a lane's last row leaked wheel reports to the pane"
+
+# And back: the same clamp at the first row, which is also how this phase
+# hands the board back to the row geometry every later phase reads.
+wheel_lane 20 4
+import -window "$WID" /output/beads-lane-scroll-home.png
+LANE_HOME_DIFF=$(crop_diff /output/beads-lane-scroll-origin.png \
+    /output/beads-lane-scroll-home.png "$SCROLL_CROP")
+[ "${LANE_HOME_DIFF:-0}" -le 200 ] \
+    || fail "scrolling back did not clamp at the first row (${LANE_HOME_DIFF:-0}px)"
+[ "$(wheel_report_count)" -eq "$LANE_WHEEL_REPORTS_BEFORE" ] \
+    || fail "a wheel clamped at a lane's first row leaked wheel reports to the pane"
+xdotool mousemove --sync --window "$WID" 13 17
+sleep 0.5
+echo 'PASS: the wheel travelled one lane, clamped at both of its ends, and the pane behind' \
+    'the board received no wheel report at travel or at either clamp'
+
 # ---- Lifetime phases: liveness, board resize, two-region isolation ---------
 # These three read real controls, the hook wire, and the window geometry record
 # rather than the pixels the visual matrix owns. Each one sets up the board

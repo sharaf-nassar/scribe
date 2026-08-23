@@ -1487,16 +1487,62 @@ no GPUI window test in this file -- visual and functional proof are
 `tests/e2e/visual/beads-board.sh` (scribe-zwtv.13) and
 `tests/e2e/func/beads-board.sh` (scribe-zwtv.14).
 
+A2's lanes scroll, and A2-I7 is that axis. The offset is per workspace *and*
+per lane in
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#lane_scroll]], live view
+state that no window record restores: a queue whose membership the next
+snapshot changes has its own offset reset by
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#reset_moved_lane_scroll]]
+while its neighbours keep theirs, and `NotDetected` or a lost region clears the
+workspace's outright. An offset indexes rows, so rows moving under it is
+exactly when it stops meaning anything; a 60-second poll that carries only
+fresher ages is not, which is why membership rather than the whole snapshot is
+the test.
+[[crates/scribe-client/src/beads_board.rs#BeadsBoards#scroll_lane_at]] resolves
+the wheel through the same [[crates/scribe-client/src/beads_board_a2.rs#queue_at]]
+split the drag hit test uses -- so a wheel moves the track it visibly landed
+on, drawer bounds included -- and clamps against
+[[crates/scribe-client/src/beads_board_a2.rs#lane_scroll_span]], the one
+formula the presentation model re-clamps with.
+[[crates/scribe-client/src/beads_board.rs#lane_wheel]] is the handler both
+surfaces that can receive one install: [[crates/scribe-client/src/beads_board.rs#lanes]]
+for the whole rail, since that element covers every track, head, gap and the
+floor between them, and [[crates/scribe-client/src/beads_board.rs#lane_drawer]]
+for itself, because the drawer `occlude`s and GPUI stops its scroll hit test at
+the first occluding hitbox. It calls `stop_propagation` unconditionally and
+`window.refresh()` only on travel -- the scribe-uu2y rule, the same split
+[[crates/scribe-client/src/beads_board.rs#flow_strip]] makes -- so no wheel over
+a lanes-mode strip reaches `scroll_pane` behind it, at either clamp or over a
+gap that names no queue at all. Only the vertical delta travels: A2-R1 gives
+A2 no horizontal axis, so the sideways half of a swipe is swallowed rather
+than handed down to be encoded as one.
+
 [[crates/scribe-client/src/beads_board_a2.rs]] derives what
 [[crates/scribe-client/src/beads_board.rs#lanes]] paints from one board
-snapshot, `RailState`, board width, height, and text scale, with zero GPUI
-types or paint calls so its geometry is a plain `#[test]` away from a window.
-It takes lane state as input from
+snapshot, `RailState`, board width, height, text scale, and each lane's
+`LaneScroll` offset, with zero GPUI types or paint calls so its geometry is a
+plain `#[test]` away from a window. It takes lane state and lane scroll as
+input from
 [[crates/scribe-client/src/beads_board.rs#BeadsBoards#collapsed_lane_state]]
-rather than owning a second copy of it.
-[[crates/scribe-client/src/beads_board_a2.rs#layout]] floor-clips every queue
-to [[crates/scribe-client/src/beads_board_a2.rs#visible_row_count]]'s whole
-rows (A2-G10, A2-S6) and hoists a lane's shared epic to its head via
+and `lane_scroll` rather than owning a second copy of either.
+[[crates/scribe-client/src/beads_board_a2.rs#layout]] gives every queue a
+window over its rows rather than the whole queue: the row the clamped offset
+lands in, the whole rows after it, and at most two more for the partial rows
+each clipped edge exposes. That bound is load-bearing -- `scribe-jfob` filed
+unvirtualised 200-row lanes as a perf bug, and a scroll axis is what could
+build them again -- and the body's own height stays
+[[crates/scribe-client/src/beads_board_a2.rs#visible_row_count]]'s whole rows
+(A2-G10). Scrolling is pixel-smooth, so A2-S6's "no clipped partial row is
+visible" is held by masking rather than snapping:
+[[crates/scribe-client/src/beads_board.rs#lane_body]] hangs the row box above
+the body by the offset's sub-row remainder and
+[[crates/scribe-client/src/beads_board.rs#lane_edge_fades]] fades whichever
+edge is actually cutting a row into the ground beneath it -- the vertical twin
+of Flow's own `edge_fades` (A3-G8), on the same present-only-when-clipped
+predicate. The `⌄` cue reads that same predicate from the bottom half of it, so
+a lane scrolled to its end stops advertising rows it no longer hides.
+[[crates/scribe-client/src/beads_board_a2.rs#layout]] also hoists a lane's
+shared epic to its head via
 [[crates/scribe-client/src/beads_board_a2.rs#common_epic]] when every item the
 snapshot carries for that queue -- not only the visible slice -- names the
 same parent-epic id (A2-S8); a mixed lane keeps per-row epic text instead.

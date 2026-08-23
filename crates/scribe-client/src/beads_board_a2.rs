@@ -156,6 +156,20 @@ const VERTICAL_CHROME: f32 = HEADBAND_H + LANES_PADDING_BOTTOM + FLOOR_H;
 /// stops as soon as a row no longer fits.
 const MAX_ROWS: usize = 256;
 
+/// Rows a scrolled lane keeps beyond the whole rows it shows: the partial row
+/// a pixel offset exposes at the body's top edge and the one it exposes at the
+/// bottom. This bound is the point of windowing at all -- a queue the server
+/// caps at 200 items builds at most `visible_rows + 2` row elements per frame
+/// however far it is scrolled, which is what `scribe-jfob` filed unvirtualised
+/// lanes as a perf bug for.
+const WINDOW_BLEED: usize = 2;
+
+/// How deep a lane body's clipped-edge fade reaches, before text scale: the
+/// row's own sub-line height, so the mask that holds A2-S6 ("no clipped
+/// partial row is visible") is a row-unit measure rather than a second number
+/// to keep in step with the row.
+pub const LANE_FADE_H: f32 = ROW_SUB_H;
+
 /// Which of the two collapsible queues, if either, is pinned open as a full
 /// lane right now. Sourced from
 /// [`crate::beads_board::BeadsBoards::collapsed_lane_state`] for Blocked and
@@ -169,8 +183,37 @@ pub struct RailState {
     pub done: CollapsedLaneState,
 }
 
-/// Everything [`layout`] needs: one board snapshot, the rail's collapsed-lane
-/// state, and the viewport it is laid out into.
+/// Each lane's own vertical scroll offset in pixels (A2-I7), sourced from
+/// [`crate::beads_board::BeadsBoards::lane_scroll`]. Like [`RailState`], this
+/// module takes lane scroll as input and never owns or mutates it; zero is a
+/// lane resting on its own first row, which is every lane until one is
+/// wheeled.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LaneScroll {
+    pub backlog: f32,
+    pub ready: f32,
+    pub in_progress: f32,
+    pub blocked: f32,
+    pub done: f32,
+}
+
+impl LaneScroll {
+    /// `queue`'s own offset, for the one owner that moves or resets it.
+    pub fn at_mut(&mut self, queue: BeadsIssueQueue) -> &mut f32 {
+        match queue {
+            BeadsIssueQueue::Backlog => &mut self.backlog,
+            BeadsIssueQueue::Ready => &mut self.ready,
+            BeadsIssueQueue::InProgress => &mut self.in_progress,
+            BeadsIssueQueue::Blocked => &mut self.blocked,
+            BeadsIssueQueue::Done => &mut self.done,
+        }
+    }
+}
+
+/// Everything [`layout`] needs besides the lane scroll it is called with: one
+/// board snapshot, the rail's collapsed-lane state, and the viewport it is
+/// laid out into. Scroll stays out of it because [`queue_at`] shares this
+/// bundle and resolves horizontal tracks alone, which no vertical offset moves.
 #[derive(Clone, Copy)]
 pub struct A2Input<'a> {
     pub snapshot: &'a BeadsBoardSnapshot,
@@ -220,11 +263,21 @@ pub struct QueueLane<'a> {
     /// same one (A2-S8). `None` for a mixed lane, which keeps per-row epic
     /// text instead.
     pub epic: Option<String>,
-    /// Whole rows only, floor-clipped to [`layout`]'s shared
-    /// `visible_rows` -- never a partial row (A2-S6, A2-G10).
+    /// The window of items this lane's body paints at its current scroll
+    /// offset: the row the offset lands in, the whole rows after it, and at
+    /// most [`WINDOW_BLEED`] more for the partial rows a pixel offset exposes
+    /// at each edge (A2-I7). Never the whole queue, however far it scrolls.
     pub rows: Vec<RowView<'a>>,
-    /// Whether this queue holds more items than `rows` shows, the board's
-    /// `⌄` overflow cue (A2-S6, A2-G9).
+    /// Pixels the row box is drawn above the body's top edge, in
+    /// `[0, row_height)`: the sub-row remainder of the clamped offset, since
+    /// `rows` starts at the row that offset lands in (A2-I7).
+    pub row_offset: f32,
+    /// Whether this lane is scrolled off its own first row, so the body's top
+    /// edge cuts a row (A2-I7). The fade that masks it is the paint layer's.
+    pub clipped_above: bool,
+    /// Whether this queue holds rows below the body's bottom edge, the board's
+    /// `⌄` overflow cue (A2-S6, A2-G9) and the bottom edge fade. False once a
+    /// lane is scrolled to its end, since nothing remains to point at.
     pub overflow: bool,
     /// Queue-specific empty-state copy, present only when `total == 0`
     /// (A2-S5).
@@ -244,7 +297,9 @@ pub struct A2Layout<'a> {
     pub rail: RailState,
     /// A row's height at the input's text scale.
     pub row_height: f32,
-    /// Whole rows every lane's `rows` is clipped to (A2-G10).
+    /// Whole rows a lane's body is tall enough to show at once (A2-G10). A
+    /// scrolled lane's own `rows` window carries up to [`WINDOW_BLEED`] more
+    /// than this for the partial rows its clipped edges expose.
     pub visible_rows: usize,
     pub backlog: QueueLane<'a>,
     pub ready: QueueLane<'a>,
@@ -253,26 +308,29 @@ pub struct A2Layout<'a> {
     pub done: QueueLane<'a>,
 }
 
-/// Derive the full A2 presentation from one snapshot, lane state, and
-/// viewport. Infallible: every input, however narrow, short, or oddly
-/// scaled, clamps to a safe (non-negative, non-overflowing, whole-row)
-/// layout rather than refusing.
-pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
+/// Derive the full A2 presentation from one snapshot, lane state, viewport,
+/// and each lane's own scroll offset. Infallible: every input, however
+/// narrow, short, oddly scaled, or far out of scroll range, clamps to a safe
+/// (non-negative, non-overflowing, in-range) layout rather than refusing.
+pub fn layout(input: A2Input<'_>, scroll: LaneScroll) -> A2Layout<'_> {
     let A2Input { snapshot, rail, board_width, board_height, text_scale } = input;
     let visible_rows = visible_row_count(board_height, text_scale);
+    let row_height = ROW_H * valid_text_scale(text_scale);
     let allocation = rail_allocation(snapshot, rail, board_width, text_scale);
     let widths = allocation.widths;
     let blocked_total = snapshot.blocked_total;
 
     A2Layout {
         rail: allocation.rail,
-        row_height: ROW_H * valid_text_scale(text_scale),
+        row_height,
         visible_rows,
         backlog: queue_lane(QueueLaneArgs {
             queue: BeadsIssueQueue::Backlog,
             total: snapshot.backlog_total,
             items: &snapshot.backlog,
             visible_rows,
+            row_height,
+            offset: scroll.backlog,
             blocked_total,
             width: widths.backlog,
         }),
@@ -281,6 +339,8 @@ pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
             total: snapshot.ready_total,
             items: &snapshot.ready,
             visible_rows,
+            row_height,
+            offset: scroll.ready,
             blocked_total,
             width: widths.ready,
         }),
@@ -289,6 +349,8 @@ pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
             total: snapshot.in_progress_total,
             items: &snapshot.in_progress,
             visible_rows,
+            row_height,
+            offset: scroll.in_progress,
             blocked_total,
             width: widths.in_progress,
         }),
@@ -297,6 +359,8 @@ pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
             total: snapshot.blocked_total,
             items: &snapshot.blocked,
             visible_rows,
+            row_height,
+            offset: scroll.blocked,
             blocked_total,
             width: widths.blocked,
         }),
@@ -305,6 +369,8 @@ pub fn layout(input: A2Input<'_>) -> A2Layout<'_> {
             total: snapshot.done_total,
             items: &snapshot.done,
             visible_rows,
+            row_height,
+            offset: scroll.done,
             blocked_total,
             width: widths.done,
         }),
@@ -317,14 +383,33 @@ struct QueueLaneArgs<'a> {
     total: u32,
     items: &'a [BeadsBoardItem],
     visible_rows: usize,
+    row_height: f32,
+    /// This lane's own vertical scroll offset in pixels, clamped here.
+    offset: f32,
     blocked_total: u32,
     width: f32,
 }
 
 fn queue_lane(args: QueueLaneArgs<'_>) -> QueueLane<'_> {
-    let QueueLaneArgs { queue, total, items, visible_rows, blocked_total, width } = args;
+    let QueueLaneArgs {
+        queue,
+        total,
+        items,
+        visible_rows,
+        row_height,
+        offset,
+        blocked_total,
+        width,
+    } = args;
     let hoisted = common_epic(items);
-    let visible = items.get(..items.len().min(visible_rows)).unwrap_or(items);
+    let span = scroll_span(items.len(), visible_rows, row_height);
+    // The store clamps every wheel against this same span, so an offset out
+    // of range here is a lane whose rows or viewport shrank under it. Clamping
+    // rather than trusting it is what keeps that frame in range.
+    let offset = if offset.is_finite() { offset.clamp(0.0, span) } else { 0.0 };
+    let first = rows_above(offset, row_height, items.len());
+    let last = items.len().min(first.saturating_add(visible_rows).saturating_add(WINDOW_BLEED));
+    let visible = items.get(first..last).unwrap_or_default();
     let rows = visible
         .iter()
         .map(|item| RowView {
@@ -342,9 +427,56 @@ fn queue_lane(args: QueueLaneArgs<'_>) -> QueueLane<'_> {
         total,
         epic: hoisted.map(short_epic),
         rows,
-        overflow: items.len() > visible_rows,
+        row_offset: offset - count_to_f32(first) * row_height,
+        clipped_above: offset > f32::EPSILON,
+        overflow: span - offset > f32::EPSILON,
         void: (total == 0).then(|| void_copy(queue, blocked_total)),
         width,
+    }
+}
+
+/// How far `queue`'s lane can be wheeled before its last row rests on the
+/// body's floor: every row's height less the body's own, never negative
+/// (A2-I7). The one formula both the board store's wheel clamp and
+/// [`layout`]'s own re-clamp read, so a painted lane and the offset behind it
+/// can never disagree about where the end is.
+pub fn lane_scroll_span(input: A2Input<'_>, queue: BeadsIssueQueue) -> f32 {
+    scroll_span(
+        queue_items(input.snapshot, queue).len(),
+        visible_row_count(input.board_height, input.text_scale),
+        ROW_H * valid_text_scale(input.text_scale),
+    )
+}
+
+fn scroll_span(items: usize, visible_rows: usize, row_height: f32) -> f32 {
+    ((count_to_f32(items) - count_to_f32(visible_rows)) * row_height).max(0.0)
+}
+
+/// How many whole rows sit entirely above `offset` -- the index of the row
+/// the body's top edge cuts. Counted the way [`visible_row_count`] counts
+/// rows, rather than through a float-to-integer cast that would have to
+/// defend its own truncation.
+fn rows_above(offset: f32, row_height: f32, rows: usize) -> usize {
+    if row_height <= 0.0 {
+        return 0;
+    }
+    (0..rows).take_while(|&index| count_to_f32(index + 1) * row_height <= offset).count()
+}
+
+/// The items one queue's lane paints, in the snapshot's own field order.
+///
+/// `pub(crate)` so the board store can compare one queue's membership across
+/// two snapshots through this same mapping instead of writing a second one.
+pub(crate) fn queue_items(
+    snapshot: &BeadsBoardSnapshot,
+    queue: BeadsIssueQueue,
+) -> &[BeadsBoardItem] {
+    match queue {
+        BeadsIssueQueue::Backlog => &snapshot.backlog,
+        BeadsIssueQueue::Ready => &snapshot.ready,
+        BeadsIssueQueue::InProgress => &snapshot.in_progress,
+        BeadsIssueQueue::Blocked => &snapshot.blocked,
+        BeadsIssueQueue::Done => &snapshot.done,
     }
 }
 
@@ -857,13 +989,16 @@ mod tests {
             ],
             ..Default::default()
         };
-        let out = layout(A2Input {
-            snapshot: &snapshot,
-            rail: all_tabs(),
-            board_width: 1200.0,
-            board_height: BEADS_BOARD_HEIGHT,
-            text_scale: 1.0,
-        });
+        let out = layout(
+            A2Input {
+                snapshot: &snapshot,
+                rail: all_tabs(),
+                board_width: 1200.0,
+                board_height: BEADS_BOARD_HEIGHT,
+                text_scale: 1.0,
+            },
+            LaneScroll::default(),
+        );
 
         assert_eq!(out.backlog.void.as_ref().map(|v| v.headline), Some("nothing waiting"));
         assert_eq!(out.ready.void.as_ref().unwrap().headline, "none ready to start");
@@ -916,13 +1051,16 @@ mod tests {
             ..Default::default()
         };
         let rail = RailState { blocked: CollapsedLaneState::Pinned, done: CollapsedLaneState::Tab };
-        let out = layout(A2Input {
-            snapshot: &snapshot,
-            rail,
-            board_width: 1200.0,
-            board_height: BEADS_BOARD_HEIGHT,
-            text_scale: 1.0,
-        });
+        let out = layout(
+            A2Input {
+                snapshot: &snapshot,
+                rail,
+                board_width: 1200.0,
+                board_height: BEADS_BOARD_HEIGHT,
+                text_scale: 1.0,
+            },
+            LaneScroll::default(),
+        );
 
         assert!(
             out.blocked.epic.is_none(),
@@ -936,22 +1074,94 @@ mod tests {
 
     #[test]
     fn overflow_marks_a_lane_holding_more_than_the_visible_rows() {
-        let items: Vec<BeadsBoardItem> =
-            (0..5).map(|n| item(&format!("sc-{n}"), None, None)).collect();
-        let snapshot =
-            BeadsBoardSnapshot { backlog_total: 5, backlog: items, ..Default::default() };
-        let out = layout(A2Input {
-            snapshot: &snapshot,
+        let snapshot = backlog_of(5);
+        let out = layout(backlog_input(&snapshot), LaneScroll::default());
+
+        assert_eq!(out.visible_rows, 3);
+        assert_eq!(out.backlog.rows.len(), 5, "three whole rows plus the window's own bleed");
+        assert!(!out.backlog.clipped_above, "an unscrolled lane rests on its own first row");
+        assert!(close(out.backlog.row_offset, 0.0));
+        assert!(out.backlog.overflow, "5 items over 3 visible rows must raise the overflow cue");
+        assert!(out.backlog.void.is_none(), "a nonempty lane never carries void copy");
+    }
+
+    // ---- lane scroll: a bounded window over the rows, never all of them ---
+
+    fn backlog_of(items: usize) -> BeadsBoardSnapshot {
+        BeadsBoardSnapshot {
+            backlog_total: u32::try_from(items).unwrap(),
+            backlog: (0..items).map(|n| item(&format!("sc-{n}"), None, None)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn backlog_input(snapshot: &BeadsBoardSnapshot) -> A2Input<'_> {
+        A2Input {
+            snapshot,
             rail: all_tabs(),
             board_width: 1200.0,
             board_height: BEADS_BOARD_HEIGHT,
             text_scale: 1.0,
-        });
+        }
+    }
 
-        assert_eq!(out.visible_rows, 3);
-        assert_eq!(out.backlog.rows.len(), 3, "whole rows only, never a partial fourth row");
-        assert!(out.backlog.overflow, "5 items over 3 visible rows must raise the overflow cue");
-        assert!(out.backlog.void.is_none(), "a nonempty lane never carries void copy");
+    fn backlog_at(snapshot: &BeadsBoardSnapshot, offset: f32) -> QueueLane<'_> {
+        layout(backlog_input(snapshot), LaneScroll { backlog: offset, ..Default::default() })
+            .backlog
+    }
+
+    /// `scribe-jfob` filed unvirtualised 200-row lanes as a perf bug, and
+    /// giving lanes a scroll axis is exactly what could reintroduce them: the
+    /// window stays bounded at every offset, at both ends, and at every text
+    /// scale, however many rows the queue holds.
+    #[test]
+    fn a_scrolled_lane_windows_its_rows_and_never_builds_the_whole_queue() {
+        let snapshot = backlog_of(200);
+        let span = lane_scroll_span(backlog_input(&snapshot), BeadsIssueQueue::Backlog);
+        assert!(close(span, ROW_H * (200.0 - 3.0)));
+
+        let mut offset = 0.0_f32;
+        while offset <= span + ROW_H {
+            let lane = backlog_at(&snapshot, offset);
+            assert!(
+                lane.rows.len() <= 3 + WINDOW_BLEED,
+                "offset {offset} built {} rows for a three-row body",
+                lane.rows.len()
+            );
+            let clamped = offset.min(span);
+            assert!((0.0..ROW_H).contains(&lane.row_offset), "offset {offset} left a whole row");
+            // The window starts at the row the body's top edge cuts, so the
+            // first painted row plus its own sub-row remainder is the offset.
+            let first: usize = lane.rows[0].item.id.trim_start_matches("sc-").parse().unwrap();
+            assert!(close(count_to_f32(first) * ROW_H + lane.row_offset, clamped));
+            offset += 7.0;
+        }
+    }
+
+    #[test]
+    fn a_lane_at_either_end_reports_only_the_edge_it_is_clipped_on() {
+        let snapshot = backlog_of(5);
+        let span = lane_scroll_span(backlog_input(&snapshot), BeadsIssueQueue::Backlog);
+
+        let home = backlog_at(&snapshot, 0.0);
+        assert!(!home.clipped_above, "nothing is cut above an unscrolled lane");
+        assert!(home.overflow, "two rows still sit below the body");
+
+        let end = backlog_at(&snapshot, span);
+        assert!(end.clipped_above);
+        assert!(!end.overflow, "a lane at its end points the `⌄` cue at nothing");
+        assert_eq!(end.rows.last().unwrap().item.id, "sc-4", "the last row rests on the floor");
+
+        // A short lane has no axis at all, and an out-of-range offset from a
+        // queue that shrank under the pointer clamps rather than paints past
+        // its own rows.
+        let short = backlog_of(2);
+        assert!(close(lane_scroll_span(backlog_input(&short), BeadsIssueQueue::Backlog), 0.0));
+        let clamped = backlog_at(&short, 4000.0);
+        assert!(!clamped.clipped_above);
+        assert!(!clamped.overflow);
+        assert_eq!(clamped.rows.len(), 2);
+        assert!(close(backlog_at(&snapshot, f32::NAN).row_offset, 0.0));
     }
 
     // ---- row count: whole rows only, never a partial final row -----------
@@ -1086,24 +1296,30 @@ mod tests {
         let snapshot = snapshot_with(12, 4, 5, 4, 559);
         let requested =
             RailState { blocked: CollapsedLaneState::Pinned, done: CollapsedLaneState::Tab };
-        let narrow = layout(A2Input {
-            snapshot: &snapshot,
-            rail: requested,
-            board_width: MIN_BOARD_W,
-            board_height: BEADS_BOARD_HEIGHT,
-            text_scale: 1.6,
-        });
+        let narrow = layout(
+            A2Input {
+                snapshot: &snapshot,
+                rail: requested,
+                board_width: MIN_BOARD_W,
+                board_height: BEADS_BOARD_HEIGHT,
+                text_scale: 1.6,
+            },
+            LaneScroll::default(),
+        );
         assert_eq!(narrow.rail.blocked, CollapsedLaneState::Tab);
         assert_eq!(narrow.rail.done, CollapsedLaneState::Tab);
         assert_eq!(requested.blocked, CollapsedLaneState::Pinned, "the preference is input state");
 
-        let restored = layout(A2Input {
-            snapshot: &snapshot,
-            rail: requested,
-            board_width: 1200.0,
-            board_height: BEADS_BOARD_HEIGHT,
-            text_scale: 1.6,
-        });
+        let restored = layout(
+            A2Input {
+                snapshot: &snapshot,
+                rail: requested,
+                board_width: 1200.0,
+                board_height: BEADS_BOARD_HEIGHT,
+                text_scale: 1.6,
+            },
+            LaneScroll::default(),
+        );
         assert_eq!(restored.rail, requested, "widening restores the persisted pin");
     }
 
@@ -1139,20 +1355,23 @@ mod tests {
 
         for (name, snapshot, rail) in states {
             for &(width, height, scale) in &extremes {
-                let out = layout(A2Input {
-                    snapshot,
-                    rail,
-                    board_width: width,
-                    board_height: height,
-                    text_scale: scale,
-                });
+                let out = layout(
+                    A2Input {
+                        snapshot,
+                        rail,
+                        board_width: width,
+                        board_height: height,
+                        text_scale: scale,
+                    },
+                    LaneScroll::default(),
+                );
                 assert_rail_widths_fit(snapshot, rail, width, scale);
                 assert!(out.visible_rows >= 1, "{name} lost every row at {height}x{scale}");
                 assert!(
                     [&out.backlog, &out.ready, &out.in_progress, &out.blocked, &out.done]
                         .into_iter()
-                        .all(|lane| lane.rows.len() <= out.visible_rows),
-                    "{name} exposed a partial row"
+                        .all(|lane| lane.rows.len() <= out.visible_rows + WINDOW_BLEED),
+                    "{name} built more rows than its own window"
                 );
             }
         }

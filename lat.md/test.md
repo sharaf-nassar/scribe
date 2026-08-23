@@ -2110,6 +2110,28 @@ Reopening after an exit must request the graph again, since exit drops it.
 Leaving Flow must return usable lanes: a currently painted card with no epic
 opens its panel and asks for no graph.
 
+#### Lane wheel scrolling and pointer isolation
+
+A2-I7 through the shipped client: the lanes claim every wheel over them, move
+only the lane the pointer is on, and clamp at both of its ends while the pane
+behind the strip receives nothing.
+
+The target lane is resolved from the live board rather than named: A2 paints
+three whole rows at the default strip, so the run takes whichever of Backlog,
+Ready, and In progress the snapshot currently overfills -- which lane that is
+depends on every drag and keyboard move the phases above landed. Its crop is
+the measured track's own row box, so a diff there is rows moving and nothing
+else, and the pointer is parked on the row before the baseline shot so the
+hover lift it paints belongs to the baseline instead of the measurement.
+
+Three notches down must move that box; twelve more must reach the last row and
+four past it must change nothing; twenty back must land on the baseline again.
+Every one of those clicks is bracketed by `wheel_report_count`, the SGR wheel
+frames the pane's still-live 1003/1006 reporting would emit -- travel and both
+clamps alike, because a surface that handles a gesture owns it even when its
+own response is a no-op. Ending at the first row is also how the phase hands
+the board back to the row geometry every later phase reads.
+
 #### Painted A2 geometry
 
 The functional run resolves every board coordinate from the generated machine
@@ -4548,11 +4570,46 @@ The keeper only prevents the bd-less visual server's periodic `NotDetected`
 from erasing long-running fixtures. It is paused for the Blocked/Done hover
 regression: each tab must paint its exact generated drawer on the hover's own
 next frame, with no injected frame, then remove it after the existing grace.
-This is the running-client regression layer for scribe-zwtv.22. A2 never gains
-a scroll assertion or substitute scroll fixture. The as-built rules live in
+This is the running-client regression layer for scribe-zwtv.22. The visual
+matrix still measures A2 at rest only; the lane scroll axis A2-I7 restored is
+proved by
+[[test#Test Harness#GPUI Client Headless Suites#Beads lane scroll]] and
+[[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Lane wheel scrolling and pointer isolation]]
+instead of by a substitute visual fixture. The as-built rules live in
 [[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]];
 real tracker writes remain
 [[test#Test Harness#E2E Functional Tests#Real Beads Board Refresh#Card drag writes and pointer isolation]].
+
+### Beads lane scroll
+
+Unit coverage pins A2-I7's two halves where each lives: the offset the board
+store owns, and the bounded window the pure presentation model derives from it.
+
+Beside the board state, a wheel resolved through the live rail moves the lane
+the pointer is over and no other, clamps at the last row and at the first, and
+reports no travel at either end -- which is what leaves a clamped wheel's frame
+unpainted while the handler claims the gesture regardless. A lane shorter than
+its own body, the control gutter and inter-track gaps, and a workspace with no
+board all name nothing to move. An offset is transient view state: the same
+rows arriving again leave it alone, a card leaving one queue resets that
+queue's offset while its neighbour keeps its own, and `NotDetected` or losing
+the region clears every lane's.
+
+In [[crates/scribe-client/src/beads_board_a2.rs]] the window is swept over a
+200-row queue at every offset from the top through past the far end: it never
+builds more than the body's whole rows plus the two partial ones its clipped
+edges expose, and the first row it does build, plus that row's own sub-row
+remainder, is exactly the offset -- which is what makes the paint layer's
+negative top offset and the model's slice one measurement rather than two.
+That bound is the guard on `scribe-jfob`, which filed unvirtualised 200-row
+lanes as a perf bug before A2 had a scroll axis to reintroduce them. A lane at
+either end reports only the edge it is actually clipped on, so the `⌄` cue and
+the bottom fade go away together once the last row rests on the floor, and an
+offset out of range for a queue that shrank clamps rather than painting past
+its own rows.
+
+The as-built rules live in
+[[client#Client#Beads Board CLI Data Source#Board interaction and issue detail]].
 
 ### Beads keyboard card move
 

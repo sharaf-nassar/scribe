@@ -10631,6 +10631,7 @@ impl TerminalView {
                 card_drag: boards.card_drag_paint(workspace_id),
                 key_move: boards.key_move_paint(workspace_id),
                 rail,
+                lane_scroll: boards.lane_scroll(workspace_id),
                 blocked_tab_focus,
                 done_tab_focus,
                 row_focus: self.row_focus.get(&workspace_id).cloned().unwrap_or_default(),
