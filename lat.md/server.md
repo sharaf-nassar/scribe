@@ -746,6 +746,82 @@ All three binaries (server, client, settings) use SHA-256 hash comparison to ski
 
 On Linux, `postinst` compares each running binary (`/proc/PID/exe`) against the installed copy and also checks whether the desired `server-runtime-generation` differs from the stamp recorded in `/run/user/{uid}/{app}/server-runtime-generation`. That stamp is an opaque SHA-256 signature derived from the launch-critical `postinst` behavior plus the installed user service unit, so package installs hot-reload after launch-contract changes even when the server binary is byte-identical. `postinst` also refreshes service enablement so older `default.target` symlinks are removed and the service is enabled for `graphical-session.target`. Replacement processes inherit GUI session variables from `systemctl --user show-environment`, falling back to the invoking shell only when needed. Client relaunches wait for every previous PID to exit and skip relaunch if one survives; the deferred helper follows the same rule after `QuitAll`, treating zombie tasks as exited. The Debian hot-reload watchdog waits up to 30 seconds for large handoff snapshots. On macOS, the updater compares old (`.app.prev`) and new server binaries plus both bundled LaunchAgent definitions, treating hash failures as changed, then asks the replacement bundle's client to register the inactive LaunchAgent. A manually replaced DMG has no old-bundle hash comparison, so launchd readiness records the serving executable's device/inode identity; a newly launched client compares it with the installed server and uses the later modification/change timestamp only for legacy markers that predate that field.
 
+## Crash Recovery Dump
+
+The server checkpoints its live state to an encrypted file on a dirty-gated interval and at graceful shutdown, and loads it back on the next cold start, so a crash, SIGKILL, or ordinary service stop no longer loses every terminal's contents.
+
+[[crates/scribe-server/src/state_dump.rs|state_dump]] persists the same [[crates/scribe-server/src/handoff.rs#HandoffState|HandoffState]] the hot handoff sends — sessions with their replay scrollback, metadata, and workspace trees — minus the PTY fds only a live SCM_RIGHTS transfer can carry, reusing [[crates/scribe-server/src/handoff.rs#serialize_state|serialize_state]]. Terminal contents are as sensitive as env values, so the dump takes the env store's at-rest posture: the MessagePack payload is AEAD-sealed via [[crates/scribe-server/src/env_store/envelope.rs#seal_bytes|seal_bytes]] with a dedicated DEK under the keystore's `state-dump-key` account ([[crates/scribe-server/src/env_store/keystore.rs#get_named_dek|get_named_dek]] / [[crates/scribe-server/src/env_store/keystore.rs#set_named_dek|set_named_dek]]), and keystore failure stops dumping rather than falling back to plaintext. The file lives under the flavor's state dir at `recovery/server-state.envz`, written 0600 in a 0700 dir via the env store's same-directory temp-file, fsync, atomic-rename pattern ([[crates/scribe-server/src/state_dump.rs#write_private_atomic|write_private_atomic]]). Serialized dumps above the handoff receiver's 256 MiB cap are skipped, so a dump can never persist what a handoff would refuse; a state with zero sessions removes the file instead, so stale ciphertext cannot outlive the sessions it described.
+
+Dumping is dirty-gated, not periodic-unconditional: every state mutation worth persisting — the PTY feed funnels, hook ingress, the session lifecycle funnels, and the workspace-manager mutators — bumps a relaxed atomic generation through [[crates/scribe-server/src/state_dump.rs#mark_dirty|mark_dirty]], and [[crates/scribe-server/src/state_dump.rs#spawn_dump_task|the dump task]] re-checkpoints on its 30 s tick ([[crates/scribe-server/src/state_dump.rs#DUMP_INTERVAL|DUMP_INTERVAL]]) only when the generation moved, sampling it before collection so a mutation landing mid-dump forces a re-dump rather than being lost. Ctrl+C and SIGTERM (systemd stop, launchd removal, reboot) both take the same dump-then-exit path via [[crates/scribe-server/src/state_dump.rs#dump_now|dump_now]]; a completed handoff deliberately writes no final dump, because the successor owns the sessions and a stale dump from the predecessor could only shadow a fresher one.
+
+Recovery is content-only and self-gating. A cold start loads the dump through [[crates/scribe-server/src/state_dump.rs#load_recovered_sessions|load_recovered_sessions]] — bounded by a 2 s timeout so a wedged keystore cannot hold the accept loop hostage — into a map keyed by env-envelope id (the client's launch id); a handoff start uses an empty map because the handed-off sessions are alive. A cold-restart replay's `CreateSession` naming a recovered launch consumes its entry and [[crates/scribe-server/src/ipc_server.rs#inject_recovered_replay|inject_recovered_replay]] seeds the fresh Term with the pre-crash scrollback before the PTY reader task exists, so the shell's first byte lands after it by construction; a trailing epilogue leaves the alt screen, resets margins, mouse reporting, and SGR, and paints a dim separator line so the dead session's terminal state cannot leak into the fresh shell. The session then has its full replay marked dirty so the drain sends the seeded history to the client, ordered ahead of live output. Consuming the entry keeps a second replay of the same snapshot (a claim-TTL reclaim after a crash loop) from stacking the history twice. Workspace and window state in the dump is ignored on load — the client's replay re-reports the layout — so the dump cannot fight the client over topology, and a window the user killed replays nothing and never shows recovered content.
+
+Every load failure degrades to an empty map: recovery is best-effort and a server must never refuse to start over it. [[crates/scribe-server/src/state_dump.rs#decode_dump|decode_dump]] gates the payload's declared version through the same [[crates/scribe-server/src/handoff.rs#handoff_version_accepted|handoff_version_accepted]] an upgrade receiver applies, and a rejected dump is deleted; an unreadable file or missing key is merely skipped. A successfully loaded file is left in place — the next dirty dump supersedes it, so a server that crashes again before its first dump still recovers the same content.
+
+### Dump round-trips through the sealed envelope
+
+A `HandoffState` sealed with the dump DEK decodes back with its version and sessions intact, and the recovered map keeps only sessions carrying both an envelope id and a replay — the id-less session has no key a cold-restart replay could present.
+
+### Dump rejects foreign versions and keys
+
+A dump declaring a future handoff version is refused exactly as an upgrade receiver would refuse it, and a dump sealed under a different DEK fails AEAD open — both degrade to no recovery rather than to garbage state.
+
+### Sessions without a replay or launch id are dropped
+
+Reducing a decoded dump to the per-launch replay map drops sessions missing a replay payload or an envelope id, keeping exactly the launches a cold-restart replay can name.
+
+### Recovered scrollback seeds a fresh Term
+
+Injecting a recovered replay into a not-yet-started session's Term puts the dead session's content on the fresh grid, with the dim "scrollback restored" marker trailing it where the fresh shell's prompt will follow.
+
+The epilogue undoes the dead session's terminal state — alt screen exited, cursor re-shown, mouse reporting, SGR encoding, and focus events off — so none of it leaks into the fresh shell. An undecodable replay seeds nothing and leaves the session blank.
+
+## Crash Recovery Dump
+
+The server checkpoints its session and workspace state to disk so a crash, SIGKILL, or ordinary service stop no longer loses every terminal's contents — the next cold start hands each replayed pane its pre-crash scrollback.
+
+Before this, the server's authoritative state lived only in RAM plus the `--upgrade` handoff socket: recovery after a dead server rode entirely on the client's own snapshots, which restore layout and relaunch commands but cannot restore what the terminals showed. [[crates/scribe-server/src/state_dump.rs]] closes that by reusing the handoff pipeline verbatim — [[crates/scribe-server/src/handoff.rs#serialize_state]] collects the same `HandoffState` (per-session zstd ANSI replays, titles, CWDs, AI state, prompt history, env identities, workspace and window trees), the dump simply drops the fds only a live SCM_RIGHTS transfer can carry — so the on-disk dump and the handoff wire can never drift apart in what they capture.
+
+### Dirty tracking and cadence
+
+[[crates/scribe-server/src/state_dump.rs#spawn_dump_task]] samples a process-wide generation counter every [[crates/scribe-server/src/state_dump.rs#DUMP_INTERVAL|30 seconds]] and writes only when it moved, so an idle server costs nothing.
+
+[[crates/scribe-server/src/state_dump.rs#mark_dirty]] is bumped from the PTY feed funnels (`feed_term` and the image-result feed), hook ingress (AI state and env events arrive off the byte path), the session lifecycle funnels (`start_session`, `finalize_session_exit`), and the [[crates/scribe-server/src/workspace_manager.rs|WorkspaceManager]] mutators (membership, moves, tree reports, window removal). The generation is sampled before collection, so a mutation landing mid-dump keeps the counter ahead and the next tick re-dumps. The loop initialises one behind the live generation, which is what makes a successor that restored handoff sessions write its first dump on the first tick. Each tick that fires is a full-state checkpoint — every live Term is re-snapshotted and re-encoded — which is the deliberate ceiling: per-session dirty tracking with cached replays is the upgrade path if the 30-second tick ever shows up in a profile.
+
+Graceful shutdown writes one final dump: the signal arm of [[crates/scribe-server/src/main.rs#run_server_loop]] runs [[crates/scribe-server/src/state_dump.rs#dump_now]] before `shutdown_pty_readers`, and the server now handles SIGTERM ([[crates/scribe-server/src/main.rs#wait_for_sigterm]]) alongside Ctrl+C — `systemctl stop`, launchd job removal, and reboot all deliver SIGTERM, so every ordinary service stop is content-preserving instead of a silent kill. The handoff exit path dumps nothing and aborts the task: the successor owns the sessions now and writes its own dumps, so a stale dump from the predecessor could only shadow a fresher one.
+
+### Sealed at rest
+
+Terminal contents are as sensitive as env values, so the dump takes the env store's exact at-rest posture: AEAD-sealed, DEK in the OS keystore, no plaintext fallback.
+
+The named-MessagePack payload is sealed by [[crates/scribe-server/src/env_store/envelope.rs#seal_bytes]] (the raw-bytes generalisation of the env envelope format) under a dedicated flavor-scoped DEK filed at the fixed keystore account `state-dump-key` ([[crates/scribe-server/src/env_store/keystore.rs#get_named_dek]]); a keystore failure skips the dump rather than writing plaintext. The file lands at `<state_dir>/recovery/server-state.envz` through the same 0700-dir/0600-file write-temp-fsync-rename dance as the env store, and a serialized state above the handoff receiver's 256 MiB cap is refused, so a dump can never persist what a handoff would not accept. A state with zero sessions removes the file instead of writing an empty one — stale ciphertext should not outlive the sessions it described — but only once this process has itself dumped live sessions: a fresh idle server's zero-session state says nothing about its predecessor's dump, and deleting it on the first tick would destroy a crash's recovery file before any client replayed it.
+
+### Load and injection
+
+A cold start loads the dump into a map keyed by env-envelope id (the client's launch id), and a cold-restart `CreateSession` naming a recovered launch gets the dead session's scrollback fed into its fresh Term before the shell's first byte.
+
+[[crates/scribe-server/src/state_dump.rs#load_recovered_sessions]] runs only on the normal (non-upgrade) startup path, bounded by a two-second timeout so a wedged keystore cannot hold the accept loop hostage — dialing clients queue in the already-bound listener's backlog either way, and a timeout just means blank replayed panes, exactly the pre-dump behavior. The payload's declared handoff version is gated through [[crates/scribe-server/src/handoff.rs#handoff_version_accepted]] exactly as an upgrade receiver would, so a dump written by an incompatible server is discarded, not misread. Only sessions carrying both an envelope id and a replay enter the map ([[crates/scribe-server/src/state_dump.rs#recovered_map_from_state]]); the dump's workspace and window state is deliberately ignored, because the client's replay re-reports the layout and a server-side copy could only fight it.
+
+Recovery is self-gating: an entry is consumed only when a replay presents its launch id ([[crates/scribe-server/src/ipc_server.rs#seed_recovered_scrollback]]), so a window the user killed — whose snapshot is gone — replays nothing and its content is never shown, and the claim-TTL reclaim path cannot stack the same history twice in one server generation. [[crates/scribe-server/src/ipc_server.rs#inject_recovered_replay]] feeds the decompressed replay through the session's own ANSI processor before the reader task exists (the kernel buffers the shell's opening output until the first read, so ordering is by construction), then appends [[crates/scribe-server/src/ipc_server.rs#RECOVERED_SCROLLBACK_EPILOGUE]]: mouse/focus DECRSTs, cursor re-show, SGR reset, and a dim marker line separating history from the fresh shell. Alt-screen exit is prepended only when the replay says the dead session was in the alt screen, and there is no `CSI r`, because both sequences home the cursor as a side effect and would paint the marker over the restored content on a primary-screen replay. Because a fresh session streams from byte zero and never receives an attach replay, the create path marks the session replay-dirty on the creating connection ([[crates/scribe-server/src/ipc_server.rs#ClientSink#mark_session_replay_dirty]]), and the writer's existing resync machinery ships the seeded Term as one compressed `SessionReplay` behind `SessionCreated`. The replay is encoded at the dead session's grid; a replayed pane is recreated at its snapshot geometry so the dims normally match, and a mismatch wraps at the old width rather than dropping content.
+
+### Dump round-trips through the sealed envelope
+
+A `HandoffState` sealed with the dump DEK decodes back with its version and sessions intact, and reduces to a recovery map holding exactly the launch-id-keyed replay payloads.
+
+### Dump rejects foreign versions and keys
+
+A payload declaring a handoff version outside the receiver's accepted range is refused after decryption, and a payload sealed under a different DEK fails AEAD authentication outright.
+
+### Sessions without a replay or launch id are dropped
+
+Only sessions carrying both an env-envelope id and a replay payload enter the recovery map; an id-less session has no key a cold-restart replay could ever present, and a replay-less one has nothing to show.
+
+### Recovered scrollback seeds a fresh Term
+
+Injecting a recovered replay puts the dead session's content and the dim marker line on the fresh grid in order, and leaves the Term untouched when the frame is corrupt.
+
+A session that died inside a full-screen app is cleaned up on the way in: the epilogue exits the alt screen, re-shows the hidden cursor, and turns off mouse and focus reporting, so none of the dead app's modes leak into the fresh shell.
+
 ## Updater
 
 Background update checker in  that polls GitHub releases and installs verified updates with platform-specific strategies.
@@ -1143,7 +1219,7 @@ Each  stashes its `env_window_id` and optional `env_envelope_id` at create time 
 
  sweeps the whole window via  after destroying every session it owns. Same best-effort posture — a missing per-window directory is success.
 
- computes the union of `connected_clients` keys and `workspace_manager::window_ids_with_sessions` (same merge `handle_list_windows` uses, so disconnected windows that still own live sessions are not skipped) and sweeps each window before broadcasting `QuitRequested`. The pre-sweep protects against clients that fail to ack the quit (crash, race, transport drop) — without it, those envelopes would survive across the quit; the subsequent per-window `CloseWindow` sweeps stay no-ops thanks to idempotency.
+`QuitAll` deliberately deletes nothing. A quit ends the clients while every session keeps running here, and each window's cold-restart snapshot survives the quit precisely so a later crash or reboot can replay those panes — a replay that asks for its saved env by the same launch id the envelope is filed under, and whose scrollback recovery ([[server#Server#Crash Recovery Dump]]) is keyed the same way. The earlier per-window pre-sweep in [[crates/scribe-server/src/ipc_server.rs#handle_quit_all]] silently broke env restore for every quit-then-crash sequence; its stated rationale ("clients follow up with `CloseWindow`") described a client that no longer exists, since the GPUI client's quit path flushes and exits without closing windows. Staleness is not a counter-argument: a fresh terminal mints a fresh launch id and reads no envelope, so a quit-surviving envelope can only ever reach the restored pane it belongs to, and the orphan GC below retires the ones no snapshot still names.
 
  — the path that runs when the child shell exits or the PTY EOFs — deliberately does NOT delete. A session that ended because the user typed `exit` is still eligible for cold-restart restore, so the envelope must remain on disk until the user issues a `CloseSession` themselves.
 

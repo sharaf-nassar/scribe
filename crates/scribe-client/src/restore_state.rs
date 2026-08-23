@@ -33,11 +33,33 @@ pub struct RestoreIndex {
     /// Windows whose snapshot has been claimed for replay but not yet
     /// superseded by a fresh snapshot. A claimed entry keeps its file on disk
     /// — the last good layout must survive until a replacement is durably
-    /// written — but is never claimed again, so a crash loop cannot
-    /// double-replay it. Absent in indexes written by older clients.
+    /// written — and is not claimable again while the claim is fresh, so a
+    /// crash loop cannot replay the same snapshot more than once per
+    /// [`CLAIM_TTL_MS`]. Absent in indexes written by older clients.
     #[serde(default)]
     pub claimed: Vec<WindowId>,
+    /// Claim timestamps (Unix ms) parallel to `claimed`. A claim older than
+    /// [`CLAIM_TTL_MS`] whose window never flushed a fresh snapshot is moved
+    /// back to `windows` at the next claim scan: without the expiry, a client
+    /// that crashed mid-replay — after claiming, before its first post-claim
+    /// flush — parked that layout in `claimed` forever and it was never
+    /// restorable again. Entries missing here (an older client rewrote the
+    /// index) are re-stamped "now" on the next scan, restarting their TTL
+    /// rather than reclaiming immediately.
+    #[serde(default)]
+    pub claimed_at_ms: Vec<u64>,
 }
+
+/// How long a claim shields its snapshot from being claimed again.
+///
+/// A live claimant with a working server flushes a fresh snapshot (which
+/// supersedes the claim) within seconds of replay, and a claimant against a
+/// dead server never replays at all — so anything still claimed after this
+/// window is a crashed or wedged claimant, and its layout should become
+/// claimable again. Long enough that a slow-but-alive claimant cannot race a
+/// second launch into a duplicate replay; short enough that one mid-replay
+/// crash costs the user a single restart, not the layout.
+pub const CLAIM_TTL_MS: u64 = 15 * 60 * 1000;
 
 /// Persisted logical state for one client window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,7 +323,7 @@ impl RestoreStore {
             index.windows.push(window_id);
         }
         // A fresh snapshot supersedes any earlier claim of the same window.
-        index.claimed.retain(|id| *id != window_id);
+        remove_claim(&mut index, window_id);
         index.updated_at_ms = unix_time_ms();
         self.save_index(&index)
     }
@@ -318,7 +340,7 @@ impl RestoreStore {
         let _lock = self.acquire_index_lock()?;
         let mut index = self.read_index_for_update()?;
         index.windows.retain(|id| *id != window_id);
-        index.claimed.retain(|id| *id != window_id);
+        remove_claim(&mut index, window_id);
         index.updated_at_ms = unix_time_ms();
         self.save_index(&index)
     }
@@ -364,6 +386,7 @@ impl RestoreStore {
     pub fn claim_first_window(&self) -> Option<(WindowRestoreState, usize)> {
         let _lock = self.acquire_index_lock().ok()?;
         let mut index = self.read_index_for_update().ok()?;
+        reclaim_stale_claims(&mut index, unix_time_ms());
         let mut claimed: Option<WindowRestoreState> = None;
         let mut remaining_valid = Vec::with_capacity(index.windows.len());
 
@@ -382,6 +405,7 @@ impl RestoreStore {
                     // this window and only a durably written replacement may
                     // retire it.
                     index.claimed.push(window_id);
+                    index.claimed_at_ms.push(unix_time_ms());
                     claimed = Some(state);
                 }
                 Some(_) => {
@@ -465,10 +489,64 @@ impl RestoreStore {
                 updated_at_ms: 0,
                 windows: Vec::new(),
                 claimed: Vec::new(),
+                claimed_at_ms: Vec::new(),
             }),
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// Drop `window_id`'s claim, keeping the timestamp vec aligned.
+fn remove_claim(index: &mut RestoreIndex, window_id: WindowId) {
+    normalize_claim_stamps(index, unix_time_ms());
+    let mut stamps = index.claimed_at_ms.iter().copied();
+    let mut kept_stamps = Vec::with_capacity(index.claimed_at_ms.len());
+    index.claimed.retain(|id| {
+        let stamp = stamps.next().unwrap_or_else(unix_time_ms);
+        let keep = *id != window_id;
+        if keep {
+            kept_stamps.push(stamp);
+        }
+        keep
+    });
+    index.claimed_at_ms = kept_stamps;
+}
+
+/// Re-stamp claims an older client's index rewrite left timestamp-less, so a
+/// missing stamp restarts its TTL instead of reading as immediately stale.
+fn normalize_claim_stamps(index: &mut RestoreIndex, now_ms: u64) {
+    index.claimed_at_ms.truncate(index.claimed.len());
+    while index.claimed_at_ms.len() < index.claimed.len() {
+        index.claimed_at_ms.push(now_ms);
+    }
+}
+
+/// Move claims older than [`CLAIM_TTL_MS`] back to the front of the claimable
+/// list, preserving their original priority over younger windows.
+fn reclaim_stale_claims(index: &mut RestoreIndex, now_ms: u64) {
+    normalize_claim_stamps(index, now_ms);
+    let mut reclaimed = Vec::new();
+    let mut kept_ids = Vec::with_capacity(index.claimed.len());
+    let mut kept_stamps = Vec::with_capacity(index.claimed.len());
+    for (id, stamp) in index.claimed.iter().copied().zip(index.claimed_at_ms.iter().copied()) {
+        if now_ms.saturating_sub(stamp) > CLAIM_TTL_MS {
+            reclaimed.push(id);
+        } else {
+            kept_ids.push(id);
+            kept_stamps.push(stamp);
+        }
+    }
+    if reclaimed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        count = reclaimed.len(),
+        "reclaiming stale restore claims whose claimant never flushed a snapshot"
+    );
+    index.claimed = kept_ids;
+    index.claimed_at_ms = kept_stamps;
+    reclaimed.append(&mut index.windows);
+    index.windows = reclaimed;
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), crate::window_state::StateError> {
@@ -669,6 +747,65 @@ mod tests {
         store.upsert_index(win_a).expect("re-index a");
         let (reclaimed, _) = store.claim_first_window().expect("claim replacement");
         assert_eq!(reclaimed.window_id, win_a);
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale claim reclaimed]]
+    #[test]
+    fn stale_claim_becomes_claimable_again() {
+        let dir = tempdir();
+        let store = store_at(&dir);
+        let window_id = WindowId::new();
+        let snapshot = leaf_snapshot(window_id, WorkspaceId::new());
+        store.save_window(&snapshot).expect("save window");
+        store.upsert_index(window_id).expect("index window");
+
+        let (first, _) = store.claim_first_window().expect("first claim");
+        assert_eq!(first.window_id, window_id);
+        // A fresh claim shields the snapshot: nothing further is claimable.
+        assert!(store.claim_first_window().is_none());
+
+        // Age the claim past the TTL by rewriting its stamp, as if the
+        // claimant crashed mid-replay fifteen-plus minutes ago.
+        let index_path = dir.join("restore").join("index.toml");
+        let mut index: RestoreIndex =
+            toml::from_str(&std::fs::read_to_string(&index_path).expect("read index"))
+                .expect("parse index");
+        assert_eq!(index.claimed, vec![window_id]);
+        index.claimed_at_ms = vec![0];
+        std::fs::write(&index_path, toml::to_string(&index).expect("encode index"))
+            .expect("rewrite index");
+
+        // The stale claim is reclaimed and the same snapshot replays again.
+        let (reclaimed, remaining) = store.claim_first_window().expect("reclaim");
+        assert_eq!(reclaimed.window_id, window_id);
+        assert_eq!(remaining, 0);
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale claim reclaimed]]
+    #[test]
+    fn missing_claim_stamp_restarts_its_ttl() {
+        // An index rewritten by an older client keeps `claimed` but drops the
+        // stamps; the claim must NOT read as immediately stale.
+        let mut index = RestoreIndex {
+            version: 1,
+            updated_at_ms: 0,
+            windows: Vec::new(),
+            claimed: vec![WindowId::new()],
+            claimed_at_ms: Vec::new(),
+        };
+        reclaim_stale_claims(&mut index, 500_000);
+        assert_eq!(index.claimed.len(), 1, "stampless claim keeps shielding its snapshot");
+        assert_eq!(index.claimed_at_ms, vec![500_000], "stamp restarts at the scan instant");
+        assert!(index.windows.is_empty());
+
+        // Only once that restarted TTL expires is the claim reclaimed, ahead
+        // of any younger unclaimed window.
+        let younger = WindowId::new();
+        index.windows.push(younger);
+        reclaim_stale_claims(&mut index, 500_000 + CLAIM_TTL_MS + 1);
+        assert!(index.claimed.is_empty());
+        assert_eq!(index.windows.len(), 2);
+        assert_eq!(index.windows[1], younger, "reclaimed window regains front priority");
     }
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale lock reclaimed]]

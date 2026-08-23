@@ -189,6 +189,16 @@ impl ClientSink {
     pub(crate) fn queue(&self) -> OutputSink {
         self.0.clone()
     }
+
+    /// Ask the drain task to send this session a fresh full `SessionReplay`.
+    ///
+    /// Used after recovered scrollback is fed straight into a fresh session's
+    /// Term at create time: a fresh session normally streams from byte zero and
+    /// never receives a replay, so without this the seeded history would exist
+    /// only server-side.
+    pub(crate) fn mark_session_replay_dirty(&self, session_id: SessionId) {
+        self.0.mark_dirty(session_id);
+    }
 }
 
 /// Shared writer half of a client connection.
@@ -1233,6 +1243,12 @@ pub struct IpcServerState {
     pub git_ref_watcher: Arc<GitRefWatcherControl>,
     /// Bounded one-shot request router for the local agent control surface.
     pub agent_api: crate::agent_api::AgentApiState,
+    /// Per-launch session content recovered from the previous process's state
+    /// dump ([`crate::state_dump`]), keyed by env-envelope id. A cold-restart
+    /// `CreateSession` naming a recovered launch consumes its entry and seeds
+    /// the fresh Term with the pre-crash scrollback before the shell's first
+    /// byte; everything else leaves the map untouched.
+    pub recovered_sessions: crate::state_dump::RecoveredSessions,
 }
 
 struct ClientDispatchContext<'a> {
@@ -7367,12 +7383,7 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             handle_close_window(target_window, context).await;
         }
         ClientMessage::QuitAll => {
-            handle_quit_all(
-                context.window_id,
-                &context.server.window_shares,
-                &context.server.workspace_manager,
-            )
-            .await;
+            handle_quit_all(context.window_id, &context.server.window_shares).await;
         }
         ClientMessage::TriggerUpdate => {
             info!(window_id = %context.window_id, "client triggered update");
@@ -7487,10 +7498,12 @@ async fn handle_create_session(
         wm.assign_session_to_window(context.window_id, session_id);
     }
 
-    let Some(session) = context.server.session_manager.take_session(session_id).await else {
+    let Some(mut session) = context.server.session_manager.take_session(session_id).await else {
         send_error(context.writer, "session vanished after creation").await;
         return;
     };
+
+    let seeded_recovery = seed_recovered_scrollback(&mut session, context).await;
 
     // Notify client of session creation.
     let creation_msg = ServerMessage::SessionCreated {
@@ -7546,6 +7559,88 @@ async fn handle_create_session(
     // text-only forever and no application running in it is ever answered.
     let _ = admit_image_capable_sessions(vec![session_id], Vec::new(), context).await;
     attached_insert(context.attached_ids, session_id).await;
+    if seeded_recovery {
+        // A fresh session streams from byte zero, so the seeded history needs
+        // one full replay to reach the client; the drain task sends it after
+        // the queued `SessionCreated`, and live output follows it in order.
+        context.writer.lock().await.mark_session_replay_dirty(session_id);
+        info!(%session_id, "seeded recovered scrollback into a replayed session");
+    }
+}
+
+/// Take the recovered replay this launch names, if any, and seed it into the
+/// not-yet-started session's Term.
+///
+/// A cold-restart replay naming a launch the previous process dumped gets its
+/// pre-crash scrollback seeded before the reader consumes the shell's first
+/// byte. Consuming the map entry keeps a second replay of the same snapshot
+/// (claim-TTL reclaim after a crash loop) from stacking the history twice in
+/// one server generation.
+async fn seed_recovered_scrollback(
+    session: &mut crate::session_manager::ManagedSession,
+    context: &ClientDispatchContext<'_>,
+) -> bool {
+    let recovered = session
+        .env_envelope_id
+        .as_deref()
+        .and_then(|launch_id| context.server.recovered_sessions.lock().ok()?.remove(launch_id));
+    match recovered {
+        Some(replay) => {
+            inject_recovered_replay(&session.term, &mut session.ansi_processor, &replay).await
+        }
+        None => false,
+    }
+}
+
+/// Everything appended after recovered scrollback so the dead session's
+/// terminal state cannot leak into the fresh shell: disable mouse reporting
+/// (1000/1002/1003), its encodings (1005/1006), and focus events (1004), show
+/// the cursor, reset SGR, then paint a dim marker line separating the restored
+/// history from the fresh shell's first output.
+///
+/// No margin reset (`CSI r`): the replay's own RIS already reset margins and
+/// never re-establishes any, while `CSI r`'s side effect homes the cursor and
+/// would paint the marker over the restored content. Alt-screen exit is
+/// prepended conditionally by [`inject_recovered_replay`] for the same reason:
+/// `CSI ? 1049 l` on a session already on the primary screen still runs its
+/// cursor-restore half, homing an unsaved cursor.
+const RECOVERED_SCROLLBACK_EPILOGUE: &str = "\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\
+\x1b[?25h\x1b[0m\r\n\
+\x1b[2m\u{2500}\u{2500} scribe: scrollback restored from previous session \u{2500}\u{2500}\x1b[22m\r\n";
+
+/// Feed a recovered session replay into a not-yet-started session's Term,
+/// returning whether anything was seeded.
+///
+/// Runs before the PTY reader task exists, so the shell's own output cannot
+/// interleave: the kernel buffers it until the reader's first read, which
+/// lands after this content by construction. The replay stream is the same
+/// self-resetting RIS-prefixed ANSI a handoff or reattach feeds, produced at
+/// the dead session's grid — a replayed pane is recreated at its snapshot
+/// geometry, so the dims normally match; when they do not, the content wraps
+/// at the old width rather than being dropped.
+pub async fn inject_recovered_replay(
+    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    ansi_processor: &mut AnsiProcessor,
+    replay: &scribe_common::screen_replay::SessionReplay,
+) -> bool {
+    let bytes = match scribe_common::screen_replay::decompress_session_replay(replay) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "recovered replay decode failed; starting the session blank");
+            return false;
+        }
+    };
+    let mut term_guard = term.lock().await;
+    ansi_processor.advance(&mut *term_guard, &bytes);
+    if replay.alt_screen {
+        // The dead session died inside a full-screen app. Its replay carries
+        // the alt grid as history; leave the alt screen so the marker and the
+        // fresh shell land on the primary screen.
+        ansi_processor.advance(&mut *term_guard, b"\x1b[?1049l");
+    }
+    ansi_processor.advance(&mut *term_guard, RECOVERED_SCROLLBACK_EPILOGUE.as_bytes());
+    true
 }
 
 /// Split a `ManagedSession`, register in the live registry, and start
@@ -7645,6 +7740,7 @@ async fn start_session(
     runtime: SessionRuntimeContext<'_>,
 ) {
     let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
+    crate::state_dump::mark_dirty();
     #[rustfmt::skip]
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
@@ -10122,50 +10218,18 @@ fn load_scrollback_lines_setting() -> usize {
 
 /// Broadcast `QuitRequested` to all connected clients, including the sender.
 ///
-/// Per T019, also sweeps every env envelope under every live window before
-/// telling clients to shut down. Clients will follow up with their own
-/// `CloseWindow` messages, but a per-window pre-sweep here protects against
-/// clients that fail to ack `QuitRequested` (crash, race, transport drop) —
-/// without it, those envelopes would survive across the quit. The
-/// `delete_window_envelopes` path is idempotent, so the subsequent
-/// `CloseWindow` sweeps are no-ops if they still arrive.
-///
-/// Window enumeration unions the share-registry keys and
-/// `workspace_manager::window_ids_with_sessions` (same merge
-/// `handle_list_windows` uses) so disconnected windows that still own live
-/// sessions are not skipped.
-async fn handle_quit_all(
-    sender_window_id: WindowId,
-    window_shares: &WindowShares,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-) {
+/// Deliberately no env-envelope sweep here. A quit ends the clients while
+/// every session keeps running on this server, and each window's cold-restart
+/// snapshot survives the quit precisely so a later server crash or reboot can
+/// replay those panes — a replay that asks for its saved env by the same
+/// launch id the envelope is filed under. Sweeping on quit silently broke that
+/// restore for every quit-then-crash sequence. Envelope deletion stays where
+/// destruction is actually requested: `CloseSession` / `CloseWindow`, the
+/// feature-disable transition, and the orphan GC for launches no snapshot
+/// still names. A stale envelope cannot leak into a fresh terminal either way:
+/// new tabs mint a fresh launch id and read no envelope.
+async fn handle_quit_all(sender_window_id: WindowId, window_shares: &WindowShares) {
     info!(%sender_window_id, "QuitAll requested — broadcasting QuitRequested");
-
-    // Compute the union of live windows before any client teardown can
-    // mutate workspace state. Read locks here only — no async work under
-    // them — so the order matches `handle_list_windows`.
-    let window_ids: HashSet<WindowId> = {
-        let shares = window_shares.read().await;
-        let wm = workspace_manager.read().await;
-        let mut ids: HashSet<WindowId> = wm.window_ids_with_sessions();
-        ids.extend(shares.keys().copied());
-        ids
-    };
-
-    // Best-effort per-window envelope sweep. Done before broadcasting
-    // `QuitRequested` so the deletes are not racing client-driven
-    // `CloseWindow` traffic.
-    for window_id in &window_ids {
-        if let Err(err) = crate::env_store::store::delete_window_envelopes(*window_id).await {
-            warn!(
-                target: "scribe_server::ipc_server",
-                %window_id,
-                error = ?err,
-                "env-envelope window sweep failed during QuitAll"
-            );
-        }
-    }
-
     let quit_msg = ServerMessage::QuitRequested;
     for writer in connected_window_writers(window_shares).await {
         send_message(&writer, &quit_msg).await;
@@ -11545,6 +11609,7 @@ async fn finalize_session_exit(
     let mut workspace_manager = ctx.workspace_manager.write().await;
     workspace_manager.remove_session(ctx.session_id);
     workspace_manager.remove_session_from_window(ctx.session_id);
+    crate::state_dump::mark_dirty();
     info!(session_id = %ctx.session_id, ?exit, "session exit finalized");
 }
 
@@ -11627,6 +11692,7 @@ async fn feed_term(
     let mut term_guard = term.lock().await;
     ansi_processor.advance(&mut *term_guard, bytes);
     search_cache.invalidate();
+    crate::state_dump::mark_dirty();
     term_commit.advance(chunk_len(bytes))
 }
 
@@ -11650,6 +11716,7 @@ async fn feed_term_image_result_observed(
         feed.image_result,
         || {
             search_cache.invalidate();
+            crate::state_dump::mark_dirty();
             term_commit.advance(chunk_len(feed.bytes));
         },
     )
@@ -13236,7 +13303,10 @@ pub async fn activate_pending_sessions(
                 .await
                 .window_for_session(session_id)
                 .unwrap_or_else(WindowId::new);
-            start_session(
+            // Boxed for the same future-size budget as `handle_create_session`'s
+            // call: `start_session` assembles the whole `LiveSession` on its
+            // frame, and this loop's future rides inside every startup path.
+            Box::pin(start_session(
                 StartSessionIds { session: session_id, workspace: workspace_id, window: window_id },
                 session,
                 InitialAttachment { writer: None, attached_ids: None },
@@ -13246,7 +13316,7 @@ pub async fn activate_pending_sessions(
                     git_ref_watcher,
                     window_shares,
                 },
-            )
+            ))
             .await;
             info!(%session_id, "activated restored session (detached)");
         }

@@ -104,7 +104,7 @@ use crate::workspace_manager::WorkspaceManager;
 /// Any payload carrying [`AiProvider::Pi`] therefore declares v8. A v8 receiver
 /// still accepts v6 and v7 senders for forward upgrades, while v6/v7 receivers
 /// refuse v8 before acknowledging so the current server keeps running.
-const HANDOFF_VERSION: u32 = 8;
+pub const HANDOFF_VERSION: u32 = 8;
 
 /// Version a payload carrying terminal image state declares.
 const HANDOFF_VERSION_WITH_IMAGES: u32 = 7;
@@ -683,7 +683,12 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
 }
 
 /// Collect serialisable state from the live session registry and workspace manager.
-async fn serialize_state(
+///
+/// `pub(crate)` because the crash-recovery dump ([`crate::state_dump`]) reuses
+/// this exact collection — dropping the fds, which only a live `SCM_RIGHTS`
+/// transfer can carry — so the on-disk dump and the handoff wire can never
+/// drift apart in what they capture.
+pub async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     github_ci_tracker: &crate::github_ci::GithubCiTrackerHandle,

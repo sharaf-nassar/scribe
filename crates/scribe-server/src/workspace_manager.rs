@@ -110,6 +110,7 @@ impl WorkspaceManager {
         session_id: SessionId,
         split_direction: Option<LayoutDirection>,
     ) {
+        crate::state_dump::mark_dirty();
         self.session_to_workspace.insert(session_id, workspace_id);
 
         // Auto-create the workspace for split-created workspaces.
@@ -152,6 +153,7 @@ impl WorkspaceManager {
             warn!(%session_id, %target, "session move ignored: unknown target workspace");
             return false;
         }
+        crate::state_dump::mark_dirty();
         if let Some(previous) = self.session_to_workspace.insert(session_id, target)
             && let Some(ws) = self.workspaces.get_mut(&previous)
         {
@@ -189,6 +191,7 @@ impl WorkspaceManager {
             return;
         }
         self.workspaces.remove(&workspace_id);
+        crate::state_dump::mark_dirty();
         info!(%workspace_id, "closed workspace");
     }
 
@@ -198,6 +201,7 @@ impl WorkspaceManager {
             && let Some(ws) = self.workspaces.get_mut(&workspace_id)
         {
             ws.sessions.retain(|&s| s != session_id);
+            crate::state_dump::mark_dirty();
             debug!(%session_id, %workspace_id, "removed session from workspace");
         }
     }
@@ -334,6 +338,7 @@ impl WorkspaceManager {
 
     /// Store a per-window workspace tree reported by a client.
     pub fn set_window_tree(&mut self, window_id: WindowId, tree: WorkspaceTreeNode) {
+        crate::state_dump::mark_dirty();
         self.window_trees.insert(window_id, tree);
     }
 
@@ -483,6 +488,7 @@ impl WorkspaceManager {
 
     /// Remove a window and all its session→window mappings.
     pub fn remove_window(&mut self, window_id: WindowId) {
+        crate::state_dump::mark_dirty();
         self.session_to_window.retain(|_, wid| *wid != window_id);
         self.window_trees.remove(&window_id);
         info!(%window_id, "removed window from registry");

@@ -26,6 +26,7 @@ mod releases;
 mod search_cache;
 mod session_manager;
 mod shell_integration;
+mod state_dump;
 mod stop_classifier;
 // Feature 013: the remote accept path (compiled into this binary via `mod
 // ipc_server`) reaches the Tailscale LocalAPI client through `crate::tailnet`.
@@ -281,7 +282,22 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
     // live until the server shuts down to hold the advisory flock.
     let (lock_guard, listener) = ipc_server::acquire_server_socket(&server_socket_path(), false)?;
 
-    run_server_loop(
+    // A cold start is the only start that can be recovering from a crash, so
+    // load the previous process's state dump here — bounded, because a wedged
+    // keystore must not hold the accept loop hostage while dialing clients
+    // queue in the already-bound listener's backlog. A timeout just means the
+    // replayed panes come up blank, exactly as they did before dumps existed.
+    let recovered_sessions =
+        tokio::time::timeout(RECOVERY_LOAD_TIMEOUT, state_dump::load_recovered_sessions())
+            .await
+            .unwrap_or_else(|_| {
+                warn!("state dump load timed out; starting without recovered content");
+                std::collections::HashMap::new()
+            });
+
+    // Boxed: the loop future carries the whole server setup and sits over the
+    // pedantic `large_futures` budget.
+    Box::pin(run_server_loop(
         session_manager,
         workspace_manager,
         (lock_guard, listener),
@@ -290,10 +306,15 @@ async fn run_normal_server(launchd_slot: Option<LaunchdSlot>) -> Result<(), Scri
             agent_api: cfg.agent_api,
             launchd_slot,
             restored_ci_windows: Vec::new(),
+            recovered_sessions,
         },
-    )
+    ))
     .await
 }
+
+/// How long a cold start waits on the keystore-backed recovery load before
+/// serving without it.
+const RECOVERY_LOAD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Start a launchd slot as either a crash-recovery owner or a warm successor.
 async fn run_launchd_managed(slot: LaunchdSlot) -> Result<(), ScribeError> {
@@ -401,7 +422,7 @@ async fn run_upgrade_receiver(
 
     info!("session restoration complete — accepting connections");
 
-    run_server_loop(
+    Box::pin(run_server_loop(
         session_manager,
         workspace_manager,
         (lock_guard, listener),
@@ -410,8 +431,12 @@ async fn run_upgrade_receiver(
             agent_api: cfg.agent_api,
             launchd_slot,
             restored_ci_windows,
+            // The handed-off sessions are alive — there is nothing to recover,
+            // and a client reattaching to a surviving server replays nothing
+            // that could consume an entry anyway.
+            recovered_sessions: std::collections::HashMap::new(),
         },
-    )
+    ))
     .await
 }
 
@@ -428,6 +453,10 @@ struct ServerLoopConfig {
     agent_api: AgentApiConfig,
     launchd_slot: Option<LaunchdSlot>,
     restored_ci_windows: Vec<github_ci::HandoffCiWindow>,
+    /// Per-launch session content recovered from the previous process's state
+    /// dump; consumed by cold-restart `CreateSession` replays.
+    recovered_sessions:
+        std::collections::HashMap<String, scribe_common::screen_replay::SessionReplay>,
 }
 
 #[allow(clippy::too_many_lines, reason = "server setup remains one ordered startup transaction")]
@@ -437,7 +466,13 @@ async fn run_server_loop(
     (_lock_guard, listener): (ipc_server::ServerLock, tokio::net::UnixListener),
     config: ServerLoopConfig,
 ) -> Result<(), ScribeError> {
-    let ServerLoopConfig { update, agent_api, launchd_slot, restored_ci_windows } = config;
+    let ServerLoopConfig {
+        update,
+        agent_api,
+        launchd_slot,
+        restored_ci_windows,
+        recovered_sessions,
+    } = config;
     let live_sessions = ipc_server::new_live_session_registry();
     let window_shares = ipc_server::new_window_shares();
     let git_ref_watcher =
@@ -523,7 +558,19 @@ async fn run_server_loop(
         remote_control: Arc::clone(&remote_control),
         git_ref_watcher: Arc::clone(&git_ref_watcher),
         agent_api: agent_api::AgentApiState::new(agent_api),
+        recovered_sessions: Arc::new(std::sync::Mutex::new(recovered_sessions)),
     };
+
+    // Crash-recovery dump: checkpoint the live state on a dirty-gated interval
+    // so a crash or SIGKILL loses at most one interval of terminal content.
+    let dump_task = state_dump::spawn_dump_task(
+        Arc::clone(&live_sessions),
+        Arc::clone(&workspace_manager),
+        github_ci_tracker.clone(),
+    );
+    // The handoff-listener arm consumes `github_ci_tracker`; the final dump
+    // below runs after the select and needs its own handle.
+    let shutdown_ci_tracker = github_ci_tracker.clone();
 
     // Spec 027: forward agent-activity lease transitions to each session's
     // window as `AgentActivity`, gated on the participant's `agent_api` bit.
@@ -578,17 +625,31 @@ async fn run_server_loop(
             info!("received shutdown signal");
             false
         }
+        () = wait_for_sigterm() => {
+            // systemd stop, launchd job removal, and reboot all deliver
+            // SIGTERM; handling it turns every ordinary service stop into the
+            // same dump-then-exit path as Ctrl+C instead of a silent kill.
+            info!("received SIGTERM");
+            false
+        }
     };
 
+    dump_task.abort();
     if handoff_triggered {
         // Defuse Pty objects so the old server's exit doesn't send SIGHUP to
         // child processes. alacritty_terminal::Pty::drop() explicitly calls
         // kill(child_pid, SIGHUP) — the new server already has the master fds.
         // The readers are deliberately left running: the new server owns these
         // children now, so nothing here may cancel a reader into the exit
-        // funnel and report their sessions dead.
+        // funnel and report their sessions dead. No final dump either: the
+        // successor owns these sessions now and writes its own, so a stale
+        // dump from this side could only shadow a fresher one.
         ipc_server::defuse_for_handoff(&live_sessions).await;
     } else {
+        // The sessions die with this process, so checkpoint them first: this
+        // is what makes an ordinary service stop or reboot content-preserving
+        // for the next cold start's replay.
+        state_dump::dump_now(&live_sessions, &workspace_manager, &shutdown_ci_tracker).await;
         // Stop the readers before the runtime unwinds, under the same bounded
         // join the close paths use, so shutdown is not the one exit path that
         // abandons a task parked on a PTY read (spec 017 US1-3).
@@ -622,6 +683,20 @@ fn spawn_inactive_slot_cleanup(active: LaunchdSlot) -> Result<(), String> {
         .spawn()
         .map(drop)
         .map_err(|error| format!("failed to spawn inactive-slot cleanup: {error}"))
+}
+
+/// Resolve when SIGTERM arrives; pends forever when the handler cannot be
+/// installed, leaving Ctrl+C and the handoff listener as the exit paths.
+async fn wait_for_sigterm() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(error) => {
+            warn!(%error, "SIGTERM handler unavailable");
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Remove the IPC socket file, ignoring "not found" errors.

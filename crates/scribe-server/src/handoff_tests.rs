@@ -654,3 +654,99 @@ fn prior_version_receiver_ignores_child_identity_key() {
 
     assert_eq!(decoded.first().expect("one session").shell_name, "zsh");
 }
+
+/// Read a Term's visible grid as one string per row (trailing blanks trimmed).
+fn visible_rows(term: &Term<ScribeEventListener>) -> Vec<String> {
+    let snapshot = snapshot_term(term);
+    let cols = usize::from(snapshot.cols);
+    snapshot
+        .cells
+        .chunks(cols)
+        .map(|row| row.iter().map(|cell| cell.c).collect::<String>().trim_end().to_owned())
+        .collect()
+}
+
+// @lat: [[server#Server#Crash Recovery Dump#Recovered scrollback seeds a fresh Term]]
+#[tokio::test]
+async fn recovered_replay_seeds_a_fresh_term_with_the_dead_sessions_content() {
+    let source = term_with_bytes(b"old history line\r\nsecond line", 40, 10);
+    let replay = build_session_replay(&snapshot_term(&source)).expect("build replay");
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let listener = ScribeEventListener::new(SessionId::new(), tx);
+    let fresh = Term::new(build_term_config(100), &TestDims { cols: 40, rows: 10 }, listener);
+    let term = Arc::new(tokio::sync::Mutex::new(fresh));
+    let mut processor: AnsiProcessor = AnsiProcessor::new();
+
+    let seeded = ipc_server::inject_recovered_replay(&term, &mut processor, &replay).await;
+    assert!(seeded, "a decodable replay must seed");
+
+    let term = term.lock().await;
+    let rows = visible_rows(&term);
+    assert!(
+        rows.iter().any(|row| row.contains("old history line")),
+        "recovered content must be on the fresh grid: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("scrollback restored")),
+        "the marker line must separate history from new output: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("second line")),
+        "the epilogue must not paint over restored content: {rows:?}"
+    );
+    // The marker line must come after the recovered content, where the fresh
+    // shell's first prompt will follow it.
+    let content_row = rows.iter().position(|row| row.contains("second line"));
+    let marker_row = rows.iter().position(|row| row.contains("scrollback restored"));
+    assert!(marker_row > content_row, "marker must trail the content: {rows:?}");
+}
+
+// @lat: [[server#Server#Crash Recovery Dump#Recovered scrollback seeds a fresh Term]]
+#[tokio::test]
+async fn recovered_replay_epilogue_cleans_up_the_dead_sessions_modes() {
+    use alacritty_terminal::term::TermMode;
+
+    // The dead session died inside a full-screen app: alt screen, hidden
+    // cursor, mouse reporting on. None of that may leak into the fresh shell.
+    let source = term_with_bytes(b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006happ frame", 40, 10);
+    let replay = build_session_replay(&snapshot_term(&source)).expect("build replay");
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let listener = ScribeEventListener::new(SessionId::new(), tx);
+    let fresh = Term::new(build_term_config(100), &TestDims { cols: 40, rows: 10 }, listener);
+    let term = Arc::new(tokio::sync::Mutex::new(fresh));
+    let mut processor: AnsiProcessor = AnsiProcessor::new();
+
+    assert!(ipc_server::inject_recovered_replay(&term, &mut processor, &replay).await);
+
+    let term = term.lock().await;
+    let mode = term.mode();
+    assert!(!mode.contains(TermMode::ALT_SCREEN), "epilogue must exit the alt screen");
+    assert!(mode.contains(TermMode::SHOW_CURSOR), "epilogue must re-show the cursor");
+    assert!(!mode.contains(TermMode::MOUSE_REPORT_CLICK), "mouse reporting must be off");
+    assert!(!mode.contains(TermMode::SGR_MOUSE), "SGR mouse encoding must be off");
+    assert!(!mode.contains(TermMode::FOCUS_IN_OUT), "focus events must be off");
+}
+
+// @lat: [[server#Server#Crash Recovery Dump#Recovered scrollback seeds a fresh Term]]
+#[tokio::test]
+async fn undecodable_recovered_replay_leaves_the_session_blank() {
+    let source = term_with_bytes(b"content", 40, 10);
+    let mut replay = build_session_replay(&snapshot_term(&source)).expect("build replay");
+    replay.replay_zstd = vec![0xde, 0xad, 0xbe, 0xef];
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let listener = ScribeEventListener::new(SessionId::new(), tx);
+    let fresh = Term::new(build_term_config(100), &TestDims { cols: 40, rows: 10 }, listener);
+    let term = Arc::new(tokio::sync::Mutex::new(fresh));
+    let mut processor: AnsiProcessor = AnsiProcessor::new();
+
+    assert!(
+        !ipc_server::inject_recovered_replay(&term, &mut processor, &replay).await,
+        "a corrupt frame must not seed (and must not feed a partial stream)"
+    );
+    let term = term.lock().await;
+    let rows = visible_rows(&term);
+    assert!(rows.iter().all(String::is_empty), "the fresh Term must stay blank: {rows:?}");
+}

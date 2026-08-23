@@ -41,6 +41,10 @@ use crate::stop_classifier;
 ///     advisory, never required.
 pub async fn handle(server: &IpcServerState, event: HookEvent) {
     let HookEvent { session_id, provider, kind } = event;
+    // Hook events mutate retained session state (AI state, prompts, env)
+    // without riding the PTY byte path, so they dirty the crash-recovery dump
+    // here rather than in `feed_term`.
+    crate::state_dump::mark_dirty();
 
     // Env-delta events never produce a `MetadataEvent`. Route them to the
     // env-store registry instead, before the generic

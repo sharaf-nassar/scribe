@@ -400,6 +400,12 @@ struct AiChrome {
     /// provider absence: a fresh AI session has no state briefly and must not
     /// be demoted before its first hook event.
     binding_cleared: HashSet<SessionId>,
+    /// Set whenever the prompt history changes, taken by the restore poll so
+    /// the cold-restart snapshot flushes without waiting for a layout change.
+    /// Prompt rows ride the snapshot's launch records, and a prompt typed
+    /// right before a server crash used to stay off disk until the next
+    /// split/close/tab switch dirtied the layout.
+    prompts_dirty: bool,
 }
 
 impl AiChrome {
@@ -411,13 +417,20 @@ impl AiChrome {
             prompts: HashMap::new(),
             conversations: HashMap::new(),
             binding_cleared: HashSet::new(),
+            prompts_dirty: false,
         }
+    }
+
+    /// Take-and-clear the prompt-history dirty flag; see `prompts_dirty`.
+    fn take_prompts_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.prompts_dirty)
     }
 
     /// Record a prompt submission for `session_id`, seeding the first-prompt row
     /// and restarting the elapsed timer on the latest row.
     fn record_prompt(&mut self, session_id: SessionId, text: &str, at: std::time::SystemTime) {
         self.prompts.entry(session_id).or_default().prompts.record_prompt(text, at);
+        self.prompts_dirty = true;
     }
 
     /// Fold one `AiStateChanged` edge onto the chrome: the conversation
@@ -434,6 +447,10 @@ impl AiChrome {
         at: std::time::SystemTime,
     ) {
         self.binding_cleared.remove(&session_id);
+        // Coarse: a state edge can retire the history (conversation switch) or
+        // freeze the elapsed timer, both of which the snapshot persists. The
+        // flush behind this flag is debounced, so over-marking costs nothing.
+        self.prompts_dirty = true;
         let provider = ai_state.provider;
         // Before the tracker takes ownership: a state edge is the only frame
         // that names the provider's conversation, and a switch must take the
@@ -481,6 +498,7 @@ impl AiChrome {
             self.conversations.insert(session_id, conversation_id);
         }
         self.prompts.entry(session_id).or_insert(prompts);
+        self.prompts_dirty = true;
     }
 
     /// Adopt the server's view of every listed session's AI chrome.
@@ -559,7 +577,9 @@ impl AiChrome {
     fn forget(&mut self, session_id: SessionId) {
         self.tracker.remove(session_id);
         self.tracker.clear_context(session_id);
-        self.prompts.remove(&session_id);
+        if self.prompts.remove(&session_id).is_some() {
+            self.prompts_dirty = true;
+        }
         self.conversations.remove(&session_id);
         self.binding_cleared.remove(&session_id);
     }
@@ -5104,6 +5124,11 @@ impl TerminalView {
             }
         }
         self.sync_launch_bindings();
+        // Prompt rows ride the snapshot's launch records, so a prompt-history
+        // change is snapshot staleness exactly as a layout change is.
+        if self.shared.ai.lock().is_ok_and(|mut ai| ai.take_prompts_dirty()) {
+            self.restore.mark_layout_dirty();
+        }
         self.replay_cold_restart(cx);
         self.flush_geometry_if_due();
         if self.restore.layout_dirty_since.is_some_and(|at| at.elapsed() >= RESTORE_DEBOUNCE) {

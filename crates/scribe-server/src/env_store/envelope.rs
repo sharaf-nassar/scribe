@@ -44,10 +44,20 @@ pub enum EnvelopeError {
 /// Returns the full envelope bytes ready to write to disk.
 pub fn seal(delta: &TerminalEnvDelta, dek: &Dek) -> Result<Vec<u8>, EnvelopeError> {
     let plaintext = rmp_serde::to_vec_named(delta)?;
+    seal_bytes(&plaintext, dek)
+}
+
+/// Seal arbitrary plaintext bytes into the same envelope binary format.
+///
+/// Shared by the env-delta store above and the server-state recovery dump
+/// ([`crate::state_dump`]), which carries terminal contents and therefore
+/// takes the same at-rest posture as env values: AEAD-sealed, DEK in the OS
+/// keystore, no plaintext fallback.
+pub fn seal_bytes(plaintext: &[u8], dek: &Dek) -> Result<Vec<u8>, EnvelopeError> {
     let key = Key::from_slice(dek.as_slice());
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ciphertext = cipher.encrypt(&nonce, plaintext.as_ref()).map_err(|_| EnvelopeError::Aead)?;
+    let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| EnvelopeError::Aead)?;
 
     let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     out.push(ENVELOPE_VERSION);
@@ -61,6 +71,13 @@ pub fn seal(delta: &TerminalEnvDelta, dek: &Dek) -> Result<Vec<u8>, EnvelopeErro
 /// version byte, reads the nonce, AEAD-opens the ciphertext (which authenticates
 /// via the appended Poly1305 tag), and `rmp_serde`-deserializes the plaintext.
 pub fn open(envelope: &[u8], dek: &Dek) -> Result<TerminalEnvDelta, EnvelopeError> {
+    let plaintext = open_bytes(envelope, dek)?;
+    let delta: TerminalEnvDelta = rmp_serde::from_slice(&plaintext)?;
+    Ok(delta)
+}
+
+/// Open an envelope back into its raw plaintext bytes; see [`seal_bytes`].
+pub fn open_bytes(envelope: &[u8], dek: &Dek) -> Result<Vec<u8>, EnvelopeError> {
     // 16 bytes for the AEAD tag are part of the ciphertext slice we pass to
     // `decrypt`, so the minimum total length is HEADER_LEN + 16 (a degenerate
     // empty plaintext).
@@ -79,10 +96,7 @@ pub fn open(envelope: &[u8], dek: &Dek) -> Result<TerminalEnvDelta, EnvelopeErro
 
     let key = Key::from_slice(dek.as_slice());
     let cipher = ChaCha20Poly1305::new(key);
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| EnvelopeError::Aead)?;
-
-    let delta: TerminalEnvDelta = rmp_serde::from_slice(&plaintext)?;
-    Ok(delta)
+    cipher.decrypt(nonce, ciphertext).map_err(|_| EnvelopeError::Aead)
 }
 
 #[cfg(test)]

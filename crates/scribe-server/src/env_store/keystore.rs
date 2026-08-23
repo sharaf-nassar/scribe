@@ -227,6 +227,51 @@ pub async fn delete_dek(window_id: WindowId, launch_id: &str) -> Result<(), Keys
     result
 }
 
+/// Fetch a 32-byte DEK stored under a fixed account name (no per-envelope
+/// coordinates). Used by the server-state recovery dump
+/// ([`crate::state_dump`]), which has exactly one envelope per install flavor.
+pub async fn get_named_dek(account: &'static str) -> Result<Dek, KeystoreError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Dek, KeystoreError> {
+        let entry = keyring::Entry::new(service_identifier(), account)?;
+        let bytes = entry.get_secret()?;
+        let len = bytes.len();
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| KeystoreError::Other(format!("dek length mismatch: {len} bytes")))
+    })
+    .await
+    .map_err(|e| KeystoreError::Other(format!("blocking task panicked: {e}")))?;
+    if let Err(ref err) = result {
+        tracing::debug!(
+            target: "scribe_server::env_store::keystore",
+            account,
+            error = %err,
+            "get_named_dek failed"
+        );
+    }
+    result
+}
+
+/// Store a 32-byte DEK under a fixed account name; see [`get_named_dek`].
+pub async fn set_named_dek(account: &'static str, dek: &Dek) -> Result<(), KeystoreError> {
+    let bytes = dek.to_vec();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), KeystoreError> {
+        let entry = keyring::Entry::new(service_identifier(), account)?;
+        entry.set_secret(&bytes)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| KeystoreError::Other(format!("blocking task panicked: {e}")))?;
+    if let Err(ref err) = result {
+        tracing::warn!(
+            target: "scribe_server::env_store::keystore",
+            account,
+            error = %err,
+            "set_named_dek failed"
+        );
+    }
+    result
+}
+
 /// Generate a fresh random 32-byte DEK for a new envelope.
 ///
 /// Uses `chacha20poly1305::aead::OsRng` (re-exported from `crypto_common`'s
