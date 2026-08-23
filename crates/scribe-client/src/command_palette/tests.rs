@@ -22,6 +22,26 @@ fn base_entries_lead_with_settings_and_end_with_remote_connect() {
 }
 
 #[test]
+fn workspace_move_actions_are_visible() {
+    let entries = base_entries();
+    let moves: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.label.starts_with("Move workspace"))
+        .map(|entry| (entry.label.as_str(), entry.action.clone()))
+        .collect();
+    assert_eq!(
+        moves,
+        vec![
+            ("Move workspace to new window", PaletteAction::MoveWorkspaceToNewWindow),
+            ("Move workspace left", PaletteAction::MoveWorkspaceLeft),
+            ("Move workspace right", PaletteAction::MoveWorkspaceRight),
+            ("Move workspace up", PaletteAction::MoveWorkspaceUp),
+            ("Move workspace down", PaletteAction::MoveWorkspaceDown),
+        ]
+    );
+}
+
+#[test]
 fn update_row_is_appended_only_when_an_update_is_available() {
     let none = build_entries(None, &[], None);
     assert!(none.iter().all(|e| !e.label.starts_with("Update Scribe")));

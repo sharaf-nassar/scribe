@@ -31,6 +31,16 @@ pub enum PaletteAction {
     Automation(AutomationAction),
     /// Open the feature-013 remote-connect picker (client-local, off-wire).
     OpenRemoteConnect,
+    /// Move the focused workspace into a fresh window.
+    MoveWorkspaceToNewWindow,
+    /// Move the focused workspace to its nearest left neighbour.
+    MoveWorkspaceLeft,
+    /// Move the focused workspace to its nearest right neighbour.
+    MoveWorkspaceRight,
+    /// Move the focused workspace to its nearest upper neighbour.
+    MoveWorkspaceUp,
+    /// Move the focused workspace to its nearest lower neighbour.
+    MoveWorkspaceDown,
 }
 
 // `AutomationAction` (frozen scribe-common) derives neither `PartialEq` nor
@@ -39,7 +49,12 @@ pub enum PaletteAction {
 impl PartialEq for PaletteAction {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::OpenRemoteConnect, Self::OpenRemoteConnect) => true,
+            (Self::OpenRemoteConnect, Self::OpenRemoteConnect)
+            | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow)
+            | (Self::MoveWorkspaceLeft, Self::MoveWorkspaceLeft)
+            | (Self::MoveWorkspaceRight, Self::MoveWorkspaceRight)
+            | (Self::MoveWorkspaceUp, Self::MoveWorkspaceUp)
+            | (Self::MoveWorkspaceDown, Self::MoveWorkspaceDown) => true,
             (Self::Automation(a), Self::Automation(b)) => format!("{a:?}") == format!("{b:?}"),
             _ => false,
         }
@@ -83,6 +98,26 @@ pub fn base_entries() -> Vec<CommandPaletteEntry> {
         CommandPaletteEntry::automation("Close Pane", AutomationAction::ClosePane),
         CommandPaletteEntry::automation("Close Tab", AutomationAction::CloseTab),
         CommandPaletteEntry::automation("New Window", AutomationAction::NewWindow),
+        CommandPaletteEntry {
+            label: "Move workspace to new window".into(),
+            action: PaletteAction::MoveWorkspaceToNewWindow,
+        },
+        CommandPaletteEntry {
+            label: "Move workspace left".into(),
+            action: PaletteAction::MoveWorkspaceLeft,
+        },
+        CommandPaletteEntry {
+            label: "Move workspace right".into(),
+            action: PaletteAction::MoveWorkspaceRight,
+        },
+        CommandPaletteEntry {
+            label: "Move workspace up".into(),
+            action: PaletteAction::MoveWorkspaceUp,
+        },
+        CommandPaletteEntry {
+            label: "Move workspace down".into(),
+            action: PaletteAction::MoveWorkspaceDown,
+        },
         CommandPaletteEntry {
             label: "Connect to remote machine…".into(),
             action: PaletteAction::OpenRemoteConnect,

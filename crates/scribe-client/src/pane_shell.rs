@@ -964,6 +964,19 @@ impl PaneShell {
         })
     }
 
+    /// Move the focused workspace through the same directional edge operation
+    /// used by a workspace-pill drag.
+    pub fn move_focused_workspace_in_direction(
+        &mut self,
+        direction: FocusDirection,
+        viewport: Rect,
+        cx: &mut App,
+    ) -> Result<bool, WorkspaceTreeError> {
+        self.workspace.update(cx, |tree, ctx| {
+            tree.move_focused_workspace_in_direction(direction, viewport, ctx)
+        })
+    }
+
     /// Set the ratio of the split between two workspace regions.
     pub fn set_workspace_ratio(
         &mut self,

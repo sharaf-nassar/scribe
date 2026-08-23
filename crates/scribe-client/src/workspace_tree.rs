@@ -212,6 +212,23 @@ impl WorkspaceTree {
         Ok(true)
     }
 
+    /// Move the focused workspace like a directional workspace-pill drop.
+    ///
+    /// A window edge has no non-wrapping neighbour, so it returns `Ok(false)`
+    /// without reporting a tree mutation.
+    pub fn move_focused_workspace_in_direction(
+        &mut self,
+        direction: crate::layout::FocusDirection,
+        viewport: Rect,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, WorkspaceTreeError> {
+        if !self.layout.move_focused_workspace_in_direction(direction, viewport)? {
+            return Ok(false);
+        }
+        self.report(cx);
+        Ok(true)
+    }
+
     /// Reset every workspace split ratio so regions share the window evenly,
     /// then report the tree.
     pub fn equalize_ratios(&mut self, cx: &mut Context<Self>) {
@@ -494,6 +511,46 @@ mod tests {
     }
 
     // @lat: [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]]
+    #[gpui::test]
+    fn directional_move_reports_only_for_a_focused_workspace_mutation(cx: &mut TestAppContext) {
+        let ws_a = WorkspaceId::new();
+        let tree = cx.new(|_| WorkspaceTree::new(ws_a, None));
+        let (count, _) = report_sink(&tree, cx);
+        let ws_b = tree
+            .update(cx, |tree, cx| tree.split_workspace(SplitDirection::Horizontal, None, cx))
+            .expect("second workspace");
+        let before_move = count.load(Ordering::SeqCst);
+        let viewport = crate::layout::Rect { x: 0.0, y: 0.0, width: 200.0, height: 100.0 };
+
+        assert_eq!(
+            tree.update(cx, |tree, cx| {
+                tree.move_focused_workspace_in_direction(
+                    crate::layout::FocusDirection::Left,
+                    viewport,
+                    cx,
+                )
+            }),
+            Ok(true)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), before_move + 1);
+        tree.read_with(cx, |tree, _| {
+            assert_eq!(tree.focused_workspace_id(), ws_b);
+            assert_eq!(tree.workspace_ids_in_order(), vec![ws_b, ws_a]);
+        });
+
+        assert_eq!(
+            tree.update(cx, |tree, cx| {
+                tree.move_focused_workspace_in_direction(
+                    crate::layout::FocusDirection::Left,
+                    viewport,
+                    cx,
+                )
+            }),
+            Ok(false)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), before_move + 1);
+    }
+
     #[gpui::test]
     fn set_workspace_ratio_clamps_and_reports(cx: &mut TestAppContext) {
         let ws_a = WorkspaceId::new();

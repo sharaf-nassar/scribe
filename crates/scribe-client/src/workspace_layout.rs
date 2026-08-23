@@ -266,16 +266,12 @@ impl WindowLayout {
         direction: FocusDirection,
         viewport: Rect,
     ) -> Option<WorkspaceId> {
-        let rects = self.compute_workspace_rects(viewport);
-        let current_rect =
-            rects.iter().find(|(id, _)| *id == self.focused_workspace).map(|(_, r)| *r)?;
-        best_workspace_candidate_in_direction(
-            current_rect,
-            self.focused_workspace,
-            direction,
-            &rects,
-        )
-        .or_else(|| {
+        self.find_workspace_in_direction_no_wrap(direction, viewport).or_else(|| {
+            let rects = self.compute_workspace_rects(viewport);
+            let current_rect = rects
+                .iter()
+                .find(|(id, _)| *id == self.focused_workspace)
+                .map(|(_, rect)| *rect)?;
             wrapped_workspace_candidate_in_direction(
                 current_rect,
                 self.focused_workspace,
@@ -284,6 +280,48 @@ impl WindowLayout {
                 &rects,
             )
         })
+    }
+
+    /// Find the nearest workspace in `direction` without wrapping at an edge.
+    ///
+    /// Palette workspace moves use this version so an edge command remains a
+    /// no-op instead of moving the focused region across the window.
+    pub fn find_workspace_in_direction_no_wrap(
+        &self,
+        direction: FocusDirection,
+        viewport: Rect,
+    ) -> Option<WorkspaceId> {
+        let rects = self.compute_workspace_rects(viewport);
+        let current_rect =
+            rects.iter().find(|(id, _)| *id == self.focused_workspace).map(|(_, rect)| *rect)?;
+        best_workspace_candidate_in_direction(
+            current_rect,
+            self.focused_workspace,
+            direction,
+            &rects,
+        )
+    }
+
+    /// Move the focused workspace to the far edge of its nearest neighbour.
+    ///
+    /// This uses the same extract/insert path as a directional workspace-pill
+    /// drop. With no non-wrapping neighbour, it leaves the tree untouched.
+    pub fn move_focused_workspace_in_direction(
+        &mut self,
+        direction: FocusDirection,
+        viewport: Rect,
+    ) -> Result<bool, WorkspaceTreeError> {
+        let source_workspace_id = self.focused_workspace;
+        let Some(target_workspace_id) =
+            self.find_workspace_in_direction_no_wrap(direction, viewport)
+        else {
+            return Ok(false);
+        };
+        self.rearrange_workspace(
+            source_workspace_id,
+            target_workspace_id,
+            workspace_drop_zone_for_direction(direction),
+        )
     }
 
     /// Compute the pixel rect for each workspace leaf, given the full viewport.
@@ -464,6 +502,25 @@ fn workspace_tree_edge(zone: WorkspaceDropZone) -> Option<WorkspaceTreeEdge> {
         WorkspaceDropZone::Top => Some(WorkspaceTreeEdge::Top),
         WorkspaceDropZone::Bottom => Some(WorkspaceTreeEdge::Bottom),
         WorkspaceDropZone::Center => None,
+    }
+}
+
+fn workspace_drop_zone_for_direction(direction: FocusDirection) -> WorkspaceDropZone {
+    match direction {
+        FocusDirection::Left => WorkspaceDropZone::Left,
+        FocusDirection::Right => WorkspaceDropZone::Right,
+        FocusDirection::Up => WorkspaceDropZone::Top,
+        FocusDirection::Down => WorkspaceDropZone::Bottom,
+    }
+}
+
+/// Feedback for a directional workspace-move command at a window edge.
+pub const fn workspace_move_no_neighbor_message(direction: FocusDirection) -> &'static str {
+    match direction {
+        FocusDirection::Left => "No workspace to the left",
+        FocusDirection::Right => "No workspace to the right",
+        FocusDirection::Up => "No workspace above",
+        FocusDirection::Down => "No workspace below",
     }
 }
 
@@ -1673,6 +1730,60 @@ mod tests {
         for (_, region) in layout.compute_workspace_rects(viewport) {
             assert!((region.width - 100.0).abs() < 1.0, "structural move re-equalizes");
         }
+    }
+
+    #[test]
+    fn directional_move_uses_focused_workspace_and_inserts_at_far_edge() {
+        let ws_a = WorkspaceId::new();
+        let mut layout = WindowLayout::new(ws_a, None);
+        let ws_b =
+            layout.split_workspace(SplitDirection::Horizontal, None).expect("second workspace");
+        let viewport = Rect { x: 0.0, y: 0.0, width: 200.0, height: 100.0 };
+
+        layout.set_focused_workspace(ws_b);
+        assert_eq!(
+            layout.move_focused_workspace_in_direction(FocusDirection::Left, viewport),
+            Ok(true)
+        );
+        assert_eq!(layout.workspace_ids_in_order(), vec![ws_b, ws_a]);
+        assert_eq!(layout.focused_workspace_id(), ws_b);
+    }
+
+    #[test]
+    fn directional_move_does_not_wrap_and_reports_no_neighbor_feedback() {
+        let (mut layout, ws_a, _, ws_c, viewport) = three_workspace_row();
+        layout.set_focused_workspace(ws_a);
+        let before = layout.to_tree(&empty_pane_map());
+
+        assert_eq!(layout.find_workspace_in_direction(FocusDirection::Left, viewport), Some(ws_c));
+        assert_eq!(
+            layout.find_workspace_in_direction_no_wrap(FocusDirection::Left, viewport),
+            None
+        );
+        assert_eq!(
+            layout.move_focused_workspace_in_direction(FocusDirection::Left, viewport),
+            Ok(false)
+        );
+        assert_eq!(layout.to_tree(&empty_pane_map()), before);
+        assert_eq!(
+            workspace_move_no_neighbor_message(FocusDirection::Left),
+            "No workspace to the left"
+        );
+    }
+
+    #[test]
+    fn directional_move_matches_equivalent_workspace_drag() {
+        let (mut drag, ws_a, ws_b, _, viewport) = three_workspace_row();
+        let mut palette = WindowLayout::from_tree(&drag.to_tree(&empty_pane_map()));
+        drag.set_focused_workspace(ws_b);
+        palette.set_focused_workspace(ws_b);
+
+        assert_eq!(drag.rearrange_workspace(ws_b, ws_a, WorkspaceDropZone::Left), Ok(true));
+        assert_eq!(
+            palette.move_focused_workspace_in_direction(FocusDirection::Left, viewport),
+            Ok(true)
+        );
+        assert_eq!(palette.to_tree(&empty_pane_map()), drag.to_tree(&empty_pane_map()));
     }
 
     fn three_workspace_row() -> (WindowLayout, WorkspaceId, WorkspaceId, WorkspaceId, Rect) {

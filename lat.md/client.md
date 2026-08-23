@@ -605,6 +605,8 @@ The shell holds no pixel state. Callers pass the grid area's measured pixel rect
 
 Workspace pills now route through [[crates/scribe-client/src/workspace_drag.rs#WorkspaceDrag]], a pure idle → armed → dragging/tear-armed → committing lifecycle. Every frame re-tests the last delivered pointer against live workspace rects and divider hit bands, so ghost and zone previews are level-triggered rather than stale hover caches. Release over an actionable zone calls [[crates/scribe-client/src/pane_shell.rs#PaneShell#rearrange_workspace]] and the existing `ReportWorkspaceTree` path; Escape, blur, disappearance, source/self drops, dividers, chrome, and tear-armed release clear the drag without a tree report.
 
+The command palette adds five client-local workspace actions. Directional actions call [[crates/scribe-client/src/pane_shell.rs#PaneShell#move_focused_workspace_in_direction]], which uses the same extract/insert operation as its matching drag edge but does not wrap at a window edge; a no-neighbor action leaves the tree unchanged and logs feedback. The new-window action enters the same correlated transfer coordinator as a tear-out, with the focused workspace and source size but no cursor placement. They are palette-only: no `KeybindingsConfig` or settings surface is added.
+
  closes a pane, or the whole region when it was the region's last one and other regions remain; when the window is down to a single pane in a single region it answers  `LastPane` and the caller closes the tab instead.  is the shared removal path, so an exited session's pane collapses the same way a deliberate close does.
 
 ### Pane Session Reconciliation

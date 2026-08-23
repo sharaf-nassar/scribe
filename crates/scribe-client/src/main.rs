@@ -142,7 +142,9 @@ use scribe_client::workspace_drag::{
     DragPoint, EmptyWorkspaceDragGhost, WorkspaceDrag, WorkspaceDragCancel, WorkspaceDragMarker,
     WorkspaceDragUpdate, tear_candidate_at, zone_preview_rect,
 };
-use scribe_client::workspace_layout::{self, WorkspaceDividerDrag};
+use scribe_client::workspace_layout::{
+    self, WorkspaceDividerDrag, workspace_move_no_neighbor_message,
+};
 use scribe_client::workspace_transfer::{
     TransferWindowSpec, TransferredWindow, WorkspaceTransferConnection, WorkspaceTransferFeedback,
     WorkspaceTransferOutcome, WorkspaceTransferRequest, WorkspaceTransferResultDisposition,
@@ -3586,7 +3588,58 @@ impl TerminalView {
                 self.execute_automation_action(automation, ActionOrigin::Local, None, cx);
             }
             PaletteAction::OpenRemoteConnect => self.open_remote_connect(cx),
+            PaletteAction::MoveWorkspaceToNewWindow => self.move_workspace_to_new_window(cx),
+            PaletteAction::MoveWorkspaceLeft => {
+                self.move_focused_workspace_in_direction(FocusDirection::Left, cx);
+            }
+            PaletteAction::MoveWorkspaceRight => {
+                self.move_focused_workspace_in_direction(FocusDirection::Right, cx);
+            }
+            PaletteAction::MoveWorkspaceUp => {
+                self.move_focused_workspace_in_direction(FocusDirection::Up, cx);
+            }
+            PaletteAction::MoveWorkspaceDown => {
+                self.move_focused_workspace_in_direction(FocusDirection::Down, cx);
+            }
         }
+    }
+
+    /// Move the workspace holding focus through the same edge operation as a drag.
+    fn move_focused_workspace_in_direction(
+        &mut self,
+        direction: FocusDirection,
+        cx: &mut Context<Self>,
+    ) {
+        match self.shell.move_focused_workspace_in_direction(direction, self.pane_viewport(), cx) {
+            Ok(true) => {
+                self.focus_pane_session(cx);
+                self.after_layout_change(cx);
+            }
+            Ok(false) => set_status(
+                &self.shared.status,
+                &self.shared.generation,
+                workspace_move_no_neighbor_message(direction).to_owned(),
+            ),
+            Err(error) => tracing::warn!(%error, ?direction, "workspace palette move refused"),
+        }
+    }
+
+    /// Start a correlated tear-out for the workspace holding focus.
+    fn move_workspace_to_new_window(&mut self, cx: &mut Context<Self>) {
+        let Some(geometry) = self.restore.geometry.as_ref() else {
+            set_status(
+                &self.shared.status,
+                &self.shared.generation,
+                "Workspace move is unavailable until window geometry is ready".to_owned(),
+            );
+            return;
+        };
+        let spec = TransferWindowSpec {
+            width: f32::from(u16::try_from(geometry.width).unwrap_or(u16::MAX)),
+            height: f32::from(u16::try_from(geometry.height).unwrap_or(u16::MAX)),
+            origin: None,
+        };
+        self.begin_workspace_transfer(self.shell.focused_workspace_id(cx), spec, cx);
     }
 
     /// Raise the client-local remote picker before requesting fresh peer lists.
@@ -7522,7 +7575,9 @@ impl TerminalView {
         let commit = self.workspace_drag.release();
 
         if let Some((workspace_id, tear_point, tear_bounds)) = tear {
-            self.begin_workspace_transfer(workspace_id, tear_point, tear_bounds, cx);
+            let spec =
+                transfer_window_spec(tear_bounds, tear_point, cursor_anchored_transfer_placement());
+            self.begin_workspace_transfer(workspace_id, spec, cx);
         } else if let Some(commit) = commit {
             match self.shell.rearrange_workspace(
                 commit.source_workspace_id,
@@ -7550,8 +7605,7 @@ impl TerminalView {
     fn begin_workspace_transfer(
         &mut self,
         workspace_id: WorkspaceId,
-        pointer: DragPoint,
-        source_bounds: Bounds<Pixels>,
+        spec: TransferWindowSpec,
         cx: &mut Context<Self>,
     ) {
         let target_window_id = WindowId::new();
@@ -7560,8 +7614,6 @@ impl TerminalView {
             workspace: workspace_id,
             target_window: target_window_id,
         };
-        let spec =
-            transfer_window_spec(source_bounds, pointer, cursor_anchored_transfer_placement());
         let Ok(mut transfers) = self.shared.workspace_transfers.lock() else {
             tracing::warn!("workspace transfer state mutex poisoned");
             return;
