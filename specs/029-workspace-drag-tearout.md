@@ -119,6 +119,46 @@ drop targeting (Zed-style zones) + drag-to-edge-to-detach (VS Code-style
 outcome)**, with palette commands as the accessible path, and *without*
 promising cursor-following windows the Linux stack cannot deliver.
 
+## Platform Input Spike Evidence (2026-08-23)
+
+A throwaway two-window example at
+`crates/scribe-client/examples/drag_delivery_probe.rs` was built against the
+workspace's pinned GPUI revision (`f96212f2c50f54d93712fa130d6226b1ce7d76b5`)
+and removed before commit. It logged `on_drag_move`, mouse exit/up/up-out,
+Escape, and `observe_window_activation`; Escape and blur logged GPUI's active
+drag state before calling `stop_active_drag`. Pointer input was scripted with
+`xdotool`.
+
+Linux coverage used X11 under Xvfb and the real GPUI Wayland backend under
+nested GNOME Shell/Mutter 46.2 on `Linux 7.0.0-29-generic x86_64`. A human-
+approved one-off GitHub Actions run supplied AppKit coverage on macOS 14.8.7
+ARM64 with rustc 1.95.0 and Xcode 15.4.
+
+| Backend actually run | Edge / outside delivery | Re-entry and release | Escape / blur | 8 px arm / 24 px disarm |
+|----------------------|-------------------------|----------------------|---------------|--------------------------|
+| X11, Xvfb `:98` | At a 420 px-wide root, the probe received `drag_move x=412` (8 px inside), then `mouse_exit x=452`, followed by out-of-bounds `drag_move x=452` and `x=500`. This confirms motion continues after X11 surface exit while the button grab is active. | Moving back produced `drag_move x=412`, then `x=395` (25 px inside); release inside produced `mouse_up ... active_drag_before=true`. A separate outside release produced `mouse_up_out x=452 ... active_drag_before=true`. | Escape arrived with `active_drag_before=true` and `stop_active_drag=true`; the next move had no drag event. Focusing the second window reported `activation active=false active_drag_before=true stopped=true`. GPUI does not auto-cancel either path before the application hook runs. | Keep 8/24. Both threshold-side coordinates were delivered; no delivery-driven tuning was indicated. |
+| Wayland, nested Mutter 46.2 on Xvfb `:97` | At the same 420 px root, the probe received `drag_move x=8`, then out-of-bounds `x=-30` and `x=-50`. Mutter retained the Wayland implicit pointer grab while pressed, so crossing the application boundary did **not** first emit a surface-leave event; origin-window motion continued with negative surface coordinates. | Moving back produced `drag_move x=8`, then `x=25` (25 px inside). Release outside produced `mouse_up_out x=-30 ... active_drag_before=true`; release after re-entry produced an in-bounds `mouse_up`. | Escape and second-window activation matched X11. Alt-Tab blur first emitted `mouse_exit ... pressed=Some(Left)`, then `activation active=false active_drag_before=true stopped=true`. | Keep 8/24 on tested Mutter. The universal inner band remains useful even though this compositor also supplied out-of-bounds coordinates. |
+| macOS, GitHub Actions run [`32667985883`](https://github.com/sharaf-nassar/scribe/actions/runs/32667985883) | At the 420 px content root, AppKit delivered `drag_move x=412` (8 px inside), then out-of-bounds `x=452` and `x=500`, all with `active_drag=true`. | Moving back delivered `x=412`, then `x=395` (25 px inside); release inside logged `mouse_up x=395 ... active_drag_before=true`. A separate outside release logged `mouse_up_out x=452 ... active_drag_before=true`. | Escape logged `key_down key=escape active_drag_before=true stopped=true`; activating Finder logged `activation active=false active_drag_before=true stopped=true`. Subsequent moves/releases had no active drag. | Keep 8/24. AppKit delivered both threshold-side positions and outside coordinates. |
+
+The successful macOS artifact `gpui-drag-delivery-macos-32667985883`
+contained `runner.txt`, `display.txt`, `automation.log`, and `probe.log`.
+`automation.log` records CoreGraphics event access, source frame
+`{{80, 120}, {420, 328}}` (420x300 GPUI content plus titlebar), and completion;
+the raw event observations are summarized in the table.
+
+Commands used were `cargo build -p scribe-client --example
+drag_delivery_probe`, an X11 run with `DISPLAY=:98 XDG_SESSION_TYPE=x11`, and a
+Wayland run with `WAYLAND_DISPLAY=wayland-probe DISPLAY=` against
+`gnome-shell --nested --wayland --no-x11`. The raw transient logs were
+`target/drag-probe-x11.log` and `target/drag-probe-wayland.log`; only the
+review-relevant event evidence above is retained.
+
+Resulting constraint: use out-of-bounds coordinates whenever delivered, but do
+not require them. Keep the 8 px inner arm band and >24 px disarm threshold as
+the backend-independent path. Treat Escape and window deactivation as explicit
+application cancellation hooks that call `stop_active_drag`; GPUI still had an
+active drag when both hooks ran on the tested backends.
+
 ## User Stories
 
 ### US1 — Rearrange workspaces within a window
@@ -176,11 +216,10 @@ another monitor).
 Acceptance criteria:
 - Arming rule (hybrid, one gesture everywhere): the drag arms tear-out when
   the cursor is within the window-edge band or beyond the window bounds
-  (out-of-bounds coordinates are used where the backend delivers them —
-  X11/macOS; the inner edge band covers Wayland, where GPUI stops
-  delivering motion after surface leave). Exact band width is fixed by the
-  platform spike; arming/disarming carries hysteresis so edge hover does
-  not flicker.
+  (out-of-bounds coordinates are used wherever the backend/compositor
+  delivers them; the inner edge band is the universal fallback). The spike
+  retained an 8 px arm / >24 px disarm threshold; arming/disarming carries
+  hysteresis so edge hover does not flicker.
 - Arming is visually explicit: in-window drop previews clear and the ghost
   switches to a "will detach" treatment. Dragging back inside disarms and
   resumes in-window drop targeting — one continuous gesture.
@@ -257,16 +296,18 @@ Acceptance criteria:
 - **C1 — GPUI pinned rev, per-window drag.** All drag machinery lives in
   Scribe using GPUI's per-window drag (`on_drag`/`on_drag_move` with a
   dedicated marker type). No upstream GPUI patches. GPUI paints drag ghosts
-  only inside the origin window; the Wayland backend stops delivering
-  motion after surface leave — the hybrid arming rule (US2) exists because
-  of this. A platform spike (P0 prerequisite) verifies drag-move delivery
-  at/beyond edges, re-entry, release, Escape, and blur on all three
-  backends before gesture code lands.
+  only inside the origin window. Delivery outside the surface is treated as
+  optional: tested X11 delivered motion after `MouseExitEvent`, while tested
+  Mutter Wayland retained its implicit grab and delivered negative surface
+  coordinates without first leaving. The hybrid edge-band rule (US2) must
+  not depend on either behavior. The P0 spike covers X11, nested-Mutter
+  Wayland, and AppKit on macOS 14.8.7.
 - **C2 — Platforms: Linux Wayland, Linux X11, macOS.** Feature must work on
   all three; behavior may degrade only in window *placement* (Wayland) and
   out-of-bounds event fidelity (covered by the edge band). E2E visual
-  tests run under Xvfb (X11); Wayland/macOS evidence comes from the spike
-  plus scripted manual verification named in the plan.
+  tests run under Xvfb (X11). The spike records X11, nested-Mutter Wayland,
+  and AppKit evidence; post-implementation scripted manual verification is
+  still named in the plan.
 - **C3 — Wayland fallback placement.** No global cursor, no client-side
   window positioning, no self-activation. The new window's position (and
   whether it takes focus) is compositor-controlled; UX copy must not
@@ -422,9 +463,10 @@ decisions, and non-blocking observations.
 - **Beads icon stays its own control**: the drag grab area is the pill
   minus the nested Beads button; Beads click/hover/keyboard behavior is a
   regression criterion.
-- **OQ1 spike is a P0 prerequisite bead**: two-window native probe on
-  Wayland, X11, macOS verifying drag-move delivery at/beyond edges,
-  re-entry, release, Escape, and blur, before gesture code lands.
+- **OQ1 spike is a P0 prerequisite bead**: the two-window native probe
+  verified drag-move delivery at/beyond edges, re-entry, release, Escape,
+  and blur on X11, nested-Mutter Wayland, and macOS AppKit. All three kept
+  the 8/24 px thresholds.
 - **Cross-window merge stays a non-goal (OQ4 closed)**: no existing-window
   destinations in v1 by pointer or palette; recorded in a phase-2 epic
   alongside tab-between-workspace drag and drag re-attach.
@@ -468,9 +510,10 @@ A: Neutral fallback pill for every region in multi-region windows; named
 pills unchanged. Reflected in Goals and US1.
 
 **Q4: How is tear-out armed during a drag?**
-A: Hybrid — at/past the window edge: out-of-bounds coordinates where the
-backend delivers them (X11/macOS), inner edge band everywhere (covers
-Wayland). Reflected in US2 and C1.
+A: Hybrid — at/past the window edge: out-of-bounds coordinates wherever the
+backend/compositor delivers them, inner edge band everywhere. The spike saw
+out-of-bounds coordinates on both tested X11 and Mutter Wayland backends;
+the edge band remains the portable contract. Reflected in US2 and C1.
 
 **Q5: How does v1 treat tear-out on shared or remotely-controlled windows?**
 A: Allow it; the share stays keyed to the source window and viewers lose
@@ -657,8 +700,9 @@ Alternatives considered and rejected:
   transitions require 4 px of travel past the boundary (hysteresis).
   Tear-out arming: armed when the cursor is ≤ 8 px from any window edge
   or beyond bounds; disarmed only when it retreats > 24 px inside
-  (16 px hysteresis band). The spike may tune the 8/24 px constants;
-  defaults are normative until it does.
+  (16 px hysteresis band). X11, nested-Mutter Wayland, and macOS AppKit all
+  delivered both threshold-side positions without loss, so the spike retained
+  8/24 px as the normative values.
 - **Identity invariants**: `WorkspaceId`, `SessionId`s stable;
   `WindowId` fresh on tear-out; `transfer_id` never reused; ledger
   entries expire only by capacity, never by time.
@@ -747,11 +791,12 @@ Alternatives considered and rejected:
 - **Palette-only run** (P3 keyboard path): every outcome — four
   directional moves incl. no-neighbor no-op, and move-to-new-window —
   driven without pointer input.
-- **Wayland/macOS evidence (P3, C2)**: the platform spike's probe binary
-  *plus* a post-implementation scripted manual checklist covering the
-  completed US1/US2 outcomes (drag, zones, arm at edge, release, tear-out
-  window contents, Escape, blur) recorded in the closure bead; no CI
-  automation exists for these backends.
+- **Wayland/macOS evidence (P3, C2)**: the platform spike supplies
+  nested-Mutter Wayland and macOS AppKit event-delivery evidence. Both
+  platforms retain a post-implementation scripted manual checklist covering
+  the completed US1/US2 outcomes (drag, zones, arm at edge, release, tear-out
+  window contents, Escape, blur) recorded in the closure bead; no permanent
+  CI automation exists for these backends.
 - **Performance (P4, named harness)**: `SCRIBE_DRAG_PROBE=1` enables
   tracing spans from pointer-event ingestion to overlay paint; the
   scripted drag in `tests/e2e/visual/` extracts the distribution from the
@@ -818,7 +863,8 @@ expressed as blocking edges (no step codes).
   probe binary opening two GPUI windows; verify drag-move delivery
   at/past edges, re-entry, release, Escape, blur on Wayland, X11, macOS;
   record findings + confirmed 8/24 px arming constants in the spec and
-  `lat.md/client.md`.
+  `lat.md/client.md`. 2026-08-23 result: X11, nested-Mutter Wayland, and
+  macOS AppKit passed with 8/24 retained; the prerequisite is complete.
 - **Shared tree operations in scribe-common** (P0; blocks: server
   transaction, drag core, palette) — `extract_workspace`,
   `insert_workspace_at_edge`, `swap_workspaces` on `WorkspaceTreeNode`,

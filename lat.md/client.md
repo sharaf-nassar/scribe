@@ -16,6 +16,39 @@ The follow-on image-protocol decision is recorded in `specs/016-gpui-client-rebu
 The cutover crate (`crates/scribe-client`) renders a live Scribe pane over the
 frozen IPC protocol and builds against pinned gpui/alacritty revisions.
 
+### Workspace Drag Edge Delivery Spike
+
+The 2026-08-23 throwaway two-window probe tested edge drag delivery against
+pinned GPUI and was removed before commit; no probe code ships in
+`scribe-client`.
+
+Full evidence is recorded in
+`specs/029-workspace-drag-tearout.md#platform-input-spike-evidence-2026-08-23`.
+The probe built against GPUI `f96212f2c50f54d93712fa130d6226b1ce7d76b5`.
+
+On X11/Xvfb, an active GPUI drag received the 8 px inner-edge coordinate,
+then `MouseExitEvent`, further out-of-bounds moves, re-entry, and release both
+inside and outside. On the GPUI Wayland backend under nested GNOME
+Shell/Mutter 46.2, the compositor retained its implicit pointer grab: the
+origin window received 8 px inner-edge, negative out-of-bounds, re-entry, and
+outside-release coordinates without first receiving surface leave. This is
+compositor evidence, not a promise that every Wayland compositor supplies
+out-of-bounds coordinates, so workspace tear-out keeps its universal inner
+edge band.
+
+On macOS 14.8.7 AppKit, GitHub Actions run
+[`32667985883`](https://github.com/sharaf-nassar/scribe/actions/runs/32667985883)
+matched X11: a 420 px content root delivered x=412, out-of-bounds x=452 and
+x=500, re-entry x=412, 25 px-inside x=395, and an outside mouse-up at x=452.
+The artifact `gpui-drag-delivery-macos-32667985883` records an ARM64 runner,
+rustc 1.95.0, Xcode 15.4, CoreGraphics event access, and raw probe logs.
+
+On all three tested backends Escape and window deactivation arrived while GPUI
+still reported an active drag; the probe's handler successfully called
+`stop_active_drag`. Drag lifecycle code must therefore cancel explicitly from
+both hooks rather than waiting for GPUI to clear the drag. The delivery data
+kept the spec's 8 px arm and >24 px disarm thresholds unchanged.
+
 ### gpui-component adoption
 
 Scribe retains bespoke chrome and revisits `gpui-component` only for isolated
