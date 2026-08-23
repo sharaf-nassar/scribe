@@ -1479,8 +1479,9 @@ negative and the board root clips its owning region, so A2 gains no horizontal
 scroll axis or cross-region paint.
 [[crates/scribe-client/src/beads_board_a2.rs#compact_relative_age]] turns
 `BeadsBoardItem.updated_at` into the row's compact age without a date
-library, parsing `bd`'s UTC timestamp through a from-scratch civil-calendar
-day count rather than trusting a malformed value into a panic.
+library, parsing `bd`'s RFC3339/ISO-8601 `Z` or signed-numeric-offset
+timestamp through a from-scratch civil-calendar day count rather than trusting
+a malformed value into a panic.
 [[crates/scribe-client/src/beads_board_a2.rs#queue_at]] answers the drag's own
 question from those same widths -- which queue a board-relative point is over
 -- so hit-testing and painting can never disagree about where a track is.

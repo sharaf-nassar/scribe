@@ -716,14 +716,30 @@ pub fn compact_relative_age(updated_at: &str, now_epoch_s: i64) -> Option<String
     })
 }
 
-/// Parse a `bd`-shaped UTC timestamp (`YYYY-MM-DDTHH:MM:SS(.fff)?Z`, the only
-/// shape the server ever emits) into Unix epoch seconds.
-///
-/// ponytail: only a trailing literal `Z` is accepted; ceiling is that a
-/// numeric-offset timestamp (`+02:00`) never parses. Upgrade path: parse and
-/// apply a numeric offset if `bd` ever emits one.
+/// Parse a `bd`-shaped RFC3339/ISO-8601 timestamp
+/// (`YYYY-MM-DDTHH:MM:SS(.fff)?Z` or a terminal signed `HH:MM` offset) into
+/// Unix epoch seconds.
 fn parse_iso8601_utc(s: &str) -> Option<i64> {
-    let s = s.strip_suffix('Z')?;
+    let (s, utc_offset_s) = if let Some(s) = s.strip_suffix('Z') {
+        (s, 0)
+    } else {
+        let offset_start = s.rfind(['+', '-'])?;
+        let (s, offset) = s.split_at(offset_start);
+        let (sign, offset) = match offset.strip_prefix('+') {
+            Some(offset) => (1, offset),
+            None => (-1, offset.strip_prefix('-')?),
+        };
+        let (hour, minute) = offset.split_once(':')?;
+        if hour.len() != 2 || minute.len() != 2 {
+            return None;
+        }
+        let hour: i64 = hour.parse().ok()?;
+        let minute: i64 = minute.parse().ok()?;
+        if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+            return None;
+        }
+        (s, sign * (hour * 3600 + minute * 60))
+    };
     let (date, time) = s.split_once('T')?;
     let mut date_parts = date.splitn(3, '-');
     let year: i64 = date_parts.next()?.parse().ok()?;
@@ -743,7 +759,10 @@ fn parse_iso8601_utc(s: &str) -> Option<i64> {
         return None;
     }
 
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+    Some(
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
+            - utc_offset_s,
+    )
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian civil (Y-M-D) date.
@@ -1263,10 +1282,23 @@ mod tests {
     }
 
     #[test]
+    fn compact_relative_age_normalizes_numeric_utc_offsets() {
+        // now = 2027-01-15T12:00:00Z
+        let now = days_from_civil(2027, 1, 15) * 86_400 + 12 * 3600;
+        assert_eq!(compact_relative_age("2027-01-15T12:00:00+02:00", now).as_deref(), Some("2h"));
+        assert_eq!(compact_relative_age("2027-01-15T10:00:00-02:00", now).as_deref(), Some("0m"));
+        assert_eq!(
+            compact_relative_age("2027-01-15T11:30:00.999+00:30", now).as_deref(),
+            Some("1h")
+        );
+    }
+
+    #[test]
     fn compact_relative_age_rejects_malformed_or_empty_timestamps() {
         assert_eq!(compact_relative_age("", 0), None);
         assert_eq!(compact_relative_age("not-an-iso-timestamp", 0), None);
-        assert_eq!(compact_relative_age("2027-01-15T12:00:00+02:00", 0), None);
+        assert_eq!(compact_relative_age("2027-01-15T12:00:00+24:00", 0), None);
+        assert_eq!(compact_relative_age("2027-01-15T12:00:00+02:60", 0), None);
     }
 
     // ---- manifest consistency: consume the generated contract -------------
