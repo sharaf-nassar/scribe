@@ -138,6 +138,10 @@ use scribe_client::window_state::{
     clamp_geometry_to_layout, geometry_from_bounds, geometry_size_is_sane, logical_px_to_i32,
     normalize_legacy_geometry, window_bounds_for,
 };
+use scribe_client::workspace_drag::{
+    DragPoint, EmptyWorkspaceDragGhost, WorkspaceDrag, WorkspaceDragCancel, WorkspaceDragMarker,
+    WorkspaceDragUpdate, zone_preview_rect,
+};
 use scribe_client::workspace_layout::{self, WorkspaceDividerDrag};
 use scribe_client::x11_focus::{X11FocusGuard, should_reconcile_window_activation};
 use scribe_client::zoom::ZoomState;
@@ -150,7 +154,8 @@ use scribe_client::{
     tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
         StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent,
-        TitlebarView, agent_active_glyph, beads_graph_icon, title_columns,
+        TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph, beads_graph_icon,
+        title_columns,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -1805,6 +1810,8 @@ struct TerminalView {
     /// rebuilt by [`Self::sync_tabs`] and painted into the grid band at each
     /// region's top strip.
     region_chrome: RegionChrome,
+    /// Client-local workspace pill drag lifecycle and actionable preview.
+    workspace_drag: WorkspaceDrag,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
     terminal_colors: GridPalette,
@@ -2425,8 +2432,7 @@ impl TerminalView {
         shared.process_shutdown.register_view();
         let (bounds_observer, (x11_focus, x11_focus_task)) =
             (Self::start_geometry_tracking(window, cx), Self::start_x11_focus_guard(window, cx));
-        let activation_observer = cx
-            .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
+        let activation_observer = cx.observe_window_activation(window, TerminalView::on_activation);
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         Self::register_close_veto(window, cx);
         // Start config watching before constructing surfaces that consume it.
@@ -2485,6 +2491,7 @@ impl TerminalView {
             rendered_tabs: TabSessions::new(),
             titlebar_slots: Vec::new(),
             region_chrome: RegionChrome::default(),
+            workspace_drag: WorkspaceDrag::default(),
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -2780,6 +2787,20 @@ impl TerminalView {
             }
             TitlebarEvent::FocusWorkspace(workspace_id) => {
                 this.focus_workspace_region(*workspace_id, ctx);
+            }
+            TitlebarEvent::ArmWorkspaceDrag(source) => {
+                let workspace_id = match source {
+                    TitlebarWorkspaceDragSource::TabIndex(index) => {
+                        this.titlebar_slot(*index).map(|slot| slot.workspace_id)
+                    }
+                    TitlebarWorkspaceDragSource::Workspace(workspace_id) => Some(*workspace_id),
+                };
+                if let Some(workspace_id) = workspace_id {
+                    this.arm_workspace_drag(workspace_id, ctx);
+                }
+            }
+            TitlebarEvent::ReleaseWorkspaceDrag => {
+                this.finish_workspace_drag(ctx);
             }
             TitlebarEvent::StandaloneBeadsHover { workspace_id, hovered } => {
                 this.hover_beads_board(*workspace_id, *hovered, ctx);
@@ -7266,6 +7287,258 @@ impl TerminalView {
             .collect()
     }
 
+    /// Arm a workspace-pill press without changing focus or selection.
+    fn arm_workspace_drag(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
+        if !self.shell.has_region(workspace_id) {
+            return;
+        }
+        self.workspace_drag.arm(workspace_id);
+        cx.notify();
+    }
+
+    fn workspace_drag_grid_origin(&self) -> DragPoint {
+        self.grid_area
+            .get()
+            .map_or(DragPoint { x: 0.0, y: scribe_client::titlebar::TITLEBAR_HEIGHT }, |bounds| {
+                DragPoint { x: f32::from(bounds.origin.x), y: f32::from(bounds.origin.y) }
+            })
+    }
+
+    fn workspace_drag_layout_point(&self, point: DragPoint) -> DragPoint {
+        let origin = self.workspace_drag_grid_origin();
+        DragPoint { x: point.x - origin.x, y: point.y - origin.y }
+    }
+
+    /// Re-evaluate edge arming and zone selection from live pointer + layout.
+    fn refresh_workspace_drag(&mut self, window: &Window, cx: &App) {
+        let Some(pointer) = self.workspace_drag.pointer() else { return };
+        let viewport = self.pane_viewport();
+        let layout_pointer = self.workspace_drag_layout_point(pointer);
+        let regions = self.shell.workspace_rects(viewport, cx);
+        let dividers = self.shell.workspace_dividers(viewport, cx);
+        let divider_blocked = workspace_layout::hit_test_workspace_divider(
+            &dividers,
+            layout_pointer.x,
+            layout_pointer.y,
+        )
+        .is_some();
+        let bounds = window.bounds();
+        self.workspace_drag.update(WorkspaceDragUpdate {
+            window_pointer: pointer,
+            window_bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            },
+            layout_pointer,
+            regions: &regions,
+            divider_blocked,
+        });
+    }
+
+    fn update_workspace_drag(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace_drag.is_active() {
+            return;
+        }
+        let pointer = DragPoint { x: f32::from(position.x), y: f32::from(position.y) };
+        let viewport = self.pane_viewport();
+        let layout_pointer = self.workspace_drag_layout_point(pointer);
+        let regions = self.shell.workspace_rects(viewport, cx);
+        let dividers = self.shell.workspace_dividers(viewport, cx);
+        let divider_blocked = workspace_layout::hit_test_workspace_divider(
+            &dividers,
+            layout_pointer.x,
+            layout_pointer.y,
+        )
+        .is_some();
+        let bounds = window.bounds();
+        self.workspace_drag.update(WorkspaceDragUpdate {
+            window_pointer: pointer,
+            window_bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            },
+            layout_pointer,
+            regions: &regions,
+            divider_blocked,
+        });
+        cx.notify();
+    }
+
+    /// Commit one actionable release or clear a no-op gesture.
+    fn finish_workspace_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.workspace_drag.is_active() {
+            return false;
+        }
+        let commit = self.workspace_drag.release();
+        if let Some(commit) = commit {
+            match self.shell.rearrange_workspace(
+                commit.source_workspace_id,
+                commit.target.workspace_id,
+                commit.target.zone,
+                cx,
+            ) {
+                Ok(true) => {
+                    // The moved region keeps its own focused pane and active
+                    // tab; only the window-level focus follows the moved pill.
+                    self.focus_pane_session(cx);
+                    self.after_layout_change(cx);
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "workspace drag commit refused"),
+            }
+            self.workspace_drag.complete_commit();
+        }
+        cx.notify();
+        true
+    }
+
+    fn cancel_workspace_drag(
+        &mut self,
+        reason: WorkspaceDragCancel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.workspace_drag.is_active() {
+            return false;
+        }
+        self.workspace_drag.cancel(reason);
+        cx.stop_active_drag(window);
+        cx.notify();
+        true
+    }
+
+    fn workspace_drag_shield(cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("workspace-drag-shield")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .cursor_grabbing()
+            .on_mouse_move(|_, _window, app| app.stop_propagation())
+            .on_drag_move(cx.listener(
+                |view, event: &DragMoveEvent<WorkspaceDragMarker>, win, ctx| {
+                    ctx.stop_propagation();
+                    view.update_workspace_drag(event.event.position, win, ctx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    view.finish_workspace_drag(ctx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    view.finish_workspace_drag(ctx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn workspace_drag_preview(
+        &self,
+        source_workspace_id: WorkspaceId,
+        cx: &App,
+    ) -> Option<gpui::AnyElement> {
+        let preview = self.workspace_drag.preview()?;
+        let region = self.shell.workspace_rect(preview.workspace_id, self.pane_viewport(), cx)?;
+        let zone = zone_preview_rect(region, preview.zone);
+        let origin = self.workspace_drag_grid_origin();
+        let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
+        Some(
+            div()
+                .absolute()
+                .left(px(origin.x + zone.x))
+                .top(px(origin.y + zone.y))
+                .w(px(zone.width))
+                .h(px(zone.height))
+                .bg(gpui::Rgba { a: 0.18, ..accent })
+                .border_2()
+                .border_color(accent)
+                .into_any_element(),
+        )
+    }
+
+    fn workspace_drag_ghost(
+        &self,
+        source_workspace_id: WorkspaceId,
+        window: &Window,
+        cx: &App,
+    ) -> Option<gpui::AnyElement> {
+        let pointer = self.workspace_drag.pointer()?;
+        let bounds = window.bounds();
+        let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let (ghost_width, ghost_height) = (160.0, 28.0);
+        let left = (pointer.x + 12.0).clamp(4.0, (width - ghost_width - 4.0).max(4.0));
+        let top = (pointer.y + 12.0).clamp(4.0, (height - ghost_height - 4.0).max(4.0));
+        let label = self
+            .workspace_name(source_workspace_id)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "workspace".to_owned());
+        let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
+        let tone = accent_tab_tone(accent, colors.bg);
+        let ghost = div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(ghost_width))
+            .h(px(ghost_height))
+            .flex()
+            .items_center()
+            .px_2()
+            .overflow_hidden()
+            .text_xs()
+            .text_color(colors.active_text)
+            .cursor_grabbing()
+            .when(self.workspace_drag.is_tear_armed(), |this| {
+                this.bg(colors.bg).border_2().border_color(accent)
+            })
+            .when(!self.workspace_drag.is_tear_armed(), |this| this.bg(tone))
+            .child(label);
+        Some(gpui::deferred(ghost).with_priority(2).into_any_element())
+    }
+
+    /// Full-window input shield, target preview, and deferred pill ghost.
+    fn render_workspace_drag_layers(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(source_workspace_id) = self.workspace_drag.source_workspace_id() else {
+            return Vec::new();
+        };
+        if !self.shell.has_region(source_workspace_id) {
+            self.workspace_drag.cancel(WorkspaceDragCancel::SourceDisappeared);
+            cx.stop_active_drag(window);
+            return Vec::new();
+        }
+        self.refresh_workspace_drag(window, cx);
+        if !self.workspace_drag.is_engaged() {
+            return Vec::new();
+        }
+        vec![
+            Some(Self::workspace_drag_shield(cx)),
+            self.workspace_drag_preview(source_workspace_id, cx),
+            self.workspace_drag_ghost(source_workspace_id, window, cx),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// One lower region's bar: named or neutral workspace pill, then its tabs,
     /// over a hairline in the region's tab tone — the same shape the titlebar
     /// draws for a top-row region's group.
@@ -7372,14 +7645,30 @@ impl TerminalView {
         if let Some(badge) = bar.badge.as_ref() {
             let label = div()
                 .id(ElementId::from(format!("region-badge-{workspace_id}")))
+                .role(gpui::Role::Button)
+                .aria_label(format!("{} workspace; drag to rearrange", badge.label))
                 .flex()
                 .items_center()
                 .px_2()
                 .h_full()
                 .text_color(colors.active_text)
                 .text_xs()
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                .cursor_grab()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _win, ctx| {
+                        ctx.stop_propagation();
+                        view.arm_workspace_drag(workspace_id, ctx);
+                    }),
+                )
+                .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
+                        ctx.stop_propagation();
+                        view.finish_workspace_drag(ctx);
+                    }),
+                )
                 .on_click(cx.listener(move |view, _, _window, ctx| {
                     if let Some(session_id) = first_session {
                         view.select_session_tab(session_id, ctx);
@@ -9050,8 +9339,11 @@ impl TerminalView {
     /// Compositor overlays never send focus events, so a genuine activation
     /// also means the user really is back: drop the guard's reactivation
     /// debounce rather than eating the keystroke that follows a real refocus.
-    fn on_activation(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn on_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = window.is_window_active();
+        if !active {
+            self.cancel_workspace_drag(WorkspaceDragCancel::WindowBlur, window, cx);
+        }
         self.update_window_activation(active, cx);
         if !active {
             return;
@@ -10859,6 +11151,73 @@ impl TerminalView {
         }
         true
     }
+
+    fn handle_root_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.focus.cursor_blink.show_now() {
+            cx.notify();
+        }
+        if self.compositor_overlay_active(event) {
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape"
+            && self.cancel_workspace_drag(WorkspaceDragCancel::Escape, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_modal_or_editor_key(event, window, cx) {
+            return;
+        }
+        cx.stop_propagation();
+        if self.handle_overlay_key(event, window, cx)
+            || self.focus_next_titlebar_control(event, window, cx)
+            || self.handle_vi_key(event, cx)
+            || self.handle_binding(event, cx)
+        {
+            return;
+        }
+        self.on_key_down(event, cx);
+    }
+
+    fn attach_root_interactions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        root.on_modifiers_changed(
+            cx.listener(|_view, _: &ModifiersChangedEvent, _win, ctx| ctx.notify()),
+        )
+        .on_action(cx.listener(|view, _: &CloseWindow, _window, ctx| {
+            view.request_window_close(ctx);
+        }))
+        .on_drag_move(cx.listener(|view, event: &DragMoveEvent<WorkspaceDragMarker>, win, ctx| {
+            view.update_workspace_drag(event.event.position, win, ctx);
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
+                if view.finish_workspace_drag(ctx) {
+                    ctx.stop_propagation();
+                }
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
+                if view.finish_workspace_drag(ctx) {
+                    ctx.stop_propagation();
+                }
+            }),
+        )
+        .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
+            view.handle_root_key_down(event, win, ctx);
+        }))
+        .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, _window, ctx| {
+            view.handle_dropped_paths(paths.paths(), ctx);
+        }))
+    }
 }
 
 /// Embed a root-synced child view in the grid band, cached only while its
@@ -10932,72 +11291,13 @@ impl Render for TerminalView {
         let share = self.build_share_overlay();
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
+        let workspace_drag_layers = self.render_workspace_drag_layers(window, cx);
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
         // translucent band over a translucent root and coming out more opaque
         // than the configured value.
-        div()
-            .track_focus(&self.focus.root)
-            // Ctrl going down or up changes what the grid shows with no pointer
-            // motion behind it, and an idle pane bumps no generation, so the
-            // redraw pump would never come round to notice. This is the only
-            // thing that rules a link under a stationary pointer.
-            //
-            // It sits on the focus root rather than on the grid band because
-            // gpui dispatches modifier changes down the *focus* path, like key
-            // events — a listener on the hovered-but-unfocusable band is never
-            // reached at all.
-            .on_modifiers_changed(cx.listener(|_view, _: &ModifiersChangedEvent, _win, ctx| {
-                ctx.notify();
-            }))
-            .on_action(cx.listener(
-                |view, _: &CloseWindow, _window, ctx| {
-                    view.request_window_close(ctx);
-                },
-            ))
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
-                if view.focus.cursor_blink.show_now() {
-                    ctx.notify();
-                }
-                // The X11 active-window guard gates everything: while a
-                // compositor overlay owns the screen the keystroke was never
-                // meant for this window, so it reaches no consumer at all.
-                if view.compositor_overlay_active(event) {
-                    ctx.stop_propagation();
-                    return;
-                }
-                if view.handle_modal_or_editor_key(event, win, ctx) {
-                    return;
-                }
-                ctx.stop_propagation();
-                // An active overlay owns every key, including plain Tab. With
-                // no overlay, plain Tab continues the chrome tab-stop order
-                // only while chrome already has focus (the status-bar update
-                // CTA is the one stop that bubbles here — titlebar controls
-                // stop propagation in their own handlers). A focused terminal
-                // keeps Tab for the PTY; modified Tab chords continue to
-                // configured bindings below.
-                if view.handle_overlay_key(event, win, ctx) {
-                    return;
-                }
-                if view.focus_next_titlebar_control(event, win, ctx) {
-                    return;
-                }
-                // Vi mode and configured bindings run before the generic PTY
-                // byte encoder.
-                if view.handle_vi_key(event, ctx) || view.handle_binding(event, ctx) {
-                    return;
-                }
-                view.on_key_down(event, ctx);
-            }))
-            // File drop from the compositor. GPUI lowers an external file drop
-            // onto an ordinary drag whose payload is `ExternalPaths`, so the
-            // drop listener goes on the root — the whole window is a valid drop
-            // target, exactly as it was under winit's `DroppedFile`.
-            .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, _window, ctx| {
-                view.handle_dropped_paths(paths.paths(), ctx);
-            }))
+        Self::attach_root_interactions(div().track_focus(&self.focus.root), cx)
             .relative()
             .size_full()
             .flex()
@@ -11015,6 +11315,7 @@ impl Render for TerminalView {
             .children(share)
             .children(tooltip)
             .children(remote_picker)
+            .children(workspace_drag_layers)
             // Last child, so the frozen banner covers every other overlay: while
             // a remote controller holds this window there is nothing else to
             // interact with.

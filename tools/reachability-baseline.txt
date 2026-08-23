@@ -24,8 +24,8 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 76
-counts modules-wired 76
+counts modules-total 77
+counts modules-wired 77
 counts server-messages-total 73
 counts server-messages-handled 66
 counts layout-actions-total 38
@@ -38,6 +38,7 @@ counts layout-actions-handled 38
 # paint path the way scribe-lpi2.9 wired beads_flow above.
 
 # scribe-07xb.3 adds this protocol result before the client tear-out flow.
+# scribe-07xb.7 wires workspace_drag into the in-window pill gesture.
 unhandled-server-message WorkspaceTransferResult
 unhandled-server-message AgentResponse
 unhandled-server-message EnvPreflightResult

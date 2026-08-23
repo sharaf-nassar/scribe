@@ -21,6 +21,7 @@ use crate::tab_bar::{
     GroupBadge, TabBarColors, TabData, accent_tab_tone, flash_blend, px_units,
     reorder_target_index, tab_display_title,
 };
+use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
 
 /// Height of the titlebar in pixels.
 pub const TITLEBAR_HEIGHT: f32 = 34.0;
@@ -56,6 +57,15 @@ pub enum TabActivationSource {
     Keyboard,
 }
 
+/// Workspace pill identity as seen by the titlebar entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitlebarWorkspaceDragSource {
+    /// A pill attached to the first tab in a titlebar workspace run.
+    TabIndex(usize),
+    /// A standalone pill for a top-row workspace with no tabs.
+    Workspace(WorkspaceId),
+}
+
 /// Events the titlebar emits for the shell to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitlebarEvent {
@@ -73,6 +83,10 @@ pub enum TitlebarEvent {
     ToggleBeadsBoard { index: usize },
     /// A pill without a tab was clicked; focus its empty workspace region.
     FocusWorkspace(WorkspaceId),
+    /// A workspace pill press armed the dedicated workspace drag marker.
+    ArmWorkspaceDrag(TitlebarWorkspaceDragSource),
+    /// The pill-owned release ends or commits the workspace drag.
+    ReleaseWorkspaceDrag,
     /// Pointer entered or left a standalone pill's Beads icon.
     StandaloneBeadsHover { workspace_id: WorkspaceId, hovered: bool },
     /// A standalone pill's Beads icon was clicked.
@@ -906,14 +920,32 @@ impl TitlebarView {
         let tag_bg = accent_tab_tone(badge.accent, self.colors.bg);
         let label = div()
             .id(ElementId::from(format!("workspace-badge-{index}")))
+            .role(Role::Button)
+            .aria_label(format!("{} workspace; drag to rearrange", badge.label))
             .flex()
             .items_center()
             .px_2()
             .h_full()
             .text_color(self.colors.active_text)
             .text_xs()
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+            .cursor_grab()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_this, _: &MouseDownEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    ctx.emit(TitlebarEvent::ArmWorkspaceDrag(
+                        TitlebarWorkspaceDragSource::TabIndex(index),
+                    ));
+                }),
+            )
+            .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_this, _: &MouseUpEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    ctx.emit(TitlebarEvent::ReleaseWorkspaceDrag);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
@@ -968,6 +1000,48 @@ impl TitlebarView {
             .collect()
     }
 
+    fn render_standalone_badge_label(
+        &self,
+        index: usize,
+        standalone: &StandaloneBadge,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspace_id = standalone.workspace_id;
+        div()
+            .id(ElementId::from(format!("standalone-workspace-badge-{index}")))
+            .role(Role::Button)
+            .aria_label(format!("{} workspace; drag to rearrange", standalone.badge.label))
+            .flex()
+            .items_center()
+            .px_2()
+            .h_full()
+            .text_color(self.colors.active_text)
+            .text_xs()
+            .cursor_grab()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_this, _: &MouseDownEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    ctx.emit(TitlebarEvent::ArmWorkspaceDrag(
+                        TitlebarWorkspaceDragSource::Workspace(workspace_id),
+                    ));
+                }),
+            )
+            .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|_this, _: &MouseUpEvent, _win, ctx| {
+                    ctx.stop_propagation();
+                    ctx.emit(TitlebarEvent::ReleaseWorkspaceDrag);
+                }),
+            )
+            .on_click(cx.listener(move |_this, _, _window, ctx| {
+                ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
+            }))
+            .child(standalone.badge.label.clone())
+            .into_any_element()
+    }
+
     fn render_standalone_badge(
         &self,
         index: usize,
@@ -977,20 +1051,7 @@ impl TitlebarView {
     ) -> AnyElement {
         let tag_bg = accent_tab_tone(standalone.badge.accent, self.colors.bg);
         let workspace_id = standalone.workspace_id;
-        let label = div()
-            .id(ElementId::from(format!("standalone-workspace-badge-{index}")))
-            .flex()
-            .items_center()
-            .px_2()
-            .h_full()
-            .text_color(self.colors.active_text)
-            .text_xs()
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
-            .on_click(cx.listener(move |_this, _, _window, ctx| {
-                ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
-            }))
-            .child(standalone.badge.label.clone());
+        let label = self.render_standalone_badge_label(index, standalone, cx);
         let mut pill = div().flex().flex_none().items_center().h_full().bg(tag_bg);
         if standalone.badge.beads {
             let focus = self

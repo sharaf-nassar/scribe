@@ -12,9 +12,10 @@ use std::collections::HashMap;
 
 use gpui::{Context, EventEmitter};
 use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::{PaneTreeNode, WorkspaceTreeNode};
+use scribe_common::protocol::{PaneTreeNode, WorkspaceTreeError, WorkspaceTreeNode};
 
 use crate::layout::{PaneId, Rect, SplitDirection};
+use crate::workspace_drag::WorkspaceDropZone;
 use crate::workspace_layout::{WindowLayout, WorkspaceSlot};
 
 /// Event emitted after every workspace-tree mutation.
@@ -196,6 +197,21 @@ impl WorkspaceTree {
         true
     }
 
+    /// Rearrange one workspace at a target zone, then emit one fresh tree.
+    pub fn rearrange_workspace(
+        &mut self,
+        source_workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        zone: WorkspaceDropZone,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, WorkspaceTreeError> {
+        if !self.layout.rearrange_workspace(source_workspace_id, target_workspace_id, zone)? {
+            return Ok(false);
+        }
+        self.report(cx);
+        Ok(true)
+    }
+
     /// Reset every workspace split ratio so regions share the window evenly,
     /// then report the tree.
     pub fn equalize_ratios(&mut self, cx: &mut Context<Self>) {
@@ -260,6 +276,7 @@ mod tests {
 
     use super::{WorkspaceTree, WorkspaceTreeEvent};
     use crate::layout::SplitDirection;
+    use crate::workspace_drag::WorkspaceDropZone;
 
     type Reports = (Arc<AtomicUsize>, Rc<RefCell<Option<WorkspaceTreeNode>>>);
 
@@ -449,6 +466,31 @@ mod tests {
         });
         // Three restore adds + one restore set_active_tab.
         assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    // @lat: [[test#Test Harness#GPUI Workspace Drag]]
+    #[gpui::test]
+    fn workspace_rearrange_reports_once_and_focuses_the_source(cx: &mut TestAppContext) {
+        let ws_a = WorkspaceId::new();
+        let tree = cx.new(|_| WorkspaceTree::new(ws_a, None));
+        let (count, last) = report_sink(&tree, cx);
+        let ws_b = tree
+            .update(cx, |tree, cx| tree.split_workspace(SplitDirection::Horizontal, None, cx))
+            .expect("second workspace");
+        let before = count.load(Ordering::SeqCst);
+
+        assert_eq!(
+            tree.update(cx, |tree, cx| {
+                tree.rearrange_workspace(ws_a, ws_b, WorkspaceDropZone::Right, cx)
+            }),
+            Ok(true)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), before + 1);
+        tree.read_with(cx, |tree, _| {
+            assert_eq!(tree.focused_workspace_id(), ws_a);
+            assert_eq!(tree.workspace_ids_in_order(), vec![ws_b, ws_a]);
+        });
+        assert!(last.borrow().is_some(), "the rearranged tree is reportable");
     }
 
     // @lat: [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]]

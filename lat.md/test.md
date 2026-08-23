@@ -5397,6 +5397,14 @@ Locks the  hook that decides whether this client claims a window of its own or j
 
 A full UUID (with or without surrounding whitespace) parses to that `WindowId`; empty, blank, non-UUID, and the short `Display` label (`win-1234abcd`) all yield `None`, which leaves explicit join intent false rather than failing the launch. The env read itself is not exercised — the workspace lints ban `set_var` — so the parser is called directly. Server coverage checks that a local connected-window claim assigns a different window without the bit and joins with it, while remote and takeover outcomes remain unchanged. Protocol coverage decodes a `Hello` missing the field as false.
 
+## GPUI Workspace Drag
+
+Pure tests in [[crates/scribe-client/src/workspace_drag.rs]] cover the complete client-local lifecycle and five-zone geometry without constructing a window.
+
+They pin every corner's normalized nearest-edge result with horizontal tie precedence, center resolution, 4px zone hysteresis, the verified 8px arm / strictly-over-24px disarm rule including out-of-bounds delivery, actionable commit selection, Escape/blur/disappearance cancellation, self/divider/tear/non-target no-ops, and a clean next arm.
+
+[[crates/scribe-client/src/workspace_layout.rs#WindowLayout#rearrange_workspace]] tests pin client-side lowering over the shared tree operations: edge extraction/insertion re-equalizes all region ratios; center swap preserves nested ratios and shape; slot metadata, active tab, pane-owned payload, and source focus stay attached. [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#rearrange_workspace]] adds the entity boundary assertion that one successful rearrangement emits one report. Existing titlebar drag-reorder suites remain the regression oracle for tab marker isolation and window-move behavior.
+
 ## GPUI Pane Dividers
 
 Covers pure divider geometry in , live overlay wiring, and drag-resize math. `tests/e2e/visual/pane-workspace-layout.sh` drags the real divider and asserts both grids re-lay.

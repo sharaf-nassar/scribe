@@ -32,13 +32,14 @@ use scribe_client::restore_replay::{
 };
 use scribe_client::restore_state::{LaunchBinding, WindowRestoreState};
 use scribe_client::tab_session::TabSessions;
+use scribe_client::workspace_drag::WorkspaceDropZone;
 use scribe_client::workspace_layout::{
     WindowLayout, WorkspaceDivider, WorkspaceSlot, pane_tree_to_layout_node,
 };
 use scribe_client::workspace_tree::WorkspaceTree;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeNode},
+    protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeError, WorkspaceTreeNode},
 };
 
 /// Accent used when a region's slot cannot be read back out of the layout,
@@ -575,13 +576,15 @@ impl PaneShell {
         viewport: Rect,
         cx: &App,
     ) -> Option<Rect> {
-        self.workspace
-            .read(cx)
-            .layout()
-            .compute_workspace_rects(viewport)
+        self.workspace_rects(viewport, cx)
             .into_iter()
             .find(|(id, _)| *id == workspace_id)
             .map(|(_, rect)| rect)
+    }
+
+    /// Every workspace region's raw bounds in tree order.
+    pub fn workspace_rects(&self, viewport: Rect, cx: &App) -> Vec<(WorkspaceId, Rect)> {
+        self.workspace.read(cx).layout().compute_workspace_rects(viewport)
     }
 
     /// The tab-bar strip each lower region reserves at its top, in region
@@ -946,6 +949,19 @@ impl PaneShell {
     /// Resolve every workspace-region divider against the grid viewport.
     pub fn workspace_dividers(&self, viewport: Rect, cx: &App) -> Vec<WorkspaceDivider> {
         self.workspace.read(cx).layout().collect_workspace_dividers(viewport)
+    }
+
+    /// Apply an in-window workspace drag through the shared tree operations.
+    pub fn rearrange_workspace(
+        &mut self,
+        source_workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        zone: WorkspaceDropZone,
+        cx: &mut App,
+    ) -> Result<bool, WorkspaceTreeError> {
+        self.workspace.update(cx, |tree, ctx| {
+            tree.rearrange_workspace(source_workspace_id, target_workspace_id, zone, ctx)
+        })
     }
 
     /// Set the ratio of the split between two workspace regions.

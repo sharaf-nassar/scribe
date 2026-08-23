@@ -127,6 +127,7 @@ pub mod vi_mode;
 pub mod window_chrome;
 pub mod window_lifecycle;
 pub mod window_state;
+pub mod workspace_drag;
 pub mod workspace_layout;
 pub mod workspace_tree;
 pub mod x11_focus;

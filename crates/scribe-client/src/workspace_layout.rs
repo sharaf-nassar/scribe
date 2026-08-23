@@ -6,14 +6,17 @@
 //! tabbed sessions ([`TabState`]). Each tab owns a [`LayoutTree`] for
 //! sub-pane splits within that session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeNode};
+use scribe_common::protocol::{
+    LayoutDirection, PaneTreeNode, WorkspaceTreeEdge, WorkspaceTreeError, WorkspaceTreeNode,
+};
 
 use crate::layout::{
     FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection, alloc_pane_id,
 };
+use crate::workspace_drag::WorkspaceDropZone;
 
 /// Fallback accent colour for new workspaces when no theme is available.
 const FALLBACK_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
@@ -396,6 +399,127 @@ impl WindowLayout {
         ws.active_tab = index;
         true
     }
+
+    /// Rearrange one workspace through the shared protocol-tree operations.
+    ///
+    /// Edge drops extract and reinsert the source leaf, re-equalizing ratios;
+    /// center drops exchange leaves in place and preserve every ratio. The
+    /// client-owned slots are then lowered back onto the edited topology so tab
+    /// state, pane trees, metadata, and active-tab selection stay attached to
+    /// their workspace IDs.
+    pub fn rearrange_workspace(
+        &mut self,
+        source_workspace_id: WorkspaceId,
+        target_workspace_id: WorkspaceId,
+        zone: WorkspaceDropZone,
+    ) -> Result<bool, WorkspaceTreeError> {
+        if source_workspace_id == target_workspace_id {
+            return Ok(false);
+        }
+        let mut topology = node_topology_to_tree(&self.root);
+        match zone {
+            WorkspaceDropZone::Center => {
+                topology.swap_workspaces(source_workspace_id, target_workspace_id)?;
+            }
+            WorkspaceDropZone::Left
+            | WorkspaceDropZone::Right
+            | WorkspaceDropZone::Top
+            | WorkspaceDropZone::Bottom => {
+                let source = topology.extract_workspace(source_workspace_id)?;
+                let Some(edge) = workspace_tree_edge(zone) else {
+                    return Ok(false);
+                };
+                topology.insert_workspace_at_edge(target_workspace_id, edge, source)?;
+            }
+        }
+        self.replace_topology(&topology);
+        // A successful direct-manipulation move keeps the moved region active;
+        // its per-region focused pane and active tab are preserved separately.
+        self.focused_workspace = source_workspace_id;
+        Ok(true)
+    }
+
+    fn replace_topology(&mut self, topology: &WorkspaceTreeNode) {
+        let current_ids: HashSet<_> = self.workspace_ids_in_order().into_iter().collect();
+        let mut replacement_ids = HashSet::new();
+        collect_workspace_tree_ids(topology, &mut replacement_ids);
+        assert_eq!(
+            current_ids, replacement_ids,
+            "workspace topology replacement must preserve the exact leaf set"
+        );
+
+        let placeholder = empty_workspace_slot(self.focused_workspace);
+        let old_root = std::mem::replace(&mut self.root, WindowNode::Workspace(placeholder));
+        let mut slots = HashMap::new();
+        collect_workspace_slots(old_root, &mut slots);
+        self.root = node_from_topology_with_slots(topology, &mut slots);
+        debug_assert!(slots.is_empty());
+    }
+}
+
+fn workspace_tree_edge(zone: WorkspaceDropZone) -> Option<WorkspaceTreeEdge> {
+    match zone {
+        WorkspaceDropZone::Left => Some(WorkspaceTreeEdge::Left),
+        WorkspaceDropZone::Right => Some(WorkspaceTreeEdge::Right),
+        WorkspaceDropZone::Top => Some(WorkspaceTreeEdge::Top),
+        WorkspaceDropZone::Bottom => Some(WorkspaceTreeEdge::Bottom),
+        WorkspaceDropZone::Center => None,
+    }
+}
+
+fn empty_workspace_slot(workspace_id: WorkspaceId) -> WorkspaceSlot {
+    WorkspaceSlot {
+        workspace_id,
+        tabs: Vec::new(),
+        active_tab: 0,
+        accent_color: FALLBACK_ACCENT,
+        name: None,
+        project_root: None,
+    }
+}
+
+fn collect_workspace_tree_ids(node: &WorkspaceTreeNode, out: &mut HashSet<WorkspaceId>) {
+    match node {
+        WorkspaceTreeNode::Leaf { workspace_id, .. } => {
+            assert!(out.insert(*workspace_id), "workspace topology contains a duplicate leaf");
+        }
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            collect_workspace_tree_ids(first, out);
+            collect_workspace_tree_ids(second, out);
+        }
+    }
+}
+
+fn collect_workspace_slots(node: WindowNode, out: &mut HashMap<WorkspaceId, WorkspaceSlot>) {
+    match node {
+        WindowNode::Workspace(slot) => {
+            let previous = out.insert(slot.workspace_id, slot);
+            debug_assert!(previous.is_none());
+        }
+        WindowNode::Split { first, second, .. } => {
+            collect_workspace_slots(*first, out);
+            collect_workspace_slots(*second, out);
+        }
+    }
+}
+
+fn node_from_topology_with_slots(
+    topology: &WorkspaceTreeNode,
+    slots: &mut HashMap<WorkspaceId, WorkspaceSlot>,
+) -> WindowNode {
+    match topology {
+        WorkspaceTreeNode::Leaf { workspace_id, .. } => {
+            let slot = slots.remove(workspace_id);
+            assert!(slot.is_some(), "validated workspace slot must exist");
+            WindowNode::Workspace(slot.unwrap_or_else(|| empty_workspace_slot(*workspace_id)))
+        }
+        WorkspaceTreeNode::Split { direction, ratio, first, second } => WindowNode::Split {
+            direction: direction_from_protocol(*direction),
+            ratio: *ratio,
+            first: Box::new(node_from_topology_with_slots(first, slots)),
+            second: Box::new(node_from_topology_with_slots(second, slots)),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +833,23 @@ fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
             ratio: ratio.clamp(0.1, 0.9),
             first: Box::new(node_from_tree(first)),
             second: Box::new(node_from_tree(second)),
+        },
+    }
+}
+
+fn node_topology_to_tree(node: &WindowNode) -> WorkspaceTreeNode {
+    match node {
+        WindowNode::Workspace(slot) => WorkspaceTreeNode::Leaf {
+            workspace_id: slot.workspace_id,
+            session_ids: Vec::new(),
+            pane_trees: Vec::new(),
+            active_tab_index: 0,
+        },
+        WindowNode::Split { direction, ratio, first, second } => WorkspaceTreeNode::Split {
+            direction: direction_to_protocol(*direction),
+            ratio: *ratio,
+            first: Box::new(node_topology_to_tree(first)),
+            second: Box::new(node_topology_to_tree(second)),
         },
     }
 }
@@ -1451,6 +1592,87 @@ mod tests {
         let tab = layout.find_workspace(ws_id).and_then(|ws| ws.active_tab()).unwrap();
         let pane_ids = tab.pane_layout.all_pane_ids();
         assert_eq!(pane_ids.len(), 2);
+    }
+
+    // @lat: [[test#Test Harness#GPUI Workspace Drag]]
+    #[test]
+    fn center_rearrange_preserves_ratios_slot_payload_and_source_focus() {
+        let (ws_a, ws_b, ws_c) = (WorkspaceId::new(), WorkspaceId::new(), WorkspaceId::new());
+        let tree = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.7,
+            first: Box::new(WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Vertical,
+                ratio: 0.2,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: ws_a,
+                    session_ids: vec![],
+                    pane_trees: vec![],
+                    active_tab_index: 0,
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: ws_b,
+                    session_ids: vec![],
+                    pane_trees: vec![],
+                    active_tab_index: 0,
+                }),
+            }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_c,
+                session_ids: vec![],
+                pane_trees: vec![],
+                active_tab_index: 0,
+            }),
+        };
+        let mut layout = WindowLayout::from_tree(&tree);
+        let first_session = SessionId::new();
+        let active = SessionId::new();
+        layout.add_tab(ws_a, first_session);
+        layout.add_tab(ws_a, active);
+        assert!(layout.set_active_tab(ws_a, 1));
+        let slot = layout.find_workspace_mut(ws_a).expect("source slot");
+        slot.name = Some("source".to_owned());
+        slot.accent_color = [0.1, 0.2, 0.3, 1.0];
+
+        assert_eq!(layout.rearrange_workspace(ws_a, ws_c, WorkspaceDropZone::Center), Ok(true));
+        assert_eq!(layout.workspace_ids_in_order(), vec![ws_c, ws_b, ws_a]);
+        assert_eq!(layout.focused_workspace_id(), ws_a);
+        let moved = layout.find_workspace(ws_a).expect("moved source slot");
+        assert_eq!(moved.name.as_deref(), Some("source"));
+        assert_eq!(moved.active_tab, 1);
+        assert_eq!(moved.active_tab().map(|tab| tab.session_id), Some(active));
+        for (actual, expected) in moved.accent_color.into_iter().zip([0.1_f32, 0.2, 0.3, 1.0]) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+
+        match layout.to_tree(&empty_pane_map()) {
+            WorkspaceTreeNode::Split { ratio: root_ratio, first: first_node, .. } => {
+                assert!((root_ratio - 0.7).abs() < f32::EPSILON);
+                match *first_node {
+                    WorkspaceTreeNode::Split { ratio: nested_ratio, .. } => {
+                        assert!((nested_ratio - 0.2).abs() < f32::EPSILON);
+                    }
+                    WorkspaceTreeNode::Leaf { .. } => panic!("expected nested split"),
+                }
+            }
+            WorkspaceTreeNode::Leaf { .. } => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn edge_rearrange_equalizes_structural_move_and_self_drop_is_unchanged() {
+        let (mut layout, ws_a, ws_b, ws_c, _) = three_workspace_row();
+        let original = layout.to_tree(&empty_pane_map());
+        assert_eq!(layout.rearrange_workspace(ws_a, ws_a, WorkspaceDropZone::Center), Ok(false));
+        assert_eq!(layout.to_tree(&empty_pane_map()), original);
+
+        assert_eq!(layout.rearrange_workspace(ws_c, ws_a, WorkspaceDropZone::Left), Ok(true));
+        assert_eq!(layout.workspace_ids_in_order(), vec![ws_c, ws_a, ws_b]);
+        assert_eq!(layout.focused_workspace_id(), ws_c);
+        let viewport = Rect { x: 0.0, y: 0.0, width: 300.0, height: 100.0 };
+        for (_, region) in layout.compute_workspace_rects(viewport) {
+            assert!((region.width - 100.0).abs() < 1.0, "structural move re-equalizes");
+        }
     }
 
     fn three_workspace_row() -> (WindowLayout, WorkspaceId, WorkspaceId, WorkspaceId, Rect) {
