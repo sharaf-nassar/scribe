@@ -5061,7 +5061,7 @@ Covers the pure halves of : the query/reply state machine, the viewport projecti
 
 Scribe-1mpq added a fourth pure half: that the row's pointer controls drive the identical state transitions the key table does (see below).
 
-None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights, its highlighted match moving when the next control is clicked, and every highlight dropping when the close control is clicked.
+None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights, its highlighted match moving when the next control is clicked, and every highlight dropping when the close control is clicked. Its scrollback phase writes 64 matching rows, cycles past one viewport of them, requires the shell's `find match scrolled into view` trace to grow twice, and compares the cropped grids, proving an off-viewport current match moves and repaints rather than merely changing hidden overlay state.
 
 The visual fixture disables the terminal cursor with DECTCEM before capturing
 its quiet baseline. That removes only cursor blink from the comparison; the
@@ -5149,6 +5149,12 @@ The overlay's mouse-down stop kept a click from reaching the grid's press handle
 The overlay paints inside the pane's own `grid_slot`, so the leaked release still resolves to a real cell and reaches [[crates/scribe-client/src/main.rs#TerminalView#forward_mouse_release]], which cannot tell a leaked release from one whose press it actually forwarded — a mouse-tracking application (vim, htop, tmux) would see a button go up it was never told went down.
 
 The test wraps the same `grid_slot`-shaped probe [[test#GPUI Client Headless Suites#Find overlay#Pointer controls drive the same transitions as the key table]] uses in an outer container standing in for the workspace's own press/release gate, recording every press and release that reaches it. A click on the box's plain chrome and on each of the three controls reaches neither handler, while a press-move-release gesture that starts and ends clear of the overlay still records both — proving the fix does not swallow a real in-grid drag. The box's own stop covers the whole row, so it alone is enough to pass this assertion; the control-level stop added alongside it (search.rs's `find_control`) only becomes load-bearing if the box's is ever scoped down, which is why the fix keeps both rather than relying on either alone.
+
+#### Cycling scrollback matches into view
+
+The pure `scroll_delta_to_current_match` helper centres an off-viewport match in the server's negative-scrollback coordinate space.
+
+The headless regression cycles a negative row, asserts its `Scroll::Delta(5)`, then rebases its viewport by five rows and finds exactly one current span at row one; the row is therefore both brought on screen and highlighted.
 
 #### Only on-screen matches are highlighted
 

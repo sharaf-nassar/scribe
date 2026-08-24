@@ -112,7 +112,7 @@ use scribe_client::scrollbar::{
 use scribe_client::search::{
     CURSOR_BLINK_INTERVAL, FindBindingMatches, FindInputAction, FindOverlayColors,
     FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors, SEARCH_RESULT_LIMIT,
-    find_input_action,
+    find_input_action, scroll_delta_to_current_match,
 };
 use scribe_client::selection::{SelectionMode, SelectionSpan};
 use scribe_client::server_lifecycle;
@@ -8915,6 +8915,7 @@ impl TerminalView {
         let overlay = cx.new(|cx| FindOverlayView::new(colors, adopted, cursor_blink, cx));
         cx.subscribe(&overlay, |this, _overlay, event: &FindOverlayEvent, ctx| match event {
             FindOverlayEvent::QueryChanged(query) => this.send_search_request(query),
+            FindOverlayEvent::MatchCycled => this.scroll_focused_pane_to_current_find_match(ctx),
             FindOverlayEvent::Dismissed => {
                 this.close_find_overlay();
                 ctx.notify();
@@ -8988,6 +8989,41 @@ impl TerminalView {
         overlay.update(cx, |view, ctx| view.adopt_results(&results, ctx));
     }
 
+    /// Scroll the focused pane until the overlay's current match is visible.
+    ///
+    /// Cycling reaches this from the overlay's one event path, shared by the
+    /// keyboard table and pointer controls. It deliberately delegates the
+    /// actual move to [`Self::scroll_session`] so find keeps the same pane
+    /// snapshot, split-scroll, scrollbar, and repaint bookkeeping as every
+    /// other terminal scroll.
+    fn scroll_focused_pane_to_current_find_match(&mut self, cx: &mut Context<Self>) {
+        let Some(match_row) =
+            self.find_overlay.as_ref().and_then(|overlay| overlay.read(cx).current_match_row())
+        else {
+            return;
+        };
+        let Some(session_id) = self.focused_session() else { return };
+        let Some(scroll) = self
+            .pane_for(session_id)
+            .and_then(|pane| {
+                pane.with_terminal(|terminal| {
+                    scroll_delta_to_current_match(
+                        match_row,
+                        terminal.content().rows.len(),
+                        terminal.history_size(),
+                        terminal.display_offset(),
+                    )
+                })
+            })
+            .flatten()
+        else {
+            return;
+        };
+
+        tracing::info!(%session_id, match_row, ?scroll, "find match scrolled into view");
+        self.scroll_session(session_id, scroll, cx);
+    }
+
     /// The find-match spans to highlight on this frame's grid.
     fn find_highlights(
         &self,
@@ -8999,7 +9035,7 @@ impl TerminalView {
         };
         let rows = content.rows.len();
         let cols = content.rows.first().map_or(0, Vec::len);
-        overlay.read(cx).highlights(rows, cols)
+        overlay.read(cx).highlights(rows, cols, content.display_offset)
     }
 
     /// Route a keystroke into the open find editor.

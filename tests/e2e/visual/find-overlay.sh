@@ -58,6 +58,9 @@ SESSION="${SESSION:?the shared-pane rig must export a created SESSION}"
 # echoed command line plus its output), so the current match and the passive
 # matches are both visible in one frame.
 NEEDLE="needle"
+# More matches than the visual fixture's terminal rows, for scroll-to-match.
+SCROLL_NEEDLE="scrollneedle"
+SCROLL_MATCH_ROWS=64
 
 # Minimum changed pixels for a crop comparison to count as "the grid repainted".
 # Well below one highlighted glyph run and far above compression noise.
@@ -149,6 +152,21 @@ largest_reported_match_count() {
 
 count_log() { grep -c "$1" "$CLIENT_LOG" 2>/dev/null || true; }
 
+wait_for_log_growth() {
+    local pattern="$1" baseline="$2" timeout_secs="${3:-15}" started now
+    started=$(date +%s)
+    while true; do
+        now=$(count_log "$pattern")
+        if [ "$now" -gt "$baseline" ]; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
 find_window() {
     local wid
     wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
@@ -175,6 +193,17 @@ shot() {
 send_keys() {
     xdotool key --clearmodifiers "$@"
     sleep 0.5
+}
+
+# Fast repeated match cycling. Each XTEST key gets enough time to reach GPUI,
+# while keeping the scrollback regression bounded.
+cycle_matches() {
+    local count="$1" _
+    for _ in $(seq 1 "$count"); do
+        xdotool key --clearmodifiers Return
+        sleep 0.05
+    done
+    sleep 0.8
 }
 
 type_text() {
@@ -453,16 +482,55 @@ NEXT_CLICK_DIFF=$(pixel_diff /output/06-grid.png /output/07-grid.png)
     || fail "PHASE 6: clicking the next control did not move the highlighted match (diff $NEXT_CLICK_DIFF)"
 echo "PHASE 6 PASS: clicking the next control advanced the current match, $NEXT_CLICK_DIFF px repainted"
 
+# ── Phase 6a: cycling scrollback matches moves the grid ────────────
+# Feed more distinct hit rows than the viewport can hold. The first cycle puts
+# the oldest off-screen hit on screen; the next 48 cycles pass its visible page
+# and must move again. The client log comes from the shared cycle event path,
+# while the screenshot diff proves the live grid repainted at the new position.
+scribe-test send "$SESSION" "for n in \$(seq 1 $SCROLL_MATCH_ROWS); do printf '$SCROLL_NEEDLE %02d\\n' \"\$n\"; done\n"
+scribe-test wait-output "$SESSION" "$SCROLL_NEEDLE 64" >/dev/null \
+    || fail "PHASE 6a: the scrollback needles never reached the session"
+
+send_keys ctrl+a
+SCROLL_REQ_BEFORE=$(count_client SearchRequest "query=$SCROLL_NEEDLE" "session_id=$SESSION")
+SCROLL_RES_BEFORE=$(count_server SearchResults "query=$SCROLL_NEEDLE" "session_id=$SESSION")
+type_text "$SCROLL_NEEDLE"
+wait_for_frames client "$SCROLL_REQ_BEFORE" 20 SearchRequest "query=$SCROLL_NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 6a: the scrollback query never left the client"
+wait_for_frames server "$SCROLL_RES_BEFORE" 20 SearchResults "query=$SCROLL_NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 6a: the server never answered the scrollback query"
+
+FIND_SCROLL_BEFORE=$(count_log "find match scrolled into view")
+send_keys Return
+wait_for_log_growth "find match scrolled into view" "$FIND_SCROLL_BEFORE" 15 \
+    || fail "PHASE 6a: cycling to the first scrollback result did not move the viewport"
+shot /output/07a-first-scrollback-match.png
+crop_grid /output/07a-first-scrollback-match.png /output/07a-grid.png
+
+FIND_SCROLL_AFTER_FIRST=$(count_log "find match scrolled into view")
+cycle_matches 48
+wait_for_log_growth "find match scrolled into view" "$FIND_SCROLL_AFTER_FIRST" 15 \
+    || fail "PHASE 6a: cycling past visible hits did not move the viewport"
+shot /output/07b-scrolled-current-match.png
+crop_grid /output/07b-scrolled-current-match.png /output/07b-grid.png
+SCROLL_CYCLE_DIFF=$(pixel_diff /output/07a-grid.png /output/07b-grid.png)
+[ "${SCROLL_CYCLE_DIFF:-0}" -gt "$DIFF_MIN" ] \
+    || fail "PHASE 6a: cycling past visible hits did not repaint the grid (diff $SCROLL_CYCLE_DIFF)"
+echo "PHASE 6a PASS: $SCROLL_MATCH_ROWS matches crossed the viewport and repainted $SCROLL_CYCLE_DIFF px"
+
 # ── Phase 7: clicking the close control drops every highlight ──────
 CLOSE_X=$(control_center_x 0)
 CLOSE_Y=$(control_center_y)
 click_at "$CLOSE_X" "$CLOSE_Y"
 shot /output/08-close-clicked.png
 crop_grid /output/08-close-clicked.png /output/08-grid.png
-CLOSE_CLICK_DIFF=$(pixel_diff /output/00-grid.png /output/08-grid.png)
-[ "${CLOSE_CLICK_DIFF:-0}" -le "$DIFF_MAX" ] \
-    || fail "PHASE 7: clicking the close control left highlights behind (diff $CLOSE_CLICK_DIFF)"
-echo "PHASE 7 PASS: clicking the close control cleared every highlight"
+# Phase 6a appended scrollback, so its current viewport—not phase 0's old
+# grid—is the stable pre-close image. Removing the overlay must change the
+# visible highlighted cells while leaving all terminal output in place.
+CLOSE_CLICK_DIFF=$(pixel_diff /output/07b-grid.png /output/08-grid.png)
+[ "${CLOSE_CLICK_DIFF:-0}" -gt "$DIFF_MIN" ] \
+    || fail "PHASE 7: clicking the close control did not clear visible highlights (diff $CLOSE_CLICK_DIFF)"
+echo "PHASE 7 PASS: clicking the close control cleared visible highlights ($CLOSE_CLICK_DIFF px)"
 
 # ── Phase 5: the overlay mounts in the focused pane, not the window ──
 # Find only ever searches the focused pane's scrollback
@@ -494,21 +562,6 @@ half_ink() {
     value=$(convert "$file" -crop "${half_w}x${grid_h}+${off_x}+${off_y}" +repage \
         -colorspace Gray -threshold 35% -format "%[fx:mean*w*h]" info:)
     printf '%s' "${value%.*}"
-}
-
-wait_for_log_growth() {
-    local pattern="$1" baseline="$2" timeout_secs="${3:-15}" started now
-    started=$(date +%s)
-    while true; do
-        now=$(count_log "$pattern")
-        if [ "$now" -gt "$baseline" ]; then
-            return 0
-        fi
-        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
-            return 1
-        fi
-        sleep 0.3
-    done
 }
 
 # Phase 7 closed the overlay via the close control, but a still-open overlay
@@ -567,6 +620,8 @@ echo "    04-overlay-closed.png      — Escape dropped every highlight"
 echo "    05-reopened.png            — the chord reopened the overlay"
 echo "    06-reseeded.png            — the reopened overlay re-seeded with the needle"
 echo "    07-next-clicked.png        — clicking the next control moved the current match"
+echo "    07a-first-scrollback-match.png — first off-screen result moved on screen"
+echo "    07b-scrolled-current-match.png — cycling past a visible page moved again"
 echo "    08-close-clicked.png       — clicking the close control dropped every highlight"
 echo "    09-split-before-find.png   — split pane, left pane focused, before find"
 echo "    10-split-find-open.png     — find opened; the box stays in the left pane"

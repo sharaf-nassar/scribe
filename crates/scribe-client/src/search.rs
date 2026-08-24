@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use alacritty_terminal_gpui::Term;
 use alacritty_terminal_gpui::event::VoidListener;
-use alacritty_terminal_gpui::grid::Dimensions as _;
+use alacritty_terminal_gpui::grid::{Dimensions as _, Scroll};
 use alacritty_terminal_gpui::index::{Boundary, Column, Direction, Point};
 use alacritty_terminal_gpui::term::search::{Match, RegexIter, RegexSearch};
 use gpui::{
@@ -307,6 +307,39 @@ pub fn visible_highlights(
             Some(MatchHighlight { row, start_col, end_col, current: index == current })
         })
         .collect()
+}
+
+/// Return the scroll needed to reveal `match_row` in the active viewport.
+///
+/// Server match rows share Alacritty's grid coordinate space: the live screen
+/// begins at zero and scrollback rows are negative. The viewport is therefore
+/// `-display_offset..rows-display_offset`; a match outside it lands at the
+/// viewport's middle row, matching the retired winit client's find navigation.
+#[must_use]
+pub fn scroll_delta_to_current_match(
+    match_row: i32,
+    rows: usize,
+    history_size: usize,
+    display_offset: usize,
+) -> Option<Scroll> {
+    if rows == 0 {
+        return None;
+    }
+
+    let offset = i32::try_from(display_offset).unwrap_or(i32::MAX);
+    let visible_top = offset.saturating_neg();
+    let visible_bottom =
+        i32::try_from(rows.saturating_sub(1)).unwrap_or(i32::MAX).saturating_sub(offset);
+    if (visible_top..=visible_bottom).contains(&match_row) {
+        return None;
+    }
+
+    let target_row = i32::try_from(rows.saturating_sub(1)).unwrap_or(i32::MAX) / 2;
+    let target_offset = target_row
+        .saturating_sub(match_row)
+        .clamp(0, i32::try_from(history_size).unwrap_or(i32::MAX));
+    let delta = target_offset.saturating_sub(offset);
+    (delta != 0).then_some(Scroll::Delta(delta))
 }
 
 /// How long the overlay waits after the last query edit before asking the
@@ -671,6 +704,8 @@ pub enum FindOverlayEvent {
     /// `SearchRequest` for a non-empty query and simply stops highlighting for
     /// an empty one.
     QueryChanged(String),
+    /// The current match changed through either the key table or pointer controls.
+    MatchCycled,
     /// The overlay was dismissed (Escape or the close control).
     Dismissed,
 }
@@ -842,10 +877,31 @@ impl FindOverlayView {
         self.matches.len()
     }
 
-    /// The visible spans the paint path highlights for a `rows` x `cols` grid.
+    /// Row of the match selected by the overlay, in Alacritty grid coordinates.
     #[must_use]
-    pub fn highlights(&self, rows: usize, cols: usize) -> Vec<MatchHighlight> {
-        visible_highlights(&self.matches, self.current, rows, cols)
+    pub fn current_match_row(&self) -> Option<i32> {
+        self.matches.get(self.current).map(|hit| hit.row)
+    }
+
+    /// The visible spans the paint path highlights for a `rows` x `cols` grid.
+    ///
+    /// Search rows are relative to the live screen, while the snapshot's rows
+    /// are relative to the active viewport. Rebase before passing them to
+    /// [`visible_highlights`], whose viewport-only contract stays unchanged.
+    #[must_use]
+    pub fn highlights(
+        &self,
+        rows: usize,
+        cols: usize,
+        display_offset: usize,
+    ) -> Vec<MatchHighlight> {
+        let offset = i32::try_from(display_offset).unwrap_or(i32::MAX);
+        let matches = self
+            .matches
+            .iter()
+            .map(|hit| ServerMatch { row: hit.row.saturating_add(offset), ..hit.clone() })
+            .collect::<Vec<_>>();
+        visible_highlights(&matches, self.current, rows, cols)
     }
 
     /// Adopt a newer `SearchResults` reply, if there is one.
@@ -985,6 +1041,7 @@ impl FindOverlayView {
             return;
         }
         self.current = (self.current + 1) % self.matches.len();
+        cx.emit(FindOverlayEvent::MatchCycled);
         cx.notify();
     }
 
@@ -995,6 +1052,7 @@ impl FindOverlayView {
         }
         let count = self.matches.len();
         self.current = (self.current + count - 1) % count;
+        cx.emit(FindOverlayEvent::MatchCycled);
         cx.notify();
     }
 
@@ -1424,8 +1482,9 @@ mod overlay_tests {
     use super::{
         BOX_MARGIN_RIGHT, BOX_MARGIN_TOP, BOX_WIDTH, CONTROL_SIZE, CURSOR_BLINK_INTERVAL,
         FIND_QUERY_DEBOUNCE, FindBindingMatches, FindInputAction, FindMove, FindOverlayColors,
-        FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X, ROW_PAD_Y,
-        SingleLineEditor, find_editor_visual, find_input_action, visible_highlights,
+        FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X, ROW_PAD_Y, Scroll,
+        SingleLineEditor, find_editor_visual, find_input_action, scroll_delta_to_current_match,
+        visible_highlights,
     };
 
     fn hit(row: i32, col_start: u16, col_end: u16) -> ServerMatch {
@@ -1695,6 +1754,37 @@ mod overlay_tests {
         assert_eq!(view.read_with(cx, |o, _| o.current_index()), 0);
     }
 
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Cycling scrollback matches into view]]
+    #[gpui::test]
+    fn cycling_a_scrollback_match_reveals_and_highlights_it(cx: &mut TestAppContext) {
+        let (view, log) = overlay(cx);
+        view.update(cx, |overlay, ctx| overlay.push_str("needle", ctx));
+        let mut results = FindResults::default();
+        results.accept("needle".to_owned(), vec![hit(-4, 0, 5)]);
+        view.update(cx, |overlay, ctx| overlay.adopt_results(&results, ctx));
+
+        view.update(cx, FindOverlayView::next_match);
+        assert_eq!(drain(&log, cx), vec![FindOverlayEvent::MatchCycled]);
+        assert!(
+            matches!(
+                scroll_delta_to_current_match(
+                    view.read_with(cx, |overlay, _| overlay.current_match_row())
+                        .expect("current match"),
+                    4,
+                    8,
+                    0,
+                ),
+                Some(Scroll::Delta(5))
+            ),
+            "cycling a negative scrollback row must move it onto the viewport"
+        );
+        assert_eq!(
+            view.read_with(cx, |overlay, _| overlay.highlights(4, 80, 5)),
+            vec![super::MatchHighlight { row: 1, start_col: 0, end_col: 5, current: true }],
+            "the moved viewport must paint the current match"
+        );
+    }
+
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#Only on-screen matches are highlighted]]
     #[test]
     fn scrollback_matches_are_projected_off_the_viewport() {
@@ -1889,8 +1979,12 @@ mod overlay_tests {
         assert_eq!(overlay.read_with(cx, |o, _| o.query().to_owned()), String::new());
         assert_eq!(
             drain(&log, cx),
-            vec![FindOverlayEvent::Dismissed],
-            "clicking the close control did not emit the same Dismissed event Escape does"
+            vec![
+                FindOverlayEvent::MatchCycled,
+                FindOverlayEvent::MatchCycled,
+                FindOverlayEvent::Dismissed,
+            ],
+            "pointer controls must emit the same cycle event the key table uses"
         );
     }
 
