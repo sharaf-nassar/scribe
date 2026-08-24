@@ -827,17 +827,13 @@ mod tests {
 
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Restore-state disk fixtures are parallel-isolated]]
     fn scratch_root() -> PathBuf {
-        loop {
-            let root = std::env::temp_dir().join(format!(
-                "scribe-gpui-restore-{}-{}",
-                std::process::id(),
-                NEXT_SCRATCH_ROOT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::create_dir(&root) {
-                Ok(()) => return root,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("create restore scratch root: {error}"),
-            }
-        }
+        let root = std::env::temp_dir().join(format!(
+            "scribe-gpui-restore-{}-{}",
+            std::process::id(),
+            NEXT_SCRATCH_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir(&root).expect("create restore scratch root");
+        root
     }
 }

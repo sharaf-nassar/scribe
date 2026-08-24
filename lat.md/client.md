@@ -471,7 +471,7 @@ A saved  loads back with its window, focused workspace, workspace name, and laun
 
 #### Restore-state disk fixtures are parallel-isolated
 
-Each disk-backed restore-state test allocates its scratch root from a process-local atomic sequence and creates it exclusively, so parallel test threads cannot share an index or window snapshot.
+Each disk-backed restore-state test names its root with its PID plus a process-local atomic sequence, removes a stale reused-PID root, then creates it exclusively. Parallel threads cannot share an index or window snapshot.
 
 #### AI resume variant names stay stable
 
