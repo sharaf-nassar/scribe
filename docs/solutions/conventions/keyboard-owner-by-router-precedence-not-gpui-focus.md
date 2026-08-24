@@ -67,11 +67,13 @@ whether the field is a text input.
 
 ## Fix
 
-Filed as **scribe-p82i** (caret, selection, clipboard, Ctrl key table),
-**scribe-h3zf** (brighter chrome), and **scribe-00ym** (the scroll-to-match gap
-found alongside them); all three unlanded as of this writing.
+The fixes landed as **scribe-p82i** (caret, selection, clipboard, Ctrl key
+table; squash `e0932217a7f4d3e13c9f2e8ca239f5ec87d24851`), **scribe-h3zf**
+(brighter chrome; squash `bd6e18df376164c11af8bb089f70e8ee9797b57c`), and
+**scribe-00ym** (scroll-to-match; squash
+`fa7071f12f5c2e296e8470f82c078645e99f1222`).
 
-The shape that matters: **make the caret and the bright state unconditional
+The shape that mattered: **make the caret and the bright state unconditional
 while the overlay is open**, with a `ponytail:` comment naming the
 modal-stacked-over-find case as an accepted simplification. No `window.focus`,
 no focus-state machine, no signature churn.

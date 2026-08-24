@@ -10,10 +10,9 @@ problem_type: bug
 
 ## Problem
 
-A Pi pane keeps Scribe's `Processing` indicator while `ask_user_question` is
-open and the agent is waiting only for the user. The questionnaire visibly
-asks for input, but the pane border and tab still say the model is running.
-Fix filed as scribe-mh1z, unlanded as of this writing.
+A Pi pane kept Scribe's `Processing` indicator while `ask_user_question` was
+open and the agent was waiting only for the user. The questionnaire visibly
+asked for input, but the pane border and tab still said the model was running.
 
 ## Root cause
 
@@ -48,15 +47,17 @@ already clears itself on answer, cancel, or error.
 
 ## Fix
 
-Per this investigation, fix filed as scribe-mh1z and unlanded: subscribe the
-standalone Scribe adapter to `rpiv:ask-user:blocked` without importing the
-optional package. Map boolean `active: true` to `WaitingForInput` and
-`active: false` to `Processing` through the existing bounded serial queue.
-Ignore malformed payloads and keep `PermissionPrompt` unsupported.
+The `scribe-mh1z` fix subscribes the standalone Scribe adapter to
+`rpiv:ask-user:blocked` without importing the optional package
+(`dist/pi-extension.ts:351-360`). Boolean `active: true` maps to
+`WaitingForInput`; `active: false` maps back to `Processing` through the
+existing bounded serial queue. Malformed payloads are ignored and
+`PermissionPrompt` remains unsupported.
 
-Add a harness event bus and leave a questionnaire open long enough to assert
-that the last helper state changes from Processing to WaitingForInput, then
-returns to Processing when the blocked event clears.
+The harness event bus leaves a questionnaire open long enough to assert that
+the last helper state changes from Processing to WaitingForInput, then returns
+to Processing when the blocked event clears. Landed in squash commit
+`69a8a6df133f4cae51950b6fc1a1e002b49bdcad`.
 
 ## Prevention
 
