@@ -15,7 +15,7 @@ use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
 use scribe_common::protocol::AutomationAction;
 use scribe_common::theme::ChromeColors;
 
-use crate::tab_bar::srgba;
+use crate::{layout::FocusDirection, tab_bar::srgba};
 
 /// Maximum number of filtered rows the palette shows at once, mirroring the winit
 /// overlay's item cap.
@@ -33,14 +33,8 @@ pub enum PaletteAction {
     OpenRemoteConnect,
     /// Move the focused workspace into a fresh window.
     MoveWorkspaceToNewWindow,
-    /// Move the focused workspace to its nearest left neighbour.
-    MoveWorkspaceLeft,
-    /// Move the focused workspace to its nearest right neighbour.
-    MoveWorkspaceRight,
-    /// Move the focused workspace to its nearest upper neighbour.
-    MoveWorkspaceUp,
-    /// Move the focused workspace to its nearest lower neighbour.
-    MoveWorkspaceDown,
+    /// Move the focused workspace to its nearest neighbour in one direction.
+    MoveWorkspace(FocusDirection),
 }
 
 // `AutomationAction` (frozen scribe-common) derives neither `PartialEq` nor
@@ -50,11 +44,8 @@ impl PartialEq for PaletteAction {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::OpenRemoteConnect, Self::OpenRemoteConnect)
-            | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow)
-            | (Self::MoveWorkspaceLeft, Self::MoveWorkspaceLeft)
-            | (Self::MoveWorkspaceRight, Self::MoveWorkspaceRight)
-            | (Self::MoveWorkspaceUp, Self::MoveWorkspaceUp)
-            | (Self::MoveWorkspaceDown, Self::MoveWorkspaceDown) => true,
+            | (Self::MoveWorkspaceToNewWindow, Self::MoveWorkspaceToNewWindow) => true,
+            (Self::MoveWorkspace(a), Self::MoveWorkspace(b)) => a == b,
             (Self::Automation(a), Self::Automation(b)) => format!("{a:?}") == format!("{b:?}"),
             _ => false,
         }
@@ -104,19 +95,19 @@ pub fn base_entries() -> Vec<CommandPaletteEntry> {
         },
         CommandPaletteEntry {
             label: "Move workspace left".into(),
-            action: PaletteAction::MoveWorkspaceLeft,
+            action: PaletteAction::MoveWorkspace(FocusDirection::Left),
         },
         CommandPaletteEntry {
             label: "Move workspace right".into(),
-            action: PaletteAction::MoveWorkspaceRight,
+            action: PaletteAction::MoveWorkspace(FocusDirection::Right),
         },
         CommandPaletteEntry {
             label: "Move workspace up".into(),
-            action: PaletteAction::MoveWorkspaceUp,
+            action: PaletteAction::MoveWorkspace(FocusDirection::Up),
         },
         CommandPaletteEntry {
             label: "Move workspace down".into(),
-            action: PaletteAction::MoveWorkspaceDown,
+            action: PaletteAction::MoveWorkspace(FocusDirection::Down),
         },
         CommandPaletteEntry {
             label: "Connect to remote machine…".into(),

@@ -721,8 +721,9 @@ Alternatives considered and rejected:
   sequence (see Affected Components); the commit point for all state is
   the in-gate mutation.
 - **Client state**: `WorkspaceDrag` state machine (idle → armed →
-  dragging{zone} → tear-armed → committing → awaiting-result);
-  `WindowLayout` consumes the shared tree ops. Neutral/standalone pill =
+  dragging{zone} / tear-armed → idle on release); the separate transfer
+  coordinator owns awaiting-result state. `WindowLayout` consumes the shared
+  tree ops. Neutral/standalone pill =
   existing `GroupBadge` with a fallback label and muted accent, rendered
   independently of first-tab existence — no new persisted fields.
 - **Zone geometry (deterministic)**: for a hovered region, compute the
@@ -780,8 +781,8 @@ Alternatives considered and rejected:
 - **Unit (client, pure)**: zone resolution across region rects including
   every corner (normalized-distance precedence, horizontal tie-break),
   4 px zone hysteresis, arming rule (8 px band, out-of-bounds, 24 px
-  disarm), drag state machine transitions (cancel/Escape/blur/
-  workspace-disappear → zero-commit, next drag immediately valid),
+  disarm), drag state machine transitions (shared cancel → zero-commit,
+  next drag immediately valid),
   directional-command neighbor selection (no wrap, no-neighbor no-op),
   focus retention, neutral/standalone pill fallback data (named, unnamed,
   zero-tab, top and lower bars).

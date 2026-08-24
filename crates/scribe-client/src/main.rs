@@ -143,17 +143,16 @@ use scribe_client::window_state::{
 };
 use scribe_client::workspace_drag::{
     DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, WorkspaceDrag,
-    WorkspaceDragCancel, WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate,
-    WorkspaceDropTarget, ZONE_FADE, ZoneFade, ghost_origin, ghost_travel_frame,
-    record_input_to_paint, tear_candidate_at, zone_fade_opacity, zone_preview_rect,
+    WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate, WorkspaceDropTarget, ZONE_FADE,
+    ZoneFade, ghost_origin, ghost_travel_frame, record_input_to_paint, tear_candidate_at,
+    zone_fade_opacity, zone_preview_rect,
 };
 use scribe_client::workspace_layout::{
     self, WorkspaceDividerDrag, workspace_move_no_neighbor_message,
 };
 use scribe_client::workspace_transfer::{
-    TransferWindowSpec, TransferredWindow, WorkspaceTransferConnection, WorkspaceTransferFeedback,
-    WorkspaceTransferOutcome, WorkspaceTransferRequest, WorkspaceTransferResultDisposition,
-    WorkspaceTransfers,
+    TransferWindowSpec, TransferredWindow, WorkspaceTransferFeedback, WorkspaceTransferOutcome,
+    WorkspaceTransferRequest, WorkspaceTransferResultDisposition, WorkspaceTransfers,
 };
 use scribe_client::x11_focus::{X11FocusGuard, should_reconcile_window_activation};
 use scribe_client::zoom::ZoomState;
@@ -3599,17 +3598,8 @@ impl TerminalView {
             }
             PaletteAction::OpenRemoteConnect => self.open_remote_connect(cx),
             PaletteAction::MoveWorkspaceToNewWindow => self.move_workspace_to_new_window(cx),
-            PaletteAction::MoveWorkspaceLeft => {
-                self.move_focused_workspace_in_direction(FocusDirection::Left, cx);
-            }
-            PaletteAction::MoveWorkspaceRight => {
-                self.move_focused_workspace_in_direction(FocusDirection::Right, cx);
-            }
-            PaletteAction::MoveWorkspaceUp => {
-                self.move_focused_workspace_in_direction(FocusDirection::Up, cx);
-            }
-            PaletteAction::MoveWorkspaceDown => {
-                self.move_focused_workspace_in_direction(FocusDirection::Down, cx);
+            PaletteAction::MoveWorkspace(direction) => {
+                self.move_focused_workspace_in_direction(direction, cx);
             }
         }
     }
@@ -5261,20 +5251,14 @@ impl TerminalView {
     }
 
     fn poll_workspace_transfers(&mut self, cx: &mut Context<Self>) {
-        let connection = match (
-            self.shared.connected.load(Ordering::Acquire),
-            self.shared.workspace_transfer.load(Ordering::Acquire),
-        ) {
-            (false, _) => WorkspaceTransferConnection::Disconnected,
-            (true, false) => WorkspaceTransferConnection::ConnectedWithoutCapability,
-            (true, true) => WorkspaceTransferConnection::Connected,
-        };
+        let can_retry = self.shared.connected.load(Ordering::Acquire)
+            && self.shared.workspace_transfer.load(Ordering::Acquire);
         let retry = self
             .shared
             .workspace_transfers
             .lock()
             .ok()
-            .and_then(|mut transfers| transfers.retry_if_due(Instant::now(), connection));
+            .and_then(|mut transfers| transfers.retry_if_due(Instant::now(), can_retry));
         if let Some(request) = retry {
             self.send_workspace_transfer_request(request, "retry");
         }
@@ -7679,7 +7663,6 @@ impl TerminalView {
                 Ok(false) => {}
                 Err(error) => tracing::warn!(%error, "workspace drag commit refused"),
             }
-            self.workspace_drag.complete_commit();
         } else if blocked_tear {
             self.show_workspace_transfer_feedback(WorkspaceTransferFeedback::CapabilityAbsent);
         }
@@ -7728,12 +7711,7 @@ impl TerminalView {
         }
     }
 
-    fn cancel_workspace_drag(
-        &mut self,
-        reason: WorkspaceDragCancel,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn cancel_workspace_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.workspace_drag.is_active() {
             return false;
         }
@@ -7741,7 +7719,7 @@ impl TerminalView {
         let release_point = self.workspace_drag.pointer();
         let grab_point = self.workspace_drag.grab_point();
         let source_bounds = self.workspace_drag_bounds.take();
-        self.workspace_drag.cancel(reason);
+        self.workspace_drag.cancel();
         self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
         if let Some(workspace_id) = source {
             self.travel_workspace_ghost(workspace_id, release_point, grab_point, source_bounds);
@@ -7923,7 +7901,7 @@ impl TerminalView {
             return layers;
         };
         if !self.shell.has_region(source_workspace_id) {
-            self.workspace_drag.cancel(WorkspaceDragCancel::SourceDisappeared);
+            self.workspace_drag.cancel();
             self.workspace_drag_bounds = None;
             self.workspace_drag_motion.clear();
             self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
@@ -9827,7 +9805,7 @@ impl TerminalView {
     fn on_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = window.is_window_active();
         if !active {
-            self.cancel_workspace_drag(WorkspaceDragCancel::WindowBlur, window, cx);
+            self.cancel_workspace_drag(window, cx);
         }
         self.update_window_activation(active, cx);
         if !active {
@@ -11650,9 +11628,7 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        if event.keystroke.key == "escape"
-            && self.cancel_workspace_drag(WorkspaceDragCancel::Escape, window, cx)
-        {
+        if event.keystroke.key == "escape" && self.cancel_workspace_drag(window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -15482,7 +15458,7 @@ fn on_workspace_transfer_result(
     let disposition = ctx
         .workspace_transfers
         .lock()
-        .map_or(WorkspaceTransferResultDisposition::Late, |mut transfers| {
+        .map_or(WorkspaceTransferResultDisposition::Ignored, |mut transfers| {
             transfers.receive_result(transfer_id, result)
         });
     match disposition {
@@ -15490,11 +15466,8 @@ fn on_workspace_transfer_result(
             tracing::info!(transfer_id, ?result, "workspace transfer result accepted");
             ctx.generation.fetch_add(1, Ordering::Release);
         }
-        WorkspaceTransferResultDisposition::Duplicate => {
-            tracing::debug!(transfer_id, "duplicate workspace transfer result ignored");
-        }
-        WorkspaceTransferResultDisposition::Late => {
-            tracing::debug!(transfer_id, "late workspace transfer result ignored");
+        WorkspaceTransferResultDisposition::Ignored => {
+            tracing::debug!(transfer_id, "workspace transfer result ignored");
         }
     }
 }

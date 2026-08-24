@@ -34,14 +34,6 @@ pub struct WorkspaceTransferRequest {
     pub target_window: WindowId,
 }
 
-/// Negotiated connection state used by retry polling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceTransferConnection {
-    Disconnected,
-    ConnectedWithoutCapability,
-    Connected,
-}
-
 /// Target-window work released only by one matching success.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransferredWindow {
@@ -106,12 +98,11 @@ pub enum WorkspaceTransferOutcome {
     Feedback(WorkspaceTransferFeedback),
 }
 
-/// Classification for late/duplicate result diagnostics.
+/// Whether a transfer result matched the pending request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTransferResultDisposition {
     Accepted,
-    Duplicate,
-    Late,
+    Ignored,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,7 +119,6 @@ struct PendingTransfer {
 pub struct WorkspaceTransfers {
     pending: Option<PendingTransfer>,
     outcomes: VecDeque<WorkspaceTransferOutcome>,
-    last_settled_id: Option<u64>,
 }
 
 impl WorkspaceTransfers {
@@ -215,7 +205,7 @@ impl WorkspaceTransfers {
     pub fn retry_if_due(
         &mut self,
         now: Instant,
-        connection: WorkspaceTransferConnection,
+        can_retry: bool,
     ) -> Option<WorkspaceTransferRequest> {
         let pending = self.pending.as_mut()?;
         if pending.deadline.is_some_and(|deadline| deadline <= now) {
@@ -225,29 +215,25 @@ impl WorkspaceTransfers {
                 WorkspaceTransferFeedback::TimedOutRetrying,
             ));
         }
-        if !pending.retry_due || connection != WorkspaceTransferConnection::Connected {
+        if !pending.retry_due || !can_retry {
             return None;
         }
         Some(pending.request)
     }
 
     /// Correlate one result. Matching success parks exactly one window open;
-    /// refusals park feedback; late and duplicate frames have no side effect.
+    /// refusals park feedback; unmatched frames have no side effect.
     pub fn receive_result(
         &mut self,
         transfer_id: u64,
         result: WorkspaceTransferResult,
     ) -> WorkspaceTransferResultDisposition {
-        if self.last_settled_id == Some(transfer_id) {
-            return WorkspaceTransferResultDisposition::Duplicate;
-        }
         let Some(pending) =
             self.pending.filter(|pending| pending.request.correlation == transfer_id)
         else {
-            return WorkspaceTransferResultDisposition::Late;
+            return WorkspaceTransferResultDisposition::Ignored;
         };
         self.pending = None;
-        self.last_settled_id = Some(transfer_id);
         match result {
             WorkspaceTransferResult::Transferred => {
                 self.outcomes.push_back(WorkspaceTransferOutcome::Open(pending.target));
@@ -345,7 +331,7 @@ mod tests {
         let mut timed_out = WorkspaceTransfers::default();
         begin_sent(&mut timed_out, 41, now);
         let retry = timed_out
-            .retry_if_due(now + WORKSPACE_TRANSFER_TIMEOUT, WorkspaceTransferConnection::Connected)
+            .retry_if_due(now + WORKSPACE_TRANSFER_TIMEOUT, true)
             .expect("timeout should retry");
         assert_eq!(retry.correlation, 41);
         assert_eq!(
@@ -356,11 +342,9 @@ mod tests {
         let mut disconnected = WorkspaceTransfers::default();
         begin_sent(&mut disconnected, 42, now);
         assert!(disconnected.disconnected());
-        assert_eq!(disconnected.retry_if_due(now, WorkspaceTransferConnection::Disconnected), None);
+        assert_eq!(disconnected.retry_if_due(now, false), None);
         assert_eq!(
-            disconnected
-                .retry_if_due(now, WorkspaceTransferConnection::Connected)
-                .map(|request| request.correlation),
+            disconnected.retry_if_due(now, true).map(|request| request.correlation),
             Some(42)
         );
     }
@@ -369,12 +353,11 @@ mod tests {
     fn late_and_duplicate_results_open_the_target_once() {
         let now = Instant::now();
         let mut transfers = WorkspaceTransfers::default();
-        let request = request(51);
-        let target = TransferredWindow { window_id: request.target_window, spec: spec() };
-        transfers.begin(true, 2, request, spec()).unwrap();
+        let initial = request(51);
+        let target = TransferredWindow { window_id: initial.target_window, spec: spec() };
+        transfers.begin(true, 2, initial, spec()).unwrap();
         transfers.mark_sent(51, now);
-        transfers
-            .retry_if_due(now + WORKSPACE_TRANSFER_TIMEOUT, WorkspaceTransferConnection::Connected);
+        transfers.retry_if_due(now + WORKSPACE_TRANSFER_TIMEOUT, true);
 
         assert_eq!(
             transfers.receive_result(51, WorkspaceTransferResult::Transferred),
@@ -382,11 +365,11 @@ mod tests {
         );
         assert_eq!(
             transfers.receive_result(51, WorkspaceTransferResult::Transferred),
-            WorkspaceTransferResultDisposition::Duplicate
+            WorkspaceTransferResultDisposition::Ignored
         );
         assert_eq!(
             transfers.receive_result(999, WorkspaceTransferResult::Transferred),
-            WorkspaceTransferResultDisposition::Late
+            WorkspaceTransferResultDisposition::Ignored
         );
         assert_eq!(
             transfers.take_outcomes(),
@@ -395,6 +378,20 @@ mod tests {
                 WorkspaceTransferOutcome::Open(target),
             ]
         );
+
+        let next = request(52);
+        let next_target = TransferredWindow { window_id: next.target_window, spec: spec() };
+        transfers.begin(true, 2, next, spec()).unwrap();
+        assert_eq!(
+            transfers.receive_result(51, WorkspaceTransferResult::Transferred),
+            WorkspaceTransferResultDisposition::Ignored
+        );
+        assert!(transfers.has_pending());
+        assert_eq!(
+            transfers.receive_result(52, WorkspaceTransferResult::Transferred),
+            WorkspaceTransferResultDisposition::Accepted
+        );
+        assert_eq!(transfers.take_outcomes(), vec![WorkspaceTransferOutcome::Open(next_target)]);
     }
 
     #[test]
@@ -413,13 +410,8 @@ mod tests {
         begin_sent(&mut retry, 62, now);
         retry.send_failed(62);
         assert!(retry.has_pending());
-        assert_eq!(retry.retry_if_due(now, WorkspaceTransferConnection::Connected), None);
+        assert_eq!(retry.retry_if_due(now, true), None);
         assert!(retry.disconnected());
-        assert_eq!(
-            retry
-                .retry_if_due(now, WorkspaceTransferConnection::Connected)
-                .map(|request| request.correlation),
-            Some(62)
-        );
+        assert_eq!(retry.retry_if_due(now, true).map(|request| request.correlation), Some(62));
     }
 }

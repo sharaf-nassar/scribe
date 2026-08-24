@@ -64,15 +64,6 @@ pub struct WorkspaceDragCommit {
     pub target: WorkspaceDropTarget,
 }
 
-/// Why a drag was interrupted before an actionable release.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceDragCancel {
-    Escape,
-    WindowBlur,
-    SourceDisappeared,
-    NonActionableRelease,
-}
-
 /// Observable phase of the workspace drag lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WorkspaceDragPhase {
@@ -88,9 +79,6 @@ pub enum WorkspaceDragPhase {
     TearArmed {
         source_workspace_id: WorkspaceId,
         pointer: DragPoint,
-    },
-    Committing {
-        commit: WorkspaceDragCommit,
     },
 }
 
@@ -149,9 +137,6 @@ impl WorkspaceDrag {
             tear_enabled,
         } = update;
         let Some(source_workspace_id) = self.source_workspace_id() else { return };
-        if matches!(self.phase, WorkspaceDragPhase::Committing { .. }) {
-            return;
-        }
 
         self.grab_point.get_or_insert(window_pointer);
         let tear_armed = matches!(self.phase, WorkspaceDragPhase::TearArmed { .. });
@@ -176,7 +161,7 @@ impl WorkspaceDrag {
                 self.pending_zone = None;
                 candidate
             }
-            WorkspaceDragPhase::Idle | WorkspaceDragPhase::Committing { .. } => return,
+            WorkspaceDragPhase::Idle => return,
         };
         self.phase =
             WorkspaceDragPhase::Dragging { source_workspace_id, pointer: window_pointer, preview };
@@ -190,25 +175,12 @@ impl WorkspaceDrag {
             }
             _ => None,
         };
-        self.pending_zone = None;
-        if let Some(commit) = commit {
-            self.phase = WorkspaceDragPhase::Committing { commit };
-        } else {
-            self.cancel(WorkspaceDragCancel::NonActionableRelease);
-        }
+        self.cancel();
         commit
     }
 
-    /// Return to idle after the selected tree edit has been attempted.
-    pub fn complete_commit(&mut self) {
-        if matches!(self.phase, WorkspaceDragPhase::Committing { .. }) {
-            self.phase = WorkspaceDragPhase::Idle;
-        }
-        self.pending_zone = None;
-    }
-
     /// Cancel every non-idle phase without producing a commit.
-    pub fn cancel(&mut self, _reason: WorkspaceDragCancel) {
+    pub fn cancel(&mut self) {
         self.phase = WorkspaceDragPhase::Idle;
         self.pending_zone = None;
     }
@@ -229,9 +201,7 @@ impl WorkspaceDrag {
     pub const fn is_engaged(&self) -> bool {
         matches!(
             self.phase,
-            WorkspaceDragPhase::Dragging { .. }
-                | WorkspaceDragPhase::TearArmed { .. }
-                | WorkspaceDragPhase::Committing { .. }
+            WorkspaceDragPhase::Dragging { .. } | WorkspaceDragPhase::TearArmed { .. }
         )
     }
 
@@ -244,7 +214,6 @@ impl WorkspaceDrag {
             | WorkspaceDragPhase::TearArmed { source_workspace_id, .. } => {
                 Some(source_workspace_id)
             }
-            WorkspaceDragPhase::Committing { commit } => Some(commit.source_workspace_id),
         }
     }
 
@@ -260,9 +229,7 @@ impl WorkspaceDrag {
         match self.phase {
             WorkspaceDragPhase::Dragging { pointer, .. }
             | WorkspaceDragPhase::TearArmed { pointer, .. } => Some(pointer),
-            WorkspaceDragPhase::Idle
-            | WorkspaceDragPhase::Armed { .. }
-            | WorkspaceDragPhase::Committing { .. } => None,
+            WorkspaceDragPhase::Idle | WorkspaceDragPhase::Armed { .. } => None,
         }
     }
 
@@ -769,19 +736,13 @@ mod tests {
     }
 
     #[test]
-    fn cancel_paths_and_non_actionable_releases_never_commit() {
+    fn cancel_and_non_actionable_releases_never_commit() {
         let source = WorkspaceId::new();
-        for reason in [
-            WorkspaceDragCancel::Escape,
-            WorkspaceDragCancel::WindowBlur,
-            WorkspaceDragCancel::SourceDisappeared,
-        ] {
-            let mut drag = WorkspaceDrag::default();
-            drag.arm(source);
-            drag.cancel(reason);
-            assert_eq!(drag.phase(), WorkspaceDragPhase::Idle);
-            assert_eq!(drag.release(), None);
-        }
+        let mut cancelled = WorkspaceDrag::default();
+        cancelled.arm(source);
+        cancelled.cancel();
+        assert_eq!(cancelled.phase(), WorkspaceDragPhase::Idle);
+        assert_eq!(cancelled.release(), None);
 
         let mut armed = WorkspaceDrag::default();
         armed.arm(source);
@@ -824,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn actionable_release_enters_committing_then_next_drag_is_healthy() {
+    fn actionable_release_resets_then_next_drag_is_healthy() {
         let source = WorkspaceId::new();
         let target = WorkspaceId::new();
         let regions = [(target, rect())];
@@ -835,8 +796,6 @@ mod tests {
         assert_eq!(commit.source_workspace_id, source);
         assert_eq!(commit.target.workspace_id, target);
         assert_eq!(commit.target.zone, WorkspaceDropZone::Left);
-        assert!(matches!(drag.phase(), WorkspaceDragPhase::Committing { .. }));
-        drag.complete_commit();
         assert_eq!(drag.phase(), WorkspaceDragPhase::Idle);
 
         drag.arm(target);

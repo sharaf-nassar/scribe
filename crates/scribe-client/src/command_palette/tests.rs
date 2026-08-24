@@ -10,6 +10,7 @@ use super::{
     CommandPaletteColors, CommandPaletteEntry, CommandPaletteEvent, CommandPaletteView,
     PaletteAction, base_entries, build_entries, filter_entries, profile_entries,
 };
+use crate::layout::FocusDirection;
 
 // @lat: [[client#GPUI Overlays#Palette base entries and update row]]
 #[test]
@@ -33,10 +34,10 @@ fn workspace_move_actions_are_visible() {
         moves,
         vec![
             ("Move workspace to new window", PaletteAction::MoveWorkspaceToNewWindow),
-            ("Move workspace left", PaletteAction::MoveWorkspaceLeft),
-            ("Move workspace right", PaletteAction::MoveWorkspaceRight),
-            ("Move workspace up", PaletteAction::MoveWorkspaceUp),
-            ("Move workspace down", PaletteAction::MoveWorkspaceDown),
+            ("Move workspace left", PaletteAction::MoveWorkspace(FocusDirection::Left)),
+            ("Move workspace right", PaletteAction::MoveWorkspace(FocusDirection::Right)),
+            ("Move workspace up", PaletteAction::MoveWorkspace(FocusDirection::Up)),
+            ("Move workspace down", PaletteAction::MoveWorkspace(FocusDirection::Down)),
         ]
     );
 }
