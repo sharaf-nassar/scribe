@@ -17,7 +17,7 @@ PLACEMENT_TOLERANCE=50
 fail() {
     echo "FAIL: $1" >&2
     echo "--- tree/frame oracle ---" >&2
-    python3 /tmp/workspace-drag-oracle.py "$RECORD" summary 2>/dev/null || true
+    oracle summary 2>/dev/null || true
     echo "--- client log ---" >&2
     tail -80 "$CLIENT_LOG" >&2 || true
     echo "--- server log ---" >&2
@@ -111,109 +111,8 @@ reset_record() {
     sleep 0.3
 }
 
-cat >/tmp/workspace-drag-oracle.py <<'PY'
-import json, sys, time
-path, command = sys.argv[1:3]
-
-def rows():
-    try:
-        with open(path) as fh:
-            for line in fh:
-                try: yield json.loads(line)
-                except ValueError: pass
-    except OSError:
-        return
-
-def trees():
-    for row in rows():
-        msg = row.get("message", {})
-        if row.get("dir") == "client" and msg.get("type") == "ReportWorkspaceTree":
-            yield msg.get("tree")
-        if row.get("dir") == "server" and msg.get("type") == "SessionList" and msg.get("workspace_tree"):
-            yield msg.get("workspace_tree")
-
-def leaves(node):
-    if not isinstance(node, dict): return []
-    if "Leaf" in node: return [node["Leaf"]]
-    inner = node.get("Split", node)
-    return leaves(inner.get("first")) + leaves(inner.get("second"))
-
-def latest():
-    found=list(trees())
-    return found[-1] if found else None
-
-def direction(node):
-    return node.get("Split", node).get("direction") if isinstance(node, dict) else None
-
-def counts():
-    out={}
-    for row in rows():
-        name=row.get("message", {}).get("type")
-        out[name]=out.get(name, 0)+1
-    return out
-
-if command == "wait-leaves":
-    wanted=int(sys.argv[3]); require_sessions=int(sys.argv[4]) if len(sys.argv)>4 else 0
-    deadline=time.time()+30
-    while time.time()<deadline:
-        tree=latest(); found=leaves(tree) if tree else []
-        if len(found)==wanted and (not require_sessions or all(x.get("session_ids") for x in found)):
-            print(" ".join(str(x["workspace_id"]) for x in found)); sys.exit(0)
-        time.sleep(.2)
-    sys.exit(1)
-if command == "wait-root":
-    wanted_direction, first, second=sys.argv[3:6]; deadline=time.time()+30
-    while time.time()<deadline:
-        tree=latest(); found=leaves(tree) if tree else []
-        if direction(tree)==wanted_direction and [str(x["workspace_id"]) for x in found]==[first,second]:
-            print(json.dumps(tree,separators=(",",":"))); sys.exit(0)
-        time.sleep(.2)
-    print(json.dumps(latest(),separators=(",",":")),file=sys.stderr); sys.exit(1)
-if command == "leaf":
-    wanted=sys.argv[3]
-    for item in leaves(latest()):
-        if str(item.get("workspace_id"))==wanted:
-            print(json.dumps(item,sort_keys=True,separators=(",",":"))); sys.exit(0)
-    sys.exit(1)
-if command == "leaf-session-count":
-    wanted=sys.argv[3]
-    for item in leaves(latest()):
-        if str(item.get("workspace_id"))==wanted:
-            print(len(item.get("session_ids",[]))); sys.exit(0)
-    print(0)
-if command == "counts":
-    print(json.dumps(counts(),sort_keys=True))
-if command == "summary":
-    print(json.dumps({"counts":counts(),"latest_tree":latest()},sort_keys=True))
-if command == "assert-transfer":
-    wanted, leaf_path, other=sys.argv[3:6]
-    source_leaf=json.load(open(leaf_path)); source_sessions=set(source_leaf.get("session_ids",[]))
-    result=False; source=False; target=False; creates=0; created=set(); known=set(); transfer_target=None
-    for row in rows():
-        msg=row.get("message",{})
-        if row.get("dir")=="client" and msg.get("type")=="TransferWorkspace": transfer_target=msg.get("target_window_id")
-        if row.get("dir")=="client" and msg.get("type")=="CreateSession": creates+=1
-        if row.get("dir")=="server" and msg.get("type")=="SessionCreated": created.add(msg.get("session_id"))
-        if row.get("dir")=="server" and msg.get("type")=="SessionList":
-            known.update(session.get("session_id") for session in msg.get("sessions", []))
-        if row.get("dir")=="server" and msg.get("type")=="WorkspaceTransferResult" and str(msg.get("result", "")).lower()=="transferred": result=True
-        tree=None
-        if row.get("dir")=="client" and msg.get("type")=="ReportWorkspaceTree": tree=msg.get("tree")
-        if row.get("dir")=="server" and msg.get("type")=="SessionList": tree=msg.get("workspace_tree")
-        found=leaves(tree) if tree else []
-        if len(found)==1 and str(found[0].get("workspace_id"))==other: source=True
-        if len(found)==1 and str(found[0].get("workspace_id"))==wanted:
-            # Target startup may publish its own follow-up report while panes
-            # attach. Preserve the first exact server-derived transfer tree as
-            # the atomic-transaction oracle rather than letting a later client
-            # repaint overwrite this positive observation.
-            target |= json.dumps(found[0],sort_keys=True,separators=(",",":"))==json.dumps(source_leaf,sort_keys=True,separators=(",",":"))
-    assert result and source and target, (result,source,target)
-    assert creates==0, creates
-    assert created <= (known | source_sessions), created - known - source_sessions
-    print(json.dumps({"target_window_id":transfer_target,"result":"Transferred","target_leaf_exact":True,"source_collapsed":True,"create_session_frames":0,"session_created_ids_preexisting":True},sort_keys=True))
-PY
-oracle() { python3 /tmp/workspace-drag-oracle.py "$RECORD" "$@"; }
+ORACLE=/tests/visual/workspace-tree-oracle.py
+oracle() { python3 "$ORACLE" "$RECORD" "$@"; }
 
 wait_for_tree_change() {
     local before=$1 deadline=$((SECONDS + 25)) current

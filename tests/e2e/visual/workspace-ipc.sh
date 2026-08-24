@@ -51,6 +51,8 @@
 set -e
 
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
+ORACLE=/tests/visual/workspace-tree-oracle.py
+oracle() { python3 "$ORACLE" "$RECORD" "$@"; }
 CONTROL="${SHARE_TAP_CONTROL:-$XDG_RUNTIME_DIR/scribe/share-tap.sock}"
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
@@ -208,22 +210,7 @@ fail() {
 }
 
 frame_types() {
-    python3 - "$RECORD" "$1" <<'PY'
-import json, sys
-path, direction = sys.argv[1:3]
-try:
-    fh = open(path)
-except OSError:
-    sys.exit(0)
-with fh:
-    for line in fh:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("dir") == direction:
-            print(row.get("message", {}).get("type"))
-PY
+    oracle frame-types "$1"
 }
 
 # Start a fresh window on the wire record so the frames a phase asserts on can
@@ -302,40 +289,7 @@ PY
 # Assert the last recorded client `ReportWorkspaceTree` carries a split with the
 # given number of workspace leaves.
 assert_reported_leaves() {
-    python3 - "$RECORD" "$1" <<'PY'
-import json, sys
-path, wanted = sys.argv[1], int(sys.argv[2])
-tree = None
-with open(path) as fh:
-    for line in fh:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        msg = row.get("message", {})
-        if row.get("dir") == "client" and msg.get("type") == "ReportWorkspaceTree":
-            tree = msg.get("tree")
-if tree is None:
-    print("no client ReportWorkspaceTree frame recorded", file=sys.stderr)
-    sys.exit(1)
-
-def leaves(node):
-    if not isinstance(node, dict):
-        return []
-    if "Leaf" in node:
-        return [node["Leaf"]]
-    if "Split" in node:
-        split = node["Split"]
-        return leaves(split.get("first")) + leaves(split.get("second"))
-    return []
-
-found = leaves(tree)
-print(f"reported tree carries {len(found)} workspace leaves: "
-      + ", ".join(str(leaf.get('workspace_id')) for leaf in found))
-if len(found) != wanted:
-    print(f"expected {wanted} leaves", file=sys.stderr)
-    sys.exit(1)
-PY
+    oracle reported-leaves "$1"
 }
 
 # ── Phase 0: hand the relaunched client a live pane to act in ─────
