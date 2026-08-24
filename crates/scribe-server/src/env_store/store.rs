@@ -150,18 +150,9 @@ pub async fn write_envelope(
 
     // Atomic write-temp + rename, on a blocking thread so the async
     // runtime is not held by `fsync`.
-    tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
-        let tmp = write_private_temp_file(&final_path, &envelope_bytes)?;
-        if let Err(e) = std::fs::rename(&tmp, &final_path) {
-            // Best-effort cleanup of the orphaned temp on rename failure.
-            drop(std::fs::remove_file(&tmp));
-            return Err(StoreError::Io(e));
-        }
-        set_private_file_perms(&final_path)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| StoreError::Io(io::Error::other(format!("blocking panic: {e}"))))?
+    tokio::task::spawn_blocking(move || write_private_atomic_file(&final_path, &envelope_bytes))
+        .await
+        .map_err(|e| StoreError::Io(io::Error::other(format!("blocking panic: {e}"))))?
 }
 
 /// Stage one envelope's workspace-transfer re-bind: copy its DEK and sealed
@@ -196,22 +187,22 @@ pub async fn stage_envelope_transfer(
 
     let target_dir = ensure_env_dir(target_window).await?;
     let target_path = target_dir.join(format!("{launch_id}.envz"));
-    tokio::task::spawn_blocking(move || copy_sealed_envelope_bytes(&sealed, &target_path))
+    tokio::task::spawn_blocking(move || write_private_atomic_file(&target_path, &sealed))
         .await
         .map_err(|e| StoreError::Io(io::Error::other(format!("blocking panic: {e}"))))??;
     Ok(true)
 }
 
-/// Write already-sealed envelope bytes at `target_path` through the private
-/// temp-file + rename dance. Pure over its paths so tests can drive it
-/// against a scratch directory without a keystore.
-fn copy_sealed_envelope_bytes(sealed: &[u8], target_path: &Path) -> Result<(), StoreError> {
-    let tmp = write_private_temp_file(target_path, sealed)?;
-    if let Err(e) = std::fs::rename(&tmp, target_path) {
+/// Write `content` to `final_path` through a private temp file and same-dir
+/// rename. The temp file is removed if the rename fails.
+fn write_private_atomic_file(final_path: &Path, content: &[u8]) -> Result<(), StoreError> {
+    let tmp = write_private_temp_file(final_path, content)?;
+    if let Err(e) = std::fs::rename(&tmp, final_path) {
+        // Best-effort cleanup of the orphaned temp on rename failure.
         drop(std::fs::remove_file(&tmp));
         return Err(StoreError::Io(e));
     }
-    set_private_file_perms(target_path)?;
+    set_private_file_perms(final_path)?;
     Ok(())
 }
 
@@ -349,10 +340,10 @@ mod tests {
 
     // @lat: [[server#Workspace Transfer#Staged env re-bind]]
     #[test]
-    fn sealed_envelope_bytes_copy_atomically_and_leave_no_temp() {
+    fn private_atomic_write_leaves_no_temp() {
         let dir = scratch_dir("copy");
         let target = dir.join("launch-a.envz");
-        copy_sealed_envelope_bytes(b"sealed-bytes", &target).expect("copy");
+        write_private_atomic_file(&target, b"sealed-bytes").expect("write");
         assert_eq!(std::fs::read(&target).expect("read staged copy"), b"sealed-bytes");
         let leftovers = std::fs::read_dir(&dir)
             .expect("list dir")
@@ -364,12 +355,10 @@ mod tests {
 
     // @lat: [[server#Workspace Transfer#Staged env re-bind]]
     #[test]
-    fn sealed_envelope_copy_failure_leaves_no_partial_target() {
+    fn private_atomic_write_failure_leaves_no_partial_target() {
         let dir = scratch_dir("fail");
-        // The rename target's parent does not exist, so the copy must fail
-        // after the temp write and clean the temp up.
         let target = dir.join("missing-subdir").join("launch-a.envz");
-        assert!(copy_sealed_envelope_bytes(b"sealed-bytes", &target).is_err());
+        assert!(write_private_atomic_file(&target, b"sealed-bytes").is_err());
         assert!(!target.exists(), "no partial file at the target coordinates");
     }
 }
