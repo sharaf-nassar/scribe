@@ -72,7 +72,7 @@ claude
 
 ```sh
 # Snapshot the Claude pane's visible content after a session that has fired several hooks:
-scribe-test screenshot --session <session_id>   # via crates/scribe-test::capture::screenshot
+scribe-test snapshot <session_id> /tmp/claude-pane.json
 ```
 
 **Expected**: no `OSC 1337` byte fragments, no `\e]1337` sequences, no `cannot create /dev/tty` strings, no other hook-originated bytes anywhere in the rendered grid or scrollback.

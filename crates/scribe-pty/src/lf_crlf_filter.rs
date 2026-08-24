@@ -92,40 +92,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn passes_through_when_no_lf() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"hello world");
-        assert!(matches!(out, LfCrlfOutput::Unchanged(_)));
-        assert_eq!(out.as_bytes(), b"hello world");
-    }
-
-    #[test]
-    fn upgrades_bare_lf_to_crlf() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"abc\ndef");
-        assert_eq!(out.as_bytes(), b"abc\r\ndef");
-    }
-
-    #[test]
-    fn leaves_existing_crlf_unchanged() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"abc\r\ndef");
-        assert!(matches!(out, LfCrlfOutput::Unchanged(_)));
-        assert_eq!(out.as_bytes(), b"abc\r\ndef");
-    }
-
-    #[test]
-    fn upgrades_only_bare_lfs_in_mixed_stream() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"a\nb\r\nc\nd");
-        assert_eq!(out.as_bytes(), b"a\r\nb\r\nc\r\nd");
-    }
-
-    #[test]
-    fn upgrades_consecutive_lfs() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"a\n\nb");
-        assert_eq!(out.as_bytes(), b"a\r\n\r\nb");
+    fn single_chunk_cases() {
+        for (input, expected, unchanged) in [
+            (&b"hello world"[..], &b"hello world"[..], true),
+            (&b"abc\ndef"[..], &b"abc\r\ndef"[..], false),
+            (&b"abc\r\ndef"[..], &b"abc\r\ndef"[..], true),
+            (&b"a\nb\r\nc\nd"[..], &b"a\r\nb\r\nc\r\nd"[..], false),
+            (&b"a\n\nb"[..], &b"a\r\n\r\nb"[..], false),
+            (&b"\nfoo"[..], &b"\r\nfoo"[..], false),
+        ] {
+            let mut filter = LfCrlfFilter::new();
+            let output = filter.filter(input);
+            assert_eq!(output.as_bytes(), expected, "input: {input:?}");
+            assert_eq!(matches!(output, LfCrlfOutput::Unchanged(_)), unchanged);
+        }
     }
 
     #[test]
@@ -136,21 +116,5 @@ mod tests {
         assert_eq!(first.as_bytes(), b"abc\r");
         let second = f.filter(b"\ndef");
         assert_eq!(second.as_bytes(), b"\ndef");
-    }
-
-    #[test]
-    fn handles_bare_lf_split_across_chunks() {
-        let mut f = LfCrlfFilter::new();
-        let first = f.filter(b"abc");
-        assert_eq!(first.as_bytes(), b"abc");
-        let second = f.filter(b"\ndef");
-        assert_eq!(second.as_bytes(), b"\r\ndef");
-    }
-
-    #[test]
-    fn lf_at_start_of_stream_gets_crlf() {
-        let mut f = LfCrlfFilter::new();
-        let out = f.filter(b"\nfoo");
-        assert_eq!(out.as_bytes(), b"\r\nfoo");
     }
 }

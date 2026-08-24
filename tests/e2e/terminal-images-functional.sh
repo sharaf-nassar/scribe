@@ -238,19 +238,7 @@ assert_session_alive viewer-return
 pass_case viewerless_retention_and_attach
 
 # ---------------------------------------------------------------------------
-# Phase 5: sharing. Zero, one, and several viewers reading the same committed
-# burst off their own queues is a receipt the landed fan-out probe already
-# collects against the production sink set; run it inside this pass rather than
-# building a second oracle for it.
-# ---------------------------------------------------------------------------
-bash /tests/terminal-image-replies-sharing.sh >"$OUT/functional-sharing.log" 2>&1 || {
-    tail -30 "$OUT/functional-sharing.log" >&2
-    fail "the viewer fan-out corpus did not pass inside the live run"
-}
-pass_case viewer_fanout
-
-# ---------------------------------------------------------------------------
-# Phase 6: local-only posture. Everything up to here ran with no network
+# Phase 5: local-only posture. Everything up to here ran with no network
 # transport at all; the SSH case below is the single deliberate loopback
 # exception, so the boundary is measured before it is opened.
 # ---------------------------------------------------------------------------
@@ -268,7 +256,7 @@ OFFNET=$(off_box_endpoints)
 pass_case network_disabled_local_only
 
 # ---------------------------------------------------------------------------
-# Phase 7: SSH. Graphics bytes and their replies must cross a real pty-over-SSH
+# Phase 6: SSH. Graphics bytes and their replies must cross a real pty-over-SSH
 # hop unchanged, which is the one transport v1 promises.
 # ---------------------------------------------------------------------------
 mkdir -p /root/.ssh /run/sshd
@@ -305,7 +293,7 @@ wait_field_at_least kitty_transfers $((TRANSFERS_BEFORE + 1)) "$MARK" ||
 pass_case ssh_transport
 
 # ---------------------------------------------------------------------------
-# Phase 8: upgrade. A hot-reload must leave the session image-capable and its
+# Phase 7: upgrade. A hot-reload must leave the session image-capable and its
 # scene coherent. Coherent means all or nothing: the successor installs the
 # whole committed scene, and a half-carried scene — placements naming
 # definitions that did not travel — is the failure this asserts against.
@@ -384,7 +372,7 @@ assert_session_alive server-upgrade
 pass_case upgrade_continuity
 
 # ---------------------------------------------------------------------------
-# Phase 9: rollback. The master switch has to stop advertising immediately for
+# Phase 8: rollback. The master switch has to stop advertising immediately for
 # a session that is already latched, leave that session's text intact, and let
 # a capable viewer latch again when it is turned back on.
 # ---------------------------------------------------------------------------

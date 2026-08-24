@@ -200,12 +200,7 @@ for _ in $(seq 1 40); do
 done
 [ -z "$WID" ] && fail "the autostarted client never mapped a window"
 xdotool windowactivate --sync "$WID" 2>/dev/null || true
-sleep 1
-scrot -o /output/00-autostarted.png
-echo "PHASE 2 PASS: the client autostarted a server, opened a shell, and painted window $WID"
+echo "PHASE 2 PASS: the client autostarted a server, opened a shell, and mapped window $WID"
 plain_log "$PHASE2_LOG" | grep -F "connected to scribe-server" | tail -1
 
-echo ""
 echo "PASS: visual server-lifecycle test"
-echo "  Inspect screenshots in test-output/:"
-echo "    00-autostarted.png — window painting against the autostarted server"

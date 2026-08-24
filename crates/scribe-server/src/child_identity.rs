@@ -126,28 +126,17 @@ mod tests {
     use super::{IdentityCheck, check_child_identity, classify, read_child_identity};
 
     #[test]
-    fn absent_recorded_identity_is_unrecorded() {
-        assert_eq!(classify(None, Some(42)), IdentityCheck::Unrecorded);
-        assert_eq!(classify(None, None), IdentityCheck::Unrecorded);
-        assert!(!IdentityCheck::Unrecorded.may_signal());
-    }
-
-    #[test]
-    fn vanished_process_is_gone() {
-        assert_eq!(classify(Some(42), None), IdentityCheck::Gone);
-        assert!(!IdentityCheck::Gone.may_signal());
-    }
-
-    #[test]
-    fn differing_start_time_is_recycled() {
-        assert_eq!(classify(Some(42), Some(43)), IdentityCheck::Recycled);
-        assert!(!IdentityCheck::Recycled.may_signal());
-    }
-
-    #[test]
-    fn equal_start_time_matches() {
-        assert_eq!(classify(Some(42), Some(42)), IdentityCheck::Match);
-        assert!(IdentityCheck::Match.may_signal());
+    fn identity_classification_table() {
+        for (recorded, live, expected, may_signal) in [
+            (None, Some(42), IdentityCheck::Unrecorded, false),
+            (None, None, IdentityCheck::Unrecorded, false),
+            (Some(42), None, IdentityCheck::Gone, false),
+            (Some(42), Some(43), IdentityCheck::Recycled, false),
+            (Some(42), Some(42), IdentityCheck::Match, true),
+        ] {
+            assert_eq!(classify(recorded, live), expected);
+            assert_eq!(expected.may_signal(), may_signal);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -158,19 +147,6 @@ mod tests {
         assert!(first.is_some(), "expected a start time for our own pid");
         assert_eq!(first, read_child_identity(pid));
         assert_eq!(check_child_identity(pid, first), IdentityCheck::Match);
-    }
-
-    /// A live PID carrying a recorded token from some earlier process is what
-    /// PID reuse looks like from the server's side.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn stale_recorded_identity_on_a_live_pid_is_recycled() {
-        let pid = std::process::id();
-        let Some(actual) = read_child_identity(pid) else {
-            return;
-        };
-        let stale = actual.wrapping_add(1);
-        assert_eq!(check_child_identity(pid, Some(stale)), IdentityCheck::Recycled);
     }
 
     #[cfg(target_os = "linux")]

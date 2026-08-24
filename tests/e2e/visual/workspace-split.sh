@@ -127,46 +127,29 @@ grid_half_diff() {
 # a surviving session across a workspace boundary.
 MOVE_RE="moved a session into another workspace region"
 
-# ── Phase 1: baseline — single workspace with content ──────────────
-# Use xdotool to type into the initial workspace (avoids daemon/client
-# output stream conflicts after later splits).
+# Seed the split topology. The assertions begin with the bar state and move
+# count below; setup screenshots added no oracle.
 focus_window
 sleep 0.5
 xdotool type --delay 30 "echo WORKSPACE-A"
 xdotool key Return
 sleep 0.8
-capture_window /output/01-single-workspace.png
-echo "PHASE 1 PASS: single workspace baseline captured"
 
-# ── Phase 2: trigger vertical workspace split via keybinding ────────
 focus_window
-# Ctrl+Alt+backslash = workspace split vertical (side-by-side)
 xdotool key --clearmodifiers ctrl+alt+backslash
 sleep 1.5
-capture_window /output/02-after-vsplit.png
-echo "PHASE 2 PASS: vertical workspace split triggered, screenshot captured"
-
-# ── Phase 3: type into the new workspace (right side, auto-focused) ─
 focus_window
-sleep 0.5
 xdotool type --delay 30 "echo WORKSPACE-B"
 xdotool key Return
 sleep 0.8
-capture_window /output/03-workspace-b-typed.png
-echo "PHASE 3 PASS: typed into new workspace (right), screenshot captured"
 
-# ── Phase 4: click the left workspace and type into it ──────────────
-# After a vertical split on 1920x1080, the left workspace occupies
-# roughly x=0..960.  Click in the center of the left region.
 click_at 480 540
 sleep 0.3
 xdotool type --delay 30 "echo STILL-ALIVE-A"
 xdotool key Return
 sleep 0.8
-capture_window /output/04-workspace-a-alive.png
-echo "PHASE 4 PASS: typed into original workspace (left), screenshot captured"
 
-# ── Phase 5: trigger horizontal workspace split in left workspace ───
+# ── Phase 1: trigger horizontal workspace split in left workspace ───
 # Click into the left workspace first, then split. The stacked lower region
 # must reserve its own in-region tab bar; the client logs the bar set
 # whenever it changes, which is the scripted oracle for chrome the
@@ -175,18 +158,15 @@ click_at 480 540
 sleep 0.3
 xdotool key --clearmodifiers ctrl+alt+minus
 sleep 1.5
-capture_window /output/05-after-hsplit.png
 wait_bar_state "ws-[0-9a-f]+:1"
-echo "PHASE 5 PASS: horizontal split created a lower region with a 1-tab bar"
+echo "PHASE 1 PASS: horizontal split created a lower region with a 1-tab bar"
 
-# ── Phase 6: type into the bottom-left workspace (newest) ───────────
+# Type into the bottom-left workspace before asserting tab growth.
 focus_window
 sleep 0.3
 xdotool type --delay 30 "echo WORKSPACE-C"
 xdotool key Return
 sleep 0.8
-capture_window /output/06-three-workspaces.png
-echo "PHASE 6 PASS: typed into third workspace, screenshot captured"
 
 # Both splits have landed, so exactly two sessions were re-filed (each
 # split's seed moving into its freshly minted workspace). Record the count
@@ -195,16 +175,15 @@ moves_after_splits=$(log_count "$MOVE_RE")
 [ "$moves_after_splits" -eq 2 ] \
     || fail "expected 2 split-seed session moves, saw $moves_after_splits"
 
-# ── Phase 7: second tab in the stacked workspace grows its bar ──────
+# ── Phase 2: second tab in the stacked workspace grows its bar ──────
 focus_window
 sleep 0.3
 xdotool key --clearmodifiers ctrl+shift+t
 sleep 1.5
-capture_window /output/07-second-tab-in-lower-bar.png
 wait_bar_state "ws-[0-9a-f]+:2"
-echo "PHASE 7 PASS: new tab joined the lower region's bar"
+echo "PHASE 2 PASS: new tab joined the lower region's bar"
 
-# ── Phase 7b: clicking the bar's inactive tab selects its session ───
+# ── Phase 3: clicking the bar's inactive tab selects its session ───
 # The lower-left region's bar sits at the top of the bottom-left region:
 # titlebar (34px) + half the grid band puts it around y=400 in this
 # 1008x756 window, and the first (inactive) tab starts at the bar's left
@@ -213,10 +192,9 @@ echo "PHASE 7 PASS: new tab joined the lower region's bar"
 click_at 90 400
 sleep 1
 wait_log "region bar selected a tab"
-capture_window /output/07b-bar-tab-clicked.png
-echo "PHASE 7b PASS: clicking the lower bar's tab reached its session"
+echo "PHASE 3 PASS: clicking the lower bar's tab reached its session"
 
-# ── Phase 8: a background tab exit cannot steal window focus ───────
+# ── Phase 4: a background tab exit cannot steal window focus ───────
 # Give the right region a static, cursor-free frame, then schedule the selected
 # lower-region tab to exit and move focus right before its shell ends. The
 # focused half must remain pixel-identical while the lower region refocuses its
@@ -250,9 +228,9 @@ sleep 2
 moves_now=$(log_count "$MOVE_RE")
 [ "$moves_now" -eq "$moves_after_splits" ] \
     || fail "a background tab exit re-filed a session across workspaces ($moves_after_splits -> $moves_now)"
-echo "PHASE 8 PASS: background exit kept $focused_diff focused-pixel changes and adopted its sibling once"
+echo "PHASE 4 PASS: background exit kept $focused_diff focused-pixel changes and adopted its sibling once"
 
-# ── Phase 9: attached last-tab collapse adopts no dead session ─────
+# ── Phase 5: attached last-tab collapse adopts no dead session ─────
 # Focus the lower region and exit its last tab. Region collapse must clear the
 # dead active session, focus the first surviving region, and route the next
 # command into that pane without any per-frame adoption loop.
@@ -284,19 +262,6 @@ routing_diff=$(grid_half_diff \
     /output/10-alive-after-collapse.png left)
 [ "$routing_diff" -ge "$ROUTING_DIFF_MIN" ] \
     || fail "last-tab collapse left routing dead ($routing_diff changed pixels)"
-echo "PHASE 9 PASS: region collapse changed $routing_diff routed pixels with no pane-adopt spam"
+echo "PHASE 5 PASS: region collapse changed $routing_diff routed pixels with no pane-adopt spam"
 
-echo ""
 echo "PASS: visual workspace split test"
-echo "  Inspect screenshots in test-output/:"
-echo "    01-single-workspace.png   — single workspace before split"
-echo "    02-after-vsplit.png        — after Ctrl+Alt+\\ (side-by-side)"
-echo "    03-workspace-b-typed.png   — after typing in right workspace"
-echo "    04-workspace-a-alive.png   — after typing in left workspace"
-echo "    05-after-hsplit.png        — after Ctrl+Alt+- (left split top/bottom)"
-echo "    07-second-tab-in-lower-bar.png — two tabs in the lower region's bar"
-echo "    08a-focused-before-background-exit.png — focused-region match baseline"
-echo "    08b-focused-after-background-exit.png — exact focused-region match"
-echo "    09-after-region-collapse.png — after the stacked region collapsed"
-echo "    10-alive-after-collapse.png — survivor accepted routed input"
-echo "    06-three-workspaces.png    — all three workspaces with content"

@@ -8,17 +8,11 @@ use std::time::Duration;
 use super::{AnimationSettings, MAX_TRANSITION};
 
 // @lat: [[test#GPUI Animation Policy#Config default enables motion]]
-#[test]
-fn config_true_no_override_enables_motion() {
-    let settings = AnimationSettings::resolve_with_env(true, None);
-    assert!(settings.enabled());
-}
-
 // @lat: [[test#GPUI Animation Policy#Config false disables motion]]
 #[test]
-fn config_false_disables_motion() {
-    let settings = AnimationSettings::resolve_with_env(false, None);
-    assert!(!settings.enabled());
+fn config_controls_motion_without_an_override() {
+    assert!(AnimationSettings::resolve_with_env(true, None).enabled());
+    assert!(!AnimationSettings::resolve_with_env(false, None).enabled());
 }
 
 // @lat: [[test#GPUI Animation Policy#Truthy env override forces motion off]]
@@ -40,19 +34,14 @@ fn falsy_or_empty_env_leaves_config_in_charge() {
 }
 
 // @lat: [[test#GPUI Animation Policy#Enabled duration clamps to 150 ms]]
-#[test]
-fn enabled_duration_is_clamped_to_max() {
-    let settings = AnimationSettings::resolve_with_env(true, None);
-    assert_eq!(settings.duration(Duration::from_millis(400)), MAX_TRANSITION);
-    assert_eq!(settings.duration(Duration::from_millis(80)), Duration::from_millis(80));
-}
-
 // @lat: [[test#GPUI Animation Policy#Disabled duration is zero]]
 #[test]
-fn disabled_duration_is_zero_for_determinism() {
-    let settings = AnimationSettings::resolve_with_env(false, None);
-    assert_eq!(settings.duration(Duration::from_millis(120)), Duration::ZERO);
-    // A disabled transition collapses to a zero-length animation so GPUI paints
-    // the end state on the first frame.
-    assert_eq!(settings.transition(Duration::from_millis(120)).duration, Duration::ZERO);
+fn duration_follows_motion_policy() {
+    let enabled = AnimationSettings::resolve_with_env(true, None);
+    assert_eq!(enabled.duration(Duration::from_millis(400)), MAX_TRANSITION);
+    assert_eq!(enabled.duration(Duration::from_millis(80)), Duration::from_millis(80));
+
+    let disabled = AnimationSettings::resolve_with_env(false, None);
+    assert_eq!(disabled.duration(Duration::from_millis(120)), Duration::ZERO);
+    assert_eq!(disabled.transition(Duration::from_millis(120)).duration, Duration::ZERO);
 }

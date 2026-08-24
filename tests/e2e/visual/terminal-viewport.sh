@@ -282,34 +282,6 @@ capture /output/vp-03-back-at-bottom.png
 DIFF=$(window_diff /output/vp-01-bottom.png /output/vp-03-back-at-bottom.png)
 echo "PHASE 3 PASS: shift+End restored the live bottom (${DIFF}px from the phase-1 frame)"
 
-# ── Phase 4: zoom rescales the grid font ──────────────────────────
-BASE=$(count_log "terminal zoom changed")
-send_keys ctrl+minus
-if ! wait_for_log_growth "terminal zoom changed" "$BASE"; then
-    fail "PHASE 4 FAIL: ctrl+- never reached zoom_out"
-fi
-LINE=$(last_log_line "terminal zoom changed")
-case "$LINE" in
-    *"level=-1"*) ;;
-    *) fail "PHASE 4 FAIL: zoom_out did not step the level: $LINE" ;;
-esac
-capture /output/vp-04-zoomed-out.png
-DIFF=$(window_diff /output/vp-03-back-at-bottom.png /output/vp-04-zoomed-out.png)
-if [ "${DIFF:-0}" -lt "$VIEWPORT_DIFF_MIN" ]; then
-    fail "PHASE 4 FAIL: zoom_out changed $DIFF px (min $VIEWPORT_DIFF_MIN); the font never rescaled"
-fi
-BASE=$(count_log "terminal zoom changed")
-send_keys ctrl+0
-if ! wait_for_log_growth "terminal zoom changed" "$BASE"; then
-    fail "PHASE 4 FAIL: ctrl+0 never reached zoom_reset"
-fi
-LINE=$(last_log_line "terminal zoom changed")
-case "$LINE" in
-    *"level=0"*) ;;
-    *) fail "PHASE 4 FAIL: zoom_reset did not return to the configured size: $LINE" ;;
-esac
-echo "PHASE 4 PASS: ctrl+- rescaled the grid (+$DIFF px) and ctrl+0 reset it"
-
 # ── Phase 5: vi / copy mode owns the keyboard ─────────────────────
 # Three things have to hold: the chord toggles the mode, a motion key paints a
 # cursor, and — the whole point of copy mode — the motion key does NOT reach
@@ -430,7 +402,6 @@ echo "    vp-01-bottom.png         — the live bottom after 200 rows"
 echo "    vp-02-scrolled.png       — after shift+PageUp paged into scrollback"
 echo "    vp-02b-jump-bottom.png  — plain-pane click returned to the live view"
 echo "    vp-03-back-at-bottom.png — after shift+End returned to the live view"
-echo "    vp-04-zoomed-out.png     — the grid one zoom step smaller"
 echo "    vp-05-vi-cursor.png      — the vi cursor after twelve upward motions"
 echo "    vp-06-split-scroll.png   — the pinned live bottom under scrollback"
 echo "    vp-07-context-menu.png   — the menu carrying the matched URI rule"

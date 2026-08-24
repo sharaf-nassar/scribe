@@ -4,7 +4,6 @@ mod client_replay;
 mod client_scene;
 mod cmd_socket;
 mod daemon;
-mod decode_spike;
 mod decode_storage;
 mod framing_probe;
 mod github_actions_api;
@@ -14,7 +13,6 @@ mod ipc_fixtures;
 mod kitty_decode;
 mod lan_peer;
 mod remote_peer;
-mod render;
 mod replay;
 mod server;
 mod session;
@@ -130,13 +128,6 @@ enum Command {
         /// Number of rows.
         rows: u16,
     },
-    /// Capture a PNG screenshot of a session.
-    Screenshot {
-        /// Target session ID.
-        session_id: String,
-        /// Output file path.
-        path: PathBuf,
-    },
     /// Capture a text snapshot of a session's screen contents.
     Snapshot {
         /// Target session ID.
@@ -208,22 +199,6 @@ enum Command {
         col: u16,
         /// Expected character / string at that cell.
         expected: String,
-    },
-    /// Assert that the cursor is at a specific position.
-    AssertCursor {
-        /// Target session ID.
-        session_id: String,
-        /// Expected cursor row (0-indexed).
-        row: u16,
-        /// Expected cursor column (0-indexed).
-        col: u16,
-    },
-    /// Assert that the current screen matches a reference snapshot (JSON file).
-    AssertSnapshotMatch {
-        /// Target session ID.
-        session_id: String,
-        /// Path to a reference snapshot JSON file (from `snapshot` command).
-        reference: PathBuf,
     },
     /// Assert that no zero-byte `PtyOutput` frame arrived for a session.
     AssertNoEmptyOutput {
@@ -315,15 +290,6 @@ enum Command {
         /// Timeout in milliseconds.
         #[arg(long, default_value_t = 5000)]
         timeout: u64,
-    },
-    /// Run the bounded terminal-image decoder feasibility probe.
-    DecodeSpike {
-        /// Frozen terminal-image contract JSON.
-        #[arg(long)]
-        contract: PathBuf,
-        /// JSON evidence destination.
-        #[arg(long)]
-        evidence: PathBuf,
     },
     /// Run adversarial checks against the vendored bounded Sixel decoder.
     SixelDecoder {
@@ -717,7 +683,6 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Session { action } => run_session(action),
         Command::Send { session_id, data } => input::send(&session_id, &data),
         Command::Resize { session_id, cols, rows } => input::resize(&session_id, cols, rows),
-        Command::Screenshot { session_id, path } => capture::screenshot(&session_id, &path),
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
         Command::BeadsBoard => capture::beads_board(),
@@ -732,14 +697,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::WaitIdle { session_id, ms, timeout } => wait::wait_idle(&session_id, ms, timeout),
         command @ (Command::AssertCell { .. }
-        | Command::AssertCursor { .. }
-        | Command::AssertSnapshotMatch { .. }
         | Command::AssertNoEmptyOutput { .. }
         | Command::AssertExit { .. }
         | Command::AssertSignal { .. }) => run_assert(command),
-        Command::DecodeSpike { contract, evidence } => {
-            decode_spike::run(&contract, &evidence).map_err(TestError::TestFailure)
-        }
         Command::SixelDecoder { contract, fixtures, evidence } => {
             sixel_decoder::run(&contract, &fixtures, &evidence).map_err(TestError::TestFailure)
         }
@@ -793,12 +753,6 @@ fn run_assert(command: Command) -> Result<(), TestError> {
         Command::AssertCell { session_id, row, col, expected } => {
             let ch = extract_char(&expected)?;
             assert::assert_cell(&session_id, row, col, ch)
-        }
-        Command::AssertCursor { session_id, row, col } => {
-            assert::assert_cursor(&session_id, row, col)
-        }
-        Command::AssertSnapshotMatch { session_id, reference } => {
-            assert::assert_snapshot_match(&session_id, &reference)
         }
         Command::AssertNoEmptyOutput { session_id } => assert::assert_no_empty_output(&session_id),
         Command::AssertExit { session_id, code, timeout } => {

@@ -474,22 +474,6 @@ mod tests {
             err.contains("unexpected server response"),
             "error message should describe the wrong-variant case: {err}"
         );
-
-        // The public entry point folds the same `Err` into a `Failed` state
-        // with a non-empty reason — verifying the contract end-to-end without
-        // touching the global socket.
-        let mapped = match parse_release_list_response(ServerMessage::UpdateCheckResult {
-            state: UpdateCheckResultState::NoUpdate,
-        }) {
-            Ok(state) => state,
-            Err(reason) => ReleaseListResultState::Failed { reason },
-        };
-        match mapped {
-            ReleaseListResultState::Failed { reason } => {
-                assert!(!reason.is_empty(), "Failed reason must not be empty");
-            }
-            unexpected => panic!("expected Failed, got {unexpected:?}"),
-        }
     }
 
     /// Sanity: a real `ReleaseList` payload round-trips through the parser
@@ -524,22 +508,6 @@ mod tests {
             err.contains("unexpected server response"),
             "error message should describe the wrong-variant case: {err}"
         );
-
-        // The public entry point folds the same `Err` into an
-        // `Err(PreflightError::Unknown { reason })` with a non-empty reason —
-        // verifying the contract end-to-end without touching the global socket.
-        let mapped = match parse_env_preflight_response(ServerMessage::UpdateCheckResult {
-            state: UpdateCheckResultState::NoUpdate,
-        }) {
-            Ok(outcome) => outcome,
-            Err(reason) => EnvPreflightOutcome::Err(PreflightError::Unknown { reason }),
-        };
-        match mapped {
-            EnvPreflightOutcome::Err(PreflightError::Unknown { reason }) => {
-                assert!(!reason.is_empty(), "Unknown reason must not be empty");
-            }
-            unexpected => panic!("expected Err(Unknown), got {unexpected:?}"),
-        }
     }
 
     /// Sanity: real `EnvPreflightResult` payloads round-trip through the

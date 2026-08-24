@@ -62,9 +62,6 @@ pub enum DaemonRequest {
         cols: u16,
         rows: u16,
     },
-    RequestScreenshot {
-        session_id: SessionId,
-    },
     RequestSnapshot {
         session_id: SessionId,
     },
@@ -89,11 +86,6 @@ pub enum DaemonRequest {
         col: u16,
         expected: char,
     },
-    AssertCursor {
-        session_id: SessionId,
-        row: u16,
-        col: u16,
-    },
     AssertExit {
         session_id: SessionId,
         expected_code: i32,
@@ -112,12 +104,6 @@ pub enum DaemonRequest {
     /// instead of shipping an empty one the whole pipeline still pays for.
     AssertNoEmptyOutput {
         session_id: SessionId,
-    },
-    /// Compare the current screen against a reference snapshot (cell content,
-    /// cursor position, cursor visibility).
-    AssertSnapshotMatch {
-        session_id: SessionId,
-        reference: Box<ScreenSnapshot>,
     },
     /// Ask for the client chrome text a session's AI state produces (the
     /// prompt-bar context meter and the tab-inline context suffix).

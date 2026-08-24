@@ -19,6 +19,17 @@
 # Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot.
 set -e
 
+fail() {
+    echo "FAIL: $1" >&2
+    exit 1
+}
+
+pixel_diff() {
+    local value
+    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
+}
+
 find_window() {
     local wid
     wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | head -1)
@@ -39,7 +50,7 @@ focus() {
 shot() {
     focus
     sleep 0.2
-    scrot "$1"
+    scrot -o "$1"
     echo "captured $1"
 }
 
@@ -61,32 +72,40 @@ xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
 sleep 1.5
 focus
 sleep 0.5
+shot /output/00-dialog-baseline.png
 send_keys ctrl+shift+d
 shot /output/01-close-dialog.png
-echo "PHASE 1 PASS: close dialog opens — Quit/Kill/Cancel, Cancel focused, backdrop dim"
+DIFF=$(pixel_diff /output/00-dialog-baseline.png /output/01-close-dialog.png)
+[ "$DIFF" -ge 500 ] || fail "close dialog changed only $DIFF pixels"
+echo "PHASE 1 PASS: close dialog painted ($DIFF px)"
 
-# Tab moves the focus ring off the safe Cancel button (onto Quit Scribe).
 send_keys Tab
 shot /output/02-close-focus-moved.png
-echo "PHASE 2 PASS: Tab cycles focus onto the accent Quit Scribe button"
+DIFF=$(pixel_diff /output/01-close-dialog.png /output/02-close-focus-moved.png)
+[ "$DIFF" -ge 10 ] || fail "close-dialog focus changed only $DIFF pixels"
+echo "PHASE 2 PASS: Tab repainted the focused button ($DIFF px)"
 
-# Esc dismisses with the safe Cancel action, tearing the modal down.
 send_keys Escape
 sleep 0.3
 shot /output/03-close-dismissed.png
-echo "PHASE 3 PASS: Esc dismisses the close dialog (safe Cancel)"
+DIFF=$(pixel_diff /output/01-close-dialog.png /output/03-close-dismissed.png)
+[ "$DIFF" -ge 500 ] || fail "Escape left the close dialog visible"
+echo "PHASE 3 PASS: Escape dismissed the close dialog"
 
 # ── Phase 4: clipboard dialog with four-button policy + preview ───
 focus
 send_keys ctrl+shift+k
 shot /output/04-clipboard-dialog.png
-echo "PHASE 4 PASS: clipboard dialog opens — 4 buttons, Deny once focused, payload preview"
+DIFF=$(pixel_diff /output/03-close-dismissed.png /output/04-clipboard-dialog.png)
+[ "$DIFF" -ge 500 ] || fail "clipboard dialog changed only $DIFF pixels"
+echo "PHASE 4 PASS: clipboard dialog painted ($DIFF px)"
 
-# Tab twice lands on the destructive Allow-once button.
 send_keys Tab
 send_keys Tab
 shot /output/05-clipboard-allow-focus.png
-echo "PHASE 5 PASS: Tab cycles onto the destructive Allow once button"
+DIFF=$(pixel_diff /output/04-clipboard-dialog.png /output/05-clipboard-allow-focus.png)
+[ "$DIFF" -ge 10 ] || fail "clipboard-dialog focus changed only $DIFF pixels"
+echo "PHASE 5 PASS: Tab repainted the focused button ($DIFF px)"
 
 send_keys Escape
 sleep 0.3

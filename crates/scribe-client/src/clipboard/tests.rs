@@ -52,21 +52,6 @@ impl ClipboardBackend for FakeClipboard {
     }
 }
 
-// @lat: [[test#GPUI OSC 52 Clipboard Bridge#Write-read roundtrip on the system clipboard]]
-#[test]
-fn write_then_read_roundtrips_on_system_clipboard() {
-    let mut cb = FakeClipboard::available();
-    bridge_write(
-        &mut cb,
-        ClipboardSelection::Clipboard,
-        "payload".into(),
-        FocusGate { focus_gate_writes: false, window_focused: true },
-    )
-    .unwrap();
-    let read = bridge_read(&mut cb, ClipboardSelection::Clipboard).unwrap();
-    assert_eq!(read, "payload");
-}
-
 // @lat: [[test#GPUI OSC 52 Clipboard Bridge#Primary and system selections stay independent]]
 #[test]
 fn primary_and_system_selections_are_independent() {

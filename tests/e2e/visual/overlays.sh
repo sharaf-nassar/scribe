@@ -13,6 +13,17 @@
 # Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS), xdotool, scrot.
 set -e
 
+fail() {
+    echo "FAIL: $1" >&2
+    exit 1
+}
+
+pixel_diff() {
+    local value
+    value=$(compare -metric AE "$1" "$2" null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
+}
+
 find_window() {
     local wid
     wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | head -1)
@@ -33,7 +44,7 @@ focus() {
 shot() {
     focus
     sleep 0.2
-    scrot "$1"
+    scrot -o "$1"
     echo "captured $1"
 }
 
@@ -60,7 +71,7 @@ right_click_at() {
     wid=$(find_window) || true
     if [ -n "$wid" ]; then
         xdotool mousemove --window "$wid" "$x" "$y"
-        xdotool click --window "$wid" 3
+        xdotool click 3
         sleep 0.3
     fi
 }
@@ -68,36 +79,46 @@ right_click_at() {
 # ── Phase 1: command palette opens and filters ────────────────────
 sleep 0.8
 focus
+shot /output/00-overlays-baseline.png
 send_keys ctrl+shift+p
 shot /output/01-palette-open.png
-echo "PHASE 1 PASS: command palette opens with rounded box + shadow"
+DIFF=$(pixel_diff /output/00-overlays-baseline.png /output/01-palette-open.png)
+[ "$DIFF" -ge 500 ] || fail "command palette changed only $DIFF pixels"
+echo "PHASE 1 PASS: command palette painted ($DIFF px)"
 
 type_text "split"
 shot /output/02-palette-filtered.png
-echo "PHASE 2 PASS: typing filters the palette rows"
+DIFF=$(pixel_diff /output/01-palette-open.png /output/02-palette-filtered.png)
+[ "$DIFF" -ge 50 ] || fail "palette filtering changed only $DIFF pixels"
+echo "PHASE 2 PASS: typing repainted the filtered rows ($DIFF px)"
 
 send_keys Down
 shot /output/03-palette-selection.png
-echo "PHASE 3 PASS: arrow keys move the highlighted selection"
+DIFF=$(pixel_diff /output/02-palette-filtered.png /output/03-palette-selection.png)
+[ "$DIFF" -ge 10 ] || fail "palette selection changed only $DIFF pixels"
+echo "PHASE 3 PASS: arrow navigation repainted selection ($DIFF px)"
 
-# Dismiss the palette so it does not obscure the next overlay.
 send_keys Escape
 sleep 0.3
+shot /output/03b-palette-dismissed.png
 
 # ── Phase 4: right-click context menu ─────────────────────────────
 right_click_at 300 300
 shot /output/04-context-menu.png
-echo "PHASE 4 PASS: right-click opens the context menu at the cursor"
+DIFF=$(pixel_diff /output/03b-palette-dismissed.png /output/04-context-menu.png)
+[ "$DIFF" -ge 200 ] || fail "context menu changed only $DIFF pixels"
+echo "PHASE 4 PASS: right-click painted the context menu ($DIFF px)"
 
-# Dismiss the menu with an outside click.
-right_click_at 700 500
-sleep 0.3
+send_keys Escape
+shot /output/04b-context-dismissed.png
 
 # ── Phase 5: hover tooltip (truncated + clamped URL) ──────────────
 focus
 send_keys ctrl+shift+u
 shot /output/05-tooltip.png
-echo "PHASE 5 PASS: tooltip shows a head+tail-truncated, clamped URL"
+DIFF=$(pixel_diff /output/04b-context-dismissed.png /output/05-tooltip.png)
+[ "$DIFF" -ge 50 ] || fail "tooltip changed only $DIFF pixels"
+echo "PHASE 5 PASS: tooltip painted ($DIFF px)"
 
 echo ""
 echo "PASS: visual overlays test"

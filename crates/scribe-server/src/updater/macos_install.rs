@@ -467,8 +467,9 @@ mod tests {
     }
 
     // @lat: [[test#Test Harness#macOS updater bundle swap#Copy failure releases the mount]]
+    // @lat: [[test#Test Harness#macOS updater bundle swap#Copy failure restores the backup]]
     #[test]
-    fn copy_failure_releases_the_mount() {
+    fn copy_failure_restores_the_backup_and_releases_the_mount() {
         let (dmg, mount, app, prev) = paths();
         let mut host = FakeHost::new();
         host.copy_result = Err("ditto boom".to_owned());
@@ -478,17 +479,6 @@ mod tests {
 
         assert_eq!(err, "ditto boom");
         assert!(host.detached(), "a failed copy still releases the mount");
-    }
-
-    // @lat: [[test#Test Harness#macOS updater bundle swap#Copy failure restores the backup]]
-    #[test]
-    fn copy_failure_restores_the_backup() {
-        let (dmg, mount, app, prev) = paths();
-        let mut host = FakeHost::new();
-        host.copy_result = Err("ditto boom".to_owned());
-
-        drop(swap_bundle_from_dmg(&mut host, &swap_paths(&dmg, &mount, &app, &prev)));
-
         assert!(
             host.calls.contains(&Call::Restore(prev.clone(), app.clone())),
             "the moved-aside bundle is renamed back"
@@ -496,8 +486,9 @@ mod tests {
     }
 
     // @lat: [[test#Test Harness#macOS updater bundle swap#Attach failure leaves the install untouched]]
+    // @lat: [[test#Test Harness#macOS updater bundle swap#Attach failure releases a partially attached image]]
     #[test]
-    fn attach_failure_leaves_the_install_untouched() {
+    fn attach_failure_leaves_install_untouched_and_releases_the_image() {
         let (dmg, mount, app, prev) = paths();
         let mut host = FakeHost::new();
         host.attach_result = Err("attach boom".to_owned());
@@ -513,17 +504,6 @@ mod tests {
             )),
             "the installed bundle is never touched when the volume did not mount"
         );
-    }
-
-    // @lat: [[test#Test Harness#macOS updater bundle swap#Attach failure releases a partially attached image]]
-    #[test]
-    fn attach_failure_releases_a_partially_attached_image() {
-        let (dmg, mount, app, prev) = paths();
-        let mut host = FakeHost::new();
-        host.attach_result = Err("attach boom".to_owned());
-
-        drop(swap_bundle_from_dmg(&mut host, &swap_paths(&dmg, &mount, &app, &prev)));
-
         assert!(
             host.calls.contains(&Call::ReleaseImage(dmg.clone())),
             "a failed attach may still have attached devices, so the image is released"

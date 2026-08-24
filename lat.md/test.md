@@ -3,6 +3,42 @@
 Scribe tests combine server-focused functional checks with GPUI headless and
 visual end-to-end coverage for the rebuilt client.
 
+## Consolidated coverage
+
+The suite keeps one strongest oracle per behavior and sends pixel assertions through the real GPUI client instead of a harness renderer.
+
+### Screen and replay inspection
+
+The harness exposes JSON snapshots for cell inspection and bounded replay comparisons for attach correctness.
+
+[[crates/scribe-test/src/capture.rs#snapshot]] serializes authoritative pane state as JSON. The unused harness PNG renderer and its `screenshot` command were removed because no caller inspected those pixels; visual tests capture the shipped GPUI window instead.
+
+The server now answers `RequestSnapshot` with a bounded `SessionReplay`. [[crates/scribe-test/src/daemon.rs#request_snapshot]] accepts that current response and the legacy `ScreenSnapshot`, while [[crates/scribe-test/src/daemon.rs#request_screen_pair]] freezes the settled replayed view before requesting the authoritative replay used by `replay assert-matches`.
+
+Unused cursor and reference-file assertion commands were removed. [[crates/scribe-test/src/assert.rs#assert_cell]] remains the focused cell oracle, and replay equality owns whole-screen and scrollback comparison.
+
+### Functional suite ownership
+
+The functional aggregate discovers executable scripts directly and routes only cases needing special images, timeouts, or keyring setup through dedicated recipes.
+
+Idle reconnect and daemon socket-loss smokes were removed because `attach-lossless.sh`, `cold-restart.sh`, and the real-client lifecycle suites cover stronger states. The functional workspace-split case was removed because it created ordinary sessions without exercising a split, and the session-isolation case no longer repeats reconnect or close coverage. Directly injected terminal-shortcut and keybinding scripts were removed because they bypassed client key translation; the visual keybinding matrix owns those effects.
+
+Generated agent guidance stays covered by CLI units, while `tests/install/postinst-regressions.sh` owns packaged setup idempotence and foreign-file refusal. The live terminal-image continuity pass no longer invokes the complete viewer-sharing gate a second time.
+
+### Visual oracle ownership
+
+Overlay, dialog, and paste tests fail on observable output rather than leaving screenshots for manual inspection.
+
+`tests/e2e/visual/overlays.sh` and `dialogs.sh` require bounded pixel changes for open, filter, focus, and dismissal transitions. `paste-confirmation.sh` uses the shared pane to prove risky bytes stay off the PTY before and after Escape while plain text passes through.
+
+The screenshot-only reconnect script was removed in favor of attach, server-lifecycle, and cold-restart assertions. Font zoom remains solely in `terminal-zoom.sh`, which checks both pixels and published cell geometry.
+
+### Compact unit matrices
+
+Table-driven cases retain branch coverage without one test function per input example.
+
+Clipboard cleanup, LF-to-CRLF filtering, stop classification, child identity, animation policy, and macOS installer failure cleanup now group equivalent input/output cases. Shell-specific quoting still reaches the dispatcher through each quoter's direct test.
+
 ## Workspace Transfer Server Transaction
 
 Focused server tests construct real live-session entries over PTY pairs and a
@@ -219,7 +255,7 @@ Container scripts exercise the real CLI-to-server control path from inside live 
 
 `tests/e2e/func/agent-read.sh` restarts the server per policy phase: an in-pane read under `deny` returns the typed `denied` envelope without disclosing a sibling's secret marker, then a read under `allow` returns the sibling's session id, title, CWD, and marker text. `tests/e2e/func/agent-world.sh` proves `world` marks exactly one caller row, `siblings` resolves the caller's window purely through the inherited origin, and `capabilities` reports surface version 1 plus the live policy modes.
 
-`tests/e2e/func/agent-write.sh` holds the target PTY's raw-mode reader behind a file gate so a complete 64 KiB write cannot be acknowledged early, then proves the exact payload landed before the successful acknowledgement. `tests/e2e/func/agent-affordance.sh` runs the packaged Claude and Codex setup scripts through fresh install, idempotent no-rewrite, default-deny policy reflection, and foreign-file refusal.
+`tests/e2e/func/agent-write.sh` holds the target PTY's raw-mode reader behind a file gate so a complete 64 KiB write cannot be acknowledged early, then proves the exact payload landed before the successful acknowledgement. CLI unit tests pin generated policy guidance, while `tests/install/postinst-regressions.sh` owns fresh install, idempotent no-rewrite, regeneration, and foreign-file refusal for the packaged Claude and Codex setup scripts.
 
 `tests/e2e/func/agent-action.sh` runs in the visual image (`just e2e-visual-agent-action`) because correlated completion needs a real GPUI window: a `new-tab` action targeted at the named client window completes and returns a created session id that a following `world` call must contain.
 
@@ -1195,16 +1231,15 @@ Kitty `OK` ahead of a DA1 carrying attribute `4`. An image transmitted over the
 same SSH hop must decode; the decode counter rather than the placement count is
 what proves it, because a login banner scrolls placements off the grid.
 
-### Viewerless Retention, Attach, and Fan-out
+### Viewerless Retention and Attach
 
 A session whose only viewer left has to keep parsing and keep its latch, and be whole when a viewer returns.
 
 An emitter armed inside the session fires after the daemon has detached. The
 detached window must still produce a decode and a placement, and the returning
-viewer must find a usable session. Zero, one, and several viewers reading one
-committed burst off their own queues is a receipt the landed fan-out probe
-already collects against the production sink set, so this corpus runs that probe
-inside the live pass instead of building a second oracle for it.
+viewer must find a usable session. Zero, one, and several-viewer delivery stays
+in the dedicated `terminal-image-replies-sharing.sh` production-sink probe; the
+live continuity pass no longer runs that complete gate a second time.
 
 ### Upgrade and Kill-switch Rollback
 
@@ -1247,8 +1282,8 @@ that follows, which is loopback as well.
 
 The manifest is payload-free by construction — case names, the observed upgrade
 outcome, and the final counters — and the run refuses any manifest that embedded
-array-shaped data. The recorded probe replies, the sharing probe's log, and the
-server log it read land beside it.
+array-shaped data. The recorded probe replies and the server log it read land
+beside it.
 
 ## Native macOS Metal Parity Corpus
 
@@ -1443,9 +1478,9 @@ Blocking synchronization helpers: wait for regex output, CWD change, or terminal
 
 ## Assertions
 
-Verify screen cell content, cursor position, snapshot equality, stream shape, and how a session's child died — returning `TestFailure` (exit 1) on mismatch.
+Verify screen cell content, stream shape, and how a session's child died — returning `TestFailure` (exit 1) on mismatch.
 
- checks that a specific cell contains the expected character; on failure the daemon includes a 3×3 neighborhood context in the error message.  verifies the cursor is at the expected row/col.  loads a reference JSON snapshot and compares cell content, cursor position, and cursor visibility.  waits up to `timeout_ms` for the session to exit with the expected code.
+ checks that a specific cell contains the expected character; on failure the daemon includes a 3×3 neighborhood context in the error message.  waits up to `timeout_ms` for the session to exit with the expected code. Replay equality uses the stronger live `replay assert-matches` oracle below rather than an unused reference-file comparison command.
 
 [[crates/scribe-test/src/assert.rs#assert_no_empty_output|assert-no-empty-output]] is the odd one out: it asserts about the *stream* rather than the screen, failing if any zero-byte `PtyOutput` ever arrived for the session. No screen assertion can catch that frame — it changes no cell — and the smoke suite runs it last, after phases that have driven the PTY filters, so a filter that starts shipping emptied chunks is caught by an existing test rather than a dedicated one.
 
@@ -1453,13 +1488,9 @@ Exit assertions come in two shapes because the wire keeps a terminating signal i
 
 ## Screen Capture
 
-Capture the current terminal state as a PNG screenshot or a JSON text snapshot for later comparison.
+ serializes the daemon's `ScreenSnapshot` to pretty-printed JSON for cell-level inspection.
 
- requests a `ScreenshotData` response from the daemon and writes the snapshot to a PNG file via .  requests the same data but serializes the `ScreenSnapshot` to pretty-printed JSON.
-
-### PNG Rendering
-
- uses `cosmic-text` for shaping, xterm-256 ANSI palette for colours, and alpha blending for compositing. Cells are 10×20 px at 14 pt.  covers I/O and PNG encoding failures.
+Pixel assertions use the real GPUI window in the visual harness. The retired harness PNG renderer never exercised the shipped client, and none of its callers inspected the generated images.
 
 ## Replay Observation
 
@@ -1475,7 +1506,7 @@ Three CLI surfaces read it back:
 
 - `scribe-test replay status <session>` prints `frames`, `failed`, `live-bytes`, and a `last-frame` line carrying geometry, cursor, alt-screen flag, compressed and inflated sizes, and the live bytes before and after the frame. `--min-frames` blocks on the `replay` notifier, because the attach reply lands on the reader task and would otherwise race the next CLI invocation; `--expect-frames 0` is how a test states that a session was never sent a replay at all.
 - `scribe-test replay screen <session>` prints the replayed screen as text, or writes it as snapshot JSON with `--json`, so scripts grep replayed content directly.
-- `scribe-test replay assert-matches <session>` requests a fresh server snapshot and compares it against the replayed view read back under the same lock — the losslessness oracle for an attach. Cursor *visibility* is excluded, because the encoder deliberately leaves the cursor hidden on alt-screen replays so the app's own output owns it. Callers settle the session with `wait-idle` first, since output arriving while the request is in flight legitimately moves the view ahead.
+- `scribe-test replay assert-matches <session>` freezes the settled replayed view, requests the server's bounded whole-pane replay, and compares the two — the losslessness oracle for an attach. Legacy `ScreenSnapshot` replies remain accepted. Cursor *visibility* is excluded because the encoder deliberately leaves it hidden on alt-screen replays so the app's own output owns it.
 
 ### Replay replaces terminal state
 
@@ -1608,8 +1639,7 @@ scribe-test wait-idle "$SID" --ms 200
 
 # Assert and capture
 scribe-test assert-cell "$SID" 0 0 'h'
-scribe-test assert-cursor "$SID" 1 0
-scribe-test screenshot "$SID" out.png
+scribe-test snapshot "$SID" out.json
 
 # Cleanup
 scribe-test session close "$SID"
@@ -1702,7 +1732,8 @@ Package regressions prove Scribe can repair its own global Pi extension without 
 `tests/install/postinst-regressions.sh` covers fresh mode-0644 installation,
 identical-content no-op, atomic replacement of stale marked content, readable
 refusal of unmarked files and every symlink or non-regular collision, sibling
-preservation, target-user deferral, and stable/development package assets.
+preservation, and target-user deferral. Package payload checks belong to the
+package extraction and release jobs rather than source-text greps here.
 Startup and settings tests require repair only while enabled and only once on a
 false-to-true transition; disabling leaves the installed file available for a
 later rollback reversal.
@@ -1864,8 +1895,8 @@ Each E2E image carries a label hashing its Rust, Cargo, Docker, and packaged-scr
 
 `just deb-dev` ends with `tests/install/dev-package-smoke.sh --package-only`,
 which extracts the built `scribe-dev` package and byte-compares every renamed
-binary and dev asset plus maintainer script against its source. It also requires
-the board snapshot and Flow named MessagePack fields in both packaged binaries.
+binary and dev asset plus maintainer script against its source. Protocol unit
+tests own MessagePack fields; scanning binary strings added no package proof.
 After an operator installs that package, `just package-smoke-dev` repeats those
 checks against `/usr`, so a stale client/server or source-versus-installed
 A2/A3 visual binary mismatch fails before launch. The Docker A2/A3 contracts
@@ -2562,9 +2593,7 @@ In every script the `scribe-test` daemon is the client stand-in: `daemon stop` i
 
 `tests/e2e/func/session-exit-status.sh` covers the child-exit watcher's reporting. It runs `exit 42` in one session and asserts the code arrives verbatim, then `exec`s a `sleep` over a second session's interactive shell — which ignores SIGTERM — and `kill -TERM`s the pid it printed, asserting a signal 15 termination rather than an exit code. A third session backgrounds a HUP-ignoring subshell before exiting, so a descendant still holds the slave fd and the master never ends: the exit is observable only through the watcher, and the script asserts the real code still arrives. A settle window and a re-assertion of all three sessions prove no second `SessionExited` follows.
 
-`tests/e2e/func/reconnect.sh` covers plain detach/reattach: run a command, start a background job, `daemon stop`, `daemon start`, `session attach`, then assert fresh input works and the background job survived the disconnect. It also asserts the attach *replay* itself — one applied frame carrying the pre-detach marker, and a closing `replay assert-matches` proving the replayed view plus the output that followed it still equals the server's screen.
-
-`tests/e2e/func/attach-lossless.sh` covers the same reattach with output *in flight*, which is the only condition the snapshot/install window is visible under. It backgrounds a 400-line trickle in the session, cycles `daemon stop` / `daemon start` / `session attach` twice while the trickle runs, then lets it drain and closes on `replay assert-matches`. Because the replayed view is the last replay plus every `PtyOutput` byte after it, a chunk lost in the attach window shifts it against the server's screen permanently and a duplicated flush shifts it the other way — neither survives the comparison, while `RequestSnapshot` alone stays green for both.
+`tests/e2e/func/attach-lossless.sh` covers detach/reattach with output *in flight*, which is the only condition the snapshot/install window is visible under. It backgrounds a 6,000-line burst in the session, cycles `daemon stop` / `daemon start` / `session attach` across three rounds, then lets each round drain and closes on `replay assert-matches`. Because the replayed view is the last replay plus every `PtyOutput` byte after it, a chunk lost in the attach window shifts it against the server's screen permanently and a duplicated flush shifts it the other way — neither survives the comparison, while `RequestSnapshot` alone stays green for both. This stronger case subsumes the retired idle reconnect smoke.
 
 `tests/e2e/func/hot-reload.sh` covers server `--upgrade` under a live client: it snapshots a session, stops the daemon, runs  (fd handoff to the new server), then reconnects and asserts the session, its background job, and its on-screen scrollback all survived the graceful handoff.
 
@@ -2576,11 +2605,11 @@ It is deliberately **not** the oracle for the client's own restore. The daemon h
 
 ### Failure-Path E2E
 
-Scripted degraded-path coverage proving the client fails loudly (never hangs) when the server is unavailable or vanishes mid-session, and recovers cleanly once it returns. Both scripts drive the disposable test server only.
+Degraded-path coverage proves launch failure is bounded and real-client server-loss recovery works without touching the user's live server.
 
 `tests/e2e/func/failure-server-down.sh` covers server-down-at-launch and adoption failure. With the server stopped, `daemon start` must return non-zero within its bounded socket wait rather than block, because  fails its initial `ipc::connect()` and the client socket never appears. It then recovers, and — on a fresh daemon with no cached `SessionCreated` — asserts that adopting a nonexistent session id errors (server denies,  times out) without crashing the still-usable client.
 
-`tests/e2e/func/failure-socket-loss.sh` covers a mid-session server crash. A SIGTERM `server stop` drops the client's IPC with no upgrade handoff; the daemon's server-reader loop ends, so it tears down and removes its command socket. The script polls until commands fail (proving loss detection, not a hang), reconnects to a freshly started server, asserts the crashed session is gone (PTYs died with the server, so re-adopt fails — the deliberate contrast with hot-reload), and confirms a fresh session works end to end.
+Mid-session loss belongs to the real GPUI lifecycle suites: `tests/e2e/visual/server-lifecycle.sh` covers failed connection diagnosis and autostart, while `tests/e2e/visual/cold-restart.sh` kills and replaces the disposable server and proves the client restores usable windows and panes. The retired daemon-only socket-loss script mainly tested the harness command socket.
 
 ## Visual E2E Tests
 
@@ -2606,7 +2635,7 @@ The client's stderr is redirected to `/output/client.log` and its pid and log pa
 
 The server's output is captured the same way: the entrypoint exports `SCRIBE_TEST_SERVER_LOG=/output/server.log`, which  honours when it spawns `scribe-server`, and re-exports it as `SCRIBE_SERVER_LOG` for scripts. That is how a test proves a *client-to-server* message crossed the wire — the server logs the window id it received it on — rather than trusting the client's own "I sent it" line.
 
-The test script's own output goes to `/output/result.log` by plain redirection, and the entrypoint streams that file to the container's stdout with a `tail -f` it owns and kills. It must never be a pipe: every process a test backgrounds inherits the test's stdout, so while the run was `timeout … | tee /output/result.log`, a single orphaned `scribe-client` held the write end open, `tee` never saw EOF, and the container hung forever *after* the test printed PASS — `TEST_TIMEOUT` bounds the test process, which had already exited. A file descriptor on the log blocks nothing, so an orphan can no longer wedge an unattended run, and the entrypoint reaps stray clients once the test returns. A script that relaunches the client still owns that process: `tests/e2e/visual/reconnect.sh` logs its phase-3 relaunch to `SCRIBE_CLIENT_LOG` and kills that pid before it exits, the same discipline `tab-window-chords.sh` and `pane-workspace-layout.sh` follow.
+The test script's own output goes to `/output/result.log` by plain redirection, and the entrypoint streams that file to the container's stdout with a `tail -f` it owns and kills. It must never be a pipe: every process a test backgrounds inherits the test's stdout, so while the run was `timeout … | tee /output/result.log`, a single orphaned `scribe-client` held the write end open, `tee` never saw EOF, and the container hung forever *after* the test printed PASS — `TEST_TIMEOUT` bounds the test process, which had already exited. A file descriptor on the log blocks nothing, so an orphan can no longer wedge an unattended run, and the entrypoint reaps stray clients once the test returns. A script that relaunches the client still owns that process; `tab-window-chords.sh`, `pane-workspace-layout.sh`, and the restore suites kill and reap every client they start.
 
 The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via  so `xdotool search --name "Scribe"` can locate the window for focus and capture.
 
@@ -2783,7 +2812,11 @@ It runs on the , so the emoji it sends through `scribe-test` reach the window it
 
 A lit-pixel phase runs first and fails separately when the window holds no pane content at all. Both guards exist because this script previously reported ~980 saturated pixels — comfortably over its 300 floor — against a completely black grid: the client was attached to nothing, and every one of those pixels came from the openbox title bar outside the window crop.
 
-`tests/e2e/visual/paste-confirmation.sh` verifies the spec-011 paste gate (): a single-line paste carrying control/escape bytes pops the confirmation with a caret-escaped preview (`^[`), while a plain single line and a tab-separated line paste straight through without a dialog.
+### Paste confirmation blocks risky bytes
+
+`tests/e2e/visual/paste-confirmation.sh` runs on the shared pane and verifies the spec-011 paste gate end to end.
+
+A single-line paste carrying an escape byte paints the confirmation and remains absent from the PTY before and after Escape. A plain single line reaches the PTY directly.
 
 ### Overlay actions run for real
 
@@ -2971,7 +3004,7 @@ The integrity oracle counts `moved a session into another workspace region` line
 
 `tests/e2e/visual/config-reload.sh` is the scripted oracle for the `ConfigReloaded` parity row: it edits `config.toml` under an already-running client, the user-visible scenario the headless suites cannot reach.
 
-The script screenshots the baseline window, rewrites the config with a new theme, font size, `line_padding`, opacity, and command-palette combo in one save, then asserts four things in order: the client logged a `config hot-reloaded` line it had not logged before (the watcher fired and  ran), the client pid is unchanged (a reload, not a restart), the captured frame is no longer pixel-identical (the new theme and font actually reached the paint path), and the newly bound `ctrl+shift+o` opens the command palette even though that combo did not exist when the window started.
+The script screenshots the baseline window, changes only the theme in one save, then asserts three things in order: the client logged a new `config hot-reloaded` line, the client pid is unchanged, and the captured frame is no longer pixel-identical. The settings theme-picker and keybindings suites own their richer live-reload behavior.
 
 Asserting on the log rather than on pixels alone is deliberate: the status bar's sparklines resample on a timer, so a screenshot diff on its own could pass without any reload having happened.
 
@@ -3033,7 +3066,9 @@ The copy phase drags a real mouse selection across the pane and first requires r
 
 ### Terminal viewport navigation
 
-`tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for : scrollback paging, jump control, font zoom, vi / copy mode, split-scroll, and the smart-selection context menu, each of which shipped as a unit-tested module with no caller.
+`tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for scrollback paging, jump control, vi / copy mode, split-scroll, and the smart-selection context menu.
+
+Font scaling has its own stronger `tests/e2e/visual/terminal-zoom.sh` oracle, which also verifies published cell geometry on the wire.
 
 It starts on the  with `terminal.scroll_pin = false`, so the plain terminal path cannot borrow the AI pin gate. The split-scroll phase hot-reloads the opt-in before posting its provider event. Every phase asserts a log line the wired path alone writes *and* a pixel effect, because either alone is weak: a log line does not prove the frame changed, and a screenshot diff does not prove which code produced it.
 
@@ -4196,15 +4231,11 @@ The reaper leaves `server.sock`, `handoff.sock`, and lock files alone — deleti
 
 Unit coverage for the ported host clipboard bridge (): OSC 52 routing, the FR-019 focus gate, primary-selection read/write with AI cleanup, and reply-message construction.
 
-An in-memory `FakeClipboard` stands in for the live arboard handle so the read+write roundtrip runs without a display server; the arboard-backed E2E stays a manual / launch-gate parity item.
-
-### Write-read roundtrip on the system clipboard
-
-A payload written through  to the system clipboard reads back verbatim through  — the scripted OSC 52 bridge roundtrip at the unit level.
+An in-memory `FakeClipboard` stands in for the live arboard handle so per-selection routing runs without a display server; the arboard-backed E2E stays a manual / launch-gate parity item.
 
 ### Primary and system selections stay independent
 
-Writes to `ClipboardSelection::Primary` and `ClipboardSelection::Clipboard` land in separate buffers and each reads back its own value, proving the per-selection routing.
+Writes to `ClipboardSelection::Primary` and `ClipboardSelection::Clipboard` land in separate buffers and each reads back its own value, covering the system write/read roundtrip while proving the stronger per-selection routing contract.
 
 ### Unavailable backend reports a bridge error
 
@@ -5258,7 +5289,7 @@ The test drives an in-range value through unchanged, checks `1.5` and `-0.2` sat
 
 Verifies  folds the configured opacity into a theme slot's alpha and touches nothing else.
 
-Painting a theme slot at `1.0` leaves it opaque; at `0.85` only the alpha moves while the RGB channels stay at the theme's colour, so a composited desktop blends toward the backdrop instead of shifting hue. Out-of-range values saturate through the same clamp.
+Painting a theme slot at `1.0` leaves it opaque; at `0.85` only the alpha moves while the RGB channels stay at the theme's colour, so a composited desktop blends toward the backdrop instead of shifting hue. The dedicated clamp test owns out-of-range values.
 
 #### Already-translucent chrome multiplies
 

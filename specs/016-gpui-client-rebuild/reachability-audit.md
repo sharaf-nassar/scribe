@@ -682,9 +682,9 @@ the app constructs the entity:
 - **To `visual-E2E`**: Font fallback (a Nerd Font glyph must actually render),
   and the whole "Input and keybinding checklist" — all 54 named actions must be
   driven through `xdotool` against the real window, not through
-  `translate_key_action` in isolation. The existing
-  `tests/e2e/func/keybindings-validation.sh` should be extended from validating
-  the binding table to asserting each action's observable effect.
+  `translate_key_action` in isolation. The later visual matrix did that; the
+  functional keybinding smoke was retired because it injected bytes directly
+  into the PTY and asserted no client action.
 - **Keep `gpui-test` only** for the nine removed-config-key rows, which assert
   the *absence* of behaviour and are genuinely load-path tests
   (`config/tests.rs:29` is the right shape).

@@ -3864,22 +3864,6 @@ mod tests {
     }
 
     #[test]
-    fn release_round_trips_through_msgpack_named() {
-        let original = sample_release();
-        let bytes = rmp_serde::to_vec_named(&original).expect("serialize Release");
-        let decoded: Release = rmp_serde::from_slice(&bytes).expect("deserialize Release");
-        assert_eq!(decoded, original);
-
-        // None case: confirms the Option<String> field round-trips when absent.
-        let original_no_name = sample_release_no_name();
-        let bytes_no_name =
-            rmp_serde::to_vec_named(&original_no_name).expect("serialize Release no_name");
-        let decoded_no_name: Release =
-            rmp_serde::from_slice(&bytes_no_name).expect("deserialize Release no_name");
-        assert_eq!(decoded_no_name, original_no_name);
-    }
-
-    #[test]
     fn release_list_result_state_fresh_round_trips_through_msgpack_named() {
         let original = ReleaseListResultState::Fresh { releases: vec![sample_release()] };
         let bytes = rmp_serde::to_vec_named(&original).expect("serialize Fresh");

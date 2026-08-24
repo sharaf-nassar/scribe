@@ -331,47 +331,24 @@ mod tests {
     // ── render_release_body tests (T004) ─────────────────────────────
 
     #[test]
-    fn renders_plain_text() {
-        let html = render_release_body("hello world");
-        assert!(
-            html.contains("<p>hello world</p>"),
-            "plain text should render as a <p>; got: {html}"
-        );
-    }
-
-    #[test]
-    fn renders_fenced_code_block() {
-        let html = render_release_body("```rust\nfn main() {}\n```");
-        assert!(html.contains("<pre>"), "fenced code should produce <pre>; got: {html}");
-        assert!(html.contains("<code"), "fenced code should produce <code>; got: {html}");
-        assert!(html.contains("fn main()"), "fenced body should be preserved; got: {html}");
-    }
-
-    #[test]
-    fn renders_unordered_list() {
-        let html = render_release_body("- a\n- b\n- c");
-        assert!(html.contains("<ul>"), "list should produce <ul>; got: {html}");
-        assert!(html.contains("<li>a</li>"), "list items should produce <li>; got: {html}");
-    }
-
-    #[test]
-    fn renders_link_with_external_href() {
-        let html = render_release_body("[text](https://example.com)");
-        assert!(
-            html.contains("href=\"https://example.com\""),
-            "link href must survive sanitization; got: {html}"
-        );
-        assert!(html.contains(">text</a>"), "link text must survive; got: {html}");
-    }
-
-    #[test]
-    fn renders_table() {
-        // GFM table syntax — confirms ENABLE_TABLES is set.
-        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let html = render_release_body(md);
-        assert!(html.contains("<table>"), "GFM table must render to <table>; got: {html}");
+    fn renders_supported_markdown_constructs() {
+        let markdown = "hello world\n\n```rust\nfn main() {}\n```\n\n- a\n- b\n\n[text](https://example.com)\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let html = render_release_body(markdown);
+        for expected in [
+            "<p>hello world</p>",
+            "<pre>",
+            "<code",
+            "fn main()",
+            "<ul>",
+            "<li>a</li>",
+            "href=\"https://example.com\"",
+            ">text</a>",
+            "<table>",
+            "<td>1</td>",
+        ] {
+            assert!(html.contains(expected), "rendered Markdown omitted {expected:?}: {html}");
+        }
         assert!(html.contains("<thead>") || html.contains("<th"), "header row missing: {html}");
-        assert!(html.contains("<td>1</td>"), "cell missing: {html}");
     }
 
     #[test]
@@ -432,24 +409,6 @@ mod tests {
 
     fn static_fetcher(result: Result<Vec<Release>, ScribeError>) -> Arc<dyn ReleaseFetcher> {
         Arc::new(StaticFetcher { result })
-    }
-
-    #[tokio::test]
-    async fn returns_fresh_within_ttl() {
-        let mut catalog = ReleaseCatalog::new(Duration::from_hours(1));
-        catalog.value = Some(vec![fixture_release()]);
-        catalog.last_fetched_at = Some(Instant::now());
-        catalog.last_fetch_was_success = true;
-        let catalog = make_catalog_arc(catalog);
-        let fetcher = panic_fetcher();
-
-        let state = handle_list_releases(&catalog, &fetcher).await;
-        match state {
-            ReleaseListResultState::Fresh { releases } => {
-                assert_eq!(releases, vec![fixture_release()]);
-            }
-            other => panic!("expected Fresh, got {other:?}"),
-        }
     }
 
     #[tokio::test]

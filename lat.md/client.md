@@ -2616,7 +2616,7 @@ The GPUI rebuild ports the three interactive overlays — command palette, right
 
  ports the right-click menu.  assembles the ordered rows verbatim: the Copy/Paste/Select-All head (Copy gated on a selection), the OSC 8 "Open URL" precedence and appended "Copy hyperlink address" entry (spec 009 FR-003 / FR-007), the file row, and the smart-selection actions resolved through . Clicking an enabled row runs  (emitting a  on ); Escape or a backdrop click runs .
 
- draws the hover tooltip, sizing and positioning it from the pure geometry ports:  centres the box on the anchor and clamps it inside the viewport,  picks above/below, and  head+tail-elides a long URI (spec 009 FR-006). The spike wires all three into  — Ctrl+Shift+P opens the palette, a right-click opens the menu, Ctrl+Shift+U toggles the tooltip demo — so the visual E2E harness (`tests/e2e/visual/overlays.sh`) can screenshot each overlay and its interaction checklist.
+ draws the hover tooltip, sizing and positioning it from the pure geometry ports:  centres the box on the anchor and clamps it inside the viewport,  picks above/below, and  head+tail-elides a long URI (spec 009 FR-006). The spike wires all three into  — Ctrl+Shift+P opens the palette, a right-click opens the menu, Ctrl+Shift+U toggles the tooltip demo — and `tests/e2e/visual/overlays.sh` requires each live surface and its filter/focus transitions to produce a bounded pixel delta.
 
 #### Overlay Chords Yield To Bindings
 
@@ -2696,7 +2696,7 @@ Each modal is one variant of  —  (quit / kill / cancel, warning about active s
 
 While a modal exists, [[crates/scribe-client/src/main.rs#TerminalView#ensure_focus]] moves GPUI keyboard focus onto its [[crates/scribe-client/src/dialog.rs#DialogView]] handle. Root dispatch applies the compositor guard, then [[crates/scribe-client/src/main.rs#TerminalView#handle_overlay_key]], before plain Tab may enter [[crates/scribe-client/src/main.rs#TerminalView#focus_next_titlebar_control]]. Tab and Shift+Tab therefore cycle only modal buttons; ordinary titlebar traversal resumes once the modal closes.
 
-The spike wires two representative modals into  — Ctrl+Shift+Q opens the close dialog and Ctrl+Shift+K opens the clipboard dialog — so the visual E2E harness (`tests/e2e/visual/dialogs.sh`) can screenshot the modal chrome, the focus ring, and the tone-tagged buttons across the three- and four-button layouts.
+The spike wires two representative modals into  — Ctrl+Shift+D opens the close dialog and Ctrl+Shift+K opens the clipboard dialog — and `tests/e2e/visual/dialogs.sh` requires both modals, their focus transitions, and safe dismissal to change the live window by bounded pixel deltas.
 
 The update confirmation is the first of the five that is a live surface rather than a demo:  routes the resolved  before dropping the overlay, so `DialogOutcome::Update` reaches  and turns into IPC (see ). The other four still only close.
 

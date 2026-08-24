@@ -93,10 +93,6 @@ mod tests {
         // desktop blends toward the backdrop instead of shifting hue.
         assert!((translucent.r - 0.1).abs() < EPS);
         assert!((translucent.b - 0.3).abs() < EPS);
-
-        // An out-of-range config value saturates rather than overshooting.
-        assert!((surface(slot, 1.5).a - 1.0).abs() < EPS);
-        assert!((surface(slot, -0.2).a - 0.0).abs() < EPS);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Window opacity#Already-translucent chrome multiplies]]

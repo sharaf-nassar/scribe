@@ -479,54 +479,21 @@ mod tests {
     // ── dedent ────────────────────────────────────────────────────────
 
     #[test]
-    fn dedent_no_indent() {
-        assert_eq!(dedent("foo\nbar"), "foo\nbar");
-    }
-
-    #[test]
-    fn dedent_uniform_indent() {
-        assert_eq!(dedent("    foo\n    bar"), "foo\nbar");
-    }
-
-    #[test]
-    fn dedent_mixed_indent_strips_minimum() {
-        assert_eq!(dedent("  foo\n    bar"), "foo\n  bar");
-    }
-
-    #[test]
-    fn dedent_empty_lines_ignored_for_minimum() {
-        assert_eq!(dedent("    foo\n\n    bar"), "foo\n\nbar");
-    }
-
-    #[test]
-    fn dedent_zero_min_is_noop() {
-        let text = "no indent\n  some indent";
-        assert_eq!(dedent(text), text);
-    }
-
-    #[test]
-    fn dedent_preserves_trailing_newline() {
-        assert_eq!(dedent("  a\n  b\n"), "a\nb\n");
-    }
-
-    #[test]
-    fn dedent_no_trailing_newline_stays_without() {
-        assert_eq!(dedent("  a\n  b"), "a\nb");
-    }
-
-    #[test]
-    fn dedent_single_line() {
-        assert_eq!(dedent("    hello"), "hello");
-    }
-
-    #[test]
-    fn dedent_all_empty_lines() {
-        assert_eq!(dedent("\n\n"), "\n\n");
-    }
-
-    #[test]
-    fn dedent_empty_string() {
-        assert_eq!(dedent(""), "");
+    fn dedent_cases() {
+        for (input, expected) in [
+            ("foo\nbar", "foo\nbar"),
+            ("    foo\n    bar", "foo\nbar"),
+            ("  foo\n    bar", "foo\n  bar"),
+            ("    foo\n\n    bar", "foo\n\nbar"),
+            ("no indent\n  some indent", "no indent\n  some indent"),
+            ("  a\n  b\n", "a\nb\n"),
+            ("  a\n  b", "a\nb"),
+            ("    hello", "hello"),
+            ("\n\n", "\n\n"),
+            ("", ""),
+        ] {
+            assert_eq!(dedent(input), expected, "input: {input:?}");
+        }
     }
 
     // ── detect_wrap_width ─────────────────────────────────────────────
@@ -540,37 +507,25 @@ mod tests {
     }
 
     #[test]
-    fn detect_width_returns_zero_for_single_line() {
-        let lines = vec!["only one line here"];
-        assert_eq!(detect_wrap_width(&lines), 0);
-    }
+    fn detect_width_edge_cases() {
+        assert_eq!(detect_wrap_width(&["only one line here"]), 0);
+        assert_eq!(detect_wrap_width(&["short", "medium length", "a different size entirely"]), 0);
 
-    #[test]
-    fn detect_width_returns_zero_for_no_dominant() {
-        let lines = vec!["short", "medium length", "a different size entirely"];
-        assert_eq!(detect_wrap_width(&lines), 0);
-    }
-
-    #[test]
-    fn detect_width_ignores_intentional_breaks() {
         let line30 = "x".repeat(30);
-        let lines = vec![
-            line30.as_str(),
-            line30.as_str(),
-            "",              // blank — intentional break
-            "- bullet item", // list marker — intentional break
-            "# heading",     // heading — intentional break
-        ];
-        assert_eq!(detect_wrap_width(&lines), 30);
-    }
+        assert_eq!(
+            detect_wrap_width(&[
+                line30.as_str(),
+                line30.as_str(),
+                "",
+                "- bullet item",
+                "# heading"
+            ]),
+            30
+        );
 
-    #[test]
-    fn detect_width_prefers_larger_on_tie() {
-        // Two lines of length 40, two of length 50.
         let a = "a".repeat(40);
         let b = "b".repeat(50);
-        let lines = vec![a.as_str(), a.as_str(), b.as_str(), b.as_str()];
-        assert_eq!(detect_wrap_width(&lines), 50);
+        assert_eq!(detect_wrap_width(&[a.as_str(), a.as_str(), b.as_str(), b.as_str()]), 50);
     }
 
     // ── unwrap_lines ──────────────────────────────────────────────────
@@ -744,85 +699,32 @@ mod tests {
     // ── is_intentional_break ──────────────────────────────────────────
 
     #[test]
-    fn break_empty_line() {
-        assert!(is_intentional_break(""));
-    }
-
-    #[test]
-    fn break_bullet_dash() {
-        assert!(is_intentional_break("- item"));
-    }
-
-    #[test]
-    fn break_bullet_star() {
-        assert!(is_intentional_break("* item"));
-    }
-
-    #[test]
-    fn break_bullet_plus() {
-        assert!(is_intentional_break("+ item"));
-    }
-
-    #[test]
-    fn break_ordered_list() {
-        assert!(is_intentional_break("1. first"));
-        assert!(is_intentional_break("12. twelfth"));
-    }
-
-    #[test]
-    fn break_heading() {
-        assert!(is_intentional_break("# Title"));
-        assert!(is_intentional_break("## Subtitle"));
-    }
-
-    #[test]
-    fn break_table_row() {
-        assert!(is_intentional_break("| a | b |"));
-    }
-
-    #[test]
-    fn break_code_fence() {
-        assert!(is_intentional_break("```rust"));
-        assert!(is_intentional_break("```"));
-    }
-
-    #[test]
-    fn break_colon_ending() {
-        assert!(is_intentional_break("options:"));
-    }
-
-    #[test]
-    fn break_brace_ending() {
-        assert!(is_intentional_break("fn main() {"));
-        assert!(is_intentional_break("}"));
-    }
-
-    #[test]
-    fn break_blockquote() {
-        assert!(is_intentional_break("> quoted text"));
-        assert!(is_intentional_break(">no space after marker"));
-    }
-
-    #[test]
-    fn break_indented_code() {
-        assert!(is_intentional_break("    code line"));
-        assert!(is_intentional_break("\tcode line"));
-    }
-
-    #[test]
-    fn not_break_normal_prose() {
-        assert!(!is_intentional_break("This is normal text"));
-    }
-
-    #[test]
-    fn not_break_dash_without_space() {
-        // A dash not followed by a space is not a list marker.
-        assert!(!is_intentional_break("-nospace"));
-    }
-
-    #[test]
-    fn not_break_number_without_dot_space() {
-        assert!(!is_intentional_break("100 items"));
+    fn intentional_break_cases() {
+        for line in [
+            "",
+            "- item",
+            "* item",
+            "+ item",
+            "1. first",
+            "12. twelfth",
+            "# Title",
+            "## Subtitle",
+            "| a | b |",
+            "```rust",
+            "```",
+            "options:",
+            "fn main() {",
+            "}",
+            "> quoted text",
+            ">no space after marker",
+            "    code line",
+            "\tcode line",
+        ] {
+            assert!(is_intentional_break(line), "line: {line:?}");
+        }
+        for line in ["This is normal text", "-nospace", "100 items"] {
+            assert!(!is_intentional_break(line), "line: {line:?}");
+        }
     }
 
     // ── end-to-end: dedent + unwrap together ──────────────────────────

@@ -78,7 +78,6 @@ arboard = { version = "3", default-features = false }
 # Pulls in gpui's headless TestAppContext / #[gpui::test] harness for the
 # layout entity suites without affecting the shipped client build.
 gpui = { workspace = true, features = ["test-support"] }
-serde_json.workspace = true
 # Asserts the embedded Symbols Nerd Font asset keeps the cmap shape GPUI's
 # face-eviction check and the fallback chain depend on.
 ttf-parser = "0.25"

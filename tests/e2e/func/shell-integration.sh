@@ -27,8 +27,4 @@ scribe-test send "$SESSION" 'pwd\n'
 scribe-test wait-output "$SESSION" "/tmp"
 echo "PHASE 4 PASS: CWD reporting via OSC 7 (cd /tmp, pwd shows /tmp)"
 
-# ── Phase 5: Screenshot for visual verification ──────────────────
-scribe-test screenshot "$SESSION" /output/shell-integration.png
-echo "PHASE 5 PASS: screenshot saved"
-
 echo "PASS: shell-integration test completed"

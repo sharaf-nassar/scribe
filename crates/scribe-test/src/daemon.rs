@@ -1263,8 +1263,7 @@ async fn process_request(
         DaemonRequest::Resize { session_id, cols, rows } => {
             handle_resize(session_id, cols, rows, state, server_writer).await
         }
-        DaemonRequest::RequestScreenshot { session_id }
-        | DaemonRequest::RequestSnapshot { session_id } => {
+        DaemonRequest::RequestSnapshot { session_id } => {
             handle_request_snapshot(session_id, state, server_writer).await
         }
         DaemonRequest::WaitOutput { session_id, pattern, timeout_ms } => {
@@ -1280,9 +1279,6 @@ async fn process_request(
             let params = CellAssertParams { session_id, row, col, expected };
             handle_assert_cell(params, state, server_writer).await
         }
-        DaemonRequest::AssertCursor { session_id, row, col } => {
-            handle_assert_cursor(session_id, row, col, state, server_writer).await
-        }
         DaemonRequest::AssertExit { session_id, expected_code, timeout_ms } => {
             let expected = ExpectedExit::Code(expected_code);
             handle_assert_exit(session_id, expected, timeout_ms, state, notifiers).await
@@ -1293,9 +1289,6 @@ async fn process_request(
         }
         DaemonRequest::AssertNoEmptyOutput { session_id } => {
             handle_assert_no_empty_output(session_id, state).await
-        }
-        DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
-            handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
         }
         request @ (DaemonRequest::RequestAiChrome { .. }
         | DaemonRequest::RequestBeadsBoard
@@ -1826,22 +1819,10 @@ async fn handle_request_snapshot(
     state: &SharedState,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    let msg = ClientMessage::RequestSnapshot { session_id };
-    if let Err(e) = send_to_server(server_writer, &msg).await {
-        return DaemonResponse::Error { message: format!("failed to send RequestSnapshot: {e}") };
-    }
-
-    // Poll for snapshot to arrive (up to 5 seconds).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(snap) = lookup_snapshot(session_id, state).await {
-            return DaemonResponse::ScreenshotData { snapshot: Box::new(snap) };
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return DaemonResponse::Error { message: "timed out waiting for snapshot".to_owned() };
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    request_snapshot(session_id, state, server_writer).await.map_or_else(
+        || DaemonResponse::Error { message: "timed out waiting for snapshot".to_owned() },
+        |snapshot| DaemonResponse::ScreenshotData { snapshot: Box::new(snapshot) },
+    )
 }
 
 /// Render the AI chrome text for a session from its last `AiStateChanged`.
@@ -1936,13 +1917,11 @@ async fn handle_replay_screen(session_id: SessionId, state: &SharedState) -> Dae
 
 /// Compare the replayed view against the server's own screen.
 ///
-/// The server's snapshot is requested fresh and read back together with the
-/// view under one lock, so the two describe the same point in the session's
-/// frame order: the reader applies output and the snapshot in arrival order, so
-/// a difference means the wire disagreed with the server's `Term` — the attach
-/// gap this assertion exists to catch. Callers still settle the session
-/// (`wait-idle`) first, since output that arrives while the request is in
-/// flight legitimately moves the view ahead.
+/// The daemon freezes its replayed view after the caller settles the pane, then
+/// asks the server for its bounded whole-pane replay. A difference between the
+/// frozen view and that authoritative reply means the attach stream lost or
+/// duplicated output. Legacy servers that still answer with `ScreenSnapshot`
+/// remain supported.
 async fn handle_assert_replay_matches(
     session_id: SessionId,
     state: &SharedState,
@@ -2013,19 +1992,21 @@ fn compare_scrollback(current: &ScreenSnapshot, reference: &ScreenSnapshot) -> O
     None
 }
 
-/// Request a fresh server snapshot and read it back paired with the replayed
-/// view captured under the same lock.
+/// Request the server's bounded whole-pane replay and compare it with the view
+/// the daemon held before the request. Older servers may still answer with a
+/// `ScreenSnapshot`, so both response shapes remain accepted.
 async fn request_screen_pair(
     session_id: SessionId,
     state: &SharedState,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> Option<(ScreenSnapshot, ScreenSnapshot)> {
-    {
+    let (baseline_replays, replayed) = {
         let mut guard = state.lock().await;
         let session = guard.sessions.get_mut(&session_id)?;
         session.latest_snapshot = None;
         session.snapshot_time = None;
-    }
+        (session.replay.applied, session.replay.view.as_ref()?.snapshot())
+    };
 
     let msg = ClientMessage::RequestSnapshot { session_id };
     send_to_server(server_writer, &msg).await.ok()?;
@@ -2036,22 +2017,17 @@ async fn request_screen_pair(
         {
             let guard = state.lock().await;
             let session = guard.sessions.get(&session_id)?;
-            if let (Some(server_screen), Some(view)) =
-                (session.latest_snapshot.clone(), session.replay.view.as_ref())
-            {
-                return Some((server_screen, view.snapshot()));
+            if let Some(server_screen) = session.latest_snapshot.clone() {
+                return Some((server_screen, replayed));
+            }
+            if session.replay.applied > baseline_replays {
+                return session.replay.view.as_ref().map(|view| (view.snapshot(), replayed));
             }
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
     }
-}
-
-/// Look up the latest snapshot for a session, if one exists.
-async fn lookup_snapshot(session_id: SessionId, state: &SharedState) -> Option<ScreenSnapshot> {
-    let guard = state.lock().await;
-    guard.sessions.get(&session_id).and_then(|s| s.latest_snapshot.clone())
 }
 
 /// Wait for output matching a regex pattern.
@@ -2334,38 +2310,6 @@ fn compare_screen_content(current: &ScreenSnapshot, reference: &ScreenSnapshot) 
     None
 }
 
-/// Assert that the current screen matches a reference snapshot.
-///
-/// Compares non-space cell content, cursor position, and cursor visibility.
-/// Reports the first mismatch found.
-async fn handle_assert_snapshot_match(
-    session_id: SessionId,
-    reference: &ScreenSnapshot,
-    state: &SharedState,
-    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
-) -> DaemonResponse {
-    let snap = get_or_request_snapshot(session_id, state, server_writer).await;
-    let Some(current) = snap else {
-        return DaemonResponse::Error { message: "failed to obtain snapshot".to_owned() };
-    };
-
-    if let Some(message) = compare_screen_content(&current, reference) {
-        return DaemonResponse::AssertFailed { message };
-    }
-
-    // Compare cursor visibility.
-    if current.cursor_visible != reference.cursor_visible {
-        return DaemonResponse::AssertFailed {
-            message: format!(
-                "cursor visibility mismatch: current {}, reference {}",
-                current.cursor_visible, reference.cursor_visible,
-            ),
-        };
-    }
-
-    DaemonResponse::Ok
-}
-
 /// Assert that no zero-byte `PtyOutput` frame ever arrived for a session.
 ///
 /// The server drops a chunk its filters emptied before framing it, so any
@@ -2387,31 +2331,6 @@ async fn handle_assert_no_empty_output(
     }
 }
 
-/// Assert that the cursor is at the expected position.
-async fn handle_assert_cursor(
-    session_id: SessionId,
-    row: u16,
-    col: u16,
-    state: &SharedState,
-    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
-) -> DaemonResponse {
-    let snapshot = get_or_request_snapshot(session_id, state, server_writer).await;
-    let Some(snap) = snapshot else {
-        return DaemonResponse::Error { message: "failed to obtain snapshot".to_owned() };
-    };
-
-    if snap.cursor_row == row && snap.cursor_col == col {
-        DaemonResponse::Ok
-    } else {
-        DaemonResponse::AssertFailed {
-            message: format!(
-                "cursor: expected ({row},{col}) but found ({},{})",
-                snap.cursor_row, snap.cursor_col
-            ),
-        }
-    }
-}
-
 /// Maximum age for a cached snapshot to be considered fresh. Assertions that
 /// run in quick succession reuse the cached snapshot instead of round-tripping
 /// to the server for each one.
@@ -2426,32 +2345,42 @@ async fn get_or_request_snapshot(
     state: &SharedState,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> Option<ScreenSnapshot> {
-    // Return the cached snapshot if fresh enough.
     if let Some(snap) = lookup_fresh_snapshot(session_id, state).await {
         return Some(snap);
     }
+    request_snapshot(session_id, state, server_writer).await
+}
 
-    // Request one from the server.
-    // Clear the stale snapshot first so the poll loop waits for the fresh one.
-    {
+/// Request the authoritative pane state, accepting both the current bounded
+/// replay response and the legacy per-cell snapshot response.
+async fn request_snapshot(
+    session_id: SessionId,
+    state: &SharedState,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> Option<ScreenSnapshot> {
+    let baseline_replays = {
         let mut guard = state.lock().await;
-        if let Some(session) = guard.sessions.get_mut(&session_id) {
-            session.latest_snapshot = None;
-            session.snapshot_time = None;
-        }
-    }
+        let session = guard.sessions.get_mut(&session_id)?;
+        session.latest_snapshot = None;
+        session.snapshot_time = None;
+        session.replay.applied
+    };
 
     let msg = ClientMessage::RequestSnapshot { session_id };
-    if send_to_server(server_writer, &msg).await.is_err() {
-        return None;
-    }
+    send_to_server(server_writer, &msg).await.ok()?;
 
-    // Poll for it to arrive.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        if let Some(snap) = lookup_snapshot(session_id, state).await {
-            return Some(snap);
+        {
+            let guard = state.lock().await;
+            let session = guard.sessions.get(&session_id)?;
+            if let Some(snapshot) = session.latest_snapshot.clone() {
+                return Some(snapshot);
+            }
+            if session.replay.applied > baseline_replays {
+                return session.replay.view.as_ref().map(ReplayView::snapshot);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return None;

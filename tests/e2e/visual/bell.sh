@@ -183,7 +183,6 @@ xprop -id "$WID" WM_HINTS | sed -n 's/^\t*//p' | tail -3
 # foreground pane silent again, which is what proves phase 2 was the gate
 # opening rather than the routing simply having warmed up.
 focus
-shot /output/01-bell-refocused.png
 SIGNALLED_BEFORE=$(count_log "$SIGNALLED")
 RECEIVED_BEFORE=$(count_log "$RECEIVED")
 ring_bell
@@ -196,8 +195,4 @@ if [ "$(count_log "$SIGNALLED")" -ne "${SIGNALLED_BEFORE:-0}" ]; then
 fi
 echo "PHASE 3 PASS: the refocused foreground pane is silent again"
 
-echo ""
 echo "PASS: visual bell test"
-echo "  Inspect screenshots in test-output/:"
-echo "    00-bell-attached.png   — client attached to the shared pane"
-echo "    01-bell-refocused.png  — window restored after the urgency hint was asserted"

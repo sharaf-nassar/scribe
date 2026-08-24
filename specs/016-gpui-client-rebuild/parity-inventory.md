@@ -275,10 +275,10 @@ implemented nine `LayoutAction` variants and routed the other twenty-six to a
 match is exhaustive over all 38 variants, and `tools/check-reachability.sh`
 fails the build if a new one is ever swallowed again.
 
-Every row's method is `visual-E2E`: each action must be driven through
-`xdotool` against the real window and asserted by its observable effect.
-`tests/e2e/func/keybindings-validation.sh` currently validates the binding
-*table*; it must be extended to assert effects.
+Every row's method is `visual-E2E`: each action is driven through `xdotool`
+against the real window and asserted by its observable effect. The retired
+functional keybinding smoke injected bytes directly into the PTY and never
+exercised client key translation.
 
 | Action | Subsystem | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |

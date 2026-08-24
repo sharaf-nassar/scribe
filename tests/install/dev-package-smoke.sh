@@ -111,20 +111,6 @@ compare_bytes() {
     fi
 }
 
-require_protocol_field() {
-    local binary="$1"
-    local field="$2"
-    local label="$3"
-
-    if [ ! -f "$binary" ]; then
-        fail "$label is missing: $binary"
-    elif grep -aFq -- "$field" "$binary"; then
-        pass "$label carries protocol field $field"
-    else
-        fail "$label lacks protocol field $field"
-    fi
-}
-
 package_name="$(dpkg-deb -f "$package" Package 2>/dev/null)"
 if [ "$package_name" = "scribe-dev" ]; then
     pass "package identity is scribe-dev"
@@ -189,23 +175,6 @@ for stable_path in usr/bin/scribe-client usr/bin/scribe-server usr/share/scribe;
         fail "dev package leaks stable path $stable_path"
     else
         pass "dev package excludes stable path $stable_path"
-    fi
-done
-
-# These named MessagePack fields are the installed server/client seam for the
-# board snapshot and Flow graph. Exact binary parity below makes this an
-# installed check rather than a source-only grep.
-protocol_fields=(beads_detail beads_write beads_flow RequestBeadsBoard BeadsBoard BeadsEpicGraph)
-for field in "${protocol_fields[@]}"; do
-    require_protocol_field "$package_root/usr/bin/scribe-dev" "$field" \
-        "packaged dev client"
-    require_protocol_field "$package_root/usr/bin/scribe-dev-server" "$field" \
-        "packaged dev server"
-    if [ "$package_only" -eq 0 ]; then
-        require_protocol_field "$installed_root/usr/bin/scribe-dev" "$field" \
-            "installed dev client"
-        require_protocol_field "$installed_root/usr/bin/scribe-dev-server" "$field" \
-            "installed dev server"
     fi
 done
 

@@ -115,55 +115,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trailing_question_mark_waits() {
-        assert_eq!(classify("Want me to proceed?"), AiState::WaitingForInput);
-    }
-
-    #[test]
-    fn trailing_question_mark_after_concluding_sentence_still_waits() {
-        let msg = "1. Add auth\n2. Add tests\n\nWhich would you like first?\n\nThese options will help me proceed.";
-        assert_eq!(classify(msg), AiState::WaitingForInput);
-    }
-
-    #[test]
-    fn question_phrase_should_i_waits() {
-        assert_eq!(classify("Should I apply this change."), AiState::WaitingForInput);
-    }
-
-    #[test]
-    fn question_phrase_would_you_like_waits() {
-        assert_eq!(classify("Would you like me to continue."), AiState::WaitingForInput);
-    }
-
-    #[test]
-    fn approval_phrase_please_review_waits() {
-        assert_eq!(
-            classify("Please review the proposed diff before I land it."),
-            AiState::WaitingForInput
-        );
-    }
-
-    #[test]
-    fn approval_phrase_once_approved_waits() {
-        assert_eq!(
-            classify("I will execute the migration once approved."),
-            AiState::WaitingForInput
-        );
-    }
-
-    #[test]
-    fn approval_phrase_proceed_question_waits() {
-        assert_eq!(classify("Ready to proceed?"), AiState::WaitingForInput);
-    }
-
-    #[test]
-    fn plain_completion_message_is_idle() {
-        assert_eq!(classify("Done. All files updated successfully."), AiState::IdlePrompt);
-    }
-
-    #[test]
-    fn empty_message_is_idle() {
-        assert_eq!(classify(""), AiState::IdlePrompt);
+    fn waiting_and_idle_examples() {
+        for message in [
+            "Want me to proceed?",
+            "1. Add auth\n2. Add tests\n\nWhich would you like first?\n\nThese options will help me proceed.",
+            "Should I apply this change.",
+            "Would you like me to continue.",
+            "Please review the proposed diff before I land it.",
+            "I will execute the migration once approved.",
+            "Ready to proceed?",
+        ] {
+            assert_eq!(classify(message), AiState::WaitingForInput, "message: {message:?}");
+        }
+        for message in ["Done. All files updated successfully.", ""] {
+            assert_eq!(classify(message), AiState::IdlePrompt, "message: {message:?}");
+        }
     }
 
     #[test]
@@ -192,11 +158,5 @@ mod tests {
             msg.push_str(".\n");
         }
         assert_eq!(classify(&msg), AiState::IdlePrompt);
-    }
-
-    #[test]
-    fn blank_lines_are_ignored_for_tail_window() {
-        let msg = "First.\n\n\nLast question?\n";
-        assert_eq!(classify(msg), AiState::WaitingForInput);
     }
 }

@@ -1,6 +1,6 @@
 # Bounded Decoder Spike Decision
 
-The decoder spike gives a conditional go for production Kitty and Sixel decoder work, with narrow vendored boundaries and Scribe-owned budget enforcement.
+This historical decoder-spike decision authorized the production Kitty and Sixel implementations. The executable spike was retired after both production decoders gained stricter adversarial gates.
 
 ## Decision
 
@@ -21,15 +21,12 @@ vendor tasks must pin crates.io source/checksum and upstream URL, retain both
 MIT and Apache-2.0 notices, document every fork delta, and assign CVE/update
 ownership. This spike does not vendor or implement either production decoder.
 
-## Evidence Schema
+## Historical evidence schema
 
-Docker writes `test-output/terminal-images/decode-spike-evidence.json` and `decoder-decision.md` through the functional harness.
-
-Evidence schema version 1 contains the contract version; exact copied limits;
-an `all_passed` aggregate; the decoder decision and library boundaries; and a
-case array. Each case has a stable id, status, typed rejection where relevant,
-and boundary-specific measurements such as work units, check interval,
-allocation peak, compressed size, dimensions, or byte ceiling.
+The retired spike wrote `decode-spike-evidence.json` with the contract version,
+exact copied limits, typed outcomes, and boundary measurements. Current release
+evidence comes from `terminal-image-kitty-decode.sh` and
+`terminal-image-sixel-decoder.sh`, which exercise the shipped implementations.
 
 The executable probe loads `contract.json` instead of duplicating constants.
 It allocates one exact 4096-square canonical buffer fallibly, rejects both

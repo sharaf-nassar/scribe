@@ -91,6 +91,7 @@ mod tests {
     fn posix_quotes_embedded_single_quote() {
         assert_eq!(quote_posix_string("a'b"), "'a'\"'\"'b'");
         assert_eq!(quote_posix_string("/tmp/plain"), "'/tmp/plain'");
+        assert_eq!(quote_path_for_shell(Path::new("a'b"), "bash"), "'a'\"'\"'b'");
     }
 
     // @lat: [[test#Drag-drop path insertion#Fish quoting escapes backslash and quote]]
@@ -98,12 +99,14 @@ mod tests {
     fn fish_escapes_backslash_and_quote() {
         assert_eq!(quote_fish_string("a\\b"), "'a\\\\b'");
         assert_eq!(quote_fish_string("a'b"), "'a\\'b'");
+        assert_eq!(quote_path_for_shell(Path::new("a'b"), "fish"), "'a\\'b'");
     }
 
     // @lat: [[test#Drag-drop path insertion#PowerShell quoting doubles single quotes]]
     #[test]
     fn powershell_doubles_single_quote() {
         assert_eq!(quote_powershell_string("a'b"), "'a''b'");
+        assert_eq!(quote_path_for_shell(Path::new("a'b"), "pwsh"), "'a''b'");
     }
 
     // @lat: [[test#Drag-drop path insertion#Nushell raw-string fencing]]
@@ -111,18 +114,9 @@ mod tests {
     fn nushell_uses_raw_string_when_quote_present() {
         assert_eq!(quote_nushell_string("plain"), "'plain'");
         assert_eq!(quote_nushell_string("a'b"), "r#'a'b'#");
+        assert_eq!(quote_path_for_shell(Path::new("a'b"), "nu"), "r#'a'b'#");
         // A path that closes the one-hash fence widens to two hashes.
         assert_eq!(quote_nushell_string("a'#b"), "r##'a'#b'##");
-    }
-
-    // @lat: [[test#Drag-drop path insertion#Shell dispatch selects quoter]]
-    #[test]
-    fn quote_path_for_shell_dispatches_by_shell() {
-        let path = Path::new("/tmp/a b");
-        assert_eq!(quote_path_for_shell(path, "bash"), "'/tmp/a b'");
-        assert_eq!(quote_path_for_shell(path, "fish"), "'/tmp/a b'");
-        assert_eq!(quote_path_for_shell(path, "pwsh"), "'/tmp/a b'");
-        assert_eq!(quote_path_for_shell(path, "nu"), "'/tmp/a b'");
     }
 
     // @lat: [[test#Drag-drop path insertion#Insertion appends trailing space]]

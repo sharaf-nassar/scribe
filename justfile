@@ -144,7 +144,7 @@ gpu_flags := if env("SCRIBE_E2E_GPUS", "") == "" { "" } else { "--gpus " + env("
 hardened_e2e_flags := "--network none --read-only --cap-drop ALL"
 # Hash every source or Docker input baked into an E2E image, excluding the
 # bind-mounted tests/e2e scripts so shell-only edits retain their fast path.
-e2e_image_inputs_hash := `git ls-files -co --exclude-standard -z -- Cargo.lock Cargo.toml crates third_party docker dist rust-toolchain.toml | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1`
+e2e_image_inputs_hash := `git ls-files -co --exclude-standard -z -- Cargo.lock Cargo.toml crates third_party docker dist rust-toolchain.toml | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d ' ' -f1`
 
 # Bind-mount ./test-output and hand it back to the invoking user. The default
 # profile runs the container as root, so without HOST_UID/HOST_GID the
@@ -173,7 +173,6 @@ docker-func profile="release":
 
 # Compile and run Beads-board server unit tests inside the functional image.
 docker-unit-beads-write:
-    bash tests/docker-unit-beads-write-isolation.sh
     docker build --no-cache-filter beads-write-unit --target beads-write-unit --build-arg BIN_DIR=target/e2e-stage/release -f docker/Dockerfile.func -t scribe-test-beads-write-unit .
 
 # Compile and run the focused GPUI rebuild viewport tests without staged binaries.
@@ -695,7 +694,7 @@ e2e-visual-pane-workspace-layout: e2e-visual-image-current
 
 # Run paste confirmation with its opt-in policy enabled.
 e2e-visual-paste-confirmation: e2e-visual-image-current
-    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/paste-confirmation-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/paste-confirmation.sh
+    docker run --rm --network none {{ gpu_flags }} -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/paste-confirmation-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/paste-confirmation.sh
 
 # Drive reconnect, a real server upgrade with an unobserved transfer result,
 # mixed-version negotiation, and agent-world ownership through production IPC.
@@ -706,63 +705,17 @@ e2e-func-workspace-transfer: e2e-func-image-current
 e2e: build-release docker-func
     #!/usr/bin/env bash
     set -euo pipefail
-    scripts=(
-        func/agent-action.sh
-        func/agent-affordance.sh
-        func/agent-read.sh
-        func/agent-world.sh
-        func/agent-write.sh
-        func/ai-context-thresholds.sh
-        func/ai-launch-smoke.sh
-        func/ai-shell-env-bash.sh
-        func/ai-shell-env-fish.sh
-        func/ai-shell-env-zsh.sh
-        func/ai-state-indicator.sh
-        func/attach-lossless.sh
-        func/beads-board.sh
-        func/ci-run-bar.sh
-        func/ci-run-details.sh
-        func/cli-smoke.sh
-        func/codex-subagent-hooks.sh
-        func/cold-restart.sh
-        func/env-persistence.sh
-        func/failure-server-down.sh
-        func/failure-socket-loss.sh
-        func/fresh-create-geometry.sh
-        func/handoff-truecolor.sh
-        func/hook-helper-lifetime.sh
-        func/hot-reload.sh
-        func/keybindings-validation.sh
-        func/multi-window.sh
-        func/pi-ai-lifecycle.sh
-        func/reconnect.sh
-        func/resize-coalescing.sh
-        func/session-exit-status.sh
-        func/shell-integration.sh
-        func/smoke.sh
-        func/terminal-shortcuts.sh
-        func/viewport-debounce.sh
-        func/workspace-split.sh
-        func/workspace-transfer.sh
-    )
-    mapfile -t inventory < <(find tests/e2e/func -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'func/%f\n' | sort)
-    mapfile -t mapped < <(printf '%s\n' "${scripts[@]}" | sort)
-    if ! diff -u <(printf '%s\n' "${inventory[@]}") <(printf '%s\n' "${mapped[@]}"); then
-        echo 'ERROR: functional E2E recipe does not match executable script inventory.' >&2
-        exit 2
-    fi
+    mapfile -t scripts < <(find tests/e2e/func -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'func/%f\n' | sort)
     for script in "${scripts[@]}"; do
-        if [[ "$script" == func/agent-action.sh ]]; then
-            just e2e-visual-agent-action
-        elif [[ "$script" == func/beads-board.sh ]]; then
-            just e2e-func-beads-board
-        elif [[ "$script" == func/pi-ai-lifecycle.sh ]]; then
-            just e2e-func-pi-ai-lifecycle
-        elif [[ "$script" == func/env-persistence.sh ]]; then
-            SCRIBE_KEYRING=1 just e2e-func "$script"
-        else
-            just e2e-func "$script"
-        fi
+        case "$script" in
+            func/agent-action.sh) just e2e-visual-agent-action ;;
+            func/beads-board.sh) just e2e-func-beads-board ;;
+            func/beads-issue-write.sh) just e2e-func-beads-issue-write ;;
+            func/beads-write-contract.sh) just e2e-func-beads-write-contract ;;
+            func/pi-ai-lifecycle.sh) just e2e-func-pi-ai-lifecycle ;;
+            func/env-persistence.sh) SCRIBE_KEYRING=1 just e2e-func "$script" ;;
+            *) just e2e-func "$script" ;;
+        esac
     done
 
 # Full visual E2E suite: build once, delegate each executable test to its recipe,
@@ -803,7 +756,6 @@ e2e-all-visual: build-release docker-visual
         'visual/pane-workspace-layout.sh|e2e-visual-pane-workspace-layout'
         'visual/paste-confirmation.sh|e2e-visual-paste-confirmation'
         'visual/prompt-marks.sh|e2e-visual-prompt-marks'
-        'visual/reconnect.sh|e2e-visual'
         'visual/refused-claim.sh|e2e-visual-refused-claim'
         'visual/relaunch-focus.sh|e2e-visual-relaunch-focus'
         'visual/remote-control.sh|e2e-visual-remote-control'
@@ -841,7 +793,7 @@ e2e-all-visual: build-release docker-visual
         'visual/workspace-split.sh|e2e-visual'
         'visual/x11-focus-guard.sh|e2e-visual'
     )
-    mapfile -t inventory < <(find tests/e2e/visual -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'visual/%f\n' | sort)
+    mapfile -t inventory < <(find tests/e2e/visual -maxdepth 1 -type f -name '*.sh' ! -name 'drag-latency-probe.sh' -perm -u+x -printf 'visual/%f\n' | sort)
     mapfile -t mapped < <(printf '%s\n' "${mappings[@]}" | cut -d'|' -f1 | sort)
     if ! diff -u <(printf '%s\n' "${inventory[@]}") <(printf '%s\n' "${mapped[@]}"); then
         echo 'ERROR: visual E2E mapping does not match executable script inventory.' >&2

@@ -34,12 +34,6 @@ serde_json.workspace = true
 rmp-serde.workspace = true
 clap.workspace = true
 regex.workspace = true
-cosmic-text = { version = "0.19", features = [
-  "shape-run-cache",
-  "monospace_fallback",
-] }
-png = "0.17"
-png_spike = { package = "png", version = "0.18.1" }
 flate2 = { version = "1.1.9", default-features = false, features = [
   "rust_backend",
 ] }
