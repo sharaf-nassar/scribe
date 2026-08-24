@@ -17,13 +17,13 @@
 
 use std::path::Path;
 
-use gpui::{App, FocusHandle, KeyDownEvent, Rgba, Role, Window, div, prelude::*, px};
+use gpui::{App, FocusHandle, Rgba, Role, Window, div, prelude::*, px};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
 
-use crate::opacity::scale_slot;
 use crate::sys_stats::SystemStats;
+use crate::{button::stop_activation_key, opacity::scale_slot};
 
 /// Outcome of a focused pane's most-recently-resolved command.
 ///
@@ -720,15 +720,7 @@ fn center_cta(
                     style.bg(rgba(colors.accent)).text_color(rgba(colors.bg))
                 })
                 // GPUI maps Enter/Space and AccessKit Click onto `on_click`.
-                // Stop the keydown here so the terminal root cannot also
-                // encode the activation key into the focused PTY.
-                .on_key_down(|event: &KeyDownEvent, _, cx| {
-                    if !event.keystroke.modifiers.modified()
-                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                    {
-                        cx.stop_propagation();
-                    }
-                })
+                .on_key_down(stop_activation_key)
                 .on_click(move |_, window, cx| action(window, cx))
                 .into_any_element(),
         _ => base.into_any_element(),

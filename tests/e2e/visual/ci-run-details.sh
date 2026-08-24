@@ -117,15 +117,22 @@ PANEL_DIFF=${PANEL_DIFF%%.*}
 [ "${PANEL_DIFF:-0}" -gt 8000 ] \
     || fail "expanded trace panel changed only ${PANEL_DIFF:-0} pixels"
 
-# Pointer activation leaves focus on the toggle. Space must close it and emit
-# the inverse interest without forwarding a byte to the terminal.
+# Pointer activation leaves focus on the toggle. One Space must close it once
+# without reopening it or forwarding a byte to the terminal.
+OPEN_BEFORE=$(interest_count true)
+CLOSE_BEFORE=$(interest_count false)
 SPACES_BEFORE=$(terminal_space_count)
 xdotool key space
 for _ in {1..30}; do
-    [ "$(interest_count false)" -gt 0 ] && break
+    [ "$(interest_count false)" -gt "$CLOSE_BEFORE" ] && break
     sleep 0.1
 done
-[ "$(interest_count false)" -gt 0 ] || fail "keyboard toggle sent no close interest"
+[ "$(interest_count false)" -gt "$CLOSE_BEFORE" ] || fail "keyboard toggle sent no close interest"
+sleep 0.3
+CLOSE_DELTA=$(( $(interest_count false) - CLOSE_BEFORE ))
+OPEN_DELTA=$(( $(interest_count true) - OPEN_BEFORE ))
+[ "$CLOSE_DELTA" -eq 1 ] || fail "keyboard toggle sent ${CLOSE_DELTA} close interests"
+[ "$OPEN_DELTA" -eq 0 ] || fail "keyboard toggle reopened with ${OPEN_DELTA} open interests"
 [ "$(terminal_space_count)" -eq "$SPACES_BEFORE" ] \
     || fail "keyboard toggle forwarded Space to the terminal"
 

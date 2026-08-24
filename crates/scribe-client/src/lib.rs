@@ -64,6 +64,7 @@ pub mod beads_flow;
 pub mod beads_panel;
 pub mod bell;
 pub mod box_drawing;
+pub mod button;
 pub mod chrome_metadata;
 pub mod ci_bar;
 pub mod clipboard;

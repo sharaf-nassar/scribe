@@ -24,8 +24,8 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 78
-counts modules-wired 78
+counts modules-total 79
+counts modules-wired 79
 counts server-messages-total 73
 counts server-messages-handled 67
 counts layout-actions-total 38

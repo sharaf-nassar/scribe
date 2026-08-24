@@ -8,20 +8,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, FocusHandle, KeyDownEvent, MouseButton, Role, SharedString, Window, div,
-    linear_color_stop, linear_gradient, prelude::*, px,
+    AnyElement, App, FocusHandle, MouseButton, Role, SharedString, Window, div, linear_color_stop,
+    linear_gradient, prelude::*, px,
 };
 use scribe_common::protocol::{
     BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue, MAX_FLOW_NODES,
 };
 
-use crate::beads_board::{BeadsBoardColors, alpha, short_id};
 use crate::beads_board_a2::{
     FLOW_BAND_GAP, FLOW_BAND_HEIGHT, FLOW_BAND_PAD_LEFT, FLOW_CHIP_GAP_Y, FLOW_CHIP_OFFSET_X,
     FLOW_CHIP_PAD_H, FLOW_CHIP_PAD_V, FLOW_CHIP_RADIUS, FLOW_DOT_SIZE, FLOW_FADE_WIDTH,
     FLOW_GRAPH_HEIGHT, FLOW_GRAPH_TOP, FLOW_HBAR_HEIGHT, FLOW_HBAR_TOP, FLOW_NODE_GAP,
     FLOW_NODE_GUTTER, FLOW_NODE_HEIGHT, FLOW_NODE_LEFT_PAD, FLOW_NODE_PAD_H, FLOW_NODE_ROW_GAP,
     FLOW_NODE_WIDTH, FLOW_PROGRESS_WIDTH, FLOW_RULER_HEIGHT,
+};
+use crate::{
+    beads_board::{BeadsBoardColors, alpha, short_id},
+    button::stop_activation_key,
 };
 
 fn scalar(value: usize) -> f32 {
@@ -1272,18 +1275,7 @@ fn flow_exit_control(
             window.focus(&click_focus, app);
             click_exit(window, app);
         })
-        // GPUI already turns Enter/Space on a focused, `on_click`-bearing
-        // element into a synthesized click (`div.rs`'s "Press enter, space
-        // to trigger click, when the element is focused"), so this only
-        // has to keep the keystroke off the PTY -- calling `on_exit` again
-        // here would double-fire it, the way `ci_bar::action_button` avoids.
-        .on_key_down(|event: &KeyDownEvent, _, app| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                app.stop_propagation();
-            }
-        })
+        .on_key_down(stop_activation_key)
         .child(control.label)
         .into_any_element()
 }
@@ -1501,11 +1493,9 @@ fn flow_node(
     text_scale: f32,
 ) -> AnyElement {
     let click_id = node.id.clone();
-    let key_id = node.id.clone();
     let hover_id = node.id.clone();
     let click_focus = control.focus.clone();
     let click_activate = Arc::clone(&control.on_activate);
-    let key_activate = Arc::clone(&control.on_activate);
     let on_hover = Arc::clone(&control.on_hover);
     let hover = colors.button_hover;
     let mut element = div()
@@ -1533,14 +1523,7 @@ fn flow_node(
             window.focus(&click_focus, app);
             click_activate(click_id.clone(), window, app);
         })
-        .on_key_down(move |event: &KeyDownEvent, window, app| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                app.stop_propagation();
-                key_activate(key_id.clone(), window, app);
-            }
-        });
+        .on_key_down(stop_activation_key);
     if node.cursor {
         element = element.bg(colors.cursor_fill).child(
             div().absolute().left_0().top_0().bottom_0().w(px(2.0)).bg(colors.cursor_keyline),
@@ -1780,6 +1763,7 @@ mod tests {
     use std::hint::black_box;
     use std::time::{Duration, Instant};
 
+    use gpui::KeyDownEvent;
     use scribe_common::protocol::{
         BeadsEpicGraph, BeadsGraphEdge, BeadsGraphNode, BeadsIssueQueue,
     };

@@ -8,8 +8,8 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, App, ElementId, FocusHandle, KeyDownEvent, MouseButton, Rgba,
-    Role, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
+    Animation, AnimationExt as _, App, ElementId, FocusHandle, MouseButton, Rgba, Role, Window,
+    div, linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 use scribe_common::{
     protocol::{
@@ -19,7 +19,9 @@ use scribe_common::{
     theme::Theme,
 };
 
-use crate::{animation::AnimationSettings, layout::Rect, opacity::scale_slot};
+use crate::{
+    animation::AnimationSettings, button::stop_activation_key, layout::Rect, opacity::scale_slot,
+};
 
 /// Fixed height of the collapsed workspace-region band.
 pub const CI_BAR_HEIGHT: f32 = 40.0;
@@ -555,7 +557,6 @@ fn collapsed_toggle(
     render: &CiBarRender,
 ) -> gpui::AnyElement {
     let toggle_click = Arc::clone(&render.on_toggle);
-    let toggle_key = Arc::clone(&render.on_toggle);
     let toggle_focus = render.toggle_focus.clone();
     let toggle_label = format!(
         "{}. CI job trace is {}",
@@ -576,14 +577,7 @@ fn collapsed_toggle(
         .gap(px(18.0))
         .focus_visible(|style| style.bg(rgba(with_alpha(colors.text, 0.08))))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_key_down(move |event: &KeyDownEvent, window, cx| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                cx.stop_propagation();
-                toggle_key(window, cx);
-            }
-        })
+        .on_key_down(stop_activation_key)
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             window.focus(&toggle_focus, cx);
@@ -973,13 +967,7 @@ fn action_button(
         .hover(|style| style.bg(rgba(with_alpha(colors.text, 0.08))).text_color(rgba(colors.text)))
         .focus_visible(|style| style.bg(rgba(colors.text)).text_color(rgba(colors.background)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_key_down(|event: &KeyDownEvent, _, cx| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                cx.stop_propagation();
-            }
-        })
+        .on_key_down(stop_activation_key)
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             window.focus(&click_focus, cx);

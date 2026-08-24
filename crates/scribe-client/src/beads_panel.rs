@@ -5300,6 +5300,7 @@ mod panel_cache_tests {
         }
         let window = cx
             .update(|app| {
+                AnimationSettings::resolve_with_env(false, None).apply_to_app(app);
                 app.open_window(
                     gpui::WindowOptions {
                         window_bounds: Some(gpui::WindowBounds::Windowed(Bounds {

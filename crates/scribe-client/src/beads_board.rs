@@ -19,6 +19,7 @@ use crate::beads_flow::{
     FlowBandControl, FlowLayout, FlowNodeControl, FlowRender, FlowTrace, layout_flow,
 };
 use crate::beads_panel::BeadsPanels;
+use crate::button::stop_activation_key;
 use crate::layout::Rect;
 use crate::opacity::surface;
 use crate::restore_replay::round_positive_f32_to_u16;
@@ -2980,7 +2981,6 @@ fn unpin_control(lane: &QueueLane<'_>, ctx: LaneCtx<'_>, focus: &FocusHandle) ->
     let queue = lane.queue;
     let workspace_id = ctx.stores.workspace_id;
     let click_boards = std::sync::Arc::clone(ctx.stores.boards);
-    let key_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_focus = focus.clone();
     let quiet = ctx.colors.quiet;
     let title = ctx.colors.title;
@@ -3008,17 +3008,7 @@ fn unpin_control(lane: &QueueLane<'_>, ctx: LaneCtx<'_>, focus: &FocusHandle) ->
             }
             window.refresh();
         })
-        .on_key_down(move |event: &KeyDownEvent, window, app| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                app.stop_propagation();
-                if let Ok(mut boards) = key_boards.lock() {
-                    boards.unpin_lane(workspace_id, queue);
-                }
-                window.refresh();
-            }
-        })
+        .on_key_down(stop_activation_key)
         .child("×")
         .into_any_element()
 }
@@ -3277,7 +3267,6 @@ fn tab_interactivity(
     let focus = ctx.tab_focus(queue);
     let hover_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_boards = std::sync::Arc::clone(ctx.stores.boards);
-    let key_boards = std::sync::Arc::clone(ctx.stores.boards);
     let click_focus = focus.clone();
     let title = ctx.colors.title;
     let hot = mode == TabMode::Open;
@@ -3317,17 +3306,7 @@ fn tab_interactivity(
             }
             window.refresh();
         })
-        .on_key_down(move |event: &KeyDownEvent, window, app| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                app.stop_propagation();
-                if let Ok(mut boards) = key_boards.lock() {
-                    activate_tab(&mut boards, workspace_id, queue, mode);
-                }
-                window.refresh();
-            }
-        })
+        .on_key_down(stop_activation_key)
 }
 
 /// The tab's vertically centred letterform spine, one glyph per line box

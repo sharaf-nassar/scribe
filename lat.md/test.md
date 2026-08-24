@@ -4781,9 +4781,11 @@ the *other* region's coordinates. That second reading is the one this suite was
 written for — both strips answered at x=10 and neither at x=514, which is a
 second region's board painted on top of the first. The overlay probe is its
 twin over [[crates/scribe-client/src/beads_panel.rs#PanelLayer]], clicking one
-region's dismiss backdrop and requiring the other region's panel to survive;
-it passes unchanged, which is how the panel's arrangement is known to be sound
-rather than merely untested.
+region's dismiss backdrop and requiring the other region's panel to survive.
+It applies the same reduce-motion policy as the runtime before drawing the
+zero-duration panel transition, so the measurement does not depend on the host
+clock advancing between GPUI animation timestamps. The surviving panel proves
+the arrangement is sound rather than merely untested.
 
 Both are sited on two regions for the reason
 [viewport-edge-fixtures-hide-anchor-bugs](../docs/solutions/conventions/viewport-edge-fixtures-hide-anchor-bugs.md)
@@ -5856,8 +5858,10 @@ open, and stops gaining them after close.
 ### Expanded trace visual and keyboard toggle
 
 Visual Docker opens the collapsed band with a pointer, injects three timed job
-states, captures the expanded trace, then closes it with Space while asserting
-both interest edges on the wire.
+states, captures the expanded trace, then closes it with one Space.
+
+After a short settling interval, the wire oracle requires exactly one new
+close interest, no new open interest, and no terminal Space byte.
 
 ## GPUI Beads Editor Input Spike
 

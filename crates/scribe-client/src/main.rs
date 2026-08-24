@@ -43,6 +43,7 @@ use scribe_client::beads_panel::{
     BeadsEditor, BeadsEditorKeyRoute, BeadsPanels, PanelLayer, PanelLayerInputs, PanelWriteIntent,
 };
 use scribe_client::bell::{BellController, BellEvent};
+use scribe_client::button::stop_activation_key;
 use scribe_client::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client::ci_bar::{self, CiBarColors, CiBarModel, CiRunBars};
 use scribe_client::clipboard::{
@@ -9270,13 +9271,7 @@ impl TerminalView {
                         ctx.notify();
                     }),
                 )
-                .on_key_down(|event: &KeyDownEvent, _window, ctx| {
-                    if !event.keystroke.modifiers.modified()
-                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                    {
-                        ctx.stop_propagation();
-                    }
-                })
+                .on_key_down(stop_activation_key)
                 // GPUI maps Enter, Space, and AccessKit Click to `on_click`.
                 .on_click(cx.listener(move |view, _, _window, ctx| {
                     view.activate_jump_button(session_id, ctx);
@@ -16941,14 +16936,6 @@ mod tests {
             }
         }
 
-        fn stop_activation_key(event: &KeyDownEvent, _window: &mut Window, cx: &mut App) {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                cx.stop_propagation();
-            }
-        }
-
         fn activate(&mut self) {
             self.activations += 1;
             self.button_visible = false;
@@ -16961,7 +16948,7 @@ mod tests {
                     .id("jump-button-focus-probe")
                     .track_focus(&button_focus)
                     .role(gpui::Role::Button)
-                    .on_key_down(Self::stop_activation_key)
+                    .on_key_down(stop_activation_key)
                     .on_click(cx.listener(|this, _, _window, _ctx| this.activate()))
             })
         }
