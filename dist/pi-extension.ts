@@ -8,6 +8,7 @@ const REGISTRATION = Symbol.for("scribe.pi.lifecycle-extension");
 const MAX_OUTSTANDING = 32;
 const HELPER_TIMEOUT_MS = 100;
 const TASK_LABEL_LIMIT = 120;
+const ASK_USER_BLOCKED_EVENT = "rpiv:ask-user:blocked";
 
 type EventName =
   | "state_changed"
@@ -352,6 +353,13 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
 
+  const unsubscribeAskUserBlocked = pi.events.on(ASK_USER_BLOCKED_EVENT, (payload) => {
+    if (!payload || typeof payload !== "object" || typeof (payload as { active?: unknown }).active !== "boolean") return;
+    enqueue("state_changed", {
+      state: (payload as { active: boolean }).active ? "waiting_for_input" : "processing",
+    });
+  });
+
   function invoke(event: EventName, payload: Payload): Promise<void> {
     return new Promise((resolve) => {
       let settled = false;
@@ -468,6 +476,7 @@ export default function scribePiExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     shutdownPromise ??= (async () => {
       shuttingDown = true;
+      unsubscribeAskUserBlocked();
       generation += 1;
       pending = [];
       if (active) await active;

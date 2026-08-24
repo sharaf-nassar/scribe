@@ -1049,6 +1049,14 @@ second load a no-op rather than a second set of handlers, which is what keeps a
 duplicate registration from emitting every event twice. Shutdown releases the
 slot, so the successor load after a reload registers normally.
 
+The adapter also consumes the shared `rpiv:ask-user:blocked` event by its
+stable literal channel name, without importing the optional questionnaire
+package. Only an object payload with boolean `active` is accepted: `true` emits
+`state_changed { waiting_for_input }` and `false` emits `state_changed {
+processing }` through the same bounded serial queue. This records a real
+mid-tool human wait rather than inferring it from `tool_call`; malformed
+payloads emit nothing. The subscription is released during shutdown.
+
 Only documented Pi lifecycle events are used:
 
 - `session_start` → `task_label_cleared`, then `state_changed { idle_prompt }`.

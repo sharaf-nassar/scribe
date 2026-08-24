@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const extensionPath = resolve(here, "../../../dist/pi-extension.ts");
+const ASK_USER_BLOCKED_EVENT = "rpiv:ask-user:blocked";
 const tempDir = await mkdtemp(join(tmpdir(), "scribe-pi-extension-"));
 const helperPath = join(tempDir, "fake-helper.mjs");
 
@@ -50,9 +51,25 @@ const { default: extensionFactory } = await import(
   `${pathToFileURL(extensionPath).href}?harness=${importCounter++}`
 );
 
+class FakeEventBus {
+  handlers = new Map();
+
+  on(name, handler) {
+    const handlers = this.handlers.get(name) ?? new Set();
+    handlers.add(handler);
+    this.handlers.set(name, handlers);
+    return () => handlers.delete(handler);
+  }
+
+  emit(name, payload) {
+    for (const handler of this.handlers.get(name) ?? []) handler(payload);
+  }
+}
+
 class FakeExtensionAPI {
   handlers = new Map();
   tools = new Map();
+  events = new FakeEventBus();
 
   on(name, handler) {
     const handlers = this.handlers.get(name) ?? [];
@@ -220,6 +237,58 @@ async function testInputSourcesAndOrder() {
   input({ type: "input", text: "machine turn", source: "extension" }, ctx);
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal((await starts(logPath)).length, before, "extension input must be ignored");
+  await shutdown(api);
+  return starts(logPath);
+}
+
+// @lat: [[test#Test Harness#Pi Extension Harness#Shared questionnaire wait]]
+async function testSharedQuestionnaireWait() {
+  const logPath = join(tempDir, "questionnaire.jsonl");
+  setHarnessEnv(logPath);
+  const api = new FakeExtensionAPI();
+  extensionFactory(api);
+  const stateCalls = async () =>
+    parsedCalls(await starts(logPath))
+      .filter(({ event }) => event === "state_changed")
+      .map(({ payload }) => payload.state);
+
+  api.handler("input")({ type: "input", text: "Wait for a choice", source: "interactive" }, makeContext());
+  await waitFor(async () => (await stateCalls()).length >= 1, "initial Processing state missing");
+  assert.deepEqual(await stateCalls(), ["processing"]);
+
+  // Opening blocks Pi inside the still-running tool.
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: true });
+  await waitFor(async () => (await stateCalls()).length >= 2, "questionnaire open state missing");
+  assert.deepEqual(await stateCalls(), ["processing", "waiting_for_input"]);
+
+  // Answering unblocks it; reopening then cancelling does the same.
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: false });
+  await waitFor(async () => (await stateCalls()).length >= 3, "questionnaire answer state missing");
+  assert.deepEqual(await stateCalls(), ["processing", "waiting_for_input", "processing"]);
+
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: true });
+  api.events.emit(ASK_USER_BLOCKED_EVENT, { active: false });
+  await waitFor(async () => (await stateCalls()).length >= 5, "questionnaire cancel state missing");
+  assert.deepEqual(await stateCalls(), [
+    "processing",
+    "waiting_for_input",
+    "processing",
+    "waiting_for_input",
+    "processing",
+  ]);
+
+  for (const payload of [undefined, null, {}, { active: "true" }, { active: 1 }]) {
+    api.events.emit(ASK_USER_BLOCKED_EVENT, payload);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(await stateCalls(), [
+    "processing",
+    "waiting_for_input",
+    "processing",
+    "waiting_for_input",
+    "processing",
+  ]);
+
   await shutdown(api);
   return starts(logPath);
 }
@@ -582,6 +651,7 @@ const allStarts = [];
 try {
   allStarts.push(...await testStartupAndDuplicateGuard());
   allStarts.push(...await testInputSourcesAndOrder());
+  allStarts.push(...await testSharedQuestionnaireWait());
   allStarts.push(...await testRetryAndSettleBehavior());
   allStarts.push(...await testMalformedMessagesAndNoPolling());
   allStarts.push(...await testIssueFocusedFromBdClaim());

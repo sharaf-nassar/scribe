@@ -1779,6 +1779,15 @@ The prompt fixture leads with a blank line and a `/reload` line and carries a
 semicolon and a control character, so it also pins the label normalization the
 adapter shares with Codex.
 
+### Shared questionnaire wait
+
+The fake Pi API opens a questionnaire through its shared event bus.
+
+`rpiv:ask-user:blocked { active: true }` changes Processing to WaitingForInput
+before the tool settles. Both answer and cancellation emit `{ active: false }`
+and restore Processing. Null, missing, string, and numeric `active` payloads
+produce no helper events, and the adapter imports no questionnaire package.
+
 ### Retry and settle behavior
 
 A duplicate `agent_start` after a captured input does not double the processing
