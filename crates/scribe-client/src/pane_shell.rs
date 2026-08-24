@@ -1499,7 +1499,7 @@ fn prune_workspace_node(
             let mut kept_sessions = Vec::new();
             let mut kept_trees = Vec::new();
             let mut kept_active = 0;
-            for (index, _) in session_ids.iter().enumerate() {
+            for (index, &session_id) in session_ids.iter().enumerate() {
                 let Some(tab) = wire_tab_pane_tree(session_ids, pane_trees, index) else {
                     continue;
                 };
@@ -1507,7 +1507,16 @@ fn prune_workspace_node(
                 if index == *active_tab_index {
                     kept_active = kept_sessions.len();
                 }
-                kept_sessions.push(first_session(&kept));
+                // A live tab's identity is its `session_ids` entry, not the
+                // split tree's leftmost pane. Replacing an active split tab
+                // with `first_session` shifts its pane tree and active index
+                // on reconnect (and would make a tear-out re-report a
+                // different tree than the server committed).
+                kept_sessions.push(if live.contains(&session_id) {
+                    session_id
+                } else {
+                    first_session(&kept)
+                });
                 kept_trees.push(match kept {
                     PaneTreeNode::Leaf { .. } => None,
                     split @ PaneTreeNode::Split { .. } => Some(split),
@@ -1748,6 +1757,29 @@ mod tests {
         assert!((a.y - b.y).abs() < 1.0, "side-by-side regions share y");
         assert!((b.x - 500.0).abs() < 1.0, "second region starts at half width");
         assert!((a.height - 600.0).abs() < 1.0, "regions span the full height");
+    }
+
+    // @lat: [[test#GPUI Workspace Drag]]
+    #[test]
+    fn pruning_keeps_a_live_active_split_tab_at_its_reported_index() {
+        let (workspace_id, first, active, split_right) =
+            (WorkspaceId::new(), SessionId::new(), SessionId::new(), SessionId::new());
+        let split = PaneTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneTreeNode::Leaf { session_id: first }),
+            second: Box::new(PaneTreeNode::Leaf { session_id: split_right }),
+        };
+        let tree = WorkspaceTreeNode::Leaf {
+            workspace_id,
+            session_ids: vec![first, active],
+            pane_trees: vec![None, Some(split.clone())],
+            active_tab_index: 1,
+        };
+        let live = [first, active, split_right].into_iter().collect();
+
+        let pruned = prune_workspace_node(&tree, &live).expect("live split tab is retained");
+        assert_eq!(pruned, tree, "reconnect cannot shift the split onto its first pane tab");
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Region reports every tab and which is active]]

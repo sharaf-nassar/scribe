@@ -99,9 +99,13 @@ jobs:
           just e2e-func func/smoke.sh
           just e2e-func func/session-exit-status.sh
           just e2e-func func/cli-smoke.sh
+          just e2e-func-workspace-transfer
 
       - name: Run visual smoke
-        run: just e2e-visual visual/titlebar.sh
+        run: |
+          just e2e-visual visual/titlebar.sh
+          just e2e-visual-workspace-drag-tearout
+          just e2e-visual-workspace-drag-palette
 
       - name: Run A2/A3 functional contract
         run: just e2e-func-beads-board

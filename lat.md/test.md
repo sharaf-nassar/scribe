@@ -25,6 +25,13 @@ cleanup with no partial target. Protocol tests round-trip
 `EnvironmentRebindFailed` alongside every other refusal and retain the
 old-peer default-false capability behavior.
 
+`tests/e2e/func/workspace-transfer.sh` adds the disposable production-socket
+oracle: it reports a rearranged tree, reconnects, leaves a transfer result
+unread across a real server handoff, retries that transfer id against the
+successor, and verifies exact source/target session trees plus the atomically
+flipped agent-world `window_id`. It also proves old-client refusal and
+old-server capability defaults without a network route.
+
 ## GitHub CI Tracking
 
 Server unit fixtures verify the local push gate before any GitHub polling or client protocol is involved.
@@ -5409,6 +5416,21 @@ They pin every corner's normalized nearest-edge result with horizontal tie prece
 [[crates/scribe-client/src/workspace_transfer.rs]] tests cover sole-workspace and absent-capability no-send decisions, every typed refusal including `EnvironmentRebindFailed`, same-id timeout/disconnect retry, first-send and retry-send failure recovery, and one-open idempotency for late or duplicate results. Binary tests pin the claimed target's `initial_session: false`, `open_restored_window` status return, inherited target size, cursor anchoring, compositor placement, and open-failure recovery copy. [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#transfer_workspace]] verifies all three correlated ids reach the ordered writer queue unchanged.
 
 [[crates/scribe-client/src/workspace_layout.rs#WindowLayout#rearrange_workspace]] tests pin client-side lowering over the shared tree operations: edge extraction/insertion re-equalizes all region ratios; center swap preserves nested ratios and shape; slot metadata, active tab, pane-owned payload, and source focus stay attached. Directional palette-move tests pin non-wrapping nearest-neighbor selection, no-neighbor feedback/no-op, focused-source movement, and equality with the matching drag edge. [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#rearrange_workspace]] adds the entity boundary assertion that one successful rearrangement emits one report; [[crates/scribe-client/src/workspace_tree.rs#WorkspaceTree#move_focused_workspace_in_direction]] covers the equivalent palette path. [[crates/scribe-client/src/command_palette.rs#base_entries]] pins all five workspace rows as visible client-local actions. Existing titlebar drag-reorder suites remain the regression oracle for tab marker isolation and window-move behavior.
+
+`tests/e2e/visual/workspace-drag-tearout.sh` drives measured workspace-pill
+drags under X11/Xvfb. Wire/tree oracles cover swap, all edge inserts,
+horizontal corner ties, Escape and disappearance cleanup, PTY isolation,
+standalone-pill rendering, and exact tear-out preservation. The matching
+`tests/e2e/visual/workspace-drag-palette.sh` drives every directional action
+and tear-out from the command palette without pointer input.
+
+The native AppKit delivery probe run `32667985883` predates the feature. The
+post-implementation AppKit attempts `32681212383`, `32683626572`,
+`32684587908`, `32685531097`, and `32686590501` did not reach a shipped pill
+drag marker; macOS pointer coverage is deliberately not claimed. The nested
+Mutter spike likewise establishes input delivery only, not a post-implementation
+Wayland interaction checklist. See `specs/029-workspace-drag-tearout.md` for
+failure signatures and the retained platform boundary.
 
 ## GPUI Pane Dividers
 

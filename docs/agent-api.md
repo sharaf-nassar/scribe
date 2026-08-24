@@ -128,6 +128,11 @@ workspace to a new window mints a fresh `window_id`; `world` and `siblings`
 show the ownership change atomically, so agents should refresh a snapshot
 rather than cache a session's or workspace's window id across operations.
 
+The v1 agent surface has no workspace-drag action. Follow-on epic `scribe-tn6m`
+tracks cross-window merge, tab-between-workspace drag, drag re-attach, and
+share migration; until that ships, agents must treat every workspace move as a
+fresh snapshot boundary rather than inferring cross-window behavior.
+
 ## Commands
 
 Session, window, and workspace ids are full UUIDs, exactly as returned by

@@ -33,6 +33,7 @@ mod terminal_image_settings;
 mod terminal_image_state_seam;
 mod terminal_image_transfer_lifecycle;
 mod wait;
+mod workspace_transfer;
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -438,6 +439,12 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Exercise workspace transfer against the real disposable server.
+    WorkspaceTransfer {
+        /// Versioned JSON evidence destination.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
 }
 
 #[derive(clap::Args)]
@@ -760,6 +767,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::TerminalImageSettings { fixtures, evidence } => run_settings(&fixtures, &evidence),
         Command::TerminalImageServerState { evidence } => run_image_server_state(&evidence),
+        Command::WorkspaceTransfer { evidence } => {
+            workspace_transfer::run(&evidence).map_err(TestError::TestFailure)
+        }
         Command::ShareTap { listen, upstream, record, control } => {
             run_share_tap(&listen, &upstream, &record, &control)
         }

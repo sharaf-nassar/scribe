@@ -588,6 +588,17 @@ e2e-visual-ai-task-label: e2e-visual-image-current
 e2e-visual-workspace-ipc: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-ipc.sh
 
+# Run the complete X11 workspace-pill pointer matrix. SessionCreated delivery is
+# delayed only inside the tap so the real zero-tab standalone pill remains on
+# screen long enough to measure; every server frame is still recorded at once.
+e2e-visual-workspace-drag-tearout: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SHARE_TAP_SESSION_CREATED_DELAY_MS=1200 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-drag-tearout.sh
+
+# Execute all five workspace commands from the real command palette without
+# pointer input, with wire/tree oracles for directional moves and tear-out.
+e2e-visual-workspace-drag-palette: e2e-visual-image-current
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/workspace-drag-palette.sh
+
 # Run the workspace Beads board visual contract against the generated mock manifest.
 e2e-visual-beads-board: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=420 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro -v ./.impeccable/mocks/a2a3-contract.json:/contract/a2a3-contract.json:ro {{ e2e_output }} scribe-test-visual /tests/visual/beads-board.sh
@@ -686,6 +697,11 @@ e2e-visual-pane-workspace-layout: e2e-visual-image-current
 e2e-visual-paste-confirmation: e2e-visual-image-current
     docker run --rm --network none {{ gpu_flags }} -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/paste-confirmation-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/paste-confirmation.sh
 
+# Drive reconnect, a real server upgrade with an unobserved transfer result,
+# mixed-version negotiation, and agent-world ownership through production IPC.
+e2e-func-workspace-transfer: e2e-func-image-current
+    TEST_TIMEOUT=180 just e2e-func func/workspace-transfer.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     #!/usr/bin/env bash
@@ -727,6 +743,7 @@ e2e: build-release docker-func
         func/terminal-shortcuts.sh
         func/viewport-debounce.sh
         func/workspace-split.sh
+        func/workspace-transfer.sh
     )
     mapfile -t inventory < <(find tests/e2e/func -maxdepth 1 -type f -name '*.sh' -perm -u+x -printf 'func/%f\n' | sort)
     mapfile -t mapped < <(printf '%s\n' "${scripts[@]}" | sort)
@@ -818,6 +835,8 @@ e2e-all-visual: build-release docker-visual
         'visual/window-chrome-bands.sh|e2e-visual-chrome-bands'
         'visual/window-lifecycle.sh|e2e-visual-window-lifecycle'
         'visual/window-resize.sh|e2e-visual-window-resize'
+        'visual/workspace-drag-palette.sh|e2e-visual-workspace-drag-palette'
+        'visual/workspace-drag-tearout.sh|e2e-visual-workspace-drag-tearout'
         'visual/workspace-ipc.sh|e2e-visual-workspace-ipc'
         'visual/workspace-split.sh|e2e-visual'
         'visual/x11-focus-guard.sh|e2e-visual'

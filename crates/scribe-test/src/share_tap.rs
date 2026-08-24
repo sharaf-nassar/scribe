@@ -20,8 +20,10 @@
 //! * a control socket injects a `ServerMessage` toward the client, which is how
 //!   the four share notices a second machine would have caused are delivered.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::protocol::{ClientMessage, ServerMessage};
@@ -32,6 +34,23 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// The injection target: the sender of the most recently accepted client
 /// connection, which under the E2E entrypoint is the client under test.
 type InjectTarget = Arc<Mutex<Option<UnboundedSender<ServerMessage>>>>;
+
+/// Optional delay for `SessionCreated` delivery through the test relay.
+///
+/// Visual coverage uses it to hold a newly split region in its real zero-tab
+/// state long enough to measure the standalone workspace pill. The frame is
+/// still produced by the real server and recorded immediately; only relay
+/// delivery is delayed inside the disposable harness.
+const SESSION_CREATED_DELAY_ENV: &str = "SCRIBE_SHARE_TAP_SESSION_CREATED_DELAY_MS";
+
+fn session_created_delay(raw: Option<&OsStr>, message: &ServerMessage) -> Duration {
+    if !matches!(message, ServerMessage::SessionCreated { .. }) {
+        return Duration::ZERO;
+    }
+    raw.and_then(OsStr::to_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::ZERO, Duration::from_millis)
+}
 
 /// Relay every connection that arrives on `listen` to the real server at
 /// `upstream`, recording the client half and serving `control` for injection.
@@ -104,6 +123,13 @@ async fn relay(
                 return;
             };
             record_frame(&downlink_record, "server", &message);
+            let delay = session_created_delay(
+                std::env::var_os(SESSION_CREATED_DELAY_ENV).as_deref(),
+                &message,
+            );
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if to_client.send(message).is_err() {
                 return;
             }
@@ -186,4 +212,34 @@ pub async fn inject(control: &Path, message: &str) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(control).await?;
     stream.write_all(format!("{message}\n").as_bytes()).await?;
     stream.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use scribe_common::ids::{SessionId, WorkspaceId};
+
+    use super::*;
+
+    #[test]
+    fn only_session_created_frames_take_the_configured_delay() {
+        let created = ServerMessage::SessionCreated {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            shell_name: "bash".to_owned(),
+        };
+        assert_eq!(
+            session_created_delay(Some(OsStr::new("1250")), &created),
+            Duration::from_millis(1250)
+        );
+        assert_eq!(session_created_delay(Some(OsStr::new("bad")), &created), Duration::ZERO);
+        assert_eq!(
+            session_created_delay(
+                Some(OsStr::new("1250")),
+                &ServerMessage::Error { message: "not delayed".to_owned() }
+            ),
+            Duration::ZERO
+        );
+    }
 }

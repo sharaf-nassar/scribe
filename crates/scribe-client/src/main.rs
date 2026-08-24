@@ -11582,6 +11582,13 @@ impl TerminalView {
             view.request_window_close(ctx);
         }))
         .on_drag_move(cx.listener(|view, event: &DragMoveEvent<WorkspaceDragMarker>, win, ctx| {
+            // The pill itself may retain titlebar focus after GPUI crosses its
+            // native drag threshold. Move focus to the root before the first
+            // active update so Escape reaches this window-level cancellation
+            // handler instead of falling through to the focused terminal.
+            if view.workspace_drag.is_active() {
+                win.focus(&view.focus.root, ctx);
+            }
             view.update_workspace_drag(event.event.position, win, ctx);
         }))
         .on_mouse_up(
@@ -12994,6 +13001,8 @@ fn open_window(
     let bounds = cold_start
         .initial_bounds
         .unwrap_or_else(|| Bounds::centered(None, startup_window_size(cx), cx));
+    #[cfg(target_os = "linux")]
+    let x11_initial_position = x11_fresh_window_position(&cold_start, bounds);
     // A cold-restart window knows its record before it opens, so its pinned
     // boards are seeded here; a window the server assigns an id to instead
     // picks them up in `adopt_assigned_geometry`.
@@ -13076,6 +13085,10 @@ fn open_window(
             if let Some(state) = startup_state {
                 monitor::assert_window_state(window, state);
             }
+            #[cfg(target_os = "linux")]
+            if let Some((x, y)) = x11_initial_position {
+                monitor::apply_saved_position(window, x, y, WindowState::Windowed);
+            }
             cx.new(|cx| {
                 TerminalView::new(
                     shared,
@@ -13093,6 +13106,23 @@ fn open_window(
             None
         }
     }
+}
+
+/// Return the post-map position for an X11 fresh window with explicit bounds.
+///
+/// GPUI's creation bounds set size but are not an X11 position request, so a
+/// tear-out needs the same post-map EWMH assertion as a restored window.
+#[cfg(target_os = "linux")]
+fn x11_fresh_window_position(cold_start: &ColdStart, bounds: Bounds<Pixels>) -> Option<(i32, i32)> {
+    (gpui::guess_compositor() == "X11"
+        && cold_start.geometry.is_none()
+        && cold_start.initial_bounds.is_some())
+    .then(|| {
+        (
+            logical_px_to_i32(f32::from(bounds.origin.x)),
+            logical_px_to_i32(f32::from(bounds.origin.y)),
+        )
+    })
 }
 
 /// Strip GPUI's stateful X11 toggle from restored creation bounds.

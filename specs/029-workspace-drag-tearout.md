@@ -81,8 +81,15 @@ issues).
 
 ## Target Epic
 
-None exists. This run will create a new feature epic for
-workspace-drag-tearout.
+`scribe-tn6m` — **Workspace drag phase 2: cross-window moves and share
+migration**. It owns v1's intentionally deferred cross-window merge,
+tab-between-workspace drag, drag re-attach, and share migration. Its acceptance
+requires palette access on every platform and pointer access where supported;
+stable workspace/session/program/tab/pane identity with no `SessionCreated`;
+capability-gated atomic source/destination ownership, env, and agent-world
+changes; a Wayland-safe non-pointer destination path; deterministic re-attach;
+explicit atomic share migration; and registered pointer/palette, reconnect,
+upgrade, mixed-version, agent-world, PTY-isolation, and share E2E coverage.
 
 ## Source Authority
 
@@ -158,6 +165,32 @@ not require them. Keep the 8 px inner arm band and >24 px disarm threshold as
 the backend-independent path. Treat Escape and window deactivation as explicit
 application cancellation hooks that call `stop_active_drag`; GPUI still had an
 active drag when both hooks ran on the tested backends.
+
+## Post-implementation platform closure (2026-08-24)
+
+The AppKit spike above is **pre-implementation delivery evidence only**. Its
+successful run [`32667985883`](https://github.com/sharaf-nassar/scribe/actions/runs/32667985883)
+proves the pinned GPUI backend delivered the tested edge, release, Escape, and
+blur events to the throwaway probe; it does not prove the shipped workspace-pill
+surface.
+
+The authorized post-implementation temporary harness did not produce a
+pointer-success claim. Run `32681212383` stopped before UI checks because the
+relay's macOS Unix socket path exceeded `SUN_LEN`. Run `32683626572` used Linux
+shortcuts. Runs `32684587908` and `32685531097` corrected frame coordinates and
+showed two workspace regions but recorded no workspace-drag frames. Run
+`32686590501` additionally scanned the visible custom chrome using
+`SCRIBE_DRAG_PROBE=1`; it confirmed two-workspace UI and the native macOS
+shortcuts but never logged `workspace drag armed`. The temporary workflow and
+probe were removed after these runs.
+
+Therefore macOS US1/US2 pointer automation is **unverified**, not failed product
+behavior: no post-implementation AppKit run reached the shipped pill's drag
+marker. No post-implementation Wayland scripted checklist ran either. The
+nested-Mutter entry in the spike table remains input-delivery evidence only;
+X11 registered E2E plus the palette path remain the user-reachable automated
+coverage. A future platform owner needs a sanctioned native input harness before
+claiming AppKit or Wayland pointer success.
 
 ## User Stories
 

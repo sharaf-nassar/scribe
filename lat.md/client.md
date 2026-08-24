@@ -49,6 +49,18 @@ still reported an active drag; the probe's handler successfully called
 both hooks rather than waiting for GPUI to clear the drag. The delivery data
 kept the spec's 8 px arm and >24 px disarm thresholds unchanged.
 
+The spike is not post-implementation workspace-pill evidence. Authorized
+AppKit closeout runs `32681212383` (socket length), `32683626572` (Linux
+shortcuts), `32684587908` / `32685531097` (no drag frames after coordinate
+correction), and `32686590501` (no `workspace drag armed` after a measured
+scan) never reached the shipped pill marker. The latter confirmed two regions
+and native shortcuts. Thus macOS pointer US1/US2 and the post-implementation
+Wayland checklist remain unverified; only X11's registered visual suite and
+the platform-neutral palette path make outcome claims. Full evidence is in
+`specs/029-workspace-drag-tearout.md`. Phase-two epic `scribe-tn6m` owns
+cross-window merge, tab-between-workspace drag, re-attach, and share migration;
+none are inferred from this v1 pointer boundary.
+
 ### gpui-component adoption
 
 Scribe retains bespoke chrome and revisits `gpui-component` only for isolated
