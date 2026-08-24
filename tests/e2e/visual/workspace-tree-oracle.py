@@ -24,13 +24,23 @@ def message(row):
     return row.get("message", {})
 
 
+_NO_TREE = object()
+
+
+def workspace_tree(row):
+    current = message(row)
+    if row.get("dir") == "client" and current.get("type") == "ReportWorkspaceTree":
+        return current.get("tree")
+    if row.get("dir") == "server" and current.get("type") == "SessionList" and current.get("workspace_tree"):
+        return current["workspace_tree"]
+    return _NO_TREE
+
+
 def trees(path):
     for row in rows(path):
-        current = message(row)
-        if row.get("dir") == "client" and current.get("type") == "ReportWorkspaceTree":
-            yield current.get("tree")
-        if row.get("dir") == "server" and current.get("type") == "SessionList" and current.get("workspace_tree"):
-            yield current.get("workspace_tree")
+        tree = workspace_tree(row)
+        if tree is not _NO_TREE:
+            yield tree
 
 
 def latest_tree(path):
@@ -138,12 +148,7 @@ def assert_transfer(path, wanted, leaf_path, source_workspace=None):
         if row.get("dir") == "server" and current.get("type") == "WorkspaceTransferResult" and str(current.get("result", "")).lower() == "transferred":
             result = True
 
-        tree = None
-        if row.get("dir") == "client" and current.get("type") == "ReportWorkspaceTree":
-            tree = current.get("tree")
-        if row.get("dir") == "server" and current.get("type") == "SessionList":
-            tree = current.get("workspace_tree")
-        found = leaves(tree) if tree else []
+        found = leaves(workspace_tree(row))
         if source_workspace is not None and len(found) == 1 and str(found[0].get("workspace_id")) == source_workspace:
             source = True
         if len(found) == 1 and str(found[0].get("workspace_id")) == wanted:
@@ -175,17 +180,6 @@ def frame_types(path, wanted_direction):
     return 0
 
 
-def reported_tree_leaves(node):
-    if not isinstance(node, dict):
-        return []
-    if "Leaf" in node:
-        return [node["Leaf"]]
-    if "Split" in node:
-        split = node["Split"]
-        return reported_tree_leaves(split.get("first")) + reported_tree_leaves(split.get("second"))
-    return []
-
-
 def reported_leaves(path, wanted):
     tree = None
     for row in rows(path):
@@ -195,7 +189,7 @@ def reported_leaves(path, wanted):
     if tree is None:
         print("no client ReportWorkspaceTree frame recorded", file=sys.stderr)
         return 1
-    found = reported_tree_leaves(tree)
+    found = leaves(tree)
     print(
         f"reported tree carries {len(found)} workspace leaves: "
         + ", ".join(str(leaf.get("workspace_id")) for leaf in found)
@@ -209,7 +203,7 @@ def reported_leaves(path, wanted):
 def main(argv):
     path, command = argv[1:3]
     if command == "wait-leaves":
-        return wait_leaves(path, int(argv[3]), int(argv[4]) if len(argv) > 4 else 0)
+        return wait_leaves(path, int(argv[3]), int(argv[4]))
     if command == "wait-root":
         return wait_root(path, *argv[3:6])
     if command == "wait-report":
