@@ -5096,7 +5096,7 @@ A joined emoji family deletes as one unit. Select-all replacement strips a paste
 
 The headless word-edit sequence reduces `junk wrong needle` to exact `needle`.
 
-Two word-left moves reach `wrong`; forward word delete removes it, then backward word delete removes `junk`. The running X11 test drives the same sequence.
+Two word-left moves reach `wrong`; forward word delete removes it, then backward word delete removes `junk`. A second check keeps `one_two, naïve` selection and word deletion exact across underscores, punctuation, and Unicode text. The running X11 test drives the same sequence.
 
 #### GUI edit key table
 

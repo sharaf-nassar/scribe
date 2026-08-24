@@ -26,6 +26,7 @@ use gpui::{
 };
 use scribe_common::protocol::SearchMatch as ServerMatch;
 use scribe_common::theme::ChromeColors;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::beads_panel::{next_grapheme_boundary, previous_grapheme_boundary};
 use crate::selection::SelectionPoint;
@@ -633,46 +634,16 @@ impl SingleLineEditor {
     }
 }
 
-fn word_grapheme(grapheme: &str) -> bool {
-    grapheme.chars().any(|character| character.is_alphanumeric() || character == '_')
-}
-
 fn previous_word_boundary(text: &str, offset: usize) -> usize {
-    let mut cursor = offset.min(text.len());
-    while cursor > 0 {
-        let previous = previous_grapheme_boundary(text, cursor);
-        if word_grapheme(&text[previous..cursor]) {
-            break;
-        }
-        cursor = previous;
-    }
-    while cursor > 0 {
-        let previous = previous_grapheme_boundary(text, cursor);
-        if !word_grapheme(&text[previous..cursor]) {
-            break;
-        }
-        cursor = previous;
-    }
-    cursor
+    let offset = offset.min(text.len());
+    text.unicode_word_indices().rfind(|(index, _)| *index < offset).map_or(0, |(index, _)| index)
 }
 
 fn next_word_boundary(text: &str, offset: usize) -> usize {
-    let mut cursor = offset.min(text.len());
-    while cursor < text.len() {
-        let next = next_grapheme_boundary(text, cursor);
-        if !word_grapheme(&text[cursor..next]) {
-            break;
-        }
-        cursor = next;
-    }
-    while cursor < text.len() {
-        let next = next_grapheme_boundary(text, cursor);
-        if word_grapheme(&text[cursor..next]) {
-            break;
-        }
-        cursor = next;
-    }
-    cursor
+    let offset = offset.min(text.len());
+    text.unicode_word_indices()
+        .find(|(index, _)| *index > offset)
+        .map_or(text.len(), |(index, _)| index)
 }
 
 #[derive(Default)]
@@ -1593,6 +1564,29 @@ mod overlay_tests {
         assert!(editor.backspace(true));
         assert_eq!(editor.text, "needle");
         assert_eq!(editor.caret, 0);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Word movement and deletion]]
+    #[test]
+    fn editor_word_edits_preserve_punctuation_underscores_and_unicode() {
+        let query = "one_two, naïve";
+        let unicode_start = "one_two, ".len();
+        let mut editor = SingleLineEditor::default();
+        assert!(editor.replace_selection(query));
+        assert!(editor.move_left(FindMove { word: true, extend: false }));
+        assert_eq!(editor.caret, unicode_start);
+        assert!(editor.move_left(FindMove { word: true, extend: true }));
+        assert_eq!(editor.selected_text(), Some("one_two, "));
+        assert!(editor.delete(true));
+        assert_eq!(editor.text, "naïve");
+
+        let mut deletion_editor = SingleLineEditor::default();
+        assert!(deletion_editor.replace_selection(query));
+        assert!(deletion_editor.move_left(FindMove { word: true, extend: false }));
+        assert!(deletion_editor.backspace(true));
+        assert_eq!(deletion_editor.text, "naïve");
+        assert!(deletion_editor.delete(true));
+        assert!(deletion_editor.text.is_empty());
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#GUI edit key table]]
