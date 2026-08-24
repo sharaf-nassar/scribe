@@ -5080,6 +5080,38 @@ counts them per half; a box still mounted on the window root instead of
 `grid_slot` paints over the RIGHT pane regardless of which one is focused,
 failing this phase.
 
+#### Grapheme-safe editor model
+
+The headless query model proves movement, deletion, replacement, and cut preserve whole graphemes.
+
+A joined emoji family deletes as one unit. Select-all replacement strips a pasted newline into one line, and cut returns the exact selected text while leaving an empty model.
+
+#### Word movement and deletion
+
+The headless word-edit sequence reduces `junk wrong needle` to exact `needle`.
+
+Two word-left moves reach `wrong`; forward word delete removes it, then backward word delete removes `junk`. The running X11 test drives the same sequence.
+
+#### GUI edit key table
+
+[[crates/scribe-client/src/search.rs#find_input_action]] is table-tested for the fixed GUI edit operations and configured clipboard bindings.
+
+Coverage includes Ctrl select-all/copy/cut/paste, Ctrl+Shift word selection, Ctrl word deletion, Command line motion/deletion, Option+Shift word selection, Shift+Insert, and a non-default configured paste binding. The explicit binding-match input keeps the table pure.
+
+#### Caret and selection render feedback
+
+[[crates/scribe-client/src/search.rs#find_editor_visual]] switches between a caret and an accent-backed selection highlight.
+
+A headless GPUI window draws the production overlay and asserts the measured caret canvas is mounted for the collapsed state and removed after select-all, while the query input remains mounted.
+
+#### Overlay-owned caret blink
+
+A headless executor observes visible → hidden → visible across two exact [[crates/scribe-client/src/search.rs#CURSOR_BLINK_INTERVAL]] advances.
+
+Disabling `appearance.cursor_blink` through the live reconfigure method cancels that task and leaves the caret visible across two more intervals.
+
+The matching-image X11/wire run adds four user-reachable editor phases before the existing highlight/cycle/close checks: `eedle` + Home + `n` emits exact `needle`; Ctrl+A changes the query crop; the word-edit sequence emits exact `needle`; and a custom configured paste chord consumes a newline-bearing clipboard payload into exact `needle` without any `KeyInput`. It then proves Ctrl+C/Ctrl+X against `xclip`, observes the cut query `eedle` on the wire, and restores `needle` through Shift+Insert. Three query-only crops 350 ms apart span the 530 ms blink interval and require a caret-sized pixel delta.
+
 #### A typed query asks the server once
 
 Every request costs the server a full-scrollback scan, so the overlay debounces edits; this pins that a burst coalesces into one request for the settled text, that every kind of edit still re-asks, and that a no-op edit does not.

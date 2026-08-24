@@ -1,0 +1,12 @@
+[appearance]
+cursor_blink = true
+
+[keybindings]
+# Proves the open editor consults the live configured paste binding rather than
+# recognizing only the shipped Ctrl+Shift+V default.
+paste = "ctrl+alt+v"
+
+[terminal]
+# The find editor must bypass this PTY-only gate even for a clipboard payload
+# containing a newline; its single-line model strips the newline directly.
+paste_confirmation = true

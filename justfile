@@ -487,7 +487,7 @@ e2e-visual-refused-claim: e2e-visual-image-current
 # SearchRequest leaving the client and SearchResults coming back can both be
 # asserted as real frames).
 e2e-visual-find: e2e-visual-image-current
-    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/find-overlay.sh
+    docker run --rm --network none {{ gpu_flags }} -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/find-overlay-config.toml)" -v ./tests/e2e:/tests:ro {{ e2e_output }} scribe-test-visual /tests/visual/find-overlay.sh
 
 # Run the feature-014 LAN approval + dial visual E2E. The wire tap records the
 # Unix socket (the approval decision leaves on it) and SCRIBE_KEYRING=1 starts a

@@ -70,7 +70,8 @@ use scribe_client::drag_drop::dropped_path_insertion;
 use scribe_client::gpui_image_lifecycle::GpuiImageCache;
 use scribe_client::input::{self, KeyInput, TerminalMode};
 use scribe_client::keybindings::{
-    KeyAction, LayoutAction, OverlayChord, translate_key_action, translate_overlay_chord,
+    KeyAction, LayoutAction, OverlayChord, any_matches, translate_key_action,
+    translate_overlay_chord,
 };
 use scribe_client::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
 use scribe_client::lan_approval::{LanApprovalAction, LanApprovalDialog};
@@ -109,8 +110,9 @@ use scribe_client::scrollbar::{
     hit_test_thumb, offset_from_drag, offset_from_track_click,
 };
 use scribe_client::search::{
-    FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
-    SEARCH_RESULT_LIMIT,
+    CURSOR_BLINK_INTERVAL, FindBindingMatches, FindInputAction, FindOverlayColors,
+    FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors, SEARCH_RESULT_LIMIT,
+    find_input_action,
 };
 use scribe_client::selection::{SelectionMode, SelectionSpan};
 use scribe_client::server_lifecycle;
@@ -863,9 +865,6 @@ const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// window list when it is due, raising a LAN device-approval prompt the reader
 /// parked, and performing the OSC 52 clipboard work it queued.
 const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
-
-/// Cursor blink interval, matching the legacy client and xterm/VTE.
-const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// How long a layout or geometry change must settle before it is written to
 /// disk. A drag-resize emits a bounds change per frame and a split re-reports
@@ -2919,9 +2918,13 @@ impl TerminalView {
         let notifications = self.config.config().config.notifications.clone();
         self.notifications.center.update(cx, |center, _| center.reconfigure(notifications));
         // A cursor setting may have changed even though it does not affect the
-        // theme/font/opacity reload plan. Start the new setting in a visible
-        // phase so a live edit cannot strand the cursor hidden.
+        // theme/font/opacity reload plan. Start both owners in a visible phase
+        // so a live edit cannot strand either cursor hidden.
         self.focus.cursor_blink.show_now();
+        let cursor_blink = self.config.config().config.appearance.cursor_blink;
+        if let Some(overlay) = self.find_overlay.clone() {
+            overlay.update(cx, |overlay, ctx| overlay.set_cursor_blink(cursor_blink, ctx));
+        }
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -8908,7 +8911,8 @@ impl TerminalView {
         self.command_palette = None;
         let adopted = self.shared.find.lock().map_or(0, |results| results.version());
         let colors = FindOverlayColors::from(&self.chrome);
-        let overlay = cx.new(|cx| FindOverlayView::new(colors, adopted, cx));
+        let cursor_blink = self.config.config().config.appearance.cursor_blink;
+        let overlay = cx.new(|cx| FindOverlayView::new(colors, adopted, cursor_blink, cx));
         cx.subscribe(&overlay, |this, _overlay, event: &FindOverlayEvent, ctx| match event {
             FindOverlayEvent::QueryChanged(query) => this.send_search_request(query),
             FindOverlayEvent::Dismissed => {
@@ -8998,38 +9002,78 @@ impl TerminalView {
         overlay.read(cx).highlights(rows, cols)
     }
 
-    /// Route a keystroke into the open find overlay.
+    /// Route a keystroke into the open find editor.
     ///
-    /// Ports the winit `handle_search_overlay_keyboard` table: Escape closes,
-    /// Enter / Shift+Enter and the arrow keys cycle the highlighted match,
-    /// Backspace and Delete edit the query, and any printable character extends
-    /// it. Every key is consumed while the overlay is up — including the find
-    /// chord itself, which must not reopen the overlay underneath itself.
+    /// Escape and match cycling keep their original meanings. Everything else
+    /// follows a native single-line editor table: grapheme/word/line movement,
+    /// selection replacement, copy/cut/select-all, and direct clipboard paste.
+    /// Configured paste and Shift+Insert deliberately bypass the PTY paste gate:
+    /// these bytes edit the local query and can never reach a terminal program.
     fn handle_find_overlay_key(
+        &mut self,
         overlay: &Entity<FindOverlayView>,
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let shift = event.keystroke.modifiers.shift;
-        let claimed_by_modifier = event.keystroke.modifiers.control
-            || event.keystroke.modifiers.alt
-            || event.keystroke.modifiers.platform;
-        match event.keystroke.key.as_str() {
-            "escape" => overlay.update(cx, FindOverlayView::dismiss),
-            "enter" if shift => overlay.update(cx, FindOverlayView::prev_match),
-            "enter" | "down" => overlay.update(cx, FindOverlayView::next_match),
-            "up" => overlay.update(cx, FindOverlayView::prev_match),
-            "backspace" => overlay.update(cx, FindOverlayView::pop_char),
-            "delete" => overlay.update(cx, FindOverlayView::clear_query),
-            _ => {
-                if claimed_by_modifier {
-                    return;
-                }
-                if let Some(text) = event.keystroke.key_char.as_ref().filter(|t| !t.is_empty()) {
-                    let text = text.clone();
-                    overlay.update(cx, |view, ctx| view.push_str(&text, ctx));
+        let input = KeyInput::from_key_down(event);
+        let configured_copy =
+            input.as_ref().is_some_and(|input| any_matches(&self.config.bindings().copy, input));
+        let configured_paste =
+            input.as_ref().is_some_and(|input| any_matches(&self.config.bindings().paste, input));
+        match find_input_action(
+            event,
+            FindBindingMatches { copy: configured_copy, paste: configured_paste },
+        ) {
+            FindInputAction::Dismiss => overlay.update(cx, FindOverlayView::dismiss),
+            FindInputAction::NextMatch => overlay.update(cx, FindOverlayView::next_match),
+            FindInputAction::PreviousMatch => overlay.update(cx, FindOverlayView::prev_match),
+            FindInputAction::MoveLeft(movement) => {
+                overlay.update(cx, |view, ctx| view.move_left(movement, ctx));
+            }
+            FindInputAction::MoveRight(movement) => {
+                overlay.update(cx, |view, ctx| view.move_right(movement, ctx));
+            }
+            FindInputAction::MoveStart { extend } => {
+                overlay.update(cx, |view, ctx| view.move_start(extend, ctx));
+            }
+            FindInputAction::MoveEnd { extend } => {
+                overlay.update(cx, |view, ctx| view.move_end(extend, ctx));
+            }
+            FindInputAction::Backspace { word } => {
+                overlay.update(cx, |view, ctx| view.backspace(word, ctx));
+            }
+            FindInputAction::Delete { word } => {
+                overlay.update(cx, |view, ctx| view.delete(word, ctx));
+            }
+            FindInputAction::DeleteToStart => {
+                overlay.update(cx, FindOverlayView::delete_to_start);
+            }
+            FindInputAction::DeleteToEnd => {
+                overlay.update(cx, FindOverlayView::delete_to_end);
+            }
+            FindInputAction::SelectAll => overlay.update(cx, FindOverlayView::select_all),
+            FindInputAction::Copy => {
+                if let Some(text) = overlay.read(cx).selected_text() {
+                    self.write_clipboard(text);
                 }
             }
+            FindInputAction::Cut => {
+                if let Some(text) = overlay.update(cx, FindOverlayView::cut_selection) {
+                    self.write_clipboard(text);
+                }
+            }
+            FindInputAction::Paste => {
+                match self.clipboard.handle.read(ClipboardSelection::Clipboard) {
+                    Ok(text) => overlay.update(cx, |view, ctx| view.push_str(&text, ctx)),
+                    Err(error) => {
+                        tracing::debug!(?error, "find paste ignored: host clipboard unavailable");
+                    }
+                }
+            }
+            FindInputAction::Insert(text) => {
+                overlay.update(cx, |view, ctx| view.push_str(&text, ctx));
+            }
+            FindInputAction::Consume => {}
         }
     }
 
@@ -9685,7 +9729,7 @@ impl TerminalView {
         // keystroke belongs to it, so nothing here can leak to the PTY or
         // reopen the overlay through its own chord.
         if let Some(overlay) = self.find_overlay.clone() {
-            Self::handle_find_overlay_key(&overlay, event, cx);
+            self.handle_find_overlay_key(&overlay, event, cx);
             return true;
         }
 

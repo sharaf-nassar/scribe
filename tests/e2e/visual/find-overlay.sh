@@ -23,9 +23,13 @@
 #   0. seed the pane with a known needle and capture the quiet grid;
 #   1. the find chord opens the overlay (it used to be a counted, dropped
 #      KeyAction::OpenFind);
-#   2. typing a query puts SearchRequest on the wire, the server answers
-#      SearchResults, the client consumes it (no unhandled-variant warning) and
-#      the grid paints highlights where the needle is;
+#   1a. the overlay-owned caret changes pixels at CURSOR_BLINK_INTERVAL;
+#   2. typing `eedle`, moving Home, and inserting `n` puts the exact `needle`
+#      SearchRequest on the wire; select-all paints a visible selection;
+#   2a. Ctrl word movement/deletion reduces `junk wrong needle` to `needle`;
+#   2b. the configured paste chord inserts a risky clipboard payload directly
+#      into the query without raising the PTY paste-confirmation modal;
+#   2c. copy/cut update the GUI clipboard and Shift+Insert inserts it directly;
 #   3. Enter moves the current match, which repaints a different cell run;
 #   4. Escape closes the overlay, every highlight is dropped, and the chord
 #      re-opens it — which it could not do if the overlay had swallowed it;
@@ -41,8 +45,9 @@
 # GPUI reads keyboard through XInput2 and ignores the synthetic events that
 # `xdotool --window` sends with XSendEvent.
 #
-# Requires: visual container with SCRIBE_SHARED_PANE=1 and SCRIBE_SHARE_TAP=1
-# (`just e2e-visual-find`); xdotool, scrot, python3, ImageMagick.
+# Requires: visual container with SCRIBE_SHARED_PANE=1, SCRIBE_SHARE_TAP=1,
+# and find-overlay-config.toml (`just e2e-visual-find`); xdotool, xclip, scrot,
+# python3, ImageMagick.
 set -e
 
 RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
@@ -177,6 +182,13 @@ type_text() {
     sleep 1.0
 }
 
+set_clipboard() {
+    # xclip forks a selection server; redirect its inherited pipe so the visual
+    # entrypoint can still exit after the script reaps it.
+    printf '%b' "$1" | xclip -selection clipboard >/dev/null 2>&1
+    sleep 0.3
+}
+
 # Click at an ABSOLUTE screen point through XTEST. Deliberately NOT the same
 # contract as the same-named helpers elsewhere in this directory: this one takes
 # absolute coordinates because control_center_x/y already add WIN_X/WIN_Y, while
@@ -245,6 +257,15 @@ crop_grid() {
         +repage "$2"
 }
 
+# Stable crop containing only the slash, query text, caret, and selection.
+# It excludes the match counter and buttons to the right and the terminal grid
+# below, so the blink/selection diffs have no unrelated moving pixels.
+crop_find_input() {
+    convert "$1" \
+        -crop "130x30+$(( WIN_X + WIN_W - 370 ))+$(( WIN_Y + PANE_TOP_OFFSET + 16 ))" \
+        +repage "$2"
+}
+
 # Changed-pixel count between two crops.
 pixel_diff() {
     local out
@@ -281,14 +302,34 @@ fi
 shot /output/01-overlay-open.png
 echo "PHASE 1 PASS: ctrl+shift+f opened the find overlay"
 
-# ── Phase 2: the query round trips and the grid highlights ────────
+# ── Phase 1a: the overlay owns a 530 ms blinking caret ────────────
+# Three samples 350 ms apart span more than one interval while each adjacent
+# pair spans less than one, so at least one pair must straddle exactly one blink.
+scrot -o /output/01a-caret-1.png
+crop_find_input /output/01a-caret-1.png /output/01a-caret-1-crop.png
+sleep 0.35
+scrot -o /output/01a-caret-2.png
+crop_find_input /output/01a-caret-2.png /output/01a-caret-2-crop.png
+sleep 0.35
+scrot -o /output/01a-caret-3.png
+crop_find_input /output/01a-caret-3.png /output/01a-caret-3-crop.png
+BLINK_DIFF_12=$(pixel_diff /output/01a-caret-1-crop.png /output/01a-caret-2-crop.png)
+BLINK_DIFF_23=$(pixel_diff /output/01a-caret-2-crop.png /output/01a-caret-3-crop.png)
+BLINK_DIFF=$(printf '%s\n%s\n' "${BLINK_DIFF_12:-0}" "${BLINK_DIFF_23:-0}" | sort -n | tail -1)
+[ "$BLINK_DIFF" -ge 8 ] && [ "$BLINK_DIFF" -le 200 ] \
+    || fail "PHASE 1a: caret blink changed $BLINK_DIFF px (pairs $BLINK_DIFF_12/$BLINK_DIFF_23)"
+echo "PHASE 1a PASS: overlay-owned caret blink changed $BLINK_DIFF px"
+
+# ── Phase 2: caret insertion round trips and highlights ───────────
 REQ_BEFORE=$(count_client SearchRequest "query=$NEEDLE" "session_id=$SESSION")
 RES_BEFORE=$(count_server SearchResults "query=$NEEDLE" "session_id=$SESSION")
-type_text "$NEEDLE"
+type_text "eedle"
+send_keys Home
+type_text "n"
 wait_for_frames client "$REQ_BEFORE" 20 SearchRequest "query=$NEEDLE" "session_id=$SESSION" \
-    || fail "PHASE 2: typing the query put no SearchRequest on the wire"
+    || fail "PHASE 2: Home insertion put no exact needle SearchRequest on the wire"
 wait_for_frames server "$RES_BEFORE" 20 SearchResults "query=$NEEDLE" "session_id=$SESSION" \
-    || fail "PHASE 2: the server never answered with SearchResults"
+    || fail "PHASE 2: the server never answered the inserted needle"
 [ "$(count_client SearchRequest "query=$NEEDLE" "limit=256")" -gt 0 ] \
     || fail "PHASE 2: the SearchRequest did not carry the 256-match limit"
 if grep -E "server message not wired into the GPUI client.*variant=SearchResults" "$CLIENT_LOG"; then
@@ -300,10 +341,69 @@ MATCHES=$(largest_reported_match_count)
 echo "client consumed SearchResults with $MATCHES matches"
 shot /output/02-matches-highlighted.png
 crop_grid /output/02-matches-highlighted.png /output/02-grid.png
+crop_find_input /output/02-matches-highlighted.png /output/02-query.png
 HIGHLIGHT_DIFF=$(pixel_diff /output/00-grid.png /output/02-grid.png)
 [ "${HIGHLIGHT_DIFF:-0}" -gt "$DIFF_MIN" ] \
     || fail "PHASE 2: the matched cells were never repainted (diff $HIGHLIGHT_DIFF)"
-echo "PHASE 2 PASS: SearchRequest left the client, SearchResults came back, $HIGHLIGHT_DIFF px repainted"
+echo "PHASE 2 PASS: inserting n at Home sent needle and repainted $HIGHLIGHT_DIFF px"
+
+# Select-all must paint a real range, not merely move hidden model state.
+send_keys ctrl+a
+shot /output/02a-selection.png
+crop_find_input /output/02a-selection.png /output/02a-selection-crop.png
+SELECTION_DIFF=$(pixel_diff /output/02-query.png /output/02a-selection-crop.png)
+[ "${SELECTION_DIFF:-0}" -ge 80 ] \
+    || fail "PHASE 2a: Ctrl+A selection changed only ${SELECTION_DIFF:-0}px"
+echo "PHASE 2a PASS: Ctrl+A painted a visible selection ($SELECTION_DIFF px)"
+
+# The exact Ctrl word sequence from the headless model test: move from the end
+# to `wrong`, delete it forward, then delete `junk` backward.
+type_text "junk wrong needle"
+WORD_REQ_BEFORE=$(count_client SearchRequest "query=$NEEDLE" "session_id=$SESSION")
+send_keys ctrl+Left ctrl+Left ctrl+Delete ctrl+BackSpace
+wait_for_frames client "$WORD_REQ_BEFORE" 20 SearchRequest "query=$NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 2b: Ctrl word movement/deletion did not produce needle"
+echo "PHASE 2b PASS: Ctrl word movement and deletion produced exact needle"
+
+# A newline is risky to the PTY paste gate but invalid in this single-line
+# editor. The configured ctrl+alt+v chord must read it directly, strip the
+# newline, and emit `needle`; routing through request_paste would raise a modal
+# and never put this SearchRequest on the wire.
+send_keys ctrl+a BackSpace
+set_clipboard 'nee\ndle'
+PASTE_REQ_BEFORE=$(count_client SearchRequest "query=$NEEDLE" "session_id=$SESSION")
+KEY_INPUT_BEFORE=$(count_client KeyInput)
+send_keys ctrl+alt+v
+wait_for_frames client "$PASTE_REQ_BEFORE" 20 SearchRequest "query=$NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 2c: configured paste did not insert needle directly"
+[ "$(count_client KeyInput)" -eq "$KEY_INPUT_BEFORE" ] \
+    || fail "PHASE 2c: configured find paste leaked KeyInput to the PTY"
+echo "PHASE 2c PASS: configured paste bypassed PTY confirmation and inserted needle"
+
+# Copy the full query, cut only its first grapheme, then use Shift+Insert to put
+# that clipboard grapheme back at the caret. Both resulting queries are exact
+# wire payloads, and the clipboard read proves Ctrl+C/Ctrl+X touched GUI state.
+send_keys ctrl+a ctrl+c
+COPIED=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$COPIED" = "$NEEDLE" ] || fail "PHASE 2d: Ctrl+C copied '$COPIED', not needle"
+send_keys Home shift+Right
+CUT_REQ_BEFORE=$(count_client SearchRequest "query=eedle" "session_id=$SESSION")
+send_keys ctrl+x
+wait_for_frames client "$CUT_REQ_BEFORE" 20 SearchRequest "query=eedle" "session_id=$SESSION" \
+    || fail "PHASE 2d: Ctrl+X did not cut the selected first grapheme"
+CUT=$(xclip -o -selection clipboard 2>/dev/null || true)
+[ "$CUT" = "n" ] || fail "PHASE 2d: Ctrl+X copied '$CUT', not n"
+SHIFT_INSERT_BEFORE=$(count_client SearchRequest "query=$NEEDLE" "session_id=$SESSION")
+SHIFT_INSERT_RES_BEFORE=$(count_server SearchResults "query=$NEEDLE" "session_id=$SESSION")
+KEY_INPUT_BEFORE=$(count_client KeyInput)
+send_keys shift+Insert
+wait_for_frames client "$SHIFT_INSERT_BEFORE" 20 SearchRequest "query=$NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 2d: Shift+Insert did not restore needle"
+wait_for_frames server "$SHIFT_INSERT_RES_BEFORE" 20 SearchResults "query=$NEEDLE" "session_id=$SESSION" \
+    || fail "PHASE 2d: restored needle received no SearchResults"
+[ "$(count_client KeyInput)" -eq "$KEY_INPUT_BEFORE" ] \
+    || fail "PHASE 2d: Shift+Insert leaked KeyInput to the PTY"
+echo "PHASE 2d PASS: copy/cut and Shift+Insert used the GUI clipboard directly"
 
 # ── Phase 3: Enter moves the current match ────────────────────────
 # The current match is painted with the opaque accent and a contrast
@@ -452,12 +552,16 @@ echo "PHASE 5: left half ${LEFT_BEFORE} -> ${LEFT_AFTER} (+${LEFT_DELTA}), right
     || fail "PHASE 5: opening find on the left-focused pane added $RIGHT_DELTA px to the unfocused right pane (max $SPLIT_INK_NOISE_MAX) — the overlay is painting over the wrong pane"
 echo "PHASE 5 PASS: the find overlay mounted in the focused (left) pane, not the window (left +$LEFT_DELTA, right +$RIGHT_DELTA)"
 
+pkill -x xclip 2>/dev/null || true
+
 echo ""
 echo "PASS: visual find-overlay test"
 echo "  Inspect screenshots in test-output/:"
 echo "    00-seeded.png              — the pane before any find"
 echo "    01-overlay-open.png        — the find chord opened the overlay"
-echo "    02-matches-highlighted.png — the query's matches painted on the grid"
+echo "    01a-caret-{1,2,3}.png      — the overlay-owned caret blink samples"
+echo "    02-matches-highlighted.png — Home insertion's exact needle highlights"
+echo "    02a-selection.png          — Ctrl+A painted the query selection"
 echo "    03-next-match.png          — Enter moved the current match"
 echo "    04-overlay-closed.png      — Escape dropped every highlight"
 echo "    05-reopened.png            — the chord reopened the overlay"

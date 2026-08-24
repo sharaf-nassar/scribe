@@ -11,18 +11,23 @@
 //! lands in [`FindResults`] and is projected onto the painted viewport as
 //! [`MatchHighlight`] spans.
 
+use std::ops::Range;
+use std::time::Duration;
+
 use alacritty_terminal_gpui::Term;
 use alacritty_terminal_gpui::event::VoidListener;
 use alacritty_terminal_gpui::grid::Dimensions as _;
 use alacritty_terminal_gpui::index::{Boundary, Column, Direction, Point};
 use alacritty_terminal_gpui::term::search::{Match, RegexIter, RegexSearch};
 use gpui::{
-    ClickEvent, Context, EventEmitter, FocusHandle, MouseButton, Pixels, Rgba, Role, div,
-    prelude::*, px,
+    Bounds, ClickEvent, Context, EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent,
+    MouseButton, Pixels, Rgba, Role, StyledText, Task, TextLayout, canvas, div, fill, prelude::*,
+    px, size,
 };
 use scribe_common::protocol::SearchMatch as ServerMatch;
 use scribe_common::theme::ChromeColors;
 
+use crate::beads_panel::{next_grapheme_boundary, previous_grapheme_boundary};
 use crate::selection::SelectionPoint;
 use crate::tab_bar::srgba;
 
@@ -312,7 +317,352 @@ pub fn visible_highlights(
 /// buy one round trip, not one per character. 150 ms sits under the ~200 ms
 /// gap that reads as a deliberate pause, so a fluent typist never sees it and a
 /// hesitant one gets intermediate results.
-pub const FIND_QUERY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+pub const FIND_QUERY_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Cursor blink interval shared by the terminal cursor and the find editor.
+pub const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Which live configured clipboard bindings match a find-editor keystroke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindBindingMatches {
+    /// The configured copy binding matched.
+    pub copy: bool,
+    /// The configured paste binding matched.
+    pub paste: bool,
+}
+
+/// One horizontal editor movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindMove {
+    /// Move by a word instead of one grapheme.
+    pub word: bool,
+    /// Extend the current selection instead of collapsing it.
+    pub extend: bool,
+}
+
+/// One keyboard operation owned by the find editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindInputAction {
+    Dismiss,
+    NextMatch,
+    PreviousMatch,
+    MoveLeft(FindMove),
+    MoveRight(FindMove),
+    MoveStart { extend: bool },
+    MoveEnd { extend: bool },
+    Backspace { word: bool },
+    Delete { word: bool },
+    DeleteToStart,
+    DeleteToEnd,
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+    Insert(String),
+    Consume,
+}
+
+/// Resolve one GUI-style find-editor keystroke.
+///
+/// Configured copy/paste chords are matched by the shell because it owns the
+/// live binding table. This pure table handles the fixed editor semantics and
+/// stays headless-testable.
+#[must_use]
+pub fn find_input_action(event: &KeyDownEvent, bindings: FindBindingMatches) -> FindInputAction {
+    let key = event.keystroke.key.as_str();
+    let modifiers = event.keystroke.modifiers;
+    let primary = modifiers.control || modifiers.platform;
+
+    if bindings.paste
+        || (key == "insert"
+            && modifiers.shift
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform)
+    {
+        return FindInputAction::Paste;
+    }
+    if bindings.copy {
+        return FindInputAction::Copy;
+    }
+
+    match key {
+        "escape" => return FindInputAction::Dismiss,
+        "enter" if modifiers.shift => return FindInputAction::PreviousMatch,
+        "enter" | "down" => return FindInputAction::NextMatch,
+        "up" => return FindInputAction::PreviousMatch,
+        _ => {}
+    }
+
+    if primary {
+        return match key {
+            "a" => FindInputAction::SelectAll,
+            "c" => FindInputAction::Copy,
+            "x" => FindInputAction::Cut,
+            "v" => FindInputAction::Paste,
+            "left" if modifiers.platform && !modifiers.control => {
+                FindInputAction::MoveStart { extend: modifiers.shift }
+            }
+            "right" if modifiers.platform && !modifiers.control => {
+                FindInputAction::MoveEnd { extend: modifiers.shift }
+            }
+            "backspace" if modifiers.platform && !modifiers.control => {
+                FindInputAction::DeleteToStart
+            }
+            "delete" if modifiers.platform && !modifiers.control => FindInputAction::DeleteToEnd,
+            "left" => FindInputAction::MoveLeft(FindMove { word: true, extend: modifiers.shift }),
+            "right" => FindInputAction::MoveRight(FindMove { word: true, extend: modifiers.shift }),
+            "backspace" | "w" => FindInputAction::Backspace { word: true },
+            "delete" => FindInputAction::Delete { word: true },
+            _ => FindInputAction::Consume,
+        };
+    }
+
+    if modifiers.alt {
+        return match key {
+            "left" => FindInputAction::MoveLeft(FindMove { word: true, extend: modifiers.shift }),
+            "right" => FindInputAction::MoveRight(FindMove { word: true, extend: modifiers.shift }),
+            "backspace" => FindInputAction::Backspace { word: true },
+            "delete" => FindInputAction::Delete { word: true },
+            _ => event
+                .keystroke
+                .key_char
+                .as_ref()
+                .filter(|text| !text.is_empty())
+                .map_or(FindInputAction::Consume, |text| FindInputAction::Insert(text.clone())),
+        };
+    }
+
+    match key {
+        "left" => FindInputAction::MoveLeft(FindMove { word: false, extend: modifiers.shift }),
+        "right" => FindInputAction::MoveRight(FindMove { word: false, extend: modifiers.shift }),
+        "home" => FindInputAction::MoveStart { extend: modifiers.shift },
+        "end" => FindInputAction::MoveEnd { extend: modifiers.shift },
+        "backspace" => FindInputAction::Backspace { word: false },
+        "delete" => FindInputAction::Delete { word: false },
+        _ => event
+            .keystroke
+            .key_char
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .map_or(FindInputAction::Consume, |text| FindInputAction::Insert(text.clone())),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SingleLineEditor {
+    text: String,
+    caret: usize,
+    selection: Range<usize>,
+}
+
+impl Default for SingleLineEditor {
+    fn default() -> Self {
+        Self { text: String::new(), caret: 0, selection: 0..0 }
+    }
+}
+
+impl SingleLineEditor {
+    fn replace_selection(&mut self, text: &str) -> bool {
+        let filtered: String = text.chars().filter(|character| !character.is_control()).collect();
+        if filtered.is_empty() && self.selection.is_empty() {
+            return false;
+        }
+        let range =
+            if self.selection.is_empty() { self.caret..self.caret } else { self.selection.clone() };
+        let caret = range.start + filtered.len();
+        self.text.replace_range(range, &filtered);
+        self.caret = caret;
+        self.selection = caret..caret;
+        true
+    }
+
+    fn backspace(&mut self, word: bool) -> bool {
+        if !self.selection.is_empty() {
+            return self.delete_selection();
+        }
+        let start = if word {
+            previous_word_boundary(&self.text, self.caret)
+        } else {
+            previous_grapheme_boundary(&self.text, self.caret)
+        };
+        self.delete_range(start..self.caret)
+    }
+
+    fn delete(&mut self, word: bool) -> bool {
+        if !self.selection.is_empty() {
+            return self.delete_selection();
+        }
+        let end = if word {
+            next_word_boundary(&self.text, self.caret)
+        } else {
+            next_grapheme_boundary(&self.text, self.caret)
+        };
+        self.delete_range(self.caret..end)
+    }
+
+    fn delete_to_start(&mut self) -> bool {
+        if !self.selection.is_empty() {
+            return self.delete_selection();
+        }
+        self.delete_range(0..self.caret)
+    }
+
+    fn delete_to_end(&mut self) -> bool {
+        if !self.selection.is_empty() {
+            return self.delete_selection();
+        }
+        self.delete_range(self.caret..self.text.len())
+    }
+
+    fn clear(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        self.text.clear();
+        self.caret = 0;
+        self.selection = 0..0;
+        true
+    }
+
+    fn move_left(&mut self, movement: FindMove) -> bool {
+        let target = if !movement.extend && !self.selection.is_empty() {
+            self.selection.start
+        } else if movement.word {
+            previous_word_boundary(&self.text, self.caret)
+        } else {
+            previous_grapheme_boundary(&self.text, self.caret)
+        };
+        self.move_to(target, movement.extend)
+    }
+
+    fn move_right(&mut self, movement: FindMove) -> bool {
+        let target = if !movement.extend && !self.selection.is_empty() {
+            self.selection.end
+        } else if movement.word {
+            next_word_boundary(&self.text, self.caret)
+        } else {
+            next_grapheme_boundary(&self.text, self.caret)
+        };
+        self.move_to(target, movement.extend)
+    }
+
+    fn move_to(&mut self, target: usize, extend: bool) -> bool {
+        let target = target.min(self.text.len());
+        let before = (self.caret, self.selection.clone());
+        if extend {
+            let anchor = if self.selection.is_empty() {
+                self.caret
+            } else if self.caret == self.selection.start {
+                self.selection.end
+            } else {
+                self.selection.start
+            };
+            self.caret = target;
+            self.selection = anchor.min(target)..anchor.max(target);
+        } else {
+            self.caret = target;
+            self.selection = target..target;
+        }
+        before != (self.caret, self.selection.clone())
+    }
+
+    fn select_all(&mut self) -> bool {
+        let before = (self.caret, self.selection.clone());
+        self.caret = self.text.len();
+        self.selection = 0..self.text.len();
+        before != (self.caret, self.selection.clone())
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        (!self.selection.is_empty()).then(|| &self.text[self.selection.clone()])
+    }
+
+    fn cut(&mut self) -> Option<String> {
+        let selected = self.selected_text()?.to_owned();
+        self.delete_selection();
+        Some(selected)
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let range = self.selection.clone();
+        self.delete_range(range)
+    }
+
+    fn delete_range(&mut self, range: Range<usize>) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        self.text.replace_range(range.clone(), "");
+        self.caret = range.start;
+        self.selection = range.start..range.start;
+        true
+    }
+}
+
+fn word_grapheme(grapheme: &str) -> bool {
+    grapheme.chars().any(|character| character.is_alphanumeric() || character == '_')
+}
+
+fn previous_word_boundary(text: &str, offset: usize) -> usize {
+    let mut cursor = offset.min(text.len());
+    while cursor > 0 {
+        let previous = previous_grapheme_boundary(text, cursor);
+        if word_grapheme(&text[previous..cursor]) {
+            break;
+        }
+        cursor = previous;
+    }
+    while cursor > 0 {
+        let previous = previous_grapheme_boundary(text, cursor);
+        if !word_grapheme(&text[previous..cursor]) {
+            break;
+        }
+        cursor = previous;
+    }
+    cursor
+}
+
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let mut cursor = offset.min(text.len());
+    while cursor < text.len() {
+        let next = next_grapheme_boundary(text, cursor);
+        if !word_grapheme(&text[cursor..next]) {
+            break;
+        }
+        cursor = next;
+    }
+    while cursor < text.len() {
+        let next = next_grapheme_boundary(text, cursor);
+        if word_grapheme(&text[cursor..next]) {
+            break;
+        }
+        cursor = next;
+    }
+    cursor
+}
+
+#[derive(Default)]
+struct FindEditorVisual {
+    caret: Option<usize>,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+fn find_editor_visual(editor: &SingleLineEditor, color: Rgba) -> FindEditorVisual {
+    if editor.selection.is_empty() {
+        return FindEditorVisual { caret: Some(editor.caret), highlights: Vec::new() };
+    }
+    FindEditorVisual {
+        caret: None,
+        highlights: vec![(
+            editor.selection.clone(),
+            HighlightStyle {
+                background_color: Some(Rgba { a: 0.35, ..color }.into()),
+                ..HighlightStyle::default()
+            },
+        )],
+    }
+}
 
 /// What the find overlay asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,7 +741,7 @@ const BOX_MARGIN_RIGHT: Pixels = px(14.0);
 /// actually puts a `SearchRequest` on the wire.
 pub struct FindOverlayView {
     colors: FindOverlayColors,
-    query: String,
+    editor: SingleLineEditor,
     matches: Vec<ServerMatch>,
     current: usize,
     /// [`FindResults::version`] of the reply last adopted, so a redraw that
@@ -402,7 +752,10 @@ pub struct FindOverlayView {
     debounce: u64,
     /// The scheduled request. Dropped — and therefore cancelled — whenever a
     /// newer edit replaces it.
-    pending: Option<gpui::Task<()>>,
+    pending: Option<Task<()>>,
+    cursor_blink: bool,
+    caret_visible: bool,
+    blink_task: Option<Task<()>>,
     /// Where a pointer click on any of the row's three controls parks the
     /// keyboard — the query-field equivalent Zed's own find bar focuses on a
     /// button click (`search_bar.rs:56-58`). The controls themselves are
@@ -412,17 +765,43 @@ pub struct FindOverlayView {
 
 impl EventEmitter<FindOverlayEvent> for FindOverlayView {}
 
+fn caret_blink_task(cx: &mut Context<FindOverlayView>) -> Task<()> {
+    cx.spawn(async move |this, app| {
+        loop {
+            app.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
+            if this
+                .update(app, |view, ctx| {
+                    view.caret_visible = !view.caret_visible;
+                    ctx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
 impl FindOverlayView {
     /// Open a fresh overlay with an empty query and no matches.
-    pub fn new(colors: FindOverlayColors, adopted: u64, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        colors: FindOverlayColors,
+        adopted: u64,
+        cursor_blink: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let blink_task = cursor_blink.then(|| caret_blink_task(cx));
         Self {
             colors,
-            query: String::new(),
+            editor: SingleLineEditor::default(),
             matches: Vec::new(),
             current: 0,
             adopted,
             debounce: 0,
             pending: None,
+            cursor_blink,
+            caret_visible: true,
+            blink_task,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -430,7 +809,19 @@ impl FindOverlayView {
     /// The query currently typed into the overlay.
     #[must_use]
     pub fn query(&self) -> &str {
-        &self.query
+        &self.editor.text
+    }
+
+    /// Byte index of the active caret, always on a grapheme boundary.
+    #[must_use]
+    pub const fn caret(&self) -> usize {
+        self.editor.caret
+    }
+
+    /// Normalized byte range selected in the query.
+    #[must_use]
+    pub fn selection(&self) -> Range<usize> {
+        self.editor.selection.clone()
     }
 
     /// The matches the overlay is highlighting.
@@ -467,7 +858,7 @@ impl FindOverlayView {
             return false;
         }
         self.adopted = results.version();
-        if results.query() != self.query {
+        if results.query() != self.editor.text {
             return false;
         }
         let (_, matches) = results.snapshot();
@@ -477,38 +868,115 @@ impl FindOverlayView {
         true
     }
 
-    /// Append a typed character and re-issue the search.
-    pub fn push_char(&mut self, c: char, cx: &mut Context<Self>) {
-        if c.is_control() {
-            return;
-        }
-        self.query.push(c);
-        self.restart_search(cx);
-    }
-
-    /// Append pasted text, dropping control characters, and re-issue the search.
+    /// Insert typed or pasted text at the caret, replacing the selection.
     pub fn push_str(&mut self, text: &str, cx: &mut Context<Self>) {
-        let before = self.query.len();
-        self.query.extend(text.chars().filter(|c| !c.is_control()));
-        if self.query.len() != before {
+        if self.editor.replace_selection(text) {
             self.restart_search(cx);
         }
     }
 
-    /// Remove the last query character and re-issue the search.
+    /// Insert one typed character at the caret, replacing the selection.
+    pub fn push_char(&mut self, character: char, cx: &mut Context<Self>) {
+        let mut encoded = [0; 4];
+        self.push_str(character.encode_utf8(&mut encoded), cx);
+    }
+
+    /// Delete one grapheme or word behind the caret.
+    pub fn backspace(&mut self, word: bool, cx: &mut Context<Self>) {
+        if self.editor.backspace(word) {
+            self.restart_search(cx);
+        } else {
+            self.show_caret(cx);
+        }
+    }
+
+    /// Compatibility wrapper for the original append-only model's Backspace.
     pub fn pop_char(&mut self, cx: &mut Context<Self>) {
-        if self.query.pop().is_some() {
+        self.backspace(false, cx);
+    }
+
+    /// Delete one grapheme or word ahead of the caret.
+    pub fn delete(&mut self, word: bool, cx: &mut Context<Self>) {
+        if self.editor.delete(word) {
+            self.restart_search(cx);
+        } else {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn delete_to_start(&mut self, cx: &mut Context<Self>) {
+        if self.editor.delete_to_start() {
+            self.restart_search(cx);
+        } else {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn delete_to_end(&mut self, cx: &mut Context<Self>) {
+        if self.editor.delete_to_end() {
+            self.restart_search(cx);
+        } else {
+            self.show_caret(cx);
+        }
+    }
+
+    /// Clear the query entirely and drop every highlight.
+    pub fn clear_query(&mut self, cx: &mut Context<Self>) {
+        if self.editor.clear() {
             self.restart_search(cx);
         }
     }
 
-    /// Clear the query entirely (Delete) and drop every highlight.
-    pub fn clear_query(&mut self, cx: &mut Context<Self>) {
-        if self.query.is_empty() {
+    pub fn move_left(&mut self, movement: FindMove, cx: &mut Context<Self>) {
+        if self.editor.move_left(movement) {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn move_right(&mut self, movement: FindMove, cx: &mut Context<Self>) {
+        if self.editor.move_right(movement) {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn move_start(&mut self, extend: bool, cx: &mut Context<Self>) {
+        if self.editor.move_to(0, extend) {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn move_end(&mut self, extend: bool, cx: &mut Context<Self>) {
+        if self.editor.move_to(self.editor.text.len(), extend) {
+            self.show_caret(cx);
+        }
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if self.editor.select_all() {
+            self.show_caret(cx);
+        }
+    }
+
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        self.editor.selected_text().map(str::to_owned)
+    }
+
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let selected = self.editor.cut()?;
+        self.restart_search(cx);
+        Some(selected)
+    }
+
+    /// Apply a live `appearance.cursor_blink` change to this overlay.
+    pub fn set_cursor_blink(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.cursor_blink == enabled {
             return;
         }
-        self.query.clear();
-        self.restart_search(cx);
+        self.cursor_blink = enabled;
+        self.caret_visible = true;
+        self.blink_task = enabled.then(|| caret_blink_task(cx));
+        cx.notify();
     }
 
     /// Highlight the next match, wrapping past the last one.
@@ -532,7 +1000,7 @@ impl FindOverlayView {
 
     /// Dismiss the overlay, clearing its query so a later reopen starts fresh.
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.query.clear();
+        self.editor = SingleLineEditor::default();
         self.matches.clear();
         self.current = 0;
         // Retire the scheduled request: a search for a query the overlay no
@@ -552,6 +1020,7 @@ impl FindOverlayView {
     /// full-scrollback scan rather than one per character (spec 017 US8-2).
     fn restart_search(&mut self, cx: &mut Context<Self>) {
         self.matches.clear();
+        self.caret_visible = true;
         self.current = 0;
         self.debounce = self.debounce.wrapping_add(1);
         let generation = self.debounce;
@@ -570,7 +1039,20 @@ impl FindOverlayView {
             return;
         }
         self.pending = None;
-        cx.emit(FindOverlayEvent::QueryChanged(self.query.clone()));
+        cx.emit(FindOverlayEvent::QueryChanged(self.editor.text.clone()));
+    }
+
+    fn show_caret(&mut self, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        cx.notify();
+    }
+
+    fn display_query(&self) -> String {
+        if self.editor.text.is_empty() {
+            "Type to search scrollback".to_owned()
+        } else {
+            self.editor.text.clone()
+        }
     }
 
     /// The inline "n/m" counter for the current state, folded from the old
@@ -579,7 +1061,7 @@ impl FindOverlayView {
     /// prose, so the counter's fixed-width slot never has to reflow the
     /// controls beside it — and `current/total` once there are matches.
     fn counter_text(&self) -> String {
-        if self.query.is_empty() {
+        if self.editor.text.is_empty() {
             String::new()
         } else if self.matches.is_empty() {
             "0/0".to_owned()
@@ -589,13 +1071,74 @@ impl FindOverlayView {
     }
 }
 
+fn find_query_input(
+    styled_query: StyledText,
+    query_value: String,
+    query_color: Rgba,
+    caret: Option<usize>,
+    caret_color: Rgba,
+) -> gpui::AnyElement {
+    let layout = styled_query.layout().clone();
+    div()
+        .id("find-query-input")
+        .debug_selector(|| "find-query-input".to_owned())
+        .role(Role::TextInput)
+        .aria_label("Find in scrollback")
+        .aria_value(query_value)
+        .flex_1()
+        .min_w(px(0.0))
+        .relative()
+        .overflow_hidden()
+        .truncate()
+        .cursor_text()
+        .text_sm()
+        .text_color(query_color)
+        .child(styled_query)
+        .when_some(caret, move |field, caret| {
+            field.child(find_caret_layer(layout.clone(), caret, caret_color))
+        })
+        .into_any_element()
+}
+
+fn find_caret_layer(layout: TextLayout, caret: usize, color: Rgba) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "find-query-caret-layer".to_owned())
+        .absolute()
+        .size_full()
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |_bounds, (), window, _app| paint_find_caret(&layout, caret, color, window),
+            )
+            .absolute()
+            .size_full(),
+        )
+        .into_any_element()
+}
+
+fn paint_find_caret(layout: &TextLayout, caret: usize, color: Rgba, window: &mut gpui::Window) {
+    let Some(origin) = layout.position_for_index(caret) else { return };
+    window.paint_quad(fill(Bounds::new(origin, size(px(2.0), layout.line_height())), color));
+}
+
 impl Render for FindOverlayView {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors;
-        let query_empty = self.query.is_empty();
-        let query_text =
-            if query_empty { "Type to search scrollback".to_owned() } else { self.query.clone() };
+        let query_empty = self.editor.text.is_empty();
+        let query_text = self.display_query();
         let query_color = if query_empty { colors.placeholder_fg } else { colors.query_fg };
+        let visual = find_editor_visual(&self.editor, colors.border);
+        // ponytail: modal-over-find is accepted; modal chrome covers this field,
+        // so carrying a second focus state would only duplicate router ownership.
+        let caret = (self.caret_visible && visual.caret.is_some()).then_some(self.editor.caret);
+        let styled_query = StyledText::new(query_text).with_highlights(visual.highlights);
+        let query_input = find_query_input(
+            styled_query,
+            self.editor.text.clone(),
+            query_color,
+            caret,
+            colors.border,
+        );
         let counter_text = self.counter_text();
 
         // The overlay mounts inside the focused pane's `grid_slot`
@@ -651,15 +1194,7 @@ impl Render for FindOverlayView {
                     // release with no press.
                     .on_mouse_up(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
                     .child(div().flex_none().text_sm().text_color(colors.border).child("/"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_sm()
-                            .text_color(query_color)
-                            .child(query_text),
-                    )
+                    .child(query_input)
                     .child(
                         div()
                             .flex_none()
@@ -879,16 +1414,18 @@ mod overlay_tests {
     use std::sync::{Arc, Mutex};
 
     use gpui::{
-        AppContext as _, Context, Entity, Modifiers, MouseButton, Pixels, Point, Render,
-        TestAppContext, VisualTestContext, WindowHandle, WindowOptions, div, point, prelude::*, px,
+        AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, Pixels,
+        Point, Render, TestAppContext, VisualTestContext, WindowHandle, WindowOptions, div, point,
+        prelude::*, px,
     };
     use scribe_common::protocol::SearchMatch as ServerMatch;
     use scribe_common::theme::minimal_dark;
 
     use super::{
-        BOX_MARGIN_RIGHT, BOX_MARGIN_TOP, BOX_WIDTH, CONTROL_SIZE, FIND_QUERY_DEBOUNCE,
-        FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X,
-        ROW_PAD_Y, visible_highlights,
+        BOX_MARGIN_RIGHT, BOX_MARGIN_TOP, BOX_WIDTH, CONTROL_SIZE, CURSOR_BLINK_INTERVAL,
+        FIND_QUERY_DEBOUNCE, FindBindingMatches, FindInputAction, FindMove, FindOverlayColors,
+        FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X, ROW_PAD_Y,
+        SingleLineEditor, find_editor_visual, find_input_action, visible_highlights,
     };
 
     fn hit(row: i32, col_start: u16, col_end: u16) -> ServerMatch {
@@ -897,9 +1434,17 @@ mod overlay_tests {
 
     type EventLog = Arc<Mutex<Vec<FindOverlayEvent>>>;
 
+    fn key_down(key: &str, modifiers: Modifiers) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke { modifiers, key: key.into(), key_char: None },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
     fn overlay(cx: &mut TestAppContext) -> (Entity<FindOverlayView>, EventLog) {
         let colors = FindOverlayColors::from(&minimal_dark().chrome);
-        let view = cx.new(|cx| FindOverlayView::new(colors, 0, cx));
+        let view = cx.new(|cx| FindOverlayView::new(colors, 0, false, cx));
         let log: EventLog = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&log);
         cx.update(|app| {
@@ -926,6 +1471,133 @@ mod overlay_tests {
     fn settle(cx: &mut TestAppContext) {
         cx.executor().advance_clock(FIND_QUERY_DEBOUNCE);
         cx.run_until_parked();
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Grapheme-safe editor model]]
+    #[test]
+    fn editor_movement_deletion_and_replacement_preserve_graphemes() {
+        let family = "👩‍👩‍👧‍👦";
+        let mut editor = SingleLineEditor::default();
+        assert!(editor.replace_selection(&format!("a{family}b")));
+        assert!(editor.move_left(FindMove { word: false, extend: false }));
+        assert!(editor.backspace(false));
+        assert_eq!(editor.text, "ab");
+        assert_eq!(editor.caret, 1);
+
+        assert!(editor.select_all());
+        assert_eq!(editor.selected_text(), Some("ab"));
+        assert!(editor.replace_selection("nee\ndle"));
+        assert_eq!(editor.text, "needle", "single-line paste drops control characters");
+        assert_eq!(editor.selection, editor.text.len()..editor.text.len());
+        assert!(editor.select_all());
+        assert_eq!(editor.cut().as_deref(), Some("needle"));
+        assert!(editor.text.is_empty());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Word movement and deletion]]
+    #[test]
+    fn editor_ctrl_word_sequence_produces_the_expected_query() {
+        let mut editor = SingleLineEditor::default();
+        assert!(editor.replace_selection("junk wrong needle"));
+        assert!(editor.move_left(FindMove { word: true, extend: false }));
+        assert!(editor.move_left(FindMove { word: true, extend: false }));
+        assert_eq!(editor.caret, "junk ".len());
+        assert!(editor.delete(true));
+        assert_eq!(editor.text, "junk needle");
+        assert!(editor.backspace(true));
+        assert_eq!(editor.text, "needle");
+        assert_eq!(editor.caret, 0);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#GUI edit key table]]
+    #[test]
+    fn gui_edit_key_table_covers_clipboard_motion_and_word_edits() {
+        let ctrl = Modifiers { control: true, ..Modifiers::default() };
+        let ctrl_shift = Modifiers { control: true, shift: true, ..Modifiers::default() };
+        let none = FindBindingMatches::default();
+        assert_eq!(find_input_action(&key_down("a", ctrl), none), FindInputAction::SelectAll);
+        assert_eq!(find_input_action(&key_down("c", ctrl), none), FindInputAction::Copy);
+        assert_eq!(find_input_action(&key_down("x", ctrl), none), FindInputAction::Cut);
+        assert_eq!(find_input_action(&key_down("v", ctrl), none), FindInputAction::Paste);
+        assert_eq!(
+            find_input_action(&key_down("left", ctrl_shift), none),
+            FindInputAction::MoveLeft(FindMove { word: true, extend: true })
+        );
+        assert_eq!(
+            find_input_action(&key_down("backspace", ctrl), none),
+            FindInputAction::Backspace { word: true }
+        );
+        assert_eq!(
+            find_input_action(&key_down("delete", ctrl), none),
+            FindInputAction::Delete { word: true }
+        );
+        assert_eq!(
+            find_input_action(
+                &key_down("insert", Modifiers { shift: true, ..Modifiers::default() }),
+                none,
+            ),
+            FindInputAction::Paste
+        );
+        assert_eq!(
+            find_input_action(
+                &key_down("q", ctrl),
+                FindBindingMatches { copy: false, paste: true },
+            ),
+            FindInputAction::Paste,
+            "the live configured paste chord wins before fixed Ctrl handling"
+        );
+
+        let command = Modifiers { platform: true, ..Modifiers::default() };
+        let option_shift = Modifiers { alt: true, shift: true, ..Modifiers::default() };
+        assert_eq!(
+            find_input_action(&key_down("left", command), none),
+            FindInputAction::MoveStart { extend: false }
+        );
+        assert_eq!(
+            find_input_action(&key_down("backspace", command), none),
+            FindInputAction::DeleteToStart
+        );
+        assert_eq!(
+            find_input_action(&key_down("right", option_shift), none),
+            FindInputAction::MoveRight(FindMove { word: true, extend: true })
+        );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Caret and selection render feedback]]
+    #[test]
+    fn render_feedback_switches_between_caret_and_selection() {
+        let mut editor = SingleLineEditor::default();
+        assert!(editor.replace_selection("needle"));
+        let caret = find_editor_visual(&editor, gpui::rgba(0xffcc_00ff));
+        assert_eq!(caret.caret, Some("needle".len()));
+        assert!(caret.highlights.is_empty());
+
+        assert!(editor.select_all());
+        let selection = find_editor_visual(&editor, gpui::rgba(0xffcc_00ff));
+        assert!(selection.caret.is_none());
+        assert_eq!(selection.highlights.len(), 1);
+        assert_eq!(selection.highlights[0].0, 0.."needle".len());
+        assert!(selection.highlights[0].1.background_color.is_some());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Overlay-owned caret blink]]
+    #[gpui::test]
+    fn overlay_owned_caret_blink_honors_config_and_interval(cx: &mut TestAppContext) {
+        let colors = FindOverlayColors::from(&minimal_dark().chrome);
+        let view = cx.new(|cx| FindOverlayView::new(colors, 0, true, cx));
+        assert!(view.read_with(cx, |view, _| view.caret_visible));
+
+        cx.executor().advance_clock(CURSOR_BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.caret_visible));
+        cx.executor().advance_clock(CURSOR_BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.caret_visible));
+
+        view.update(cx, |view, ctx| view.set_cursor_blink(false, ctx));
+        cx.executor().advance_clock(CURSOR_BLINK_INTERVAL * 2);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.caret_visible));
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#A typed query asks the server once]]
@@ -1084,7 +1756,7 @@ mod overlay_tests {
         let window = cx
             .update(|app| {
                 app.open_window(WindowOptions::default(), move |_window, app| {
-                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, ctx));
+                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, false, ctx));
                     app.new(|_| FindOverlayProbe { overlay, container_width })
                 })
             })
@@ -1099,6 +1771,30 @@ mod overlay_tests {
                 .detach();
         });
         (window, overlay, log)
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Caret and selection render feedback]]
+    #[gpui::test]
+    fn render_mounts_the_caret_layer_only_for_a_collapsed_selection(cx: &mut TestAppContext) {
+        let (window, overlay, _log) = overlay_window(cx);
+        overlay.update(cx, |view, ctx| view.push_str("needle", ctx));
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw caret state");
+        {
+            let mut test_window = VisualTestContext::from_window(window.into(), cx);
+            assert!(test_window.debug_bounds("find-query-input").is_some());
+            assert!(test_window.debug_bounds("find-query-caret-layer").is_some());
+        }
+
+        overlay.update(cx, FindOverlayView::select_all);
+        cx.update_window(window.into(), |_, window, app| window.draw(app).clear())
+            .expect("draw selection state");
+        let mut test_window = VisualTestContext::from_window(window.into(), cx);
+        assert!(test_window.debug_bounds("find-query-input").is_some());
+        assert!(
+            test_window.debug_bounds("find-query-caret-layer").is_none(),
+            "selection highlight should replace the caret layer"
+        );
     }
 
     /// The on-screen center of one control in the find row, counting from the
@@ -1282,7 +1978,7 @@ mod overlay_tests {
         let window = cx
             .update(|app| {
                 app.open_window(WindowOptions::default(), move |_window, app| {
-                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, ctx));
+                    let overlay = app.new(|ctx| FindOverlayView::new(colors, 0, false, ctx));
                     app.new(|_| MouseReportProbe { overlay, reports: probe_reports })
                 })
             })
