@@ -22,11 +22,12 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId, Entity, FocusHandle,
-    Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StyleRefinement,
-    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions, canvas, div, point, prelude::*, px, relative, size,
+    AnimationExt as _, App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId,
+    Entity, FocusHandle, Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollWheelEvent, Size, StyleRefinement, Subscription, Task, TitlebarOptions, WeakEntity,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div,
+    point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -139,8 +140,10 @@ use scribe_client::window_state::{
     normalize_legacy_geometry, window_bounds_for,
 };
 use scribe_client::workspace_drag::{
-    DragPoint, EmptyWorkspaceDragGhost, WorkspaceDrag, WorkspaceDragCancel, WorkspaceDragMarker,
-    WorkspaceDragUpdate, tear_candidate_at, zone_preview_rect,
+    DragPoint, DragProbe, EmptyWorkspaceDragGhost, GHOST_SIZE, GHOST_TRAVEL, WorkspaceDrag,
+    WorkspaceDragCancel, WorkspaceDragMarker, WorkspaceDragMotion, WorkspaceDragUpdate,
+    WorkspaceDropTarget, ZONE_FADE, ZoneFade, ghost_origin, ghost_travel_frame,
+    record_input_to_paint, tear_candidate_at, zone_fade_opacity, zone_preview_rect,
 };
 use scribe_client::workspace_layout::{
     self, WorkspaceDividerDrag, workspace_move_no_neighbor_message,
@@ -1837,6 +1840,11 @@ struct TerminalView {
     /// Source bounds sampled with the last drag update, used by release paths
     /// whose titlebar event no longer carries a `Window` reference.
     workspace_drag_bounds: Option<Bounds<Pixels>>,
+    /// Zone fade-out and post-release ghost travel: the drag feedback that
+    /// outlives the lifecycle phase which produced it.
+    workspace_drag_motion: WorkspaceDragMotion,
+    /// Input-to-paint stopwatch, inert unless `SCRIBE_DRAG_PROBE` is truthy.
+    workspace_drag_probe: DragProbe,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
     terminal_colors: GridPalette,
@@ -2518,6 +2526,8 @@ impl TerminalView {
             region_chrome: RegionChrome::default(),
             workspace_drag: WorkspaceDrag::default(),
             workspace_drag_bounds: None,
+            workspace_drag_motion: WorkspaceDragMotion::default(),
+            workspace_drag_probe: DragProbe::from_env(),
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -2824,9 +2834,6 @@ impl TerminalView {
                 if let Some(workspace_id) = workspace_id {
                     this.arm_workspace_drag(workspace_id, ctx);
                 }
-            }
-            TitlebarEvent::ReleaseWorkspaceDrag => {
-                this.finish_workspace_drag(ctx);
             }
             TitlebarEvent::StandaloneBeadsHover { workspace_id, hovered } => {
                 this.hover_beads_board(*workspace_id, *hovered, ctx);
@@ -7465,11 +7472,61 @@ impl TerminalView {
     /// Arm a workspace-pill press without changing focus or selection.
     fn arm_workspace_drag(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) {
         if !self.shell.has_region(workspace_id) {
+            if self.workspace_drag_probe.enabled() {
+                tracing::warn!(
+                    target: "scribe::drag_probe",
+                    %workspace_id,
+                    "workspace drag source has no live region"
+                );
+            }
             return;
         }
         self.workspace_drag.arm(workspace_id);
         self.workspace_drag_bounds = None;
+        self.workspace_drag_motion.clear();
+        if self.workspace_drag_probe.enabled() {
+            tracing::info!(target: "scribe::drag_probe", %workspace_id, "workspace drag armed");
+        }
         cx.notify();
+    }
+
+    fn animations(&self) -> AnimationSettings {
+        AnimationSettings::from_config(&self.config.config().config)
+    }
+
+    /// Centre of the region a workspace occupies, in window coordinates.
+    fn workspace_center(&self, workspace_id: WorkspaceId, cx: &App) -> Option<DragPoint> {
+        let rect = self.shell.workspace_rect(workspace_id, self.pane_viewport(), cx)?;
+        let origin = self.workspace_drag_grid_origin();
+        Some(DragPoint {
+            x: origin.x + rect.x + rect.width / 2.0,
+            y: origin.y + rect.y + rect.height / 2.0,
+        })
+    }
+
+    /// Record the ghost's post-release travel: onto the region the workspace
+    /// landed in, or back to the grab point when the gesture changed nothing.
+    ///
+    /// Purely visual. With motion off the resolved duration is zero, so nothing
+    /// is recorded and the observable end state is the same either way.
+    fn travel_workspace_ghost(
+        &mut self,
+        workspace_id: WorkspaceId,
+        release: Option<DragPoint>,
+        destination: Option<DragPoint>,
+        bounds: Option<Bounds<Pixels>>,
+    ) {
+        let (Some(release), Some(destination), Some(bounds)) = (release, destination, bounds)
+        else {
+            return;
+        };
+        let bounds = rect_from_window_bounds(bounds);
+        self.workspace_drag_motion.begin_ghost_travel(
+            workspace_id,
+            ghost_origin(release, bounds),
+            ghost_origin(destination, bounds),
+            self.animations().duration(GHOST_TRAVEL),
+        );
     }
 
     fn workspace_drag_grid_origin(&self) -> DragPoint {
@@ -7524,6 +7581,10 @@ impl TerminalView {
         if !self.workspace_drag.is_active() {
             return;
         }
+        self.workspace_drag_probe.ingest();
+        if self.workspace_drag_probe.enabled() {
+            tracing::info!(target: "scribe::drag_probe", "workspace drag pointer ingested");
+        }
         let pointer = DragPoint { x: f32::from(position.x), y: f32::from(position.y) };
         let viewport = self.pane_viewport();
         let layout_pointer = self.workspace_drag_layout_point(pointer);
@@ -7559,7 +7620,9 @@ impl TerminalView {
             return false;
         }
         let capable = self.shared.workspace_transfer.load(Ordering::Acquire);
+        let source = self.workspace_drag.source_workspace_id();
         let release_point = self.workspace_drag.pointer();
+        let grab_point = self.workspace_drag.grab_point();
         let source_bounds = self.workspace_drag_bounds.take();
         let tear = self
             .workspace_drag
@@ -7573,6 +7636,8 @@ impl TerminalView {
                 tear_candidate_at(point, rect_from_window_bounds(bounds))
             });
         let commit = self.workspace_drag.release();
+        let tearing = tear.is_some();
+        let mut landed = None;
 
         if let Some((workspace_id, tear_point, tear_bounds)) = tear {
             let spec =
@@ -7590,6 +7655,7 @@ impl TerminalView {
                     // tab; only the window-level focus follows the moved pill.
                     self.focus_pane_session(cx);
                     self.after_layout_change(cx);
+                    landed = Some(commit.source_workspace_id);
                 }
                 Ok(false) => {}
                 Err(error) => tracing::warn!(%error, "workspace drag commit refused"),
@@ -7598,6 +7664,15 @@ impl TerminalView {
         } else if blocked_tear {
             self.show_workspace_transfer_feedback(WorkspaceTransferFeedback::CapabilityAbsent);
         }
+
+        // A tear-out replaces this window's ghost with a whole new window, so
+        // only in-window outcomes settle or snap back.
+        if let Some(workspace_id) = source.filter(|_| !tearing) {
+            let destination =
+                landed.and_then(|landed| self.workspace_center(landed, cx)).or(grab_point);
+            self.travel_workspace_ghost(workspace_id, release_point, destination, source_bounds);
+        }
+        self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
         cx.notify();
         true
     }
@@ -7643,8 +7718,15 @@ impl TerminalView {
         if !self.workspace_drag.is_active() {
             return false;
         }
+        let source = self.workspace_drag.source_workspace_id();
+        let release_point = self.workspace_drag.pointer();
+        let grab_point = self.workspace_drag.grab_point();
+        let source_bounds = self.workspace_drag_bounds.take();
         self.workspace_drag.cancel(reason);
-        self.workspace_drag_bounds = None;
+        self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
+        if let Some(workspace_id) = source {
+            self.travel_workspace_ghost(workspace_id, release_point, grab_point, source_bounds);
+        }
         cx.stop_active_drag(window);
         cx.notify();
         true
@@ -7681,14 +7763,18 @@ impl TerminalView {
             .into_any_element()
     }
 
-    fn workspace_drag_preview(
+    /// One zone highlight, fading in as the live preview or out as the zone the
+    /// pointer just left. Both directions end where the zero-duration path
+    /// paints on its first frame: fully lit, or gone.
+    fn workspace_drag_zone(
         &self,
+        target: WorkspaceDropTarget,
+        fade: ZoneFade,
         source_workspace_id: WorkspaceId,
         cx: &App,
     ) -> Option<gpui::AnyElement> {
-        let preview = self.workspace_drag.preview()?;
-        let region = self.shell.workspace_rect(preview.workspace_id, self.pane_viewport(), cx)?;
-        let zone = zone_preview_rect(region, preview.zone);
+        let region = self.shell.workspace_rect(target.workspace_id, self.pane_viewport(), cx)?;
+        let zone = zone_preview_rect(region, target.zone);
         let origin = self.workspace_drag_grid_origin();
         let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
         Some(
@@ -7701,22 +7787,25 @@ impl TerminalView {
                 .bg(gpui::Rgba { a: 0.18, ..accent })
                 .border_2()
                 .border_color(accent)
+                .with_animation(
+                    ElementId::Name(
+                        format!(
+                            "workspace-drop-zone-{fade:?}-{}-{:?}",
+                            target.workspace_id, target.zone
+                        )
+                        .into(),
+                    ),
+                    self.animations().transition(ZONE_FADE),
+                    move |highlight, progress| highlight.opacity(zone_fade_opacity(fade, progress)),
+                )
                 .into_any_element(),
         )
     }
 
-    fn workspace_drag_ghost(
-        &self,
-        source_workspace_id: WorkspaceId,
-        window: &Window,
-        cx: &App,
-    ) -> Option<gpui::AnyElement> {
-        let pointer = self.workspace_drag.pointer()?;
-        let bounds = window.bounds();
-        let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-        let (ghost_width, ghost_height) = (160.0, 28.0);
-        let left = (pointer.x + 12.0).clamp(4.0, (width - ghost_width - 4.0).max(4.0));
-        let top = (pointer.y + 12.0).clamp(4.0, (height - ghost_height - 4.0).max(4.0));
+    /// The pill ghost itself, unpositioned so the live drag and the post-release
+    /// travel paint the same element from one definition.
+    fn workspace_ghost_pill(&self, source_workspace_id: WorkspaceId, cx: &App) -> gpui::Div {
+        let (width, height) = GHOST_SIZE;
         let label = self
             .workspace_name(source_workspace_id)
             .filter(|name| !name.trim().is_empty())
@@ -7724,12 +7813,10 @@ impl TerminalView {
         let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
         let accent = opaque_slot(self.shell.workspace_accent(source_workspace_id, cx));
         let tone = accent_tab_tone(accent, colors.bg);
-        let ghost = div()
+        div()
             .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(ghost_width))
-            .h(px(ghost_height))
+            .w(px(width))
+            .h(px(height))
             .flex()
             .items_center()
             .px_2()
@@ -7741,22 +7828,86 @@ impl TerminalView {
                 this.bg(colors.bg).border_2().border_color(accent)
             })
             .when(!self.workspace_drag.is_tear_armed(), |this| this.bg(tone))
-            .child(label);
+            .child(label)
+    }
+
+    fn workspace_drag_ghost(
+        &self,
+        source_workspace_id: WorkspaceId,
+        window: &Window,
+        cx: &App,
+    ) -> Option<gpui::AnyElement> {
+        let pointer = self.workspace_drag.pointer()?;
+        let origin = ghost_origin(pointer, rect_from_window_bounds(window.bounds()));
+        let ghost =
+            self.workspace_ghost_pill(source_workspace_id, cx).left(px(origin.x)).top(px(origin.y));
         Some(gpui::deferred(ghost).with_priority(2).into_any_element())
     }
 
-    /// Full-window input shield, target preview, and deferred pill ghost.
+    /// The ghost still travelling after the gesture ended: settling onto the
+    /// region the workspace landed in, or snapping back to the grab point.
+    fn workspace_drag_settle(
+        &mut self,
+        animations: AnimationSettings,
+        cx: &App,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(travel) = self.workspace_drag_motion.ghost_travel() else {
+            return Vec::new();
+        };
+        if !self.shell.has_region(travel.workspace_id) {
+            self.workspace_drag_motion.clear();
+            return Vec::new();
+        }
+        let ghost = self.workspace_ghost_pill(travel.workspace_id, cx).with_animation(
+            ElementId::Name(format!("workspace-ghost-settle-{}", travel.workspace_id).into()),
+            animations.transition(GHOST_TRAVEL),
+            move |ghost, progress| {
+                let frame = ghost_travel_frame(travel.from, travel.to, progress);
+                ghost.left(px(frame.x)).top(px(frame.y)).opacity(frame.opacity)
+            },
+        );
+        vec![gpui::deferred(ghost).with_priority(2).into_any_element()]
+    }
+
+    /// Close one input-to-paint sample when the overlay layer actually paints.
+    fn workspace_drag_probe_layer(ingested: std::time::Instant) -> gpui::AnyElement {
+        gpui::deferred(
+            canvas(move |_, _, _| ingested, |_, ingested, _, _| record_input_to_paint(ingested))
+                .absolute()
+                .size_full(),
+        )
+        .with_priority(3)
+        .into_any_element()
+    }
+
+    /// Full-window input shield, zone highlights, deferred pill ghost, and the
+    /// travel a finished gesture leaves behind.
     fn render_workspace_drag_layers(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let animations = self.animations();
+        let sample = self.workspace_drag_probe.take_ingested();
         let Some(source_workspace_id) = self.workspace_drag.source_workspace_id() else {
-            return Vec::new();
+            let fading =
+                self.workspace_drag_motion.track_zone(None, animations.duration(ZONE_FADE));
+            let transient_workspace = self.workspace_drag_motion.workspace_id();
+            let mut layers = self.workspace_drag_settle(animations, cx);
+            if let Some(zone) = fading
+                && let Some(workspace_id) = transient_workspace
+                && let Some(highlight) =
+                    self.workspace_drag_zone(zone, ZoneFade::Out, workspace_id, cx)
+            {
+                layers.push(highlight);
+            }
+            return layers;
         };
         if !self.shell.has_region(source_workspace_id) {
             self.workspace_drag.cancel(WorkspaceDragCancel::SourceDisappeared);
             self.workspace_drag_bounds = None;
+            self.workspace_drag_motion.clear();
+            self.titlebar.update(cx, |titlebar, _| titlebar.end_workspace_drag());
             cx.stop_active_drag(window);
             return Vec::new();
         }
@@ -7764,10 +7915,18 @@ impl TerminalView {
         if !self.workspace_drag.is_engaged() {
             return Vec::new();
         }
+        let preview = self.workspace_drag.preview();
+        let fading = self.workspace_drag_motion.track_zone(preview, animations.duration(ZONE_FADE));
         vec![
             Some(Self::workspace_drag_shield(cx)),
-            self.workspace_drag_preview(source_workspace_id, cx),
+            fading.and_then(|target| {
+                self.workspace_drag_zone(target, ZoneFade::Out, source_workspace_id, cx)
+            }),
+            preview.and_then(|target| {
+                self.workspace_drag_zone(target, ZoneFade::In, source_workspace_id, cx)
+            }),
             self.workspace_drag_ghost(source_workspace_id, window, cx),
+            sample.map(Self::workspace_drag_probe_layer),
         ]
         .into_iter()
         .flatten()
@@ -7892,18 +8051,13 @@ impl TerminalView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _: &MouseDownEvent, _win, ctx| {
-                        ctx.stop_propagation();
+                        // GPUI records this press after the custom listener to
+                        // arm `on_drag`; stopping propagation here prevents the
+                        // native threshold from ever engaging.
                         view.arm_workspace_drag(workspace_id, ctx);
                     }),
                 )
                 .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|view, _: &MouseUpEvent, _win, ctx| {
-                        ctx.stop_propagation();
-                        view.finish_workspace_drag(ctx);
-                    }),
-                )
                 .on_click(cx.listener(move |view, _, _window, ctx| {
                     if let Some(session_id) = first_session {
                         view.select_session_tab(session_id, ctx);

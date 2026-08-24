@@ -85,8 +85,6 @@ pub enum TitlebarEvent {
     FocusWorkspace(WorkspaceId),
     /// A workspace pill press armed the dedicated workspace drag marker.
     ArmWorkspaceDrag(TitlebarWorkspaceDragSource),
-    /// The pill-owned release ends or commits the workspace drag.
-    ReleaseWorkspaceDrag,
     /// Pointer entered or left a standalone pill's Beads icon.
     StandaloneBeadsHover { workspace_id: WorkspaceId, hovered: bool },
     /// A standalone pill's Beads icon was clicked.
@@ -179,6 +177,9 @@ pub struct TitlebarView {
     show_equalize: bool,
     hovered_tab: Option<usize>,
     drag: Option<DragState>,
+    /// A workspace pill owns the current press. Kept separately from tab-drag
+    /// state so the titlebar never hands that press to the compositor.
+    workspace_drag_armed: bool,
     /// Press origin recorded by a left press on the move region, or `None` when
     /// unarmed. Once the pointer travels [`WINDOW_MOVE_THRESHOLD`] px from it,
     /// the window is handed to the compositor via [`Window::start_window_move`].
@@ -204,6 +205,7 @@ impl TitlebarView {
             show_equalize: false,
             hovered_tab: None,
             drag: None,
+            workspace_drag_armed: false,
             move_arm: None,
             focus_handle: cx.focus_handle(),
             tab_focus_handles: Vec::new(),
@@ -212,6 +214,12 @@ impl TitlebarView {
             beads_focus_handles: Vec::new(),
             standalone_beads_focus_handles: Vec::new(),
         }
+    }
+
+    /// Release the titlebar's workspace-pill press ownership after Escape,
+    /// blur, or source disappearance, where no titlebar mouse-up may arrive.
+    pub fn end_workspace_drag(&mut self) {
+        self.workspace_drag_armed = false;
     }
 
     /// Swap the chrome palette, e.g. after a live theme edit is hot-reloaded.
@@ -931,21 +939,16 @@ impl TitlebarView {
             .cursor_grab()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_this, _: &MouseDownEvent, _win, ctx| {
-                    ctx.stop_propagation();
+                cx.listener(move |this, _: &MouseDownEvent, _win, ctx| {
+                    // Do not stop propagation here: GPUI records the same
+                    // press later in the bubble phase to arm `on_drag`.
+                    this.workspace_drag_armed = true;
                     ctx.emit(TitlebarEvent::ArmWorkspaceDrag(
                         TitlebarWorkspaceDragSource::TabIndex(index),
                     ));
                 }),
             )
             .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|_this, _: &MouseUpEvent, _win, ctx| {
-                    ctx.stop_propagation();
-                    ctx.emit(TitlebarEvent::ReleaseWorkspaceDrag);
-                }),
-            )
             .on_click(cx.listener(move |this, _, _window, ctx| {
                 this.select(index, TabActivationSource::Pointer, ctx);
             }))
@@ -1020,21 +1023,16 @@ impl TitlebarView {
             .cursor_grab()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_this, _: &MouseDownEvent, _win, ctx| {
-                    ctx.stop_propagation();
+                cx.listener(move |this, _: &MouseDownEvent, _win, ctx| {
+                    // Do not stop propagation here: GPUI records the same
+                    // press later in the bubble phase to arm `on_drag`.
+                    this.workspace_drag_armed = true;
                     ctx.emit(TitlebarEvent::ArmWorkspaceDrag(
                         TitlebarWorkspaceDragSource::Workspace(workspace_id),
                     ));
                 }),
             )
             .on_drag(WorkspaceDragMarker, |_, _, _, cx| cx.new(|_| EmptyWorkspaceDragGhost))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|_this, _: &MouseUpEvent, _win, ctx| {
-                    ctx.stop_propagation();
-                    ctx.emit(TitlebarEvent::ReleaseWorkspaceDrag);
-                }),
-            )
             .on_click(cx.listener(move |_this, _, _window, ctx| {
                 ctx.emit(TitlebarEvent::FocusWorkspace(workspace_id));
             }))
@@ -1159,7 +1157,8 @@ impl Render for TitlebarView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _win, _ctx| {
-                    this.move_arm = this.drag.is_none().then_some(event.position);
+                    this.move_arm = (this.drag.is_none() && !this.workspace_drag_armed)
+                        .then_some(event.position);
                 }),
             )
             // A press anywhere outside the titlebar ends any arm it left behind.
@@ -1182,6 +1181,7 @@ impl Render for TitlebarView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
                     this.move_arm = None;
+                    this.workspace_drag_armed = false;
                     let click_swallowed = ctx.has_active_drag();
                     this.end_drag(click_swallowed, ctx);
                 }),
@@ -1193,6 +1193,7 @@ impl Render for TitlebarView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| {
                     this.move_arm = None;
+                    this.workspace_drag_armed = false;
                     let click_swallowed = ctx.has_active_drag();
                     this.end_drag(click_swallowed, ctx);
                 }),

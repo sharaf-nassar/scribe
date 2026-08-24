@@ -118,8 +118,9 @@ impl AnimationSettings {
 /// Accepts the common truthy spellings (`1`, `true`, `yes`, `on`, case
 /// insensitive); everything else — including the empty string and unparseable
 /// bytes — is treated as falsy so a stray `SCRIBE_DISABLE_ANIMATIONS=` does not
-/// silently kill motion.
-fn env_is_truthy(value: &OsStr) -> bool {
+/// silently kill motion. Shared with the drag probe's own env switch so both
+/// gates spell "on" the same way.
+pub(crate) fn env_is_truthy(value: &OsStr) -> bool {
     value
         .to_str()
         .map(str::trim)
