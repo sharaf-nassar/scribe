@@ -469,6 +469,10 @@ Clearing follows intent, and only a window close is destruction. A quit ends the
 
 A saved  loads back with its window, focused workspace, workspace name, and launch records intact and reports as replayable.
 
+#### Restore-state disk fixtures are parallel-isolated
+
+Each disk-backed restore-state test allocates its scratch root from a process-local atomic sequence and creates it exclusively, so parallel test threads cannot share an index or window snapshot.
+
 #### AI resume variant names stay stable
 
 Both AI resume modes serialize to their historical `New`/`Resume` TOML names and deserialize back to the same variant.

@@ -607,7 +607,11 @@ pub fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_SCRATCH_ROOT: AtomicU64 = AtomicU64::new(0);
 
     fn store_at(root: &Path) -> RestoreStore {
         RestoreStore { root: Some(root.join("restore")) }
@@ -641,7 +645,7 @@ mod tests {
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Snapshot round-trips through disk]]
     #[test]
     fn snapshot_round_trips_through_disk() {
-        let dir = tempdir();
+        let dir = scratch_root();
         let store = store_at(&dir);
         let window_id = WindowId::new();
         let workspace_id = WorkspaceId::new();
@@ -702,7 +706,7 @@ mod tests {
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Claim skips non-replayable and remaining count]]
     #[test]
     fn claim_first_window_skips_non_replayable_and_reports_remaining() {
-        let dir = tempdir();
+        let dir = scratch_root();
         let store = store_at(&dir);
 
         let win_blank = WindowId::new();
@@ -752,7 +756,7 @@ mod tests {
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale claim reclaimed]]
     #[test]
     fn stale_claim_becomes_claimable_again() {
-        let dir = tempdir();
+        let dir = scratch_root();
         let store = store_at(&dir);
         let window_id = WindowId::new();
         let snapshot = leaf_snapshot(window_id, WorkspaceId::new());
@@ -811,7 +815,7 @@ mod tests {
     // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale lock reclaimed]]
     #[test]
     fn stale_lock_is_reclaimed() {
-        let dir = tempdir();
+        let dir = scratch_root();
         let lock = dir.join("bootstrap.lock");
         std::fs::write(&lock, "0").expect("seed lock");
         // now_ms far past the 30 s window makes the lock stale.
@@ -821,13 +825,19 @@ mod tests {
         assert!(!RestoreStore::lock_is_stale(&lock, 60_000).expect("fresh check"));
     }
 
-    fn tempdir() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "scribe-gpui-restore-{}-{}",
-            std::process::id(),
-            unix_time_ms()
-        ));
-        std::fs::create_dir_all(&base).expect("create tempdir");
-        base
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Restore-state disk fixtures are parallel-isolated]]
+    fn scratch_root() -> PathBuf {
+        loop {
+            let root = std::env::temp_dir().join(format!(
+                "scribe-gpui-restore-{}-{}",
+                std::process::id(),
+                NEXT_SCRATCH_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create restore scratch root: {error}"),
+            }
+        }
     }
 }
