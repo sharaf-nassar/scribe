@@ -5478,8 +5478,10 @@ standalone-pill rendering, and exact tear-out preservation. The matching
 and tear-out from the command palette without pointer input. These scripts and
 `tests/e2e/visual/workspace-ipc.sh` call the checked-in, network-free
 `tests/e2e/visual/workspace-tree-oracle.py`: IPC keeps its latest-client-report
-leaf-count contract, pointer tear-out keeps source-collapse plus any exact
-atomic target report, and palette keeps its final exact target-leaf contract.
+leaf-count contract, waits for a serialized-message substring with its requested
+bounded timeout, and reads fields from the first matching post-reset frame;
+pointer tear-out keeps source-collapse plus any exact atomic target report, and
+palette keeps its final exact target-leaf contract.
 
 The native AppKit delivery probe run `32667985883` predates the feature. The
 post-implementation AppKit attempts `32681212383`, `32683626572`,

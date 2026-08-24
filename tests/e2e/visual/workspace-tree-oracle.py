@@ -180,6 +180,36 @@ def frame_types(path, wanted_direction):
     return 0
 
 
+def wait_frame(path, wanted_direction, wanted_type, needle, timeout):
+    started = int(time.time())
+    while True:
+        for row in rows(path):
+            current = message(row)
+            if (
+                row.get("dir") == wanted_direction
+                and current.get("type") == wanted_type
+                and (not needle or needle in json.dumps(current))
+            ):
+                print(json.dumps(current)[:400])
+                return 0
+        if int(time.time()) - started >= timeout:
+            return 1
+        time.sleep(0.3)
+
+
+def first_frame_field(path, wanted_direction, wanted_type, field):
+    for row in rows(path):
+        current = message(row)
+        if (
+            row.get("dir") == wanted_direction
+            and current.get("type") == wanted_type
+            and field in current
+        ):
+            print(current[field])
+            return 0
+    return 1
+
+
 def reported_leaves(path, wanted):
     tree = None
     for row in rows(path):
@@ -225,6 +255,10 @@ def main(argv):
         return assert_transfer(path, argv[3], argv[4], argv[5] if len(argv) > 5 else None)
     if command == "frame-types":
         return frame_types(path, argv[3])
+    if command == "wait-frame":
+        return wait_frame(path, argv[3], argv[4], argv[5], int(argv[6]))
+    if command == "first-frame-field":
+        return first_frame_field(path, argv[3], argv[4], argv[5])
     if command == "reported-leaves":
         return reported_leaves(path, int(argv[3]))
     raise SystemExit(f"unknown workspace oracle command: {command}")

@@ -220,72 +220,12 @@ reset_record() {
     sleep 0.2
 }
 
-# Wait until a recorded frame in `$1` of type `$2` mentions `$3` somewhere in
-# its payload, printing the matching frame.
-wait_for_frame() {
-    local direction="$1" wanted="$2" needle="$3" timeout_secs="${4:-20}" started
-    started=$(date +%s)
-    while true; do
-        if python3 - "$RECORD" "$direction" "$wanted" "$needle" <<'PY'
-import json, sys
-path, direction, wanted, needle = sys.argv[1:5]
-try:
-    fh = open(path)
-except OSError:
-    sys.exit(1)
-with fh:
-    for line in fh:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("dir") != direction:
-            continue
-        msg = row.get("message", {})
-        if msg.get("type") != wanted:
-            continue
-        if not needle or needle in json.dumps(msg):
-            print(json.dumps(msg)[:400])
-            sys.exit(0)
-sys.exit(1)
-PY
-        then
-            return 0
-        fi
-        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
-            return 1
-        fi
-        sleep 0.3
-    done
-}
-
-# Print one field of the FIRST recorded frame of a given direction and type.
-#
+# The shared oracle owns bounded frame waits and FIRST-frame field lookup.
 # First rather than last on purpose: the record is truncated at each phase
 # boundary and `CreateWorkspace` is the first frame the split sends, so the
 # first `WorkspaceInfo` in the window is its answer. The server also fans a
 # `WorkspaceInfo` out for the *existing* workspace when the split's session is
 # created, and taking the last frame would pick that one up instead.
-frame_field() {
-    python3 - "$RECORD" "$1" "$2" "$3" <<'PY'
-import json, sys
-path, direction, wanted, field = sys.argv[1:5]
-with open(path) as fh:
-    for line in fh:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("dir") != direction:
-            continue
-        msg = row.get("message", {})
-        if msg.get("type") == wanted and field in msg:
-            print(msg[field])
-            sys.exit(0)
-sys.exit(1)
-PY
-}
-
 # Assert the last recorded client `ReportWorkspaceTree` carries a split with the
 # given number of workspace leaves.
 assert_reported_leaves() {
@@ -332,16 +272,16 @@ send_keys ctrl+alt+backslash
 if ! wait_for_log_growth "split the window into a new workspace region" "$WS_SPLITS_BEFORE" 15; then
     fail "PHASE 1 FAIL: ctrl+alt+backslash never reached workspace_split_vertical"
 fi
-if ! wait_for_frame client CreateWorkspace "" 20; then
+if ! oracle wait-frame client CreateWorkspace "" 20; then
     fail "PHASE 1 FAIL: the split put no CreateWorkspace frame on the wire"
 fi
-if ! wait_for_frame server WorkspaceInfo "" 20; then
+if ! oracle wait-frame server WorkspaceInfo "" 20; then
     fail "PHASE 1 FAIL: the server never answered CreateWorkspace with WorkspaceInfo"
 fi
 if ! wait_for_log_growth "a workspace region adopted a server workspace" "$ADOPTS_BEFORE" 20; then
     fail "PHASE 1 FAIL: the new region never adopted the server's workspace id"
 fi
-NEW_WS=$(frame_field server WorkspaceInfo workspace_id) \
+NEW_WS=$(oracle first-frame-field server WorkspaceInfo workspace_id) \
     || fail "PHASE 1 FAIL: the recorded WorkspaceInfo carries no workspace_id"
 sleep 1.5
 focus
@@ -353,7 +293,7 @@ fi
 echo "PHASE 1 PASS: CreateWorkspace crossed the wire and the region adopted $NEW_WS (+$WS_DIFF px)"
 
 # ── Phase 2: the split reports the two-region tree ────────────────
-if ! wait_for_frame client ReportWorkspaceTree "$NEW_WS" 20; then
+if ! oracle wait-frame client ReportWorkspaceTree "$NEW_WS" 20; then
     fail "PHASE 2 FAIL: no client ReportWorkspaceTree frame naming $NEW_WS"
 fi
 assert_reported_leaves 2 || fail "PHASE 2 FAIL: the reported tree is not a two-region split"
@@ -363,10 +303,10 @@ echo "PHASE 2 PASS: the split reported a two-region workspace tree to the server
 # The pane the split opened asks for its session through the FIRST region's
 # workspace, because the second one did not exist yet. `MoveSession` is what
 # tells the server the session ended up somewhere else.
-if ! wait_for_frame client MoveSession "$NEW_WS" 25; then
+if ! oracle wait-frame client MoveSession "$NEW_WS" 25; then
     fail "PHASE 3 FAIL: no client MoveSession frame targeting $NEW_WS"
 fi
-MOVED=$(frame_field client MoveSession session_id) \
+MOVED=$(oracle first-frame-field client MoveSession session_id) \
     || fail "PHASE 3 FAIL: the recorded MoveSession carries no session_id"
 if [ "$MOVED" = "$SESSION" ]; then
     fail "PHASE 3 FAIL: MoveSession named the first region's own session $SESSION"
@@ -377,10 +317,10 @@ echo "PHASE 3 PASS: session $MOVED was moved into workspace $NEW_WS on the wire"
 # The status bar renders the focused pane's workspace name. Injecting the frame
 # through the tap is what makes this an assertion about the INBOUND row rather
 # than about the outbound one: nothing the client did causes it.
-TARGET_WS=$(frame_field client MoveSession target_workspace) || TARGET_WS="$NEW_WS"
+TARGET_WS=$(oracle first-frame-field client MoveSession target_workspace) || TARGET_WS="$NEW_WS"
 # Echo the server's own accent back so the name is the only thing that moves
 # between the captures; a different accent would also retint the focus ring.
-WS_ACCENT=$(frame_field server WorkspaceInfo accent_color) || WS_ACCENT="#a78bfa"
+WS_ACCENT=$(oracle first-frame-field server WorkspaceInfo accent_color) || WS_ACCENT="#a78bfa"
 INFOS_BEFORE=$(count_log "workspace info received")
 focus
 status_bar_shot /output/03-before-workspace-name.png
@@ -420,7 +360,7 @@ send_keys ctrl+shift+w
 if ! wait_for_log_growth "closed a workspace region on the server" "$CLOSES_BEFORE" 20; then
     fail "PHASE 5 FAIL: ctrl+shift+w never collapsed the second region"
 fi
-if ! wait_for_frame client CloseWorkspace "$NEW_WS" 20; then
+if ! oracle wait-frame client CloseWorkspace "$NEW_WS" 20; then
     fail "PHASE 5 FAIL: no client CloseWorkspace frame naming $NEW_WS"
 fi
 assert_reported_leaves 1 \
