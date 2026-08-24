@@ -6052,20 +6052,22 @@ impl TerminalView {
     ///
     /// A tab whose workspace has no region in this window (a reattach after
     /// reconnect, a strip that outlived its region) has nowhere of its own to
-    /// go and falls back to the focused pane.
+    /// go and falls back to the focused pane. A session absent from the strip
+    /// is dead or already closed and has no adoption target.
     fn tab_adoption_pane(&self, session_id: SessionId, cx: &App) -> Option<(WorkspaceId, PaneId)> {
-        let own_region = self
-            .shared
-            .tabs
-            .lock()
-            .ok()
-            .and_then(|tabs| tabs.workspace_of(session_id))
-            .filter(|workspace_id| self.shell.has_region(*workspace_id))
-            .and_then(|workspace_id| {
+        let workspace_id =
+            self.shared.tabs.lock().ok().and_then(|tabs| tabs.workspace_of(session_id));
+        match tab_adoption_target(
+            workspace_id,
+            workspace_id.is_some_and(|workspace_id| self.shell.has_region(workspace_id)),
+        )? {
+            TabAdoptionTarget::Own(workspace_id) => {
                 Some((workspace_id, self.shell.region_focused_pane(workspace_id)?))
-            });
-        own_region
-            .or_else(|| Some((self.shell.focused_workspace_id(cx), self.shell.focused_pane(cx)?)))
+            }
+            TabAdoptionTarget::Focused => {
+                Some((self.shell.focused_workspace_id(cx), self.shell.focused_pane(cx)?))
+            }
+        }
     }
 
     /// Hand keyboard focus back to the terminal after a pointer tab action.
@@ -6955,7 +6957,21 @@ impl TerminalView {
             }
             changed |= retired.changed;
         }
-        let active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        // An attached region's last tab clears the reader-owned pointer before
+        // this pass collapses that region. Take up the surviving focused pane
+        // now; a still-open active tab is preserved because it may be waiting
+        // for the adoption pass immediately below.
+        let previous_active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let active = active_session_after_pane_reconcile(
+            previous_active,
+            previous_active.is_some_and(|session_id| live.contains(&session_id)),
+            self.shell.focused_session(cx).filter(|session_id| live.contains(session_id)),
+        );
+        if active != previous_active
+            && let Ok(mut guard) = self.shared.active_session.lock()
+        {
+            *guard = active;
+        }
         // A replay queues every pane and `active` is the newest `SessionCreated`.
         // Let `fill_pending_panes` pair the FIFO launches and panes instead.
         if !self.restore.replaying
@@ -14649,6 +14665,51 @@ fn include_open_panel_boards(
 ///
 /// Split out of [`dispatch_server_message`] so the dispatch table reads as one
 /// screen of routing decisions rather than of session bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExitFocus {
+    Preserve,
+    Refocus(SessionId),
+    Clear,
+}
+
+fn session_exit_focus(
+    attached: Option<SessionId>,
+    exited: SessionId,
+    region_refocus: Option<SessionId>,
+) -> SessionExitFocus {
+    if attached != Some(exited) {
+        return SessionExitFocus::Preserve;
+    }
+    region_refocus.map_or(SessionExitFocus::Clear, SessionExitFocus::Refocus)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabAdoptionTarget {
+    Own(WorkspaceId),
+    Focused,
+}
+
+fn tab_adoption_target(
+    workspace_id: Option<WorkspaceId>,
+    own_region_exists: bool,
+) -> Option<TabAdoptionTarget> {
+    workspace_id.map(|workspace_id| {
+        if own_region_exists {
+            TabAdoptionTarget::Own(workspace_id)
+        } else {
+            TabAdoptionTarget::Focused
+        }
+    })
+}
+
+fn active_session_after_pane_reconcile(
+    active: Option<SessionId>,
+    active_has_tab: bool,
+    focused: Option<SessionId>,
+) -> Option<SessionId> {
+    if active.is_some() && active_has_tab { active } else { focused }
+}
+
 fn on_session_exited(
     ctx: &ReaderCtx,
     registry: &mut session_lifecycle::SessionRegistry,
@@ -14680,8 +14741,15 @@ fn on_session_exited(
     });
     if existed && tabs_empty {
         request_permanent_window_close(&ctx.lifecycle, &ctx.sink);
-    } else if let Some(next) = refocused {
-        attach_session(ctx, next)?;
+    }
+    match session_exit_focus(attached, session_id, refocused) {
+        SessionExitFocus::Preserve => {}
+        SessionExitFocus::Refocus(next) => attach_session(ctx, next)?,
+        SessionExitFocus::Clear => {
+            if let Ok(mut active) = ctx.active_session.lock() {
+                *active = None;
+            }
+        }
     }
     if existed && Some(session_id) == attached {
         set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
@@ -16440,6 +16508,65 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn background_exit_preserves_the_focused_session() {
+        let focused = SessionId::new();
+        let exited = SessionId::new();
+        let sibling = SessionId::new();
+
+        assert_eq!(
+            session_exit_focus(Some(focused), exited, Some(sibling)),
+            SessionExitFocus::Preserve
+        );
+        assert_eq!(
+            active_session_after_pane_reconcile(Some(focused), true, Some(sibling)),
+            Some(focused)
+        );
+    }
+
+    #[test]
+    fn attached_exit_refocuses_its_same_region_sibling() {
+        let exited = SessionId::new();
+        let sibling = SessionId::new();
+
+        assert_eq!(
+            session_exit_focus(Some(exited), exited, Some(sibling)),
+            SessionExitFocus::Refocus(sibling)
+        );
+        assert_eq!(
+            active_session_after_pane_reconcile(Some(sibling), true, Some(sibling)),
+            Some(sibling)
+        );
+    }
+
+    #[test]
+    fn attached_last_tab_exit_repoints_after_region_collapse() {
+        let exited = SessionId::new();
+        let survivor = SessionId::new();
+
+        assert_eq!(session_exit_focus(Some(exited), exited, None), SessionExitFocus::Clear);
+        assert_eq!(
+            active_session_after_pane_reconcile(None, false, Some(survivor)),
+            Some(survivor)
+        );
+    }
+
+    #[test]
+    fn tabless_sessions_have_no_adoption_target() {
+        let workspace_id = WorkspaceId::new();
+
+        assert_eq!(tab_adoption_target(None, false), None);
+        assert_eq!(
+            tab_adoption_target(Some(workspace_id), false),
+            Some(TabAdoptionTarget::Focused),
+            "an open tab whose region is absent still reattaches to the focused pane"
+        );
+        assert_eq!(
+            tab_adoption_target(Some(workspace_id), true),
+            Some(TabAdoptionTarget::Own(workspace_id))
+        );
+    }
 
     #[test]
     fn client_parser_stops_non_startup_arguments_before_client_setup() {

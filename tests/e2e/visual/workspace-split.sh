@@ -4,31 +4,41 @@
 #
 # Presses Ctrl+Alt+\ in the real scribe-client window to trigger a
 # vertical workspace split, then verifies both workspace regions are
-# alive by typing into each via xdotool.  Screenshots are captured at
-# each stage for visual inspection.
+# alive by typing into each via xdotool. It also exits a tab after moving
+# focus to another region and exits the attached last tab of a region,
+# pinning paint/input focus and one-shot pane adoption across both paths.
 #
 # Requires: visual container (optional GPU passthrough via SCRIBE_E2E_GPUS)
 set -e
 
-# Helper: focus the Scribe window and capture a full-screen screenshot.
-capture_window() {
-    local out="$1"
-    local wid
-    wid=$(xdotool search --name "Scribe" | head -1) || true
-    if [ -n "$wid" ]; then
-        xdotool windowfocus --sync "$wid" 2>/dev/null || true
-        sleep 0.3
-    fi
-    scrot "$out"
-}
+TITLEBAR_H=34
+BOTTOM_BANDS_H=24
+ROUTING_DIFF_MIN="${ROUTING_DIFF_MIN:-300}"
+WIN_X=0
+WIN_Y=0
+WIN_W=0
+WIN_H=0
 
-# Helper: focus the Scribe window.
+# Helper: focus the Scribe window and cache its geometry for pixel crops.
 focus_window() {
     local wid
     wid=$(xdotool search --name "Scribe" | head -1) || true
     if [ -n "$wid" ]; then
         xdotool windowfocus --sync "$wid" 2>/dev/null || true
+        eval "$(xdotool getwindowgeometry --shell "$wid")"
+        WIN_X="$X"
+        WIN_Y="$Y"
+        WIN_W="$WIDTH"
+        WIN_H="$HEIGHT"
     fi
+}
+
+# Helper: focus the Scribe window and capture a full-screen screenshot.
+capture_window() {
+    local out="$1"
+    focus_window
+    sleep 0.3
+    scrot -o "$out"
 }
 
 # Helper: click at pixel coordinates inside the Scribe window.
@@ -88,6 +98,27 @@ wait_bar_state() {
 # Helper: count client-log lines matching an extended regex.
 log_count() {
     grep -cE "$1" "$CLIENT_LOG" 2>/dev/null || true
+}
+
+# Count differing pixels in one half of the terminal grid, excluding window
+# chrome, pane borders, and the caller's bottom inset. The right pane body is
+# byte-identical across a background exit; routing checks keep the prompt rows.
+grid_half_diff() {
+    local before="$1" after="$2" half="$3" bottom_inset="${4:-8}"
+    local half_w=$((WIN_W / 2))
+    local crop_x=$((WIN_X + 8))
+    local crop_y=$((WIN_Y + TITLEBAR_H + 8))
+    local crop_w=$((half_w - 16))
+    local crop_h=$((WIN_H - TITLEBAR_H - BOTTOM_BANDS_H - 8 - bottom_inset))
+    local value
+    if [ "$half" = "right" ]; then
+        crop_x=$((crop_x + half_w))
+    fi
+    value=$(compare -metric AE \
+        \( "$before" -crop "${crop_w}x${crop_h}+${crop_x}+${crop_y}" +repage \) \
+        \( "$after" -crop "${crop_w}x${crop_h}+${crop_x}+${crop_y}" +repage \) \
+        null: 2>&1 || true)
+    printf '%s' "${value%%.*}"
 }
 
 # A session is re-filed on the server once per workspace split (the seed
@@ -185,39 +216,75 @@ wait_log "region bar selected a tab"
 capture_window /output/07b-bar-tab-clicked.png
 echo "PHASE 7b PASS: clicking the lower bar's tab reached its session"
 
-# ── Phase 8: exiting one tab keeps the refocus inside the workspace ─
+# ── Phase 8: a background tab exit cannot steal window focus ───────
+# Give the right region a static, cursor-free frame, then schedule the selected
+# lower-region tab to exit and move focus right before its shell ends. The
+# focused half must remain pixel-identical while the lower region refocuses its
+# surviving sibling exactly once.
 focus_window
-sleep 0.3
-xdotool type --delay 30 "exit"
+click_at "$((WIN_W * 3 / 4))" "$((WIN_H / 2))"
+xdotool type --delay 10 "printf '\\033[?25l'; clear; echo FOCUSED-RIGHT-STABLE"
 xdotool key Return
+sleep 0.8
+capture_window /output/08a-focused-before-background-exit.png
+
+click_at "$((WIN_W / 4))" "$((WIN_H * 3 / 4))"
+adopts_before=$(log_count "pane adopted a session")
+xdotool type --delay 10 "sleep 1; exit"
+xdotool key Return
+click_at "$((WIN_W * 3 / 4))" "$((WIN_H / 2))"
 sleep 2
-capture_window /output/08-after-tab-exit.png
+capture_window /output/08b-focused-after-background-exit.png
 wait_bar_state "ws-[0-9a-f]+:1"
+focused_diff=$(grid_half_diff \
+    /output/08a-focused-before-background-exit.png \
+    /output/08b-focused-after-background-exit.png right 64)
+[ "$focused_diff" -eq 0 ] \
+    || fail "background exit changed $focused_diff pixels in the focused region"
+adopts_after=$(log_count "pane adopted a session")
+[ $((adopts_after - adopts_before)) -eq 1 ] \
+    || fail "background exit adopted $((adopts_after - adopts_before)) panes instead of one"
+sleep 2
+[ "$(log_count "pane adopted a session")" -eq "$adopts_after" ] \
+    || fail "background exit kept re-adopting a pane after reconciliation"
 moves_now=$(log_count "$MOVE_RE")
 [ "$moves_now" -eq "$moves_after_splits" ] \
-    || fail "a tab exit re-filed a session across workspaces ($moves_after_splits -> $moves_now)"
-echo "PHASE 8 PASS: tab exit refocused within its workspace, no session moved"
+    || fail "a background tab exit re-filed a session across workspaces ($moves_after_splits -> $moves_now)"
+echo "PHASE 8 PASS: background exit kept $focused_diff focused-pixel changes and adopted its sibling once"
 
-# ── Phase 9: collapsing the stacked region moves no session either ──
-focus_window
-sleep 0.3
+# ── Phase 9: attached last-tab collapse adopts no dead session ─────
+# Focus the lower region and exit its last tab. Region collapse must clear the
+# dead active session, focus the first surviving region, and route the next
+# command into that pane without any per-frame adoption loop.
+click_at "$((WIN_W / 4))" "$((WIN_H * 3 / 4))"
+adopts_before=$(log_count "pane adopted a session")
 xdotool type --delay 30 "exit"
 xdotool key Return
 sleep 2
 capture_window /output/09-after-region-collapse.png
 wait_bar_state "none"
 wait_log "closed a workspace region on the server"
+sleep 2
+adopts_after=$(log_count "pane adopted a session")
+[ "$adopts_after" -eq "$adopts_before" ] \
+    || fail "last-tab collapse adopted a dead session $((adopts_after - adopts_before)) times"
 moves_now=$(log_count "$MOVE_RE")
 [ "$moves_now" -eq "$moves_after_splits" ] \
     || fail "a region collapse re-filed a session across workspaces ($moves_after_splits -> $moves_now)"
-# The surviving regions must still accept input after the collapse.
-focus_window
-sleep 0.3
-xdotool type --delay 30 "echo STILL-ALIVE-AFTER-COLLAPSE"
+
+# The collapsed region's replacement focus must paint and receive input from
+# the same surviving session. Cursor blink can move one cell; the long command
+# and its output must move substantially more pixels in the left half.
+xdotool type --delay 20 "echo STILL-ALIVE-AFTER-COLLAPSE-ROUTED-TO-SURVIVOR"
 xdotool key Return
 sleep 0.8
 capture_window /output/10-alive-after-collapse.png
-echo "PHASE 9 PASS: region collapsed cleanly, no session changed workspace"
+routing_diff=$(grid_half_diff \
+    /output/09-after-region-collapse.png \
+    /output/10-alive-after-collapse.png left)
+[ "$routing_diff" -ge "$ROUTING_DIFF_MIN" ] \
+    || fail "last-tab collapse left routing dead ($routing_diff changed pixels)"
+echo "PHASE 9 PASS: region collapse changed $routing_diff routed pixels with no pane-adopt spam"
 
 echo ""
 echo "PASS: visual workspace split test"
@@ -228,6 +295,8 @@ echo "    03-workspace-b-typed.png   — after typing in right workspace"
 echo "    04-workspace-a-alive.png   — after typing in left workspace"
 echo "    05-after-hsplit.png        — after Ctrl+Alt+- (left split top/bottom)"
 echo "    07-second-tab-in-lower-bar.png — two tabs in the lower region's bar"
-echo "    08-after-tab-exit.png      — after exiting one lower-region tab"
+echo "    08a-focused-before-background-exit.png — focused-region match baseline"
+echo "    08b-focused-after-background-exit.png — exact focused-region match"
 echo "    09-after-region-collapse.png — after the stacked region collapsed"
+echo "    10-alive-after-collapse.png — survivor accepted routed input"
 echo "    06-three-workspaces.png    — all three workspaces with content"

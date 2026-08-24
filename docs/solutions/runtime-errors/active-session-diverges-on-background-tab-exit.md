@@ -16,8 +16,7 @@ switching away) makes a terminal from that workspace appear in the focused
 workspace, painted on top of the pane the user is looking at. The displaced
 pane's tab stays highlighted and its scrollbar/prompt chrome still render —
 a chimera pane. Keystrokes silently go to the other workspace's session.
-Switching tabs back and forth repairs it. Filed as scribe-txyk, unlanded as
-of this writing.
+Switching tabs back and forth repairs it. Filed as scribe-txyk.
 
 ## Root cause
 
@@ -67,14 +66,13 @@ divergence is downstream of it.
 
 ## Fix
 
-Per this investigation (bead scribe-txyk, unlanded): re-point
-`active_session` in `on_session_exited` only when the exited session *was*
-the attached one; background regions are already repopulated by
-`fill_empty_region_panes` (main.rs:6716) via `stream_session`, which
-deliberately never touches `active_session`. Clear `active_session` when
-the attached session exits with no refocus target and re-point it from the
-shell's focused pane after the region collapse. Never adopt an active
-session that has no tab in `TabSessions`.
+The scribe-txyk fix re-points `active_session` in `on_session_exited` only
+when the exited session *was* the attached one; background regions are
+already repopulated by `fill_empty_region_panes` via `stream_session`, which
+deliberately never touches `active_session`. It clears `active_session` when
+the attached session exits with no refocus target and re-points it from the
+shell's focused pane after the region collapse. Reconciliation never adopts
+an active session that has no tab in `TabSessions`.
 
 ## Prevention
 
