@@ -1556,7 +1556,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 
@@ -1570,6 +1570,7 @@ mod tests {
 
     const MACOS_BASELINE_PATH: &str =
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    const ZSH_UNAME_PROBE: &str = "$(uname -s 2>/dev/null)";
 
     #[test]
     fn macos_path_baseline_covers_empty_and_unset_path() {
@@ -1923,9 +1924,10 @@ mod tests {
     }
 
     // The zsh integration's Darwin login-profile emulation gates on
-    // `uname -s`, so these tests shim `uname` on PATH and run the real
-    // script through `/bin/zsh`, making the Darwin branch testable on any
-    // Unix host.
+    // `uname -s`. These tests replace that exact probe in a private copy of
+    // the shipped script, then source the copy through `/bin/zsh`. This keeps
+    // the startup contract testable on any Unix host without a nested helper
+    // process that can fail independently under full-suite load.
 
     #[test]
     fn zsh_integration_sources_zprofile_for_non_login_shells_on_darwin() {
@@ -1969,45 +1971,50 @@ mod tests {
         let home = make_temp_home(&format!("zsh-startup-{name}"));
         fs::write(home.join(".zprofile"), "export ZPROFILE_SEEN=1\n").expect("write .zprofile");
 
-        let shim_dir = home.join("shim-bin");
-        fs::create_dir_all(&shim_dir).expect("create uname shim dir");
-        let shim = shim_dir.join("uname");
-        fs::write(&shim, format!("#!/bin/sh\necho {uname_reports}\n")).expect("write uname shim");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
-                .expect("make uname shim executable");
-        }
-
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let shipped_script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../dist/shell-integration/zsh/scribe.zsh")
             .canonicalize()
             .expect("canonicalize zsh integration script path");
+        let source = fs::read_to_string(shipped_script).expect("read zsh integration script");
+        assert_eq!(source.matches(ZSH_UNAME_PROBE).count(), 1, "expected one zsh uname probe");
+        let script = home.join("scribe.zsh");
+        fs::write(&script, source.replacen(ZSH_UNAME_PROBE, uname_reports, 1))
+            .expect("write controlled zsh integration script");
+
         let output = Command::new("/bin/zsh")
             .arg("-c")
             .arg(format!(
-                "{prelude}source '{}'; printf 'ZPROFILE=%s GUARD=%s\\n' \
-                 \"${{ZPROFILE_SEEN:-0}}\" \"${{_SCRIBE_LOGIN_PROFILE_SOURCED:-0}}\"",
+                "{prelude}source '{}'; source_status=$?; \
+                 printf 'ZPROFILE=%s GUARD=%s\\n' \
+                 \"${{ZPROFILE_SEEN:-0}}\" \"${{_SCRIBE_LOGIN_PROFILE_SOURCED:-0}}\"; \
+                 exit $source_status",
                 script.display()
             ))
             .env_clear()
             .env("HOME", &home)
-            .env("PATH", format!("{}:/usr/bin:/bin", shim_dir.display()))
+            .env("PATH", "/usr/bin:/bin")
             .env("TERM_PROGRAM", "Scribe")
             .env("SCRIBE_ENV_PERSIST", "0")
             .output()
             .expect("run zsh integration check");
         cleanup_temp_home(&home);
+        assert!(
+            output.status.success(),
+            "zsh integration check exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn make_temp_home(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("scribe-{name}-{nonce}"));
-        fs::create_dir_all(&dir).expect("create temp home");
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("scribe-{name}-{}-{sequence}", std::process::id()));
+        cleanup_temp_home(&dir);
+        fs::create_dir(&dir).expect("create temp home");
         dir
     }
 
