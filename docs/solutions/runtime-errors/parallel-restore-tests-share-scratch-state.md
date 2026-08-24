@@ -24,11 +24,14 @@ full reruns were green.
 
 ## Root cause
 
-The signatures show cross-test scratch-state interference rather than a product
-regression: each test creates nominally isolated state, yet the failures contain
-the other test's generated ids or a concurrently truncated shared index. The
-exact collision mechanism still needs a focused stress reproduction; follow-up
-bug `scribe-1hp7` owns that work.
+Before `713af6f`, the shared test helper named roots with the process id and
+`unix_time_ms()`. Parallel test threads could call it in the same millisecond,
+receive the same directory, and exchange one restore index. That explains the
+swapped ids, extra entries, and reads of a concurrently truncated TOML file in
+`claim_first_window_skips_non_replayable_and_reports_remaining`
+(`crates/scribe-client/src/restore_state.rs:708`) and
+`stale_claim_becomes_claimable_again`
+(`crates/scribe-client/src/restore_state.rs:758`).
 
 ## What didn't work
 
@@ -37,16 +40,26 @@ assertions moved between unrelated integrations, and no staged diff touched
 `restore_state.rs`. Re-running only the full suite without first checking the
 exact tests also obscured the stable signature.
 
+## Fix
+
+`scribe-1hp7` landed as `713af6f`. The fixture now combines the process id with
+a process-local atomic sequence (`crates/scribe-client/src/restore_state.rs:614,
+829-837`), so live threads cannot choose the same root. A later ponytail review
+filed `scribe-u7kp`; `aa97384` removed the unnecessary retry loop while keeping
+stale reused-PID cleanup followed by exclusive creation. Focused threaded
+stress, full workspace tests, pre-commit, and `lat check` passed for both beads.
+
 ## Prevention
 
 On this signature:
 
 1. run each named test with `--exact --nocapture`;
 2. compare ids and index contents in the failure to sibling tests;
-3. file the shared-state defect rather than changing unrelated code;
-4. require a final full-suite pass before committing.
+3. inspect scratch names for clock-only uniqueness before changing product code;
+4. stress the whole sibling test group with ordinary parallel test threads;
+5. require a final full-suite pass before committing.
 
-The durable fix should give every restore-state test a unique scratch root and
-stress the pair under ordinary parallel test threads. Until `scribe-1hp7`
-lands, isolated success plus a clean full rerun distinguishes this known flake
-from an integration regression.
+Time is not an identity. Test scratch roots shared by parallel callers need a
+process id plus an atomic sequence or an operating-system-created unique path.
+If stale roots can survive PID reuse, remove the exact stale root before an
+exclusive create rather than accepting its old contents.
