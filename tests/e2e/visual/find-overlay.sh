@@ -234,7 +234,7 @@ click_at() {
 # On-screen center of one find-row pointer control, counting from the right:
 # 0 = close, 1 = next, 2 = previous. Mirrors
 # crates/scribe-client/src/search.rs's control-row layout constants exactly
-# (BOX_MARGIN_RIGHT/TOP=14, a 1px border, ROW_PAD_X=8, ROW_PAD_Y=6,
+# (BOX_MARGIN_RIGHT/TOP=14, a 2px border, ROW_PAD_X=8, ROW_PAD_Y=6,
 # CONTROL_SIZE=22, ROW_GAP=6), so these targets cannot drift from the
 # production geometry. The box's right margin — and therefore every
 # control's x — is independent of whether the box's own width is clamped by
@@ -247,12 +247,12 @@ click_at() {
 PANE_TOP_OFFSET=17
 CONTROL_STRIDE=28
 control_center_x() {
-    echo $(( WIN_X + WIN_W - 34 - CONTROL_STRIDE * $1 ))
+    echo $(( WIN_X + WIN_W - 35 - CONTROL_STRIDE * $1 ))
 }
-# PANE_TOP_OFFSET + BOX_MARGIN_TOP(14) + border(1) + ROW_PAD_Y(6) +
+# PANE_TOP_OFFSET + BOX_MARGIN_TOP(14) + border(2) + ROW_PAD_Y(6) +
 # half a control(11) = the control row's vertical center.
 control_center_y() {
-    echo $(( WIN_Y + PANE_TOP_OFFSET + 14 + 1 + 6 + 11 ))
+    echo $(( WIN_Y + PANE_TOP_OFFSET + 14 + 2 + 6 + 11 ))
 }
 
 WIN_X=0

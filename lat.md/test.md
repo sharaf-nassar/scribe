@@ -5080,6 +5080,12 @@ counts them per half; a box still mounted on the window root instead of
 `grid_slot` paints over the RIGHT pane regardless of which one is focused,
 failing this phase.
 
+#### Active chrome contrast
+
+Headless coverage pins the typed query to active tab text and the placeholder to muted tab text.
+
+It requires the placeholder alpha to stay lower, the panel alpha to remain at least 98%, and the opaque border to keep the theme accent's RGB channels. The keyboard-owning surface cannot regress to dim chrome or a literal palette.
+
 #### Grapheme-safe editor model
 
 The headless query model proves movement, deletion, replacement, and cut preserve whole graphemes.

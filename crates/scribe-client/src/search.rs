@@ -710,6 +710,9 @@ pub enum FindOverlayEvent {
     Dismissed,
 }
 
+/// Near-opaque floor for the keyboard-owning find surface.
+const FIND_OVERLAY_BG_ALPHA: f32 = 0.98;
+
 /// Resolved GPUI colours for the find overlay box.
 #[derive(Clone, Copy)]
 pub struct FindOverlayColors {
@@ -729,18 +732,15 @@ pub struct FindOverlayColors {
 
 impl From<&ChromeColors> for FindOverlayColors {
     fn from(chrome: &ChromeColors) -> Self {
-        let mut bg = srgba(chrome.tab_bar_active_bg);
-        bg.a = 0.96;
-        let mut input_bg = srgba(chrome.status_bar_bg);
-        input_bg.a = 0.98;
-        let query_fg = srgba(chrome.status_bar_text);
+        let bg = Rgba { a: FIND_OVERLAY_BG_ALPHA, ..srgba(chrome.tab_bar_active_bg) };
+        let input_bg = Rgba { a: FIND_OVERLAY_BG_ALPHA, ..srgba(chrome.status_bar_bg) };
         Self {
             bg,
             input_bg,
-            border: srgba(chrome.accent),
+            border: Rgba { a: 1.0, ..srgba(chrome.accent) },
             header_fg: srgba(chrome.tab_text_active),
-            query_fg,
-            placeholder_fg: Rgba { a: query_fg.a * 0.7, ..query_fg },
+            query_fg: srgba(chrome.tab_text_active),
+            placeholder_fg: srgba(chrome.tab_text),
         }
     }
 }
@@ -1241,7 +1241,7 @@ impl Render for FindOverlayView {
                     .py(ROW_PAD_Y)
                     .gap(ROW_GAP)
                     .bg(colors.bg)
-                    .border_1()
+                    .border_2()
                     .border_color(colors.border)
                     .rounded(px(4.0))
                     .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
@@ -1484,7 +1484,7 @@ mod overlay_tests {
         FIND_QUERY_DEBOUNCE, FindBindingMatches, FindInputAction, FindMove, FindOverlayColors,
         FindOverlayEvent, FindOverlayView, FindResults, ROW_GAP, ROW_PAD_X, ROW_PAD_Y, Scroll,
         SingleLineEditor, find_editor_visual, find_input_action, scroll_delta_to_current_match,
-        visible_highlights,
+        srgba, visible_highlights,
     };
 
     fn hit(row: i32, col_start: u16, col_end: u16) -> ServerMatch {
@@ -1530,6 +1530,33 @@ mod overlay_tests {
     fn settle(cx: &mut TestAppContext) {
         cx.executor().advance_clock(FIND_QUERY_DEBOUNCE);
         cx.run_until_parked();
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Active chrome contrast]]
+    #[test]
+    fn find_overlay_colors_keep_typed_input_active_and_placeholder_muted() {
+        let mut chrome = minimal_dark().chrome;
+        chrome.accent[3] = 0.4;
+        let colors = FindOverlayColors::from(&chrome);
+
+        assert_eq!(colors.query_fg, srgba(chrome.tab_text_active));
+        assert_eq!(colors.placeholder_fg, srgba(chrome.tab_text));
+        assert!(
+            colors.placeholder_fg.a < colors.query_fg.a,
+            "the empty field must remain dimmer than typed input"
+        );
+        assert!(colors.bg.a >= 0.98, "the keyboard-owning panel must stay near-opaque");
+        let accent = srgba(chrome.accent);
+        assert!(
+            (colors.border.r - accent.r).abs() < f32::EPSILON
+                && (colors.border.g - accent.g).abs() < f32::EPSILON
+                && (colors.border.b - accent.b).abs() < f32::EPSILON,
+            "the border must retain the theme accent"
+        );
+        assert!(
+            (colors.border.a - 1.0).abs() < f32::EPSILON,
+            "the theme accent border stays opaque"
+        );
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#Grapheme-safe editor model]]
@@ -1890,13 +1917,13 @@ mod overlay_tests {
     /// The on-screen center of one control in the find row, counting from the
     /// right: `0` = close, `1` = next, any other value = previous. Mirrors
     /// `FindOverlayView::render`'s control row exactly — the border is
-    /// `.border_1()` (a fixed 1px, not the rem-based padding scale) and every
+    /// `.border_2()` (a fixed 2px, not the rem-based padding scale) and every
     /// control at or right of the query field is `flex_none` at a fixed size,
     /// so this position does not depend on font metrics. Only valid when the
     /// mount is wide enough that the box renders at its unclamped
     /// [`BOX_WIDTH`] (see [`CONTAINER_WIDTH`]).
     fn control_center(container_width: Pixels, index_from_right: u8) -> Point<Pixels> {
-        let border = px(1.0);
+        let border = px(2.0);
         let box_left = container_width - BOX_MARGIN_RIGHT - BOX_WIDTH;
         let content_right = box_left + BOX_WIDTH - border - ROW_PAD_X;
         let stride = CONTROL_SIZE + ROW_GAP;
@@ -2091,7 +2118,7 @@ mod overlay_tests {
         // A point on the box's own chrome, left of every control: the box's
         // stop covers the whole row (`FindOverlayView::render`), not just its
         // three pointer controls.
-        let border = px(1.0);
+        let border = px(2.0);
         let box_left = CONTAINER_WIDTH - BOX_MARGIN_RIGHT - BOX_WIDTH;
         let row_center_y = BOX_MARGIN_TOP + border + ROW_PAD_Y + CONTROL_SIZE * 0.5;
         let box_chrome = point(box_left + ROW_PAD_X, row_center_y);
