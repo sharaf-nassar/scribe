@@ -46,11 +46,13 @@ The server adapts its authoritative PTY, workspace, window-share, and automation
 
 ### Admission and capability policy
 
-Every request is admitted; every operation except `Capabilities` is policy-authorized before any target or registry lookup.
+Every request is admitted; every operation except `Capabilities` is policy-authorized before protected target or session lookup.
+
+Prompt delivery may resolve caller orientation to choose a window, but capture, target-session, and action execution seams remain after authorization.
 
 [[crates/scribe-server/src/agent_api/mod.rs#AgentApiState]] admits four concurrent calls. `WriteInput` byte length is checked before admission can raise a prompt; excess requests return typed `Busy`, and oversized input returns `TooLarge` without touching a session or client.
 
-[[crates/scribe-server/src/agent_api/policy.rs#AgentPolicyEngine]] resolves `Deny`, `Allow`, or `Prompt` per capability. Prompt mode denies when no local `agent_api` client exists, otherwise issues one correlated prompt and parks up to 64 same-key requests behind it. The key is caller-supplied agent label, capability, and target. Decisions are reused for the configured burst window; timeout denies; `AlwaysAllow` and `AlwaysDeny` update only the matching in-memory axis.
+[[crates/scribe-server/src/agent_api/policy.rs#AgentPolicyEngine]] resolves `Deny`, `Allow`, or `Prompt` per capability. A live `origin_session_id` routes a prompt only to its owning window's capable local client; if that window cannot render it, prompt mode denies rather than using another window. Originless or stale callers use the deterministic capable-window fallback. Prompt mode otherwise denies when no local `agent_api` client exists, issues one correlated prompt, and parks up to 64 same-key requests behind it. The key is caller-supplied agent label, capability, and target. Decisions are reused for the configured burst window; timeout denies; `AlwaysAllow` and `AlwaysDeny` update only the matching in-memory axis.
 
 `ConfigReloaded` projects the fresh `[agent_api]` table through [[crates/scribe-server/src/config.rs#project_config]] and [[crates/scribe-server/src/agent_api/mod.rs#AgentApiState#refresh_policy]]. Refresh cancels pending prompts and takes effect on the next call without restarting the server. An all-`Deny` policy also releases held activity leases; it is the off state, not a separate master switch.
 

@@ -11023,8 +11023,8 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
 }
 
 /// Select one owning-machine client that advertised agent prompt support.
-/// Stable window ordering keeps concurrent callers from spraying the same
-/// prompt across several windows; the policy engine correlates the reply.
+/// Stable window ordering keeps originless or stale callers from spraying the
+/// same prompt across several windows; the policy engine correlates the reply.
 async fn first_local_agent_api_writer(window_shares: &WindowShares) -> Option<SharedWriter> {
     window_shares
         .read()
@@ -11037,17 +11037,56 @@ async fn first_local_agent_api_writer(window_shares: &WindowShares) -> Option<Sh
         .map(|(_, writer)| writer)
 }
 
+fn agent_request_origin_session_id(
+    request: &scribe_common::agent::AgentRequest,
+) -> Option<SessionId> {
+    match request {
+        scribe_common::agent::AgentRequest::World { origin_session_id, .. }
+        | scribe_common::agent::AgentRequest::Siblings { origin_session_id, .. }
+        | scribe_common::agent::AgentRequest::ReadScreen { origin_session_id, .. }
+        | scribe_common::agent::AgentRequest::DispatchAction { origin_session_id, .. }
+        | scribe_common::agent::AgentRequest::WriteInput { origin_session_id, .. }
+        | scribe_common::agent::AgentRequest::Capabilities { origin_session_id, .. } => {
+            *origin_session_id
+        }
+    }
+}
+
+/// Select a local prompt writer from caller orientation when it still names a
+/// live window. A known origin never falls back to another window: an incapable
+/// origin window makes prompt policy deny headlessly. Missing origins retain the
+/// stable fallback for external CLI callers.
+async fn local_agent_api_writer_for_request(
+    window_shares: &WindowShares,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    request: &scribe_common::agent::AgentRequest,
+) -> Option<SharedWriter> {
+    let Some(origin_session_id) = agent_request_origin_session_id(request) else {
+        return first_local_agent_api_writer(window_shares).await;
+    };
+    let origin_window_id = workspace_manager.read().await.window_for_session(origin_session_id);
+    let Some(origin_window_id) = origin_window_id else {
+        return first_local_agent_api_writer(window_shares).await;
+    };
+    window_shares.read().await.get(&origin_window_id).and_then(WindowShare::local_agent_api_writer)
+}
+
 /// Spec 027 transient one-shot: route an `AgentRequest` through the agent
 /// dispatcher and reply on the same connection, which then closes without
-/// registering a window or attaching a session. The registry seams are
-/// closures over this server's live-session, share, and workspace state;
+/// registering a window or attaching a session. The protected registry seams
+/// are closures over this server's live-session, share, and workspace state;
 /// they run only after the dispatcher's policy gate admits the request.
 async fn handle_transient_agent_request(
     server: &IpcServerState,
     writer: &SharedWriter,
     request: &scribe_common::agent::AgentRequest,
 ) {
-    let prompt_writer = first_local_agent_api_writer(&server.window_shares).await;
+    let prompt_writer = local_agent_api_writer_for_request(
+        &server.window_shares,
+        &server.workspace_manager,
+        request,
+    )
+    .await;
     let live_sessions = Arc::clone(&server.live_sessions);
     let world_sessions = Arc::clone(&server.live_sessions);
     let world_shares = Arc::clone(&server.window_shares);
@@ -14989,6 +15028,133 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_prompts_route_to_the_later_sorted_origin_window() {
+        let earlier_window: WindowId =
+            "00000000-0000-0000-0000-000000000001".parse().expect("valid earlier window id");
+        let origin_window: WindowId =
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".parse().expect("valid origin window id");
+        let origin_session = SessionId::new();
+        let mut manager = WorkspaceManager::new(Vec::new());
+        let workspace = manager.create_workspace();
+        manager.add_session(workspace, origin_session, None);
+        manager.assign_session_to_window(origin_window, origin_session);
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (earlier_writer, mut earlier_client) = ci_test_writer();
+        let (origin_writer, mut origin_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(earlier_window, agent_share(&earlier_writer, true));
+            shares.insert(origin_window, agent_share(&origin_writer, true));
+        }
+        let request = scribe_common::agent::AgentRequest::World {
+            request_id: 1,
+            agent_label: "origin-test".into(),
+            origin_session_id: Some(origin_session),
+        };
+
+        let mut server =
+            transfer_server_state(manager, super::new_live_session_registry(), Arc::clone(&shares));
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                read_metadata: scribe_common::agent::AgentPolicyMode::Prompt,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        let (request_writer, mut request_client) = ci_test_writer();
+        let dispatch = super::handle_transient_agent_request(&server, &request_writer, &request);
+        tokio::pin!(dispatch);
+        let prompt_id = tokio::select! {
+            () = &mut dispatch => panic!("prompted request completed before delivery"),
+            message = read_message::<ServerMessage, _>(&mut origin_client) => {
+                let ServerMessage::AgentPromptRequest { prompt_id, capability, .. } =
+                    message.expect("read origin prompt")
+                else {
+                    panic!("expected agent prompt request");
+                };
+                assert_eq!(capability, scribe_common::agent::AgentCapability::ReadMetadata);
+                prompt_id
+            }
+        };
+        assert!(
+            server
+                .agent_api
+                .resolve_prompt(prompt_id, scribe_common::protocol::ClipboardDecision::AllowOnce,)
+        );
+        dispatch.await;
+        assert!(matches!(
+            read_message(&mut request_client).await.unwrap(),
+            ServerMessage::AgentResponse(response) if response.result.is_ok()
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_message::<ServerMessage, _>(&mut earlier_client),
+            )
+            .await
+            .is_err(),
+            "a capable but non-origin window received the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompts_deny_when_the_known_origin_window_is_incapable() {
+        let origin_window = WindowId::new();
+        let fallback_window = WindowId::new();
+        let origin_session = SessionId::new();
+        let mut manager = WorkspaceManager::new(Vec::new());
+        let workspace = manager.create_workspace();
+        manager.add_session(workspace, origin_session, None);
+        manager.assign_session_to_window(origin_window, origin_session);
+        let manager = Arc::new(RwLock::new(manager));
+
+        let (origin_writer, mut origin_client) = ci_test_writer();
+        let (fallback_writer, mut fallback_client) = ci_test_writer();
+        let shares = new_window_shares();
+        {
+            let mut shares = shares.write().await;
+            shares.insert(origin_window, agent_share(&origin_writer, false));
+            shares.insert(fallback_window, agent_share(&fallback_writer, true));
+        }
+        let request = scribe_common::agent::AgentRequest::World {
+            request_id: 2,
+            agent_label: "origin-test".into(),
+            origin_session_id: Some(origin_session),
+        };
+
+        assert!(
+            super::local_agent_api_writer_for_request(&shares, &manager, &request).await.is_none(),
+            "an incapable origin must not fall back to another window"
+        );
+
+        let mut server =
+            transfer_server_state(manager, super::new_live_session_registry(), Arc::clone(&shares));
+        server.agent_api =
+            crate::agent_api::AgentApiState::new(scribe_common::config::AgentApiConfig {
+                read_metadata: scribe_common::agent::AgentPolicyMode::Prompt,
+                ..scribe_common::config::AgentApiConfig::default()
+            });
+        let (request_writer, mut request_client) = ci_test_writer();
+        super::handle_transient_agent_request(&server, &request_writer, &request).await;
+        assert!(matches!(
+            read_message(&mut request_client).await.unwrap(),
+            ServerMessage::AgentResponse(response)
+                if matches!(response.result, Err(scribe_common::agent::AgentError::Denied { .. }))
+        ));
+        for client in [&mut origin_client, &mut fallback_client] {
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    read_message::<ServerMessage, _>(client),
+                )
+                .await
+                .is_err(),
+                "known incapable origin must not prompt another window"
+            );
+        }
     }
 
     #[tokio::test]

@@ -395,11 +395,15 @@ prompts that are still pending.
 A `prompt` capability raises a Scribe-owned confirmation dialog naming the
 caller-supplied agent label and the requested capability. The decision
 defaults to Deny, Escape denies, and choosing "Always" persists that
-capability's mode as `allow`. The call is denied when no Scribe window that
-understands the prompt is attached (headless), or when `prompt_timeout_ms`
-elapses unanswered. An approval is reused for repeated calls with the same
-agent label, capability, and target within `burst_window_ms`, so one
-confirmation covers a tight burst instead of interrogating you per call.
+capability's mode as `allow`. With a live `SCRIBE_SESSION_ID`, Scribe sends
+the prompt only to that session's window; if that window cannot render it,
+the call is denied rather than prompting another window. Originless or stale
+callers use the deterministic capable-window fallback. The call is also
+denied when no attached Scribe window understands the prompt (headless),
+or when `prompt_timeout_ms` elapses unanswered. An approval is reused for
+repeated calls with the same agent label, capability, and target within
+`burst_window_ms`, so one confirmation covers a tight burst instead of
+interrogating you per call.
 
 ### Limits
 

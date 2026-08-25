@@ -245,7 +245,9 @@ The same suite parses every v1 command, enforces the 64-character caller label a
 
 ### Socket gating and client compatibility
 
-Server IPC tests prove agent requests use the transient local pool, prompt and activity frames reach only participants advertising `agent_api`, activity resolves through the session's owning window, and unknown sessions emit no frame.
+Server IPC tests prove agent requests use the transient local pool, prompt and activity frames reach only participants advertising `agent_api`, and activity resolves through the session's owning window.
+
+Prompt routing covers two capable windows with the origin window lexicographically later, plus denial when a known origin window cannot render the prompt; unknown sessions emit no frame.
 
 The `scribe-test` daemon and IPC fixtures explicitly advertise `agent_api: false`; they tolerate the additive variants without claiming to implement an agent consumer. The dedicated recipes below instead drive the surface through the real `scribe` CLI inside live panes, so the harness itself never claims the capability.
 
