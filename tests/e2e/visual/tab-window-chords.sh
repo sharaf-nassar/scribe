@@ -29,10 +29,10 @@
 #   * Ctrl+Alt+Z opens exactly one Pi tab, and the `pi` stub it runs records a
 #     plain tab's startup — the rc file every other tab reads, the integration
 #     marker, the `PATH` that rc exported, the focused pane's CWD, and no
-#     leftover restore-delta file — with no argv of its own. Ctrl+C then ends
-#     the stub and the server finalizes that exact session, which is what
-#     `exec pi` buys: quitting Pi closes its tab rather than dropping the user
-#     at a stray prompt.
+#     leftover restore-delta file — with no argv of its own. The rc also
+#     wraps `pi`, proving command-position shell resolution. Ctrl+C then ends
+#     the stub and the server finalizes that exact session after the shell exits
+#     with Pi's status.
 #
 # Phase 0 is the same session-adoption dance `overlay-actions.sh` documents:
 # the entrypoint creates $SESSION after the client launched, so the running
@@ -71,6 +71,9 @@ PI_PROBE=/tmp/scribe-pi-probe.sh
 # Exported by the rc file below, so a Pi tab that skipped normal shell startup
 # records no marker at all.
 PI_RC_MARKER=PI_STARTUP_ORDER=bashrc
+# Exported by the rc-defined Pi wrapper, proving Pi ran in shell command
+# position rather than as an argument to Bash's `exec` builtin.
+PI_WRAPPER_MARKER=PI_COMMAND_RESOLUTION=bash_function
 
 # Every mapped Scribe window, newest last.
 list_windows() {
@@ -303,11 +306,13 @@ echo "PHASE 3 PASS: the close dialog opens on its relocated chord (+$DIFF px)"
 # Pi is launch-only: no provider, no resume, no AI chrome. What it must inherit
 # is a plain tab's startup, so the rc file below is the oracle — it is the only
 # place `PI_STARTUP_ORDER` and the stub's own `PATH` entry come from, and a Pi
-# tab that resolved its shell differently records neither.
+# tab that resolved its shell differently records neither. Its `pi` function
+# also exports a marker, then forwards through `command pi` to the existing stub.
 rm -f "$PI_RECORD" "$PI_CWD_PROBE"
 mkdir -p "$PI_CWD"
-# shellcheck disable=SC2016 # $PATH is written literally; the rc file expands it.
-printf 'export %s\nexport PATH="/tests/bin:$PATH"\n' "$PI_RC_MARKER" >>"$HOME/.bashrc"
+# shellcheck disable=SC2016 # $PATH and $@ are written literally for Bash.
+printf 'export %s\nexport PATH="/tests/bin:$PATH"\npi() { export %s; command pi "$@"; }\n' \
+    "$PI_RC_MARKER" "$PI_WRAPPER_MARKER" >>"$HOME/.bashrc"
 
 # Give the focused pane a CWD of its own, and report it the way a shell would.
 # Sourced rather than typed so the OSC 7 escape survives xdotool verbatim, and
@@ -361,7 +366,7 @@ if [ -n "$(awk '/^--ENV--$/ { exit } { print }' "$PI_RECORD")" ]; then
 fi
 # SCRIBE_SHELL_INTEGRATION is deliberately absent from this list: it only exists
 # when the server finds the integration scripts, which this image does not ship.
-for expected in "PWD=$PI_CWD" "$PI_RC_MARKER" "TERM_PROGRAM=Scribe"; do
+for expected in "PWD=$PI_CWD" "$PI_RC_MARKER" "$PI_WRAPPER_MARKER" "TERM_PROGRAM=Scribe"; do
     if ! grep -Fqx "$expected" "$PI_RECORD"; then
         fail "PHASE 4 FAIL: the pi environment is missing '$expected'"
     fi
@@ -379,9 +384,9 @@ echo "PHASE 4 PASS: ctrl+alt+z opened one Pi tab in $PI_CWD with a plain tab's s
 
 # @lat: [[test#Visual E2E Tests#Tab and window chords reach their actions#Quitting Pi ends its tab]]
 # ── Phase 5: quitting Pi ends its tab ─────────────────────────────
-# The shell execs Pi over itself, so Pi is the PTY's direct child and its exit
-# is the session's. Assert on that exact session id rather than on a count, so
-# an unrelated pane dying cannot pass this phase.
+# The shell exits with Pi's status, so Pi's exit finalizes the tab. Assert on
+# that exact session id rather than on a count, so an unrelated pane dying
+# cannot pass this phase.
 PI_SESSION_UUID=$(sed -n 's/^SCRIBE_SESSION_ID=//p' "$PI_RECORD" | head -1)
 if [ -z "$PI_SESSION_UUID" ]; then
     fail "PHASE 5 FAIL: the pi environment carried no SCRIBE_SESSION_ID"

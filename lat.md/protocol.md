@@ -78,7 +78,7 @@ A legacy named-MessagePack `CreateSession` frame with no `ai_launch` field decod
 
 `shell_tool: Option<ShellTool>` names a CLI the tab runs after its shell's startup files, with no AI semantics attached.
 
-[[crates/scribe-common/src/protocol.rs#ShellTool]] is deliberately not an [[crates/scribe-common/src/ai_state.rs#AiProvider]]: a launch-only tool has no hook channel, no conversation and no resume mode, so it is never tracked as AI chrome. The wire carries the variant, not a binary name, so the server's shell command string can never be composed from client-supplied text — see [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]]. Normal clients send it with `command: None`; the server still normalizes malformed mixed requests as `ai_launch > shell_tool > command` before resolving either the executable or argv.
+[[crates/scribe-common/src/protocol.rs#ShellTool]] is deliberately not an [[crates/scribe-common/src/ai_state.rs#AiProvider]]: a launch-only tool has no hook channel, no conversation and no resume mode, so it is never tracked as AI chrome. The wire carries the variant, not a binary name, so the server's shell command string can never be composed from client-supplied text — see [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that run through their shell]]. Normal clients send it with `command: None`; the server still normalizes malformed mixed requests as `ai_launch > shell_tool > command` before resolving either the executable or argv.
 
 `SessionInfo.shell_tool` carries the same typed identity back on a warm list response. It defaults to `None` for older servers, and lets a new client process reconstruct the launch record without guessing from the running command.
 

@@ -17,7 +17,7 @@ analysis.md's Principle 2 tension row); it was hit in practice.
 
 AI tabs are now the plain-tab argv plus an interactive `-c` command that execs
 the provider. Current behavior is documented in `lat.md/server.md` §
-[[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]].
+[[server#Server#Sessions#Session Creation#AI tabs are plain tabs that run through their shell]].
 What survived from this spec: server-owned argv construction, the structured
 `CreateSession.ai_launch` field, and the `REMOTE_PROTOCOL_VERSION` 3→4 bump.
 What was deleted: `ai_login_shell` and its passwd-first tier logging, the

@@ -2920,7 +2920,9 @@ Both chords were claimed by  before the binding dispatcher ever saw them, so onl
 
 #### Ctrl+Alt+Z opens one Pi tab that starts like a plain tab
 
-The chord must produce exactly one new tab, and the `pi` stub it runs must record a plain tab's startup: the rc file every other tab reads, the `PATH` that rc exported, `TERM_PROGRAM`, and the focused pane's CWD, with no argv of its own.
+The chord must produce exactly one new tab. Its `pi` stub records ordinary rc startup, `PATH`, `TERM_PROGRAM`, focused CWD, and no argv.
+
+The rc fixture defines a `pi` function that exports a unique marker before forwarding to the stub, proving the launch resolves Pi in shell command position rather than as Bash's `exec` argument.
 
 No `SCRIBE_RESTORE_ENV_DELTA_FILE` may survive into that environment either, since the launch consumes the staged delta on its way through. A `tests/e2e/bin/pi` stand-in is what makes any of that observable — it dumps its argv and environment, then stays alive so the tab has a live process in it. The CWD assertion is the reason the phase types a `cd` first and reports it by hand: this image ships no shell-integration scripts, so nothing else emits an OSC 7 and the pane's directory has to be something other than the server's `$HOME` fallback or the two are indistinguishable. The tab count is asserted as *exactly one* rather than "at least one", because a chord reaching two handlers is the failure this row exists to catch.
 
@@ -2928,13 +2930,13 @@ No `SCRIBE_RESTORE_ENV_DELTA_FILE` may survive into that environment either, sin
 
 Ctrl+C must make the server finalize the exact session the stub reported through `SCRIBE_SESSION_ID`.
 
-That is what `exec pi` buys: the tool is the PTY's direct child, so quitting it closes the tab rather than dropping the user at a stray prompt. Asserting on the session id rather than on a count is deliberate — an unrelated pane dying elsewhere in the window must not be able to pass this phase. The environment carries the full UUID while the server logs `SessionId`'s prefixed short form, so the phase derives the log id rather than matching the two directly.
+Pi runs in shell command position, then the shell exits with Pi's status, so quitting it still closes the tab rather than dropping the user at a stray prompt. Asserting on the session id rather than on a count is deliberate — an unrelated pane dying elsewhere in the window must not be able to pass this phase. The environment carries the full UUID while the server logs `SessionId`'s prefixed short form, so the phase derives the log id rather than matching the two directly.
 
 #### Typed Pi restore regressions
 
-Focused unit regressions cover the legacy Pi launch representation beyond the visual launch.
+Focused unit regressions cover structured and legacy Pi launch representation beyond the visual launch.
 
-A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`. Structured provider compatibility and the v8 handoff gate are covered separately by [[test#Test Harness#Pi Provider Compatibility]].
+Both forms require Bash/Zsh/unknown-shell `pi; exit $?`, fish `pi; exit $status`, nushell `pi; exit $env.LAST_EXIT_CODE`, and PowerShell's existing `pi` command form. Zsh and fish assertions retain the restore-delta preamble. Structured Pi ignores malformed resume metadata, so no Pi argv can carry a resume flag or conversation id. A warm `SessionInfo` seeds client metadata and reconstructs `LaunchKind::ShellTool`; named handoff serialization round-trips `ShellTool::Pi` while older payloads default it to none; request normalization discards a simultaneous legacy command with precedence `ai_launch > shell_tool > command`. Structured provider compatibility and the v8 handoff gate are covered separately by [[test#Test Harness#Pi Provider Compatibility]].
 
 ### Tab switching is live
 

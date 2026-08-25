@@ -259,7 +259,7 @@ pub enum ShellTool {
 }
 
 impl ShellTool {
-    /// The binary the tab execs.
+    /// The binary command the tab's shell runs.
     #[must_use]
     pub fn binary_name(self) -> &'static str {
         match self {

@@ -1099,7 +1099,7 @@ fn build_shell(
     Some((program, args))
 }
 
-/// The PTY shell for a launch, with or without a trailing tool to exec.
+/// The PTY shell for a launch, with or without a trailing provider command.
 ///
 /// An AI tab is deliberately not its own session class, and neither is a
 /// launch-only tool tab: each is the ordinary [`build_shell`] invocation —
@@ -1139,24 +1139,24 @@ fn launch_exec_command(
     if let Some(launch) = ai_launch {
         return Some(ai_exec_command(kind, launch));
     }
-    shell_tool.map(|tool| exec_prefixed(kind, tool.binary_name()))
+    shell_tool.map(|tool| shell_command_with_exit(kind, tool.binary_name()))
 }
 
-/// Trailing argv that runs `exec` and ends the session with it.
+/// Trailing argv that runs the provider command after shell startup.
 ///
-/// POSIX-family shells `exec` the tool over themselves, so the CLI becomes
-/// the PTY's direct child and quitting it closes the tab instead of dropping
-/// the user at a stray prompt.
+/// Claude and Codex `exec` over POSIX-family shells. Pi stays in command
+/// position for shell wrapper resolution, then exits the shell with its status.
+/// Both forms close the tab instead of leaving a stray prompt.
 fn tool_exec_args(kind: ShellKind, exec: &str) -> Vec<String> {
     match kind {
         // Nushell rejects the grouped short form and takes no integration
         // under any `-c` variant (its vendor autoload is REPL-only).
         ShellKind::Nushell => vec![String::from("-i"), String::from("-c"), exec.to_owned()],
         // Zsh and fish schedule their restore-delta apply for the first
-        // `precmd` so it lands after the user's rc; such a tab execs before any
-        // prompt, so that consumer never runs and both the delta and its temp
-        // file would be left behind. The `-c` command is the only point that
-        // is still after user rc and still before `exec`, so it consumes the
+        // `precmd` so it lands after the user's rc; such a tab runs its
+        // provider before any prompt, so that consumer never runs and both the
+        // delta and its temp file would be left behind. The `-c` command is the
+        // only point after user rc and before the provider, so it consumes the
         // file itself. Bash needs no equivalent — `scribe.bash` applies the
         // delta inline while it is being sourced, which is already post-rc.
         ShellKind::Zsh => vec![
@@ -1183,12 +1183,30 @@ fn tool_exec_args(kind: ShellKind, exec: &str) -> Vec<String> {
     }
 }
 
+/// Run a command through the shell, then terminate with its status.
+///
+/// Pi must occupy command position so shell functions and aliases loaded by
+/// startup files resolve before the external binary. PowerShell exits when its
+/// `-Command` returns, so it needs no explicit exit form.
+fn shell_command_with_exit(kind: ShellKind, command: &str) -> String {
+    match kind {
+        ShellKind::Fish => format!("{command}; exit $status"),
+        ShellKind::Nushell => format!("{command}; exit $env.LAST_EXIT_CODE"),
+        ShellKind::PowerShell => command.to_owned(),
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Unknown => format!("{command}; exit $?"),
+    }
+}
+
 /// `binary`, prefixed with `exec` on every shell that has one.
 fn exec_prefixed(kind: ShellKind, binary: &str) -> String {
     if kind == ShellKind::PowerShell { binary.to_owned() } else { format!("exec {binary}") }
 }
 
 fn ai_exec_command(kind: ShellKind, launch: &AiLaunchSpec) -> String {
+    if launch.provider == AiProvider::Pi {
+        return shell_command_with_exit(kind, launch.provider.binary_name());
+    }
+
     let mut command = exec_prefixed(kind, launch.provider.binary_name());
     if launch.resume_mode == AiResumeMode::Resume {
         for arg in launch.provider.resume_args() {
@@ -1699,7 +1717,7 @@ mod tests {
         launch_argv(kind, integration_script, None, Some(ShellTool::Pi))
     }
 
-    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]]
+    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that run through their shell]]
     #[test]
     fn ai_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
         let new = AiLaunchSpec {
@@ -1755,49 +1773,69 @@ mod tests {
         );
     }
 
-    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that exec]]
+    // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that run through their shell]]
     #[test]
-    fn ai_argv_for_pi_execs_with_no_resume_args() {
-        // Pi is a first-class AI provider but never supports resume, so a
-        // structured launch is byte-for-byte the plain-tab argv plus an exec
-        // of `pi` — the same shape the legacy ShellTool::Pi path already
-        // produced (see `tool_argv_is_the_plain_tab_argv_plus_an_interactive_exec`
-        // below), and no resume flag exists to append even if one were asked for.
+    fn ai_argv_for_pi_uses_shell_resolution_with_no_resume_args() {
+        // Pi runs in command position so shell functions and aliases from the
+        // normal startup path resolve. The shell exits with Pi's status, and a
+        // malformed resume launch cannot add arguments to Pi.
         let launch = AiLaunchSpec {
             provider: AiProvider::Pi,
             resume_mode: AiResumeMode::New,
             conversation_id: None,
         };
+        let malformed_resume = AiLaunchSpec {
+            resume_mode: AiResumeMode::Resume,
+            conversation_id: Some(String::from("must-not-reach-pi")),
+            ..launch.clone()
+        };
         assert_eq!(
             ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &launch),
-            ["--rcfile", "/s/scribe.bash", "-ic", "exec pi"]
+            ["--rcfile", "/s/scribe.bash", "-ic", "pi; exit $?"]
         );
-        assert_eq!(ai_argv(ShellKind::Nushell, None, &launch), ["-i", "-c", "exec pi"]);
+        assert_eq!(
+            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &malformed_resume),
+            ["--rcfile", "/s/scribe.bash", "-ic", "pi; exit $?"]
+        );
+        let zsh = ai_argv(ShellKind::Zsh, None, &launch);
+        assert!(zsh[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", zsh[1]);
+        assert!(zsh[1].ends_with("pi; exit $?"), "{}", zsh[1]);
+        let fish = ai_argv(ShellKind::Fish, None, &launch);
+        assert!(fish[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", fish[1]);
+        assert!(fish[1].ends_with("pi; exit $status"), "{}", fish[1]);
+        assert_eq!(
+            ai_argv(ShellKind::Nushell, None, &launch),
+            ["-i", "-c", "pi; exit $env.LAST_EXIT_CODE"]
+        );
+        assert_eq!(ai_argv(ShellKind::Unknown, None, &launch), ["-ic", "pi; exit $?"]);
         assert_eq!(
             ai_argv(ShellKind::PowerShell, Some("/s/scribe.ps1"), &launch),
             ["-NoLogo", "-Command", "pi"]
         );
     }
 
-    // @lat: [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that exec]]
+    // @lat: [[server#Server#Sessions#Session Creation#Tool tabs are plain tabs that run through their shell]]
     #[test]
-    fn tool_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
-        // Byte-for-byte the AI-tab argv with the provider swapped for the tool:
-        // same `--rcfile` attachment, same interactive `-c`, same `exec`, so a
-        // Pi tab reads the startup files a plain tab reads and ends when Pi
-        // does. No resume arguments exist to append — Pi is launch-only.
+    fn tool_argv_for_pi_uses_shell_resolution_with_status_exit() {
+        // Legacy ShellTool::Pi uses the same shell command form as structured
+        // Pi: startup files resolve wrappers, then the shell exits with Pi's
+        // status. No resume arguments exist because Pi is launch-only.
         assert_eq!(
             tool_argv(ShellKind::Bash, Some("/s/scribe.bash")),
-            ["--rcfile", "/s/scribe.bash", "-ic", "exec pi"]
+            ["--rcfile", "/s/scribe.bash", "-ic", "pi; exit $?"]
         );
         let zsh = tool_argv(ShellKind::Zsh, None);
         assert_eq!(zsh[0], "-ic");
         assert!(zsh[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", zsh[1]);
-        assert!(zsh[1].ends_with("exec pi"), "{}", zsh[1]);
+        assert!(zsh[1].ends_with("pi; exit $?"), "{}", zsh[1]);
         let fish = tool_argv(ShellKind::Fish, None);
         assert!(fish[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", fish[1]);
-        assert!(fish[1].ends_with("exec pi"), "{}", fish[1]);
-        assert_eq!(tool_argv(ShellKind::Nushell, None), ["-i", "-c", "exec pi"]);
+        assert!(fish[1].ends_with("pi; exit $status"), "{}", fish[1]);
+        assert_eq!(
+            tool_argv(ShellKind::Nushell, None),
+            ["-i", "-c", "pi; exit $env.LAST_EXIT_CODE"]
+        );
+        assert_eq!(tool_argv(ShellKind::Unknown, None), ["-ic", "pi; exit $?"]);
         assert_eq!(
             tool_argv(ShellKind::PowerShell, Some("/s/scribe.ps1")),
             ["-NoLogo", "-Command", "pi"]
