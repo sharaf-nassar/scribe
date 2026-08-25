@@ -128,13 +128,13 @@ Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (`Option<f32>`, 8
 
  independently toggles CPU, memory, GPU, and network display.  wraps a single `enabled` flag for shell prompt marks.  maps an  to the matching integration toggle.
 
-`focus_follows_mouse` is a flat `[terminal]` boolean that defaults to `true`.
+`focus_follows_mouse` is a flat `[terminal]` boolean that defaults to `false`.
 The client reads it from the live config on each pointer decision, so the file
 watcher and settings save path change running windows without a restart.
 
-#### Focus follows mouse defaults on and persists an opt-out
+#### Focus follows mouse defaults off and persists an opt-in
 
-Verifies the absent key enables hover focus and an explicit `false` survives the same TOML serialization round trip used by [[crates/scribe-common/src/config.rs#save_config]].
+Verifies the absent key keeps click-to-focus and an explicit `true` survives the same TOML serialization round trip used by [[crates/scribe-common/src/config.rs#save_config]].
 
 #### Prompt bar font size follows the terminal
 

@@ -1054,11 +1054,11 @@ mod tests {
         apply_config_key(
             &mut config,
             "terminal.focus_follows_mouse",
-            &serde_json::Value::Bool(false),
+            &serde_json::Value::Bool(true),
         )
         .expect("focus-follows-mouse toggle should apply");
 
-        assert!(!config.terminal.focus.focus_follows_mouse);
+        assert!(config.terminal.focus.focus_follows_mouse);
     }
 
     #[test]

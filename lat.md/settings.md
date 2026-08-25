@@ -107,7 +107,7 @@ Terminal page general section — scrollback lines, natural scrolling, copy on s
 
 The "Focus follows mouse" toggle writes the flat
 `terminal.focus_follows_mouse` boolean through
-[[crates/scribe-client/src/settings/apply.rs#apply_config_key]]. It defaults ON,
+[[crates/scribe-client/src/settings/apply.rs#apply_config_key]]. It defaults OFF,
 reads back through the settings value model, and applies live through the
 running client's existing config watcher.
 
@@ -138,9 +138,11 @@ Status bar stat toggles remain on the Terminal page under the Status Bar section
 
 Smart Selection settings live in their own Terminal page section and persist as one global `terminal.smart_selection` payload.
 
-The settings page manages activation (`double_click` or `quad_click`), ordered regex rules, enabled state, precision, and per-rule actions. `terminal.smart_selection.reset` restores the built-in recognizers. The apply path in  deserializes the full payload and validates enabled Rust regexes before saving, so bad rules are not written to config.
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_smart_selection_panel]] uses progressive disclosure: activation first, then a scrollable tab list beside the selected rule editor. Rules can be added, duplicated, removed, reordered, enabled, named, assigned precision, and tested at a chosen sample-text cursor.
 
-The frontend rule editor in  supports add, duplicate, remove, reorder, enable/disable, regex validation, preview text, and action editing for Open File, Open URL, Run Command, Run Coprocess, Send Text, Run Command in Window, and Copy. Smart Selection remains global; there are no profile-specific rule sets.
+Each selected rule expands its ordered context-menu actions. Kind, parameter, and legacy/interpolated mode are editable for Open File, Open URL, Run Command, Run Coprocess, Send Text, Run Command in Window, and Copy; actions can be added, duplicated, removed, or reordered.
+
+Every durable edit sends the whole `terminal.smart_selection` payload through the existing apply path, which validates enabled Rust regexes before saving. Invalid regexes stay in the field with inline recovery text and can be disabled without discarding the draft; valid changes live-reload already-open panes. Keyboard focus scrolls offscreen rule rows into view. Smart Selection remains global.
 
 ### AI Keys
 
@@ -172,27 +174,13 @@ The settings window writes these keys itself — see [[settings#Settings#GPUI Se
 
 ### Update Keys
 
-Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer hours, 1–168, stored internally as seconds), and `channel` (stable/beta) to select the release track.
+The Updates page exposes `update.enabled` and `update.check_interval_hours` for automatic update behavior. `update.channel` remains supported in `config.toml` for updater compatibility, but the settings window no longer renders a Channel control.
 
-The Updates page also exposes `github_ci.enabled` as "GitHub CI run status". The existing toggle reader and apply path persist it immediately, then `ConfigReloaded` updates [[crates/scribe-server/src/github_ci.rs#github_ci_enabled]] without restarting Scribe.
+The old Releases page is folded into Updates. "Check for updates" remains beside the automatic-update controls and still bypasses the periodic schedule when `update.enabled = false`.
 
-Enabling the setting only makes later qualifying local pushes eligible for CI tracking. The save and reload paths run no `gh` authentication probe and make no GitHub request, so idle traffic stays zero.
+Opening Updates lazily requests `ListReleases`; the worker also converts every sanitized body into typed GPUI blocks before returning to the UI thread. The bottom viewer uses its own 360px scroll region; a centered title sits between equal arrow slots, and an arrow exists only when that direction has another release.
 
-The Updates page also exposes a "Check Now" action button that bypasses the periodic schedule entirely and works even when `enabled = false`. Clicking it sends a webview IPC of type `request_update_check`, which the host translates into a transient connection to `server.sock` carrying a `CheckForUpdates` message — see  for the server-side path. The result (`NoUpdate`, `UpdateAvailable { version, release_url }`, or `Failed { reason }`) is rendered inline as status text next to the button via the JS callback `updateCheckResult`. When the result is `UpdateAvailable`, the same broadcast that the periodic checker would emit also fires, so the regular client-side CTA appears alongside the in-settings status.
-
-The settings binary's transient `server.sock` connection is implemented in  using synchronous std I/O plus the same length-prefixed msgpack framing as the rest of the protocol. Cross-thread delivery of the response back onto the GTK main loop uses `glib::timeout_add_local` polling a `std::sync::mpsc` channel; on macOS it goes through a new `TaoUserEvent::UpdateCheckResult` variant on the existing event-loop proxy. The active glib timeout source is tracked so the window-close path can cancel any in-flight poll before the webview is dropped.
-
-#### Update Now Mode
-
-After a `UpdateAvailable` result the same action button morphs in place to a green `Update Now`, and a module-level `pendingUpdate` flag routes subsequent clicks to install instead of re-running the check.
-
-The button is the single source of truth for state, switched by  across four modes (`check`, `checking`, `update`, `installing`) that map to label + disabled + `is-primary` class. Confirmation uses a native `window.confirm` — the wry webview supports it and the codebase has no in-app modal primitive worth reusing. On confirm the JS dispatches a `trigger_update` IPC, the button flips to disabled `Installing…` (still green), and the status line acknowledges the install is in flight.
-
-The host-side `trigger_update` branch in  dispatches to , which spawns a worker thread that calls  — a fire-and-forget `TriggerUpdate` frame on a fresh transient socket. The server accepts it via a sibling first-message arm to `CheckForUpdates` / `ListReleases` (see ) and drives the install through the same `UpdaterHandle::trigger()` channel the in-client overlay uses. Install progress is broadcast only to registered clients, so the in-client overlay still owns the live download/verify/install feedback and the restart-required prompt; the settings UI deliberately stays optimistic — `Installing…` until the user re-clicks `Check Now` or reopens settings.
-
-If the server is unreachable when the click lands (daemon stopped, socket path missing), the worker thread logs a `WARN` and the button stays in `Installing…` indefinitely — there is no automatic timeout-back-to-`Update Now` path, since success is unobservable from the transient socket. Recovery requires the user to reopen settings and re-click `Check Now`.
-
-The version text rendered after `Update available:` is an inline link (`.update-check-link`) that does not navigate the OS browser. Instead,  calls `.click()` on `.nav-item[data-tab="releases"]`, so the existing `initNavigation` handler swaps the active page and lazy-loads the release list. This keeps the user inside the settings window with full notes for every version rather than opening a tag-specific page in the browser.
+`github_ci.enabled` appears on the Terminal page under Status bar as "GitHub CI run status". Its existing reader and apply path persist it immediately, then `ConfigReloaded` updates [[crates/scribe-server/src/github_ci.rs#github_ci_enabled]] without restarting Scribe. Enabling it only makes later qualifying local pushes eligible for CI tracking; saving performs no `gh` authentication probe or GitHub request, so idle traffic stays zero.
 
 ### Notification Keys
 
@@ -234,25 +222,13 @@ Feature 015's "Window Sharing" section governs who may type into a shared window
 
 ## Releases
 
-Browse historical Scribe releases from inside the settings window. The panel uses a single-content-area layout with a native `<select>` picker, Newer / Older nav buttons, and a "View on GitHub" link, driven by a `selectedReleaseVersion` JS state.
+Release history shares the Updates page instead of owning a sidebar page. [[crates/scribe-client/src/settings/window.rs#SettingsWindow#load_releases]] lazily sends `ListReleases`; [[crates/scribe-client/src/settings/release_notes.rs]] converts sanitized HTML into GPUI heading, paragraph, list, code, quote, and rule blocks.
 
-Release data is fetched over IPC from  via a one-shot Unix-socket request implemented in . The host-side IPC dispatcher in  routes `request_releases` (spawns a worker thread, calls `request_release_list`, then `evaluate_script("window.SCRIBE_ON_RELEASE_LIST(...)")` on the UI thread) and `open_external_url` (http(s)-scheme-validated via , dispatched to `xdg-open` / `open`).
+The newest release opens first. Left moves newer, right moves older, unavailable directions render no arrow, and navigation resets only the nested note scroller. Only the compact centered title/date block is the GitHub release link—not the surrounding header row—and its zero-delay "View in Github" tooltip is anchored above the block so it never covers the notes.
 
-### Layout
+Body links retain sanitized HTTP(S) targets and open through the client's allowlisted URL path. A persistent right-edge track/thumb makes overflow visible immediately; the document is also a keyboard stop whose Page Up, Page Down, Home, and End keys control only its nested scroll.
 
-The page header is a flex row: title and subtitle on the left, "View on GitHub" anchor on the right. The panel below centers `[Older]` `[picker]` `[Newer]` as a single flex row.
-
-Vertical rhythm: `.page-header-row` carries a 16px bottom margin into the panel, and `.releases-header` carries a matching 16px bottom margin into the release-notes article — so the nav row reads as vertically centered between the page subtitle above and the article below.
-
-The content area below is a single `<article id="release-notes">` that receives the pre-sanitized HTML for the selected release. Both nav buttons start `disabled`; `updateNavBoundaries()` is the single source of truth that toggles the `disabled` attribute as the selection moves — Newer disables at index 0, Older at index `releases.length - 1` — so the picker and buttons stay in sync.
-
-The native `<select>` carries one `<option>` per release labeled `vX.Y.Z — YYYY-MM-DD` with a `[PRE]` prefix when `prerelease` is true. Native `<select>` cannot render arbitrary HTML, so pre-release affordances live in the option label text and as a `.pre-release-badge` span inside the rendered notes header. Links inside rendered notes and the `[data-external]` GitHub link are delegated to `open_external_url` so the OS browser opens them instead of the webview.
-
-### Failure UX
-
-The status banner under the content area renders distinct loading, stale, and failed sub-views, all backed by the Fresh / Stale / Failed transitions in .
-
-Loading shows a non-blocking "Loading releases…" message (class `is-loading`). Stale renders the cached releases plus a "may be stale" indicator with the last refresh timestamp and reason (class `is-stale`) and a Refresh button that re-posts `request_releases`. Failed renders the plain-language `reason` from the payload (class `is-error`) and a Retry button that re-posts `request_releases`. The Refresh / Retry buttons reuse the `.releases-nav-btn` styling for visual consistency.
+Fresh results render immediately. Stale results keep cached notes and expose Refresh; failed results explain the problem and expose Retry. The server-side catalog and protocol remain unchanged.
 
 ## Sidebar Footer
 
@@ -264,7 +240,7 @@ The GPUI window renders `Scribe v<version>` directly in [[crates/scribe-client/s
 
 The settings app uses the same singleton structure as the terminal client: a lock file plus a Unix socket for focus handoff. `settings.lock` serializes bind-or-connect, while the bound `settings.sock` owns the singleton lifetime.
 
-Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process. Focus commands may carry the launcher terminal rectangle; new settings processes receive the same anchor via `SCRIBE_SETTINGS_ANCHOR`.
+Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process. Focus commands may carry the launcher terminal rectangle; `run_settings` parses the same anchor from `SCRIBE_SETTINGS_ANCHOR` before singleton acquisition and window creation.
 
 That same socket also accepts a `quit` command from the client and server shutdown paths. The client sends it immediately for explicit `Quit Scribe`, and the server sends it after a short grace period once the last client disconnects, so the standalone settings window does not outlive the app while still tolerating fast reconnect handoffs. Socket-driven `quit` exits preserve the persisted `open` flag on both Linux and macOS so the next fresh Scribe launch restores settings only when the window had been open before app shutdown; native user closes still mark it closed.
 
@@ -272,69 +248,155 @@ That same socket also accepts a `quit` command from the client and server shutdo
 
 Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via .
 
-The GPUI settings launch opens at its 1040×720 layout minimum when the display
-can hold it. Saved geometry is restored only when its size is between that
-minimum and the primary display's visible work area; undersized or oversized
-legacy physical-pixel geometry migrates to the compact centered composition.
+The GPUI settings launch opens at its 1040×720 layout minimum when the display can hold it. [[crates/scribe-client/src/main.rs#TerminalView#open_or_focus_settings]] passes the launching terminal's live screen-space rectangle to [[crates/scribe-client/src/settings/window.rs#open_settings_window]].
+
+An in-app anchor owns position: the saved settings size is retained when sane, then centered over the source terminal and clamped to the source display's visible work area. Saved `x`/`y` apply only when no launcher anchor exists, so a prior top-right placement cannot override the window that opened Settings.
+
+Undersized or oversized legacy physical-pixel geometry migrates to the compact composition. Platforms that do not expose a source origin fall back to GPUI/compositor placement rather than inventing `(0, 0)`.
+
+Computing the anchor is not enough to be placed by it. On X11 the creation
+bounds handed to `open_window` are only a hint — GPUI sets no
+`USPosition`/`PPosition`, and under ICCCM a window without one is placed at the
+window manager's discretion, which is why a correctly centred settings window
+still opened in the corner of the screen. [[crates/scribe-client/src/settings/window.rs#open_settings_window]]
+therefore re-asserts the computed origin through
+[[crates/scribe-client/src/monitor.rs#apply_saved_position]], the same EWMH
+move the terminal windows already use, once before the window is mapped and
+again from the first frame via `SettingsWindow::apply_pending_position` — a
+window manager may ignore a move for a window it has not mapped yet. The
+pending value is taken, so it runs once and never fights a window the user has
+since moved.
+
+Only an anchored position is asserted. Without a launcher anchor every
+candidate is a guess — a stale saved position, or a centring on whichever
+display GPUI calls primary — and forcing a guess is worse than the window
+manager's own placement, which at least lands on the active monitor. An
+unanchored open therefore stays a hint, as it was before the assertion existed.
+
+The anchor itself comes from the launching window's live rect
+([[crates/scribe-client/src/main.rs#TerminalView#live_settings_anchor]]),
+refreshed by the same bounds observer that drives geometry capture, and falls
+back to the persisted record. The record alone was not enough: it carries an
+origin only on platforms that expose one, and a window that has never moved has
+no saved position at all.
+
+Raising counts as opening. A second chord raises the existing settings window
+rather than stacking a duplicate, and
+[[crates/scribe-client/src/settings/window.rs#recenter_settings_window]] moves
+it back over the window that asked. Without it the chord answered from wherever
+the window was left — after a move, or on a second monitor, an entirely
+different screen from the one the user pressed it on.
 
 ## GPUI Settings Window
 
 The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process, opened from a running terminal window or from `scribe-client --settings`.
 
-### Typeset Ink presentation
+### Console presentation
 
-The settings window is set like technical documentation: one unified ink ground, hierarchy carried by type and spacing instead of boxed rows, and amber spent only on live state.
+The settings window is one instrument surface: a single ground, one hairline
+between rows, and one accent that means live state and nothing else.
 
-[[crates/scribe-client/src/settings/window.rs#SettingsColors#resolve]] fixes the
-settings palette independently from the active terminal theme: `#141518`
-unified ground, `#1d1f24` raised controls, `#101114` engraved text inputs,
-`#22242a` menus, white-alpha hairlines (8% seams, 12% emphasis), `#e9e8e4`
-text, `#a6a5a0` secondary, `#83827b` quiet, and `#f5b83a` amber reserved for
-selection glyphs, focused inputs, the on-state, and status. Validation
-failures use a separate `#e0584c` error ink so a rejected edit never scans
-like live state, and the status line speaks product language ("Saved
-Ligatures.", "Workspace root added.") via `commit_status` rather than
-echoing dotted config keys. Rows carry no rules; hovering washes a row in a
-faint bled pill, and the only structural hairlines are the titlebar seam,
-the sidebar seam, and control outlines.
+No cards, no tiles, no boxed controls, and no standing status chrome —
+hierarchy comes from type scale, spacing, and restraint.
 
-The 38px titlebar shares the ground and centers `Scribe Settings` between a
-120px macOS traffic-light reservation and three 40px icon-glyph window
-controls. Below it a 232px sidebar leads with the search field, scrolls its
-contents list independently, and ends in a monospace `Scribe v<version>`
-footer. The eleven pages group under Terminal, Intelligence, Workflow,
-System, and Connectivity; groups separate by air under quiet uppercase
-labels, and each 32px inset row rounds at 5px with a neutral selected wash
-whose page glyph turns amber. Non-focusable group labels do not enter
+[[crates/scribe-client/src/settings/window.rs#SettingsColors#resolve]] fixes
+the settings palette independently from the active terminal theme: `#0c0d0f`
+ground, `#17181c` for the one lifted surface (the anchored menu), white-alpha
+hairlines (6% rules, 8% window edge), `#edeef1` text, `#9aa0a8` data values,
+`#7d838d` for every secondary text role, and `#666c75` for non-text marks
+only. That last split is load-bearing: `quiet_text` clears WCAG 1.4.3 at
+4.6:1 and carries section labels, units, captions, and placeholders, while
+`glyph` clears only 1.4.11 at 3.7:1 and is restricted to chevrons, arrows,
+the search magnifier, and window controls. Putting text in `glyph` is the
+regression this pair exists to prevent.
+
+`#6e8bff` is spent only on live state — the keyboard focus ring, an
+in-progress shortcut capture, and the mark on a selected menu option. Active
+state is white (`text`): the ON toggle track, the selected nav row's label,
+a selected inline option. Keeping "on" and "live" in different channels is
+what lets the accent stay rare enough to read. Validation failures use a
+separate `#ff7a70` error ink.
+
+The 44px titlebar shares the ground, carries no seam, and leads with
+`Settings` at the same 18px spine the sidebar labels use; macOS keeps its
+traffic-light reservation. The 212px sidebar has no seam either — the measure
+and the gutter separate the columns. Its contents list is text-only at 28px
+per row (no page glyphs; the label is the affordance), grouped under quiet
+10px tracked labels with 26px of air above each group, and it ends in a
+monospace `v<version>` footer. Non-focusable group labels do not enter
 keyboard traversal.
 
 The real AccessKit search input at the top of the sidebar receives focus with
 Ctrl+K and filters page names, summaries, section names, control labels, and
-dotted keys. Matching pages remain navigable, and matching controls filter
-inside the selected page. Its visual placeholder disappears while the empty
-field is focused, while the AccessKit placeholder remains available to
-assistive technology.
+dotted keys. It has no resting chrome: a wash on hover, an accent ring on
+focus, and the magnifier at the trailing edge so the placeholder starts on
+the label spine. Matching pages remain navigable, and matching controls
+filter inside the selected page.
 
-Content uses 44px gutters and caps every row at an 840px measure. The page
-header pairs a 20px bold title with a monospace `config.toml · live apply`
-corner note (omitted on the server-driven Releases page) over a 14px summary.
-Section heads are quiet uppercase caps with more air above than below, and
-rows run 46px (62px with a description) against a stable 300px value column:
-choices are 240×30 with an anchored 30px-row menu, steppers 152×30 with 36px
-actions, switches 38×22 fully rounded with an amber on-fill, text inputs are
-30px tall on the engraved inset, and color selectors are 240×30 swatch/value
-triggers with anchored preset and custom palettes. Actions are 30px neutral
-outline buttons. Keybinding and gated values render as plain right-aligned
-dim monospace — the missing control outline is the read-only mark, and
-AccessKit still says `Read-only value` explicitly.
+Content uses 34px gutters and caps every row at a 660px measure centred in
+the pane, so the shared right edge the controls align on stays put as the
+window grows. The page header is a 17px medium title over a quiet 12.5px
+summary and carries no corner note: live apply is the contract, not a
+caption, and the config path belongs in a command rather than in chrome.
+Section labels are 10px tracked caps with 42px above and 4px below.
+
+Rows run 52px, growing only for a rejected edit or a capture hint, separated
+by one hairline that the first row of each section suppresses. Controls carry
+no resting fill: switches are 32×18 with a white on-track and a ground-tone
+knob, steppers are a bare monospace value whose `−`/`+` are revealed by the
+row's own hover group so the number column never shifts, choices are the
+value plus a chevron, text and hex fields are an underline that appears on
+hover and turns accent on focus, and actions are text with a rule under them.
+A gated row mutes to `quiet_text` and appends `· off` rather than dropping to
+an opacity that would push its explanation below 4.5:1. Keybinding and
+read-only values render as plain right-aligned quiet monospace — the missing
+outline is the read-only mark, and AccessKit still says `Read-only value`.
+
+The Colors page leads with the palette rather than the controls that adjust
+it. [[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_ansi_palette]]
+renders the sixteen ANSI entries as one 8×2 swatch grid instead of sixteen
+near-identical hex rows — the palette shown as a palette — and
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#render_terminal_preview]]
+follows it with a live sample line, so an edit is judged against terminal
+output instead of against abstract chips. Theme, prompt-bar, and the rest of
+the rows sit underneath; the reader never scrolls to see what a control just
+did. Each grid cell keeps the same anchored editor the rows used — presets,
+hue strip, custom palette, exact-value entry.
+
+### Preset preview
+
+A preset row answers one question — is this readable — so it renders one line
+of terminal set in the candidate theme rather than a strip of colour chips.
+
+[[crates/scribe-client/src/settings/window.rs#theme_preview_strip]] paints the
+row's tile from that preset's own background, foreground, and prompt colours,
+and the menu widens to `THEME_MENU_WIDTH` to hold a name beside it. Long
+preset names elide instead of wrapping, because a wrapped label in a
+fixed-height row overlaps the row beneath it.
+
+Hovering a row previews it across the whole page: `preview_theme` holds the
+pointed-at theme, and
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow#displayed_theme]]
+is what the swatch grid, its hex captions, and the terminal preview paint
+from. The preview pane draws its own background from that theme and takes
+every colour in it — including the dim text, which is the theme's bright black
+rather than a settings token. Background is the half of a theme that decides
+whether anything else on it is legible, so a preview that kept the settings
+ground would misreport every contrast it showed. Nothing is written until the row is clicked — browsing costs no config
+edit — and closing the menu clears it.
+
+Sliding between rows fires the entered row's hover before the left row's, so
+the leave branch clears `preview_theme` only when the theme still on screen is
+its own. Without that guard the row being left erases the preview its
+neighbour just set, and the page snaps back to the saved theme mid-browse.
 
 The content pane's page-length affordance is the terminal's own overlay
 scrollbar rather than a second one: [[crates/scribe-client/src/settings/window.rs#SettingsWindow#tick_content_scrollbar]]
 drives [[crates/scribe-client/src/scrollbar.rs#ScrollbarState]] on the render
 pass, so the same 6px thumb fades in on scroll and out after 1.5s of idle. It
 also shows once on open and on every page switch, which is when page length
-is the thing the reader needs told. The thumb is a quiet 24% white wash, not
-amber — length is structure, not live state — and it is painted absolutely
+is the thing the reader needs told. The thumb is a quiet white wash, not
+the accent — length is structure, not live state — and it is painted absolutely
 over the scroller, reserving no column. Under `reduce_motion` it simply stays
 put on an overflowing page instead of animating. Pixels are the scroll unit
 the pure geometry counts in, converted through
@@ -374,7 +436,7 @@ The eleven settings pages are described by
 [[crates/scribe-client/src/settings/model.rs#page_controls]]: each owns an
 ordered control list keyed by the dotted config key the apply path understands.
 
-The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
+The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, notifications, remote, and agent API. Updates combines the old update and release actions; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
 The Colors page keeps only the `Custom` escape hatch in its declarative preset
 control. [[crates/scribe-client/src/settings/window.rs#build_theme_preset_cache]]

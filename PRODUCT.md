@@ -27,13 +27,16 @@ across tabs, panes, and a prompt bar.
 - The settings surface is a second GPUI window inside the running client
   process (`crates/scribe-client/src/settings/`), opened from a keybinding,
   the command palette, the status-bar gear, or `scribe-client --settings`.
+  In-app launches center it over the terminal window that initiated them.
 - Settings edits live-apply through a TOML config write plus file-watcher
   reload; there is no Save button.
+- Updates embeds browsable release notes; Terminal includes the full Smart
+  Selection rule editor.
 - The settings palette is deliberately fixed (independent of the active
   terminal theme) so the surface stays a stable instrument while the user
   edits themes.
 - Eleven pages: Appearance, Colors, Terminal, Keybindings, AI, Environment,
-  Workspaces, Updates, Releases, Notifications, Remote.
+  Workspaces, Updates, Notifications, Remote, Agent API.
 
 ## Capabilities and Constraints
 
@@ -49,11 +52,12 @@ across tabs, panes, and a prompt bar.
 
 ## Brand Commitments
 
-- Amber (`#f5b83a` family) is the settings surface's incumbent accent
-  [assumed: carries CRT amber-phosphor heritage worth keeping as identity].
-- Warm off-white text on deep neutral ground; flat surfaces, 0–6px radii,
-  one-pixel rules; no cards-with-shadows chrome [assumed from incumbent
-  design and user's stated frontend defaults].
+- The settings surface is monochrome: white marks the "on" state and a
+  single indigo (`#6e8bff`) marks live state only — focus, capture, and the
+  selected menu option.
+- Near-white text on a deep neutral ground; flat surfaces, 0–8px radii,
+  one-pixel rules; no cards, tiles, or boxed controls.
+- Monospace is data only; the data face is the terminal's own JetBrains Mono.
 
 ## Product Principles
 

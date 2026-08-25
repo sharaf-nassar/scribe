@@ -972,19 +972,12 @@ impl Default for TerminalPromptBarConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalFocusConfig {
     /// Focus a painted terminal pane when the pointer enters it without a
-    /// button held. Enabled by default; click-to-focus remains unchanged when
-    /// disabled.
-    #[serde(default = "default_true")]
+    /// button held. Disabled by default; click-to-focus remains unchanged.
+    #[serde(default)]
     pub focus_follows_mouse: bool,
-}
-
-impl Default for TerminalFocusConfig {
-    fn default() -> Self {
-        Self { focus_follows_mouse: true }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2632,20 +2625,20 @@ danger_color = "#ff0000"
         assert_eq!(parsed.terminal.prompt_bar.font_size, Some(22.0));
     }
 
-    // @lat: [[common#Configuration#Terminal#Focus follows mouse defaults on and persists an opt-out]]
+    // @lat: [[common#Configuration#Terminal#Focus follows mouse defaults off and persists an opt-in]]
     #[test]
-    fn focus_follows_mouse_defaults_on_and_persists_false() {
+    fn focus_follows_mouse_defaults_off_and_persists_true() {
         let default = super::ScribeConfig::default();
-        assert!(default.terminal.focus.focus_follows_mouse);
+        assert!(!default.terminal.focus.focus_follows_mouse);
 
         let parsed: super::ScribeConfig =
-            toml::from_str("[terminal]\nfocus_follows_mouse = false\n")
-                .expect("explicit opt-out parses");
-        assert!(!parsed.terminal.focus.focus_follows_mouse);
+            toml::from_str("[terminal]\nfocus_follows_mouse = true\n")
+                .expect("explicit opt-in parses");
+        assert!(parsed.terminal.focus.focus_follows_mouse);
 
         let written = toml::to_string_pretty(&parsed).expect("config serializes");
         let round_trip: super::ScribeConfig = toml::from_str(&written).expect("config reparses");
-        assert!(!round_trip.terminal.focus.focus_follows_mouse);
+        assert!(round_trip.terminal.focus.focus_follows_mouse);
     }
 }
 

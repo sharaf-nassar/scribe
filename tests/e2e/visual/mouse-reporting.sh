@@ -605,6 +605,7 @@ capture /output/mouse-09-tracking-off.png
 echo "PHASE 9 PASS: DECRST 1000 gave the wheel back to the scrollback — $LINE"
 
 reset_pane
+set_focus_follows_mouse true
 
 # @lat: [[test#Test Harness#Visual E2E Tests#The wheel scrolls and mouse reports reach the PTY]]
 # ── Phase 10: button-free motion focuses exactly once ─────────────

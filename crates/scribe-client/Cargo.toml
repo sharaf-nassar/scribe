@@ -25,6 +25,7 @@ gpui_platform.workspace = true
 gpui_tokio.workspace = true
 image = { version = "0.25.10", default-features = false }
 notify.workspace = true
+quick-xml = "0.39"
 regex.workspace = true
 # Settings window: singleton socket peer-cred/flock, one-shot server-action
 # framing, and the {key,value} config-apply payloads.

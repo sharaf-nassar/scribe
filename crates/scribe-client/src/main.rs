@@ -161,13 +161,12 @@ use scribe_client::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{
         GroupBadge, TabBarColors, TabData, accent_tab_tone, context_suffix, flash_blend, px_units,
-        reorder_target_index, tab_display_title, workspace_pill_label,
+        reorder_target_index, workspace_pill_label,
     },
     tab_session::{TabAddress, TabEntry, TabSessions},
     titlebar::{
         StandaloneBadge, TAB_MIN_WIDTH, TAB_WIDTH, TabActivationSource, TitlebarEvent,
         TitlebarView, TitlebarWorkspaceDragSource, agent_active_glyph, beads_graph_icon,
-        title_columns,
     },
 };
 use scribe_common::agent::{AgentActionOutcome, AgentCapability, AgentPolicyMode};
@@ -189,6 +188,7 @@ use scribe_common::{
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
+    settings_window::{SETTINGS_WINDOW_ANCHOR_ENV, SettingsWindowAnchor},
     socket::{ClientFocusGeneration, server_socket_path},
     terminal_images::ImageLimits,
 };
@@ -1981,6 +1981,10 @@ struct TerminalView {
     /// Cold-restart snapshot persistence, geometry persistence, and the replay
     /// of whatever this process claimed at launch.
     restore: RestoreRuntime,
+    /// This window's most recent live rect, refreshed every frame by
+    /// [`TerminalView::capture_geometry`] and used as the settings window's
+    /// centring anchor.
+    last_window_bounds: Option<Bounds<Pixels>>,
     /// This view has retired from the process-wide active-view count.
     process_shutdown_finished: bool,
     /// Held to keep the window-bounds observer alive, which is what notices a
@@ -2373,6 +2377,11 @@ impl TerminalView {
         // later X11 start in the screen corner; the record stores no origin at
         // all instead, and restore falls back to the default placement.
         let bounds = window.bounds();
+        // The settings anchor reads this rather than the persisted record: the
+        // record only carries an origin on platforms that expose one, and a
+        // window that has never been moved has no saved position at all. The
+        // live rect is what "centre it on the window I opened it from" means.
+        self.last_window_bounds = Some(bounds);
         let (board_pins, lane_pins, board_heights, board_text_scale) = self
             .shared
             .beads_boards
@@ -2567,6 +2576,7 @@ impl TerminalView {
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
             restore: RestoreRuntime::from_seed(seed),
+            last_window_bounds: None,
             process_shutdown_finished: false,
             _bounds_observer: bounds_observer,
         }
@@ -3545,14 +3555,48 @@ impl TerminalView {
     /// chord can never drift apart, and wiring one surface wires both. Every
     /// variant is named rather than folded into a `_` arm, so a new
     /// [`KeyAction`] fails to compile instead of silently joining a dropped set.
-    fn dispatch_key_action(&mut self, action: KeyAction, cx: &mut Context<Self>) {
+    fn dispatch_key_action(
+        &mut self,
+        action: KeyAction,
+        settings_anchor: Option<SettingsWindowAnchor>,
+        cx: &mut Context<Self>,
+    ) {
         match action {
             KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
             KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
             KeyAction::OpenCommandPalette => self.open_command_palette(cx),
             KeyAction::OpenFind => self.open_find_overlay(cx),
-            KeyAction::OpenSettings => self.open_or_focus_settings(cx),
+            KeyAction::OpenSettings => self.open_or_focus_settings(settings_anchor, cx),
         }
+    }
+
+    fn current_settings_anchor(&self) -> Option<SettingsWindowAnchor> {
+        self.live_settings_anchor().or_else(|| self.recorded_settings_anchor())
+    }
+
+    /// The anchor from this window's live rect — the first choice, because it
+    /// exists as soon as the window has painted a frame and does not depend on
+    /// a geometry record that may carry no origin.
+    fn live_settings_anchor(&self) -> Option<SettingsWindowAnchor> {
+        let bounds = self.last_window_bounds?;
+        let anchor = SettingsWindowAnchor {
+            x: logical_px_to_i32(f32::from(bounds.origin.x)),
+            y: logical_px_to_i32(f32::from(bounds.origin.y)),
+            width: logical_px_to_i32(f32::from(bounds.size.width)),
+            height: logical_px_to_i32(f32::from(bounds.size.height)),
+        };
+        anchor.is_sane().then_some(anchor)
+    }
+
+    fn recorded_settings_anchor(&self) -> Option<SettingsWindowAnchor> {
+        let geometry = self.restore.geometry.as_ref()?;
+        let anchor = SettingsWindowAnchor {
+            x: geometry.x?,
+            y: geometry.y?,
+            width: i32::try_from(geometry.width).ok()?,
+            height: i32::try_from(geometry.height).ok()?,
+        };
+        anchor.is_sane().then_some(anchor)
     }
 
     /// Open the settings window from inside the running terminal window, or
@@ -3566,21 +3610,36 @@ impl TerminalView {
     /// socket — the window is opened here and its [`WindowHandle`] retained.
     /// That handle *is* the deduplication: a second request updates it, which
     /// fails only once the window has been closed, and a live update activates
-    /// the existing window instead of stacking a duplicate.
+    /// the existing window instead of stacking a duplicate. A new window uses
+    /// the initiating terminal's live bounds as its centering anchor.
     ///
     /// The cross-process singleton ([`scribe_client::settings::singleton`])
     /// is deliberately not consulted here. It is the `--settings` launch path's
     /// guard, and its primary holds an exclusive `flock` for the whole window
     /// lifetime, so acquiring it from the terminal window would park the live
     /// shell on a lock rather than answer a keystroke.
-    fn open_or_focus_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_or_focus_settings(
+        &mut self,
+        anchor: Option<SettingsWindowAnchor>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(handle) = self.settings_window
-            && handle.update(cx, |_, window, _| window.activate_window()).is_ok()
+            && handle
+                .update(cx, |_, window, ctx| {
+                    window.activate_window();
+                    // Raising it is not enough: it has to come back over *this*
+                    // window, which after a move or on a second monitor is not
+                    // where it was left.
+                    if let Some(anchor) = anchor {
+                        scribe_client::settings::recenter_settings_window(window, anchor, ctx);
+                    }
+                })
+                .is_ok()
         {
             tracing::info!("focused the open settings window");
             return;
         }
-        self.settings_window = open_settings_window(cx);
+        self.settings_window = open_settings_window(cx, anchor);
         if self.settings_window.is_some() {
             tracing::info!("opened the settings window");
         }
@@ -3875,7 +3934,8 @@ impl TerminalView {
                 self.offer_action_to_controller(action);
                 return;
             }
-            self.dispatch_key_action(key_action, cx);
+            let settings_anchor = self.current_settings_anchor();
+            self.dispatch_key_action(key_action, settings_anchor, cx);
             if let Some(correlation_id) = correlation_id {
                 self.report_action_completion(correlation_id, AgentActionOutcome::Completed, None);
             }
@@ -8187,8 +8247,9 @@ impl TerminalView {
             b: (colors.bg.b + 0.04).min(1.0),
             a: colors.bg.a,
         };
-        let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
-        let (display, _truncated) = tab_display_title(&tab.title, title_columns(suffix_len, tab));
+        // Same as the titlebar: the flexed label truncates at the real edge,
+        // so a fixed column budget only cuts the title short of its own slot.
+        let display = tab.title.clone();
         let agent_glyph = tab.agent_active.then(|| agent_active_glyph(colors.accent));
         let ai_dot = tab
             .ai_indicator
@@ -8221,7 +8282,7 @@ impl TerminalView {
             .relative()
             .flex()
             .items_center()
-            .flex_grow_0()
+            .flex_grow(1.0)
             .flex_shrink_1()
             .flex_basis(px(TAB_WIDTH))
             .min_w(px(TAB_MIN_WIDTH))
@@ -9773,7 +9834,12 @@ impl TerminalView {
     /// terminal shortcut sends its fixed escape sequence. Returns `true` when
     /// the key was consumed, leaving level 4 ([`Self::on_key_down`]) for
     /// everything else.
-    fn handle_binding(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_binding(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(input) = KeyInput::from_key_down(event) else {
             return false;
         };
@@ -9783,7 +9849,7 @@ impl TerminalView {
         // One dispatcher for chords and palette rows alike; the palette chord
         // is normally claimed earlier by `handle_overlay_key`, and reaching it
         // here simply opens the overlay.
-        self.dispatch_key_action(action, cx);
+        self.dispatch_key_action(action, settings_anchor_from_bounds(window.bounds()), cx);
         true
     }
 
@@ -10511,8 +10577,11 @@ impl TerminalView {
             }
         });
         let settings_view = cx.entity().downgrade();
-        let on_settings = Box::new(move |_window: &mut Window, app: &mut App| {
-            if let Err(error) = settings_view.update(app, TerminalView::open_or_focus_settings) {
+        let on_settings = Box::new(move |window: &mut Window, app: &mut App| {
+            let anchor = settings_anchor_from_bounds(window.bounds());
+            if let Err(error) = settings_view.update(app, |view, ctx| {
+                view.open_or_focus_settings(anchor, ctx);
+            }) {
                 tracing::debug!(?error, "settings gear activation dropped with its view");
             }
         });
@@ -11673,7 +11742,7 @@ impl TerminalView {
         if self.handle_overlay_key(event, window, cx)
             || self.focus_next_titlebar_control(event, window, cx)
             || self.handle_vi_key(event, cx)
-            || self.handle_binding(event, cx)
+            || self.handle_binding(event, window, cx)
         {
             return;
         }
@@ -12033,6 +12102,16 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
         )
     });
     size(px(wanted.width), px(wanted.height))
+}
+
+fn settings_anchor_from_bounds(bounds: Bounds<Pixels>) -> Option<SettingsWindowAnchor> {
+    let anchor = SettingsWindowAnchor {
+        x: logical_px_to_i32(f32::from(bounds.origin.x)),
+        y: logical_px_to_i32(f32::from(bounds.origin.y)),
+        width: logical_px_to_i32(f32::from(bounds.size.width)),
+        height: logical_px_to_i32(f32::from(bounds.size.height)),
+    };
+    anchor.is_sane().then_some(anchor)
 }
 
 fn rect_from_window_bounds(bounds: Bounds<Pixels>) -> Rect {
@@ -13045,7 +13124,10 @@ fn probe_vulkan() -> Result<(), String> {
 fn run_settings() {
     use scribe_client::settings::singleton::{self, SingletonResult};
 
-    let (listener, socket_path) = match singleton::acquire(None) {
+    let anchor = std::env::var(SETTINGS_WINDOW_ANCHOR_ENV)
+        .ok()
+        .and_then(|value| SettingsWindowAnchor::from_env_value(&value));
+    let (listener, socket_path) = match singleton::acquire(anchor) {
         Ok(SingletonResult::Primary { listener, socket_path }) => (listener, socket_path),
         Ok(SingletonResult::AlreadyRunning) => {
             tracing::info!("settings window already running; sent focus and exiting");
@@ -13066,7 +13148,7 @@ fn run_settings() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         // The handle is only useful to a caller that can be asked twice; this
         // process exists to show one settings window and exit with it.
-        open_settings_window(cx);
+        open_settings_window(cx, anchor);
         cx.activate(true);
     });
 
@@ -16595,6 +16677,14 @@ mod tests {
     use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
 
     use super::*;
+
+    #[test]
+    fn settings_anchor_uses_the_live_terminal_bounds() {
+        let bounds = Bounds::new(point(px(120.0), px(80.0)), size(px(1440.0), px(900.0)));
+        let anchor = settings_anchor_from_bounds(bounds).expect("sane terminal bounds");
+
+        assert_eq!((anchor.x, anchor.y, anchor.width, anchor.height), (120, 80, 1440, 900));
+    }
 
     #[test]
     fn background_exit_preserves_the_focused_session() {

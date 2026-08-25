@@ -108,14 +108,14 @@ CONTENT_CHANGE_MIN="${CONTENT_CHANGE_MIN:-1000}"
 SIDEBAR_CHANGE_MIN="${SIDEBAR_CHANGE_MIN:-100}"
 
 # `settings_nav_pages()` order, from settings/window.rs: Appearance, Colors,
-# Terminal, Keybindings, AI, Environment, Workspaces, Updates, Releases,
-# Notifications, Remote. Focus traversal starts at index 0 with no visible
-# focus, so N Down presses land on index N.
+# Terminal, Keybindings, AI, Environment, Workspaces, Updates, Notifications,
+# Remote, Agent API. Focus traversal starts at index 0 with no visible focus,
+# so N Down presses land on index N.
 #
 # Keybindings is the overflow page: 60 action rows are several viewports tall.
-# Releases is the page that fits: two action rows under one heading.
+# Environment is the page that fits: two action rows under one heading.
 DOWNS_TO_KEYBINDINGS=3
-DOWNS_TO_RELEASES=8
+DOWNS_TO_ENVIRONMENT=5
 
 WIN=""
 WIN_X=0
@@ -402,7 +402,7 @@ echo "PHASE 5 PASS: the track click jumped the thumb ${JUMPED}px and repainted $
 # it consumes one. So a ring that clears is a press that reached the root, and
 # a ring that survives is a press the invisible overlay ate.
 reset_focus
-press_down "$DOWNS_TO_RELEASES"
+press_down "$DOWNS_TO_ENVIRONMENT"
 key Return
 point_at "$HOVER_CX" "$(( TITLEBAR_H + (WIN_H - TITLEBAR_H) / 2 ))"
 sleep 1.2

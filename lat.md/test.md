@@ -832,7 +832,7 @@ A missing `[github_ci]` table leaves tracking disabled, while an explicit `githu
 
 ### Settings round trip
 
-The Updates page exposes a labelled toggle whose reader and apply path round-trip `github_ci.enabled` without a separate UI persistence route.
+The Terminal page exposes a labelled toggle whose reader and apply path round-trip `github_ci.enabled` without a separate UI persistence route.
 
 ### Live projection
 
@@ -1623,7 +1623,9 @@ scribe-test server stop
 
 ### Smart Selection Manual Verification
 
-Smart Selection currently relies on manual quickstart scenarios rather than new test code, matching the project instruction for this feature.
+Smart Selection combines runtime manual scenarios with focused GPUI settings-editor unit coverage.
+
+The editor tests dynamic field routing, rule/action mutations, selection clamping, cursor-contained regex preview, invalid-regex feedback, and disabling a rule without discarding its invalid draft.
 
 Manual coverage lives in `specs/002-smart-selection/quickstart.md`: configure quad-click and double-click activation, verify default matches for words, namespace identifiers, paths, quoted strings, include paths, URIs, Objective-C selectors, and emails, edit and restore rules in Settings, and confirm context-menu actions execute only after explicit menu selection.
 
@@ -6099,11 +6101,13 @@ The feature-015 presence badge reports the attached-participant count and names 
 
 ## GPUI Settings Window
 
-Unit tests for the GPUI settings window that replaces the deleted `scribe-settings` GTK/wry app, proving the rebuilt surface stays 1:1 with the old page inventory and that a second launch hands off focus rather than opening a duplicate. See .
+Unit tests for the GPUI settings window that replaces the deleted `scribe-settings` GTK/wry app, proving the current page model routes controls correctly and that a second launch hands off focus rather than opening a duplicate. See .
 
 ### Per-page parity checklist
 
-Every page in  exposes controls, and every config-backed control routes cleanly through the ported  with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
+Every settings page exposes controls, and each config-backed control routes through the apply path with the value the window reads for it.
+
+Window-placement coverage converts the live terminal bounds into a launcher anchor and proves the settings rectangle is centered over that anchor before display clamping. Updates additionally proves release navigation stops at both ends, HTTP(S) link targets survive parsing, sanitized HTML becomes readable typed note blocks without duplicate version chrome, and the persistent nested scrollbar tracks scroll progress only when notes overflow.
 
 ### Theme preset cache
 

@@ -937,7 +937,7 @@ Agent-dispatched actions run through the same foreground handlers as keyboard, p
 
 The client mirrors server `AgentActivity` edges into a per-session set and derives tab data from it; it does not invent timers or clear activity locally.
 
-[[crates/scribe-client/src/titlebar.rs#agent_active_glyph]] renders a leading `◆` in the accent color before the existing AI dot. [[crates/scribe-client/src/titlebar.rs#title_columns]] reserves one column for the agent glyph and two for the AI dot so both remain visible without stealing unbudgeted title width. The same children are used in the top titlebar and lower split-region tab bars. [[crates/scribe-client/src/titlebar.rs#tab_accessible_label]] appends “agent active” to the AccessKit name.
+[[crates/scribe-client/src/titlebar.rs#agent_active_glyph]] renders a leading `◆` in the accent color before the existing AI dot. Both indicators are `flex_none` siblings of the flexed title, so they keep their room and the title truncates around them rather than being budgeted against a fixed column count. The same children are used in the top titlebar and lower split-region tab bars. [[crates/scribe-client/src/titlebar.rs#tab_accessible_label]] appends “agent active” to the AccessKit name.
 
 The visible edge follows the server's lease+dwell state. Duplicate active/inactive frames are no-ops; a changed set bumps the shared redraw generation. Server leases drive the indicator for screen reads, input writes, and correlated actions with a valid same-window origin or explicit focus target.
 
@@ -2291,13 +2291,30 @@ Verifies  returns the base color unchanged for `None`, mixes toward the accent b
 
 Verifies  leaves short titles intact, truncates an overflowing title to exactly the available columns ending in an ellipsis, and flags truncation (driving the tooltip hover target).
 
-### Title budget reserves AI dot columns
+### Tabs divide the strip and titles use it
 
-Verifies [[crates/scribe-client/src/titlebar.rs#title_columns]] reserves two extra columns while a tab shows the AI dot, on top of the padding/close and context-suffix reservations, clamping to zero on degenerate budgets.
+Tabs flex: each takes an equal share of its group bar, so the strip fills the
+band instead of leaving it empty to the right of a fixed slot.
 
-Under-reserving let a full-width tab's title outgrow its slot when the dot appeared and wrap onto a hidden second line, showing as raised text. The title element also wears `truncate` so any residual overflow clips on one line instead of wrapping.
+The bar itself is what makes that possible. A group row sizes to its content, so
+its tabs had nothing to grow into and every one stayed at its `TAB_WIDTH` basis
+no matter how wide the window was; the flowed (non-aligned) row now takes the
+strip. An aligned multi-region bar already carried an explicit region width and
+needed no change.
 
-The shell's in-region bars render their own tabs at the same width with the same chrome, and carried a private column budget that skipped the dot and a title element without `truncate` — so the fix held in the titlebar while an alerting AI tab below the top row still rode up. Both bars now call `title_columns` and truncate, so the reservation cannot drift apart again.
+Titles carry no column budget. The label is a flex child wearing `truncate`, so
+it already ends in an ellipsis exactly where its tab runs out of room; the
+former fixed 22-column reservation cut every title short of the space it had —
+a tab in a wide window showed twelve characters and an ellipsis with half its
+own width empty. Both bars render `tab.title` directly and let the layout end
+it, so the two cannot drift apart again. `TAB_WIDTH` survives as the flex basis
+and as the drag geometry's fallback.
+
+Drag-reorder follows the painted width rather than the basis: `TitlebarView`
+measures the first tab from the frame and feeds that width to
+[[crates/scribe-client/src/tab_bar.rs#reorder_target_index]] and the slide
+offset. A tab that grew to fill the strip would otherwise be dragged against a
+176px grid it no longer occupies.
 
 ### Context suffix bands and suppression
 
@@ -3033,8 +3050,8 @@ the same path as pointer tab activation.
 The focus move returns before application mouse reporting, selection, link,
 scroll, or click handling, so it emits no synthetic pointer input. It changes
 only Scribe's internal pane focus and never requests OS window activation.
-`terminal.focus_follows_mouse` defaults ON and is read from the live config;
-turning it off restores click-to-focus without changing click behavior.
+`terminal.focus_follows_mouse` defaults OFF and is read from the live config;
+turning it on enables hover focus without changing ordinary click behavior.
 
 ### Drag And Drop
 
@@ -3386,7 +3403,7 @@ An overlay scrollbar in  that fades in on scroll and fades out after 1.5s of ina
 
 Width animates on hover via lerp expansion. The hit zone is 3x the visible width for easy targeting. Drag-to-scroll computes offset from mouse delta relative to track height. Fade-out duration is 0.3 seconds.
 
-The pure module has a second consumer: the settings window's content pane reuses the same fade state, thumb geometry, and pointer gestures — hover widen, click-to-jump, and thumb drag — as its page-length affordance, counting whole pixels as its scroll unit. Its render pass goes through `build_scrollbar_render` with no command marks, because that is where the module drives the hover width target. See [[lat.md/settings#Settings#GPUI Settings Window#Typeset Ink presentation]].
+The pure module has a second consumer: the settings window's content pane reuses the same fade state, thumb geometry, and pointer gestures — hover widen, click-to-jump, and thumb drag — as its page-length affordance, counting whole pixels as its scroll unit. Its render pass goes through `build_scrollbar_render` with no command marks, because that is where the module drives the hover width target. See [[lat.md/settings#Settings#GPUI Settings Window#Console presentation]].
 
 ### Prompt Mark Indicators
 

@@ -1,5 +1,5 @@
-//! GPUI settings window: the 1:1 rebuild of the deleted standalone settings
-//! GTK/wry app as a window in the client process.
+//! GPUI settings window rebuilt from the deleted standalone GTK/wry app as a
+//! window in the client process.
 //!
 //! The webview app is gone; its feature set is reproduced here. [`apply`] and
 //! [`server_action`] are ported verbatim from the old crate — the config-write
@@ -18,13 +18,15 @@
 
 pub mod apply;
 pub mod model;
+mod release_notes;
 pub mod server_action;
 pub mod singleton;
+mod smart_selection_editor;
 pub mod state;
 pub mod values;
 pub mod window;
 
-pub use window::{SettingsWindow, open_settings_window};
+pub use window::{SettingsWindow, open_settings_window, recenter_settings_window};
 
 #[cfg(test)]
 mod parity_tests {
@@ -37,8 +39,7 @@ mod parity_tests {
     // @lat: [[test#GPUI Settings Window#Per-page parity checklist]]
     /// Every page exposes controls, and every config-backed control on every
     /// page routes cleanly through the ported apply path with the value the
-    /// window would read for it — the concrete per-page parity checklist against
-    /// the old settings surface. A hex placeholder stands in for color controls
+    /// window would read for it. A hex placeholder stands in for color controls
     /// so an unset custom theme still proves the key is wired.
     #[test]
     fn every_page_control_routes_through_apply() {
@@ -54,11 +55,11 @@ mod parity_tests {
 
     // @lat: [[test#GitHub CI Opt-in#Settings round trip]]
     #[test]
-    fn github_ci_toggle_round_trips_through_the_updates_page() {
-        let control = page_controls(SettingsPage::Updates)
+    fn github_ci_toggle_round_trips_through_the_terminal_page() {
+        let control = page_controls(SettingsPage::Terminal)
             .into_iter()
             .find(|control| control.key == "github_ci.enabled")
-            .expect("Updates page must expose GitHub CI");
+            .expect("Terminal page must expose GitHub CI");
         assert!(matches!(control.kind, ControlKind::Toggle));
 
         let mut config = ScribeConfig::default();

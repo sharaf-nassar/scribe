@@ -58,8 +58,8 @@ SEEDED_GATEWAY_MAC="aa:bb:cc:dd:ee:02"
 # make from a freshly reset focus. They are page-model positions, not pixels.
 #
 # `settings_nav_pages()` order: Appearance, Colors, Terminal, Keybindings, AI,
-# Environment, Workspaces, Updates, Releases, Notifications, Remote.
-NAV_STEPS_TO_REMOTE=10
+# Environment, Workspaces, Updates, Notifications, Remote, Agent API.
+NAV_STEPS_TO_REMOTE=9
 # With the search reading `remote` exactly one nav page survives the filter, so
 # the Remote page's live trust actions follow it immediately:
 #   0 Remote (nav)  1 Refresh trust state  2 Trust this network

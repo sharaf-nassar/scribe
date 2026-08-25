@@ -268,10 +268,10 @@ mod tests {
     #[test]
     fn reads_focus_follows_mouse_value() {
         let mut config = scribe_common::config::ScribeConfig::default();
-        assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), true);
-
-        config.terminal.focus.focus_follows_mouse = false;
         assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), false);
+
+        config.terminal.focus.focus_follows_mouse = true;
+        assert_eq!(current_value(&config, "terminal.focus_follows_mouse"), true);
     }
 
     #[test]

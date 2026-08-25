@@ -1,17 +1,14 @@
 //! Declarative page/control model for the GPUI settings window.
 //!
-//! The old standalone webview described its ten pages in `settings.html`
-//! and wrote every edit through a `{key, value}` message that
-//! [`crate::settings::apply::apply_settings_change`] routed to the config file.
-//! This module reproduces that page inventory as a data-driven model: each
-//! [`SettingsPage`] owns an ordered list of [`Control`]s keyed by the exact
-//! dotted config key the apply path understands. The GPUI window renders these
-//! generically, and the parity checklist test asserts every apply-handled key
-//! namespace is represented, so the port stays 1:1 with the deleted surface
-//! without hand-transcribing 3000 lines of HTML.
+//! The old standalone webview wrote every edit through a `{key, value}` message
+//! that [`crate::settings::apply::apply_settings_change`] routed to the config
+//! file. This module describes the current page inventory as a data-driven
+//! model: each [`SettingsPage`] owns an ordered list of [`Control`]s keyed by the
+//! exact dotted config key the apply path understands, and the GPUI window
+//! renders them generically.
 
-/// The settings pages. `AgentApi` is appended so existing page-backed
-/// AccessKit element IDs remain stable.
+/// The settings pages. `Notifications` keeps its previous discriminant so
+/// removing the standalone Releases page does not renumber existing AccessKit IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     Appearance,
@@ -22,16 +19,15 @@ pub enum SettingsPage {
     Keybindings,
     Workspaces,
     Updates,
-    Releases,
-    Notifications,
+    Notifications = 9,
     Remote,
     AgentApi,
 }
 
 impl SettingsPage {
-    /// Every page, in nav order.
+    /// Every settings page.
     #[must_use]
-    pub fn all() -> [SettingsPage; 12] {
+    pub fn all() -> [SettingsPage; 11] {
         [
             SettingsPage::Appearance,
             SettingsPage::Colors,
@@ -41,7 +37,6 @@ impl SettingsPage {
             SettingsPage::Keybindings,
             SettingsPage::Workspaces,
             SettingsPage::Updates,
-            SettingsPage::Releases,
             SettingsPage::Notifications,
             SettingsPage::Remote,
             SettingsPage::AgentApi,
@@ -60,7 +55,6 @@ impl SettingsPage {
             SettingsPage::Keybindings => "Keybindings",
             SettingsPage::Workspaces => "Workspaces",
             SettingsPage::Updates => "Updates",
-            SettingsPage::Releases => "Releases",
             SettingsPage::Notifications => "Notifications",
             SettingsPage::Remote => "Remote",
             SettingsPage::AgentApi => "Agent API",
@@ -247,7 +241,6 @@ pub fn page_controls(page: SettingsPage) -> Vec<Control> {
         SettingsPage::Keybindings => keybinding_controls(),
         SettingsPage::Workspaces => workspace_controls(),
         SettingsPage::Updates => update_controls(),
-        SettingsPage::Releases => release_controls(),
         SettingsPage::Notifications => notification_controls(),
         SettingsPage::Remote => remote_controls(),
         SettingsPage::AgentApi => agent_api_controls(),
@@ -376,7 +369,7 @@ fn terminal_controls() -> Vec<Control> {
         toggle("terminal.status_bar_stats.memory", "Status bar: memory"),
         toggle("terminal.status_bar_stats.gpu", "Status bar: GPU"),
         toggle("terminal.status_bar_stats.network", "Status bar: network"),
-        action("terminal.smart_selection.reset", "Reset smart selection rules"),
+        toggle("github_ci.enabled", "GitHub CI run status"),
     ]
 }
 
@@ -467,17 +460,9 @@ fn agent_api_controls() -> Vec<Control> {
 
 fn update_controls() -> Vec<Control> {
     vec![
-        toggle("github_ci.enabled", "GitHub CI run status"),
         toggle("update.enabled", "Automatic updates"),
         stepper("update.check_interval_hours", "Check interval (hours)", (1.0, 168.0, 1.0, 0)),
-        choice("update.channel", "Channel", vec![("stable", "Stable"), ("beta", "Beta")]),
-    ]
-}
-
-fn release_controls() -> Vec<Control> {
-    vec![
         action("action.check_for_updates", "Check for updates"),
-        action("action.list_releases", "List releases"),
     ]
 }
 
@@ -554,6 +539,19 @@ mod tests {
 
         assert_eq!(control.label, "Focus follows mouse");
         assert!(matches!(control.kind, ControlKind::Toggle));
+    }
+
+    #[test]
+    fn updates_page_uses_an_embedded_release_viewer_without_channel_or_list_button() {
+        let keys = page_controls(SettingsPage::Updates)
+            .into_iter()
+            .map(|control| control.key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            keys,
+            ["update.enabled", "update.check_interval_hours", "action.check_for_updates"]
+        );
     }
 
     #[test]

@@ -22,9 +22,10 @@
 //! same pointer gestures — hover widens the thumb and pins the overlay, a press
 //! on the thumb drags it, and a press elsewhere on the track jumps the page.
 //!
-//! Two pages additionally talk to the local server through
-//! [`crate::settings::server_action`]: `Environment` gates its env-persistence
-//! toggle on an `EnvPreflight` probe, and `Remote` renders the feature-014 LAN
+//! Three pages additionally talk to the local server through
+//! [`crate::settings::server_action`]: `Updates` loads the release catalog,
+//! `Environment` gates its env-persistence toggle on an `EnvPreflight` probe,
+//! and `Remote` renders the feature-014 LAN
 //! trust surface (`GetLanEnv`, `ListTrustedNetworks`, `ListTrustedDevices`) with
 //! `AddCurrentNetworkTrusted` / `RemoveTrustedNetwork` / `RevokeTrustedDevice`
 //! mutations, plus the feature-013 tailnet summary (`GetRemoteEnv`). Every one
@@ -52,19 +53,19 @@
 use std::{cell::Cell, ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
-    AccessibleAction, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
+    AccessibleAction, Anchor, App, Bounds, Context, CursorStyle, Decorations, ElementInputHandler,
     EntityInputHandler, FocusHandle, FontWeight, HitboxBehavior, KeyDownEvent, Keystroke,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
     Pixels, Point, ResizeEdge, Rgba, Role, ScrollHandle, Size, Text, Tiling, TitlebarOptions,
     Toggled, UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb,
-    rgba, size,
+    WindowDecorations, WindowHandle, WindowOptions, anchored, canvas, div, fill, point, prelude::*,
+    px, rgb, rgba, size,
 };
-use scribe_common::config::{ScribeConfig, load_config};
+use scribe_common::config::{ScribeConfig, SmartSelectionActionKind, load_config};
 use scribe_common::protocol::{
-    PreflightError, Release, ReleaseListResultState, TrustedDeviceInfo, TrustedNetworkInfo,
-    UpdateCheckResultState,
+    PreflightError, TrustedDeviceInfo, TrustedNetworkInfo, UpdateCheckResultState,
 };
+use scribe_common::settings_window::{SettingsWindowAnchor, centered_settings_position};
 use scribe_common::theme::{Theme, all_preset_names, resolve_preset};
 use serde_json::{Value, json};
 
@@ -83,13 +84,32 @@ use crate::settings::model::{
     SettingsPage, keybinding_actions, keybinding_label, page_controls,
     workspace_badge_color_controls,
 };
+use crate::settings::release_notes::{
+    ReleaseNoteBlockKind, ReleasePanelItem, ReleasePanelState, adjacent_release_index,
+    release_date, release_title,
+};
 use crate::settings::server_action::{self, EnvPreflightOutcome, LanEnvOutcome, RemoteEnvOutcome};
+use crate::settings::smart_selection_editor::{
+    ACTION_KIND_OPTIONS, ACTIVATION_OPTIONS, PARAMETER_MODE_OPTIONS, PRECISION_OPTIONS,
+    PREVIEW_CURSOR_KEY, PREVIEW_KEY, SmartActionTarget, action_kind_key, action_kind_label,
+    action_mode_key, action_parameter_hint, action_parameter_key, activation_key,
+    apply_action as apply_smart_action, apply_control_value as apply_smart_control_value,
+    control_value as smart_control_value, inline_placeholder as smart_inline_placeholder,
+    is_smart_control_key, matches_query as smart_selection_matches_query, precision_label,
+    preview_match, rule_enabled_key, rule_name_key, rule_precision_key, rule_regex_key,
+    rule_validation_error, selected_rule_index,
+    validate_inline_value as validate_smart_inline_value,
+};
 use crate::settings::values::{current_value, keybinding_combos};
 use crate::tab_bar::srgba;
 
-/// One-shot server-action timeout for the releases page (update check / release
-/// list). Short so a click never hangs the UI thread if the server is down.
+/// One-shot server-action timeout. Short so a click never hangs if the server is down.
 const SERVER_ACTION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Fixed viewport for the nested release document; the page itself remains scrollable.
+const RELEASE_NOTES_HEIGHT: Pixels = px(360.0);
+const RELEASE_SCROLLBAR_INSET: f32 = 8.0;
+const RELEASE_SCROLLBAR_MIN_HEIGHT: f32 = 32.0;
 
 /// How long [`SettingsWindow::after_paint`] yields before starting a blocking
 /// server action — two frames at 60 Hz, enough for the pending status line to
@@ -122,7 +142,28 @@ const SETTINGS_MIN_HEIGHT: f32 = 720.0;
 
 /// Native macOS traffic lights occupy a 28px titlebar band; 38px clears them
 /// and gives the seamless ground-colored band a calm cross-platform height.
-const SETTINGS_TITLEBAR_HEIGHT: f32 = 38.0;
+const SETTINGS_TITLEBAR_HEIGHT: f32 = 44.0;
+
+/// Sidebar width: the contents column plus its 12px gutters.
+const SETTINGS_SIDEBAR_WIDTH: f32 = 212.0;
+
+/// Content gutters and the measure every row is capped at.
+const CONTENT_GUTTER: f32 = 34.0;
+const CONTENT_MEASURE: f32 = 660.0;
+
+/// Control rows: one height, growing only for a description or an error.
+const ROW_HEIGHT: f32 = 52.0;
+
+/// Section labels sit far closer to what follows them than to what precedes.
+const SECTION_LEAD: f32 = 42.0;
+const SECTION_TRAIL: f32 = 4.0;
+
+/// The interface face and the data face. Monospace is data only — values, hex,
+/// chords, dates, versions — and `JetBrains Mono` is the face the terminal
+/// itself ships with, so the settings window renders data in the same type its
+/// user is configuring.
+const UI_FONT: &str = "IBM Plex Sans";
+const DATA_FONT: &str = "JetBrains Mono";
 
 /// The feature-014 LAN trust state the Remote page renders, refreshed from the
 /// local server by [`SettingsWindow::refresh_trust`].
@@ -214,12 +255,16 @@ struct SettingsColors {
     /// One step firmer hairline for the window edge and emphasized outlines.
     strong_border: Rgba,
     accent: Rgba,
-    /// Ink for validation failures — a separate channel from amber, so a
+    /// Ink for validation failures — a separate channel from the accent, so a
     /// rejected edit never scans like live state.
     error: Rgba,
     text: Rgba,
     dim_text: Rgba,
     quiet_text: Rgba,
+    /// Non-text marks only — chevrons, arrows, the search magnifier, window
+    /// controls. Never put text in this tone: it clears 1.4.11 (3:1) but not
+    /// 1.4.3 (4.5:1), which is exactly the split it exists to enforce.
+    glyph: Rgba,
     /// The content pane's overlay scrollbar thumb — a quiet white wash, not
     /// amber: page length is structure, not live state.
     scrollbar: Rgba,
@@ -229,30 +274,59 @@ impl SettingsColors {
     fn resolve(_config: &ScribeConfig) -> Self {
         // Settings must remain a stable instrument while the user edits the
         // terminal theme, so none of these roles derive from the active preset.
-        let page_bg = rgb(0x0014_1518);
-        let accent = rgb(0x00f5_b83a);
-        let text = rgb(0x00e9_e8e4);
+        let page_bg = rgb(0x000c_0d0f);
+        let accent = rgb(0x006e_8bff);
+        let text = rgb(0x00ed_eef1);
         Self {
             page_bg,
-            frame_bg: rgb(0x000b_0c0e),
-            nav_active_bg: rgba(0xffff_ff0f),
-            nav_hover_bg: rgba(0xffff_ff08),
+            frame_bg: rgb(0x0008_090a),
+            nav_active_bg: rgba(0xffff_ff0a),
+            nav_hover_bg: rgba(0xffff_ff06),
             row_hover_bg: rgba(0xffff_ff06),
-            control_bg: rgb(0x001d_1f24),
-            control_hover_bg: rgb(0x0026_2931),
-            control_pressed_bg: rgb(0x0019_1b1f),
-            input_bg: rgb(0x0010_1114),
-            menu_bg: rgb(0x0022_242a),
-            status_bg: rgb(0x001a_1b1f),
-            border: rgba(0xffff_ff14),
-            strong_border: rgba(0xffff_ff1f),
+            // Controls carry no resting fill in this system; the raised tones
+            // exist for the one lifted surface (the anchored menu) and for the
+            // press feedback that has to read against the ground.
+            control_bg: page_bg,
+            control_hover_bg: rgb(0x0017_181c),
+            control_pressed_bg: rgb(0x0010_1115),
+            input_bg: page_bg,
+            menu_bg: rgb(0x0017_181c),
+            status_bg: page_bg,
+            border: rgba(0xffff_ff0f),
+            strong_border: rgba(0xffff_ff14),
             accent,
-            error: rgb(0x00e0_584c),
+            error: rgb(0x00ff_7a70),
             text,
-            dim_text: rgb(0x00a6_a5a0),
-            quiet_text: rgb(0x0083_827b),
-            scrollbar: rgba(0xffff_ff3d),
+            dim_text: rgb(0x009a_a0a8),
+            quiet_text: rgb(0x007d_838d),
+            glyph: rgb(0x0066_6c75),
+            scrollbar: rgba(0xffff_ff14),
         }
+    }
+}
+
+struct ReleaseHeaderTooltip {
+    anchor: Bounds<Pixels>,
+    colors: SettingsColors,
+}
+
+impl Render for ReleaseHeaderTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        anchored()
+            .anchor(Anchor::BottomCenter)
+            .position(point(self.anchor.center().x, self.anchor.origin.y - px(4.0)))
+            .snap_to_window_with_margin(px(4.0))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .bg(self.colors.menu_bg)
+                    .border_1()
+                    .border_color(self.colors.strong_border)
+                    .text_xs()
+                    .text_color(self.colors.text)
+                    .child("View in Github"),
+            )
     }
 }
 
@@ -261,11 +335,31 @@ pub struct SettingsWindow {
     config: ScribeConfig,
     theme: Theme,
     theme_presets: Vec<PresetEntry>,
+    /// The theme under the pointer in the preset menu. While it is set the
+    /// palette grid and the terminal preview render *it* rather than the saved
+    /// theme, so a preset is judged before it is committed. Cleared when the
+    /// pointer leaves the row or the menu closes; it never touches config.
+    preview_theme: Option<Theme>,
+    /// Where this window was computed to open, re-asserted once from the first
+    /// frame. A window manager may ignore a move issued before the window is
+    /// mapped, so the anchor is applied again once it exists.
+    pending_position: Option<(i32, i32)>,
     colors: SettingsColors,
     page: SettingsPage,
     /// Last action/error line shown under the content (server-action results,
     /// apply failures, and follow-on notices).
     status: Option<String>,
+    /// Release notes loaded lazily when Updates first becomes visible.
+    releases: ReleasePanelState,
+    /// Selected release in newest-first order.
+    release_index: usize,
+    /// Independent scroll position for the nested release document.
+    release_scroll: ScrollHandle,
+    /// Selected Smart Selection rule and local sample text for its preview.
+    smart_rule_index: usize,
+    smart_sample_text: String,
+    smart_sample_cursor: usize,
+    smart_rule_scroll: ScrollHandle,
     /// LAN trust state rendered by the Remote page.
     trust: TrustState,
     focus_handle: FocusHandle,
@@ -399,6 +493,17 @@ fn theme_preset_preview(
         .map(|preset| preset_strip_colors(&preset.theme))
 }
 
+/// The inputs one choice-menu row is built from.
+struct ChoiceRow<'a> {
+    control: &'a Control,
+    option: &'a String,
+    label: &'a String,
+    token: &'a str,
+    index: usize,
+    count: usize,
+    theme_menu: bool,
+}
+
 /// One focus stop in the settings window's stable keyboard traversal order.
 /// The sidebar comes first, followed by actionable controls on the selected
 /// page and (on Remote) every live trust mutation row.
@@ -409,6 +514,13 @@ enum SettingsFocusTarget {
     Control(Control),
     PromptBarColorReset(String),
     Action(String),
+    ReleaseNewer,
+    ReleaseOlder,
+    ReleaseRefresh,
+    ReleaseSource(String),
+    ReleaseDocument,
+    ReleaseLink { index: usize, target: String },
+    SmartAction(SmartActionTarget),
     WorkspaceRootInput,
     WorkspaceRootBrowse,
     WorkspaceRootAdd,
@@ -488,6 +600,49 @@ struct StepperState {
     step: f64,
 }
 
+#[derive(Clone, Copy)]
+struct SmartFieldSpec<'a> {
+    label: &'a str,
+    description: &'a str,
+    control: &'a Control,
+}
+
+#[derive(Clone, Copy)]
+struct SmartActionEditorSpec {
+    rule_index: usize,
+    action_index: usize,
+    kind: SmartSelectionActionKind,
+}
+
+struct ReleaseBlockRender {
+    kind: ReleaseNoteBlockKind,
+    text: String,
+    target: Option<String>,
+    link_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReleaseScrollbarGeometry {
+    top: f32,
+    height: f32,
+}
+
+fn release_scrollbar_geometry(
+    viewport: f32,
+    overflow: f32,
+    scrolled: f32,
+) -> Option<ReleaseScrollbarGeometry> {
+    if viewport <= RELEASE_SCROLLBAR_INSET * 2.0 || overflow <= 0.0 {
+        return None;
+    }
+    let track = viewport - RELEASE_SCROLLBAR_INSET * 2.0;
+    let height =
+        (viewport / (viewport + overflow) * track).clamp(RELEASE_SCROLLBAR_MIN_HEIGHT, track);
+    let travel = track - height;
+    let top = RELEASE_SCROLLBAR_INSET + scrolled.clamp(0.0, overflow) / overflow * travel;
+    Some(ReleaseScrollbarGeometry { top, height })
+}
+
 fn focus_targets_match(a: &SettingsFocusTarget, b: &SettingsFocusTarget) -> bool {
     match (a, b) {
         (SettingsFocusTarget::Page(a), SettingsFocusTarget::Page(b)) => a == b,
@@ -496,10 +651,20 @@ fn focus_targets_match(a: &SettingsFocusTarget, b: &SettingsFocusTarget) -> bool
             SettingsFocusTarget::PromptBarColorReset(a),
             SettingsFocusTarget::PromptBarColorReset(b),
         )
-        | (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b)) => a == b,
-        (SettingsFocusTarget::WorkspaceRootInput, SettingsFocusTarget::WorkspaceRootInput)
+        | (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b))
+        | (SettingsFocusTarget::ReleaseSource(a), SettingsFocusTarget::ReleaseSource(b)) => a == b,
+        (SettingsFocusTarget::ReleaseNewer, SettingsFocusTarget::ReleaseNewer)
+        | (SettingsFocusTarget::ReleaseOlder, SettingsFocusTarget::ReleaseOlder)
+        | (SettingsFocusTarget::ReleaseRefresh, SettingsFocusTarget::ReleaseRefresh)
+        | (SettingsFocusTarget::ReleaseDocument, SettingsFocusTarget::ReleaseDocument)
+        | (SettingsFocusTarget::WorkspaceRootInput, SettingsFocusTarget::WorkspaceRootInput)
         | (SettingsFocusTarget::WorkspaceRootBrowse, SettingsFocusTarget::WorkspaceRootBrowse)
         | (SettingsFocusTarget::WorkspaceRootAdd, SettingsFocusTarget::WorkspaceRootAdd) => true,
+        (
+            SettingsFocusTarget::ReleaseLink { index: a, target: a_target },
+            SettingsFocusTarget::ReleaseLink { index: b, target: b_target },
+        ) => a == b && a_target == b_target,
+        (SettingsFocusTarget::SmartAction(a), SettingsFocusTarget::SmartAction(b)) => a == b,
         (
             SettingsFocusTarget::WorkspaceRootRemove { index: a, root: a_root },
             SettingsFocusTarget::WorkspaceRootRemove { index: b, root: b_root },
@@ -529,6 +694,40 @@ fn push_control_focus_targets(targets: &mut Vec<SettingsFocusTarget>, control: C
 
 fn prompt_bar_reset_change(key: &str) -> (&str, &'static str) {
     (key, "")
+}
+
+fn smart_choice_control(
+    key: String,
+    label: &str,
+    options: &'static [(&'static str, &'static str)],
+) -> Control {
+    Control { key, label: label.to_owned(), kind: ControlKind::Choice(options.to_vec()) }
+}
+
+fn smart_text_control(key: String, label: &str) -> Control {
+    Control { key, label: label.to_owned(), kind: ControlKind::Text }
+}
+
+fn smart_toggle_control(key: String, label: &str) -> Control {
+    Control { key, label: label.to_owned(), kind: ControlKind::Toggle }
+}
+
+fn smart_stepper_control(key: String, label: &str, max: f64) -> Control {
+    Control {
+        key,
+        label: label.to_owned(),
+        kind: ControlKind::Stepper { min: 0.0, max, step: 1.0, decimals: 0 },
+    }
+}
+
+fn smart_preview_max(text: &str) -> f64 {
+    f64::from(u16::try_from(text.chars().count().saturating_sub(1)).unwrap_or(u16::MAX))
+}
+
+fn pending_regex_belongs_to_toggle(edit_key: Option<&str>, toggle_key: &str) -> bool {
+    let Some(prefix) = toggle_key.strip_suffix("enabled") else { return false };
+    let regex_key = format!("{prefix}regex");
+    edit_key == Some(regex_key.as_str())
 }
 
 /// Whether committing `key`/`value` against `config` is the settings window's
@@ -773,9 +972,18 @@ impl SettingsWindow {
             config,
             theme,
             theme_presets,
+            preview_theme: None,
+            pending_position: None,
             colors,
             page: SettingsPage::Appearance,
             status: None,
+            releases: ReleasePanelState::default(),
+            release_index: 0,
+            release_scroll: ScrollHandle::new(),
+            smart_rule_index: 0,
+            smart_sample_text: "https://example.com/path?q=1".to_owned(),
+            smart_sample_cursor: 10,
+            smart_rule_scroll: ScrollHandle::new(),
             trust: TrustState::default(),
             focus_handle: cx.focus_handle(),
             search_handle: cx.focus_handle().tab_index(0),
@@ -984,7 +1192,92 @@ impl SettingsWindow {
             self.colors = SettingsColors::resolve(&config);
             self.theme = scribe_common::config::resolve_theme(&config);
             self.config = config;
+            self.smart_rule_index = selected_rule_index(
+                self.smart_rule_index,
+                self.config.terminal.smart_selection.rules.len(),
+            )
+            .unwrap_or(0);
             self.theme_presets = build_theme_preset_cache();
+        }
+    }
+
+    fn control_value(&self, key: &str) -> Value {
+        smart_control_value(
+            &self.config.terminal.smart_selection,
+            &self.smart_sample_text,
+            self.smart_sample_cursor,
+            key,
+        )
+        .unwrap_or_else(|| current_value(&self.config, key))
+    }
+
+    fn commit_control_value(&mut self, key: &str, value: Value, cx: &mut Context<Self>) -> bool {
+        if !is_smart_control_key(key) {
+            return self.commit(key, value, cx);
+        }
+        let mut smart_selection = self.config.terminal.smart_selection.clone();
+        let mut preview = self.smart_sample_text.clone();
+        let mut preview_cursor = self.smart_sample_cursor;
+        let durable = match apply_smart_control_value(
+            &mut smart_selection,
+            &mut preview,
+            &mut preview_cursor,
+            key,
+            &value,
+        ) {
+            Ok(durable) => durable,
+            Err(error) => {
+                self.status = Some(format!("Smart Selection was not changed — {error}"));
+                cx.notify();
+                return false;
+            }
+        };
+        if !durable {
+            self.smart_sample_text = preview;
+            self.smart_sample_cursor = preview_cursor;
+            cx.notify();
+            return true;
+        }
+        match serde_json::to_value(smart_selection) {
+            Ok(serialized) => self.commit("terminal.smart_selection", serialized, cx),
+            Err(error) => {
+                self.status = Some(format!("Smart Selection was not saved — {error}"));
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn run_smart_action(&mut self, action: SmartActionTarget, cx: &mut Context<Self>) {
+        if self.edit_key().is_some_and(is_smart_control_key) {
+            if !self.save_inline_edit(cx) {
+                return;
+            }
+            self.clear_inline_edit();
+        }
+        self.clear_choice_menu_state();
+        if let SmartActionTarget::SelectRule(index) = action {
+            self.smart_rule_index =
+                index.min(self.config.terminal.smart_selection.rules.len().saturating_sub(1));
+            cx.notify();
+            return;
+        }
+        let mut smart_selection = self.config.terminal.smart_selection.clone();
+        let before = smart_selection.clone();
+        self.smart_rule_index =
+            apply_smart_action(&mut smart_selection, self.smart_rule_index, action);
+        if smart_selection == before {
+            cx.notify();
+            return;
+        }
+        match serde_json::to_value(smart_selection) {
+            Ok(value) => {
+                self.commit("terminal.smart_selection", value, cx);
+            }
+            Err(error) => {
+                self.status = Some(format!("Smart Selection was not saved — {error}"));
+                cx.notify();
+            }
         }
     }
 
@@ -1008,6 +1301,7 @@ impl SettingsWindow {
         match key {
             "workspaces.add_root" | "workspaces.remove_root" => "Workspace root".to_owned(),
             "workspaces.reset_badge_colors" => "Badge colors".to_owned(),
+            "terminal.smart_selection" => "Smart Selection".to_owned(),
             // A keybinding commits under `keybindings.<action>` while its row is
             // keyed on the bare action, so the prefix comes off before the
             // lookup or every shortcut would fall back to a generated name.
@@ -1031,6 +1325,7 @@ impl SettingsWindow {
             "workspaces.add_root" => "Workspace root added.".to_owned(),
             "workspaces.remove_root" => "Workspace root removed.".to_owned(),
             "workspaces.reset_badge_colors" => "Badge colors reset to defaults.".to_owned(),
+            "terminal.smart_selection" => "Smart Selection saved.".to_owned(),
             _ => format!("Saved {}.", self.commit_label(key)),
         }
     }
@@ -1074,6 +1369,9 @@ impl SettingsWindow {
     fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_theme_preset(cx);
         if page != self.page {
+            if self.edit_key().is_some_and(is_smart_control_key) && !self.save_inline_edit(cx) {
+                return;
+            }
             let edit_was_focused = self.edit_handle.is_focused(window);
             let edit_was_active = self.clear_inline_edit();
             if (edit_was_focused || edit_was_active) && !self.search_handle.is_focused(window) {
@@ -1107,7 +1405,107 @@ impl SettingsWindow {
             self.run_action(REFRESH_TRUST_ACTION, window, cx);
             return;
         }
+        if page == SettingsPage::Updates {
+            self.ensure_releases_loaded(cx);
+        }
         cx.notify();
+    }
+
+    fn release_notes_match_search(&self) -> bool {
+        let query = self.search_query.trim().to_lowercase();
+        query.is_empty()
+            || self.page.nav_label().to_lowercase() == query
+            || "release notes release history current release".contains(&query)
+    }
+
+    fn smart_selection_matches_search(&self) -> bool {
+        smart_selection_matches_query(
+            &self.config.terminal.smart_selection,
+            &self.search_query.trim().to_lowercase(),
+        )
+    }
+
+    fn smart_selection_focus_targets(&self) -> Vec<SettingsFocusTarget> {
+        let config = &self.config.terminal.smart_selection;
+        let mut targets = vec![
+            SettingsFocusTarget::Control(smart_choice_control(
+                activation_key(),
+                "Activation",
+                ACTIVATION_OPTIONS,
+            )),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::AddRule),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::RestoreDefaults),
+        ];
+        targets.extend(config.rules.iter().enumerate().map(|(index, _)| {
+            SettingsFocusTarget::SmartAction(SmartActionTarget::SelectRule(index))
+        }));
+        let Some(rule_index) = selected_rule_index(self.smart_rule_index, config.rules.len())
+        else {
+            targets.retain(|target| match target {
+                SettingsFocusTarget::SmartAction(action) => self.smart_action_enabled(action),
+                _ => true,
+            });
+            return targets;
+        };
+        let Some(rule) = config.rules.get(rule_index) else { return targets };
+        let preview_max = smart_preview_max(&self.smart_sample_text);
+        targets.extend([
+            SettingsFocusTarget::SmartAction(SmartActionTarget::DuplicateRule),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::MoveRuleUp),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::MoveRuleDown),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::RemoveRule),
+            SettingsFocusTarget::Control(smart_toggle_control(
+                rule_enabled_key(rule_index),
+                "Enabled",
+            )),
+            SettingsFocusTarget::Control(smart_text_control(
+                rule_name_key(rule_index),
+                "Rule name",
+            )),
+            SettingsFocusTarget::Control(smart_choice_control(
+                rule_precision_key(rule_index),
+                "Precision",
+                PRECISION_OPTIONS,
+            )),
+            SettingsFocusTarget::Control(smart_text_control(
+                rule_regex_key(rule_index),
+                "Regular expression",
+            )),
+            SettingsFocusTarget::Control(smart_text_control(PREVIEW_KEY.to_owned(), "Test text")),
+            SettingsFocusTarget::Control(smart_stepper_control(
+                PREVIEW_CURSOR_KEY.to_owned(),
+                "Test cursor",
+                preview_max,
+            )),
+            SettingsFocusTarget::SmartAction(SmartActionTarget::AddAction),
+        ]);
+        for (action_index, _) in rule.actions.iter().enumerate() {
+            targets.extend([
+                SettingsFocusTarget::SmartAction(SmartActionTarget::MoveActionUp(action_index)),
+                SettingsFocusTarget::SmartAction(SmartActionTarget::MoveActionDown(action_index)),
+                SettingsFocusTarget::SmartAction(SmartActionTarget::DuplicateAction(action_index)),
+                SettingsFocusTarget::SmartAction(SmartActionTarget::RemoveAction(action_index)),
+                SettingsFocusTarget::Control(smart_choice_control(
+                    action_kind_key(rule_index, action_index),
+                    "Action kind",
+                    ACTION_KIND_OPTIONS,
+                )),
+                SettingsFocusTarget::Control(smart_choice_control(
+                    action_mode_key(rule_index, action_index),
+                    "Parameter mode",
+                    PARAMETER_MODE_OPTIONS,
+                )),
+                SettingsFocusTarget::Control(smart_text_control(
+                    action_parameter_key(rule_index, action_index),
+                    "Action parameter",
+                )),
+            ]);
+        }
+        targets.retain(|target| match target {
+            SettingsFocusTarget::SmartAction(action) => self.smart_action_enabled(action),
+            _ => true,
+        });
+        targets
     }
 
     fn focus_targets(&self) -> Vec<SettingsFocusTarget> {
@@ -1153,15 +1551,69 @@ impl SettingsWindow {
                 targets.push(SettingsFocusTarget::WorkspaceRootAdd);
             }
         }
+        let mut smart_inserted = false;
         for control in self.controls_for_page(self.page) {
             // A control its parent toggle has gated renders inert, so keyboard
             // traversal must skip it too rather than stop on a dead stop.
             if !self.control_matches_search(&control) || !self.control_is_enabled(&control.key) {
                 continue;
             }
+            if self.page == SettingsPage::Terminal
+                && !smart_inserted
+                && control_section(self.page, &control.key) == "Status bar"
+                && self.smart_selection_matches_search()
+            {
+                targets.extend(self.smart_selection_focus_targets());
+                smart_inserted = true;
+            }
             push_control_focus_targets(&mut targets, control);
         }
+        if self.page == SettingsPage::Terminal
+            && !smart_inserted
+            && self.smart_selection_matches_search()
+        {
+            targets.extend(self.smart_selection_focus_targets());
+        }
+        if self.page == SettingsPage::Updates && self.release_notes_match_search() {
+            self.push_release_focus_targets(&mut targets);
+        }
         targets
+    }
+
+    fn push_release_focus_targets(&self, targets: &mut Vec<SettingsFocusTarget>) {
+        if self.release_index > 0 {
+            targets.push(SettingsFocusTarget::ReleaseNewer);
+        }
+        if adjacent_release_index(self.release_index, self.releases.len(), 1).is_some() {
+            targets.push(SettingsFocusTarget::ReleaseOlder);
+        }
+        if let Some(item) = self.releases.selected(self.release_index) {
+            if item.release.html_url.starts_with("https://")
+                || item.release.html_url.starts_with("http://")
+            {
+                targets.push(SettingsFocusTarget::ReleaseSource(item.release.html_url.clone()));
+            }
+            if matches!(self.releases, ReleasePanelState::Ready { stale_reason: Some(_), .. }) {
+                targets.push(SettingsFocusTarget::ReleaseRefresh);
+            }
+            targets.push(SettingsFocusTarget::ReleaseDocument);
+            targets.extend(self.release_link_focus_targets());
+        } else if matches!(self.releases, ReleasePanelState::Failed(_)) {
+            targets.push(SettingsFocusTarget::ReleaseRefresh);
+        }
+    }
+
+    fn release_link_focus_targets(&self) -> Vec<SettingsFocusTarget> {
+        self.releases
+            .selected(self.release_index)
+            .into_iter()
+            .flat_map(ReleasePanelItem::body_link_targets)
+            .enumerate()
+            .map(|(index, target)| SettingsFocusTarget::ReleaseLink {
+                index,
+                target: target.to_owned(),
+            })
+            .collect()
     }
 
     fn focused_target(&self) -> Option<SettingsFocusTarget> {
@@ -1224,6 +1676,13 @@ impl SettingsWindow {
                 self.input_selection = NativeInputSelection::Caret;
                 window.focus(&self.workspace_root_handle, cx);
             }
+            Some(SettingsFocusTarget::SmartAction(SmartActionTarget::SelectRule(index))) => {
+                let row = f32::from(u16::try_from(index).unwrap_or(u16::MAX)) * 52.0;
+                self.smart_rule_scroll.set_offset(point(px(0.0), px(-row)));
+                self.active_input = None;
+                self.input_selection = NativeInputSelection::Caret;
+                window.focus(&self.focus_handle, cx);
+            }
             Some(SettingsFocusTarget::Control(control))
                 if matches!(control.kind, ControlKind::Text) =>
             {
@@ -1243,6 +1702,19 @@ impl SettingsWindow {
         self.edit_control.as_ref().map(|control| control.key.as_str())
     }
 
+    fn switch_inline_edit(&mut self, control: &Control, cx: &mut Context<Self>) -> bool {
+        if self.edit_key().is_some_and(is_smart_control_key)
+            && self.edit_key() != Some(control.key.as_str())
+        {
+            if !self.save_inline_edit(cx) {
+                return false;
+            }
+            self.clear_inline_edit();
+        }
+        self.begin_inline_edit(control);
+        true
+    }
+
     /// Open the shared inline editor on a color or free-text control, seeding it
     /// with the saved value that Escape later restores.
     fn begin_inline_edit(&mut self, control: &Control) {
@@ -1255,7 +1727,7 @@ impl SettingsWindow {
             self.focus_index = index;
         }
         if self.edit_key() != Some(control.key.as_str()) {
-            let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+            let value = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
             self.edit_input.clone_from(&value);
             self.edit_original = value;
             self.edit_control = Some(control.clone());
@@ -1263,7 +1735,11 @@ impl SettingsWindow {
             self.edit_error = None;
         }
         self.active_input = Some(NativeInputTarget::Inline);
-        self.input_selection = NativeInputSelection::Caret;
+        self.input_selection = if is_smart_control_key(&control.key) {
+            NativeInputSelection::All
+        } else {
+            NativeInputSelection::Caret
+        };
     }
 
     /// Start listening for the keystroke that replaces a keybinding.
@@ -1391,6 +1867,15 @@ impl SettingsWindow {
                 ControlKind::Keybinding => self.begin_capture(&control.key, window, cx),
             },
             SettingsFocusTarget::Action(key) => self.run_action(&key, window, cx),
+            SettingsFocusTarget::ReleaseNewer => self.navigate_release(-1, cx),
+            SettingsFocusTarget::ReleaseOlder => self.navigate_release(1, cx),
+            SettingsFocusTarget::ReleaseRefresh => self.load_releases(cx),
+            SettingsFocusTarget::ReleaseSource(target) => crate::url_detect::open_url(&target),
+            SettingsFocusTarget::ReleaseDocument => {}
+            SettingsFocusTarget::ReleaseLink { target, .. } => {
+                crate::url_detect::open_url(&target);
+            }
+            SettingsFocusTarget::SmartAction(action) => self.run_smart_action(action, cx),
             SettingsFocusTarget::WorkspaceRootInput => {
                 self.active_input = Some(NativeInputTarget::WorkspaceRoot);
                 self.input_selection = NativeInputSelection::Caret;
@@ -1450,6 +1935,8 @@ impl SettingsWindow {
             || page_summary(page).to_lowercase().contains(&query)
             || (page == SettingsPage::Workspaces
                 && workspace_roots_match_query(&query, &self.config.workspaces.roots))
+            || (page == SettingsPage::Terminal
+                && smart_selection_matches_query(&self.config.terminal.smart_selection, &query))
             || self.controls_for_page(page).iter().any(|control| {
                 control.label.to_lowercase().contains(&query)
                     || control.key.to_lowercase().contains(&query)
@@ -1487,7 +1974,7 @@ impl SettingsWindow {
         workspace_root_matches_query(&self.search_query.trim().to_lowercase(), root)
     }
 
-    fn align_page_to_search(&mut self) {
+    fn align_page_to_search(&mut self, cx: &mut Context<Self>) {
         if !self.page_matches_search(self.page)
             && let Some(page) =
                 settings_nav_pages().into_iter().find(|page| self.page_matches_search(*page))
@@ -1504,6 +1991,9 @@ impl SettingsWindow {
             self.scroll_handle.set_offset(Point::default());
             self.content_scrolled = 0;
             self.pulse_content_scrollbar();
+            if page == SettingsPage::Updates {
+                self.ensure_releases_loaded(cx);
+            }
         }
     }
 
@@ -1523,21 +2013,21 @@ impl SettingsWindow {
             }
             "backspace" => {
                 self.search_query.pop();
-                self.align_page_to_search();
+                self.align_page_to_search(cx);
             }
             // The caret is pinned to the end of the query, so there is nothing to
             // the right to forward-delete. Wiping the whole query here made Delete
             // and Backspace behave wildly differently for no reason; Escape is the
             // deliberate clear.
             "delete" => {}
-            "enter" => self.align_page_to_search(),
+            "enter" => self.align_page_to_search(cx),
             "tab" => window.focus_next(cx),
             _ if !claimed_by_modifier => {
                 if let Some(text) =
                     event.keystroke.key_char.as_ref().filter(|text| !text.is_empty())
                 {
                     self.search_query.push_str(text);
-                    self.align_page_to_search();
+                    self.align_page_to_search(cx);
                 }
             }
             _ => {}
@@ -1661,6 +2151,19 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    fn save_smart_edit_before_navigation(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.active_input != Some(NativeInputTarget::Inline)
+            || !self.edit_key().is_some_and(is_smart_control_key)
+        {
+            return true;
+        }
+        if !self.save_inline_edit(cx) {
+            return false;
+        }
+        self.clear_inline_edit();
+        true
+    }
+
     fn handle_native_input_key(
         &mut self,
         event: &KeyDownEvent,
@@ -1717,6 +2220,9 @@ impl SettingsWindow {
                 true
             }
             "tab" => {
+                if !self.save_smart_edit_before_navigation(cx) {
+                    return true;
+                }
                 if self
                     .edit_control
                     .as_ref()
@@ -1729,10 +2235,16 @@ impl SettingsWindow {
                 true
             }
             "down" => {
+                if !self.save_smart_edit_before_navigation(cx) {
+                    return true;
+                }
                 self.move_focus(1, window, cx);
                 true
             }
             "up" => {
+                if !self.save_smart_edit_before_navigation(cx) {
+                    return true;
+                }
                 self.move_focus(-1, window, cx);
                 true
             }
@@ -1743,11 +2255,41 @@ impl SettingsWindow {
         }
     }
 
+    fn scroll_release_document(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let max = f32::from(self.release_scroll.max_offset().y);
+        let current = f32::from(self.release_scroll.offset().y);
+        let next = match key {
+            "pageup" => (current + 240.0).min(0.0),
+            "pagedown" => (current - 240.0).max(-max),
+            "home" => 0.0,
+            "end" => -max,
+            _ => return false,
+        };
+        self.release_scroll.set_offset(point(self.release_scroll.offset().x, px(next)));
+        cx.notify();
+        true
+    }
+
+    fn handle_release_document_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        !event.keystroke.modifiers.modified()
+            && matches!(self.focused_target(), Some(SettingsFocusTarget::ReleaseDocument))
+            && self.scroll_release_document(&event.keystroke.key, cx)
+    }
+
+    fn handle_capture_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.capture_action.is_none() {
+            return false;
+        }
+        self.capture_keystroke(event, cx);
+        true
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // A recording row claims every key ahead of the window's own shortcuts,
-        // or Ctrl+K and Tab could never be bound to anything.
-        if self.capture_action.is_some() {
-            self.capture_keystroke(event, cx);
+        if self.handle_release_document_key(event, cx) || self.handle_capture_key(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1859,7 +2401,7 @@ impl SettingsWindow {
                     self.input_selection = NativeInputSelection::Caret;
                 }
             }
-            Some(DismissedTransient::PageSearch) => self.align_page_to_search(),
+            Some(DismissedTransient::PageSearch) => self.align_page_to_search(cx),
             None => return false,
         }
         cx.notify();
@@ -1887,8 +2429,18 @@ impl SettingsWindow {
     }
 
     fn toggle(&mut self, key: &str, cx: &mut Context<Self>) {
-        let current = current_value(&self.config, key).as_bool().unwrap_or(false);
+        let current = self.control_value(key).as_bool().unwrap_or(false);
         let next = !current;
+        let keeps_pending_regex = !next && pending_regex_belongs_to_toggle(self.edit_key(), key);
+        if self.edit_key().is_some_and(is_smart_control_key)
+            && self.edit_key() != Some(key)
+            && !keeps_pending_regex
+        {
+            if !self.save_inline_edit(cx) {
+                return;
+            }
+            self.clear_inline_edit();
+        }
         // Turning env persistence ON is gated on the server's OS-keystore probe:
         // committing a setting the keystore cannot back would silently degrade at
         // runtime, so a failing probe refuses the edit and surfaces the reason.
@@ -1896,7 +2448,7 @@ impl SettingsWindow {
             self.enable_env_persistence(key, cx);
             return;
         }
-        self.commit(key, Value::Bool(next), cx);
+        self.commit_control_value(key, Value::Bool(next), cx);
     }
 
     /// Commit the open inline edit through the one shared apply path, then
@@ -1908,6 +2460,17 @@ impl SettingsWindow {
         };
         let key = control.key;
         let is_color = matches!(control.kind, ControlKind::Color);
+        if is_smart_control_key(&key)
+            && let Err(error) = validate_smart_inline_value(
+                &self.config.terminal.smart_selection,
+                &key,
+                &self.edit_input,
+            )
+        {
+            self.edit_error = Some(error);
+            cx.notify();
+            return false;
+        }
         let stored = match inline_commit_value(is_color, &key, &self.edit_input) {
             Ok(stored) => stored,
             Err(error) => {
@@ -1916,7 +2479,7 @@ impl SettingsWindow {
                 return false;
             }
         };
-        if self.commit(&key, Value::String(stored.clone()), cx) {
+        if self.commit_control_value(&key, Value::String(stored.clone()), cx) {
             self.edit_input.clone_from(&stored);
             self.edit_original = stored;
             self.edit_marked_range = None;
@@ -2049,6 +2612,66 @@ impl SettingsWindow {
         .detach();
     }
 
+    fn ensure_releases_loaded(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.releases, ReleasePanelState::Unloaded) {
+            self.load_releases(cx);
+        }
+    }
+
+    /// Fetch release data without blocking the GPUI thread. The sync protocol
+    /// client owns a short-lived worker because settings has no async socket.
+    fn load_releases(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.releases, ReleasePanelState::Loading) {
+            return;
+        }
+        self.releases = ReleasePanelState::Loading;
+        cx.notify();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        drop(std::thread::spawn(move || {
+            let state = server_action::request_release_list(SERVER_ACTION_TIMEOUT);
+            drop(send.send(ReleasePanelState::from_wire(state)));
+        }));
+        cx.spawn(async move |settings, app| {
+            let state = receive.await.unwrap_or_else(|_| {
+                ReleasePanelState::Failed(
+                    "release worker stopped before returning a result".to_owned(),
+                )
+            });
+            settings.update(app, |settings, ctx| settings.finish_release_load(state, ctx)).ok();
+        })
+        .detach();
+    }
+
+    fn finish_release_load(&mut self, state: ReleasePanelState, cx: &mut Context<Self>) {
+        let selected_version =
+            self.releases.selected(self.release_index).map(|item| item.release.version.clone());
+        self.releases = state;
+        self.release_index = selected_version
+            .and_then(|version| match &self.releases {
+                ReleasePanelState::Ready { releases, .. } => {
+                    releases.iter().position(|item| item.release.version == version)
+                }
+                ReleasePanelState::Unloaded
+                | ReleasePanelState::Loading
+                | ReleasePanelState::Failed(_) => None,
+            })
+            .unwrap_or(0);
+        self.release_scroll.set_offset(Point::default());
+        cx.notify();
+        Self::after_paint(cx, |_, next_cx| next_cx.notify());
+    }
+
+    fn navigate_release(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let Some(next) = adjacent_release_index(self.release_index, self.releases.len(), direction)
+        else {
+            return;
+        };
+        self.release_index = next;
+        self.release_scroll.set_offset(Point::default());
+        cx.notify();
+        Self::after_paint(cx, |_, next_cx| next_cx.notify());
+    }
+
     /// The gated ON transition of [`ENV_PERSISTENCE_KEY`]: probe the server's OS
     /// keystore first and commit only if it answers `ok`. A failing probe leaves
     /// the config untouched and reports the actionable reason.
@@ -2104,7 +2727,7 @@ impl SettingsWindow {
     }
 
     fn choice_token(&self, key: &str) -> String {
-        let value = current_value(&self.config, key);
+        let value = self.control_value(key);
         let saved = value.as_str().unwrap_or("");
         if key == "theme.preset" {
             self.pending_theme_preset.as_deref().unwrap_or(saved).to_owned()
@@ -2137,7 +2760,7 @@ impl SettingsWindow {
         if key == "theme.preset" {
             self.defer_theme_preset(chosen.clone(), cx);
         } else {
-            self.commit(key, Value::String(chosen.clone()), cx);
+            self.commit_control_value(key, Value::String(chosen.clone()), cx);
         }
     }
 
@@ -2215,7 +2838,7 @@ impl SettingsWindow {
 
     fn step(&mut self, key: &str, bounds: (f64, f64), delta: f64, cx: &mut Context<Self>) {
         let (min, max) = bounds;
-        let current = current_value(&self.config, key).as_f64().unwrap_or(min);
+        let current = self.control_value(key).as_f64().unwrap_or(min);
         let next = (current + delta).clamp(min, max);
         // Preserve integer shape for whole-number steppers so serde deserializes
         // into the u16/u32/u64 fields the apply path expects. The integer branch
@@ -2225,7 +2848,7 @@ impl SettingsWindow {
         } else {
             json!((next * 100.0).round() / 100.0)
         };
-        self.commit(key, value, cx);
+        self.commit_control_value(key, value, cx);
     }
 
     /// Re-read the whole Remote page's runtime surface from the local server:
@@ -2433,14 +3056,6 @@ impl SettingsWindow {
                 let state = server_action::request_update_check(SERVER_ACTION_TIMEOUT);
                 self.status = Some(update_check_summary(&state));
             }
-            "action.list_releases" => {
-                let state = server_action::request_release_list(SERVER_ACTION_TIMEOUT);
-                self.status = Some(release_list_summary(&state));
-            }
-            "terminal.smart_selection.reset" => {
-                self.commit(key, Value::Bool(true), cx);
-                return;
-            }
             // Unreachable from the UI: every action key the model renders has an
             // arm above. Kept loud rather than silent so a future control wired
             // to a missing key reports itself instead of looking inert.
@@ -2464,7 +3079,6 @@ fn action_pending_message(key: &str) -> Option<String> {
         ADD_CURRENT_NETWORK_ACTION => Some("Trusting the current network…".to_owned()),
         ENV_PREFLIGHT_ACTION => Some(KEYSTORE_PENDING.to_owned()),
         "action.check_for_updates" => Some("Checking for updates…".to_owned()),
-        "action.list_releases" => Some("Fetching the release list…".to_owned()),
         _ => None,
     }
 }
@@ -2473,9 +3087,7 @@ fn action_pending_message(key: &str) -> Option<String> {
 /// of the state enum the panel used to print.
 fn update_check_summary(state: &UpdateCheckResultState) -> String {
     match state {
-        UpdateCheckResultState::NoUpdate => {
-            "Up to date — no newer release on this channel.".to_owned()
-        }
+        UpdateCheckResultState::NoUpdate => "Up to date — no newer release available.".to_owned(),
         UpdateCheckResultState::UpdateAvailable { version, release_url } => {
             format!("Update available: {version} — {release_url}")
         }
@@ -2483,46 +3095,33 @@ fn update_check_summary(state: &UpdateCheckResultState) -> String {
     }
 }
 
-/// Plain-language rendering of a release listing.
-///
-/// Only the version, date, and pre-release flag are shown: a `Release` also
-/// carries `body_html`, and Debug-printing the whole state dumped that sanitized
-/// markup — escaped entities and literal `\n` included — straight into the panel.
-fn release_list_summary(state: &ReleaseListResultState) -> String {
-    match state {
-        ReleaseListResultState::Fresh { releases } => {
-            format!("Releases — {}", release_versions(releases))
+impl SettingsWindow {
+    /// Re-assert the opening position once the window exists.
+    ///
+    /// Runs from the first frame because the pre-map move in
+    /// [`open_settings_window`] is advisory: an X11 window manager is free to
+    /// ignore a position for a window it has not mapped yet, and several do.
+    /// Taking the value means this runs once and never fights a window the user
+    /// has since moved.
+    fn apply_pending_position(&mut self, window: &Window) {
+        let Some((x, y)) = self.pending_position.take() else { return };
+        #[cfg(target_os = "linux")]
+        crate::monitor::apply_saved_position(
+            window,
+            x,
+            y,
+            crate::window_state::WindowState::Windowed,
+        );
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (window, x, y);
         }
-        ReleaseListResultState::Stale { releases, reason } => {
-            format!("Releases (cached; refresh failed — {reason}) — {}", release_versions(releases))
-        }
-        ReleaseListResultState::Failed { reason } => format!("Release list failed — {reason}"),
-    }
-}
-
-/// The newest few releases as `version — date`, with a count of the remainder.
-fn release_versions(releases: &[Release]) -> String {
-    if releases.is_empty() {
-        return "none published.".to_owned();
-    }
-    let shown = releases
-        .iter()
-        .take(RELEASE_SUMMARY_MAX)
-        .map(|release| {
-            let date = release.published_at.split('T').next().unwrap_or(&release.published_at);
-            let tag = if release.prerelease { " (pre-release)" } else { "" };
-            format!("{} — {date}{tag}", release.version)
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    match releases.len().saturating_sub(RELEASE_SUMMARY_MAX) {
-        0 => shown,
-        rest => format!("{shown}; +{rest} older"),
     }
 }
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_position(window);
         let colors = self.colors;
         // The window asked for client-side decorations, but the compositor gets
         // the last word: X11 without a running compositor falls back to server
@@ -2874,11 +3473,10 @@ impl SettingsWindow {
             .flex_none()
             .flex()
             .items_center()
-            // The titlebar shares the interior ground; only the hairline seam
-            // below it marks the band.
+            // The titlebar shares the interior ground and carries no seam: the
+            // window is one surface, and the title is the only thing in the
+            // band that is not a control.
             .bg(colors.page_bg)
-            .border_b_1()
-            .border_color(colors.border)
             // `WindowControlArea::Drag` is what makes dragging work on Windows;
             // both Linux backends implement `on_hit_test_window_control` as an
             // empty body, so the explicit press/move pair below is the real
@@ -2910,15 +3508,15 @@ impl SettingsWindow {
                     key_window.start_window_move();
                 }
             }))
-            // Balance the three 40px controls on the right. On macOS this also
-            // reserves the traffic-light region, keeping the centered title
-            // clear of the native buttons without platform-specific offsets.
+            // The title leads the band. macOS still needs its traffic-light
+            // reservation; every other platform starts at the same 18px spine
+            // the sidebar labels use.
             .child(
                 div()
-                    .w(px(120.0))
+                    .w(px(if cfg!(target_os = "macos") { 78.0 } else { 18.0 }))
                     .h_full()
                     .flex_none()
-                    .window_control_area(WindowControlArea::Drag)
+                    .window_control_area(WindowControlArea::Drag),
             )
             .child(
                 div()
@@ -2926,12 +3524,12 @@ impl SettingsWindow {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .justify_center()
                     .window_control_area(WindowControlArea::Drag)
-                    .text_sm()
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors.text)
-                    .child("Scribe Settings"),
+                    .child("Settings"),
             )
             .child(settings_window_control(SettingsWindowControl::Minimize, window, &colors, cx))
             .child(settings_window_control(SettingsWindowControl::Maximize, window, &colors, cx))
@@ -2952,13 +3550,15 @@ impl SettingsWindow {
             .collect::<Vec<_>>();
         div()
             .id("settings-sidebar")
-            .w(px(232.0))
+            .w(px(SETTINGS_SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(colors.border)
+            .pl(px(12.0))
+            .pr(px(10.0))
+            // No seam: the sidebar is the same ground as the content, separated
+            // by the measure and the gutter alone.
             // Search leads the sidebar — the platform settings idiom — and
             // stays pinned above the scrolling contents list.
             .child(self.render_search(window, cx))
@@ -2972,7 +3572,6 @@ impl SettingsWindow {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .pt(px(14.0))
                     .children(items),
             )
             .child(
@@ -2981,15 +3580,15 @@ impl SettingsWindow {
                     .role(Role::Note)
                     .aria_label(concat!("Scribe v", env!("CARGO_PKG_VERSION")))
                     .w_full()
-                    .h(px(36.0))
                     .flex_none()
-                    .px(px(20.0))
+                    .px(px(6.0))
+                    .py(px(16.0))
                     .flex()
                     .items_center()
-                    .font_family("monospace")
-                    .text_xs()
+                    .font_family(DATA_FONT)
+                    .text_size(px(10.5))
                     .text_color(colors.quiet_text)
-                    .child(concat!("Scribe v", env!("CARGO_PKG_VERSION"))),
+                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
             )
             .into_any_element()
     }
@@ -3015,15 +3614,15 @@ impl SettingsWindow {
                 .aria_level(2)
                 .aria_label(group)
                 .w_full()
-                .h(px(28.0))
                 .flex_none()
-                .when(group_index > 0, |el| el.mt(px(14.0)))
-                .px(px(20.0))
+                .when(group_index > 0, |el| el.pt(px(26.0)))
+                .px(px(6.0))
+                .pb(px(10.0))
                 .flex()
                 .items_end()
-                .pb(px(6.0))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_family(UI_FONT)
+                .text_size(px(10.0))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(self.colors.quiet_text)
                 .child(group)
                 .into_any_element(),
@@ -3039,11 +3638,11 @@ impl SettingsWindow {
         let position =
             settings_nav_pages().iter().position(|candidate| *candidate == page).unwrap_or(0);
         let weight = if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL };
-        let foreground = if selected { colors.text } else { colors.dim_text };
-        // Selection is a neutral wash plus the page glyph turning amber —
-        // the only lit state in the column. Keyboard focus is an amber
-        // hairline outline, so the two never look alike.
-        let icon_color = if selected { colors.accent } else { colors.quiet_text };
+        // Selection is a neutral wash plus white text — white is "on"
+        // everywhere in this system, which keeps the accent rare enough to
+        // mean live state. Keyboard focus is an accent hairline, so the two
+        // never look alike. The label is the whole affordance: no glyph.
+        let foreground = if selected { colors.text } else { colors.quiet_text };
         div()
             .id(("settings-nav", page as usize))
             .focusable()
@@ -3053,15 +3652,14 @@ impl SettingsWindow {
             .aria_selected(selected)
             .aria_position_in_set(position + 1)
             .aria_size_of_set(settings_nav_pages().len())
-            .h(px(32.0))
+            .h(px(28.0))
             .flex_none()
-            .mx(px(8.0))
-            .px(px(12.0))
+            .px(px(6.0))
             .flex()
             .items_center()
-            .gap_3()
-            .rounded(px(5.0))
-            .text_sm()
+            .rounded(px(4.0))
+            .font_family(UI_FONT)
+            .text_size(px(12.5))
             .font_weight(weight)
             .text_color(foreground)
             .when(selected, |el| el.bg(colors.nav_active_bg))
@@ -3072,19 +3670,6 @@ impl SettingsWindow {
                 this.begin_pointer_interaction(&SettingsFocusTarget::Page(page));
                 this.select_page(page, page_window, ctx);
             }))
-            .child(
-                div()
-                    .size(px(18.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .font_family("Symbols Nerd Font Mono")
-                    .text_base()
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(icon_color)
-                    .child(page_icon(page)),
-            )
             .child(page.nav_label())
             .into_any_element()
     }
@@ -3107,6 +3692,10 @@ impl SettingsWindow {
             children.extend(self.render_workspace_root_sections(window, cx));
         }
         children.extend(self.render_control_rows(window, cx));
+        if self.page == SettingsPage::Updates && self.release_notes_match_search() {
+            children.push(self.control_section_heading("Release notes"));
+            children.push(self.render_release_panel(cx));
+        }
 
         div()
             .id("settings-content")
@@ -3150,16 +3739,22 @@ impl SettingsWindow {
                             // so the content never measures as overflowing and the wheel
                             // is clamped to a zero maximum.
                             .track_scroll(&self.scroll_handle)
-                            .px(px(44.0))
-                            .pb(px(48.0))
+                            .px(px(CONTENT_GUTTER))
+                            .pb(px(56.0))
                             .flex()
                             .flex_col()
-                            // A typeset column keeps a readable measure: every row caps
-                            // at 840px and stays left-aligned when the window grows.
-                            // Capping per row (not via one wrapping column) preserves
-                            // the scroller's content-extent measurement noted above.
+                            // Every row caps at the measure and centres in the pane,
+                            // so the shared right edge the controls align on stays put
+                            // as the window grows. Capping per row (not via one
+                            // wrapping column) preserves the scroller's content-extent
+                            // measurement noted above.
                             .children(children.into_iter().map(|child| {
-                                div().w_full().max_w(px(840.0)).flex_none().child(child)
+                                div()
+                                    .w_full()
+                                    .max_w(px(CONTENT_MEASURE))
+                                    .mx_auto()
+                                    .flex_none()
+                                    .child(child)
                             })),
                     )
                     // Painted after the scroller so the overlay reads as an
@@ -3201,25 +3796,23 @@ impl SettingsWindow {
             .aria_value(query.clone())
             .w_full()
             .h(px(30.0))
-            .px(px(10.0))
+            .px(px(6.0))
             .flex()
             .items_center()
             .gap_2()
             .rounded(px(5.0))
-            .border_1()
-            .border_color(if focused { colors.accent } else { colors.border })
-            // Focus outranks hover here. The hover rule used to repaint a focused
-            // field's border in the dim hover colour, so a focused-and-hovered
-            // field looked exactly like an unfocused one.
-            .bg(colors.input_bg)
-            .text_sm()
+            // The field has no resting chrome. Hover washes it, focus rings it
+            // in the accent — the only two moments it needs an outline.
+            .when(focused, |el| el.bg(colors.nav_hover_bg).border_1().border_color(colors.accent))
+            .when(!focused, |el| el.border_1().border_color(gpui::transparent_black()))
+            .font_family(UI_FONT)
+            .text_size(px(12.5))
             .text_color(colors.text)
             .cursor_text()
-            .when(!focused, |el| el.hover(move |style| style.border_color(colors.strong_border)))
+            .when(!focused, |el| el.hover(move |style| style.bg(colors.nav_hover_bg)))
             .on_click(cx.listener(move |_, _, focused_window, ctx| {
                 focused_window.focus(&focus, ctx);
             }))
-            .child(settings_search_icon(colors.quiet_text))
             .child(
                 div()
                     .flex_1()
@@ -3248,25 +3841,17 @@ impl SettingsWindow {
                         )
                     }),
             )
-            // The shortcut hint has done its job once the field is focused.
-            .when(!focused, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .font_family("monospace")
-                        .text_xs()
-                        .text_color(colors.quiet_text)
-                        .child("Ctrl+K"),
-                )
-            });
+            // The magnifier sits at the trailing edge so the placeholder starts
+            // on the same spine as every contents label below it.
+            .child(settings_search_icon(colors.glyph));
         div()
             .id("settings-search-region")
             .role(Role::Search)
             .aria_label("Settings search")
             .w_full()
             .flex_none()
-            .pt(px(12.0))
-            .px(px(12.0))
+            .pt(px(2.0))
+            .pb(px(20.0))
             .flex()
             .items_center()
             .child(field)
@@ -3276,9 +3861,6 @@ impl SettingsWindow {
     fn render_page_heading(&self) -> gpui::AnyElement {
         let colors = self.colors;
         let summary = page_summary(self.page);
-        // The Releases page renders server data, not config keys, so the
-        // config-source line would be untrue there.
-        let source = (self.page != SettingsPage::Releases).then_some("config.toml · live apply");
         div()
             .id("settings-page-heading")
             .role(Role::Heading)
@@ -3290,33 +3872,21 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .text_color(colors.text)
+            // No corner note. Live apply is the contract, not a caption, and
+            // the config path belongs in a command rather than in chrome.
             .child(
                 div()
-                    .w_full()
-                    .flex()
-                    .items_end()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div().text_xl().font_weight(FontWeight::BOLD).child(self.page.nav_label()),
-                    )
-                    // The quiet man-page corner note: where these values
-                    // persist, and that edits commit as they are made.
-                    .children(source.map(|source| {
-                        div()
-                            .flex_none()
-                            .pb(px(2.0))
-                            .font_family("monospace")
-                            .text_xs()
-                            .text_color(colors.quiet_text)
-                            .child(source)
-                    })),
+                    .font_family(UI_FONT)
+                    .text_size(px(17.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.page.nav_label()),
             )
             .child(
                 div()
-                    .mt(px(6.0))
-                    .text_sm()
-                    .text_color(colors.dim_text)
+                    .mt(px(5.0))
+                    .font_family(UI_FONT)
+                    .text_size(px(12.5))
+                    .text_color(colors.quiet_text)
                     .child(Text::new_inaccessible(elide(summary, PAGE_SUMMARY_MAX_CHARS).into())),
             )
             .into_any_element()
@@ -3329,24 +3899,1458 @@ impl SettingsWindow {
     ) -> Vec<gpui::AnyElement> {
         let mut rows = Vec::new();
         let mut previous_section = None;
+        let mut smart_inserted = false;
+
+        // The palette leads the Colors page. It is the page's subject — the
+        // theme rows below it are adjustments to something you should already
+        // be looking at, so the grid and its live preview come first and the
+        // reader never scrolls to see the effect of the control they just used.
+        let ansi: Vec<Control> = if self.page == SettingsPage::Colors {
+            self.controls_for_page(self.page)
+                .into_iter()
+                .filter(|control| self.control_matches_search(control))
+                .filter(|control| control_section(self.page, &control.key) == "ANSI palette")
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !ansi.is_empty() {
+            rows.push(self.control_section_heading("ANSI palette"));
+            rows.push(self.render_ansi_palette(&ansi, window, cx));
+        }
         for control in self
             .controls_for_page(self.page)
             .into_iter()
             .filter(|control| self.control_matches_search(control))
         {
             let section = control_section(self.page, &control.key);
-            if previous_section != Some(section) {
+            if self.page == SettingsPage::Terminal
+                && !smart_inserted
+                && section == "Status bar"
+                && self.smart_selection_matches_search()
+            {
+                rows.push(self.control_section_heading("Smart selection"));
+                rows.push(self.render_smart_selection_panel(window, cx));
+                smart_inserted = true;
+                previous_section = None;
+            }
+            if self.page == SettingsPage::Colors && section == "ANSI palette" {
+                continue;
+            }
+            let first_in_section = previous_section != Some(section);
+            if first_in_section {
                 rows.push(self.control_section_heading(section));
                 previous_section = Some(section);
             }
-            rows.push(self.render_control(&control, window, cx));
+            rows.push(self.render_control(&control, first_in_section, window, cx));
+        }
+        if self.page == SettingsPage::Terminal
+            && !smart_inserted
+            && self.smart_selection_matches_search()
+        {
+            rows.push(self.control_section_heading("Smart selection"));
+            rows.push(self.render_smart_selection_panel(window, cx));
+            smart_inserted = true;
         }
         if rows.is_empty()
+            && !smart_inserted
             && !(self.page == SettingsPage::Workspaces && self.workspace_roots_match_search())
         {
             rows.push(self.note_row("No settings match this search."));
         }
         rows
+    }
+
+    /// The ANSI palette as one 8×2 grid of swatches rather than sixteen rows.
+    ///
+    /// Sixteen near-identical hex rows made the user read a column of labels to
+    /// find a colour they could simply have looked at. The grid shows the
+    /// palette *as* a palette; each cell keeps the same anchored editor the
+    /// rows used, so nothing is lost but the scrolling.
+    fn render_ansi_palette(
+        &self,
+        controls: &[Control],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let rows = controls
+            .chunks(8)
+            .enumerate()
+            .map(|(row_index, chunk)| {
+                div()
+                    .id(("settings-ansi-row", row_index))
+                    .w_full()
+                    .flex()
+                    .gap(px(5.0))
+                    .when(row_index > 0, |el| el.mt(px(5.0)))
+                    .children(
+                        chunk
+                            .iter()
+                            .map(|control| self.render_ansi_cell(control, window, cx))
+                            .collect::<Vec<_>>(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("settings-ansi-palette")
+            .role(Role::Group)
+            .aria_label("ANSI palette")
+            .w_full()
+            .flex_none()
+            .pt(px(14.0))
+            .flex()
+            .flex_col()
+            .children(rows)
+            .child(self.render_terminal_preview())
+            .into_any_element()
+    }
+
+    fn render_ansi_cell(
+        &self,
+        control: &Control,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let open = self.open_color.as_deref() == Some(control.key.as_str());
+        let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
+        let value = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        // A hovered preset repaints the grid without touching config, so the
+        // cell reads its colour from the previewed theme's own slot rather than
+        // from the value the file still holds.
+        let previewed = self.preview_theme.as_ref().and_then(|theme| {
+            ansi_slot(&control.key).and_then(|slot| theme.ansi_colors.get(slot).copied())
+        });
+        let swatch = previewed
+            .or_else(|| color_swatch(&self.theme, &control.key, &value))
+            .map_or(colors.page_bg, srgba);
+        let label = previewed.map_or_else(
+            || value.trim_start_matches('#').to_uppercase(),
+            |color| rgba_hex(color).trim_start_matches('#').to_uppercase(),
+        );
+        let picker_control = control.clone();
+        let pointer_target = SettingsFocusTarget::Control(control.clone());
+        let close_target = pointer_target.clone();
+        div()
+            .id(("settings-ansi-cell", key_hash(&control.key)))
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .when(open, |el| el.child(self.render_color_menu(control, window, cx)))
+            .child(
+                div()
+                    .id(("settings-ansi-swatch", key_hash(&control.key)))
+                    .role(Role::ComboBox)
+                    .aria_label(format!("{} color", control.label))
+                    .aria_value(value)
+                    .aria_expanded(open)
+                    .focusable()
+                    .tab_stop(true)
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .cursor_pointer()
+                    .when(open, |cell| {
+                        cell.capture_any_mouse_down(cx.listener(
+                            move |this, event: &MouseDownEvent, _window, ctx| {
+                                this.press_open_color_trigger(event, &close_target, ctx);
+                            },
+                        ))
+                    })
+                    .on_click(cx.listener(move |this, _, _window, ctx| {
+                        this.begin_pointer_interaction(&pointer_target);
+                        this.toggle_color_picker(&picker_control, ctx);
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(28.0))
+                            .rounded(px(3.0))
+                            .bg(swatch)
+                            .border_1()
+                            .border_color(if focused || open {
+                                colors.accent
+                            } else {
+                                gpui::transparent_black().into()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .pt(px(7.0))
+                            .font_family(DATA_FONT)
+                            .text_size(px(11.0))
+                            .text_color(colors.quiet_text)
+                            .child(Text::new_inaccessible(label.into())),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The theme the colour surfaces paint from: the hovered preset while the
+    /// preset menu is being browsed, the saved theme otherwise.
+    fn displayed_theme(&self) -> &Theme {
+        self.preview_theme.as_ref().unwrap_or(&self.theme)
+    }
+
+    /// A live sample of the palette being edited, so a change is judged against
+    /// terminal output rather than against sixteen abstract chips.
+    fn render_terminal_preview(&self) -> gpui::AnyElement {
+        // Deliberately no `self.colors` here: every colour in this element
+        // comes from the theme being previewed.
+        let theme = self.displayed_theme();
+        let ansi = |index: usize| srgba(theme.ansi_colors.get(index).copied().unwrap_or_default());
+        let line = |children: Vec<gpui::AnyElement>| {
+            div().w_full().flex().items_center().gap(px(6.0)).children(children)
+        };
+        let span = |text: &str, color: Rgba| {
+            div().text_color(color).child(Text::new_inaccessible(text.to_owned().into()))
+        };
+        div()
+            .id("settings-terminal-preview")
+            .role(Role::Note)
+            .aria_label("Palette preview")
+            .w_full()
+            .flex_none()
+            .mt(px(20.0))
+            .px(px(14.0))
+            .py(px(13.0))
+            .rounded(px(4.0))
+            // The theme's own background, not the settings ground. Background
+            // is the half of a theme that decides whether anything else on it
+            // is legible; a preview that keeps the surrounding ground shows
+            // foreground colours against a surface the theme never uses and
+            // quietly misreports every contrast in it.
+            .bg(srgba(theme.background))
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .font_family(DATA_FONT)
+            .text_size(px(12.0))
+            .text_color(srgba(theme.foreground))
+            .child(line(vec![
+                span("~/work/scribe", ansi(2)).into_any_element(),
+                span("main*", ansi(3)).into_any_element(),
+                // Dim text inside the pane is the theme's bright black, not a
+                // settings token: nothing in here may come from outside the
+                // theme being previewed.
+                span("·", ansi(8)).into_any_element(),
+                span("cargo", ansi(4)).into_any_element(),
+                span("test --workspace", srgba(theme.foreground)).into_any_element(),
+            ]))
+            .child(line(vec![
+                span("   Compiling scribe-client", ansi(8)).into_any_element(),
+            ]))
+            .child(line(vec![
+                span("test result:", srgba(theme.foreground)).into_any_element(),
+                span("ok", ansi(2)).into_any_element(),
+                span("412 passed; 0 failed", srgba(theme.foreground)).into_any_element(),
+                div()
+                    .w(px(8.0))
+                    .h(px(15.0))
+                    .bg(srgba(theme.cursor))
+                    .into_any_element(),
+            ]))
+            .into_any_element()
+    }
+
+    fn render_release_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        let content = match &self.releases {
+            ReleasePanelState::Unloaded | ReleasePanelState::Loading => {
+                Self::release_message("Loading release notes…", colors.dim_text)
+            }
+            ReleasePanelState::Failed(reason) => self.render_release_failure(reason, cx),
+            ReleasePanelState::Ready { releases, .. } if releases.is_empty() => {
+                Self::release_message("No releases have been published yet.", colors.dim_text)
+            }
+            ReleasePanelState::Ready { releases, stale_reason } => {
+                releases.get(self.release_index).or_else(|| releases.first()).map_or_else(
+                    || Self::release_message("No release selected.", colors.dim_text),
+                    |item| {
+                        self.render_loaded_release(
+                            item,
+                            releases.len(),
+                            stale_reason.as_deref(),
+                            cx,
+                        )
+                    },
+                )
+            }
+        };
+        div()
+            .id("release-notes-panel")
+            .role(Role::Group)
+            .aria_label("Scribe release notes")
+            .w_full()
+            .h(RELEASE_NOTES_HEIGHT)
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.input_bg)
+            .child(content)
+            .into_any_element()
+    }
+
+    fn release_message(message: &'static str, color: Rgba) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(color)
+            .child(message)
+            .into_any_element()
+    }
+
+    fn render_release_failure(&self, reason: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .text_sm()
+            .text_color(colors.dim_text)
+            .child("Release notes could not be loaded.")
+            .child(
+                div()
+                    .max_w(px(560.0))
+                    .text_center()
+                    .text_xs()
+                    .text_color(colors.quiet_text)
+                    .child(reason.to_owned()),
+            )
+            .child(self.render_release_refresh_button(
+                "Retry",
+                "release-notes-retry",
+                "Retry loading release notes",
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_loaded_release(
+        &self,
+        item: &ReleasePanelItem,
+        count: usize,
+        stale_reason: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(self.render_release_header(item, count, cx))
+            .child(self.render_release_document(item, stale_reason, cx))
+            .into_any_element()
+    }
+
+    fn render_release_header(
+        &self,
+        item: &ReleasePanelItem,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let date = release_date(&item.release);
+        let metadata = if item.release.prerelease {
+            format!("Pre-release · {date}")
+        } else {
+            date.to_owned()
+        };
+        let newer = (self.release_index > 0)
+            .then(|| self.render_release_nav_button(-1, &SettingsFocusTarget::ReleaseNewer, cx));
+        let older = adjacent_release_index(self.release_index, count, 1)
+            .map(|_| self.render_release_nav_button(1, &SettingsFocusTarget::ReleaseOlder, cx));
+        div()
+            .h(px(58.0))
+            .flex_none()
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(div().w(px(42.0)).flex_none().children(newer))
+            .child(self.render_release_title_link(item, metadata, cx))
+            .child(div().w(px(42.0)).flex_none().children(older))
+            .into_any_element()
+    }
+
+    fn render_release_title_link(
+        &self,
+        item: &ReleasePanelItem,
+        metadata: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let title = release_title(&item.release);
+        let target = item.release.html_url.clone();
+        let valid = target.starts_with("https://") || target.starts_with("http://");
+        let focus_target = SettingsFocusTarget::ReleaseSource(target.clone());
+        let focused = valid && self.target_is_focused(&focus_target);
+        let pointer_target = focus_target.clone();
+        let tooltip_bounds = Rc::new(Cell::new(None));
+        let measured_bounds = Rc::clone(&tooltip_bounds);
+        let tooltip_anchor = tooltip_bounds;
+        let body = div()
+            .id("release-title-content")
+            .max_w(px(560.0))
+            .h(px(48.0))
+            .px(px(12.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .text_center()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(if focused { colors.accent } else { rgba(0x0000_0000) })
+            .child(
+                div()
+                    .max_w(px(536.0))
+                    .truncate()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child(title.clone()),
+            )
+            .child(div().text_xs().text_color(colors.quiet_text).child(metadata));
+        let body = if valid {
+            body.focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_label(format!("View {title} in GitHub"))
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.nav_hover_bg))
+                .tooltip(move |_window, tooltip_cx| {
+                    let anchor = tooltip_anchor.get().unwrap_or_default();
+                    tooltip_cx.new(|_| ReleaseHeaderTooltip { anchor, colors }).into()
+                })
+                .tooltip_show_delay(Duration::ZERO)
+                .on_click(cx.listener(move |this, _, _, ctx| {
+                    this.begin_pointer_interaction(&pointer_target);
+                    crate::url_detect::open_url(&target);
+                    ctx.notify();
+                }))
+        } else {
+            body
+        };
+        div()
+            .on_children_prepainted(move |children, _window, _app| {
+                measured_bounds.set(children.first().copied());
+            })
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_release_document(
+        &self,
+        item: &ReleasePanelItem,
+        stale_reason: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let stale = stale_reason.map(|reason| {
+            div()
+                .w_full()
+                .mb(px(14.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .text_xs()
+                .text_color(colors.quiet_text)
+                .child(format!("Cached notes · refresh failed: {reason}"))
+                .child(self.render_release_refresh_button(
+                    "Refresh",
+                    "release-notes-refresh",
+                    "Refresh release notes",
+                    cx,
+                ))
+        });
+        let document_target = SettingsFocusTarget::ReleaseDocument;
+        let document_focused = self.target_is_focused(&document_target);
+        let blocks = self.render_release_blocks(item, cx);
+        let scrollbar = self.render_release_scrollbar();
+        let document = div()
+            .id("release-notes-scroll")
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Region)
+            .aria_label("Current release notes; Page Up and Page Down scroll")
+            .border_1()
+            .border_color(if document_focused { colors.accent } else { colors.input_bg })
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.release_scroll)
+            .pl(px(22.0))
+            .pr(px(34.0))
+            .py(px(18.0))
+            .children(stale)
+            .children(blocks);
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(document)
+            .children(scrollbar)
+            .into_any_element()
+    }
+
+    fn render_release_scrollbar(&self) -> Option<gpui::AnyElement> {
+        let viewport = f32::from(self.release_scroll.bounds().size.height);
+        let overflow = f32::from(self.release_scroll.max_offset().y);
+        let scrolled = f32::from(-self.release_scroll.offset().y);
+        let geometry = release_scrollbar_geometry(viewport, overflow, scrolled)?;
+        Some(
+            div()
+                .absolute()
+                .right(px(5.0))
+                .top(px(RELEASE_SCROLLBAR_INSET))
+                .bottom(px(RELEASE_SCROLLBAR_INSET))
+                .w(px(3.0))
+                .rounded_full()
+                .bg(self.colors.control_bg)
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(-1.0))
+                        .top(px(geometry.top - RELEASE_SCROLLBAR_INSET))
+                        .w(px(5.0))
+                        .h(px(geometry.height))
+                        .rounded_full()
+                        .bg(self.colors.scrollbar),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_release_blocks(
+        &self,
+        item: &ReleasePanelItem,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut link_index = 0;
+        item.blocks
+            .iter()
+            .map(|block| {
+                let index = block.target.as_ref().map(|_| {
+                    let index = link_index;
+                    link_index += 1;
+                    index
+                });
+                self.render_release_note_block(
+                    ReleaseBlockRender {
+                        kind: block.kind,
+                        text: block.text.clone(),
+                        target: block.target.clone(),
+                        link_index: index,
+                    },
+                    cx,
+                )
+            })
+            .collect()
+    }
+
+    fn render_release_refresh_button(
+        &self,
+        label: &str,
+        id: &'static str,
+        aria_label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let target = SettingsFocusTarget::ReleaseRefresh;
+        let focused = self.target_is_focused(&target);
+        let pointer_target = target.clone();
+        action_button(label, &colors)
+            .id(id)
+            .when(focused, |button| button.border_color(colors.accent))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(aria_label)
+            .on_click(cx.listener(move |this, _, _, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.load_releases(ctx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_release_nav_button(
+        &self,
+        direction: isize,
+        target: &SettingsFocusTarget,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let focused = self.target_is_focused(target);
+        let pointer_target = target.clone();
+        let (label, glyph) = if direction.is_negative() {
+            ("View newer release", "\u{f060}")
+        } else {
+            ("View older release", "\u{f061}")
+        };
+        div()
+            .id(if direction.is_negative() { "release-notes-newer" } else { "release-notes-older" })
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(label)
+            .size(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(if focused { colors.accent } else { colors.border })
+            .bg(colors.control_bg)
+            .font_family("Symbols Nerd Font Mono")
+            .text_sm()
+            .text_color(colors.dim_text)
+            .cursor_pointer()
+            .hover(move |style| style.bg(colors.control_hover_bg).text_color(colors.text))
+            .active(move |style| style.bg(colors.control_pressed_bg))
+            .on_click(cx.listener(move |this, _, _, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.navigate_release(direction, ctx);
+            }))
+            .child(glyph)
+            .into_any_element()
+    }
+
+    fn render_release_note_block(
+        &self,
+        block: ReleaseBlockRender,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ReleaseBlockRender { kind, text, target, link_index } = block;
+        let colors = self.colors;
+        match kind {
+            ReleaseNoteBlockKind::Heading => div()
+                .mt(px(16.0))
+                .mb(px(6.0))
+                .text_base()
+                .line_height(px(23.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text)
+                .child(text)
+                .into_any_element(),
+            ReleaseNoteBlockKind::Paragraph => div()
+                .mb(px(12.0))
+                .text_sm()
+                .line_height(px(21.0))
+                .text_color(colors.dim_text)
+                .child(text)
+                .into_any_element(),
+            ReleaseNoteBlockKind::ListItem => div()
+                .mb(px(8.0))
+                .flex()
+                .items_start()
+                .gap_3()
+                .text_sm()
+                .line_height(px(21.0))
+                .text_color(colors.dim_text)
+                .child(div().flex_none().text_color(colors.quiet_text).child("•"))
+                .child(div().min_w(px(0.0)).child(text))
+                .into_any_element(),
+            ReleaseNoteBlockKind::Code => div()
+                .mb(px(12.0))
+                .p(px(12.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.control_pressed_bg)
+                .font_family("monospace")
+                .text_xs()
+                .line_height(px(18.0))
+                .text_color(colors.text)
+                .child(text)
+                .into_any_element(),
+            ReleaseNoteBlockKind::Quote => div()
+                .mb(px(12.0))
+                .pl(px(12.0))
+                .border_l_1()
+                .border_color(colors.strong_border)
+                .text_sm()
+                .line_height(px(21.0))
+                .text_color(colors.dim_text)
+                .child(text)
+                .into_any_element(),
+            ReleaseNoteBlockKind::Link => self.render_release_link(text, target, link_index, cx),
+            ReleaseNoteBlockKind::Rule => {
+                div().my(px(16.0)).h(px(1.0)).w_full().bg(colors.border).into_any_element()
+            }
+        }
+    }
+
+    fn render_release_link(
+        &self,
+        text: String,
+        target: Option<String>,
+        link_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(target) = target else {
+            return div()
+                .mb(px(10.0))
+                .text_sm()
+                .text_color(self.colors.dim_text)
+                .child(text)
+                .into_any_element();
+        };
+        let index = link_index.unwrap_or_default();
+        let focus_target = SettingsFocusTarget::ReleaseLink { index, target: target.clone() };
+        let pointer_target = focus_target.clone();
+        let focused = self.target_is_focused(&focus_target);
+        action_button(&text, &self.colors)
+            .id(("release-note-link", index))
+            .mb(px(10.0))
+            .when(focused, |button| button.border_color(self.colors.accent))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(format!("Open link: {text}"))
+            .on_click(cx.listener(move |this, _, _, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                crate::url_detect::open_url(&target);
+                ctx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_smart_selection_panel(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let config = &self.config.terminal.smart_selection;
+        let activation = smart_choice_control(activation_key(), "Activation", ACTIVATION_OPTIONS);
+        let editor = selected_rule_index(self.smart_rule_index, config.rules.len())
+            .map(|index| self.render_smart_rule_editor(index, window, cx));
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.render_control(&activation, true, window, cx))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(480.0))
+                    .flex()
+                    .overflow_hidden()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.input_bg)
+                    .child(self.render_smart_rule_sidebar(cx))
+                    .child(div().flex_1().min_w(px(0.0)).flex().flex_col().children(editor).when(
+                        config.rules.is_empty(),
+                        |el| {
+                            el.items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(colors.dim_text)
+                                .child("Add a rule to start editing.")
+                        },
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_rule_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        let rules = &self.config.terminal.smart_selection.rules;
+        let rows = if rules.is_empty() {
+            vec![
+                div()
+                    .px(px(14.0))
+                    .py(px(22.0))
+                    .text_sm()
+                    .text_color(colors.dim_text)
+                    .child("No rules. Add one or restore the defaults.")
+                    .into_any_element(),
+            ]
+        } else {
+            rules
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| self.render_smart_rule_row(index, rule, cx))
+                .collect()
+        };
+        div()
+            .w(px(220.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex_none()
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.quiet_text)
+                            .child(format!("{} RULES", rules.len())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(self.render_smart_action_button(
+                                "Add",
+                                "Add Smart Selection rule",
+                                SmartActionTarget::AddRule,
+                                cx,
+                            ))
+                            .child(self.render_smart_action_button(
+                                "Restore",
+                                "Restore default Smart Selection rules",
+                                SmartActionTarget::RestoreDefaults,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("smart-selection-rule-list")
+                    .role(Role::TabList)
+                    .aria_label("Smart Selection rules")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.smart_rule_scroll)
+                    .py(px(4.0))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_rule_row(
+        &self,
+        index: usize,
+        rule: &scribe_common::config::SmartSelectionRule,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let target = SettingsFocusTarget::SmartAction(SmartActionTarget::SelectRule(index));
+        let focused = self.target_is_focused(&target);
+        let selected = index == self.smart_rule_index;
+        let validation = rule_validation_error(rule);
+        let pointer_target = target.clone();
+        div()
+            .id(("smart-selection-rule", index))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Tab)
+            .aria_selected(selected)
+            .aria_label(format!(
+                "{}, {}, {}, {} action(s), {}",
+                rule.name,
+                if rule.enabled { "enabled" } else { "disabled" },
+                precision_label(rule.precision),
+                rule.actions.len(),
+                validation.as_deref().unwrap_or("valid regex")
+            ))
+            .h(px(52.0))
+            .mx(px(4.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .gap_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(if focused { colors.accent } else { rgba(0x0000_0000) })
+            .when(selected, |row| row.bg(colors.nav_active_bg))
+            .cursor_pointer()
+            .hover(move |style| style.bg(colors.nav_hover_bg))
+            .on_click(cx.listener(move |this, _, _, ctx| {
+                this.begin_pointer_interaction(&pointer_target);
+                this.run_smart_action(SmartActionTarget::SelectRule(index), ctx);
+            }))
+            .child(div().size(px(7.0)).flex_none().rounded_full().bg(if rule.enabled {
+                colors.accent
+            } else {
+                colors.quiet_text
+            }))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(if selected {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if rule.enabled { colors.text } else { colors.dim_text })
+                            .child(if rule.name.trim().is_empty() {
+                                "Untitled rule".to_owned()
+                            } else {
+                                rule.name.clone()
+                            }),
+                    )
+                    .child(self.render_smart_rule_summary(rule, validation)),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_rule_summary(
+        &self,
+        rule: &scribe_common::config::SmartSelectionRule,
+        validation: Option<String>,
+    ) -> gpui::AnyElement {
+        let color = if validation.is_some() { self.colors.error } else { self.colors.quiet_text };
+        let text = validation.unwrap_or_else(|| {
+            format!(
+                "{} · {} action{}",
+                precision_label(rule.precision),
+                rule.actions.len(),
+                if rule.actions.len() == 1 { "" } else { "s" }
+            )
+        });
+        div().text_xs().text_color(color).child(text).into_any_element()
+    }
+
+    fn render_smart_rule_editor(
+        &self,
+        rule_index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(rule) = self.config.terminal.smart_selection.rules.get(rule_index) else {
+            return div().into_any_element();
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(self.render_smart_rule_header(cx))
+            .child(
+                div()
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(self.render_smart_rule_basics(rule_index, window, cx))
+                    .child(self.render_smart_rule_actions(rule_index, rule, window, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_rule_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        div()
+            .min_h(px(48.0))
+            .flex_none()
+            .px(px(16.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child("Rule details"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.render_smart_action_button(
+                        "Duplicate",
+                        "Duplicate selected rule",
+                        SmartActionTarget::DuplicateRule,
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "↑",
+                        "Move selected rule up",
+                        SmartActionTarget::MoveRuleUp,
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "↓",
+                        "Move selected rule down",
+                        SmartActionTarget::MoveRuleDown,
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "Remove",
+                        "Remove selected rule",
+                        SmartActionTarget::RemoveRule,
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_rule_basics(
+        &self,
+        rule_index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let enabled = smart_toggle_control(rule_enabled_key(rule_index), "Enabled");
+        let name = smart_text_control(rule_name_key(rule_index), "Rule name");
+        let precision =
+            smart_choice_control(rule_precision_key(rule_index), "Precision", PRECISION_OPTIONS);
+        let regex = smart_text_control(rule_regex_key(rule_index), "Regular expression");
+        let preview = smart_text_control(PREVIEW_KEY.to_owned(), "Test text");
+        let preview_max = smart_preview_max(&self.smart_sample_text);
+        let cursor =
+            smart_stepper_control(PREVIEW_CURSOR_KEY.to_owned(), "Test cursor", preview_max);
+        let preview_line = self.smart_preview_line(&regex.key, &preview.key);
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .child(div().flex_1().min_w(px(0.0)).child(self.render_smart_field(
+                        SmartFieldSpec {
+                            label: "Name",
+                            description: "Shown in the rule list and context menu.",
+                            control: &name,
+                        },
+                        window,
+                        cx,
+                    )))
+                    .child(div().w(px(240.0)).flex_none().child(self.render_smart_choice_field(
+                        SmartFieldSpec {
+                            label: "Precision",
+                            description: "Higher precision wins when rules overlap.",
+                            control: &precision,
+                        },
+                        window,
+                        cx,
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(div().text_sm().text_color(colors.dim_text).child("Enabled"))
+                    .child(self.render_toggle(&enabled, cx)),
+            )
+            .child(self.render_smart_field(
+                SmartFieldSpec {
+                    label: "Regular expression",
+                    description: "Rust regex syntax. Enabled rules must be valid before they save.",
+                    control: &regex,
+                },
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.quiet_text)
+                            .child("TEST THIS RULE"),
+                    )
+                    .child(self.render_inline_field(&preview, window, cx))
+                    .child(self.render_control(&cursor, true, window, cx))
+                    .child(
+                        div()
+                            .min_h(px(18.0))
+                            .text_xs()
+                            .text_color(preview_line.1)
+                            .child(preview_line.0),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn smart_preview_line(&self, regex_key: &str, preview_key: &str) -> (String, Rgba) {
+        let colors = self.colors;
+        match preview_match(
+            &self.editor_control_text(regex_key),
+            &self.editor_control_text(preview_key),
+            self.smart_sample_cursor,
+        ) {
+            Ok(Some(found)) => (format!("Match: {found}"), colors.text),
+            Ok(None) => ("No match in the test text.".to_owned(), colors.quiet_text),
+            Err(error) => (error, colors.error),
+        }
+    }
+
+    fn render_smart_rule_actions(
+        &self,
+        rule_index: usize,
+        rule: &scribe_common::config::SmartSelectionRule,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let actions = if rule.actions.is_empty() {
+            vec![
+                div()
+                    .py(px(14.0))
+                    .text_sm()
+                    .text_color(colors.dim_text)
+                    .child("No actions. Selection still works; add one for the context menu.")
+                    .into_any_element(),
+            ]
+        } else {
+            rule.actions
+                .iter()
+                .enumerate()
+                .map(|(action_index, action)| {
+                    self.render_smart_action_editor(
+                        SmartActionEditorSpec { rule_index, action_index, kind: action.kind },
+                        window,
+                        cx,
+                    )
+                })
+                .collect()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .pt(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.text)
+                                    .child("Context menu actions"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.quiet_text)
+                                    .child("Run only when the user chooses them."),
+                            ),
+                    )
+                    .child(self.render_smart_action_button(
+                        "Add action",
+                        "Add context menu action",
+                        SmartActionTarget::AddAction,
+                        cx,
+                    )),
+            )
+            .children(actions)
+            .into_any_element()
+    }
+
+    fn render_smart_action_editor(
+        &self,
+        spec: SmartActionEditorSpec,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let SmartActionEditorSpec { rule_index, action_index, kind } = spec;
+        let colors = self.colors;
+        let kind_control = smart_choice_control(
+            action_kind_key(rule_index, action_index),
+            "Action kind",
+            ACTION_KIND_OPTIONS,
+        );
+        let parameter =
+            smart_text_control(action_parameter_key(rule_index, action_index), "Action parameter");
+        let mode = smart_choice_control(
+            action_mode_key(rule_index, action_index),
+            "Parameter mode",
+            PARAMETER_MODE_OPTIONS,
+        );
+        div()
+            .w_full()
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.control_pressed_bg)
+            .child(self.render_smart_action_header(action_index, kind, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .child(div().flex_1().min_w(px(0.0)).child(self.render_smart_choice_field(
+                        SmartFieldSpec {
+                            label: "Action",
+                            description: action_parameter_hint(kind),
+                            control: &kind_control,
+                        },
+                        window,
+                        cx,
+                    )))
+                    .child(div().w(px(240.0)).flex_none().child(self.render_smart_choice_field(
+                        SmartFieldSpec {
+                            label: "Parameter mode",
+                            description: "Legacy uses \\0; interpolated uses \\(matches[0]).",
+                            control: &mode,
+                        },
+                        window,
+                        cx,
+                    ))),
+            )
+            .child(self.render_smart_field(
+                SmartFieldSpec {
+                    label: "Parameter",
+                    description: action_parameter_hint(kind),
+                    control: &parameter,
+                },
+                window,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_smart_action_header(
+        &self,
+        action_index: usize,
+        kind: SmartSelectionActionKind,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.quiet_text)
+                    .child(format!("ACTION {} · {}", action_index + 1, action_kind_label(kind))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(self.render_smart_action_button(
+                        "↑",
+                        "Move action up",
+                        SmartActionTarget::MoveActionUp(action_index),
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "↓",
+                        "Move action down",
+                        SmartActionTarget::MoveActionDown(action_index),
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "Duplicate",
+                        "Duplicate action",
+                        SmartActionTarget::DuplicateAction(action_index),
+                        cx,
+                    ))
+                    .child(self.render_smart_action_button(
+                        "Remove",
+                        "Remove action",
+                        SmartActionTarget::RemoveAction(action_index),
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_field(
+        &self,
+        spec: SmartFieldSpec<'_>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let SmartFieldSpec { label, description, control } = spec;
+        let colors = self.colors;
+        let error = (self.edit_key() == Some(control.key.as_str()))
+            .then(|| self.edit_error.clone())
+            .flatten();
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.quiet_text)
+                    .child(label.to_owned()),
+            )
+            .child(self.render_inline_field(control, window, cx))
+            .child(
+                div()
+                    .min_h(px(16.0))
+                    .text_xs()
+                    .text_color(if error.is_some() { colors.error } else { colors.quiet_text })
+                    .child(error.unwrap_or_else(|| description.to_owned())),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_choice_field(
+        &self,
+        spec: SmartFieldSpec<'_>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let SmartFieldSpec { label, description, control } = spec;
+        let ControlKind::Choice(options) = &control.kind else {
+            return div().into_any_element();
+        };
+        let colors = self.colors;
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.quiet_text)
+                    .child(label.to_owned()),
+            )
+            .child(self.render_choice(control, options, window, cx))
+            .child(
+                div()
+                    .min_h(px(16.0))
+                    .text_xs()
+                    .text_color(colors.quiet_text)
+                    .child(description.to_owned()),
+            )
+            .into_any_element()
+    }
+
+    fn render_smart_action_button(
+        &self,
+        label: &str,
+        aria_label: &str,
+        action: SmartActionTarget,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let enabled = self.smart_action_enabled(&action);
+        let id = key_hash(&format!("{aria_label}:{action:?}"));
+        let target = SettingsFocusTarget::SmartAction(action);
+        let pointer_target = target.clone();
+        let focused = self.target_is_focused(&target);
+        let button = action_button(label, &colors)
+            .id(("smart-selection-action", id))
+            .when(focused, |button| button.border_color(colors.accent))
+            .focusable()
+            .tab_stop(enabled)
+            .role(Role::Button)
+            .aria_label(aria_label.to_owned())
+            .when(!enabled, |button| button.opacity(0.45).cursor_not_allowed());
+        if enabled {
+            button
+                .on_click(cx.listener(move |this, _, _, ctx| {
+                    this.begin_pointer_interaction(&pointer_target);
+                    this.run_smart_action(action, ctx);
+                }))
+                .into_any_element()
+        } else {
+            button.into_any_element()
+        }
+    }
+
+    fn smart_action_enabled(&self, action: &SmartActionTarget) -> bool {
+        let rules = &self.config.terminal.smart_selection.rules;
+        let Some(selected) = selected_rule_index(self.smart_rule_index, rules.len()) else {
+            return matches!(
+                action,
+                SmartActionTarget::AddRule | SmartActionTarget::RestoreDefaults
+            );
+        };
+        let Some(rule) = rules.get(selected) else { return false };
+        match action {
+            SmartActionTarget::SelectRule(index) => *index < rules.len(),
+            SmartActionTarget::AddRule
+            | SmartActionTarget::RestoreDefaults
+            | SmartActionTarget::DuplicateRule
+            | SmartActionTarget::RemoveRule
+            | SmartActionTarget::AddAction => true,
+            SmartActionTarget::MoveRuleUp => selected > 0,
+            SmartActionTarget::MoveRuleDown => selected + 1 < rules.len(),
+            SmartActionTarget::DuplicateAction(index) | SmartActionTarget::RemoveAction(index) => {
+                *index < rule.actions.len()
+            }
+            SmartActionTarget::MoveActionUp(index) => *index > 0 && *index < rule.actions.len(),
+            SmartActionTarget::MoveActionDown(index) => *index + 1 < rule.actions.len(),
+        }
+    }
+
+    fn editor_control_text(&self, key: &str) -> String {
+        if self.edit_key() == Some(key) {
+            self.edit_input.clone()
+        } else {
+            self.control_value(key).as_str().unwrap_or("").to_owned()
+        }
     }
 
     fn render_workspace_root_sections(
@@ -3912,12 +5916,17 @@ impl SettingsWindow {
     fn render_control(
         &self,
         control: &Control,
+        is_first: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = self.colors;
         let enabled = self.control_is_enabled(&control.key);
-        let label = row_label(&control.label, colors.text);
+        // Gating mutes with colour, never with an opacity that drops the
+        // explanatory text below 4.5:1 — the description is the only thing
+        // saying why the row is unavailable.
+        let label =
+            row_label(&control.label, if enabled { colors.text } else { colors.quiet_text });
         let value_widget = if enabled {
             self.render_value_widget(control, window, cx)
         } else {
@@ -3925,6 +5934,7 @@ impl SettingsWindow {
         };
         div()
             .id(("settings-control", key_hash(&control.key)))
+            .group(STEPPER_GROUP)
             .role(Role::Group)
             .aria_label(control.label.clone())
             .when(!enabled, |el| el.aria_description("Unavailable while its parent setting is off"))
@@ -3934,21 +5944,23 @@ impl SettingsWindow {
                 if (self.edit_key() == Some(control.key.as_str()) && self.edit_error.is_some())
                     || self.capture_action.as_deref() == Some(control.key.as_str())
                 {
-                    78.0
+                    ROW_HEIGHT + 26.0
                 } else {
-                    46.0
+                    ROW_HEIGHT
                 },
             ))
             .flex_none()
             .flex()
             .items_center()
             .gap_6()
-            // Rows separate by rhythm alone; the hover wash bleeds past the
-            // text margin so the pill reads as a surface, not a stripe.
+            // One hairline between rows and nothing else: no boxes, no cards.
+            // The hover wash bleeds past the text margin so it reads as a
+            // surface rather than a stripe.
             .mx(px(-12.0))
             .px(px(12.0))
-            .rounded(px(6.0))
-            .when(!enabled, |el| el.opacity(GATED_OPACITY))
+            .rounded(px(4.0))
+            .border_t_1()
+            .border_color(if is_first { gpui::transparent_black().into() } else { colors.border })
             .when(enabled, |el| el.hover(move |style| style.bg(colors.row_hover_bg)))
             .child(label)
             .child(
@@ -4030,16 +6042,20 @@ impl SettingsWindow {
     fn render_toggle(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
         let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
-        let on = current_value(&self.config, &control.key).as_bool().unwrap_or(false);
+        let on = self.control_value(&control.key).as_bool().unwrap_or(false);
         let key = control.key.clone();
-        let track_bg = if on { colors.accent } else { colors.control_bg };
-        let track_border = if on { colors.accent } else { colors.strong_border };
-        let hover_bg = if on { rgb(0x00ff_c85c) } else { colors.control_hover_bg };
-        let pressed_bg = if on { rgb(0x00df_a42f) } else { colors.control_pressed_bg };
+        // White is "on" across this whole system, which keeps the accent rare
+        // enough to mean live state and keeps the switch legible to anyone who
+        // cannot separate an accent hue from the ground.
+        let track_bg = if on { colors.text } else { rgba(0xffff_ff17) };
+        let hover_bg = if on { colors.text } else { rgba(0xffff_ff21) };
+        let pressed_bg = if on { colors.dim_text } else { rgba(0xffff_ff2b) };
         let pointer_target = SettingsFocusTarget::Control(control.clone());
-        // The knob is warm white over amber and neutral white over ink, so the
-        // on state reads at a glance even in a long column of switches.
-        let knob = div().size(px(16.0)).rounded_full().bg(colors.text);
+        let knob = div().size(px(12.0)).rounded_full().bg(if on {
+            colors.page_bg
+        } else {
+            rgb(0x008d_94a2)
+        });
         div()
             .id(("toggle", key_hash(&control.key)))
             .focusable()
@@ -4047,17 +6063,17 @@ impl SettingsWindow {
             .role(Role::Switch)
             .aria_label(control.label.clone())
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
-            .w(px(38.0))
-            .h(px(22.0))
-            .p(px(2.0))
+            .w(px(32.0))
+            .h(px(18.0))
+            .p(px(3.0))
             .flex()
             .items_center()
             .when(on, gpui::Styled::justify_end)
             .rounded_full()
             .border_1()
-            // A white ring, not amber: the focused ON track is already amber,
-            // so an amber ring would make keyboard focus invisible there.
-            .border_color(if focused { colors.text } else { track_border })
+            // The ON track is white, so keyboard focus rings in the accent:
+            // the two states can never be confused for each other.
+            .border_color(if focused { colors.accent } else { gpui::transparent_black().into() })
             .bg(track_bg)
             .cursor_pointer()
             .hover(move |style| style.bg(hover_bg))
@@ -4099,23 +6115,20 @@ impl SettingsWindow {
             .aria_value(display.clone())
             .aria_expanded(open)
             .w(px(CHOICE_WIDTH))
-            .h(px(30.0))
-            .px(px(10.0))
+            .h(px(26.0))
             .flex()
             .items_center()
-            .justify_between()
-            .gap_3()
-            .rounded(px(5.0))
+            .justify_end()
+            .gap(px(7.0))
+            .rounded(px(4.0))
             .border_1()
-            .border_color(if focused || open { colors.accent } else { colors.border })
-            .bg(colors.control_bg)
-            .text_sm()
-            .text_color(colors.text)
+            .border_color(if focused { colors.accent } else { gpui::transparent_black().into() })
+            .font_family(DATA_FONT)
+            .text_size(px(13.0))
+            .text_color(if open { colors.text } else { colors.dim_text })
             .cursor_pointer()
-            .hover(move |style| {
-                style.bg(colors.control_hover_bg).border_color(colors.strong_border)
-            })
-            .active(move |style| style.bg(colors.control_pressed_bg))
+            .hover(move |style| style.text_color(colors.text))
+            .active(move |style| style.text_color(colors.dim_text))
             .when(open, |button| {
                 button.capture_any_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, choice_window, ctx| {
@@ -4131,8 +6144,8 @@ impl SettingsWindow {
             .child(
                 div()
                     .font_family("Symbols Nerd Font Mono")
-                    .text_sm()
-                    .text_color(colors.quiet_text)
+                    .text_size(px(12.0))
+                    .text_color(colors.glyph)
                     .child(if open { "\u{f106}" } else { "\u{f107}" }),
             );
         div()
@@ -4143,11 +6156,42 @@ impl SettingsWindow {
             // absolutely positioned, so with an automatic height this shell
             // measures as zero-height and the hit test never reaches the button
             // inside it — the control stops responding to clicks entirely.
-            .h(px(30.0))
+            .h(px(26.0))
             .flex_none()
             .when(open, |el| el.child(self.render_choice_menu(control, &effective, window, cx)))
             .child(button)
             .into_any_element()
+    }
+
+    /// The resolved theme behind a preset token, when the cache holds one.
+    fn preset_theme(&self, token: &str) -> Option<Theme> {
+        self.theme_presets
+            .iter()
+            .find(|preset| preset.token == token)
+            .map(|preset| preset.theme.clone())
+    }
+
+    /// Take or release the hovered preset's page-wide preview.
+    ///
+    /// Sliding between rows fires the entered row's hover before the left
+    /// row's, so a leave only clears the preview when the theme still on screen
+    /// is its own — otherwise the row being left erases the preview its
+    /// neighbour has just set and the page snaps back mid-browse.
+    fn hover_preview(&mut self, preset: &Theme, entered: bool, cx: &mut Context<Self>) {
+        let showing = theme_identity(self.preview_theme.as_ref());
+        let mine = theme_identity(Some(preset));
+        if entered {
+            if showing == mine {
+                return;
+            }
+            self.preview_theme = Some(preset.clone());
+        } else {
+            if showing != mine {
+                return;
+            }
+            self.preview_theme = None;
+        }
+        cx.notify();
     }
 
     fn render_choice_menu_rows(
@@ -4156,8 +6200,7 @@ impl SettingsWindow {
         options: &[(String, String)],
         cx: &mut Context<Self>,
     ) -> (Vec<gpui::AnyElement>, bool) {
-        let colors = self.colors;
-        let token = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let token = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
         let theme_menu = control.key == "theme.preset";
         let filtered =
             filter_choice_options(options, if theme_menu { &self.choice_filter } else { "" });
@@ -4166,60 +6209,86 @@ impl SettingsWindow {
             .into_iter()
             .enumerate()
             .map(|(index, (option, label))| {
-                let selected = *option == token;
-                let highlighted = self.choice_highlight.as_deref() == Some(option.as_str());
-                let (commit_key, commit_value) = (control.key.clone(), option.clone());
-                let preview = theme_preset_preview(
-                    &self.config,
-                    &control.key,
-                    &token,
+                let row = ChoiceRow {
+                    control,
                     option,
-                    &self.theme_presets,
-                )
-                .map(theme_preview_strip);
-                div()
-                    .id(("choice-option", key_hash(&format!("{}:{option}", control.key))))
-                    .focusable()
-                    .tab_stop(true)
-                    .role(Role::MenuItem)
-                    .aria_label(label.clone())
-                    .aria_selected(selected)
-                    .aria_position_in_set(index + 1)
-                    .aria_size_of_set(filtered_count)
-                    .w_full()
-                    .h(px(CHOICE_OPTION_HEIGHT))
-                    .flex_none()
-                    .px(px(10.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .text_sm()
-                    .text_color(if selected { colors.accent } else { colors.text })
-                    .cursor_pointer()
-                    .when(highlighted, |row| {
-                        row.bg(colors.control_hover_bg).aria_active_descendant()
-                    })
-                    .hover(move |style| style.bg(colors.control_hover_bg))
-                    .active(move |style| style.bg(colors.control_pressed_bg))
-                    .on_click(cx.listener(move |this, _, choice_window, ctx| {
-                        this.clear_choice_menu_state();
-                        choice_window.focus(&this.focus_handle, ctx);
-                        this.commit(&commit_key, Value::String(commit_value.clone()), ctx);
-                    }))
-                    .child(choice_option_label(label))
-                    .children(preview)
-                    .child(
-                        div()
-                            .font_family("Symbols Nerd Font Mono")
-                            .text_xs()
-                            .text_color(colors.accent)
-                            .child(if selected { "\u{f00c}" } else { "" }),
-                    )
-                    .into_any_element()
+                    label,
+                    token: &token,
+                    index,
+                    count: filtered_count,
+                    theme_menu,
+                };
+                self.render_choice_menu_row(&row, cx)
             })
             .collect();
         (rows, theme_menu && filtered_count == 0)
+    }
+
+    /// One option row: its label, the themed preview a preset row carries, and
+    /// the mark on the live value.
+    fn render_choice_menu_row(
+        &self,
+        spec: &ChoiceRow<'_>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let &ChoiceRow { control, option, label, token, index, count, theme_menu } = spec;
+        let colors = self.colors;
+        let selected = option == token;
+        let highlighted = self.choice_highlight.as_deref() == Some(option.as_str());
+        let (commit_key, commit_value) = (control.key.clone(), option.clone());
+        let preview =
+            theme_preset_preview(&self.config, &control.key, token, option, &self.theme_presets)
+                .map(theme_preview_strip);
+        // Browsing the menu repaints the page's palette grid and terminal
+        // preview under the pointer. Nothing is written until the row is
+        // clicked, so a look costs no config edit.
+        let hovered = theme_menu.then(|| self.preset_theme(option.as_str())).flatten();
+        let preview_listener = hovered.map(|preset| {
+            cx.listener(move |this, entered: &bool, _win, ctx| {
+                this.hover_preview(&preset, *entered, ctx);
+            })
+        });
+        div()
+            .id(("choice-option", key_hash(&format!("{}:{option}", control.key))))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::MenuItem)
+            .aria_label(label.clone())
+            .aria_selected(selected)
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(count)
+            .w_full()
+            .h(px(CHOICE_OPTION_HEIGHT))
+            .flex_none()
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .text_sm()
+            .text_color(if selected { colors.accent } else { colors.text })
+            .cursor_pointer()
+            .when(highlighted, |option_row| {
+                option_row.bg(colors.control_hover_bg).aria_active_descendant()
+            })
+            .hover(move |style| style.bg(colors.control_hover_bg))
+            .active(move |style| style.bg(colors.control_pressed_bg))
+            .when_some(preview_listener, |option_row, listener| option_row.on_hover(listener))
+            .on_click(cx.listener(move |this, _, choice_window, ctx| {
+                this.clear_choice_menu_state();
+                choice_window.focus(&this.focus_handle, ctx);
+                this.commit_control_value(&commit_key, Value::String(commit_value.clone()), ctx);
+            }))
+            .child(choice_option_label(label))
+            .children(preview)
+            .child(
+                div()
+                    .font_family("Symbols Nerd Font Mono")
+                    .text_xs()
+                    .text_color(colors.accent)
+                    .child(if selected { "\u{f00c}" } else { "" }),
+            )
+            .into_any_element()
     }
 
     /// The anchored dropdown for an open choice control: one activatable row per
@@ -4262,7 +6331,7 @@ impl SettingsWindow {
                 choice_window.focus(&this.focus_handle, ctx);
             }))
             .when(theme_menu, |menu| menu.track_focus(&self.choice_filter_handle))
-            .w(px(CHOICE_WIDTH))
+            .w(px(if theme_menu { THEME_MENU_WIDTH } else { CHOICE_WIDTH }))
             .mt(px(34.0))
             .max_h(px(CHOICE_MENU_MAX_HEIGHT))
             .flex()
@@ -4377,6 +6446,12 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) {
         self.flush_theme_preset(cx);
+        if self.edit_key().is_some_and(is_smart_control_key) && self.edit_key() != Some(key) {
+            if !self.save_inline_edit(cx) {
+                return;
+            }
+            self.clear_inline_edit();
+        }
         if self.open_choice.as_deref() == Some(key) {
             self.clear_choice_menu_state();
             window.focus(&self.focus_handle, cx);
@@ -4399,7 +6474,7 @@ impl SettingsWindow {
     /// theme preset list would open on an unrelated stretch of the alphabet.
     fn align_choice_scroll(&mut self, key: &str, options: &[(&'static str, &'static str)]) {
         let options = self.choice_options(key, options);
-        let value = current_value(&self.config, key);
+        let value = self.control_value(key);
         let token = value.as_str().unwrap_or("");
         let index = options.iter().position(|(candidate, _)| candidate == token).unwrap_or(0);
         self.choice_highlight = options.get(index).map(|(candidate, _)| candidate.clone());
@@ -4425,7 +6500,7 @@ impl SettingsWindow {
         let ControlKind::Choice(declared) = &control.kind else {
             return;
         };
-        let selected = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let selected = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
         let options = self.choice_options(&control.key, declared);
         let query = if control.key == "theme.preset" { &self.choice_filter } else { "" };
         let filtered = filter_choice_options(&options, query);
@@ -4446,7 +6521,7 @@ impl SettingsWindow {
         let ControlKind::Choice(declared) = &control.kind else {
             return;
         };
-        let selected = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let selected = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
         let options = self.choice_options(&control.key, declared);
         let query = if control.key == "theme.preset" { &self.choice_filter } else { "" };
         let filtered = filter_choice_options(&options, query);
@@ -4487,11 +6562,12 @@ impl SettingsWindow {
         };
         self.clear_choice_menu_state();
         window.focus(&self.focus_handle, cx);
-        self.commit(&control.key, Value::String(token), cx);
+        self.commit_control_value(&control.key, Value::String(token), cx);
     }
 
     fn clear_choice_menu_state(&mut self) -> bool {
         let was_open = self.open_choice.take().is_some();
+        self.preview_theme = None;
         self.choice_highlight = None;
         self.choice_filter.clear();
         self.choice_filter_marked_range = None;
@@ -4706,7 +6782,7 @@ impl SettingsWindow {
         let colors = self.colors;
         let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
         let (min, max, step) = bounds;
-        let current = current_value(&self.config, &control.key).as_f64().unwrap_or(min);
+        let current = self.control_value(&control.key).as_f64().unwrap_or(min);
         let display = format!("{current:.*}", decimals as usize);
         let key_a11y_dec = control.key.clone();
         let key_a11y_inc = control.key.clone();
@@ -4733,30 +6809,25 @@ impl SettingsWindow {
             )
             .flex()
             .items_center()
-            .w(px(152.0))
-            .h(px(30.0))
-            .rounded(px(5.0))
+            .gap(px(8.0))
+            .h(px(26.0))
+            .rounded(px(4.0))
             .border_1()
-            .border_color(if focused { colors.accent } else { colors.border })
-            .bg(colors.control_bg)
-            .overflow_hidden()
+            .border_color(if focused { colors.accent } else { gpui::transparent_black().into() })
+            // The value holds the column on its own; the adjusters sit either
+            // side of it and only come up on approach, so the number never
+            // shifts when they appear.
             .child(minus)
             .child(
                 div()
                     .id(("stepper-value", key_hash(&control.key)))
                     .role(Role::Label)
                     .aria_label(display.clone())
-                    .h_full()
-                    .flex_1()
-                    .px_2()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(colors.border)
-                    .font_family("monospace")
-                    .text_sm()
+                    .justify_end()
+                    .font_family(DATA_FONT)
+                    .text_size(px(13.0))
                     .text_color(colors.text)
                     .child(Text::new_inaccessible(display.into())),
             )
@@ -4827,7 +6898,7 @@ impl SettingsWindow {
             .id(("color-selector-shell", key_hash(&control.key)))
             .relative()
             .w(px(CHOICE_WIDTH))
-            .h(px(30.0))
+            .h(px(26.0))
             .flex_none()
             .when(open, |el| el.child(self.render_color_menu(control, window, cx)))
             .child(self.render_color_trigger(control, open, cx))
@@ -4897,20 +6968,16 @@ impl SettingsWindow {
             .focusable()
             .tab_stop(true)
             .w(px(CHOICE_WIDTH))
-            .h(px(30.0))
-            .px(px(7.0))
+            .h(px(26.0))
             .flex()
             .items_center()
-            .gap_2()
-            .rounded(px(5.0))
+            .justify_end()
+            .gap(px(9.0))
+            .rounded(px(4.0))
             .border_1()
-            .border_color(if focused || open { colors.accent } else { colors.border })
-            .bg(colors.control_bg)
+            .border_color(if focused || open { colors.accent } else { gpui::transparent_black().into() })
             .cursor_pointer()
-            .hover(move |style| {
-                style.bg(colors.control_hover_bg).border_color(colors.strong_border)
-            })
-            .active(move |style| style.bg(colors.control_pressed_bg))
+            .hover(move |style| style.bg(colors.row_hover_bg))
             .when(open, |trigger| {
                 trigger.capture_any_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, _window, ctx| {
@@ -4924,32 +6991,24 @@ impl SettingsWindow {
             }))
             .child(
                 div()
-                    .size(px(18.0))
+                    .size(px(14.0))
                     .flex_none()
-                    .rounded(px(4.0))
+                    .rounded(px(3.0))
                     .border_1()
                     .border_color(colors.strong_border)
                     .bg(swatch),
             )
             .child(
                 div()
-                    .flex_1()
                     .overflow_hidden()
-                    .font_family("monospace")
-                    .text_sm()
+                    .font_family(DATA_FONT)
+                    .text_size(px(13.0))
                     .text_color(if display.starts_with('#') || display.starts_with("ansi:") {
                         colors.text
                     } else {
                         colors.quiet_text
                     })
                     .child(Text::new_inaccessible(display.into())),
-            )
-            .child(
-                div()
-                    .font_family("Symbols Nerd Font Mono")
-                    .text_sm()
-                    .text_color(colors.quiet_text)
-                    .child(if open { "\u{f106}" } else { "\u{f107}" }),
             )
             .into_any_element()
     }
@@ -5170,7 +7229,7 @@ impl SettingsWindow {
         let is_color = matches!(control.kind, ControlKind::Color);
         let editing =
             self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window);
-        let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let saved = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
         let value = if editing { self.edit_input.clone() } else { saved.clone() };
         let swatch_color = color_swatch(&self.theme, &control.key, &value)
             .or_else(|| color_swatch(&self.theme, &control.key, &saved))
@@ -5233,7 +7292,7 @@ impl SettingsWindow {
         let colors = self.colors;
         let editing =
             self.edit_key() == Some(control.key.as_str()) && self.edit_handle.is_focused(window);
-        let saved = current_value(&self.config, &control.key).as_str().unwrap_or("").to_owned();
+        let saved = self.control_value(&control.key).as_str().unwrap_or("").to_owned();
         let value = if editing { self.edit_input.clone() } else { saved };
         let is_color = matches!(control.kind, ControlKind::Color);
         let placeholder = inline_placeholder(&control.key, is_color);
@@ -5257,24 +7316,26 @@ impl SettingsWindow {
             .focusable()
             .tab_stop(true)
             .w_full()
-            .h(px(30.0))
-            .px(px(10.0))
+            .h(px(26.0))
             .flex()
             .items_center()
+            .justify_end()
             .overflow_hidden()
             .relative()
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(if editing { colors.accent } else { colors.border })
-            .bg(colors.input_bg)
-            .font_family("monospace")
-            .text_sm()
+            // A line, not a box: nothing at rest, a hairline under the pointer,
+            // the accent under the caret.
+            .border_b_1()
+            .border_color(if editing { colors.accent } else { gpui::transparent_black().into() })
+            .font_family(DATA_FONT)
+            .text_size(px(13.0))
             .text_color(if value.is_empty() { colors.quiet_text } else { colors.text })
             .cursor_text()
-            .when(!editing, |el| el.hover(move |style| style.border_color(colors.strong_border)))
+            .when(!editing, |el| el.hover(move |style| style.border_color(colors.border)))
             .on_click(cx.listener(move |this, _, input_window, ctx| {
                 this.begin_pointer_interaction(&pointer_target);
-                this.begin_inline_edit(&edit_control);
+                if !this.switch_inline_edit(&edit_control, ctx) {
+                    return;
+                }
                 input_window.focus(&focus, ctx);
                 ctx.notify();
             }))
@@ -5307,6 +7368,10 @@ const VALUE_COLUMN_WIDTH: f32 = 300.0;
 
 /// Width of a choice button and its anchored menu inside the value column.
 const CHOICE_WIDTH: f32 = 240.0;
+
+/// The preset menu carries a name and a themed preview line on one row, so it
+/// is wider than a menu that only lists words.
+const THEME_MENU_WIDTH: f32 = 340.0;
 
 /// Height of one dropdown option row, also the unit the open-scroll uses to put
 /// the live value on screen.
@@ -5350,12 +7415,6 @@ fn color_menu_left_offset() -> f32 {
 /// toggle's gated ON transition), so the two surfaces say the same thing.
 const KEYSTORE_PENDING: &str = "Probing the OS keystore…";
 
-/// How many releases the status line names before it summarizes the rest.
-const RELEASE_SUMMARY_MAX: usize = 4;
-
-/// Dimming applied to a control whose parent toggle is off.
-const GATED_OPACITY: f32 = 0.42;
-
 fn choice_scroll_offset(index: usize) -> Pixels {
     let rows = f32::from(u16::try_from(index).unwrap_or(u16::MAX));
     px(-(rows * CHOICE_OPTION_HEIGHT - CHOICE_MENU_LEAD).max(0.0))
@@ -5366,20 +7425,83 @@ fn choice_option_label(label: &str) -> gpui::AnyElement {
         .flex_1()
         .min_w(px(0.0))
         .overflow_hidden()
+        // A theme row carries a preview tile beside the name, so a long preset
+        // label has to elide rather than wrap: two wrapped lines in a
+        // fixed-height row collide with the row below it.
+        .whitespace_nowrap()
+        .text_ellipsis()
         .child(Text::new_inaccessible(label.to_owned().into()))
         .into_any_element()
 }
 
+/// `Theme` has no `PartialEq`, and a hover that repainted on every mouse move
+/// would notify the window dozens of times a second. The name is the identity
+/// the preview cares about.
+fn theme_identity(theme: Option<&Theme>) -> Option<&str> {
+    theme.map(|theme| theme.name.as_ref())
+}
+
+/// The `theme.ansi_normal.N` / `theme.ansi_bright.N` slot a control key names.
+fn ansi_slot(key: &str) -> Option<usize> {
+    let (base, index) = key
+        .strip_prefix("theme.ansi_normal.")
+        .map(|index| (0, index))
+        .or_else(|| key.strip_prefix("theme.ansi_bright.").map(|index| (8, index)))?;
+    let index: usize = index.parse().ok()?;
+    (index < 8).then_some(base + index)
+}
+
+fn rgba_hex(color: [f32; 4]) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        hex_channel(color, 0),
+        hex_channel(color, 1),
+        hex_channel(color, 2)
+    )
+}
+
+/// One 0-255 channel of a normalised colour.
+///
+/// The workspace denies lossy float-to-int casts, so the rounding is done by
+/// walking the byte scale rather than by casting a float and hoping it landed
+/// in range.
+fn hex_channel(color: [f32; 4], index: usize) -> u8 {
+    let value = color.get(index).copied().unwrap_or_default().clamp(0.0, 1.0);
+    let scaled = value * 255.0;
+    (0u8..=u8::MAX).find(|byte| f32::from(*byte) >= scaled - 0.5).unwrap_or(u8::MAX)
+}
+
+/// A preset row shows what the theme *looks like*, not what colours it
+/// contains: ten abstract chips told the reader nothing about legibility, which
+/// is the only question a theme picker actually answers. This is one line of
+/// terminal set in the candidate theme — its own background, its own
+/// foreground, its own prompt colours — so contrast is visible in the menu.
+///
+/// `colors` arrives from [`preset_strip_colors`] as background, foreground,
+/// then ANSI 0-7.
 fn theme_preview_strip(colors: [[f32; 4]; 10]) -> gpui::AnyElement {
+    let background = srgba(colors[0]);
+    let foreground = srgba(colors[1]);
+    let green = srgba(colors[4]);
+    let blue = srgba(colors[6]);
+    let cell = |text: &'static str, color: Rgba| div().flex_none().text_color(color).child(text);
     div()
         .flex_none()
-        .h(px(10.0))
+        .w(px(112.0))
+        .h(px(22.0))
+        .px(px(6.0))
+        .rounded(px(3.0))
+        .bg(background)
         .flex()
         .items_center()
-        .gap(px(1.0))
-        .children(
-            colors.into_iter().map(|color| div().w(px(7.0)).h_full().flex_none().bg(srgba(color))),
-        )
+        .gap(px(4.0))
+        .overflow_hidden()
+        .font_family(DATA_FONT)
+        .text_size(px(10.0))
+        .child(cell("~/scribe", green))
+        .child(cell("$", blue))
+        .child(cell("ls", foreground))
+        .child(div().w(px(5.0)).h(px(11.0)).flex_none().bg(foreground))
         .into_any_element()
 }
 
@@ -5482,6 +7604,9 @@ fn search_display_text(query: &str, focused: bool) -> String {
 }
 
 fn inline_placeholder(key: &str, is_color: bool) -> &'static str {
+    if let Some(placeholder) = smart_inline_placeholder(key) {
+        return placeholder;
+    }
     if !is_color {
         return "Not set";
     }
@@ -5757,8 +7882,8 @@ fn elide(text: &str, max: usize) -> String {
     out
 }
 
-/// One section head: uppercase tracked caps in the quiet ink, more air above
-/// than below — the typeset grammar's only grouping device.
+/// One section head: 10px tracked caps in the quiet ink, with far more air
+/// above than below so a section reads as belonging to what follows it.
 fn heading_label(id: &'static str, text: &str, colors: &SettingsColors) -> gpui::AnyElement {
     div()
         .id((id, key_hash(text)))
@@ -5767,14 +7892,19 @@ fn heading_label(id: &'static str, text: &str, colors: &SettingsColors) -> gpui:
         .aria_label(text.to_owned())
         .w_full()
         .flex_none()
-        .pt(px(34.0))
-        .pb(px(10.0))
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
+        .pt(px(SECTION_LEAD))
+        .pb(px(SECTION_TRAIL))
+        .font_family(UI_FONT)
+        .text_size(px(10.0))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(colors.quiet_text)
         .child(Text::new_inaccessible(text.to_uppercase().into()))
         .into_any_element()
 }
+
+/// Rows own this hover group so a stepper's adjusters can come up when the
+/// pointer is anywhere on the row rather than only over the glyph itself.
+const STEPPER_GROUP: &str = "settings-stepper";
 
 /// The left-hand label of a settings row: it takes the leftover width but never
 /// forces the row wider than the pane, so the right-aligned control stays on
@@ -5787,7 +7917,8 @@ fn row_label(text: &str, color: Rgba) -> gpui::Stateful<gpui::Div> {
         .flex_1()
         .min_w(px(0.0))
         .overflow_hidden()
-        .text_sm()
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
@@ -5812,14 +7943,14 @@ fn read_only_value(
         .aria_label(format!("{label}: {value}"))
         .aria_description("Read-only value")
         .w(px(VALUE_COLUMN_WIDTH))
-        .h(px(30.0))
+        .h(px(26.0))
         .flex()
         .items_center()
         .justify_end()
         .overflow_hidden()
-        .font_family("monospace")
-        .text_sm()
-        .text_color(colors.dim_text)
+        .font_family(DATA_FONT)
+        .text_size(px(13.0))
+        .text_color(colors.quiet_text)
         .child(Text::new_inaccessible(elide(value, READ_ONLY_MAX_CHARS).into()))
         .into_any_element()
 }
@@ -5859,15 +7990,17 @@ fn a11y_inline_edit_handler(
         weak_settings
             .update(app, move |this, ctx| {
                 this.edit_input = input;
-                current_value(&this.config, &control.key)
+                this.control_value(&control.key)
                     .as_str()
                     .unwrap_or("")
                     .clone_into(&mut this.edit_original);
+                let smart = is_smart_control_key(&control.key);
                 this.edit_control = Some(control);
                 this.edit_marked_range = None;
                 this.edit_error = None;
                 this.active_input = Some(NativeInputTarget::Inline);
-                this.input_selection = NativeInputSelection::Caret;
+                this.input_selection =
+                    if smart { NativeInputSelection::All } else { NativeInputSelection::Caret };
                 ctx.notify();
             })
             .ok();
@@ -5889,25 +8022,24 @@ fn a11y_step_handler(
 /// Quiet neutral action button: amber stays reserved for live state, so an
 /// idle action reads at the same volume as the rest of the page.
 fn action_button(text: &str, colors: &SettingsColors) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = colors.control_hover_bg;
-    let hover_border = colors.strong_border;
-    let pressed_bg = colors.control_pressed_bg;
+    let hover_border = colors.text;
+    let pressed = colors.dim_text;
     div()
         .id("settings-action-button")
-        .h(px(30.0))
-        .px(px(12.0))
         .flex()
         .items_center()
-        .rounded(px(5.0))
-        .border_1()
+        .pb(px(2.0))
+        // An action is text with a rule under it. Filled buttons are reserved
+        // for a genuine primary, and a settings row never has one.
+        .border_b_1()
         .border_color(colors.border)
-        .text_sm()
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
         .font_weight(FontWeight::MEDIUM)
-        .bg(colors.control_bg)
         .text_color(colors.text)
         .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg).border_color(hover_border))
-        .active(move |style| style.bg(pressed_bg))
+        .hover(move |style| style.border_color(hover_border))
+        .active(move |style| style.text_color(pressed))
         .child(text.to_owned())
 }
 
@@ -6008,27 +8140,28 @@ fn stepper_button(
     disabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
     let hover_bg = colors.control_hover_bg;
-    let pressed_bg = colors.control_pressed_bg;
     div()
         .id("settings-stepper-button")
-        .w(px(36.0))
-        .h_full()
+        .size(px(20.0))
         .flex()
         .items_center()
         .justify_center()
-        .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if disabled { colors.quiet_text } else { colors.dim_text })
-        .when(disabled, |el| el.cursor_not_allowed().opacity(0.55))
+        .rounded(px(3.0))
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
+        .text_color(colors.glyph)
+        // Invisible at rest and brought up by the row's own hover: the value is
+        // the information, the adjusters are only an affordance.
+        .opacity(0.0)
+        .group_hover(STEPPER_GROUP, |el| el.opacity(if disabled { 0.25 } else { 1.0 }))
+        .when(disabled, gpui::Styled::cursor_not_allowed)
         .when(!disabled, |el| {
-            el.cursor_pointer()
-                .hover(move |style| style.bg(hover_bg))
-                .active(move |style| style.bg(pressed_bg))
+            el.cursor_pointer().hover(move |style| style.bg(hover_bg).text_color(colors.text))
         })
         .child(text)
 }
 
-fn settings_nav_pages() -> [SettingsPage; 12] {
+fn settings_nav_pages() -> [SettingsPage; 11] {
     [
         SettingsPage::Appearance,
         SettingsPage::Colors,
@@ -6038,7 +8171,6 @@ fn settings_nav_pages() -> [SettingsPage; 12] {
         SettingsPage::Environment,
         SettingsPage::Workspaces,
         SettingsPage::Updates,
-        SettingsPage::Releases,
         SettingsPage::Notifications,
         SettingsPage::Remote,
         SettingsPage::AgentApi,
@@ -6054,8 +8186,7 @@ fn settings_nav_groups() -> [(&'static str, &'static [SettingsPage]); 5] {
     ];
     const INTELLIGENCE: &[SettingsPage] = &[SettingsPage::Ai];
     const WORKFLOW: &[SettingsPage] = &[SettingsPage::Environment, SettingsPage::Workspaces];
-    const SYSTEM: &[SettingsPage] =
-        &[SettingsPage::Updates, SettingsPage::Releases, SettingsPage::Notifications];
+    const SYSTEM: &[SettingsPage] = &[SettingsPage::Updates, SettingsPage::Notifications];
     const CONNECTIVITY: &[SettingsPage] = &[SettingsPage::Remote, SettingsPage::AgentApi];
     [
         ("TERMINAL", TERMINAL),
@@ -6066,34 +8197,16 @@ fn settings_nav_groups() -> [(&'static str, &'static [SettingsPage]); 5] {
     ]
 }
 
-fn page_icon(page: SettingsPage) -> &'static str {
-    match page {
-        SettingsPage::Appearance => "\u{f108}",
-        SettingsPage::Colors => "\u{f1fc}",
-        SettingsPage::Terminal => "\u{f120}",
-        SettingsPage::Keybindings => "\u{f11c}",
-        SettingsPage::Ai => "\u{f0d0}",
-        SettingsPage::Environment => "\u{f121}",
-        SettingsPage::Workspaces => "\u{f07b}",
-        SettingsPage::Updates => "\u{f019}",
-        SettingsPage::Releases => "\u{f02b}",
-        SettingsPage::Notifications => "\u{f0f3}",
-        SettingsPage::Remote => "\u{f1eb}",
-        SettingsPage::AgentApi => "\u{f1e5}",
-    }
-}
-
 fn page_summary(page: SettingsPage) -> &'static str {
     match page {
         SettingsPage::Appearance => "Type, cursor, spacing, and terminal chrome",
         SettingsPage::Colors => "Theme palette, ANSI colors, and prompt bar overrides",
         SettingsPage::Ai => "Assistant integrations, prompt bar, and state signals",
-        SettingsPage::Terminal => "Session behavior, clipboard policy, and status metrics",
+        SettingsPage::Terminal => "Session behavior, Smart Selection, clipboard, and status",
         SettingsPage::Environment => "Securely restore environment variables across sessions",
         SettingsPage::Keybindings => "Click a shortcut, then press the keys you want to use",
         SettingsPage::Workspaces => "Workspace roots and badge appearance",
-        SettingsPage::Updates => "Automatic update cadence and release channel",
-        SettingsPage::Releases => "Query available versions from the Scribe server",
+        SettingsPage::Updates => "Automatic updates, manual checks, and release history",
         SettingsPage::Notifications => "Desktop delivery conditions and timeout behavior",
         SettingsPage::Remote => "Tailnet, local-network trust, and sharing policy",
         SettingsPage::AgentApi => "Control local agent access to Scribe capabilities",
@@ -6115,8 +8228,8 @@ fn control_section(page: SettingsPage, key: &str) -> &'static str {
         SettingsPage::Keybindings => keybinding_section(key),
         SettingsPage::Workspaces if key.starts_with("workspaces.badge_colors.") => "Badge colors",
         SettingsPage::Workspaces => "Workspace configuration",
+        SettingsPage::Updates if key.starts_with("action.") => "Release service",
         SettingsPage::Updates => "Automatic updates",
-        SettingsPage::Releases => "Release service",
         SettingsPage::Notifications => notification_section(key),
         SettingsPage::Remote => remote_section(key),
         SettingsPage::AgentApi => "Capability policy",
@@ -6171,10 +8284,8 @@ fn ai_section(key: &str) -> &'static str {
 fn terminal_section(key: &str) -> &'static str {
     if key.starts_with("terminal.clipboard.") {
         "Clipboard (OSC 52)"
-    } else if key.starts_with("terminal.status_bar_stats.") {
+    } else if key.starts_with("terminal.status_bar_stats.") || key == "github_ci.enabled" {
         "Status bar"
-    } else if key == "terminal.smart_selection.reset" {
-        "Smart selection"
     } else {
         "Session"
     }
@@ -6292,19 +8403,94 @@ fn key_hash(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// Re-centre an already-open settings window over the window asking for it.
+///
+/// "Centred on the window I opened it from" has to hold every time the chord is
+/// pressed, not only the first. Raising the existing window is the right answer
+/// to a second request — stacking duplicates is not — but raising it where it
+/// happens to sit, which after a move or on a second monitor can be an entirely
+/// different screen, is not what was asked for. This re-applies the same
+/// centring the open path uses, to the window that already exists.
+pub fn recenter_settings_window(window: &mut Window, anchor: SettingsWindowAnchor, cx: &mut App) {
+    if !anchor.is_sane() {
+        return;
+    }
+    let size = window.bounds().size;
+    let centre = point(
+        px(logical_i32(anchor.x.saturating_add(anchor.width / 2))),
+        px(logical_i32(anchor.y.saturating_add(anchor.height / 2))),
+    );
+    let display = cx
+        .displays()
+        .into_iter()
+        .map(|display| display.visible_bounds())
+        .find(|bounds| bounds.contains(&centre))
+        .or_else(|| cx.primary_display().map(|display| display.visible_bounds()));
+    let Some(display) = display else { return };
+    let bounds = centered_settings_bounds(anchor, size, display);
+    #[cfg(target_os = "linux")]
+    if gpui::guess_compositor() == "X11" {
+        crate::monitor::apply_saved_position(
+            window,
+            crate::window_state::logical_px_to_i32(f32::from(bounds.origin.x)),
+            crate::window_state::logical_px_to_i32(f32::from(bounds.origin.y)),
+            crate::window_state::WindowState::Windowed,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = bounds;
+}
+
 /// Open the settings window in the running GPUI [`App`].
 ///
 /// The caller is responsible for the singleton handshake (see
 /// [`crate::settings::singleton`]) before invoking this — a second launch should
 /// hand focus to the existing window rather than open a duplicate.
 ///
+/// `anchor` is the live terminal rectangle that initiated an in-app launch. It
+/// owns the new window's position while a sane persisted geometry may still
+/// supply its size.
+///
 /// The handle comes back so an in-process caller can keep it and raise the very
 /// same window on the next request instead of stacking duplicates: the terminal
 /// shell's settings entry point ([`crate::settings`] is a window in the client
 /// process, not a separate binary) holds it for exactly that. `None` means the
 /// platform refused the window, which is already logged here.
-pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
-    let visible = cx.primary_display().map(|display| display.visible_bounds());
+pub fn open_settings_window(
+    cx: &mut App,
+    anchor: Option<SettingsWindowAnchor>,
+) -> Option<WindowHandle<SettingsWindow>> {
+    let (bounds, anchored, minimum) = settings_open_bounds(anchor, cx);
+    tracing::info!(
+        anchored,
+        anchor = ?anchor,
+        origin_x = f32::from(bounds.origin.x),
+        origin_y = f32::from(bounds.origin.y),
+        "opening settings window"
+    );
+    open_settings_window_at(bounds, anchored, minimum, cx)
+}
+
+/// Where a new settings window belongs, and whether that position is ours to
+/// assert against the window manager.
+fn settings_open_bounds(
+    anchor: Option<SettingsWindowAnchor>,
+    cx: &mut App,
+) -> (Bounds<Pixels>, bool, Size<Pixels>) {
+    let anchor_point = anchor.map(|anchor| {
+        point(
+            px(logical_i32(anchor.x.saturating_add(anchor.width / 2))),
+            px(logical_i32(anchor.y.saturating_add(anchor.height / 2))),
+        )
+    });
+    let visible = anchor_point
+        .and_then(|point| {
+            cx.displays()
+                .into_iter()
+                .map(|display| display.visible_bounds())
+                .find(|bounds| bounds.contains(&point))
+        })
+        .or_else(|| cx.primary_display().map(|display| display.visible_bounds()));
     let available =
         visible.map_or(size(px(SETTINGS_MIN_WIDTH), px(SETTINGS_MIN_HEIGHT)), |bounds| bounds.size);
     let minimum = size(
@@ -6314,24 +8500,37 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
     let saved = crate::settings::state::load()
         .geometry
         .filter(|geometry| saved_settings_geometry_fits(*geometry, available));
-    let bounds = saved.map_or_else(
-        || Bounds::centered(None, minimum, cx),
-        |geometry| {
-            let saved_width = logical_i32(geometry.width);
-            let saved_height = logical_i32(geometry.height);
-            let saved_size = size(px(saved_width), px(saved_height));
-            let Some(display) = visible else {
-                return Bounds::centered(None, saved_size, cx);
-            };
-            let left = f32::from(display.origin.x);
-            let top = f32::from(display.origin.y);
-            let right = left + f32::from(display.size.width) - saved_width;
-            let bottom = top + f32::from(display.size.height) - saved_height;
-            let x = logical_i32(geometry.x).clamp(left, right.max(left));
-            let y = logical_i32(geometry.y).clamp(top, bottom.max(top));
-            Bounds::new(point(px(x), px(y)), saved_size)
-        },
-    );
+    let window_size = saved.map_or(minimum, |geometry| {
+        size(px(logical_i32(geometry.width)), px(logical_i32(geometry.height)))
+    });
+    // Whether the position is *ours* to assert. With a launcher anchor the
+    // window belongs over that window and the window manager must be told so.
+    // Without one, every candidate is a guess — a stale saved position, or a
+    // centring on whichever display GPUI calls primary — and forcing a guess is
+    // worse than the placement the window manager would have chosen, which at
+    // least lands on the active monitor. So: anchored positions are asserted,
+    // unanchored ones stay hints.
+    let (bounds, anchored) = match (anchor.filter(|anchor| anchor.is_sane()), visible) {
+        (Some(anchor), Some(display)) => {
+            (centered_settings_bounds(anchor, window_size, display), true)
+        }
+        (_, _) => (
+            saved.map_or_else(
+                || Bounds::centered(None, window_size, cx),
+                |geometry| saved_settings_bounds(geometry, window_size, visible, cx),
+            ),
+            false,
+        ),
+    };
+    (bounds, anchored, minimum)
+}
+
+fn open_settings_window_at(
+    bounds: Bounds<Pixels>,
+    anchored: bool,
+    minimum: Size<Pixels>,
+    cx: &mut App,
+) -> Option<WindowHandle<SettingsWindow>> {
     match cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -6347,7 +8546,31 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
             ..Default::default()
         },
         |window, cx| {
+            // Creation bounds are only a hint on X11: GPUI sets no
+            // `USPosition`/`PPosition`, and under ICCCM a window without one is
+            // placed entirely at the window manager's discretion — which is how
+            // a settings window computed to sit over its terminal still opened
+            // in the corner of the screen. The terminal windows already
+            // re-assert their own position for exactly this reason; this is the
+            // same move, applied to the anchor the caller worked out.
+            #[cfg(target_os = "linux")]
+            if anchored && gpui::guess_compositor() == "X11" {
+                crate::monitor::apply_saved_position(
+                    window,
+                    crate::window_state::logical_px_to_i32(f32::from(bounds.origin.x)),
+                    crate::window_state::logical_px_to_i32(f32::from(bounds.origin.y)),
+                    crate::window_state::WindowState::Windowed,
+                );
+            }
             let view = cx.new(SettingsWindow::new);
+            if anchored {
+                view.update(cx, |this, _| {
+                    this.pending_position = Some((
+                        crate::window_state::logical_px_to_i32(f32::from(bounds.origin.x)),
+                        crate::window_state::logical_px_to_i32(f32::from(bounds.origin.y)),
+                    ));
+                });
+            }
             // GPUI dispatches key events along the path built from the focused
             // node, so until something is focused the path excludes
             // `#settings-root` and its `on_key_down` never runs. Focusing the
@@ -6364,6 +8587,46 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
             None
         }
     }
+}
+
+fn centered_settings_bounds(
+    anchor: SettingsWindowAnchor,
+    window_size: Size<Pixels>,
+    display: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let width = crate::window_state::logical_px_to_i32(f32::from(window_size.width));
+    let height = crate::window_state::logical_px_to_i32(f32::from(window_size.height));
+    let (wanted_x, wanted_y) = centered_settings_position(anchor, width, height);
+    clamped_settings_bounds(wanted_x, wanted_y, window_size, display)
+}
+
+fn saved_settings_bounds(
+    geometry: crate::settings::state::SettingsWindowGeometry,
+    window_size: Size<Pixels>,
+    visible: Option<Bounds<Pixels>>,
+    cx: &App,
+) -> Bounds<Pixels> {
+    visible.map_or_else(
+        || Bounds::centered(None, window_size, cx),
+        |display| clamped_settings_bounds(geometry.x, geometry.y, window_size, display),
+    )
+}
+
+fn clamped_settings_bounds(
+    wanted_x: i32,
+    wanted_y: i32,
+    window_size: Size<Pixels>,
+    display: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let width = f32::from(window_size.width);
+    let height = f32::from(window_size.height);
+    let left = f32::from(display.origin.x);
+    let top = f32::from(display.origin.y);
+    let right = left + f32::from(display.size.width) - width;
+    let bottom = top + f32::from(display.size.height) - height;
+    let x = logical_i32(wanted_x).clamp(left, right.max(left));
+    let y = logical_i32(wanted_y).clamp(top, bottom.max(top));
+    Bounds::new(point(px(x), px(y)), window_size)
 }
 
 /// Whether persisted geometry is already usable in GPUI's logical coordinate
@@ -6406,27 +8669,39 @@ mod tests {
     use super::{
         ChoiceMenuKey, NativeInputSelection, NativeInputTarget, Rect, SCROLLBAR_WIDTH,
         ScrollMetrics, ScrollbarDrag, ScrollbarLayout, SettingsFocusTarget, adjacent_color_preset,
-        build_theme_preset_cache, canonical_combo, choice_menu_key_action,
-        choice_options_from_cache, choice_scroll_offset, color_menu_left_offset, combo_for_capture,
-        commits_pi_integration_enable, conflicting_action, content_scroll_offset, control_section,
-        dismiss_choice_or_search, filter_choice_options, focus_targets_match, inline_commit_value,
-        inline_placeholder, is_modifier_key, key_combo_text, move_choice_highlight,
-        offset_from_drag, offset_from_track_click, palette_color_at, pi_integration_enable_status,
-        prompt_bar_reset_change, prompt_bar_theme_swatch, push_control_focus_targets, px,
-        release_inline_input, replace_pending_theme_preset, revert_inline_input,
-        search_display_text, settings_nav_pages, take_pending_theme_preset, theme_preset_preview,
-        utf16_range_to_utf8, workspace_badge_color_controls, workspace_root_controls_match_query,
+        build_theme_preset_cache, canonical_combo, centered_settings_bounds,
+        choice_menu_key_action, choice_options_from_cache, choice_scroll_offset,
+        color_menu_left_offset, combo_for_capture, commits_pi_integration_enable,
+        conflicting_action, content_scroll_offset, control_section, dismiss_choice_or_search,
+        filter_choice_options, focus_targets_match, inline_commit_value, inline_placeholder,
+        is_modifier_key, key_combo_text, move_choice_highlight, offset_from_drag,
+        offset_from_track_click, palette_color_at, pending_regex_belongs_to_toggle,
+        pi_integration_enable_status, prompt_bar_reset_change, prompt_bar_theme_swatch,
+        push_control_focus_targets, px, release_inline_input, release_scrollbar_geometry,
+        replace_pending_theme_preset, revert_inline_input, search_display_text, settings_nav_pages,
+        take_pending_theme_preset, theme_preset_preview, utf16_range_to_utf8,
+        workspace_badge_color_controls, workspace_root_controls_match_query,
         workspace_root_focus_index, workspace_root_matches_query, workspace_root_prompt_options,
         workspace_roots_match_query,
     };
     use gpui::{Bounds, Keystroke, Modifiers, point, size};
     use scribe_common::config::{KeyComboList, ScribeConfig, ThemeConfig};
+    use scribe_common::settings_window::SettingsWindowAnchor;
     use serde_json::json;
 
     use crate::settings::model::{SettingsPage, page_controls};
 
     fn keystroke(modifiers: Modifiers, key: &str) -> Keystroke {
         Keystroke { modifiers, key: key.to_owned(), key_char: None }
+    }
+
+    #[test]
+    fn settings_window_centers_over_the_launching_terminal() {
+        let anchor = SettingsWindowAnchor { x: 100, y: 50, width: 1400, height: 900 };
+        let display = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
+        let bounds = centered_settings_bounds(anchor, size(px(1040.0), px(720.0)), display);
+
+        assert_eq!(bounds.origin, point(px(280.0), px(140.0)));
     }
 
     // @lat: [[test#GPUI Settings Window#Scrollbar gestures map back onto the scroller]]
@@ -6455,6 +8730,16 @@ mod tests {
         let dragged = offset_from_drag(&layout, &drag, 100.0, SCROLLBAR_WIDTH);
         assert!(dragged < top);
         assert!(content_scroll_offset(800, dragged) < px(0.0));
+    }
+
+    #[test]
+    fn release_scrollbar_stays_visible_and_tracks_scroll_progress() {
+        let top = release_scrollbar_geometry(300.0, 600.0, 0.0).expect("overflowing release");
+        let bottom = release_scrollbar_geometry(300.0, 600.0, 600.0).expect("overflowing release");
+
+        assert!(top.height >= super::RELEASE_SCROLLBAR_MIN_HEIGHT);
+        assert!(bottom.top > top.top);
+        assert!(release_scrollbar_geometry(300.0, 0.0, 0.0).is_none());
     }
 
     // @lat: [[test#GPUI Settings Window#Shortcut capture]]
@@ -6821,6 +9106,19 @@ mod tests {
         assert!(
             row_top + super::CHOICE_OPTION_HEIGHT <= viewport_top + super::CHOICE_MENU_MAX_HEIGHT
         );
+    }
+
+    #[test]
+    fn disabling_a_rule_can_preserve_its_pending_invalid_regex() {
+        let regex = "terminal.smart_selection.rules.2.regex";
+        let enabled = "terminal.smart_selection.rules.2.enabled";
+
+        assert!(pending_regex_belongs_to_toggle(Some(regex), enabled));
+        assert!(!pending_regex_belongs_to_toggle(None, enabled));
+        assert!(!pending_regex_belongs_to_toggle(
+            Some("terminal.smart_selection.rules.1.regex"),
+            enabled,
+        ));
     }
 
     #[test]

@@ -26,17 +26,14 @@ use crate::workspace_drag::{EmptyWorkspaceDragGhost, WorkspaceDragMarker};
 /// Height of the titlebar in pixels.
 pub const TITLEBAR_HEIGHT: f32 = 34.0;
 
-/// Number of label columns a tab reserves at [`CHAR_WIDTH`] each.
-const TAB_COLS: usize = 22;
-
 /// Approximate advance width of one label character.
 const CHAR_WIDTH: f32 = 8.0;
 
 /// Leading tab mark shown while the server holds an agent activity lease.
 const AGENT_ACTIVE_GLYPH: &str = "◆";
 
-/// Fixed width of one tab in pixels (`TAB_COLS * CHAR_WIDTH`). Matching the
-/// legacy fixed-column tab layout keeps the drag-reorder geometry deterministic.
+/// The width a tab starts from before it flexes: its basis, and the fallback
+/// the drag geometry uses until a frame has measured a real one.
 pub const TAB_WIDTH: f32 = 176.0;
 
 /// Floor a shrinking tab stops at: room for the close button plus a few title
@@ -191,6 +188,12 @@ pub struct TitlebarView {
     equalize_focus_handle: FocusHandle,
     beads_focus_handles: Vec<FocusHandle>,
     standalone_beads_focus_handles: Vec<FocusHandle>,
+    /// Width one tab actually received, measured from the first painted tab.
+    ///
+    /// Tabs flex to fill the strip, so their width is a layout result rather
+    /// than a constant. Drag-reorder geometry has to use the width the user is
+    /// looking at, not the basis it started from.
+    measured_tab_width: std::rc::Rc<std::cell::Cell<f32>>,
 }
 
 impl EventEmitter<TitlebarEvent> for TitlebarView {}
@@ -213,7 +216,43 @@ impl TitlebarView {
             equalize_focus_handle: cx.focus_handle().tab_stop(true),
             beads_focus_handles: Vec::new(),
             standalone_beads_focus_handles: Vec::new(),
+            measured_tab_width: std::rc::Rc::new(std::cell::Cell::new(TAB_WIDTH)),
         }
+    }
+
+    /// Arm a tab drag from the press that starts it.
+    fn tab_press_listener(
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
+        cx.listener(move |this, event: &MouseDownEvent, _win, ctx| {
+            let cursor_x = f32::from(event.position.x);
+            let origin_x = this.tabs_origin_x();
+            this.begin_drag(index, cursor_x, origin_x, ctx);
+        })
+    }
+
+    /// A zero-ink overlay that records the tab it sits in.
+    ///
+    /// Tabs flex, so their width is a layout result. The drag geometry needs
+    /// the width the user is looking at, and this is the only place the painted
+    /// value exists.
+    fn tab_width_probe(&self) -> AnyElement {
+        let measured = std::rc::Rc::clone(&self.measured_tab_width);
+        gpui::canvas(
+            move |bounds, _window, _cx| measured.set(f32::from(bounds.size.width)),
+            |_, (), _window, _cx| {},
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The width one tab occupies right now: measured when a frame has painted,
+    /// the fixed basis before that.
+    fn tab_width(&self) -> f32 {
+        let measured = self.measured_tab_width.get();
+        if measured.is_finite() && measured >= TAB_MIN_WIDTH { measured } else { TAB_WIDTH }
     }
 
     /// Release the titlebar's workspace-pill press ownership after Escape,
@@ -318,7 +357,7 @@ impl TitlebarView {
         if source >= self.tabs.len() {
             return;
         }
-        let tab_x = origin_x + px_units(source) * TAB_WIDTH;
+        let tab_x = origin_x + px_units(source) * self.tab_width();
         let grab_offset = cursor_x - tab_x;
         self.drag = Some(DragState { source, origin_x, grab_offset, cursor_x, reordered: false });
         cx.notify();
@@ -334,9 +373,10 @@ impl TitlebarView {
         // a swap then always requires half a tab of overlap regardless of
         // where inside the tab the grab landed, so slots cannot thrash when
         // the pointer sits near a boundary.
-        let center = cursor_x - drag.grab_offset + TAB_WIDTH / 2.0;
+        let width = self.tab_width();
+        let center = cursor_x - drag.grab_offset + width / 2.0;
         let target =
-            reorder_target_index(center, drag.origin_x, TAB_WIDTH, self.tabs.len(), drag.source);
+            reorder_target_index(center, drag.origin_x, width, self.tabs.len(), drag.source);
         if target != drag.source {
             self.move_tab(drag.source, target);
             cx.emit(TitlebarEvent::ReorderTab { from: drag.source, to: target });
@@ -522,25 +562,6 @@ pub fn beads_graph_icon(color: Rgba) -> AnyElement {
         .into_any_element()
 }
 
-/// Label columns left for a tab title once padding and the close button
-/// (4 columns), the context-% suffix, the leading agent glyph (1 column), and
-/// the AI dot (6px + margin ≈ 2 columns) are reserved. Under-reserving here
-/// makes the title overflow its slot at full tab width, which used to wrap it
-/// onto a hidden second line.
-///
-/// Shared with the shell's lower-region bars: those tabs are the same width
-/// with the same chrome, so they must reserve both indicators identically.
-#[must_use]
-pub fn title_columns(suffix_len: usize, tab: &TabData) -> usize {
-    let agent_cols = usize::from(tab.agent_active);
-    let dot_cols = if tab.ai_indicator.is_some() { 2 } else { 0 };
-    TAB_COLS
-        .saturating_sub(4)
-        .saturating_sub(suffix_len)
-        .saturating_sub(agent_cols)
-        .saturating_sub(dot_cols)
-}
-
 /// One-column leading activity glyph shared by both tab-bar renderers.
 #[must_use]
 pub fn agent_active_glyph(color: Rgba) -> AnyElement {
@@ -615,10 +636,11 @@ impl TitlebarView {
     fn tab_slide_offset(&self, index: usize) -> Option<f32> {
         self.drag.and_then(|d| {
             (d.source == index).then(|| {
+                let width = self.tab_width();
                 let origin = self.tabs_origin_x();
-                let max_left = origin + px_units(self.tabs.len().saturating_sub(1)) * TAB_WIDTH;
+                let max_left = origin + px_units(self.tabs.len().saturating_sub(1)) * width;
                 let left = (d.cursor_x - d.grab_offset).clamp(origin, max_left);
-                let tab_x = origin + px_units(index) * TAB_WIDTH;
+                let tab_x = origin + px_units(index) * width;
                 left - tab_x
             })
         })
@@ -664,9 +686,11 @@ impl TitlebarView {
 
     fn render_tab_children(&self, render: TabRender<'_>, cx: &mut Context<Self>) -> TabChildren {
         let TabRender { index, tab, foreground, id, focused, close_focused } = render;
-        let suffix_len = tab.context_suffix.as_ref().map_or(0, |s| s.text.chars().count());
-        let available = title_columns(suffix_len, tab);
-        let (display, _truncated) = tab_display_title(&tab.title, available);
+        // No column budget here. The label is a flex child with `truncate`, so
+        // it already ends in an ellipsis exactly where the tab runs out of
+        // room; pre-cutting it to a fixed 22-column slot only made every title
+        // shorter than the space it had, which is what it looked like.
+        let display = tab.title.clone();
         let agent_indicator = tab.agent_active.then(|| agent_active_glyph(self.colors.accent));
         let ai_indicator = tab
             .ai_indicator
@@ -738,10 +762,12 @@ impl TitlebarView {
             .relative()
             .flex()
             .items_center()
-            // A tab wants its fixed slot but shrinks inside a narrow group
-            // bar, truncating its flexed title while the close button stays
-            // whole — instead of the bar's clip slicing glyphs in half.
-            .flex_grow_0()
+            // A tab takes an equal share of the strip: with room to spare the
+            // tabs grow into it rather than leaving the band empty, and in a
+            // narrow group bar they shrink, truncating the flexed title while
+            // the close button stays whole — instead of the bar's clip slicing
+            // glyphs in half.
+            .flex_grow(1.0)
             .flex_shrink_1()
             .flex_basis(px(TAB_WIDTH))
             .min_w(px(TAB_MIN_WIDTH))
@@ -755,6 +781,9 @@ impl TitlebarView {
             .border_color(self.colors.separator);
         if focused {
             tab_el = tab_el.border_2().border_color(self.colors.accent);
+        }
+        if index == 0 {
+            tab_el = tab_el.child(self.tab_width_probe());
         }
         let slide = self.tab_slide_offset(index);
         if let Some(dx) = slide {
@@ -775,14 +804,7 @@ impl TitlebarView {
                 this.hovered_tab = if *hovered { Some(index) } else { None };
                 ctx.notify();
             }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _win, ctx| {
-                    let cursor_x = f32::from(event.position.x);
-                    let origin_x = this.tabs_origin_x();
-                    this.begin_drag(index, cursor_x, origin_x, ctx);
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, Self::tab_press_listener(index, cx))
             // Registers [`TabDrag`] as GPUI's active drag once the pressed
             // pointer travels past the drag threshold; from then on the root's
             // `on_drag_move` receives every mouse move in the window.
@@ -899,7 +921,11 @@ impl TitlebarView {
                     tabs.get(index).map(|tab| self.render_tab(index, tab, window, cx))
                 }));
                 if !aligned {
-                    return row.into_any_element();
+                    // The group bar takes the strip so its tabs have something
+                    // to grow into. Without this the row sizes to its content
+                    // and every tab stays at its basis, leaving the band empty
+                    // to the right no matter how wide the window is.
+                    return row.flex_1().min_w(px(0.0)).overflow_hidden().into_any_element();
                 }
                 let left = edges.get(group).copied().flatten().unwrap_or(0.0);
                 let row = row.absolute().top_0().left(px(left)).overflow_hidden();
@@ -1237,8 +1263,8 @@ mod tests {
     use scribe_common::{ids::WorkspaceId, theme::minimal_dark};
 
     use super::{
-        StandaloneBadge, TAB_COLS, TabActivationSource, TitlebarEvent, TitlebarView,
-        badge_width_px, tab_accessible_label, title_columns, workspace_group_ranges,
+        StandaloneBadge, TabActivationSource, TitlebarEvent, TitlebarView, badge_width_px,
+        tab_accessible_label, workspace_group_ranges,
     };
     use crate::tab_bar::{GroupBadge, TabBarColors, TabData};
 
@@ -1335,21 +1361,6 @@ mod tests {
             assert!(bar.tabs.is_empty());
             assert_eq!(bar.standalone_badges, vec![badge]);
         });
-    }
-
-    // @lat: [[client#GPUI Titlebar#Title budget reserves AI dot columns]]
-    #[test]
-    fn title_budget_reserves_agent_glyph_and_ai_dot_columns() {
-        let mut tab = TabData::new("build");
-        // Without indicators or suffix the title keeps every non-chrome column.
-        assert_eq!(title_columns(0, &tab), TAB_COLS - 4);
-        // Agent and AI indicators coexist: one leading glyph column plus two dot columns.
-        tab.agent_active = true;
-        tab.ai_indicator = Some(gpui::Rgba::default());
-        assert_eq!(title_columns(0, &tab), TAB_COLS - 7);
-        assert_eq!(title_columns(4, &tab), TAB_COLS - 11);
-        // Degenerate budgets clamp to zero instead of underflowing.
-        assert_eq!(title_columns(TAB_COLS, &tab), 0);
     }
 
     #[test]
