@@ -50,9 +50,18 @@ Do not cherry-pick or resolve directly on main. That bypasses the rail's
 verified worker tree, squash preparation, integration gate, cleanup, and audit
 record.
 
-Recovery record: bead `scribe-i6pb`; preserved worker commit
-`f5b7c954716886171d17dac1c1f9553f36e6dd05`. No squash commit exists because
-the task remained stuck at `prepare`.
+The original run cannot turn that successful worker result into a retry: the
+retry gate requires a failed prior result. When the conflict is later approved
+for repair, file a narrow follow-up bead with the exact conflicting files and
+acceptance criteria. Give it a fresh rail worktree from current main, replay the
+preserved commit there, inspect every conflict, and run the full normal
+result-to-cleanup lifecycle.
+
+That path preserved the retired decoder row and sparse release evidence map
+while applying the production-renderer lifecycle changes. Fix record: bead
+`scribe-i6pb.1`, squash commit
+`22811309403f12e907fe90049f0087b146ab8d36`. The original worker commit
+`f5b7c954716886171d17dac1c1f9553f36e6dd05` remains the recovery source.
 
 ## Prevention
 
