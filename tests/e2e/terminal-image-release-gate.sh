@@ -24,43 +24,42 @@ fail() {
 
 [ -d "$OUT" ] || fail "no evidence directory at $OUT; run the terminal-image gates first"
 
-# Every criterion in specs/020-terminal-images/spec.md, in document order, with
-# the evidence that proves it. `just e2e-release-gate` re-derives the criterion
-# count from the spec and refuses a table that has drifted from it, so a new
-# acceptance criterion cannot land unmapped.
+# Evidence mapping only. Specification prose stays solely in spec.md;
+# `just e2e-release-gate` re-derives its criterion count so a new criterion
+# still cannot land unmapped.
 CRITERIA=(
-    "US1.1|Kitty RGB/RGBA/PNG, chunking, bounded zlib, classic placements, placeholders, and Sixel implemented against primary specifications|contract.json framing.json kitty-decode-evidence.json sixel-decoder-evidence.json"
-    "US1.2|The compatibility contract documents actions, encodings, placement, reset, numeric limits, and deliberate exclusions|contract.json"
-    "US1.3|Running-client fixtures display both protocols with stable visible output over direct PTY and SSH|linux/client/client.json functional.json"
-    "US1.4|Yazi placeholders, a dual-protocol previewer, a plotting workflow, and protocol fixtures form the interoperability corpus|linux/apps/apps.json contract.json"
-    "US1.5|Unsupported, malformed, truncated, or over-budget sequences never corrupt adjacent text or crash the client|framing.json transfer-lifecycle.json functional.json"
-    "US2.1|Required query replies use the selected protocol's specified framing and values|contract.json replies-sharing.json"
-    "US2.2|Each protocol reply is emitted exactly once, in byte order, to the originating PTY|replies-sharing.json"
-    "US2.3|Typed IPC carries bounded replay and render state without exposing a Scribe-specific application protocol|ipc.json state-seam-ipc.json"
-    "US2.4|Capability claims expose only implemented subsets; excluded transports and actions are never advertised|contract.json replies-sharing.json"
-    "US2.5|Runtime policy including the master kill switch controls truthful advertising|settings.json functional.json"
-    "US2.6|Split, reconnect, and concurrent-pane validation proves replies reach only the originating session in order|replies-sharing.json observer-parity.json"
-    "US3.1|Placement geometry derives from cells and pane metrics, clips to the viewport, and follows z-order rules|client-scene.json linux/renderer/renderer.json"
-    "US3.2|Scroll, erase, delete, reset, alternate screen, resize, and pane destruction update image state|mutations.json linux/renderer/renderer.json"
-    "US3.3|Text stays selectable and copyable without image data leaking into copied text|client-scene.json linux/client/client.json"
-    "US3.4|Surrounding text survives a disabled or rejected image beside a non-payload diagnostic affordance|settings.json linux/client/client.json"
-    "US3.5|Protocol state is isolated per server session and GPU resources are isolated per pane view|convergence.json server-state-manifest.json linux/renderer/renderer.json"
-    "US4.1|Lengths, decoded bytes, dimensions, multiplication, accumulation, retention, placements, and budgets are checked|accounting.json kitty-decode-evidence.json sixel-decoder-evidence.json"
-    "US4.2|Decode and decompression run outside the GPUI paint path; only bounded finished resources reach upload|scheduler.json linux/gpui-spike.json"
-    "US4.3|Per-pane eviction is deterministic, protocol-correct, and never evicts another pane's content|server-state-manifest.json linux/renderer/renderer.json"
-    "US4.4|File, temporary-file, shared-memory, URL, network, and every other indirect transport is refused|contract.json kitty-decode-evidence.json"
-    "US4.5|Decoder selection may patch, vendor, or replace upstream to enforce caller-controlled limits|kitty-decode-evidence.json sixel-decoder-evidence.json"
-    "US4.6|Corpus-based malformed-input validation covers framing, chunking, decompression, dimensions, and deletion|framing.json kitty-decode-evidence.json sixel-decoder-evidence.json mutations.json"
-    "US5.1|Named measurements compare text-only throughput, input latency, CPU use, and frame stability|performance.json linux/client/frame-stability.json"
-    "US5.2|Named measurements record decode latency, upload latency, peak retained memory, and eviction|performance.json linux/gpui-spike.json"
-    "US5.3|Release review records whether the measurements show a material regression, without invented thresholds|performance.json"
-    "US5.4|Exact numeric security limits stay mandatory and distinct from qualitative performance review|contract.json accounting.json performance.json"
-    "US5.5|Bounded server state survives detach, reattach, replay, client restart, and simultaneous viewers|replay.json client-replay.json handoff.json"
-    "US5.6|Closing or replacing a pane releases every image resource that view held|mutations.json linux/renderer/renderer.json"
-    "US6.1|Linux X11 and Wayland behavior is verified only through the Docker E2E harness|linux/client/client.json linux/renderer/renderer.json"
-    "US6.2|Native macOS build and runtime verification completes before default-on release|macos/metal.json"
-    "US6.3|Linux and macOS advertise the same verified protocol subset at release|contract.json macos/metal.json"
-    "US6.4|Platform texture formats, scale factors, and GPU limits do not change protocol-visible semantics|linux/gpui-spike.json macos/metal.json"
+    "US1.1|contract.json framing.json kitty-decode-evidence.json sixel-decoder-evidence.json"
+    "US1.2|contract.json"
+    "US1.3|linux/client/client.json functional.json"
+    "US1.4|linux/apps/apps.json contract.json"
+    "US1.5|framing.json transfer-lifecycle.json functional.json"
+    "US2.1|contract.json replies-sharing.json"
+    "US2.2|replies-sharing.json"
+    "US2.3|ipc.json state-seam-ipc.json"
+    "US2.4|contract.json replies-sharing.json"
+    "US2.5|settings.json functional.json"
+    "US2.6|replies-sharing.json observer-parity.json"
+    "US3.1|client-scene.json linux/renderer/renderer.json"
+    "US3.2|mutations.json linux/renderer/renderer.json"
+    "US3.3|client-scene.json linux/client/client.json"
+    "US3.4|settings.json linux/client/client.json"
+    "US3.5|convergence.json server-state-manifest.json linux/renderer/renderer.json"
+    "US4.1|accounting.json kitty-decode-evidence.json sixel-decoder-evidence.json"
+    "US4.2|scheduler.json linux/gpui-spike.json"
+    "US4.3|mutations.json server-state-manifest.json linux/renderer/renderer.json"
+    "US4.4|contract.json kitty-decode-evidence.json"
+    "US4.5|kitty-decode-evidence.json sixel-decoder-evidence.json"
+    "US4.6|framing.json kitty-decode-evidence.json sixel-decoder-evidence.json mutations.json"
+    "US5.1|performance.json linux/client/frame-stability.json"
+    "US5.2|performance.json linux/gpui-spike.json"
+    "US5.3|performance.json"
+    "US5.4|contract.json accounting.json performance.json"
+    "US5.5|replay.json client-replay.json handoff.json"
+    "US5.6|mutations.json linux/renderer/renderer.json"
+    "US6.1|linux/client/client.json linux/renderer/renderer.json"
+    "US6.2|macos/metal.json"
+    "US6.3|contract.json macos/metal.json"
+    "US6.4|linux/gpui-spike.json macos/metal.json"
 )
 
 # The literal that certifies an artifact. Most gates publish a typed status;
@@ -116,8 +115,7 @@ status=pass
 
 for row in "${CRITERIA[@]}"; do
     id=${row%%|*}
-    rest=${row#*|}
-    files=${rest#*|}
+    files=${row#*|}
     [[ "$id" =~ ^US[0-9]+\.[0-9]+$ ]] || fail "criterion id $id is malformed"
     [ -z "${SEEN[$id]+set}" ] || fail "criterion $id is mapped twice"
     SEEN[$id]=1
@@ -156,9 +154,7 @@ done
     first=1
     for row in "${CRITERIA[@]}"; do
         id=${row%%|*}
-        rest=${row#*|}
-        text=${rest%%|*}
-        files=${rest#*|}
+        files=${row#*|}
         verdict=pass
         detail=""
         for file in $files; do
@@ -170,7 +166,7 @@ done
         done
         [ "$first" = 1 ] || printf ',\n'
         first=0
-        printf '    "%s": { "criterion": "%s", "evidence": [' "$id" "$text"
+        printf '    "%s": { "evidence": [' "$id"
         sep=""
         for file in $files; do
             printf '%s"%s"' "$sep" "$file"

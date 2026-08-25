@@ -167,8 +167,8 @@ this contract task.
 | Chafa | `1.18.2` | `--format kitty --probe off` and `--format sixels --probe off`; direct PTY and SSH. |
 | gnuplot | `6.0.3` | `set terminal sixelgd`; direct PTY and SSH with the build's terminal list verified first. |
 
-The owned manifest covers query ordering; raw RGB; chunked zlib RGBA; PNG;
+The owned registry covers query ordering; raw RGB; chunked zlib RGBA; PNG;
 Unicode placeholders; delete forms; 7-bit and C1 Sixel; mode chronology; and
 CAN/SUB malformed recovery. Fixtures are ASCII hex so review and transport do
-not alter control bytes. Their exact paths and expected outcomes are frozen in
-the machine-readable contract and `fixtures.tsv`.
+not alter control bytes. Their exact paths and expected outcomes are frozen only
+in the machine-readable contract.

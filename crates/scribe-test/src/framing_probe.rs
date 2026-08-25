@@ -1,8 +1,9 @@
 //! Harness-only terminal-images-v1 framing and parser verification.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use scribe_image_decode::{DecodeStorage, StorageProcess, StorageValidation};
@@ -13,21 +14,22 @@ use scribe_pty::graphics_framing::{
     KittyDelete, KittyFormat, KittyPlacementMode, MAX_CONTROL_STRING_BYTES, RawByteRange,
     SixelMode, SixelParameters,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const OWNED_FIXTURES: [&str; 10] = [
-    "kitty-query-order.hex",
-    "kitty-rgb-classic.hex",
-    "kitty-rgba-zlib-chunked.hex",
-    "kitty-png-classic.hex",
-    "kitty-unicode-placeholder.hex",
-    "kitty-delete-lifecycle.hex",
-    "sixel-7bit.hex",
-    "sixel-c1-transparent.hex",
-    "sixel-mode-chronology.hex",
-    "malformed-recovery.hex",
-];
+#[derive(Deserialize)]
+struct FixtureRegistry {
+    contract_version: String,
+    fixtures: Vec<OwnedFixture>,
+}
+
+#[derive(Deserialize)]
+struct OwnedFixture {
+    id: String,
+    path: PathBuf,
+    encoding: String,
+    expect: String,
+}
 
 fn validation_framer(max: Option<usize>) -> GraphicsFramer {
     let budget: Arc<GraphicsStorageBudget> = DecodeStorage::new(
@@ -42,7 +44,7 @@ fn validation_framer(max: Option<usize>) -> GraphicsFramer {
 #[derive(Serialize)]
 struct Evidence {
     schema_version: u32,
-    contract_version: &'static str,
+    contract_version: String,
     status: &'static str,
     all_passed: bool,
     payload_bytes_recorded: bool,
@@ -84,12 +86,14 @@ struct Outcome {
 }
 
 pub fn run(fixtures: &Path, evidence_path: &Path) -> Result<(), String> {
-    let mut fixture_evidence = Vec::with_capacity(OWNED_FIXTURES.len());
-    for name in OWNED_FIXTURES {
-        let bytes = read_hex(&fixtures.join(name))?;
-        assert_owned_fixture_every_split(name, &bytes)?;
+    let registry = fixture_registry(fixtures)?;
+    let fixture_count = registry.fixtures.len();
+    let mut fixture_evidence = Vec::with_capacity(fixture_count);
+    for fixture in registry.fixtures {
+        let bytes = read_hex(&fixture.path)?;
+        assert_owned_fixture_every_split(&fixture.id, &fixture.expect, &bytes)?;
         fixture_evidence.push(FixtureEvidence {
-            id: name.trim_end_matches(".hex").to_owned(),
+            id: fixture.id,
             byte_length: bytes.len(),
             split_points_verified: bytes.len().saturating_add(1),
             one_byte_reads_verified: true,
@@ -108,14 +112,64 @@ pub fn run(fixtures: &Path, evidence_path: &Path) -> Result<(), String> {
     verify_sixel_header_quota_boundary()?;
     verify_cancellation_preserves_first_failure()?;
     verify_non_image_passthrough()?;
-    publish_evidence(evidence_path, fixture_evidence)?;
+    publish_evidence(evidence_path, registry.contract_version, fixture_evidence)?;
 
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "PASS: bounded terminal-image framing and parsers")
         .map_err(|error| error.to_string())
 }
 
-fn publish_evidence(evidence_path: &Path, fixtures: Vec<FixtureEvidence>) -> Result<(), String> {
+fn fixture_registry(fixtures: &Path) -> Result<FixtureRegistry, String> {
+    let contract_path = fixtures.join("contract.json");
+    let bytes = fs::read(&contract_path)
+        .map_err(|error| format!("read {}: {error}", contract_path.display()))?;
+    let mut registry: FixtureRegistry = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", contract_path.display()))?;
+    if registry.contract_version != "terminal-images-v1" {
+        return Err(format!("unsupported fixture contract {}", registry.contract_version));
+    }
+    if registry.fixtures.is_empty() {
+        return Err("terminal image contract has no owned fixtures".to_owned());
+    }
+
+    let root = fixtures
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("fixture directory has no test root: {}", fixtures.display()))?;
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for fixture in &mut registry.fixtures {
+        if fixture.id.is_empty() || !ids.insert(fixture.id.clone()) {
+            return Err(format!("duplicate or empty fixture id {}", fixture.id));
+        }
+        if fixture.encoding != "hex" {
+            return Err(format!(
+                "fixture {} uses unsupported encoding {}",
+                fixture.id, fixture.encoding
+            ));
+        }
+        if fixture.expect.is_empty() {
+            return Err(format!("fixture {} has no semantic expectation", fixture.id));
+        }
+        if fixture.path.components().any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        }) || !fixture.path.starts_with("fixtures/terminal-images")
+        {
+            return Err(format!("fixture {} escapes the owned directory", fixture.path.display()));
+        }
+        if !paths.insert(fixture.path.clone()) {
+            return Err(format!("duplicate fixture path {}", fixture.path.display()));
+        }
+        fixture.path = root.join(&fixture.path);
+    }
+    Ok(registry)
+}
+
+fn publish_evidence(
+    evidence_path: &Path,
+    contract_version: String,
+    fixtures: Vec<FixtureEvidence>,
+) -> Result<(), String> {
     let parent = evidence_path
         .parent()
         .ok_or_else(|| format!("evidence path has no parent: {}", evidence_path.display()))?;
@@ -126,7 +180,7 @@ fn publish_evidence(evidence_path: &Path, fixtures: Vec<FixtureEvidence>) -> Res
     let raw_range_tiling_cases = fixture_split_points_verified.saturating_add(fixture_count);
     let evidence = Evidence {
         schema_version: 1,
-        contract_version: "terminal-images-v1",
+        contract_version,
         status: "pass",
         all_passed: true,
         payload_bytes_recorded: false,
@@ -138,7 +192,7 @@ fn publish_evidence(evidence_path: &Path, fixtures: Vec<FixtureEvidence>) -> Res
             raw_range_tiling_cases,
         },
         fixtures,
-        cases: evidence_cases(),
+        cases: evidence_cases(fixture_count),
     };
     let mut encoded = serde_json::to_vec_pretty(&evidence)
         .map_err(|error| format!("serialize framing evidence: {error}"))?;
@@ -151,13 +205,13 @@ fn publish_evidence(evidence_path: &Path, fixtures: Vec<FixtureEvidence>) -> Res
     })
 }
 
-fn evidence_cases() -> Vec<CaseEvidence> {
-    let mut cases = core_evidence_cases();
+fn evidence_cases(fixture_count: usize) -> Vec<CaseEvidence> {
+    let mut cases = core_evidence_cases(fixture_count);
     cases.extend(hardening_evidence_cases());
     cases
 }
 
-fn core_evidence_cases() -> Vec<CaseEvidence> {
+fn core_evidence_cases(fixture_count: usize) -> Vec<CaseEvidence> {
     vec![
         CaseEvidence {
             id: "owned_fixture_split_invariance",
@@ -165,7 +219,7 @@ fn core_evidence_cases() -> Vec<CaseEvidence> {
             facts: json!({
                 "every_split": true,
                 "one_byte_reads": true,
-                "explicit_expected_semantics": 10,
+                "explicit_expected_semantics": fixture_count,
             }),
         },
         CaseEvidence {
@@ -317,20 +371,24 @@ fn assert_every_split(name: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn assert_owned_fixture_every_split(name: &str, bytes: &[u8]) -> Result<(), String> {
+fn assert_owned_fixture_every_split(
+    name: &str,
+    expectation: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     for split in 0..=bytes.len() {
         let left = bytes.get(..split).ok_or_else(|| "split left out of range".to_owned())?;
         let right = bytes.get(split..).ok_or_else(|| "split right out of range".to_owned())?;
         let case = format!("{name} split {split}");
         let events = events_for_chunks(&[left, right], None);
         assert_ranges_tile(&case, &events, bytes)?;
-        assert_owned_fixture_semantics(name, bytes, events)?;
+        assert_owned_fixture_semantics(name, expectation, bytes, events)?;
     }
 
     let one_byte_chunks = bytes.chunks(1).collect::<Vec<_>>();
     let events = events_for_chunks(&one_byte_chunks, None);
     assert_ranges_tile(&format!("{name} one-byte feed"), &events, bytes)?;
-    assert_owned_fixture_semantics(name, bytes, events)
+    assert_owned_fixture_semantics(name, expectation, bytes, events)
 }
 
 fn observe(chunks: &[&[u8]], max: Option<usize>) -> Outcome {
@@ -402,22 +460,25 @@ fn assert_ranges_tile(name: &str, events: &[GraphicsEvent], input: &[u8]) -> Res
 
 fn assert_owned_fixture_semantics(
     name: &str,
+    expectation: &str,
     bytes: &[u8],
     events: Vec<GraphicsEvent>,
 ) -> Result<(), String> {
     let outcome = outcome_from_events(events);
-    let valid = match name {
-        "kitty-query-order.hex" => matches_kitty_query(bytes, &outcome),
-        "kitty-rgb-classic.hex" => matches_kitty_rgb(bytes, &outcome),
-        "kitty-rgba-zlib-chunked.hex" => matches_kitty_chunked(bytes, &outcome),
-        "kitty-png-classic.hex" => matches_kitty_png(bytes, &outcome),
-        "kitty-unicode-placeholder.hex" => matches_kitty_placeholder(bytes, &outcome),
-        "kitty-delete-lifecycle.hex" => matches_kitty_delete(bytes, &outcome),
-        "sixel-7bit.hex" => matches_sixel_7bit(bytes, &outcome),
-        "sixel-c1-transparent.hex" => matches_sixel_c1(bytes, &outcome),
-        "sixel-mode-chronology.hex" => matches_sixel_chronology(bytes, &outcome),
-        "malformed-recovery.hex" => matches_malformed_recovery(bytes, &outcome),
-        _ => return Err(format!("owned fixture lacks an explicit expectation: {name}")),
+    let valid = match expectation {
+        "kitty_ok_precedes_da1" => matches_kitty_query(bytes, &outcome),
+        "one_red_rgb_definition_and_classic_placement" => matches_kitty_rgb(bytes, &outcome),
+        "one_half_alpha_red_rgba_definition_after_two_chunks" => {
+            matches_kitty_chunked(bytes, &outcome)
+        }
+        "one_png_definition_and_classic_placement" => matches_kitty_png(bytes, &outcome),
+        "virtual_placement_and_two_placeholder_cells" => matches_kitty_placeholder(bytes, &outcome),
+        "soft_specific_then_hard_image_delete" => matches_kitty_delete(bytes, &outcome),
+        "opaque_red_six_pixel_column" => matches_sixel_7bit(bytes, &outcome),
+        "transparent_background_red_six_pixel_column" => matches_sixel_c1(bytes, &outcome),
+        "xterm_80_8452_cursor_and_text_order" => matches_sixel_chronology(bytes, &outcome),
+        "can_sub_abort_and_adjacent_text_survives" => matches_malformed_recovery(bytes, &outcome),
+        _ => return Err(format!("owned fixture {name} has unknown expectation {expectation}")),
     };
     if valid { Ok(()) } else { Err(format!("{name}: explicit semantic expectation failed")) }
 }

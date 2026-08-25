@@ -338,14 +338,10 @@ stream past the buffer ceiling abandons the snapshot with a typed error.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-client-replay.sh` runs the probe and validates the payload-free
-evidence it writes.
-
-The gate pins the schema version, the production engine name, a passing result
-for all five cases, the burst's record and staging counts, the buffered and
-drained live counts, every staleness and resurrection total, a typed refusal
-for each corruption, and the cleanup totals including the frozen buffer
-ceiling. It also refuses any evidence that embedded array-shaped payload data.
+`terminal-image-client-replay.sh` runs the production probe and propagates its
+exit status. The probe owns every staging, ordering, staleness, corruption,
+cleanup, and payload-free assertion and writes the reviewable JSON only after
+they pass.
 
 ## Terminal Image Session State Seam
 
@@ -376,12 +372,11 @@ byte-exact RSS.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-state-seam.sh` runs the production probe and the existing IPC fixture verifier inside the functional image.
+`terminal-image-state-seam.sh` runs both typed probes and propagates their exit
+statuses.
 
-The gate checks shared production ingress, exact sink routing, clone-free
-normal framing, transactional exhaustion, and disconnected image fanout. It
-also requires the IPC verifier to compare newly encoded default MessagePack
-bytes with pinned legacy fixture hex.
+The probes own shared-ingress, routing, framing, exhaustion, fanout, and
+MessagePack compatibility assertions.
 
 ## Terminal Image Observer Parity
 
@@ -415,10 +410,9 @@ screen activation. Evidence is schema-versioned and payload-free.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-observer-parity.sh` runs the exact production observer probe in the functional Docker image.
-
-The gate pins Alacritty `0.26.0-rc1`, one processor, payload-free evidence, and
-an explicit passing result for every lifecycle case.
+`terminal-image-observer-parity.sh` runs the exact production observer probe in
+the functional Docker image and propagates its exit status. The probe owns the
+Alacritty version, one-processor, payload-free, and lifecycle assertions.
 
 ## Transactional Image Mutations
 
@@ -459,11 +453,9 @@ untouched. One resize clips the active and inactive grids alike.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-mutations.sh` runs the production mutation probe in the functional Docker image.
-
-The gate pins the schema version, the production mutation engine name,
-payload-free evidence, both session ceilings, and an explicit passing result
-for every transactional case.
+`terminal-image-mutations.sh` runs the production mutation probe in the
+functional Docker image and propagates its exit status. The probe owns the
+engine, payload-free, ceiling, and transactional assertions.
 
 ## Client Convergence and Counter Safety
 
@@ -507,11 +499,9 @@ either way.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-convergence.sh` runs the production convergence probe in the functional Docker image.
-
-The gate pins the schema version, the production publication engine name,
-payload-free evidence, and an explicit passing result for every convergence and
-counter-safety case.
+`terminal-image-convergence.sh` runs the production convergence probe in the
+functional Docker image and propagates its exit status. The probe owns the
+publication, payload-free, convergence, and counter-safety assertions.
 
 ## Terminal Image Storage Accounting
 
@@ -611,7 +601,10 @@ canvas reservation in that class peak.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-accounting.sh` runs the production accounting probe in the functional Docker image and validates payload-free exact-limit, replacement, rollback, cross-session, and zero-release outcomes.
+`terminal-image-accounting.sh` runs the production accounting probe in the
+functional Docker image and propagates its exit status. The probe solely owns
+payload-free exact-limit, replacement, rollback, cross-session, and zero-release
+outcomes.
 
 ## Mandatory Decode Scheduling
 
@@ -675,7 +668,11 @@ the production seam while an unrelated session holds one of two slots.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-scheduler.sh` runs the production scheduling probe in the functional Docker image and validates payload-free admission, refusal, ordering, cancellation, deadline, bounded-queue, and zero-ownership outcomes.
+`terminal-image-scheduler.sh` runs the production scheduling probe and
+propagates its exit status.
+
+The probe solely owns payload-free admission, refusal, ordering, cancellation,
+deadline, bounded-queue, and zero-ownership outcomes.
 
 ## Incomplete Transfer Retirement
 
@@ -731,57 +728,42 @@ retirement can reorder a reply that was already owed.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-transfer-lifecycle.sh` runs the production retirement probe in the functional Docker image and validates payload-free typed boundaries, invisibility, idempotence, refused-admission, chronology, and zero-ownership outcomes.
+`terminal-image-transfer-lifecycle.sh` runs the production retirement probe and
+propagates its exit status.
+
+The probe solely owns payload-free typed boundaries, invisibility, idempotence,
+refused-admission, chronology, and zero-ownership outcomes.
 
 ## Authoritative Image State Assembly
 
-The functional harness runs one multi-session scenario across every image invariant at once and publishes the versioned payload-free manifest that closes the epic.
+The functional harness keeps one multi-session probe for behavior that exists
+only when independently verified components compose.
 
 ### Cross-Invariant Assembly Probe
 
-Two production sessions on one shared process policy run an ordered scenario
-whose stages each depend on the state the previous stage left behind.
+Two production sessions share one process policy.
 
-Framing goes first: one read carries ordinary text ahead of a Kitty transfer
-whose first chunk is incomplete, and a second read completes it after moving the
-cursor, so the placement must anchor where the final chunk observed the cursor.
-Accounting is then read off that session's ledger — capacity was reserved before
-every allocation and reconciled against observed capacity — and a session under
-a quota too small for one canonical image is refused with a typed storage
-rejection that retains nothing. Scheduling is checked against the process
-scheduler the seam admits through: every decode was issued, admitted, and
-released, none survives, and peak concurrency stayed inside the process ceiling.
+In the first scenario, ordinary text precedes an incomplete Kitty chunk and a
+later read moves the cursor before completing it. The assembled path must
+publish exactly one image at that final observed cursor and immediately
+converge with the production client scene.
 
-Observer effects then move the surviving placement through a half-open margin
-scroll, both alternate-screen switches, and a resize, and the seam's active
-screen is compared with the real Alacritty `Term` at each boundary. Mutations
-follow with compound define-and-place, soft and hard deletes, a malformed
-operand that fails as typed protocol input without mutating anything, and enough
-transmits to hold the session image ceiling through eviction. The second session
-abandons a Kitty transfer and closes, which must retire it as a typed truncated
-sequence, publish nothing, consume no generation, keep no pending state, and
-repeat idempotently. Overflow is proven on the production path with sequence and
-generation ceilings that reject before mutation.
-
-Convergence is asserted after every stage and again at the end as a canonical
-digest folded from generation, active screen, sorted definitions, and sorted
-screen-scoped placements on both the server and the production client scene.
-Independence closes the scenario: the two sessions hold distinct decode
-identities and disjoint canonical state while reading the identical process
-ledger.
+The second scenario first gives session B its own committed scene, then fills
+session A through deterministic eviction. Session A must evict only its oldest
+image while session B's server and client digests remain unchanged. Both
+sessions must keep distinct decode identities, their requested-storage currents
+must sum to the one shared process current, and both client scenes must converge
+at the end. Component-local accounting, scheduling, retirement, observer,
+mutation, and counter assertions stay in their dedicated probes.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-server-state.sh` requires every child gate's evidence to be
-present and passing in the same output directory, then runs the assembly probe
-and validates the manifest it writes.
+`terminal-image-server-state.sh` runs the assembly probe and propagates its exit
+status.
 
-The gate pins the schema version, the production engine name, payload-free
-evidence, a passing result for all nine assembly cases, the typed retirement and
-overflow outcomes, the frozen limits, the reserve-before-allocation and
-scheduler counters, one converged digest pair per session, and a complete
-40-criterion mapping. It also refuses any manifest that embedded array-shaped
-payload data.
+The probe writes a payload-free manifest containing only split publication,
+cross-session eviction isolation, and final convergence evidence. It neither
+requires child artifacts nor remaps specification criteria.
 
 ## Image Replies and Viewer Sharing
 
@@ -833,15 +815,12 @@ deliver nothing while still holding its capability.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-replies-sharing.sh` runs the probe against the pinned fixture
-directory and validates the payload-free evidence it writes.
+`terminal-image-replies-sharing.sh` runs the production probe and propagates its
+exit status.
 
-The gate pins the schema version, the production engine name, a passing result
-for all ten cases, the exact reply order and counts, the per-quiet-level failure
-reply counts and their answered code, the enabled and disabled DA1 strings, the
-exact kill-switch transition sequence, every viewer delivery and receipt count,
-and the typed refusal totals. It also refuses any evidence that embedded
-array-shaped payload data.
+The probe owns reply ordering, quiet levels, DA1, kill-switch, fanout, refusal,
+and payload-free assertions and writes reviewable evidence only after they
+pass.
 
 ## GitHub CI Opt-in
 
@@ -949,17 +928,13 @@ populated diagnostic record to confirm it carries only enums and numbers.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-settings.sh` runs the probe against the pinned fixture directory
-with an isolated config root and validates the payload-free evidence it writes.
+`terminal-image-settings.sh` runs the production probe with an isolated config
+root and propagates its exit status.
 
-The gate pins the schema version, the production engine name, a passing result
-for all eleven cases, the settings key and label, the exact TOML lines both
-writes left behind, the release counters, the transition sequence, the enabled
-and disabled DA1 strings, the renderer classification, and the exact localized
-strings for the disabled and renderer-unavailable affordances. It then refuses
-the evidence, the run log, or the saved config if any of them contains the
-fixture's image payload, a graphics control string, or array-shaped payload
-data.
+The probe owns settings, release, advertising, renderer, localization,
+saved-config, and typed evidence assertions. The wrapper keeps the distinct
+process-output trust check by refusing a run log containing the fixture payload
+or a graphics control string.
 
 ## Combined Image Replay
 
@@ -1025,14 +1000,11 @@ duplicate scene" means in evidence.
 
 ### Docker Evidence Entry Point
 
-`terminal-image-replay.sh` runs the probe against the pinned fixture directory
-and validates the payload-free evidence it writes.
+`terminal-image-replay.sh` runs the production probe and propagates its exit
+status.
 
-The gate pins the schema version, the production engine name, a passing result
-for all eight cases, the maximum-scene byte and chunk totals against the frozen
-limits, the attaching viewer's exact wire order, every debt and delivery count
-across the attach drain and the overflow and recovery sequence, and the
-viewer-count independence of the plan. It also refuses any evidence that embedded array-shaped payload data.
+The probe owns maximum-scene bounds, wire ordering, replay debt, overflow
+recovery, viewer-count independence, and payload-free assertions.
 
 ## Terminal Image Handoff
 
@@ -1092,14 +1064,11 @@ and requires that nothing at all was exported. Pi's v8 precedence is covered by
 
 ### Docker Evidence Entry Point
 
-`terminal-image-handoff.sh` runs the probe against the pinned fixture directory
-and validates the payload-free evidence it writes.
+`terminal-image-handoff.sh` runs the production probe and propagates its exit
+status.
 
-The gate pins the production engine name, a passing result for every case, the
-Kitty and Sixel partial-string protocols, the presence of an in-flight transfer,
-control parity for every resumed session, the maximum-scene chunk and ceiling
-totals against the frozen limits, the dropped scene's exact two-record burst,
-both malformed refusals, and every version and downgrade fact.
+The probe owns partial-string resume, in-flight transfer, control parity, scene
+bounds, malformed refusal, version, downgrade, and payload-free assertions.
 
 ## Layered GPUI Terminal Images
 
@@ -6209,7 +6178,7 @@ The primary then accepts the handoff connection, verifies the peer UID, and read
 
 ## Terminal Image Release Gate
 
-The release gate assembles `test-output/terminal-images/release-manifest.json`, the machine-readable counterpart of the human Evidence Index, mapping every specification acceptance criterion to the evidence that proves it.
+The release gate assembles `test-output/terminal-images/release-manifest.json`, the machine-readable counterpart of the human Evidence Index, mapping every specification criterion id to its evidence without copying specification prose.
 
 `tests/e2e/terminal-image-release-gate.sh` runs no Scribe runtime of its own.
 Every claim it publishes is read back out of evidence a sibling gate already
@@ -6219,13 +6188,15 @@ those gates ran and passed together. It must therefore follow a green
 
 ### Criterion table cannot drift from the spec
 
-The criterion count is re-derived from the spec on every invocation, so a new
-acceptance criterion fails the gate until it is mapped to evidence.
+The criterion count is re-derived from the spec on every invocation.
 
-`just e2e-release-gate` counts the acceptance bullets in
-`specs/020-terminal-images/spec.md` and passes the total in. The script
-refuses a table whose row count disagrees, which is what stops a criterion
-being silently omitted.
+A new acceptance criterion fails the gate until its id is mapped to evidence.
+Specification text remains solely in `specs/020-terminal-images/spec.md`;
+release JSON carries ids, evidence paths, and verdicts only.
+
+`just e2e-release-gate` counts the acceptance bullets and passes the total in.
+The script refuses a table whose row count disagrees, which stops a criterion
+being silently omitted without maintaining a second prose copy.
 
 ### An unproven criterion cannot be green
 

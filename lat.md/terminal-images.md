@@ -660,30 +660,22 @@ exhausted counter is reused.
 
 ## Authoritative Image State Assembly
 
-The independently verified image invariants compose into one server-owned engine whose combined behavior is certified by a versioned payload-free evidence manifest.
+Independently verified image components compose through one small cross-invariant probe rather than being certified a second time by an aggregate.
 
 Assembly adds no engine. Every session is one
 [[crates/scribe-server/src/terminal_image_state.rs#PtyTerminalImageState]] over
-the shared immutable process policy, so framing order, storage reservation,
-decode admission, transfer retirement, Alacritty-derived observation,
-transactional commit, and client publication are the same code paths the child
-invariants certified. Sessions are independent in canonical state and decode
-identity while sharing one process storage ledger and one decode scheduler, so
-neither session can spend the other's image state or bypass the process
-ceilings that bound them both.
+the shared immutable process policy. Component probes remain the sole owners of
+framing, storage, scheduling, retirement, observer, mutation, and counter
+assertions.
 
-The manifest is the objective artifact that closes the epic and that downstream
-live-fanout work reads. It is versioned by `schema_version`, names the engine it
-came from, and carries the frozen `ImageLimits`, exact per-session and process
-storage counters, scheduler admission counters, typed outcomes for every
-rejection and retirement the scenario produced, and a canonical convergence
-digest pair per session. It records no image payload: definitions and
-placements are metadata only, and the digests are folded from that metadata
-rather than from pixels.
-
-Every specification acceptance criterion maps to the assembly case that
-exercised it and to the child functional gate that certifies it independently,
-so a reviewer can trace any criterion to evidence without rerunning the epic.
+The assembly probe keeps only composed behavior no child owns alone. A Kitty
+transfer split across reads must publish exactly once at the cursor observed by
+its final chunk and immediately converge in the production client scene. Two
+sessions then share one process ledger while keeping distinct decode identities
+and canonical state; filling one session through deterministic eviction must
+leave the other session's server and client digests unchanged. The versioned
+payload-free manifest records those cross-invariants and one final convergence
+digest pair per session.
 
 ## Session Capability Latch
 
@@ -1122,8 +1114,8 @@ classic placement. gnuplot is `6.0.3`, exercised through
 
 Ten owned ASCII-hex fixtures cover Kitty query ordering, RGB, chunked zlib
 RGBA, PNG, Unicode placeholders, deletion; 7-bit and C1 Sixel; xterm mode/text
-chronology; and CAN/SUB malformed recovery. `fixtures.tsv` and `contract.json`
-freeze every path and expected outcome.
+chronology; and CAN/SUB malformed recovery. `contract.json` is the sole registry
+for every path and expected outcome.
 
 ## Pinned Application Corpus
 
@@ -1190,9 +1182,10 @@ written by the container as root.
 | `visual/terminal-images-visual.sh` | `linux/client/client.json` |
 | `visual/terminal-images-frame-stability.sh` | `linux/client/frame-stability.json` |
 
-`server-state-manifest.json` is not independent: it refuses to write unless the
-state-seam, accounting, scheduler, transfer-lifecycle, observer-parity,
-mutations, and convergence evidence is already green in the same directory.
+Typed `scribe-test` probes own their assertions and write evidence only after
+those assertions pass. Their shell entry points propagate the probe exit status
+without reparsing JSON fields. `server-state-manifest.json` owns only the
+cross-invariant assembly scenarios described above.
 
 The native macOS corpus writes `macos/` in the same directory and is the only
 evidence that does not come from Docker; it is produced on a hosted runner and
@@ -1200,20 +1193,23 @@ retrieved as a workflow artifact rather than run locally.
 
 ## Contract Verification
 
-Docker verification proves the frozen limits, matrix markers, app pins, and owned fixture inventory and emits reviewable contract evidence.
+Docker verification publishes the frozen contract and validates its sole owned-fixture registry without restating contract fields in shell.
 
 `tests/e2e/terminal-image-contract.sh` runs only under `SCRIBE_E2E_SANDBOX`,
-checks exact security values and fixture ownership/hex integrity, then copies
-the canonical JSON unchanged to
-`test-output/terminal-images/contract.json`. Invoke it with
-`just e2e-func terminal-image-contract.sh` after building the functional image.
+parses `contract.json`, rejects duplicate or escaping fixture entries, validates
+each registered file as lowercase even-length ASCII hex, then copies the
+canonical JSON unchanged to `test-output/terminal-images/contract.json`.
+Runtime security limits and protocol behavior remain owned by their typed
+production probes. Invoke it with `just e2e-func terminal-image-contract.sh`
+after building the functional image.
 
 ## Framing Verification
 
 Docker verification proves framing is invariant across PTY read boundaries and that recovery never consumes adjacent terminal text.
 
 `tests/e2e/terminal-image-framing.sh` runs the production `scribe-pty` framer
-through `scribe-test image-framing`. Every owned fixture is tried whole, at
+through `scribe-test image-framing`. The probe loads paths and expected outcomes
+from `contract.json`; no second fixture inventory exists. Every owned fixture is tried whole, at
 every two-chunk byte split, and one byte per read. Every feed verifies the
 fixture's complete parsed command expectation and contiguous raw-range tiling.
 For every forwarded event, it also proves range length equals byte length and
@@ -1399,10 +1395,10 @@ erase, hard reset, interrupted generation replacement, and stale rejection.
 It also freezes placeholder-copy input and typed capability mismatch data.
 
 `tests/e2e/terminal-image-client-scene.sh` invokes
-`scribe-test terminal-image-client-scene`, writes
-`test-output/terminal-images/client-scene.json`, and requires every evidence
-field to pass. This is CPU-scene evidence only; it makes no renderer, replay,
-server fanout, or settings claim.
+`scribe-test terminal-image-client-scene` and propagates its exit status. The
+probe owns every assertion and writes
+`test-output/terminal-images/client-scene.json` for review. This is CPU-scene
+evidence only; it makes no renderer, replay, server fanout, or settings claim.
 
 ## Staged Client Replay Verification
 
@@ -1418,12 +1414,13 @@ every record through
 so atomicity is an observation of the published `Arc` identity rather than an
 inference.
 
-The gate pins one publication per burst, zero partial observations, an
-order-preserving live drain compared against the same records applied without
-buffering, typed refusal of an older generation as both a snapshot and a
-buffered delta, a typed error for each of six corruptions built by permuting
+The production probe owns one publication per burst, zero partial observations,
+an order-preserving live drain compared against the same records applied
+without buffering, typed refusal of an older generation as both a snapshot and
+a buffered delta, a typed error for each of six corruptions built by permuting
 real planned records, and the released pixels, retained-byte total, and buffer
-ceiling that make cleanup observable.
+ceiling that make cleanup observable. Its shell entry point only propagates the
+exit status.
 
 ## GPUI Lifecycle Verification
 
@@ -1494,11 +1491,11 @@ invalidation remains a device-recovery proxy, not a physical-device-loss claim.
 
 `just e2e-func terminal-image-settings.sh` proves the master switch, its resource release, its truthful advertising, the diagnostic catalog, and the renderer-failure taxonomy against shipped code.
 
-The gate writes `test-output/terminal-images/settings.json` and its own run log,
-then refuses either artifact if the pinned fixture's image payload appears in
-it. The probe drives the settings model, the settings write path, the server
-latch and reply planner, the session image seam, the client scene, and the GPUI
-error taxonomy; see [[test#Test Harness#Image Settings and Diagnostics]] for the
+The probe writes `test-output/terminal-images/settings.json` only after its
+settings, resource-release, advertising, diagnostics, saved-config, and renderer
+assertions pass. Its shell entry point propagates that exit status and separately
+refuses a run log containing the pinned fixture payload or a graphics control
+string. See [[test#Test Harness#Image Settings and Diagnostics]] for the
 case-by-case description.
 
 ## Native macOS Metal Validation

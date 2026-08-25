@@ -6,23 +6,6 @@
 # @lat: [[terminal-images#Terminal Images#IPC Contract Verification]]
 set -euo pipefail
 
-FIXTURES=/tests/fixtures/terminal-images/ipc.json
-OUTPUT=/output/terminal-images/ipc.json
-
-[ -f "$FIXTURES" ] || {
-    echo "FAIL: missing terminal-image IPC fixture manifest" >&2
-    exit 1
-}
-
-scribe-test terminal-image-ipc --fixtures "$FIXTURES" --output "$OUTPUT"
-
-grep -Fq '"old_local_handshake_defaults": true' "$OUTPUT"
-grep -Fq '"new_local_handshake_round_trip": true' "$OUTPUT"
-grep -Fq '"older_remote_updates_client": true' "$OUTPUT"
-grep -Fq '"newer_remote_updates_server": true' "$OUTPUT"
-grep -Fq '"max_replay_chunk_bytes": 1048576' "$OUTPUT"
-grep -Fq '"clipped_replay_round_trip": true' "$OUTPUT"
-grep -Fq '"legacy_none_omitted_and_defaulted": true' "$OUTPUT"
-grep -Fq '"malformed_replays_rejected": 5' "$OUTPUT"
-
-echo "PASS: terminal image IPC bounds, placement validation, and compatibility"
+exec scribe-test terminal-image-ipc \
+    --fixtures /tests/fixtures/terminal-images/ipc.json \
+    --output /output/terminal-images/ipc.json

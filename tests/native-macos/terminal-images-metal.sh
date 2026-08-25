@@ -79,10 +79,9 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Phase 1: the frozen contract is the same one Linux verified.
 #
-# `tests/e2e/terminal-image-contract.sh` owns the exhaustive field audit inside
-# the container. Re-running that list here would fork it; instead the driver
-# records the contract digest and asserts only the values this run itself
-# exercises natively.
+# `tests/e2e/terminal-image-contract.sh` owns registry integrity and evidence
+# publication inside the container. This driver records the contract digest and
+# asserts only candidate-specific values the native run itself exercises.
 # ---------------------------------------------------------------------------
 [ -f "$CONTRACT" ] || fail "missing frozen contract $CONTRACT"
 CONTRACT_SHA=$(sha256 "$CONTRACT")
