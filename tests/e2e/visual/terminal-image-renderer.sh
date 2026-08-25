@@ -110,11 +110,31 @@ RUST_LOG="${RUST_LOG:-scribe_client=info},gpui_wgpu=info" \
 PROBE_PID=$!
 trap 'kill "$PROBE_PID" 2>/dev/null || true' EXIT
 
+wait_for_log 'terminal image renderer max-plus-one rejected before allocation' 45 \
+    || fail "max-plus-one dimension rejection was not observed"
 wait_for_log 'terminal image renderer ready' 45 || fail "renderer did not reach first paint"
+wait_for_log 'Selected GPU adapter' 15 || fail "GPUI did not record its selected adapter"
 sleep 1
 sed -e 's/\x1b\[[0-9;]*m//g' "$LOG" >"$CLEAN_LOG"
-grep -Eq 'render_images_created[=: ]+10' "$CLEAN_LOG" \
+grep -Eq 'Selected GPU adapter:.*\((Vulkan|Gl)\)$' "$CLEAN_LOG" \
+    || fail "running GPUI window did not select a Linux WGPU backend"
+BACKEND=$(sed -n 's/.*Selected GPU adapter:.* (\([^()]\+\))$/\1/p' "$CLEAN_LOG" | tail -1)
+[ -n "$BACKEND" ] || fail "could not parse selected WGPU backend"
+grep -Eq 'backend[=: ]+"?wgpu"?' "$CLEAN_LOG" \
+    || fail "the running window did not report its GPUI render backend"
+grep -zq '^VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json$' \
+    "/proc/$PROBE_PID/environ" \
+    || fail "running GPUI window did not inherit the pinned Lavapipe ICD"
+grep -Eq 'render_images_created[=: ]+12' "$CLEAN_LOG" \
     || fail "renderer did not create one source per fixture definition"
+grep -Eq 'cache_reuses[=: ]+[1-9][0-9]*' "$CLEAN_LOG" \
+    || fail "full and cropped placements did not reuse one RenderImage"
+grep -Eq 'render_images_created_before[=: ]+0.*render_images_created_after[=: ]+0' "$CLEAN_LOG" \
+    || fail "max-plus-one reached GPUI allocation"
+grep -Eq 'terminal image source uploaded.*image_id[=: ]+100.*width[=: ]+4096.*height[=: ]+1' "$CLEAN_LOG" \
+    || fail "renderer did not upload the maximum axis fixture"
+grep -Eq 'terminal image source uploaded.*image_id[=: ]+101.*width[=: ]+1.*height[=: ]+1' "$CLEAN_LOG" \
+    || fail "renderer did not upload the one-pixel fixture"
 
 SCALE_FACTOR=$(log_value scale_factor)
 GRID_LEFT=$(log_value grid_left)
@@ -187,11 +207,11 @@ capture "$OUT/01-pressure.png"
 PRESSURE_DIFF=$(pixel_diff "$OUT/00-layered.png" "$OUT/01-pressure.png")
 [ "$PRESSURE_DIFF" -eq 0 ] || fail "pressure changed $PRESSURE_DIFF queued pixels"
 sed -e 's/\x1b\[[0-9;]*m//g' "$LOG" >"$CLEAN_LOG"
-grep -Eq 'terminal image renderer pressure rejected without eviction.*render_images_created[=: ]+10' "$CLEAN_LOG" \
+grep -Eq 'terminal image renderer pressure rejected without eviction.*render_images_created[=: ]+12' "$CLEAN_LOG" \
     || fail "pressure created or replaced a baseline RenderImage"
 grep -Eq 'terminal image renderer pressure rejected without eviction.*atlas_drops[=: ]+0' "$CLEAN_LOG" \
     || fail "pressure dropped a live atlas tile"
-grep -Eq 'terminal image renderer pressure rejected without eviction.*projected_gpu_bytes[=: ]+91136' "$CLEAN_LOG" \
+grep -Eq 'terminal image renderer pressure rejected without eviction.*projected_gpu_bytes[=: ]+123912' "$CLEAN_LOG" \
     || fail "pressure exceeded or shrank the hard cache bound"
 PRESSURE_REJECTIONS=$(event_value 'terminal image renderer pressure rejected without eviction' pressure_rejections)
 PRESSURE_CREATED=$(event_value 'terminal image renderer pressure rejected without eviction' render_images_created)
@@ -206,8 +226,10 @@ record_scalar pressure_projected_gpu_bytes "$PRESSURE_BYTES"
 # Atlas recovery and explicit between-frame eviction recreate identical pixels.
 focus >/dev/null
 xdotool key --clearmodifiers d
-wait_for_log 'terminal image renderer device-loss atlas invalidated' 15 \
+wait_for_log 'terminal image renderer atlas invalidated for recovery' 15 \
     || fail "device-loss atlas invalidation proxy was not observed"
+wait_for_log 'terminal image renderer cache reused after atlas invalidation' 15 \
+    || fail "atlas recovery did not preserve source identities"
 sleep 1
 capture "$OUT/02-device-loss-proxy.png"
 DEVICE_DIFF=$(pixel_diff "$OUT/01-pressure.png" "$OUT/02-device-loss-proxy.png")
@@ -216,15 +238,17 @@ record_scalar device_loss_pixel_diff "$DEVICE_DIFF"
 
 focus >/dev/null
 xdotool key --clearmodifiers e
-wait_for_log 'terminal image renderer cache evicted' 15 \
+wait_for_log 'terminal image renderer cache evicted at final reference' 15 \
     || fail "explicit renderer eviction was not observed"
+wait_for_log 'terminal image renderer cache recreated after final-reference eviction' 15 \
+    || fail "evicted source identities were not recreated"
 sleep 1
 capture "$OUT/03-eviction-recreated.png"
 EVICTION_DIFF=$(pixel_diff "$OUT/01-pressure.png" "$OUT/03-eviction-recreated.png")
 [ "$EVICTION_DIFF" -eq 0 ] || fail "eviction recreation changed $EVICTION_DIFF pixels"
 sed -e 's/\x1b\[[0-9;]*m//g' "$LOG" >"$CLEAN_LOG"
-grep -Eq 'terminal image renderer cache evicted.*final_reference_drops[=: ]+10' "$CLEAN_LOG" \
-    || fail "explicit eviction did not drop ten final references"
+grep -Eq 'terminal image renderer cache evicted at final reference.*final_reference_drops[=: ]+12' "$CLEAN_LOG" \
+    || fail "explicit eviction did not drop every final reference"
 record_scalar eviction_pixel_diff "$EVICTION_DIFF"
 
 # First production scroll stores the current margin without changing source
@@ -411,15 +435,37 @@ capture "$OUT/09-pane-close.png"
 CLOSE_DIFF=$(pixel_diff "$OUT/08-resize-clip.png" "$OUT/09-pane-close.png")
 [ "$CLOSE_DIFF" -gt 0 ] || fail "pane close did not remove rendered images"
 sed -e 's/\x1b\[[0-9;]*m//g' "$LOG" >"$CLEAN_LOG"
-grep -Eq 'terminal image renderer pane cache dropped.*final_reference_drops[=: ]+20' "$CLEAN_LOG" \
+grep -Eq 'terminal image renderer pane cache dropped.*final_reference_drops[=: ]+24' "$CLEAN_LOG" \
     || fail "pane close did not drop every recreated cache source"
 record_scalar pane_close_pixel_diff "$CLOSE_DIFF"
 
-python3 - "$OUT/renderer.json" "$MEASUREMENTS" <<'PY'
+# The native Metal runner cannot synthesize key events. Exercise the same
+# production probe's render-driven lifecycle before relying on it there.
+kill "$PROBE_PID" 2>/dev/null || true
+wait "$PROBE_PID" 2>/dev/null || true
+LOG="$OUT/renderer-auto.log"
+CLEAN_LOG="$OUT/renderer-auto-clean.log"
+: >"$LOG"
+SCRIBE_TERMINAL_IMAGE_RENDERER_PROBE_AUTO=1 \
+RUST_LOG="${RUST_LOG:-scribe_client=info},gpui_wgpu=info" \
+    scribe-client --terminal-image-renderer-probe >"$LOG" 2>&1 &
+PROBE_PID=$!
+for marker in \
+    'terminal image renderer ready' \
+    'terminal image renderer atlas invalidated for recovery' \
+    'terminal image renderer cache reused after atlas invalidation' \
+    'terminal image renderer cache evicted at final reference' \
+    'terminal image renderer cache recreated after final-reference eviction'
+do
+    wait_for_log "$marker" 45 \
+        || fail "the unattended lifecycle sequence never reached: $marker"
+done
+
+python3 - "$OUT/renderer.json" "$MEASUREMENTS" "$BACKEND" <<'PY'
 import json
 import sys
 
-path, measurements_path = sys.argv[1:]
+path, measurements_path, backend = sys.argv[1:]
 pixels = {}
 scalars = {}
 with open(measurements_path, encoding="utf-8") as source:
@@ -440,6 +486,21 @@ evidence = {
     "schema": 3,
     "platform": "linux",
     "renderer_boundary": "production-committed-image-scene",
+    "render_image_reuse": True,
+    "gpui_lifecycle": {
+        "renderer": f"wgpu-{backend.lower()}",
+        "selected_backend": backend,
+        "configured_vulkan_icd": "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json",
+        "crop_strategy": "shared-render-image-translated-bounds-content-mask",
+        "shared_render_image_count": 1,
+        "max_axis_pixels_uploaded": 4096,
+        "min_axis_pixels_uploaded": 1,
+        "max_plus_one_rejected": 4097,
+        "render_images_created_by_rejection": 0,
+        "final_reference_drop_count": 12,
+        "atlas_recovery_preserved_source_ids": True,
+        "unattended_auto_sequence": True,
+    },
     "dpi": {
         "scale_factor": scalars["dpi_scale_factor"],
         "device_size": [scalars["initial_device_width"], scalars["initial_device_height"]],

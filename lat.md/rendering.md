@@ -71,8 +71,8 @@ Definition deletion and pane/session removal are reconciled during paint by
 and
 [[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache#retain_sessions]],
 so both paths drop atlas keys while a live `Window` is available.
-[[terminal-images#GPUI Lifecycle Verification]] records Linux runtime evidence
-and the separate native Metal gate.
+[[terminal-images#Layered GPUI Renderer Verification]] records Linux runtime
+evidence and the separate native Metal gate.
 
 ## Terminal Image Paint Phases
 

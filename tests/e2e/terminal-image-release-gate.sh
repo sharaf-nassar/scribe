@@ -45,13 +45,13 @@ CRITERIA=(
     "US3.4|settings.json linux/client/client.json"
     "US3.5|convergence.json server-state-manifest.json linux/renderer/renderer.json"
     "US4.1|accounting.json kitty-decode-evidence.json sixel-decoder-evidence.json"
-    "US4.2|scheduler.json linux/gpui-spike.json"
+    "US4.2|scheduler.json linux/renderer/renderer.json"
     "US4.3|mutations.json server-state-manifest.json linux/renderer/renderer.json"
     "US4.4|contract.json kitty-decode-evidence.json"
     "US4.5|kitty-decode-evidence.json sixel-decoder-evidence.json"
     "US4.6|framing.json kitty-decode-evidence.json sixel-decoder-evidence.json mutations.json"
     "US5.1|performance.json linux/client/frame-stability.json"
-    "US5.2|performance.json linux/gpui-spike.json"
+    "US5.2|performance.json linux/renderer/renderer.json"
     "US5.3|performance.json"
     "US5.4|contract.json accounting.json performance.json"
     "US5.5|replay.json client-replay.json handoff.json"
@@ -59,7 +59,7 @@ CRITERIA=(
     "US6.1|linux/client/client.json linux/renderer/renderer.json"
     "US6.2|macos/metal.json"
     "US6.3|contract.json macos/metal.json"
-    "US6.4|linux/gpui-spike.json macos/metal.json"
+    "US6.4|linux/renderer/renderer.json macos/metal.json"
 )
 
 # The literal that certifies an artifact. Most gates publish a typed status;

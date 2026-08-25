@@ -254,7 +254,6 @@ fn is_known_client_argument(flag: &str) -> bool {
         flag,
         "--settings"
             | "--vulkan-probe"
-            | "--gpui-image-spike"
             | "--terminal-image-renderer-probe"
             | restore_replay::RESTORE_CHILD_ARG
             | server_lifecycle::FINISH_UPDATE_RESTART_ARG
@@ -12862,10 +12861,6 @@ fn main() -> std::process::ExitCode {
             tracing::error!(%error, "Scribe Vulkan probe failed");
             return std::process::ExitCode::FAILURE;
         }
-        return std::process::ExitCode::SUCCESS;
-    }
-    if std::env::args().skip(1).any(|arg| arg == "--gpui-image-spike") {
-        scribe_client::gpui_image_spike::run();
         return std::process::ExitCode::SUCCESS;
     }
     if std::env::args().skip(1).any(|arg| arg == "--terminal-image-renderer-probe") {

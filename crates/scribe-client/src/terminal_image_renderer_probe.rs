@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{Context as _, ensure};
 use gpui::{
     App, AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
     KeyDownEvent, ParentElement as _, Render, Rgba, Styled as _, TitlebarOptions, Window,
@@ -15,7 +16,7 @@ use gpui::{
 use gpui_platform::application;
 use scribe_client::{
     color::TerminalColors,
-    gpui_image_lifecycle::GpuiImageCache,
+    gpui_image_lifecycle::{GpuiImageCache, GpuiImageError, GpuiImageKey},
     search::{MatchHighlight, MatchHighlightColors},
     selection::SelectionSpan,
     terminal_image_scene::{CommittedImageScene, KITTY_IMAGE_PLACEHOLDER, LiveImageDefinition},
@@ -24,10 +25,11 @@ use scribe_common::{
     config::CursorShape,
     ids::SessionId,
     terminal_images::{
-        CellExtent, PixelRect, PlaceholderMetadata, TerminalCellAnchor, TerminalGridEffect,
-        TerminalImageCellClip, TerminalImageDefinition, TerminalImageDelete,
-        TerminalImageDeleteScope, TerminalImageGeneration, TerminalImageId, TerminalImagePlacement,
-        TerminalImagePlacementKind, TerminalImageProtocol, TerminalPlacementId, TerminalScreenKind,
+        CellExtent, ImageBoundError, ImageLimitName, ImageLimits, PixelRect, PlaceholderMetadata,
+        TerminalCellAnchor, TerminalGridEffect, TerminalImageCellClip, TerminalImageDefinition,
+        TerminalImageDelete, TerminalImageDeleteScope, TerminalImageGeneration, TerminalImageId,
+        TerminalImagePlacement, TerminalImagePlacementKind, TerminalImageProtocol,
+        TerminalPlacementId, TerminalScreenKind,
     },
     theme::minimal_dark,
 };
@@ -43,7 +45,12 @@ use crate::{
 const WINDOW_WIDTH: f32 = 840.0;
 const WINDOW_HEIGHT: f32 = 500.0;
 const GENERATION: TerminalImageGeneration = TerminalImageGeneration(1);
-const FIXTURE_PROJECTED_GPU_BYTES: u64 = 91_136;
+const FIXTURE_SOURCE_COUNT: u64 = 12;
+const FIXTURE_PROJECTED_GPU_BYTES: u64 = 123_912;
+const FULL_CROP_IMAGE_ID: u64 = 1;
+const MAX_AXIS_IMAGE_ID: u64 = 100;
+const ONE_PIXEL_IMAGE_ID: u64 = 101;
+const RENDER_BACKEND: &str = if cfg!(target_os = "macos") { "metal" } else { "wgpu" };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeStage {
@@ -55,6 +62,25 @@ enum ProbeStage {
     OffMarginResized,
     OffMarginScrolled,
     PaneClosed,
+}
+
+#[derive(Default)]
+struct LifecycleEvidence {
+    ids_before_invalidation: Option<[usize; 3]>,
+    ids_before_eviction: Option<[usize; 3]>,
+}
+
+#[derive(Clone)]
+struct RendererReady {
+    logged: Rc<StateCell<bool>>,
+    max_plus_one_verified: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoLifecycleStage {
+    Initial,
+    InvalidationScheduled,
+    EvictionScheduled,
 }
 
 struct RendererProbe {
@@ -70,9 +96,12 @@ struct RendererProbe {
     off_margin_scrolled_scene: Arc<CommittedImageScene>,
     content: Arc<Content>,
     stage: ProbeStage,
-    ready_logged: Rc<StateCell<bool>>,
+    ready: RendererReady,
     pressure_logged: Rc<StateCell<bool>>,
     close_logged: Rc<StateCell<bool>>,
+    lifecycle: Rc<RefCell<LifecycleEvidence>>,
+    auto_lifecycle: bool,
+    auto_lifecycle_stage: AutoLifecycleStage,
     grid_bounds: GridBounds,
 }
 
@@ -80,6 +109,14 @@ impl RendererProbe {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let mut cache = GpuiImageCache::with_projected_gpu_limit(FIXTURE_PROJECTED_GPU_BYTES);
+        let max_plus_one_verified = match verify_max_plus_one(&mut cache, window) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(%error, "terminal image renderer initialization failed");
+                false
+            }
+        };
         let scene = Arc::new(fixture_scene());
         let pressure_scene = Arc::new(fixture_pressure_scene());
         let first_scroll_scene = Arc::new(fixture_scrolled_scene(false));
@@ -90,9 +127,7 @@ impl RendererProbe {
         Self {
             focus,
             session_id: SessionId::new(),
-            cache: Rc::new(RefCell::new(GpuiImageCache::with_projected_gpu_limit(
-                FIXTURE_PROJECTED_GPU_BYTES,
-            ))),
+            cache: Rc::new(RefCell::new(cache)),
             scene,
             pressure_scene,
             first_scroll_scene,
@@ -102,34 +137,25 @@ impl RendererProbe {
             off_margin_scrolled_scene,
             content: Arc::new(fixture_content()),
             stage: ProbeStage::Initial,
-            ready_logged: Rc::new(StateCell::new(false)),
+            ready: RendererReady { logged: Rc::new(StateCell::new(false)), max_plus_one_verified },
             pressure_logged: Rc::new(StateCell::new(false)),
             close_logged: Rc::new(StateCell::new(false)),
+            lifecycle: Rc::new(RefCell::new(LifecycleEvidence::default())),
+            auto_lifecycle: std::env::var_os("SCRIBE_TERMINAL_IMAGE_RENDERER_PROBE_AUTO")
+                .is_some_and(|value| value == "1"),
+            auto_lifecycle_stage: AutoLifecycleStage::Initial,
             grid_bounds: GridBounds::default(),
         }
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        match event.keystroke.key.as_ref() {
-            "d" => match self.cache.borrow_mut().invalidate_atlas(window) {
-                Ok(()) => {
-                    tracing::info!("terminal image renderer device-loss atlas invalidated");
-                    cx.notify();
-                }
-                Err(error) => tracing::error!(%error, "renderer device-loss invalidation failed"),
-            },
-            "e" => match self.evict_cache(window) {
-                Ok(()) => {
-                    let stats = self.cache.borrow().stats();
-                    tracing::info!(
-                        atlas_drops = stats.atlas_drops,
-                        final_reference_drops = stats.final_reference_drops,
-                        "terminal image renderer cache evicted"
-                    );
-                    cx.notify();
-                }
-                Err(error) => tracing::error!(%error, "renderer cache eviction failed"),
-            },
+        self.handle_action(&event.keystroke.key, window, cx);
+    }
+
+    fn handle_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            "d" => self.invalidate_atlas(window, cx),
+            "e" => self.evict_lifecycle_sources(window, cx),
             "q" => {
                 self.stage = ProbeStage::Pressure;
                 cx.notify();
@@ -146,6 +172,54 @@ impl RendererProbe {
                 cx.notify();
             }
             _ => {}
+        }
+    }
+
+    fn invalidate_atlas(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = match lifecycle_source_ids(&self.cache, self.session_id) {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::error!(%error, "renderer lifecycle sources were not cached");
+                return;
+            }
+        };
+        let result = self.cache.borrow_mut().invalidate_atlas(window);
+        match result {
+            Ok(()) => {
+                self.lifecycle.borrow_mut().ids_before_invalidation = Some(ids);
+                tracing::info!(
+                    source_id = ids[0],
+                    max_axis_id = ids[1],
+                    one_pixel_id = ids[2],
+                    atlas_drops = self.cache.borrow().stats().atlas_drops,
+                    "terminal image renderer atlas invalidated for recovery"
+                );
+                cx.notify();
+            }
+            Err(error) => tracing::error!(%error, "renderer device-loss invalidation failed"),
+        }
+    }
+
+    fn evict_lifecycle_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = match lifecycle_source_ids(&self.cache, self.session_id) {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::error!(%error, "renderer lifecycle sources were not cached");
+                return;
+            }
+        };
+        match self.evict_cache(window) {
+            Ok(()) => {
+                self.lifecycle.borrow_mut().ids_before_eviction = Some(ids);
+                let stats = self.cache.borrow().stats();
+                tracing::info!(
+                    atlas_drops = stats.atlas_drops,
+                    final_reference_drops = stats.final_reference_drops,
+                    "terminal image renderer cache evicted at final reference"
+                );
+                cx.notify();
+            }
+            Err(error) => tracing::error!(%error, "renderer cache eviction failed"),
         }
     }
 
@@ -212,38 +286,53 @@ impl RendererProbe {
         cx.notify();
     }
 
-    fn evict_cache(
-        &self,
-        window: &mut Window,
-    ) -> Result<(), scribe_client::gpui_image_lifecycle::GpuiImageError> {
-        self.cache.borrow_mut().clear(window)
+    fn evict_cache(&self, window: &mut Window) -> anyhow::Result<()> {
+        let final_reference_drops = self.cache.borrow().stats().final_reference_drops;
+        self.cache.borrow_mut().clear(window)?;
+        let final_drops = self.cache.borrow().stats().final_reference_drops - final_reference_drops;
+        ensure!(
+            final_drops == FIXTURE_SOURCE_COUNT,
+            "not every renderer cache entry reached its final reference"
+        );
+        Ok(())
+    }
+
+    fn schedule_auto_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.auto_lifecycle {
+            return;
+        }
+        let action = match self.auto_lifecycle_stage {
+            AutoLifecycleStage::Initial => {
+                self.auto_lifecycle_stage = AutoLifecycleStage::InvalidationScheduled;
+                "d"
+            }
+            AutoLifecycleStage::InvalidationScheduled => {
+                self.auto_lifecycle_stage = AutoLifecycleStage::EvictionScheduled;
+                "e"
+            }
+            AutoLifecycleStage::EvictionScheduled => return,
+        };
+        let probe = cx.entity();
+        window.on_next_frame(move |window, app| {
+            probe.update(app, |probe, probe_cx| probe.handle_action(action, window, probe_cx));
+        });
     }
 
     fn marker(&self) -> impl IntoElement {
         let cache = Rc::clone(&self.cache);
-        let ready_logged = Rc::clone(&self.ready_logged);
+        let ready = self.ready.clone();
         let pressure_logged = Rc::clone(&self.pressure_logged);
         let close_logged = Rc::clone(&self.close_logged);
+        let lifecycle = Rc::clone(&self.lifecycle);
         let grid_bounds = Rc::clone(&self.grid_bounds);
+        let session_id = self.session_id;
         let stage = self.stage;
         canvas(
             |_, _, _| (),
             move |_, (), window, _| {
+                log_renderer_ready(&cache, session_id, &ready, &grid_bounds, window);
                 let stats = cache.borrow().stats();
-                if !ready_logged.replace(true) {
-                    let bounds = grid_bounds.get().unwrap_or_default();
-                    let font = GridFont::default();
-                    tracing::info!(
-                        scale_factor = window.scale_factor(),
-                        grid_left = f32::from(bounds.left()),
-                        grid_top = f32::from(bounds.top()),
-                        cell_width = font.cell_width(),
-                        line_height = font.line_height,
-                        render_images_created = stats.render_images_created,
-                        projected_gpu_bytes = cache.borrow().projected_gpu_bytes(),
-                        "terminal image renderer ready"
-                    );
-                }
+                record_lifecycle_evidence(&cache, session_id, &lifecycle);
                 if stage == ProbeStage::Pressure
                     && stats.pressure_rejections > 0
                     && !pressure_logged.replace(true)
@@ -272,8 +361,160 @@ impl RendererProbe {
     }
 }
 
+fn log_renderer_ready(
+    cache: &Rc<RefCell<GpuiImageCache>>,
+    session_id: SessionId,
+    ready: &RendererReady,
+    grid_bounds: &GridBounds,
+    window: &Window,
+) {
+    if ready.logged.get() {
+        return;
+    }
+    if !ready.max_plus_one_verified {
+        tracing::error!("renderer max-plus-one validation did not complete");
+        return;
+    }
+    let ids = match lifecycle_source_ids(cache, session_id) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, "renderer lifecycle sources were not uploaded");
+            return;
+        }
+    };
+    let stats = cache.borrow().stats();
+    if stats.render_images_created != FIXTURE_SOURCE_COUNT || stats.cache_reuses == 0 {
+        tracing::error!(
+            render_images_created = stats.render_images_created,
+            cache_reuses = stats.cache_reuses,
+            "renderer did not share one source across full and cropped placements"
+        );
+        return;
+    }
+    ready.logged.set(true);
+    let bounds = grid_bounds.get().unwrap_or_default();
+    let font = GridFont::default();
+    tracing::info!(
+        backend = RENDER_BACKEND,
+        source_id = ids[0],
+        full_placement_id = ids[0],
+        crop_placement_id = ids[0],
+        max_axis_id = ids[1],
+        one_pixel_id = ids[2],
+        scale_factor = window.scale_factor(),
+        grid_left = f32::from(bounds.left()),
+        grid_top = f32::from(bounds.top()),
+        cell_width = font.cell_width(),
+        line_height = font.line_height,
+        render_images_created = stats.render_images_created,
+        cache_reuses = stats.cache_reuses,
+        projected_gpu_bytes = cache.borrow().projected_gpu_bytes(),
+        "terminal image renderer ready"
+    );
+}
+
+fn verify_max_plus_one(cache: &mut GpuiImageCache, window: &mut Window) -> anyhow::Result<()> {
+    let created_before = cache.stats().render_images_created;
+    let over_limit = TerminalImageDefinition {
+        id: TerminalImageId(102),
+        generation: GENERATION,
+        width: ImageLimits::V1.max_width_pixels + 1,
+        height: 1,
+        rgba_bytes: 0,
+        has_alpha: false,
+    };
+    match cache.get_or_insert(&over_limit, &[], window) {
+        Err(GpuiImageError::Bound(ImageBoundError::LimitExceeded(ImageLimitName::Dimensions))) => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => anyhow::bail!("max-plus-one reached GPUI allocation"),
+    }
+    ensure!(
+        cache.stats().render_images_created == created_before,
+        "max-plus-one changed RenderImage creation count"
+    );
+    tracing::info!(
+        max_width = ImageLimits::V1.max_width_pixels,
+        rejected_width = over_limit.width,
+        render_images_created_before = created_before,
+        render_images_created_after = cache.stats().render_images_created,
+        "terminal image renderer max-plus-one rejected before allocation"
+    );
+    Ok(())
+}
+
+fn lifecycle_source_ids(
+    cache: &Rc<RefCell<GpuiImageCache>>,
+    session_id: SessionId,
+) -> anyhow::Result<[usize; 3]> {
+    let cache = cache.borrow();
+    Ok([
+        lifecycle_source_id(&cache, session_id, FULL_CROP_IMAGE_ID)?,
+        lifecycle_source_id(&cache, session_id, MAX_AXIS_IMAGE_ID)?,
+        lifecycle_source_id(&cache, session_id, ONE_PIXEL_IMAGE_ID)?,
+    ])
+}
+
+fn lifecycle_source_id(
+    cache: &GpuiImageCache,
+    session_id: SessionId,
+    image_id: u64,
+) -> anyhow::Result<usize> {
+    cache
+        .get(GpuiImageKey {
+            session_id: Some(session_id),
+            image_id: TerminalImageId(image_id),
+            generation: GENERATION,
+        })
+        .with_context(|| format!("lifecycle source {image_id} is not cached"))
+        .map(|image| image.id.0)
+}
+
+fn record_lifecycle_evidence(
+    cache: &Rc<RefCell<GpuiImageCache>>,
+    session_id: SessionId,
+    lifecycle: &Rc<RefCell<LifecycleEvidence>>,
+) {
+    let ids_before_invalidation = lifecycle.borrow().ids_before_invalidation;
+    if let Some(prior) = ids_before_invalidation {
+        match lifecycle_source_ids(cache, session_id) {
+            Ok(ids) if ids == prior => {
+                lifecycle.borrow_mut().ids_before_invalidation = None;
+                tracing::info!(
+                    source_id = ids[0],
+                    max_axis_id = ids[1],
+                    one_pixel_id = ids[2],
+                    "terminal image renderer cache reused after atlas invalidation"
+                );
+            }
+            Ok(_) => tracing::error!("renderer atlas invalidation changed source identities"),
+            Err(error) => {
+                tracing::error!(%error, "renderer atlas recovery did not restore sources");
+            }
+        }
+    }
+    let ids_before_eviction = lifecycle.borrow().ids_before_eviction;
+    if let Some(prior) = ids_before_eviction {
+        match lifecycle_source_ids(cache, session_id) {
+            Ok(ids) if ids.iter().zip(prior).all(|(new, old)| *new != old) => {
+                lifecycle.borrow_mut().ids_before_eviction = None;
+                tracing::info!(
+                    old_source_id = prior[0],
+                    new_source_id = ids[0],
+                    old_max_axis_id = prior[1],
+                    new_max_axis_id = ids[1],
+                    old_one_pixel_id = prior[2],
+                    new_one_pixel_id = ids[2],
+                    "terminal image renderer cache recreated after final-reference eviction"
+                );
+            }
+            Ok(_) => tracing::error!("renderer eviction retained a stale source identity"),
+            Err(error) => tracing::error!(%error, "renderer eviction did not recreate sources"),
+        }
+    }
+}
+
 impl Render for RendererProbe {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = minimal_dark();
         let mut terminal_colors = TerminalColors::new();
         terminal_colors.set_theme(&theme);
@@ -336,6 +577,8 @@ impl Render for RendererProbe {
             cache: Rc::clone(&self.cache),
             active_sessions: Rc::new(active_sessions),
         });
+
+        self.schedule_auto_lifecycle(window, cx);
 
         div()
             .track_focus(&self.focus)
@@ -497,6 +740,15 @@ fn fixture_scene() -> CommittedImageScene {
             PixelRect { x: 32, y: 0, width: 32, height: 32 },
             8,
         ),
+        classic_placement((100, 1), (0, 45), (1, 1), full_source(64, 64), 0),
+        classic_placement(
+            (101, MAX_AXIS_IMAGE_ID),
+            (0, 50),
+            (1, 1),
+            full_source(ImageLimits::V1.max_width_pixels, 1),
+            0,
+        ),
+        classic_placement((102, ONE_PIXEL_IMAGE_ID), (0, 54), (1, 1), full_source(1, 1), 0),
     ];
     CommittedImageScene {
         generation: Some(GENERATION),
@@ -676,6 +928,8 @@ fn fixture_definitions() -> Vec<LiveImageDefinition> {
         solid(11, 8, 8, [180, 30, 210, 255]),
         placeholder_quadrants(33_554_474, 64, 64),
         quadrants(43, 64, 32),
+        solid(MAX_AXIS_IMAGE_ID, ImageLimits::V1.max_width_pixels, 1, [0, 160, 255, 255]),
+        solid(ONE_PIXEL_IMAGE_ID, 1, 1, [255, 0, 255, 255]),
     ]
     .into_iter()
     .flatten()

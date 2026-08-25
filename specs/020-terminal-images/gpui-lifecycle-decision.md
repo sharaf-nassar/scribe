@@ -85,30 +85,32 @@ Run:
 ```bash
 just build-release
 just docker-visual
-just e2e-visual terminal-image-gpui-spike.sh
+just e2e-visual terminal-image-renderer.sh
 ```
 
 The probe requires all of the following before writing
-`test-output/terminal-images/linux/gpui-spike.json`:
+`test-output/terminal-images/linux/renderer/renderer.json`:
 
 1. GPUI logs its selected llvmpipe adapter and WGPU backend; evidence also
    records the visual image's configured Lavapipe Vulkan ICD rather than
    assuming which backend won selection.
-2. Full and cropped placements share one `RenderImage` identity and the cache
-   creates exactly one source per definition; pinned `Window::paint_image`
-   source proves that identity is the atlas key.
-3. The cropped capture is the expected green quadrant.
+2. Full and cropped production placements share one `RenderImage` identity and
+   the cache creates exactly one source per definition; pinned
+   `Window::paint_image` source proves that identity is the atlas key.
+3. The cropped production capture is the expected green quadrant.
 4. Calling `Window::drop_image` as a recovery invalidation preserves pixels
    and source identities after repaint; pinned WGPU recovery source performs
    the same atlas clear before lazy repaint.
-5. Final-reference cache eviction calls `drop_image` for all three sources;
-   recreated identities repaint with zero differing pixels.
+5. Final-reference cache eviction calls `drop_image` for every production
+   source; recreated identities repaint with zero differing pixels.
 6. 1-by-1 and 4096-by-1 upload, while 4097-by-1 creates zero GPUI images.
+7. The same renderer reaches all lifecycle stages under its unattended
+   render-driven sequence.
 
-The 2026-08-03 Docker run selected llvmpipe through WGPU `Gl`, while retaining
-the configured Lavapipe Vulkan ICD in process state. Crop means were green
-`1.0`, red `0.0`, and blue `0.0`; recovery and eviction comparisons each
-changed zero pixels, and all three final cache references were dropped.
+The pre-consolidation 2026-08-03 Docker run selected llvmpipe through WGPU
+`Gl` while retaining the configured Lavapipe Vulkan ICD in process state. The
+production renderer now records the same backend, green crop, zero-difference
+recovery and eviction comparisons, and complete cache cleanup in one artifact.
 
 The runtime invalidation/repaint and pinned-source audit together prove GPUI's
 image reupload seam, tile cleanup, and recovery design. They do not claim that
@@ -120,24 +122,18 @@ Native Metal remains a distinct fail-closed runtime gate on the sanctioned GitHu
 
 The downstream executable `tests/native-macos/terminal-images-metal.sh` must:
 
-1. verify GitHub Actions, macOS ARM64, the sanctioned runner marker, candidate
-   SHA, and a WGPU `Metal` adapter before product assertions;
-2. run the shared-source probe at 1-by-1 and 4096-by-1, reject 4097-by-1 before
-   `RenderImage` creation, and record adapter texture limits without raising
-   frozen `ImageLimits`;
-3. require identical full/crop source IDs, one initial upload, a green crop,
-   reusable texture space after `drop_image`, three final-reference drops, and
-   zero-difference recreation;
-4. invoke a pinned one-shot test hook that produces a recoverable, non-destroyed
-   Metal device-loss signal after the initial frame;
-5. observe GPUI's context-recreation start and completion, atlas recreation,
-   preserved CPU source IDs, one lazy reupload per live source, and a
-   zero-difference post-recovery capture;
-6. write machine-readable results, logs, and all compared captures beneath
+1. verify GitHub Actions, macOS ARM64, and the sanctioned runner marker before
+   product assertions;
+2. run the production renderer probe at 1-by-1 and 4096-by-1, reject 4097-by-1
+   before `RenderImage` creation, and require the window-reported `metal`
+   backend;
+3. require one source per production definition, identical full/crop source
+   IDs, atlas recovery with preserved source IDs, and final-reference cleanup
+   for every fixture;
+4. advance those lifecycle stages through
+   `SCRIBE_TERMINAL_IMAGE_RENDERER_PROBE_AUTO=1` without synthesized keys;
+5. name the unavailable SSH, pixel-capture, and induced-device-loss assertions
+   in the manifest rather than treating the atlas-clear proxy as hardware
+   device loss;
+6. write machine-readable results and logs beneath
    `SCRIBE_NATIVE_MACOS_OUTPUT_DIR`, failing on missing fields or artifacts.
-
-The lifecycle spike intentionally does not create that driver. Terminal image
-placement rendering and the genuine device-loss hook land downstream; a driver
-created now could test only the isolated surrogate and would incorrectly make
-the guarded workflow green. Until both exist, the workflow's missing-driver
-check remains the correct release-blocking result.

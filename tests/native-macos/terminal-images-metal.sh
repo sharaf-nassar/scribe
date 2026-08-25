@@ -24,7 +24,7 @@ GPUI="$OUT/gpui"
 WORK=${TMPDIR:-/tmp}/scribe-native-macos
 SERVER_LOG="$APPS/server.log"
 STEPS="$APPS/steps.tsv"
-SPIKE_LOG="$GPUI/spike.log"
+RENDERER_LOG="$GPUI/renderer.log"
 
 # Pinned exactly as `docker/Dockerfile.visual` pins them, so the two platforms
 # assert against the same programs. Chafa and gnuplot build from the identical
@@ -70,7 +70,7 @@ sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 cpus() { sysctl -n hw.ncpu; }
 
 cleanup() {
-    kill "${SPIKE_PID:-}" 2>/dev/null || true
+    kill "${PROBE_PID:-}" 2>/dev/null || true
     scribe-test daemon stop >/dev/null 2>&1 || true
     scribe-test server stop >/dev/null 2>&1 || true
 }
@@ -372,66 +372,64 @@ echo "PASS: pinned application corpus on native macOS"
 # ---------------------------------------------------------------------------
 # Phase 5: Metal. The only phase Docker cannot stand in for.
 #
-# The isolated spike window owns the GPUI lifecycle surface: one shared source
-# per definition, the maximum allowed axis uploaded for real, max-plus-one
-# refused before any RenderImage exists, atlas recovery, and final-reference
-# eviction. `SCRIBE_GPUI_IMAGE_SPIKE_AUTO=1` walks those stages from the render
-# pass itself, because synthesizing key events on a hosted runner needs an
-# interactive accessibility grant it does not have.
+# The production renderer probe owns the GPUI lifecycle surface: it uploads the
+# maximum and minimum axis fixtures, rejects max-plus-one before any RenderImage
+# exists, shares a source across full and cropped placements, then proves atlas
+# recovery and final-reference eviction. The unattended sequence advances from
+# render passes because the hosted runner cannot synthesize key events.
 # ---------------------------------------------------------------------------
-: >"$SPIKE_LOG"
-SCRIBE_GPUI_IMAGE_SPIKE_AUTO=1 RUST_LOG="${RUST_LOG:-scribe_client=info}" \
-    scribe-client --gpui-image-spike >"$SPIKE_LOG" 2>&1 &
-SPIKE_PID=$!
+: >"$RENDERER_LOG"
+SCRIBE_TERMINAL_IMAGE_RENDERER_PROBE_AUTO=1 RUST_LOG="${RUST_LOG:-scribe_client=info}" \
+    scribe-client --terminal-image-renderer-probe >"$RENDERER_LOG" 2>&1 &
+PROBE_PID=$!
 
-wait_spike_log() {
+wait_renderer_log() {
     local pattern="$1" deadline=$((SECONDS + ${2:-60}))
-    until grep -qF "$pattern" "$SPIKE_LOG" 2>/dev/null; do
+    until grep -qF "$pattern" "$RENDERER_LOG" 2>/dev/null; do
         [ "$SECONDS" -lt "$deadline" ] || {
-            tail -40 "$SPIKE_LOG" >&2 2>/dev/null || true
-            fail "the Metal spike never logged: $pattern"
+            tail -40 "$RENDERER_LOG" >&2 2>/dev/null || true
+            fail "the Metal renderer probe never logged: $pattern"
         }
-        kill -0 "$SPIKE_PID" 2>/dev/null || {
-            tail -40 "$SPIKE_LOG" >&2 2>/dev/null || true
-            fail "the Metal spike exited before logging: $pattern"
+        kill -0 "$PROBE_PID" 2>/dev/null || {
+            tail -40 "$RENDERER_LOG" >&2 2>/dev/null || true
+            fail "the Metal renderer probe exited before logging: $pattern"
         }
         sleep 0.3
     done
 }
 
-wait_spike_log 'GPUI image max-plus-one rejected before allocation'
-wait_spike_log 'GPUI image spike ready'
-wait_spike_log 'GPUI image atlas invalidated for recovery'
-wait_spike_log 'GPUI image cache reused after atlas invalidation'
-wait_spike_log 'GPUI image cache evicted at final reference'
-wait_spike_log 'GPUI image cache recreated after final-reference eviction'
-kill "$SPIKE_PID" 2>/dev/null || true
-wait "$SPIKE_PID" 2>/dev/null || true
-SPIKE_PID=""
+wait_renderer_log 'terminal image renderer max-plus-one rejected before allocation'
+wait_renderer_log 'terminal image renderer ready'
+wait_renderer_log 'terminal image renderer atlas invalidated for recovery'
+wait_renderer_log 'terminal image renderer cache reused after atlas invalidation'
+wait_renderer_log 'terminal image renderer cache evicted at final reference'
+wait_renderer_log 'terminal image renderer cache recreated after final-reference eviction'
+kill "$PROBE_PID" 2>/dev/null || true
+wait "$PROBE_PID" 2>/dev/null || true
+PROBE_PID=""
 
-CLEAN_SPIKE="$GPUI/spike-clean.log"
-plain <"$SPIKE_LOG" >"$CLEAN_SPIKE"
+CLEAN_RENDERER="$GPUI/renderer-clean.log"
+plain <"$RENDERER_LOG" >"$CLEAN_RENDERER"
 
 # macOS windows are drawn by `gpui_macos`, whose only renderer is Metal. It logs
-# no adapter line and returns no `gpu_specs`, unlike the `gpui_wgpu` backend the
-# Linux spike reads, so the running window reports the renderer that painted it
-# and the host's Metal device is recorded beside it.
-grep -Eq 'backend[=: ]+"?metal"?' "$CLEAN_SPIKE" \
+# no adapter line and returns no `gpu_specs`, unlike Linux WGPU, so the running
+# production renderer reports the backend that painted it.
+grep -Eq 'backend[=: ]+"?metal"?' "$CLEAN_RENDERER" \
     || fail "the running GPUI window did not paint through the Metal renderer"
 system_profiler SPDisplaysDataType >"$GPUI/metal.txt" 2>&1 || true
 ADAPTER=$(sed -n 's/^ *Chipset Model: *//p' "$GPUI/metal.txt" | head -1)
 METAL_SUPPORT=$(sed -n 's/^ *Metal Support: *//p' "$GPUI/metal.txt" | head -1)
-grep -Eq 'render_images_created_before[=: ]+0.*render_images_created_after[=: ]+0' "$CLEAN_SPIKE" \
+grep -Eq 'render_images_created_before[=: ]+0.*render_images_created_after[=: ]+0' "$CLEAN_RENDERER" \
     || fail "max-plus-one reached GPUI allocation on Metal"
-grep -Eq 'rejected_width[=: ]+4097' "$CLEAN_SPIKE" \
+grep -Eq 'rejected_width[=: ]+4097' "$CLEAN_RENDERER" \
     || fail "the rejected dimension was not the frozen max-plus-one"
-grep -Eq 'render_images_created[=: ]+3' "$CLEAN_SPIKE" \
-    || fail "Metal did not upload one source per definition"
-grep -Eq 'cache_reuses[=: ]+1' "$CLEAN_SPIKE" \
+grep -Eq 'render_images_created[=: ]+12' "$CLEAN_RENDERER" \
+    || fail "Metal did not upload every production renderer fixture"
+grep -Eq 'cache_reuses[=: ]+[1-9][0-9]*' "$CLEAN_RENDERER" \
     || fail "full and cropped placements did not reuse one Metal source"
-grep -Eq 'final_reference_drops[=: ]+3' "$CLEAN_SPIKE" \
+grep -Eq 'final_reference_drops[=: ]+12' "$CLEAN_RENDERER" \
     || fail "not every Metal cache entry reached its final reference"
-PROJECTED=$(sed -n 's/.* projected_gpu_bytes[=: ]*\([0-9][0-9]*\).*/\1/p' "$CLEAN_SPIKE" | head -1)
+PROJECTED=$(sed -n 's/.* projected_gpu_bytes[=: ]*\([0-9][0-9]*\).*/\1/p' "$CLEAN_RENDERER" | head -1)
 [ -n "$PROJECTED" ] || fail "the Metal run recorded no projected GPU accounting"
 echo "PASS: Metal renderer, scale, upload, reuse, recovery, and eviction"
 
@@ -484,9 +482,9 @@ manifest = {
         "max_axis_pixels_uploaded": 4096,
         "min_axis_pixels_uploaded": 1,
         "rejected_width_pixels": 4097,
-        "render_images_created": 3,
+        "render_images_created": 12,
         "cache_reuses": 1,
-        "final_reference_drops": 3,
+        "final_reference_drops": 12,
         "projected_gpu_bytes": int("$PROJECTED"),
     },
     "protocol_probes": "$PROBES".split(),

@@ -1076,7 +1076,10 @@ The visual harness exercises the production terminal image renderer and its view
 
 ### Renderer phases and lifecycle stay pixel-stable
 
-The 2x corpus samples all phases, geometry, placeholders, Sixel chronology, find precedence, scroll/resize envelopes, off-margin immunity, soft/hard deletion and unplaced-data retention, pressure, eviction, pane close, and recovery.
+The 2x corpus samples phases, geometry, placeholders, Sixel chronology, scroll/resize, deletion, pressure, eviction, pane close, and recovery.
+
+It also verifies max/minimum uploads, max-plus-one refusal, and the native
+unattended lifecycle.
 
 ## Pinned Terminal Image Application Corpus
 
@@ -1285,13 +1288,13 @@ counters: the owned placeholder fixture, Chafa through Kitty and through Sixel,
 gnuplot's `sixelgd`, and Yazi's answered generic Kitty query followed by a
 Sixel draw, with no typed graphics failure anywhere.
 
-The Metal phase requires the running window to report the `metal` renderer,
-one source per definition, one
+The Metal phase runs the production renderer probe and requires the running
+window to report the `metal` renderer, one source per production definition,
 reuse across the full and cropped placements, 1-by-1 and 4096-by-1 uploads,
 4097-by-1 rejection with zero `RenderImage` objects created, atlas recovery
-that preserves source identities, and three final-reference drops. Stages
-advance unattended from the render pass, because the runner cannot synthesize
-key events.
+that preserves source identities, and final-reference cleanup for every
+fixture. Stages advance unattended from the render pass because the runner
+cannot synthesize key events.
 
 ### Native evidence entry point
 
@@ -1299,7 +1302,7 @@ key events.
 
 Evidence lands under `test-output/terminal-images/macos/`: `metal.json` is the
 machine-readable manifest, with the protocol probe evidence, the application
-step counters and server log, and the sanitized spike log beside it. The
+step counters and server log, and the sanitized renderer log beside it. The
 manifest names what the native run deliberately does not cover — the SSH hop,
 compared pixel captures, and an induced device loss — so review reads the gap
 from the artifact instead of inferring it. See

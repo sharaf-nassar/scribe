@@ -774,7 +774,6 @@ e2e-all-visual: build-release docker-visual
         'visual/tab-switching.sh|e2e-visual-tab-switching'
         'visual/tab-window-chords.sh|e2e-visual'
         'visual/terminal-image-apps.sh|e2e-visual'
-        'visual/terminal-image-gpui-spike.sh|e2e-visual'
         'visual/terminal-image-renderer.sh|e2e-visual'
         'visual/terminal-images-frame-stability.sh|e2e-visual'
         'visual/terminal-images-visual.sh|e2e-visual'

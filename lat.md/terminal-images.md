@@ -1176,7 +1176,6 @@ written by the container as root.
 | `terminal-image-settings.sh` | `settings.json`, `settings-run.log` |
 | `terminal-images-functional.sh` | `functional.json` and its probe transcripts |
 | `terminal-images-performance.sh` | `performance.json` |
-| `visual/terminal-image-gpui-spike.sh` | `linux/gpui-spike.json` |
 | `visual/terminal-image-renderer.sh` | `linux/renderer/renderer.json` and captures |
 | `visual/terminal-image-apps.sh` | `linux/apps/apps.json` |
 | `visual/terminal-images-visual.sh` | `linux/client/client.json` |
@@ -1422,36 +1421,13 @@ real planned records, and the released pixels, retained-byte total, and buffer
 ceiling that make cleanup observable. Its shell entry point only propagates the
 exit status.
 
-## GPUI Lifecycle Verification
-
-The isolated visual spike proves the selected shared-source crop and lifecycle path on Linux WGPU without implementing terminal image placement rendering.
-
-`tests/e2e/visual/terminal-image-gpui-spike.sh` launches the guarded
-`--gpui-image-spike` surface inside the visual Docker harness. The release
-binary records GPUI's selected Linux WGPU adapter/backend, paints a
-four-quadrant source twice through one `RenderImage`, and checks GPUI's source
-identity across atlas invalidation. It uses
-[[crates/scribe-client/src/gpui_image_lifecycle.rs#paint_cropped_image]],
-requiring the cropped destination to remain green before and after atlas
-invalidation and final-reference eviction.
-
-[[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache]] rejects
-4097-by-1 metadata before constructing a `RenderImage`, uploads 1-by-1 and
-4096-by-1 sources, shares one source identity across full and cropped
-placements, and calls `Window::drop_image` for each final cache reference.
-Evidence lands in `test-output/terminal-images/linux/gpui-spike.json` beside
-the three compared captures and sanitized log. The chosen path and pinned
-source audit prove that the shared identity is one atlas key, `drop_image`
-deallocates it, and device recovery clears then lazily rebuilds that key. Those
-facts are frozen in
-`specs/020-terminal-images/gpui-lifecycle-decision.md`.
-
 ## Layered GPUI Renderer Verification
 
-The Docker visual corpus verifies production placement paint, phase ordering, geometry, placeholder mapping, and final-reference cleanup on Linux WGPU.
+The Docker visual corpus verifies production placement paint, phase ordering,
+geometry, placeholder mapping, and GPUI lifecycle cleanup on Linux WGPU.
 
 `tests/e2e/visual/terminal-image-renderer.sh` launches the guarded
-`--terminal-image-renderer-probe` surface at a real 2x GPUI X11 scale and
+`--terminal-image-renderer-probe` surface at a real 2x GPUI X11 scale. It
 captures crop, scale, alpha, every paint phase, 8-bit inherited and 32-bit
 placeholder mapping, Sixel text chronology, production scroll/margin effects,
 cache pressure, eviction, pane close, and atlas recovery. It invokes the same
@@ -1459,15 +1435,25 @@ cache pressure, eviction, pane close, and atlas recovery. It invokes the same
 [[crates/scribe-client/src/gpui_image_lifecycle.rs#GpuiImageCache]] used by live
 panes.
 
+Before first paint, the production probe rejects 4097-by-1 metadata before a
+`RenderImage` exists. Its committed scene uploads 1-by-1 and 4096-by-1
+fixtures, paints one source as full and cropped placements, and records the
+selected Linux WGPU backend. Linux captures require the crop to stay green
+through atlas invalidation and final-reference eviction; the cache preserves
+its source identities on recovery and recreates every one after eviction. The
+same render-driven unattended lifecycle is exercised in Docker for the native
+Metal runner.
+
 Evidence lands under `test-output/terminal-images/linux/renderer/`.
 `renderer.json` records device-space coordinates plus observed and expected RGB
-for every phase/geometry assertion, the platform scale factor, and pixel
-comparisons. Pressure must reject the extra live source without an atlas drop
-or pixel change at the hard cache bound. Distinct overlapping Sixels prove
-later completion wins below text; a selected current match proves find
-precedence above images.
-Eviction and Linux atlas-invalidation repaint must each change zero pixels;
-pane close must leave zero projected GPU bytes after `Window::drop_image`.
+for every phase/geometry assertion, lifecycle facts, the platform scale factor,
+and pixel comparisons. Pressure must reject the extra live source without an
+atlas drop or pixel change at the hard cache bound. Distinct overlapping Sixels
+prove later completion wins below text; a selected current match proves find
+precedence above images. Eviction and Linux atlas-invalidation repaint must each
+change zero pixels; pane close must leave zero projected GPU bytes after
+`Window::drop_image`. The pinned source audit and chosen crop path remain in
+`specs/020-terminal-images/gpui-lifecycle-decision.md`.
 
 The probe applies typed scroll effects through
 [[crates/scribe-client/src/terminal_image_scene.rs#CommittedImageScene#apply_grid_effect]],
@@ -1559,14 +1545,14 @@ Its Metal phase requires the running window to report the `metal` renderer.
 selected adapter and returns `None` from `Window::gpu_specs`, so the backend
 name is the whole of the assertion. The manifest's `device` and
 `device_metal_support` fields are best-effort `system_profiler` scrapes and are
-empty on the hosted runner by design; nothing gates on them. The phase then requires one `RenderImage` per
-definition, one reuse across the full and cropped placements, 1-by-1 and
-4096-by-1 uploads, 4097-by-1 rejection with zero `RenderImage` objects created,
-atlas recovery that preserves source identities, and three final-reference
-drops. Stages advance from the render pass under
-`SCRIBE_GPUI_IMAGE_SPIKE_AUTO=1`, because a hosted runner cannot synthesize key
-events without an interactive accessibility grant; the Linux spike proves that
-same unattended path.
+empty on the hosted runner by design; nothing gates on them. The phase then
+requires one `RenderImage` per production definition, reuse across the full and
+cropped placements, 1-by-1 and 4096-by-1 uploads, 4097-by-1 rejection with
+zero `RenderImage` objects created, atlas recovery that preserves source
+identities, and final-reference cleanup for every fixture. Stages advance from
+the render pass under `SCRIBE_TERMINAL_IMAGE_RENDERER_PROBE_AUTO=1`, because a
+hosted runner cannot synthesize key events without an interactive accessibility
+grant; the Docker renderer gate proves that same unattended path.
 
 Three Linux assertions have no native counterpart and the manifest names them
 in `not_covered_natively`: the SSH hop (a transport, not a platform, fact), the
@@ -1582,14 +1568,10 @@ atlas-clear proxy must not satisfy it.
 
 ### Recorded green run
 
-The gate has passed once against the shipped epic, and that run is the evidence a release review cites.
+Run `31040886874` recorded the pre-consolidation lifecycle fixture.
 
-Run `31040886874` against candidate SHA `209da99` on runner
-`github-actions-macos-14` retained artifact `native-macos-metal-31040886874`.
-Its manifest records `backend=metal`, a 4096-pixel maximum and 1-pixel minimum
-upload, a 4097-pixel rejection refused before GPUI, three `RenderImage` objects
-created, one cache reuse, and three final-reference drops, with `ssh_transport`,
-`pixel_captures`, and `induced_metal_device_loss` listed in
-`not_covered_natively`. The run also produced a fix rather than only a verdict:
-the harness wrote the server PID file before anything created the runtime
-directory, which fails only on a fresh macOS host.
+That artifact against candidate SHA `209da99` on runner
+`github-actions-macos-14` also produced a fix rather than only a verdict: the
+harness wrote the server PID file before anything created the runtime directory,
+which fails only on a fresh macOS host. The production renderer probe requires a
+new exact-candidate artifact before a release cites native Metal evidence.
