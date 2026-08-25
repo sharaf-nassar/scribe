@@ -1144,9 +1144,8 @@ fn launch_exec_command(
 
 /// Trailing argv that runs the provider command after shell startup.
 ///
-/// Claude and Codex `exec` over POSIX-family shells. Pi stays in command
-/// position for shell wrapper resolution, then exits the shell with its status.
-/// Both forms close the tab instead of leaving a stray prompt.
+/// Providers stay in command position for shell wrapper resolution, then the
+/// shell exits with the provider status instead of leaving a stray prompt.
 fn tool_exec_args(kind: ShellKind, exec: &str) -> Vec<String> {
     match kind {
         // Nushell rejects the grouped short form and takes no integration
@@ -1197,18 +1196,9 @@ fn shell_command_with_exit(kind: ShellKind, command: &str) -> String {
     }
 }
 
-/// `binary`, prefixed with `exec` on every shell that has one.
-fn exec_prefixed(kind: ShellKind, binary: &str) -> String {
-    if kind == ShellKind::PowerShell { binary.to_owned() } else { format!("exec {binary}") }
-}
-
 fn ai_exec_command(kind: ShellKind, launch: &AiLaunchSpec) -> String {
-    if launch.provider == AiProvider::Pi {
-        return shell_command_with_exit(kind, launch.provider.binary_name());
-    }
-
-    let mut command = exec_prefixed(kind, launch.provider.binary_name());
-    if launch.resume_mode == AiResumeMode::Resume {
+    let mut command = launch.provider.binary_name().to_owned();
+    if launch.provider != AiProvider::Pi && launch.resume_mode == AiResumeMode::Resume {
         for arg in launch.provider.resume_args() {
             command.push(' ');
             command.push_str(arg);
@@ -1218,7 +1208,7 @@ fn ai_exec_command(kind: ShellKind, launch: &AiLaunchSpec) -> String {
             command.push_str(&shell_single_quote(kind, conversation_id));
         }
     }
-    command
+    shell_command_with_exit(kind, &command)
 }
 
 /// Quote one argument in the command language spoken by the resolved shell.
@@ -1719,38 +1709,53 @@ mod tests {
 
     // @lat: [[server#Server#Sessions#Session Creation#AI tabs are plain tabs that run through their shell]]
     #[test]
-    fn ai_argv_is_the_plain_tab_argv_plus_an_interactive_exec() {
-        let new = AiLaunchSpec {
+    fn ai_argv_runs_providers_through_the_shell_then_exits() {
+        let claude_new = AiLaunchSpec {
             provider: AiProvider::ClaudeCode,
             resume_mode: AiResumeMode::New,
             conversation_id: None,
         };
-        let resume = AiLaunchSpec { resume_mode: AiResumeMode::Resume, ..new.clone() };
-        let targeted =
-            AiLaunchSpec { conversation_id: Some(String::from("it's mine")), ..resume.clone() };
+        let claude_resume =
+            AiLaunchSpec { resume_mode: AiResumeMode::Resume, ..claude_new.clone() };
+        let claude_targeted = AiLaunchSpec {
+            conversation_id: Some(String::from("it's mine")),
+            ..claude_resume.clone()
+        };
+        let codex_new = AiLaunchSpec { provider: AiProvider::CodexCode, ..claude_new.clone() };
+        let codex_resume = AiLaunchSpec {
+            conversation_id: Some(String::from("it's mine")),
+            ..AiLaunchSpec { resume_mode: AiResumeMode::Resume, ..codex_new.clone() }
+        };
 
         // Bash keeps the plain `--rcfile` attachment ahead of the command, so
         // the AI tab reads exactly the startup files a plain tab reads.
         assert_eq!(
-            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &new),
-            ["--rcfile", "/s/scribe.bash", "-ic", "exec claude"]
+            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &claude_new),
+            ["--rcfile", "/s/scribe.bash", "-ic", "claude; exit $?"]
+        );
+        assert_eq!(
+            ai_argv(ShellKind::Bash, Some("/s/scribe.bash"), &codex_resume),
+            ["--rcfile", "/s/scribe.bash", "-ic", "codex resume 'it'\"'\"'s mine'; exit $?"]
         );
         // Env-hook shells carry no startup argv at all, plain or AI, but zsh
         // and fish prepend the restore-delta consumer their prompt never runs.
-        let zsh = ai_argv(ShellKind::Zsh, None, &resume);
+        let zsh = ai_argv(ShellKind::Zsh, None, &claude_resume);
         assert_eq!(zsh[0], "-ic");
         assert!(zsh[1].contains("SCRIBE_RESTORE_ENV_DELTA_FILE"), "{}", zsh[1]);
-        assert!(zsh[1].ends_with("exec claude --resume"), "{}", zsh[1]);
+        assert!(zsh[1].ends_with("claude --resume; exit $?"), "{}", zsh[1]);
         // A conversation id is quoted in the language the shell speaks.
-        let fish = ai_argv(ShellKind::Fish, None, &targeted);
-        assert!(fish[1].ends_with("exec claude --resume 'it\\'s mine'"), "{}", fish[1]);
+        let fish = ai_argv(ShellKind::Fish, None, &claude_targeted);
+        assert!(fish[1].ends_with("claude --resume 'it\\'s mine'; exit $status"), "{}", fish[1]);
         // Nushell rejects the grouped short form.
-        assert_eq!(ai_argv(ShellKind::Nushell, None, &new), ["-i", "-c", "exec claude"]);
+        assert_eq!(
+            ai_argv(ShellKind::Nushell, None, &codex_new),
+            ["-i", "-c", "codex; exit $env.LAST_EXIT_CODE"]
+        );
         // PowerShell speaks neither `-i` nor `exec`, and its `-File` attachment
         // has to be last, so an AI launch drops the script for `-Command`.
         assert_eq!(
-            ai_argv(ShellKind::PowerShell, Some("/s/scribe.ps1"), &new),
-            ["-NoLogo", "-Command", "claude"]
+            ai_argv(ShellKind::PowerShell, Some("/s/scribe.ps1"), &codex_resume),
+            ["-NoLogo", "-Command", "codex resume 'it''s mine'"]
         );
         // Without AI intent the very same call is the untouched plain-tab argv.
         assert_eq!(
@@ -1892,7 +1897,7 @@ mod tests {
         };
         assert_eq!(
             launch_exec_command(ShellKind::Bash, Some(&claude), Some(ShellTool::Pi)).as_deref(),
-            Some("exec claude")
+            Some("claude; exit $?")
         );
         // Neither means the plain-tab argv, unchanged.
         assert_eq!(launch_exec_command(ShellKind::Bash, None, None), None);

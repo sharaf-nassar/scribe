@@ -2489,9 +2489,9 @@ adjacent `@lat` comments link them to this executor section and
 
 Three functional scripts verify structured AI launch behavior across the supported bash, zsh, and fish shells without relying on a GPUI client.
 
-Every script exports `SHELL` before restarting the disposable container server, because the session shell is resolved env-first from the daemon's own environment. The deterministic Claude stub records resumed-provider argv and the environment after shell startup.
+Every script exports `SHELL` before restarting the disposable container server, because the session shell is resolved env-first from the daemon's own environment. The deterministic Claude stubs record resumed-provider argv and the environment after shell startup; the Bash row also covers a Codex stub.
 
-What all three now assert is that an AI tab starts the shell exactly as a plain tab does. Each script places the Claude stub's `PATH` in the file a plain tab reads and nowhere else, so a regression that reintroduces a bespoke AI launch produces a command-not-found `exec` and records no invocation at all.
+What all three now assert is that an AI tab starts the shell exactly as a plain tab does. Each script places its provider stub's `PATH` in the file a plain tab reads and nowhere else, so a regression that reintroduces a bespoke AI launch produces a command-not-found provider and records no invocation at all.
 
 The matrix covers the server side of AI-tab working directories: an existing `--cwd` is preserved, while a nonexistent path falls back to `$HOME`. Choosing that directory is a client concern — the project root of the focused region, then the focused pane's CWD — and needs no server-side row.
 
@@ -2511,7 +2511,7 @@ The source session stays alive while polling for the `.envz` and through AI cons
 
 `tests/e2e/func/ai-shell-env-bash.sh` verifies that bash starts non-login for an AI tab and reads `.bashrc`, the same file every other Scribe tab reads.
 
-The stub must see `.bashrc`'s marker and PATH and none of `.bash_profile`, `.bash_login`, or `.profile` — the three login-profile files a non-login bash never touches. It also requires `SCRIBE_SHELL_INTEGRATION=1` while the restore-file and `ENV` variables are absent.
+The fixture defines `claude()` and `codex()` wrappers that export distinct markers before forwarding every argument to deterministic stubs. Requested-CWD and home-fallback resumed launches must record the matching marker and exact provider argv (`--resume` for Claude, `resume` for Codex), proving shell command resolution without using either real CLI. The requested-CWD sessions must finalize with each stub's zero status, proving the status exit closes the tab. Both stubs must also see `.bashrc`'s startup marker and PATH and none of `.bash_profile`, `.bash_login`, or `.profile` — the three login-profile files a non-login bash never touches. They require `SCRIBE_SHELL_INTEGRATION=1` while the restore-file and `ENV` variables are absent.
 
 #### Zsh AI Shell Environment
 

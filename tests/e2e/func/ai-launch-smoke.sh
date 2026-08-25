@@ -65,10 +65,8 @@ if ! grep -qx 'PWD=/tmp' "$RECORD"; then
     exit 1
 fi
 
-# The shell `exec`s the provider over itself, so the provider IS the PTY child
-# and its exit is the session's exit. That is the whole reason the AI tab keeps
-# an `exec` rather than running the CLI from a resident shell: quitting the AI
-# app closes the tab instead of dropping the user at a stray prompt.
+# The shell exits with the provider's status, so the session ends with it
+# rather than dropping the user at a stray prompt.
 scribe-test assert-exit "$AI_SESSION" 0 --timeout 5000
 
 echo "PHASE 1 PASS: AI launch reached claude stub with expected argv, cwd, and envelope id, and the tab exited with it"
