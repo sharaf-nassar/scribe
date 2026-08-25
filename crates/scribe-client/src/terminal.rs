@@ -42,6 +42,7 @@ use alacritty_terminal_gpui::{
     index::{Column, Line},
     term::{Config, Osc52, Term, TermMode},
 };
+use scribe_client::input::{KittyFlags, TerminalMode as KeyboardMode};
 use scribe_client::mouse_reporting::{MotionReporting, MouseModes, MouseReportMode};
 use scribe_client::scrollbar::ScrollMetrics;
 use scribe_client::selection::{
@@ -725,6 +726,32 @@ impl DisplayOnlyTerminal {
         vi_mode::is_vi_mode(&self.term)
     }
 
+    /// Live keyboard-protocol state negotiated by this pane's application.
+    ///
+    /// The config switch opts out of Kitty enhancements only. DEC application
+    /// cursor/keypad modes remain live because applications negotiate them
+    /// independently through terminfo.
+    #[must_use]
+    pub fn keyboard_mode(&self, keyboard_protocol_enhanced: bool) -> KeyboardMode {
+        let mode = self.term.mode();
+        let kitty = if keyboard_protocol_enhanced {
+            KittyFlags::legacy_set()
+                .with_disambiguate(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES))
+                .with_report_event_types(mode.contains(TermMode::REPORT_EVENT_TYPES))
+                .with_report_alternate_keys(mode.contains(TermMode::REPORT_ALTERNATE_KEYS))
+                .with_report_all_keys(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+                .with_report_associated_text(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT))
+        } else {
+            KittyFlags::legacy_set()
+        };
+
+        KeyboardMode {
+            kitty,
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            app_keypad: mode.contains(TermMode::APP_KEYPAD),
+        }
+    }
+
     /// Whether the pane's application has enabled bracketed paste (DEC 2004).
     ///
     /// A paste is wrapped in the DEC 2004 markers only when this is set, and
@@ -1206,6 +1233,16 @@ impl PaneGrid {
         self.published.lock().ok().map(|published| Arc::clone(&published))
     }
 
+    /// Read this pane's negotiated keyboard mode without republishing its
+    /// render projection.
+    #[must_use]
+    pub fn keyboard_mode(&self, keyboard_protocol_enhanced: bool) -> Option<KeyboardMode> {
+        self.stream
+            .lock()
+            .ok()
+            .map(|stream| stream.terminal.keyboard_mode(keyboard_protocol_enhanced))
+    }
+
     /// The nearest raw-frame or parser synchronized-update deadline.
     ///
     /// Read-only, so it deliberately skips the republish [`Self::with_stream`]
@@ -1330,6 +1367,7 @@ impl PaneGrids {
 
 #[cfg(test)]
 mod tests {
+    use scribe_client::input::{KeyInput, KeyLocation, KeyState, KeyToken, NamedKey, encode};
     use scribe_common::config::SmartSelectionConfig;
     use scribe_common::protocol::PromptMarkKind;
 
@@ -1352,6 +1390,110 @@ mod tests {
 
     fn pinned() -> SplitScrollEligibility {
         SplitScrollEligibility { scroll_pin_enabled: true, ai_provider_enabled: true }
+    }
+
+    fn assert_all_kitty_flags(flags: KittyFlags) {
+        assert!(flags.disambiguate());
+        assert!(flags.report_event_types());
+        assert!(flags.report_alternate_keys());
+        assert!(flags.report_all_keys());
+        assert!(flags.report_associated_text());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Kitty set reset push and pop stay live]]
+    #[test]
+    fn kitty_set_reset_push_and_pop_stay_live() {
+        let mut terminal = DisplayOnlyTerminal::new(20, 2);
+
+        terminal.feed_output(b"\x1b[>31u");
+        assert_all_kitty_flags(terminal.keyboard_mode(true).kitty);
+
+        terminal.feed_output(b"\x1b[=4;3u");
+        let reset = terminal.keyboard_mode(true).kitty;
+        assert!(reset.disambiguate());
+        assert!(reset.report_event_types());
+        assert!(!reset.report_alternate_keys());
+        assert!(reset.report_all_keys());
+        assert!(reset.report_associated_text());
+
+        terminal.feed_output(b"\x1b[>2u");
+        let pushed = terminal.keyboard_mode(true).kitty;
+        assert!(!pushed.disambiguate());
+        assert!(pushed.report_event_types());
+        assert!(!pushed.report_alternate_keys());
+        assert!(!pushed.report_all_keys());
+        assert!(!pushed.report_associated_text());
+
+        terminal.feed_output(b"\x1b[<u");
+        assert_all_kitty_flags(terminal.keyboard_mode(true).kitty);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Keyboard modes stay screen and pane local]]
+    #[test]
+    fn keyboard_modes_stay_screen_and_pane_local() {
+        let mut first = DisplayOnlyTerminal::new(20, 2);
+        let second = DisplayOnlyTerminal::new(20, 2);
+
+        first.feed_output(b"\x1b[>1u");
+        assert!(first.keyboard_mode(true).kitty.disambiguate());
+        assert!(second.keyboard_mode(true).kitty.legacy());
+
+        first.feed_output(b"\x1b[?1049h");
+        assert!(first.keyboard_mode(true).kitty.legacy());
+        first.feed_output(b"\x1b[>2u");
+        assert!(first.keyboard_mode(true).kitty.report_event_types());
+
+        first.feed_output(b"\x1b[?1049l");
+        let main = first.keyboard_mode(true).kitty;
+        assert!(main.disambiguate());
+        assert!(!main.report_event_types());
+
+        first.feed_output(b"\x1b[?1049h");
+        let alternate = first.keyboard_mode(true).kitty;
+        assert!(!alternate.disambiguate());
+        assert!(alternate.report_event_types());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#DEC modes survive the Kitty opt out]]
+    #[test]
+    fn dec_modes_survive_the_kitty_opt_out() {
+        let mut terminal = DisplayOnlyTerminal::new(20, 2);
+        terminal.feed_output(b"\x1b[>31u\x1b[?1h\x1b=");
+
+        let enabled = terminal.keyboard_mode(true);
+        assert_all_kitty_flags(enabled.kitty);
+        assert!(enabled.app_cursor);
+        assert!(enabled.app_keypad);
+
+        let disabled = terminal.keyboard_mode(false);
+        assert!(disabled.kitty.legacy());
+        assert!(disabled.app_cursor);
+        assert!(disabled.app_keypad);
+
+        let arrow = KeyInput {
+            token: KeyToken::Named(NamedKey::ArrowUp),
+            base: None,
+            text: None,
+            modifiers: gpui::Modifiers::default(),
+            location: KeyLocation::Standard,
+            state: KeyState::Pressed,
+        };
+        let numpad = KeyInput {
+            token: KeyToken::Char('1'),
+            base: Some('1'),
+            text: Some(String::from("1")),
+            location: KeyLocation::Numpad,
+            ..arrow.clone()
+        };
+        assert_eq!(encode(&arrow, disabled), Some(b"\x1bOA".to_vec()));
+        assert_eq!(encode(&numpad, disabled), Some(b"\x1bOq".to_vec()));
+
+        terminal.feed_output(b"\x1b[?1l\x1b>");
+        let reset = terminal.keyboard_mode(false);
+        assert!(!reset.app_cursor);
+        assert!(!reset.app_keypad);
+        assert_eq!(encode(&arrow, reset), Some(b"\x1b[A".to_vec()));
+        assert_eq!(encode(&numpad, reset), Some(b"1".to_vec()));
     }
 
     // @lat: [[test#GPUI Terminal Viewport#Link lookup follows the scrolled viewport]]

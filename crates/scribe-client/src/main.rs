@@ -23,7 +23,7 @@ use std::{
 
 use gpui::{
     AnimationExt as _, App, AppContext as _, AsyncApp, Bounds, Context, DragMoveEvent, ElementId,
-    Entity, FocusHandle, Focusable, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    Entity, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
     ScrollWheelEvent, Size, StyleRefinement, Subscription, Task, TitlebarOptions, WeakEntity,
     Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, canvas, div,
@@ -69,7 +69,7 @@ use scribe_client::dialog::{
 use scribe_client::divider::{self, DividerDrag};
 use scribe_client::drag_drop::dropped_path_insertion;
 use scribe_client::gpui_image_lifecycle::GpuiImageCache;
-use scribe_client::input::{self, KeyInput, TerminalMode};
+use scribe_client::input::{self, KeyInput, KeyState, KittyFlags, TerminalMode};
 use scribe_client::keybindings::{
     KeyAction, LayoutAction, OverlayChord, any_matches, translate_key_action,
     translate_overlay_chord,
@@ -9880,11 +9880,7 @@ impl TerminalView {
         true
     }
 
-    /// Encodes a keystroke and enqueues it as `KeyInput` for the attached pane.
-    ///
-    /// Interim passthrough encoder: printable characters plus a handful of
-    /// control keys. The full kitty/CSI-u encoder lands with the input-encoder
-    /// port; this only proves the outbound [`IpcSink`] path end to end.
+    /// Encode a key press with the focused pane's live terminal modes.
     ///
     /// A live share viewer never reaches the encoder: its keystroke is consumed
     /// by [`Self::run_share_key`], which raises the take-control affordance
@@ -9893,9 +9889,14 @@ impl TerminalView {
         if self.run_share_key(event, cx) {
             return;
         }
-        let Some(bytes) = encode_key(event) else {
-            return;
-        };
+        let mode = self.focused_terminal_mode();
+        let codex = self.focused_pane_is_codex();
+        let bytes = KeyInput::from_key_down(event)
+            .as_ref()
+            .and_then(|input| codex_alt_enter_newline_bytes(input, codex, mode.kitty))
+            .or_else(|| encode_key_down(event, mode));
+        let Some(bytes) = bytes else { return };
+
         tracing::debug!(key = %event.keystroke.key, "encoding a keystroke for the PTY");
         if let Some(session_id) =
             self.shared.active_session.lock().ok().and_then(|session| *session)
@@ -9916,6 +9917,35 @@ impl TerminalView {
             cx.notify();
         }
         self.send_key_bytes(bytes);
+    }
+
+    /// Encode a release only through the generic level-4 encoder.
+    ///
+    /// Releases never enter the press-only overlay/binding/share router. They
+    /// produce bytes only when the focused application negotiated Kitty event
+    /// types; legacy mode and every other Kitty flag continue to swallow them.
+    fn on_key_up(&self, event: &KeyUpEvent) {
+        let mode = self.focused_terminal_mode();
+        if let Some(bytes) = encode_key_up(event, mode) {
+            self.send_key_bytes(bytes);
+        }
+    }
+
+    /// Snapshot the focused pane's negotiated Kitty and DEC keyboard modes.
+    ///
+    /// Read for every generic press/repeat/release so focus changes, alternate
+    /// screens, and Kitty push/pop operations take effect on the next event.
+    fn focused_terminal_mode(&self) -> TerminalMode {
+        let enhanced = self.config.config().config.terminal.keyboard_protocol_enhanced;
+        self.focused_pane()
+            .and_then(|pane| pane.keyboard_mode(enhanced))
+            .unwrap_or_else(TerminalMode::legacy)
+    }
+
+    fn focused_pane_is_codex(&self) -> bool {
+        self.focused_session().and_then(|session_id| {
+            self.shared.ai.lock().ok()?.tracker.provider_for_session(session_id)
+        }) == Some(AiProvider::CodexCode)
     }
 
     /// Whether a `ControlRequested` grant/deny prompt is currently modal.
@@ -10224,36 +10254,46 @@ fn escape_report_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Keystroke encoder feeding the outbound [`IpcSink`] (see
-/// [`TerminalView::on_key_down`]).
+/// Encode one GPUI key-down event through the production level-4 encoder.
 ///
-/// This is the live entry point of the ported terminal encoder: the GPUI event
-/// is lowered by [`KeyInput::from_key_down`] and handed to
-/// [`input::encode`](scribe_client::input::encode), the same function the
-/// golden byte fixtures pin. It replaced an interim passthrough table that only
-/// knew Enter/Tab/Backspace/Escape and the four arrows, so every other named
-/// key — PageUp/PageDown, Home/End, Insert/Delete, the function keys — was
-/// silently dropped before the PTY even though the encoder had always mapped
-/// them (`CSI 5~` / `CSI 6~` and friends).
-///
-/// The mode is [`TerminalMode::legacy`] because this client tracks no per-pane
-/// DECCKM/DECPAM or Kitty negotiation yet; that state lands with the terminal
-/// mode plumbing and is the only thing standing between here and full parity.
-fn encode_key(event: &KeyDownEvent) -> Option<Vec<u8>> {
+/// `mode` is read from the focused pane immediately before this call. Text with
+/// multiple codepoints still follows the IME-compatible verbatim path retained
+/// from the GPUI cutover; single-key events use the negotiated encoder.
+fn encode_key_down(event: &KeyDownEvent, mode: TerminalMode) -> Option<Vec<u8>> {
     let text = event.keystroke.key_char.as_deref().filter(|text| !text.is_empty());
-    // Multi-codepoint text has no single-key encoder form (the encoder works on
-    // one logical key), so forward it verbatim as the interim table did.
     if let Some(text) = text
         && text.chars().count() > 1
     {
         return Some(text.as_bytes().to_vec());
     }
     if let Some(key_input) = KeyInput::from_key_down(event) {
-        return input::encode(&key_input, TerminalMode::legacy());
+        return input::encode(&key_input, mode);
     }
-    // The keystroke names no key the encoder knows; if the platform still
-    // produced text, that text is the best available encoding.
     text.map(|text| text.as_bytes().to_vec())
+}
+
+/// Encode one GPUI key-up event through the generic encoder only.
+fn encode_key_up(event: &KeyUpEvent, mode: TerminalMode) -> Option<Vec<u8>> {
+    input::encode(&KeyInput::from_key_up(event)?, mode)
+}
+
+/// Codex's Alt+Enter compatibility binding, applied once on the initial press.
+fn codex_alt_enter_newline_bytes(
+    key_input: &KeyInput,
+    codex: bool,
+    flags: KittyFlags,
+) -> Option<Vec<u8>> {
+    if !codex
+        || key_input.state != KeyState::Pressed
+        || key_input.token != input::KeyToken::Named(input::NamedKey::Enter)
+        || !key_input.modifiers.alt
+        || key_input.modifiers.shift
+        || key_input.modifiers.control
+    {
+        return None;
+    }
+
+    Some(if flags.is_any() { b"\x1b[13;2u".to_vec() } else { b"\n".to_vec() })
 }
 
 /// Drains the config watcher's change signal on the GPUI foreground.
@@ -11675,6 +11715,10 @@ impl TerminalView {
         )
         .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
             view.handle_root_key_down(event, win, ctx);
+        }))
+        .on_key_up(cx.listener(|view, event: &KeyUpEvent, _window, ctx| {
+            ctx.stop_propagation();
+            view.on_key_up(event);
         }))
         .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, _window, ctx| {
             view.handle_dropped_paths(paths.paths(), ctx);
@@ -16810,7 +16854,7 @@ mod tests {
                 return;
             }
             cx.stop_propagation();
-            if let Some(bytes) = encode_key(event) {
+            if let Some(bytes) = encode_key_down(event, TerminalMode::legacy()) {
                 self.pty_bytes.push(bytes);
             }
         }
@@ -16926,7 +16970,7 @@ mod tests {
     impl JumpButtonFocusProbe {
         fn route_terminal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
             cx.stop_propagation();
-            if let Some(bytes) = encode_key(event) {
+            if let Some(bytes) = encode_key_down(event, TerminalMode::legacy()) {
                 self.pty_bytes.push(bytes);
             }
         }
@@ -18163,17 +18207,87 @@ mod tests {
         }
     }
 
+    fn key_up(key: &str, modifiers: gpui::Modifiers) -> KeyUpEvent {
+        KeyUpEvent { keystroke: gpui::Keystroke { modifiers, key: key.into(), key_char: None } }
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Production Shift Enter uses the live mode]]
+    #[test]
+    fn production_shift_enter_uses_the_live_mode() {
+        let shift = gpui::Modifiers { shift: true, ..gpui::Modifiers::default() };
+        let mode = TerminalMode {
+            kitty: KittyFlags::legacy_set().with_disambiguate(true),
+            ..TerminalMode::legacy()
+        };
+
+        assert_eq!(encode_key_down(&key_down("enter", shift), mode), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Key releases bypass the press router]]
+    #[test]
+    fn key_releases_use_only_generic_event_encoding() {
+        let mode = TerminalMode {
+            kitty: KittyFlags::legacy_set().with_report_event_types(true),
+            ..TerminalMode::legacy()
+        };
+
+        assert_eq!(
+            encode_key_up(&key_up("enter", gpui::Modifiers::default()), mode),
+            Some(b"\x1b[13;1:3u".to_vec())
+        );
+        assert_eq!(
+            encode_key_up(&key_up("enter", gpui::Modifiers::default()), TerminalMode::legacy()),
+            None
+        );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Codex Alt Enter fires once on press]]
+    #[test]
+    fn codex_alt_enter_fires_once_on_press() {
+        let alt = gpui::Modifiers { alt: true, ..gpui::Modifiers::default() };
+        let pressed = KeyInput::from_key_down(&key_down("enter", alt)).expect("Enter input");
+        let repeated = KeyInput { state: KeyState::Repeat, ..pressed.clone() };
+        let released = KeyInput { state: KeyState::Released, ..pressed.clone() };
+        let shifted = KeyInput {
+            modifiers: gpui::Modifiers { alt: true, shift: true, ..gpui::Modifiers::default() },
+            ..pressed.clone()
+        };
+
+        assert_eq!(
+            codex_alt_enter_newline_bytes(&pressed, true, KittyFlags::legacy_set()),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(codex_alt_enter_newline_bytes(&repeated, true, KittyFlags::legacy_set()), None);
+        assert_eq!(codex_alt_enter_newline_bytes(&released, true, KittyFlags::legacy_set()), None);
+        assert_eq!(codex_alt_enter_newline_bytes(&shifted, true, KittyFlags::legacy_set()), None);
+        assert_eq!(codex_alt_enter_newline_bytes(&pressed, false, KittyFlags::legacy_set()), None);
+        assert_eq!(
+            codex_alt_enter_newline_bytes(
+                &pressed,
+                true,
+                KittyFlags::legacy_set().with_disambiguate(true)
+            ),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+    }
+
     // @lat: [[client#Input#Terminal focus keeps Tab for the PTY]]
     #[test]
     fn focused_terminal_keeps_tab_for_the_pty() {
         let tab = key_down("tab", gpui::Modifiers::default());
         assert!(!TerminalView::traversal_claims_tab(&tab, true));
-        assert_eq!(encode_key(&tab).as_deref(), Some(b"\t".as_slice()));
+        assert_eq!(
+            encode_key_down(&tab, TerminalMode::legacy()).as_deref(),
+            Some(b"\t".as_slice())
+        );
 
         let shift = gpui::Modifiers { shift: true, ..gpui::Modifiers::default() };
         let shift_tab = key_down("tab", shift);
         assert!(!TerminalView::traversal_claims_tab(&shift_tab, true));
-        assert_eq!(encode_key(&shift_tab).as_deref(), Some(b"\x1b[Z".as_slice()));
+        assert_eq!(
+            encode_key_down(&shift_tab, TerminalMode::legacy()).as_deref(),
+            Some(b"\x1b[Z".as_slice())
+        );
     }
 
     // @lat: [[client#Input#Chrome focus keeps Tab traversal]]
@@ -18192,7 +18306,10 @@ mod tests {
         assert!(!TerminalView::traversal_claims_tab(&key_down("tab", ctrl), false));
         let ctrl_i = key_down("i", ctrl);
         assert!(!TerminalView::traversal_claims_tab(&ctrl_i, false));
-        assert_eq!(encode_key(&ctrl_i).as_deref(), Some(b"\t".as_slice()));
+        assert_eq!(
+            encode_key_down(&ctrl_i, TerminalMode::legacy()).as_deref(),
+            Some(b"\t".as_slice())
+        );
     }
 
     #[test]

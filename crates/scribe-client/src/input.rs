@@ -1023,11 +1023,23 @@ fn alternate_codepoints(logical: char, base: u32, flags: KittyFlags) -> Vec<u32>
 
 /// Unicode scalar values of the event's associated text, when
 /// `report_associated_text` is negotiated and the event carries text.
+///
+/// C0/C1 controls are excluded as required by the Kitty protocol; release
+/// events carry no associated text.
 fn associated_text_codepoints(input: &KeyInput, flags: KittyFlags) -> Vec<u32> {
     if !flags.report_associated_text() || input.state == KeyState::Released {
         return Vec::new();
     }
-    input.text.as_ref().map(|t| t.chars().map(u32::from).collect()).unwrap_or_default()
+    input
+        .text
+        .as_ref()
+        .map(|text| {
+            text.chars()
+                .map(u32::from)
+                .filter(|codepoint| !matches!(codepoint, 0..=31 | 127..=159))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Map a [`NamedKey`] to its Kitty CSI-u functional-key codepoint.

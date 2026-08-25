@@ -2935,14 +2935,14 @@ Key events are resolved through a four-level priority chain from layout shortcut
 
 On macOS, GPUI application actions reserve bare `cmd+w` and `cmd+q` before that chain and expose them through the native File and Scribe menus. `cmd+w` follows the active window's normal close path, while `cmd+q` defers its terminal-window update until action dispatch returns the active window to GPUI's table, then raises the server-owned close dialog before any process exits; neither chord can fall through to pane bindings or terminal input.
 
-Above the level-4 encoder,  short-circuits the dispatch at the entry of `handle_keyboard` whenever an OS IME composition is in flight, so synthesized winit key events that the IME is mid-composing never reach the legacy or Kitty encoder. See  for the state machine that drives that predicate.
+Above the level-4 encoder, the GPUI IME owns composed text through [[crates/scribe-client/src/main.rs#TerminalView#commit_ime_text]], so committed multi-codepoint text bypasses single-key encoding and raw key presses clear stale preedit state only after the press router declines them.
 
 1. Layout shortcuts (configurable keybindings) produce `LayoutAction` enum values
 2. Special commands (command palette, settings, find, hover-preview inline editor)
 3. Terminal shortcuts (word navigation, line navigation)
 4. Generic terminal key translation produces PTY bytes — legacy xterm modifier encoding, or full Kitty CSI-u when the focused application negotiated the keyboard protocol
 
-Pane-local terminals enable kitty keyboard tracking so an application's negotiated progressive-enhancement flags shape encoding.  turns tracking on;  bundles the five negotiated flags from the focused pane's `Term` mode together with the two DEC private modes (`APP_CURSOR` for DECCKM, `APP_KEYPAD` for DECPAM) into  — Kitty flags are forced all-off when the `[terminal]` `keyboard_protocol_enhanced` opt-out is disabled, but the DEC modes always reflect the pane so terminfo `smkx` / `rmkx` keeps working. The level-4 encoder emits CSI-u for Kitty functional keys whose protocol entries are true codepoints, but arrows, Insert/Delete, Page keys, Home/End, and F1-F12 stay on their Kitty legacy-shaped CSI letter/tilde forms; repeat/release markers are carried in the modifier parameter's event-type subfield. With no Kitty flag negotiated the legacy byte encoding is reproduced byte-identically. Codex panes still map Alt+Enter to Codex's newline binding before the generic path.
+Pane-local terminals enable Kitty keyboard tracking so an application's negotiated progressive-enhancement flags shape encoding. [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#new]] turns tracking on; [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#keyboard_mode]] maps all five live Kitty bits plus `APP_CURSOR` (DECCKM) and `APP_KEYPAD` (DECPAM), and [[crates/scribe-client/src/main.rs#TerminalView#focused_terminal_mode]] reads that focused-pane snapshot before every generic press, repeat, or release. The `[terminal] keyboard_protocol_enhanced = false` opt-out clears only Kitty flags; DEC modes stay live so terminfo `smkx` / `rmkx` keeps working. Kitty push/pop state and main/alternate-screen stacks remain owned by Alacritty's per-pane `Term`, so focus and screen switches cannot leak negotiation across panes. The level-4 encoder emits CSI-u for Kitty functional keys whose protocol entries are true codepoints, but arrows, Insert/Delete, Page keys, Home/End, and F1-F12 stay on their Kitty legacy-shaped CSI letter/tilde forms; repeat/release markers are carried in the modifier parameter's event-type subfield. With no Kitty flag negotiated the legacy byte encoding is reproduced byte-identically. Codex panes map Alt+Enter once on its initial press to Codex's newline binding; key releases bypass every press-only router and enter only the generic encoder.
 
 #### DEC Application Modes
 
@@ -2962,7 +2962,7 @@ Numeric-keypad keys (`KeyLocation::Numpad`) emit SS3 sequences when DECPAM is ac
 
 ### Terminal focus keeps Tab for the PTY
 
-Verifies [[crates/scribe-client/src/main.rs#TerminalView#traversal_claims_tab]] never claims plain Tab or Shift+Tab while the terminal root owns focus, and that [[crates/scribe-client/src/main.rs#encode_key]] emits `\t` and `ESC [ Z` so tab completion reaches the PTY.
+Verifies [[crates/scribe-client/src/main.rs#TerminalView#traversal_claims_tab]] never claims plain Tab or Shift+Tab while the terminal root owns focus, and that [[crates/scribe-client/src/main.rs#encode_key_down]] emits `\t` and `ESC [ Z` so tab completion reaches the PTY.
 
 ### Chrome focus keeps Tab traversal
 
@@ -2972,11 +2972,9 @@ Verifies traversal claims plain Tab and Shift+Tab once chrome owns focus, while 
 
 The GPUI rebuild reproduces the level-4 terminal byte encoder in , byte-identical to the winit client's  across legacy xterm, Kitty CSI-u, DECCKM, and DECPAM output.
 
-Because GPUI's `Keystroke` drops numeric-keypad location and a distinct unshifted base vs shifted glyph, the encoder consumes an intermediate  carrying the key token, base character, associated text, modifiers, , and press/repeat/release state.  lowers a GPUI `KeyDownEvent` into that shape — numpad location is unavailable on that path, so callers with richer platform data set it directly. Negotiated Kitty flags travel through  and the two DEC modes through , mirroring the winit encoder's .
+Because GPUI's `Keystroke` drops numeric-keypad location and a distinct unshifted base vs shifted glyph, the encoder consumes an intermediate [[crates/scribe-client/src/input.rs#KeyInput]] carrying the key token, base character, associated text, modifiers, location, and press/repeat/release state. [[crates/scribe-client/src/input.rs#KeyInput#from_key_down]] and [[crates/scribe-client/src/input.rs#KeyInput#from_key_up]] lower GPUI events into that shape — numpad location is unavailable on this boundary, so callers with richer platform data set it directly. Negotiated Kitty flags and DEC modes travel together through [[crates/scribe-client/src/input.rs#TerminalMode]]. Associated-text encoding drops C0 and C1 controls before building its Kitty field.
 
-The keybinding dispatch above this encoder is wired into the shell (see ), and the level-4 byte encoder is now the binary's own key path:  lowers the GPUI event and calls  directly. The port is verified against the committed oracle (see ) by a golden byte-capture test that replays every case in `tests/fixtures/gpui-client/keyboard-byte-golden.json`.
-
-The one piece still missing is the per-pane mode: the binary always passes `::legacy` because it tracks no negotiated Kitty flags and no DECCKM/DECPAM state yet, so the Kitty and application-mode branches of the encoder stay unreachable from the running client even though the golden test covers them. Wiring the focused pane's mode (the winit client's ) is the remaining step to full parity.
+The keybinding dispatch above this encoder remains press-only, and the level-4 byte encoder is the binary's own production path: [[crates/scribe-client/src/main.rs#encode_key_down]] and [[crates/scribe-client/src/main.rs#encode_key_up]] call [[crates/scribe-client/src/input.rs#encode]] with the focused pane's current mode. Root key-up handling does not run overlays, bindings, share claims, or the Codex override. The port remains verified against `tests/fixtures/gpui-client/keyboard-byte-golden.json`, with production regressions for negotiated Shift+Enter, release routing, Codex Alt+Enter, text-special report-all encoding, C0/C1 filtering, Kitty stack/screen/pane isolation, and live DEC modes.
 
 ### GPUI Keybindings Port
 

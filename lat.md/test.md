@@ -4950,6 +4950,42 @@ The pure  split-tree drives the "Pane layout" keybinding actions (`close_pane`, 
 
 Over a 2x2 pane grid the suite exercises the surface the entity tests do not reach directly:  resolves a direct neighbor on all four axes and wraps to the opposite edge along the same column when none exists;  cycles panes in depth-first order and wraps past the last leaf;  exchanges two leaf positions; and  promotes a closed pane's sibling while refusing to remove the sole remaining leaf.
 
+### GPUI Negotiated Keyboard Routing
+
+Production-seam and live-terminal tests close the gap between the golden byte encoder and the focused pane that supplies its mode. They exercise [[crates/scribe-client/src/main.rs#encode_key_down]], [[crates/scribe-client/src/main.rs#encode_key_up]], [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#keyboard_mode]], and [[crates/scribe-client/src/input.rs#encode]] without replacing the encoder.
+
+#### Production Shift Enter uses the live mode
+
+A GPUI Shift+Enter event encoded with focused Kitty disambiguation must produce exact `ESC [ 13 ; 2 u`, the production regression for Pi prompt newline insertion.
+
+#### Kitty set reset push and pop stay live
+
+A live `DisplayOnlyTerminal` parses Kitty replace/difference/push/pop sequences. All five bits map independently; reset removes only its bit, push replaces the active view, and pop restores the prior entry.
+
+#### Keyboard modes stay screen and pane local
+
+Two terminal instances prove negotiation never crosses panes. One terminal then carries distinct main- and alternate-screen stacks across repeated DEC 1049 switches, proving the mode read follows the active screen instead of a window-global cache.
+
+#### DEC modes survive the Kitty opt out
+
+Live DECCKM and DECPAM sequences set `app_cursor` and `app_keypad`; disabling `keyboard_protocol_enhanced` clears all Kitty flags while preserving both DEC modes, and their reset sequences clear them normally.
+
+#### Key releases bypass the press router
+
+A GPUI key-up emits the Kitty event-type release through the generic encoder and emits nothing in legacy mode. Root key-up wiring calls this seam directly rather than entering overlays, bindings, share routing, or Codex compatibility.
+
+#### Codex Alt Enter fires once on press
+
+The compatibility mapping accepts only an initial Alt+Enter press in a Codex pane: legacy mode emits LF, negotiated Kitty mode emits Shift+Enter CSI-u, and repeat, release, non-Codex, Shift, or Control inputs are declined.
+
+#### Report all keys covers text specials
+
+Enter, Tab, and Backspace each emit their Kitty CSI-u codepoint under report-all-keys instead of falling back to CR, HT, or DEL.
+
+#### Associated text excludes C0 and C1
+
+An associated-text payload containing printable Unicode plus C0/C1 controls retains only printable scalar values in the CSI-u text field.
+
 ### GPUI keybindings dispatch
 
 Verifies the ported  parser and  dispatch so no configured shortcut regresses across the GPUI cutover.

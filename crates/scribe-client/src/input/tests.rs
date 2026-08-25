@@ -181,3 +181,34 @@ fn released_key_without_event_reporting_emits_nothing() {
     // Legacy mode swallows releases.
     assert_eq!(encode(&input, TerminalMode::legacy()), None);
 }
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Report all keys covers text specials]]
+#[test]
+fn report_all_keys_covers_enter_tab_and_backspace() {
+    let mode = TerminalMode {
+        kitty: KittyFlags::legacy_set().with_report_all_keys(true),
+        ..TerminalMode::legacy()
+    };
+
+    assert_eq!(encode(&named_input(NamedKey::Enter, no_mods()), mode), Some(b"\x1b[13u".to_vec()));
+    assert_eq!(encode(&named_input(NamedKey::Tab, no_mods()), mode), Some(b"\x1b[9u".to_vec()));
+    assert_eq!(
+        encode(&named_input(NamedKey::Backspace, no_mods()), mode),
+        Some(b"\x1b[127u".to_vec())
+    );
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI Negotiated Keyboard Routing#Associated text excludes C0 and C1]]
+#[test]
+fn associated_text_excludes_c0_and_c1_controls() {
+    let mode = TerminalMode {
+        kitty: KittyFlags::legacy_set()
+            .with_report_all_keys(true)
+            .with_report_associated_text(true),
+        ..TerminalMode::legacy()
+    };
+    let input =
+        KeyInput { text: Some(String::from("A\t\u{80}é")), ..char_input('a', 'a', no_mods()) };
+
+    assert_eq!(encode(&input, mode), Some(b"\x1b[97;65:233u".to_vec()));
+}
