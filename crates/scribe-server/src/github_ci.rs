@@ -618,6 +618,14 @@ fn epoch_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// One run as the last published state described it.
+struct ObservedRun {
+    status: CiWorkflowStatus,
+    conclusion: Option<CiRunConclusion>,
+    started_at_epoch_secs: Option<u64>,
+    updated_at_epoch_secs: Option<u64>,
+}
+
 struct PollWindow {
     repository: GithubRepository,
     roots: BTreeSet<PathBuf>,
@@ -628,6 +636,14 @@ struct PollWindow {
     observed: Option<CiRunState>,
     offline_backoff: Duration,
     transient_logged: bool,
+    /// When this head reached a terminal rollup. It then schedules no request,
+    /// but stays reopenable by a same-OID generation until the next sweep past
+    /// its discovery window retires it.
+    settled_at: Option<Instant>,
+    /// Highest run id this head had already published when a same-OID
+    /// generation reopened it. Until GitHub returns a run above it, responses
+    /// carry only the previous generation and must not settle the window.
+    generation_baseline: Option<u64>,
 }
 
 impl PollWindow {
@@ -642,7 +658,44 @@ impl PollWindow {
             observed: None,
             offline_backoff: POLL_INTERVAL,
             transient_logged: false,
+            settled_at: None,
+            generation_baseline: None,
         }
+    }
+
+    /// Highest run id in the last published state.
+    fn newest_observed_run(&self) -> Option<u64> {
+        self.observed.as_ref().and_then(|state| state.workflows.iter().map(|run| run.run_id).max())
+    }
+
+    /// A terminal head schedules no further request.
+    fn settled(&self) -> bool {
+        self.settled_at.is_some()
+    }
+
+    /// What the bar already shows for each run at this head, so a
+    /// re-observation keeps the clocks it derived from.
+    fn observed_runs(&self) -> HashMap<u64, ObservedRun> {
+        self.observed
+            .as_ref()
+            .map(|state| {
+                state
+                    .workflows
+                    .iter()
+                    .map(|run| {
+                        (
+                            run.run_id,
+                            ObservedRun {
+                                status: run.status,
+                                conclusion: run.conclusion,
+                                started_at_epoch_secs: run.started_at_epoch_secs,
+                                updated_at_epoch_secs: run.updated_at_epoch_secs,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -752,9 +805,13 @@ impl GithubCiTracker {
                 // in place instead of clearing, so a still-active workflow the window
                 // already observed survives alongside whatever the new generation adds.
                 // `observed` and `roots` are carried forward untouched above; only the
-                // poll timers restart, mirroring a fresh window's initial values.
+                // poll timers restart, mirroring a fresh window's initial values. A
+                // settled head reopens the same way, and the baseline keeps the first
+                // old-only response from settling it again before the new run appears.
                 window.discovery_deadline = now.checked_add(DISCOVERY_WINDOW);
                 window.next_attempt = now;
+                window.generation_baseline = window.newest_observed_run();
+                window.settled_at = None;
             }
             return Some(PushResult {
                 #[cfg(test)]
@@ -853,7 +910,7 @@ impl GithubCiTracker {
         let run_ready = self
             .windows
             .iter()
-            .filter(|(_, window)| window.next_attempt <= now)
+            .filter(|(_, window)| !window.settled() && window.next_attempt <= now)
             .min_by_key(|(_, window)| window.next_attempt)
             .map(|(key, _)| key.clone());
         if let Some(detail_key) = detail_ready.clone()
@@ -1046,19 +1103,31 @@ impl GithubCiTracker {
             return Vec::new();
         }
         workflows.truncate(MAX_WORKFLOWS);
-        let first_seen = window.observed.as_ref().map(|state| {
-            state
-                .workflows
-                .iter()
-                .map(|workflow| (workflow.run_id, workflow.started_at_epoch_secs))
-                .collect::<HashMap<_, _>>()
-        });
+        let seen = window.observed_runs();
+        // A reopened generation that has produced nothing newer than the run
+        // it already published keeps polling: GitHub often serves the previous
+        // generation's runs for a few seconds before the new one appears.
+        let newest_run = workflows.iter().map(|run| run.run_id).max().unwrap_or_default();
+        let awaiting_generation =
+            window.generation_baseline.is_some_and(|baseline| newest_run <= baseline);
+        if !awaiting_generation {
+            window.generation_baseline = None;
+        }
         for workflow in &mut workflows {
-            workflow.started_at_epoch_secs = first_seen
-                .as_ref()
-                .and_then(|seen| seen.get(&workflow.run_id).copied().flatten())
+            let previous = seen.get(&workflow.run_id);
+            workflow.started_at_epoch_secs =
+                previous.and_then(|run| run.started_at_epoch_secs).or(Some(observation.epoch_secs));
+            // While a generation is still awaited, every returned run is one
+            // already published; re-stamping them would drift the elapsed
+            // clock of a bar whose runs reported no news.
+            workflow.updated_at_epoch_secs = previous
+                .filter(|run| {
+                    awaiting_generation
+                        && run.status == workflow.status
+                        && run.conclusion == workflow.conclusion
+                })
+                .and_then(|run| run.updated_at_epoch_secs)
                 .or(Some(observation.epoch_secs));
-            workflow.updated_at_epoch_secs = Some(observation.epoch_secs);
         }
         let state = CiRunState {
             repository: key.full_name(),
@@ -1068,16 +1137,18 @@ impl GithubCiTracker {
             workflows,
             stale: false,
         };
-        window.discovery_deadline = None;
+        if !awaiting_generation {
+            window.discovery_deadline = None;
+        }
         window.observed = Some(state.clone());
-        let publications = publications(&window.roots, &CiRunDelta::Set(state.clone()));
-        if matches!(
+        // A terminal head stops polling but stays tracked, so a later same-OID
+        // generation reopens it in place rather than starting blind.
+        let terminal = matches!(
             state.rollup,
             CiRunStatus::Success | CiRunStatus::Failure | CiRunStatus::Cancelled
-        ) {
-            self.windows.remove(key);
-        }
-        publications
+        );
+        window.settled_at = (!awaiting_generation && terminal).then_some(observation.at);
+        publications(&window.roots, &CiRunDelta::Set(state))
     }
 
     fn mark_stale_or_backoff(
@@ -1116,9 +1187,17 @@ impl GithubCiTracker {
         publications(&window.roots, &CiRunDelta::Set(state))
     }
 
+    /// Drop windows whose discovery window lapsed without a run, and settled
+    /// heads old enough that no same-OID generation can still be following
+    /// them. Retiring a settled head here keeps a long session from holding a
+    /// snapshot per repository it happened to push to once.
     fn expire_discovery(&mut self, now: Instant) {
-        self.windows
-            .retain(|_, window| window.discovery_deadline.is_none_or(|deadline| deadline > now));
+        self.windows.retain(|_, window| {
+            window.settled_at.map_or_else(
+                || window.discovery_deadline.is_none_or(|deadline| deadline > now),
+                |settled| now.saturating_duration_since(settled) < DISCOVERY_WINDOW,
+            )
+        });
     }
 
     fn clear(&mut self) -> Vec<(PathBuf, CiRunDelta)> {
@@ -1138,6 +1217,7 @@ impl GithubCiTracker {
         let next_poll = self
             .windows
             .values()
+            .filter(|window| !window.settled())
             .map(|window| window.next_attempt)
             .min()
             .map(|due| self.scheduler.ready_at().map_or(due, |ready| due.max(ready)));
@@ -1154,6 +1234,7 @@ impl GithubCiTracker {
     fn handoff_windows(&self, now: Instant) -> Vec<HandoffCiWindow> {
         self.windows
             .values()
+            .filter(|window| !window.settled())
             .map(|window| HandoffCiWindow {
                 repository: window.repository.clone(),
                 roots: window.roots.iter().cloned().collect(),
@@ -1202,6 +1283,12 @@ impl GithubCiTracker {
     #[cfg(test)]
     fn window_count(&self) -> usize {
         self.windows.len()
+    }
+
+    /// Windows still scheduling requests; a settled terminal head is excluded.
+    #[cfg(test)]
+    fn polling_count(&self) -> usize {
+        self.windows.values().filter(|window| !window.settled()).count()
     }
 
     #[cfg(test)]
@@ -1429,9 +1516,9 @@ mod tests {
     };
 
     use super::{
-        ApiError, ApiRequest, ApiRequestKind, ApiResponse, BoxFuture, DetailInterest, GithubApi,
-        GithubCiTracker, GithubJobsResponse, GithubRepository, HttpGithubApi, PollScheduler,
-        github_ci_enabled, set_github_ci_enabled,
+        ApiError, ApiRequest, ApiRequestKind, ApiResponse, BoxFuture, DISCOVERY_WINDOW,
+        DetailInterest, GithubApi, GithubCiTracker, GithubJobsResponse, GithubRepository,
+        HttpGithubApi, PollScheduler, github_ci_enabled, set_github_ci_enabled,
     };
     use crate::git_ref_watcher::{PushDetected, RemoteRepository};
 
@@ -1874,7 +1961,7 @@ mod tests {
         assert_eq!(second.workflows[0].updated_at_epoch_secs, Some(1_005));
         assert_eq!(second.rollup, CiRunStatus::Success);
         assert_eq!(api.etags.lock().unwrap().as_slice(), &[None, Some("etag".into())]);
-        assert_eq!(tracker.window_count(), 0);
+        assert_eq!(tracker.polling_count(), 0, "a terminal rollup must stop polling");
     }
 
     // @lat: [[test#GitHub CI Tracking#Active same-SHA generation]]
@@ -1938,7 +2025,7 @@ mod tests {
         let first = tracker.poll_one(start, 1_000, &api).await;
         let CiRunDelta::Set(first) = &first[0].1 else { panic!("expected state") };
         assert_eq!(first.rollup, CiRunStatus::Failure);
-        assert_eq!(tracker.window_count(), 0, "a terminal rollup must stop the window");
+        assert_eq!(tracker.polling_count(), 0, "a terminal rollup must stop polling");
 
         tracker
             .accept_push(
@@ -1955,6 +2042,77 @@ mod tests {
             CiRunStatus::Success,
             "a superseded failed run poisoned the rollup"
         );
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Old-only generation response keeps polling]]
+    #[tokio::test]
+    async fn a_reopened_generation_keeps_polling_through_an_old_only_response() {
+        let start = Instant::now();
+        let failed = run(900, CiWorkflowStatus::Completed, Some(CiRunConclusion::Failure));
+        let api = RunsApi::with_responses(vec![
+            workflows_response(vec![(50, failed.clone())]),
+            workflows_response(vec![(50, failed.clone())]),
+            workflows_response(vec![
+                (50, failed),
+                (50, run(901, CiWorkflowStatus::InProgress, None)),
+            ]),
+        ]);
+        let mut tracker = GithubCiTracker::default();
+        tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
+        tracker.poll_one(start, 1_000, &api).await;
+        assert_eq!(tracker.polling_count(), 0, "a terminal rollup must stop polling");
+
+        tracker
+            .accept_push(
+                generation_push("git@github.com:acme/widget.git", "/a", "head-a"),
+                start + Duration::from_secs(1),
+            )
+            .expect("trusted generation reopens the settled head");
+        let old_only = tracker.poll_one(start + Duration::from_secs(5), 1_005, &api).await;
+        let CiRunDelta::Set(old_only) = &old_only[0].1 else { panic!("expected state") };
+        assert_eq!(old_only.rollup, CiRunStatus::Failure);
+        assert_eq!(
+            old_only.workflows[0].updated_at_epoch_secs,
+            Some(1_000),
+            "a run that reported no news must keep the clock the bar already shows"
+        );
+        assert_eq!(
+            tracker.polling_count(),
+            1,
+            "an old-only response closed the generation before its new run appeared"
+        );
+
+        let generation = tracker.poll_one(start + Duration::from_secs(10), 1_010, &api).await;
+        let CiRunDelta::Set(generation) = &generation[0].1 else { panic!("expected state") };
+        assert_eq!(generation.workflows.iter().map(|run| run.run_id).collect::<Vec<_>>(), [901]);
+        assert_eq!(generation.rollup, CiRunStatus::Running);
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Settled heads leave on the next sweep]]
+    #[tokio::test]
+    async fn a_settled_head_is_retired_once_no_generation_can_follow_it() {
+        let start = Instant::now();
+        let api = RunsApi::with_responses(vec![
+            runs_response(CiWorkflowStatus::Completed, Some(CiRunConclusion::Success)),
+            runs_response(CiWorkflowStatus::InProgress, None),
+        ]);
+        let mut tracker = GithubCiTracker::default();
+        tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
+        tracker.poll_one(start, 1_000, &api).await;
+        assert_eq!(tracker.window_count(), 1, "a settled head stays reopenable");
+
+        // Another repository's push drives the sweep; the settled head is still
+        // young enough for a retag to reopen it.
+        tracker.accept_push(
+            push("git@github.com:acme/other.git", "/b", "head-b"),
+            start + Duration::from_secs(5),
+        );
+        tracker.poll_one(start + Duration::from_secs(5), 1_005, &api).await;
+        assert_eq!(tracker.window_count(), 2);
+
+        tracker.poll_one(start + DISCOVERY_WINDOW + Duration::from_secs(5), 1_130, &api).await;
+        assert_eq!(tracker.window_count(), 1, "the settled head outlived its generation window");
+        assert_eq!(tracker.head_for("acme/other"), Some("head-b"), "a live head must not expire");
     }
 
     // @lat: [[test#GitHub CI Tracking#Rate-limit delay]]

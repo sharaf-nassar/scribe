@@ -146,6 +146,16 @@ Multiple roots for one GitHub repository share one tracker, and a newer pushed h
 
 A trusted same-OID generation at an unchanged head reopens the active window in place, so an already-observed workflow survives alongside a second workflow the next response adds, with one rollup and no `Cleared` delta.
 
+### Old-only generation response keeps polling
+
+A settled head reopened by a trusted same-OID generation survives a response that still carries only the previous generation's terminal run, then adopts the new run once GitHub returns it.
+
+A run returned unchanged while that generation is awaited keeps the observation timestamp the bar already shows, so the wait cannot advance a finished run's elapsed clock.
+
+### Settled heads leave on the next sweep
+
+A terminal head stays tracked while a generation could still follow it, and the first expiry sweep past its discovery window retires it. Sweeps driven by other repositories' polling leave live heads alone.
+
 ### Retag collapses to the newest run
 
 Two runs for one workflow at the same head — an earlier failed attempt and a retag's newer run — collapse to the newest run id, so the superseded failure cannot poison the rollup.

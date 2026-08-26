@@ -326,9 +326,14 @@ The tracker normalizes each poll response to the newest run per workflow at
 the pushed head, so a superseded run (a retag replacing an earlier attempt)
 never enters rollup, details, link selection, or terminal-stop decisions,
 while distinct workflows running concurrently at the same head both survive.
-A trusted same-OID ref event reopens an active window at an unchanged head in
-place, carrying its observed state and roots forward rather than clearing it;
-only an actual head change clears and opens a fresh window.
+A trusted same-OID ref event reopens a window at an unchanged head in place,
+settled or not, carrying its observed state and roots forward rather than
+clearing it; only an actual head change clears and opens a fresh window. A
+terminal head settles rather than disappearing: it stops polling and leaves
+handoff state, but stays reopenable until an expiry sweep past its own
+discovery window retires it. While a reopened generation has produced nothing
+newer than the run it already published, responses publish without settling the
+window, so a run GitHub creates a few seconds late is still adopted.
 
 Hot handoff carries active repository/head descriptors, remaining discovery
 time, roots, and last bounded run state. It never carries the GitHub token. The

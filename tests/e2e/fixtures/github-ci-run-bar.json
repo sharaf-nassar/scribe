@@ -4,6 +4,7 @@
       "workflow_runs": [
         {
           "id": 101,
+          "workflow_id": 11,
           "name": "rust-linux",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -12,6 +13,7 @@
         },
         {
           "id": 102,
+          "workflow_id": 12,
           "name": "rust-macos",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -20,6 +22,7 @@
         },
         {
           "id": 103,
+          "workflow_id": 13,
           "name": "lat-check",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -32,6 +35,7 @@
       "workflow_runs": [
         {
           "id": 101,
+          "workflow_id": 11,
           "name": "rust-linux",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -40,6 +44,7 @@
         },
         {
           "id": 102,
+          "workflow_id": 12,
           "name": "rust-macos",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -48,6 +53,7 @@
         },
         {
           "id": 103,
+          "workflow_id": 13,
           "name": "lat-check",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
@@ -60,6 +66,7 @@
       "workflow_runs": [
         {
           "id": 201,
+          "workflow_id": 11,
           "name": "rust-linux",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
@@ -68,6 +75,7 @@
         },
         {
           "id": 202,
+          "workflow_id": 12,
           "name": "rust-macos",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
@@ -76,6 +84,7 @@
         },
         {
           "id": 203,
+          "workflow_id": 13,
           "name": "lat-check",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
@@ -88,6 +97,7 @@
       "workflow_runs": [
         {
           "id": 301,
+          "workflow_id": 11,
           "name": "rust-linux",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
@@ -96,6 +106,7 @@
         },
         {
           "id": 302,
+          "workflow_id": 12,
           "name": "rust-macos",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
@@ -104,6 +115,7 @@
         },
         {
           "id": 303,
+          "workflow_id": 13,
           "name": "lat-check",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
@@ -116,6 +128,7 @@
       "workflow_runs": [
         {
           "id": 401,
+          "workflow_id": 11,
           "name": "rust-linux",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",
@@ -124,6 +137,7 @@
         },
         {
           "id": 402,
+          "workflow_id": 12,
           "name": "rust-macos",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",
@@ -132,6 +146,7 @@
         },
         {
           "id": 403,
+          "workflow_id": 13,
           "name": "lat-check",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",

@@ -4,6 +4,7 @@
       "workflow_runs": [
         {
           "id": 101,
+          "workflow_id": 11,
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "queued",
@@ -11,6 +12,7 @@
         },
         {
           "id": 999,
+          "workflow_id": 12,
           "name": "other head",
           "head_sha": "2222222222222222222222222222222222222222",
           "status": "completed",
@@ -22,6 +24,7 @@
       "workflow_runs": [
         {
           "id": 101,
+          "workflow_id": 11,
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "in_progress",
@@ -33,6 +36,7 @@
       "workflow_runs": [
         {
           "id": 101,
+          "workflow_id": 11,
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "completed",
