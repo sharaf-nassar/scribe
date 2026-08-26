@@ -168,9 +168,13 @@ One scheduler enforces the 5-second minimum cadence and 720-attempt rolling-hour
 
 An idle tracker performs no auth or HTTP call, and failed token acquisition removes the relevant window before any HTTP request.
 
+### Every triggering event at the head
+
+One workflow file triggered twice at the same head by different events keeps both runs, so a `pull_request` run and a `push` run of the same file both reach the rollup.
+
 ### Trusted API request
 
-Production and loopback request URLs use the exact run-list query, while non-loopback API overrides fail before authentication.
+Production and loopback request URLs use the exact head-scoped run-list query without an event filter, while non-loopback API overrides fail before authentication.
 
 ### Observation timestamps and terminal stop
 

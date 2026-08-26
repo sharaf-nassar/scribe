@@ -8,7 +8,8 @@
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "queued",
-          "conclusion": null
+          "conclusion": null,
+          "event": "push"
         },
         {
           "id": 999,
@@ -16,7 +17,8 @@
           "name": "other head",
           "head_sha": "2222222222222222222222222222222222222222",
           "status": "completed",
-          "conclusion": "success"
+          "conclusion": "success",
+          "event": "push"
         }
       ]
     },
@@ -28,7 +30,8 @@
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "in_progress",
-          "conclusion": null
+          "conclusion": null,
+          "event": "push"
         }
       ]
     },
@@ -40,7 +43,8 @@
           "name": "quality",
           "head_sha": "1111111111111111111111111111111111111111",
           "status": "completed",
-          "conclusion": "success"
+          "conclusion": "success",
+          "event": "push"
         }
       ]
     }

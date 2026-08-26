@@ -27,6 +27,14 @@ const DISCOVERY_WINDOW: Duration = Duration::from_mins(2);
 const MAX_ATTEMPTS_PER_HOUR: usize = 720;
 const MAX_WORKFLOWS: usize = 100;
 const MAX_REPOSITORY_ROOTS: usize = 64;
+/// Bound on a workflow run's triggering event, kept well above the longest
+/// event GitHub documents so two distinct events cannot dedup into one key.
+const MAX_EVENT_BYTES: usize = 64;
+
+/// Dedup identity of a workflow run at one head: the workflow file plus the
+/// event that triggered it, so a `push` and a `pull_request` run of the same
+/// file both survive while a retag's superseded run does not.
+type WorkflowKey = (u64, String);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -118,12 +126,12 @@ pub fn aggregate_status(workflows: &[CiWorkflowRun]) -> CiRunStatus {
 /// Keeps only the highest-id run for each workflow at this head, so a same-OID
 /// generation (retag) collapses onto its newest run while distinct concurrent
 /// workflows at the same head all survive into the published rollup.
-fn newest_per_workflow(runs: Vec<(u64, CiWorkflowRun)>) -> Vec<CiWorkflowRun> {
-    let mut newest: HashMap<u64, CiWorkflowRun> = HashMap::new();
-    for (workflow_id, run) in runs {
-        let keep = newest.get(&workflow_id).is_none_or(|existing| run.run_id > existing.run_id);
+fn newest_per_workflow(runs: Vec<(WorkflowKey, CiWorkflowRun)>) -> Vec<CiWorkflowRun> {
+    let mut newest: HashMap<WorkflowKey, CiWorkflowRun> = HashMap::new();
+    for (key, run) in runs {
+        let keep = newest.get(&key).is_none_or(|existing| run.run_id > existing.run_id);
         if keep {
-            newest.insert(workflow_id, run);
+            newest.insert(key, run);
         }
     }
     let mut workflows: Vec<CiWorkflowRun> = newest.into_values().collect();
@@ -199,7 +207,7 @@ impl ApiRequest {
 
 pub enum ApiResponse {
     NotModified,
-    Runs { etag: Option<String>, branch: String, workflows: Vec<(u64, CiWorkflowRun)> },
+    Runs { etag: Option<String>, branch: String, workflows: Vec<(WorkflowKey, CiWorkflowRun)> },
     Jobs { etag: Option<String>, run_id: u64, jobs: Vec<CiJob> },
 }
 
@@ -208,7 +216,7 @@ struct RunsObservation {
     epoch_secs: u64,
     etag: Option<String>,
     branch: String,
-    workflows: Vec<(u64, CiWorkflowRun)>,
+    workflows: Vec<(WorkflowKey, CiWorkflowRun)>,
 }
 
 #[derive(Debug)]
@@ -298,10 +306,7 @@ impl HttpGithubApi {
             }
         };
         url.set_path(&format!("/repos/{}/{}/actions/runs", repository.owner, repository.name));
-        url.query_pairs_mut()
-            .append_pair("head_sha", head_sha)
-            .append_pair("event", "push")
-            .append_pair("per_page", "100");
+        url.query_pairs_mut().append_pair("head_sha", head_sha).append_pair("per_page", "100");
         Ok(url)
     }
 
@@ -444,6 +449,8 @@ struct GithubWorkflowRun {
     head_sha: String,
     #[serde(default)]
     head_branch: String,
+    #[serde(default)]
+    event: String,
     status: String,
     conclusion: Option<String>,
 }
@@ -485,7 +492,7 @@ impl GithubRunsResponse {
                     branch = truncate_text(&run.head_branch, 256);
                 }
                 (
-                    run.workflow_id,
+                    (run.workflow_id, truncate_text(&run.event, MAX_EVENT_BYTES)),
                     CiWorkflowRun {
                         run_id: run.id,
                         name: truncate_text(&run.name, 256),
@@ -1518,7 +1525,7 @@ mod tests {
     use super::{
         ApiError, ApiRequest, ApiRequestKind, ApiResponse, BoxFuture, DISCOVERY_WINDOW,
         DetailInterest, GithubApi, GithubCiTracker, GithubJobsResponse, GithubRepository,
-        HttpGithubApi, PollScheduler, github_ci_enabled, set_github_ci_enabled,
+        HttpGithubApi, PollScheduler, WorkflowKey, github_ci_enabled, set_github_ci_enabled,
     };
     use crate::git_ref_watcher::{PushDetected, RemoteRepository};
 
@@ -1728,12 +1735,12 @@ mod tests {
         let production = HttpGithubApi::with_override(None);
         assert_eq!(
             production.prepare(&repository, "abc123").unwrap().url.as_str(),
-            "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abc123&event=push&per_page=100"
+            "https://api.github.com/repos/acme/widget/actions/runs?head_sha=abc123&per_page=100"
         );
         let fixture = HttpGithubApi::with_override(Some("http://127.0.0.1:8098".into()));
         assert_eq!(
             fixture.prepare(&repository, "abc123").unwrap().url.as_str(),
-            "http://127.0.0.1:8098/repos/acme/widget/actions/runs?head_sha=abc123&event=push&per_page=100"
+            "http://127.0.0.1:8098/repos/acme/widget/actions/runs?head_sha=abc123&per_page=100"
         );
         let attacker = HttpGithubApi::with_override(Some("https://example.com".into()));
         assert!(matches!(
@@ -1844,7 +1851,7 @@ mod tests {
                     ApiRequestKind::Runs { .. } => Ok(ApiResponse::Runs {
                         etag: None,
                         branch: "main".into(),
-                        workflows: vec![(42, run(42, CiWorkflowStatus::InProgress, None))],
+                        workflows: vec![(pushed(42), run(42, CiWorkflowStatus::InProgress, None))],
                     }),
                     ApiRequestKind::Jobs { run_id } => Ok(self.jobs_response(run_id)),
                 }
@@ -1932,11 +1939,16 @@ mod tests {
     }
 
     fn runs_response(status: CiWorkflowStatus, conclusion: Option<CiRunConclusion>) -> ApiResponse {
-        workflows_response(vec![(1, run(1, status, conclusion))])
+        workflows_response(vec![(pushed(1), run(1, status, conclusion))])
     }
 
-    fn workflows_response(workflows: Vec<(u64, CiWorkflowRun)>) -> ApiResponse {
+    fn workflows_response(workflows: Vec<(WorkflowKey, CiWorkflowRun)>) -> ApiResponse {
         ApiResponse::Runs { etag: Some("etag".into()), branch: "main".into(), workflows }
+    }
+
+    /// A `push`-triggered run of workflow file `workflow_id`.
+    fn pushed(workflow_id: u64) -> WorkflowKey {
+        (workflow_id, "push".into())
     }
 
     // @lat: [[test#GitHub CI Tracking#Observation timestamps and terminal stop]]
@@ -1970,10 +1982,10 @@ mod tests {
         let start = Instant::now();
         let branch_run = run(201, CiWorkflowStatus::InProgress, None);
         let api = RunsApi::with_responses(vec![
-            workflows_response(vec![(10, branch_run.clone())]),
+            workflows_response(vec![(pushed(10), branch_run.clone())]),
             workflows_response(vec![
-                (10, branch_run),
-                (20, run(305, CiWorkflowStatus::InProgress, None)),
+                (pushed(10), branch_run),
+                (pushed(20), run(305, CiWorkflowStatus::InProgress, None)),
             ]),
         ]);
         let mut tracker = GithubCiTracker::default();
@@ -2016,8 +2028,8 @@ mod tests {
         let failed = run(900, CiWorkflowStatus::Completed, Some(CiRunConclusion::Failure));
         let retried = run(901, CiWorkflowStatus::Completed, Some(CiRunConclusion::Success));
         let api = RunsApi::with_responses(vec![
-            workflows_response(vec![(50, failed.clone())]),
-            workflows_response(vec![(50, failed), (50, retried)]),
+            workflows_response(vec![(pushed(50), failed.clone())]),
+            workflows_response(vec![(pushed(50), failed), (pushed(50), retried)]),
         ]);
         let mut tracker = GithubCiTracker::default();
         tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
@@ -2050,11 +2062,11 @@ mod tests {
         let start = Instant::now();
         let failed = run(900, CiWorkflowStatus::Completed, Some(CiRunConclusion::Failure));
         let api = RunsApi::with_responses(vec![
-            workflows_response(vec![(50, failed.clone())]),
-            workflows_response(vec![(50, failed.clone())]),
+            workflows_response(vec![(pushed(50), failed.clone())]),
+            workflows_response(vec![(pushed(50), failed.clone())]),
             workflows_response(vec![
-                (50, failed),
-                (50, run(901, CiWorkflowStatus::InProgress, None)),
+                (pushed(50), failed),
+                (pushed(50), run(901, CiWorkflowStatus::InProgress, None)),
             ]),
         ]);
         let mut tracker = GithubCiTracker::default();
@@ -2113,6 +2125,26 @@ mod tests {
         tracker.poll_one(start + DISCOVERY_WINDOW + Duration::from_secs(5), 1_130, &api).await;
         assert_eq!(tracker.window_count(), 1, "the settled head outlived its generation window");
         assert_eq!(tracker.head_for("acme/other"), Some("head-b"), "a live head must not expire");
+    }
+
+    // @lat: [[test#GitHub CI Tracking#Every triggering event at the head]]
+    #[tokio::test]
+    async fn push_and_pull_request_runs_of_one_workflow_both_survive() {
+        let start = Instant::now();
+        let api = RunsApi::with_responses(vec![workflows_response(vec![
+            (pushed(50), run(900, CiWorkflowStatus::InProgress, None)),
+            ((50, "pull_request".into()), run(901, CiWorkflowStatus::InProgress, None)),
+        ])]);
+        let mut tracker = GithubCiTracker::default();
+        tracker.accept_push(push("git@github.com:acme/widget.git", "/a", "head-a"), start);
+
+        let observed = tracker.poll_one(start, 1_000, &api).await;
+        let CiRunDelta::Set(observed) = &observed[0].1 else { panic!("expected state") };
+        assert_eq!(
+            observed.workflows.iter().map(|run| run.run_id).collect::<Vec<_>>(),
+            [900, 901],
+            "one workflow file triggered by two events must keep both runs"
+        );
     }
 
     // @lat: [[test#GitHub CI Tracking#Rate-limit delay]]

@@ -197,8 +197,13 @@ constraints at the same time.
   `X-RateLimit-Reset`; do not query `/rate_limit` merely to inspect quota.
 
 The discovery URL is stable and specific:
-`GET /repos/{owner}/{repo}/actions/runs?head_sha={sha}&event=push&per_page=100`.
+`GET /repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=100`.
 GitHub documents `head_sha` filtering and `Actions: read` for this endpoint.
+The original query also pinned `event=push`. That was dropped (2026-08-25):
+`event` accepts one value per request, and a `pull_request` run carries the
+PR's head commit as its `head_sha` — the same commit the local push wrote —
+so filtering on `push` hid every branch whose workflows only trigger through
+a pull request while costing an extra request to recover.
 The jobs endpoint uses the same fine-grained permission. See the official
 [workflow-run endpoint](https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2026-03-10#list-workflow-runs-for-a-repository)
 and [workflow-job endpoint](https://docs.github.com/en/rest/actions/workflow-jobs?apiVersion=2026-03-10#list-jobs-for-a-workflow-run).

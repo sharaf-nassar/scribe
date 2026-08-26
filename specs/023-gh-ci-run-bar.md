@@ -38,15 +38,18 @@ contract and separates offline automation from the required real-GitHub gate.
 
 - Non-GitHub CI providers (GitLab CI, Buildkite, Jenkins, …). The detection
   seam should not preclude them, but only GitHub Actions is in scope.
-- Runs not triggered by the user's own local push: pushes from other
-  machines, teammates' merges, scheduled/dispatch workflows. Documented
-  limitation of v1, not a bug.
+- Runs at a commit the user never pushed locally: pushes from other
+  machines, teammates' merges, scheduled/dispatch workflows at an
+  untracked head. Documented limitation of v1, not a bug. Every workflow
+  run GitHub attaches to a tracked head does count, whatever event
+  triggered it.
 - Pushes made inside remote (SSH) sessions — they mutate the remote host's
   repo and are invisible to local detection. v1 covers local repos only.
 - GitHub Enterprise Server / non-github.com hosts. The host seam stays
   generic but only github.com is supported in v1.
 - PR check rollups (check-runs API, third-party checks). v1 tracks the
-  workflow runs for the pushed head commit.
+  workflow runs for the pushed head commit, including the `pull_request`
+  runs GitHub attaches to that commit.
 - Acting on CI from the bar (re-run, cancel, approve deployments) — v1 is
   view/track only, with at most "open in browser".
 - Full log streaming of job output inside the bar. Realtime here means
@@ -217,6 +220,10 @@ machines, teammates' merges, scheduled workflows, and pushes inside remote
 A: All workflow runs for the pushed head commit, aggregated into a
 worst-status rollup (like GitHub's checks UI). PR check rollups are a v1
 non-goal. Reflected in Goals, Non-Goals, and Stories 2 and 4.
+REVISED (2026-08-25): the run-list query dropped its `event=push` filter,
+which had hidden every `pull_request` run and so left the bar blank on any
+branch whose workflows only trigger through a PR. Runs are selected by head
+SHA alone, and a workflow file triggered by two events keeps both runs.
 
 **Q4: May Scribe create a webhook on the user's repo?**
 A: Not by default — but allowed as an explicit opt-in enhancement. Research
@@ -322,10 +329,11 @@ The server tracker records each workflow's first and latest local observation
 times. This gives the bar a stable elapsed clock without adding a provider-date
 parser; a re-observed run keeps its first timestamp by run id.
 
-The tracker normalizes each poll response to the newest run per workflow at
-the pushed head, so a superseded run (a retag replacing an earlier attempt)
-never enters rollup, details, link selection, or terminal-stop decisions,
-while distinct workflows running concurrently at the same head both survive.
+The tracker normalizes each poll response to the newest run per workflow and
+triggering event at the pushed head, so a superseded run (a retag replacing an
+earlier attempt) never enters rollup, details, link selection, or terminal-stop
+decisions, while distinct workflows running concurrently at the same head both
+survive.
 A trusted same-OID ref event reopens a window at an unchanged head in place,
 settled or not, carrying its observed state and roots forward rather than
 clearing it; only an actual head change clears and opens a fresh window. A
@@ -420,8 +428,10 @@ evidence with an offline rerun.
   and tracked remote may also reopen that OID. Tags at untracked OIDs cannot
   infer a destination. Access events and packed or reftable storage rewrites
   remain non-triggers.
-- Remote SSH pushes, scheduled runs, teammate pushes, manual re-runs without a
-  local ref event, and no-op pushes that write no ref remain invisible.
+- Remote SSH pushes, teammate pushes, manual re-runs without a local ref
+  event, and no-op pushes that write no ref remain invisible. Scheduled and
+  dispatched runs are visible only when they sit at a head a local push
+  already opened a window for.
 - Terminal snapshots stop polling but stay visible in the client until owner
   dismissal or replacement by an observed later head.
 

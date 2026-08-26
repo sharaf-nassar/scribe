@@ -8,6 +8,7 @@
           "name": "rust-linux",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -17,6 +18,7 @@
           "name": "rust-macos",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "in_progress",
           "conclusion": null
         },
@@ -26,6 +28,7 @@
           "name": "lat-check",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "queued",
           "conclusion": null
         }
@@ -39,6 +42,7 @@
           "name": "rust-linux",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -48,6 +52,7 @@
           "name": "rust-macos",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -57,6 +62,7 @@
           "name": "lat-check",
           "head_sha": "__RUNNING_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         }
@@ -70,6 +76,7 @@
           "name": "rust-linux",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "failure"
         },
@@ -79,6 +86,7 @@
           "name": "rust-macos",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -88,6 +96,7 @@
           "name": "lat-check",
           "head_sha": "__FAILURE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         }
@@ -101,6 +110,7 @@
           "name": "rust-linux",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -110,6 +120,7 @@
           "name": "rust-macos",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "cancelled"
         },
@@ -119,6 +130,7 @@
           "name": "lat-check",
           "head_sha": "__CANCELLED_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         }
@@ -132,6 +144,7 @@
           "name": "rust-linux",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "completed",
           "conclusion": "success"
         },
@@ -141,6 +154,7 @@
           "name": "rust-macos",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "in_progress",
           "conclusion": null
         },
@@ -150,6 +164,7 @@
           "name": "lat-check",
           "head_sha": "__STALE_HEAD__",
           "head_branch": "main",
+          "event": "push",
           "status": "queued",
           "conclusion": null
         }

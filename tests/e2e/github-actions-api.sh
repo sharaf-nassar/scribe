@@ -60,7 +60,7 @@ grep -Eq "^[[:space:]]*[0-9]+: 0100007F:1FA2 " /proc/net/tcp \
 ! grep -Eq "^[[:space:]]*[0-9]+: 00000000:1FA2 " /proc/net/tcp \
     || fail "fixture is bound to all IPv4 interfaces"
 
-RUNS="/repos/acme/widget/actions/runs?head_sha=$SHA&event=push&per_page=100"
+RUNS="/repos/acme/widget/actions/runs?head_sha=$SHA&per_page=100"
 response=$(http_get "$RUNS")
 status_is "$response" 200
 body=$(body_of "$response")
